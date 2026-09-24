@@ -4,6 +4,32 @@ C++20 Hexo rules and search engine, Python interface, and local browser game.
 
 The current priority is a self-play learning loop with a local experiment dashboard. Checkpoints earn promotion through matches against frozen opponents; fitting loss alone never replaces the incumbent.
 
+An optional Strix root-probe experiment is available in `arena.py` after building
+the [separate reference executable](tools/strix/README.md). `--strix-root-ms 20`
+allocates up to 20 ms of each turn to that reference; its default is zero.
+`--strix-root-nodes 1000`, `--strix-root-depth 8`, and `--strix-root-wide` expose
+the solver limits and generator. The probe must have less time than `--ms`.
+Only a sequentially legal winning PV can supply the current turn, recorded as
+`source=strix_reference`, `score=null`, and `independent_proof=false`. All other
+results fall back to native PVS with the remaining wall budget. No training
+targets or native tactical rules change.
+
+Each arena worker warms one persistent reference process during setup and
+records that latency separately. Hard timeouts kill the process; later restart
+costs count against the next turn. No work runs during the opponent's turn.
+Reports include combined timings, overruns, call/result counts, executable and
+adapter hashes. Native fallback receives at least 1 ms even after a scheduler
+or cleanup overrun, which remains visible in the report.
+
+A bounded operational check used the same trained pattern checkpoint, Seal at
+100 ms, seeds 20260929/20260930, alternating which configuration ran first,
+two color-swapped games per seed, and an 800-stone cap. Both probe-off and
+20-ms/1,000-node probe-on lost all four games. The probe made 47 calls with
+43 scoped negatives, four unknowns, and zero reference selections. Both
+configurations stayed below 105 ms per measured turn; initial probe setup took
+118–120 ms. This small check establishes neither a strength advantage nor a
+strength equivalence. The experiment remains disabled by default.
+
 Player 1 opens at the origin. Players then alternate two placements. Each placement must be empty and within hex distance eight of an existing stone of either color. Six or more connected stones along any of the three axes wins immediately, including on the first placement of a turn.
 
 ## Build and play
