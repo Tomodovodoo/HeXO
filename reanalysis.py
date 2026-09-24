@@ -13,8 +13,11 @@ from train import merge_nnue, nnue_example, pack_nnue, write_json
 
 
 def digest(path):
+    result = hashlib.sha256()
     with open(path, "rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+        for block in iter(lambda: handle.read(1024*1024), b""):
+            result.update(block)
+    return result.hexdigest()
 
 
 def validate_history(record, curriculum="legacy"):
