@@ -285,6 +285,9 @@ def main(args):
                 publish(checkpoint,dict(identity,checkpoint=iteration),writer,metrics);del model,optimizer
                 if args.device=='cuda':torch.cuda.empty_cache()
             metrics=verify_artifact(checkpoint,dict(identity,checkpoint=iteration))['metrics']
+            verify_artifact(corpus,corpus_identity(iteration))
+            if metrics['corpus_sha256']!=digest(corpus/'manifest.json'):
+                raise ValueError('Pending checkpoint consumed corpus changed')
             comparisons={}
             for opponent in sorted({0,league['champion']}):
                 comparisons[opponent]=evaluate(run,iteration,opponent,args,lambda data:event('validation-matches',iteration,opponent=opponent,**data))
