@@ -412,6 +412,32 @@ struct Search {
         }
         out.push_back(selected);
     }
+    bool cover_exists(const std::vector<std::vector<Cell>>& threats,std::array<Cell,2>& selected,
+                      int used,int remaining) const {
+        for(const auto& completion:threats) {
+            bool hit=false;
+            for(auto cell:completion) for(int i=0;i<std::min(used,2);++i) if(selected[i]==cell) hit=true;
+            if(hit) continue;
+            if(remaining<=0 || used>=2) return false;
+            for(auto cell:completion) {
+                selected[used]=cell;
+                if(cover_exists(threats,selected,used+1,remaining-1)) return true;
+            }
+            return false;
+        }
+        // A spare placement may be anywhere legal. Its strategic value is
+        // unknown; existence of a cover is never treated as a forced win.
+        return true;
+    }
+    bool unavoidable_loss(const Board& b) const {
+        if(b.threats[1-b.player].empty()) return false;
+        auto threats=b.completions(1-b.player);
+        std::erase_if(threats,[&](const auto& completion) {
+            return !std::all_of(completion.begin(),completion.end(),[&](Cell c){return b.legal(c);});
+        });
+        std::array<Cell,2> selected{};
+        return !cover_exists(threats,selected,0,b.remaining);
+    }
     std::vector<Turn> turns(Board& b,bool timed=true) {
         Turn win=immediate(b); if(win.count) {win.score=mate;return {win};}
         int side=b.player;
@@ -467,7 +493,7 @@ struct Search {
         ++nodes;check();
         if(b.winner>=0) return b.winner==b.player?mate:-mate;
         if(immediate(b).count) return mate;
-        if(depth<=0) return b.score(b.player);
+        if(depth<=0) return unavoidable_loss(b)?-mate:b.score(b.player);
         uint64_t key=b.hash();auto& entry=tt[key&(tt.size()-1)];
         if(entry.key==key && entry.depth>=depth) {
             if(entry.flag==0) return entry.score;
