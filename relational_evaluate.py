@@ -129,6 +129,8 @@ def freeze(args):
     if opponent_snapshot:
         from relational_opponents import load_opponent
         opponent = json.loads((opponent_snapshot/'opponent.json').read_text())
+        if opponent['kind'] == 'strix' and args.max_stones > 800:
+            raise ValueError('Strix evaluation stone cap must not exceed 800')
         checked = load_opponent(opponent, opponent_snapshot)
         checked.close()
         source_names.append('relational_opponents.py')
