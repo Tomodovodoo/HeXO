@@ -85,8 +85,46 @@ def klent_run(run):
             "rating": "UNRATED", "rating_reason": "External paired match evidence is not attached to this run."}
 
 
+def relational_run(run, declared_family=None):
+    status_path = run/"status.json"
+    if not status_path.exists():
+        status_path = run.with_suffix('.status.json')
+    status = read_json(status_path, {})
+    manifests = sorted((run/'checkpoints').glob('[0-9][0-9][0-9][0-9]/manifest.json'))
+    manifest_path = manifests[-1] if manifests else run/'manifest.json'
+    manifest = read_json(manifest_path, {})
+    identity = manifest.get('identity', {})
+    provenance = read_json(run/'provenance.json', {})
+    family = identity.get('backbone') or identity.get('kind') or status.get('schema') or provenance.get('model_family') or declared_family or ''
+    if 'relational' not in family:
+        return None
+    evaluation = status if provenance.get('schema') == 'hexo-relational-evaluation-v1' else None
+    model_hash = manifest.get('files', {}).get('model.pt') or status.get('candidate_sha256')
+    if not evaluation and model_hash:
+        for folder in (run/'evaluation/confirmation', run/'evaluation'):
+            candidate = read_json(folder/'status.json', {})
+            if candidate.get('candidate_sha256') == model_hash:
+                evaluation = candidate
+                break
+    warmstart = identity.get('kind') == 'relational-human-policy-q-v1' or 'epoch' in status or 'epochs' in status
+    backend = (evaluation or {}).get('backend')
+    artifact = manifest_path if manifest else None
+    if evaluation is status and (run/'report.json').exists():
+        artifact = run/'report.json'
+    return dict(name=run.name, path=str(run), model_family='relational-policy-q',
+        phase=status.get('stage', 'initialized'), training_backend='human policy/Q fitting' if warmstart else 'KLENT policy/Q',
+        evaluation_backend=backend, checkpoint_sha256=model_hash,
+        source_sha256=identity.get('sources') or provenance.get('files_sha256'),
+        opponent=(evaluation or {}).get('opponent'), evaluation=evaluation,
+        heartbeat=status_path.stat().st_mtime if status_path.exists() else None,
+        workers=status.get('workers', []), last_artifact=str(artifact) if artifact else None,
+        status=status, metrics=manifest.get('metrics', {}), config=identity.get('config', {}),
+        rating='UNRATED', model_identity_pending=not bool(manifest or provenance))
+
+
 class Handler(BaseHTTPRequestHandler):
     run = Path("runs/selfplay")
+    model_family = None
     hardware = {"time": 0, "gpu": None}
     hardware_history = deque(maxlen=300)
 
@@ -117,7 +155,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/run":
             summary = self.run / "summary.json"
             events = self.run / "events.jsonl"
-            if not summary.exists():
+            relational = relational_run(self.run, self.model_family)
+            if relational:
+                data = {"kind": "relational", "relational": relational, "summary": None, "events": []}
+            elif not summary.exists():
                 klent = klent_run(self.run)
                 data = {"kind": "klent" if klent else "native", "klent": klent, "summary": None, "events": []}
             else:
@@ -157,7 +198,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", default="runs/selfplay")
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--model-family", choices=['relational-policy-q'], help='Identify a run before its first manifest is published')
     args = parser.parse_args()
     Handler.run = Path(args.run).resolve()
+    Handler.model_family = args.model_family
     print(f"Training dashboard: http://127.0.0.1:{args.port}", flush=True)
     HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
