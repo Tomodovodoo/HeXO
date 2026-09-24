@@ -52,6 +52,10 @@ class NeuralTree(unittest.TestCase):
         game = Game(search.history)
         self.assertEqual(game.winner, 0)
         game.close()
+        result = search.search(8)
+        self.assertEqual(result['exact_winner'], 0)
+        self.assertEqual(result['proof_status'], 'PROVEN_LOSS')
+        self.assertIsNone(result['action'])
 
     def test_exact_defense_preserves_a_complete_turn(self):
         history = [[0,0],[1,5],[3,3],[-2,2],[-1,1],[2,4],[0,6]]
