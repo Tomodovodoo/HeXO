@@ -45,6 +45,10 @@ def run(args):
     rng = random.Random(args.seed)
     opponent = Seal() if args.opponent == "seal" else None
     opponent_metadata = None
+    if args.opponent == "seal-current-best":
+        from tools.seal_current import SealCurrent
+        opponent = SealCurrent()
+        opponent_metadata = opponent.metadata
     if args.opponent == "orca":
         from tools.orca_adapter import Orca
         opponent = Orca(args.orca_source, args.orca_checkpoint, args.orca_sims,
@@ -88,9 +92,12 @@ def run(args):
                           if 0 < max(abs(q), abs(r), abs(q+r)) <= 2]
             opening += rng.sample(candidates, 2)
         game = Game(opening)
+        if args.opponent == "seal-current-best":
+            opponent.reset()
         our_color = index % 2
         timings = [[], []]
         searches = []
+        turns = []
         reason = "truncated"
         error = None
         while game.winner < 0 and len(game.cells) < args.max_stones:
@@ -123,6 +130,8 @@ def run(args):
                     for _ in moves:
                         game.undo()
                 timings[side].append((time.perf_counter()-before)*1000)
+                turns.append({"player": side, "ply": len(game.cells), "moves": moves,
+                              "elapsed_ms": timings[side][-1], "requested_ms": args.ms})
                 if not moves:
                     raise ValueError("Opponent returned no moves")
                 for move in moves:
@@ -138,7 +147,7 @@ def run(args):
             reason = "six-in-a-row"
         record = {"index": index, "our_color": our_color, "winner": game.winner,
                   "reason": reason, "error": error, "cells": game.cells, "time_ms": timings,
-                  "searches": searches}
+                  "searches": searches, "turns": turns, "opening": opening}
         games.append(record)
         completed = [g for g in games if g["reason"] == "six-in-a-row"]
         wins = sum(g["winner"] == g["our_color"] for g in completed)
@@ -167,7 +176,7 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--opponent", choices=["seal", "orca", "shallow", "random"], default="shallow")
+    parser.add_argument("--opponent", choices=["seal", "seal-current-best", "orca", "shallow", "random"], default="shallow")
     parser.add_argument("--orca-source", help="External hexbot-building-framework checkout")
     parser.add_argument("--orca-checkpoint", help="Defaults to orca/checkpoint.pt within --orca-source")
     parser.add_argument("--orca-sims", type=int, default=200, help="MCTS simulations per placement, not a time budget")

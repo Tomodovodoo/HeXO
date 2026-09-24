@@ -172,6 +172,22 @@ python arena.py --opponent seal --run runs/gpu-selfplay --checkpoint 1 --games 2
 
 The adapter compiles the external engine without vendoring it. Seal's fixed array has a smaller coordinate range; games outside the adapter's safe range are marked invalid rather than counted as victories. Equal requested budgets are used, and both engines' actual elapsed times are retained. `--run` loads the promoted checkpoint, `--checkpoint` selects another saved candidate, and `--table` or `--nnue` loads a standalone export. Reports identify the loaded model and its hash. Without a model option the arena uses the original evaluator.
 
+The separate `seal-current-best` opponent uses [Ramora0/SealBot at c94749c](https://github.com/Ramora0/SealBot/tree/c94749c21c16c3b072fff6da49762dd5f92f3986), with its `best` pattern table. This is a newer search implementation than `seal`, which uses HexTicTacToe. The best table itself is unchanged from oldSeal. No project license was found at the pinned SealBot revision; upstream code stays in an external checkout.
+
+```sh
+git clone --depth 1 --filter=blob:none --sparse https://github.com/Ramora0/SealBot.git ../seal-current-reference
+git -C ../seal-current-reference sparse-checkout set best
+git -C ../seal-current-reference fetch origin c94749c21c16c3b072fff6da49762dd5f92f3986
+git -C ../seal-current-reference checkout --detach c94749c21c16c3b072fff6da49762dd5f92f3986
+python tools/seal_current.py ../seal-current-reference
+python arena.py --opponent seal-current-best --nnue runs/example/checkpoints/0001/model.nnue --games 40 --ms 100 --max-stones 800 --output artifacts/seal-current-best.json
+python -m unittest tests.test_seal_current -v
+```
+
+The optional adapter build requires a GCC-compatible C++20 compiler. Its manifest records every compiled upstream header hash, canonical and on-disk weight hashes, adapter and binary hashes, compiler, and build command. Arena verifies the binary against that manifest, resets upstream search state between games, and records both sides' ordered turns and elapsed times. The 100 ms setting is an upstream best-effort full-turn deadline, not a hard timeout. Upstream initializes randomness independently of the arena opening seed. Coordinates outside ±55, illegal moves, extra placements after a win, and incomplete turns are rejected. This upstream engine does not correctly support non-opening partial-turn roots, so the adapter rejects those explicitly; arena calls start at complete-turn boundaries.
+
+Other public references were checked on 2026-09-24. [Mantis at 9c94b95](https://github.com/Cmiller132/Hexo-Shrimp-Bot/tree/9c94b95ce5e3ccf4f892eeadca20524c522d0629) provides maintained Rust/Python inference and match entry points, but no public trained checkpoint or project license was found. [Strix at 5a771e5](https://github.com/SootyOwl/hexo-strix/tree/5a771e572553a8bd8e010112b2ce65f16e5afa1b) is MIT-licensed and publishes a [2,810,120-byte safetensors model](https://hexo.tyto.cc/model.safetensors), SHA256 `aec92391c66050e737d9b769757248b520ffc1bf44fa039db7c8abd3ef720185`. Its metadata says `checkpoint_000010.pt`, step 10, not the private `pulsatrix-246` checkpoint. Its relational graph requires direct `InferModel::eval_states` with Gumbel MCTS; the pinned HX04 server drops the required relational edge fields. [HextocZero at dc1be7b](https://codeberg.org/Kubuxu/HextocZero/src/commit/dc1be7b175dd9f27b6db8481e00153c9a0f2e3ae) is MIT-licensed heuristic MCTS with neural inference unimplemented; its documented legality omits the radius-eight restriction. None of these source discoveries establishes comparative strength.
+
 To compare against the published Orca model, use an external checkout:
 
 ```sh
