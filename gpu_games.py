@@ -17,6 +17,14 @@ class StepResult:
     truncated: torch.Tensor
 
 
+@dataclass
+class TacticalAction:
+    action: torch.Tensor
+    forced: torch.Tensor
+    winning: torch.Tensor
+    defending: torch.Tensor
+
+
 class BatchedHexo:
     def __init__(self, batch_size, device="cuda", capacity=128, max_placements=None):
         if batch_size < 1 or capacity < 1:
@@ -35,6 +43,20 @@ class BatchedHexo:
         self.truncated = torch.zeros(batch_size, device=device, dtype=torch.bool)
         self.features = torch.zeros((batch_size, 729), device=device, dtype=torch.int32)
         self._rows = torch.arange(batch_size, device=device)
+        # Each occupied anchor stores its 18 six-cell windows. Duplicates avoid
+        # hashing and do not change completion or defensive-cover decisions.
+        self._window_codes = torch.zeros((batch_size, capacity, 3, 6), device=device, dtype=torch.int16)
+        self._axes = torch.tensor(((1, 0), (0, 1), (1, -1)), device=device)
+        codes = torch.arange(729, device=device)
+        digits = codes[:, None] // (3 ** torch.arange(6, device=device)) % 3
+        empty = digits == 0
+        missing = empty.sum(1)
+        self._missing_first = empty.to(torch.int64).argmax(1)
+        self._missing_last = 5 - empty.flip(1).to(torch.int64).argmax(1)
+        self._completion_size = torch.stack([
+            torch.where(((digits == 0) | (digits == color)).all(1) & (missing >= 1) & (missing <= 2), missing, 7)
+            for color in (1, 2)])
+        self._tactical_codes = ((self._completion_size <= 2).any(0)).nonzero().flatten()
         self._upper_count = 0
         self._powers = 3 ** torch.arange(6, device=device)
         self._windows = 5 - torch.arange(6, device=device)[:, None] + torch.arange(6, device=device)[None, :]
@@ -64,6 +86,7 @@ class BatchedHexo:
         self.winner.masked_fill_(mask, -1)
         self.truncated.masked_fill_(mask, False)
         self.features.masked_fill_(mask[:, None], 0)
+        self._window_codes.masked_fill_(mask[:, None, None, None], 0)
 
     def _actions(self, actions):
         actions = torch.as_tensor(actions, device=self.device)
@@ -156,6 +179,65 @@ class BatchedHexo:
         candidates = torch.where((self.counts == 0)[:, None, None], 0, candidates)
         return candidates, self.legal(candidates)
 
+    def tactical_action(self):
+        """Find an exact win this turn, otherwise a complete next-turn defense.
+
+        A pure four/five-stone six-cell window needs at most two empty cells.
+        Those cells are within five of an existing stone, so either placement
+        order is legal. Windows crossing the coordinate bound are excluded.
+        Defense hits every opponent one/two-cell completion set using at most
+        `remaining` stones. Recompute after placement to finish a chosen pair.
+        This is exact immediate tactics, not a search of later turns.
+        """
+        moves = torch.zeros((self.batch_size, 2), dtype=torch.int64, device=self.device)
+        win = torch.zeros_like(self.truncated)
+        defend = torch.zeros_like(self.truncated)
+        # Histograms cheaply identify quiet games. Only tactical rows allocate
+        # endpoint tensors; nonzero synchronizes once to compact the batch.
+        potential = self.active & (self.features[:, self._tactical_codes].sum(1) > 0)
+        ids = potential.nonzero().flatten()
+        if not ids.numel():
+            return TacticalAction(moves, win | defend, win, defend)
+        codes = self._window_codes[ids].to(torch.int64)
+        owner_valid = (self.owners[ids] >= 0)[:, :, None, None]
+        shift = torch.arange(6, device=self.device)
+        first = self.coords[ids, :, None, None, :] + self._axes[None, None, :, None, :] * (self._missing_first[codes] - shift)[..., None]
+        last = self.coords[ids, :, None, None, :] + self._axes[None, None, :, None, :] * (self._missing_last[codes] - shift)[..., None]
+        bounded = ((first >= -10**12) & (first <= 10**12) & (last >= -10**12) & (last <= 10**12)).all(-1)
+        valid = (owner_valid & bounded).flatten(1)
+        first, last = first.flatten(1, 3), last.flatten(1, 3)
+        codes = codes.flatten(1)
+        rows = torch.arange(len(ids), device=self.device)
+        side = self.player[ids]
+        needed = self._completion_size[side[:, None], codes]
+        own = valid & (needed <= self.remaining[ids, None])
+        own_index = needed.masked_fill(~own, 7).argmin(1)
+        has_win = own.any(1)
+        own_move = first[rows, own_index]
+
+        threat = valid & (self._completion_size[1-side[:, None], codes] <= 2)
+        threat_index = threat.to(torch.int8).argmax(1)
+        # Any cover must contain one endpoint of the first threat.
+        branch = torch.stack((first[rows, threat_index], last[rows, threat_index]), dim=1)
+        hit = ((branch[:, :, None, :] == first[:, None, :, :]).all(-1)
+               | (branch[:, :, None, :] == last[:, None, :, :]).all(-1))
+        uncovered = threat[:, None, :] & ~hit
+        single = ~uncovered.any(-1)
+        # Once an endpoint is chosen, any second stone must hit the first
+        # remaining threat. Its two endpoints exhaust the possible covers.
+        next_index = uncovered.to(torch.int8).argmax(-1)
+        second = torch.stack((first[rows[:, None], next_index], last[rows[:, None], next_index]), dim=2)
+        second_hit = ((second[:, :, :, None, :] == first[:, None, None, :, :]).all(-1)
+                      | (second[:, :, :, None, :] == last[:, None, None, :, :]).all(-1))
+        pairs = ~(uncovered[:, :, None, :] & ~second_hit).any(-1)
+        cover = single | ((self.remaining[ids, None] == 2) & pairs.any(-1))
+        has_cover = cover.any(1) & threat.any(1)
+        defend_move = branch[rows, cover.to(torch.int8).argmax(1)]
+        moves[ids] = torch.where(has_win[:, None], own_move, defend_move)
+        win[ids] = has_win
+        defend[ids] = has_cover & ~has_win
+        return TacticalAction(moves, win | defend, win, defend)
+
     def _grow(self):
         if self._upper_count < self.coords.shape[1]:
             return
@@ -165,6 +247,7 @@ class BatchedHexo:
             return
         self.coords = torch.cat((self.coords, torch.zeros_like(self.coords)), dim=1)
         self.owners = torch.cat((self.owners, torch.full_like(self.owners, -1)), dim=1)
+        self._window_codes = torch.cat((self._window_codes, torch.zeros_like(self._window_codes)), dim=1)
 
     @torch.no_grad()
     def step(self, actions):
@@ -176,7 +259,15 @@ class BatchedHexo:
         before, after = self.candidate_codes(actions)
         won = (after == torch.where(self.player == 0, 364, 728)[:, None, None, None]).flatten(1).any(1) & accepted
         self.features += self._feature_delta(before, after).squeeze(1) * accepted[:, None]
+        # Update every previously registered window that contains this move.
+        q, r = (actions[:, 0, None, :].clamp(-10**12-16, 10**12+16) - self.coords).unbind(-1)
+        position = torch.stack((q, r, q), dim=-1)[..., None] + torch.arange(6, device=self.device)
+        aligned = torch.stack((r == 0, q == 0, q+r == 0), dim=-1)[..., None]
+        changed = aligned & (position >= 0) & (position < 6) & (self.owners >= 0)[:, :, None, None] & accepted[:, None, None, None]
+        increment = self._powers[position.clamp(0, 5)] * (self.player+1)[:, None, None, None] * changed
+        self._window_codes += increment.to(torch.int16)
         index = self.counts.clamp_max(self.coords.shape[1]-1)
+        self._window_codes[self._rows, index] = torch.where(accepted[:, None, None], after[:, 0], self._window_codes[self._rows, index]).to(torch.int16)
         self.coords[self._rows, index] = torch.where(accepted[:, None], actions[:, 0], self.coords[self._rows, index])
         self.owners[self._rows, index] = torch.where(accepted, self.player, self.owners[self._rows, index]).to(torch.int8)
         self.counts += accepted
@@ -193,7 +284,7 @@ class BatchedHexo:
 
 @torch.no_grad()
 def generate_games(tasks, *, candidates=32, epsilon=0.1, device="cuda", progress=None):
-    """Generate replay with a GPU sampled-candidate, one-placement policy.
+    """Generate replay with exact immediate tactics and sampled quiet moves.
 
     This actor is separate from native search. `ms` and `width` do not apply;
     frozen-opponent promotion evaluation must continue using native search.
@@ -234,6 +325,9 @@ def generate_games(tasks, *, candidates=32, epsilon=0.1, device="cuda", progress
     for ply in range(3, cap):
         active = env.active
         actions, legal = env.sampled_candidates(candidates, generator=rng)
+        tactical = env.tactical_action()
+        actions = torch.cat((actions, tactical.action[:, None, :]), dim=1)
+        legal = torch.cat((legal, tactical.forced[:, None]), dim=1)
         before, after = env.candidate_codes(actions)
         table = tables[rows, env.player]
         before_value = table.gather(1, before.flatten(1)).reshape_as(before)
@@ -245,18 +339,20 @@ def generate_games(tasks, *, candidates=32, epsilon=0.1, device="cuda", progress
         # An immediate sampled win is mandatory even under exploration.
         signed = torch.where(winning, float("inf"), signed).masked_fill(~legal, -float("inf"))
         best = signed.argmax(1)
-        random_pick = torch.rand((batch, candidates), device=device, generator=rng).masked_fill(~legal, -1).argmax(1)
+        random_pick = torch.rand((batch, candidates+1), device=device, generator=rng).masked_fill(~legal, -1).argmax(1)
         explore = (torch.rand(batch, device=device, generator=rng) < epsilon) & ~(winning & legal).any(1)
-        chosen = torch.where(explore, random_pick, best)
+        chosen = torch.where(tactical.forced, candidates, torch.where(explore, random_pick, best))
         saved_features.append(env.features.clone())
-        saved_values.append(torch.tanh(values[rows, chosen]/6000))
+        target_value = torch.tanh(values[rows, chosen]/6000)
+        target_value = torch.where(tactical.winning, torch.where(env.player == 0, 1., -1.), target_value)
+        saved_values.append(target_value)
         saved_masks.append(active.clone())
         env.step(actions[rows, chosen])
         env.truncated |= (env.counts >= caps) & (env.winner < 0)
         if (ply-2) % 16 == 0 or ply == cap-1:
             completed = int((~env.active).sum().item())
             if progress:
-                progress(completed, batch, {"actor": "gpu-pattern-one-ply", "placements": ply+1})
+                progress(completed, batch, {"actor": "gpu-pattern-tactical", "placements": ply+1})
             if completed == batch:
                 break
     if env.device.type == "cuda":
@@ -278,7 +374,7 @@ def generate_games(tasks, *, candidates=32, epsilon=0.1, device="cuda", progress
                   "cells": [[int(q), int(r), int(owner)] for (q, r), owner in zip(coords[i, :counts[i]], owners[i, :counts[i]])],
                   "times": [[], []], "depths": [], "tables": task["tables"],
                   "challenger_color": task.get("challenger_color"),
-                  "actor": "gpu-pattern-one-ply", "actor_candidates": candidates,
+                  "actor": "gpu-pattern-tactical", "actor_candidates": candidates,
                   "actor_epsilon": epsilon, "actor_batch_seed": batch_seed,
                   "actor_batch_seconds": elapsed}
         f = features[masks[:, i], i] if saved_features else np.empty((0, 729), dtype=np.int32)
@@ -304,6 +400,6 @@ def recommended_batch(candidates=32, max_stones=256, device="cuda"):
         return 64
     free, _ = torch.cuda.mem_get_info(device)
     capacity = max(128, 1 << (max_stones-1).bit_length())
-    per_game = capacity*candidates*192 + max_stones*729*12 + 65536
+    per_game = capacity*(candidates*192 + 4096) + max_stones*729*12 + 65536
     count = max(1, min(2048, int(free*.65/per_game)))
     return max(1, count//64*64) if count >= 64 else count

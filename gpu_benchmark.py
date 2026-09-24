@@ -80,7 +80,7 @@ def benchmark_actor(batch, placements, device, candidates, epsilon):
                 game.play(q, r)
             assert record["winner"] == game.winner
             game.close()
-        return {"actor": "gpu-pattern-one-ply", "batch": batch, "max_placements": placements,
+        return {"actor": "gpu-pattern-tactical", "batch": batch, "max_placements": placements,
                 "device": device, "candidates": candidates, "epsilon": epsilon,
                 "seconds": elapsed, "games_per_second": batch/elapsed,
                 "placements_per_second": stones/elapsed, "completed": completed,
@@ -111,3 +111,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
