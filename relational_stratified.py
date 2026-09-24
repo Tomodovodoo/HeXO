@@ -60,6 +60,9 @@ def fit(args):
     verify(previous,prior['identity'])
     if prior['identity'].get('kind')!='relational-human-policy-q-v1':
         raise ValueError('Expected the initial human warmstart artifact, not another continuation')
+    for name in ('relational_data.py','human_corpus.py','corpus_warmstart.py'):
+        if prior['identity']['sources'].get(name)!=source['sources'][name]:
+            raise ValueError(f'Previous human sampler changed: {name}')
     old_config=prior['identity']['config']
     histories,all_rows,data=human_examples(args.corpus)
     _,old_rows,_=human_examples(args.corpus,old_config['positions'],old_config['seed'])
@@ -106,6 +109,9 @@ def fit(args):
         raise ValueError('Stratified source or native library changed')
     if digest(Path(args.corpus)/'manifest.json')!=data['manifest_sha256'] or digest(Path(args.corpus)/'games.jsonl')!=data['histories_sha256']:
         raise ValueError('Human corpus changed during fitting')
+    for shards in data['shards'].values():
+        for name,expected in shards.items():
+            if digest(Path(name))!=expected:raise ValueError(f'Human shard changed during fitting: {name}')
     report=dict(initial_validation=baseline,epochs=[dict(epoch=1,train=train,validation=validation)],
         selected={'epoch':1},train_positions=len(rows['train']),validation_positions=len(rows['validation']),
         seconds=time.perf_counter()-started,gpu_memory_peak_mb=torch.cuda.max_memory_allocated()/2**20 if args.device=='cuda' else 0,
