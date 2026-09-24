@@ -3,6 +3,7 @@ from dataclasses import dataclass, asdict
 import math
 import hashlib
 import json
+import copy
 from contextlib import nullcontext
 import numpy as np
 import torch
@@ -140,6 +141,7 @@ class RelationalNet(nn.Module):
 
 class NeuralEvaluator:
     def __init__(self, model, device='cuda', *, max_nodes=12000, max_edges=600000, mixed_precision=True, backend='native', model_version=None):
+        model = copy.deepcopy(model).requires_grad_(False)
         if backend == 'native':
             from relational_native import encode as encoder
         elif backend == 'reference':
