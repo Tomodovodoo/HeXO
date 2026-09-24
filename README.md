@@ -170,7 +170,7 @@ python arena.py --opponent seal --games 20 --ms 100 --output artifacts/seal.json
 python arena.py --opponent seal --run runs/gpu-selfplay --checkpoint 1 --games 20 --ms 100
 ```
 
-The adapter compiles the external engine without vendoring it. Seal's fixed array has a smaller coordinate range; games outside the adapter's safe range are marked invalid rather than counted as victories. Equal requested budgets are used, and both engines' actual elapsed times are retained. `--run` loads the promoted checkpoint, `--checkpoint` selects another saved candidate, and `--table` loads a standalone export. Reports identify the loaded table and its hash. Without a model option the arena uses the original evaluator.
+The adapter compiles the external engine without vendoring it. Seal's fixed array has a smaller coordinate range; games outside the adapter's safe range are marked invalid rather than counted as victories. Equal requested budgets are used, and both engines' actual elapsed times are retained. `--run` loads the promoted checkpoint, `--checkpoint` selects another saved candidate, and `--table` or `--nnue` loads a standalone export. Reports identify the loaded model and its hash. Without a model option the arena uses the original evaluator.
 
 To compare against the published Orca model, use an external checkout:
 
@@ -196,13 +196,15 @@ The benchmark prints JSON with seeded positions, source and library hashes, hard
 
 ## Status and remaining work
 
-The initial non-neural version is playable. Direct runtime checks have covered the radius-eight frontier, sequential expansion, immediate wins, and 800 make/unmake comparisons. A differential run matched 2,019 transitions against the official TypeScript rules, including rejected moves, turn phase, cells, and winner. Sparse expansion to coordinate 800 also passed. An initial eight-game development comparison against Seal scored two wins and six losses at 100 ms per turn. This is an initial measurement, not a competitive-strength claim. Two tactical-extension experiments scored zero wins in the same eight openings and were removed.
+The local game, native engine, self-play trainer, checkpoint evaluation and dashboard are playable. The committed suite currently has 22 tests covering reference rules, CPU/CUDA parity, NNUE inference and undo, curriculum partitioning and training-target semantics. Native search now orders a stored transposition move first when it is already in the selected legal turn list. The table is still local to each search.
 
-The first complete learning run collected 516 positions from 12 games and trained on the RTX 3070 Ti. Its challenger scored three wins, four losses, and one incomplete evaluation game and was rejected. That demonstrates the loop, not a strength gain. Larger runs are needed to measure improvement.
+The old GPU actor produced 6,144 games but missed immediate wins. Its best early candidate scored 28/40, then only 78/160 on fresh confirmation games. The tactical replacement produced 6,144 games and 1,060,519 positions, with 526 capped games whose outcomes remain unlabeled. Its first candidate passed the paired promotion test at 104 wins and 56 losses against the frozen reference. Later candidates were rejected against that incumbent, including one that scored 110/160 against the reference but only 66/160 against the incumbent. Self-Elo is opponent-dependent; more training has not consistently improved the deployed checkpoint.
 
-A subsequent native-actor run collected 10,130 positions from 192 games. None of its three candidates earned promotion. The GPU pipeline has also completed generation, fitting, native evaluation, checkpoint persistence, and resumed training with optimizer lineage. GPU trajectories and feature targets have been replayed against the native engine. No convincing Elo gain has been established yet. The first 6,144-game GPU run produced 138,652 positions. Its best initial candidate scored 28 wins in 40 games, then only 78 wins in 160 fresh confirmation games. An audit found that 9.03% of its replay positions had a provable win that the shallow actor later lost. The tactical actor fixes those missed wins; use a fresh run directory for its data.
+Fresh independent matches used 40 games and seed 20260924. The promoted pattern engine scored **4 wins and 36 losses against Seal** at 100 ms per turn for both engines. The handwritten engine scored **39 wins and 1 loss against the published Orca checkpoint** using 100 ms per turn versus Orca's 200 simulations per placement on CUDA. Orca averaged about 434 ms per turn versus HeXO's 89 ms, so this is not an equal-time comparison. There is no claim of superiority over all known bots.
 
-Further work includes training-quality improvements, search profiling, stronger threat search, larger held-out opponent matches, Orca integration, and game-data import. Match clocks, rated lobbies, and online account play are not part of the local board yet.
+The first native NNUE experiment collected 15,558 positions from 128 games and scored 39 wins and 41 losses against its zero-head NNUE reference. It was rejected. That reference pays NNUE inference costs; this experiment does not establish an improvement over the faster bare handwritten engine. The GPU NNUE pipeline has completed training, native evaluation and resumed training, with separate policy/value losses and actual optimizer exposure counts on the dashboard.
+
+Remaining work includes complete-turn candidate recall and controlled widening, stronger-search reanalysis, bounded tactical search, broader independent equal-time matches, and architecture/compute comparisons. The current NNUE has width 32 and nonlinear fusion of crossing lines, but no neighboring-cell mixing block. Match clocks, rated lobbies, and online account play are not part of the local board yet.
 
 ## References
 
@@ -211,7 +213,7 @@ Rules and turn semantics were checked against the [official HeXO source](https:/
 Independent opponents: [Seal](https://github.com/Ramora0/HexTicTacToe) and [Orca framework](https://github.com/Saiki77/hexbot-building-framework). The site bundles a Seal WebAssembly build; the optional native adapter currently compares against the selected external source revision, which may differ from that build.
 
 The intended learned evaluator follows ideas from [Rapfi](https://github.com/dhbloo/rapfi) and [NNUE](https://official-stockfish.github.io/docs/nnue-pytorch-wiki/docs/nnue.html), adapted to Hexo's three axes and turn semantics. Their existing game-specific weights are not used.
-# Centered-line NNUE contract
+## Centered-line NNUE contract
 
 The `nnue` model uses three centered eleven-cell ternary patterns at every center
 whose lines contain a stone. A placement changes 33 directional patterns at 31
