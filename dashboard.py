@@ -21,7 +21,8 @@ def read_json(path, default=None):
 def episode_counts(path, modified):
     episodes = read_json(Path(path), [])
     return {"games": len(episodes), "terminal_games": sum(e["winner"] >= 0 for e in episodes),
-            "bootstrapped_games": sum(e["winner"] < 0 for e in episodes)}
+            "bootstrapped_games": sum(e["winner"] < 0 for e in episodes),
+            "positions": sum(len(e["moves"]) for e in episodes)}
 
 
 def klent_run(run):

@@ -103,14 +103,19 @@ class KlentTest(unittest.TestCase):
             initial = {"schema": "hexo-klent-scalar-v1", "identity": {"config": {"games": 2}},
                        "metrics": None, "files": {"klent.pt": "initial-actor"}}
             (root/"checkpoints/0000/manifest.json").write_text(json.dumps(initial))
-            (root/"status.json").write_text(json.dumps({"iteration": 1, "stage": "fitting", "positions": 6}))
+            # Collection can publish its corpus and crash before replacing stale status.
+            (root/"status.json").write_text(json.dumps({"iteration": 1, "stage": "collection", "positions": 4}))
             (root/"corpus/0001").mkdir(parents=True)
             (root/"corpus/0001/manifest.json").write_text(json.dumps({"identity": {"actor_sha256": "initial-actor"}}))
-            (root/"corpus/0001/episodes.json").write_text(json.dumps([{"winner": 0}, {"winner": -1}]))
+            (root/"corpus/0001/episodes.json").write_text(json.dumps([
+                {"winner": 0, "moves": [[0, 0], [1, 0], [2, 0]]},
+                {"winner": -1, "moves": [[0, 0], [0, 1], [0, 2]]}]))
             active = klent_run(root)
             self.assertEqual(active["rating"], "UNRATED")
             self.assertEqual(active["totals"]["games"], 2)
             self.assertEqual(active["totals"]["terminal_games"], 1)
+            self.assertEqual(active["totals"]["positions"], 6)
+            self.assertEqual(active["active"]["positions"], 6)
             self.assertNotIn("examples_processed", active["active"])
             metrics = {"games": 2, "positions": 6, "terminal_games": 1, "bootstrapped_games": 1, "optimizer_steps": 2}
             (root/"checkpoints/0001").mkdir()
