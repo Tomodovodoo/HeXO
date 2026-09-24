@@ -347,7 +347,8 @@ struct Search {
     Clock::time_point deadline;
     int width;
     uint64_t nodes=0;
-    std::vector<Entry> tt;
+    std::vector<Entry> tt, frozen_hints;
+    bool inject_tt=false;
     Search(int ms,int width,bool table=true):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(table?1<<16:0){}
     void check() const { if(Clock::now()>=deadline) throw Timeout{}; }
     Turn immediate(Board& b) {
@@ -410,13 +411,14 @@ struct Search {
         }
         out.push_back(selected);
     }
-    std::vector<Turn> turns(Board& b,bool timed=true) {
+    std::vector<Turn> turns(Board& b,bool timed=true,Turn hint={}) {
         Turn win=immediate(b); if(win.count) {win.score=mate;return {win};}
         int side=b.player;
         auto constraints=b.completions(1-side);
         std::vector<Turn> result;
         std::unordered_set<uint64_t> seen;
-        auto add=[&](Turn t) {
+        auto add=[&](Turn t,bool mandatory=false) {
+            if(t.count<1 || t.count>2 || t.count>b.remaining) return;
             Restore restore(b);
             for(int i=0;i<t.count;++i) {
                 if(!b.legal(t.cells[i])) return;
@@ -424,12 +426,17 @@ struct Search {
                 if(b.winner>=0) {t.count=i+1;break;}
             }
             if(b.winner<0 && b.player==side) return;
+            if(mandatory && b.winner<0 && !b.completions(1-side).empty()) return;
             if(!seen.insert(b.hash()).second) return;
             t.score=b.winner==side?mate:b.score(side);
             // Every immediate opponent completion must be covered.
             if(b.winner<0 && !b.completions(1-side).empty()) t.score=-mate;
             result.push_back(t);
         };
+        // Validate both placements in order before reserving a slot. A defensive
+        // hint must cover every immediate threat; own wins were handled above.
+        add(hint,!constraints.empty());
+        const bool pinned=!result.empty();
         if(!constraints.empty()) {
             std::vector<std::vector<Cell>> defenses;std::vector<Cell> selected;
             covers(constraints,selected,b.remaining,defenses);
@@ -447,7 +454,7 @@ struct Search {
                     for(auto c:seconds) add({{cover[0],c},2,0});
                 }
             }
-            if(!result.empty()) {std::sort(result.begin(),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});return result;}
+            if(!result.empty()) {std::sort(result.begin()+int(pinned),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});return result;}
         }
         auto firsts=candidates(b,width);
         for(auto a:firsts) {
@@ -457,7 +464,7 @@ struct Search {
             auto seconds=candidates(b,std::max(6,width/2));b.undo();
             for(auto c:seconds) add({{a,c},2,0});
         }
-        std::stable_sort(result.begin(),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});
+        std::stable_sort(result.begin()+int(pinned),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});
         if(int(result.size())>width*2) result.resize(width*2);
         return result;
     }
@@ -467,19 +474,20 @@ struct Search {
         if(immediate(b).count) return mate;
         if(depth<=0) return b.score(b.player);
         uint64_t key=b.hash();auto& entry=tt[key&(tt.size()-1)];
-        if(entry.key==key && entry.depth>=depth) {
+        if(!inject_tt && entry.key==key && entry.depth>=depth) {
             if(entry.flag==0) return entry.score;
             if(entry.flag==1 && entry.score>=beta) return entry.score;
             if(entry.flag==2 && entry.score<=alpha) return entry.score;
         }
-        const Turn hint=entry.key==key?entry.best:Turn{};
+        const auto& move_entry=inject_tt?frozen_hints[key&(frozen_hints.size()-1)]:entry;
+        const Turn hint=move_entry.key==key?move_entry.best:Turn{};
         const int original=alpha;
-        auto moves=turns(b);
+        auto moves=turns(b,true,inject_tt?hint:Turn{});
         if(moves.empty()) return b.score(b.player);
         // Only reorder the selected, independently validated turns. Injecting a
         // hash move before truncation would change this selective search tree.
         // Keep the actual generated turn, including early first-stone wins.
-        if(hint.count>=1 && hint.count<=2) {
+        if(!inject_tt && hint.count>=1 && hint.count<=2) {
             auto found=std::find_if(moves.begin(),moves.end(),[&](const Turn& t) {
                 return t.count==hint.count && t.cells[0]==hint.cells[0] &&
                     (t.count==1 || t.cells[1]==hint.cells[1]);
@@ -575,6 +583,10 @@ struct Search {
                 if(!roots.empty()) chosen=roots.front();
                 if(root_seconds) roots=diversify(b,std::move(roots),root_seconds,root_turns);
                 for(int depth=1;depth<=max_depth;++depth) {
+                    // Freeze admission for the whole iteration, including PVS
+                    // re-searches. Scores from a different admitted tree cannot
+                    // provide bounds; only previous-iteration moves are reused.
+                    if(inject_tt) frozen_hints=tt;
                     int best=-mate-1;Turn iteration=chosen;
                     for(auto& t:roots) {
                         check();Restore branch(b);int side=b.player;apply(b,t);
@@ -614,6 +626,15 @@ int hx_search_root(void* p,int ms,int depth,int width,int seconds,int cap,HxResu
     if(ms<1 || depth<1 || width<2 || width>128 || seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024) return 0;
     try {
         auto start=Clock::now();Search search(ms,width);
+        *out=search.run(*static_cast<Board*>(p),depth,seconds,cap);
+        out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;
+    } catch(...) {return 0;}
+}
+int hx_search_tt(void* p,int ms,int depth,int width,int seconds,int cap,HxResult* out) {
+    if(ms<1 || depth<1 || width<2 || width>128 ||
+        ((seconds || cap) && (seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024))) return 0;
+    try {
+        auto start=Clock::now();Search search(ms,width);search.inject_tt=true;
         *out=search.run(*static_cast<Board*>(p),depth,seconds,cap);
         out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;
     } catch(...) {return 0;}

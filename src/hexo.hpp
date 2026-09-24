@@ -32,6 +32,9 @@ HX_API int hx_search(void*, int milliseconds, int max_depth, int width, HxResult
 // Optional root-only admission; zeros retain the original candidate tree.
 HX_API int hx_search_root(void*, int milliseconds, int max_depth, int width,
     int root_seconds, int root_turns, HxResult*);
+// Experimental frozen-iteration TT move admission; no TT score cutoffs.
+HX_API int hx_search_tt(void*, int milliseconds, int max_depth, int width,
+    int root_seconds, int root_turns, HxResult*);
 HX_API int hx_turns(void*, int width, int root_seconds, int root_turns, HxTurn*, int capacity);
 HX_API uint64_t hx_hash(void*);
 HX_API int hx_evaluate(void*);

@@ -50,6 +50,8 @@ bind("hx_moves", C.c_int, C.c_void_p, C.POINTER(Cell), C.c_int)
 bind("hx_search", C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int, C.POINTER(Result))
 bind("hx_search_root", C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int,
      C.c_int, C.c_int, C.POINTER(Result))
+bind("hx_search_tt", C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int,
+     C.c_int, C.c_int, C.POINTER(Result))
 bind("hx_turns", C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int, C.POINTER(Turn), C.c_int)
 bind("hx_features", C.c_int, C.c_void_p, C.POINTER(C.c_int32), C.c_int)
 bind("hx_load_table", C.c_int, C.c_void_p, C.POINTER(C.c_int32), C.c_int)
@@ -156,9 +158,10 @@ class Game:
     def undo(self):
         return bool(lib.hx_undo(self.ptr))
 
-    def search(self, ms=1000, depth=12, width=16, root_seconds=0, root_turns=0):
+    def search(self, ms=1000, depth=12, width=16, root_seconds=0, root_turns=0, tt_injection=False):
         result = Result()
-        if not lib.hx_search_root(self.ptr, ms, depth, width, root_seconds, root_turns, C.byref(result)):
+        search = lib.hx_search_tt if tt_injection else lib.hx_search_root
+        if not search(self.ptr, ms, depth, width, root_seconds, root_turns, C.byref(result)):
             raise ValueError("Invalid search budget or root admission settings")
         moves = [(result.q1, result.r1), (result.q2, result.r2)][:result.count]
         return {"moves": moves, "score": result.score, "depth": result.depth,
