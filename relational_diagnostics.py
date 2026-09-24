@@ -1,6 +1,7 @@
 """Read-only immediate-tactic diagnostics; masks are not eventual Q labels."""
 import argparse
 from collections import defaultdict
+import hashlib
 import json
 from pathlib import Path
 
@@ -13,7 +14,10 @@ from train import write_json
 
 
 def evaluate(checkpoint, fixtures, args):
-    source=json.loads(Path(fixtures).read_text())
+    fixture_bytes=Path(fixtures).read_bytes()
+    fixture_sha=hashlib.sha256(fixture_bytes).hexdigest()
+    source=json.loads(fixture_bytes)
+    identity=source_identity(('relational_diagnostics.py',))
     model_sha=digest(Path(checkpoint))
     model=load_model(checkpoint,args.device,expected_sha256=model_sha).eval()
     rows=[]
@@ -49,7 +53,9 @@ def evaluate(checkpoint, fixtures, args):
                           **{name:dict(argmax_acceptable=sum(r[name]['argmax_acceptable'] for r in values),
                                        mean_acceptable_mass=float(np.mean([r[name]['acceptable_mass'] for r in values])))
                              for name in ('pi','mu')}) for category,values in groups.items()}
-    return dict(model_sha256=model_sha,fixtures_sha256=digest(Path(fixtures)),**source_identity(('relational_diagnostics.py',)),
+    if source_identity(('relational_diagnostics.py',))!=identity:
+        raise ValueError('Diagnostic source or native library changed during evaluation')
+    return dict(model_sha256=model_sha,fixtures_sha256=fixture_sha,**identity,
                 scope='Development immediate-safety masks, not held-out strength tests or eventual Q labels',
                 config=vars(args),summary=summary,positions=rows)
 

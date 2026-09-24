@@ -12,6 +12,7 @@ import torch
 from human_corpus import digest as history_digest, owner
 from klent import digest
 from relational_data import human_examples
+from relational_diagnostics import evaluate as diagnose
 from relational_model import ModelConfig, RelationalNet
 from relational_train import collect, fit, load_model, main, rebuild, save_model, graph
 from relational_warmstart import fit as warmstart
@@ -97,6 +98,28 @@ class RelationalLearningTests(unittest.TestCase):
             history.write_text(json.dumps(records[0]))
             with self.assertRaisesRegex(ValueError,'Missing allowed'):
                 human_examples(root)
+
+    def test_diagnostics_hash_parsed_fixture_and_reject_source_changes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);model=RelationalNet(config())
+            checkpoint=root/'model.pt';save_model(checkpoint,model)
+            moves=record()['moves'][:7];item=graph(moves,model)
+            fixtures=root/'fixtures.json'
+            fixtures.write_text(json.dumps({'positions':[dict(history=moves,player=item.player,
+                remaining=item.remaining,all_legal_actions=item.actions.tolist(),
+                good_actions=[item.actions[0].tolist()],category='fixture',source='test')]}))
+            expected=digest(fixtures)
+            args=self.args()
+            def changed_file(*unused):
+                fixtures.write_text('{}')
+                return {'source':'same'}
+            with patch('relational_diagnostics.source_identity',side_effect=changed_file):
+                result=diagnose(checkpoint,fixtures,args)
+            self.assertEqual(result['fixtures_sha256'],expected)
+            fixtures.write_text(json.dumps({'positions':[]}))
+            with patch('relational_diagnostics.source_identity',side_effect=[{'source':'before'},{'source':'after'}]):
+                with self.assertRaisesRegex(ValueError,'changed during evaluation'):
+                    diagnose(checkpoint,fixtures,args)
 
     def test_frozen_capped_actor_full_legal_targets_and_one_fit_pass(self):
         model=RelationalNet(config())
