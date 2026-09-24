@@ -194,6 +194,18 @@ The tests compare native rules and incremental features with an independent Pyth
 
 The benchmark prints JSON with seeded positions, source and library hashes, hardware, actual search times, nodes and agreement with a wider search. Timing-dependent search results can vary across runs. There are no machine-specific speed assertions. A wider search is a selective reference, not a proof of the best move. Candidate-cell recall is reported only when the native candidate API is available; it does not measure whether the final pruned turn list retained that pair.
 
+## Bounded forcing certificates
+
+`proof.py` searches continuous double-threat attacks and returns `PROVEN_WIN`, `PROVEN_LOSS`, or `UNKNOWN`. Every winning certificate covers all relevant defensive branches. Immediate counterwins take priority; a defense with a free second stone is unsupported and returns unknown. The independent verifier reconstructs rules and covers from raw coordinates. Ordinary search scores are never treated as certificates.
+
+```sh
+python proof.py --history position.json --ms 100 --output proof-result.json
+python proof.py --history position.json --verify proof-result.json
+python proof.py --benchmark
+```
+
+A history is a JSON list of `[q, r]` placements in play order. Verification needs a returned certificate; an unknown result has none. The solver is separate from deployed PVS and has no demonstrated Elo benefit. Its deadline is cooperative: a synchronous native candidate call can overrun it, and late results become unknown. In one benchmark a 13-stone forcing win verified in 35 ms, while a 1001-stone sparse board took 236 ms under a requested 100 ms budget.
+
 ## Experimental root turn coverage
 
 Quiet root widening is opt-in. It retains every existing selected turn and adds complete pairs by conditional rank, with separate second-placement and final-turn budgets. Immediate wins and mandatory defenses keep their exact handling. Deeper search keeps its existing candidate restrictions.
