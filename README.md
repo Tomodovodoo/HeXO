@@ -203,7 +203,7 @@ python arena.py --opponent seal --games 40 --ms 100 --width 16 --root-seconds 16
 python -m tests.benchmark --trace artifacts/seal-trained-fresh-40.json --first-game 10 --positions 12 --ms 100 --width 16 --reference-ms 1000 --root-seconds 16 --root-turns 48 --output artifacts/pair-admission.json
 ```
 
-The trace benchmark reports complete ordered-turn lists, resulting-position recall, depth, nodes and actual time. An optional `--seal-library` uses a separately built Seal adapter as reference; `--reference-report` reuses frozen reference turns for another ablation. On 12 held-out development positions, the 48-turn setting raised Seal-reference result recall from 4/12 to 7/12, while mean completed depth fell from 2.50 to 2.42 at 100 ms. This demonstrates coverage, not a playing-strength gain. Search clocks are best-effort; generation and legal fallback can exceed very short budgets.
+The trace benchmark reports complete ordered-turn lists, resulting-position recall, depth, nodes and actual time. An optional `--seal-library` uses a separately built Seal adapter as reference; `--reference-report` reuses frozen reference turns for another ablation. On 12 development positions, the 48-turn setting raised Seal-reference result recall from 4/12 to 7/12, while mean completed depth fell from 2.50 to 2.42 at 100 ms. These traces include a repeated position family, so this is a development diagnostic rather than independent validation. Both default and widened settings later scored 4 wins and 36 losses against Seal on the same 40 fresh games at 100 ms. No playing-strength gain is established. Search clocks are best-effort; generation and legal fallback can exceed very short budgets.
 
 ## Status and remaining work
 
