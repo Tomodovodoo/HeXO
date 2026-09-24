@@ -160,8 +160,10 @@ struct Board {
                 for(int j=0;j<32;++j) center.sum[j]+=z[j]-a[j];
             }
             for(int j=0;j<32;++j) {
-                pool[j]+=std::max(0,center.sum[j])-std::max(0,before[j]);
-                pool[j+32]+=std::max(0,-center.sum[j])-std::max(0,-before[j]);
+                int positive=std::max(0,center.sum[j])-std::max(0,before[j]);
+                pool[j]+=positive;
+                // ReLU(-x) = ReLU(x)-x, exactly in the integer accumulator.
+                pool[j+32]+=positive-(center.sum[j]-before[j]);
             }
             if(!(center.codes[0]|center.codes[1]|center.codes[2])) centers.erase(target);
         };
@@ -207,11 +209,9 @@ struct Board {
     std::array<float,16> rank_context() const {
         std::array<float,16> out{};if(!model) return out;
         auto x=inputs();
-        for(int h=0;h<16;++h) {
-            out[h]=model->policy_b[h];
-            for(int j=0;j<64;++j) out[h]+=model->policy_w[h*104+j]*x[j];
-            for(int j=0;j<4;++j) out[h]+=model->policy_w[h*104+96+j]*x[64+j];
-        }
+        out=model->policy_b;
+        for(int j=0;j<64;++j) for(int h=0;h<16;++h) out[h]+=model->policy_w[j*16+h]*x[j];
+        for(int j=0;j<4;++j) for(int h=0;h<16;++h) out[h]+=model->policy_w[(96+j)*16+h]*x[64+j];
         return out;
     }
     float rank(Cell c,const std::array<float,16>& shared) const {
@@ -223,12 +223,10 @@ struct Board {
         }
         if(player==1) for(int j=0;j<16;++j) local[j]=-local[j];
         auto correlation=pair(c);float out=model->policy_bias;
-        for(int h=0;h<16;++h) {
-            float x=shared[h];
-            for(int j=0;j<32;++j) x+=model->policy_w[h*104+64+j]*local[j];
-            for(int j=0;j<4;++j) x+=model->policy_w[h*104+100+j]*correlation[j];
-            out+=std::max(0.0f,x)*model->policy_out[h];
-        }
+        auto hidden=shared;
+        for(int j=0;j<32;++j) for(int h=0;h<16;++h) hidden[h]+=model->policy_w[(64+j)*16+h]*local[j];
+        for(int j=0;j<4;++j) for(int h=0;h<16;++h) hidden[h]+=model->policy_w[(100+j)*16+h]*correlation[j];
+        for(int h=0;h<16;++h) out+=std::max(0.0f,hidden[h])*model->policy_out[h];
         return out;
     }
     int at(Cell c) const { auto it=cells.find(c); return it==cells.end() ? -1 : it->second; }
