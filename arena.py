@@ -59,7 +59,6 @@ def run(args):
     weights = [0]*729
     nnue_path = None
     if args.run or args.table or args.nnue:
-        import numpy as np
         if args.run:
             run_dir = Path(args.run).resolve()
             summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
@@ -74,6 +73,7 @@ def run(args):
             path = nnue_path or Path(args.table).resolve()
             checkpoint = None
         if nnue_path is None:
+            import numpy as np
             table = np.load(path, allow_pickle=False)
             if table.shape != (729,) or table.dtype != np.int32:
                 raise ValueError("Expected a 729-entry int32 native pattern table")

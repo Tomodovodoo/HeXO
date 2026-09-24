@@ -49,13 +49,13 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Think time must be 1..30000 ms")
                 checkpoint = None
                 if self.run is not None:
-                    import numpy as np
                     summary = json.loads((self.run / "summary.json").read_text(encoding="utf-8"))
                     checkpoint = summary["incumbent"]
                     model = next(c for c in summary["checkpoints"] if c["id"] == checkpoint)
                     if model.get("kind") == "nnue":
                         self.game.load_model(self.run / model["nnue"])
                     else:
+                        import numpy as np
                         self.game.load_table(np.load(self.run / model["table"], allow_pickle=False))
                 analysis = self.game.search(ms)
                 analysis["checkpoint"] = checkpoint
