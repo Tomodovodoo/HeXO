@@ -12,6 +12,7 @@ class DirectPlayer(unittest.TestCase):
         actor.mode, actor.model_sha256 = mode, 'test-model'
         actor.history, actor.tree, actor.prover = [], None, None
         actor.milliseconds, actor.alpha, actor.beta = 1000, .03, .1
+        actor.proof_ms = 1000
         actor.simulations, actor.root_samples, actor.batch_size = 16, 8, 4
         actor.evaluator = Mock()
         return actor
@@ -85,6 +86,69 @@ class DirectPlayer(unittest.TestCase):
         finally:
             actor.close()
 
+    def test_proof_mode_completes_mandatory_defense_when_solver_unknown(self):
+        from tests.test_neural_search import Uniform
+        from proof import _completions
+        actor = self.actor('gumbel-proof')
+        actor.seed, actor.evaluator = 0, Uniform()
+        actor.prover = Mock()
+        actor.prover.solve.return_value = actor.prover.history.return_value = {'status':'UNKNOWN'}
+        history = [[0,0],[1,5],[3,3],[-2,2],[-1,1],[2,4],[0,6]]
+        actor.set_history(history)
+        game = Game(history)
+        try:
+            result = actor.turn(game)
+            self.assertEqual(len(game.cells), len(history))
+            for action in result['moves']:
+                game.play(*action)
+            self.assertEqual(len(result['moves']), 2)
+            self.assertFalse(_completions({(q,r):p for q,r,p in game.cells}, 1, 2, lambda: None))
+            self.assertEqual(result['proof_scope'], 'verified-root-and-tree-tactics')
+            self.assertEqual(result['proof_budget_ms'], 1000)
+            self.assertEqual(actor.tree.proof_ms, 1000)
+            actor.prover.solve.assert_called_once_with(unittest.mock.ANY, ms=250, idtt_ms=20)
+            actor.prover.history.assert_called()
+            self.assertTrue(all(call.kwargs['ms'] <= 250 for call in actor.prover.history.call_args_list))
+        finally:
+            actor.close()
+            game.close()
+
+    def test_invalid_proof_budget_does_not_create_snapshot(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from relational_evaluate import freeze
+        with TemporaryDirectory() as directory:
+            output = Path(directory)/'evaluation'
+            args = SimpleNamespace(output=output, games=2, seal_ms=100, neural_ms=1000,
+                                   simulations=8, root_samples=4, batch_size=4, max_stones=80)
+            for budget in (0, 60001):
+                args.proof_ms = budget
+                with self.assertRaisesRegex(ValueError, 'Proof budget'):
+                    freeze(args)
+                self.assertFalse(output.exists())
+
+    def test_tree_immediate_win_reaches_turn_proof_status(self):
+        from tests.test_neural_search import Uniform
+        actor = self.actor('gumbel-proof')
+        actor.seed, actor.evaluator = 0, Uniform()
+        actor.prover = Mock()
+        actor.prover.solve.return_value = actor.prover.history.return_value = {'status':'UNKNOWN'}
+        history = [(0,0),(0,2),(1,2),(1,0),(2,0),(2,2),(3,2),(3,0),(4,0),(-2,2),(-3,2)]
+        actor.set_history(history)
+        game = Game(history)
+        try:
+            result = actor.turn(game)
+            self.assertEqual(result['proof_status'], 'PROVEN_WIN')
+            self.assertEqual(result['proof']['status'], 'UNKNOWN')
+            self.assertEqual(len(game.cells), len(history))
+            for action in result['moves']:
+                game.play(*action)
+            self.assertEqual(game.winner, 0)
+        finally:
+            actor.close()
+            game.close()
+
     def test_search_that_uses_its_budget_still_completes_two_placements(self):
         actor = self.actor('gumbel')
         actor.history, actor.tree = [(0,0)], Mock()
@@ -118,7 +182,7 @@ class DirectPlayer(unittest.TestCase):
             seal.write_bytes(b'seal')
             (root/'seal_revision.txt').write_text('pinned')
             output = root/'evaluation'
-            args = SimpleNamespace(output=output, checkpoint=checkpoint, seal_library=seal, mode='pi',
+            args = SimpleNamespace(output=output, checkpoint=checkpoint, seal_library=seal, mode='pi', proof_ms=1000,
                 games=2, seal_ms=100, neural_ms=1000, simulations=8, root_samples=4, batch_size=4, max_stones=80)
             original = shutil.copyfile
             def copy(source, target):
