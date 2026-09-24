@@ -5,6 +5,7 @@ on:
       - 'src/**'
       - '*.py'
       - 'tests/**'
+      - 'tools/seal_current*'
       - 'CMakeLists.txt'
       - '.github/workflows/native.yml'
   workflow_dispatch:
@@ -22,7 +23,7 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build --parallel 2
       - run: python -m pip install numpy
-      - run: python -m unittest tests.test_neural_search tests.test_engine.NativeRules tests.test_curriculum tests.test_proof tests.test_leaf_tactics tests.test_notation_api -v
+      - run: python -m unittest tests.test_neural_search tests.test_engine.NativeRules tests.test_curriculum tests.test_proof tests.test_leaf_tactics tests.test_notation_api tests.test_seal_current -v
       - run: c++ -std=c++20 -O2 tests/tt_injection.cpp -o build/tt_injection
       - run: ./build/tt_injection
       - run: c++ -std=c++20 -O2 tests/gumbel.cpp -o build/gumbel_test
