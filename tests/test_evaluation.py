@@ -3,14 +3,24 @@ import math
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
-from evaluate import verify_trace, verify_runtime, sha, publish_failure
+from evaluate import verify_trace, verify_runtime, sha, publish_failure, freeze
 from hexo import Game
 from train import paired_metrics
 
 
 class PairedEvaluation(unittest.TestCase):
+    def test_invalid_width_does_not_create_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)/'evaluation'
+            for width in (1, 129):
+                args = SimpleNamespace(output=output, games=2, ms=1, workers=1, max_stones=5, width=width)
+                with self.assertRaisesRegex(ValueError, 'width in 2..128'):
+                    freeze(args)
+                self.assertFalse(output.exists())
+
     def test_runtime_dependency_changes_and_failed_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

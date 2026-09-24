@@ -126,8 +126,8 @@ def freeze(args):
     output = args.output.resolve()
     if output.exists():
         raise ValueError("Evaluation output must be a new directory; existing evidence is never overwritten")
-    if args.games < 2 or args.games % 2 or min(args.ms, args.width, args.max_stones, args.workers) < 1:
-        raise ValueError("Use an even game count and positive search, stone and worker budgets")
+    if args.games < 2 or args.games % 2 or min(args.ms, args.workers) < 1 or args.max_stones < 5 or not 2 <= args.width <= 128:
+        raise ValueError("Use an even game count, positive time/workers, stone cap >= 5 and native width in 2..128")
     # Read inputs before creating output, then use only immutable copied bytes.
     models = {name: path.resolve().read_bytes() for name, path in (("candidate", args.candidate), ("reference", args.reference))}
     sources = ["evaluate.py", "train.py", "hexo.py", "curriculum.py", "src/hexo.cpp", "src/hexo.hpp", "src/nnue.hpp", "CMakeLists.txt"]
