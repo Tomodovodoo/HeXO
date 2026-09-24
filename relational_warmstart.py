@@ -74,6 +74,8 @@ def fit(args, config=None):
     best=None
     with tempfile.TemporaryDirectory(dir=output.parent,prefix='relational-fit-') as temporary:
         temporary=Path(temporary)
+        save_model(temporary/'initial_model.pt',model)
+        initial_validation=epoch(model,histories,rows['validation'],args)
         for number in range(1,args.epochs+1):
             last=[0.,None]
             def progress(stage,completed,total):
@@ -99,13 +101,14 @@ def fit(args, config=None):
         for files in data_identity['shards'].values():
             for path,expected in files.items():
                 if digest(Path(path))!=expected:raise ValueError('Human split shard changed during fitting')
-        report=dict(epochs=metrics,selected=best,seconds=time.perf_counter()-started,
+        report=dict(epochs=metrics,initial_validation=initial_validation,selected=best,seconds=time.perf_counter()-started,
                     train_positions=len(rows['train']),validation_positions=len(rows['validation']),
                     gpu_memory_peak_mb=torch.cuda.max_memory_allocated()/2**20 if args.device=='cuda' else 0,
                     target='Human chosen actions and terminal STM outcomes; unknown action Q values remain unlabeled',
                     promotion=False)
         def writer(stage):
             shutil.copy2(temporary/'model.pt',stage/'model.pt')
+            shutil.copy2(temporary/'initial_model.pt',stage/'initial_model.pt')
             shutil.copy2(temporary/'optimizer.pt',stage/'optimizer.pt')
             (stage/'report.json').write_text(json.dumps(report,indent=2))
         publish(output,identity,writer,report)
