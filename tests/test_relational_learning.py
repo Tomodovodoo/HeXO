@@ -136,6 +136,27 @@ class RelationalLearningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'continued after terminal'):
             verify_terminal(moves[:-1],moves[-1],[99,99],1)
 
+    def test_klent_zero_output_control_and_terminal_threshold(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);model=RelationalNet(config())
+            checkpoint=root/'start.pt';save_model(checkpoint,model)
+            args=self.args(run=str(root/'run'),initial_model=str(checkpoint),games=1,max_plies=2,
+                           critic_initialization='zero-output',min_terminal_fraction=.75)
+            main(args)
+            initial=load_model(root/'run/checkpoints/0000/model.pt')
+            for name,value in model.state_dict().items():
+                if name.startswith('critic.3.'):
+                    self.assertTrue(torch.equal(initial.state_dict()[name],torch.zeros_like(value)))
+                else:torch.testing.assert_close(initial.state_dict()[name],value,rtol=0,atol=0)
+            status=json.loads((root/'run/status.json').read_text())
+            self.assertEqual(status['stage'],'collection_insufficient')
+            self.assertFalse(status['fitting_started'])
+            self.assertEqual(status['terminal_games'],0)
+            self.assertTrue((root/'run/corpus/0001/manifest.json').exists())
+            self.assertFalse((root/'run/checkpoints/0001').exists())
+            main(args)
+            self.assertFalse((root/'run/checkpoints/0001').exists())
+
     def test_zero_row_short_game_membership_remains_untrained(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)/'corpus';records=fixture(root)
