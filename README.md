@@ -678,6 +678,36 @@ python dashboard.py --run runs/search-selfplay --port 8766
 
 A policy/Q warm start preserves its backbone and policy and initializes a new scalar value head at zero. Native trees batch neural leaves across games. Graph memory limits split whole positions without cropping legal actions. Training holds out whole terminal games for validation.
 
-Checkpoint 0 is the internal Elo anchor at zero. Every candidate plays equal-search-budget, color-swapped games against that anchor and the incumbent champion. The dashboard shows all checkpoint ratings with uncertainty, losses, throughput and GPU telemetry. A positive paired test at p < 0.05 selects a new champion. Learning continues from the latest candidate regardless of champion selection. Ratings describe this internal league and search budget, not an external leaderboard. The p-value is per comparison, not a guarantee across indefinitely repeated runs.
+Checkpoint 0 is the internal Elo anchor at zero. Every candidate plays equal-search-budget, color-swapped games against recent checkpoints, with a smaller allocation against the anchor. The dashboard shows all checkpoint ratings with uncertainty, losses, throughput and GPU telemetry. A positive paired test at p < 0.05 selects a new champion. Learning continues from the latest candidate regardless of champion selection. Ratings describe this internal league and search budget, not an external leaderboard. The p-value is per comparison, not a guarantee across indefinitely repeated runs.
 
 Rerun the same command to resume completed artifacts; only the requested iteration count may change. Saved corpora and optimizer checkpoints are verified. A partial fitting pass restarts from the preceding checkpoint rather than silently applying the same targets twice. Active run source files must remain unchanged.
+
+### Moving internal opponents and league ratings
+
+Search-training evaluation uses `--eval-games 32` against the previous checkpoint
+and the current champion, plus `--reference-games 8` against checkpoint 0. When
+previous and champion coincide, the second opponent is approximately 20% earlier
+in training. Duplicate opponents are played once. Self-play training still uses
+the latest network on both sides with Gumbel search targets and terminal outcomes.
+
+League Elo fits all completed internal comparisons, fixing checkpoint 0 at zero.
+The fit weights comparisons by their game counts, so most new evidence comes from
+recent opponents. Historical ratings can change when new results arrive. Raw
+match scores and reference-only estimates remain in `league.json`.
+
+The displayed 95% intervals are approximate Bayesian credible intervals. Each
+comparison records whether the candidate wins zero, one, or two games in each
+color-swapped opening pair. A Jeffreys Dirichlet prior over those three outcomes
+retains uncertainty even after a sweep or a set of split pairs. The dashboard uses
+2,048 posterior draws projected into Bradley-Terry ratings. These intervals are
+conditional on the paired-outcome model, not a guarantee of future performance.
+New comparisons use distinct opponent-specific seeds; older comparisons may
+share opening schedules, a dependence this approximation does not model across
+comparisons. Promotion continues to use the separately recorded paired test.
+
+To upgrade a completed older search run, reuse its original learning and search
+arguments, add `--upgrade-run --reference-games 8`, and increase `--iterations`.
+The trainer requires a finished checkpoint boundary and an exclusive run lock.
+It verifies and binds the old manifests in `history.json`, preserves model and
+optimizer files, and records the new source identity. Normal later resumes omit
+`--upgrade-run`. Never change the source checkout of an active trainer.

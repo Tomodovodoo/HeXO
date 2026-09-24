@@ -19,12 +19,13 @@ from neural_search import NeuralSearch, SearchCoordinator, EvaluationCache
 from relational_model import RelationalNet, NeuralEvaluator
 from relational_train import load_model, save_model, precision, graph, work_batches, VALUE_SCHEMA
 from train import write_json, task_opening, paired_metrics
+from checkpoint_league import evaluation_schedule, rate_league, RATING_METHOD
 
 SCHEMA = 'hexo-search-selfplay-v1'
 
 
 def source_identity():
-    names = ('search_train.py','relational_model.py','relational_train.py','relational_native.py',
+    names = ('search_train.py','checkpoint_league.py','relational_model.py','relational_train.py','relational_native.py',
              'relational_encoder.py','neural_search.py','hexo.py','klent.py','train.py','curriculum.py',
              'src/gumbel.cpp','src/hexo.cpp','src/hexo.hpp','src/relational_graph.cpp')
     files = {name:digest(ROOT/name) for name in names}
@@ -55,6 +56,75 @@ def publish(path, identity, writer, metrics=None):
         write_json(stage/'manifest.json',dict(schema=SCHEMA,identity=identity,metrics=metrics,
             files={p.name:digest(p) for p in stage.iterdir()}))
         stage.rename(path)
+
+
+def capture_history(run, previous_identity, config):
+    """Bind an existing stopped run's immutable artifacts before changing its evaluator."""
+    if json.loads((run/'status.json').read_text())['stage']!='finished':
+        raise ValueError('Upgrade requires a finished checkpoint boundary')
+    if {k:v for k,v in config.items() if k!='reference_games'}!=previous_identity['config']:
+        raise ValueError('Upgrade may change evaluation allocation, not learning or search settings')
+    league=json.loads((run/'league.json').read_text())
+    numbers=sorted(c['id'] for c in league['checkpoints'])
+    if numbers!=list(range(len(numbers))):raise ValueError('Incomplete checkpoint history')
+    artifacts={}
+    def remember(path,expected=None):
+        manifest=verify_artifact(path,expected)
+        artifacts[path.relative_to(run).as_posix()]=digest(path/'manifest.json')
+        return manifest
+    for number in numbers:
+        path=run/'checkpoints'/f'{number:04d}'
+        raw=json.loads((path/'manifest.json').read_text())
+        expected=dict(previous_identity,checkpoint=number) if 'checkpoint' in raw['identity'] else previous_identity
+        manifest=remember(path,expected)
+        if number:
+            corpus=run/'corpus'/f'{number:04d}'
+            raw=json.loads((corpus/'manifest.json').read_text())
+            expected=dict(previous_identity,actor_sha256=digest(run/'checkpoints'/f'{number-1:04d}'/'model.pt'),
+                policy_target='Gumbel completed-Q improved policy',value_target='Final terminal outcome from position player perspective')
+            if 'iteration' in raw['identity']:expected['iteration']=number
+            remember(corpus,expected)
+            if manifest['metrics']['corpus_sha256']!=digest(corpus/'manifest.json'):
+                raise ValueError('Historical checkpoint consumed a different corpus')
+    for path in sorted((run/'evaluation').glob('*-vs-*')):
+        if not path.is_dir():continue
+        manifest=remember(path);report=json.loads((path/'report.json').read_text())
+        a,b=report['candidate'],report['opponent']
+        if a not in numbers or b not in numbers or path.name!=f'{a:04d}-vs-{b:04d}':
+            raise ValueError('Historical comparison identity changed')
+        expected=dict(candidate=digest(run/'checkpoints'/f'{a:04d}'/'model.pt'),
+            opponent=digest(run/'checkpoints'/f'{b:04d}'/'model.pt'),simulations=config['simulations'],
+            root_samples=config['root_samples'],games=config['eval_games'],seed=config['seed']+100000+a*1000,opening_suite='standard-v1')
+        if manifest['identity']!=expected:raise ValueError('Historical comparison settings changed')
+    return dict(previous_identity=previous_identity,through=numbers[-1],artifacts=artifacts)
+
+
+def update_ratings(run, league, args, history):
+    reports=[];ids={c['id'] for c in league['checkpoints']}
+    hashes={number:digest(run/'checkpoints'/f'{number:04d}'/'model.pt') for number in ids}
+    for path in sorted((run/'evaluation').glob('*-vs-*')):
+        if not path.is_dir():continue
+        manifest=verify_artifact(path);report=json.loads((path/'report.json').read_text())
+        a,b=report['candidate'],report['opponent']
+        if a not in ids or b not in ids:continue
+        if path.name!=f'{a:04d}-vs-{b:04d}':raise ValueError('Comparison filename disagrees with opponents')
+        for key,number in [('candidate',a),('opponent',b)]:
+            if manifest['identity'][key]!=hashes[number]:
+                raise ValueError('Rating comparison model changed')
+        for key in ('simulations','root_samples'):
+            if manifest['identity'][key]!=getattr(args,key):raise ValueError('Rating search budgets differ')
+        inherited=history.get('artifacts',{}).get(path.relative_to(run).as_posix())
+        if inherited and inherited!=digest(path/'manifest.json'):raise ValueError('Historical evaluation changed')
+        reports.append(report)
+    ratings,intervals=rate_league(ids,reports,seed=args.seed)
+    for checkpoint in league['checkpoints']:
+        if 'reference_elo' not in checkpoint:
+            checkpoint['reference_elo']=checkpoint.get('elo')
+            checkpoint['reference_elo_interval']=checkpoint.get('elo_interval')
+        checkpoint['elo']=ratings[checkpoint['id']]
+        checkpoint['elo_interval']=intervals.get(checkpoint['id'])
+    league['rating_method']=RATING_METHOD
+    league['rating_interval_note']='Approximate 95% Bayesian credible intervals from 2048 paired-outcome posterior draws. Each comparison uses a Jeffreys Dirichlet prior over 0, 1 or 2 wins per opening pair. Reference-only intervals are retained separately.'
 
 
 def warm_start(path, device, seed, expected_sha256=None):
@@ -197,27 +267,28 @@ def fit(model,optimizer,episodes,rows,args,iteration,progress):
     return dict(**last,optimizer_steps=steps,validation_game_ids=sorted(validation),training_games=len(families)-len(validation))
 
 
-def evaluate(run,candidate,opponent,args,progress):
+def evaluate(run,candidate,opponent,args,progress,games=None):
+    games=args.eval_games if games is None else games
     path=run/'evaluation'/f'{candidate:04d}-vs-{opponent:04d}'
     a=run/'checkpoints'/f'{candidate:04d}'/'model.pt';b=run/'checkpoints'/f'{opponent:04d}'/'model.pt'
     run_identity=json.loads((run/'config.json').read_text())
     verify_artifact(a.parent,dict(run_identity,checkpoint=candidate))
     verify_artifact(b.parent,dict(run_identity,checkpoint=opponent))
     identity=dict(run=run_identity,candidate=digest(a),opponent=digest(b),simulations=args.simulations,root_samples=args.root_samples,
-                  games=args.eval_games,seed=args.seed+100000+candidate*1000,opening_suite='standard-v1')
+                  games=games,seed=args.seed+100000+candidate*1000+opponent*1000003,opening_suite='standard-v1')
     if path.exists():
         verify_artifact(path,identity)
         return json.loads((path/'report.json').read_text())
-    openings=[task_opening(identity['seed']+i//2,True,args.max_plies,'standard-v1')['opening'] for i in range(args.eval_games)]
-    assignments=[(0,1) if i%2==0 else (1,0) for i in range(args.eval_games)]
+    openings=[task_opening(identity['seed']+i//2,True,args.max_plies,'standard-v1')['opening'] for i in range(games)]
+    assignments=[(0,1) if i%2==0 else (1,0) for i in range(games)]
     episodes,_=play_games([a,b],assignments,openings,args,identity['seed'],progress)
-    games=[dict(index=e['id'],pair=e['id']//2,seed=identity['seed']+e['id']//2,challenger_color=e['id']%2,winner=e['winner'],reason=e['reason'],
+    records=[dict(index=e['id'],pair=e['id']//2,seed=identity['seed']+e['id']//2,challenger_color=e['id']%2,winner=e['winner'],reason=e['reason'],
                 opening=e['opening'],moves=e['moves']) for e in episodes]
-    metrics=paired_metrics(games,args.eval_games)
+    metrics=paired_metrics(records,games)
     point=400*math.log10((metrics['wins']+.5)/(metrics['losses']+.5)) if not metrics['incomplete'] else None
     report=dict(candidate=candidate,opponent=opponent,metrics=metrics,elo=point,
         elo_interval=metrics['elo_delta_95pct_open'],rating_scope='Internal checkpoints at identical search budgets; checkpoint0000 is Elo0',
-        estimate='Jeffreys-smoothed log-odds point; paired Hoeffding interval',games=games)
+        estimate='Jeffreys-smoothed log-odds point; paired Hoeffding interval',games=records)
     publish(path,identity,lambda stage:write_json(stage/'report.json',report))
     return report
 
@@ -225,7 +296,7 @@ def evaluate(run,candidate,opponent,args,progress):
 def main(args):
     run=Path(args.run).resolve();run.mkdir(parents=True,exist_ok=True)
     torch.set_num_threads(2);torch.manual_seed(args.seed)
-    config={k:v for k,v in vars(args).items() if k not in ('run','iterations')}
+    config={k:v for k,v in vars(args).items() if k not in ('run','iterations','upgrade_run')}
     config['initial_model']=str(Path(args.initial_model).resolve());config['initial_sha256']=digest(Path(args.initial_model))
     identity=dict(run=str(run),backbone=VALUE_SCHEMA,config=config,sources=source_identity(),runtime=dict(torch=str(torch.__version__),cuda=torch.version.cuda))
     with (run/'training.lock').open('x') as stream:stream.write(str(os.getpid()))
@@ -234,16 +305,32 @@ def main(args):
         write_json(run/'status.json',record)
         with (run/'events.jsonl').open('a') as stream:stream.write(json.dumps(record)+'\n')
     try:
+        history_path=run/'history.json'
+        history=json.loads(history_path.read_text()) if history_path.exists() else {}
+        if args.upgrade_run and not history:
+            previous_identity=json.loads((run/'config.json').read_text())
+            history=capture_history(run,previous_identity,config)
+            write_json(history_path,history)
+        if history:identity['history_sha256']=digest(history_path)
         if (run/'config.json').exists():
-            if json.loads((run/'config.json').read_text())!=identity:raise ValueError('Run source or configuration changed')
+            existing=json.loads((run/'config.json').read_text())
+            if args.upgrade_run and history and existing==history['previous_identity']:
+                write_json(run/'config.json',identity)
+            elif existing!=identity:raise ValueError('Run source or configuration changed')
         else:write_json(run/'config.json',identity)
+        def verify_run_artifact(path,expected):
+            inherited=history.get('artifacts',{}).get(path.relative_to(run).as_posix())
+            if inherited:
+                if digest(path/'manifest.json')!=inherited:raise ValueError('Inherited artifact manifest changed')
+                return verify_artifact(path)
+            return verify_artifact(path,expected)
         league=json.loads((run/'league.json').read_text()) if (run/'league.json').exists() else dict(champion=0,checkpoints=[dict(id=0,elo=0.,elo_interval=[0.,0.],promoted=True,reference=True)])
         zero=run/'checkpoints/0000'
         if not zero.exists():
             model=warm_start(args.initial_model,args.device,args.seed,config['initial_sha256']);optimizer=torch.optim.Adam(model.parameters(),lr=args.lr)
             def writer(stage):save_model(stage/'model.pt',model);torch.save(optimizer.state_dict(),stage/'optimizer.pt')
             publish(zero,dict(identity,checkpoint=0),writer);del model,optimizer
-        verify_artifact(zero,dict(identity,checkpoint=0))
+        verify_run_artifact(zero,dict(identity,checkpoint=0))
         def corpus_identity(number):
             return dict(identity,iteration=number,
                 actor_sha256=digest(run/'checkpoints'/f'{number-1:04d}'/'model.pt'),
@@ -253,16 +340,17 @@ def main(args):
         # the fixed anchor and every checkpoint referenced by the league.
         for saved in sorted(league['checkpoints'],key=lambda c:c['id']):
             number=saved['id']
-            manifest=verify_artifact(run/'checkpoints'/f'{number:04d}',dict(identity,checkpoint=number))
+            manifest=verify_run_artifact(run/'checkpoints'/f'{number:04d}',dict(identity,checkpoint=number))
             if number:
                 old_corpus=run/'corpus'/f'{number:04d}'
-                verify_artifact(old_corpus,corpus_identity(number))
+                verify_run_artifact(old_corpus,corpus_identity(number))
                 if manifest['metrics']['corpus_sha256']!=digest(old_corpus/'manifest.json'):
                     raise ValueError('Previously consumed search corpus changed')
+        update_ratings(run,league,args,history)
         write_json(run/'league.json',league)
         for iteration in range(1,args.iterations+1):
             if any(c['id']==iteration for c in league['checkpoints']):continue
-            previous=run/'checkpoints'/f'{iteration-1:04d}';verify_artifact(previous,dict(identity,checkpoint=iteration-1))
+            previous=run/'checkpoints'/f'{iteration-1:04d}';verify_run_artifact(previous,dict(identity,checkpoint=iteration-1))
             checkpoint=run/'checkpoints'/f'{iteration:04d}';corpus=run/'corpus'/f'{iteration:04d}'
             if not checkpoint.exists():
                 if not corpus.exists():
@@ -289,15 +377,20 @@ def main(args):
             if metrics['corpus_sha256']!=digest(corpus/'manifest.json'):
                 raise ValueError('Pending checkpoint consumed corpus changed')
             comparisons={}
-            for opponent in sorted({0,league['champion']}):
-                comparisons[opponent]=evaluate(run,iteration,opponent,args,lambda data:event('validation-matches',iteration,opponent=opponent,**data))
+            for opponent,games in evaluation_schedule(iteration,league['champion'],args.eval_games,args.reference_games):
+                comparisons[opponent]=evaluate(run,iteration,opponent,args,lambda data:event('validation-matches',iteration,opponent=opponent,**data),games)
             anchor=comparisons[0];versus=comparisons[league['champion']]['metrics']
             promoted=not versus['incomplete'] and versus['wins']>versus['losses'] and versus['opening_pair_p']<.05
             league['checkpoints'].append(dict(id=iteration,elo=anchor['elo'],elo_interval=anchor['elo_interval'],promoted=promoted,
                 anchor_score={k:anchor['metrics'][k] for k in ('wins','losses','incomplete')},versus_champion=league['champion'],
                 champion_score={k:versus[k] for k in ('wins','losses','incomplete','opening_pair_p')},loss=metrics))
+            league['checkpoints'][-1]['previous_score']={k:comparisons[iteration-1]['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
+            for opponent,comparison in comparisons.items():
+                if opponent not in (0,iteration-1,league['champion']):
+                    league['checkpoints'][-1]['older_score']=dict(opponent=opponent,**{k:comparison['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')})
             if promoted:league['champion']=iteration
-            write_json(run/'league.json',league);event('checkpoint',iteration,elo=anchor['elo'],promoted=promoted,champion=league['champion'])
+            update_ratings(run,league,args,history)
+            write_json(run/'league.json',league);event('checkpoint',iteration,elo=league['checkpoints'][-1]['elo'],promoted=promoted,champion=league['champion'])
         event('finished',args.iterations,champion=league['champion'])
     except BaseException as error:
         event('failed',locals().get('iteration',0),error=repr(error));raise
@@ -308,11 +401,12 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run',required=True);parser.add_argument('--initial-model',required=True)
     parser.add_argument('--device',choices=['cpu','cuda'],default='cuda')
-    for name,default in [('iterations',3),('games',32),('eval-games',32),('envs',8),('simulations',16),('root-samples',8),
+    parser.add_argument('--upgrade-run',action='store_true',help='Preserve and bind a finished run before changing its evaluation schedule')
+    for name,default in [('iterations',3),('games',32),('eval-games',32),('reference-games',8),('envs',8),('simulations',16),('root-samples',8),
                          ('leaf-batch',16),('batch',16),('epochs',1),('max-plies',128),('max-nodes',10000),('max-edges',600000),('cache-positions',1024),('seed',1740)]:
         parser.add_argument('--'+name,type=int,default=default)
     parser.add_argument('--lr',type=float,default=.0001)
     args=parser.parse_args()
-    if min(args.iterations,args.games,args.eval_games,args.envs,args.simulations,args.root_samples,args.leaf_batch,args.batch,args.epochs,args.max_plies,args.max_nodes,args.max_edges,args.cache_positions)<1 or args.games<2 or args.eval_games%2 or not math.isfinite(args.lr) or args.lr<=0:
+    if min(args.iterations,args.games,args.eval_games,args.reference_games,args.envs,args.simulations,args.root_samples,args.leaf_batch,args.batch,args.epochs,args.max_plies,args.max_nodes,args.max_edges,args.cache_positions)<1 or args.games<2 or args.eval_games%2 or args.reference_games%2 or args.reference_games>args.eval_games or not math.isfinite(args.lr) or args.lr<=0:
         parser.error('Positive settings, at least two self-play games, and an even evaluation count required')
     main(args)
