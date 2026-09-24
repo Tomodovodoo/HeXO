@@ -1,6 +1,7 @@
 """Bounded, seed-controlled measurements; no pass/fail throughput threshold."""
 import argparse
 import hashlib
+import io
 import json
 import platform
 import random
@@ -21,6 +22,7 @@ def pair_admission(args):
     trace = json.loads(Path(args.trace).read_text())
     model = trace.get("model")
     table_path = None
+    table_digest = None
     table = [0]*729
     if model:
         if model.get("kind", "pattern") != "pattern":
@@ -30,7 +32,11 @@ def pair_admission(args):
         if stored_path is None:
             raise ValueError("Trace model does not identify its pattern table")
         table_path = Path(stored_path)
-        array = np.load(table_path, allow_pickle=False)
+        table_bytes = table_path.read_bytes()
+        table_digest = hashlib.sha256(table_bytes).hexdigest()
+        if table_digest != model.get("sha256"):
+            raise ValueError("Trace pattern table SHA-256 does not match the recorded evaluator")
+        array = np.load(io.BytesIO(table_bytes), allow_pickle=False)
         if array.shape != (729,) or array.dtype != np.int32:
             raise ValueError("Trace model must contain a 729-entry int32 pattern table")
         table = array.tolist()
@@ -123,7 +129,7 @@ def pair_admission(args):
             "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
             "platform": platform.platform(),
             "trace_sha256": hashlib.sha256(Path(args.trace).read_bytes()).hexdigest(),
-            "table_sha256": hashlib.sha256(table_path.read_bytes()).hexdigest() if table_path else None,
+            "table_sha256": table_digest,
             "engine_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
             "source_sha256": hashlib.sha256((ROOT/"src/hexo.cpp").read_bytes()).hexdigest(),
             "benchmark_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
