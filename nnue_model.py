@@ -248,6 +248,8 @@ def optimize_nnue(run, checkpoint, incumbent, replay_paths, args, progress, log)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.001, fused=device == "cuda")
     if incumbent.get("optimizer"):
         optimizer.load_state_dict(torch.load(run / incumbent["optimizer"], map_location=device, weights_only=True))
+        for group in optimizer.param_groups:
+            group["fused"] = device == "cuda"
     batch_size = args.batch or 256
     generator = np.random.default_rng(args.seed+checkpoint)
     best, best_state, best_optimizer, best_metrics = math.inf, None, None, None
