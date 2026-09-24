@@ -534,3 +534,60 @@ identical losses, value-head parameters and Adam states in that experiment.
 This is a value-pass measurement, not an overall training or GPU speedup.
 Reproduce it with `python -m tests.benchmark_value --corpus <directory>
 --model <model.pt> --output <report.json>`.
+
+## Primary relational policy/Q model
+
+`relational_model.RelationalNet(ModelConfig())` implements the new primary
+representation: width 256, eight residual blocks, eight attention heads,
+feed-forward width 1,024, and 16 learned global tokens. It has **31,860,930
+trainable parameters**. Each block performs local relational attention, stone
+attention, global read/write attention, then local attention again. Legal-cell
+representations persist through every block. Policy and bounded scalar-Q heads
+return every legal action in native `Game.legal_moves()` order.
+
+The encoder shares stone/cell identity across every nonempty six-cell window.
+Window occupancy and incidence slots are tied under reversal; no absolute axis
+embedding is used. Radius-eight stone/cell links and local legal-cell neighbors
+retain geometry outside window coverage. Both the independent Python reference
+and the native accelerator preserve all 12 board symmetries. The native encoder
+is the explicit default of `NeuralEvaluator`; `backend="reference"` selects the
+reference implementation, and a missing native library does not silently fall
+back. Normal CMake builds include `hexo_graph`.
+
+Training calls `encode(history)`, `pack(graphs, device)`, and `model(batch)`.
+Outputs are flat FP32 `logits`, bounded FP32 `q`, and `action_offsets`.
+`NeuralEvaluator(model, device).evaluate(histories)` returns ordered action,
+logit, and Q arrays per position. Histories contain all placements, including
+the origin. Native rules determine side and remaining placements; terminal
+positions belong to the search implementation.
+
+Default work budgets are 12,000 nodes and 600,000 relation traversals per batch
+(local edges count twice). Whole graphs are batched in order; a single graph
+exceeding the configured budget raises `WorkBudgetError`, never truncates its
+actions. These are explicit resource limits, not game rules. Increase them only
+after checking memory. Edge chunks control temporary allocations; autograd still
+retains work proportional to edges times width. Block checkpointing, BF16
+projections, and FP32 normalization, softmax, reductions, and residuals keep the
+production model practical on the RTX 3070 Ti.
+
+The production model completed forward/backward/Adam on a 150-stone position
+with 6,166 nodes, 442,732 relation traversals, and all 3,938 legal outputs:
+2.045 seconds, 2,272 MiB peak allocated and 3,072 MiB peak reserved. The device
+reported 6,949 MiB free before the step; this was not a competing-load benchmark.
+These measurements establish executable capacity, not playing strength.
+`python -m tests.benchmark_relational --output <report.json>` reproduces the
+fixture and records configuration, source hashes, and memory measurements.
+Geometry, action indexing, 12 symmetries, batch isolation, native/reference
+parity, and checkpoint gradients are covered by `tests.test_relational`.
+Held-out prediction gains and superiority against independent bots remain to
+be established by training and external evaluation.
+
+Each graph exposes `position_key`, a SHA256 of the rule identifier, native
+player/remaining phase, and sorted absolute stone coordinates and owners.
+Evaluator records echo that identity, `player`, `remaining`, and `model_version`
+alongside the full native-order actions, logits, and Q. Deployed callers pass the
+checkpoint SHA as `model_version`; standalone callers receive a configuration
+and parameter digest. The evaluator copies and freezes the supplied model so
+later training or checkpoint loads on the caller's model cannot change its identity.
+Terminal inference is rejected because the rules and search own terminal values.
+
