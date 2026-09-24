@@ -1,4 +1,4 @@
-"""Frozen direct relational players versus pinned Seal, with paired openings."""
+"""Frozen direct relational players versus pinned opponents, with paired openings."""
 import argparse
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import json
@@ -27,14 +27,32 @@ def prepare(config, checkpoint):
     global PLAYER, OPPONENT
     from arena import Seal
     PLAYER = create_player(config, checkpoint)
-    OPPONENT = Seal()
+    if config.get('opponent_kind', 'seal') == 'seal':
+        OPPONENT = Seal()
+    else:
+        from relational_opponents import load_opponent
+        folder = checkpoint.parent.parent/'opponent'
+        OPPONENT = load_opponent(json.loads((folder/'opponent.json').read_text()), folder)
     # Warm the actual model and CUDA kernels before binding loaded dependencies.
     PLAYER.evaluator.evaluate([[(0, 0)]])
 
 
+def close_players():
+    global PLAYER, OPPONENT
+    if PLAYER is not None:
+        PLAYER.close()
+    if OPPONENT is not None and hasattr(OPPONENT, 'close'):
+        OPPONENT.close()
+    PLAYER = OPPONENT = None
+
+
 def worker_start(output):
+    import atexit
     provenance = json.loads((output/'provenance.json').read_text())
     prepare(provenance['config'], output/'models/candidate.pt')
+    # Register after temporary runtime creation so handles close before its
+    # weakref cleanup on Windows interpreter shutdown.
+    atexit.register(close_players)
     verify_runtime(provenance['runtime_files_sha256'])
 
 
@@ -45,6 +63,8 @@ def heartbeat(output, index, phase, **extra):
 def play(task):
     game = Game(task['opening'])
     PLAYER.set_history(task['opening'])
+    if hasattr(OPPONENT, 'set_history'):
+        OPPONENT.set_history(task['opening'])
     trace = []
     output = Path(task['output'])
     start = time.perf_counter()
@@ -56,12 +76,13 @@ def play(task):
     try:
         while game.winner < 0 and len(game.cells)+game.remaining <= task['max_stones']:
             side, remaining, ply = game.player, game.remaining, len(game.cells)
-            heartbeat(output, task['index'], 'neural' if side == task['challenger_color'] else 'seal', ply=ply)
+            heartbeat(output, task['index'], 'neural' if side == task['challenger_color'] else 'opponent', ply=ply)
             turn_start = time.perf_counter()
             if side == task['challenger_color']:
                 result = PLAYER.turn(game)
             else:
-                result = dict(moves=OPPONENT(game, task['seal_ms']), backend='seal')
+                result = (OPPONENT.turn(game, task['seal_ms']) if hasattr(OPPONENT, 'turn')
+                          else dict(moves=OPPONENT(game, task['seal_ms']), backend='seal'))
             wall = (time.perf_counter()-turn_start)*1000
             if not result['moves']:
                 raise RuntimeError('Player returned an empty turn')
@@ -100,6 +121,14 @@ def freeze(args):
         'CMakeLists.txt', 'tools/seal_adapter.cpp'] + [str(p.relative_to(ROOT)) for p in (ROOT/'src').glob('*') if p.is_file()]
     binaries = [library, library.with_name(library.name.replace('hexo', 'hexo_graph')),
                 library.with_name(library.name.replace('hexo', 'hexo_gumbel'))]
+    opponent_snapshot = getattr(args, 'opponent_snapshot', None)
+    opponent = None
+    if opponent_snapshot:
+        from relational_opponents import load_opponent
+        opponent = json.loads((opponent_snapshot/'opponent.json').read_text())
+        checked = load_opponent(opponent, opponent_snapshot)
+        checked.close()
+        source_names.append('relational_opponents.py')
     if args.mode == 'gumbel-proof':
         from tactical_proof import NativeTactics, PACKAGE
         proof = NativeTactics()
@@ -107,11 +136,14 @@ def freeze(args):
         source_names += [str((PACKAGE/name).relative_to(ROOT)) for name in proof.metadata['sources']]
         binary = Path(proof.lib._name)
         binaries += [binary, binary.with_suffix(binary.suffix+'.json')]
-    revision_file = args.seal_library.parent/'seal_revision.txt'
-    if not revision_file.exists() and args.seal_library.parent.name in ('Release', 'Debug', 'RelWithDebInfo', 'MinSizeRel'):
-        revision_file = args.seal_library.parent.parent/'seal_revision.txt'
+    opponent_inputs = []
+    if opponent is None:
+        revision_file = args.seal_library.parent/'seal_revision.txt'
+        if not revision_file.exists() and args.seal_library.parent.name in ('Release', 'Debug', 'RelWithDebInfo', 'MinSizeRel'):
+            revision_file = args.seal_library.parent.parent/'seal_revision.txt'
+        opponent_inputs = [args.seal_library, revision_file]
     # Validate all inputs before creating the immutable destination.
-    for path in [checkpoint, args.seal_library, revision_file, *binaries, *(ROOT/name for name in source_names)]:
+    for path in [checkpoint, *opponent_inputs, *binaries, *(ROOT/name for name in source_names)]:
         if not path.is_file():
             raise FileNotFoundError(path)
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
@@ -128,16 +160,28 @@ def freeze(args):
         target = output/'source'/binary.relative_to(ROOT)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(binary, target)
-    seal = output/'source'/library.relative_to(ROOT).with_name(library.name.replace('hexo', 'hexo_seal'))
-    shutil.copyfile(args.seal_library, seal)
+    if opponent is None:
+        seal = output/'source'/library.relative_to(ROOT).with_name(library.name.replace('hexo', 'hexo_seal'))
+        shutil.copyfile(args.seal_library, seal)
+        config['seal_revision'] = revision_file.read_text().strip()
+        opponent = dict(kind='seal', revision=config['seal_revision'], binary_sha256=sha(seal),
+                        budget=dict(unit='milliseconds per complete turn', milliseconds=args.seal_ms))
+    else:
+        shutil.copytree(opponent_snapshot, output/'opponent')
+        copied_opponent = json.loads((output/'opponent/opponent.json').read_text())
+        if copied_opponent != opponent:
+            raise ValueError('Opponent manifest changed while freezing')
+        checked = load_opponent(opponent, output/'opponent')
+        checked.close()
+    config['opponent_kind'] = opponent['kind']
     # Capture runtime from the copied tree after warm-up, not from a different host module path.
-    config['seal_revision'] = revision_file.read_text().strip()
     identity = {str(p.relative_to(output)): sha(p) for p in output.rglob('*') if p.is_file()}
     write_json(output/'provenance.json', dict(schema='hexo-relational-evaluation-v1', config=config,
-        files_sha256=identity, model_input_sha256={'candidate': sha(output/'models/candidate.pt'), 'reference': sha(seal)},
+        files_sha256=identity, model_input_sha256={'candidate': sha(output/'models/candidate.pt'), 'reference': opponent['binary_sha256']},
+        opponent=opponent,
         revision=revision, dirty=dirty,
         model_family='relational-policy-q', backend=args.mode, promotion=False,
-        budget_comparison='unequal: neural simulations per placement with cooperative turn deadline; Seal milliseconds per turn'))
+        budget_comparison='Unequal compute; neural and opponent budgets are recorded separately'))
     return output
 
 
@@ -151,6 +195,7 @@ def execute(output):
     check_files()
     prepare(config, output/'models/candidate.pt')
     copied = {p.resolve() for p in (output/'source').rglob('*') if p.is_file()}
+    copied.update(getattr(OPPONENT, 'private_runtime_paths', set()))
     if 'runtime_files_sha256' in provenance:
         verify_runtime(provenance['runtime_files_sha256'])
     runtime = provenance.get('runtime_files_sha256') or {str(path): sha(path) for path in loaded_modules() if path not in copied}
@@ -160,8 +205,7 @@ def execute(output):
     provenance['hardware'] = dict(device=config['device'], torch=torch.__version__, cuda=torch.version.cuda,
         gpu=torch.cuda.get_device_name(torch.device(config['device'])) if config['device'].startswith('cuda') else None)
     write_json(output/'provenance.json', provenance)
-    PLAYER.close()
-    PLAYER = OPPONENT = None
+    close_players()
     if config['device'].startswith('cuda'):
         torch.cuda.empty_cache()
     records, started = [], time.perf_counter()
@@ -177,7 +221,8 @@ def execute(output):
             run=output.name, model_family='relational-policy-q', backend=config['mode'],
             candidate_sha256=provenance['model_input_sha256']['candidate'],
             reference_sha256=provenance['model_input_sha256']['reference'],
-            source_sha256=provenance['files_sha256'], opponent={'backend': 'seal', 'ms': config['seal_ms'], 'revision': config['seal_revision']},
+            source_sha256=provenance['files_sha256'], opponent=provenance.get('opponent',
+                {'backend': 'seal', 'ms': config['seal_ms'], 'revision': config.get('seal_revision')}),
             heartbeat=time.time(), workers=[json.loads(p.read_text()) for p in sorted((output/'workers').glob('*.json'))],
             last_artifact='report.json', completed=len(records), total=config['games'],
             elapsed_seconds=time.perf_counter()-started, **metrics)
@@ -213,6 +258,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--seal-library', type=Path)
+    parser.add_argument('--opponent-snapshot', type=Path,
+                        help='Directory published by relational_opponents.freeze_opponent')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--mode', choices=('pi', 'mu', 'gumbel', 'gumbel-proof'), default='gumbel')
     parser.add_argument('--device', default='cuda')
@@ -228,8 +275,8 @@ def main():
             publish_failure(args.execute_snapshot, error)
             raise
     else:
-        if not all((args.checkpoint, args.seal_library, args.output)):
-            parser.error('--checkpoint, --seal-library and --output are required')
+        if not all((args.checkpoint, args.output)) or bool(args.seal_library) == bool(args.opponent_snapshot):
+            parser.error('--checkpoint, --output and exactly one of --seal-library or --opponent-snapshot are required')
         output = freeze(args)
         subprocess.run([sys.executable, str(output/'source/relational_evaluate.py'), '--execute-snapshot', str(output)], check=True)
 
