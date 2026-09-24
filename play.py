@@ -17,6 +17,34 @@ class Handler(BaseHTTPRequestHandler):
     model = None
     label = None
     neural = None
+    search_run = None
+    search_checkpoint = None
+    neural_options = {}
+
+    @classmethod
+    def refresh_champion(cls):
+        if cls.search_run is None:
+            return
+        league = json.loads((cls.search_run / "league.json").read_text(encoding="utf-8"))
+        number = league["champion"]
+        selected = next(c for c in league["checkpoints"] if c["id"] == number)
+        if not selected.get("promoted"):
+            raise ValueError("Search champion must be a promoted checkpoint")
+        if number == cls.search_checkpoint:
+            return
+        from relational_player import RelationalPlayer
+        directory = cls.search_run / "checkpoints" / f"{number:04d}"
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        candidate = RelationalPlayer(directory / "model.pt", **cls.neural_options)
+        if candidate.model_sha256 != manifest["files"]["model.pt"]:
+            candidate.close()
+            raise ValueError("Search champion model digest changed")
+        previous = cls.neural
+        cls.neural = candidate
+        cls.search_checkpoint = number
+        cls.label = f"Internal champion {number} | {candidate.mode} | {candidate.model_sha256[:12]} | updates on New game"
+        if previous:
+            previous.close()
 
     def state(self):
         promoted = promoted_checkpoint(self.run) if self.run else None
@@ -29,7 +57,7 @@ class Handler(BaseHTTPRequestHandler):
             backend = "table-pvs"
         return {**self.game.state(), "opponent": self.label,
                 "backend": backend,
-                "checkpoint": promoted["id"] if promoted else None,
+                "checkpoint": self.search_checkpoint if self.search_run else promoted["id"] if promoted else None,
                 "default_budget_ms": 10000 if self.neural else 1000,
                 "model_sha256": self.neural.model_sha256 if self.neural else None}
 
@@ -60,6 +88,7 @@ class Handler(BaseHTTPRequestHandler):
             args = json.loads(self.rfile.read(length) or "{}")
             analysis = None
             if self.path == "/new":
+                self.refresh_champion()
                 self.game.close()
                 Handler.game = Game()
                 if self.neural:
@@ -74,7 +103,7 @@ class Handler(BaseHTTPRequestHandler):
                 ms = args.get("ms", 1000)
                 if type(ms) is not int or not 1 <= ms <= 30000:
                     raise ValueError("Think time must be 1..30000 ms")
-                checkpoint = None
+                checkpoint = self.search_checkpoint if self.search_run else None
                 if self.neural is not None:
                     analysis = self.neural.turn(self.game, milliseconds=ms)
                 elif self.model is not None:
@@ -97,7 +126,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(200, {**self.state(), "analysis": analysis})
         except (ValueError, KeyError, TypeError) as error:
             self.respond(400, {"error": str(error)})
-        except (TimeoutError, RuntimeError) as error:
+        except (TimeoutError, RuntimeError, OSError, StopIteration) as error:
             self.respond(503, {"error": str(error)})
 
 
@@ -108,6 +137,7 @@ if __name__ == "__main__":
     opponent.add_argument("--run", type=Path, help="Play against the latest promoted checkpoint in this run")
     opponent.add_argument("--model", type=Path, help="Play against a specific NNUE export, without claiming promotion")
     opponent.add_argument("--relational", type=Path, help="Play the actual relational policy/Q checkpoint")
+    opponent.add_argument("--search-run", type=Path, help="Use the internal search champion; refresh on New game")
     parser.add_argument("--neural-mode", choices=("pi", "mu", "gumbel", "gumbel-proof"), default="gumbel")
     parser.add_argument("--simulations", type=int, default=16, help="Maximum neural search simulations per placement")
     parser.add_argument("--device", default="cuda")
@@ -128,6 +158,9 @@ if __name__ == "__main__":
     if Handler.neural:
         name = args.label or "Experimental relational policy/Q"
         Handler.label = f"{name} | {Handler.neural.mode} | {Handler.neural.model_sha256[:12]}"
+    Handler.search_run = args.search_run.resolve() if args.search_run else None
+    Handler.neural_options = dict(mode=args.neural_mode, simulations=args.simulations, device=args.device)
+    Handler.refresh_champion()
     print(f"HeXO is ready at http://127.0.0.1:{args.port}", flush=True)
     try:
         HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
