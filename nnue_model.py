@@ -64,7 +64,8 @@ class NNUE(nn.Module):
         pool = torch.where(player[:, None] == 0, pool, pool[:, self.perspective])
         return torch.cat((pool, phase), 1)
 
-    def forward(self, batch):
+    def features(self, batch):
+        """Shared position/candidate features; support padded or flat ragged actions."""
         centers = batch["centers"]
         candidates = batch["candidate_codes"]
         all_codes = torch.cat((centers.flatten(), candidates.flatten(), centers.new_zeros(1)))
@@ -74,13 +75,23 @@ class NNUE(nn.Module):
         candidate_emb = embedded[split:-1].reshape(*candidates.shape, 32)
         inputs = self.position_inputs(center_emb, batch["center_owner"], batch["center_counts"],
                                       batch["phase"], batch["player"], embedded[-1])
+        local = candidate_emb.sum(-2)
+        if candidates.ndim == 2:
+            owner = batch["candidate_owner"]
+            sign = torch.where(batch["player"][owner] == 0, 1, -1).to(local.dtype)
+            local = torch.cat((local[:, :16]*sign[:, None], local[:, 16:]), -1)
+            policy_input = torch.cat((inputs[owner, :64], local, batch["phase"][owner], batch["pairs"]), -1)
+        else:
+            sign = torch.where(batch["player"] == 0, 1, -1).to(local.dtype)
+            local = torch.cat((local[..., :16]*sign[:, None, None], local[..., 16:]), -1)
+            policy_input = torch.cat((inputs[:, None, :64].expand(-1, local.shape[1], -1), local,
+                                      batch["phase"][:, None].expand(-1, local.shape[1], -1), batch["pairs"]), -1)
+        return inputs, policy_input
+
+    def forward(self, batch):
+        inputs, policy_input = self.features(batch)
         residual = self.value(inputs).squeeze(1)
         value = torch.tanh(batch["baseline"]/SCORE_SCALE + residual)
-        local = candidate_emb.sum(-2)
-        sign = torch.where(batch["player"] == 0, 1, -1).to(local.dtype)
-        local = torch.cat((local[..., :16]*sign[:, None, None], local[..., 16:]), -1)
-        policy_input = torch.cat((inputs[:, None, :64].expand(-1, local.shape[1], -1), local,
-                                  batch["phase"][:, None].expand(-1, local.shape[1], -1), batch["pairs"]), -1)
         logits = self.policy(policy_input).squeeze(-1).masked_fill(~batch["candidate_mask"], -float("inf"))
         return value, logits
 
