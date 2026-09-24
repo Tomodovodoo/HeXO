@@ -58,6 +58,7 @@ class SealCurrent:
         self.metadata = json.loads(path.with_suffix(path.suffix + ".json").read_text(encoding="utf-8"))
         if self.metadata["revision"] != REVISION or self.metadata["weights_sha256"] != WEIGHTS_SHA256 or self.metadata["binary_sha256"] != sha(path):
             raise ValueError("SealBot build manifest mismatch; rebuild the pinned adapter")
+        self.metadata["python_adapter_sha256"] = sha(__file__)
         self.lib = C.CDLL(str(path))
         self.lib.seal_current_reset.argtypes = []
         self.lib.seal_current_reset.restype = None
@@ -88,10 +89,12 @@ class SealCurrent:
         side = game.player
         try:
             for move in moves:
-                if game.winner >= 0:
-                    raise ValueError("SealBot returned a placement after a terminal win")
                 game.play(*move)
                 played += 1
+                if game.winner >= 0:
+                    # Upstream always returns a fixed pair for nonempty roots.
+                    # The actual turn ends on its first winning placement.
+                    return moves[:played]
             if game.winner < 0 and game.player == side:
                 raise ValueError("SealBot returned an incomplete turn")
         finally:

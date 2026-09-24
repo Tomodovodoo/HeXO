@@ -49,10 +49,27 @@ class SealCurrentContract(unittest.TestCase):
         with closing(Game(opening)) as game:
             before = game.cells
             self.assertEqual(self.adapter([(5,0)])(game, 10), [(5,0)])
-            with self.assertRaisesRegex(ValueError, "terminal"):
-                self.adapter([(5,0),(6,0)])(game, 10)
+            self.assertEqual(self.adapter([(5,0),(6,0)])(game, 10), [(5,0)])
             self.assertEqual(game.cells, before)
             self.assertEqual(game.winner, -1)
+
+    def test_real_adapter_rotated_first_wins(self):
+        try:
+            adapter = SealCurrent()
+        except FileNotFoundError:
+            self.skipTest("Optional pinned external adapter has not been built")
+        opening = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(4,0),(4,3),(5,4)]
+        for rotation in range(6):
+            with closing(Game(opening)) as game:
+                before = game.cells
+                adapter.reset()
+                moves = adapter(game, 100)
+                self.assertEqual(game.cells, before)
+                for move in moves:
+                    self.assertEqual(game.winner, -1)
+                    game.play(*move)
+                self.assertEqual(game.winner, 0)
+            opening = [(-r,q+r) for q,r in opening]
 
 
 if __name__ == "__main__":
