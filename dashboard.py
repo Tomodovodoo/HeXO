@@ -99,19 +99,27 @@ def relational_run(run, declared_family=None):
     if 'relational' not in family:
         return None
     evaluation = status if provenance.get('schema') == 'hexo-relational-evaluation-v1' else None
+    evaluation_provenance = provenance if evaluation is not None else {}
     evaluation_path = run if evaluation is not None else None
     model_hash = manifest.get('files', {}).get('model.pt') or status.get('candidate_sha256') or provenance.get('model_input_sha256', {}).get('candidate')
     if not evaluation and model_hash:
         for folder in (run/'evaluation/confirmation', run/'evaluation'):
             candidate = read_json(folder/'status.json', {})
-            if candidate.get('candidate_sha256') == model_hash:
+            candidate_provenance = read_json(folder/'provenance.json', {})
+            candidate_hash = candidate.get('candidate_sha256') or candidate_provenance.get('model_input_sha256', {}).get('candidate')
+            if candidate_hash == model_hash:
                 evaluation = candidate
+                evaluation_provenance = candidate_provenance
                 evaluation_path = folder
                 break
     warmstart = identity.get('kind') == 'relational-human-policy-q-v1' or 'epoch' in status or 'epochs' in status
     training_backend = 'Not recorded in evaluation artifact' if provenance else (
         'human policy/Q fitting' if warmstart else 'KLENT policy/Q' if identity.get('backbone') else 'Not published yet')
-    backend = (evaluation or {}).get('backend') or provenance.get('backend')
+    backend = (evaluation or {}).get('backend') or evaluation_provenance.get('backend')
+    opponent = (evaluation or {}).get('opponent')
+    if not opponent and evaluation_provenance.get('config', {}).get('seal_revision'):
+        config = evaluation_provenance['config']
+        opponent = dict(backend='seal', ms=config.get('seal_ms'), revision=config['seal_revision'])
     artifact = manifest_path if manifest else None
     live = evaluation if evaluation is not None else status
     live_status_path = evaluation_path/'status.json' if evaluation_path else status_path
@@ -124,7 +132,7 @@ def relational_run(run, declared_family=None):
         phase=live.get('stage', 'initialized'), training_backend=training_backend,
         evaluation_backend=backend, checkpoint_sha256=model_hash,
         source_sha256=identity.get('sources') or provenance.get('files_sha256'),
-        opponent=(evaluation or {}).get('opponent'), evaluation=evaluation,
+        opponent=opponent, evaluation=evaluation,
         heartbeat=heartbeat,
         workers=live.get('workers', []), last_artifact=str(artifact) if artifact else None,
         status=live, training_status=status, metrics=manifest.get('metrics', {}), config=identity.get('config', {}),
