@@ -108,6 +108,27 @@ class DirectPlayer(unittest.TestCase):
             actor.close()
             game.close()
 
+    def test_tree_immediate_win_reaches_turn_proof_status(self):
+        from tests.test_neural_search import Uniform
+        actor = self.actor('gumbel-proof')
+        actor.seed, actor.evaluator = 0, Uniform()
+        actor.prover = Mock()
+        actor.prover.solve.return_value = actor.prover.history.return_value = {'status':'UNKNOWN'}
+        history = [(0,0),(0,2),(1,2),(1,0),(2,0),(2,2),(3,2),(3,0),(4,0),(-2,2),(-3,2)]
+        actor.set_history(history)
+        game = Game(history)
+        try:
+            result = actor.turn(game)
+            self.assertEqual(result['proof_status'], 'PROVEN_WIN')
+            self.assertEqual(result['proof']['status'], 'UNKNOWN')
+            self.assertEqual(len(game.cells), len(history))
+            for action in result['moves']:
+                game.play(*action)
+            self.assertEqual(game.winner, 0)
+        finally:
+            actor.close()
+            game.close()
+
     def test_search_that_uses_its_budget_still_completes_two_placements(self):
         actor = self.actor('gumbel')
         actor.history, actor.tree = [(0,0)], Mock()
