@@ -39,11 +39,11 @@ class EvaluationCache:
         self.capacity, self.entries = capacity, OrderedDict()
 
     def key(self, history, version):
-        game = Game(history)
-        try:
-            return (version, game.player, game.remaining, tuple(sorted(tuple(cell) for cell in game.cells)))
-        finally:
-            game.close()
+        # Requests come from native legal histories. Exact tuples resolve hash
+        # collisions and retain colors, phase and model without rebuilding a board.
+        size=len(history)
+        return (version, ((size+1)//2)%2, 2 if size%2 else 1,
+                tuple(sorted((int(q),int(r),((i+1)//2)%2) for i,(q,r) in enumerate(history))))
 
     def get(self, key):
         value = self.entries.get(key)
