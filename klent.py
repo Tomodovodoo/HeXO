@@ -92,27 +92,30 @@ _weights = np.asarray([0, 1, 12, 150, 2400, 24000, 1000000])
 _baseline = np.where(_white == 0, _weights[_black], np.where(_black == 0, -_weights[_white], 0))
 
 
-def observe(game):
+def observe(game, *, value_only=False):
     legal = game.legal_moves()
     if not legal:
         raise ValueError("Cannot act on terminal board")
     coords = np.asarray(legal, dtype="<i8")
-    codes, pairs = game.nnue_policy_batch(coords)
-    return {"centers": game.nnue_centers(), "candidate_codes": codes,
-            "pairs": pairs, "phase": game.nnue_context(), "player": game.player,
+    result = {"centers": game.nnue_centers(), "phase": game.nnue_context(), "player": game.player,
             "baseline": float(np.asarray(game.features(), np.int64)@_baseline)*(1 if game.player == 0 else -1),
             "legal": legal, "legal_sha256": hashlib.sha256(coords.tobytes()).hexdigest()}
+    if not value_only:
+        result["candidate_codes"], result["pairs"] = game.nnue_policy_batch(coords)
+    return result
 
 
-def pack(observations, device):
+def pack(observations, device, *, value_only=False):
     nc = np.asarray([len(o["centers"]) for o in observations])
     na = np.asarray([len(o["legal"]) for o in observations])
-    arrays = {key: np.concatenate([o[key] for o in observations]) for key in ("centers", "candidate_codes", "pairs")}
+    keys = ("centers",) if value_only else ("centers", "candidate_codes", "pairs")
+    arrays = {key: np.concatenate([o[key] for o in observations]) for key in keys}
     arrays.update({key: np.asarray([o[key] for o in observations]) for key in ("phase", "player", "baseline")})
     arrays["baseline"] = arrays["baseline"].astype(np.float32)
     arrays["phase"] = arrays["phase"].astype(np.float32)
-    arrays.update(center_owner=np.repeat(np.arange(len(nc)), nc), center_counts=nc.astype(np.float32),
-                  candidate_owner=np.repeat(np.arange(len(na)), na), offsets=np.cumsum(np.r_[0, na]))
+    arrays.update(center_owner=np.repeat(np.arange(len(nc)), nc), center_counts=nc.astype(np.float32))
+    if not value_only:
+        arrays.update(candidate_owner=np.repeat(np.arange(len(na)), na), offsets=np.cumsum(np.r_[0, na]))
     return {k: torch.as_tensor(v, device=device) for k, v in arrays.items()}
 
 
@@ -202,10 +205,10 @@ def collect(model, args, iteration, progress=None):
             slot["game"].close()
 
 
-def rebuild(row, episodes):
+def rebuild(row, episodes, *, value_only=False):
     with_game = Game(episodes[row["game"]]["moves"][:row["ply"]])
     try:
-        obs = observe(with_game)
+        obs = observe(with_game, value_only=value_only)
         if (obs["legal_sha256"] != row["legal_sha256"] or obs["player"] != row["player"]
                 or with_game.remaining != row["remaining"] or obs["legal"][row["chosen"]] != tuple(row["action"])
                 or len(obs["legal"]) != len(row["mu"])):
@@ -260,12 +263,12 @@ def fit(model, optimizer, value_optimizer, episodes, rows, args, iteration, prog
     value_order = order if any(abs(r["target"]) > 1e-8 for r in rows) else []
     for start in range(0, len(value_order), args.batch):
         selected = [rows[int(i)] for i in value_order[start:start+args.batch]]
-        observations = [rebuild(row, episodes) for row in selected]
+        observations = [rebuild(row, episodes, value_only=True) for row in selected]
         value_optimizer.zero_grad(set_to_none=True)
         for ids in chunks(observations, args):
-            batch = pack([observations[i] for i in ids], args.device)
+            batch = pack([observations[i] for i in ids], args.device, value_only=True)
             with torch.no_grad():
-                inputs, _ = model.nnue.features(batch)
+                inputs = model.nnue.position_features(batch)
             value = torch.tanh(batch["baseline"]/SCORE_SCALE+model.nnue.value(inputs).squeeze(-1))
             target = torch.tensor([selected[i]["target"] for i in ids], device=args.device)
             value_loss = (value-target).square().mean()

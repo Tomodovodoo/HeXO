@@ -18,6 +18,67 @@ from dashboard import klent_run
 
 
 class KlentTest(unittest.TestCase):
+    def test_value_only_features_preserve_geometry_and_inputs(self):
+        model = Model()
+        observations, values = [], []
+        history = [(0,0), (8,0), (16,0), (24,0), (32,0)]
+        for n in range(6):
+            game = Game(history[:n])
+            try:
+                observations.append(observe(game))
+                with patch.object(Game, "nnue_policy_batch", side_effect=AssertionError("unused candidates")):
+                    values.append(observe(game, value_only=True))
+            finally:
+                game.close()
+        for full, value in zip(observations, values):
+            for key in value:
+                if isinstance(value[key], np.ndarray):
+                    self.assertEqual(value[key].tobytes(), full[key].tobytes())
+                else:
+                    self.assertEqual(value[key], full[key])
+        for device in (["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]):
+            model.to(device)
+            with torch.no_grad():
+                full = model.nnue.features(pack(observations, device))[0]
+                value = model.nnue.position_features(pack(values, device, value_only=True))
+            torch.testing.assert_close(full, value, rtol=0, atol=0)
+
+    def test_value_only_fitting_preserves_updates_and_chunking(self):
+        # CPU scatter-add gradients can differ between threaded actor replays.
+        torch.set_num_threads(1)
+        initial = Model()
+        with torch.no_grad():
+            initial.q[2].bias.fill_(.2)
+        args = self.args(max_plies=5, batch=5, cells=1024)
+        episodes, rows = collect(initial, args, 1)
+        models, optimizers, metrics, progress = [], [], [], []
+        for optimized in (False, True):
+            model = copy.deepcopy(initial)
+            actor = torch.optim.Adam([p for n,p in model.named_parameters() if not n.startswith("nnue.value.")])
+            value = torch.optim.Adam(model.nnue.value.parameters())
+            updates = []
+            if optimized:
+                result = fit(model, actor, value, episodes, rows, args, 1, progress=updates.append)
+            else:
+                with patch("klent.rebuild", side_effect=lambda r,e,**kw: rebuild(r,e)), \
+                     patch("klent.pack", side_effect=lambda o,d,**kw: pack(o,d)), \
+                     patch.object(model.nnue, "position_features", side_effect=lambda b: model.nnue.features(b)[0]):
+                    result = fit(model, actor, value, episodes, rows, args, 1, progress=updates.append)
+            models.append(model.state_dict())
+            optimizers.append(value.state_dict())
+            metrics.append(result)
+            progress.append(updates)
+        for name in models[0]:
+            torch.testing.assert_close(models[0][name], models[1][name], rtol=0, atol=0)
+        self.assertEqual(metrics[0], metrics[1])
+        self.assertEqual(progress[0], progress[1])
+        for key, state in optimizers[0]["state"].items():
+            for name, tensor in state.items():
+                torch.testing.assert_close(tensor, optimizers[1]["state"][key][name], rtol=0, atol=0)
+        bad = {**rows[0], "legal_sha256": "invalid"}
+        with self.assertRaisesRegex(ValueError, "geometry"):
+            rebuild(bad, {e["id"]:e for e in episodes}, value_only=True)
+
     def test_fitting_progress_counts_actor_and_value_passes(self):
         model = Model()
         with torch.no_grad():
