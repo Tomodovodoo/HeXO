@@ -30,4 +30,6 @@ HX_API int hx_moves(void*, HxCell* output, int capacity);
 HX_API int hx_search(void*, int milliseconds, int max_depth, int width, HxResult*);
 HX_API uint64_t hx_hash(void*);
 HX_API int hx_evaluate(void*);
+HX_API int hx_features(void*, int32_t* output, int capacity);
+HX_API int hx_load_table(void*, const int32_t* weights, int count);
 }

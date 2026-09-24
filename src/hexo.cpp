@@ -36,16 +36,20 @@ struct WindowHash {
     size_t operator()(const Window& w) const { return CellHash{}(w.start)^mix(w.axis+51); }
 };
 using Counts = std::array<int,2>;
+struct WindowData { Counts counts{}; int pattern=0; };
+constexpr int powers[]={1,3,9,27,81,243};
 constexpr int weight[]={0,1,12,150,2400,24000,1000000};
 int value(Counts c) { return c[1]==0 ? weight[c[0]] : c[0]==0 ? -weight[c[1]] : 0; }
 struct Undo { Cell c; int player,remaining,winner; };
 struct Board {
     std::unordered_map<Cell,int,CellHash> cells;
-    std::unordered_map<Window,Counts,WindowHash> windows;
+    std::unordered_map<Window,WindowData,WindowHash> windows;
     std::array<std::unordered_set<Window,WindowHash>,2> threats;
     std::vector<Undo> history;
     int player=0,remaining=1,winner=-1;
     int64_t evaluation=0;
+    int64_t learned_score=0;
+    std::array<int32_t,729> features{},adjustment{};
     uint64_t stones_hash=0;
     int at(Cell c) const { auto it=cells.find(c); return it==cells.end() ? -1 : it->second; }
     bool legal(Cell c) const {
@@ -64,12 +68,18 @@ struct Board {
     void update(Cell c,int p,int delta) {
         for(int d=0;d<3;++d) for(int k=0;k<6;++k) {
             Window w{c+axes[d]*(-k),d};
-            auto [it,_]=windows.try_emplace(w,Counts{0,0});
-            Counts& n=it->second;
+            auto [it,_]=windows.try_emplace(w,WindowData{});
+            Counts& n=it->second.counts;
+            int& pattern=it->second.pattern;
+            if(pattern) --features[pattern];
+            learned_score-=adjustment[pattern];
             evaluation-=value(n);
             for(int side=0;side<2;++side)
                 if(n[side]>=4 && n[1-side]==0) threats[side].erase(w);
             n[p]+=delta;
+            pattern+=delta*(p+1)*powers[k];
+            if(pattern) ++features[pattern];
+            learned_score+=adjustment[pattern];
             evaluation+=value(n);
             for(int side=0;side<2;++side)
                 if(n[side]>=4 && n[1-side]==0) threats[side].insert(w);
@@ -92,7 +102,7 @@ struct Board {
         player=u.player;remaining=u.remaining;winner=u.winner;
     }
     int score(int p) const {
-        auto v=std::clamp<int64_t>(evaluation,-500000,500000);
+        auto v=std::clamp<int64_t>(evaluation+learned_score,-500000,500000);
         return int(p==0?v:-v);
     }
     std::vector<Cell> legal_moves() const {
@@ -128,7 +138,10 @@ struct Board {
         int score=0;
         for(int d=0;d<3;++d) for(int k=0;k<6;++k) {
             auto it=windows.find({c+axes[d]*(-k),d});
-            Counts n=it==windows.end()?Counts{0,0}:it->second;
+            Counts n=it==windows.end()?Counts{0,0}:it->second.counts;
+            int pattern=it==windows.end()?0:it->second.pattern;
+            int delta=adjustment[pattern+(p+1)*powers[k]]-adjustment[pattern];
+            score+=p==0?delta:-delta;
             if(n[1-p]==0) score+=weight[n[p]+1]-weight[n[p]];
             if(n[p]==0) score+=(weight[n[1-p]+1]-weight[n[1-p]])*3/4;
         }
@@ -173,7 +186,7 @@ struct Search {
                 if(b.at(c+Cell{q,r})<0) set.insert(c+Cell{q,r});
         }
         // Include every empty cell of a promising line, even far from the last move.
-        for(auto [w,n]:b.windows) if((n[0]>=2 && !n[1]) || (n[1]>=2 && !n[0]))
+        for(auto [w,data]:b.windows) if((data.counts[0]>=2 && !data.counts[1]) || (data.counts[1]>=2 && !data.counts[0]))
             for(auto c:b.empty(w)) set.insert(c);
         std::vector<std::pair<int,Cell>> ranked;
         for(auto c:set) if(b.legal(c)) ranked.emplace_back(b.gain(c,b.player),c);
@@ -342,4 +355,12 @@ int hx_moves(void* p,HxCell* out,int cap){auto cells=static_cast<Board*>(p)->leg
 int hx_search(void* p,int ms,int depth,int width,HxResult* out){if(ms<1 || depth<1 || width<2 || width>128)return 0;try{auto start=Clock::now();Search s(ms,width);*out=s.run(*static_cast<Board*>(p),depth);out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;}catch(...){return 0;}}
 uint64_t hx_hash(void* p){return static_cast<Board*>(p)->hash();}
 int hx_evaluate(void* p){auto& b=*static_cast<Board*>(p);return b.score(b.player);}
+int hx_features(void* p,int32_t* out,int cap){auto& b=*static_cast<Board*>(p);for(int i=0;i<std::min(cap,729);++i)out[i]=b.features[i];return 729;}
+int hx_load_table(void* p,const int32_t* weights,int count){
+    if(count!=729 || weights[0]!=0) return 0;
+    for(int i=0;i<729;++i) if(weights[i]<-10000 || weights[i]>10000) return 0;
+    auto& b=*static_cast<Board*>(p);b.learned_score=0;
+    for(int i=0;i<729;++i){b.adjustment[i]=weights[i];b.learned_score+=int64_t(b.features[i])*weights[i];}
+    return 1;
+}
 }

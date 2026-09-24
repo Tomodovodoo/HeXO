@@ -8,6 +8,7 @@ from hexo import Game
 
 class Handler(BaseHTTPRequestHandler):
     game = Game()
+    run = None
 
     def respond(self, status, data, content_type="application/json"):
         payload = data.encode() if isinstance(data, str) else json.dumps(data).encode()
@@ -46,7 +47,15 @@ class Handler(BaseHTTPRequestHandler):
                 ms = args.get("ms", 1000)
                 if type(ms) is not int or not 1 <= ms <= 30000:
                     raise ValueError("Think time must be 1..30000 ms")
+                checkpoint = None
+                if self.run is not None:
+                    import numpy as np
+                    summary = json.loads((self.run / "summary.json").read_text(encoding="utf-8"))
+                    checkpoint = summary["incumbent"]
+                    model = next(c for c in summary["checkpoints"] if c["id"] == checkpoint)
+                    self.game.load_table(np.load(self.run / model["table"], allow_pickle=False))
                 analysis = self.game.search(ms)
+                analysis["checkpoint"] = checkpoint
                 for q, r in analysis["moves"]:
                     self.game.play(q, r)
             else:
@@ -59,6 +68,8 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--run", type=Path, help="Play against the latest promoted checkpoint in this run")
     args = parser.parse_args()
+    Handler.run = args.run.resolve() if args.run else None
     print(f"HeXO is ready at http://127.0.0.1:{args.port}", flush=True)
     HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
