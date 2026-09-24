@@ -1,6 +1,7 @@
 """Independent public Strix checkpoint opponent using direct relational inference."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import queue
 import threading
@@ -40,7 +41,7 @@ class StrixLearned(StrixReference):
                 or type(seed) is not int or not 0 <= seed < 1 << 64 or not 0 < timeout_ms <= 600000):
             raise ValueError("invalid Strix learned search budget")
         binary = Path(__file__).parent/"strix_learned/target/release/hexo-strix-learned"
-        if binary.with_suffix(".exe").exists():
+        if os.name == "nt":
             binary = binary.with_suffix(".exe")
         super().__init__(executable or binary)
         self.model_content = Path(model_path).read_bytes()

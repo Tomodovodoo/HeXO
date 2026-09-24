@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -48,7 +49,7 @@ def main():
                "--config", str(config)]
     subprocess.run(command, check=True)
     executable = package/"target/release/hexo-strix-learned"
-    if executable.with_suffix(".exe").exists():
+    if os.name == "nt":
         executable = executable.with_suffix(".exe")
     report = dict(upstream=URL, revision=REVISION, patch_file=relative,
         pristine_sha256=hashlib.sha256(pristine).hexdigest(), patched_sha256=hashlib.sha256(patched).hexdigest(),
