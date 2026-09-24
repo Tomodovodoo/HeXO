@@ -74,7 +74,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         import numpy as np
                         self.game.load_table(np.load(self.run / model["table"], allow_pickle=False))
-                if analysis is None:
+                if self.neural is None:
                     analysis = self.game.search(ms)
                 analysis["checkpoint"] = checkpoint
                 for q, r in analysis["moves"]:
