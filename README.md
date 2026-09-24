@@ -1,5 +1,20 @@
 # HeXO
 
+## Native verified tactical strategies
+
+The optional `tactical_proof.NativeTactics` library runs wide Strix IDTT followed by PDS-PN at pinned revision `5a771e572553a8bd8e010112b2ce65f16e5afa1b`. IDTT principal variations are only hints. An exact positive requires a complete PDS-PN strategy DAG accepted by a separate raw-coordinate Rust checker. `independent_verify` also rechecks the exported strategy through the independent Python rules implementation.
+
+```sh
+python tools/build_tactical.py
+python -m unittest tests.test_tactical_proof -v
+```
+
+This needs Rust/Cargo supporting edition 2024 and uses locked dependencies. The build manifest binds the native binary to its wrapper sources and Cargo lockfile. `NativeTactics().solve(game, ms=100)` returns `PROVEN_WIN` with `native_verified=true` and the complete current turn only after verification; unresolved searches return `UNKNOWN`, never a global loss. Partial-turn roots are supported. The exact board, player, remaining placements, fixed rules and verifier scope identify cached facts; neural model evaluations and visit counts are not stored here.
+
+The certificate checker covers both mandatory two-cell defenses and a mandatory single block followed by every legal free second placement. For singleton covers it enumerates the entire radius-eight frontier after the block, including newly legal fillers, and preserves a legal order for each resulting pair. `solve(game, root_moves=[first, second], ...)` can verify a proposed attacker turn by constructing all these defensive branches and proving every continuation with bounded PDS-PN. The default upstream generator still searches fully forcing attacks; entirely quiet defender nodes and unresolved continuations remain `UNKNOWN`. A legal open-three fixture yields a 1,295-node wide-search strategy accepted by both checkers, whereas tight IDTT finds no forcing win. On the development host, a fresh verified proof took about 0.7 seconds and cached re-verification about 18 ms; this is a tactical correctness result, not a strength result.
+
+Upstream certificate reconstruction does not honor its search deadline. One persistent native worker bounds how long callers wait and rejects overlapping requests as `UNKNOWN`; it may finish work after the caller times out. Reports expose background-worker state, completed-late counts, elapsed worker time and Windows thread CPU time. These are **not equal-compute tournament clocks**. Late or partial certificates never become exact search values. Primary neural MCTS integration remains a separate task. The optional candidate route proved a legal 27-stone fixture with one mandatory block and 745 distinct legal free-placement replies. Both independent checkers accepted its 45,063-node strategy, and deleting one reply invalidated it. That proof took about ten seconds on the development host; it is not a 100 ms tactical result. All legal free placements are covered when a positive is returned, but finding a strategy remains selective and budget-limited.
+
 C++20 Hexo rules and search engine, Python interface, and local browser game.
 
 The current priority is a self-play learning loop with a local experiment dashboard. Checkpoints earn promotion through matches against frozen opponents; fitting loss alone never replaces the incumbent.
