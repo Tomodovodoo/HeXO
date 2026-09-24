@@ -86,6 +86,8 @@ def klent_run(run):
 
 
 def relational_run(run, declared_family=None):
+    plan = read_json(run.with_suffix('.plan.json'), {})
+    launch = read_json(run.with_suffix('.launch.json'), {})
     status_path = run/"status.json"
     if not status_path.exists():
         status_path = run.with_suffix('.status.json')
@@ -95,7 +97,7 @@ def relational_run(run, declared_family=None):
     manifest = read_json(manifest_path, {})
     identity = manifest.get('identity', {})
     provenance = read_json(run/'provenance.json', {})
-    family = identity.get('backbone') or identity.get('kind') or status.get('schema') or provenance.get('model_family') or declared_family or ''
+    family = identity.get('backbone') or identity.get('kind') or status.get('schema') or provenance.get('model_family') or plan.get('kind') or declared_family or ''
     if 'relational' not in family:
         return None
     evaluation = status if provenance.get('schema') == 'hexo-relational-evaluation-v1' else None
@@ -120,7 +122,7 @@ def relational_run(run, declared_family=None):
     if not opponent and evaluation_provenance.get('config', {}).get('seal_revision'):
         config = evaluation_provenance['config']
         opponent = dict(backend='seal', ms=config.get('seal_ms'), revision=config['seal_revision'])
-    artifact = manifest_path if manifest else None
+    artifact = manifest_path if manifest else run.with_suffix('.plan.json') if plan else None
     live = evaluation if evaluation is not None else status
     live_status_path = evaluation_path/'status.json' if evaluation_path else status_path
     if evaluation_path and (evaluation_path/'report.json').exists():
@@ -131,6 +133,8 @@ def relational_run(run, declared_family=None):
     return dict(name=run.name, path=str(run), model_family='relational-policy-q',
         phase=live.get('stage', 'initialized'), training_backend=training_backend,
         evaluation_backend=backend, checkpoint_sha256=model_hash,
+        initial_checkpoint_sha256=plan.get('initial_model_sha256') or identity.get('config', {}).get('initial_model_sha256'),
+        launch_source_commit=launch.get('source_commit'),
         source_sha256=identity.get('sources') or provenance.get('files_sha256'),
         opponent=opponent, evaluation=evaluation,
         heartbeat=heartbeat,
