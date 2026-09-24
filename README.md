@@ -120,7 +120,7 @@ python arena.py --opponent shallow --games 20 --ms 100
 python arena.py --opponent random --games 20 --ms 100
 ```
 
-The arena alternates colors and reuses each opening for a pair of games. Results contain moves, actual decision times, engine hashes, and a Wilson interval. Move-cap truncations and invalid games are recorded separately from wins and losses. The current interval treats games as independent; use a larger opening-family analysis before making strength claims.
+The arena alternates colors and reuses each opening for a pair of games. Results contain moves, actual decision times, engine hashes, and conservative opening-pair confidence bounds. Truncations, invalid games and unplayed partners of a partial pair contribute unknown outcomes to those bounds. A completed-games-only Wilson interval is retained separately and must not be used as an overall strength estimate.
 
 To compare against Seal, clone its source outside this repository, then configure the optional adapter:
 
@@ -133,6 +133,15 @@ python arena.py --opponent seal --run runs/gpu-selfplay --checkpoint 1 --games 2
 ```
 
 The adapter compiles the external engine without vendoring it. Seal's fixed array has a smaller coordinate range; games outside the adapter's safe range are marked invalid rather than counted as victories. Equal requested budgets are used, and both engines' actual elapsed times are retained. `--run` loads the promoted checkpoint, `--checkpoint` selects another saved candidate, and `--table` loads a standalone export. Reports identify the loaded table and its hash. Without a model option the arena uses the original evaluator.
+
+To compare against the published Orca model, use an external checkout:
+
+```sh
+git clone https://github.com/Saiki77/hexbot-building-framework.git ../orca-reference
+python arena.py --opponent orca --orca-source ../orca-reference --orca-sims 200 --games 20 --ms 100 --max-stones 800 --output artifacts/orca.json
+```
+
+This requires PyTorch. The adapter strictly loads the checkout's seven-channel `orca/checkpoint.pt` without adding random weights. Use `--orca-checkpoint` to select another compatible checkpoint and `--orca-device cuda` for GPU inference. The report records source revision, checkpoint hash, simulation budget and actual turn times. Orca receives simulations per placement; our engine receives milliseconds per complete turn. This comparison does not use equal time budgets. Native rules validate every returned move, and replay disagreements remain invalid games rather than wins.
 
 ## Status and remaining work
 
