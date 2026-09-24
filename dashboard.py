@@ -107,12 +107,14 @@ def relational_run(run, declared_family=None):
                 evaluation = candidate
                 break
     warmstart = identity.get('kind') == 'relational-human-policy-q-v1' or 'epoch' in status or 'epochs' in status
+    training_backend = 'Not recorded in evaluation artifact' if provenance else (
+        'human policy/Q fitting' if warmstart else 'KLENT policy/Q' if identity.get('backbone') else 'Not published yet')
     backend = (evaluation or {}).get('backend')
     artifact = manifest_path if manifest else None
     if evaluation is status and (run/'report.json').exists():
         artifact = run/'report.json'
     return dict(name=run.name, path=str(run), model_family='relational-policy-q',
-        phase=status.get('stage', 'initialized'), training_backend='human policy/Q fitting' if warmstart else 'KLENT policy/Q',
+        phase=status.get('stage', 'initialized'), training_backend=training_backend,
         evaluation_backend=backend, checkpoint_sha256=model_hash,
         source_sha256=identity.get('sources') or provenance.get('files_sha256'),
         opponent=(evaluation or {}).get('opponent'), evaluation=evaluation,

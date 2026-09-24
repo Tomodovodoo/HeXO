@@ -69,7 +69,7 @@ $('truncated').textContent=`${n(s.totals.bootstrapped_games)} collected games re
 function renderRelational(s){
 const a=s.status||{},e=s.evaluation,labels={pi:'Raw policy',mu:'KLENT-improved policy',gumbel:'Full Gumbel MCTS','gumbel-proof':'Gumbel MCTS with verified root tactics'};
 $('status').textContent=s.phase;$('config').textContent=`${s.name} · ${s.model_family} · ${s.training_backend}`;$('error').textContent=a.error||'';
-const completed=a.completed??a.games??a.fit_completed,total=a.total??a.games_total??a.fit_total;
+const completed=a.completed??a.games??a.fit_completed,total=a.total??a.games_total??a.fit_total??(s.phase==='fitting'?a.positions:undefined);
 $('r-progress').textContent=`${s.phase}${a.epoch?' · epoch '+a.epoch+' / '+a.epochs:''}${a.iteration!==undefined?' · iteration '+a.iteration:''}${Number.isFinite(completed)&&Number.isFinite(total)?' · '+completed+' / '+total:''}`;
 const bar=$('r-bar');if(Number.isFinite(completed)&&total>0){bar.max=total;bar.value=completed}else if(s.phase==='finished'){bar.max=1;bar.value=1}else bar.removeAttribute('value');
 $('r-heartbeat').textContent=s.heartbeat?`Last worker status ${new Date(s.heartbeat*1000).toLocaleString()} · ${Math.max(0,Math.round(Date.now()/1000-s.heartbeat))} seconds ago. A timestamp alone does not prove that a worker is running.`:'No worker heartbeat has been published.';
