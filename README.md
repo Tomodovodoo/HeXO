@@ -194,6 +194,18 @@ The tests compare native rules and incremental features with an independent Pyth
 
 The benchmark prints JSON with seeded positions, source and library hashes, hardware, actual search times, nodes and agreement with a wider search. Timing-dependent search results can vary across runs. There are no machine-specific speed assertions. A wider search is a selective reference, not a proof of the best move. Candidate-cell recall is reported only when the native candidate API is available; it does not measure whether the final pruned turn list retained that pair.
 
+## Bounded forcing certificates
+
+`proof.py` searches continuous double-threat attacks and returns `PROVEN_WIN`, `PROVEN_LOSS`, or `UNKNOWN`. Every winning certificate covers all relevant defensive branches. Immediate counterwins take priority; a defense with a free second stone is unsupported and returns unknown. The independent verifier reconstructs rules and covers from raw coordinates. Ordinary search scores are never treated as certificates.
+
+```sh
+python proof.py --history position.json --ms 100 --output proof-result.json
+python proof.py --history position.json --verify proof-result.json
+python proof.py --benchmark
+```
+
+A history is a JSON list of `[q, r]` placements in play order. Verification needs a returned certificate; an unknown result has none. The solver is separate from deployed PVS and has no demonstrated Elo benefit. Its deadline is cooperative: a synchronous native candidate call can overrun it, and late results become unknown. In one benchmark a 13-stone forcing win verified in 35 ms, while a 1001-stone sparse board took 236 ms under a requested 100 ms budget.
+
 ## Experimental root turn coverage
 
 Quiet root widening is opt-in. It retains every existing selected turn and adds complete pairs by conditional rank, with separate second-placement and final-turn budgets. Immediate wins and mandatory defenses keep their exact handling. Deeper search keeps its existing candidate restrictions.
@@ -265,6 +277,36 @@ the row-major int16 table, then float32 value `W1,b1,W2,b2`, then policy
 whole-file SHA256. Native loading validates dimensions, sizes, finite weights,
 table bounds and table symmetries. A model handle is immutable and shared by
 attached boards. Loading a legacy table detaches NNUE and vice versa.
+
+After an engine change, start a new rating run while retaining learned NNUE weights:
+
+```sh
+python train.py --run runs/nnue-new-engine --model nnue --initial-model runs/nnue-old/checkpoints/0001/model.pt --initial-optimizer runs/nnue-old/checkpoints/0001/optimizer.pt --device cuda
+```
+
+`--initial-optimizer` is optional. When supplied, AdamW moments and step counters
+are retained, and `--lr` sets the new run's learning rate. The imported model is
+validated, copied into checkpoint zero, and exported with the current native
+format. Source paths and hashes are recorded; resume requires the same arguments
+and unchanged source files. Ratings start at zero against the imported anchor.
+Existing runs and checkpoint files are never reinitialized by these options.
+
+Saved NNUE histories can be revisited with a frozen evaluator and a larger native
+search budget, then supplied to an ordinary training run:
+
+```sh
+python reanalysis.py --run runs/nnue-selfplay --iteration 1 --checkpoint 0 --max-positions 256 --ms 200 --width 32 --output runs/reanalysis-0001
+python train.py --run runs/nnue-with-reanalysis --model nnue --reanalysis runs/reanalysis-0001 --device cuda
+```
+
+`--reanalysis` accepts multiple completed shard directories. Their positions join
+the replay sampling pool independently of `--replay-iterations`, which still
+limits only chronological self-play shards. External files are read in place;
+their manifests, search provenance and hashes are recorded in the run and each
+trained checkpoint. Modified shards or manifests prevent resume. Repeating the
+reanalysis command reuses completed root searches when its provenance matches.
+Targets remain selective search estimates. A conditional second-stone row loses
+the source game's outcome label when the teacher's first move diverges.
 
 NNUE replay is versioned separately from legacy six-cell histograms. It stores
 ragged center-code triples and candidate-code triples with offsets, candidate
