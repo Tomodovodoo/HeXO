@@ -44,6 +44,12 @@ def wilson(wins, games):
 def run(args):
     rng = random.Random(args.seed)
     opponent = Seal() if args.opponent == "seal" else None
+    opponent_metadata = None
+    if args.opponent == "orca":
+        from tools.orca_adapter import Orca
+        opponent = Orca(args.orca_source, args.orca_checkpoint, args.orca_sims,
+                        args.orca_device, args.max_stones)
+        opponent_metadata = opponent.metadata
     games = []
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -136,13 +142,22 @@ def run(args):
         games.append(record)
         completed = [g for g in games if g["reason"] == "six-in-a-row"]
         wins = sum(g["winner"] == g["our_color"] for g in completed)
+        pairs = (len(games)+1)//2
+        paired_games = 2*pairs
+        censored = paired_games-len(completed)
+        margin = math.sqrt(math.log(40)/(2*pairs))
         report = {"revision": revision, "dirty": dirty, "platform": platform.platform(),
                   "model": model,
                   "engine_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
                   "source_sha256": hashlib.sha256((ROOT / "src/hexo.cpp").read_bytes()).hexdigest(),
-                  "opponent_revision": (ROOT / "build/seal_revision.txt").read_text().strip() if opponent else None,
+                  "opponent_revision": (ROOT / "build/seal_revision.txt").read_text().strip() if args.opponent == "seal" else (opponent_metadata or {}).get("revision"),
+                  "opponent_metadata": opponent_metadata,
                   "config": vars(args), "wins": wins, "losses": len(completed)-wins,
-                  "incomplete": len(games)-len(completed), "win_rate_95pct": wilson(wins, len(completed)),
+                  "incomplete": len(games)-len(completed),
+                  "unplayed_pair_partners": paired_games-len(games),
+                  "win_rate_95pct": [max(0, wins/paired_games-margin), min(1, (wins+censored)/paired_games+margin)],
+                  "interval_method": "Opening-pair Hoeffding 95%; incomplete games and unplayed pair partners bounded",
+                  "completed_only_wilson_95pct": wilson(wins, len(completed)),
                   "games": games}
         output.write_text(json.dumps(report, indent=2))
         print(f"Game {index+1}: {reason}, winner {game.winner}; {wins} wins / {len(completed)-wins} losses / {len(games)-len(completed)} incomplete", flush=True)
@@ -152,7 +167,11 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--opponent", choices=["seal", "shallow", "random"], default="shallow")
+    parser.add_argument("--opponent", choices=["seal", "orca", "shallow", "random"], default="shallow")
+    parser.add_argument("--orca-source", help="External hexbot-building-framework checkout")
+    parser.add_argument("--orca-checkpoint", help="Defaults to orca/checkpoint.pt within --orca-source")
+    parser.add_argument("--orca-sims", type=int, default=200, help="MCTS simulations per placement, not a time budget")
+    parser.add_argument("--orca-device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--games", type=int, default=20)
     parser.add_argument("--ms", type=int, default=100)
     parser.add_argument("--width", type=int, default=16)
@@ -169,4 +188,6 @@ if __name__ == "__main__":
         parser.error("games and ms must be positive; max-stones must be at least 3")
     if args.checkpoint is not None and not args.run:
         parser.error("--checkpoint requires --run")
+    if args.opponent == "orca" and (not args.orca_source or args.orca_sims < 1):
+        parser.error("Orca requires --orca-source and positive --orca-sims")
     run(args)

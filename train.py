@@ -182,14 +182,16 @@ def play_game(task):
 def write_json(path, data):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(data, indent=2, allow_nan=False), encoding="utf-8")
+    # Windows readers can briefly deny rename while the dashboard reads a file.
+    # Retry only sharing/access errors, retaining atomic publication throughout.
     for attempt in range(8):
         try:
             os.replace(temporary, path)
-            break
+            return
         except PermissionError as error:
-            if os.name != "nt" or getattr(error, "winerror", None) not in (5, 32) or attempt == 7:
+            if os.name != "nt" or error.winerror not in (5, 32) or attempt == 7:
                 raise
-            time.sleep(.01*2**attempt)
+            time.sleep(.01 * 2**attempt)
 
 
 def event(run, kind, **fields):

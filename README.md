@@ -61,12 +61,12 @@ python dashboard.py --run runs/gpu-selfplay
 
 `--gpu-games-batch 0` chooses a batch from available VRAM and the episode cap. `--batch 0` increases the learner batch while preserving the reference batch-256 optimizer update count. `--updates-per-epoch` sets an explicit update budget. CUDA training uses fused AdamW and keeps replay tensors on the device. Replay sampling occurs before concatenating shards, and `--replay-positions` bounds retained positions. The limit also accounts for available device memory. Best validation weights and the matching optimizer state are saved.
 
-The GPU `pattern` actor uses exact sparse rules with growing coordinate storage and incremental native-compatible pattern features. Its candidate policy combines nearby cells, axial development, and broader exploration. It chooses one placement at a time using the learned evaluator, with `--exploration` controlling stochastic choices. It does not run native PVS; `--ms` and `--width` do not control this actor. Replay records identify the actor and one-placement target semantics. Promotion always measures the native deployed engine at equal wall-clock budgets.
+The GPU `pattern` actor uses exact sparse rules with growing coordinate storage and incremental native-compatible pattern features. They first take exact one- or two-stone wins, then choose a placement belonging to a complete cover of all immediate opponent threats when such a cover exists. These choices override exploration. Quiet candidates combine nearby cells, axial development, and broader exploration, scored one placement at a time by the learned evaluator. They do not run native PVS; `--ms` and `--width` do not control this actor. Replay records identify the actor and one-placement target semantics. Promotion always measures the native deployed engine at equal wall-clock budgets.
 
-On this RTX 3070 Ti, the zero-residual GPU actor generated about 835 games/second at batch 512 and 907 at batch 2048, using 32 candidates and a 96-stone cap. All games in those measured batches completed. These timings include generation and replay transfer, but not training or native evaluation. They measure throughput, not strength. Reproduce on your hardware:
+On this RTX 3070 Ti, the tactical zero-residual GPU actor generated about 184 games/second and 28,300 placements/second at batch 512 with 32 quiet candidates and a 256-stone cap. Of those 512 games, 388 finished and 124 reached the cap; peak PyTorch allocation was about 920 MiB. These timings include generation and replay transfer, but not training or native evaluation. The earlier actor was faster but frequently missed immediate wins. Its shorter games make raw games/second an unfair performance comparison. Reproduce on your hardware:
 
 ```sh
-python gpu_benchmark.py --actor --batches 64 256 512 2048 --placements 96
+python gpu_benchmark.py --actor --batches 64 256 512 2048 --placements 256
 python gpu_benchmark.py --batches 64 512 2048 --placements 96
 ```
 
@@ -158,7 +158,7 @@ python arena.py --opponent shallow --games 20 --ms 100
 python arena.py --opponent random --games 20 --ms 100
 ```
 
-The arena alternates colors and reuses each opening for a pair of games. Results contain moves, actual decision times, engine hashes, and a Wilson interval. Move-cap truncations and invalid games are recorded separately from wins and losses. The current interval treats games as independent; use a larger opening-family analysis before making strength claims.
+The arena alternates colors and reuses each opening for a pair of games. Results contain moves, actual decision times, engine hashes, and conservative opening-pair confidence bounds. Truncations, invalid games and unplayed partners of a partial pair contribute unknown outcomes to those bounds. A completed-games-only Wilson interval is retained separately and must not be used as an overall strength estimate.
 
 To compare against Seal, clone its source outside this repository, then configure the optional adapter:
 
@@ -172,13 +172,35 @@ python arena.py --opponent seal --run runs/gpu-selfplay --checkpoint 1 --games 2
 
 The adapter compiles the external engine without vendoring it. Seal's fixed array has a smaller coordinate range; games outside the adapter's safe range are marked invalid rather than counted as victories. Equal requested budgets are used, and both engines' actual elapsed times are retained. `--run` loads the promoted checkpoint, `--checkpoint` selects another saved candidate, and `--table` loads a standalone export. Reports identify the loaded table and its hash. Without a model option the arena uses the original evaluator.
 
+To compare against the published Orca model, use an external checkout:
+
+```sh
+git clone https://github.com/Saiki77/hexbot-building-framework.git ../orca-reference
+python arena.py --opponent orca --orca-source ../orca-reference --orca-sims 200 --games 20 --ms 100 --max-stones 800 --output artifacts/orca.json
+```
+
+This requires PyTorch. The adapter strictly loads the checkout's seven-channel `orca/checkpoint.pt` without adding random weights. Use `--orca-checkpoint` to select another compatible checkpoint and `--orca-device cuda` for GPU inference. The report records source revision, checkpoint hash, simulation budget and actual turn times. Orca receives simulations per placement; our engine receives milliseconds per complete turn. This comparison does not use equal time budgets. Native rules validate every returned move, and replay disagreements remain invalid games rather than wins.
+
+## Correctness tests and local benchmarks
+
+Build the native library with the CMake commands above, then run:
+
+```sh
+python -m unittest discover -s tests -v
+python -m tests.benchmark --positions 12 --ms 5 --reference-ms 25
+```
+
+The tests compare native rules and incremental features with an independent Python board reference. They cover sequential radius-eight legality, turn phase, both colors, all three winning axes, first-placement wins, overlines, distant expansion, make/unmake and hash restoration, residual-table bounds, tactical wins and defensive covers. With PyTorch installed, the same batched-environment checks run on CPU and on CUDA when available, including capacity growth, reset and truncation. GPU checks are skipped when PyTorch is unavailable. The NNUE implementation adds separate export/value/policy checks. Pull requests run the native rules subset on Linux; CPU/CUDA tensor parity is also run locally.
+
+The benchmark prints JSON with seeded positions, source and library hashes, hardware, actual search times, nodes and agreement with a wider search. Timing-dependent search results can vary across runs. There are no machine-specific speed assertions. A wider search is a selective reference, not a proof of the best move. Candidate-cell recall is reported only when the native candidate API is available; it does not measure whether the final pruned turn list retained that pair.
+
 ## Status and remaining work
 
 The initial non-neural version is playable. Direct runtime checks have covered the radius-eight frontier, sequential expansion, immediate wins, and 800 make/unmake comparisons. A differential run matched 2,019 transitions against the official TypeScript rules, including rejected moves, turn phase, cells, and winner. Sparse expansion to coordinate 800 also passed. An initial eight-game development comparison against Seal scored two wins and six losses at 100 ms per turn. This is an initial measurement, not a competitive-strength claim. Two tactical-extension experiments scored zero wins in the same eight openings and were removed.
 
 The first complete learning run collected 516 positions from 12 games and trained on the RTX 3070 Ti. Its challenger scored three wins, four losses, and one incomplete evaluation game and was rejected. That demonstrates the loop, not a strength gain. Larger runs are needed to measure improvement.
 
-A subsequent native-actor run collected 10,130 positions from 192 games. None of its three candidates earned promotion. The GPU pipeline has also completed generation, fitting, native evaluation, checkpoint persistence, and resumed training with optimizer lineage. GPU trajectories and feature targets have been replayed against the native engine. No convincing Elo gain has been established yet.
+A subsequent native-actor run collected 10,130 positions from 192 games. None of its three candidates earned promotion. The GPU pipeline has also completed generation, fitting, native evaluation, checkpoint persistence, and resumed training with optimizer lineage. GPU trajectories and feature targets have been replayed against the native engine. No convincing Elo gain has been established yet. The first 6,144-game GPU run produced 138,652 positions. Its best initial candidate scored 28 wins in 40 games, then only 78 wins in 160 fresh confirmation games. An audit found that 9.03% of its replay positions had a provable win that the shallow actor later lost. The tactical actor fixes those missed wins; use a fresh run directory for its data.
 
 Further work includes training-quality improvements, search profiling, stronger threat search, larger held-out opponent matches, Orca integration, and game-data import. Match clocks, rated lobbies, and online account play are not part of the local board yet.
 
