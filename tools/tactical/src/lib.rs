@@ -1,13 +1,13 @@
 mod check;
 use std::collections::BTreeMap;
 use std::ffi::{CStr,CString,c_char};
-use std::sync::{Mutex,OnceLock};
+use std::sync::{Arc,Mutex,OnceLock};
 use std::sync::{mpsc,atomic::{AtomicBool,Ordering}};
 use std::time::{Duration,Instant};
 use hexo_engine::types::Player;
 use hexo_solver::prover::{self,Ctl,DriverKind,ProverConfig};
 use hexo_solver::prover::io::{Position,PosConfig};
-use hexo_solver::prover::certificate::ProofCertificate;
+use hexo_solver::prover::certificate::{ProofCertificate,ProofNode,ProofResponse};
 use serde::Deserialize;
 use serde_json::{json,Value};
 
@@ -20,6 +20,48 @@ static CACHE:OnceLock<Mutex<BTreeMap<Key,ProofCertificate>>>=OnceLock::new();
 struct Request {
     history:Vec<(i32,i32)>, ms:u32, idtt_ms:u32, nodes:u64, depth:u8,
     #[serde(default)] certificate:Option<ProofCertificate>,
+    #[serde(default)] root_moves:Option<Vec<(i32,i32)>>,
+}
+fn control(deadline:Instant)->Ctl {
+    Ctl{deadline:Some(deadline),cancel:Arc::new(AtomicBool::new(false))}
+}
+fn complete_candidate(req:&Request,board:&check::Board,moves:&[(i32,i32)],deadline:Instant)->Result<ProofCertificate,String> {
+    let side=check::phase(req.history.len()).0;
+    let (post,ply,terminal)=check::apply(board,req.history.len(),moves)?;
+    if terminal {return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::ImmediateWin{action:moves.to_vec()}]});}
+    let defenses=check::defenses(&post,side,deadline)?;
+    let mut cert=ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![
+        ProofNode::AttackerMove{action:moves.to_vec(),child:1,alternatives:vec![]},
+        ProofNode::Unstoppable{threats:vec![]} ]};
+    if defenses.is_empty(){return Ok(cert);}
+    let mut responses=Vec::new();let mut left=req.nodes;
+    for action in defenses.into_values() {
+        if Instant::now()>=deadline || left==0 {return Err("candidate defense expansion budget".into());}
+        let (next,n,won)=check::apply(&post,ply,&action)?;
+        if won {return Err("defender counterwin".into());}
+        let pos=Position{stones:next.iter().map(|(&p,&s)|(p,if s==0{Player::P1}else{Player::P2})).collect(),
+            attacker:if side==0{Player::P1}else{Player::P2},placements_remaining:check::phase(n).1,
+            config:PosConfig{win_length:6,placement_radius:8,max_moves:u32::MAX}};
+        let cfg=ProverConfig{driver:DriverKind::Pdspn,wide:true,node_budget:left,tt_mb:1,pn2_nodes:1000,..Default::default()};
+        let ctl=control(deadline);
+        let child=prover::pdspn::solve(&pos,&cfg,&ctl);
+        left=left.saturating_sub(child.stats.nodes.max(1));
+        let mut child=child.certificate.ok_or("candidate has unproved defender continuation")?;
+        if cert.nodes.len()+child.nodes.len()>50000 {return Err("candidate certificate size limit".into());}
+        let offset=cert.nodes.len() as u32;
+        responses.push(ProofResponse{action,child:offset+child.root});
+        for node in &mut child.nodes {
+            match node {
+                ProofNode::AttackerMove{child,alternatives,..}=>{
+                    *child+=offset;for alternative in alternatives {alternative.child+=offset;}
+                }
+                ProofNode::DefenderReplies{responses}=>{for response in responses {response.child+=offset;}}
+                _=>{}
+            }
+        }
+        cert.nodes.extend(child.nodes);
+    }
+    cert.nodes[1]=ProofNode::DefenderReplies{responses};Ok(cert)
 }
 fn run(req:Request, start:Instant) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.idtt_ms>=req.ms
@@ -29,12 +71,17 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
     let (side,remaining)=check::phase(req.history.len());
     let key=(board.iter().map(|(&p,&s)|(p,s)).collect(),side,remaining);
     let scope=json!({"rules":{"win_length":6,"placement_radius":8,"match_move_cap":null},
-        "defenses":"complete two-stone covers; free second and quiet defender nodes unsupported",
-        "attacks":"wide Strix proposals; selective negatives remain UNKNOWN","checker_version":1});
+        "defenses":"all legal two-stone covers including complete free-second frontier; quiet defender nodes unsupported",
+        "attacks":"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN","checker_version":2,
+        "budget":{"requested_ms":req.ms,"idtt_ms":req.idtt_ms,"idtt_depth_cap":req.depth,
+            "pds_pn":"unbounded forcing driver with node/time limits; verifier path limit128",
+            "nodes_per_driver":req.nodes,"candidate_all_children_total_nodes":req.nodes}});
     let cache=CACHE.get_or_init(||Mutex::new(BTreeMap::new()));
     let mut cache_hit=false;
     let mut probe_verdict=None;
-    let cert=if let Some(cert)=req.certificate {Some(cert)} else {
+    let cert=if let Some(cert)=req.certificate.clone() {Some(cert)} else if let Some(moves)=&req.root_moves {
+        Some(complete_candidate(&req,&board,moves,deadline)?)
+    } else {
         let saved=cache.lock().map_err(|_|"cache lock")?.get(&key).cloned();
         if saved.is_some() {cache_hit=true;saved} else {
             let pos=Position{stones:board.iter().map(|(&p,&s)|(p,if s==0{Player::P1}else{Player::P2})).collect(),
@@ -43,12 +90,12 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
             let cfg=ProverConfig{driver:DriverKind::Pdspn,wide:true,depth_cap:req.depth,
                 node_budget:req.nodes,tt_mb:16,pn2_nodes:1000,..Default::default()};
             if req.idtt_ms>0 {
-                let ctl=Ctl::new(req.idtt_ms as f64/1000.0);
+                let ctl=control((Instant::now()+Duration::from_millis(req.idtt_ms as u64)).min(deadline));
                 let probe=prover::idtt(&pos,&cfg,&ctl);
                 probe_verdict=Some(format!("{:?}",probe.verdict));
             }
             if Instant::now()>=deadline {None} else {
-                let ctl=Ctl::new(deadline.saturating_duration_since(Instant::now()).as_secs_f64());
+                let ctl=control(deadline);
                 // Only PDS-PN emits an all-defense DAG. An IDTT PV is never enough.
                 prover::pdspn::solve(&pos,&cfg,&ctl).certificate
             }

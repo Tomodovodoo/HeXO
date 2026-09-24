@@ -1,8 +1,9 @@
 """Native independently checked tactical strategies, separate from estimated values.
 
-The current positive subset requires defender threats to consume both placements.
-Free-second and quiet defender states remain UNKNOWN. Deadlines are cooperative;
-late native results are discarded, not exposed as exact values.
+Certificates cover every legal defense, including a free second placement.
+An optional root candidate expands those obligations explicitly; quiet defender
+nodes remain UNKNOWN. A single native worker limits caller wait; reconstruction
+may finish in the background. Late results are not exposed as exact values.
 """
 import ctypes as C
 import hashlib
@@ -33,11 +34,11 @@ class NativeTactics:
         self.lib.hexo_tactical_free.restype = None
         self.lock = threading.Lock()
 
-    def solve(self, game, *, ms=100, idtt_ms=20, nodes=100000, depth=8, certificate=None):
+    def solve(self, game, *, ms=100, idtt_ms=20, nodes=100000, depth=8, certificate=None, root_moves=None):
         return self.history([cell[:2] for cell in game.cells], ms=ms, idtt_ms=idtt_ms,
-                            nodes=nodes, depth=depth, certificate=certificate)
+                            nodes=nodes, depth=depth, certificate=certificate, root_moves=root_moves)
 
-    def history(self, history, *, ms=100, idtt_ms=20, nodes=100000, depth=8, certificate=None):
+    def history(self, history, *, ms=100, idtt_ms=20, nodes=100000, depth=8, certificate=None, root_moves=None):
         if (type(ms) is not int or not 1 <= ms <= 60000 or type(idtt_ms) is not int
                 or not 0 <= idtt_ms < ms or type(nodes) is not int or not 1 <= nodes <= 10000000
                 or type(depth) is not int or not 1 <= depth <= 64):
@@ -55,6 +56,8 @@ class NativeTactics:
                            nodes=nodes, depth=depth)
             if certificate is not None:
                 request['certificate'] = certificate
+            if root_moves is not None:
+                request['root_moves'] = root_moves
             payload = json.dumps(request, separators=(',', ':')).encode()
             if len(payload) > 8*1024*1024:
                 return unknown('request size limit')
@@ -93,7 +96,7 @@ def independent_verify(certificate, history):
         if node['kind'] == 'unstoppable':
             return dict(kind='uncovered')
         if node['kind'] == 'defender_replies':
-            return dict(kind='defenses', branches=[dict(moves=r['action'], child=expand(r['child'], stack))
+            return dict(kind='defenses_all', branches=[dict(moves=r['action'], child=expand(r['child'], stack))
                                                    for r in node['responses']])
         raise ValueError('Unknown certificate node')
     if certificate['version'] != 1 or certificate['width'] != 'wide':
@@ -101,4 +104,4 @@ def independent_verify(certificate, history):
     n = len(history)
     attacker = ((n+1)//2) % 2 if n else 0
     converted = dict(version=1, history=[list(p) for p in history], attacker=attacker, tree=expand(certificate['root'], set()))
-    return verify(converted, history)
+    return verify(converted, history, deadline=time.perf_counter()+10)

@@ -70,7 +70,7 @@ fn covers(threats:&BTreeSet<Vec<Point>>, deadline:Instant) -> Result<BTreeSet<Ve
     }
     Ok(result)
 }
-fn apply(b:&Board, n:usize, moves:&[Point]) -> Result<(Board,usize,bool),String> {
+pub fn apply(b:&Board, n:usize, moves:&[Point]) -> Result<(Board,usize,bool),String> {
     let (side,remaining)=phase(n);
     if moves.is_empty() || moves.len()>remaining as usize {return Err("invalid turn length".into());}
     let mut out=b.clone();let mut win=false;
@@ -80,6 +80,37 @@ fn apply(b:&Board, n:usize, moves:&[Point]) -> Result<(Board,usize,bool),String>
     }
     if !win && phase(n+moves.len()).0==side {return Err("incomplete turn".into());}
     Ok((out,n+moves.len(),win))
+}
+
+pub fn defenses(b:&Board, attacker:u8, deadline:Instant) -> Result<BTreeMap<Vec<Point>,Vec<Point>>,String> {
+    if !completions(b,1-attacker,2,deadline)?.is_empty() {return Err("defender counterwin".into());}
+    let threats=completions(b,attacker,2,deadline)?;
+    if threats.is_empty() {return Err("quiet defender unsupported".into());}
+    let small=covers(&threats,deadline)?;
+    let mut result=BTreeMap::new();
+    for cover in small {
+        check(deadline)?;
+        if cover.len()==2 {result.insert(cover.clone(),cover);continue;}
+        let fixed=cover[0];let mut post=b.clone();post.insert(fixed,1-attacker);
+        // Full finite legal frontier AFTER the mandatory block. This includes
+        // fillers made legal by that first placement, with that order retained.
+        let mut frontier=BTreeSet::new();
+        for &(q,r) in post.keys() {
+            check(deadline)?;
+            for dq in -8i32..=8 {for dr in -8i32..=8 {
+                if dq.abs().max(dr.abs()).max((dq+dr).abs())<=8 && !post.contains_key(&(q+dq,r+dr)) {
+                    frontier.insert((q+dq,r+dr));
+                }
+            }}
+        }
+        for filler in frontier {
+            check(deadline)?;
+            let mut key=vec![fixed,filler];key.sort();
+            result.entry(key).or_insert(vec![fixed,filler]);
+            if result.len()>50000 {return Err("free-second coverage work limit".into());}
+        }
+    }
+    Ok(result)
 }
 
 pub fn verify(history:&[Point], cert:&ProofCertificate, deadline:Instant, max_nodes:usize) -> Result<Vec<Point>,String> {
@@ -107,19 +138,18 @@ pub fn verify(history:&[Point], cert:&ProofCertificate, deadline:Instant, max_no
                 ProofNode::DefenderReplies{responses} => {
                     if side==self.attacker || remaining!=2 {return Err("defender phase mismatch".into());}
                     if !completions(b,side,remaining,self.deadline)?.is_empty() {return Err("defender counterwin".into());}
-                    let threats=completions(b,self.attacker,2,self.deadline)?;
-                    if threats.is_empty() {return Err("quiet defender unsupported".into());}
-                    let required=covers(&threats,self.deadline)?;
-                    if required.is_empty() || required.iter().any(|c|c.len()!=2) {return Err("free-second defense unsupported".into());}
+                    let required=defenses(b,self.attacker,self.deadline)?;
+                    if required.is_empty() {return Err("defenses supplied for unstoppable position".into());}
+                    if responses.len()!=required.len() {return Err("missing defense branch including free-second coverage".into());}
                     let mut seen=BTreeSet::new();
                     for reply in responses {
                         let mut key=reply.action.clone();key.sort();
-                        if !required.contains(&key) || !seen.insert(key) {return Err("invalid/duplicate defense".into());}
+                        if !required.contains_key(&key) || !seen.insert(key) {return Err("invalid/duplicate defense".into());}
                         let (next,ply,terminal)=apply(b,n,&reply.action)?;
                         if terminal {return Err("defender wins".into());}
                         self.walk(reply.child,&next,ply)?;
                     }
-                    if seen!=required {return Err("missing defense branch".into());}
+                    if seen!=required.keys().cloned().collect() {return Err("missing defense branch including free-second coverage".into());}
                 }
                 ProofNode::Unstoppable{..} => {
                     if side==self.attacker || remaining!=2 {return Err("unstoppable phase mismatch".into());}
@@ -137,5 +167,24 @@ pub fn verify(history:&[Point], cert:&ProofCertificate, deadline:Instant, max_no
     match &cert.nodes[cert.root as usize] {
         ProofNode::ImmediateWin{action}|ProofNode::AttackerMove{action,..}=>Ok(action.clone()),
         _=>Err("root must be attacker action".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn free_filler_frontier_expands_after_mandatory_block() {
+        for sign in [-1,1] {
+            let mut b=Board::new();
+            for q in 0..5 {b.insert((sign*q,0),0);}
+            b.insert((-sign,0),1);
+            let fixed=(sign*5,0);let filler=(sign*13,0);
+            assert!(!legal(&b,filler));
+            let replies=defenses(&b,0,Instant::now()+std::time::Duration::from_secs(1)).unwrap();
+            let mut key=vec![fixed,filler];key.sort();
+            assert_eq!(replies.get(&key),Some(&vec![fixed,filler]));
+            b.insert(fixed,1);assert!(legal(&b,filler));
+        }
     }
 }

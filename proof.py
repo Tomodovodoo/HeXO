@@ -184,7 +184,7 @@ def solve(game, *, deadline, node_limit=10000, attack_turns=3, width=8):
             "elapsed_ms": (perf_counter()-start)*1000, "reason": reason}
 
 
-def verify(certificate, history):
+def verify(certificate, history, *, deadline=None):
     """Independent raw-board checker; return certified root status or raise ValueError.
 
     history is supplied by the caller, not accepted solely from the certificate.
@@ -192,6 +192,8 @@ def verify(certificate, history):
     Does not call native code or the solver's completion/cover functions.
     """
     def require(condition):
+        if deadline is not None and perf_counter() >= deadline:
+            raise ValueError("Certificate verification deadline")
         if not condition:
             raise ValueError("Invalid forcing certificate")
 
@@ -267,8 +269,28 @@ def verify(certificate, history):
         if kind == "uncovered":
             require(not covers)
             return
-        require(kind == "defenses" and bool(covers))
-        require(all(len(c) == remaining for c in covers))
+        require(kind in ("defenses", "defenses_all") and bool(covers))
+        if kind == "defenses_all":
+            full = {c for c in covers if len(c) == remaining}
+            for cover in covers:
+                if len(cover) == remaining:
+                    continue
+                require(remaining == 2 and len(cover) == 1)
+                blocked = dict(board)
+                blocked[next(iter(cover))] = side
+                for q, r in blocked:
+                    require(True)
+                    for dq in range(-8, 9):
+                        for dr in range(-8, 9):
+                            if (abs(dq)+abs(dr)+abs(dq+dr))//2 > 8:
+                                continue
+                            filler = q+dq, r+dr
+                            if filler not in blocked and max(map(abs, filler)) <= 10**12:
+                                full.add(cover | {filler})
+                require(len(full) <= 50000)
+            covers = full
+        else:
+            require(all(len(c) == remaining for c in covers))
         seen = set()
         for branch in node["branches"]:
             cover = frozenset(tuple(p) for p in branch["moves"])

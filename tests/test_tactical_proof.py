@@ -70,6 +70,31 @@ class NativeStrategy(unittest.TestCase):
         self.assertEqual(r['status'], 'UNKNOWN')
         self.assertIn('counterwin', r['reason'])
 
+    def test_free_second_every_legal_filler_has_verified_continuation(self):
+        from tests.reference import interleave, Reference
+        ours = [(q,r) for r in (0,3,6,9) for q in range(3)] + [(12,0)]
+        theirs = [(-1,0)] + [(6+(i%3)*3,2+3*(i//3)) for i in range(13)]
+        history = [list(p) for p in interleave([ours,theirs])]
+        result = self.engine.history(history, ms=20000, idtt_ms=0, nodes=1000000,
+                                     root_moves=[[3,0],[5,0]])
+        self.assertEqual(result['status'], 'PROVEN_WIN', result.get('reason'))
+        cert = result['certificate']
+        self.assertEqual(independent_verify(cert, history), 'PROVEN_WIN')
+        reference = Reference()
+        for p in history+[[3,0],[5,0],[4,0]]: reference.play(*p)
+        frontier = {(q+dq,r+dr) for q,r in reference.cells for dq in range(-8,9) for dr in range(-8,9)
+                    if max(abs(dq),abs(dr),abs(dq+dr))<=8 and (q+dq,r+dr) not in reference.cells}
+        responses = cert['nodes'][cert['nodes'][cert['root']]['child']]['responses']
+        actual = {frozenset(map(tuple,response['action'])) for response in responses}
+        self.assertEqual(actual, {frozenset(((4,0),filler)) for filler in frontier})
+        self.assertEqual(len(actual), 745)
+        bad = copy.deepcopy(cert)
+        bad['nodes'][bad['nodes'][bad['root']]['child']]['responses'].pop()
+        rejected = self.engine.history(history, ms=3000, certificate=bad)
+        self.assertEqual(rejected['status'], 'UNKNOWN')
+        self.assertFalse(rejected['native_verified'])
+        with self.assertRaises(ValueError): independent_verify(bad, history)
+
     def test_deadline_and_unknown_are_not_loss(self):
         start = time.perf_counter()
         result = self.engine.history([[0,0]], ms=1, idtt_ms=0, nodes=1)
