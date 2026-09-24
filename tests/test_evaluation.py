@@ -34,6 +34,12 @@ class PairedEvaluation(unittest.TestCase):
             self.assertEqual(status['candidate_sha256'], 'abc')
             self.assertEqual(status['reference_sha256'], 'def')
             self.assertEqual(status['completed'], 3)
+            publish_failure(root, KeyboardInterrupt())
+            status = json.loads((root/'status.json').read_text())
+            self.assertEqual(status['stage'], 'failed')
+            self.assertTrue(status['interrupted'])
+            self.assertEqual(status['candidate_sha256'], 'abc')
+            self.assertEqual(status['completed'], 3)
 
     def test_pair_statistics_and_uncensored_rating(self):
         records = [{'seed': p, 'challenger_color': c, 'winner': c if p < 3 else 1-c}

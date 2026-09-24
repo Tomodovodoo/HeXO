@@ -73,6 +73,7 @@ def publish_failure(output, error):
     provenance = json.loads((output/"provenance.json").read_text(encoding="utf-8"))
     status = json.loads((output/"status.json").read_text(encoding="utf-8")) if (output/"status.json").exists() else {}
     status.update(stage="failed", error=repr(error),
+                  interrupted=isinstance(error, KeyboardInterrupt),
                   candidate_sha256=provenance["model_input_sha256"]["candidate"],
                   reference_sha256=provenance["model_input_sha256"]["reference"])
     write_json(output/"status.json", status)
@@ -238,7 +239,7 @@ def main():
         output = args.execute_snapshot.resolve()
         try:
             execute(output)
-        except Exception as error:
+        except (Exception, KeyboardInterrupt) as error:
             publish_failure(output, error)
             raise
     else:
