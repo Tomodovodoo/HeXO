@@ -66,7 +66,7 @@ GPU actors use exact sparse rules with growing coordinate storage and incrementa
 On this RTX 3070 Ti, the tactical zero-residual GPU actor generated about 184 games/second and 28,300 placements/second at batch 512 with 32 quiet candidates and a 256-stone cap. Of those 512 games, 388 finished and 124 reached the cap; peak PyTorch allocation was about 920 MiB. These timings include generation and replay transfer, but not training or native evaluation. The earlier actor was faster but frequently missed immediate wins. Its shorter games make raw games/second an unfair performance comparison. Reproduce on your hardware:
 
 ```sh
-python gpu_benchmark.py --actor --batches 64 256 512 2048 --placements 96
+python gpu_benchmark.py --actor --batches 64 256 512 2048 --placements 256
 python gpu_benchmark.py --batches 64 512 2048 --placements 96
 ```
 
