@@ -26,11 +26,18 @@ def select(histories,rows,previous,positions,cap,seed):
             buckets[int(len(histories[row['game']])-row['ply']>8)].append(row)
     rng=np.random.default_rng(seed)
     counts=Counter();chosen=[]
-    for bucket in buckets:
+    earlier_counts=Counter(r['game'] for r in buckets[1])
+    earlier_capacity=sum(min(count,cap) for count in earlier_counts.values())
+    for stratum,bucket in enumerate(buckets):
         selected=[]
         for index in rng.permutation(len(bucket)):
             row=bucket[int(index)]
             if counts[row['game']]>=cap:continue
+            if stratum==0:
+                remaining=cap-counts[row['game']]
+                consumed=min(earlier_counts[row['game']],remaining)-min(earlier_counts[row['game']],remaining-1)
+                if earlier_capacity-consumed<positions//2:continue
+                earlier_capacity-=consumed
             selected.append(row);counts[row['game']]+=1
             if len(selected)==positions//2:break
         if len(selected)!=positions//2:raise ValueError('Insufficient new positions for declared stratum and game cap')

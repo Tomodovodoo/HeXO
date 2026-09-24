@@ -75,6 +75,11 @@ class RelationalLearningTests(unittest.TestCase):
         self.assertLessEqual(max(Counter(r['game'] for r in chosen).values()),4)
         with self.assertRaisesRegex(ValueError,'Insufficient'):
             select(histories,rows,previous,14,4,19)
+        histories={'long':[None]*20,'short':[None]*8}
+        rows=[dict(game=key,ply=ply) for key,history in histories.items() for ply in range(len(history))]
+        for seed in range(10):
+            selected=select(histories,rows,[],2,1,seed)
+            self.assertEqual([r['game'] for r in selected],['short','long'])
 
     def setUp(self):
         threads=torch.get_num_threads();torch.set_num_threads(2)
