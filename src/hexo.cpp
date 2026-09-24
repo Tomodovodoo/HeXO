@@ -169,6 +169,7 @@ struct Board {
         for(int d=0;d<3;++d) for(int k=-5;k<=5;++k) if(k) change(c+axes[d]*k,d,5-k,false);
     }
     void set_model(nnue::Handle next) {
+        if(next && next==model) return;
         model=std::move(next);centers=CenterTable{};pool.fill(0);
         adjustment.fill(0);learned_score=0;
         if(model) for(const auto& [c,p]:cells) nn_update(c,p,1);
