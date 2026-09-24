@@ -2,6 +2,7 @@
 import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -23,6 +24,25 @@ def episode_counts(path, modified):
     return {"games": len(episodes), "terminal_games": sum(e["winner"] >= 0 for e in episodes),
             "bootstrapped_games": sum(e["winner"] < 0 for e in episodes),
             "positions": sum(len(e["moves"]) for e in episodes)}
+
+
+def bound_evaluation(run, checkpoint):
+    model = run/"checkpoints"/f"{checkpoint:04d}"/"model.nnue"
+    if not model.exists():
+        return None
+    current = hashlib.sha256(model.read_bytes()).hexdigest()
+    for folder in (run/"evaluation/confirmation", run/"evaluation"):
+        status = read_json(folder/"status.json")
+        if not status:
+            continue
+        candidate = status.get("candidate_sha256")
+        if not candidate:
+            report = read_json(folder/"report.json", {})
+            path = report.get("config", {}).get("candidate")
+            candidate = report.get("identity", {}).get(path)
+        if candidate == current:
+            return {**status, "candidate_sha256": current, "checkpoint": checkpoint}
+    return None
 
 
 def klent_run(run):
@@ -61,7 +81,7 @@ def klent_run(run):
             "source_sha256": identity.get("sources", {}).get("klent.py"),
             "engine_sha256": identity.get("engine_sha256"), "training_lock_present": (run/"training.lock").exists(),
             "status_modified": (run/"status.json").stat().st_mtime if (run/"status.json").exists() else None,
-            "evaluation": read_json(run/"evaluation/status.json"),
+            "evaluation": bound_evaluation(run, checkpoints[-1]["id"]),
             "rating": "UNRATED", "rating_reason": "External paired match evidence is not attached to this run."}
 
 
