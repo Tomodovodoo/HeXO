@@ -575,7 +575,9 @@ def _run_training(args):
             initial_metadata = initialize_nnue(initial, args, artifacts, identity)
             initial_table = "checkpoints/0000/model.nnue"
         else:
-            initial.mkdir(exist_ok=False)
+            # Preserve deterministic pattern initialization recovery after a
+            # failed summary write; imported NNUE artifacts use the manifest above.
+            initial.mkdir(exist_ok=True)
             initial_metadata = {}
             from learning_model import PatternModel
             torch.save(PatternModel().state_dict(), initial / "model.pt")

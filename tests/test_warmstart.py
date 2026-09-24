@@ -95,6 +95,26 @@ class WarmStartTest(unittest.TestCase):
             initialize_nnue(parent/"0000", self.args, initial_artifacts(self.args))
         self.assertFalse((parent/"0000").exists())
 
+    def test_pattern_initialization_retries_after_summary_failure(self):
+        self.args.model = "pattern"
+        self.args.initial_model = None
+        self.args.initial_optimizer = None
+        real_write = train.write_json
+        def interrupted(path, value):
+            if path.name == "summary.json":
+                raise OSError("interrupted pattern publication")
+            return real_write(path, value)
+        with patch.object(train, "write_json", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "pattern publication"):
+                _run_training(self.args)
+        initial = Path(self.args.run)/"checkpoints/0000"
+        before = {p.name: p.read_bytes() for p in initial.iterdir()}
+        _run_training(self.args)
+        self.assertEqual({p.name: p.read_bytes() for p in initial.iterdir()}, before)
+        summary = json.loads((Path(self.args.run)/"summary.json").read_text())
+        self.assertEqual(summary["checkpoints"][0]["kind"], "pattern")
+        self.assertEqual(summary["status"], "finished")
+
     def test_interrupted_summary_publication_recovers_only_matching_checkpoint(self):
         real_write = train.write_json
         def interrupted(path, value):
