@@ -14,8 +14,8 @@ from hexo import Game, ROOT, library
 
 class Seal:
     def __init__(self):
-        name = "libhexo_seal.dll" if platform.system() == "Windows" else "libhexo_seal.so"
-        self.lib = C.CDLL(str(ROOT / "build" / name))
+        adapter = library.with_name(library.name.replace("hexo", "hexo_seal"))
+        self.lib = C.CDLL(str(adapter))
         self.fn = self.lib.seal_move
         self.fn.argtypes = [C.POINTER(C.c_int), C.c_int, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_int)]
         self.fn.restype = C.c_int
@@ -63,6 +63,8 @@ def run(args):
         reason = "truncated"
         error = None
         while game.winner < 0 and len(game.cells) < args.max_stones:
+            if len(game.cells) + game.remaining > args.max_stones:
+                break
             side = game.player
             before = time.perf_counter()
             try:
