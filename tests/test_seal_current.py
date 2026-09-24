@@ -10,6 +10,44 @@ from tools.seal_current import REVISION, WEIGHTS_SHA256, sha, build
 
 
 class SealCurrentContract(unittest.TestCase):
+    def test_frozen_opponent_copies_dependencies_and_rejects_changed_inputs(self):
+        from relational_opponents import freeze_opponent, load_opponent
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'tools').mkdir()
+            source = root/'tools/seal_current_adapter.cpp'
+            source.write_bytes(b'compiled source')
+            python = root/'tools/seal_current.py'
+            python.write_bytes(b'frozen Python adapter')
+            binary = root/'seal.dll'
+            binary.write_bytes(b'pinned binary')
+            build = dict(revision=REVISION, weights_sha256=WEIGHTS_SHA256,
+                         binary_sha256=sha(binary), adapter_source_sha256=sha(source))
+            binary.with_suffix('.dll.json').write_text(json.dumps(build))
+            runtime = root/'system.dll'
+            runtime.write_bytes(b'host system runtime')
+            dependencies = ({'runtime.dll': ('runtime.dll', b'private dependency')},
+                            {str(runtime): sha(runtime)}, {'seal.dll': ['runtime.dll']})
+            with patch('relational_opponents._dependencies', return_value=dependencies):
+                metadata = freeze_opponent('seal-current', root/'frozen',
+                    dict(binary=binary, source_root=root))
+            self.assertEqual((root/'frozen/build/runtime.dll').read_bytes(), b'private dependency')
+            source.write_bytes(b'changed original source')
+            self.assertEqual((root/'frozen/tools/seal_current_adapter.cpp').read_bytes(), b'compiled source')
+            for name in ('build/runtime.dll', metadata['binary'], 'tools/seal_current.py'):
+                with self.subTest(name=name):
+                    path = root/'frozen'/name
+                    content = path.read_bytes()
+                    path.write_bytes(content+b'changed')
+                    with patch('relational_opponents._module') as launch:
+                        with self.assertRaisesRegex(ValueError, 'Frozen opponent input changed'):
+                            load_opponent(metadata, root/'frozen')
+                        launch.assert_not_called()
+                    path.write_bytes(content)
+            runtime.write_bytes(b'changed system runtime')
+            with self.assertRaisesRegex(ValueError, 'system dependency changed'):
+                load_opponent(metadata, root/'frozen')
+
     def test_cpp_edit_during_compile_does_not_publish_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
