@@ -128,6 +128,26 @@ class DirectPlayer(unittest.TestCase):
                     freeze(args)
                 self.assertFalse(output.exists())
 
+    def test_tree_immediate_win_reaches_turn_proof_status(self):
+        from tests.test_neural_search import Uniform
+        actor = self.actor('gumbel-proof')
+        actor.seed, actor.evaluator = 0, Uniform()
+        actor.prover = Mock()
+        actor.prover.solve.return_value = actor.prover.history.return_value = {'status':'UNKNOWN'}
+        history = [(0,0),(0,2),(1,2),(1,0),(2,0),(2,2),(3,2),(3,0),(4,0),(-2,2),(-3,2)]
+        actor.set_history(history)
+        game = Game(history)
+        try:
+            result = actor.turn(game)
+            self.assertEqual(result['proof_status'], 'PROVEN_WIN')
+            self.assertEqual(result['proof']['status'], 'UNKNOWN')
+            self.assertEqual(len(game.cells), len(history))
+            for action in result['moves']:
+                game.play(*action)
+            self.assertEqual(game.winner, 0)
+        finally:
+            actor.close()
+            game.close()
 
     def test_search_that_uses_its_budget_still_completes_two_placements(self):
         actor = self.actor('gumbel')
@@ -169,9 +189,15 @@ class DirectPlayer(unittest.TestCase):
                 original(source, target)
                 if Path(target) == output/'models/candidate.pt':
                     checkpoint.write_bytes(b'replacement')
-            with patch('relational_evaluate.shutil.copyfile', side_effect=copy):
+            def git_snapshot(command, **kwargs):
+                self.assertFalse(output.exists())
+                return 'source-revision' if command[1] == 'rev-parse' else ''
+            with patch('relational_evaluate.shutil.copyfile', side_effect=copy), patch(
+                    'relational_evaluate.subprocess.check_output', side_effect=git_snapshot):
                 freeze(args)
-            identity = json.loads((output/'provenance.json').read_text())['model_input_sha256']['candidate']
+            provenance = json.loads((output/'provenance.json').read_text())
+            self.assertFalse(provenance['dirty'])
+            identity = provenance['model_input_sha256']['candidate']
             self.assertEqual(identity, hashlib.sha256(b'evaluated').hexdigest())
             self.assertNotEqual(identity, hashlib.sha256(checkpoint.read_bytes()).hexdigest())
 

@@ -126,11 +126,18 @@ class RelationalPlayer:
                 moves.append(list(action))
                 self._advance(action)
                 diagnostics.append({**detail, 'action': list(action), 'elapsed_ms': (time.perf_counter()-decision_start)*1000})
+            status = 'UNKNOWN'
+            if proof and proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified'):
+                status = 'PROVEN_WIN'
+            elif any(item.get('proof_status') == 'PROVEN_WIN' for item in diagnostics):
+                status = 'PROVEN_WIN'
+            elif diagnostics and diagnostics[0].get('proof_status') == 'PROVEN_LOSS':
+                status = 'PROVEN_LOSS'
             elapsed = (time.perf_counter()-start)*1000
             return dict(moves=moves, elapsed_ms=elapsed, backend=self.mode, model_sha256=self.model_sha256,
                         placements=diagnostics, deadline_ms=budget, deadline_scope='complete-turn-cooperative',
                         overrun_ms=max(0, elapsed-budget),
-                        proof_status='PROVEN_WIN' if proof and proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified') else 'UNKNOWN',
+                        proof_status=status,
                         proof=proof, proof_budget_ms=self.proof_ms if self.prover is not None else None,
                         proof_scope='verified-root-and-tree-tactics' if self.prover is not None else 'disabled')
         except Exception:

@@ -181,6 +181,7 @@ class SearchCoordinator:
             raise ValueError('Positive search budgets required')
         starts, finishes = [], [None]*len(searches)
         evaluated, hits = [0]*len(searches), [0]*len(searches)
+        proof_spent = [0.]*len(searches)
         active = set()
         cursor = 0
         try:
@@ -229,13 +230,22 @@ class SearchCoordinator:
                             if search.proof_solver is not None:
                                 def proof_budget():
                                     return search.proof_ms if limits[i] is None else min(search.proof_ms,
-                                        max(1, int((limits[i]-(time.perf_counter()-starts[i])*1000)/4)))
-                                proof = search.proof_solver.history(history, ms=proof_budget(), idtt_ms=0)
-                                if finished(i):
-                                    continue
-                                if (proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified')
-                                        and search.fulfill_proof(request, history, proof['certificate'], proof_budget())):
-                                    continue
+                                        max(0, int(min(limits[i]/4-proof_spent[i],
+                                            (limits[i]-(time.perf_counter()-starts[i])*1000)/4))))
+                                allowance = proof_budget()
+                                if allowance:
+                                    proof_start = time.perf_counter()
+                                    proof = search.proof_solver.history(history, ms=allowance, idtt_ms=0)
+                                    proof_spent[i] += (time.perf_counter()-proof_start)*1000
+                                    if finished(i):
+                                        continue
+                                    allowance = proof_budget()
+                                    if (allowance and proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified')):
+                                        proof_start = time.perf_counter()
+                                        fulfilled = search.fulfill_proof(request, history, proof['certificate'], allowance)
+                                        proof_spent[i] += (time.perf_counter()-proof_start)*1000
+                                        if fulfilled:
+                                            continue
                             key = self.cache.key(history, self.model_version)
                             cached = self.cache.get(key)
                             if cached is None:
