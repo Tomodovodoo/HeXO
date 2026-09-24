@@ -344,6 +344,24 @@ improvement. `--initial-q` accepts a saved `q.pt` only with its exact matching
 `--initial-model` file. Q depends on the learned shared representation, so an
 unrelated Q head is rejected. No handwritten value is silently substituted for Q.
 
+An explicit human-corpus Q warm-start can provide a nonzero critic before fresh
+self-play. It freezes the matching NNUE features and fits only the Q head on
+verified human chosen actions and their terminal outcomes in the acting player's
+frame. The existing hashed family train/validation split is retained; test and
+excluded shards are never loaded. These targets describe human continuations,
+not optimal actions or on-policy KLENT returns. Values for unchosen actions are
+model extrapolations that self-play must test.
+
+```sh
+python q_warmstart.py --corpus artifacts/datasets/human-warmstart-v1 --model artifacts/models/human-warmstart-12/model.pt --output artifacts/models/human-q-warmstart-12 --positions 40000 --epochs 12 --device cuda
+python klent.py --run runs/human-initialized-klent --initial-model artifacts/models/human-q-warmstart-12/model.pt --initial-q artifacts/models/human-q-warmstart-12/q.pt --device cuda
+```
+
+Q initialization selects the best validation epoch and publishes into a new
+directory atomically. Its copied `model.pt` and native export remain unchanged;
+`q.pt` records their representation identity plus corpus and source provenance.
+The tool does not resume partial fits or overwrite an existing output.
+
 Checkpoint directories retain standard `model.pt` and `model.nnue` deployment
 artifacts, plus `klent.pt` with Q/optimizer state and a representation-bound
 `q.pt`. Complete corpus directories preserve every sampled move, legal-set hash,
