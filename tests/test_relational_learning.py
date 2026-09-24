@@ -48,6 +48,19 @@ def fixture(root):
 
 
 class RelationalLearningTests(unittest.TestCase):
+    def test_stratified_rejects_invalid_clipping_and_unsupported_previous_kind(self):
+        from relational_stratified import fit as stratified
+        for clip in (0,-1,float('inf'),float('nan')):
+            with self.assertRaisesRegex(ValueError,'Positive fitting'):
+                stratified(self.args(grad_clip=clip))
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);previous=root/'previous';previous.mkdir()
+            (previous/'manifest.json').write_text(json.dumps({'identity':{'kind':'relational-human-stratified-v1'}}))
+            args=self.args(output=str(root/'next'),previous_run=str(previous))
+            with patch('relational_stratified.source_identity',return_value={}),patch('relational_stratified.verify'):
+                with self.assertRaisesRegex(ValueError,'initial human warmstart'):
+                    stratified(args)
+
     def test_stratified_selection_excludes_replay_and_enforces_both_quotas(self):
         from collections import Counter
         from relational_stratified import select

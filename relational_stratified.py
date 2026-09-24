@@ -39,17 +39,20 @@ def select(histories,rows,previous,positions,cap,seed):
 
 
 def fit(args):
-    if args.batch<1 or args.max_nodes<1 or args.max_edges<1 or not math.isfinite(args.lr) or args.lr<=0:
+    if (args.batch<1 or args.max_nodes<1 or args.max_edges<1
+            or not all(math.isfinite(v) and v>0 for v in (args.lr,args.grad_clip))):
         raise ValueError('Positive fitting and graph budgets required')
     output=Path(args.output)
     if output.exists():raise ValueError('New stratified output directory required')
     torch.set_num_threads(2)
     torch.manual_seed(args.seed)
-    source=source_identity(('relational_stratified.py','relational_warmstart.py','relational_data.py','human_corpus.py'))
+    source=source_identity(('relational_stratified.py','relational_warmstart.py','relational_data.py','human_corpus.py','corpus_warmstart.py'))
     import json
     previous=Path(args.previous_run)
     prior=json.loads((previous/'manifest.json').read_bytes())
     verify(previous,prior['identity'])
+    if prior['identity'].get('kind')!='relational-human-policy-q-v1':
+        raise ValueError('Expected the initial human warmstart artifact, not another continuation')
     old_config=prior['identity']['config']
     histories,all_rows,data=human_examples(args.corpus)
     _,old_rows,_=human_examples(args.corpus,old_config['positions'],old_config['seed'])
@@ -92,7 +95,7 @@ def fit(args):
                 progress=lambda completed,total:progress('training',completed,total))
     validation=epoch(model,histories,rows['validation'],args,
                      progress=lambda completed,total:progress('validation',completed,total))
-    if source!=source_identity(('relational_stratified.py','relational_warmstart.py','relational_data.py','human_corpus.py')):
+    if source!=source_identity(('relational_stratified.py','relational_warmstart.py','relational_data.py','human_corpus.py','corpus_warmstart.py')):
         raise ValueError('Stratified source or native library changed')
     if digest(Path(args.corpus)/'manifest.json')!=data['manifest_sha256'] or digest(Path(args.corpus)/'games.jsonl')!=data['histories_sha256']:
         raise ValueError('Human corpus changed during fitting')
