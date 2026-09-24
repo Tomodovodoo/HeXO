@@ -207,6 +207,14 @@ python arena.py --opponent orca --orca-source ../orca-reference --orca-sims 200 
 
 This requires PyTorch. The adapter strictly loads the checkout's seven-channel `orca/checkpoint.pt` without adding random weights. Use `--orca-checkpoint` to select another compatible checkpoint and `--orca-device cuda` for GPU inference. The report records source revision, checkpoint hash, simulation budget and actual turn times. Orca receives simulations per placement; our engine receives milliseconds per complete turn. This comparison does not use equal time budgets. Native rules validate every returned move, and replay disagreements remain invalid games rather than wins.
 
+The optional [learned Strix adapter](tools/strix_learned/README.md) loads the
+pinned public `checkpoint_000010.pt` safetensors artifact and runs direct
+relational graph inference plus Gumbel MCTS in a persistent CPU process.
+Use `--opponent strix --strix-model PATH` after its separate build. Reports
+identify the model, source patch, executable and actual timings. This public
+step-10 model is not the private Pulsatrix checkpoint; its checkpoint license
+is unknown. Its simulation budget is not an equal-time match against native PVS.
+
 ## Correctness tests and local benchmarks
 
 Build the native library with the CMake commands above, then run:

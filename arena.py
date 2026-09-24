@@ -43,23 +43,31 @@ def wilson(wins, games):
 
 def run(args):
     probe = None
+    learned = None
     if getattr(args, "strix_root_ms", 0):
         from strix_root import StrixRoot
         probe = StrixRoot(args.strix_root_ms, args.ms, nodes=args.strix_root_nodes,
                           depth=args.strix_root_depth, wide=args.strix_root_wide)
     try:
+        if args.opponent == "strix":
+            from tools.strix_learned_adapter import StrixLearned
+            learned = StrixLearned(args.strix_model, args.strix_sims, args.strix_actions,
+                                   args.strix_timeout_ms, args.seed)
+            learned.warm_up()
         if probe:
             probe.warm_up()
-        return run_matches(args, probe)
+        return run_matches(args, probe, learned)
     finally:
         if probe:
             probe.close()
+        if learned:
+            learned.close()
 
 
-def run_matches(args, probe=None):
+def run_matches(args, probe=None, learned=None):
     rng = random.Random(args.seed)
-    opponent = Seal() if args.opponent == "seal" else None
-    opponent_metadata = None
+    opponent = learned or (Seal() if args.opponent == "seal" else None)
+    opponent_metadata = learned.metadata if learned else None
     if args.opponent == "orca":
         from tools.orca_adapter import Orca
         opponent = Orca(args.orca_source, args.orca_checkpoint, args.orca_sims,
@@ -106,6 +114,7 @@ def run_matches(args, probe=None):
         our_color = index % 2
         timings = [[], []]
         searches = []
+        opponent_searches = []
         reason = "truncated"
         error = None
         while game.winner < 0 and len(game.cells) < args.max_stones:
@@ -130,6 +139,8 @@ def run_matches(args, probe=None):
                     moves = search["moves"]
                 elif opponent:
                     moves = opponent(game, args.ms)
+                    if learned:
+                        opponent_searches.append(learned.last_result)
                 elif args.opponent == "shallow":
                     game.load_table([0]*729)
                     moves = game.search(args.ms, depth=1, width=args.width)["moves"]
@@ -159,13 +170,15 @@ def run_matches(args, probe=None):
                 if game.winner < 0 and game.player == side:
                     raise ValueError("Opponent did not complete its turn")
             except (ValueError, RuntimeError) as exc:
+                if learned and side != our_color and learned.last_result:
+                    opponent_searches.append(learned.last_result)
                 reason, error = "invalid", str(exc)
                 break
         if game.winner >= 0:
             reason = "six-in-a-row"
         record = {"index": index, "our_color": our_color, "winner": game.winner,
                   "reason": reason, "error": error, "cells": game.cells, "time_ms": timings,
-                  "searches": searches}
+                  "searches": searches, "opponent_searches": opponent_searches}
         games.append(record)
         completed = [g for g in games if g["reason"] == "six-in-a-row"]
         wins = sum(g["winner"] == g["our_color"] for g in completed)
@@ -195,7 +208,11 @@ def run_matches(args, probe=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--opponent", choices=["seal", "orca", "shallow", "random"], default="shallow")
+    parser.add_argument("--opponent", choices=["seal", "orca", "strix", "shallow", "random"], default="shallow")
+    parser.add_argument("--strix-model", help="Pinned public Strix safetensors checkpoint")
+    parser.add_argument("--strix-sims", type=int, default=8, help="Gumbel MCTS simulations per placement; not equal wall time")
+    parser.add_argument("--strix-actions", type=int, default=4)
+    parser.add_argument("--strix-timeout-ms", type=int, default=5000, help="Safety deadline for one complete Strix turn")
     parser.add_argument("--orca-source", help="External hexbot-building-framework checkout")
     parser.add_argument("--orca-checkpoint", help="Defaults to orca/checkpoint.pt within --orca-source")
     parser.add_argument("--orca-sims", type=int, default=200, help="MCTS simulations per placement, not a time budget")
@@ -234,4 +251,8 @@ if __name__ == "__main__":
         parser.error("--checkpoint requires --run")
     if args.opponent == "orca" and (not args.orca_source or args.orca_sims < 1):
         parser.error("Orca requires --orca-source and positive --orca-sims")
+    if args.opponent == "strix" and (not args.strix_model or args.max_stones > 800
+            or not 1 <= args.strix_sims <= 100000 or not 1 <= args.strix_actions <= 1024
+            or not 1 <= args.strix_timeout_ms <= 600000):
+        parser.error("Strix requires --strix-model, max-stones<=800, simulations1..100000, actions1..1024 and timeout1..600000ms")
     run(args)
