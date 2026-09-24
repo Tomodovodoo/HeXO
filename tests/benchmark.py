@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import platform
 import random
 import statistics
@@ -62,7 +63,12 @@ def pair_admission(args):
         searches = record["searches"]
         if not searches:
             continue
-        loss = next((i for i, s in enumerate(searches) if s["score"] <= -10000000), len(searches)-1)
+        # Reference-selected turns have no numeric evaluation. They cannot
+        # identify a native forced-loss transition; retain the existing final
+        # search fallback when no scored loss was recorded.
+        loss = next((i for i, s in enumerate(searches)
+                     if isinstance(score := s.get("score"), (int, float))
+                     and math.isfinite(score) and score <= -10000000), len(searches)-1)
         selected = searches[max(0, loss-2)]
         first = selected["moves"][0]
         count = next(i for i, cell in enumerate(record["cells"]) if cell[:2] == first)

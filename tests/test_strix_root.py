@@ -1,8 +1,13 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from hexo import Game
 from strix_root import StrixRoot
+from tests.benchmark import pair_admission
 
 MOVES = [(0,0),(0,3),(1,3),(1,0),(2,0),(3,3),(4,3),(3,0),(4,0),(5,3),(6,3)]
 
@@ -108,6 +113,22 @@ class StrixRootTests(unittest.TestCase):
         self.assertEqual(probe.counts["skipped"], 1)
         self.assertEqual(probe.counts["calls"], 0)
         self.assertTrue(result["strix"]["overrun"])
+
+    def test_pair_admission_accepts_unscored_reference_trace(self):
+        game = self.position(MOVES+[(5,0)])
+        cells = game.cells
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory)/"trace.json"
+            args = SimpleNamespace(trace=str(trace), reference_report=None, seal_library=None,
+                first_game=0, reference_ms=1, reference_width=4, width=4, root_seconds=6,
+                root_turns=8, repeats=1, ms=1, positions=1)
+            for score_field in ({"score": None}, {}):
+                selected = dict(moves=[[5,3],[6,3]], source="strix_reference", **score_field)
+                trace.write_text(json.dumps(dict(games=[dict(index=0, winner=0, our_color=1,
+                    cells=cells, searches=[selected])])), encoding="utf-8")
+                result = pair_admission(args)
+                self.assertEqual(len(result["samples"]), 1)
+                self.assertEqual(result["samples"][0]["recorded"], selected)
 
 
 if __name__ == "__main__":
