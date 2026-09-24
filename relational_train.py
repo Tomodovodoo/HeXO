@@ -45,12 +45,14 @@ def precision(device):
 
 def source_identity(extra=()):
     files = ('relational_train.py', 'relational_encoder.py', 'relational_model.py',
-             'klent.py', 'hexo.py', 'train.py') + tuple(extra)
-    return dict(engine_sha256=digest(library), sources={name: digest(ROOT/name) for name in files})
+             'relational_native.py', 'klent.py', 'hexo.py', 'train.py') + tuple(extra)
+    from relational_native import _load
+    return dict(engine_sha256=digest(library), graph_engine_sha256=digest(Path(_load()._name)),
+                sources={name: digest(ROOT/name) for name in files})
 
 
 def graph(history, model, args=None):
-    from relational_encoder import encode
+    from relational_native import encode
     budgets = dict(max_nodes=args.max_nodes, max_edges=args.max_edges) if args else {}
     return encode(history, global_tokens=model.config.global_tokens, **budgets)
 

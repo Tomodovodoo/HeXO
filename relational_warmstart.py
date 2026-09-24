@@ -14,9 +14,10 @@ import torch
 from klent import digest, publish, segmented_log_softmax
 from relational_data import human_examples
 from relational_train import graph, outputs, save_model, source_identity, work_batches
+from train import write_json
 
 
-def epoch(model, histories, rows, args, optimizer=None, seed=0):
+def epoch(model, histories, rows, args, optimizer=None, seed=0, progress=None):
     model.train(optimizer is not None)
     order = np.random.default_rng(seed).permutation(len(rows)) if optimizer else np.arange(len(rows))
     totals = np.zeros(4)
@@ -49,6 +50,7 @@ def epoch(model, histories, rows, args, optimizer=None, seed=0):
         if optimizer:
             torch.nn.utils.clip_grad_norm_(model.parameters(),args.grad_clip,error_if_nonfinite=True)
             optimizer.step()
+        if progress:progress(min(start+args.batch,len(rows)),len(rows))
     return dict(policy_ce=totals[0]/len(rows),q_mse=totals[1]/len(rows),
                 policy_accuracy=totals[2]/len(rows),chosen_q_sign_accuracy=totals[3]/len(rows))
 
@@ -73,8 +75,16 @@ def fit(args, config=None):
     with tempfile.TemporaryDirectory(dir=output.parent,prefix='relational-fit-') as temporary:
         temporary=Path(temporary)
         for number in range(1,args.epochs+1):
-            train=epoch(model,histories,rows['train'],args,optimizer,args.seed+number)
-            validation=epoch(model,histories,rows['validation'],args)
+            last=[0.,None]
+            def progress(stage,completed,total):
+                if stage!=last[1] or time.monotonic()-last[0]>.5 or completed==total:
+                    write_json(output.with_suffix('.status.json'),dict(stage=stage,epoch=number,epochs=args.epochs,
+                               completed=completed,total=total,seconds=time.perf_counter()-started))
+                    last[:]=[time.monotonic(),stage]
+            train=epoch(model,histories,rows['train'],args,optimizer,args.seed+number,
+                        lambda completed,total:progress('training',completed,total))
+            validation=epoch(model,histories,rows['validation'],args,
+                             progress=lambda completed,total:progress('validation',completed,total))
             metric=dict(epoch=number,train=train,validation=validation)
             metrics.append(metric)
             score=validation['policy_ce']+validation['q_mse']
@@ -99,6 +109,7 @@ def fit(args, config=None):
             shutil.copy2(temporary/'optimizer.pt',stage/'optimizer.pt')
             (stage/'report.json').write_text(json.dumps(report,indent=2))
         publish(output,identity,writer,report)
+        write_json(output.with_suffix('.status.json'),dict(stage='finished',**report))
     return report
 
 
