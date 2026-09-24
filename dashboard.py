@@ -26,6 +26,17 @@ def episode_counts(path, modified):
             "positions": sum(len(e["moves"]) for e in episodes)}
 
 
+@lru_cache(maxsize=64)
+def evaluation_openings(path, modified):
+    report = read_json(Path(path), {})
+    games = report.get('games', [])
+    return [dict(id=f"{report['candidate']}-{report['opponent']}-{game['pair']}",
+                 candidate=report['candidate'], opponent=report['opponent'],
+                 pair=game['pair'], seed=game['seed'], moves=game['opening'],
+                 games=[g['index'] for g in games if g['pair'] == game['pair']])
+            for game in games if game['index'] % 2 == 0]
+
+
 def bound_evaluation(run, checkpoint):
     model = run/"checkpoints"/f"{checkpoint:04d}"/"model.nnue"
     if not model.exists():
@@ -173,6 +184,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             payload = (Path(__file__).parent / "web/training.html").read_bytes()
             content_type = "text/html; charset=utf-8"
+        elif self.path == "/openings.js":
+            payload = (Path(__file__).parent / "web/openings.js").read_bytes()
+            content_type = "text/javascript; charset=utf-8"
         elif self.path == "/api/run":
             summary = self.run / "summary.json"
             events = self.run / "events.jsonl"
@@ -199,7 +213,9 @@ class Handler(BaseHTTPRequestHandler):
                             elo_interval=None, promoted=False, pending=True, loss=manifest.get('metrics')))
                 data = dict(kind='search', search=dict(name=self.run.name,
                     config=search_config, status=read_json(self.run/'status.json', {}),
-                    league=league), events=recent[-300:])
+                    league=league, openings=[opening
+                        for path in sorted((self.run/'evaluation').glob('*-vs-*/report.json'), reverse=True)
+                        for opening in evaluation_openings(str(path), path.stat().st_mtime_ns)]), events=recent[-300:])
             elif relational:
                 data = {"kind": "relational", "relational": relational, "summary": None, "events": []}
             elif not summary.exists():
