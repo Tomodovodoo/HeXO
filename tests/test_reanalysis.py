@@ -10,8 +10,8 @@ import numpy as np
 import torch
 
 from hexo import Game
-from nnue_model import NNUE, collate, objective
-from reanalysis import analyze, reconstruct, run, validate_history
+from nnue_model import NNUE, collate, load_replay, objective
+from reanalysis import analyze, external_replays, reconstruct, replay_inputs, run, validate_history
 
 
 def record():
@@ -98,6 +98,36 @@ class ReanalysisTest(unittest.TestCase):
                 second = run(args)
                 self.assertEqual(search.call_count, 1)
                 self.assertEqual(first["replay_sha256"], second["replay_sha256"])
+                trainer = SimpleNamespace(reanalysis=[str(args.output)], external_replay=external_replays([args.output]),
+                    replay_iterations=1, replay_positions=100, nnue_replay_centers=100000)
+                # External directory lies outside the trainer run; its filename
+                # must not evict the newest ordinary chronological shard.
+                training_run = Path(directory)/"training"
+                training_run.mkdir()
+                ordinary = [training_run/"0001.npz", training_run/"0002.npz"]
+                for path in ordinary:
+                    path.write_bytes((args.output/"replay.npz").read_bytes())
+                paths, metadata = replay_inputs(training_run, ordinary, trainer)
+                self.assertEqual(paths, [ordinary[-1], args.output/"replay.npz"])
+                self.assertEqual(metadata[0]["path"], "0002.npz")
+                self.assertTrue(metadata[1]["external"])
+                replay, count = load_replay(paths, trainer, 3)
+                self.assertEqual(count, 2*first["rows"])
+                self.assertEqual(len(replay["family"]), count)
+                manifest_path = args.output/"manifest.json"
+                original = manifest_path.read_text()
+                changed = json.loads(original)
+                changed["provenance"]["search"]["ms"] += 1
+                manifest_path.write_text(json.dumps(changed))
+                with self.assertRaisesRegex(ValueError, "changed since"):
+                    replay_inputs(training_run, ordinary, trainer)
+                manifest_path.write_text(original)
+                replay_path = args.output/"replay.npz"
+                replay_bytes = replay_path.read_bytes()
+                replay_path.write_bytes(replay_bytes+b"modified")
+                with self.assertRaisesRegex(ValueError, "hash changed"):
+                    external_replays([args.output])
+                replay_path.write_bytes(replay_bytes)
                 args.ms += 1
                 with self.assertRaisesRegex(ValueError, "provenance"):
                     run(args)

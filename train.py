@@ -429,11 +429,18 @@ def _run_training(args):
     for folder in ("checkpoints", "data", "matches"):
         (run / folder).mkdir(exist_ok=True)
     summary_path = run / "summary.json"
+    if getattr(args, "reanalysis", []):
+        if args.model != "nnue":
+            raise ValueError("--reanalysis requires --model nnue")
+        from reanalysis import external_replays
+        args.reanalysis = [str(Path(p).resolve()) for p in args.reanalysis]
+        args.external_replay = external_replays(args.reanalysis)
     config = {k: v for k, v in vars(args).items() if k not in ("iterations", "run")}
     source_files = [Path(__file__), ROOT / "learning_model.py", ROOT / "hexo.py"]
     if args.model == "nnue":
         source_files.append(ROOT / "nnue_model.py")
         source_files.append(ROOT / "src" / "nnue.hpp")
+        source_files.append(ROOT / "reanalysis.py")
     if args.curriculum == "mixed-v1":
         source_files.append(ROOT / "curriculum.py")
     if args.selfplay_backend == "gpu":
@@ -623,6 +630,8 @@ if __name__ == "__main__":
     parser.add_argument("--exploration", type=float, default=.1, help="Random legal candidate probability for GPU self-play")
     parser.add_argument("--lr", type=float, default=.002)
     parser.add_argument("--replay-iterations", type=int, default=8)
+    parser.add_argument("--reanalysis", nargs="+", default=[], metavar="DIRECTORY",
+                        help="Completed external NNUE reanalysis directories; retained outside the chronological replay window")
     parser.add_argument("--replay-positions", type=int, default=250000, help="Maximum uniformly sampled replay positions; CUDA also reserves memory for training")
     parser.add_argument("--nnue-replay-centers", type=int, default=2000000, help="Bound NNUE replay by sparse center count")
     parser.add_argument("--nnue-batch-centers", type=int, default=32768, help="Split NNUE batches by center count as well as positions")

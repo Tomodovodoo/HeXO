@@ -225,7 +225,8 @@ def optimize_nnue(run, checkpoint, incumbent, replay_paths, args, progress, log)
         raise RuntimeError("CUDA requested but unavailable")
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
-    paths = replay_paths[-args.replay_iterations:]
+    from reanalysis import replay_inputs
+    paths, replay_metadata = replay_inputs(run, replay_paths, args)
     replay, available = load_replay(paths, args, args.seed+checkpoint)
     train_ids = np.flatnonzero(replay["family"] % 5 != 0)
     val_ids = np.flatnonzero(replay["family"] % 5 == 0)
@@ -296,4 +297,4 @@ def optimize_nnue(run, checkpoint, incumbent, replay_paths, args, progress, log)
             "loss": best_metrics, "selected_epoch": best_metrics["epoch"],
             "selection": "validation" if len(val_ids) else "training-only",
             "training_seconds": time.perf_counter()-started, "model_sha256": digest,
-            "replay": [{"path": str(p.relative_to(run)), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in paths]}
+            "replay": replay_metadata}

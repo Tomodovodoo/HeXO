@@ -78,6 +78,86 @@ def save_npz(path, data):
     os.replace(temporary, path)
 
 
+def external_replays(directories):
+    """Validate completed shards and return the immutable trainer input snapshot."""
+    result = []
+    for directory in directories:
+        directory = Path(directory).resolve()
+        manifest_path = directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        provenance = manifest["provenance"]
+        if manifest.get("status") != "finished" or provenance.get("schema") != 1 or manifest.get("replay") != "replay.npz":
+            raise ValueError(f"Reanalysis shard is not completed schema 1: {directory}")
+        for key in ("history_sha256", "model_sha256", "engine_sha256"):
+            value = provenance.get(key, "")
+            if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                raise ValueError(f"Missing reanalysis provenance: {key}")
+        if not provenance.get("sources") or not provenance.get("search") or not provenance.get("target_semantics"):
+            raise ValueError("Incomplete reanalysis source/search provenance")
+        for value in provenance["sources"].values():
+            if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                raise ValueError("Malformed reanalysis source hash")
+        if any(provenance["search"].get(key, 0) < 1 for key in ("ms", "width", "depth", "policy_candidates")):
+            raise ValueError("Malformed reanalysis search budget")
+        if len(manifest["completed"]) != len(provenance["positions"]):
+            raise ValueError("Reanalysis manifest has unfinished positions")
+        path = directory / "replay.npz"
+        sha = digest(path)
+        if sha != manifest["replay_sha256"]:
+            raise ValueError(f"Reanalysis replay hash changed: {path}")
+        with np.load(path, allow_pickle=False) as data:
+            if data["nnue_schema"].tolist() != [1]:
+                raise ValueError("Reanalysis requires NNUE replay schema 1")
+            n = len(data["family"])
+            if not n or n != manifest["rows"]:
+                raise ValueError("Reanalysis row count disagrees with manifest")
+            for offsets, key in (("center_offsets", "centers"), ("candidate_offsets", "candidate_codes")):
+                values = data[offsets]
+                if values.shape != (n+1,) or values[0] != 0 or values[-1] != len(data[key]) or np.any(np.diff(values) <= 0):
+                    raise ValueError(f"Malformed reanalysis {offsets}")
+            for key, width in (("centers", 3), ("candidate_codes", 3), ("pairs", 4), ("candidate_coords", 2)):
+                if data[key].ndim != 2 or data[key].shape[1] != width:
+                    raise ValueError(f"Malformed reanalysis {key}")
+            for key in ("centers", "candidate_codes"):
+                if data[key].dtype.kind not in "iu" or np.any(data[key] < 0) or np.any(data[key] >= 3**11):
+                    raise ValueError(f"Invalid reanalysis centered-line codes: {key}")
+            for key in ("pairs", "candidate_coords"):
+                if len(data[key]) != len(data["candidate_codes"]):
+                    raise ValueError("Mismatched reanalysis candidate arrays")
+            for key in ("player", "baseline", "chosen", "search", "search_valid", "policy_valid", "ply", "search_depth", "search_ms", "outcome"):
+                if data[key].shape != (n,):
+                    raise ValueError(f"Malformed reanalysis {key}")
+            if data["phase"].shape != (n, 4) or np.any(data["chosen"] < 0) or np.any(data["chosen"] >= np.diff(data["candidate_offsets"])):
+                raise ValueError("Malformed reanalysis phase or teacher choice")
+            for key in ("phase", "baseline", "pairs", "search", "search_ms"):
+                if not np.isfinite(data[key]).all():
+                    raise ValueError(f"Nonfinite reanalysis {key}")
+            if not np.isin(data["player"], [0, 1]).all() or np.any(np.abs(data["search"]) > 1):
+                raise ValueError("Invalid reanalysis player or value target")
+            if np.any(~np.isnan(data["outcome"]) & ~np.isin(data["outcome"], [-1, 1])):
+                raise ValueError("Invalid reanalysis outcome")
+            recorded_rows = [(row["ply"], item["family"]) for item in manifest["completed"] for row in item["rows"]]
+            if recorded_rows != list(zip(data["ply"].tolist(), data["family"].tolist())):
+                raise ValueError("Replay geometry provenance disagrees with manifest")
+        result.append({"path": str(path), "sha256": sha, "manifest": str(manifest_path),
+                       "manifest_sha256": digest(manifest_path), "provenance": provenance})
+    if len({x["path"] for x in result}) != len(result):
+        raise ValueError("Duplicate reanalysis shard")
+    return result
+
+
+def replay_inputs(run, ordinary, args):
+    """Apply the chronological window only to self-play, then append external shards."""
+    paths = list(ordinary[-args.replay_iterations:])
+    metadata = [{"path": str(p.relative_to(run)), "sha256": digest(p)} for p in paths]
+    external = external_replays(getattr(args, "reanalysis", []))
+    if external != getattr(args, "external_replay", []):
+        raise ValueError("External reanalysis changed since run initialization")
+    paths.extend(Path(item["path"]) for item in external)
+    metadata.extend({"external": True, **item} for item in external)
+    return paths, metadata
+
+
 def run(args):
     source = args.run.resolve()
     output = args.output.resolve()
