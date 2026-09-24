@@ -18,6 +18,7 @@ from klent import (digest, improved_policy, load_corpus, publish, save_corpus,
 from train import write_json
 
 MODEL_SCHEMA = 'hexo-relational-policy-q-v1'
+VALUE_SCHEMA = 'hexo-relational-policy-value-v1'
 
 
 def load_model(path, device='cpu', *, expected_sha256=None):
@@ -26,8 +27,10 @@ def load_model(path, device='cpu', *, expected_sha256=None):
     if expected_sha256 is not None and hashlib.sha256(source).hexdigest() != expected_sha256:
         raise ValueError('Relational checkpoint changed before loading')
     payload = torch.load(io.BytesIO(source), map_location=device, weights_only=True)
-    if payload.get('schema') != MODEL_SCHEMA:
-        raise ValueError('Expected a relational policy/Q checkpoint, not NNUE weights')
+    if payload.get('schema') not in (MODEL_SCHEMA, VALUE_SCHEMA):
+        raise ValueError('Expected a relational checkpoint, not NNUE weights')
+    if (payload['config'].get('head', 'q') == 'value') != (payload['schema'] == VALUE_SCHEMA):
+        raise ValueError('Checkpoint head and schema disagree')
     model = RelationalNet(ModelConfig(**payload['config'])).to(device)
     model.load_state_dict(payload['state'], strict=True)
     if any(not torch.isfinite(p).all() for p in model.parameters()):
@@ -36,7 +39,8 @@ def load_model(path, device='cpu', *, expected_sha256=None):
 
 
 def save_model(path, model):
-    torch.save(dict(schema=MODEL_SCHEMA, config=asdict(model.config), state=model.state_dict()), path)
+    schema = VALUE_SCHEMA if model.config.head == 'value' else MODEL_SCHEMA
+    torch.save(dict(schema=schema, config=asdict(model.config), state=model.state_dict()), path)
 
 
 def precision(device):
@@ -221,6 +225,8 @@ def main(args):
                     model.critic[-1].weight.zero_()
                     model.critic[-1].bias.zero_()
             completed = 0
+        if model.config.head != 'q':
+            raise ValueError('Policy/value checkpoints require search_train.py, not KLENT targets')
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         if existing:
             optimizer.load_state_dict(torch.load(latest/'optimizer.pt', map_location=args.device, weights_only=True))
