@@ -157,16 +157,40 @@ class Adapter:
             game.close()
 
 
-def server(adapter, port=8767):
+def server(adapter, port=8790, *, read_timeout=2):
     """Create a loopback-only HTTP server; caller owns serve_forever/shutdown."""
+    if not math.isfinite(read_timeout) or read_timeout <= 0:
+        raise ValueError("Read timeout must be finite and positive")
+
     class Handler(BaseHTTPRequestHandler):
+        timeout = read_timeout
+
         def respond(self, status, body):
             payload = json.dumps(body, allow_nan=False).encode()
-            self.send_response(status)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            try:
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except OSError:
+                # A disconnected/expired client must not interrupt the server.
+                self.close_connection = True
+
+        def read_body(self, length):
+            # Absolute body deadline also bounds a client that dribbles bytes.
+            deadline, body = perf_counter()+read_timeout, bytearray()
+            while len(body) < length:
+                remaining = deadline-perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError("Request body read timed out")
+                self.connection.settimeout(remaining)
+                chunk = self.rfile.read1(min(65536, length-len(body)))
+                if not chunk:
+                    raise APIError("Request body ended before Content-Length")
+                body.extend(chunk)
+            self.connection.settimeout(read_timeout)
+            return body
 
         def do_GET(self):
             if self.path == '/capabilities.json':
@@ -184,11 +208,14 @@ def server(adapter, port=8767):
                     raise APIError('Request exceeds the local body limit', 413)
                 if self.headers.get_content_type() != 'application/json':
                     raise APIError('Content-Type must be application/json', 415)
-                data = json.loads(self.rfile.read(length))
+                data = json.loads(self.read_body(length))
                 self.respond(200, adapter.turn(data))
+            except TimeoutError:
+                self.close_connection = True
+                self.respond(408, {'error': 'Request body read timed out'})
             except APIError as exc:
                 self.respond(exc.status, {'error': str(exc)})
-            except (ValueError, UnicodeError) as exc:
+            except (ValueError, UnicodeError, RecursionError) as exc:
                 self.respond(400, {'error': str(exc)})
 
     return HTTPServer(('127.0.0.1', port), Handler)
@@ -196,7 +223,7 @@ def server(adapter, port=8767):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--port', type=int, default=8767)
+    parser.add_argument('--port', type=int, default=8790)
     parser.add_argument('--ms', type=int, default=100)
     parser.add_argument('--width', type=int, default=16)
     parser.add_argument('--depth', type=int, default=12)

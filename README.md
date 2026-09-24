@@ -294,7 +294,7 @@ kept intact. Python callers can use `loads(text)` and `dumps(record_or_history)`
 ```sh
 python notation.py import match.txt > match.json
 python notation.py export match.json > match-roundtrip.txt
-python bot_api.py --port 8767 --ms 100
+python bot_api.py --port 8790 --ms 100
 ```
 
 The loopback HTTP adapter exposes `GET /capabilities.json` and
@@ -323,3 +323,6 @@ bodies and 1,025 board cells; notation accepts 4,097 placements and 1 MiB text.
 search and reconstruction cannot guarantee a hard response deadline, so
 `move_time_limit` is false. Websocket and matchmaking capabilities are not declared.
 Run `python -m unittest tests.test_notation_api -v` for the protocol checks.
+
+The local adapter bounds idle socket reads and request-body transfer to two seconds.
+These transport limits are separate from its advisory search budget.

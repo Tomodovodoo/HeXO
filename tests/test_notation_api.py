@@ -1,5 +1,6 @@
 import json
 import random
+import socket
 import threading
 import time
 import unittest
@@ -136,6 +137,25 @@ class OfficialAPI(unittest.TestCase):
         with self.assertRaises(APIError) as caught:
             adapter.turn({'board':board(history)})
         self.assertEqual(caught.exception.status, 409)
+
+    def test_incomplete_body_times_out_and_server_recovers(self):
+        httpd = server(Adapter(ms=1, width=4), port=0, read_timeout=.1)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        client = socket.create_connection(httpd.server_address, timeout=2)
+        try:
+            client.sendall(b'POST /stateless/v1-alpha/turn HTTP/1.0\r\n'
+                           b'Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{')
+            # Keep the incomplete sender connected while requesting another route.
+            root = f'http://127.0.0.1:{httpd.server_port}'
+            with urlopen(root+'/capabilities.json', timeout=2) as response:
+                self.assertEqual(response.status, 200)
+            self.assertIn(b'408', client.recv(4096).split(b'\r\n', 1)[0])
+        finally:
+            client.close()
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join()
 
     def test_local_http_routes_and_errors(self):
         httpd = server(Adapter(ms=1, width=4), port=0)
