@@ -16,6 +16,91 @@ class Uniform:
         return out
 
 class NeuralTree(unittest.TestCase):
+    def test_verified_pending_turn_and_rejected_certificate(self):
+        from tactical_proof import NativeTactics
+        try:
+            solver = NativeTactics()
+        except FileNotFoundError:
+            self.skipTest('Build tools/tactical with tools/build_tactical.py first')
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        cert = dict(version=1, width='wide', root=0,
+                    nodes=[dict(kind='immediate_win', action=[[-1,0],[4,0]])])
+        search = NeuralSearch(Uniform(), 'verified-turn', history, proof_solver=solver, proof_ms=1000)
+        self.addCleanup(search.close)
+        self.assertTrue(native.hxg_begin(search.ptr, 8, 4))
+        request, pending_history = search.request()
+        bad = dict(version=1, width='wide', root=0,
+                   nodes=[dict(kind='immediate_win', action=[[8,0],[9,0]])])
+        self.assertFalse(search.fulfill_proof(request, pending_history, bad))
+        self.assertEqual(native.hxg_exact(search.ptr), -1)
+        changed = [list(p) for p in pending_history]
+        changed[8] = [8,4]
+        with self.assertRaisesRegex(ValueError, 'Proof history mismatch'):
+            search.fulfill_proof(request, changed, cert)
+        self.assertTrue(search.fulfill_proof(request, pending_history, cert))
+        # The second certified placement survives tree advancement even if
+        # later proof work is unavailable.
+        search.proof_solver = None
+        result = search.search(8)
+        self.assertEqual(result['action'], [-1,0])
+        self.assertEqual(result['exact_winner'], 0)
+        search.advance(result['action'])
+        result = search.search(8)
+        self.assertEqual(result['action'], [4,0])
+        self.assertEqual(result['exact_winner'], 0)
+        search.advance(result['action'])
+        game = Game(search.history)
+        self.assertEqual(game.winner, 0)
+        game.close()
+
+    def test_exact_defense_preserves_a_complete_turn(self):
+        history = [[0,0],[1,5],[3,3],[-2,2],[-1,1],[2,4],[0,6]]
+        good = [[-2,8],[-1,7],[4,2],[5,1]]
+        from proof import _completions
+        for seed in range(4):
+            search = NeuralSearch(Uniform(), 'exact-defense', history, seed, tactics=True)
+            self.addCleanup(search.close)
+            result = search.search(8, root_samples=8)
+            self.assertIn(result['action'], good)
+            self.assertEqual(result['exact_winner'], -1)
+            self.assertEqual(result['proof_status'], 'UNKNOWN')
+            game = Game(history)
+            self.assertEqual(result['actions'].tolist(), [list(p) for p in game.legal_moves()])
+            game.close()
+            self.assertEqual([a for a,p in zip(result['actions'].tolist(),result['policy']) if p>0], good)
+            search.advance(result['action'])
+            result = search.search(8, root_samples=8)
+            search.advance(result['action'])
+            game = Game(search.history)
+            cells = {(q,r):p for q,r,p in game.cells}
+            self.assertFalse(_completions(cells, 1, 2, lambda: None))
+            game.close()
+
+    def test_exact_loss_and_counterwin_keep_absolute_winner(self):
+        history = [[0,0],[1,5],[3,3],[-2,2],[-1,1],[2,4],[0,6],[1,-1]]
+        search = NeuralSearch(Uniform(), 'exact-loss', history, tactics=True)
+        self.addCleanup(search.close)
+        result = search.search(8)
+        self.assertEqual(result['exact_winner'], 1)
+        self.assertEqual(result['proof_status'], 'PROVEN_LOSS')
+        self.assertTrue(np.all(result['values'] == -1))
+        self.assertEqual(len(result['actions']), 372)
+        # A current-player completion takes precedence over mandatory defense.
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]]
+        search = NeuralSearch(Uniform(), 'exact-win', history, tactics=True)
+        self.addCleanup(search.close)
+        result = search.search(8)
+        self.assertEqual(result['exact_winner'], 0)
+        self.assertEqual(result['proof_status'], 'PROVEN_WIN')
+        search.advance(result['action'])
+        game = Game(search.history)
+        if game.winner < 0:
+            game.close()
+            search.advance(search.search(8)['action'])
+            game = Game(search.history)
+        self.assertEqual(game.winner, 0)
+        game.close()
+
     def searcher(self, history=(), seed=7, evaluator=None):
         search = NeuralSearch(evaluator or Uniform(), 'test-v1', history, seed)
         self.addCleanup(search.close)
