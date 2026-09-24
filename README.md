@@ -1,5 +1,20 @@
 # HeXO
 
+## Native verified tactical strategies
+
+The optional `tactical_proof.NativeTactics` library runs wide Strix IDTT followed by PDS-PN at pinned revision `5a771e572553a8bd8e010112b2ce65f16e5afa1b`. IDTT principal variations are only hints. An exact positive requires a complete PDS-PN strategy DAG accepted by a separate raw-coordinate Rust checker. `independent_verify` also rechecks the exported strategy through the independent Python rules implementation.
+
+```sh
+python tools/build_tactical.py
+python -m unittest tests.test_tactical_proof -v
+```
+
+This needs Rust/Cargo supporting edition 2024 and uses locked dependencies. The build manifest binds the native binary to its wrapper sources and Cargo lockfile. `NativeTactics().solve(game, ms=100)` returns `PROVEN_WIN` with `native_verified=true` and the complete current turn only after verification; unresolved searches return `UNKNOWN`, never a global loss. Partial-turn roots are supported. The exact board, player, remaining placements, fixed rules and verifier scope identify cached facts; neural model evaluations and visit counts are not stored here.
+
+The initial verified subset handles attacker quiet builders but requires every defender obligation to consume both placements. Singleton covers with a free second placement and entirely quiet defender nodes are explicitly unsupported. Extending certificates to every legal free placement remains required work. A legal open-three fixture yields a 1,295-node wide-search strategy accepted by both checkers, whereas tight IDTT finds no forcing win. On the development host, a fresh verified proof took about 0.7 seconds and cached re-verification about 18 ms; this is a tactical correctness result, not a strength result.
+
+Upstream certificate reconstruction does not honor its search deadline. One persistent native worker bounds how long callers wait and rejects overlapping requests as `UNKNOWN`; it may finish work after the caller times out. Reports expose background-worker state, completed-late counts, elapsed worker time and Windows thread CPU time. These are **not equal-compute tournament clocks**. Late or partial certificates never become exact search values. Primary neural MCTS integration and complete free-filler proof support are still separate outstanding tasks.
+
 C++20 Hexo rules and search engine, Python interface, and local browser game.
 
 The current priority is a self-play learning loop with a local experiment dashboard. Checkpoints earn promotion through matches against frozen opponents; fitting loss alone never replaces the incumbent.
