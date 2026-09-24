@@ -64,6 +64,13 @@ class NNUE(nn.Module):
         pool = torch.where(player[:, None] == 0, pool, pool[:, self.perspective])
         return torch.cat((pool, phase), 1)
 
+    def position_features(self, batch):
+        """Value inputs without encoding or embedding policy candidates."""
+        centers = batch["centers"]
+        embedded = self.embeddings(torch.cat((centers.flatten(), centers.new_zeros(1))))
+        return self.position_inputs(embedded[:-1].reshape(-1, 3, 32), batch["center_owner"],
+                                    batch["center_counts"], batch["phase"], batch["player"], embedded[-1])
+
     def features(self, batch):
         """Shared position/candidate features; support padded or flat ragged actions."""
         centers = batch["centers"]
