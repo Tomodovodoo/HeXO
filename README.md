@@ -380,3 +380,14 @@ The trace benchmark's ordered and resulting-position recall measure the complete
 figures do not claim that a turn was searched within the budget. The report records
 generation time, completed depth, and zero-depth trials separately. Reused reference
 reports must match both the trace hash and the exact position history.
+
+Experimental TT turn admission is available through
+`Game.search(..., tt_injection=True)` and `arena.py --tt-injection`.
+The arena records the flag in its configuration and applies it only to the
+contender. It validates and reserves a previous-iteration complete turn before
+candidate truncation, preserving immediate wins and mandatory defenses. Hints
+are frozen throughout each iteration, including PVS re-searches; TT score-bound
+reuse is disabled in this mode. The table remains local to one search call,
+with no persistent entries or cross-model score reuse. The default remains off.
+A 12-position development benchmark showed identical depth-three results with
+4.6% more elapsed time; this experiment has no demonstrated playing-strength gain.
