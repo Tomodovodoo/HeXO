@@ -1,5 +1,6 @@
 """Persistent, isolated Strix IDTT reference. No result is a training label."""
 import json
+import hashlib
 import math
 from pathlib import Path
 import queue
@@ -76,9 +77,15 @@ class StrixReference:
         self.executable = str(executable or default)
         self.process = None
         self.reader = None
+        self.writer = None
+        self.executable_sha256 = None
         self.lock = threading.Lock()
 
     def _start(self):
+        digest = hashlib.sha256(Path(self.executable).read_bytes()).hexdigest()
+        if self.executable_sha256 is not None and digest != self.executable_sha256:
+            raise RuntimeError("reference executable changed across process restarts")
+        self.executable_sha256 = digest
         self.process = subprocess.Popen([self.executable], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -98,6 +105,9 @@ class StrixReference:
             if self.process.poll() is None:
                 self.process.kill()
             self.process.wait()
+            if self.writer is not None:
+                self.writer.join()
+                self.writer = None
             self.reader.join()
             self.process.stdin.close()
             self.process.stdout.close()
@@ -112,6 +122,8 @@ class StrixReference:
     def solve(self, stones, attacker, remaining, *, depth=8, nodes=100000,
               wide=False, timeout_s=1.0):
         stones = [list(stone) for stone in stones]
+        if len(stones) > 4096:
+            raise ValueError("reference adapter accepts at most 4096 stones")
         snapshot(stones, attacker, remaining)
         if type(depth) is not int or not 1 <= depth <= 255:
             raise ValueError("depth must be in 1..255")
@@ -121,6 +133,9 @@ class StrixReference:
             raise ValueError("invalid generator/timeout")
         request = dict(stones=stones, attacker=attacker, placements_remaining=remaining,
                        depth=depth, nodes=nodes, wide=wide)
+        message = json.dumps(request) + "\n"
+        if len(message.encode("utf-8")) > 512*1024:
+            raise ValueError("reference request exceeds 512 KiB")
         scope = dict(driver="idtt", generator="wide" if wide else "tight", attacker=attacker,
                      placements_remaining=remaining, depth_cap=depth, node_budget=nodes,
                      depth_convention="attacker turns including completing turn",
@@ -129,16 +144,34 @@ class StrixReference:
         unknown = dict(status="UNKNOWN", revision=REVISION, scope=scope,
                        independently_verified_proof=False, pv=[])
         with self.lock:
-            start = time.monotonic()
+            deadline = time.monotonic() + timeout_s
+            def remaining_time():
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                return remaining
             try:
                 if self.process is None:
                     self._start()
-                self.process.stdin.write(json.dumps(request) + "\n")
-                self.process.stdin.flush()
-                line = self.responses.get(timeout=max(0, timeout_s-(time.monotonic()-start)))
+                remaining_time()
+                process, responses = self.process, self.responses
+                def write():
+                    try:
+                        process.stdin.write(message)
+                        process.stdin.flush()
+                    except (OSError, ValueError):
+                        responses.put(None)
+                self.writer = threading.Thread(target=write, daemon=True)
+                self.writer.start()
+                self.writer.join(timeout=remaining_time())
+                remaining_time()
+                line = self.responses.get(timeout=remaining_time())
+                remaining_time()
                 if line is None:
                     raise RuntimeError("reference process exited")
                 response = json.loads(line)
+                if not isinstance(response, dict):
+                    raise RuntimeError("reference response must be an object")
                 if response.get("revision") != REVISION or response.get("scope") != scope:
                     raise RuntimeError("reference identity/scope mismatch")
                 if response["status"] not in ("UNKNOWN", "REFERENCE_WIN_WITHIN_SCOPE",
@@ -150,10 +183,13 @@ class StrixReference:
                     if not valid:
                         raise RuntimeError("returned principal variation failed sequential replay")
                     response["pv_replay_valid"] = True
+                remaining_time()
+                response["independently_verified_proof"] = False
+                response["executable_sha256"] = self.executable_sha256
                 return response
             except queue.Empty:
                 self.close()
-                return dict(unknown, reason="wall_timeout")
+                return dict(unknown, reason="wall_timeout", executable_sha256=self.executable_sha256)
             except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
                 self.close()
-                return dict(unknown, reason=str(error))
+                return dict(unknown, reason=str(error), executable_sha256=self.executable_sha256)

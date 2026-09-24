@@ -30,9 +30,16 @@ The process stays alive across successful queries. Each query gets a fresh
 solver state, so no negative result leaks between generator modes or budgets.
 Calls on one client serialize. Close the client when finished. A wall timeout
 kills and reaps the process, returns `UNKNOWN`, and starts a new process on the
-next call. The timeout covers solver startup/search/PV extraction, with normal
+next call. Transport runs in a worker thread. Absolute deadline checks discard
+late replies, including those already queued or delayed by PV validation.
+The timeout covers solver startup/search/PV extraction, with normal
 OS scheduling and cleanup overhead. IDTT does not expose a usable node counter;
 responses report `nodes: null` instead of claiming zero search work.
+Direct responses carry the executable SHA256 recorded before first launch.
+The client refuses to restart if those bytes change, so a replacement binary
+requires a new client and produces distinct provenance. Malformed non-object
+responses become `UNKNOWN`, and the client always sets the independent-proof
+flag to false itself.
 
 ## Result scope
 
@@ -61,7 +68,8 @@ the domain unrestricted. Principal-variation replay checks each placement in
 order, alternates players only after the declared phase expires, and stops on
 the first winning stone. A PV alone cannot verify all defensive branches.
 
-Input snapshots may be unreachable; they are not advertised as legal game
+The adapter limits requests to 4096 stones and 512 KiB. Input snapshots may be
+unreachable; they are not advertised as legal game
 histories. Duplicate stones, invalid players/phases, existing sixes, and
 coordinates outside ±2^30 are rejected. Strix's dense-grid spread/allocation
 guards may still return `UNKNOWN` for valid unbounded HeXO positions. The HeXO
@@ -82,7 +90,7 @@ invents winning labels nor treats game logs as independent puzzle snapshots.
 These public files are distinct from the unavailable 20-case ZIP quoted in the
 user's audit. No claim is made to have reproduced that audit.
 
-Local smoke run at depth 8, 10,000 nodes, and 0.5 seconds per snapshot:
+Local bounded interface check at depth 8, 10,000 nodes, and 0.5 seconds per snapshot:
 
 | Generator | Reference wins | Scoped negatives | Unknown |
 | --- | ---: | ---: | ---: |
@@ -91,5 +99,5 @@ Local smoke run at depth 8, 10,000 nodes, and 0.5 seconds per snapshot:
 
 All returned winning lines passed sequential replay. Wide mode spends its
 budget on more candidates, so this small-budget count is not a comparison of
-the generators' eventual completeness. Seven adapter tests pass. This is an
-interface smoke check, not a solver-strength or proof-soundness benchmark.
+the generators' eventual completeness. Ten adapter tests pass. This is a
+bounded interface check, not a solver-strength or proof-soundness benchmark.
