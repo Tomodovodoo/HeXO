@@ -9,6 +9,11 @@ from hexo import Game
 class Handler(BaseHTTPRequestHandler):
     game = Game()
     run = None
+    model = None
+    label = None
+
+    def state(self):
+        return {**self.game.state(), "opponent": self.label}
 
     def respond(self, status, data, content_type="application/json"):
         payload = data.encode() if isinstance(data, str) else json.dumps(data).encode()
@@ -22,7 +27,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             return self.respond(200, (Path(__file__).parent / "web" / "index.html").read_text(encoding="utf-8"), "text/html; charset=utf-8")
         if self.path == "/state":
-            return self.respond(200, self.game.state())
+            return self.respond(200, self.state())
         self.respond(404, {"error": "Not found"})
 
     def do_POST(self):
@@ -48,7 +53,9 @@ class Handler(BaseHTTPRequestHandler):
                 if type(ms) is not int or not 1 <= ms <= 30000:
                     raise ValueError("Think time must be 1..30000 ms")
                 checkpoint = None
-                if self.run is not None:
+                if self.model is not None:
+                    self.game.load_model(self.model)
+                elif self.run is not None:
                     summary = json.loads((self.run / "summary.json").read_text(encoding="utf-8"))
                     checkpoint = summary["incumbent"]
                     model = next(c for c in summary["checkpoints"] if c["id"] == checkpoint)
@@ -63,7 +70,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.game.play(q, r)
             else:
                 return self.respond(404, {"error": "Not found"})
-            self.respond(200, {**self.game.state(), "analysis": analysis})
+            self.respond(200, {**self.state(), "analysis": analysis})
         except (ValueError, KeyError, TypeError) as error:
             self.respond(400, {"error": str(error)})
 
@@ -71,8 +78,16 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--run", type=Path, help="Play against the latest promoted checkpoint in this run")
+    opponent = parser.add_mutually_exclusive_group()
+    opponent.add_argument("--run", type=Path, help="Play against the latest promoted checkpoint in this run")
+    opponent.add_argument("--model", type=Path, help="Play against a specific NNUE export, without claiming promotion")
+    parser.add_argument("--label", help="Visible opponent name")
     args = parser.parse_args()
     Handler.run = args.run.resolve() if args.run else None
+    Handler.model = args.model.resolve() if args.model else None
+    if Handler.model:
+        Handler.game.load_model(Handler.model)
+    Handler.label = args.label or (str(Handler.model) if Handler.model else
+                                  f"Promoted checkpoint from {Handler.run.name}" if Handler.run else "Native engine")
     print(f"HeXO is ready at http://127.0.0.1:{args.port}", flush=True)
     HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
