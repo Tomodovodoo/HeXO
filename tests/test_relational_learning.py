@@ -133,6 +133,27 @@ class RelationalLearningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'continued after terminal'):
             verify_terminal(moves[:-1],moves[-1],[99,99],1)
 
+    def test_zero_row_short_game_membership_remains_untrained(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)/'corpus';records=fixture(root)
+            short=copy.deepcopy(records[1]);short.update(split='train',family=103)
+            longer=copy.deepcopy(records[0])
+            longer['moves']=[[r,q] for q,r in longer['moves']]
+            longer.update(split='validation',family=100,content_sha256=history_digest(longer['moves']))
+            manifest=root/'manifest.json';metadata=json.loads(manifest.read_text())
+            metadata['minimum_ply']=11
+            metadata['shards'][0]['games'].append(short['content_sha256'])
+            metadata['shards'][0]['game_row_counts'].append(0)
+            metadata['shards'][1]['games']=[longer['content_sha256']]
+            manifest.write_text(json.dumps(metadata))
+            (root/'games.jsonl').write_text('\n'.join(json.dumps(r) for r in [records[0],short,longer]))
+            histories,rows,_=human_examples(root)
+            self.assertNotIn(short['content_sha256'],histories)
+            self.assertEqual({k:len(v) for k,v in rows.items()},{'train':1,'validation':1})
+            metadata['minimum_ply']=7;manifest.write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(ValueError,'Zero-row corpus game has eligible'):
+                human_examples(root)
+
     def test_frozen_capped_actor_full_legal_targets_and_one_fit_pass(self):
         model=RelationalNet(config())
         before={k:v.clone() for k,v in model.state_dict().items()}

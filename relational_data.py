@@ -29,9 +29,9 @@ def human_examples(directory, positions=0, seed=1729):
                 offset = 0
                 for game, count in zip(item['games'], item['game_row_counts'], strict=True):
                     values = np.unique(families[offset:offset+count])
-                    if count < 1 or len(values) != 1 or game in allowed:
+                    if count < 0 or (count and len(values) != 1) or game in allowed:
                         raise ValueError('Malformed or duplicate corpus game membership')
-                    allowed[game] = (split, int(values[0]))
+                    allowed[game] = (split, int(values[0]) if count else None)
                     offset += count
                 if offset != len(families):
                     raise ValueError('Corpus game row counts disagree with split shard')
@@ -52,9 +52,13 @@ def human_examples(directory, positions=0, seed=1729):
                 raise ValueError('Training history is absent from verified split membership')
             continue
         split, family = allowed.pop(key)
-        if record['split'] != split or record['family'] != family or digest(record['moves']) != key:
+        if record['split'] != split or (family is not None and record['family'] != family) or digest(record['moves']) != key:
             raise ValueError('History changed or disagrees with verified split membership')
         validate(record)
+        if family is None:
+            if len(record['moves'])>minimum:
+                raise ValueError('Zero-row corpus game has eligible positions')
+            continue
         histories[key] = record['moves']
         for ply in range(minimum, len(record['moves'])):
             result[split].append(dict(game=key, ply=ply, action=record['moves'][ply],
