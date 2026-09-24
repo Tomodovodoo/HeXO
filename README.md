@@ -492,6 +492,43 @@ including clients that keep sending bytes. Request-body transfer has a separate
 two-second deadline. These transport limits are separate from its advisory search
 budget. A configured model that disappears or becomes unreadable returns JSON 503.
 
+## Relational policy/Q training
+
+`relational_warmstart.py` initializes both heads of the primary relational model
+from full human histories. Geometry is rebuilt from chronological moves. Existing
+hashed corpus shard membership supplies the family split; NNUE features and
+weights are not transferred. Only the recorded action receives a Q target, using
+the actual terminal outcome from its mover's perspective. Human actions are
+imitation labels, not claims of optimal play. Test and excluded games never
+supply training or validation examples.
+
+```powershell
+python relational_warmstart.py --corpus artifacts/datasets/human-warmstart-v1 --output artifacts/models/relational-human --epochs 12 --device cuda
+python relational_train.py --run runs/relational-v1 --initial-model artifacts/models/relational-human/model.pt --games 256 --envs 8 --iterations 5 --max-plies 300 --device cuda
+```
+
+The default network uses width 256, eight blocks, eight attention heads, feed-forward
+width 1024 and sixteen global tokens. `--positions 0` uses all available human
+positions after the corpus family-prefix boundary; a positive value selects a
+seeded bounded sample. Graph microbatches are bounded by `--max-nodes` and
+`--max-edges`. A single position exceeding a budget raises an explicit error;
+legal actions are never cropped. CUDA uses BF16 matrix operations and FP32
+normalization, losses and return targets.
+
+KLENT collects each fresh corpus with frozen weights and fits it in exactly one
+shuffled pass. It uses the existing scalar policy/Q objective and signed lambda
+returns, including actual-player sign changes and explicit cap bootstrap. It
+neither mixes old replay into the fit nor distills an NNUE value/export. Proofs
+are not substituted for historical returns. New runs reset Adam; resuming an
+existing run restores its model and optimizer and verifies source, engine,
+initial model and previously consumed corpus hashes. A completed pending corpus
+is reused after an interrupted fit.
+
+`model.pt` contains schema `hexo-relational-policy-q-v1`, the complete model
+configuration and state dictionary, including Q. `relational_train.load_model`
+loads this format for the neural evaluator/player. Native NNUE loading is not a
+supported deployment path. Training metrics remain unrated until the neural
+player is measured against pinned independent opponents under stated budgets.
 KLENT's separate deployment-value pass reconstructs and validates the same full
 legal action ordering as the actor pass, retaining its row order and chunk
 boundaries, but skips candidate feature encoding and embedding. It trains only
@@ -501,3 +538,97 @@ identical losses, value-head parameters and Adam states in that experiment.
 This is a value-pass measurement, not an overall training or GPU speedup.
 Reproduce it with `python -m tests.benchmark_value --corpus <directory>
 --model <model.pt> --output <report.json>`.
+
+## Primary relational policy/Q model
+
+`relational_model.RelationalNet(ModelConfig())` implements the new primary
+representation: width 256, eight residual blocks, eight attention heads,
+feed-forward width 1,024, and 16 learned global tokens. It has **31,860,930
+trainable parameters**. Each block performs local relational attention, stone
+attention, global read/write attention, then local attention again. Legal-cell
+representations persist through every block. Policy and bounded scalar-Q heads
+return every legal action in native `Game.legal_moves()` order.
+
+The encoder shares stone/cell identity across every nonempty six-cell window.
+Window occupancy and incidence slots are tied under reversal; no absolute axis
+embedding is used. Radius-eight stone/cell links and local legal-cell neighbors
+retain geometry outside window coverage. Both the independent Python reference
+and the native accelerator preserve all 12 board symmetries. The native encoder
+is the explicit default of `NeuralEvaluator`; `backend="reference"` selects the
+reference implementation, and a missing native library does not silently fall
+back. Normal CMake builds include `hexo_graph`.
+
+Training calls `encode(history)`, `pack(graphs, device)`, and `model(batch)`.
+Outputs are flat FP32 `logits`, bounded FP32 `q`, and `action_offsets`.
+`NeuralEvaluator(model, device).evaluate(histories)` returns ordered action,
+logit, and Q arrays per position. Histories contain all placements, including
+the origin. Native rules determine side and remaining placements; terminal
+positions belong to the search implementation.
+
+Default work budgets are 12,000 nodes and 600,000 relation traversals per batch
+(local edges count twice). Whole graphs are batched in order; a single graph
+exceeding the configured budget raises `WorkBudgetError`, never truncates its
+actions. These are explicit resource limits, not game rules. Increase them only
+after checking memory. Edge chunks control temporary allocations; autograd still
+retains work proportional to edges times width. Block checkpointing, BF16
+projections, and FP32 normalization, softmax, reductions, and residuals keep the
+production model practical on the RTX 3070 Ti.
+
+The production model completed forward/backward/Adam on a 150-stone position
+with 6,166 nodes, 442,732 relation traversals, and all 3,938 legal outputs:
+2.045 seconds, 2,272 MiB peak allocated and 3,072 MiB peak reserved. The device
+reported 6,949 MiB free before the step; this was not a competing-load benchmark.
+These measurements establish executable capacity, not playing strength.
+`python -m tests.benchmark_relational --output <report.json>` reproduces the
+fixture and records configuration, source hashes, and memory measurements.
+Geometry, action indexing, 12 symmetries, batch isolation, native/reference
+parity, and checkpoint gradients are covered by `tests.test_relational`.
+Held-out prediction gains and superiority against independent bots remain to
+be established by training and external evaluation.
+
+### Shared relational action/value contract
+
+The model, collector and neural search consume chronological axial histories,
+replayed by the exact native rules. The resulting position is identified by
+`position_key`: SHA256 of sorted `(q, r, absolute_owner)` stones plus the native
+player to move and placements remaining. History order within an equivalent
+position is not a distinct neural state. Coordinates retain their actual values;
+this identity is not a symmetry-canonical cache key.
+
+`Graph.actions` contains **all** native legal coordinates as `int64[N, 2]`, in
+`Game.legal_moves()` order (lexicographic q, then r). `Graph.player` and
+`Graph.remaining` are authoritative native phase values. Packing preserves that
+order and supplies `action_owner[N]` and `action_offsets[B+1]`; offsets start at
+zero, end at N, and delimit each position's complete action set. Newly reachable
+second placements are encoded from the position after the first placement.
+
+The differentiable network returns finite FP32 `logits[N]`, bounded scalar
+`q[N]` in [-1, 1], and the same `action_offsets`. Each Q value uses the player to
+move's perspective. The inference adapter echoes `position_key`, `player`,
+`remaining`, aligned `actions`, and `model_version` for every record. Deployed
+`model_version` is the SHA256 of the exact loaded relational `model.pt` bytes.
+The loader validates those bytes before deserialization. No adapter may fall back
+to a native NNUE model, handwritten values, or reordered/truncated actions.
+
+Value constructions are deliberately distinct:
+
+- KLENT collection uses `mu = softmax((Q + beta * log(pi)) / (alpha + beta))`
+  and `V_mu = sum(mu * Q)` for frozen-actor return bootstraps.
+- Neural search uses the network prior `pi = softmax(logits)` and
+  `V_pi = sum(pi * Q)` for unresolved leaves.
+
+Neither is a proven value. Actual terminal outcomes come from the rules; proofs
+retain their separate verified scope. Backups keep the sign when the same player
+continues a turn and reverse it only when control changes. A first-placement win
+terminates immediately. Training stores the acting distribution and action index
+with the full legal-coordinate hash, player and phase, then checks that identity
+when reconstructing replay. These requirements apply equally to raw-policy,
+KLENT-improved-policy, Gumbel-search and verified-tactics modes of the same player.
+Each graph exposes `position_key`, a SHA256 of the rule identifier, native
+player/remaining phase, and sorted absolute stone coordinates and owners.
+Evaluator records echo that identity, `player`, `remaining`, and `model_version`
+alongside the full native-order actions, logits, and Q. Deployed callers pass the
+checkpoint SHA as `model_version`; standalone callers receive a configuration
+and parameter digest. Keep an evaluator's model immutable for its lifetime.
+Terminal inference is rejected because the rules and search own terminal values.
+

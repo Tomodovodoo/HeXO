@@ -122,6 +122,7 @@ def play_game(task):
     rng = random.Random(task["seed"] ^ 0xC0FFEE)
     explored_turns = 0
     features, searches, times, depths, examples = [], [], [[], []], [], []
+    search_trace = []
     while game.winner < 0 and len(game.cells) < task["max_stones"]:
         if len(game.cells) + game.remaining > task["max_stones"]:
             break
@@ -149,6 +150,9 @@ def play_game(task):
         start = time.perf_counter()
         result = game.search(task["ms"], width=task["width"])
         times[side].append((time.perf_counter()-start)*1000)
+        if task.get("record_searches"):
+            search_trace.append({"ply": len(game.cells), "player": side, "remaining": game.remaining,
+                                 "wall_ms": times[side][-1], "result": result})
         depths.append(result["depth"])
         searches.append(math.tanh(result["score"]/6000) * (1 if side == 0 else -1))
         if not result["moves"]:
@@ -164,6 +168,8 @@ def play_game(task):
               "opening": initial, "prefix_length": len(initial), "curriculum": task.get("curriculum", "legacy"),
               "native_exploration": task.get("native_exploration", 0), "exploratory_turns": explored_turns,
               "challenger_color": task.get("challenger_color")}
+    if task.get("record_searches"):
+        record["search_trace"] = search_trace
     samples = None
     if not task["evaluation"]:
         outcome = (1 if game.winner == 0 else -1) if game.winner >= 0 else float("nan")
@@ -348,6 +354,52 @@ def optimize(run, checkpoint, incumbent, replay_paths, args, progress=None):
             "table_sha256": hashlib.sha256(table.tobytes()).hexdigest()}
 
 
+def paired_metrics(records, planned_games=None):
+    total = len(records) if planned_games is None else planned_games
+    if total < 2 or total % 2 or len(records) > total:
+        raise ValueError("An even planned game count of at least two is required")
+    completed = [g for g in records if g["winner"] >= 0]
+    wins = sum(g["winner"] == g["challenger_color"] for g in completed)
+    n = len(completed)
+    incomplete = len(records)-n
+    pending = total-len(records)
+    margin = math.sqrt(math.log(40)/(2*(total//2)))
+    low = max(0, wins/total-margin)
+    high = min(1, (wins+incomplete+pending)/total+margin)
+    pairs = {}
+    for game in records:
+        pair = pairs.setdefault(game["seed"], {})
+        color = game["challenger_color"]
+        if color not in (0, 1) or color in pair:
+            raise ValueError("Duplicate or invalid color within an opening pair")
+        pair[color] = game
+    if len(pairs) > total//2:
+        raise ValueError("Too many distinct opening pairs")
+    valid = [[int(g["winner"] == g["challenger_color"]) for g in pair.values()]
+             for pair in pairs.values() if len(pair) == 2 and all(g["winner"] >= 0 for g in pair.values())]
+    pair_wins = sum(sum(p) == 2 for p in valid)
+    pair_losses = sum(sum(p) == 0 for p in valid)
+    decisive = pair_wins+pair_losses
+    pair_p = sum(math.comb(decisive, k) for k in range(pair_wins, decisive+1))/2**decisive if decisive else 1
+    logit = lambda p: 400*math.log10(max(1e-6, p)/max(1e-6, 1-p))
+    rate = (wins+.5)/(n+1)
+    rated = not incomplete and not pending and n > 0
+    return {"wins": wins, "losses": n-wins, "incomplete": incomplete, "pending": pending,
+            "rated": rated, "win_rate": wins/n if rated else None,
+            "completed_only_win_rate": wins/n if n else None,
+            "completed_only_provisional_elo": logit(rate) if n else None,
+            "win_rate_95pct": [low, high], "elo_delta": logit(rate) if rated else None,
+            # Keep the legacy finite display interval; exact open bounds are explicit.
+            "elo_delta_95pct": [logit(low), logit(high)],
+            "elo_delta_95pct_open": [logit(low) if low > 0 else None, logit(high) if high < 1 else None],
+            "elo_display_probability_floor": 1e-6,
+            "played_games": len(records), "planned_games": total,
+            "interval_method": "opening-pair Hoeffding 95%, censored and pending outcomes bounded",
+            "opening_pair_wins": pair_wins, "opening_pair_losses": pair_losses,
+            "opening_pair_ties": len(valid)-pair_wins-pair_losses,
+            "incomplete_pairs": total//2-len(valid), "opening_pair_p": pair_p}
+
+
 def evaluate(pool, run, challenger, opponent, iteration, args, progress=None):
     tasks = []
     # A fixed pair count eventually cannot pass the shrinking promotion threshold.
@@ -373,37 +425,8 @@ def evaluate(pool, run, challenger, opponent, iteration, args, progress=None):
         event(run, "evaluation_game", iteration=iteration, opponent=opponent["id"],
               finished=len(records), total=len(tasks), winner=record["winner"],
               challenger_color=record["challenger_color"], reason=record["reason"])
-    completed = [g for g in records if g["winner"] >= 0]
-    wins = sum(g["winner"] == g["challenger_color"] for g in completed)
-    n = len(completed)
-    incomplete = len(records)-n
-    # Each opening pair is one independent bounded observation. Hoeffding's
-    # interval remains valid under dependence between the two color-swapped games.
-    # Censored outcomes contribute zero to the lower score and one to the upper.
-    pair_count = len(records)//2
-    margin = math.sqrt(math.log(40)/(2*pair_count))
-    low = max(0, wins/len(records)-margin)
-    high = min(1, (wins+incomplete)/len(records)+margin)
-    rate = (wins+.5)/(n+1)
-    pairs = {}
-    for g in completed:
-        pairs.setdefault(g["seed"], []).append(int(g["winner"] == g["challenger_color"]))
-    pair_wins = sum(len(p) == 2 and sum(p) == 2 for p in pairs.values())
-    pair_losses = sum(len(p) == 2 and sum(p) == 0 for p in pairs.values())
-    decisive = pair_wins + pair_losses
-    pair_p = sum(math.comb(decisive, k) for k in range(pair_wins, decisive+1))/2**decisive if decisive else 1
-    logit = lambda p: 400*math.log10(max(1e-6,p)/max(1e-6,1-p))
-    metrics = {"opponent": opponent["id"], "wins": wins, "losses": n-wins,
-               "incomplete": incomplete, "rated": incomplete == 0 and n > 0,
-               "win_rate": wins/n if n and not incomplete else None,
-               "completed_only_win_rate": wins/n if n else None,
-               "completed_only_provisional_elo": logit(rate) if n else None,
-               "win_rate_95pct": [low, high], "elo_delta": logit(rate) if n and not incomplete else None,
-               "elo_delta_95pct": [logit(low), logit(high)],
-               "requested_games": args.eval_games, "played_games": len(records),
-               "interval_method": "opening-pair Hoeffding 95%, censored outcomes bounded",
-               "opening_pair_wins": pair_wins, "opening_pair_losses": pair_losses,
-               "opening_pair_p": pair_p}
+    metrics = paired_metrics(records)
+    metrics.update(opponent=opponent["id"], requested_games=args.eval_games)
     write_json(run / "matches" / f"{iteration:04d}-vs-{opponent['id']:04d}.json", {"metrics": metrics, "games": records})
     event(run, "evaluation", iteration=iteration, **metrics)
     return metrics
