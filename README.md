@@ -194,6 +194,29 @@ The tests compare native rules and incremental features with an independent Pyth
 
 The benchmark prints JSON with seeded positions, source and library hashes, hardware, actual search times, nodes and agreement with a wider search. Timing-dependent search results can vary across runs. There are no machine-specific speed assertions. A wider search is a selective reference, not a proof of the best move. Candidate-cell recall is reported only when the native candidate API is available; it does not measure whether the final pruned turn list retained that pair.
 
+## Bounded forcing certificates
+
+`proof.py` searches continuous double-threat attacks and returns `PROVEN_WIN`, `PROVEN_LOSS`, or `UNKNOWN`. Every winning certificate covers all relevant defensive branches. Immediate counterwins take priority; a defense with a free second stone is unsupported and returns unknown. The independent verifier reconstructs rules and covers from raw coordinates. Ordinary search scores are never treated as certificates.
+
+```sh
+python proof.py --history position.json --ms 100 --output proof-result.json
+python proof.py --history position.json --verify proof-result.json
+python proof.py --benchmark
+```
+
+A history is a JSON list of `[q, r]` placements in play order. Verification needs a returned certificate; an unknown result has none. The solver is separate from deployed PVS and has no demonstrated Elo benefit. Its deadline is cooperative: a synchronous native candidate call can overrun it, and late results become unknown. In one benchmark a 13-stone forcing win verified in 35 ms, while a 1001-stone sparse board took 236 ms under a requested 100 ms budget.
+
+## Experimental root turn coverage
+
+Quiet root widening is opt-in. It retains every existing selected turn and adds complete pairs by conditional rank, with separate second-placement and final-turn budgets. Immediate wins and mandatory defenses keep their exact handling. Deeper search keeps its existing candidate restrictions.
+
+```sh
+python arena.py --opponent seal --games 40 --ms 100 --width 16 --root-seconds 16 --root-turns 48 --max-stones 800 --output artifacts/seal-widened.json
+python -m tests.benchmark --trace artifacts/seal-trained-fresh-40.json --first-game 10 --positions 12 --ms 100 --width 16 --reference-ms 1000 --root-seconds 16 --root-turns 48 --output artifacts/pair-admission.json
+```
+
+The trace benchmark reports complete ordered-turn lists, resulting-position recall, depth, nodes and actual time. An optional `--seal-library` uses a separately built Seal adapter as reference; `--reference-report` reuses frozen reference turns for another ablation. On 12 development positions, the 48-turn setting raised Seal-reference result recall from 4/12 to 7/12, while mean completed depth fell from 2.50 to 2.42 at 100 ms. These traces include a repeated position family, so this is a development diagnostic rather than independent validation. Both default and widened settings later scored 4 wins and 36 losses against Seal on the same 40 fresh games at 100 ms. No playing-strength gain is established. Search clocks are best-effort; generation and legal fallback can exceed very short budgets.
+
 ## Status and remaining work
 
 The local game, native engine, self-play trainer, checkpoint evaluation and dashboard are playable. The committed suite currently has 22 tests covering reference rules, CPU/CUDA parity, NNUE inference and undo, curriculum partitioning and training-target semantics. Native search now orders a stored transposition move first when it is already in the selected legal turn list. The table is still local to each search.
@@ -255,6 +278,19 @@ whole-file SHA256. Native loading validates dimensions, sizes, finite weights,
 table bounds and table symmetries. A model handle is immutable and shared by
 attached boards. Loading a legacy table detaches NNUE and vice versa.
 
+After an engine change, start a new rating run while retaining learned NNUE weights:
+
+```sh
+python train.py --run runs/nnue-new-engine --model nnue --initial-model runs/nnue-old/checkpoints/0001/model.pt --initial-optimizer runs/nnue-old/checkpoints/0001/optimizer.pt --device cuda
+```
+
+`--initial-optimizer` is optional. When supplied, AdamW moments and step counters
+are retained, and `--lr` sets the new run's learning rate. The imported model is
+validated, copied into checkpoint zero, and exported with the current native
+format. Source paths and hashes are recorded; resume requires the same arguments
+and unchanged source files. Ratings start at zero against the imported anchor.
+Existing runs and checkpoint files are never reinitialized by these options.
+
 Saved NNUE histories can be revisited with a frozen evaluator and a larger native
 search budget, then supplied to an ordinary training run:
 
@@ -280,3 +316,9 @@ the search-selected first and conditional second placements, not alpha-beta
 visit counts. Unfinished outcomes remain missing. Native PVS and the GPU
 complete-turn beam identify their teacher semantics in the recorded games;
 their search targets should not be treated as interchangeable depths.
+
+The trace benchmark's ordered and resulting-position recall measure the complete
+**untimed** generated lists. Timed searches can expire during generation, so these
+figures do not claim that a turn was searched within the budget. The report records
+generation time, completed depth, and zero-depth trials separately. Reused reference
+reports must match both the trace hash and the exact position history.

@@ -17,6 +17,49 @@ class NativeRules(unittest.TestCase):
         self.addCleanup(game.close)
         return game
 
+    def test_root_admission_retains_baseline_and_exact_ordered_turns(self):
+        game = self.make_game([(0, 0), (-2, 0), (-1, 0)])
+        before = (game.key, game.state(), game.evaluation, game.features())
+        base = game.turns(width=4)
+        wider = game.turns(width=4, root_seconds=12, root_turns=24)
+        base_moves = {tuple(t["moves"]) for t in base}
+        self.assertTrue(base_moves <= {tuple(t["moves"]) for t in wider})
+        self.assertGreater(len(wider), len(base))
+        self.assertLessEqual(len(wider), 24)
+        hashes = set()
+        for turn in wider:
+            side = game.player
+            for point in turn["moves"]:
+                self.assertTrue(game.legal(*point))
+                game.play(*point)
+            self.assertTrue(game.winner >= 0 or game.player != side)
+            self.assertNotIn(game.key, hashes)
+            hashes.add(game.key)
+            for _ in turn["moves"]:
+                game.undo()
+        self.assertEqual((game.key, game.state(), game.evaluation, game.features()), before)
+        for budget in (1, 5):
+            result = game.search(budget, width=4, root_seconds=12, root_turns=24)
+            self.assertEqual((game.key, game.state(), game.evaluation, game.features()), before)
+            for point in result["moves"]:
+                game.play(*point)
+            for _ in result["moves"]:
+                game.undo()
+
+    def test_root_admission_preserves_immediate_first_stone_win(self):
+        moves = interleave([[(q, 0) for q in range(6)], [(2*q, 6) for q in range(6)]])
+        game = self.make_game(moves[:-1])
+        base = game.turns(width=4)
+        self.assertEqual(base, game.turns(width=4, root_seconds=12, root_turns=24))
+        self.assertEqual(len(base[0]["moves"]), 1)
+        game.play(*base[0]["moves"][0])
+        self.assertEqual(game.winner, 0)
+        game.undo()
+        for options in ({"root_seconds": 5, "root_turns": 24},
+                        {"root_seconds": 12, "root_turns": 7}):
+            with self.assertRaises(ValueError):
+                game.search(1, width=4, **options)
+
     def assert_state(self, game, reference):
         self.assertEqual((game.player, game.remaining, game.winner),
                          (reference.player, reference.remaining, reference.winner))
@@ -142,6 +185,7 @@ class NativeRules(unittest.TestCase):
             for point in history:
                 reference.play(*point)
             winning = bool(reference.completions(1))
+            self.assertEqual(game.turns(width=4), game.turns(width=4, root_seconds=12, root_turns=24))
             result = game.search(5, width=4)
             self.assertEqual(len(result["moves"]), 2)
             for move in result["moves"]:
