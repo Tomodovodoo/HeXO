@@ -18,7 +18,7 @@ class SealCurrentContract(unittest.TestCase):
             source = root/'tools/seal_current_adapter.cpp'
             source.write_bytes(b'compiled source')
             python = root/'tools/seal_current.py'
-            python.write_bytes(b'frozen Python adapter')
+            python.write_text(f'REVISION = {REVISION!r}\nWEIGHTS_SHA256 = {WEIGHTS_SHA256!r}\n')
             binary = root/'seal.dll'
             binary.write_bytes(b'pinned binary')
             build = dict(revision=REVISION, weights_sha256=WEIGHTS_SHA256,

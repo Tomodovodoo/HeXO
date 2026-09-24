@@ -30,6 +30,14 @@ def _dependencies(binary, runtime_dirs, objdump):
     if os.name != 'nt':
         raise RuntimeError('Opponent freezing currently supports Windows PE builds')
     system = Path(os.environ['SystemRoot'])/'System32'
+    import winreg
+    known = set()
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+            r'SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs') as key:
+        for index in range(winreg.QueryInfoKey(key)[1]):
+            _, value, _ = winreg.EnumValue(key, index)
+            if isinstance(value, str) and value.lower().endswith('.dll'):
+                known.add(value.lower())
     compiler = shutil.which('g++')
     directories = [binary.parent, *map(Path, runtime_dirs)]
     if compiler:
@@ -50,13 +58,13 @@ def _dependencies(binary, runtime_dirs, objdump):
             if name.lower().startswith(('api-ms-win-', 'ext-ms-win-')):
                 continue
             os_file = system/name
-            if os_file.is_file():
+            source = next((p/name for p in directories if (p/name).is_file()), None)
+            if name.lower() in known or source is None:
+                if not os_file.is_file():
+                    raise FileNotFoundError(f'Unresolved native opponent dependency: {name}')
                 host[str(os_file.resolve())] = _sha(os_file.read_bytes())
                 pending.append(os_file.resolve())
                 continue
-            source = next((p/name for p in directories if (p/name).is_file()), None)
-            if source is None:
-                raise FileNotFoundError(f'Unresolved native opponent dependency: {name}')
             data = source.read_bytes()
             if name.lower() in copies and copies[name.lower()][1] != data:
                 raise ValueError(f'Conflicting native dependency: {name}')
@@ -82,7 +90,8 @@ def freeze_opponent(kind, destination, config):
     files = {}
     settings = {}
     if kind == 'seal-current':
-        from tools.seal_current import REVISION, WEIGHTS_SHA256
+        selected_adapter = _module(source/'tools/seal_current.py')
+        REVISION, WEIGHTS_SHA256 = selected_adapter.REVISION, selected_adapter.WEIGHTS_SHA256
         manifest_path = binary.with_suffix(binary.suffix+'.json')
         build_bytes = manifest_path.read_bytes()
         build = json.loads(build_bytes)
@@ -97,14 +106,17 @@ def freeze_opponent(kind, destination, config):
         budget = dict(unit='milliseconds per complete turn', deadline='upstream best-effort',
                       equal_compute=False, randomness='upstream random_device; arena seed does not seed Seal')
     else:
-        from strix_reference import REVISION
-        from tools.strix_learned_adapter import MODEL_SHA256
+        selected_reference = _module(source/'strix_reference.py')
+        selected_adapter = _module(source/'tools/strix_learned_adapter.py', selected_reference)
+        REVISION, MODEL_SHA256 = selected_reference.REVISION, selected_adapter.MODEL_SHA256
         build_bytes = binary.with_name('build-provenance.json').read_bytes()
         build = json.loads(build_bytes)
         model = Path(config['model']).read_bytes()
         if (build['revision'] != REVISION or build['executable_sha256'] != _sha(image)
                 or _sha(model) != MODEL_SHA256):
             raise ValueError('Learned Strix build/model identity mismatch')
+        if set(build['wrapper_sha256']) != {'Cargo.toml', 'Cargo.lock', 'src/main.rs'}:
+            raise ValueError('Unexpected learned Strix wrapper paths')
         for name, digest in build['wrapper_sha256'].items():
             data = (source/'tools/strix_learned'/name).read_bytes()
             if _sha(data) != digest:
