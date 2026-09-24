@@ -2,7 +2,7 @@
 import unittest
 import numpy as np
 from hexo import Game
-from neural_search import NeuralSearch, EvaluationCache, native
+from neural_search import NeuralSearch, EvaluationCache, SearchCoordinator, native
 from tests.reference import Reference
 
 class Uniform:
@@ -182,6 +182,65 @@ class NeuralTree(unittest.TestCase):
         self.assertEqual(result['evaluated'], 0)
         # Cancelled reservations must permit another full search budget.
         self.assertEqual(search.search(4, root_samples=2)['completed'], 4)
+
+    def test_multiple_trees_share_batches_and_keep_visits_local(self):
+        class Recording(Uniform):
+            def __init__(self):
+                self.batches = []
+            def evaluate(self, histories):
+                self.batches.append([list(map(tuple, h)) for h in histories])
+                return super().evaluate(histories)
+        evaluator = Recording()
+        first = self.searcher([(0,0)], seed=1, evaluator=evaluator)
+        second = self.searcher([(0,0),(1,0)], seed=2, evaluator=evaluator)
+        coordinator = SearchCoordinator(evaluator, 'test-v1')
+        result = coordinator.search_many([first, second], simulations=[16,24], root_samples=4, batch_size=8)
+        self.assertEqual([r['completed'] for r in result], [16,24])
+        self.assertEqual([int(r['visits'].sum()) for r in result], [16,24])
+        self.assertGreater(coordinator.last_stats['largest_batch'], 1)
+        self.assertTrue(any(any(len(h)==1 for h in batch) and any(len(h)==2 for h in batch) for batch in evaluator.batches))
+        for tree, report in zip((first, second), result):
+            tree.advance(report['action'])
+        again = coordinator.search_many([first, second], simulations=7, root_samples=2)
+        self.assertEqual([r['completed'] for r in again], [7,7])
+
+    def test_coordinator_deduplicates_evaluation_not_visits(self):
+        evaluator = Uniform()
+        trees = [self.searcher([(0,0)], seed=5, evaluator=evaluator) for _ in range(2)]
+        coordinator = SearchCoordinator(evaluator, 'test-v1')
+        results = coordinator.search_many(trees, simulations=4, root_samples=4, batch_size=8)
+        self.assertEqual([int(r['visits'].sum()) for r in results], [4,4])
+        self.assertLess(coordinator.last_stats['unique_positions'], sum(r['evaluated'] for r in results))
+        with self.assertRaises(ValueError):
+            coordinator.search_many([trees[0],trees[0]])
+        trees[1].model_version = 'different'
+        with self.assertRaises(ValueError):
+            coordinator.search_many(trees)
+
+    def test_one_tree_deadline_does_not_cancel_other_tree(self):
+        from unittest.mock import patch
+        evaluator = Uniform()
+        trees = [self.searcher([(0,0)], evaluator=evaluator) for _ in range(2)]
+        coordinator = SearchCoordinator(evaluator, 'test-v1')
+        ticks = iter(np.arange(0, 10, .0001))
+        with patch('neural_search.time.perf_counter', side_effect=lambda: float(next(ticks))):
+            results = coordinator.search_many(trees, simulations=4, milliseconds=[.01,None])
+        self.assertEqual(results[0]['completed'], 0)
+        self.assertIsNone(results[0]['action'])
+        self.assertEqual(results[1]['completed'], 4)
+        self.assertEqual(coordinator.search_many([trees[0]], simulations=4)[0]['completed'], 4)
+
+    def test_failed_batch_cancels_every_tree(self):
+        class Broken(Uniform):
+            def evaluate(self, histories):
+                raise RuntimeError('inference failed')
+        evaluator = Broken()
+        trees = [self.searcher([(0,0)], evaluator=evaluator) for _ in range(2)]
+        coordinator = SearchCoordinator(evaluator, 'test-v1')
+        with self.assertRaises(RuntimeError):
+            coordinator.search_many(trees, simulations=4)
+        evaluator.evaluate = Uniform().evaluate
+        self.assertEqual([r['completed'] for r in coordinator.search_many(trees, simulations=4)], [4,4])
 
     def test_wrong_legal_order_rejected(self):
         search = self.searcher([(0, 0)])
