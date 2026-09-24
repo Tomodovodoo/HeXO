@@ -121,6 +121,21 @@ class RelationalLearningTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'changed during evaluation'):
                     diagnose(checkpoint,fixtures,args)
 
+    def test_terminal_teacher_uses_actual_reply_and_rejects_wrong_outcome(self):
+        from relational_teacher import examples, verify_terminal
+        for limit in (0,-1):
+            with self.assertRaisesRegex(ValueError,'Positive family'):
+                examples(SimpleNamespace(train_families=32,validation_families=8,negative_actions=limit))
+        moves=record()['moves']
+        verify_terminal(moves[:-1],moves[-1],None,1)
+        verify_terminal(moves[:-2],moves[-2],moves[-1],-1)
+        with self.assertRaisesRegex(ValueError,'terminal'):
+            verify_terminal(moves[:-2],moves[-2],None,-1)
+        with self.assertRaisesRegex(ValueError,'terminal'):
+            verify_terminal(moves[:-2],moves[-2],moves[-1],1)
+        with self.assertRaisesRegex(ValueError,'continued after terminal'):
+            verify_terminal(moves[:-1],moves[-1],[99,99],1)
+
     def test_zero_row_short_game_membership_remains_untrained(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)/'corpus';records=fixture(root)
