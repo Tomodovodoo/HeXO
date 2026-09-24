@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 
 REVISION = "c94749c21c16c3b072fff6da49762dd5f92f3986"
 WEIGHTS_SHA256 = "2819d28d6bce7baaacbd42c00cd8c5a21e171a95327245efe3f29eda79f434bd"
@@ -22,30 +23,41 @@ def build(source, compiler="g++"):
         return subprocess.check_output(["git", "-C", str(source), *args], text=True).strip()
     if git("rev-parse", "HEAD") != REVISION:
         raise ValueError(f"SealBot checkout must be exactly {REVISION}")
-    paths = git("ls-files", "best").splitlines()
+    paths = git("ls-tree", "-r", "--name-only", REVISION, "best").splitlines()
     if git("status", "--porcelain", "--untracked-files=all", "--", "best"):
         raise ValueError("SealBot best source has local changes or untracked files")
-    weights = (source / "best/pattern_data.h").read_bytes()
-    if hashlib.sha256(weights.replace(b"\r\n", b"\n")).hexdigest() != WEIGHTS_SHA256:
+    # Compile immutable pinned Git blobs, never a mutable checkout. This also
+    # excludes ignored/untracked compiler inputs and line-ending conversions.
+    content = {p: subprocess.check_output(["git", "-C", str(source), "show", f"{REVISION}:{p}"])
+               for p in paths if p.endswith(".h")}
+    weights = content["best/pattern_data.h"]
+    if hashlib.sha256(weights).hexdigest() != WEIGHTS_SHA256:
         raise ValueError("SealBot best weights differ from pinned bytes")
-    sources = {p: sha(source / p) for p in paths if p.endswith(".h")}
+    sources = {p: hashlib.sha256(data).hexdigest() for p, data in content.items()}
     adapter = ROOT / "tools/seal_current_adapter.cpp"
-    adapter_hash = sha(adapter)
+    adapter_content = adapter.read_bytes()
+    adapter_hash = hashlib.sha256(adapter_content).hexdigest()
     out = ROOT / "build" / ("hexo_seal_current.dll" if os.name == "nt" else "libhexo_seal_current.so")
     out.parent.mkdir(exist_ok=True)
-    command = [compiler, "-std=c++20", "-O3", "-shared", "-I", str(source / "best"), str(adapter), "-o", str(out)]
-    command += ["-static-libgcc", "-static-libstdc++"] if os.name == "nt" else ["-fPIC"]
     version = subprocess.check_output([compiler, "--version"], text=True).splitlines()[0]
-    subprocess.run(command, check=True)
-    if sources != {p: sha(source / p) for p in sources}:
-        raise ValueError("SealBot sources changed during compilation")
+    with tempfile.TemporaryDirectory(prefix="hexo-seal-build-") as directory:
+        snapshot = Path(directory)
+        for relative, data in content.items():
+            target = snapshot / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        copied_adapter = snapshot / "seal_current_adapter.cpp"
+        copied_adapter.write_bytes(adapter_content)
+        command = [compiler, "-std=c++20", "-O3", "-shared", "-I", str(snapshot / "best"), str(copied_adapter), "-o", str(out)]
+        command += ["-static-libgcc", "-static-libstdc++"] if os.name == "nt" else ["-fPIC"]
+        subprocess.run(command, check=True)
     if sha(adapter) != adapter_hash:
         raise ValueError("SealBot adapter changed during compilation")
     metadata = {"name": "seal-current-best", "repository": "https://github.com/Ramora0/SealBot",
                 "revision": REVISION, "variant": "best", "license": "No project license found at pinned revision",
                 "source_directory": str(source), "source_sha256": sources,
-                "weights_sha256": WEIGHTS_SHA256, "weights_file_sha256": sha(source / "best/pattern_data.h"),
-                "weights_hash_encoding": "canonical LF, with compiled file bytes separately hashed",
+                "weights_sha256": WEIGHTS_SHA256, "weights_file_sha256": sources["best/pattern_data.h"],
+                "weights_hash_encoding": "exact pinned Git blob bytes compiled from private temporary snapshot",
                 "adapter_source_sha256": adapter_hash,
                 "binary_sha256": sha(out), "compiler": version, "build_command": command,
                 "budget": "milliseconds per complete turn, upstream best-effort deadline; not a hard timeout",

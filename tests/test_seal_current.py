@@ -22,7 +22,8 @@ class SealCurrentContract(unittest.TestCase):
             def command(args, **kwargs):
                 if args[-1] == "--version": return "test compiler"
                 if "rev-parse" in args: return REVISION
-                if "ls-files" in args: return "best/pattern_data.h"
+                if "ls-tree" in args: return "best/pattern_data.h"
+                if "show" in args: return b"test weights"
                 return ""
             def compile(args, **kwargs): adapter.write_bytes(b"changed during compile")
             with patch('tools.seal_current.ROOT', root), patch('tools.seal_current.WEIGHTS_SHA256', sha(weights)), \
@@ -31,6 +32,36 @@ class SealCurrentContract(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "adapter changed during compilation"):
                     build(root)
             self.assertEqual(list((root / 'build').glob('*.json')), [])
+
+    def test_checkout_changes_cannot_change_pinned_compiler_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'tools').mkdir()
+            (root / 'best').mkdir()
+            (root / 'tools/seal_current_adapter.cpp').write_bytes(b'our adapter')
+            weights = root / 'best/pattern_data.h'
+            weights.write_bytes(b'pinned weights')
+            expected = sha(weights)
+            def command(args, **kwargs):
+                if args[-1] == '--version': return 'test compiler'
+                if 'rev-parse' in args: return REVISION
+                if 'ls-tree' in args: return 'best/pattern_data.h'
+                if 'show' in args:
+                    self.assertEqual(args[-1], REVISION + ':best/pattern_data.h')
+                    weights.write_bytes(b'another checkout revision')
+                    return b'pinned weights'
+                return ''
+            def compile(args, **kwargs):
+                include = Path(args[args.index('-I')+1])
+                self.assertNotEqual(include, root / 'best')
+                self.assertEqual((include/'pattern_data.h').read_bytes(), b'pinned weights')
+                Path(args[args.index('-o')+1]).write_bytes(b'compiled pinned snapshot')
+            with patch('tools.seal_current.ROOT', root), patch('tools.seal_current.WEIGHTS_SHA256', expected), \
+                    patch('tools.seal_current.subprocess.check_output', side_effect=command), \
+                    patch('tools.seal_current.subprocess.run', side_effect=compile):
+                result = build(root)
+            manifest = json.loads(result.with_suffix(result.suffix+'.json').read_text())
+            self.assertEqual(manifest['source_sha256']['best/pattern_data.h'], expected)
 
     def test_stale_cpp_adapter_rejected_before_loading(self):
         import os
