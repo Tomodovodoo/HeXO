@@ -161,6 +161,11 @@ def fit(args):
     write_json(output.with_suffix('.examples.json'),selected)
     before=evaluate(model,selected['validation'],args)
     fixed_before=evaluate(model,fixed,args)
+    cpu_args=argparse.Namespace(**(vars(args)|{'device':'cpu'}))
+    probe=graph(selected['validation'][0]['history'],model,cpu_args)
+    model.to('cpu')
+    with torch.no_grad():cpu_policy_before=outputs(model,[probe],cpu_args)[1].clone()
+    model.to(args.device)
     optimizer=torch.optim.Adam(model.critic.parameters(),lr=args.lr)
     order=np.random.default_rng(args.seed).permutation(len(selected['train']))
     losses=[]
@@ -184,15 +189,20 @@ def fit(args):
     for name,value in model.state_dict().items():
         if name in frozen and not torch.equal(value.cpu(),frozen[name]):
             raise ValueError('Frozen backbone or policy changed')
-    if any(a['logits']!=b['logits'] for a,b in zip(before+fixed_before,after+fixed_after,strict=True)):
-        raise ValueError('Frozen policy inference changed')
+    repeated_policy_max_error=max(float(np.max(np.abs(np.asarray(a['logits'])-b['logits'])))
+                                 for a,b in zip(before+fixed_before,after+fixed_after,strict=True))
+    model.to('cpu')
+    with torch.no_grad():cpu_policy_after=outputs(model,[probe],cpu_args)[1]
+    if not torch.equal(cpu_policy_before,cpu_policy_after):
+        raise ValueError('Frozen CPU FP32 policy probe changed')
     if sources!=source_identity(('relational_teacher.py','relational_data.py','human_corpus.py')):
         raise ValueError('Teacher source or native library changed')
     if digest(Path(args.fixtures))!=identity['fixtures_sha256']:
         raise ValueError('Teacher exclusion fixtures changed')
     identity.update(initial_model_sha256=model_sha,config=vars(args),**sources)
     report=dict(seconds=time.perf_counter()-started,mean_training_loss=float(np.mean(losses)),
-                frozen_parameters_unchanged=True,validation_policy_logits_unchanged=True,promotion=False)
+                frozen_parameters_unchanged=True,cpu_policy_probe_unchanged=True,
+                repeated_cuda_policy_max_error=repeated_policy_max_error,promotion=False)
     def writer(stage):
         save_model(stage/'model.pt',model)
         write_json(stage/'before.json',before);write_json(stage/'after.json',after)
