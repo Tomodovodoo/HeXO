@@ -5,12 +5,14 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from hexo import Game
 from nnue_model import NNUE
 from train import _run_training, initial_artifacts, initialize_nnue
+import train
 
 
 class WarmStartTest(unittest.TestCase):
@@ -92,6 +94,36 @@ class WarmStartTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incompatible"):
             initialize_nnue(parent/"0000", self.args, initial_artifacts(self.args))
         self.assertFalse((parent/"0000").exists())
+
+    def test_interrupted_summary_publication_recovers_only_matching_checkpoint(self):
+        real_write = train.write_json
+        def interrupted(path, value):
+            if path.name == "summary.json":
+                raise OSError("interrupted after checkpoint rename")
+            return real_write(path, value)
+        with patch.object(train, "write_json", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "after checkpoint rename"):
+                _run_training(self.args)
+        run = Path(self.args.run)
+        initial = run/"checkpoints/0000"
+        self.assertFalse((run/"summary.json").exists())
+        before = {p.name: p.read_bytes() for p in initial.iterdir()}
+        self.assertIn("initialization.json", before)
+        # A different configuration cannot adopt the stranded checkpoint.
+        self.args.lr *= 2
+        with self.assertRaisesRegex(ValueError, "identity"):
+            _run_training(self.args)
+        self.args.lr /= 2
+        _run_training(self.args)
+        self.assertEqual({p.name: p.read_bytes() for p in initial.iterdir()}, before)
+        self.assertTrue((run/"summary.json").is_file())
+        # Recovery validates every saved file, including optimizer state.
+        (run/"summary.json").unlink()
+        with (initial/"optimizer.pt").open("ab") as handle:
+            handle.write(b"corruption")
+        with self.assertRaisesRegex(ValueError, "file hash changed"):
+            _run_training(self.args)
+        self.assertEqual((initial/"model.pt").read_bytes(), before["model.pt"])
 
 
 if __name__ == "__main__":

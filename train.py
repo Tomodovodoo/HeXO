@@ -439,14 +439,31 @@ def initial_artifacts(args):
     return result
 
 
-def initialize_nnue(initial, args, artifacts):
+def initialize_nnue(initial, args, artifacts, identity=None):
     """Validate before publishing checkpoint zero; never overwrite an existing one."""
     import io
     import tempfile
     import torch
     from nnue_model import NNUE
     if initial.exists():
-        raise ValueError("Checkpoint zero already exists; refusing to overwrite it")
+        manifest_path = initial / "initialization.json"
+        if identity is None or not manifest_path.is_file():
+            raise ValueError("Checkpoint zero already exists; refusing to overwrite it without a matching initialization record")
+        manifest = json.loads(manifest_path.read_text())
+        expected_files = {"model.pt", "model.nnue"} | ({"optimizer.pt"} if "optimizer" in artifacts else set())
+        if (manifest.get("schema") != 1 or manifest.get("identity") != identity
+                or set(manifest.get("files", {})) != expected_files
+                or {p.name for p in initial.iterdir()} != expected_files | {"initialization.json"}):
+            raise ValueError("Checkpoint zero initialization identity or file set differs; refusing to overwrite it")
+        for name, digest in manifest["files"].items():
+            if hashlib.sha256((initial/name).read_bytes()).hexdigest() != digest:
+                raise ValueError("Checkpoint zero initialization file hash changed; refusing to overwrite it")
+        metadata = {"model_sha256": manifest["files"]["model.nnue"],
+                    **({"initial_artifacts": artifacts} if artifacts else {}),
+                    **({"optimizer": "checkpoints/0000/optimizer.pt"} if "optimizer" in artifacts else {})}
+        if manifest.get("metadata") != metadata:
+            raise ValueError("Checkpoint zero initialization metadata differs; refusing to overwrite it")
+        return metadata
     contents = {key: Path(item["path"]).read_bytes() for key, item in artifacts.items()}
     if any(hashlib.sha256(contents[key]).hexdigest() != item["sha256"] for key, item in artifacts.items()):
         raise ValueError("Initial checkpoint changed while loading")
@@ -498,9 +515,17 @@ def initialize_nnue(initial, args, artifacts):
             if hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest() != item["sha256"]:
                 raise ValueError("Initial checkpoint changed while loading")
         digest = model.export(stage/"model.nnue")
+        metadata = {"model_sha256": digest, **({"initial_artifacts": artifacts} if artifacts else {}),
+                    **({"optimizer": "checkpoints/0000/optimizer.pt"} if optimizer else {})}
+        if identity is not None:
+            manifest = {"schema": 1, "identity": identity, "metadata": metadata,
+                        "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in stage.iterdir()}}
+            write_json(stage/"initialization.json", manifest)
+            for path in stage.iterdir():
+                with path.open("r+b") as handle:
+                    os.fsync(handle.fileno())
         stage.rename(initial)
-    return {"model_sha256": digest, **({"initial_artifacts": artifacts} if artifacts else {}),
-            **({"optimizer": "checkpoints/0000/optimizer.pt"} if optimizer else {})}
+    return metadata
 
 
 def _run_training(args):
@@ -545,7 +570,9 @@ def _run_training(args):
         torch.manual_seed(args.seed)
         initial = run / "checkpoints" / "0000"
         if args.model == "nnue":
-            initial_metadata = initialize_nnue(initial, args, artifacts)
+            identity = {"run": str(run), "config": config, "training_sha256": training_hash,
+                        "engine_sha256": hashlib.sha256(library.read_bytes()).hexdigest()}
+            initial_metadata = initialize_nnue(initial, args, artifacts, identity)
             initial_table = "checkpoints/0000/model.nnue"
         else:
             initial.mkdir(exist_ok=False)
