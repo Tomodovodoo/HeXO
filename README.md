@@ -222,6 +222,14 @@ python arena.py --opponent orca --orca-source ../orca-reference --orca-sims 200 
 
 This requires PyTorch. The adapter strictly loads the checkout's seven-channel `orca/checkpoint.pt` without adding random weights. Use `--orca-checkpoint` to select another compatible checkpoint and `--orca-device cuda` for GPU inference. The report records source revision, checkpoint hash, simulation budget and actual turn times. Orca receives simulations per placement; our engine receives milliseconds per complete turn. This comparison does not use equal time budgets. Native rules validate every returned move, and replay disagreements remain invalid games rather than wins.
 
+The optional [learned Strix adapter](tools/strix_learned/README.md) loads the
+pinned public `checkpoint_000010.pt` safetensors artifact and runs direct
+relational graph inference plus Gumbel MCTS in a persistent CPU process.
+Use `--opponent strix --strix-model PATH` after its separate build. Reports
+identify the model, source patch, executable and actual timings. This public
+step-10 model is not the private Pulsatrix checkpoint; its checkpoint license
+is unknown. Its simulation budget is not an equal-time match against native PVS.
+
 ## Correctness tests and local benchmarks
 
 Build the native library with the CMake commands above, then run:
@@ -498,3 +506,13 @@ The local adapter bounds the request line and headers together to two seconds,
 including clients that keep sending bytes. Request-body transfer has a separate
 two-second deadline. These transport limits are separate from its advisory search
 budget. A configured model that disappears or becomes unreadable returns JSON 503.
+
+KLENT's separate deployment-value pass reconstructs and validates the same full
+legal action ordering as the actor pass, retaining its row order and chunk
+boundaries, but skips candidate feature encoding and embedding. It trains only
+the value head against the existing return targets. A CPU comparison on 128
+saved corpus rows measured 0.857 to 0.423 seconds for this pass (2.03x), with
+identical losses, value-head parameters and Adam states in that experiment.
+This is a value-pass measurement, not an overall training or GPU speedup.
+Reproduce it with `python -m tests.benchmark_value --corpus <directory>
+--model <model.pt> --output <report.json>`.
