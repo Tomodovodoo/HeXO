@@ -19,7 +19,9 @@ def pair_admission(args):
     import ctypes as C
     import numpy as np
 
-    trace = json.loads(Path(args.trace).read_text())
+    trace_bytes = Path(args.trace).read_bytes()
+    trace_digest = hashlib.sha256(trace_bytes).hexdigest()
+    trace = json.loads(trace_bytes)
     model = trace.get("model")
     table_path = None
     table_digest = None
@@ -42,8 +44,11 @@ def pair_admission(args):
         table = array.tolist()
     references = {}
     if args.reference_report:
-        references = {(s["game"], s["stones"]): s["reference_turn"]
-                      for s in json.loads(Path(args.reference_report).read_text())["samples"]}
+        reference_report = json.loads(Path(args.reference_report).read_text())
+        if reference_report.get("trace_sha256") != trace_digest:
+            raise ValueError("Reference report does not match the current trace SHA-256")
+        references = {(s["game"], s["stones"]): s
+                      for s in reference_report["samples"]}
     seal = None
     if args.seal_library:
         seal_library = C.CDLL(str(Path(args.seal_library).resolve()))
@@ -68,7 +73,10 @@ def pair_admission(args):
         try:
             before = (game.key, game.state(), game.features())
             if references:
-                target = [tuple(point) for point in references[record["index"], count]]
+                reference_sample = references[record["index"], count]
+                if [tuple(point) for point in reference_sample["history"]] != history:
+                    raise ValueError("Reference sample history differs from the current position")
+                target = [tuple(point) for point in reference_sample["reference_turn"]]
             elif seal:
                 cells = game.cells
                 data = (C.c_int*(3*len(cells)))(*(v for cell in cells for v in cell))
@@ -128,12 +136,13 @@ def pair_admission(args):
     return {"config": vars(args), "summary": summary, "samples": samples,
             "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
             "platform": platform.platform(),
-            "trace_sha256": hashlib.sha256(Path(args.trace).read_bytes()).hexdigest(),
+            "trace_sha256": trace_digest,
+            "recall_scope": "Untimed generated-turn lists; a timed search may expire before admitting or searching these turns. See generation_ms, trial depth, and zero_depth.",
             "table_sha256": table_digest,
             "engine_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
             "source_sha256": hashlib.sha256((ROOT/"src/hexo.cpp").read_bytes()).hexdigest(),
             "benchmark_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-            "notes": "Alternating equal-time pairs. Reference recall is diagnostic, not win rate or proof of superior moves. Background CPU load affects completed depth."}
+            "notes": "Alternating equal-time searches with separately measured untimed candidate recall. Recall does not measure searched turns, win rate, or proof of superior moves. Background CPU load affects completed depth."}
 
 
 def measure(args):

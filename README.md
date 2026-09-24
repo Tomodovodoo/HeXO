@@ -274,3 +274,9 @@ the search-selected first and conditional second placements, not alpha-beta
 visit counts. Unfinished outcomes remain missing. Native PVS and the GPU
 complete-turn beam identify their teacher semantics in the recorded games;
 their search targets should not be treated as interchangeable depths.
+
+The trace benchmark's ordered and resulting-position recall measure the complete
+**untimed** generated lists. Timed searches can expire during generation, so these
+figures do not claim that a turn was searched within the budget. The report records
+generation time, completed depth, and zero-depth trials separately. Reused reference
+reports must match both the trace hash and the exact position history.
