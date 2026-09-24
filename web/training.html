@@ -67,7 +67,7 @@ $('feed').textContent=[`Iteration ${s.iteration}: ${stage}`, ...history.slice(-8
 $('truncated').textContent=`${n(s.totals.bootstrapped_games)} collected games reached the cap and used value bootstrapping. Caps are not natural terminals or draws.`+(stage==='collection'?' Natural-terminal and cap counts for this collection become available when its corpus is published.':'');
 }
 function renderRelational(s){
-const a=s.status||{},e=s.evaluation,labels={pi:'Raw policy',mu:'KLENT-improved policy',gumbel:'Full Gumbel MCTS','gumbel-proof':'Full Gumbel MCTS with verified tactics'};
+const a=s.status||{},e=s.evaluation,labels={pi:'Raw policy',mu:'KLENT-improved policy',gumbel:'Full Gumbel MCTS','gumbel-proof':'Gumbel MCTS with verified root overrides'};
 $('status').textContent=s.phase;$('config').textContent=`${s.name} · ${s.model_family} · ${s.training_backend}`;$('error').textContent=a.error||'';
 const completed=a.completed??a.games??a.fit_completed,total=a.total??a.games_total??a.fit_total??(s.phase==='fitting'?a.positions:undefined);
 $('r-progress').textContent=`${s.phase}${a.epoch?' · epoch '+a.epoch+' / '+a.epochs:''}${a.iteration!==undefined?' · iteration '+a.iteration:''}${Number.isFinite(completed)&&Number.isFinite(total)?' · '+completed+' / '+total:''}`;

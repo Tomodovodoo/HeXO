@@ -133,7 +133,7 @@ def relational_run(run, declared_family=None):
     return dict(name=run.name, path=str(run), model_family='relational-policy-q',
         phase=live.get('stage', 'initialized'), training_backend=training_backend,
         evaluation_backend=backend, checkpoint_sha256=model_hash,
-        initial_checkpoint_sha256=plan.get('initial_model_sha256') or identity.get('config', {}).get('initial_model_sha256'),
+        initial_checkpoint_sha256=identity.get('config', {}).get('initial_model_sha256') or plan.get('initial_model_sha256'),
         launch_source_commit=launch.get('source_commit'),
         source_sha256=identity.get('sources') or provenance.get('files_sha256'),
         opponent=opponent, evaluation=evaluation,
