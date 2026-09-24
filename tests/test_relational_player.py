@@ -108,9 +108,25 @@ class DirectPlayer(unittest.TestCase):
             self.assertEqual(actor.tree.proof_ms, 1000)
             actor.prover.solve.assert_called_once_with(unittest.mock.ANY, ms=250, idtt_ms=20)
             actor.prover.history.assert_called()
+            self.assertTrue(all(call.kwargs['ms'] <= 250 for call in actor.prover.history.call_args_list))
         finally:
             actor.close()
             game.close()
+
+    def test_invalid_proof_budget_does_not_create_snapshot(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from relational_evaluate import freeze
+        with TemporaryDirectory() as directory:
+            output = Path(directory)/'evaluation'
+            args = SimpleNamespace(output=output, games=2, seal_ms=100, neural_ms=1000,
+                                   simulations=8, root_samples=4, batch_size=4, max_stones=80)
+            for budget in (0, 60001):
+                args.proof_ms = budget
+                with self.assertRaisesRegex(ValueError, 'Proof budget'):
+                    freeze(args)
+                self.assertFalse(output.exists())
 
 
 if __name__ == '__main__':

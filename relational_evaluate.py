@@ -91,6 +91,8 @@ def freeze(args):
         raise ValueError('Output must be a new directory')
     if args.games < 2 or args.games % 2 or min(args.seal_ms, args.neural_ms, args.simulations, args.root_samples, args.batch_size) < 1 or args.max_stones < 5:
         raise ValueError('Even paired game count, positive budgets and cap >=5 required')
+    if not 1 <= args.proof_ms <= 60000:
+        raise ValueError('Proof budget must be between 1 and 60000 milliseconds')
     output = args.output.resolve()
     checkpoint = args.checkpoint.resolve()
     config = {name: str(value.resolve()) if isinstance(value, Path) else value

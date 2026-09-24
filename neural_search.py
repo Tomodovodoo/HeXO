@@ -229,7 +229,7 @@ class SearchCoordinator:
                             if search.proof_solver is not None:
                                 def proof_budget():
                                     return search.proof_ms if limits[i] is None else min(search.proof_ms,
-                                        max(1, int(limits[i]-(time.perf_counter()-starts[i])*1000)))
+                                        max(1, int((limits[i]-(time.perf_counter()-starts[i])*1000)/4)))
                                 proof = search.proof_solver.history(history, ms=proof_budget(), idtt_ms=0)
                                 if finished(i):
                                     continue
