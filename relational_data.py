@@ -37,6 +37,8 @@ def human_examples(directory, positions=0, seed=1729):
                     raise ValueError('Corpus game row counts disagree with split shard')
     result = {'train': [], 'validation': []}
     histories = {}
+    converted_games = set(allowed)
+    limited = manifest.get('conversion', {}).get('limit_games_per_split', 0) > 0
     minimum = manifest['minimum_ply']
     if minimum < 3:
         raise ValueError('Unsafe corpus family prefix')
@@ -44,7 +46,9 @@ def human_examples(directory, positions=0, seed=1729):
         record = json.loads(text)
         key = record['content_sha256']
         if key not in allowed:
-            if record['split'] in result:
+            if key in converted_games:
+                raise ValueError('Duplicate converted human history')
+            if record['split'] in result and not limited:
                 raise ValueError('Training history is absent from verified split membership')
             continue
         split, family = allowed.pop(key)

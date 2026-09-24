@@ -74,6 +74,30 @@ class RelationalLearningTests(unittest.TestCase):
             (root/'games.jsonl').write_text(text)
             with self.assertRaisesRegex(ValueError,'split membership'):human_examples(root)
 
+    def test_declared_conversion_limit_skips_only_unsharded_histories(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)/'corpus';records=fixture(root)
+            extra=copy.deepcopy(records[0])
+            extra['content_sha256']='unconverted-game'
+            history=root/'games.jsonl'
+            original=history.read_text()
+            history.write_text(original+'\n'+json.dumps(extra))
+            with self.assertRaisesRegex(ValueError,'absent from verified split'):
+                human_examples(root)
+            manifest=root/'manifest.json'
+            metadata=json.loads(manifest.read_text())
+            metadata['conversion']={'limit_games_per_split':1}
+            manifest.write_text(json.dumps(metadata))
+            histories,rows,_=human_examples(root)
+            self.assertEqual(set(histories),{r['content_sha256'] for r in records})
+            self.assertEqual(len(rows['train']),5)
+            history.write_text(original+'\n'+json.dumps(records[0]))
+            with self.assertRaisesRegex(ValueError,'Duplicate converted'):
+                human_examples(root)
+            history.write_text(json.dumps(records[0]))
+            with self.assertRaisesRegex(ValueError,'Missing allowed'):
+                human_examples(root)
+
     def test_frozen_capped_actor_full_legal_targets_and_one_fit_pass(self):
         model=RelationalNet(config())
         before={k:v.clone() for k,v in model.state_dict().items()}
