@@ -13,7 +13,7 @@ import time
 import torch
 from hexo import Game, ROOT, library
 from relational_encoder import pack
-from relational_native import encode
+from relational_native import encode, _load
 from relational_model import ModelConfig, RelationalNet
 
 
@@ -72,6 +72,7 @@ def run(output):
                   device=torch.cuda.get_device_name(),torch=torch.__version__,history=history,rows=rows,
                   precision='BF16 projections, FP32 softmax/normalization/reductions/residuals',
                   engine_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
+                  graph_engine_sha256=hashlib.sha256(Path(_load()._name).read_bytes()).hexdigest(),
                   source_hashes={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest()
                                  for name in ('relational_encoder.py','relational_native.py','relational_model.py','src/relational_graph.cpp')})
     output.parent.mkdir(parents=True,exist_ok=True)
