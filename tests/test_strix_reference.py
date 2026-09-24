@@ -6,10 +6,12 @@ import shutil
 import tempfile
 import threading
 import subprocess
+import sys
 from unittest.mock import patch
 from pathlib import Path
 
 from strix_reference import StrixReference, validate_pv
+from tools import strix_corpus
 
 
 class SequentialReplay(unittest.TestCase):
@@ -26,6 +28,30 @@ class SequentialReplay(unittest.TestCase):
     def test_no_illegal_radius_or_incomplete_pv(self):
         self.assertFalse(validate_pv([[0, 0, "P1"]], "P2", 2, [[9, 0]]))
         self.assertFalse(validate_pv([[0, 0, "P1"]], "P2", 2, [[8, 0], [16, 0]]))
+
+
+class CorpusProvenance(unittest.TestCase):
+    def run_corpus(self, hashes, output):
+        def git(command, **kwargs):
+            if command[3] == "rev-parse":
+                return strix_corpus.REVISION
+            if command[3] == "ls-tree":
+                return "scripts/fixtures/forcing_puzzles/a.json\nscripts/fixtures/forcing_puzzles/b.json"
+            return json.dumps(dict(stones=[[0, 0, "P1"]], attacker="P2", placements_remaining=2)).encode()
+        with patch.object(sys, "argv", ["strix_corpus", "unused-source", "--output", str(output)]), \
+             patch("tools.strix_corpus.subprocess.check_output", side_effect=git), \
+             patch("tools.strix_corpus.StrixReference") as factory:
+            factory.return_value.__enter__.return_value.solve.side_effect = [
+                dict(status="UNKNOWN", executable_sha256=digest) for digest in hashes]
+            strix_corpus.main()
+
+    def test_report_uses_executed_hash_and_rejects_mixed_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)/"report.json"
+            self.run_corpus([None, "actual-executed-image"], output)
+            self.assertEqual(json.loads(output.read_text())["executable_sha256"], "actual-executed-image")
+            with self.assertRaisesRegex(RuntimeError, "different executable"):
+                self.run_corpus(["first", "second"], output)
 
 
 class NativeReference(unittest.TestCase):

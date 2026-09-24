@@ -23,8 +23,8 @@ def main():
     if revision != REVISION:
         parser.error("source checkout does not match pinned solver")
     records = []
+    executable_hash = None
     with StrixReference() as reference:
-        executable_hash = hashlib.sha256(Path(reference.executable).read_bytes()).hexdigest()
         paths = subprocess.check_output(["git", "-C", str(args.source), "ls-tree", "-r", "--name-only",
             REVISION, "scripts/fixtures/forcing_puzzles"], text=True).splitlines()
         for relative in sorted(name for name in paths if name.endswith(".json")):
@@ -41,6 +41,11 @@ def main():
                     depth=args.depth, nodes=args.nodes, timeout_s=args.seconds, wide=args.wide)
             except (KeyError, ValueError) as error:
                 result = dict(status="UNKNOWN", reason=f"unsupported fixture: {error}")
+            executed_hash = result.get("executable_sha256")
+            if executed_hash is not None:
+                if executable_hash is not None and executed_hash != executable_hash:
+                    raise RuntimeError("corpus results came from different executable images")
+                executable_hash = executed_hash
             records.append(dict(file=path.name, sha256=hashlib.sha256(data).hexdigest(), result=result))
             print(path.name, result["status"], flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)

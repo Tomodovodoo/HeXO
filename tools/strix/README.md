@@ -103,5 +103,5 @@ Local bounded interface check at depth 8, 10,000 nodes, and 0.5 seconds per snap
 
 All returned winning lines passed sequential replay. Wide mode spends its
 budget on more candidates, so this small-budget count is not a comparison of
-the generators' eventual completeness. Twelve adapter tests pass. This is a
+the generators' eventual completeness. Thirteen adapter tests pass. This is a
 bounded interface check, not a solver-strength or proof-soundness benchmark.
