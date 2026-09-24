@@ -211,7 +211,8 @@ def execute(output):
     records, started = [], time.perf_counter()
     tasks = [dict(index=i, seed=config['seed']+i//2, challenger_color=i%2, output=str(output),
                   max_stones=config['max_stones'], seal_ms=config['seal_ms'],
-                  **task_opening(config['seed']+i//2, True, config['max_stones'], 'mixed-v1')) for i in range(config['games'])]
+                  **task_opening(config['seed']+i//2, True, config['max_stones'],
+                                 config.get('opening_suite', 'mixed-v1'))) for i in range(config['games'])]
     write_json(output/'openings.json', tasks)
     def publish(finished=False):
         metrics = paired_metrics(records, config['games'])
@@ -262,6 +263,8 @@ def main():
                         help='Directory published by relational_opponents.freeze_opponent')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--mode', choices=('pi', 'mu', 'gumbel', 'gumbel-proof'), default='gumbel')
+    parser.add_argument('--opening-suite', choices=('standard-v1', 'mixed-v1'), default='standard-v1',
+                        help='Three-stone openings for strength comparisons; mixed-v1 includes tactical exercises')
     parser.add_argument('--device', default='cuda')
     for name, default in [('games',4),('seed',20261003),('simulations',16),('root-samples',8),('batch-size',4),
                           ('max-nodes',12000),('max-edges',1000000),('max-stones',80),('neural-ms',10000),('seal-ms',100)]:
