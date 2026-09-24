@@ -6,6 +6,11 @@ from pathlib import Path
 from hexo import Game
 
 
+def promoted_checkpoint(run):
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    return next(c for c in summary["checkpoints"] if c["id"] == summary["incumbent"])
+
+
 class Handler(BaseHTTPRequestHandler):
     game = Game()
     run = None
@@ -14,8 +19,17 @@ class Handler(BaseHTTPRequestHandler):
     neural = None
 
     def state(self):
+        promoted = promoted_checkpoint(self.run) if self.run else None
+        backend = "native-pvs"
+        if self.neural:
+            backend = self.neural.mode
+        elif self.model or (promoted and promoted.get("kind") == "nnue"):
+            backend = "nnue-pvs"
+        elif promoted:
+            backend = "table-pvs"
         return {**self.game.state(), "opponent": self.label,
-                "backend": self.neural.mode if self.neural else "nnue-pvs" if self.model else "pvs",
+                "backend": backend,
+                "checkpoint": promoted["id"] if promoted else None,
                 "default_budget_ms": 10000 if self.neural else 1000,
                 "model_sha256": self.neural.model_sha256 if self.neural else None}
 
@@ -66,9 +80,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif self.model is not None:
                     self.game.load_model(self.model)
                 elif self.run is not None:
-                    summary = json.loads((self.run / "summary.json").read_text(encoding="utf-8"))
-                    checkpoint = summary["incumbent"]
-                    model = next(c for c in summary["checkpoints"] if c["id"] == checkpoint)
+                    model = promoted_checkpoint(self.run)
+                    checkpoint = model["id"]
                     if model.get("kind") == "nnue":
                         self.game.load_model(self.run / model["nnue"])
                     else:
@@ -101,6 +114,8 @@ if __name__ == "__main__":
     parser.add_argument("--label", help="Visible opponent name")
     args = parser.parse_args()
     Handler.run = args.run.resolve() if args.run else None
+    if Handler.run:
+        promoted_checkpoint(Handler.run)
     Handler.model = args.model.resolve() if args.model else None
     if Handler.model:
         Handler.game.load_model(Handler.model)
