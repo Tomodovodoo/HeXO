@@ -14,13 +14,22 @@ from tests.reference import Reference
 
 
 def pair_admission(args):
-    """Measure final ordered-turn admission on untouched recorded loss positions."""
+    """Measure final ordered-turn admission on recorded development positions."""
     import ctypes as C
     import numpy as np
 
     trace = json.loads(Path(args.trace).read_text())
-    table_path = Path(trace["model"]["table"])
-    table = np.load(table_path).tolist()
+    model = trace.get("model")
+    table_path = None
+    table = [0]*729
+    if model:
+        if model.get("kind", "pattern") != "pattern":
+            raise ValueError("Trace benchmark requires a pattern-table or handwritten evaluator")
+        table_path = Path(model["path"])
+        array = np.load(table_path, allow_pickle=False)
+        if array.shape != (729,) or array.dtype != np.int32:
+            raise ValueError("Trace model must contain a 729-entry int32 pattern table")
+        table = array.tolist()
     references = {}
     if args.reference_report:
         references = {(s["game"], s["stones"]): s["reference_turn"]
@@ -96,7 +105,7 @@ def pair_admission(args):
         if len(samples) >= args.positions:
             break
     if not samples:
-        raise ValueError("No eligible held-out loss positions")
+        raise ValueError("No eligible recorded loss positions")
     summary = {}
     for name in ("baseline", "diverse"):
         searches = [trial[name] for sample in samples for trial in sample["trials"]]
@@ -110,7 +119,7 @@ def pair_admission(args):
             "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
             "platform": platform.platform(),
             "trace_sha256": hashlib.sha256(Path(args.trace).read_bytes()).hexdigest(),
-            "table_sha256": hashlib.sha256(table_path.read_bytes()).hexdigest(),
+            "table_sha256": hashlib.sha256(table_path.read_bytes()).hexdigest() if table_path else None,
             "engine_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
             "source_sha256": hashlib.sha256((ROOT/"src/hexo.cpp").read_bytes()).hexdigest(),
             "benchmark_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
