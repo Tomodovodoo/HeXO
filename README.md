@@ -521,6 +521,16 @@ configuration and state dictionary, including Q. `relational_train.load_model`
 loads this format for the neural evaluator/player. Native NNUE loading is not a
 supported deployment path. Training metrics remain unrated until the neural
 player is measured against pinned independent opponents under stated budgets.
+KLENT's separate deployment-value pass reconstructs and validates the same full
+legal action ordering as the actor pass, retaining its row order and chunk
+boundaries, but skips candidate feature encoding and embedding. It trains only
+the value head against the existing return targets. A CPU comparison on 128
+saved corpus rows measured 0.857 to 0.423 seconds for this pass (2.03x), with
+identical losses, value-head parameters and Adam states in that experiment.
+This is a value-pass measurement, not an overall training or GPU speedup.
+Reproduce it with `python -m tests.benchmark_value --corpus <directory>
+--model <model.pt> --output <report.json>`.
+
 ## Primary relational policy/Q model
 
 `relational_model.RelationalNet(ModelConfig())` implements the new primary

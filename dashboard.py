@@ -2,11 +2,87 @@
 import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
 import time
 from collections import deque
+from functools import lru_cache
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+@lru_cache(maxsize=32)
+def episode_counts(path, modified):
+    episodes = read_json(Path(path), [])
+    return {"games": len(episodes), "terminal_games": sum(e["winner"] >= 0 for e in episodes),
+            "bootstrapped_games": sum(e["winner"] < 0 for e in episodes),
+            "positions": sum(len(e["moves"]) for e in episodes)}
+
+
+def bound_evaluation(run, checkpoint):
+    model = run/"checkpoints"/f"{checkpoint:04d}"/"model.nnue"
+    if not model.exists():
+        return None
+    current = hashlib.sha256(model.read_bytes()).hexdigest()
+    for folder in (run/"evaluation/confirmation", run/"evaluation"):
+        status = read_json(folder/"status.json")
+        if not status:
+            continue
+        candidate = status.get("candidate_sha256")
+        if not candidate:
+            report = read_json(folder/"report.json", {})
+            path = report.get("config", {}).get("candidate")
+            candidate = report.get("identity", {}).get(path)
+        if candidate == current:
+            return {**status, "candidate_sha256": current, "checkpoint": checkpoint}
+    return None
+
+
+def klent_run(run):
+    checkpoints = []
+    identity, schema = {}, None
+    for path in sorted((run/"checkpoints").glob("[0-9][0-9][0-9][0-9]/manifest.json")):
+        manifest = read_json(path)
+        if not manifest or not manifest.get("schema", "").startswith("hexo-klent-"):
+            continue
+        identity, schema = manifest["identity"], manifest["schema"]
+        checkpoints.append({"id": int(path.parent.name), "metrics": manifest.get("metrics"),
+                            "actor_sha256": manifest.get("files", {}).get("klent.pt")})
+    if not schema:
+        return None
+    status = read_json(run/"status.json", {})
+    number = status.get("iteration", checkpoints[-1]["id"])
+    corpus = run/"corpus"/f"{number:04d}"
+    corpus_manifest = read_json(corpus/"manifest.json", {})
+    active = dict(status)
+    episodes = corpus/"episodes.json"
+    if corpus_manifest and episodes.exists():
+        active.update(episode_counts(str(episodes), episodes.stat().st_mtime_ns))
+    totals = {key: sum((c["metrics"] or {}).get(key, 0) for c in checkpoints)
+              for key in ("games", "positions", "terminal_games", "bootstrapped_games", "optimizer_steps")}
+    # A published checkpoint already includes the last status: never double count it.
+    if number > checkpoints[-1]["id"]:
+        for key in totals:
+            if key in active:
+                totals[key] += active[key]
+    return {"name": run.name, "schema": schema, "config": identity.get("config", {}),
+            "stage": status.get("stage", "initialized"), "iteration": number,
+            "active": active, "totals": totals, "checkpoints": checkpoints,
+            "actor": corpus_manifest.get("identity", {}).get("policy", "softmax((Q+beta*logpi)/(alpha+beta))"),
+            "actions": corpus_manifest.get("identity", {}).get("actions", "full-legal"),
+            "actor_sha256": corpus_manifest.get("identity", {}).get("actor_sha256") or status.get("actor_sha256") or checkpoints[-1]["actor_sha256"],
+            "source_sha256": identity.get("sources", {}).get("klent.py"),
+            "engine_sha256": identity.get("engine_sha256"), "training_lock_present": (run/"training.lock").exists(),
+            "status_modified": (run/"status.json").stat().st_mtime if (run/"status.json").exists() else None,
+            "evaluation": bound_evaluation(run, checkpoints[-1]["id"]),
+            "rating": "UNRATED", "rating_reason": "External paired match evidence is not attached to this run."}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -42,7 +118,8 @@ class Handler(BaseHTTPRequestHandler):
             summary = self.run / "summary.json"
             events = self.run / "events.jsonl"
             if not summary.exists():
-                data = {"summary": None, "events": []}
+                klent = klent_run(self.run)
+                data = {"kind": "klent" if klent else "native", "klent": klent, "summary": None, "events": []}
             else:
                 recent = []
                 if events.exists():
@@ -58,7 +135,7 @@ class Handler(BaseHTTPRequestHandler):
                                 recent.append(json.loads(line))
                             except json.JSONDecodeError:
                                 pass  # The trainer may be writing the last line.
-                data = {"summary": json.loads(summary.read_text(encoding="utf-8")), "events": recent[-500:]}
+                data = {"kind": "native", "summary": read_json(summary), "events": recent[-500:]}
             data["hardware"] = self.gpu_status()
             payload = json.dumps(data).encode()
             content_type = "application/json"

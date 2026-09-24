@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <set>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -30,7 +31,14 @@ API const float* hgr_features(Graph* g,I* length) { *length=I(g->f.size()); retu
 API Graph* hgr_build(const I* stones,I ns,const I* actions,I na,I ng,int player,const float* phase,I maxnodes,I maxedges) {
  Graph* g=nullptr;
  try {
-  if(ns<0||na<0||ng<1) throw std::runtime_error("Invalid graph dimensions");
+  if(ns<0||na<0||ng<1||ng>1000000) throw std::runtime_error("Invalid graph dimensions");
+  // Check worst-case window/node and int64 edge-buffer sizes before arithmetic.
+  constexpr I limit=std::numeric_limits<I>::max()/I(sizeof(I));
+  if(ns>limit/432 || na>limit/40 || ns>limit/(5*std::max(I(1),ns)))
+   throw std::runtime_error("Graph dimensions exceed representable buffer sizes");
+  I upper=19*ns+na+ng;
+  if(upper>limit/8 || ng>limit/(5*std::max(I(1),upper)))
+   throw std::runtime_error("Graph dimensions exceed representable buffer sizes");
   if(maxnodes>=0&&ns+na+ng>maxnodes) throw std::runtime_error("Stone/legal nodes exceed node budget");
   std::vector<std::array<I,3>> sorted;
   for(I i=0;i<ns;i++) sorted.push_back({stones[3*i],stones[3*i+1],stones[3*i+2]});

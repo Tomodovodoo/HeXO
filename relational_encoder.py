@@ -6,6 +6,7 @@ permute the graph without changing its features.
 """
 from dataclasses import dataclass
 import math
+import hashlib
 import numpy as np
 from hexo import Game
 
@@ -52,6 +53,17 @@ class Graph:
     global_tokens: int
 
     @property
+    def position_key(self):
+        # Absolute ownership and native phase identify the state, independently
+        # of which chronological ordering reached it. Coordinates remain int64.
+        n = len(self.stone_coords)
+        occupied = np.empty((n,3),dtype='<i8')
+        occupied[:,:2] = self.stone_coords
+        occupied[:,2] = np.where(self.owners[:n] == 0,self.player,1-self.player)
+        phase = np.asarray([self.player,self.remaining],dtype='<i8')
+        return hashlib.sha256(b'hexo-six-radius8-v1\0'+phase.tobytes()+occupied.tobytes()).hexdigest()
+
+    @property
     def node_count(self):
         return len(self.kinds)
 
@@ -69,8 +81,8 @@ def _edges(rows):
 
 
 def encode(history, *, global_tokens=16, max_nodes=None, max_edges=None):
-    if type(global_tokens) is not int or global_tokens < 1:
-        raise ValueError('Need positive global token count')
+    if type(global_tokens) is not int or not 1 <= global_tokens <= 1_000_000:
+        raise ValueError('Global token count must be in 1..1000000')
     game = Game(history)
     try:
         if game.winner >= 0:
@@ -198,4 +210,7 @@ def pack(graphs, device='cpu'):
                 global_index=np.tile(np.arange(graphs[0].global_tokens),len(graphs)))
     result = {k:torch.as_tensor(v,device=device) for k,v in data.items()}
     result['global_tokens'] = graphs[0].global_tokens
+    result['position_keys'] = tuple(g.position_key for g in graphs)
+    result['players'] = torch.tensor([g.player for g in graphs],dtype=torch.int64,device=device)
+    result['remaining'] = torch.tensor([g.remaining for g in graphs],dtype=torch.int64,device=device)
     return result
