@@ -16,6 +16,29 @@ class Uniform:
         return out
 
 class NeuralTree(unittest.TestCase):
+    def test_unknown_proofs_reserve_inference_across_large_batches(self):
+        from unittest.mock import patch
+        clock, spent = [0.], [0.]
+        class Unknown:
+            def history(self, history, ms, **kwargs):
+                spent[0] += ms
+                clock[0] += ms/1000
+                return {'status': 'UNKNOWN'}
+        class Timed(Uniform):
+            def evaluate(self, histories):
+                clock[0] += .005
+                return super().evaluate(histories)
+        search = NeuralSearch(Timed(), 'proof-reserve', [(0,0)],
+                              proof_solver=Unknown(), proof_ms=1000)
+        self.addCleanup(search.close)
+        with patch('neural_search.time.perf_counter', side_effect=lambda: clock[0]):
+            result = search.search(32, root_samples=16, batch_size=16, milliseconds=100)
+        self.assertLessEqual(spent[0], 25)
+        self.assertGreater(result['evaluated'], 0)
+        ref = Reference()
+        ref.play(0,0)
+        ref.play(*result['action'])
+
     def test_verified_pending_turn_and_rejected_certificate(self):
         from tactical_proof import NativeTactics
         try:
