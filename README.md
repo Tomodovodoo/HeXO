@@ -52,17 +52,37 @@ Open <http://127.0.0.1:8766>. The dashboard shows self-play progress, positions 
 
 The defaults use four CPU actors, 64 self-play games per iteration, a 50 ms self-play budget, and 40 evaluation games per opponent at 100 ms per turn. PyTorch trains on the GPU when available. Use `--device cpu` for a CPU learner. Each game cap is a truncation, not a draw. Truncated positions retain search targets but have no outcome label.
 
+To generate games on the GPU and use larger learner batches:
+
+```sh
+python train.py --run runs/gpu-selfplay --selfplay-backend gpu --games 2048 --gpu-games-batch 0 --batch 0 --device cuda
+python dashboard.py --run runs/gpu-selfplay
+```
+
+`--gpu-games-batch 0` chooses a batch from available VRAM and the episode cap. `--batch 0` increases the learner batch while preserving the reference batch-256 optimizer update count. `--updates-per-epoch` sets an explicit update budget. CUDA training uses fused AdamW and keeps replay tensors on the device. Replay sampling occurs before concatenating shards, and `--replay-positions` bounds retained positions. The limit also accounts for available device memory. Best validation weights and the matching optimizer state are saved.
+
+GPU actors use exact sparse rules with growing coordinate storage and incremental native-compatible pattern features. Their candidate policy combines nearby cells, axial development, and broader exploration. They choose one placement at a time using the learned evaluator, with `--exploration` controlling stochastic choices. They do not run native PVS; `--ms` and `--width` do not control this actor. Replay records identify the actor and one-placement target semantics. Promotion always measures the native deployed engine at equal wall-clock budgets.
+
+On this RTX 3070 Ti, the zero-residual GPU actor generated about 835 games/second at batch 512 and 907 at batch 2048, using 32 candidates and a 96-stone cap. All games in those measured batches completed. These timings include generation and replay transfer, but not training or native evaluation. They measure throughput, not strength. Reproduce on your hardware:
+
+```sh
+python gpu_benchmark.py --actor --batches 64 256 512 2048 --placements 96
+python gpu_benchmark.py --batches 64 512 2048 --placements 96
+```
+
+The second command compares only exact rule transitions and feature updates with C++. Small GPU batches are slower than native code. The dashboard exposes device utilization, VRAM, power, and temperature; telemetry includes other applications using the GPU. A small pattern learner cannot productively saturate every GPU unit at all times, so larger game batches and measured throughput guide settings.
+
 The first learned evaluator is deliberately small. An `18 -> 32 -> 1` network maps six-cell ternary patterns to a bounded residual on top of the hand-written evaluator. Training pools every occupied six-cell window without cropping the board. Color antisymmetry and line reversal are enforced. The 729-entry integer table is exported for native incremental evaluation and move ordering. No Python or GPU calls occur inside search. This is the initial six-cell learner, not yet the larger length-11 NNUE model from the project plan.
 
 Each iteration:
 
-1. Play the incumbent against itself and earlier promoted checkpoints, with varied openings.
+1. Play the latest learner against itself and earlier promoted checkpoints, with varied openings. The rated incumbent remains separate from the current learner.
 2. Store positions, search targets, game outcomes, and complete move histories.
-3. Fit a challenger on the recent replay data. Entire opening families stay together; the 12 hex symmetries determine family identity. One fifth of family hash buckets is reserved for validation.
+3. Continue the latest learner and its optimizer on recent replay data, even if it was rejected for deployment. Entire opening families stay together; the 12 hex symmetries determine family identity. One fifth of family hash buckets is reserved for validation.
 4. Evaluate the challenger against the incumbent, the original checkpoint, and an older promoted checkpoint when available. These openings include radius-three placements, distinct from radius-two training openings, and are paired with colors exchanged.
-5. Promote only after a positive lower game-level confidence bound and an opening-pair sign test. The significance budget shrinks across successive attempts to limit false promotions. Incomplete evaluation games prevent promotion. Clear losses against older checkpoints also prevent promotion.
+5. Promote only after a positive observed advantage and an exact opening-pair sign test. The significance budget shrinks across successive attempts to limit false promotions; evaluation sample sizes grow when needed so promotion does not become mathematically impossible. Incomplete evaluation games prevent promotion. Clear losses against older checkpoints also prevent promotion.
 
-Elo is estimated against the frozen original checkpoint, whose rating is zero. It is a within-run estimate, not a site leaderboard rating. Graphs include rejected challengers and approximate game-level confidence intervals. The pair test, rather than the graph alone, governs promotion. A small evaluation may be unable to establish improvement. No run is guaranteed to produce a stronger checkpoint.
+Elo is estimated against the frozen original checkpoint, whose rating is zero. It is a within-run estimate, not a site leaderboard rating. Graphs include rejected challengers and conservative opening-pair confidence intervals. An incomplete evaluation has no Elo point estimate; bounds account for the unknown outcomes. `--eval-max-stones` defaults to 800 independently of the shorter training cap. The pair test, rather than the graph alone, governs promotion. A small evaluation may be unable to establish improvement. No run is guaranteed to produce a stronger checkpoint.
 
 Run directories contain `summary.json`, append-only `events.jsonl`, replay batches, match histories, and checkpoint model/table files. Repeat the same command to perform additional iterations with the same configuration. Engine or training-source changes require a new run directory, keeping ratings comparable. A lock prevents concurrent trainers from writing the same run. If a process is forcibly killed, verify it has stopped before removing its stale `training.lock`.
 
@@ -78,7 +98,7 @@ For a short end-to-end run, use a separate directory:
 python train.py --run runs/short-run --iterations 1 --games 12 --eval-games 8 --ms 10 --eval-ms 20 --epochs 4 --workers 2
 ```
 
-Eight evaluation games cannot pass the default first-iteration pair-test significance threshold. This command checks collection, training, evaluation, and rejection behavior; it cannot establish competitive strength.
+The evaluator increases undersized requests enough to make the pair test possible. This short command exercises collection, training, evaluation, and checkpoint decisions; it cannot by itself establish competitive strength.
 
 ## Engine
 
@@ -90,6 +110,8 @@ Eight evaluation games cannot pass the default first-iteration pair-test signifi
 - A hand-written window evaluator plus an optional learned pattern residual, updated on make/unmake and loaded through `Game.load_table()`.
 
 The legal environment is exact within its integer representation. Search is selective: ordinary candidates come from nearby cells and promising lines, and quiet turns are shortlisted. It does not prove game-theoretic wins. A mate-like search score is not a proof certificate. Deadlines are checked during search; setup and an individual candidate-generation operation can exceed very small budgets. Search metadata includes total native elapsed time.
+
+Window storage uses a contiguous growing hash table with compact counts and pattern codes. Benchmarked completed searches improved by 8-22% compared with the initial node-based table; the measured make/undo workload improved by 31%. Moves, scores, depths and node counts matched at completed depths. Differential verification covered 28,723 states, 292 timeout/restoration checks, and 80 full legal-frontier comparisons.
 
 ## Opponent matches
 
@@ -107,15 +129,18 @@ git clone https://github.com/Ramora0/HexTicTacToe.git ../seal-reference
 cmake -S . -B build -DHEXO_SEAL_SOURCE=../seal-reference
 cmake --build build --config Release -j 4
 python arena.py --opponent seal --games 20 --ms 100 --output artifacts/seal.json
+python arena.py --opponent seal --run runs/gpu-selfplay --checkpoint 1 --games 20 --ms 100
 ```
 
-The adapter compiles the external engine without vendoring it. Seal's fixed array has a smaller coordinate range; games outside the adapter's safe range are marked invalid rather than counted as victories. Equal requested budgets are used, and both engines' actual elapsed times are retained.
+The adapter compiles the external engine without vendoring it. Seal's fixed array has a smaller coordinate range; games outside the adapter's safe range are marked invalid rather than counted as victories. Equal requested budgets are used, and both engines' actual elapsed times are retained. `--run` loads the promoted checkpoint, `--checkpoint` selects another saved candidate, and `--table` loads a standalone export. Reports identify the loaded table and its hash. Without a model option the arena uses the original evaluator.
 
 ## Status and remaining work
 
 The initial non-neural version is playable. Direct runtime checks have covered the radius-eight frontier, sequential expansion, immediate wins, and 800 make/unmake comparisons. A differential run matched 2,019 transitions against the official TypeScript rules, including rejected moves, turn phase, cells, and winner. Sparse expansion to coordinate 800 also passed. An initial eight-game development comparison against Seal scored two wins and six losses at 100 ms per turn. This is an initial measurement, not a competitive-strength claim. Two tactical-extension experiments scored zero wins in the same eight openings and were removed.
 
 The first complete learning run collected 516 positions from 12 games and trained on the RTX 3070 Ti. Its challenger scored three wins, four losses, and one incomplete evaluation game and was rejected. That demonstrates the loop, not a strength gain. Larger runs are needed to measure improvement.
+
+A subsequent native-actor run collected 10,130 positions from 192 games. None of its three candidates earned promotion. The GPU pipeline has also completed generation, fitting, native evaluation, checkpoint persistence, and resumed training with optimizer lineage. GPU trajectories and feature targets have been replayed against the native engine. No convincing Elo gain has been established yet.
 
 Further work includes training-quality improvements, search profiling, stronger threat search, larger held-out opponent matches, Orca integration, and game-data import. Match clocks, rated lobbies, and online account play are not part of the local board yet.
 

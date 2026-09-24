@@ -17,7 +17,7 @@ struct Cell {
     Cell operator+(Cell b) const { return {q+b.q,r+b.r}; }
     Cell operator*(int n) const { return {q*n,r*n}; }
 };
-uint64_t mix(uint64_t x) {
+constexpr uint64_t mix(uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
     x = (x^(x>>30))*0xbf58476d1ce4e5b9ULL;
     x = (x^(x>>27))*0x94d049bb133111ebULL;
@@ -33,17 +33,66 @@ struct Window {
     bool operator==(const Window&) const = default;
 };
 struct WindowHash {
-    size_t operator()(const Window& w) const { return CellHash{}(w.start)^mix(w.axis+51); }
+    size_t operator()(const Window& w) const {
+        constexpr uint64_t directions[]={mix(51),mix(52),mix(53)};
+        return CellHash{}(w.start)^directions[w.axis];
+    }
 };
-using Counts = std::array<int,2>;
-struct WindowData { Counts counts{}; int pattern=0; };
+using Counts = std::array<uint8_t,2>;
+struct WindowData { Counts counts{}; uint16_t pattern=0; };
+// Search repeatedly creates and removes the same six-cell windows. An open
+// table avoids a heap allocation on every make/undo and keeps probes contiguous.
+// Backshift deletion leaves no tombstones to accumulate during long searches.
+struct WindowTable {
+    struct Slot {
+        Cell start{};
+        uint64_t hash=0;
+        WindowData data{};
+        uint8_t axis=0;
+        Window key() const { return {start,axis}; }
+    };
+    std::vector<Slot> slots=std::vector<Slot>(128);
+    size_t count=0;
+    static uint64_t hash(Window w) { auto h=WindowHash{}(w);return h?h:1; }
+    const WindowData* find(Window w) const {
+        auto h=hash(w);size_t i=h&(slots.size()-1);
+        while(slots[i].hash) {
+            if(slots[i].hash==h && slots[i].key()==w) return &slots[i].data;
+            i=(i+1)&(slots.size()-1);
+        }
+        return nullptr;
+    }
+    WindowData& get(Window w) {
+        if((count+1)*4>=slots.size()*3) {
+            auto old=std::move(slots);slots=std::vector<Slot>(old.size()*2);count=0;
+            for(const auto& s:old) if(s.hash) get(s.key())=s.data;
+        }
+        auto h=hash(w);size_t i=h&(slots.size()-1);
+        while(slots[i].hash) {
+            if(slots[i].hash==h && slots[i].key()==w) return slots[i].data;
+            i=(i+1)&(slots.size()-1);
+        }
+        slots[i]={w.start,h,{},uint8_t(w.axis)};++count;return slots[i].data;
+    }
+    void erase(Window w) {
+        auto h=hash(w);const size_t mask=slots.size()-1;size_t hole=h&mask;
+        while(slots[hole].hash!=h || !(slots[hole].key()==w)) hole=(hole+1)&mask;
+        for(size_t next=(hole+1)&mask;slots[next].hash;next=(next+1)&mask) {
+            size_t home=slots[next].hash&mask;
+            if(((next-home)&mask)>=((next-hole)&mask)) {
+                slots[hole]=slots[next];hole=next;
+            }
+        }
+        slots[hole]={};--count;
+    }
+};
 constexpr int powers[]={1,3,9,27,81,243};
 constexpr int weight[]={0,1,12,150,2400,24000,1000000};
 int value(Counts c) { return c[1]==0 ? weight[c[0]] : c[0]==0 ? -weight[c[1]] : 0; }
 struct Undo { Cell c; int player,remaining,winner; };
 struct Board {
     std::unordered_map<Cell,int,CellHash> cells;
-    std::unordered_map<Window,WindowData,WindowHash> windows;
+    WindowTable windows;
     std::array<std::unordered_set<Window,WindowHash>,2> threats;
     std::vector<Undo> history;
     int player=0,remaining=1,winner=-1;
@@ -68,9 +117,9 @@ struct Board {
     void update(Cell c,int p,int delta) {
         for(int d=0;d<3;++d) for(int k=0;k<6;++k) {
             Window w{c+axes[d]*(-k),d};
-            auto [it,_]=windows.try_emplace(w,WindowData{});
-            Counts& n=it->second.counts;
-            int& pattern=it->second.pattern;
+            auto& data=windows.get(w);
+            Counts& n=data.counts;
+            auto& pattern=data.pattern;
             if(pattern) --features[pattern];
             learned_score-=adjustment[pattern];
             evaluation-=value(n);
@@ -84,7 +133,7 @@ struct Board {
             for(int side=0;side<2;++side)
                 if(n[side]>=4 && n[1-side]==0) threats[side].insert(w);
             if(n[p]>=6) winner=p;
-            if(n[0]+n[1]==0) windows.erase(it);
+            if(n[0]+n[1]==0) windows.erase(w);
         }
     }
     void make(Cell c) {
@@ -137,9 +186,9 @@ struct Board {
     int gain(Cell c,int p) const {
         int score=0;
         for(int d=0;d<3;++d) for(int k=0;k<6;++k) {
-            auto it=windows.find({c+axes[d]*(-k),d});
-            Counts n=it==windows.end()?Counts{0,0}:it->second.counts;
-            int pattern=it==windows.end()?0:it->second.pattern;
+            auto data=windows.find({c+axes[d]*(-k),d});
+            Counts n=data?data->counts:Counts{0,0};
+            int pattern=data?data->pattern:0;
             int delta=adjustment[pattern+(p+1)*powers[k]]-adjustment[pattern];
             score+=p==0?delta:-delta;
             if(n[1-p]==0) score+=weight[n[p]+1]-weight[n[p]];
@@ -186,11 +235,23 @@ struct Search {
                 if(b.at(c+Cell{q,r})<0) set.insert(c+Cell{q,r});
         }
         // Include every empty cell of a promising line, even far from the last move.
-        for(auto [w,data]:b.windows) if((data.counts[0]>=2 && !data.counts[1]) || (data.counts[1]>=2 && !data.counts[0]))
-            for(auto c:b.empty(w)) set.insert(c);
+        for(const auto& slot:b.windows.slots) if(slot.hash) {
+            const auto& data=slot.data;
+            if((data.counts[0]>=2 && !data.counts[1]) || (data.counts[1]>=2 && !data.counts[0]))
+                for(auto c:b.empty(slot.key())) set.insert(c);
+        }
         std::vector<std::pair<int,Cell>> ranked;
-        for(auto c:set) if(b.legal(c)) ranked.emplace_back(b.gain(c,b.player),c);
-        std::sort(ranked.begin(),ranked.end(),[](auto a,auto z){ return a.first!=z.first ? a.first>z.first : a.second<z.second; });
+        // Every candidate is empty and within five cells of an occupied cell.
+        // Only the coordinate representation limit needs checking here.
+        ranked.reserve(set.size());
+        for(auto c:set) if(std::abs(c.q)<=1000000000000LL && std::abs(c.r)<=1000000000000LL)
+            ranked.emplace_back(b.gain(c,b.player),c);
+        const auto better=[](const auto& a,const auto& z){ return a.first!=z.first ? a.first>z.first : a.second<z.second; };
+        if(int(ranked.size())>limit) {
+            std::nth_element(ranked.begin(),ranked.begin()+limit,ranked.end(),better);
+            ranked.resize(limit);
+        }
+        std::sort(ranked.begin(),ranked.end(),better);
         std::vector<Cell> out;
         for(int i=0;i<std::min(limit,int(ranked.size()));++i) out.push_back(ranked[i].second);
         // Tactical cells cannot be removed by ordinary move ordering.
@@ -313,7 +374,10 @@ struct Search {
             {Restore fallback(b);int side=b.player;b.make(chosen.cells[0]);
                 if(b.player==side && b.winner<0) {
                     if(chosen.count<2) {auto second=candidates(b,1);chosen.cells[1]=second.front();chosen.count=2;}
+                    b.make(chosen.cells[1]);
                 }
+                chosen.score=b.winner==side?mate:b.score(side);
+                if(b.winner<0 && !b.completions(1-side).empty()) chosen.score=-mate;
             }
             try {
                 auto roots=turns(b);
