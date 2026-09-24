@@ -1,11 +1,34 @@
 from contextlib import closing
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+import json
+from pathlib import Path
+import tempfile
 from hexo import Game
 from tools.seal_current import SealCurrent
+from tools.seal_current import REVISION, WEIGHTS_SHA256, sha
 
 
 class SealCurrentContract(unittest.TestCase):
+    def test_stale_cpp_adapter_rejected_before_loading(self):
+        import os
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "build").mkdir()
+            (root / "tools").mkdir()
+            source = root / "tools/seal_current_adapter.cpp"
+            source.write_bytes(b"old source")
+            binary = root / "build" / ("hexo_seal_current.dll" if os.name == "nt" else "libhexo_seal_current.so")
+            binary.write_bytes(b"unchanged binary")
+            manifest = dict(revision=REVISION, weights_sha256=WEIGHTS_SHA256,
+                            binary_sha256=sha(binary), adapter_source_sha256=sha(source))
+            binary.with_suffix(binary.suffix + ".json").write_text(json.dumps(manifest))
+            source.write_bytes(b"new source")
+            with patch('tools.seal_current.ROOT', root), patch('tools.seal_current.C.CDLL') as load:
+                with self.assertRaisesRegex(ValueError, "manifest mismatch"):
+                    SealCurrent()
+                load.assert_not_called()
+
     def adapter(self, moves):
         adapter = SealCurrent.__new__(SealCurrent)
         def reply(data, count, player, remaining, ms, out):

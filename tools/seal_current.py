@@ -56,7 +56,9 @@ class SealCurrent:
     def __init__(self):
         path = ROOT / "build" / ("hexo_seal_current.dll" if os.name == "nt" else "libhexo_seal_current.so")
         self.metadata = json.loads(path.with_suffix(path.suffix + ".json").read_text(encoding="utf-8"))
-        if self.metadata["revision"] != REVISION or self.metadata["weights_sha256"] != WEIGHTS_SHA256 or self.metadata["binary_sha256"] != sha(path):
+        if (self.metadata["revision"] != REVISION or self.metadata["weights_sha256"] != WEIGHTS_SHA256
+                or self.metadata["binary_sha256"] != sha(path)
+                or self.metadata["adapter_source_sha256"] != sha(ROOT / "tools/seal_current_adapter.cpp")):
             raise ValueError("SealBot build manifest mismatch; rebuild the pinned adapter")
         self.metadata["python_adapter_sha256"] = sha(__file__)
         self.lib = C.CDLL(str(path))
