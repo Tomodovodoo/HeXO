@@ -6,10 +6,32 @@ from pathlib import Path
 import tempfile
 from hexo import Game
 from tools.seal_current import SealCurrent
-from tools.seal_current import REVISION, WEIGHTS_SHA256, sha
+from tools.seal_current import REVISION, WEIGHTS_SHA256, sha, build
 
 
 class SealCurrentContract(unittest.TestCase):
+    def test_cpp_edit_during_compile_does_not_publish_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "tools").mkdir()
+            (root / "best").mkdir()
+            adapter = root / "tools/seal_current_adapter.cpp"
+            adapter.write_bytes(b"before compile")
+            weights = root / "best/pattern_data.h"
+            weights.write_bytes(b"test weights")
+            def command(args, **kwargs):
+                if args[-1] == "--version": return "test compiler"
+                if "rev-parse" in args: return REVISION
+                if "ls-files" in args: return "best/pattern_data.h"
+                return ""
+            def compile(args, **kwargs): adapter.write_bytes(b"changed during compile")
+            with patch('tools.seal_current.ROOT', root), patch('tools.seal_current.WEIGHTS_SHA256', sha(weights)), \
+                    patch('tools.seal_current.subprocess.check_output', side_effect=command), \
+                    patch('tools.seal_current.subprocess.run', side_effect=compile):
+                with self.assertRaisesRegex(ValueError, "adapter changed during compilation"):
+                    build(root)
+            self.assertEqual(list((root / 'build').glob('*.json')), [])
+
     def test_stale_cpp_adapter_rejected_before_loading(self):
         import os
         with tempfile.TemporaryDirectory() as directory:

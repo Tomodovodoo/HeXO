@@ -30,6 +30,7 @@ def build(source, compiler="g++"):
         raise ValueError("SealBot best weights differ from pinned bytes")
     sources = {p: sha(source / p) for p in paths if p.endswith(".h")}
     adapter = ROOT / "tools/seal_current_adapter.cpp"
+    adapter_hash = sha(adapter)
     out = ROOT / "build" / ("hexo_seal_current.dll" if os.name == "nt" else "libhexo_seal_current.so")
     out.parent.mkdir(exist_ok=True)
     command = [compiler, "-std=c++20", "-O3", "-shared", "-I", str(source / "best"), str(adapter), "-o", str(out)]
@@ -38,12 +39,14 @@ def build(source, compiler="g++"):
     subprocess.run(command, check=True)
     if sources != {p: sha(source / p) for p in sources}:
         raise ValueError("SealBot sources changed during compilation")
+    if sha(adapter) != adapter_hash:
+        raise ValueError("SealBot adapter changed during compilation")
     metadata = {"name": "seal-current-best", "repository": "https://github.com/Ramora0/SealBot",
                 "revision": REVISION, "variant": "best", "license": "No project license found at pinned revision",
                 "source_directory": str(source), "source_sha256": sources,
                 "weights_sha256": WEIGHTS_SHA256, "weights_file_sha256": sha(source / "best/pattern_data.h"),
                 "weights_hash_encoding": "canonical LF, with compiled file bytes separately hashed",
-                "adapter_source_sha256": sha(adapter),
+                "adapter_source_sha256": adapter_hash,
                 "binary_sha256": sha(out), "compiler": version, "build_command": command,
                 "budget": "milliseconds per complete turn, upstream best-effort deadline; not a hard timeout",
                 "randomness": "Upstream random_device initialization, not seeded by arena seed"}
