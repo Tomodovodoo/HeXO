@@ -114,6 +114,8 @@ def freeze(args):
     for path in [checkpoint, args.seal_library, revision_file, *binaries, *(ROOT/name for name in source_names)]:
         if not path.is_file():
             raise FileNotFoundError(path)
+    revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    dirty = bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip())
     output.mkdir(parents=True)
     (output/'models').mkdir()
     (output/'workers').mkdir()
@@ -133,8 +135,7 @@ def freeze(args):
     identity = {str(p.relative_to(output)): sha(p) for p in output.rglob('*') if p.is_file()}
     write_json(output/'provenance.json', dict(schema='hexo-relational-evaluation-v1', config=config,
         files_sha256=identity, model_input_sha256={'candidate': sha(output/'models/candidate.pt'), 'reference': sha(seal)},
-        revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
-        dirty=bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip()),
+        revision=revision, dirty=dirty,
         model_family='relational-policy-q', backend=args.mode, promotion=False,
         budget_comparison='unequal: neural simulations per placement with cooperative turn deadline; Seal milliseconds per turn'))
     return output

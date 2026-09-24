@@ -148,9 +148,15 @@ class DirectPlayer(unittest.TestCase):
                 original(source, target)
                 if Path(target) == output/'models/candidate.pt':
                     checkpoint.write_bytes(b'replacement')
-            with patch('relational_evaluate.shutil.copyfile', side_effect=copy):
+            def git_snapshot(command, **kwargs):
+                self.assertFalse(output.exists())
+                return 'source-revision' if command[1] == 'rev-parse' else ''
+            with patch('relational_evaluate.shutil.copyfile', side_effect=copy), patch(
+                    'relational_evaluate.subprocess.check_output', side_effect=git_snapshot):
                 freeze(args)
-            identity = json.loads((output/'provenance.json').read_text())['model_input_sha256']['candidate']
+            provenance = json.loads((output/'provenance.json').read_text())
+            self.assertFalse(provenance['dirty'])
+            identity = provenance['model_input_sha256']['candidate']
             self.assertEqual(identity, hashlib.sha256(b'evaluated').hexdigest())
             self.assertNotEqual(identity, hashlib.sha256(checkpoint.read_bytes()).hexdigest())
 
