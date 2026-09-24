@@ -170,6 +170,14 @@ class RelationalTests(unittest.TestCase):
             next(model.parameters()).add_(1)
         self.assertNotEqual(first,NeuralEvaluator(model,'cpu').model_version)
         self.assertEqual(NeuralEvaluator(model,'cpu',model_version='checkpoint-sha').model_version,'checkpoint-sha')
+        evaluator = NeuralEvaluator(model,'cpu')
+        before = evaluator.evaluate([history])[0]
+        with torch.no_grad():
+            model.policy[-1].bias.add_(3)
+        after = evaluator.evaluate([history])[0]
+        np.testing.assert_array_equal(before['logits'],after['logits'])
+        self.assertEqual(before['model_version'],after['model_version'])
+        self.assertTrue(all(not p.requires_grad for p in evaluator.model.parameters()))
 
 
 if __name__ == '__main__':

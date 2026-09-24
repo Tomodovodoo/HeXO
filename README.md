@@ -1,5 +1,20 @@
 # HeXO
 
+## Native verified tactical strategies
+
+The optional `tactical_proof.NativeTactics` library runs wide Strix IDTT followed by PDS-PN at pinned revision `5a771e572553a8bd8e010112b2ce65f16e5afa1b`. IDTT principal variations are only hints. An exact positive requires a complete PDS-PN strategy DAG accepted by a separate raw-coordinate Rust checker. `independent_verify` also rechecks the exported strategy through the independent Python rules implementation.
+
+```sh
+python tools/build_tactical.py
+python -m unittest tests.test_tactical_proof -v
+```
+
+This needs Rust/Cargo supporting edition 2024 and uses locked dependencies. The build manifest binds the native binary to its wrapper sources and Cargo lockfile. `NativeTactics().solve(game, ms=100)` returns `PROVEN_WIN` with `native_verified=true` and the complete current turn only after verification; unresolved searches return `UNKNOWN`, never a global loss. Partial-turn roots are supported. The exact board, player, remaining placements, fixed rules and verifier scope identify cached facts; neural model evaluations and visit counts are not stored here.
+
+The certificate checker covers both mandatory two-cell defenses and a mandatory single block followed by every legal free second placement. For singleton covers it enumerates the entire radius-eight frontier after the block, including newly legal fillers, and preserves a legal order for each resulting pair. `solve(game, root_moves=[first, second], ...)` can verify a proposed attacker turn by constructing all these defensive branches and proving every continuation with bounded PDS-PN. The default upstream generator still searches fully forcing attacks; entirely quiet defender nodes and unresolved continuations remain `UNKNOWN`. A legal open-three fixture yields a 1,295-node wide-search strategy accepted by both checkers, whereas tight IDTT finds no forcing win. On the development host, a fresh verified proof took about 0.7 seconds and cached re-verification about 18 ms; this is a tactical correctness result, not a strength result.
+
+Upstream certificate reconstruction does not honor its search deadline. One persistent native worker bounds how long callers wait and rejects overlapping requests as `UNKNOWN`; it may finish work after the caller times out. Reports expose background-worker state, completed-late counts, elapsed worker time and Windows thread CPU time. These are **not equal-compute tournament clocks**. Late or partial certificates never become exact search values. Primary neural MCTS integration remains a separate task. The optional candidate route proved a legal 27-stone fixture with one mandatory block and 745 distinct legal free-placement replies. Both independent checkers accepted its 45,063-node strategy, and deleting one reply invalidated it. That proof took about ten seconds on the development host; it is not a 100 ms tactical result. All legal free placements are covered when a positive is returned, but finding a strategy remains selective and budget-limited.
+
 C++20 Hexo rules and search engine, Python interface, and local browser game.
 
 The current priority is a self-play learning loop with a local experiment dashboard. Checkpoints earn promotion through matches against frozen opponents; fitting loss alone never replaces the incumbent.
@@ -197,6 +212,24 @@ python arena.py --opponent seal --run runs/gpu-selfplay --checkpoint 1 --games 2
 ```
 
 The adapter compiles the external engine without vendoring it. Seal's fixed array has a smaller coordinate range; games outside the adapter's safe range are marked invalid rather than counted as victories. Equal requested budgets are used, and both engines' actual elapsed times are retained. `--run` loads the promoted checkpoint, `--checkpoint` selects another saved candidate, and `--table` or `--nnue` loads a standalone export. Reports identify the loaded model and its hash. Without a model option the arena uses the original evaluator.
+
+The separate `seal-current-best` opponent uses [Ramora0/SealBot at c94749c](https://github.com/Ramora0/SealBot/tree/c94749c21c16c3b072fff6da49762dd5f92f3986), with its `best` pattern table. This is a newer search implementation than `seal`, which uses HexTicTacToe. The best table itself is unchanged from oldSeal. No project license was found at the pinned SealBot revision; upstream code stays in an external checkout.
+
+```sh
+git clone --depth 1 --filter=blob:none --sparse https://github.com/Ramora0/SealBot.git ../seal-current-reference
+git -C ../seal-current-reference sparse-checkout set best
+git -C ../seal-current-reference fetch origin c94749c21c16c3b072fff6da49762dd5f92f3986
+git -C ../seal-current-reference checkout --detach c94749c21c16c3b072fff6da49762dd5f92f3986
+python tools/seal_current.py ../seal-current-reference
+python arena.py --opponent seal-current-best --nnue runs/example/checkpoints/0001/model.nnue --games 40 --ms 100 --max-stones 800 --output artifacts/seal-current-best.json
+python -m unittest tests.test_seal_current -v
+```
+
+The optional adapter build requires a GCC-compatible C++20 compiler. Its manifest records every compiled upstream header hash, canonical and on-disk weight hashes, adapter and binary hashes, compiler, and build command. Arena verifies the binary against that manifest, resets upstream search state between games, and records both sides' ordered turns and elapsed times. The 100 ms setting is an upstream best-effort full-turn deadline, not a hard timeout. Upstream initializes randomness independently of the arena opening seed. Coordinates outside ±55, illegal moves, and incomplete turns are rejected. Upstream returns fixed pairs; when its first placement wins under native rules, only that winning prefix is played. This upstream engine does not correctly support non-opening partial-turn roots, so the adapter rejects those explicitly; arena calls start at complete-turn boundaries.
+
+Other public references were checked on 2026-09-24. [Mantis at 9c94b95](https://github.com/Cmiller132/Hexo-Shrimp-Bot/tree/9c94b95ce5e3ccf4f892eeadca20524c522d0629) provides maintained Rust/Python inference and match entry points, but no public trained checkpoint or project license was found. [Strix at 5a771e5](https://github.com/SootyOwl/hexo-strix/tree/5a771e572553a8bd8e010112b2ce65f16e5afa1b) is MIT-licensed and publishes a [2,810,120-byte safetensors model](https://hexo.tyto.cc/model.safetensors), SHA256 `aec92391c66050e737d9b769757248b520ffc1bf44fa039db7c8abd3ef720185`. Its metadata says `checkpoint_000010.pt`, step 10, not the private `pulsatrix-246` checkpoint. Its relational graph requires direct `InferModel::eval_states` with Gumbel MCTS; the pinned HX04 server drops the required relational edge fields. [HextocZero at dc1be7b](https://codeberg.org/Kubuxu/HextocZero/src/commit/dc1be7b175dd9f27b6db8481e00153c9a0f2e3ae) is MIT-licensed heuristic MCTS with neural inference unimplemented; its documented legality omits the radius-eight restriction. None of these source discoveries establishes comparative strength.
+
+The first current-Seal comparison used 40 games, 20 color-swapped opening pairs, seed `20261003`, width 16, and 100 ms requested per turn. The internally promoted `nnue-reanalysis-native-v1` checkpoint 1 scored **5 wins and 35 losses**, with no invalid or truncated games. Actual turn means were 87.72 ms for HeXO and 79.63 ms for SealBot, with maxima 117.79 and 103.76 ms. The conservative opening-pair 95% win-rate interval was [0, 0.429]. All 1,938 post-opening placements were independently replayed through the Python rules reference. This run used adapter commit `a4cc08a`, NNUE SHA256 `6c0599e380b3b87a764f7b95c76b21e43863f81fdc1a273bb4865434aed353ae`, and trace SHA256 `4b23e04428505d54411b5b1464919e7f5bb374ad8fb2c9f02e578926375575d5`. A subsequent adapter fix accepts upstream fixed pairs whose first placement wins; independent replay confirmed none of the 492 Seal turns in this trace had that case, so this recorded result is unaffected. It does not establish superiority over current SealBot.
 
 To compare against the published Orca model, use an external checkout:
 
@@ -629,6 +662,7 @@ player/remaining phase, and sorted absolute stone coordinates and owners.
 Evaluator records echo that identity, `player`, `remaining`, and `model_version`
 alongside the full native-order actions, logits, and Q. Deployed callers pass the
 checkpoint SHA as `model_version`; standalone callers receive a configuration
-and parameter digest. Keep an evaluator's model immutable for its lifetime.
+and parameter digest. The evaluator copies and freezes the supplied model so
+later training or checkpoint loads on the caller's model cannot change its identity.
 Terminal inference is rejected because the rules and search own terminal values.
 

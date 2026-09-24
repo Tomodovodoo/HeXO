@@ -68,6 +68,10 @@ def run_matches(args, probe=None, learned=None):
     rng = random.Random(args.seed)
     opponent = learned or (Seal() if args.opponent == "seal" else None)
     opponent_metadata = learned.metadata if learned else None
+    if args.opponent == "seal-current-best":
+        from tools.seal_current import SealCurrent
+        opponent = SealCurrent()
+        opponent_metadata = opponent.metadata
     if args.opponent == "orca":
         from tools.orca_adapter import Orca
         opponent = Orca(args.orca_source, args.orca_checkpoint, args.orca_sims,
@@ -111,9 +115,12 @@ def run_matches(args, probe=None, learned=None):
                           if 0 < max(abs(q), abs(r), abs(q+r)) <= 2]
             opening += rng.sample(candidates, 2)
         game = Game(opening)
+        if args.opponent == "seal-current-best":
+            opponent.reset()
         our_color = index % 2
         timings = [[], []]
         searches = []
+        turns = []
         opponent_searches = []
         reason = "truncated"
         error = None
@@ -156,6 +163,8 @@ def run_matches(args, probe=None, learned=None):
                         game.undo()
                 elapsed_ms = (time.perf_counter()-before)*1000
                 timings[side].append(elapsed_ms)
+                turns.append({"player": side, "ply": len(game.cells), "moves": moves,
+                              "elapsed_ms": elapsed_ms, "requested_ms": args.ms})
                 if probe and side == our_color:
                     overrun = elapsed_ms > args.ms
                     probe.counts["overruns"] += int(overrun)-int(search["strix"]["overrun"])
@@ -178,7 +187,8 @@ def run_matches(args, probe=None, learned=None):
             reason = "six-in-a-row"
         record = {"index": index, "our_color": our_color, "winner": game.winner,
                   "reason": reason, "error": error, "cells": game.cells, "time_ms": timings,
-                  "searches": searches, "opponent_searches": opponent_searches}
+                  "searches": searches, "turns": turns, "opening": opening,
+                  "opponent_searches": opponent_searches}
         games.append(record)
         completed = [g for g in games if g["reason"] == "six-in-a-row"]
         wins = sum(g["winner"] == g["our_color"] for g in completed)
@@ -208,7 +218,7 @@ def run_matches(args, probe=None, learned=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--opponent", choices=["seal", "orca", "strix", "shallow", "random"], default="shallow")
+    parser.add_argument("--opponent", choices=["seal", "seal-current-best", "orca", "strix", "shallow", "random"], default="shallow")
     parser.add_argument("--strix-model", help="Pinned public Strix safetensors checkpoint")
     parser.add_argument("--strix-sims", type=int, default=8, help="Gumbel MCTS simulations per placement; not equal wall time")
     parser.add_argument("--strix-actions", type=int, default=4)
