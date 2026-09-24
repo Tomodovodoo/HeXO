@@ -385,6 +385,14 @@ visit counts. Unfinished outcomes remain missing. Native PVS and the GPU
 complete-turn beam identify their teacher semantics in the recorded games;
 their search targets should not be treated as interchangeable depths.
 
+Native depth-zero evaluation checks whether the opponent's immediate completion
+sets can be covered by the remaining placements, after checking our own immediate
+win. An impossible cover is a mate loss; a cover with a spare placement remains
+unresolved. This fixes three observed leaf misvaluations. In a fresh paired
+100 ms comparison against the pinned public Seal engine (20 opening pairs per
+build, seed 20260929), the baseline scored 3-37 and the guard scored 2-38, with no
+truncated games. This experiment did not demonstrate a playing-strength gain.
+
 The trace benchmark's ordered and resulting-position recall measure the complete
 **untimed** generated lists. Timed searches can expire during generation, so these
 figures do not claim that a turn was searched within the budget. The report records
