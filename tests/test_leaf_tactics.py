@@ -21,6 +21,7 @@ FORKS = [
 
 
 class LeafTactics(unittest.TestCase):
+    quiescence_depth = 0
     def position(self, moves):
         game, reference = Game(moves), Reference()
         self.addCleanup(game.close)
@@ -35,7 +36,7 @@ class LeafTactics(unittest.TestCase):
                 before = (game.key, game.state(), game.features())
                 side = game.player
                 self.assertFalse(reference.completions(side, game.remaining))
-                result = game.search(1000, depth=1, width=16)
+                result = game.search(1000, depth=1, width=16, quiescence_depth=self.quiescence_depth)
                 self.assertEqual((result["depth"], result["score"]), (1, 10000000))
                 self.assertEqual((game.key, game.state(), game.features()), before)
                 for point in result["moves"]:
@@ -52,7 +53,7 @@ class LeafTactics(unittest.TestCase):
         side = game.player
         self.assertFalse(has_cover(reference.completions(1-side), game.remaining))
         self.assertTrue(reference.completions(side, game.remaining))
-        result = game.search(1000, depth=1, width=16)
+        result = game.search(1000, depth=1, width=16, quiescence_depth=self.quiescence_depth)
         self.assertEqual(result["score"], 10000000)
         self.assertEqual(len(result["moves"]), 1)
         reference.play(*result["moves"][0])
@@ -61,7 +62,7 @@ class LeafTactics(unittest.TestCase):
     def test_shared_covers_are_not_mistaken_for_unavoidable_loss(self):
         game, reference = self.position([(0,0),(0,5),(3,3),(1,0),(2,0),(-3,5),(5,-3)])
         side = game.player
-        result = game.search(1000, depth=1, width=16)
+        result = game.search(1000, depth=1, width=16, quiescence_depth=self.quiescence_depth)
         self.assertLess(abs(result["score"]), 10000000)
         for point in result["moves"]:
             reference.play(*point)
@@ -72,7 +73,7 @@ class LeafTactics(unittest.TestCase):
     def test_one_block_leaves_the_free_placement_unresolved(self):
         game, reference = self.position([(0,0),(-1,0),(0,5),(1,0),(2,0),(3,3),(-3,5)])
         side = game.player
-        result = game.search(1000, depth=1, width=16)
+        result = game.search(1000, depth=1, width=16, quiescence_depth=self.quiescence_depth)
         self.assertLess(abs(result["score"]), 10000000)
         for point in result["moves"]:
             reference.play(*point)
@@ -80,6 +81,10 @@ class LeafTactics(unittest.TestCase):
         self.assertTrue(threats)
         self.assertTrue(has_cover(threats, 1))
         self.assertEqual(reference.remaining, 2)
+
+
+class QuiescenceTactics(LeafTactics):
+    quiescence_depth = 2
 
 
 if __name__ == "__main__":

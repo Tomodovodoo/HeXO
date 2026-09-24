@@ -349,6 +349,7 @@ struct Search {
     uint64_t nodes=0;
     std::vector<Entry> tt, frozen_hints;
     bool inject_tt=false;
+    int quiescence_depth=0;
     Search(int ms,int width,bool table=true):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(table?1<<16:0){}
     void check() const { if(Clock::now()>=deadline) throw Timeout{}; }
     Turn immediate(Board& b) {
@@ -494,11 +495,36 @@ struct Search {
         if(int(result.size())>width*2) result.resize(width*2);
         return result;
     }
+    int quiescence(Board& b,int remaining,int alpha,int beta) {
+        ++nodes;check();
+        if(b.winner>=0) return b.winner==b.player?mate:-mate;
+        if(immediate(b).count) return mate;
+        if(unavoidable_loss(b)) return -mate;
+        auto constraints=b.completions(1-b.player);
+        std::erase_if(constraints,[&](const auto& completion) {
+            return !std::all_of(completion.begin(),completion.end(),[&](Cell c){return b.legal(c);});
+        });
+        if(!remaining || constraints.empty()) return b.score(b.player);
+        // Only mandatory defensive turns extend the horizon. Free second
+        // placements use the ordinary selective generator, so this is no proof.
+        auto moves=turns(b);
+        int best=-mate-1;
+        for(const auto& turn:moves) {
+            check();Restore restore(b);int side=b.player;apply(b,turn);
+            if(b.winner<0 && !b.completions(1-side).empty()) continue;
+            int score=b.winner==side?mate:-quiescence(b,remaining-1,-beta,-alpha);
+            best=std::max(best,score);alpha=std::max(alpha,score);
+            if(alpha>=beta) break;
+        }
+        // A selective generator failing to supply a defense is not a proof.
+        return best==-mate-1?b.score(b.player):best;
+    }
     int negamax(Board& b,int depth,int alpha,int beta) {
         ++nodes;check();
         if(b.winner>=0) return b.winner==b.player?mate:-mate;
         if(immediate(b).count) return mate;
-        if(depth<=0) return unavoidable_loss(b)?-mate:b.score(b.player);
+        if(depth<=0) return quiescence_depth?quiescence(b,quiescence_depth,alpha,beta):
+            (unavoidable_loss(b)?-mate:b.score(b.player));
         uint64_t key=b.hash();auto& entry=tt[key&(tt.size()-1)];
         if(!inject_tt && entry.key==key && entry.depth>=depth) {
             if(entry.flag==0) return entry.score;
@@ -661,6 +687,15 @@ int hx_search_tt(void* p,int ms,int depth,int width,int seconds,int cap,HxResult
         ((seconds || cap) && (seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024))) return 0;
     try {
         auto start=Clock::now();Search search(ms,width);search.inject_tt=true;
+        *out=search.run(*static_cast<Board*>(p),depth,seconds,cap);
+        out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;
+    } catch(...) {return 0;}
+}
+int hx_search_quiescence(void* p,int ms,int depth,int width,int seconds,int cap,int inject,int qdepth,HxResult* out) {
+    if(ms<1 || depth<1 || width<2 || width>128 || qdepth<0 || qdepth>8 ||
+        ((seconds || cap) && (seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024))) return 0;
+    try {
+        auto start=Clock::now();Search search(ms,width);search.inject_tt=inject!=0;search.quiescence_depth=qdepth;
         *out=search.run(*static_cast<Board*>(p),depth,seconds,cap);
         out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;
     } catch(...) {return 0;}

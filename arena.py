@@ -104,7 +104,7 @@ def run(args):
                         game.load_model(nnue_path)
                     else:
                         game.load_table(weights)
-                    search = game.search(args.ms, width=args.width, root_seconds=args.root_seconds, root_turns=args.root_turns, tt_injection=args.tt_injection)
+                    search = game.search(args.ms, width=args.width, root_seconds=args.root_seconds, root_turns=args.root_turns, tt_injection=args.tt_injection, quiescence_depth=args.quiescence_depth)
                     searches.append(search)
                     moves = search["moves"]
                 elif opponent:
@@ -175,6 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--games", type=int, default=20)
     parser.add_argument("--ms", type=int, default=100)
     parser.add_argument("--width", type=int, default=16)
+    parser.add_argument("--quiescence-depth", type=int, default=0, choices=range(9), help="Optional mandatory-defense leaf extension in complete turns")
     parser.add_argument("--tt-injection", action="store_true", help="Experimental previous-iteration TT turn admission; disables TT score cutoffs")
     parser.add_argument("--root-seconds", type=int, default=0, help="Experimental conditional-second budget; requires --root-turns")
     parser.add_argument("--root-turns", type=int, default=0, help="Experimental complete-turn root cap; requires --root-seconds")

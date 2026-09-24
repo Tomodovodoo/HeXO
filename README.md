@@ -457,3 +457,5 @@ The local adapter bounds the request line and headers together to two seconds,
 including clients that keep sending bytes. Request-body transfer has a separate
 two-second deadline. These transport limits are separate from its advisory search
 budget. A configured model that disappears or becomes unreadable returns JSON 503.
+
+Optional forcing quiescence: `Game.search(quiescence_depth=2)` or `arena.py --quiescence-depth 2` extends leaves by at most two complete turns while legal opponent completion constraints require defense. Zero remains the default. Own immediate wins and unavoidable losses are checked first. Free second placements remain selective, and returned scores are search estimates, not proof certificates. Quiet leaves retain static evaluation. The extension shares the search deadline and does not store quiescence bounds in the transposition table.
