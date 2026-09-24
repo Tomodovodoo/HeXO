@@ -19,6 +19,7 @@ class Handler(BaseHTTPRequestHandler):
     neural = None
     search_run = None
     search_checkpoint = None
+    search_label = "Internal champion"
     neural_options = {}
 
     @classmethod
@@ -42,7 +43,7 @@ class Handler(BaseHTTPRequestHandler):
         previous = cls.neural
         cls.neural = candidate
         cls.search_checkpoint = number
-        cls.label = f"Internal champion {number} | {candidate.mode} | {candidate.model_sha256[:12]} | updates on New game"
+        cls.label = f"{cls.search_label} {number} | {candidate.mode} | {candidate.model_sha256[:12]} | updates on New game"
         if previous:
             previous.close()
 
@@ -159,6 +160,7 @@ if __name__ == "__main__":
         name = args.label or "Experimental relational policy/Q"
         Handler.label = f"{name} | {Handler.neural.mode} | {Handler.neural.model_sha256[:12]}"
     Handler.search_run = args.search_run.resolve() if args.search_run else None
+    Handler.search_label = args.label or "Internal champion"
     Handler.neural_options = dict(mode=args.neural_mode, simulations=args.simulations, device=args.device)
     Handler.refresh_champion()
     print(f"HeXO is ready at http://127.0.0.1:{args.port}", flush=True)
