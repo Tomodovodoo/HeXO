@@ -143,6 +143,19 @@ python arena.py --opponent orca --orca-source ../orca-reference --orca-sims 200 
 
 This requires PyTorch. The adapter strictly loads the checkout's seven-channel `orca/checkpoint.pt` without adding random weights. Use `--orca-checkpoint` to select another compatible checkpoint and `--orca-device cuda` for GPU inference. The report records source revision, checkpoint hash, simulation budget and actual turn times. Orca receives simulations per placement; our engine receives milliseconds per complete turn. This comparison does not use equal time budgets. Native rules validate every returned move, and replay disagreements remain invalid games rather than wins.
 
+## Correctness tests and local benchmarks
+
+Build the native library with the CMake commands above, then run:
+
+```sh
+python -m unittest discover -s tests -v
+python -m tests.benchmark --positions 12 --ms 5 --reference-ms 25
+```
+
+The tests compare native rules and incremental features with an independent Python board reference. They cover sequential radius-eight legality, turn phase, both colors, all three winning axes, first-placement wins, overlines, distant expansion, make/unmake and hash restoration, residual-table bounds, tactical wins and defensive covers. With PyTorch installed, the same batched-environment checks run on CPU and on CUDA when available, including capacity growth, reset and truncation. GPU checks are skipped when PyTorch is unavailable. The NNUE implementation adds separate export/value/policy checks. Pull requests run the native rules subset on Linux; CPU/CUDA tensor parity is also run locally.
+
+The benchmark prints JSON with seeded positions, source and library hashes, hardware, actual search times, nodes and agreement with a wider search. Timing-dependent search results can vary across runs. There are no machine-specific speed assertions. A wider search is a selective reference, not a proof of the best move. Candidate-cell recall is reported only when the native candidate API is available; it does not measure whether the final pruned turn list retained that pair.
+
 ## Status and remaining work
 
 The initial non-neural version is playable. Direct runtime checks have covered the radius-eight frontier, sequential expansion, immediate wins, and 800 make/unmake comparisons. A differential run matched 2,019 transitions against the official TypeScript rules, including rejected moves, turn phase, cells, and winner. Sparse expansion to coordinate 800 also passed. An initial eight-game development comparison against Seal scored two wins and six losses at 100 ms per turn. This is an initial measurement, not a competitive-strength claim. Two tactical-extension experiments scored zero wins in the same eight openings and were removed.
