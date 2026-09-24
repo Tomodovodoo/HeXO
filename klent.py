@@ -223,13 +223,13 @@ def loss(model, batch, target_policy, taken, returns):
     return ce+mse, ce.detach(), mse.detach()
 
 
-def fit(model, optimizer, value_optimizer, episodes, rows, args, iteration):
+def fit(model, optimizer, value_optimizer, episodes, rows, args, iteration, progress=None):
     """Exactly one actor pass, followed by one explicitly separate V-head pass."""
     model.train()
     episodes = {e["id"]: e for e in episodes}
     order = np.random.default_rng(args.seed+iteration).permutation(len(rows))
     totals = np.zeros(3)
-    updates = 0
+    updates = value_updates = examples = value_examples = 0
     # Only one position-batch's observations are resident; full legal sets remain intact.
     for start in range(0, len(order), args.batch):
         selected = [rows[int(i)] for i in order[start:start+args.batch]]
@@ -247,6 +247,13 @@ def fit(model, optimizer, value_optimizer, episodes, rows, args, iteration):
         if any(not torch.isfinite(p).all() for p in model.parameters()):
             raise FloatingPointError("Nonfinite KLENT parameters")
         updates += 1
+        examples += len(selected)
+        if progress:
+            progress({"fit_phase": "actor and Q", "fit_completed": examples, "fit_total": len(rows),
+                      "optimizer_steps": updates, "examples_processed": examples,
+                      "value_optimizer_steps": 0, "value_examples_processed": 0,
+                      "policy_ce": totals[0]/examples, "q_mse": totals[1]/examples,
+                      "deployment_value_mse": None})
     # Freeze the shared representation during deployment value distillation.
     # This term is not part of the KLENT actor/critic objective.
     # A zero-Q, all-capped corpus supplies no reason to erase a pretrained V.
@@ -265,10 +272,19 @@ def fit(model, optimizer, value_optimizer, episodes, rows, args, iteration):
             (value_loss*(len(ids)/len(selected))).backward()
             totals[2] += value_loss.item()*len(ids)
         value_optimizer.step()
+        value_updates += 1
+        value_examples += len(selected)
+        if progress:
+            progress({"fit_phase": "deployment value", "fit_completed": value_examples, "fit_total": len(value_order),
+                      "optimizer_steps": updates, "examples_processed": examples,
+                      "value_optimizer_steps": value_updates, "value_examples_processed": value_examples,
+                      "policy_ce": totals[0]/examples, "q_mse": totals[1]/examples,
+                      "deployment_value_mse": totals[2]/value_examples})
     if any(not torch.isfinite(p).all() for p in model.parameters()):
         raise FloatingPointError("Nonfinite deployment value parameters")
     return dict(zip(("policy_ce", "q_mse", "deployment_value_mse"), (totals/len(rows)).tolist()),
-                optimizer_steps=updates, deployment_value_fitted=bool(len(value_order)))
+                optimizer_steps=updates, examples_processed=examples, value_optimizer_steps=value_updates,
+                value_examples_processed=value_examples, deployment_value_fitted=bool(len(value_order)))
 
 
 def verify(directory, identity):
@@ -402,17 +418,30 @@ def main(args):
                                "policy": "softmax((Q+beta*logpi)/(alpha+beta))",
                                "returns": "signed-lambda-v1-cap-bootstrap", "actions": "full-legal"}
             corpus = run/"corpus"/f"{number:04d}"
+            def status(stage, **values):
+                write_json(run/"status.json", {"iteration": number, "stage": stage,
+                           "updated_at": time.time(), "schema": SCHEMA,
+                           "actor_sha256": corpus_identity["actor_sha256"], "games_total": args.games, **values})
             if not corpus.exists():
                 last = [0.]
+                status("collection", games=0, positions=0)
                 def progress(completed, positions):
                     if time.monotonic()-last[0] >= .5:
-                        write_json(run/"status.json", {"iteration": number, "stage": "collection", "games": completed, "positions": positions})
+                        status("collection", games=completed, positions=positions)
                         last[0] = time.monotonic()
                 episodes, rows = collect(model, args, number, progress)
                 save_corpus(corpus, corpus_identity, episodes, rows)
             episodes, rows, corpus_manifest = load_corpus(corpus, corpus_identity)
-            write_json(run/"status.json", {"iteration": number, "stage": "fitting", "positions": len(rows)})
-            metrics = fit(model, optimizer, value_optimizer, episodes, rows, args, number)
+            counts = {"games": len(episodes), "positions": len(rows),
+                      "terminal_games": sum(e["winner"] >= 0 for e in episodes),
+                      "bootstrapped_games": sum(e["winner"] < 0 for e in episodes)}
+            status("fitting", **counts)
+            last_fit = [0.]
+            def fit_progress(values):
+                if time.monotonic()-last_fit[0] >= .5 or values["fit_completed"] == values["fit_total"]:
+                    status("fitting", **counts, **values)
+                    last_fit[0] = time.monotonic()
+            metrics = fit(model, optimizer, value_optimizer, episodes, rows, args, number, progress=fit_progress)
             metrics.update(iteration=number, games=len(episodes), terminal_games=sum(e["winner"] >= 0 for e in episodes),
                            bootstrapped_games=sum(e["winner"] < 0 for e in episodes), positions=len(rows),
                            acting_kl=float(np.mean([r["kl"] for r in rows])),
@@ -430,7 +459,7 @@ def main(args):
                            ratings="unrated; external paired evaluation required")
             latest = run/"checkpoints"/f"{number:04d}"
             publish(latest, identity, checkpoint, metrics)
-            write_json(run/"status.json", {"iteration": number, "stage": "finished", **metrics})
+            status("finished", **metrics)
             print(json.dumps(metrics), flush=True)
     finally:
         lock.unlink()
