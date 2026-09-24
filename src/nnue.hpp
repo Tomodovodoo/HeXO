@@ -24,12 +24,13 @@ struct Model {
     float policy_bias=0;
     const int16_t* row(int code) const {return table.data()+size_t(code)*channels;}
     float value(const std::array<float,68>& input) const {
+        auto hidden=value_b;
+        // Input-major weights vectorize independent neurons. Each neuron keeps
+        // the original input accumulation order, without reassociation.
+        for(int j=0;j<68;++j)
+            for(int h=0;h<32;++h) hidden[h]+=value_w[j*32+h]*input[j];
         float out=value_bias;
-        for(int h=0;h<32;++h) {
-            float x=value_b[h];
-            for(int j=0;j<68;++j) x+=value_w[h*68+j]*input[j];
-            out+=std::max(0.0f,x)*value_out[h];
-        }
+        for(int h=0;h<32;++h) out+=std::max(0.0f,hidden[h])*value_out[h];
         return out;
     }
 };
@@ -63,6 +64,11 @@ inline Handle load(const char* path) {
     floats(model->value_b.data(),32);floats(model->value_out.data(),32);floats(&model->value_bias,1);
     floats(model->policy_w.data(),model->policy_w.size());
     floats(model->policy_b.data(),16);floats(model->policy_out.data(),16);floats(&model->policy_bias,1);
+    // The file remains output-major; only the immutable runtime layout changes.
+    auto value_rows=model->value_w;
+    for(int h=0;h<32;++h) for(int j=0;j<68;++j) model->value_w[j*32+h]=value_rows[h*68+j];
+    auto policy_rows=model->policy_w;
+    for(int h=0;h<16;++h) for(int j=0;j<104;++j) model->policy_w[j*16+h]=policy_rows[h*104+j];
     if(file.peek()!=std::char_traits<char>::eof()) throw std::runtime_error("Trailing NNUE payload");
     for(int code=0;code<patterns;++code) {
         int reverse=0,swap=0,n=code;
