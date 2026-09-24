@@ -85,6 +85,29 @@ class DirectPlayer(unittest.TestCase):
         finally:
             actor.close()
 
+    def test_proof_mode_completes_mandatory_defense_when_solver_unknown(self):
+        from tests.test_neural_search import Uniform
+        from proof import _completions
+        actor = self.actor('gumbel-proof')
+        actor.seed, actor.evaluator = 0, Uniform()
+        actor.prover = Mock()
+        actor.prover.solve.return_value = actor.prover.history.return_value = {'status':'UNKNOWN'}
+        history = [[0,0],[1,5],[3,3],[-2,2],[-1,1],[2,4],[0,6]]
+        actor.set_history(history)
+        game = Game(history)
+        try:
+            result = actor.turn(game)
+            self.assertEqual(len(game.cells), len(history))
+            for action in result['moves']:
+                game.play(*action)
+            self.assertEqual(len(result['moves']), 2)
+            self.assertFalse(_completions({(q,r):p for q,r,p in game.cells}, 1, 2, lambda: None))
+            self.assertEqual(result['proof_scope'], 'verified-root-and-tree-tactics')
+            actor.prover.history.assert_called()
+        finally:
+            actor.close()
+            game.close()
+
 
 if __name__ == '__main__':
     unittest.main()

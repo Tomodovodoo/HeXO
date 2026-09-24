@@ -45,7 +45,8 @@ class RelationalPlayer:
         if self.mode.startswith('gumbel'):
             from neural_search import EvaluationCache, NeuralSearch
             self.cache = EvaluationCache()
-            self.tree = NeuralSearch(self.evaluator, self.model_sha256, self.history, self.seed, self.cache)
+            self.tree = NeuralSearch(self.evaluator, self.model_sha256, self.history, self.seed, self.cache,
+                                     tactics=self.mode == 'gumbel-proof', proof_solver=self.prover)
 
     def _sync(self, game):
         current = [tuple(cell[:2]) for cell in game.cells]
@@ -127,7 +128,7 @@ class RelationalPlayer:
                         placements=diagnostics, deadline_ms=budget, deadline_scope='complete-turn-cooperative',
                         overrun_ms=max(0, elapsed-budget),
                         proof_status='PROVEN_WIN' if proof and proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified') else 'UNKNOWN',
-                        proof=proof, proof_scope='verified-root-override' if self.prover is not None else 'disabled')
+                        proof=proof, proof_scope='verified-root-and-tree-tactics' if self.prover is not None else 'disabled')
         except Exception:
             self.set_history([cell[:2] for cell in game.cells])
             raise
