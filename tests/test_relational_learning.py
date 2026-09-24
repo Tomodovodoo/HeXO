@@ -122,7 +122,10 @@ class RelationalLearningTests(unittest.TestCase):
                     diagnose(checkpoint,fixtures,args)
 
     def test_terminal_teacher_uses_actual_reply_and_rejects_wrong_outcome(self):
-        from relational_teacher import verify_terminal
+        from relational_teacher import examples, verify_terminal
+        for limit in (0,-1):
+            with self.assertRaisesRegex(ValueError,'Positive family'):
+                examples(SimpleNamespace(train_families=32,validation_families=8,negative_actions=limit))
         moves=record()['moves']
         verify_terminal(moves[:-1],moves[-1],None,1)
         verify_terminal(moves[:-2],moves[-2],moves[-1],-1)

@@ -7,6 +7,7 @@ import argparse
 from contextlib import closing
 import hashlib
 import json
+import math
 from pathlib import Path
 import time
 
@@ -57,6 +58,8 @@ def replay(history):
 
 
 def examples(args):
+    if min(args.train_families,args.validation_families,args.negative_actions)<1:
+        raise ValueError('Positive family and negative-action limits required')
     histories,rows,data_identity=human_examples(args.corpus)
     fixture_bytes=Path(args.fixtures).read_bytes()
     fixtures=json.loads(fixture_bytes)['positions']
@@ -137,6 +140,8 @@ def evaluate(model,rows,args):
 
 
 def fit(args):
+    if min(args.max_nodes,args.max_edges)<1 or not math.isfinite(args.lr) or args.lr<=0:
+        raise ValueError('Positive graph budgets and finite learning rate required')
     output=Path(args.output)
     if output.exists():raise ValueError('New teacher output directory required')
     torch.set_num_threads(2)
