@@ -308,6 +308,56 @@ reanalysis command reuses completed root searches when its provenance matches.
 Targets remain selective search estimates. A conditional second-stone row loses
 the source game's outcome label when the teacher's first move diverges.
 
+### Experimental KLENT training
+
+`klent.py` runs a separate policy/Q experiment; ordinary `train.py` is unchanged.
+It shares the centered-line NNUE representation and adds a scalar candidate Q
+head. Neural collection and fitting batch on CUDA, while exact native rules and
+feature reconstruction run on the CPU. Every legal cell is included, including
+newly reachable cells after the first placement. Memory limits split batches;
+they never crop the legal action set.
+
+```sh
+python klent.py --run runs/klent --initial-model runs/nnue-selfplay/checkpoints/0001/model.pt --games 16 --envs 8 --max-plies 128 --device cuda
+```
+
+One frozen actor collects each fresh corpus. With `pi = softmax(policy_logits)`
+and `Q = tanh(q_head)`, the acting policy is
+`mu = softmax((Q + beta * log(pi)) / (alpha + beta))`. One shuffled fitting pass
+minimizes `CE(mu, pi_new) + (Q_new(taken_action) - G)^2`; stored targets are
+detached. This follows the [KLENT paper's policy and scalar-Q objectives](https://arxiv.org/html/2602.10894v2#S4).
+The defaults are alpha 0.03, beta 0.1, gamma 1, and placement-level lambda
+`exp(-1/16)`.
+
+Returns use the actual mover change: the sign is positive between two placements
+by the same player and negative when the opponent acts next. The winning
+placement has target +1. Capped games bootstrap the final nonterminal state from
+that same frozen actor and remain explicitly unfinished; they are never draws.
+Both colors' records are retained. A separate, reported value-head-only pass
+distills the returns for native PVS with shared features detached; this auxiliary
+pass is skipped when every critic target is zero.
+
+Q starts at zero. With no terminal episodes, zero tail bootstraps can leave the
+critic without a learning signal. Check `critic_targets_informative`,
+`nonzero_return_fraction`, and `terminal_fraction`; throughput is not evidence of
+improvement. `--initial-q` accepts a saved `q.pt` only with its exact matching
+`--initial-model` file. Q depends on the learned shared representation, so an
+unrelated Q head is rejected. No handwritten value is silently substituted for Q.
+
+Checkpoint directories retain standard `model.pt` and `model.nnue` deployment
+artifacts, plus `klent.pt` with Q/optimizer state and a representation-bound
+`q.pt`. Complete corpus directories preserve every sampled move, legal-set hash,
+acting distribution/value, mover/phase and return target. Manifests bind them to
+the actor, code, engine, configuration and content hashes. Resume validates these
+artifacts and reuses a completed corpus after an interrupted fit; unfinished
+collection restarts deterministically. Each iteration consumes only its own
+corpus. This path does not promote checkpoints or assign Elo; use paired external
+evaluation of its native exports.
+
+The inspected [Mantis implementation](https://github.com/Cmiller132/Hexo-Shrimp-Bot/blob/9c94b95ce5e3ccf4f892eeadca20524c522d0629/python/mantisnet/mantisnet/klent/train.py)
+instead trains a categorical critic. Its [acting operator](https://github.com/Cmiller132/Hexo-Shrimp-Bot/blob/9c94b95ce5e3ccf4f892eeadca20524c522d0629/python/mantisnet/mantisnet/klent/improve.py)
+also permits a mass-normalized Q score. Those adaptations are not enabled here.
+
 NNUE replay is versioned separately from legacy six-cell histograms. It stores
 ragged center-code triples and candidate-code triples with offsets, candidate
 coordinates, pair context, turn context, player, handwritten baseline, chosen
@@ -330,6 +380,17 @@ The trace benchmark's ordered and resulting-position recall measure the complete
 figures do not claim that a turn was searched within the budget. The report records
 generation time, completed depth, and zero-depth trials separately. Reused reference
 reports must match both the trace hash and the exact position history.
+
+Experimental TT turn admission is available through
+`Game.search(..., tt_injection=True)` and `arena.py --tt-injection`.
+The arena records the flag in its configuration and applies it only to the
+contender. It validates and reserves a previous-iteration complete turn before
+candidate truncation, preserving immediate wins and mandatory defenses. Hints
+are frozen throughout each iteration, including PVS re-searches; TT score-bound
+reuse is disabled in this mode. The table remains local to one search call,
+with no persistent entries or cross-model score reuse. The default remains off.
+A 12-position development benchmark showed identical depth-three results with
+4.6% more elapsed time; this experiment has no demonstrated playing-strength gain.
 
 ## Official notation and local bot API
 

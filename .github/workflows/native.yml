@@ -22,3 +22,5 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build --parallel 2
       - run: python -m unittest tests.test_engine.NativeRules tests.test_curriculum tests.test_proof tests.test_leaf_tactics tests.test_notation_api -v
+      - run: c++ -std=c++20 -O2 tests/tt_injection.cpp -o build/tt_injection
+      - run: ./build/tt_injection
