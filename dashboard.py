@@ -214,7 +214,7 @@ class Handler(BaseHTTPRequestHandler):
                 data = dict(kind='search', search=dict(name=self.run.name,
                     config=search_config, status=read_json(self.run/'status.json', {}),
                     league=league, openings=[opening
-                        for path in sorted((self.run/'evaluation').glob('*-vs-*/report.json'), reverse=True)
+                        for path in sorted((self.run/'evaluation').glob('*-vs-*/report.json'), reverse=True)[:16]
                         for opening in evaluation_openings(str(path), path.stat().st_mtime_ns)]), events=recent[-300:])
             elif relational:
                 data = {"kind": "relational", "relational": relational, "summary": None, "events": []}
