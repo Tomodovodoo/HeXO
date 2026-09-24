@@ -240,13 +240,15 @@ class FrozenOpponent:
                 kernel.GetModuleHandleW.argtypes = [C.c_wchar_p]
                 kernel.GetModuleHandleW.restype = C.c_void_p
                 kernel.GetModuleFileNameW.argtypes = [C.c_void_p, C.c_wchar_p, C.c_ulong]
-                for path in (private/'build').glob('*.dll'):
-                    handle = kernel.GetModuleHandleW(path.name)
+                expected_loaded = {path.name: _sha(path.read_bytes()) for path in (private/'build').glob('*.dll')}
+                expected_loaded.update({Path(name).name: digest for name, digest in metadata['host_system_files_sha256'].items()})
+                for name, digest in expected_loaded.items():
+                    handle = kernel.GetModuleHandleW(name)
                     buffer = C.create_unicode_buffer(32768)
                     if not handle or not kernel.GetModuleFileNameW(handle, buffer, len(buffer)):
                         raise C.WinError(C.get_last_error())
-                    if _sha(Path(buffer.value).read_bytes()) != _sha(path.read_bytes()):
-                        raise ValueError(f'Loaded opponent DLL differs from frozen bytes: {path.name}')
+                    if _sha(Path(buffer.value).read_bytes()) != digest:
+                        raise ValueError(f'Loaded opponent DLL differs from frozen bytes: {name}')
             elif metadata['kind'] == 'strix':
                 reference = _module(private/'strix_reference.py')
                 adapter = _module(private/'tools/strix_learned_adapter.py', reference)
