@@ -26,7 +26,7 @@ class RelationalPlayer:
         self.simulations, self.root_samples, self.batch_size = simulations, root_samples, batch_size
         self.milliseconds, self.alpha, self.beta = milliseconds, alpha, beta
         self.model_sha256 = hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest()
-        model = load_model(checkpoint, device, expected_sha256=self.model_sha256)
+        model = load_model(checkpoint, 'cpu', expected_sha256=self.model_sha256)
         self.evaluator = NeuralEvaluator(model, device, max_nodes=max_nodes, max_edges=max_edges)
         self.tree, self.cache, self.prover = None, None, None
         if mode == 'gumbel-proof':
