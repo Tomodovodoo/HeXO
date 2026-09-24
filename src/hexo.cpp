@@ -727,6 +727,14 @@ int hx_nnue_policy_features(void* p,int64_t q,int64_t r,int32_t* out,float* pair
     auto codes=b.codes(c);for(int d=0;d<3;++d) out[d]=codes[d]+(b.player+1)*nnue::powers[5];
     auto correlation=b.pair(c);std::copy(correlation.begin(),correlation.end(),pair);return 1;
 }
+int hx_nnue_policy_batch(void* p,const int64_t* coordinates,int count,int32_t* codes,float* pairs) {
+    if(count<0 || (count && (!coordinates || !codes || !pairs))) return 0;
+    for(int i=0;i<count;++i) {
+        const size_t row=size_t(i);
+        if(!hx_nnue_policy_features(p,coordinates[2*row],coordinates[2*row+1],codes+3*row,pairs+4*row)) return 0;
+    }
+    return 1;
+}
 float hx_nnue_rank(void* p,int64_t q,int64_t r) {
     auto& b=*static_cast<Board*>(p);if(!b.legal({q,r})) return std::numeric_limits<float>::quiet_NaN();
     return b.rank({q,r},b.rank_context());

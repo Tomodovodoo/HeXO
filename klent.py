@@ -96,10 +96,10 @@ def observe(game):
     legal = game.legal_moves()
     if not legal:
         raise ValueError("Cannot act on terminal board")
-    codes, pairs = zip(*(game.nnue_policy_features(c) for c in legal))
     coords = np.asarray(legal, dtype="<i8")
-    return {"centers": game.nnue_centers(), "candidate_codes": np.asarray(codes, np.int32),
-            "pairs": np.asarray(pairs, np.float32), "phase": game.nnue_context(), "player": game.player,
+    codes, pairs = game.nnue_policy_batch(coords)
+    return {"centers": game.nnue_centers(), "candidate_codes": codes,
+            "pairs": pairs, "phase": game.nnue_context(), "player": game.player,
             "baseline": float(np.asarray(game.features(), np.int64)@_baseline)*(1 if game.player == 0 else -1),
             "legal": legal, "legal_sha256": hashlib.sha256(coords.tobytes()).hexdigest()}
 

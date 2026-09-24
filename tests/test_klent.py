@@ -23,6 +23,45 @@ class KlentTest(unittest.TestCase):
         self.addCleanup(torch.set_num_threads, old)
         torch.manual_seed(54)
 
+    def test_bulk_features_match_scalar_for_full_legal_actions(self):
+        import random
+        from tests.reference import interleave
+        rng = random.Random(20261008)
+        game = Game()
+        self.addCleanup(game.close)
+        phases = set()
+        for ply in range(32):
+            legal = game.legal_moves()
+            phases.add((game.player, game.remaining))
+            before = (game.key, game.state(), game.features(), game.nnue_centers().tobytes())
+            # Reversed views exercise noncontiguous input while preserving order.
+            coords = np.asarray(legal, dtype=np.int64)[::-1]
+            codes, pairs = game.nnue_policy_batch(coords)
+            scalar = [game.nnue_policy_features(tuple(c)) for c in coords]
+            expected_codes = np.asarray([x[0] for x in scalar], np.int32)
+            expected_pairs = np.asarray([x[1] for x in scalar], np.float32)
+            self.assertEqual(codes.tobytes(), expected_codes.tobytes())
+            self.assertEqual(pairs.tobytes(), expected_pairs.tobytes())
+            observation = observe(game)
+            self.assertEqual(observation['legal'], legal)
+            self.assertEqual(observation['candidate_codes'].tobytes(), codes[::-1].tobytes())
+            self.assertEqual(observation['pairs'].tobytes(), pairs[::-1].tobytes())
+            self.assertEqual((game.key, game.state(), game.features(), game.nnue_centers().tobytes()), before)
+            # The second placement at distance sixteen relies on the first one.
+            point = ((0,0), (8,0), (16,0))[ply] if ply < 3 else rng.choice(legal)
+            game.play(*point)
+        self.assertEqual(phases, {(0,1), (0,2), (1,1), (1,2)})
+        codes, pairs = game.nnue_policy_batch([])
+        self.assertEqual((codes.shape, pairs.shape), ((0,3), (0,4)))
+        for bad in ([[0,0]], [[10**12+1,0]], [[1.5,0]], [[True,False]], [1,2], [[2**64-1,0]]):
+            with self.assertRaises(ValueError):
+                game.nnue_policy_batch(bad)
+        history = interleave([[(q,0) for q in range(6)], [(2*q,6) for q in range(6)]])
+        terminal = Game(history)
+        self.addCleanup(terminal.close)
+        with self.assertRaises(ValueError):
+            terminal.nnue_policy_batch([[0,8]])
+
     def args(self, **updates):
         values = dict(seed=1729, device="cpu", alpha=.03, beta=.1, gamma=1., lambda_return=.939,
                       games=2, envs=2, max_plies=3, batch=4, cells=65536, centers=65536,
