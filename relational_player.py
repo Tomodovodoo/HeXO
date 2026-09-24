@@ -95,7 +95,7 @@ class RelationalPlayer:
         proof = None
         try:
             if self.prover is not None:
-                proof_ms = min(self.proof_ms, max(1, int(budget)))
+                proof_ms = min(self.proof_ms, max(1, int(budget/4)))
                 proof = self.prover.solve(local, ms=proof_ms, idtt_ms=min(20, proof_ms-1))
                 if proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified'):
                     for action in proof['moves']:

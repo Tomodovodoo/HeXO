@@ -106,7 +106,7 @@ class DirectPlayer(unittest.TestCase):
             self.assertEqual(result['proof_scope'], 'verified-root-and-tree-tactics')
             self.assertEqual(result['proof_budget_ms'], 1000)
             self.assertEqual(actor.tree.proof_ms, 1000)
-            actor.prover.solve.assert_called_once_with(unittest.mock.ANY, ms=1000, idtt_ms=20)
+            actor.prover.solve.assert_called_once_with(unittest.mock.ANY, ms=250, idtt_ms=20)
             actor.prover.history.assert_called()
         finally:
             actor.close()
