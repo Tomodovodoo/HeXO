@@ -27,6 +27,11 @@ class Result(C.Structure):
         ("count", C.c_int32), ("score", C.c_int32), ("depth", C.c_int32)]
 
 
+class Turn(C.Structure):
+    _fields_ = [(name, C.c_int64) for name in ("q1", "r1", "q2", "r2")] + [
+        ("count", C.c_int32), ("score", C.c_int32)]
+
+
 def bind(name, result, *args):
     fn = getattr(lib, name)
     fn.restype, fn.argtypes = result, list(args)
@@ -43,6 +48,9 @@ bind("hx_hash", C.c_uint64, C.c_void_p)
 bind("hx_cell", C.c_int, C.c_void_p, C.c_int, C.POINTER(Cell))
 bind("hx_moves", C.c_int, C.c_void_p, C.POINTER(Cell), C.c_int)
 bind("hx_search", C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int, C.POINTER(Result))
+bind("hx_search_root", C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int,
+     C.c_int, C.c_int, C.POINTER(Result))
+bind("hx_turns", C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int, C.POINTER(Turn), C.c_int)
 bind("hx_features", C.c_int, C.c_void_p, C.POINTER(C.c_int32), C.c_int)
 bind("hx_load_table", C.c_int, C.c_void_p, C.POINTER(C.c_int32), C.c_int)
 bind("hx_model_load", C.c_void_p, C.c_char_p)
@@ -148,13 +156,23 @@ class Game:
     def undo(self):
         return bool(lib.hx_undo(self.ptr))
 
-    def search(self, ms=1000, depth=12, width=16):
+    def search(self, ms=1000, depth=12, width=16, root_seconds=0, root_turns=0):
         result = Result()
-        if not lib.hx_search(self.ptr, ms, depth, width, C.byref(result)):
-            raise ValueError("Search failed; require ms >= 1, depth >= 1, width in 2..128")
+        if not lib.hx_search_root(self.ptr, ms, depth, width, root_seconds, root_turns, C.byref(result)):
+            raise ValueError("Invalid search budget or root admission settings")
         moves = [(result.q1, result.r1), (result.q2, result.r2)][:result.count]
         return {"moves": moves, "score": result.score, "depth": result.depth,
                 "nodes": result.nodes, "elapsed_ms": result.elapsed_ms}
+
+    def turns(self, width=16, root_seconds=0, root_turns=0):
+        """Actual complete ordered turns selected for search, including tactics."""
+        n = lib.hx_turns(self.ptr, width, root_seconds, root_turns, None, 0)
+        if n < 0:
+            raise ValueError("Invalid root admission settings")
+        output = (Turn*n)()
+        lib.hx_turns(self.ptr, width, root_seconds, root_turns, output, n)
+        return [{"moves": [(t.q1, t.r1), (t.q2, t.r2)][:t.count], "score": t.score}
+                for t in output]
 
     def state(self):
         return {"cells": self.cells, "player": self.player,

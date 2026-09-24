@@ -423,12 +423,120 @@ def run_training(args):
         lock.unlink(missing_ok=True)
 
 
+def initial_artifacts(args):
+    model = getattr(args, "initial_model", None)
+    optimizer = getattr(args, "initial_optimizer", None)
+    if optimizer and not model:
+        raise ValueError("--initial-optimizer requires --initial-model")
+    if (model or optimizer) and args.model != "nnue":
+        raise ValueError("Initial checkpoint import currently requires --model nnue")
+    result = {}
+    for key, value in (("model", model), ("optimizer", optimizer)):
+        if value:
+            path = Path(value).resolve()
+            setattr(args, "initial_"+key, str(path))
+            result[key] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    return result
+
+
+def initialize_nnue(initial, args, artifacts, identity=None):
+    """Validate before publishing checkpoint zero; never overwrite an existing one."""
+    import io
+    import tempfile
+    import torch
+    from nnue_model import NNUE
+    if initial.exists():
+        manifest_path = initial / "initialization.json"
+        if identity is None or not manifest_path.is_file():
+            raise ValueError("Checkpoint zero already exists; refusing to overwrite it without a matching initialization record")
+        manifest = json.loads(manifest_path.read_text())
+        expected_files = {"model.pt", "model.nnue"} | ({"optimizer.pt"} if "optimizer" in artifacts else set())
+        if (manifest.get("schema") != 1 or manifest.get("identity") != identity
+                or set(manifest.get("files", {})) != expected_files
+                or {p.name for p in initial.iterdir()} != expected_files | {"initialization.json"}):
+            raise ValueError("Checkpoint zero initialization identity or file set differs; refusing to overwrite it")
+        for name, digest in manifest["files"].items():
+            if hashlib.sha256((initial/name).read_bytes()).hexdigest() != digest:
+                raise ValueError("Checkpoint zero initialization file hash changed; refusing to overwrite it")
+        metadata = {"model_sha256": manifest["files"]["model.nnue"],
+                    **({"initial_artifacts": artifacts} if artifacts else {}),
+                    **({"optimizer": "checkpoints/0000/optimizer.pt"} if "optimizer" in artifacts else {})}
+        if manifest.get("metadata") != metadata:
+            raise ValueError("Checkpoint zero initialization metadata differs; refusing to overwrite it")
+        return metadata
+    contents = {key: Path(item["path"]).read_bytes() for key, item in artifacts.items()}
+    if any(hashlib.sha256(contents[key]).hexdigest() != item["sha256"] for key, item in artifacts.items()):
+        raise ValueError("Initial checkpoint changed while loading")
+    model = NNUE()
+    if artifacts:
+        state = torch.load(io.BytesIO(contents["model"]), map_location="cpu", weights_only=True)
+        model.load_state_dict(state, strict=True)
+        if any(not torch.isfinite(value).all() for value in model.state_dict().values()):
+            raise ValueError("Initial model contains nonfinite weights")
+    optimizer = None
+    if "optimizer" in artifacts:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.001)
+        optimizer.load_state_dict(torch.load(io.BytesIO(contents["optimizer"]), map_location="cpu", weights_only=True))
+        for group in optimizer.param_groups:
+            if any(key not in group for key in ("betas", "eps", "weight_decay", "amsgrad", "maximize")):
+                raise ValueError("Initial optimizer lacks AdamW hyperparameters")
+            beta1, beta2 = group["betas"]
+            if not (0 <= beta1 < 1 and 0 <= beta2 < 1 and math.isfinite(group["eps"]) and group["eps"] >= 0
+                    and math.isfinite(group["weight_decay"]) and group["weight_decay"] >= 0):
+                raise ValueError("Invalid initial optimizer hyperparameters")
+        for parameter, state in optimizer.state.items():
+            if set(state) not in (set(), {"step", "exp_avg", "exp_avg_sq"}, {"step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"}):
+                raise ValueError("Initial optimizer is not a compatible AdamW state")
+            for name, value in state.items():
+                if not torch.is_tensor(value) or not torch.isfinite(value).all():
+                    raise ValueError("Initial optimizer contains invalid state")
+                if name == "step":
+                    valid = value.numel() == 1 and value.item() >= 0
+                else:
+                    valid = value.shape == parameter.shape
+                    if name in ("exp_avg_sq", "max_exp_avg_sq"):
+                        valid = valid and bool((value >= 0).all())
+                if not valid:
+                    raise ValueError("Initial optimizer state shape/value is incompatible")
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
+            group["fused"] = False
+            group["capturable"] = False
+    with tempfile.TemporaryDirectory(prefix="initial-", dir=initial.parent) as temporary:
+        stage = Path(temporary)/"checkpoint"
+        stage.mkdir()
+        if artifacts:
+            (stage/"model.pt").write_bytes(contents["model"])
+        else:
+            torch.save(model.state_dict(), stage/"model.pt")
+        if optimizer:
+            torch.save(optimizer.state_dict(), stage/"optimizer.pt")
+        for item in artifacts.values():
+            if hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest() != item["sha256"]:
+                raise ValueError("Initial checkpoint changed while loading")
+        digest = model.export(stage/"model.nnue")
+        metadata = {"model_sha256": digest, **({"initial_artifacts": artifacts} if artifacts else {}),
+                    **({"optimizer": "checkpoints/0000/optimizer.pt"} if optimizer else {})}
+        if identity is not None:
+            manifest = {"schema": 1, "identity": identity, "metadata": metadata,
+                        "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in stage.iterdir()}}
+            write_json(stage/"initialization.json", manifest)
+            for path in stage.iterdir():
+                with path.open("r+b") as handle:
+                    os.fsync(handle.fileno())
+        stage.rename(initial)
+    return metadata
+
+
 def _run_training(args):
     run = Path(args.run).resolve()
     run.mkdir(parents=True, exist_ok=True)
     for folder in ("checkpoints", "data", "matches"):
         (run / folder).mkdir(exist_ok=True)
     summary_path = run / "summary.json"
+    artifacts = initial_artifacts(args)
+    if artifacts:
+        args.initial_artifacts = artifacts
     if getattr(args, "reanalysis", []):
         if args.model != "nnue":
             raise ValueError("--reanalysis requires --model nnue")
@@ -461,14 +569,16 @@ def _run_training(args):
         torch.set_num_threads(2)
         torch.manual_seed(args.seed)
         initial = run / "checkpoints" / "0000"
-        initial.mkdir(exist_ok=True)
         if args.model == "nnue":
-            from nnue_model import NNUE
-            model = NNUE()
-            torch.save(model.state_dict(), initial / "model.pt")
-            model.export(initial / "model.nnue")
+            identity = {"run": str(run), "config": config, "training_sha256": training_hash,
+                        "engine_sha256": hashlib.sha256(library.read_bytes()).hexdigest()}
+            initial_metadata = initialize_nnue(initial, args, artifacts, identity)
             initial_table = "checkpoints/0000/model.nnue"
         else:
+            # Preserve deterministic pattern initialization recovery after a
+            # failed summary write; imported NNUE artifacts use the manifest above.
+            initial.mkdir(exist_ok=True)
+            initial_metadata = {}
             from learning_model import PatternModel
             torch.save(PatternModel().state_dict(), initial / "model.pt")
             np.save(initial / "table.npy", np.zeros(729, dtype=np.int32), allow_pickle=False)
@@ -483,7 +593,7 @@ def _run_training(args):
                    "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                    "incumbent": 0, "checkpoints": [{"id": 0, "model": "checkpoints/0000/model.pt",
                    ("nnue" if args.model == "nnue" else "table"): initial_table, "kind": args.model, "promoted": True,
-                   "anchor_elo": 0, "anchor_elo_95pct": None, "evaluations": []}]}
+                   "anchor_elo": 0, "anchor_elo_95pct": None, "evaluations": [], **initial_metadata}]}
         write_json(summary_path, summary)
     try:
         summary.pop("error", None)
@@ -608,6 +718,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", default="runs/selfplay")
     parser.add_argument("--model", choices=["pattern", "nnue"], default="pattern")
+    parser.add_argument("--initial-model", help="Initialize checkpoint zero of a new NNUE run from model.pt; ratings restart at zero")
+    parser.add_argument("--initial-optimizer", help="Optional matching AdamW state; preserves moments and steps, uses --lr")
     parser.add_argument("--curriculum", choices=["legacy", "mixed-v1"], default="mixed-v1")
     parser.add_argument("--native-exploration", type=float, default=.05,
                         help="Quiet native turns to explore without adding teacher labels")
