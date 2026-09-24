@@ -121,9 +121,11 @@ def run_matches(args, probe=None):
                         game.load_table(weights)
                     if probe:
                         search = probe.search(game, args.ms, start=before, width=args.width,
-                                              root_seconds=args.root_seconds, root_turns=args.root_turns)
+                                              root_seconds=args.root_seconds, root_turns=args.root_turns,
+                                              tt_injection=args.tt_injection)
                     else:
-                        search = game.search(args.ms, width=args.width, root_seconds=args.root_seconds, root_turns=args.root_turns)
+                        search = game.search(args.ms, width=args.width, root_seconds=args.root_seconds,
+                                             root_turns=args.root_turns, tt_injection=args.tt_injection)
                     searches.append(search)
                     moves = search["moves"]
                 elif opponent:
@@ -206,6 +208,7 @@ if __name__ == "__main__":
     parser.add_argument("--strix-root-depth", type=int, default=8, help="Attacker-turn horizon including winning turn")
     parser.add_argument("--strix-root-wide", action="store_true", help="Use Strix's wider attacking-partner generator")
     parser.add_argument("--width", type=int, default=16)
+    parser.add_argument("--tt-injection", action="store_true", help="Experimental previous-iteration TT turn admission; disables TT score cutoffs")
     parser.add_argument("--root-seconds", type=int, default=0, help="Experimental conditional-second budget; requires --root-turns")
     parser.add_argument("--root-turns", type=int, default=0, help="Experimental complete-turn root cap; requires --root-seconds")
     parser.add_argument("--max-stones", type=int, default=250)

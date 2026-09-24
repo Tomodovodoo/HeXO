@@ -370,6 +370,24 @@ improvement. `--initial-q` accepts a saved `q.pt` only with its exact matching
 `--initial-model` file. Q depends on the learned shared representation, so an
 unrelated Q head is rejected. No handwritten value is silently substituted for Q.
 
+An explicit human-corpus Q warm-start can provide a nonzero critic before fresh
+self-play. It freezes the matching NNUE features and fits only the Q head on
+verified human chosen actions and their terminal outcomes in the acting player's
+frame. The existing hashed family train/validation split is retained; test and
+excluded shards are never loaded. These targets describe human continuations,
+not optimal actions or on-policy KLENT returns. Values for unchosen actions are
+model extrapolations that self-play must test.
+
+```sh
+python q_warmstart.py --corpus artifacts/datasets/human-warmstart-v1 --model artifacts/models/human-warmstart-12/model.pt --output artifacts/models/human-q-warmstart-12 --positions 40000 --epochs 12 --device cuda
+python klent.py --run runs/human-initialized-klent --initial-model artifacts/models/human-q-warmstart-12/model.pt --initial-q artifacts/models/human-q-warmstart-12/q.pt --device cuda
+```
+
+Q initialization selects the best validation epoch and publishes into a new
+directory atomically. Its copied `model.pt` and native export remain unchanged;
+`q.pt` records their representation identity plus corpus and source provenance.
+The tool does not resume partial fits or overwrite an existing output.
+
 Checkpoint directories retain standard `model.pt` and `model.nnue` deployment
 artifacts, plus `klent.pt` with Q/optimizer state and a representation-bound
 `q.pt`. Complete corpus directories preserve every sampled move, legal-set hash,
@@ -406,3 +424,62 @@ The trace benchmark's ordered and resulting-position recall measure the complete
 figures do not claim that a turn was searched within the budget. The report records
 generation time, completed depth, and zero-depth trials separately. Reused reference
 reports must match both the trace hash and the exact position history.
+
+Experimental TT turn admission is available through
+`Game.search(..., tt_injection=True)` and `arena.py --tt-injection`.
+The arena records the flag in its configuration and applies it only to the
+contender. It validates and reserves a previous-iteration complete turn before
+candidate truncation, preserving immediate wins and mandatory defenses. Hints
+are frozen throughout each iteration, including PVS re-searches; TT score-bound
+reuse is disabled in this mode. The table remains local to one search call,
+with no persistent entries or cross-model score reuse. The default remains off.
+A 12-position development benchmark showed identical depth-three results with
+4.6% more elapsed time; this experiment has no demonstrated playing-strength gain.
+
+## Official notation and local bot API
+
+`notation.py` imports and exports [notation v1](https://github.com/hex-tic-tac-toe/hexagonal-tic-tac-toe-notation/tree/15bb7877ae020d661497e332adf0810d00d24e3e).
+Cross is native player 0; its origin placement is implicit in the text and present
+in imported histories. Turn numbers, sequential radius-8 legality, and terminal
+states are checked. Metadata and `!` annotations are preserved without inferring
+their meaning. The upstream example uses `datetime` rather than `utcdatetime`,
+and a named time control that differs from its numeric grammar; these values are
+kept intact. Python callers can use `loads(text)` and `dumps(record_or_history)`.
+
+```sh
+python notation.py import match.txt > match.json
+python notation.py export match.json > match-roundtrip.txt
+python bot_api.py --port 8790 --ms 100
+```
+
+The loopback HTTP adapter exposes `GET /capabilities.json` and
+`POST /stateless/v1-alpha/turn` according to the
+[published API definitions](https://github.com/hex-tic-tac-toe/htttx-bot-api/tree/37d2385f1016abe8b25798238a7d0c4a17a25dda/definitions).
+For example, send `{"board":{"to_move":"o","cells":[{"q":0,"r":0,"p":"x"}]},"request_id":1}`
+with content type `application/json`. Responses contain `move.pieces` objects
+with `q` and `r`, and echo an optional request ID. Add `--model path/to/model.bin`
+to use a native NNUE export; capabilities identify its SHA256. Otherwise the
+adapter uses the handwritten evaluator. This command does not register a bot
+with any external service.
+
+Both published formats require exactly two placements per recorded turn or API
+move, while the API also forbids placements after a win. A first-placement win
+cannot satisfy both requirements. Notation export raises `NotationConflict` for
+that case, partial turns, and empty boards. The API returns HTTP 409 for origin
+turns, partial turns, already-terminal boards, or a chosen first-placement win;
+it never pads a winning move. Full two-placement wins are supported.
+
+The stateless board is unordered. The adapter reconstructs a legal ordering of
+exactly the supplied cells and checks counts and `to_move`; it never assumes array
+order is history. Unreachable positions return 400, and a reconstruction exceeding
+one second or 20,000 visited states returns 503. Local limits are 1 MiB request
+bodies and 1,025 board cells; notation accepts 4,097 placements and 1 MiB text.
+`time_limit` is used as an advisory search cap, with zero returning 408. Native
+search and reconstruction cannot guarantee a hard response deadline, so
+`move_time_limit` is false. Websocket and matchmaking capabilities are not declared.
+Run `python -m unittest tests.test_notation_api -v` for the protocol checks.
+
+The local adapter bounds the request line and headers together to two seconds,
+including clients that keep sending bytes. Request-body transfer has a separate
+two-second deadline. These transport limits are separate from its advisory search
+budget. A configured model that disappears or becomes unreadable returns JSON 503.

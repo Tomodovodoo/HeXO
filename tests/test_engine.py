@@ -17,6 +17,30 @@ class NativeRules(unittest.TestCase):
         self.addCleanup(game.close)
         return game
 
+    def test_tt_injection_preserves_board_and_returns_complete_legal_turn(self):
+        from curriculum import opening_for
+        for seed in range(12):
+            game = self.make_game(opening_for(20261001+seed, evaluation=True))
+            before = (game.key, game.state(), game.evaluation, game.features())
+            for ms in (1, 10):
+                result = game.search(ms, depth=4, width=4, tt_injection=True)
+                self.assertEqual((game.key, game.state(), game.evaluation, game.features()), before)
+                side = game.player
+                for point in result["moves"]:
+                    self.assertTrue(game.legal(*point))
+                    game.play(*point)
+                self.assertTrue(game.winner >= 0 or game.player != side)
+                for _ in result["moves"]:
+                    game.undo()
+        history = interleave([[(q, 0) for q in range(6)], [(2*q, 6) for q in range(6)]])
+        game = self.make_game(history[:-1])
+        result = game.search(100, width=4, tt_injection=True)
+        self.assertEqual(len(result["moves"]), 1)
+        game.play(*result["moves"][0])
+        self.assertGreaterEqual(game.winner, 0)
+        with self.assertRaises(ValueError):
+            game.search(100, width=1, tt_injection=True)
+
     def test_root_admission_retains_baseline_and_exact_ordered_turns(self):
         game = self.make_game([(0, 0), (-2, 0), (-1, 0)])
         before = (game.key, game.state(), game.evaluation, game.features())
