@@ -1,0 +1,75 @@
+import copy
+import math
+import unittest
+
+from evaluate import verify_trace
+from hexo import Game
+from train import paired_metrics
+
+
+class PairedEvaluation(unittest.TestCase):
+    def test_pair_statistics_and_uncensored_rating(self):
+        records = [{'seed': p, 'challenger_color': c, 'winner': c if p < 3 else 1-c}
+                   for p in range(4) for c in (0, 1)]
+        result = paired_metrics(records)
+        self.assertTrue(result['rated'])
+        self.assertEqual((result['wins'], result['losses']), (6, 2))
+        self.assertEqual(result['opening_pair_p'], 5/16)
+        self.assertAlmostEqual(result['elo_delta'], 400*math.log10(6.5/2.5))
+        self.assertLess(result['elo_delta_95pct_open'][0], 0)
+        self.assertIsNone(result['elo_delta_95pct_open'][1])
+        for partial in (records[:-1], records[:-1]+[{**records[-1], 'winner': -1}]):
+            metric = paired_metrics(partial, 8)
+            self.assertFalse(metric['rated'])
+            self.assertIsNone(metric['elo_delta'])
+            self.assertIsNone(metric['win_rate'])
+        with self.assertRaises(ValueError):
+            paired_metrics([records[0], records[0]], 8)
+
+    def test_ordered_turn_trace_replay_and_corruption(self):
+        opening = [(0, 0), (8, 0), (16, 0)]
+        game = Game(opening)
+        try:
+            turn = {'ply': 3, 'player': game.player, 'remaining': game.remaining,
+                    'result': {'moves': [(24, 0), (32, 0)]}}
+            for move in turn['result']['moves']:
+                game.play(*move)
+            record = {'opening': opening, 'cells': game.cells, 'winner': -1,
+                      'reason': 'truncated', 'search_trace': [turn]}
+            verify_trace(record)
+            for key, value in (('winner', 0), ('reason', 'six-in-a-row')):
+                bad = copy.deepcopy(record)
+                bad[key] = value
+                with self.assertRaises(ValueError):
+                    verify_trace(bad)
+            bad = copy.deepcopy(record)
+            bad['search_trace'][0]['result']['moves'].reverse()
+            with self.assertRaises(ValueError):
+                verify_trace(bad)
+            bad = copy.deepcopy(record)
+            bad['search_trace'][0]['remaining'] = 1
+            with self.assertRaises(ValueError):
+                verify_trace(bad)
+        finally:
+            game.close()
+
+    def test_first_stone_win_ends_turn_immediately(self):
+        opening = [(0,0), (0,3), (1,3), (1,0), (2,0), (3,3),
+                   (4,3), (3,0), (4,0), (5,3), (6,3)]
+        game = Game(opening)
+        try:
+            turn = {'ply': len(opening), 'player': game.player, 'remaining': 2,
+                    'result': {'moves': [(5,0)]}}
+            game.play(5,0)
+            record = {'opening': opening, 'cells': game.cells, 'winner': 0,
+                      'reason': 'six-in-a-row', 'search_trace': [turn]}
+            verify_trace(record)
+            turn['result']['moves'].append((6,0))
+            with self.assertRaisesRegex(ValueError, 'first-stone win'):
+                verify_trace(record)
+        finally:
+            game.close()
+
+
+if __name__ == '__main__':
+    unittest.main()
