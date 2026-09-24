@@ -3,6 +3,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import shutil
@@ -13,6 +14,68 @@ import time
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def loaded_modules():
+    """Resolved file-backed modules, including transitive native runtime libraries."""
+    if os.name == "nt":
+        import ctypes as C
+        kernel = C.WinDLL("kernel32", use_last_error=True)
+        psapi = C.WinDLL("psapi", use_last_error=True)
+        kernel.GetCurrentProcess.restype = C.c_void_p
+        psapi.EnumProcessModulesEx.argtypes = [C.c_void_p, C.POINTER(C.c_void_p), C.c_ulong, C.POINTER(C.c_ulong), C.c_ulong]
+        kernel.GetModuleFileNameW.argtypes = [C.c_void_p, C.c_wchar_p, C.c_ulong]
+        process = kernel.GetCurrentProcess()
+        capacity = 256
+        while True:
+            modules = (C.c_void_p*capacity)()
+            needed = C.c_ulong()
+            if not psapi.EnumProcessModulesEx(process, modules, C.sizeof(modules), C.byref(needed), 3):
+                raise C.WinError(C.get_last_error())
+            if needed.value <= C.sizeof(modules):
+                break
+            capacity = needed.value//C.sizeof(C.c_void_p)
+        paths = []
+        for module in modules[:needed.value//C.sizeof(C.c_void_p)]:
+            buffer = C.create_unicode_buffer(32768)
+            if not kernel.GetModuleFileNameW(module, buffer, len(buffer)):
+                raise C.WinError(C.get_last_error())
+            paths.append(Path(buffer.value).resolve())
+    elif sys.platform.startswith("linux"):
+        paths = [Path(line.split(maxsplit=5)[5].strip()).resolve()
+                 for line in Path("/proc/self/maps").read_text().splitlines()
+                 if len(line.split(maxsplit=5)) == 6 and line.split(maxsplit=5)[5].startswith("/")]
+    else:
+        raise RuntimeError("Loaded runtime provenance currently supports Windows and Linux")
+    return sorted(set(paths))
+
+
+def runtime_identity():
+    from hexo import library
+    return {str(path): sha(path) for path in loaded_modules() if path != library.resolve()}
+
+
+def verify_runtime(expected, loaded=None):
+    actual = {os.path.normcase(str(path.resolve())) for path in (loaded_modules() if loaded is None else loaded)}
+    for path, digest in expected.items():
+        resolved = Path(path).resolve()
+        if os.path.normcase(str(resolved)) not in actual or not resolved.is_file() or sha(resolved) != digest:
+            raise ValueError(f"Native runtime dependency missing, relocated or changed: {path}")
+
+
+def initialize_worker(runtime):
+    import train  # Load the same native library and feature dependencies before checking.
+    verify_runtime(runtime)
+
+
+def publish_failure(output, error):
+    from train import write_json
+    provenance = json.loads((output/"provenance.json").read_text(encoding="utf-8"))
+    status = json.loads((output/"status.json").read_text(encoding="utf-8")) if (output/"status.json").exists() else {}
+    status.update(stage="failed", error=repr(error),
+                  candidate_sha256=provenance["model_input_sha256"]["candidate"],
+                  reference_sha256=provenance["model_input_sha256"]["reference"])
+    write_json(output/"status.json", status)
 
 
 def verify_trace(record):
@@ -58,6 +121,7 @@ def play(task):
 def freeze(args):
     from hexo import ROOT, library
     from train import write_json
+    runtime = runtime_identity()
     output = args.output.resolve()
     if output.exists():
         raise ValueError("Evaluation output must be a new directory; existing evidence is never overwritten")
@@ -86,6 +150,8 @@ def freeze(args):
     config = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "execute_snapshot"}
     write_json(output/"provenance.json", {"schema": "hexo-paired-nnue-v1", "revision": revision, "dirty": dirty,
                "files_sha256": identity, "config": config, "python": sys.version, "platform": platform.platform(),
+               "runtime_files_sha256": runtime,
+               "runtime_scope": "Resolved file-backed modules loaded after native/Python imports; checked in parent and workers. Host files are verified, not copied; this is not whole-OS hermetic isolation.",
                "reference_elo": 0, "promotion": False,
                "rating_scope": "relative to this exact reference checkpoint, rules, search budget and opening distribution",
                "timing": "per-turn native search wall time; model attachment excluded; full search results retained",
@@ -102,6 +168,7 @@ def execute(output):
         if any(sha(output/name) != value for name, value in provenance["files_sha256"].items()):
             raise ValueError("Frozen evaluation source, model or DLL changed")
     check_identity()
+    verify_runtime(provenance["runtime_files_sha256"])
     model_paths = {name: str(output/"models"/f"{name}.nnue") for name in ("candidate", "reference")}
     game = Game()
     try:
@@ -141,12 +208,14 @@ def execute(output):
         write_json(output/"status.json", status)
         return metrics
     publish()
-    with ProcessPoolExecutor(max_workers=config["workers"]) as pool:
+    with ProcessPoolExecutor(max_workers=config["workers"], initializer=initialize_worker,
+                             initargs=(provenance["runtime_files_sha256"],)) as pool:
         for future in as_completed([pool.submit(play, task) for task in tasks]):
             records.append(future.result())
             metrics = publish()
             print(f"{len(records)}/{config['games']}: {metrics['wins']} W / {metrics['losses']} L / {metrics['incomplete']} capped", flush=True)
     check_identity()
+    verify_runtime(provenance["runtime_files_sha256"])
     publish(finished=True)
 
 
@@ -167,11 +236,10 @@ def main():
     args = parser.parse_args()
     if args.execute_snapshot:
         output = args.execute_snapshot.resolve()
-        from train import write_json
         try:
             execute(output)
         except Exception as error:
-            write_json(output/"status.json", {"stage": "failed", "error": repr(error)})
+            publish_failure(output, error)
             raise
     else:
         if not all((args.candidate, args.reference, args.output)):

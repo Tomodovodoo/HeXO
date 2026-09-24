@@ -7,6 +7,10 @@ python evaluate.py --candidate runs/example/checkpoints/0005/model.nnue --refere
 The output directory must not exist. The CLI copies and hashes both checkpoints,
 the loaded native library, and its Python/C++ sources. Matches run in that copied
 source tree. Each fresh mixed-v1 held-out opening is played with swapped colors.
+On Windows and Linux, provenance also records resolved paths and hashes for loaded
+file-backed runtime modules, including transitive native dependencies. These host
+files are checked before matches, in each worker, and after completion. They are
+verified in place rather than copied; the snapshot does not isolate the whole OS.
 Choose the game count and seed before inspecting results; repeated exploratory
 comparisons do not constitute a prespecified confirmation.
 
@@ -16,6 +20,7 @@ Each game is replay-validated before publication. Model attachment time is exclu
 from search timing. `status.json` is updated atomically for the training dashboard;
 put this output under the run's `evaluation` directory to attach it. The candidate
 hash must match the latest checkpoint before the dashboard shows its evidence.
+Failed status retains both checkpoint hashes and the last progress counts.
 
 The reference has an arbitrary anchor of zero Elo. The reported relative estimate
 uses a half-win/half-loss continuity correction and a conservative 95% opening-pair

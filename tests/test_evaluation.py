@@ -1,13 +1,40 @@
 import copy
 import math
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
-from evaluate import verify_trace
+from evaluate import verify_trace, verify_runtime, sha, publish_failure
 from hexo import Game
 from train import paired_metrics
 
 
 class PairedEvaluation(unittest.TestCase):
+    def test_runtime_dependency_changes_and_failed_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dependency = root/'runtime.dll'
+            dependency.write_bytes(b'original')
+            identity = {str(dependency): sha(dependency)}
+            verify_runtime(identity, [dependency])
+            with self.assertRaisesRegex(ValueError, 'missing, relocated or changed'):
+                verify_runtime(identity, [])
+            dependency.write_bytes(b'changed')
+            with self.assertRaises(ValueError):
+                verify_runtime(identity, [dependency])
+            dependency.unlink()
+            with self.assertRaises(ValueError):
+                verify_runtime(identity, [dependency])
+            (root/'provenance.json').write_text(json.dumps({'model_input_sha256': {'candidate': 'abc', 'reference': 'def'}}))
+            (root/'status.json').write_text(json.dumps({'completed': 3, 'total': 8}))
+            publish_failure(root, ValueError('dependency changed'))
+            status = json.loads((root/'status.json').read_text())
+            self.assertEqual(status['stage'], 'failed')
+            self.assertEqual(status['candidate_sha256'], 'abc')
+            self.assertEqual(status['reference_sha256'], 'def')
+            self.assertEqual(status['completed'], 3)
+
     def test_pair_statistics_and_uncensored_rating(self):
         records = [{'seed': p, 'challenger_color': c, 'winner': c if p < 3 else 1-c}
                    for p in range(4) for c in (0, 1)]
