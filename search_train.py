@@ -95,6 +95,7 @@ def capture_history(run, previous_identity, config):
         expected=dict(candidate=digest(run/'checkpoints'/f'{a:04d}'/'model.pt'),
             opponent=digest(run/'checkpoints'/f'{b:04d}'/'model.pt'),simulations=config['simulations'],
             root_samples=config['root_samples'],games=config['eval_games'],seed=config['seed']+100000+a*1000,opening_suite='standard-v1')
+        if 'run' in manifest['identity']:expected['run']=previous_identity
         if manifest['identity']!=expected:raise ValueError('Historical comparison settings changed')
     return dict(previous_identity=previous_identity,through=numbers[-1],artifacts=artifacts)
 
@@ -267,13 +268,14 @@ def fit(model,optimizer,episodes,rows,args,iteration,progress):
     return dict(**last,optimizer_steps=steps,validation_game_ids=sorted(validation),training_games=len(families)-len(validation))
 
 
-def evaluate(run,candidate,opponent,args,progress,games=None):
+def evaluate(run,candidate,opponent,args,progress,games=None,verify_checkpoint=None):
     games=args.eval_games if games is None else games
     path=run/'evaluation'/f'{candidate:04d}-vs-{opponent:04d}'
     a=run/'checkpoints'/f'{candidate:04d}'/'model.pt';b=run/'checkpoints'/f'{opponent:04d}'/'model.pt'
     run_identity=json.loads((run/'config.json').read_text())
-    verify_artifact(a.parent,dict(run_identity,checkpoint=candidate))
-    verify_artifact(b.parent,dict(run_identity,checkpoint=opponent))
+    verify_checkpoint=verify_artifact if verify_checkpoint is None else verify_checkpoint
+    verify_checkpoint(a.parent,dict(run_identity,checkpoint=candidate))
+    verify_checkpoint(b.parent,dict(run_identity,checkpoint=opponent))
     identity=dict(run=run_identity,candidate=digest(a),opponent=digest(b),simulations=args.simulations,root_samples=args.root_samples,
                   games=games,seed=args.seed+100000+candidate*1000+opponent*1000003,opening_suite='standard-v1')
     if path.exists():
@@ -378,7 +380,7 @@ def main(args):
                 raise ValueError('Pending checkpoint consumed corpus changed')
             comparisons={}
             for opponent,games in evaluation_schedule(iteration,league['champion'],args.eval_games,args.reference_games):
-                comparisons[opponent]=evaluate(run,iteration,opponent,args,lambda data:event('validation-matches',iteration,opponent=opponent,**data),games)
+                comparisons[opponent]=evaluate(run,iteration,opponent,args,lambda data:event('validation-matches',iteration,opponent=opponent,**data),games,verify_run_artifact)
             anchor=comparisons[0];versus=comparisons[league['champion']]['metrics']
             promoted=not versus['incomplete'] and versus['wins']>versus['losses'] and versus['opening_pair_p']<.05
             league['checkpoints'].append(dict(id=iteration,elo=anchor['elo'],elo_interval=anchor['elo_interval'],promoted=promoted,
