@@ -25,7 +25,11 @@ def pair_admission(args):
     if model:
         if model.get("kind", "pattern") != "pattern":
             raise ValueError("Trace benchmark requires a pattern-table or handwritten evaluator")
-        table_path = Path(model["path"])
+        # Older arena reports stored the pattern path under "table".
+        stored_path = model.get("path", model.get("table"))
+        if stored_path is None:
+            raise ValueError("Trace model does not identify its pattern table")
+        table_path = Path(stored_path)
         array = np.load(table_path, allow_pickle=False)
         if array.shape != (729,) or array.dtype != np.int32:
             raise ValueError("Trace model must contain a 729-entry int32 pattern table")
