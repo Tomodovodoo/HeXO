@@ -42,15 +42,19 @@ bind("hx_hash", C.c_uint64, C.c_void_p)
 bind("hx_cell", C.c_int, C.c_void_p, C.c_int, C.POINTER(Cell))
 bind("hx_moves", C.c_int, C.c_void_p, C.POINTER(Cell), C.c_int)
 bind("hx_search", C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int, C.POINTER(Result))
+bind("hx_features", C.c_int, C.c_void_p, C.POINTER(C.c_int32), C.c_int)
+bind("hx_load_table", C.c_int, C.c_void_p, C.POINTER(C.c_int32), C.c_int)
 
 
 class Game:
-    def __init__(self, moves=()):
+    def __init__(self, moves=(), table=None):
         self.ptr = lib.hx_new()
         if not self.ptr:
             raise MemoryError("Unable to allocate native board")
         for q, r in moves:
             self.play(q, r)
+        if table is not None:
+            self.load_table(table)
 
     def close(self):
         if self.ptr:
@@ -118,3 +122,18 @@ class Game:
     def state(self):
         return {"cells": self.cells, "player": self.player,
                 "remaining": self.remaining, "winner": self.winner}
+
+    def features(self):
+        data = (C.c_int32 * 729)()
+        lib.hx_features(self.ptr, data, 729)
+        return list(data)
+
+    def load_table(self, weights):
+        weights = list(weights)
+        if len(weights) != 729 or any(int(w) != w for w in weights):
+            raise ValueError("Pattern table must have 729 integer weights")
+        if any(w < -10000 or w > 10000 for w in weights):
+            raise ValueError("Pattern weights must be within +/- 10000")
+        data = (C.c_int32 * 729)(*(int(w) for w in weights))
+        if not lib.hx_load_table(self.ptr, data, len(weights)):
+            raise ValueError("Pattern table requires zero empty baseline and weights within +/- 10000")

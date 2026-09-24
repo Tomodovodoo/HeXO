@@ -49,6 +49,27 @@ def run(args):
     output.parent.mkdir(parents=True, exist_ok=True)
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], text=True).strip())
+    model = None
+    weights = [0]*729
+    if args.run or args.table:
+        import numpy as np
+        if args.run:
+            run_dir = Path(args.run).resolve()
+            summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+            checkpoint = summary["incumbent"] if args.checkpoint is None else args.checkpoint
+            descriptor = next((c for c in summary["checkpoints"] if c["id"] == checkpoint), None)
+            if descriptor is None:
+                raise ValueError(f"Checkpoint {checkpoint} is not present in {run_dir}")
+            path = run_dir / descriptor["table"]
+        else:
+            path = Path(args.table).resolve()
+            checkpoint = None
+        table = np.load(path, allow_pickle=False)
+        if table.shape != (729,) or table.dtype != np.int32:
+            raise ValueError("Expected a 729-entry int32 native pattern table")
+        weights = table.tolist()
+        model = {"checkpoint": checkpoint, "table": str(path),
+                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     for index in range(args.games):
         if index % 2 == 0:
             opening = [(0, 0)]
@@ -69,12 +90,14 @@ def run(args):
             before = time.perf_counter()
             try:
                 if side == our_color:
+                    game.load_table(weights)
                     search = game.search(args.ms, width=args.width)
                     searches.append(search)
                     moves = search["moves"]
                 elif opponent:
                     moves = opponent(game, args.ms)
                 elif args.opponent == "shallow":
+                    game.load_table([0]*729)
                     moves = game.search(args.ms, depth=1, width=args.width)["moves"]
                 else:
                     moves = []
@@ -107,6 +130,7 @@ def run(args):
         completed = [g for g in games if g["reason"] == "six-in-a-row"]
         wins = sum(g["winner"] == g["our_color"] for g in completed)
         report = {"revision": revision, "dirty": dirty, "platform": platform.platform(),
+                  "model": model,
                   "engine_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
                   "source_sha256": hashlib.sha256((ROOT / "src/hexo.cpp").read_bytes()).hexdigest(),
                   "opponent_revision": (ROOT / "build/seal_revision.txt").read_text().strip() if opponent else None,
@@ -128,7 +152,13 @@ if __name__ == "__main__":
     parser.add_argument("--max-stones", type=int, default=250)
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--output", default="artifacts/arena.json")
+    model_source = parser.add_mutually_exclusive_group()
+    model_source.add_argument("--run", help="Run directory; defaults to its promoted checkpoint")
+    model_source.add_argument("--table", help="Exported native table.npy")
+    parser.add_argument("--checkpoint", type=int, help="Specific checkpoint in --run, including rejected candidates")
     args = parser.parse_args()
     if args.games < 1 or args.ms < 1 or args.max_stones < 3:
         parser.error("games and ms must be positive; max-stones must be at least 3")
+    if args.checkpoint is not None and not args.run:
+        parser.error("--checkpoint requires --run")
     run(args)
