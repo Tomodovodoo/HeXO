@@ -216,6 +216,10 @@ def main(args):
             if not args.initial_model and not args.allow_cold_start:
                 raise ValueError('Warm-start policy and Q, or explicitly request --allow-cold-start')
             model = load_model(args.initial_model,args.device,expected_sha256=config['initial_model_sha256']) if args.initial_model else RelationalNet(ModelConfig()).to(args.device)
+            if getattr(args,'critic_initialization','checkpoint')=='zero-output':
+                with torch.no_grad():
+                    model.critic[-1].weight.zero_()
+                    model.critic[-1].bias.zero_()
             completed = 0
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         if existing:
@@ -249,6 +253,16 @@ def main(args):
                 episodes, rows = collect(model,args,number,progress)
                 save_corpus(corpus,corpus_identity,episodes,rows)
             episodes, rows, _ = load_corpus(corpus,corpus_identity)
+            terminal_games=sum(e['winner']>=0 for e in episodes)
+            terminal_fraction=terminal_games/len(episodes)
+            minimum_terminal_fraction=getattr(args,'min_terminal_fraction',0.)
+            if terminal_fraction<minimum_terminal_fraction:
+                write_json(run/'status.json',dict(schema=MODEL_SCHEMA,updated_at=time.time(),
+                    stage='collection_insufficient',iteration=number,games=len(episodes),positions=len(rows),
+                    terminal_games=terminal_games,bootstrapped_games=len(episodes)-terminal_games,
+                    terminal_fraction=terminal_fraction,min_terminal_fraction=minimum_terminal_fraction,
+                    fitting_started=False,reason='Fresh corpus terminal fraction is below the declared fitting threshold'))
+                return
             metrics = fit(model,optimizer,episodes,rows,args,number,progress)
             metrics.update(iteration=number,games=len(episodes),positions=len(rows),
                            terminal_games=sum(e['winner']>=0 for e in episodes),
@@ -281,6 +295,10 @@ def parse_args():
     parser.add_argument('--run',required=True)
     parser.add_argument('--initial-model')
     parser.add_argument('--allow-cold-start',action='store_true')
+    parser.add_argument('--critic-initialization',choices=['checkpoint','zero-output'],default='checkpoint',
+                        help='Only new runs: retain checkpoint Q, or zero only its final projection and record that control')
+    parser.add_argument('--min-terminal-fraction',type=float,default=0.,
+                        help='Preserve collection but skip fitting when too many games reached the placement cap')
     for name,default in [('iterations',1),('games',16),('envs',8),('max-plies',128),('batch',8),
                          ('max-nodes',12000),('max-edges',600000),('seed',1729)]:
         parser.add_argument('--'+name,type=int,default=default)
@@ -290,6 +308,8 @@ def parse_args():
     args=parser.parse_args()
     if min(args.iterations,args.games,args.envs,args.max_plies,args.batch,args.max_nodes,args.max_edges)<1:
         parser.error('Counts and graph budgets must be positive')
+    if not math.isfinite(args.min_terminal_fraction) or not 0<=args.min_terminal_fraction<=1:
+        parser.error('Minimum terminal fraction must be between zero and one')
     if not all(math.isfinite(getattr(args,k)) for k in ('alpha','beta','gamma','lambda_return','lr','grad_clip')) or not (
         args.alpha>=0 and args.beta>=0 and args.alpha+args.beta>0 and 0<args.gamma<=1 and 0<=args.lambda_return<=1 and args.lr>0 and args.grad_clip>0):
         parser.error('Invalid optimization coefficients')
