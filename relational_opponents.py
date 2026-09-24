@@ -3,7 +3,8 @@
 freeze_opponent writes a new opponent directory. Its returned manifest belongs in
 the enclosing evaluation provenance. load_opponent verifies that manifest and
 runs private copies; it never builds, downloads, or substitutes another engine.
-Windows system DLLs remain host dependencies, with their exact bytes verified.
+Explicit system DLL imports remain verified host dependencies. API-set contracts
+are resolved by the host OS and are not part of the frozen application image.
 """
 import builtins
 import ctypes as C
@@ -25,7 +26,7 @@ def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _dependencies(binary, runtime_dirs, objdump):
+def _dependencies(binary, runtime_dirs, objdump, image=None):
     """Resolve the transitive PE imports; keep OS DLLs explicitly host-bound."""
     if os.name != 'nt':
         raise RuntimeError('Opponent freezing currently supports Windows PE builds')
@@ -42,13 +43,19 @@ def _dependencies(binary, runtime_dirs, objdump):
     directories = [binary.parent, *map(Path, runtime_dirs)]
     if compiler:
         directories.append(Path(compiler).parent)
-    pending, visited, copies, host, imports = [binary], set(), {}, {}, {}
+    pending = [(binary, binary.read_bytes() if image is None else image)]
+    visited, copies, host, imports = {}, {}, {}, {}
     while pending:
-        current = pending.pop()
+        current, image_bytes = pending.pop()
         if current in visited:
+            if visited[current] != _sha(image_bytes):
+                raise ValueError(f'Native dependency changed during freezing: {current}')
             continue
-        visited.add(current)
-        output = subprocess.check_output([objdump, '-p', str(current)], text=True)
+        visited[current] = _sha(image_bytes)
+        with tempfile.TemporaryDirectory(prefix='hexo-pe-') as directory:
+            captured = Path(directory)/current.name
+            captured.write_bytes(image_bytes)
+            output = subprocess.check_output([objdump, '-p', str(captured)], text=True)
         names = re.findall(r'DLL Name:\s*(\S+)', output)
         if not names and current == binary:
             raise ValueError(f'No PE dependency information for {current}')
@@ -62,14 +69,15 @@ def _dependencies(binary, runtime_dirs, objdump):
             if name.lower() in known or source is None:
                 if not os_file.is_file():
                     raise FileNotFoundError(f'Unresolved native opponent dependency: {name}')
-                host[str(os_file.resolve())] = _sha(os_file.read_bytes())
-                pending.append(os_file.resolve())
+                host_bytes = os_file.read_bytes()
+                host[str(os_file.resolve())] = _sha(host_bytes)
+                pending.append((os_file.resolve(), host_bytes))
                 continue
             data = source.read_bytes()
             if name.lower() in copies and copies[name.lower()][1] != data:
                 raise ValueError(f'Conflicting native dependency: {name}')
             copies[name.lower()] = (source.name, data)
-            pending.append(source.resolve())
+            pending.append((source.resolve(), data))
     return copies, host, imports
 
 
@@ -90,7 +98,8 @@ def freeze_opponent(kind, destination, config):
     files = {}
     settings = {}
     if kind == 'seal-current':
-        selected_adapter = _module(source/'tools/seal_current.py')
+        adapter_python = (source/'tools/seal_current.py').read_bytes()
+        selected_adapter = _module(source/'tools/seal_current.py', source_bytes=adapter_python)
         REVISION, WEIGHTS_SHA256 = selected_adapter.REVISION, selected_adapter.WEIGHTS_SHA256
         manifest_path = binary.with_suffix(binary.suffix+'.json')
         build_bytes = manifest_path.read_bytes()
@@ -101,13 +110,16 @@ def freeze_opponent(kind, destination, config):
                 or build['adapter_source_sha256'] != _sha(adapter)):
             raise ValueError('Current Seal build/source identity mismatch')
         entry = 'build/hexo_seal_current.dll'
-        files.update({'tools/seal_current.py': (source/'tools/seal_current.py').read_bytes(),
+        files.update({'tools/seal_current.py': adapter_python,
                       'tools/seal_current_adapter.cpp': adapter, entry+'.json': build_bytes})
         budget = dict(unit='milliseconds per complete turn', deadline='upstream best-effort',
                       equal_compute=False, randomness='upstream random_device; arena seed does not seed Seal')
     else:
-        selected_reference = _module(source/'strix_reference.py')
-        selected_adapter = _module(source/'tools/strix_learned_adapter.py', selected_reference)
+        reference_python = (source/'strix_reference.py').read_bytes()
+        adapter_python = (source/'tools/strix_learned_adapter.py').read_bytes()
+        selected_reference = _module(source/'strix_reference.py', source_bytes=reference_python)
+        selected_adapter = _module(source/'tools/strix_learned_adapter.py', selected_reference,
+                                   source_bytes=adapter_python)
         REVISION, MODEL_SHA256 = selected_reference.REVISION, selected_adapter.MODEL_SHA256
         build_bytes = binary.with_name('build-provenance.json').read_bytes()
         build = json.loads(build_bytes)
@@ -126,8 +138,8 @@ def freeze_opponent(kind, destination, config):
         if _sha(setup) != build['setup_sha256']:
             raise ValueError('Learned Strix build script changed')
         files['tools/build_strix_learned.py'] = setup
-        for name in ('strix_reference.py', 'tools/strix_learned_adapter.py'):
-            files[name] = (source/name).read_bytes()
+        files['strix_reference.py'] = reference_python
+        files['tools/strix_learned_adapter.py'] = adapter_python
         entry = 'build/hexo-strix-learned.exe'
         files['build/build-provenance.json'] = build_bytes
         files['models/model.safetensors'] = model
@@ -144,7 +156,7 @@ def freeze_opponent(kind, destination, config):
                       equal_compute=False, caller_milliseconds_ignored=True,
                       root_forcing=dict(generator='wide', depth=6, nodes=2000),
                       leaf_forcing=False, independent_proof=False)
-    copies, host, imports = _dependencies(binary, config.get('runtime_dirs', []), config.get('objdump', 'objdump'))
+    copies, host, imports = _dependencies(binary, config.get('runtime_dirs', []), config.get('objdump', 'objdump'), image)
     # StrixReference starts a private executable copy. The pinned public build
     # is self-contained apart from OS DLLs; reject builds needing app-local DLLs.
     if kind == 'strix' and copies:
@@ -158,7 +170,9 @@ def freeze_opponent(kind, destination, config):
         binary=entry, binary_sha256=_sha(image), settings=settings, budget=budget,
         files_sha256={name:_sha(data) for name,data in files.items()},
         host_system_files_sha256=host, imports=imports,
-        runtime_scope='Exact private copies of app inputs and non-system DLLs; verified host Windows DLLs and API-set contracts',
+        runtime_scope='Private app inputs and non-system DLLs; verified explicit host DLL imports. API-set contracts remain host-resolved and are not frozen.',
+        host_resolved_api_sets=sorted({name for names in imports.values() for name in names
+                                     if name.lower().startswith(('api-ms-win-', 'ext-ms-win-'))}),
         build=build)
     if kind == 'strix':
         metadata.update(model='models/model.safetensors', model_sha256=MODEL_SHA256)
@@ -171,14 +185,17 @@ def freeze_opponent(kind, destination, config):
     return metadata
 
 
-def _module(path, reference=None):
+def _module(path, reference=None, source_bytes=None):
     spec = importlib.util.spec_from_file_location('_frozen_'+path.stem, path)
     module = importlib.util.module_from_spec(spec)
     if reference is not None:
         def import_reference(name, *args, **kwargs):
             return reference if name == 'strix_reference' else builtins.__import__(name, *args, **kwargs)
         module.__dict__['__builtins__'] = dict(vars(builtins), __import__=import_reference)
-    spec.loader.exec_module(module)
+    if source_bytes is None:
+        spec.loader.exec_module(module)
+    else:
+        exec(compile(source_bytes, str(path), 'exec'), module.__dict__)
     return module
 
 
