@@ -2,6 +2,7 @@
 import argparse
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import json
+import multiprocessing
 from pathlib import Path
 import shutil
 import subprocess
@@ -107,6 +108,8 @@ def freeze(args):
         binary = Path(proof.lib._name)
         binaries += [binary, binary.with_suffix(binary.suffix+'.json')]
     revision_file = args.seal_library.parent/'seal_revision.txt'
+    if not revision_file.exists() and args.seal_library.parent.name in ('Release', 'Debug', 'RelWithDebInfo', 'MinSizeRel'):
+        revision_file = args.seal_library.parent.parent/'seal_revision.txt'
     # Validate all inputs before creating the immutable destination.
     for path in [checkpoint, args.seal_library, revision_file, *binaries, *(ROOT/name for name in source_names)]:
         if not path.is_file():
@@ -138,6 +141,7 @@ def freeze(args):
 
 
 def execute(output):
+    global PLAYER, OPPONENT
     provenance = json.loads((output/'provenance.json').read_text())
     config = provenance['config']
     def check_files():
@@ -156,6 +160,9 @@ def execute(output):
         gpu=torch.cuda.get_device_name() if config['device'].startswith('cuda') else None)
     write_json(output/'provenance.json', provenance)
     PLAYER.close()
+    PLAYER = OPPONENT = None
+    if config['device'].startswith('cuda'):
+        torch.cuda.empty_cache()
     records, started = [], time.perf_counter()
     tasks = [dict(index=i, seed=config['seed']+i//2, challenger_color=i%2, output=str(output),
                   max_stones=config['max_stones'], seal_ms=config['seal_ms'],
@@ -177,7 +184,8 @@ def execute(output):
             openings_sha256=sha(output/'openings.json'), games=sorted(records, key=lambda g: g['index'])))
         write_json(output/'status.json', status)
     publish()
-    with ProcessPoolExecutor(max_workers=1, initializer=worker_start, initargs=(output,)) as pool:
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context('spawn'),
+                             initializer=worker_start, initargs=(output,)) as pool:
         pending = {pool.submit(play, task) for task in tasks}
         while pending:
             done, pending = wait(pending, timeout=2, return_when=FIRST_COMPLETED)
