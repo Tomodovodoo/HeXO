@@ -255,6 +255,19 @@ whole-file SHA256. Native loading validates dimensions, sizes, finite weights,
 table bounds and table symmetries. A model handle is immutable and shared by
 attached boards. Loading a legacy table detaches NNUE and vice versa.
 
+After an engine change, start a new rating run while retaining learned NNUE weights:
+
+```sh
+python train.py --run runs/nnue-new-engine --model nnue --initial-model runs/nnue-old/checkpoints/0001/model.pt --initial-optimizer runs/nnue-old/checkpoints/0001/optimizer.pt --device cuda
+```
+
+`--initial-optimizer` is optional. When supplied, AdamW moments and step counters
+are retained, and `--lr` sets the new run's learning rate. The imported model is
+validated, copied into checkpoint zero, and exported with the current native
+format. Source paths and hashes are recorded; resume requires the same arguments
+and unchanged source files. Ratings start at zero against the imported anchor.
+Existing runs and checkpoint files are never reinitialized by these options.
+
 Saved NNUE histories can be revisited with a frozen evaluator and a larger native
 search budget, then supplied to an ordinary training run:
 
