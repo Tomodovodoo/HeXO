@@ -10,7 +10,8 @@
 <section><h2>Checkpoint history</h2><div class="table-scroll"><table><thead><tr><th>Checkpoint</th><th>Decision</th><th>Reference Elo</th><th>Versus incumbent</th><th>Pair-test p</th><th>Validation loss</th></tr></thead><tbody id="checkpoints"></tbody></table></div></section>
 </div>
 <div id="klent-run" hidden>
-<section><div class="top"><h2>KLENT experiment</h2><strong class="unrated">UNRATED</strong></div><p>No external match evidence is attached. Policy, Q and value losses do not imply Elo or promotion.</p><div id="klent-progress" role="status"></div><progress id="klent-bar" max="1" value="0" aria-label="Current KLENT phase progress"></progress><p id="klent-update"></p></section>
+<section><div class="top"><h2>KLENT experiment</h2><strong class="unrated">UNRATED</strong></div><p id="k-rating-note">No external match evidence is attached. Policy, Q and value losses do not imply Elo or promotion.</p><div id="klent-progress" role="status"></div><progress id="klent-bar" max="1" value="0" aria-label="Current KLENT phase progress"></progress><p id="klent-update"></p></section>
+<section id="k-evaluation" hidden><h2>External paired evaluation</h2><p id="k-evaluation-progress" role="status"></p><progress id="k-evaluation-bar" max="1" value="0" aria-label="External evaluation progress"></progress><p id="k-evaluation-results" style="white-space:pre-line"></p></section>
 <div class="metrics"><div class="metric"><small>Natural terminals</small><strong id="k-terminals">0</strong></div><div class="metric"><small>Bootstrapped caps</small><strong id="k-caps">0</strong></div><div class="metric"><small>Collected positions</small><strong id="k-positions">0</strong></div><div class="metric"><small>Latest saved checkpoint</small><strong id="k-checkpoint">0</strong></div></div>
 <div class="charts"><section><h2>Policy cross entropy</h2><canvas id="k-policy" role="img" aria-label="KLENT policy cross entropy by iteration"></canvas><p>One actor fitting pass per collection. Live values are averages over the current pass.</p></section><section><h2>Q and deployment value error</h2><canvas id="k-critic" role="img" aria-label="Q and deployment value mean squared errors by iteration"></canvas><p>Blue: Q MSE. Orange: deployment value MSE from its separate fitting pass. These are fitting errors, not match results.</p></section></div>
 <section><h2>Optimizer work</h2><p id="k-optimizer"></p><p id="k-coverage"></p></section>
@@ -36,6 +37,15 @@ const a=s.active||{},c=s.config||{},saved=s.checkpoints||[],last=saved.at(-1),st
 $('status').textContent=`Iteration ${s.iteration} · ${stage}`+(!s.training_lock_present&&['collection','fitting'].includes(stage)?' · no active run lock':'');
 $('config').textContent=`${s.name} · KLENT · ${c.device||'device not reported'} · ${n(c.envs)} environments · ${n(c.games)} games per iteration · ${n(c.max_plies)} placement cap`;
 $('error').textContent=a.error||'';
+const evaluation=s.evaluation;$('k-evaluation').hidden=!evaluation;
+if(evaluation){const opponent=evaluation.stage==='native'?'initial NNUE':evaluation.stage==='seal'?'Seal':evaluation.stage;const active=['native','seal'].includes(evaluation.stage);if(active)$('status').textContent=`Evaluation vs ${opponent} · ${n(evaluation.completed)} / ${n(evaluation.total)}`;
+$('k-rating-note').textContent='External paired match results are shown below. No Elo rating is assigned; fitting losses never count as match evidence.';
+$('k-evaluation-progress').textContent=`${active?'Playing against '+opponent:'Evaluation '+opponent}: ${n(evaluation.completed)} / ${n(evaluation.total)} games.`;
+const eb=$('k-evaluation-bar');if(Number.isFinite(evaluation.completed)&&evaluation.total>0){eb.max=evaluation.total;eb.value=evaluation.completed}else eb.removeAttribute('value');
+const resultText=(label,r)=>{const bounds=r.win_rate_95pct;return `${label}: ${n(r.wins)} wins / ${n(r.losses)} losses / ${n(r.incomplete)} incomplete.`+(Array.isArray(bounds)&&bounds.length===2?` Opening-pair 95% score interval: ${(100*bounds[0]).toFixed(1)}–${(100*bounds[1]).toFixed(1)}%.`:'')};
+$('k-evaluation-results').textContent=(evaluation.results?Object.entries(evaluation.results).map(([label,r])=>resultText(label==='native'?'Initial NNUE':label,r)).join('\n'):resultText(opponent,evaluation))+'\nThis is a finite paired sample, not a promotion decision.';
+if(evaluation.stage==='failed'){$('status').textContent='External evaluation failed';$('k-evaluation-results').textContent=evaluation.error||'Evaluation error not reported'}
+}else $('k-rating-note').textContent='No external match evidence is attached. Policy, Q and value losses do not imply Elo or promotion.';
 $('k-terminals').textContent=n(s.totals.terminal_games);$('k-caps').textContent=n(s.totals.bootstrapped_games);$('k-positions').textContent=n(s.totals.positions);$('k-checkpoint').textContent=last?.id??'None';
 let completed,total,text;
 if(stage==='collection'){completed=a.games;total=a.games_total??c.games;text=`Collecting games: ${n(completed)} / ${n(total)}. ${n(a.positions)} positions so far.`}

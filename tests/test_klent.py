@@ -56,6 +56,12 @@ class KlentTest(unittest.TestCase):
             (root/"checkpoints/0001/manifest.json").write_text(json.dumps({**initial, "metrics": metrics}))
             (root/"status.json").write_text(json.dumps({"iteration": 1, "stage": "finished", **metrics}))
             self.assertEqual(klent_run(root)["totals"], metrics)
+            (root/"evaluation").mkdir()
+            evaluation = {"stage": "native", "completed": 4, "total": 160, "wins": 1, "losses": 3}
+            (root/"evaluation/status.json").write_text(json.dumps(evaluation))
+            observed = klent_run(root)
+            self.assertEqual(observed["evaluation"], evaluation)
+            self.assertEqual(observed["rating"], "UNRATED")
 
     def setUp(self):
         old = torch.get_num_threads()

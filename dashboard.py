@@ -60,6 +60,7 @@ def klent_run(run):
             "source_sha256": identity.get("sources", {}).get("klent.py"),
             "engine_sha256": identity.get("engine_sha256"), "training_lock_present": (run/"training.lock").exists(),
             "status_modified": (run/"status.json").stat().st_mtime if (run/"status.json").exists() else None,
+            "evaluation": read_json(run/"evaluation/status.json"),
             "rating": "UNRATED", "rating_reason": "External paired match evidence is not attached to this run."}
 
 
