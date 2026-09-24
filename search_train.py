@@ -62,8 +62,9 @@ def capture_history(run, previous_identity, config):
     """Bind an existing stopped run's immutable artifacts before changing its evaluator."""
     if json.loads((run/'status.json').read_text())['stage']!='finished':
         raise ValueError('Upgrade requires a finished checkpoint boundary')
-    if {k:v for k,v in config.items() if k!='reference_games'}!=previous_identity['config']:
-        raise ValueError('Upgrade may change evaluation allocation, not learning or search settings')
+    mutable={'reference_games','games','replay_positions','reuse_ratio','evaluate_every','actor_tactics'}
+    if {k:v for k,v in config.items() if k not in mutable}!={k:v for k,v in previous_identity['config'].items() if k not in mutable}:
+        raise ValueError('Upgrade may change collection and replay scheduling, not model or evaluation settings')
     league=json.loads((run/'league.json').read_text())
     numbers=sorted(c['id'] for c in league['checkpoints'])
     if numbers!=list(range(len(numbers))):raise ValueError('Incomplete checkpoint history')
@@ -161,7 +162,7 @@ def play_games(checkpoints, assignments, openings, args, seed, progress, *, trai
             while len(live)<args.envs and next_id<len(assignments):
                 history=openings[next_id]
                 trees=[NeuralSearch(ev,versions[j],history,seed+(next_id if training else next_id//2)*1009+j,
-                                   coordinators[j].cache,tactics=False) for j,ev in enumerate(evaluators)]
+                                   coordinators[j].cache,tactics=training and args.actor_tactics) for j,ev in enumerate(evaluators)]
                 live.append(dict(id=next_id,game=Game(history),history=list(history),trees=trees,rows=[]))
                 next_id+=1
             # Freeze this sweep's side assignments before applying any move.
@@ -178,7 +179,7 @@ def play_games(checkpoints, assignments, openings, args, seed, progress, *, trai
                     if training:
                         e['rows'].append(dict(game=e['id'],ply=len(e['history']),player=g.player,remaining=g.remaining,
                             action=result['action'],legal_sha256=hashlib.sha256(actions.astype(np.int64).tobytes()).hexdigest(),
-                            policy=policy.astype(np.float32),simulations=result['completed'],evaluated=result['evaluated']))
+                            policy=policy.astype(np.float32),simulations=result['completed'],evaluated=result['evaluated'],tactics=args.actor_tactics,exact_winner=result['exact_winner']))
                     action=result['action'];g.play(*action);e['history'].append(action)
                     for tree in e['trees']:tree.advance(action)
                     completed_placements+=1
@@ -227,19 +228,45 @@ def read_corpus(path, expected_identity):
     return episodes,rows
 
 
-def fit(model,optimizer,episodes,rows,args,iteration,progress):
+def recent_replay(run,iteration,capacity,verify):
+    episodes=[];rows=[];sources=[]
+    for number in range(iteration,0,-1):
+        path=run/'corpus'/f'{number:04d}'
+        manifest=verify(path)
+        games,items=read_corpus(path,manifest['identity'])
+        # Keep newest rows when the oldest admitted corpus crosses the bound.
+        items=items[-(capacity-len(rows)):]
+        used={r['game'] for r in items}
+        episodes.extend(dict(e,id=(number,e['id'])) for e in games if e['id'] in used)
+        rows.extend(dict(r,game=(number,r['game']),corpus=number,
+                         actor_sha256=manifest['identity']['actor_sha256'],target_age=iteration-number) for r in items)
+        sources.append(dict(iteration=number,manifest_sha256=digest(path/'manifest.json'),positions=len(items),
+                            actor_sha256=manifest['identity']['actor_sha256']))
+        if len(rows)>=capacity:break
+    return episodes,rows,sources
+
+
+def fit(model,optimizer,episodes,rows,args,iteration,progress,presentations=None):
     episodes={e['id']:e for e in episodes}
     families=sorted({r['game'] for r in rows})
-    if len(families)<2:raise ValueError('Need at least two terminal games for disjoint validation')
+    if not families or (presentations is None and len(families)<2):raise ValueError('No training rows, or too few games for disjoint validation')
     rng=np.random.default_rng(args.seed+iteration)
-    validation=set(rng.permutation(families)[:max(1,len(families)//4)].tolist())
+    validation=set() if presentations is not None else set(rng.permutation(families)[:max(1,len(families)//4)].tolist())
     train=[r for r in rows if r['game'] not in validation];valid=[r for r in rows if r['game'] in validation]
-    steps=0;last={}
-    for epoch in range(args.epochs):
-        for phase,selected in [('train',[train[i] for i in rng.permutation(len(train))]),('validation',valid)]:
+    steps=0;last={'validation':None};age_counts={}
+    if presentations is not None:
+        order=[]
+        while len(order)<presentations:order.extend(rng.permutation(len(train))[:presentations-len(order)].tolist())
+        phases=[('train',[train[i] for i in order])]
+    else:phases=None
+    for epoch in range(1 if presentations is not None else args.epochs):
+        for phase,selected in phases or [('train',[train[i] for i in rng.permutation(len(train))]),('validation',valid)]:
             model.train(phase=='train');total=np.zeros(2);completed=0
             for start in range(0,len(selected),args.batch):
                 batch_rows=selected[start:start+args.batch]
+                if phase=='train':
+                    for row in batch_rows:
+                        age=row.get('target_age',0);age_counts[age]=age_counts.get(age,0)+1
                 graphs=[graph(episodes[r['game']]['moves'][:r['ply']],model,args) for r in batch_rows]
                 for row,item in zip(batch_rows,graphs,strict=True):
                     if hashlib.sha256(item.actions.astype(np.int64).tobytes()).hexdigest()!=row['legal_sha256'] or (item.player,item.remaining)!=(row['player'],row['remaining']):
@@ -265,7 +292,8 @@ def fit(model,optimizer,episodes,rows,args,iteration,progress):
                 progress(dict(epoch=epoch+1,epochs=args.epochs,fit_phase=phase,completed=completed,total=len(selected),
                     policy_ce=total[0]/completed,value_mse=total[1]/completed,optimizer_steps=steps))
             last[phase]=dict(policy_ce=total[0]/completed,value_mse=total[1]/completed,positions=completed)
-    return dict(**last,optimizer_steps=steps,validation_game_ids=sorted(validation),training_games=len(families)-len(validation))
+    return dict(**last,optimizer_steps=steps,validation_game_ids=sorted(validation),training_games=len(families)-len(validation),
+        examples_presented=sum(age_counts.values()),target_age_presentations=age_counts)
 
 
 def evaluate(run,candidate,opponent,args,progress,games=None,verify_checkpoint=None):
@@ -368,8 +396,14 @@ def main(args):
                 optimizer=torch.optim.Adam(model.parameters(),lr=args.lr)
                 optimizer.load_state_dict(torch.load(previous/'optimizer.pt',map_location=args.device,weights_only=True))
                 started=time.perf_counter()
-                metrics=fit(model,optimizer,episodes,rows,args,iteration,lambda data:event('fitting',iteration,**data))
-                metrics.update(games=len(episodes),terminal_games=sum(e['winner']>=0 for e in episodes),positions=len(rows),seconds=time.perf_counter()-started,corpus_sha256=digest(corpus/'manifest.json'))
+                fresh_positions=len(rows);fresh_games=len(episodes);terminals=sum(e['winner']>=0 for e in episodes)
+                episodes,rows,replay_sources=recent_replay(run,iteration,args.replay_positions,
+                    lambda path:verify_run_artifact(path,corpus_identity(int(path.name))))
+                presentations=args.reuse_ratio*min(fresh_positions,args.replay_positions)
+                metrics=fit(model,optimizer,episodes,rows,args,iteration,lambda data:event('fitting',iteration,**data),presentations)
+                metrics.update(games=fresh_games,terminal_games=terminals,positions=fresh_positions,
+                    replay_positions=len(rows),replay_sources=replay_sources,reuse_ratio=args.reuse_ratio,
+                    seconds=time.perf_counter()-started,corpus_sha256=digest(corpus/'manifest.json'))
                 if source_identity()!=identity['sources']:raise ValueError('Training source changed')
                 def writer(stage):save_model(stage/'model.pt',model);torch.save(optimizer.state_dict(),stage/'optimizer.pt')
                 publish(checkpoint,dict(identity,checkpoint=iteration),writer,metrics);del model,optimizer
@@ -378,21 +412,24 @@ def main(args):
             verify_artifact(corpus,corpus_identity(iteration))
             if metrics['corpus_sha256']!=digest(corpus/'manifest.json'):
                 raise ValueError('Pending checkpoint consumed corpus changed')
-            comparisons={}
-            for opponent,games in evaluation_schedule(iteration,league['champion'],args.eval_games,args.reference_games):
-                comparisons[opponent]=evaluate(run,iteration,opponent,args,lambda data:event('validation-matches',iteration,opponent=opponent,**data),games,verify_run_artifact)
-            anchor=comparisons[0];versus=comparisons[league['champion']]['metrics']
-            promoted=not versus['incomplete'] and versus['wins']>versus['losses'] and versus['opening_pair_p']<.05
-            league['checkpoints'].append(dict(id=iteration,elo=anchor['elo'],elo_interval=anchor['elo_interval'],promoted=promoted,
-                anchor_score={k:anchor['metrics'][k] for k in ('wins','losses','incomplete')},versus_champion=league['champion'],
-                champion_score={k:versus[k] for k in ('wins','losses','incomplete','opening_pair_p')},loss=metrics))
-            league['checkpoints'][-1]['previous_score']={k:comparisons[iteration-1]['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
-            for opponent,comparison in comparisons.items():
-                if opponent not in (0,iteration-1,league['champion']):
-                    league['checkpoints'][-1]['older_score']=dict(opponent=opponent,**{k:comparison['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')})
-            if promoted:league['champion']=iteration
+            entry=dict(id=iteration,elo=None,elo_interval=None,promoted=False,loss=metrics,evaluation_due=iteration%args.evaluate_every==0)
+            if entry['evaluation_due']:
+                comparisons={}
+                for opponent,games in evaluation_schedule(iteration,league['champion'],args.eval_games,args.reference_games):
+                    comparisons[opponent]=evaluate(run,iteration,opponent,args,lambda data:event('validation-matches',iteration,opponent=opponent,**data),games,verify_run_artifact)
+                anchor=comparisons[0];versus=comparisons[league['champion']]['metrics']
+                promoted=not versus['incomplete'] and versus['wins']>versus['losses'] and versus['opening_pair_p']<.05
+                entry.update(elo=anchor['elo'],elo_interval=anchor['elo_interval'],promoted=promoted,
+                    anchor_score={k:anchor['metrics'][k] for k in ('wins','losses','incomplete')},versus_champion=league['champion'],
+                    champion_score={k:versus[k] for k in ('wins','losses','incomplete','opening_pair_p')})
+                entry['previous_score']={k:comparisons[iteration-1]['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
+                for opponent,comparison in comparisons.items():
+                    if opponent not in (0,iteration-1,league['champion']):
+                        entry['older_score']=dict(opponent=opponent,**{k:comparison['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')})
+                if promoted:league['champion']=iteration
+            league['checkpoints'].append(entry)
             update_ratings(run,league,args,history)
-            write_json(run/'league.json',league);event('checkpoint',iteration,elo=league['checkpoints'][-1]['elo'],promoted=promoted,champion=league['champion'])
+            write_json(run/'league.json',league);event('checkpoint',iteration,elo=entry['elo'],promoted=entry['promoted'],champion=league['champion'])
         event('finished',args.iterations,champion=league['champion'])
     except BaseException as error:
         event('failed',locals().get('iteration',0),error=repr(error));raise
@@ -403,12 +440,13 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run',required=True);parser.add_argument('--initial-model',required=True)
     parser.add_argument('--device',choices=['cpu','cuda'],default='cuda')
+    parser.add_argument('--actor-tactics',action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument('--upgrade-run',action='store_true',help='Preserve and bind a finished run before changing its evaluation schedule')
-    for name,default in [('iterations',3),('games',32),('eval-games',32),('reference-games',8),('envs',8),('simulations',16),('root-samples',8),
+    for name,default in [('replay-positions',200000),('reuse-ratio',4),('evaluate-every',4),('iterations',100),('games',128),('eval-games',32),('reference-games',8),('envs',8),('simulations',16),('root-samples',8),
                          ('leaf-batch',16),('batch',16),('epochs',1),('max-plies',128),('max-nodes',10000),('max-edges',600000),('cache-positions',1024),('seed',1740)]:
         parser.add_argument('--'+name,type=int,default=default)
     parser.add_argument('--lr',type=float,default=.0001)
     args=parser.parse_args()
-    if min(args.iterations,args.games,args.eval_games,args.reference_games,args.envs,args.simulations,args.root_samples,args.leaf_batch,args.batch,args.epochs,args.max_plies,args.max_nodes,args.max_edges,args.cache_positions)<1 or args.games<2 or args.eval_games%2 or args.reference_games%2 or args.reference_games>args.eval_games or not math.isfinite(args.lr) or args.lr<=0:
+    if min(args.replay_positions,args.reuse_ratio,args.evaluate_every,args.iterations,args.games,args.eval_games,args.reference_games,args.envs,args.simulations,args.root_samples,args.leaf_batch,args.batch,args.epochs,args.max_plies,args.max_nodes,args.max_edges,args.cache_positions)<1 or args.games<2 or args.eval_games%2 or args.reference_games%2 or args.reference_games>args.eval_games or not math.isfinite(args.lr) or args.lr<=0:
         parser.error('Positive settings, at least two self-play games, and an even evaluation count required')
     main(args)
