@@ -127,6 +127,8 @@ def freeze(args):
     opponent_snapshot = getattr(args, 'opponent_snapshot', None)
     opponent = None
     if opponent_snapshot:
+        if output.is_relative_to(opponent_snapshot.resolve()):
+            raise ValueError('Evaluation output must be outside the opponent snapshot')
         from relational_opponents import load_opponent
         opponent = json.loads((opponent_snapshot/'opponent.json').read_text())
         if opponent['kind'] == 'strix' and args.max_stones > 800:
