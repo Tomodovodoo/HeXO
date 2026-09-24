@@ -132,6 +132,8 @@ class Game:
         weights = list(weights)
         if len(weights) != 729 or any(int(w) != w for w in weights):
             raise ValueError("Pattern table must have 729 integer weights")
+        if any(w < -10000 or w > 10000 for w in weights):
+            raise ValueError("Pattern weights must be within +/- 10000")
         data = (C.c_int32 * 729)(*(int(w) for w in weights))
         if not lib.hx_load_table(self.ptr, data, len(weights)):
             raise ValueError("Pattern table requires zero empty baseline and weights within +/- 10000")
