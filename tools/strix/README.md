@@ -28,7 +28,8 @@ with StrixReference() as solver:
 
 The process stays alive across successful queries. Each query gets a fresh
 solver state, so no negative result leaks between generator modes or budgets.
-Calls on one client serialize. Close the client when finished. A wall timeout
+Calls on one client serialize, with queue waiting included in the timeout.
+A queued timeout leaves the active query untouched. Close the client when finished. A wall timeout
 kills and reaps the process, returns `UNKNOWN`, and starts a new process on the
 next call. Transport runs in a worker thread. Absolute deadline checks discard
 late replies, including those already queued or delayed by PV validation.
@@ -36,6 +37,9 @@ The timeout covers solver startup/search/PV extraction, with normal
 OS scheduling and cleanup overhead. IDTT does not expose a usable node counter;
 responses report `nodes: null` instead of claiming zero search work.
 Direct responses carry the executable SHA256 recorded before first launch.
+The worker launches a private temporary image written from those same verified
+bytes, so replacing the source path between hashing and launch cannot change
+the executed image. The private image is removed only after the process exits.
 The client refuses to restart if those bytes change, so a replacement binary
 requires a new client and produces distinct provenance. Malformed non-object
 responses become `UNKNOWN`, and the client always sets the independent-proof
@@ -99,5 +103,5 @@ Local bounded interface check at depth 8, 10,000 nodes, and 0.5 seconds per snap
 
 All returned winning lines passed sequential replay. Wide mode spends its
 budget on more candidates, so this small-budget count is not a comparison of
-the generators' eventual completeness. Ten adapter tests pass. This is a
+the generators' eventual completeness. Twelve adapter tests pass. This is a
 bounded interface check, not a solver-strength or proof-soundness benchmark.

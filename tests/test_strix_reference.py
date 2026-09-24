@@ -4,6 +4,8 @@ import hashlib
 import json
 import shutil
 import tempfile
+import threading
+import subprocess
 from unittest.mock import patch
 from pathlib import Path
 
@@ -98,6 +100,53 @@ class NativeReference(unittest.TestCase):
                 self.assertIn("changed across", result["reason"])
                 self.assertEqual(result["executable_sha256"], original_hash)
                 self.assertIsNone(reference.process)
+
+    def test_queue_timeout_leaves_active_query_alive(self):
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        stones = [[q, 0, "P1"] for q in range(5)]
+        self.reference.solve(stones, "P1", 1)
+        pid = self.reference.process.pid
+        def paused_pv(*args):
+            entered.set()
+            release.wait(1)
+            return validate_pv(*args)
+        with patch("strix_reference.validate_pv", paused_pv):
+            worker = threading.Thread(target=lambda: results.append(self.reference.solve(stones, "P1", 1)))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                result = self.reference.solve(stones, "P1", 1, timeout_s=.005)
+                self.assertEqual((result["status"], result["reason"]), ("UNKNOWN", "wall_timeout"))
+                self.assertEqual(self.reference.process.pid, pid)
+                self.assertIsNone(self.reference.process.poll())
+            finally:
+                release.set()
+                worker.join()
+        self.assertEqual(results[0]["status"], "REFERENCE_WIN_WITHIN_SCOPE")
+
+    def test_launch_uses_verified_private_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory)/Path(self.reference.executable).name
+            shutil.copyfile(self.reference.executable, original)
+            expected = hashlib.sha256(original.read_bytes()).hexdigest()
+            real_popen = subprocess.Popen
+            images = []
+            def change_source_before_launch(command, **kwargs):
+                with original.open("ab") as output:
+                    output.write(b"source changed after hash")
+                image = Path(command[0])
+                self.assertNotEqual(image, original)
+                self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), expected)
+                images.append(image)
+                return real_popen(command, **kwargs)
+            with StrixReference(original) as reference:
+                with patch("strix_reference.subprocess.Popen", change_source_before_launch):
+                    result = reference.solve([[0, 0, "P1"]], "P2", 2)
+                self.assertEqual(result["executable_sha256"], expected)
+                self.assertTrue(images[0].exists())
+                self.assertIsNone(reference.process.poll())
+            self.assertFalse(images[0].exists())
 
     def test_late_transport_and_late_pv_are_unknown(self):
         stones = [[q, 0, "P1"] for q in range(5)]

@@ -6,6 +6,7 @@ from pathlib import Path
 import queue
 import subprocess
 import threading
+import tempfile
 import time
 
 REVISION = "5a771e572553a8bd8e010112b2ce65f16e5afa1b"
@@ -79,14 +80,20 @@ class StrixReference:
         self.reader = None
         self.writer = None
         self.executable_sha256 = None
+        self.snapshot_directory = None
         self.lock = threading.Lock()
 
     def _start(self):
-        digest = hashlib.sha256(Path(self.executable).read_bytes()).hexdigest()
+        content = Path(self.executable).read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
         if self.executable_sha256 is not None and digest != self.executable_sha256:
             raise RuntimeError("reference executable changed across process restarts")
         self.executable_sha256 = digest
-        self.process = subprocess.Popen([self.executable], stdin=subprocess.PIPE,
+        self.snapshot_directory = tempfile.TemporaryDirectory(prefix="hexo-strix-")
+        image = Path(self.snapshot_directory.name)/Path(self.executable).name
+        image.write_bytes(content)
+        image.chmod(0o700)
+        self.process = subprocess.Popen([str(image)], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.responses = queue.Queue()
@@ -112,6 +119,9 @@ class StrixReference:
             self.process.stdin.close()
             self.process.stdout.close()
             self.process = None
+        if self.snapshot_directory is not None:
+            self.snapshot_directory.cleanup()
+            self.snapshot_directory = None
 
     def __enter__(self):
         return self
@@ -143,14 +153,18 @@ class StrixReference:
                      domain="fully forcing attacks consuming the defender's whole turn")
         unknown = dict(status="UNKNOWN", revision=REVISION, scope=scope,
                        independently_verified_proof=False, pv=[])
-        with self.lock:
-            deadline = time.monotonic() + timeout_s
+        deadline = time.monotonic() + timeout_s
+        if not self.lock.acquire(timeout=timeout_s):
+            # This caller owns neither the process nor the in-flight query.
+            return dict(unknown, reason="wall_timeout", executable_sha256=self.executable_sha256)
+        try:
             def remaining_time():
                 remaining = deadline-time.monotonic()
                 if remaining <= 0:
                     raise queue.Empty
                 return remaining
             try:
+                remaining_time()
                 if self.process is None:
                     self._start()
                 remaining_time()
@@ -193,3 +207,5 @@ class StrixReference:
             except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
                 self.close()
                 return dict(unknown, reason=str(error), executable_sha256=self.executable_sha256)
+        finally:
+            self.lock.release()
