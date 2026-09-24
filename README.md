@@ -280,3 +280,11 @@ the search-selected first and conditional second placements, not alpha-beta
 visit counts. Unfinished outcomes remain missing. Native PVS and the GPU
 complete-turn beam identify their teacher semantics in the recorded games;
 their search targets should not be treated as interchangeable depths.
+
+Native depth-zero evaluation checks whether the opponent's immediate completion
+sets can be covered by the remaining placements, after checking our own immediate
+win. An impossible cover is a mate loss; a cover with a spare placement remains
+unresolved. This fixes three observed leaf misvaluations. In a fresh paired
+100 ms comparison against the pinned public Seal engine (20 opening pairs per
+build, seed 20260929), the baseline scored 3–37 and the guard scored 2–38, with no
+truncated games. This experiment did not demonstrate a playing-strength gain.
