@@ -297,11 +297,45 @@ if __name__ == "__main__":
     import hashlib
     import json
     from pathlib import Path
-    from hexo import Game, library
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--benchmark", action="store_true", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--benchmark", action="store_true")
+    source.add_argument("--history", type=Path, help="JSON list of placement coordinates in play order")
+    parser.add_argument("--verify", type=Path, help="Verify a saved proof report against --history")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--ms", type=int, default=100)
+    parser.add_argument("--nodes", type=int, default=10000)
+    parser.add_argument("--attack-turns", type=int, default=3)
+    parser.add_argument("--width", type=int, default=8)
     args = parser.parse_args()
+    if args.verify and not args.history:
+        parser.error("--verify requires --history")
+    if args.ms < 1:
+        parser.error("--ms must be positive")
+    if args.history:
+        history = json.loads(args.history.read_text(encoding="utf-8"))
+        if args.verify:
+            report = json.loads(args.verify.read_text(encoding="utf-8"))
+            result = {"status": verify(report["certificate"], history), "verified": True}
+        else:
+            from hexo import Game
+            game = Game(history)
+            try:
+                result = solve(game, deadline=perf_counter()+args.ms/1000, node_limit=args.nodes,
+                               attack_turns=args.attack_turns, width=args.width)
+                if result["certificate"]:
+                    if verify(result["certificate"], history) != result["status"]:
+                        raise ValueError("Proof result disagrees with independent verification")
+                    result["verified"] = True
+            finally:
+                game.close()
+        payload = json.dumps(result, indent=2)
+        if args.output:
+            args.output.write_text(payload, encoding="utf-8")
+        print(payload)
+        raise SystemExit(0)
+    from hexo import Game, library
     histories = {"native_forcing": [(0,0),(0,6),(2,6),(1,0),(2,0),(4,6),(6,6),
                                      (0,2),(1,2),(8,6),(10,6),(2,2),(10,1)]}
     histories.update({f"distant_{n}": [(8*k, 0) for k in range(n)] for n in (101, 301, 1001)})
