@@ -108,6 +108,52 @@ class DirectPlayer(unittest.TestCase):
             actor.close()
             game.close()
 
+    def test_search_that_uses_its_budget_still_completes_two_placements(self):
+        actor = self.actor('gumbel')
+        actor.history, actor.tree = [(0,0)], Mock()
+        clock, actions = [0.], iter(([8,0], [16,0]))
+        def search(**kwargs):
+            clock[0] += kwargs['milliseconds']/1000
+            return {'action':next(actions)}
+        actor.tree.search.side_effect = search
+        game = Game([(0,0)])
+        try:
+            with patch('relational_player.time.perf_counter', side_effect=lambda:clock[0]):
+                result = actor.turn(game)
+            self.assertEqual(result['moves'], [[8,0],[16,0]])
+            self.assertEqual(result['elapsed_ms'], 1000)
+            self.assertEqual(len(game.cells), 1)
+        finally:
+            game.close()
+
+    def test_snapshot_identity_uses_copied_checkpoint(self):
+        import hashlib
+        import json
+        from pathlib import Path
+        import shutil
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from relational_evaluate import freeze
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint, seal = root/'model.pt', root/'seal.dll'
+            checkpoint.write_bytes(b'evaluated')
+            seal.write_bytes(b'seal')
+            (root/'seal_revision.txt').write_text('pinned')
+            output = root/'evaluation'
+            args = SimpleNamespace(output=output, checkpoint=checkpoint, seal_library=seal, mode='pi',
+                games=2, seal_ms=100, neural_ms=1000, simulations=8, root_samples=4, batch_size=4, max_stones=80)
+            original = shutil.copyfile
+            def copy(source, target):
+                original(source, target)
+                if Path(target) == output/'models/candidate.pt':
+                    checkpoint.write_bytes(b'replacement')
+            with patch('relational_evaluate.shutil.copyfile', side_effect=copy):
+                freeze(args)
+            identity = json.loads((output/'provenance.json').read_text())['model_input_sha256']['candidate']
+            self.assertEqual(identity, hashlib.sha256(b'evaluated').hexdigest())
+            self.assertNotEqual(identity, hashlib.sha256(checkpoint.read_bytes()).hexdigest())
+
 
 if __name__ == '__main__':
     unittest.main()

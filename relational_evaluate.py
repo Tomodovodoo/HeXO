@@ -132,7 +132,7 @@ def freeze(args):
     config['seal_revision'] = revision_file.read_text().strip()
     identity = {str(p.relative_to(output)): sha(p) for p in output.rglob('*') if p.is_file()}
     write_json(output/'provenance.json', dict(schema='hexo-relational-evaluation-v1', config=config,
-        files_sha256=identity, model_input_sha256={'candidate': sha(checkpoint), 'reference': sha(seal)},
+        files_sha256=identity, model_input_sha256={'candidate': sha(output/'models/candidate.pt'), 'reference': sha(seal)},
         revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         dirty=bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip()),
         model_family='relational-policy-q', backend=args.mode, promotion=False,
@@ -157,7 +157,7 @@ def execute(output):
     provenance['runtime_scope'] = 'Loaded file-backed native dependencies after actual neural warmup; verified host paths, not whole-OS isolation'
     import torch
     provenance['hardware'] = dict(device=config['device'], torch=torch.__version__, cuda=torch.version.cuda,
-        gpu=torch.cuda.get_device_name() if config['device'].startswith('cuda') else None)
+        gpu=torch.cuda.get_device_name(torch.device(config['device'])) if config['device'].startswith('cuda') else None)
     write_json(output/'provenance.json', provenance)
     PLAYER.close()
     PLAYER = OPPONENT = None
@@ -187,12 +187,22 @@ def execute(output):
     with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context('spawn'),
                              initializer=worker_start, initargs=(output,)) as pool:
         pending = {pool.submit(play, task) for task in tasks}
-        while pending:
-            done, pending = wait(pending, timeout=2, return_when=FIRST_COMPLETED)
-            for future in done:
-                records.append(future.result())
-                print(f'{len(records)}/{config["games"]} completed', flush=True)
-            publish()
+        try:
+            while pending:
+                done, pending = wait(pending, timeout=2, return_when=FIRST_COMPLETED)
+                for future in done:
+                    records.append(future.result())
+                    print(f'{len(records)}/{config["games"]} completed', flush=True)
+                publish()
+        except BaseException as error:
+            publish_failure(output, error)
+            for future in pending:
+                future.cancel()
+            # Python 3.12 has no public Executor.terminate_workers method.
+            # Terminate only this executor's processes before its context waits.
+            for process in pool._processes.values():
+                process.terminate()
+            raise
     check_files()
     verify_runtime(runtime)
     publish(True)

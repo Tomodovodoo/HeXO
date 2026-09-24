@@ -12,6 +12,7 @@ import torch
 from human_corpus import digest as history_digest, owner
 from klent import digest
 from relational_data import human_examples
+from relational_diagnostics import evaluate as diagnose
 from relational_model import ModelConfig, RelationalNet
 from relational_train import collect, fit, load_model, main, rebuild, save_model, graph
 from relational_warmstart import fit as warmstart
@@ -73,6 +74,73 @@ class RelationalLearningTests(unittest.TestCase):
             text=(root/'games.jsonl').read_text().replace('"family": 101','"family": 105')
             (root/'games.jsonl').write_text(text)
             with self.assertRaisesRegex(ValueError,'split membership'):human_examples(root)
+
+    def test_declared_conversion_limit_skips_only_unsharded_histories(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)/'corpus';records=fixture(root)
+            extra=copy.deepcopy(records[0])
+            extra['content_sha256']='unconverted-game'
+            history=root/'games.jsonl'
+            original=history.read_text()
+            history.write_text(original+'\n'+json.dumps(extra))
+            with self.assertRaisesRegex(ValueError,'absent from verified split'):
+                human_examples(root)
+            manifest=root/'manifest.json'
+            metadata=json.loads(manifest.read_text())
+            metadata['conversion']={'limit_games_per_split':1}
+            manifest.write_text(json.dumps(metadata))
+            histories,rows,_=human_examples(root)
+            self.assertEqual(set(histories),{r['content_sha256'] for r in records})
+            self.assertEqual(len(rows['train']),5)
+            history.write_text(original+'\n'+json.dumps(records[0]))
+            with self.assertRaisesRegex(ValueError,'Duplicate converted'):
+                human_examples(root)
+            history.write_text(json.dumps(records[0]))
+            with self.assertRaisesRegex(ValueError,'Missing allowed'):
+                human_examples(root)
+
+    def test_diagnostics_hash_parsed_fixture_and_reject_source_changes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);model=RelationalNet(config())
+            checkpoint=root/'model.pt';save_model(checkpoint,model)
+            moves=record()['moves'][:7];item=graph(moves,model)
+            fixtures=root/'fixtures.json'
+            fixtures.write_text(json.dumps({'positions':[dict(history=moves,player=item.player,
+                remaining=item.remaining,all_legal_actions=item.actions.tolist(),
+                good_actions=[item.actions[0].tolist()],category='fixture',source='test')]}))
+            expected=digest(fixtures)
+            args=self.args()
+            def changed_file(*unused):
+                fixtures.write_text('{}')
+                return {'source':'same'}
+            with patch('relational_diagnostics.source_identity',side_effect=changed_file):
+                result=diagnose(checkpoint,fixtures,args)
+            self.assertEqual(result['fixtures_sha256'],expected)
+            fixtures.write_text(json.dumps({'positions':[]}))
+            with patch('relational_diagnostics.source_identity',side_effect=[{'source':'before'},{'source':'after'}]):
+                with self.assertRaisesRegex(ValueError,'changed during evaluation'):
+                    diagnose(checkpoint,fixtures,args)
+
+    def test_zero_row_short_game_membership_remains_untrained(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)/'corpus';records=fixture(root)
+            short=copy.deepcopy(records[1]);short.update(split='train',family=103)
+            longer=copy.deepcopy(records[0])
+            longer['moves']=[[r,q] for q,r in longer['moves']]
+            longer.update(split='validation',family=100,content_sha256=history_digest(longer['moves']))
+            manifest=root/'manifest.json';metadata=json.loads(manifest.read_text())
+            metadata['minimum_ply']=11
+            metadata['shards'][0]['games'].append(short['content_sha256'])
+            metadata['shards'][0]['game_row_counts'].append(0)
+            metadata['shards'][1]['games']=[longer['content_sha256']]
+            manifest.write_text(json.dumps(metadata))
+            (root/'games.jsonl').write_text('\n'.join(json.dumps(r) for r in [records[0],short,longer]))
+            histories,rows,_=human_examples(root)
+            self.assertNotIn(short['content_sha256'],histories)
+            self.assertEqual({k:len(v) for k,v in rows.items()},{'train':1,'validation':1})
+            metadata['minimum_ply']=7;manifest.write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(ValueError,'Zero-row corpus game has eligible'):
+                human_examples(root)
 
     def test_frozen_capped_actor_full_legal_targets_and_one_fit_pass(self):
         model=RelationalNet(config())
