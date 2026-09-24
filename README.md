@@ -255,6 +255,23 @@ whole-file SHA256. Native loading validates dimensions, sizes, finite weights,
 table bounds and table symmetries. A model handle is immutable and shared by
 attached boards. Loading a legacy table detaches NNUE and vice versa.
 
+Saved NNUE histories can be revisited with a frozen evaluator and a larger native
+search budget, then supplied to an ordinary training run:
+
+```sh
+python reanalysis.py --run runs/nnue-selfplay --iteration 1 --checkpoint 0 --max-positions 256 --ms 200 --width 32 --output runs/reanalysis-0001
+python train.py --run runs/nnue-with-reanalysis --model nnue --reanalysis runs/reanalysis-0001 --device cuda
+```
+
+`--reanalysis` accepts multiple completed shard directories. Their positions join
+the replay sampling pool independently of `--replay-iterations`, which still
+limits only chronological self-play shards. External files are read in place;
+their manifests, search provenance and hashes are recorded in the run and each
+trained checkpoint. Modified shards or manifests prevent resume. Repeating the
+reanalysis command reuses completed root searches when its provenance matches.
+Targets remain selective search estimates. A conditional second-stone row loses
+the source game's outcome label when the teacher's first move diverges.
+
 NNUE replay is versioned separately from legacy six-cell histograms. It stores
 ragged center-code triples and candidate-code triples with offsets, candidate
 coordinates, pair context, turn context, player, handwritten baseline, chosen
