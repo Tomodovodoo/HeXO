@@ -146,7 +146,7 @@ def fit(args):
     if output.exists():raise ValueError('New teacher output directory required')
     torch.set_num_threads(2)
     torch.manual_seed(args.seed)
-    sources=source_identity(('relational_teacher.py','relational_data.py','human_corpus.py'))
+    sources=source_identity(('relational_teacher.py','relational_data.py','human_corpus.py','corpus_warmstart.py'))
     selected,identity=examples(args)
     fixed=[dict(history=p['history'],kind=p['category'],family=None,
                 labels=[dict(action=a,target=None) for a in p['good_actions']])
@@ -200,11 +200,11 @@ def fit(args):
     with torch.no_grad():cpu_policy_after=outputs(model,[probe],cpu_args)[1]
     if not torch.equal(cpu_policy_before,cpu_policy_after):
         raise ValueError('Frozen CPU FP32 policy probe changed')
-    if sources!=source_identity(('relational_teacher.py','relational_data.py','human_corpus.py')):
+    if sources!=source_identity(('relational_teacher.py','relational_data.py','human_corpus.py','corpus_warmstart.py')):
         raise ValueError('Teacher source or native library changed')
     if digest(Path(args.fixtures))!=identity['fixtures_sha256']:
         raise ValueError('Teacher exclusion fixtures changed')
-    identity.update(initial_model_sha256=model_sha,config=vars(args),**sources)
+    identity.update(kind='relational-terminal-teacher-v1',initial_model_sha256=model_sha,config=vars(args),**sources)
     report=dict(seconds=time.perf_counter()-started,mean_training_loss=float(np.mean(losses)),
                 frozen_parameters_unchanged=True,cpu_policy_probe_unchanged=True,
                 repeated_cuda_policy_max_error=repeated_policy_max_error,promotion=False)
