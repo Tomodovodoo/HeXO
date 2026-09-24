@@ -116,7 +116,7 @@ def relational_run(run, declared_family=None):
                 break
     warmstart = identity.get('kind') == 'relational-human-policy-q-v1' or 'epoch' in status or 'epochs' in status
     training_backend = 'Not recorded in evaluation artifact' if provenance else (
-        'human policy/Q fitting' if warmstart else 'KLENT policy/Q' if identity.get('backbone') else 'Not published yet')
+        'human policy/Q fitting' if warmstart else 'terminal teacher critic fitting' if identity.get('kind') == 'relational-terminal-teacher-v1' else 'KLENT policy/Q' if identity.get('backbone') else 'Not published yet')
     backend = (evaluation or {}).get('backend') or evaluation_provenance.get('backend')
     opponent = (evaluation or {}).get('opponent')
     if not opponent and evaluation_provenance.get('config', {}).get('seal_revision'):
