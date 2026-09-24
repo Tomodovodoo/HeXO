@@ -31,8 +31,8 @@ def _load():
 
 
 def encode(history, *, global_tokens=16, max_nodes=None, max_edges=None):
-    if type(global_tokens) is not int or global_tokens < 1:
-        raise ValueError('Need positive global token count')
+    if type(global_tokens) is not int or not 1 <= global_tokens <= 1_000_000:
+        raise ValueError('Global token count must be in 1..1000000')
     game = Game(history)
     try:
         if game.winner >= 0:
@@ -44,8 +44,8 @@ def encode(history, *, global_tokens=16, max_nodes=None, max_edges=None):
 
 def encode_game(game, *, global_tokens=16, max_nodes=None, max_edges=None):
     """Encode an existing native position without replaying its history."""
-    if type(global_tokens) is not int or global_tokens < 1:
-        raise ValueError('Need positive global token count')
+    if type(global_tokens) is not int or not 1 <= global_tokens <= 1_000_000:
+        raise ValueError('Global token count must be in 1..1000000')
     if game.winner >= 0:
         raise ValueError('Terminal positions are handled by exact search, not the network')
     if (max_nodes is not None and max_nodes < 0) or (max_edges is not None and max_edges < 0):
