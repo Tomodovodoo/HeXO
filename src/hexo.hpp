@@ -50,6 +50,9 @@ HX_API int hx_nnue_centers(void*, int64_t* coordinates, int32_t* codes, int capa
 HX_API int hx_nnue_context(void*, float* output);
 HX_API int hx_nnue_inputs(void*, float* output, int capacity);
 HX_API int hx_nnue_policy_features(void*, int64_t q, int64_t r, int32_t* codes, float* pair);
+// Ordered n-by-2 coordinates to n-by-3 codes and n-by-4 pair features.
+// Returns 0 on any illegal coordinate; outputs must be discarded on failure.
+HX_API int hx_nnue_policy_batch(void*, const int64_t* coordinates, int count, int32_t* codes, float* pairs);
 HX_API float hx_nnue_rank(void*, int64_t q, int64_t r);
 HX_API int hx_candidates(void*, int limit, HxCell* output, int capacity);
 // Quiet-turn exploration must defer to search when either side can finish now.

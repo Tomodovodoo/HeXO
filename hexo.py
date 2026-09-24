@@ -63,6 +63,8 @@ bind("hx_nnue_centers", C.c_int, C.c_void_p, C.POINTER(C.c_int64), C.POINTER(C.c
 bind("hx_nnue_context", C.c_int, C.c_void_p, C.POINTER(C.c_float))
 bind("hx_nnue_policy_features", C.c_int, C.c_void_p, C.c_int64, C.c_int64,
      C.POINTER(C.c_int32), C.POINTER(C.c_float))
+bind("hx_nnue_policy_batch", C.c_int, C.c_void_p, C.POINTER(C.c_int64), C.c_int,
+     C.POINTER(C.c_int32), C.POINTER(C.c_float))
 bind("hx_nnue_inputs", C.c_int, C.c_void_p, C.POINTER(C.c_float), C.c_int)
 bind("hx_nnue_rank", C.c_float, C.c_void_p, C.c_int64, C.c_int64)
 bind("hx_candidates", C.c_int, C.c_void_p, C.c_int, C.POINTER(Cell), C.c_int)
@@ -216,6 +218,26 @@ class Game:
         if not lib.hx_nnue_policy_features(self.ptr, *move, codes, pairs):
             raise ValueError("NNUE policy features require a legal placement")
         return list(codes), list(pairs)
+
+    def nnue_policy_batch(self, moves):
+        """Exact ordered policy features in contiguous NumPy arrays (N,3)/(N,4)."""
+        import numpy as np
+        coords = np.asarray(moves)
+        if coords.shape == (0,):
+            coords = np.empty((0, 2), dtype=np.int64)
+        if (coords.ndim != 2 or coords.shape[1] != 2 or coords.dtype.kind not in 'iu'
+                or len(coords) > 2**31-1):
+            raise ValueError("Coordinates must be an N-by-2 integer array")
+        if coords.size and (coords.min() < -10**12 or coords.max() > 10**12):
+            raise ValueError("Coordinates must be within +/- 10^12")
+        coords = np.ascontiguousarray(coords, dtype=np.int64)
+        codes = np.empty((len(coords), 3), dtype=np.int32)
+        pairs = np.empty((len(coords), 4), dtype=np.float32)
+        if not lib.hx_nnue_policy_batch(self.ptr, coords.ctypes.data_as(C.POINTER(C.c_int64)),
+                len(coords), codes.ctypes.data_as(C.POINTER(C.c_int32)),
+                pairs.ctypes.data_as(C.POINTER(C.c_float))):
+            raise ValueError("NNUE policy features require legal placements")
+        return codes, pairs
 
     def nnue_inputs(self):
         output = (C.c_float*68)()
