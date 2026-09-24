@@ -34,10 +34,12 @@ def source_identity():
     return files
 
 
-def verify_artifact(path):
+def verify_artifact(path, expected_identity=None):
     manifest = json.loads((path/'manifest.json').read_text())
     if manifest['schema'] != SCHEMA:
         raise ValueError('Expected a search self-play artifact')
+    if expected_identity is not None and manifest['identity'] != expected_identity:
+        raise ValueError(f'Artifact run, iteration or actor identity changed: {path}')
     for name, sha in manifest['files'].items():
         if Path(name).name != name or digest(path/name) != sha:
             raise ValueError(f'Artifact changed: {path/name}')
@@ -55,9 +57,9 @@ def publish(path, identity, writer, metrics=None):
         stage.rename(path)
 
 
-def warm_start(path, device, seed):
+def warm_start(path, device, seed, expected_sha256=None):
     torch.manual_seed(seed)
-    previous=load_model(path,'cpu')
+    previous=load_model(path,'cpu',expected_sha256=expected_sha256)
     if previous.config.head=='value':
         return previous.to(device)
     model=RelationalNet(replace(previous.config,head='value'))
@@ -143,8 +145,8 @@ def save_corpus(path,identity,episodes,rows):
     publish(path,identity,writer)
 
 
-def read_corpus(path):
-    verify_artifact(path)
+def read_corpus(path, expected_identity):
+    verify_artifact(path, expected_identity)
     episodes=json.loads((path/'episodes.json').read_text());rows=json.loads((path/'rows.json').read_text())
     with np.load(path/'targets.npz',allow_pickle=False) as data:
         offsets=data['offsets'];probabilities=data['probabilities']
@@ -198,10 +200,13 @@ def fit(model,optimizer,episodes,rows,args,iteration,progress):
 def evaluate(run,candidate,opponent,args,progress):
     path=run/'evaluation'/f'{candidate:04d}-vs-{opponent:04d}'
     a=run/'checkpoints'/f'{candidate:04d}'/'model.pt';b=run/'checkpoints'/f'{opponent:04d}'/'model.pt'
-    identity=dict(candidate=digest(a),opponent=digest(b),simulations=args.simulations,root_samples=args.root_samples,
+    run_identity=json.loads((run/'config.json').read_text())
+    verify_artifact(a.parent,dict(run_identity,checkpoint=candidate))
+    verify_artifact(b.parent,dict(run_identity,checkpoint=opponent))
+    identity=dict(run=run_identity,candidate=digest(a),opponent=digest(b),simulations=args.simulations,root_samples=args.root_samples,
                   games=args.eval_games,seed=args.seed+100000+candidate*1000,opening_suite='standard-v1')
     if path.exists():
-        if verify_artifact(path)['identity']!=identity:raise ValueError('Internal evaluation identity changed')
+        verify_artifact(path,identity)
         return json.loads((path/'report.json').read_text())
     openings=[task_opening(identity['seed']+i//2,True,args.max_plies,'standard-v1')['opening'] for i in range(args.eval_games)]
     assignments=[(0,1) if i%2==0 else (1,0) for i in range(args.eval_games)]
@@ -222,37 +227,53 @@ def main(args):
     torch.set_num_threads(2);torch.manual_seed(args.seed)
     config={k:v for k,v in vars(args).items() if k not in ('run','iterations')}
     config['initial_model']=str(Path(args.initial_model).resolve());config['initial_sha256']=digest(Path(args.initial_model))
-    identity=dict(backbone=VALUE_SCHEMA,config=config,sources=source_identity(),runtime=dict(torch=str(torch.__version__),cuda=torch.version.cuda))
-    if (run/'config.json').exists():
-        if json.loads((run/'config.json').read_text())!=identity:raise ValueError('Run source or configuration changed')
-    else:write_json(run/'config.json',identity)
+    identity=dict(run=str(run),backbone=VALUE_SCHEMA,config=config,sources=source_identity(),runtime=dict(torch=str(torch.__version__),cuda=torch.version.cuda))
     with (run/'training.lock').open('x') as stream:stream.write(str(os.getpid()))
     def event(stage,iteration,**data):
         record=dict(schema=SCHEMA,stage=stage,iteration=iteration,updated_at=time.time(),**data)
         write_json(run/'status.json',record)
         with (run/'events.jsonl').open('a') as stream:stream.write(json.dumps(record)+'\n')
     try:
+        if (run/'config.json').exists():
+            if json.loads((run/'config.json').read_text())!=identity:raise ValueError('Run source or configuration changed')
+        else:write_json(run/'config.json',identity)
         league=json.loads((run/'league.json').read_text()) if (run/'league.json').exists() else dict(champion=0,checkpoints=[dict(id=0,elo=0.,elo_interval=[0.,0.],promoted=True,reference=True)])
         zero=run/'checkpoints/0000'
         if not zero.exists():
-            model=warm_start(args.initial_model,args.device,args.seed);optimizer=torch.optim.Adam(model.parameters(),lr=args.lr)
+            model=warm_start(args.initial_model,args.device,args.seed,config['initial_sha256']);optimizer=torch.optim.Adam(model.parameters(),lr=args.lr)
             def writer(stage):save_model(stage/'model.pt',model);torch.save(optimizer.state_dict(),stage/'optimizer.pt')
-            publish(zero,identity,writer);del model,optimizer
+            publish(zero,dict(identity,checkpoint=0),writer);del model,optimizer
+        verify_artifact(zero,dict(identity,checkpoint=0))
+        def corpus_identity(number):
+            return dict(identity,iteration=number,
+                actor_sha256=digest(run/'checkpoints'/f'{number-1:04d}'/'model.pt'),
+                policy_target='Gumbel completed-Q improved policy',
+                value_target='Final terminal outcome from position player perspective')
+        # Validate completed history before skipping work on resume, including
+        # the fixed anchor and every checkpoint referenced by the league.
+        for saved in sorted(league['checkpoints'],key=lambda c:c['id']):
+            number=saved['id']
+            manifest=verify_artifact(run/'checkpoints'/f'{number:04d}',dict(identity,checkpoint=number))
+            if number:
+                old_corpus=run/'corpus'/f'{number:04d}'
+                verify_artifact(old_corpus,corpus_identity(number))
+                if manifest['metrics']['corpus_sha256']!=digest(old_corpus/'manifest.json'):
+                    raise ValueError('Previously consumed search corpus changed')
         write_json(run/'league.json',league)
         for iteration in range(1,args.iterations+1):
             if any(c['id']==iteration for c in league['checkpoints']):continue
-            previous=run/'checkpoints'/f'{iteration-1:04d}';verify_artifact(previous)
+            previous=run/'checkpoints'/f'{iteration-1:04d}';verify_artifact(previous,dict(identity,checkpoint=iteration-1))
             checkpoint=run/'checkpoints'/f'{iteration:04d}';corpus=run/'corpus'/f'{iteration:04d}'
             if not checkpoint.exists():
                 if not corpus.exists():
                     event('self-play',iteration,completed=0,total=args.games)
                     episodes,rows=play_games([previous/'model.pt'],[(0,0)]*args.games,[[] for _ in range(args.games)],args,args.seed+iteration*10000,
                         lambda data:event('self-play',iteration,**data),training=True)
-                    if sum(e['winner']>=0 for e in episodes)<max(2,args.games//2):
+                    if sum(e['winner']>=0 for e in episodes)<max(2,(args.games+1)//2):
                         write_json(run/f'insufficient-{iteration:04d}.json',episodes)
                         raise ValueError('Fewer than half of self-play games terminated; no outcome targets fabricated')
-                    save_corpus(corpus,dict(**identity,actor_sha256=digest(previous/'model.pt'),policy_target='Gumbel completed-Q improved policy',value_target='Final terminal outcome from position player perspective'),episodes,rows)
-                episodes,rows=read_corpus(corpus)
+                    save_corpus(corpus,corpus_identity(iteration),episodes,rows)
+                episodes,rows=read_corpus(corpus,corpus_identity(iteration))
                 model=load_model(previous/'model.pt',args.device)
                 optimizer=torch.optim.Adam(model.parameters(),lr=args.lr)
                 optimizer.load_state_dict(torch.load(previous/'optimizer.pt',map_location=args.device,weights_only=True))
@@ -261,9 +282,9 @@ def main(args):
                 metrics.update(games=len(episodes),terminal_games=sum(e['winner']>=0 for e in episodes),positions=len(rows),seconds=time.perf_counter()-started,corpus_sha256=digest(corpus/'manifest.json'))
                 if source_identity()!=identity['sources']:raise ValueError('Training source changed')
                 def writer(stage):save_model(stage/'model.pt',model);torch.save(optimizer.state_dict(),stage/'optimizer.pt')
-                publish(checkpoint,identity,writer,metrics);del model,optimizer
+                publish(checkpoint,dict(identity,checkpoint=iteration),writer,metrics);del model,optimizer
                 if args.device=='cuda':torch.cuda.empty_cache()
-            metrics=verify_artifact(checkpoint)['metrics']
+            metrics=verify_artifact(checkpoint,dict(identity,checkpoint=iteration))['metrics']
             comparisons={}
             for opponent in sorted({0,league['champion']}):
                 comparisons[opponent]=evaluate(run,iteration,opponent,args,lambda data:event('validation-matches',iteration,opponent=opponent,**data))
