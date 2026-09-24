@@ -554,6 +554,7 @@ player/remaining phase, and sorted absolute stone coordinates and owners.
 Evaluator records echo that identity, `player`, `remaining`, and `model_version`
 alongside the full native-order actions, logits, and Q. Deployed callers pass the
 checkpoint SHA as `model_version`; standalone callers receive a configuration
-and parameter digest. Keep an evaluator's model immutable for its lifetime.
+and parameter digest. The evaluator copies and freezes the supplied model so
+later training or checkpoint loads on the caller's model cannot change its identity.
 Terminal inference is rejected because the rules and search own terminal values.
 
