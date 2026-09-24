@@ -286,5 +286,5 @@ sets can be covered by the remaining placements, after checking our own immediat
 win. An impossible cover is a mate loss; a cover with a spare placement remains
 unresolved. This fixes three observed leaf misvaluations. In a fresh paired
 100 ms comparison against the pinned public Seal engine (20 opening pairs per
-build, seed 20260929), the baseline scored 3–37 and the guard scored 2–38, with no
+build, seed 20260929), the baseline scored 3-37 and the guard scored 2-38, with no
 truncated games. This experiment did not demonstrate a playing-strength gain.
