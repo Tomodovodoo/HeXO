@@ -12,7 +12,7 @@ import torch
 from human_corpus import examples
 from klent import Model, SCHEMA
 from nnue_model import collate
-from q_warmstart import chosen_features, fit_head, main
+from q_warmstart import chosen_features, fit_head, main, source_hashes
 from tests.test_human_corpus import record
 
 
@@ -22,6 +22,18 @@ class QWarmStartTest(unittest.TestCase):
         torch.set_num_threads(2)
         self.addCleanup(torch.set_num_threads, threads)
         torch.manual_seed(73)
+
+    def test_replay_loader_dependency_changes_provenance(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for name in ("q_warmstart.py", "corpus_warmstart.py", "nnue_model.py", "klent.py", "train.py", "hexo.py"):
+                (root/name).write_text("original", encoding="utf-8")
+            before = source_hashes(root)
+            (root/"train.py").write_text("changed replay merger", encoding="utf-8")
+            after = source_hashes(root)
+            self.assertNotEqual(before["train.py"], after["train.py"])
+            self.assertEqual({k: v for k, v in before.items() if k != "train.py"},
+                             {k: v for k, v in after.items() if k != "train.py"})
 
     def test_chosen_features_match_shared_candidate_geometry(self):
         replay = examples(record(), minimum=3, candidates=8, positions=8)
@@ -80,6 +92,8 @@ class QWarmStartTest(unittest.TestCase):
             self.assertEqual(payload["model_sha256"], hashlib.sha256(original).hexdigest())
             self.assertFalse(torch.equal(payload["state"]["2.weight"], model.q[2].weight))
             self.assertEqual(set(payload["initialization"]["shards"]), {"train", "validation"})
+            self.assertIn("train.py", payload["initialization"]["sources"])
+            self.assertIn("hexo.py", payload["initialization"]["sources"])
             with self.assertRaisesRegex(ValueError, "new directory"):
                 main(args)
 

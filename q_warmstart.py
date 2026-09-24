@@ -23,6 +23,12 @@ from nnue_model import batches_for, collate, load_replay
 from train import write_json
 
 
+def source_hashes(root):
+    # load_replay calls train.merge_nnue; hexo selects the native library.
+    return {name: digest(root/name) for name in
+            ("q_warmstart.py", "corpus_warmstart.py", "nnue_model.py", "klent.py", "train.py", "hexo.py")}
+
+
 @torch.no_grad()
 def chosen_features(nnue, replay, ids, device):
     """Reuse exact NNUE feature code, encoding only the human's chosen action."""
@@ -110,7 +116,7 @@ def main(args):
                 "corpus_manifest_sha256": digest(args.corpus/"manifest.json"), "engine_sha256": digest(library),
                 "shards": {split: [{"path": str(path.resolve()), "sha256": digest(path)} for path in files]
                            for split, files in paths.items()},
-                "sources": {name: digest(ROOT/name) for name in ("q_warmstart.py", "corpus_warmstart.py", "nnue_model.py", "klent.py")},
+                "sources": source_hashes(ROOT),
                 "target": "STM terminal outcome at the human chosen action; human continuation, not optimal or KLENT on-policy Q"}
     tx, ty, tf, ta = encode_split(model.nnue, paths["train"], args, .8)
     vx, vy, vf, va = encode_split(model.nnue, paths["validation"], args, .2)
