@@ -20,7 +20,8 @@ def create_player(config, checkpoint):
     from relational_player import RelationalPlayer
     return RelationalPlayer(checkpoint, mode=config['mode'], device=config['device'],
         simulations=config['simulations'], root_samples=config['root_samples'], batch_size=config['batch_size'],
-        milliseconds=config['neural_ms'], max_nodes=config['max_nodes'], max_edges=config['max_edges'], seed=config['seed'])
+        milliseconds=config['neural_ms'], max_nodes=config['max_nodes'], max_edges=config['max_edges'], seed=config['seed'],
+        proof_ms=config['proof_ms'])
 
 
 def prepare(config, checkpoint):
@@ -216,7 +217,7 @@ def main():
     parser.add_argument('--mode', choices=('pi', 'mu', 'gumbel', 'gumbel-proof'), default='gumbel')
     parser.add_argument('--device', default='cuda')
     for name, default in [('games',4),('seed',20261003),('simulations',16),('root-samples',8),('batch-size',4),
-                          ('max-nodes',12000),('max-edges',1000000),('max-stones',80),('neural-ms',10000),('seal-ms',100)]:
+                          ('max-nodes',12000),('max-edges',1000000),('max-stones',80),('neural-ms',10000),('seal-ms',100),('proof-ms',1000)]:
         parser.add_argument('--'+name, type=int, default=default)
     parser.add_argument('--execute-snapshot', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()

@@ -17,14 +17,17 @@ MODES = ('pi', 'mu', 'gumbel', 'gumbel-proof')
 class RelationalPlayer:
     def __init__(self, checkpoint, *, mode='gumbel', device='cuda', simulations=16,
                  root_samples=8, batch_size=4, max_nodes=12000, max_edges=1000000,
-                 milliseconds=10000, seed=0, alpha=.03, beta=.1):
+                 milliseconds=10000, seed=0, alpha=.03, beta=.1, proof_ms=1000):
         if mode not in MODES or min(simulations, root_samples, batch_size, milliseconds) < 1:
             raise ValueError('Invalid relational player mode or search budget')
         if alpha < 0 or beta < 0 or alpha+beta <= 0:
             raise ValueError('KLENT coefficients require nonnegative values and positive sum')
+        if not 1 <= proof_ms <= 60000:
+            raise ValueError('Proof budget must be between 1 and 60000 milliseconds')
         self.mode, self.seed = mode, seed
         self.simulations, self.root_samples, self.batch_size = simulations, root_samples, batch_size
         self.milliseconds, self.alpha, self.beta = milliseconds, alpha, beta
+        self.proof_ms = proof_ms
         self.model_sha256 = hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest()
         model = load_model(checkpoint, 'cpu', expected_sha256=self.model_sha256)
         self.evaluator = NeuralEvaluator(model, device, max_nodes=max_nodes, max_edges=max_edges)
@@ -46,7 +49,7 @@ class RelationalPlayer:
             from neural_search import EvaluationCache, NeuralSearch
             self.cache = EvaluationCache()
             self.tree = NeuralSearch(self.evaluator, self.model_sha256, self.history, self.seed, self.cache,
-                                     tactics=self.mode == 'gumbel-proof', proof_solver=self.prover)
+                                     tactics=self.mode == 'gumbel-proof', proof_solver=self.prover, proof_ms=self.proof_ms)
 
     def _sync(self, game):
         current = [tuple(cell[:2]) for cell in game.cells]
@@ -92,7 +95,7 @@ class RelationalPlayer:
         proof = None
         try:
             if self.prover is not None:
-                proof_ms = min(100, max(1, int(budget)))
+                proof_ms = min(self.proof_ms, max(1, int(budget)))
                 proof = self.prover.solve(local, ms=proof_ms, idtt_ms=min(20, proof_ms-1))
                 if proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified'):
                     for action in proof['moves']:
@@ -128,7 +131,8 @@ class RelationalPlayer:
                         placements=diagnostics, deadline_ms=budget, deadline_scope='complete-turn-cooperative',
                         overrun_ms=max(0, elapsed-budget),
                         proof_status='PROVEN_WIN' if proof and proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified') else 'UNKNOWN',
-                        proof=proof, proof_scope='verified-root-and-tree-tactics' if self.prover is not None else 'disabled')
+                        proof=proof, proof_budget_ms=self.proof_ms if self.prover is not None else None,
+                        proof_scope='verified-root-and-tree-tactics' if self.prover is not None else 'disabled')
         except Exception:
             self.set_history([cell[:2] for cell in game.cells])
             raise

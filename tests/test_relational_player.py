@@ -12,6 +12,7 @@ class DirectPlayer(unittest.TestCase):
         actor.mode, actor.model_sha256 = mode, 'test-model'
         actor.history, actor.tree, actor.prover = [], None, None
         actor.milliseconds, actor.alpha, actor.beta = 1000, .03, .1
+        actor.proof_ms = 1000
         actor.simulations, actor.root_samples, actor.batch_size = 16, 8, 4
         actor.evaluator = Mock()
         return actor
@@ -103,6 +104,9 @@ class DirectPlayer(unittest.TestCase):
             self.assertEqual(len(result['moves']), 2)
             self.assertFalse(_completions({(q,r):p for q,r,p in game.cells}, 1, 2, lambda: None))
             self.assertEqual(result['proof_scope'], 'verified-root-and-tree-tactics')
+            self.assertEqual(result['proof_budget_ms'], 1000)
+            self.assertEqual(actor.tree.proof_ms, 1000)
+            actor.prover.solve.assert_called_once_with(unittest.mock.ANY, ms=1000, idtt_ms=20)
             actor.prover.history.assert_called()
         finally:
             actor.close()
