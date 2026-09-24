@@ -1,6 +1,8 @@
 """Primary sparse relational policy/Q Transformer; no NNUE export or board crop."""
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import math
+import hashlib
+import json
 from contextlib import nullcontext
 import numpy as np
 import torch
@@ -137,7 +139,7 @@ class RelationalNet(nn.Module):
 
 
 class NeuralEvaluator:
-    def __init__(self, model, device='cuda', *, max_nodes=12000, max_edges=600000, mixed_precision=True, backend='native'):
+    def __init__(self, model, device='cuda', *, max_nodes=12000, max_edges=600000, mixed_precision=True, backend='native', model_version=None):
         if backend == 'native':
             from relational_native import encode as encoder
         elif backend == 'reference':
@@ -145,6 +147,15 @@ class NeuralEvaluator:
         else:
             raise ValueError("Encoder backend must be 'native' or 'reference'")
         self.encoder, self.backend = encoder, backend
+        if model_version is None:
+            digest = hashlib.sha256(json.dumps(asdict(model.config),sort_keys=True).encode())
+            for name,tensor in model.state_dict().items():
+                digest.update(name.encode()+str(tensor.dtype).encode()+str(tuple(tensor.shape)).encode())
+                digest.update(tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+            model_version = digest.hexdigest()
+        if not isinstance(model_version,str) or not model_version:
+            raise ValueError('Model version must be a nonempty immutable identity')
+        self.model_version = model_version
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
         self.max_nodes, self.max_edges = max_nodes, max_edges
@@ -166,6 +177,8 @@ class NeuralEvaluator:
             offset = 0
             for graph in group:
                 end = offset+len(graph.actions)
-                result.append({'actions':graph.actions.copy(),'logits':logits[offset:end].copy(),'q':q[offset:end].copy()})
+                result.append({'actions':graph.actions.copy(),'logits':logits[offset:end].copy(),'q':q[offset:end].copy(),
+                               'position_key':graph.position_key,'player':graph.player,'remaining':graph.remaining,
+                               'model_version':self.model_version})
                 offset = end
         return result

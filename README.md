@@ -616,3 +616,11 @@ terminates immediately. Training stores the acting distribution and action index
 with the full legal-coordinate hash, player and phase, then checks that identity
 when reconstructing replay. These requirements apply equally to raw-policy,
 KLENT-improved-policy, Gumbel-search and verified-tactics modes of the same player.
+Each graph exposes `position_key`, a SHA256 of the rule identifier, native
+player/remaining phase, and sorted absolute stone coordinates and owners.
+Evaluator records echo that identity, `player`, `remaining`, and `model_version`
+alongside the full native-order actions, logits, and Q. Deployed callers pass the
+checkpoint SHA as `model_version`; standalone callers receive a configuration
+and parameter digest. Keep an evaluator's model immutable for its lifetime.
+Terminal inference is rejected because the rules and search own terminal values.
+

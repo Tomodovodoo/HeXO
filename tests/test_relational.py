@@ -39,6 +39,7 @@ class RelationalTests(unittest.TestCase):
                         self.assertEqual(left.tobytes(),right.tobytes(),name)
                     else:
                         self.assertEqual(left,right)
+                self.assertEqual(reference.position_key,native.position_key)
                 for kwargs in ({'max_nodes':native.node_count-1},{'max_edges':native.edge_count-1}):
                     with self.assertRaises(WorkBudgetError):
                         native_encode(history,global_tokens=2,**kwargs)
@@ -118,6 +119,9 @@ class RelationalTests(unittest.TestCase):
             np.testing.assert_array_equal(result['actions'],graph.actions)
             self.assertEqual(result['logits'].dtype,np.float32)
             self.assertEqual(result['q'].dtype,np.float32)
+            self.assertEqual(result['position_key'],graph.position_key)
+            self.assertEqual((result['player'],result['remaining']),(graph.player,graph.remaining))
+            self.assertEqual(result['model_version'],evaluator.model_version)
             self.assertTrue((np.abs(result['q']) <= 1).all())
         for kwargs in ({'max_nodes':1},{'max_edges':1}):
             with self.assertRaises(WorkBudgetError):
@@ -151,6 +155,21 @@ class RelationalTests(unittest.TestCase):
             encode(history)
         with self.assertRaises(ValueError):
             encode([(0,0),(9,0)])
+
+    def test_position_and_model_identity(self):
+        history = [(0,0),(1,0),(2,0),(0,1),(0,2)]
+        reordered = [history[i] for i in (0,2,1,4,3)]
+        graph = encode(history,global_tokens=2)
+        self.assertEqual(graph.position_key,encode(reordered,global_tokens=2).position_key)
+        changed_owner = [history[i] for i in (0,3,2,1,4)]
+        self.assertNotEqual(graph.position_key,encode(changed_owner,global_tokens=2).position_key)
+        model = RelationalNet(self.config)
+        first = NeuralEvaluator(model,'cpu').model_version
+        self.assertEqual(first,NeuralEvaluator(copy.deepcopy(model),'cpu').model_version)
+        with torch.no_grad():
+            next(model.parameters()).add_(1)
+        self.assertNotEqual(first,NeuralEvaluator(model,'cpu').model_version)
+        self.assertEqual(NeuralEvaluator(model,'cpu',model_version='checkpoint-sha').model_version,'checkpoint-sha')
 
 
 if __name__ == '__main__':
