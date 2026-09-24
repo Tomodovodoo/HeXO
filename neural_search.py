@@ -25,6 +25,9 @@ bind('hxg_advance', C.c_int, ptr, C.c_int64, C.c_int64)
 bind('hxg_stats', C.c_int, ptr, ptr, ptr, ptr, ptr)
 bind('hxg_policy', C.c_int, ptr, ptr)
 bind('hxg_completed', C.c_int, ptr)
+bind('hxg_tactics', C.c_int, ptr, C.c_int)
+bind('hxg_exact', C.c_int, ptr)
+bind('hxg_prove', C.c_int, ptr, C.c_int, ints, C.c_int, C.c_int, C.c_int, ints, C.c_int)
 
 def checked(ok):
     if not ok:
@@ -55,7 +58,8 @@ class EvaluationCache:
             self.entries.popitem(last=False)
 
 class NeuralSearch:
-    def __init__(self, evaluator, model_version, history=(), seed=0, cache=None):
+    def __init__(self, evaluator, model_version, history=(), seed=0, cache=None,
+                 tactics=False, proof_solver=None, proof_ms=100):
         if not model_version:
             raise ValueError('A model version is required')
         self.evaluator, self.model_version = evaluator, model_version
@@ -64,6 +68,8 @@ class NeuralSearch:
         if not self.ptr:
             raise MemoryError('Native tree allocation failed')
         self.history = []
+        self.proof_solver, self.proof_ms = proof_solver, proof_ms
+        checked(native.hxg_tactics(self.ptr, int(tactics)))
         try:
             for point in history:
                 self.advance(point)
@@ -110,6 +116,26 @@ class NeuralSearch:
         coordinator = SearchCoordinator(self.evaluator, self.model_version, self.cache)
         return coordinator.search_many([self], simulations, root_samples, batch_size, milliseconds)[0]
 
+    def fulfill_proof(self, request, history, certificate, milliseconds=None):
+        """Verify a certificate against this pending state before exact backup."""
+        if self.proof_solver is None:
+            raise ValueError('A native certificate verifier is required')
+        result = self.proof_solver.history(history, ms=self.proof_ms if milliseconds is None else milliseconds,
+                                          idtt_ms=0, certificate=certificate)
+        if result.get('status') != 'PROVEN_WIN' or not result.get('native_verified'):
+            return False
+        moves = result.get('moves', [])
+        if not moves:
+            return False
+        game = Game(history)
+        try:
+            h = np.ascontiguousarray(history, dtype=np.int64).reshape(-1, 2)
+            checked(native.hxg_prove(self.ptr, request, h, len(h), game.player,
+                                    game.remaining, np.ascontiguousarray(moves, dtype=np.int64), len(moves)))
+        finally:
+            game.close()
+        return True
+
     def result(self, start, finished, evaluated, hits):
         n = native.hxg_stats(self.ptr, None, None, None, None)
         actions = np.empty((n, 2), np.int64)
@@ -119,10 +145,14 @@ class NeuralSearch:
         policy = np.empty(n)
         native.hxg_policy(self.ptr, policy.ctypes.data)
         selected = int(np.argmax(scores)) if n and np.isfinite(scores).any() else None
+        winner = native.hxg_exact(self.ptr)
         return dict(action=actions[selected].tolist() if selected is not None else None,
                     actions=actions, visits=visits, values=values, policy=policy,
                     completed=native.hxg_completed(self.ptr), evaluated=evaluated, cache_hits=hits,
-                    elapsed_ms=(finished-start)*1000, proof_status='UNKNOWN')
+                    elapsed_ms=(finished-start)*1000,
+                    exact_winner=winner,
+                    proof_status=('UNKNOWN' if winner < 0 else
+                                  'PROVEN_WIN' if winner == ((len(self.history)+1)//2)%2 else 'PROVEN_LOSS'))
 
 
 
@@ -195,6 +225,17 @@ class SearchCoordinator:
                             idle += 1
                         else:
                             idle = 0
+                            search = searches[i]
+                            if search.proof_solver is not None:
+                                def proof_budget():
+                                    return search.proof_ms if limits[i] is None else min(search.proof_ms,
+                                        max(1, int(limits[i]-(time.perf_counter()-starts[i])*1000)))
+                                proof = search.proof_solver.history(history, ms=proof_budget(), idtt_ms=0)
+                                if finished(i):
+                                    continue
+                                if (proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified')
+                                        and search.fulfill_proof(request, history, proof['certificate'], proof_budget())):
+                                    continue
                             key = self.cache.key(history, self.model_version)
                             cached = self.cache.get(key)
                             if cached is None:
