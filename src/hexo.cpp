@@ -348,7 +348,7 @@ struct Search {
     int width;
     uint64_t nodes=0;
     std::vector<Entry> tt;
-    Search(int ms,int width):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(1<<16){}
+    Search(int ms,int width,bool table=true):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(table?1<<16:0){}
     void check() const { if(Clock::now()>=deadline) throw Timeout{}; }
     Turn immediate(Board& b) {
         auto completions=b.completions(b.player,b.remaining);
@@ -410,6 +410,32 @@ struct Search {
         }
         out.push_back(selected);
     }
+    bool cover_exists(const std::vector<std::vector<Cell>>& threats,std::array<Cell,2>& selected,
+                      int used,int remaining) const {
+        for(const auto& completion:threats) {
+            bool hit=false;
+            for(auto cell:completion) for(int i=0;i<std::min(used,2);++i) if(selected[i]==cell) hit=true;
+            if(hit) continue;
+            if(remaining<=0 || used>=2) return false;
+            for(auto cell:completion) {
+                selected[used]=cell;
+                if(cover_exists(threats,selected,used+1,remaining-1)) return true;
+            }
+            return false;
+        }
+        // A spare placement may be anywhere legal. Its strategic value is
+        // unknown; existence of a cover is never treated as a forced win.
+        return true;
+    }
+    bool unavoidable_loss(const Board& b) const {
+        if(b.threats[1-b.player].empty()) return false;
+        auto threats=b.completions(1-b.player);
+        std::erase_if(threats,[&](const auto& completion) {
+            return !std::all_of(completion.begin(),completion.end(),[&](Cell c){return b.legal(c);});
+        });
+        std::array<Cell,2> selected{};
+        return !cover_exists(threats,selected,0,b.remaining);
+    }
     std::vector<Turn> turns(Board& b,bool timed=true) {
         Turn win=immediate(b); if(win.count) {win.score=mate;return {win};}
         int side=b.player;
@@ -465,7 +491,7 @@ struct Search {
         ++nodes;check();
         if(b.winner>=0) return b.winner==b.player?mate:-mate;
         if(immediate(b).count) return mate;
-        if(depth<=0) return b.score(b.player);
+        if(depth<=0) return unavoidable_loss(b)?-mate:b.score(b.player);
         uint64_t key=b.hash();auto& entry=tt[key&(tt.size()-1)];
         if(entry.key==key && entry.depth>=depth) {
             if(entry.flag==0) return entry.score;
@@ -503,7 +529,48 @@ struct Search {
         entry={key,depth,best,best<=original?2:best>=beta?1:0,best_turn};
         return best;
     }
-    HxResult run(Board& b,int max_depth) {
+    std::vector<Turn> diversify(Board& b,std::vector<Turn> base,int seconds,int cap,bool timed=true) {
+        // Existing tactical branches and all selected baseline turns survive.
+        if(!seconds || int(base.size())>=cap || b.remaining!=2 || immediate(b).count ||
+            !b.completions(1-b.player).empty()) return base;
+        struct Alternative {int priority,first,second;Turn turn;};
+        std::vector<Alternative> alternatives;
+        auto firsts=candidates(b,width);
+        for(int i=0;i<int(firsts.size());++i) {
+            if(timed) check();
+            Restore restore(b);b.make(firsts[i]);
+            auto following=candidates(b,seconds);
+            for(int j=0;j<int(following.size());++j)
+                alternatives.push_back({(i+1)*(j+1),i,j,{{firsts[i],following[j]},2,0}});
+        }
+        // Rank-product admission gives low-ranked conditional replies to strong
+        // first placements a chance without another global static-score cut.
+        std::sort(alternatives.begin(),alternatives.end(),[](const auto& a,const auto& z) {
+            if(a.priority!=z.priority) return a.priority<z.priority;
+            if(a.first!=z.first) return a.first<z.first;
+            return a.second<z.second;
+        });
+        std::unordered_set<uint64_t> seen;
+        for(const auto& t:base) {Restore restore(b);apply(b,t);seen.insert(b.hash());}
+        int side=b.player;
+        for(auto& alternative:alternatives) {
+            if(timed) check();
+            if(int(base.size())>=cap) break;
+            auto t=alternative.turn;Restore restore(b);
+            bool valid=true;
+            for(int i=0;i<t.count;++i) {
+                if(!b.legal(t.cells[i])) {valid=false;break;}
+                b.make(t.cells[i]);if(b.winner>=0) {t.count=i+1;break;}
+            }
+            if(!valid || (b.winner<0 && b.player==side) || !seen.insert(b.hash()).second) continue;
+            t.score=b.winner==side?mate:b.score(side);
+            if(b.winner<0 && !b.completions(1-side).empty()) t.score=-mate;
+            base.push_back(t);
+        }
+        std::stable_sort(base.begin(),base.end(),[](const auto& a,const auto& z){return a.score>z.score;});
+        return base;
+    }
+    HxResult run(Board& b,int max_depth,int root_seconds=0,int root_turns=0) {
         auto start=Clock::now();Restore restore(b);HxResult output{};
         if(b.winner>=0) return output;
         Turn chosen=immediate(b);
@@ -532,6 +599,7 @@ struct Search {
             try {
                 auto roots=turns(b);
                 if(!roots.empty()) chosen=roots.front();
+                if(root_seconds) roots=diversify(b,std::move(roots),root_seconds,root_turns);
                 for(int depth=1;depth<=max_depth;++depth) {
                     int best=-mate-1;Turn iteration=chosen;
                     for(auto& t:roots) {
@@ -567,6 +635,25 @@ int hx_cell(void* p,int index,HxCell* out){auto& b=*static_cast<Board*>(p);if(in
 int hx_legal(void* p,int64_t q,int64_t r){return static_cast<Board*>(p)->legal({q,r});}
 int hx_moves(void* p,HxCell* out,int cap){auto cells=static_cast<Board*>(p)->legal_moves();for(int i=0;i<std::min(cap,int(cells.size()));++i)out[i]={cells[i].q,cells[i].r,-1};return int(cells.size());}
 int hx_search(void* p,int ms,int depth,int width,HxResult* out){if(ms<1 || depth<1 || width<2 || width>128)return 0;try{auto start=Clock::now();Search s(ms,width);*out=s.run(*static_cast<Board*>(p),depth);out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;}catch(...){return 0;}}
+int hx_search_root(void* p,int ms,int depth,int width,int seconds,int cap,HxResult* out) {
+    if(!seconds && !cap) return hx_search(p,ms,depth,width,out);
+    if(ms<1 || depth<1 || width<2 || width>128 || seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024) return 0;
+    try {
+        auto start=Clock::now();Search search(ms,width);
+        *out=search.run(*static_cast<Board*>(p),depth,seconds,cap);
+        out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;
+    } catch(...) {return 0;}
+}
+int hx_turns(void* p,int width,int seconds,int cap,HxTurn* out,int capacity) {
+    if(width<2 || width>128 || ((seconds || cap) && (seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024))) return -1;
+    auto& b=*static_cast<Board*>(p);if(b.winner>=0) return 0;
+    Search search(1,width,false);auto turns=search.turns(b,false);
+    if(seconds) turns=search.diversify(b,std::move(turns),seconds,cap,false);
+    if(out) for(int i=0;i<std::min(capacity,int(turns.size()));++i) {
+        const auto& t=turns[i];out[i]={t.cells[0].q,t.cells[0].r,t.cells[1].q,t.cells[1].r,t.count,t.score};
+    }
+    return int(turns.size());
+}
 uint64_t hx_hash(void* p){return static_cast<Board*>(p)->hash();}
 int hx_evaluate(void* p){auto& b=*static_cast<Board*>(p);return b.score(b.player);}
 int hx_features(void* p,int32_t* out,int cap){auto& b=*static_cast<Board*>(p);for(int i=0;i<std::min(cap,729);++i)out[i]=b.features[i];return 729;}

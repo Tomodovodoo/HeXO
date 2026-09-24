@@ -4,6 +4,9 @@ import socket
 import threading
 import time
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -156,6 +159,70 @@ class OfficialAPI(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
             thread.join()
+
+    def test_dribbled_request_line_and_headers_have_absolute_deadline(self):
+        httpd = server(Adapter(ms=1, width=4), port=0, read_timeout=.12)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        root = f'http://127.0.0.1:{httpd.server_port}'
+        try:
+            for prefix in (b'GET /capab', b'GET /capabilities.json HTTP/1.0\r\nX-Drip: '):
+                client = socket.create_connection(httpd.server_address, timeout=2)
+                client.sendall(prefix)
+                stop = threading.Event()
+                def dribble():
+                    while not stop.wait(.02):
+                        try:
+                            client.sendall(b'a')
+                        except OSError:
+                            break
+                sender = threading.Thread(target=dribble, daemon=True)
+                sender.start()
+                try:
+                    # Sender remains active; idle timeout alone never expires.
+                    start = time.monotonic()
+                    with urlopen(root+'/capabilities.json', timeout=1) as response:
+                        self.assertEqual(response.status, 200)
+                    self.assertLess(time.monotonic()-start, .8)
+                finally:
+                    stop.set()
+                    sender.join()
+                    client.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join()
+
+    def test_missing_unreadable_or_unloadable_model_returns_json_503(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)/'model.bin'
+            path.write_bytes(b'test-only model')
+            with patch.object(Game, 'load_model'):
+                adapter = Adapter(ms=1, width=4, model=path)
+            httpd = server(adapter, port=0)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            request = Request(f'http://127.0.0.1:{httpd.server_port}/stateless/v1-alpha/turn',
+                              json.dumps({'board':board([(0,0)])}).encode(),
+                              {'Content-Type':'application/json'})
+            def assert_unavailable():
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                with caught.exception as response:
+                    self.assertEqual(response.code, 503)
+                    self.assertIn('Configured model', json.load(response)['error'])
+            try:
+                path.unlink()
+                assert_unavailable()
+                path.write_bytes(b'test-only model')
+                with patch.object(Path, 'read_bytes', side_effect=PermissionError('unreadable')):
+                    assert_unavailable()
+                with patch.object(Game, 'load_model', side_effect=ValueError('disappeared before load')):
+                    assert_unavailable()
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join()
 
     def test_local_http_routes_and_errors(self):
         httpd = server(Adapter(ms=1, width=4), port=0)

@@ -104,7 +104,7 @@ def run(args):
                         game.load_model(nnue_path)
                     else:
                         game.load_table(weights)
-                    search = game.search(args.ms, width=args.width)
+                    search = game.search(args.ms, width=args.width, root_seconds=args.root_seconds, root_turns=args.root_turns)
                     searches.append(search)
                     moves = search["moves"]
                 elif opponent:
@@ -175,6 +175,8 @@ if __name__ == "__main__":
     parser.add_argument("--games", type=int, default=20)
     parser.add_argument("--ms", type=int, default=100)
     parser.add_argument("--width", type=int, default=16)
+    parser.add_argument("--root-seconds", type=int, default=0, help="Experimental conditional-second budget; requires --root-turns")
+    parser.add_argument("--root-turns", type=int, default=0, help="Experimental complete-turn root cap; requires --root-seconds")
     parser.add_argument("--max-stones", type=int, default=250)
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--output", default="artifacts/arena.json")
@@ -186,6 +188,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.games < 1 or args.ms < 1 or args.max_stones < 3:
         parser.error("games and ms must be positive; max-stones must be at least 3")
+    if not 2 <= args.width <= 128:
+        parser.error("width must be in 2..128")
+    if (args.root_seconds or args.root_turns) and not (max(6, args.width//2) <= args.root_seconds <= 128 and 2*args.width <= args.root_turns <= 1024):
+        parser.error("Root budgets must both be zero, or seconds in max(6,width/2)..128 and turns in 2*width..1024")
     if args.checkpoint is not None and not args.run:
         parser.error("--checkpoint requires --run")
     if args.opponent == "orca" and (not args.orca_source or args.orca_sims < 1):

@@ -9,6 +9,8 @@ import argparse
 import hashlib
 import json
 import math
+import socket
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from time import perf_counter
@@ -140,9 +142,16 @@ class Adapter:
         game = board_game(request.get('board'), deadline=perf_counter()+1)
         try:
             if self.model:
-                if hashlib.sha256(Path(self.model).read_bytes()).hexdigest() != self.model_sha256:
+                try:
+                    model_hash = hashlib.sha256(Path(self.model).read_bytes()).hexdigest()
+                except OSError as exc:
+                    raise APIError("Configured model is unavailable", 503) from exc
+                if model_hash != self.model_sha256:
                     raise APIError("Configured model changed since adapter startup", 503)
-                game.load_model(self.model)
+                try:
+                    game.load_model(self.model)
+                except (OSError, ValueError) as exc:
+                    raise APIError("Configured model could not be loaded", 503) from exc
             result = game.search(ms=ms, width=self.width, depth=self.depth)
             moves = result['moves']
             if len(moves) != 2:
@@ -164,6 +173,36 @@ def server(adapter, port=8790, *, read_timeout=2):
 
     class Handler(BaseHTTPRequestHandler):
         timeout = read_timeout
+
+        def handle_one_request(self):
+            # Socket idle timeouts alone allow an endless trickle during both
+            # the request line and headers. Shutdown also interrupts readline.
+            self.header_deadline = perf_counter()+read_timeout
+            def expire():
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            self.header_timer = threading.Timer(read_timeout, expire)
+            self.header_timer.daemon = True
+            self.header_timer.start()
+            try:
+                super().handle_one_request()
+            except OSError:
+                self.close_connection = True
+            finally:
+                self.header_timer.cancel()
+
+        def parse_request(self):
+            try:
+                valid = super().parse_request()
+                if perf_counter() >= self.header_deadline:
+                    self.close_connection = True
+                    return False
+                return valid
+            finally:
+                # Finished parsing: body/search have their own budgets.
+                self.header_timer.cancel()
 
         def respond(self, status, body):
             payload = json.dumps(body, allow_nan=False).encode()
