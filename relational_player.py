@@ -30,6 +30,8 @@ class RelationalPlayer:
         self.proof_ms = proof_ms
         self.model_sha256 = hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest()
         model = load_model(checkpoint, 'cpu', expected_sha256=self.model_sha256)
+        if model.config.head == 'value' and mode == 'mu':
+            raise ValueError('Policy/value models use pi or Gumbel; they have no action-Q head for KLENT')
         self.evaluator = NeuralEvaluator(model, device, max_nodes=max_nodes, max_edges=max_edges)
         self.tree, self.cache, self.prover = None, None, None
         if mode == 'gumbel-proof':

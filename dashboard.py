@@ -176,8 +176,31 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/run":
             summary = self.run / "summary.json"
             events = self.run / "events.jsonl"
+            search_config = read_json(self.run/'config.json', {})
             relational = relational_run(self.run, self.model_family)
-            if relational:
+            if search_config.get('backbone') == 'hexo-relational-policy-value-v1':
+                recent = []
+                if events.exists():
+                    with events.open('rb') as stream:
+                        stream.seek(0, 2)
+                        size = stream.tell()
+                        stream.seek(max(0, size-128000))
+                        if size > 128000: stream.readline()
+                        for line in stream:
+                            try: recent.append(json.loads(line))
+                            except json.JSONDecodeError: pass
+                league = read_json(self.run/'league.json', {})
+                checkpoint_ids = {c['id'] for c in league.get('checkpoints', [])}
+                for path in sorted((self.run/'checkpoints').glob('[0-9][0-9][0-9][0-9]/manifest.json')):
+                    number = int(path.parent.name)
+                    if number not in checkpoint_ids:
+                        manifest = read_json(path, {})
+                        league.setdefault('checkpoints', []).append(dict(id=number, elo=None,
+                            elo_interval=None, promoted=False, pending=True, loss=manifest.get('metrics')))
+                data = dict(kind='search', search=dict(name=self.run.name,
+                    config=search_config, status=read_json(self.run/'status.json', {}),
+                    league=league), events=recent[-300:])
+            elif relational:
                 data = {"kind": "relational", "relational": relational, "summary": None, "events": []}
             elif not summary.exists():
                 klent = klent_run(self.run)

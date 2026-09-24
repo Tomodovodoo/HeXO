@@ -22,12 +22,15 @@ class ModelConfig:
     global_tokens: int = 16
     edge_chunk: int = 8192
     checkpoint: bool = True
+    head: str = 'q'
 
     def __post_init__(self):
         if any(type(x) is not int or x < 1 for x in (self.width,self.blocks,self.heads,self.ff,self.global_tokens,self.edge_chunk)):
             raise ValueError('Model dimensions must be positive integers')
         if self.width % self.heads:
             raise ValueError('Width must be divisible by attention heads')
+        if self.head not in ('q', 'value'):
+            raise ValueError('Expected q or value head')
 
 
 class FloatNorm(nn.LayerNorm):
@@ -121,7 +124,10 @@ class RelationalNet(nn.Module):
         def head():
             return nn.Sequential(FloatNorm(c.width),nn.Linear(c.width,c.width//2 or 1),nn.GELU(),nn.Linear(c.width//2 or 1,1))
         self.policy = head()
-        self.critic = head()
+        if c.head == 'value':
+            self.value = head()
+        else:
+            self.critic = head()
 
     def forward(self, batch):
         if batch['global_tokens'] != self.config.global_tokens:
@@ -134,6 +140,11 @@ class RelationalNet(nn.Module):
             else:
                 x = block(x,batch)
         legal = x[batch['action_nodes']]
+        if self.config.head == 'value':
+            pooled = x[batch['global_nodes']].reshape(-1, self.config.global_tokens, self.config.width).mean(1)
+            return {'logits': self.policy(legal).squeeze(-1).float(),
+                    'value': self.value(pooled).squeeze(-1).float().tanh(),
+                    'action_offsets': batch['action_offsets']}
         return {'logits': self.policy(legal).squeeze(-1).float(),
                 'q': self.critic(legal).squeeze(-1).float().tanh(),
                 'action_offsets': batch['action_offsets']}
@@ -173,7 +184,11 @@ class NeuralEvaluator:
                        if self.device.type == 'cuda' and self.mixed_precision else nullcontext())
             with context:
                 prediction = self.model(batch)
-            logits, q = prediction['logits'].cpu().numpy(), prediction['q'].cpu().numpy()
+            # The native tree accepts per-action initial values and averages them
+            # under the policy. Broadcasting V(s) therefore backs up exactly V(s),
+            # without introducing an action-Q head into policy/value learning.
+            q = prediction['value'][batch['action_owner']] if 'value' in prediction else prediction['q']
+            logits, q = prediction['logits'].cpu().numpy(), q.cpu().numpy()
             if not np.isfinite(logits).all() or not np.isfinite(q).all():
                 raise FloatingPointError('Nonfinite relational model predictions')
             offset = 0

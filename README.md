@@ -666,3 +666,18 @@ and parameter digest. The evaluator copies and freezes the supplied model so
 later training or checkpoint loads on the caller's model cannot change its identity.
 Terminal inference is rejected because the rules and search own terminal values.
 
+
+## Search-trained policy/value self-play
+
+`search_train.py` trains the relational policy/value model from Gumbel MCTS self-play. The policy target is the full legal-action Gumbel completed-Q improved policy. The value target is the final game result from the player-to-move perspective. Capped games supply no outcome target. This path does not use KLENT action-Q targets or external bots for checkpoint selection.
+
+```powershell
+python search_train.py --run runs/search-selfplay --initial-model path/to/model.pt --games 32 --eval-games 32 --iterations 3 --device cuda
+python dashboard.py --run runs/search-selfplay --port 8766
+```
+
+A policy/Q warm start preserves its backbone and policy and initializes a new scalar value head at zero. Native trees batch neural leaves across games. Graph memory limits split whole positions without cropping legal actions. Training holds out whole terminal games for validation.
+
+Checkpoint 0 is the internal Elo anchor at zero. Every candidate plays equal-search-budget, color-swapped games against that anchor and the incumbent champion. The dashboard shows all checkpoint ratings with uncertainty, losses, throughput and GPU telemetry. A positive paired test at p < 0.05 selects a new champion. Learning continues from the latest candidate regardless of champion selection. Ratings describe this internal league and search budget, not an external leaderboard. The p-value is per comparison, not a guarantee across indefinitely repeated runs.
+
+Rerun the same command to resume completed artifacts; only the requested iteration count may change. Saved corpora and optimizer checkpoints are verified. A partial fitting pass restarts from the preceding checkpoint rather than silently applying the same targets twice. Active run source files must remain unchanged.
