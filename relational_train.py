@@ -255,7 +255,7 @@ def main(args):
                            bootstrapped_games=sum(e['winner']<0 for e in episodes),
                            terminal_fraction=sum(e['winner']>=0 for e in episodes)/len(episodes),
                            nonzero_return_fraction=float(np.mean([abs(r['target'])>1e-8 for r in rows])),
-                           critic_targets_informative=any(abs(r['target'])>1e-8 for r in rows),
+                           target_variance_nonzero=float(np.std([r['target'] for r in rows]))>1e-8,
                            acting_entropy=float(np.mean([r['entropy'] for r in rows])),
                            acting_normalized_entropy=float(np.mean([r['entropy']/math.log(len(r['mu'])) if len(r['mu'])>1 else 0 for r in rows])),
                            acting_kl=float(np.mean([r['kl'] for r in rows])),
