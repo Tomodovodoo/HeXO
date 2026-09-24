@@ -38,6 +38,18 @@ def opening_for(seed, evaluation=False):
             return opening
 
 
+def task_opening(seed, evaluation, max_stones, curriculum):
+    if curriculum == "mixed-v1":
+        from curriculum import opening_for as sampler, family as identify
+    else:
+        sampler, identify = opening_for, family
+    for attempt in range(100):
+        prefix = sampler(seed+attempt*15485863, evaluation)
+        if len(prefix)+2 <= max_stones:
+            return {"opening": prefix, "family": identify(prefix), "curriculum": curriculum}
+    raise ValueError("No curriculum prefix fits the stone cap; increase the cap")
+
+
 def load_table(path):
     table = np.load(path, allow_pickle=False)
     if table.shape != (729,) or table.dtype != np.int32:
@@ -45,18 +57,94 @@ def load_table(path):
     return table
 
 
+def checkpoint_artifact(checkpoint):
+    return checkpoint["nnue"] if checkpoint.get("kind") == "nnue" else checkpoint["table"]
+
+
+def merge_nnue(batches):
+    """Merge variable-length replay without padding the infinite-board features."""
+    merged = {"nnue_schema": np.asarray([1], dtype=np.int32)}
+    for key in batches[0]:
+        if key in ("nnue_schema", "center_offsets", "candidate_offsets"):
+            continue
+        merged[key] = np.concatenate([b[key] for b in batches])
+    for key, values in (("center_offsets", "centers"), ("candidate_offsets", "candidate_codes")):
+        offsets, count = [np.asarray([0], dtype=np.int64)], 0
+        for batch in batches:
+            offsets.append(batch[key][1:]+count)
+            count += len(batch[values])
+        merged[key] = np.concatenate(offsets)
+    return merged
+
+
+def nnue_example(game, move, result, candidates):
+    choices = game.candidates(candidates)[:candidates]
+    if move not in choices:
+        choices = choices[:max(0, candidates-1)] + [move]
+    codes, pairs = zip(*(game.nnue_policy_features(c) for c in choices))
+    powers = 3**np.arange(6)
+    digits = np.arange(729)[:, None]//powers % 3
+    black, white = (digits == 1).sum(1), (digits == 2).sum(1)
+    weights = np.asarray([0, 1, 12, 150, 2400, 24000, 1000000])
+    baseline = np.where(white == 0, weights[black], np.where(black == 0, -weights[white], 0))
+    return {"centers": game.nnue_centers(), "candidate_codes": np.asarray(codes, dtype=np.int32),
+            "pairs": np.asarray(pairs, dtype=np.float32), "candidate_coords": np.asarray(choices, dtype=np.int64),
+            "phase": game.nnue_context(), "player": game.player,
+            "baseline": float(np.asarray(game.features(), dtype=np.int64)@baseline)*(1 if game.player == 0 else -1),
+            "chosen": choices.index(move), "search": math.tanh(result["score"]/6000),
+            "ply": len(game.cells), "search_depth": result["depth"], "search_ms": result["elapsed_ms"],
+            "search_valid": result["depth"] > 0, "policy_valid": result["depth"] > 0}
+
+
+def pack_nnue(rows, outcome, fid):
+    data = {"nnue_schema": np.asarray([1], dtype=np.int32)}
+    for key in ("centers", "candidate_codes", "pairs", "candidate_coords"):
+        data[key] = np.concatenate([r[key] for r in rows])
+    for key, values in (("center_offsets", "centers"), ("candidate_offsets", "candidate_codes")):
+        data[key] = np.concatenate(([0], np.cumsum([len(r[values]) for r in rows]))).astype(np.int64)
+    for key, dtype in (("phase", np.float32), ("player", np.int64), ("baseline", np.float32),
+                       ("chosen", np.int64), ("search", np.float32), ("search_valid", bool), ("policy_valid", bool)):
+        data[key] = np.asarray([r[key] for r in rows], dtype=dtype)
+    for key, dtype in (("ply", np.int32), ("search_depth", np.int16), ("search_ms", np.float32)):
+        data[key] = np.asarray([r[key] for r in rows], dtype=dtype)
+    data["outcome"] = np.where(data["player"] == 0, outcome, -outcome).astype(np.float32)
+    data["family"] = np.full(len(rows), fid, dtype=np.uint32)
+    return data
+
+
 def play_game(task):
     # Workers import no PyTorch and perform native CPU search only.
-    tables = [load_table(p) for p in task["tables"]]
-    game = Game(opening_for(task["seed"], task["evaluation"]))
+    nnue = task.get("model_kind", "pattern") == "nnue"
+    tables = task["tables"] if nnue else [load_table(p) for p in task["tables"]]
+    game = Game(task.get("opening") or opening_for(task["seed"], task["evaluation"]))
     initial = [(q, r) for q, r, _ in game.cells]
-    features, searches, times, depths = [], [], [[], []], []
+    fid = task["family"] if "family" in task else family(initial)
+    rng = random.Random(task["seed"] ^ 0xC0FFEE)
+    explored_turns = 0
+    features, searches, times, depths, examples = [], [], [[], []], [], []
     while game.winner < 0 and len(game.cells) < task["max_stones"]:
         if len(game.cells) + game.remaining > task["max_stones"]:
             break
         side = game.player
-        game.load_table(tables[side])
-        if not task["evaluation"]:
+        if nnue:
+            game.load_model(tables[side])
+        else:
+            game.load_table(tables[side])
+        # Explore only after a searched turn and only when no immediate tactic
+        # exists. Exploratory actions are omitted from teacher replay entirely.
+        if (not task["evaluation"] and depths and rng.random() < task.get("native_exploration", 0)
+                and not game.tactical()):
+            while game.player == side and game.winner < 0:
+                if game.tactical():
+                    continuation = game.search(task["ms"], width=task["width"])
+                    for move in continuation["moves"]:
+                        game.play(*move)
+                    break
+                choices = game.legal_moves() if rng.random() < .2 else game.candidates(min(8, task["width"]))
+                game.play(*rng.choice(choices))
+            explored_turns += 1
+            continue
+        if not task["evaluation"] and not nnue:
             features.append(game.features())
         start = time.perf_counter()
         result = game.search(task["ms"], width=task["width"])
@@ -66,19 +154,27 @@ def play_game(task):
         if not result["moves"]:
             raise RuntimeError("Nonterminal search returned no move")
         for move in result["moves"]:
+            if nnue and not task["evaluation"]:
+                examples.append(nnue_example(game, move, result, task["policy_candidates"]))
             game.play(*move)
-    record = {"seed": task["seed"], "family": family(initial), "winner": game.winner,
+    record = {"seed": task["seed"], "family": fid, "winner": game.winner,
               "reason": "six-in-a-row" if game.winner >= 0 else "truncated",
               "cells": game.cells, "times": times, "depths": depths,
-              "tables": task["tables"], "challenger_color": task.get("challenger_color")}
+              "tables": task["tables"], "model_kind": task.get("model_kind", "pattern"),
+              "opening": initial, "prefix_length": len(initial), "curriculum": task.get("curriculum", "legacy"),
+              "native_exploration": task.get("native_exploration", 0), "exploratory_turns": explored_turns,
+              "challenger_color": task.get("challenger_color")}
     samples = None
     if not task["evaluation"]:
         outcome = (1 if game.winner == 0 else -1) if game.winner >= 0 else float("nan")
-        n = len(features)
-        samples = {"features": np.asarray(features, dtype=np.int32).reshape(-1, 729),
-                   "search": np.asarray(searches, dtype=np.float32),
-                   "outcome": np.full(n, outcome, dtype=np.float32),
-                   "family": np.full(n, family(initial), dtype=np.uint32)}
+        if nnue:
+            samples = pack_nnue(examples, outcome, fid)
+        else:
+            n = len(features)
+            samples = {"features": np.asarray(features, dtype=np.int32).reshape(-1, 729),
+                       "search": np.asarray(searches, dtype=np.float32),
+                       "outcome": np.full(n, outcome, dtype=np.float32),
+                       "family": np.full(n, fid, dtype=np.uint32)}
     game.close()
     return record, samples
 
@@ -86,7 +182,14 @@ def play_game(task):
 def write_json(path, data):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(data, indent=2, allow_nan=False), encoding="utf-8")
-    os.replace(temporary, path)
+    for attempt in range(8):
+        try:
+            os.replace(temporary, path)
+            break
+        except PermissionError as error:
+            if os.name != "nt" or getattr(error, "winerror", None) not in (5, 32) or attempt == 7:
+                raise
+            time.sleep(.01*2**attempt)
 
 
 def event(run, kind, **fields):
@@ -95,6 +198,10 @@ def event(run, kind, **fields):
 
 
 def optimize(run, checkpoint, incumbent, replay_paths, args, progress=None):
+    if args.model == "nnue":
+        from nnue_model import optimize_nnue
+        return optimize_nnue(run, checkpoint, incumbent, replay_paths, args, progress,
+                             lambda **metrics: event(run, "training", **metrics))
     import torch
     from learning_model import PatternModel, pattern_data
     torch.set_num_threads(2)
@@ -247,10 +354,13 @@ def evaluate(pool, run, challenger, opponent, iteration, args, progress=None):
     game_count = max(args.eval_games, 2*math.ceil(math.log2(1/alpha)))
     for index in range(game_count):
         color = index % 2
-        tables = [str(run / opponent["table"])] * 2
-        tables[color] = str(run / challenger["table"])
-        tasks.append({"tables": tables, "seed": args.seed+1000000+iteration*10000+index//2,
+        tables = [str(run / checkpoint_artifact(opponent))] * 2
+        tables[color] = str(run / checkpoint_artifact(challenger))
+        seed = args.seed+1000000+iteration*10000+index//2
+        tasks.append({"tables": tables, "seed": seed,
                       "evaluation": True, "ms": args.eval_ms, "width": args.width,
+                      "model_kind": args.model,
+                      **task_opening(seed, True, args.eval_max_stones, args.curriculum),
                       "max_stones": args.eval_max_stones, "challenger_color": color})
     records = []
     for future in as_completed([pool.submit(play_game, task) for task in tasks]):
@@ -319,8 +429,15 @@ def _run_training(args):
     summary_path = run / "summary.json"
     config = {k: v for k, v in vars(args).items() if k not in ("iterations", "run")}
     source_files = [Path(__file__), ROOT / "learning_model.py", ROOT / "hexo.py"]
+    if args.model == "nnue":
+        source_files.append(ROOT / "nnue_model.py")
+        source_files.append(ROOT / "src" / "nnue.hpp")
+    if args.curriculum == "mixed-v1":
+        source_files.append(ROOT / "curriculum.py")
     if args.selfplay_backend == "gpu":
         source_files.append(ROOT / "gpu_games.py")
+        if args.model == "nnue":
+            source_files.append(ROOT / "gpu_nnue.py")
     training_hash = hashlib.sha256(b"".join(p.read_bytes() for p in source_files)).hexdigest()
     if summary_path.exists():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -332,12 +449,21 @@ def _run_training(args):
             raise ValueError("Training code changed. Use a new run directory to preserve run provenance.")
     else:
         import torch
-        from learning_model import PatternModel
+        torch.set_num_threads(2)
         torch.manual_seed(args.seed)
         initial = run / "checkpoints" / "0000"
         initial.mkdir(exist_ok=True)
-        torch.save(PatternModel().state_dict(), initial / "model.pt")
-        np.save(initial / "table.npy", np.zeros(729, dtype=np.int32), allow_pickle=False)
+        if args.model == "nnue":
+            from nnue_model import NNUE
+            model = NNUE()
+            torch.save(model.state_dict(), initial / "model.pt")
+            model.export(initial / "model.nnue")
+            initial_table = "checkpoints/0000/model.nnue"
+        else:
+            from learning_model import PatternModel
+            torch.save(PatternModel().state_dict(), initial / "model.pt")
+            np.save(initial / "table.npy", np.zeros(729, dtype=np.int32), allow_pickle=False)
+            initial_table = "checkpoints/0000/table.npy"
         summary = {"schema": 2, "started": time.time(), "status": "starting", "iteration": 0,
                    "positions": 0, "self_play_games": 0, "truncated_games": 0,
                    "config": config, "engine_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
@@ -347,7 +473,7 @@ def _run_training(args):
                                "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None},
                    "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                    "incumbent": 0, "checkpoints": [{"id": 0, "model": "checkpoints/0000/model.pt",
-                   "table": "checkpoints/0000/table.npy", "promoted": True,
+                   ("nnue" if args.model == "nnue" else "table"): initial_table, "kind": args.model, "promoted": True,
                    "anchor_elo": 0, "anchor_elo_95pct": None, "evaluations": []}]}
         write_json(summary_path, summary)
     try:
@@ -370,18 +496,27 @@ def _run_training(args):
                 tasks = []
                 for index in range(args.games):
                     rival = selfplay_pool[(index//2) % len(selfplay_pool)]
-                    tables = [str(run / learner["table"]), str(run / rival["table"])]
+                    tables = [str(run / checkpoint_artifact(learner)), str(run / checkpoint_artifact(rival))]
                     if index % 2:
                         tables.reverse()
-                    tasks.append({"tables": tables, "seed": args.seed+iteration*10000+index,
+                    seed = args.seed+iteration*10000+index
+                    tasks.append({"tables": tables, "seed": seed,
                                   "evaluation": False, "ms": args.ms, "width": args.width,
+                                  "model_kind": args.model, "policy_candidates": args.policy_candidates,
+                                  "native_exploration": args.native_exploration,
+                                  **task_opening(seed, False, args.max_stones, args.curriculum),
                                   "max_stones": args.max_stones})
                 records, batches = [], []
                 started = time.perf_counter()
                 last_progress = started
                 if args.selfplay_backend == "gpu":
-                    from gpu_games import generate_games, recommended_batch
-                    gpu_batch = args.gpu_games_batch or min(len(tasks), recommended_batch(args.gpu_candidates, args.max_stones))
+                    if args.model == "nnue":
+                        from gpu_nnue import generate_games, recommended_batch
+                        backend_options = {"beam": args.gpu_beam}
+                    else:
+                        from gpu_games import generate_games, recommended_batch
+                        backend_options = {}
+                    gpu_batch = args.gpu_games_batch or min(len(tasks), recommended_batch(args.gpu_candidates, args.max_stones, **backend_options))
                     summary["gpu_games_batch"] = gpu_batch
                     write_json(summary_path, summary)
                     def gpu_results():
@@ -390,13 +525,15 @@ def _run_training(args):
                             def gpu_progress(completed, total, metrics):
                                 progress(offset+completed, len(tasks), metrics)
                             yield from generate_games(chunk, candidates=args.gpu_candidates,
-                                                      epsilon=args.exploration, device="cuda", progress=gpu_progress)
+                                                      epsilon=args.exploration, device="cuda", progress=gpu_progress,
+                                                      **backend_options)
                     results = gpu_results()
                 else:
                     results = (future.result() for future in as_completed([pool.submit(play_game, task) for task in tasks]))
                 for record, samples in results:
+                    record["training_positions"] = len(samples["family"])
                     records.append(record);batches.append(samples)
-                    summary["active_positions"] += len(samples["features"])
+                    summary["active_positions"] += len(samples["family"])
                     summary["active_truncated_games"] += record["winner"] < 0
                     now = time.perf_counter()
                     if args.selfplay_backend == "native" or now-last_progress >= .5 or len(records) == len(tasks):
@@ -410,7 +547,7 @@ def _run_training(args):
                 data_path = run / "data" / f"{iteration:04d}.npz"
                 ordered = sorted(zip(records, batches), key=lambda pair: pair[0]["seed"])
                 records, batches = map(list, zip(*ordered))
-                merged = {k: np.concatenate([b[k] for b in batches]) for k in batches[0]}
+                merged = merge_nnue(batches) if args.model == "nnue" else {k: np.concatenate([b[k] for b in batches]) for k in batches[0]}
                 np.savez_compressed(data_path, **merged)
                 write_json(run / "data" / f"{iteration:04d}-games.json", records)
                 summary.update(status="training", stage_completed=0, stage_total=args.epochs, stage_metrics={})
@@ -441,7 +578,7 @@ def _run_training(args):
                 summary["checkpoints"].append(challenger)
                 if promoted:
                     summary["incumbent"] = iteration
-                summary["positions"] += len(merged["features"])
+                summary["positions"] += len(merged["family"])
                 summary["self_play_games"] += len(records)
                 summary["truncated_games"] += sum(g["winner"] < 0 for g in records)
                 summary.update(iteration=iteration, status="iteration-complete", active_positions=0,
@@ -461,6 +598,10 @@ def _run_training(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", default="runs/selfplay")
+    parser.add_argument("--model", choices=["pattern", "nnue"], default="pattern")
+    parser.add_argument("--curriculum", choices=["legacy", "mixed-v1"], default="mixed-v1")
+    parser.add_argument("--native-exploration", type=float, default=.05,
+                        help="Quiet native turns to explore without adding teacher labels")
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--games", type=int, default=64)
     parser.add_argument("--eval-games", type=int, default=40)
@@ -471,15 +612,20 @@ if __name__ == "__main__":
     parser.add_argument("--eval-max-stones", type=int, default=800, help="Separate evaluation cap; unfinished matches remain unrated")
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch", type=int, default=256, help="Learner batch size; 0 chooses up to 8192 positions on CUDA and keeps the batch-256 update count")
+    parser.add_argument("--batch", type=int, default=256, help="0: pattern uses up to 8192 CUDA positions with reference updates; NNUE uses 256 bounded by sparse centers")
     parser.add_argument("--updates-per-epoch", type=int, default=0, help="0 uses the batch-derived update count; positive values set an explicit optimizer-step budget")
     parser.add_argument("--selfplay-backend", choices=["native", "gpu"], default="native")
     parser.add_argument("--gpu-games-batch", type=int, default=0, help="0 sizes simultaneous GPU games from available VRAM")
     parser.add_argument("--gpu-candidates", type=int, default=32)
+    parser.add_argument("--gpu-beam", type=int, default=4, help="NNUE complete-turn GPU beam width")
     parser.add_argument("--exploration", type=float, default=.1, help="Random legal candidate probability for GPU self-play")
     parser.add_argument("--lr", type=float, default=.002)
     parser.add_argument("--replay-iterations", type=int, default=8)
     parser.add_argument("--replay-positions", type=int, default=250000, help="Maximum uniformly sampled replay positions; CUDA also reserves memory for training")
+    parser.add_argument("--nnue-replay-centers", type=int, default=2000000, help="Bound NNUE replay by sparse center count")
+    parser.add_argument("--nnue-batch-centers", type=int, default=32768, help="Split NNUE batches by center count as well as positions")
+    parser.add_argument("--policy-candidates", type=int, default=32)
+    parser.add_argument("--policy-weight", type=float, default=.25)
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = parser.parse_args()
@@ -491,6 +637,14 @@ if __name__ == "__main__":
         parser.error("GPU batch must be nonnegative, candidate count positive, exploration in [0,1]")
     if args.selfplay_backend == "gpu" and args.device == "cpu":
         parser.error("GPU self-play requires device auto or cuda")
+    if not 1 <= args.gpu_beam <= 16:
+        parser.error("GPU NNUE beam must be in 1..16")
+    if args.nnue_replay_centers < 1 or args.nnue_batch_centers < 1 or not 2 <= args.policy_candidates <= 128:
+        parser.error("NNUE center limits must be positive and policy candidates in 2..128")
+    if not math.isfinite(args.policy_weight) or args.policy_weight < 0:
+        parser.error("Policy weight must be finite and nonnegative")
+    if not 0 <= args.native_exploration <= 1:
+        parser.error("Native exploration must be in [0,1]")
     if args.eval_games % 2 or args.max_stones < 5 or args.eval_max_stones < 5 or not 2 <= args.width <= 128:
         parser.error("Evaluation games must be even, both stone caps >= 5, width in 2..128")
     run_training(args)

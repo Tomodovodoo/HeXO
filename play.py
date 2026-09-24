@@ -53,7 +53,10 @@ class Handler(BaseHTTPRequestHandler):
                     summary = json.loads((self.run / "summary.json").read_text(encoding="utf-8"))
                     checkpoint = summary["incumbent"]
                     model = next(c for c in summary["checkpoints"] if c["id"] == checkpoint)
-                    self.game.load_table(np.load(self.run / model["table"], allow_pickle=False))
+                    if model.get("kind") == "nnue":
+                        self.game.load_model(self.run / model["nnue"])
+                    else:
+                        self.game.load_table(np.load(self.run / model["table"], allow_pickle=False))
                 analysis = self.game.search(ms)
                 analysis["checkpoint"] = checkpoint
                 for q, r in analysis["moves"]:
