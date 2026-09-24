@@ -121,6 +121,18 @@ class RelationalLearningTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'changed during evaluation'):
                     diagnose(checkpoint,fixtures,args)
 
+    def test_terminal_teacher_uses_actual_reply_and_rejects_wrong_outcome(self):
+        from relational_teacher import verify_terminal
+        moves=record()['moves']
+        verify_terminal(moves[:-1],moves[-1],None,1)
+        verify_terminal(moves[:-2],moves[-2],moves[-1],-1)
+        with self.assertRaisesRegex(ValueError,'terminal'):
+            verify_terminal(moves[:-2],moves[-2],None,-1)
+        with self.assertRaisesRegex(ValueError,'terminal'):
+            verify_terminal(moves[:-2],moves[-2],moves[-1],1)
+        with self.assertRaisesRegex(ValueError,'continued after terminal'):
+            verify_terminal(moves[:-1],moves[-1],[99,99],1)
+
     def test_frozen_capped_actor_full_legal_targets_and_one_fit_pass(self):
         model=RelationalNet(config())
         before={k:v.clone() for k,v in model.state_dict().items()}
