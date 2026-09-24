@@ -1,5 +1,6 @@
 """Thin ctypes interface to the native rules and search engine."""
 import ctypes as C
+from functools import lru_cache
 import os
 from pathlib import Path
 
@@ -44,6 +45,42 @@ bind("hx_moves", C.c_int, C.c_void_p, C.POINTER(Cell), C.c_int)
 bind("hx_search", C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int, C.POINTER(Result))
 bind("hx_features", C.c_int, C.c_void_p, C.POINTER(C.c_int32), C.c_int)
 bind("hx_load_table", C.c_int, C.c_void_p, C.POINTER(C.c_int32), C.c_int)
+bind("hx_model_load", C.c_void_p, C.c_char_p)
+bind("hx_model_free", None, C.c_void_p)
+bind("hx_model_error", C.c_char_p)
+bind("hx_set_model", C.c_int, C.c_void_p, C.c_void_p)
+bind("hx_nnue_centers", C.c_int, C.c_void_p, C.POINTER(C.c_int64), C.POINTER(C.c_int32), C.c_int)
+bind("hx_nnue_context", C.c_int, C.c_void_p, C.POINTER(C.c_float))
+bind("hx_nnue_policy_features", C.c_int, C.c_void_p, C.c_int64, C.c_int64,
+     C.POINTER(C.c_int32), C.POINTER(C.c_float))
+bind("hx_nnue_inputs", C.c_int, C.c_void_p, C.POINTER(C.c_float), C.c_int)
+bind("hx_nnue_rank", C.c_float, C.c_void_p, C.c_int64, C.c_int64)
+bind("hx_candidates", C.c_int, C.c_void_p, C.c_int, C.POINTER(Cell), C.c_int)
+bind("hx_tactical", C.c_int, C.c_void_p)
+
+
+class NativeModel:
+    def __init__(self, path):
+        self.ptr = lib.hx_model_load(os.fsencode(path))
+        if not self.ptr:
+            raise ValueError(lib.hx_model_error().decode("utf-8"))
+
+    def __del__(self):
+        if self.ptr:
+            lib.hx_model_free(self.ptr)
+            self.ptr = None
+
+
+@lru_cache(maxsize=8)
+def _native_model(path, modified_ns, size):
+    # File metadata also prevents reusing a handle after an explicit file update.
+    return NativeModel(path)
+
+
+def native_model(path):
+    path = Path(path).resolve()
+    info = path.stat()
+    return _native_model(str(path), info.st_mtime_ns, info.st_size)
 
 
 class Game:
@@ -127,6 +164,46 @@ class Game:
         data = (C.c_int32 * 729)()
         lib.hx_features(self.ptr, data, 729)
         return list(data)
+
+    def load_model(self, path):
+        if not lib.hx_set_model(self.ptr, native_model(str(Path(path).resolve())).ptr):
+            raise ValueError("Native NNUE model could not be attached")
+
+    def candidates(self, limit=32):
+        n = lib.hx_candidates(self.ptr, limit, None, 0)
+        cells = (Cell*n)()
+        lib.hx_candidates(self.ptr, limit, cells, n)
+        return [(c.q, c.r) for c in cells]
+
+    def tactical(self):
+        return bool(lib.hx_tactical(self.ptr))
+
+    def nnue_centers(self):
+        import numpy as np
+        n = lib.hx_nnue_centers(self.ptr, None, None, 0)
+        coords, codes = (C.c_int64*(n*2))(), (C.c_int32*(n*3))()
+        lib.hx_nnue_centers(self.ptr, coords, codes, n)
+        return np.ctypeslib.as_array(codes).reshape(n, 3).copy()
+
+    def nnue_context(self):
+        output = (C.c_float*4)()
+        lib.hx_nnue_context(self.ptr, output)
+        return list(output)
+
+    def nnue_policy_features(self, move):
+        codes, pairs = (C.c_int32*3)(), (C.c_float*4)()
+        if not lib.hx_nnue_policy_features(self.ptr, *move, codes, pairs):
+            raise ValueError("NNUE policy features require a legal placement")
+        return list(codes), list(pairs)
+
+    def nnue_inputs(self):
+        output = (C.c_float*68)()
+        if lib.hx_nnue_inputs(self.ptr, output, 68) != 68:
+            raise ValueError("NNUE inputs require an attached model")
+        return list(output)
+
+    def nnue_rank(self, move):
+        return float(lib.hx_nnue_rank(self.ptr, *move))
 
     def load_table(self, weights):
         weights = list(weights)

@@ -61,7 +61,7 @@ python dashboard.py --run runs/gpu-selfplay
 
 `--gpu-games-batch 0` chooses a batch from available VRAM and the episode cap. `--batch 0` increases the learner batch while preserving the reference batch-256 optimizer update count. `--updates-per-epoch` sets an explicit update budget. CUDA training uses fused AdamW and keeps replay tensors on the device. Replay sampling occurs before concatenating shards, and `--replay-positions` bounds retained positions. The limit also accounts for available device memory. Best validation weights and the matching optimizer state are saved.
 
-GPU actors use exact sparse rules with growing coordinate storage and incremental native-compatible pattern features. They first take exact one- or two-stone wins, then choose a placement belonging to a complete cover of all immediate opponent threats when such a cover exists. These choices override exploration. Quiet candidates combine nearby cells, axial development, and broader exploration, scored one placement at a time by the learned evaluator. They do not run native PVS; `--ms` and `--width` do not control this actor. Replay records identify the actor and one-placement target semantics. Promotion always measures the native deployed engine at equal wall-clock budgets.
+The GPU `pattern` actor uses exact sparse rules with growing coordinate storage and incremental native-compatible pattern features. They first take exact one- or two-stone wins, then choose a placement belonging to a complete cover of all immediate opponent threats when such a cover exists. These choices override exploration. Quiet candidates combine nearby cells, axial development, and broader exploration, scored one placement at a time by the learned evaluator. They do not run native PVS; `--ms` and `--width` do not control this actor. Replay records identify the actor and one-placement target semantics. Promotion always measures the native deployed engine at equal wall-clock budgets.
 
 On this RTX 3070 Ti, the tactical zero-residual GPU actor generated about 184 games/second and 28,300 placements/second at batch 512 with 32 quiet candidates and a 256-stone cap. Of those 512 games, 388 finished and 124 reached the cap; peak PyTorch allocation was about 920 MiB. These timings include generation and replay transfer, but not training or native evaluation. The earlier actor was faster but frequently missed immediate wins. Its shorter games make raw games/second an unfair performance comparison. Reproduce on your hardware:
 
@@ -72,7 +72,45 @@ python gpu_benchmark.py --batches 64 512 2048 --placements 96
 
 The second command compares only exact rule transitions and feature updates with C++. Small GPU batches are slower than native code. The dashboard exposes device utilization, VRAM, power, and temperature; telemetry includes other applications using the GPU. A small pattern learner cannot productively saturate every GPU unit at all times, so larger game batches and measured throughput guide settings.
 
-The first learned evaluator is deliberately small. An `18 -> 32 -> 1` network maps six-cell ternary patterns to a bounded residual on top of the hand-written evaluator. Training pools every occupied six-cell window without cropping the board. Color antisymmetry and line reversal are enforced. The 729-entry integer table is exported for native incremental evaluation and move ordering. No Python or GPU calls occur inside search. This is the initial six-cell learner, not yet the larger length-11 NNUE model from the project plan.
+The default `pattern` evaluator uses an `18 -> 32 -> 1` network to map six-cell ternary patterns to a bounded residual on top of the handwritten evaluator. It exports a 729-entry integer table. The `nnue` evaluator uses centered eleven-cell lines, nonlinear combinations of all three axes, an incremental 64-channel position summary, and separate value and conditional move-ranking heads. Both run entirely in C++ during search.
+
+To train the full NNUE model with native search actors and a CUDA learner:
+
+```sh
+python train.py --model nnue --run runs/nnue --selfplay-backend native --device cuda --batch 0
+```
+
+NNUE replay stores sparse center patterns and search-selected first and second placements. `--nnue-replay-centers` bounds retained center features, and `--nnue-batch-centers` splits batches by feature count. NNUE's native format and feature definitions are documented below.
+
+The GPU NNUE actor loads the same exported model and maintains the same sparse
+center features. It ranks candidate first placements, evaluates conditional
+second placements, and chooses a complete turn using the value head. Exact
+immediate wins and defensive obligations override the quiet beam search.
+`--gpu-beam 4` uses four first candidates and four conditional second candidates;
+this remains selective search, not exhaustive play or native PVS. Exploration
+does not create valid policy-teacher labels. Native matches still decide promotion.
+
+```sh
+python train.py --model nnue --selfplay-backend gpu --run runs/nnue-gpu --games 512 --gpu-beam 4 --device cuda
+```
+
+For NNUE, `--batch 0` means at most 256 positions, further limited by sparse
+center count. Each epoch visits the selected training positions once unless
+`--updates-per-epoch` explicitly requests another update budget. Metrics record
+optimizer steps, examples processed, retained positions and retained centers.
+
+New runs use `--curriculum mixed-v1`: legal prefixes of 3, 5, 7, 9 or 11 stones,
+including compact fights, broad placements, separated groups and chained distant
+placements. Families preserve stone owners and turn phase under all 12 board
+symmetries. Evaluation reserves a separate family bucket that neither training
+nor loss validation can use. `--curriculum legacy` retains the original narrow
+three-stone distribution for explicit comparisons.
+
+Native actors explore 5% of quiet turns by default. `--native-exploration` controls
+this probability. Wins and mandatory defenses override exploration, including a
+fresh check before the second placement. Exploratory actions do not become
+teacher labels. Replay retains each sampled position's absolute ply and every
+game's complete history, so omitted exploratory turns do not lose geometry.
 
 Each iteration:
 
@@ -132,7 +170,7 @@ python arena.py --opponent seal --games 20 --ms 100 --output artifacts/seal.json
 python arena.py --opponent seal --run runs/gpu-selfplay --checkpoint 1 --games 20 --ms 100
 ```
 
-The adapter compiles the external engine without vendoring it. Seal's fixed array has a smaller coordinate range; games outside the adapter's safe range are marked invalid rather than counted as victories. Equal requested budgets are used, and both engines' actual elapsed times are retained. `--run` loads the promoted checkpoint, `--checkpoint` selects another saved candidate, and `--table` loads a standalone export. Reports identify the loaded table and its hash. Without a model option the arena uses the original evaluator.
+The adapter compiles the external engine without vendoring it. Seal's fixed array has a smaller coordinate range; games outside the adapter's safe range are marked invalid rather than counted as victories. Equal requested budgets are used, and both engines' actual elapsed times are retained. `--run` loads the promoted checkpoint, `--checkpoint` selects another saved candidate, and `--table` or `--nnue` loads a standalone export. Reports identify the loaded model and its hash. Without a model option the arena uses the original evaluator.
 
 To compare against the published Orca model, use an external checkout:
 
@@ -158,13 +196,15 @@ The benchmark prints JSON with seeded positions, source and library hashes, hard
 
 ## Status and remaining work
 
-The initial non-neural version is playable. Direct runtime checks have covered the radius-eight frontier, sequential expansion, immediate wins, and 800 make/unmake comparisons. A differential run matched 2,019 transitions against the official TypeScript rules, including rejected moves, turn phase, cells, and winner. Sparse expansion to coordinate 800 also passed. An initial eight-game development comparison against Seal scored two wins and six losses at 100 ms per turn. This is an initial measurement, not a competitive-strength claim. Two tactical-extension experiments scored zero wins in the same eight openings and were removed.
+The local game, native engine, self-play trainer, checkpoint evaluation and dashboard are playable. The committed suite currently has 22 tests covering reference rules, CPU/CUDA parity, NNUE inference and undo, curriculum partitioning and training-target semantics. Native search now orders a stored transposition move first when it is already in the selected legal turn list. The table is still local to each search.
 
-The first complete learning run collected 516 positions from 12 games and trained on the RTX 3070 Ti. Its challenger scored three wins, four losses, and one incomplete evaluation game and was rejected. That demonstrates the loop, not a strength gain. Larger runs are needed to measure improvement.
+The old GPU actor produced 6,144 games but missed immediate wins. Its best early candidate scored 28/40, then only 78/160 on fresh confirmation games. The tactical replacement produced 6,144 games and 1,060,519 positions, with 526 capped games whose outcomes remain unlabeled. Its first candidate passed the paired promotion test at 104 wins and 56 losses against the frozen reference. Later candidates were rejected against that incumbent, including one that scored 110/160 against the reference but only 66/160 against the incumbent. Self-Elo is opponent-dependent; more training has not consistently improved the deployed checkpoint.
 
-A subsequent native-actor run collected 10,130 positions from 192 games. None of its three candidates earned promotion. The GPU pipeline has also completed generation, fitting, native evaluation, checkpoint persistence, and resumed training with optimizer lineage. GPU trajectories and feature targets have been replayed against the native engine. No convincing Elo gain has been established yet. The first 6,144-game GPU run produced 138,652 positions. Its best initial candidate scored 28 wins in 40 games, then only 78 wins in 160 fresh confirmation games. An audit found that 9.03% of its replay positions had a provable win that the shallow actor later lost. The tactical actor fixes those missed wins; use a fresh run directory for its data.
+Fresh independent matches used 40 games and seed 20260924. The promoted pattern engine scored **4 wins and 36 losses against Seal** at 100 ms per turn for both engines. The handwritten engine scored **39 wins and 1 loss against the published Orca checkpoint** using 100 ms per turn versus Orca's 200 simulations per placement on CUDA. Orca averaged about 434 ms per turn versus HeXO's 89 ms, so this is not an equal-time comparison. There is no claim of superiority over all known bots.
 
-Further work includes training-quality improvements, search profiling, stronger threat search, larger held-out opponent matches, Orca integration, and game-data import. Match clocks, rated lobbies, and online account play are not part of the local board yet.
+The first native NNUE experiment collected 15,558 positions from 128 games and scored 39 wins and 41 losses against its zero-head NNUE reference. It was rejected. That reference pays NNUE inference costs; this experiment does not establish an improvement over the faster bare handwritten engine. The GPU NNUE pipeline has completed training, native evaluation and resumed training, with separate policy/value losses and actual optimizer exposure counts on the dashboard.
+
+Remaining work includes complete-turn candidate recall and controlled widening, stronger-search reanalysis, bounded tactical search, broader independent equal-time matches, and architecture/compute comparisons. The current NNUE has width 32 and nonlinear fusion of crossing lines, but no neighboring-cell mixing block. Match clocks, rated lobbies, and online account play are not part of the local board yet.
 
 ## References
 
@@ -173,3 +213,53 @@ Rules and turn semantics were checked against the [official HeXO source](https:/
 Independent opponents: [Seal](https://github.com/Ramora0/HexTicTacToe) and [Orca framework](https://github.com/Saiki77/hexbot-building-framework). The site bundles a Seal WebAssembly build; the optional native adapter currently compares against the selected external source revision, which may differ from that build.
 
 The intended learned evaluator follows ideas from [Rapfi](https://github.com/dhbloo/rapfi) and [NNUE](https://official-stockfish.github.io/docs/nnue-pytorch-wiki/docs/nnue.html), adapted to Hexo's three axes and turn semantics. Their existing game-specific weights are not used.
+## Centered-line NNUE contract
+
+The `nnue` model uses three centered eleven-cell ternary patterns at every center
+whose lines contain a stone. A placement changes 33 directional patterns at 31
+centers. The exported shared table has 177147 rows and 32 signed int16 channels,
+scaled by 256. Channels 0–15 are odd under color swap; channels 16–31 are even.
+All channels are invariant under line reversal. The learned mapping is
+33 → 64 → 32 with ReLU and tanh. Training uses straight-through quantization.
+
+For each center, sum its three table rows into `u`. Its 64-channel contribution
+is `[ReLU(u), ReLU(-u)] - [ReLU(3*table[0]), ReLU(-3*table[0])]`. This subtraction
+makes empty space contribute zero. C++ maintains exact int64 pooled sums. Divide
+the pool by `256*sqrt(max(1, number_of_active_centers))`. For player 1, swap the
+positive and negative halves of the first 16 channels. The other channels stay
+in place. There is no board crop.
+
+The value head is 68 → 32 → 1 with ReLU. Its inputs are the pooled 64 channels
+and four context values: `remaining==1`, `remaining==2`, `log1p(stones)/8`, and
+`(own_stones-other_stones)/max(1,stones)`. Its output times 6000 is a residual
+added to the handwritten evaluation from the current player's perspective.
+The resulting ordinary search score is clamped to ±500000; terminal scores
+remain separate.
+
+The conditional policy head is 104 → 16 → 1 with ReLU. Its inputs are pooled
+64 channels, the 32-channel sum of the candidate's three lines **after** its
+placement divided by 256, the four context values, and four pair values.
+The candidate channels use the current player's perspective. Pair values are
+`has_first`, `shares_axis`, `min(hex_distance,8)/8`, and
+`shares_axis*max(0,6-hex_distance)/5`. All four are zero without a first stone
+from the current turn. Second-stone examples are collected after the first
+stone is applied. Policy scores order candidates; tactical inclusions remain
+mandatory.
+
+Native files begin with a packed little-endian 60-byte header: magic
+`HXNNUE1\0`; nine uint32 values `1, 0x01020304, 177147, 32, 64, 4, 4, 32, 16`;
+float32 scales `256, 6000`; and uint64 payload length. The payload contains
+the row-major int16 table, then float32 value `W1,b1,W2,b2`, then policy
+`W1,b1,W2,b2`. Shapes follow the heads above. Checkpoint metadata records the
+whole-file SHA256. Native loading validates dimensions, sizes, finite weights,
+table bounds and table symmetries. A model handle is immutable and shared by
+attached boards. Loading a legacy table detaches NNUE and vice versa.
+
+NNUE replay is versioned separately from legacy six-cell histograms. It stores
+ragged center-code triples and candidate-code triples with offsets, candidate
+coordinates, pair context, turn context, player, handwritten baseline, chosen
+candidate, search depth validity, outcome and opening family. Policy labels are
+the search-selected first and conditional second placements, not alpha-beta
+visit counts. Unfinished outcomes remain missing. Native PVS and the GPU
+complete-turn beam identify their teacher semantics in the recorded games;
+their search targets should not be treated as interchangeable depths.

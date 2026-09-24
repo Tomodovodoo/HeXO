@@ -1,4 +1,5 @@
 #include "hexo.hpp"
+#include "nnue.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -90,6 +91,49 @@ constexpr int powers[]={1,3,9,27,81,243};
 constexpr int weight[]={0,1,12,150,2400,24000,1000000};
 int value(Counts c) { return c[1]==0 ? weight[c[0]] : c[0]==0 ? -weight[c[1]] : 0; }
 struct Undo { Cell c; int player,remaining,winner; };
+struct Center {
+    std::array<int32_t,3> codes{};
+    std::array<int32_t,32> sum{};
+};
+struct CenterTable {
+    struct Slot { Cell key{}; uint64_t hash=0; Center data{}; };
+    std::vector<Slot> slots;
+    size_t count=0;
+    static uint64_t hash(Cell c) {auto h=CellHash{}(c);return h?h:1;}
+    const Center* find(Cell c) const {
+        if(slots.empty()) return nullptr;
+        auto h=hash(c);size_t i=h&(slots.size()-1);
+        while(slots[i].hash) {
+            if(slots[i].hash==h && slots[i].key==c) return &slots[i].data;
+            i=(i+1)&(slots.size()-1);
+        }
+        return nullptr;
+    }
+    Center& get(Cell c,const nnue::Model& model) {
+        if(slots.empty()) slots.resize(128);
+        if((count+1)*4>=slots.size()*3) {
+            auto old=std::move(slots);slots=std::vector<Slot>(old.size()*2);count=0;
+            for(const auto& s:old) if(s.hash) get(s.key,model)=s.data;
+        }
+        auto h=hash(c);size_t i=h&(slots.size()-1);
+        while(slots[i].hash) {
+            if(slots[i].hash==h && slots[i].key==c) return slots[i].data;
+            i=(i+1)&(slots.size()-1);
+        }
+        slots[i]={c,h,{}};++count;
+        for(int j=0;j<32;++j) slots[i].data.sum[j]=3*model.row(0)[j];
+        return slots[i].data;
+    }
+    void erase(Cell c) {
+        auto h=hash(c);size_t mask=slots.size()-1,hole=h&mask;
+        while(slots[hole].hash!=h || !(slots[hole].key==c)) hole=(hole+1)&mask;
+        for(size_t next=(hole+1)&mask;slots[next].hash;next=(next+1)&mask) {
+            size_t home=slots[next].hash&mask;
+            if(((next-home)&mask)>=((next-hole)&mask)) {slots[hole]=slots[next];hole=next;}
+        }
+        slots[hole]={};--count;
+    }
+};
 struct Board {
     std::unordered_map<Cell,int,CellHash> cells;
     WindowTable windows;
@@ -100,6 +144,93 @@ struct Board {
     int64_t learned_score=0;
     std::array<int32_t,729> features{},adjustment{};
     uint64_t stones_hash=0;
+    nnue::Handle model;
+    CenterTable centers;
+    std::array<int64_t,64> pool{};
+    std::array<int64_t,2> stone_counts{};
+    void nn_update(Cell c,int p,int delta) {
+        if(!model) return;
+        auto change=[&](Cell target,int axis,int digit,bool all_axes) {
+            auto& center=centers.get(target,*model);
+            const auto before=center.sum;
+            for(int d=0;d<3;++d) if(all_axes || d==axis) {
+                int old=center.codes[d];
+                center.codes[d]+=delta*(p+1)*nnue::powers[digit];
+                const auto* a=model->row(old);const auto* z=model->row(center.codes[d]);
+                for(int j=0;j<32;++j) center.sum[j]+=z[j]-a[j];
+            }
+            for(int j=0;j<32;++j) {
+                pool[j]+=std::max(0,center.sum[j])-std::max(0,before[j]);
+                pool[j+32]+=std::max(0,-center.sum[j])-std::max(0,-before[j]);
+            }
+            if(!(center.codes[0]|center.codes[1]|center.codes[2])) centers.erase(target);
+        };
+        change(c,0,5,true);
+        for(int d=0;d<3;++d) for(int k=-5;k<=5;++k) if(k) change(c+axes[d]*k,d,5-k,false);
+    }
+    void set_model(nnue::Handle next) {
+        if(next && next==model) return;
+        model=std::move(next);centers=CenterTable{};pool.fill(0);
+        adjustment.fill(0);learned_score=0;
+        if(model) for(const auto& [c,p]:cells) nn_update(c,p,1);
+    }
+    std::array<float,4> context() const {
+        float n=float(history.size());
+        return {remaining==1?1.0f:0.0f,remaining==2?1.0f:0.0f,
+            std::log1p(n)/8.0f,float(stone_counts[player]-stone_counts[1-player])/std::max(1.0f,n)};
+    }
+    std::array<float,68> inputs() const {
+        std::array<float,68> out{};
+        float scale=1.0f/(256.0f*std::sqrt(float(std::max(size_t(1),centers.count))));
+        for(int j=0;j<64;++j) {
+            int source=player==1 && j%32<16 ? (j+32)%64:j;
+            out[j]=float(pool[source])*scale;
+        }
+        auto phase=context();std::copy(phase.begin(),phase.end(),out.begin()+64);return out;
+    }
+    std::array<int32_t,3> codes(Cell c) const {
+        if(model) {auto entry=centers.find(c);return entry?entry->codes:std::array<int32_t,3>{};}
+        std::array<int32_t,3> out{};
+        for(int d=0;d<3;++d) for(int k=-5;k<=5;++k) {
+            int p=at(c+axes[d]*k);if(p>=0) out[d]+=(p+1)*nnue::powers[k+5];
+        }
+        return out;
+    }
+    std::array<float,4> pair(Cell c) const {
+        if(remaining!=1 || history.empty() || history.back().player!=player) return {};
+        auto first=history.back().c;int64_t q=c.q-first.q,r=c.r-first.r;
+        auto distance=std::max({std::abs(q),std::abs(r),std::abs(q+r)});
+        bool axis=q==0 || r==0 || q+r==0;
+        return {1,float(axis),float(std::min(int64_t(8),distance))/8.0f,
+            axis?float(std::max(int64_t(0),6-distance))/5.0f:0.0f};
+    }
+    std::array<float,16> rank_context() const {
+        std::array<float,16> out{};if(!model) return out;
+        auto x=inputs();
+        for(int h=0;h<16;++h) {
+            out[h]=model->policy_b[h];
+            for(int j=0;j<64;++j) out[h]+=model->policy_w[h*104+j]*x[j];
+            for(int j=0;j<4;++j) out[h]+=model->policy_w[h*104+96+j]*x[64+j];
+        }
+        return out;
+    }
+    float rank(Cell c,const std::array<float,16>& shared) const {
+        if(!model) return 0;
+        auto code=codes(c);std::array<float,32> local{};
+        for(int d=0;d<3;++d) {
+            auto row=model->row(code[d]+(player+1)*nnue::powers[5]);
+            for(int j=0;j<32;++j) local[j]+=float(row[j])/256.0f;
+        }
+        if(player==1) for(int j=0;j<16;++j) local[j]=-local[j];
+        auto correlation=pair(c);float out=model->policy_bias;
+        for(int h=0;h<16;++h) {
+            float x=shared[h];
+            for(int j=0;j<32;++j) x+=model->policy_w[h*104+64+j]*local[j];
+            for(int j=0;j<4;++j) x+=model->policy_w[h*104+100+j]*correlation[j];
+            out+=std::max(0.0f,x)*model->policy_out[h];
+        }
+        return out;
+    }
     int at(Cell c) const { auto it=cells.find(c); return it==cells.end() ? -1 : it->second; }
     bool legal(Cell c) const {
         if(winner>=0 || at(c)>=0) return false;
@@ -141,17 +272,21 @@ struct Board {
         cells.emplace(c,player);
         stones_hash^=mix(CellHash{}(c)^mix(player+991));
         update(c,player,1);
+        nn_update(c,player,1);++stone_counts[player];
         if(--remaining==0) { player=1-player; remaining=2; }
     }
     void undo() {
         auto u=history.back(); history.pop_back();
         update(u.c,u.player,-1);
+        nn_update(u.c,u.player,-1);--stone_counts[u.player];
         cells.erase(u.c);
         stones_hash^=mix(CellHash{}(u.c)^mix(u.player+991));
         player=u.player;remaining=u.remaining;winner=u.winner;
     }
     int score(int p) const {
-        auto v=std::clamp<int64_t>(evaluation+learned_score,-500000,500000);
+        int64_t residual=0;
+        if(model) residual=int64_t(std::clamp(model->value(inputs())*6000.0f,-1000000.0f,1000000.0f))*(player==0?1:-1);
+        auto v=std::clamp<int64_t>(evaluation+learned_score+residual,-500000,500000);
         return int(p==0?v:-v);
     }
     std::vector<Cell> legal_moves() const {
@@ -227,7 +362,7 @@ struct Search {
         }
         return {};
     }
-    std::vector<Cell> candidates(Board& b,int limit) {
+    static std::vector<Cell> candidates(Board& b,int limit) {
         if(b.cells.empty()) return {{0,0}};
         std::unordered_set<Cell,CellHash> set;
         for(auto [c,_]:b.cells) {
@@ -244,8 +379,14 @@ struct Search {
         // Every candidate is empty and within five cells of an occupied cell.
         // Only the coordinate representation limit needs checking here.
         ranked.reserve(set.size());
-        for(auto c:set) if(std::abs(c.q)<=1000000000000LL && std::abs(c.r)<=1000000000000LL)
-            ranked.emplace_back(b.gain(c,b.player),c);
+        if(b.model) {
+            auto shared=b.rank_context();
+            for(auto c:set) if(std::abs(c.q)<=1000000000000LL && std::abs(c.r)<=1000000000000LL)
+                ranked.emplace_back(b.gain(c,b.player)+int(std::clamp(b.rank(c,shared)*6000.0f,-1000000.0f,1000000.0f)),c);
+        } else {
+            for(auto c:set) if(std::abs(c.q)<=1000000000000LL && std::abs(c.r)<=1000000000000LL)
+                ranked.emplace_back(b.gain(c,b.player),c);
+        }
         const auto better=[](const auto& a,const auto& z){ return a.first!=z.first ? a.first>z.first : a.second<z.second; };
         if(int(ranked.size())>limit) {
             std::nth_element(ranked.begin(),ranked.begin()+limit,ranked.end(),better);
@@ -333,9 +474,20 @@ struct Search {
             if(entry.flag==1 && entry.score>=beta) return entry.score;
             if(entry.flag==2 && entry.score<=alpha) return entry.score;
         }
+        const Turn hint=entry.key==key?entry.best:Turn{};
         const int original=alpha;
         auto moves=turns(b);
         if(moves.empty()) return b.score(b.player);
+        // Only reorder the selected, independently validated turns. Injecting a
+        // hash move before truncation would change this selective search tree.
+        // Keep the actual generated turn, including early first-stone wins.
+        if(hint.count>=1 && hint.count<=2) {
+            auto found=std::find_if(moves.begin(),moves.end(),[&](const Turn& t) {
+                return t.count==hint.count && t.cells[0]==hint.cells[0] &&
+                    (t.count==1 || t.cells[1]==hint.cells[1]);
+            });
+            if(found!=moves.end()) std::rotate(moves.begin(),found,found+1);
+        }
         int best=-mate-1;Turn best_turn=moves.front();bool first=true;
         for(const auto& t:moves) {
             Restore restore(b);int side=b.player;apply(b,t);
@@ -424,7 +576,72 @@ int hx_load_table(void* p,const int32_t* weights,int count){
     if(count!=729 || weights[0]!=0) return 0;
     for(int i=0;i<729;++i) if(weights[i]<-10000 || weights[i]>10000) return 0;
     auto& b=*static_cast<Board*>(p);b.learned_score=0;
+    if(b.model) b.set_model({});
     for(int i=0;i<729;++i){b.adjustment[i]=weights[i];b.learned_score+=int64_t(b.features[i])*weights[i];}
     return 1;
+}
+void* hx_model_load(const char* path) {
+    try {auto model=nnue::load(path);nnue::error.clear();return new nnue::Handle(std::move(model));}
+    catch(const std::exception& e) {nnue::error=e.what();return nullptr;}
+}
+void hx_model_free(void* p) {delete static_cast<nnue::Handle*>(p);}
+const char* hx_model_error() {return nnue::error.c_str();}
+int hx_set_model(void* p,void* model) {
+    try {static_cast<Board*>(p)->set_model(model?*static_cast<nnue::Handle*>(model):nnue::Handle{});return 1;}
+    catch(const std::exception& e) {nnue::error=e.what();return 0;}
+}
+int hx_nnue_centers(void* p,int64_t* coordinates,int32_t* codes,int capacity) {
+    auto& b=*static_cast<Board*>(p);
+    std::vector<std::pair<Cell,std::array<int32_t,3>>> result;
+    if(b.model) {
+        result.reserve(b.centers.count);
+        for(const auto& s:b.centers.slots) if(s.hash) result.emplace_back(s.key,s.data.codes);
+    } else {
+        std::unordered_map<Cell,std::array<int32_t,3>,CellHash> out;
+        for(const auto& [c,side]:b.cells) for(int d=0;d<3;++d) for(int k=-5;k<=5;++k)
+            out[c+axes[d]*k][d]+=(side+1)*nnue::powers[5-k];
+        result.assign(out.begin(),out.end());
+    }
+    std::sort(result.begin(),result.end(),[](const auto& a,const auto& z){return a.first<z.first;});
+    for(int i=0;i<std::min(capacity,int(result.size()));++i) {
+        if(coordinates) {coordinates[2*i]=result[i].first.q;coordinates[2*i+1]=result[i].first.r;}
+        if(codes) std::copy(result[i].second.begin(),result[i].second.end(),codes+3*i);
+    }
+    return int(result.size());
+}
+int hx_nnue_context(void* p,float* out) {
+    if(!out) return 0;
+    auto x=static_cast<Board*>(p)->context();std::copy(x.begin(),x.end(),out);return 4;
+}
+int hx_nnue_inputs(void* p,float* out,int capacity) {
+    auto x=static_cast<Board*>(p)->inputs();if(out) std::copy_n(x.begin(),std::max(0,std::min(capacity,68)),out);return 68;
+}
+int hx_nnue_policy_features(void* p,int64_t q,int64_t r,int32_t* out,float* pair) {
+    auto& b=*static_cast<Board*>(p);Cell c{q,r};if(!b.legal(c) || !out || !pair) return 0;
+    auto codes=b.codes(c);for(int d=0;d<3;++d) out[d]=codes[d]+(b.player+1)*nnue::powers[5];
+    auto correlation=b.pair(c);std::copy(correlation.begin(),correlation.end(),pair);return 1;
+}
+float hx_nnue_rank(void* p,int64_t q,int64_t r) {
+    auto& b=*static_cast<Board*>(p);if(!b.legal({q,r})) return std::numeric_limits<float>::quiet_NaN();
+    return b.rank({q,r},b.rank_context());
+}
+int hx_candidates(void* p,int limit,HxCell* out,int capacity) {
+    if(limit<1 || limit>128) return -1;
+    auto& b=*static_cast<Board*>(p);if(b.winner>=0) return 0;
+    auto cells=Search::candidates(b,limit);
+    if(out) for(int i=0;i<std::min(capacity,int(cells.size()));++i) out[i]={cells[i].q,cells[i].r,-1};
+    return int(cells.size());
+}
+int hx_tactical(void* p) {
+    auto& b=*static_cast<Board*>(p);
+    if(b.winner>=0) return 0;
+    for(int side=0;side<2;++side) {
+        for(const auto& completion:b.completions(side,side==b.player?b.remaining:2)) {
+            // Each empty belongs to a six-cell window containing stones, so it
+            // is already within the legal radius before either placement.
+            if(std::all_of(completion.begin(),completion.end(),[&](Cell c){return b.legal(c);})) return 1;
+        }
+    }
+    return 0;
 }
 }

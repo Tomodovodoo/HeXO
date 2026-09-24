@@ -32,4 +32,18 @@ HX_API uint64_t hx_hash(void*);
 HX_API int hx_evaluate(void*);
 HX_API int hx_features(void*, int32_t* output, int capacity);
 HX_API int hx_load_table(void*, const int32_t* weights, int count);
+HX_API void* hx_model_load(const char* utf8_path);
+HX_API void hx_model_free(void* model);
+HX_API const char* hx_model_error();
+HX_API int hx_set_model(void* board, void* model);
+// Sparse finite-support centers, sorted by coordinate; codes use absolute colors.
+// Coordinates have 2*capacity entries; codes have 3*capacity entries.
+HX_API int hx_nnue_centers(void*, int64_t* coordinates, int32_t* codes, int capacity);
+HX_API int hx_nnue_context(void*, float* output);
+HX_API int hx_nnue_inputs(void*, float* output, int capacity);
+HX_API int hx_nnue_policy_features(void*, int64_t q, int64_t r, int32_t* codes, float* pair);
+HX_API float hx_nnue_rank(void*, int64_t q, int64_t r);
+HX_API int hx_candidates(void*, int limit, HxCell* output, int capacity);
+// Quiet-turn exploration must defer to search when either side can finish now.
+HX_API int hx_tactical(void*);
 }

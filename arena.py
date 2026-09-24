@@ -57,8 +57,8 @@ def run(args):
     dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], text=True).strip())
     model = None
     weights = [0]*729
-    if args.run or args.table:
-        import numpy as np
+    nnue_path = None
+    if args.run or args.table or args.nnue:
         if args.run:
             run_dir = Path(args.run).resolve()
             summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
@@ -66,15 +66,19 @@ def run(args):
             descriptor = next((c for c in summary["checkpoints"] if c["id"] == checkpoint), None)
             if descriptor is None:
                 raise ValueError(f"Checkpoint {checkpoint} is not present in {run_dir}")
-            path = run_dir / descriptor["table"]
+            nnue_path = run_dir / descriptor["nnue"] if descriptor.get("kind") == "nnue" else None
+            path = nnue_path or run_dir / descriptor["table"]
         else:
-            path = Path(args.table).resolve()
+            nnue_path = Path(args.nnue).resolve() if args.nnue else None
+            path = nnue_path or Path(args.table).resolve()
             checkpoint = None
-        table = np.load(path, allow_pickle=False)
-        if table.shape != (729,) or table.dtype != np.int32:
-            raise ValueError("Expected a 729-entry int32 native pattern table")
-        weights = table.tolist()
-        model = {"checkpoint": checkpoint, "table": str(path),
+        if nnue_path is None:
+            import numpy as np
+            table = np.load(path, allow_pickle=False)
+            if table.shape != (729,) or table.dtype != np.int32:
+                raise ValueError("Expected a 729-entry int32 native pattern table")
+            weights = table.tolist()
+        model = {"checkpoint": checkpoint, "kind": "nnue" if nnue_path else "pattern", "path": str(path),
                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     for index in range(args.games):
         if index % 2 == 0:
@@ -96,7 +100,10 @@ def run(args):
             before = time.perf_counter()
             try:
                 if side == our_color:
-                    game.load_table(weights)
+                    if nnue_path:
+                        game.load_model(nnue_path)
+                    else:
+                        game.load_table(weights)
                     search = game.search(args.ms, width=args.width)
                     searches.append(search)
                     moves = search["moves"]
@@ -174,6 +181,7 @@ if __name__ == "__main__":
     model_source = parser.add_mutually_exclusive_group()
     model_source.add_argument("--run", help="Run directory; defaults to its promoted checkpoint")
     model_source.add_argument("--table", help="Exported native table.npy")
+    model_source.add_argument("--nnue", help="Exported native model.nnue")
     parser.add_argument("--checkpoint", type=int, help="Specific checkpoint in --run, including rejected candidates")
     args = parser.parse_args()
     if args.games < 1 or args.ms < 1 or args.max_stones < 3:

@@ -307,10 +307,16 @@ def generate_games(tasks, *, candidates=32, epsilon=0.1, device="cuda", progress
     batch = len(tasks)
     cap = max(task["max_stones"] for task in tasks)
     env = BatchedHexo(batch, device, capacity=min(cap, 128), max_placements=cap)
-    openings = [opening_for(task["seed"], False) for task in tasks]
-    opening_tensor = torch.tensor(openings, device=device)
-    for i in range(3):
-        env.step(opening_tensor[:, i])
+    openings = [task["opening"] if "opening" in task else opening_for(task["seed"], False) for task in tasks]
+    if any(not p or len(p) > task["max_stones"] for p, task in zip(openings, tasks)):
+        raise ValueError("Opening prefixes must be nonempty and fit their episode caps")
+    prefix_lengths = torch.tensor([len(p) for p in openings], device=device)
+    longest = max(map(len, openings))
+    opening_tensor = torch.tensor([p + [(0, 0)]*(longest-len(p)) for p in openings], device=device)
+    for i in range(longest):
+        accepted = env.step(opening_tensor[:, i]).accepted
+        if not torch.equal(accepted, i < prefix_lengths):
+            raise ValueError("An opening prefix contains an illegal or post-terminal placement")
     caps = torch.tensor([task["max_stones"] for task in tasks], device=device)
     env.truncated |= env.counts >= caps
     baseline = pattern_data(device)[3]
@@ -322,7 +328,7 @@ def generate_games(tasks, *, candidates=32, epsilon=0.1, device="cuda", progress
     rng = torch.Generator(device=device).manual_seed(batch_seed)
     saved_features, saved_values, saved_masks = [], [], []
     rows = torch.arange(batch, device=device)
-    for ply in range(3, cap):
+    for ply in range(min(map(len, openings)), cap):
         active = env.active
         actions, legal = env.sampled_candidates(candidates, generator=rng)
         tactical = env.tactical_action()
@@ -352,7 +358,7 @@ def generate_games(tasks, *, candidates=32, epsilon=0.1, device="cuda", progress
         if (ply-2) % 16 == 0 or ply == cap-1:
             completed = int((~env.active).sum().item())
             if progress:
-                progress(completed, batch, {"actor": "gpu-pattern-tactical", "placements": ply+1})
+                progress(completed, batch, {"actor": "gpu-pattern-tactical", "placements": int(env.counts.max().item())})
             if completed == batch:
                 break
     if env.device.type == "cuda":
@@ -368,13 +374,15 @@ def generate_games(tasks, *, candidates=32, epsilon=0.1, device="cuda", progress
     results = []
     for i, task in enumerate(tasks):
         winner = winners[i]
-        fid = family(openings[i])
+        fid = task["family"] if "family" in task else family(openings[i])
         record = {"seed": task["seed"], "family": fid, "winner": winner,
                   "reason": "six-in-a-row" if winner >= 0 else "truncated",
                   "cells": [[int(q), int(r), int(owner)] for (q, r), owner in zip(coords[i, :counts[i]], owners[i, :counts[i]])],
                   "times": [[], []], "depths": [], "tables": task["tables"],
                   "challenger_color": task.get("challenger_color"),
                   "actor": "gpu-pattern-tactical", "actor_candidates": candidates,
+                  "opening": openings[i], "opening_length": len(openings[i]),
+                  "curriculum": task.get("curriculum", "legacy"),
                   "actor_epsilon": epsilon, "actor_batch_seed": batch_seed,
                   "actor_batch_seconds": elapsed}
         f = features[masks[:, i], i] if saved_features else np.empty((0, 729), dtype=np.int32)
