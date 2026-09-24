@@ -48,6 +48,21 @@ def fixture(root):
 
 
 class RelationalLearningTests(unittest.TestCase):
+    def test_stratified_selection_excludes_replay_and_enforces_both_quotas(self):
+        from collections import Counter
+        from relational_stratified import select
+        histories={key:[None]*20 for key in ('a','b','c')}
+        rows=[dict(game=key,ply=ply) for key in histories for ply in range(20)]
+        previous=rows[:3]+rows[17:20]
+        chosen=select(histories,rows,previous,12,4,19)
+        self.assertEqual(chosen,select(histories,rows,previous,12,4,19))
+        self.assertEqual(sum(20-r['ply']<=8 for r in chosen),6)
+        self.assertEqual(len({(r['game'],r['ply']) for r in chosen}),12)
+        self.assertFalse({(r['game'],r['ply']) for r in chosen}&{(r['game'],r['ply']) for r in previous})
+        self.assertLessEqual(max(Counter(r['game'] for r in chosen).values()),4)
+        with self.assertRaisesRegex(ValueError,'Insufficient'):
+            select(histories,rows,previous,14,4,19)
+
     def setUp(self):
         threads=torch.get_num_threads();torch.set_num_threads(2)
         self.addCleanup(torch.set_num_threads,threads)
