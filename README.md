@@ -567,3 +567,42 @@ Geometry, action indexing, 12 symmetries, batch isolation, native/reference
 parity, and checkpoint gradients are covered by `tests.test_relational`.
 Held-out prediction gains and superiority against independent bots remain to
 be established by training and external evaluation.
+
+### Shared relational action/value contract
+
+The model, collector and neural search consume chronological axial histories,
+replayed by the exact native rules. The resulting position is identified by
+`position_key`: SHA256 of sorted `(q, r, absolute_owner)` stones plus the native
+player to move and placements remaining. History order within an equivalent
+position is not a distinct neural state. Coordinates retain their actual values;
+this identity is not a symmetry-canonical cache key.
+
+`Graph.actions` contains **all** native legal coordinates as `int64[N, 2]`, in
+`Game.legal_moves()` order (lexicographic q, then r). `Graph.player` and
+`Graph.remaining` are authoritative native phase values. Packing preserves that
+order and supplies `action_owner[N]` and `action_offsets[B+1]`; offsets start at
+zero, end at N, and delimit each position's complete action set. Newly reachable
+second placements are encoded from the position after the first placement.
+
+The differentiable network returns finite FP32 `logits[N]`, bounded scalar
+`q[N]` in [-1, 1], and the same `action_offsets`. Each Q value uses the player to
+move's perspective. The inference adapter echoes `position_key`, `player`,
+`remaining`, aligned `actions`, and `model_version` for every record. Deployed
+`model_version` is the SHA256 of the exact loaded relational `model.pt` bytes.
+The loader validates those bytes before deserialization. No adapter may fall back
+to a native NNUE model, handwritten values, or reordered/truncated actions.
+
+Value constructions are deliberately distinct:
+
+- KLENT collection uses `mu = softmax((Q + beta * log(pi)) / (alpha + beta))`
+  and `V_mu = sum(mu * Q)` for frozen-actor return bootstraps.
+- Neural search uses the network prior `pi = softmax(logits)` and
+  `V_pi = sum(pi * Q)` for unresolved leaves.
+
+Neither is a proven value. Actual terminal outcomes come from the rules; proofs
+retain their separate verified scope. Backups keep the sign when the same player
+continues a turn and reverse it only when control changes. A first-placement win
+terminates immediately. Training stores the acting distribution and action index
+with the full legal-coordinate hash, player and phase, then checks that identity
+when reconstructing replay. These requirements apply equally to raw-policy,
+KLENT-improved-policy, Gumbel-search and verified-tactics modes of the same player.
