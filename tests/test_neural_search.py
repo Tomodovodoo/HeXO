@@ -155,6 +155,34 @@ class NeuralTree(unittest.TestCase):
         for reply in (R,S):
             self.assertTrue(any(len(h)>=4 and h[1:4]==[A,C,reply] for h in evaluator.seen))
 
+    def test_corrupt_evaluator_coordinates_rejected_before_cast(self):
+        search = self.searcher([(0, 0)])
+        native.hxg_begin(search.ptr, 4, 2)
+        request, history = search.request()
+        original = Uniform().evaluate([history])[0]
+        for dtype, value in ((np.float64, -7.5), (np.uint64, 2**64-1)):
+            prediction = {k: v.copy() for k,v in original.items()}
+            prediction['actions'] = prediction['actions'].astype(dtype)
+            prediction['actions'][0, 0] = value
+            with self.assertRaises(ValueError):
+                search.fulfill(request, prediction)
+        native.hxg_cancel(search.ptr)
+
+    def test_cached_work_respects_deadline_during_gather(self):
+        from unittest.mock import patch
+        source = self.searcher([(0, 0)], seed=7)
+        source.search(16, root_samples=4, batch_size=1)
+        search = self.searcher([(0, 0)], seed=7)
+        search.cache = source.cache
+        ticks = iter(np.arange(0, 10, .0005))
+        with patch('neural_search.time.perf_counter', side_effect=lambda: float(next(ticks))):
+            result = search.search(16, root_samples=4, batch_size=16, milliseconds=3)
+        self.assertLess(result['completed'], 16)
+        self.assertGreater(result['cache_hits'], 0)
+        self.assertEqual(result['evaluated'], 0)
+        # Cancelled reservations must permit another full search budget.
+        self.assertEqual(search.search(4, root_samples=2)['completed'], 4)
+
     def test_wrong_legal_order_rejected(self):
         search = self.searcher([(0, 0)])
         native.hxg_begin(search.ptr, 4, 2)

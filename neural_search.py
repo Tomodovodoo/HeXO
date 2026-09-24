@@ -95,7 +95,11 @@ class NeuralSearch:
         return request, history.tolist()
 
     def fulfill(self, request, prediction):
-        actions = np.ascontiguousarray(prediction['actions'], dtype=np.int64)
+        raw_actions = np.asarray(prediction['actions'])
+        if raw_actions.dtype.kind not in 'iu' or (raw_actions.size and
+                (np.any(raw_actions < -10**12) or np.any(raw_actions > 10**12))):
+            raise ValueError('Evaluator coordinates must be integers within +/- 10^12')
+        actions = np.ascontiguousarray(raw_actions, dtype=np.int64)
         logits = np.ascontiguousarray(prediction['logits'], dtype=np.float64)
         q = np.ascontiguousarray(prediction['q'], dtype=np.float64)
         if actions.shape != (len(logits), 2) or q.shape != logits.shape or logits.ndim != 1:
@@ -115,6 +119,8 @@ class NeuralSearch:
                     break
                 pending = []
                 while len(pending) < batch_size:
+                    if milliseconds is not None and (time.perf_counter()-start)*1000 >= milliseconds:
+                        break
                     request, history = self.request()
                     if request == -1:
                         continue
@@ -127,6 +133,8 @@ class NeuralSearch:
                         hits += 1
                     else:
                         pending.append((request, history, key))
+                if milliseconds is not None and (time.perf_counter()-start)*1000 >= milliseconds:
+                    break
                 if pending:
                     predictions = self.evaluator.evaluate([x[1] for x in pending])
                     if len(predictions) != len(pending):
