@@ -3,6 +3,7 @@ import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import hashlib
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -29,12 +30,129 @@ def report_digest(path,modified,size):
     return cached[2]
 
 
+def run_histories(run, config):
+    """Follow the hash-bound migration chain without changing the run."""
+    expected=config.get('history_sha256');path=run/'history.json';histories=[]
+    while expected:
+        if len(expected)!=64 or any(character not in '0123456789abcdef' for character in expected):
+            raise ValueError('Invalid migration history digest')
+        if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
+            if path==run/'history.json':
+                path=run/f'history-{expected}.json'
+            if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
+                raise ValueError(f'Run migration history changed: {path}')
+        history=read_json(path)
+        histories.append(history)
+        name=history.get('prior_history_file')
+        if not name:break
+        if Path(name).name!=name:raise ValueError('Invalid prior migration history path')
+        path=run/name;expected=history['prior_history_sha256']
+    return histories
+
+
+def validate_archived_games(report, path):
+    """Check saved scores against intact color-swapped games; archives lack a report seal."""
+    games=report['games'];target=report['target_games'];metrics=report['metrics']
+    if target<2 or target%2 or len(games)>target or len(games)%2:
+        raise ValueError(f'Invalid archived comparison length: {path}')
+    wins=losses=incomplete=pair_wins=pair_losses=ties=valid=0
+    for pair in range(len(games)//2):
+        first,second=games[2*pair:2*pair+2]
+        if any(game.get('index')!=2*pair+color or game.get('pair')!=pair or
+               game.get('challenger_color')!=color or game.get('seed')!=first.get('seed') or
+               game.get('winner') not in (-1,0,1) or game.get('moves',[])[:len(game.get('opening',[]))]!=game.get('opening')
+               for color,game in enumerate((first,second))) or first['opening']!=second['opening']:
+            raise ValueError(f'Invalid archived opening pair: {path}')
+        outcomes=[]
+        for game in (first,second):
+            if game['winner']<0:incomplete+=1
+            else:
+                success=game['winner']==game['challenger_color'];outcomes.append(success)
+                wins+=success;losses+=not success
+        if len(outcomes)==2:
+            valid+=1;pair_wins+=sum(outcomes)==2;pair_losses+=sum(outcomes)==0;ties+=sum(outcomes)==1
+    decisive=pair_wins+pair_losses
+    pair_p=sum(math.comb(decisive,k) for k in range(pair_wins,decisive+1))/2**decisive if decisive else 1
+    expected=dict(wins=wins,losses=losses,incomplete=incomplete,pending=0,played_games=len(games),
+                  planned_games=len(games),opening_pair_wins=pair_wins,opening_pair_losses=pair_losses,
+                  opening_pair_ties=ties,incomplete_pairs=len(games)//2-valid,opening_pair_p=pair_p)
+    if any(metrics.get(key)!=value for key,value in expected.items()):
+        raise ValueError(f'Archived comparison metrics disagree with games: {path}')
+
+
+def historical_background(run, entries, hashes, histories):
+    from checkpoint_league import evaluation_schedule
+    generations={history['previous_config_sha256']:history for history in histories
+                 if 'previous_config_sha256' in history}
+    inherited_through=max((history['through'] for history in histories),default=-1)
+    for entry in entries.values():
+        if entry['id']<=inherited_through:
+            entry['inherited_checkpoint']=True
+            if entry.get('evaluation_due') is False:
+                entry['historical_background_status']='Not scheduled under the current protocol'
+    seen={}
+    for path in sorted((run/'background-evaluation').glob('*-vs-*.json')):
+        report=read_json(path);identity=report['background_identity']
+        history=generations.get(identity['config_sha256'])
+        if history is None:continue
+        previous=history['previous_identity']
+        if identity['sources']!=previous['sources'] or identity['device']!='cpu':
+            raise ValueError(f'Historical background worker identity changed: {path}')
+        a,b=report['candidate'],report['opponent']
+        if a>history['through'] or a not in entries or b not in entries:continue
+        if path.name!=f'{a:04d}-vs-{b:04d}.json' or report.get('protocol')!=identity.get('protocol') or \
+                report['target_games'] not in (previous['config']['eval_games'],previous['config']['reference_games']):
+            raise ValueError(f'Historical background comparison settings changed: {path}')
+        if report['model_hashes']!={str(n):hashes[n] for n in (a,b)}:
+            raise ValueError(f'Historical background models changed: {path}')
+        validate_archived_games(report,path)
+        score={k:report['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
+        score.update(played=len(report['games']),planned=report['target_games'])
+        record=entries[a].setdefault('historical_background',{})
+        if 'champion' in record and record['champion']!=report['champion']:
+            raise ValueError(f'Historical background champion changed: {path}')
+        record['champion']=report['champion']
+        seen.setdefault((a,identity['config_sha256']),set()).add(b)
+        record['partial']=record.get('partial',False) or len(report['games'])<report['target_games']
+        record['source']='Archived CPU report (not migration-hash verified)'
+        if b==0:record['anchor_score']=score
+        if b==a-1:record['previous_score']=score
+        if b==report['champion']:record.update(champion_score=score,versus_champion=b)
+        if b not in (0,a-1,report['champion']):record['older_score']=dict(score,opponent=b)
+    for (number,config_sha),opponents in seen.items():
+        record=entries[number]['historical_background'];old=generations[config_sha]['previous_identity']['config']
+        expected={opponent for opponent,_ in evaluation_schedule(number,record['champion'],old['eval_games'],old['reference_games'])}
+        record['partial']=record['partial'] or opponents!=expected
+    matched_record={}
+    for history in reversed(histories):
+        old=history['previous_identity']['config']
+        sources=history['previous_identity']['sources'];runtime=history['previous_identity']['runtime']
+        fingerprint=lambda value:hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        protocol=dict(max_plies=old.get('eval_max_plies',old.get('max_plies')),tactics=old.get('eval_tactics',False),
+                      simulations=old.get('simulations'),root_samples=old.get('root_samples'),device=old.get('device'),
+                      opening_suite='standard-v1',source_sha256=fingerprint(sources),runtime_sha256=fingerprint(runtime))
+        for key,rating in history.get('prior_joint_ratings',{}).items():
+            entry=entries.get(int(key))
+            if entry is None:continue
+            records=entry.get('historical_ratings',[]);last=matched_record.get(int(key),-1)
+            def matches(record):
+                return record.get('source')=='paired joint rating' and record.get('protocol')==protocol and \
+                       record.get('elo')==rating.get('elo')
+            index=next((i for i in range(last+1,len(records)) if matches(records[i])),None)
+            if index is None and last>=0 and matches(records[last]):index=last
+            if index is not None:
+                records[index]['rating_pairs']=rating.get('rating_pairs')
+                matched_record[int(key)]=index
+
+
 def background_results(run, league):
     """Overlay separately published estimates without changing trainer-owned state."""
     background=read_json(run/'background-league.json',{})
     config_hash=hashlib.sha256((run/'config.json').read_bytes()).hexdigest()
+    histories=run_histories(run,read_json(run/'config.json',{}))
     entries={c['id']:c for c in league.get('checkpoints',[])}
     hashes={n:read_json(run/'checkpoints'/f'{n:04d}'/'manifest.json',{}).get('files',{}).get('model.pt') for n in entries}
+    historical_background(run,entries,hashes,histories)
     for number,entry in entries.items():
         if not entry.get('pending'):continue
         for path in sorted((run/'evaluation').glob(f'{number:04d}-vs-*/report.json')):
