@@ -34,8 +34,13 @@ def run_histories(run, config):
     """Follow the hash-bound migration chain without changing the run."""
     expected=config.get('history_sha256');path=run/'history.json';histories=[]
     while expected:
-        if hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
-            raise ValueError(f'Run migration history changed: {path}')
+        if len(expected)!=64 or any(character not in '0123456789abcdef' for character in expected):
+            raise ValueError('Invalid migration history digest')
+        if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
+            if path==run/'history.json':
+                path=run/f'history-{expected}.json'
+            if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
+                raise ValueError(f'Run migration history changed: {path}')
         history=read_json(path)
         histories.append(history)
         name=history.get('prior_history_file')
