@@ -117,6 +117,13 @@ def publish_ratings(run,worker_identity):
                 'Promotion evidence' if score['wins']>score['losses'] and score['opening_pair_p']<.05 else 'No promotion evidence')
         if b==0:record['anchor_score']=score
         if b not in (0,a-1,report['champion']):record['older_score']=dict(score,opponent=b)
+    for number,record in entries.items():
+        if not record.get('background'):continue
+        candidate_reports=[r for r in data if r['candidate']==number and 'background_identity' in r]
+        champion=candidate_reports[0]['champion']
+        expected=dict(evaluation_schedule(number,champion,worker_identity['eval_games'],worker_identity['reference_games']))
+        completed={r['opponent']:len(r['games']) for r in candidate_reports}
+        record['provisional']=any(completed.get(opponent,0)<count for opponent,count in expected.items())
     write_json(run/'background-league.json',dict(config_sha256=digest(run/'config.json'),updated_at=time.time(),
         checkpoints=list(entries.values()),rating_method=RATING_METHOD,
         note='Approximate joint Elo from scheduled CUDA mixed-precision and background CPU float32 matches at the same search budget. CPU estimates do not promote champions. Intervals model paired-game sampling, not numerical-backend differences.'))
@@ -140,9 +147,11 @@ def next_comparison(run,identity,first):
 def main(args):
     run=Path(args.run).resolve();folder=run/'background-evaluation';folder.mkdir(exist_ok=True)
     torch.set_num_threads(args.threads)
-    config=read(run/'config.json')['config']
+    run_identity=read(run/'config.json');config=run_identity['config']
+    sources=source_identity()
+    if sources!=run_identity['sources']:raise ValueError('Evaluator sources or native libraries differ from the training run')
     play=SimpleNamespace(**config);play.device='cpu';play.envs=2
-    identity=dict(config_sha256=digest(run/'config.json'),sources=source_identity(),worker_sha256=digest(Path(__file__)),
+    identity=dict(config_sha256=digest(run/'config.json'),sources=sources,worker_sha256=digest(Path(__file__)),
         device='cpu',precision='float32',threads=args.threads,simulations=config['simulations'],root_samples=config['root_samples'],
         eval_games=config['eval_games'],reference_games=config['reference_games'],seed=config['seed']+700000)
     lock=run/'background-evaluation.lock'
