@@ -29,12 +29,71 @@ def report_digest(path,modified,size):
     return cached[2]
 
 
+def run_histories(run, config):
+    """Follow the hash-bound migration chain without changing the run."""
+    expected=config.get('history_sha256');path=run/'history.json';histories=[]
+    while expected:
+        if hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
+            raise ValueError(f'Run migration history changed: {path}')
+        history=read_json(path)
+        histories.append(history)
+        name=history.get('prior_history_file')
+        if not name:break
+        if Path(name).name!=name:raise ValueError('Invalid prior migration history path')
+        path=run/name;expected=history['prior_history_sha256']
+    return histories
+
+
+def historical_background(run, entries, hashes, histories):
+    generations={history['previous_config_sha256']:history for history in histories
+                 if 'previous_config_sha256' in history}
+    inherited_through=max((history['through'] for history in histories),default=-1)
+    for entry in entries.values():
+        if entry['id']<=inherited_through:
+            entry['inherited_checkpoint']=True
+            if entry.get('evaluation_due') is False:
+                entry['historical_background_status']='No background comparison saved before migration'
+    for path in sorted((run/'background-evaluation').glob('*-vs-*.json')):
+        report=read_json(path);identity=report['background_identity']
+        history=generations.get(identity['config_sha256'])
+        if history is None:continue
+        previous=history['previous_identity']
+        if identity['sources']!=previous['sources'] or identity['device']!='cpu':
+            raise ValueError(f'Historical background worker identity changed: {path}')
+        a,b=report['candidate'],report['opponent']
+        if a>history['through'] or a not in entries or b not in entries:continue
+        if path.name!=f'{a:04d}-vs-{b:04d}.json' or report.get('protocol')!=identity.get('protocol') or \
+                report['target_games'] not in (previous['config']['eval_games'],previous['config']['reference_games']):
+            raise ValueError(f'Historical background comparison settings changed: {path}')
+        if report['model_hashes']!={str(n):hashes[n] for n in (a,b)}:
+            raise ValueError(f'Historical background models changed: {path}')
+        score={k:report['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
+        score.update(played=len(report['games']),planned=report['target_games'])
+        record=entries[a].setdefault('historical_background',{})
+        record['partial']=record.get('partial',False) or len(report['games'])<report['target_games']
+        record['source']='Historical CPU comparison'
+        if b==0:record['anchor_score']=score
+        if b==a-1:record['previous_score']=score
+        if b==report['champion']:record.update(champion_score=score,versus_champion=b)
+        if b not in (0,a-1,report['champion']):record['older_score']=dict(score,opponent=b)
+        entries[a].pop('historical_background_status',None)
+    for history in histories:
+        for key,rating in history.get('prior_joint_ratings',{}).items():
+            entry=entries.get(int(key))
+            if entry is None:continue
+            for record in entry.get('historical_ratings',[]):
+                if record.get('source')=='paired joint rating' and record.get('elo')==rating.get('elo'):
+                    record['rating_pairs']=rating.get('rating_pairs')
+
+
 def background_results(run, league):
     """Overlay separately published estimates without changing trainer-owned state."""
     background=read_json(run/'background-league.json',{})
     config_hash=hashlib.sha256((run/'config.json').read_bytes()).hexdigest()
+    histories=run_histories(run,read_json(run/'config.json',{}))
     entries={c['id']:c for c in league.get('checkpoints',[])}
     hashes={n:read_json(run/'checkpoints'/f'{n:04d}'/'manifest.json',{}).get('files',{}).get('model.pt') for n in entries}
+    historical_background(run,entries,hashes,histories)
     for number,entry in entries.items():
         if not entry.get('pending'):continue
         for path in sorted((run/'evaluation').glob(f'{number:04d}-vs-*/report.json')):
