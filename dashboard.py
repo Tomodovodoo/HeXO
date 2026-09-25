@@ -27,7 +27,12 @@ def background_results(run, league):
     if background.get('config_sha256')==config_hash:
         for record in background['checkpoints']:
             number=record['id']
-            if number in entries and record.get('model_sha256')==hashes[number]:entries[number].update(record)
+            if number in entries and record.get('model_sha256')==hashes[number]:
+                entry=entries[number]
+                entry.update(record)
+                # An opponent can acquire a rating before any of its own matches.
+                if entry.get('evaluation_due') is False:
+                    entry['provisional']=record.get('provisional',True)
         league['background_note']=background['note']
     for path in sorted((run/'value-diagnostics').glob('*.json')):
         probe=read_json(path,{})
