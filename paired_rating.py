@@ -96,6 +96,7 @@ def model_digest(path,modified,size):
 
 def snapshot(run):
     config_hash=sha(run/'config.json');config=read(run/'config.json');league=read(run/'league.json')
+    protocol=league.get('rating_protocol')
     hashes={c['id']:read(run/'checkpoints'/f"{c['id']:04d}"/'manifest.json')['files']['model.pt'] for c in league['checkpoints']}
     for path in sorted((run/'checkpoints').glob('[0-9][0-9][0-9][0-9]/manifest.json')):
         number=int(path.parent.name)
@@ -115,12 +116,14 @@ def snapshot(run):
         if a not in hashes or b not in hashes:continue
         digest=hashlib.sha256(contents).hexdigest()
         if 'background_identity' in report:
+            if protocol and report.get('protocol')!=protocol:continue
             if background_identity is None:background_identity=report['background_identity']
             if report['background_identity']!=background_identity:raise ValueError('Background worker identities differ')
             if report['background_identity']['config_sha256']!=config_hash or report['model_hashes']!={str(a):hashes[a],str(b):hashes[b]}:
                 raise ValueError('Background rating input identity changed')
         else:
             manifest=read(path.parent/'manifest.json')
+            if protocol and manifest['identity'].get('protocol')!=protocol:continue
             if manifest['files']['report.json']!=digest or any(manifest['identity'][role]!=hashes[report[role]] for role in ('candidate','opponent')):
                 raise ValueError('Scheduled rating input identity changed')
         reports.append(report);sources[path.relative_to(run).as_posix()]=digest

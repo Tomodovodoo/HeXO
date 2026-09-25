@@ -9,9 +9,10 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from checkpoint_league import evaluation_schedule, rate_league, RATING_METHOD
+from checkpoint_league import evaluation_schedule
 from klent import digest
-from search_train import play_games, source_identity, read_corpus
+from paired_rating import fit_ratings, METHOD as JOINT_METHOD, NOTE as JOINT_NOTE
+from search_train import play_games, source_identity, read_corpus, evaluation_protocol
 from relational_train import load_model
 from relational_model import NeuralEvaluator
 from train import paired_metrics, task_opening, write_json
@@ -77,29 +78,36 @@ def checkpoint(run,number):
 
 def reports(run):
     result=[]
+    protocol=read(run/'league.json').get('rating_protocol')
     for path in sorted((run/'evaluation').glob('*-vs-*/report.json')):
         manifest=read(path.parent/'manifest.json')
+        if protocol and manifest['identity'].get('protocol')!=protocol:continue
         if digest(path)!=manifest['files']['report.json']:raise ValueError('Evaluation report changed')
         report=read(path)
         for role in ('candidate','opponent'):
             if read(run/'checkpoints'/f"{report[role]:04d}"/'manifest.json')['files']['model.pt']!=manifest['identity'][role]:
                 raise ValueError('Evaluation opponents changed')
         result.append(report)
-    result.extend(read(path) for path in sorted((run/'background-evaluation').glob('*-vs-*.json')))
+    result.extend(report for path in sorted((run/'background-evaluation').glob('*-vs-*.json'))
+                  if (report:=read(path)) and (not protocol or report.get('protocol')==protocol))
     return result
 
 
 def publish_ratings(run,worker_identity):
     league=read(run/'league.json');ids=[c['id'] for c in league['checkpoints']]
-    data=reports(run)
+    # CPU estimates are their own league. CUDA scheduled matches and older CPU
+    # worker generations must not enter this fit.
+    data=[read(path) for path in sorted((run/'background-evaluation').glob('*-vs-*.json'))]
+    data=[report for report in data if report.get('background_identity')==worker_identity]
+    if not data:return
     model_hashes={n:read(run/'checkpoints'/f'{n:04d}'/'manifest.json')['files']['model.pt'] for n in ids}
     for report in data:
         if 'background_identity' in report:
             if report['background_identity']!=worker_identity:raise ValueError('Background evaluation configuration changed')
             if report['model_hashes']!={str(n):model_hashes[n] for n in (report['candidate'],report['opponent'])}:
                 raise ValueError('Background model changed')
-    points,intervals=rate_league(ids,data,seed=worker_identity['seed'])
-    entries={n:dict(id=n,elo=points[n],elo_interval=intervals.get(n),model_sha256=model_hashes[n]) for n in ids}
+    ratings,diagnostics=fit_ratings(ids,data,seed=worker_identity['seed'])
+    entries={n:dict(record,model_sha256=model_hashes[n]) for n,record in ratings.items()}
     for report in data:
         if 'background_identity' not in report:continue
         if report['background_identity']!=worker_identity:raise ValueError('Background evaluation configuration changed')
@@ -125,8 +133,8 @@ def publish_ratings(run,worker_identity):
         completed={r['opponent']:len(r['games']) for r in candidate_reports}
         record['provisional']=any(completed.get(opponent,0)<count for opponent,count in expected.items())
     write_json(run/'background-league.json',dict(config_sha256=digest(run/'config.json'),updated_at=time.time(),
-        checkpoints=list(entries.values()),rating_method=RATING_METHOD,
-        note='Approximate joint Elo from scheduled CUDA mixed-precision and background CPU float32 matches at the same search budget. CPU estimates do not promote champions. Intervals model paired-game sampling, not numerical-backend differences.'))
+        protocol=worker_identity['protocol'],checkpoints=list(entries.values()),rating_method=JOINT_METHOD,
+        diagnostics=diagnostics,note='Separate CPU float32 estimates from background paired games. CUDA scheduled ratings use their own protocol. CPU estimates do not promote champions. '+JOINT_NOTE))
 
 
 def next_comparison(run,identity,first):
@@ -148,20 +156,23 @@ def main(args):
     run=Path(args.run).resolve();folder=run/'background-evaluation';folder.mkdir(exist_ok=True)
     torch.set_num_threads(args.threads)
     run_identity=read(run/'config.json');config=run_identity['config']
+    history=read(run/'history.json') if (run/'history.json').exists() else {}
+    inherited_through=history.get('through',-1) if history and run_identity.get('history_sha256')==digest(run/'history.json') else -1
     sources=source_identity()
     if sources!=run_identity['sources']:raise ValueError('Evaluator sources or native libraries differ from the training run')
     play=SimpleNamespace(**config);play.device='cpu';play.envs=2
     identity=dict(config_sha256=digest(run/'config.json'),sources=sources,worker_sha256=digest(Path(__file__)),
         device='cpu',precision='float32',threads=args.threads,simulations=config['simulations'],root_samples=config['root_samples'],
-        eval_games=config['eval_games'],reference_games=config['reference_games'],seed=config['seed']+700000)
+        eval_games=config['eval_games'],reference_games=config['reference_games'],seed=config['seed']+700000,
+        protocol=evaluation_protocol(play))
     lock=run/'background-evaluation.lock'
     with lock.open('x') as stream:stream.write(str(os.getpid()))
     def status(stage,**data):write_json(run/'background-status.json',dict(stage=stage,updated_at=time.time(),**data))
     try:
         while True:
             if digest(run/'config.json')!=identity['config_sha256']:raise ValueError('Run upgraded; restart the background evaluator explicitly')
-            validation_probe(run,args.from_checkpoint,status)
-            job=next_comparison(run,identity,args.from_checkpoint)
+            validation_probe(run,max(args.from_checkpoint,inherited_through),status)
+            job=next_comparison(run,identity,max(args.from_checkpoint,inherited_through+1))
             if job is None:
                 publish_ratings(run,identity);status('waiting-for-checkpoints')
                 if args.once:return
@@ -170,11 +181,11 @@ def main(args):
             a,ah=checkpoint(run,candidate);b,bh=checkpoint(run,opponent)
             base=identity['seed']+candidate*1000+opponent*1000003
             report=report or dict(candidate=candidate,opponent=opponent,champion=champion,target_games=target,games=[],
-                background_identity=identity,model_hashes={str(candidate):ah,str(opponent):bh})
+                background_identity=identity,model_hashes={str(candidate):ah,str(opponent):bh},protocol=identity['protocol'])
             if report['model_hashes']!={str(candidate):ah,str(opponent):bh} or len(report['games'])%2:
                 raise ValueError('Invalid saved background pair or model identity')
             pair=len(report['games'])//2
-            opening=task_opening(base+pair,True,play.max_plies,'standard-v1')['opening']
+            opening=task_opening(base+pair,True,play.eval_max_plies,'standard-v1')['opening']
             def progress(data):status('playing',candidate=candidate,opponent=opponent,paired_games_saved=2*pair,target_games=target,**data)
             episodes,_=play_games([a,b],[(0,1),(1,0)],[opening,opening],play,base+pair*1009,progress)
             for e in episodes:

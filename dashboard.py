@@ -39,6 +39,8 @@ def background_results(run, league):
         if not entry.get('pending'):continue
         for path in sorted((run/'evaluation').glob(f'{number:04d}-vs-*/report.json')):
             report=read_json(path);manifest=read_json(path.parent/'manifest.json');stat=path.stat()
+            if league.get('rating_protocol') and manifest['identity'].get('protocol')!=league['rating_protocol']:
+                continue
             a,b=report['candidate'],report['opponent']
             if a!=number or manifest['files']['report.json']!=report_digest(str(path),stat.st_mtime_ns,stat.st_size) or any(
                 manifest['identity'][role]!=hashes.get(report[role]) for role in ('candidate','opponent')):
@@ -52,15 +54,18 @@ def background_results(run, league):
         for record in background['checkpoints']:
             number=record['id']
             if number in entries and record.get('model_sha256')==hashes[number]:
-                entry=entries[number]
-                entry.update(record)
-                # An opponent can acquire a rating before any of its own matches.
-                if entry.get('evaluation_due') is False:
-                    entry['provisional']=record.get('provisional',True)
+                entries[number]['cpu_estimate']=record
         league['background_note']=background['note']
+        league['background_protocol']=background.get('protocol')
     joint=read_json(run/'paired-ratings.json',{})
     if joint.get('config_sha256')==config_hash:
-        paths=list((run/'evaluation').glob('*-vs-*/report.json'))+list((run/'background-evaluation').glob('*-vs-*.json'))
+        paths=[]
+        for path in list((run/'evaluation').glob('*-vs-*/report.json'))+list((run/'background-evaluation').glob('*-vs-*.json')):
+            if league.get('rating_protocol'):
+                protocol=(read_json(path.parent/'manifest.json',{}).get('identity',{}).get('protocol')
+                          if path.name=='report.json' else read_json(path,{}).get('protocol'))
+                if protocol!=league['rating_protocol']:continue
+            paths.append(path)
         current={}
         for path in paths:
             stat=path.stat()
