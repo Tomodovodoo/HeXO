@@ -92,7 +92,8 @@ def outcome_rows(rows,winner):
 def capture_history(run, previous_identity, config, target_sources, target_runtime, prior_history=None):
     """Bind an existing stopped run's immutable artifacts before changing its evaluator."""
     status=json.loads((run/'status.json').read_text())
-    if status['stage']!='finished' and not (status['stage']=='failed' and status.get('iteration')==0):
+    recovering=status['stage']=='failed' and status.get('iteration')==0
+    if status['stage']!='finished' and not recovering:
         raise ValueError('Upgrade requires a finished checkpoint boundary')
     mutable={'reference_games','games','replay_positions','reuse_ratio','evaluate_every','actor_tactics',
              'eval_max_plies','eval_tactics'}
@@ -101,6 +102,11 @@ def capture_history(run, previous_identity, config, target_sources, target_runti
     league=json.loads((run/'league.json').read_text())
     numbers=sorted(c['id'] for c in league['checkpoints'])
     if numbers!=list(range(len(numbers))):raise ValueError('Incomplete checkpoint history')
+    if recovering:
+        events=run/'events.jsonl'
+        if not events.exists() or not any((event:=json.loads(line)).get('stage')=='finished' and event.get('iteration')==numbers[-1]
+                                            for line in events.read_text().splitlines()):
+            raise ValueError('No prior finished event proves the upgrade boundary')
     prior_history=prior_history or {}
     if prior_history and prior_history.get('previous_identity') is None:
         raise ValueError('Prior upgrade history has no previous identity')
@@ -139,7 +145,8 @@ def capture_history(run, previous_identity, config, target_sources, target_runti
             raise ValueError('Historical comparison identity changed')
         evidence=manifest['identity'];relative=path.relative_to(run).as_posix()
         if relative not in prior_history.get('artifacts',{}):
-            if report['metrics']['planned_games'] not in (config['eval_games'],config['reference_games']):
+            if report['metrics']['planned_games'] not in (previous_identity['config']['eval_games'],
+                                                           previous_identity['config']['reference_games']):
                 raise ValueError('Historical comparison game count changed')
             expected=dict(run=previous_identity,candidate=digest(run/'checkpoints'/f'{a:04d}'/'model.pt'),
                 opponent=digest(run/'checkpoints'/f'{b:04d}'/'model.pt'),simulations=config['simulations'],
