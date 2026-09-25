@@ -6,7 +6,6 @@ import math
 import os
 from pathlib import Path
 import time
-from functools import lru_cache
 
 import numpy as np
 from scipy.optimize import minimize
@@ -84,18 +83,26 @@ def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 def read(path):return json.loads(path.read_text())
 
 
-@lru_cache(maxsize=256)
+_model_digests={}
+
+
 def model_digest(path,modified,size):
     # Published models are immutable; invalidate verification when file metadata changes.
-    return sha(Path(path))
+    cached=_model_digests.get(path)
+    if cached is None or cached[:2]!=(modified,size):
+        cached=(modified,size,sha(Path(path)));_model_digests[path]=cached
+    return cached[2]
 
 
 def snapshot(run):
     config_hash=sha(run/'config.json');league=read(run/'league.json')
     hashes={c['id']:read(run/'checkpoints'/f"{c['id']:04d}"/'manifest.json')['files']['model.pt'] for c in league['checkpoints']}
+    model_paths=set()
     for number,expected in hashes.items():
         path=run/'checkpoints'/f'{number:04d}'/'model.pt';stat=path.stat()
+        model_paths.add(str(path))
         if model_digest(str(path),stat.st_mtime_ns,stat.st_size)!=expected:raise ValueError('Rating checkpoint bytes changed')
+    for path in set(_model_digests)-model_paths:del _model_digests[path]
     reports=[];sources={};background_identity=None
     for path in sorted((run/'evaluation').glob('*-vs-*/report.json'))+sorted((run/'background-evaluation').glob('*-vs-*.json')):
         contents=path.read_bytes();report=json.loads(contents);a,b=report['candidate'],report['opponent']
