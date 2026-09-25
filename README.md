@@ -740,6 +740,29 @@ New comparisons use distinct opponent-specific seeds; older comparisons may
 share opening schedules, a dependence this approximation does not model across
 comparisons. Promotion continues to use the separately recorded paired test.
 
+For live sparse-checkpoint estimates, run `python paired_rating.py --run runs/gumbel-policy-value-v1`
+beside the evaluator. The dashboard prefers its `paired-ratings.json` output.
+This fits actual opening-pair counts jointly, replacing the older projection of
+independently smoothed matchup scores. In particular, one swept pair against a weak
+reference is not converted into an artificial 70% observation that drags down a model
+which tied a stronger champion. No extra games or pseudo-wins enter this likelihood.
+
+For an Elo difference `d` in log-odds units, pair outcomes 0, 1, 2 wins have probabilities
+`softmax(-h, tau, h)`, with `h = d/2 + asinh(exp(tau)*sinh(d/2)/2)`.
+The expected game score is exactly `logistic(d)` for every `tau`. A shared dispersion
+parameter permits more or fewer split pairs than independent games. Ratings have a
+weak Normal(0, 1000 Elo) prior with checkpoint 0 fixed; `tau` has a Normal(log(2), 2)
+prior. The point estimate is the joint posterior mode. A multivariate Student-t proposal
+around that mode supplies 32,768 importance-weighted posterior samples for the 95%
+credible interval; publication requires at least 1,000 effective samples. The dashboard
+shows the number of rated pairs involving each checkpoint, including games as opponent.
+
+These are model-dependent estimates. A single split pair means zero head-to-head Elo
+difference with large uncertainty; other observed matchups can still change the joint
+estimate. Capped comparisons are excluded, and CPU/CUDA differences and historical
+shared-opening dependence across comparisons remain outside this uncertainty model.
+The rating worker reads saved results only and changes neither promotion nor training.
+
 To upgrade a completed older search run, reuse its original learning and search
 arguments, add `--upgrade-run --reference-games 8`, and increase `--iterations`. Collection size, replay capacity/reuse, evaluation cadence and actor tactics may change during this explicit upgrade; network, optimizer hyperparameters and evaluation search settings must match. The default replay options apply to the upgrade.
 The trainer requires a finished checkpoint boundary and an exclusive run lock.

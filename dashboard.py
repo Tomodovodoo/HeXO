@@ -34,6 +34,14 @@ def background_results(run, league):
                 if entry.get('evaluation_due') is False:
                     entry['provisional']=record.get('provisional',True)
         league['background_note']=background['note']
+    joint=read_json(run/'paired-ratings.json',{})
+    if joint.get('config_sha256')==config_hash:
+        for record in joint['checkpoints']:
+            number=record['id']
+            if number in entries and record.get('model_sha256')==hashes[number]:entries[number].update(record)
+        league['rating_method']=joint['rating_method']
+        league['joint_rating_note']=joint['note']
+        league['rating_updated_at']=joint['updated_at']
     for path in sorted((run/'value-diagnostics').glob('*.json')):
         probe=read_json(path,{})
         number=probe.get('checkpoint')
