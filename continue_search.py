@@ -1,8 +1,9 @@
 """Resume a finished search run one saved checkpoint at a time.
 
-This controller never starts beside the original trainer or evaluation workers.
-Each child invocation restores the last saved model and Adam state through
-search_train.py, evaluates the new checkpoint, and exits before the next begins.
+This controller never starts beside the original trainer. Evaluation workers
+must stop for a source/configuration migration; compatible read-only workers
+may run after it. Each child restores the last saved model and Adam state,
+evaluates the new checkpoint, and exits before the next begins.
 """
 import argparse
 import json

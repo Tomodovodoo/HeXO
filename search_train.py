@@ -61,7 +61,11 @@ def publish(path, identity, writer, metrics=None):
 def evaluation_protocol(args):
     return dict(max_plies=args.eval_max_plies,tactics=args.eval_tactics,
                 simulations=args.simulations,root_samples=args.root_samples,device=args.device,
-                opening_suite='standard-v1')
+                opening_suite='standard-v1',source_sha256=source_fingerprint(source_identity()))
+
+
+def source_fingerprint(sources):
+    return hashlib.sha256(json.dumps(sources,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
 def pessimistic_promotion(report):
@@ -141,7 +145,7 @@ def capture_history(run, previous_identity, config, prior_history=None):
                 expected['protocol']=dict(max_plies=previous_identity['config']['eval_max_plies'],
                     tactics=previous_identity['config']['eval_tactics'],simulations=config['simulations'],
                     root_samples=config['root_samples'],device=previous_identity['config']['device'],
-                    opening_suite='standard-v1')
+                    opening_suite='standard-v1',source_sha256=source_fingerprint(previous_identity['sources']))
             if evidence!=expected:raise ValueError('Historical comparison settings changed')
     history=dict(previous_identity=previous_identity,previous_config_sha256=digest(run/'config.json'),
                  through=numbers[-1],artifacts=artifacts)
@@ -184,7 +188,8 @@ def update_ratings(run, league, args, history):
             old=history['previous_identity']['config']
             previous=dict(max_plies=old.get('eval_max_plies',old['max_plies']),
                           tactics=old.get('eval_tactics',False),simulations=old['simulations'],
-                          root_samples=old['root_samples'],device=old['device'],opening_suite='standard-v1')
+                          root_samples=old['root_samples'],device=old['device'],opening_suite='standard-v1',
+                          source_sha256=source_fingerprint(history['previous_identity']['sources']))
         for checkpoint in league['checkpoints']:
             older=history.get('prior_joint_ratings',{}).get(str(checkpoint['id']))
             elo=older['elo'] if older and older.get('elo') is not None else checkpoint.get('elo')
