@@ -45,6 +45,7 @@ def run_histories(run, config):
 
 
 def historical_background(run, entries, hashes, histories):
+    from checkpoint_league import evaluation_schedule
     generations={history['previous_config_sha256']:history for history in histories
                  if 'previous_config_sha256' in history}
     inherited_through=max((history['through'] for history in histories),default=-1)
@@ -53,6 +54,7 @@ def historical_background(run, entries, hashes, histories):
             entry['inherited_checkpoint']=True
             if entry.get('evaluation_due') is False:
                 entry['historical_background_status']='No background comparison saved before migration'
+    seen={}
     for path in sorted((run/'background-evaluation').glob('*-vs-*.json')):
         report=read_json(path);identity=report['background_identity']
         history=generations.get(identity['config_sha256'])
@@ -70,19 +72,33 @@ def historical_background(run, entries, hashes, histories):
         score={k:report['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
         score.update(played=len(report['games']),planned=report['target_games'])
         record=entries[a].setdefault('historical_background',{})
+        if 'champion' in record and record['champion']!=report['champion']:
+            raise ValueError(f'Historical background champion changed: {path}')
+        record['champion']=report['champion']
+        seen.setdefault((a,identity['config_sha256']),set()).add(b)
         record['partial']=record.get('partial',False) or len(report['games'])<report['target_games']
         record['source']='Historical CPU comparison'
         if b==0:record['anchor_score']=score
         if b==a-1:record['previous_score']=score
         if b==report['champion']:record.update(champion_score=score,versus_champion=b)
         if b not in (0,a-1,report['champion']):record['older_score']=dict(score,opponent=b)
-        entries[a].pop('historical_background_status',None)
+    for (number,config_sha),opponents in seen.items():
+        record=entries[number]['historical_background'];old=generations[config_sha]['previous_identity']['config']
+        expected={opponent for opponent,_ in evaluation_schedule(number,record['champion'],old['eval_games'],old['reference_games'])}
+        record['partial']=record['partial'] or opponents!=expected
     for history in histories:
+        old=history['previous_identity']['config']
+        sources=history['previous_identity']['sources'];runtime=history['previous_identity']['runtime']
+        fingerprint=lambda value:hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        protocol=dict(max_plies=old.get('eval_max_plies',old.get('max_plies')),tactics=old.get('eval_tactics',False),
+                      simulations=old.get('simulations'),root_samples=old.get('root_samples'),device=old.get('device'),
+                      opening_suite='standard-v1',source_sha256=fingerprint(sources),runtime_sha256=fingerprint(runtime))
         for key,rating in history.get('prior_joint_ratings',{}).items():
             entry=entries.get(int(key))
             if entry is None:continue
             for record in entry.get('historical_ratings',[]):
-                if record.get('source')=='paired joint rating' and record.get('elo')==rating.get('elo'):
+                if record.get('source')=='paired joint rating' and record.get('protocol')==protocol and \
+                        record.get('elo')==rating.get('elo') and 'rating_pairs' not in record:
                     record['rating_pairs']=rating.get('rating_pairs')
 
 
