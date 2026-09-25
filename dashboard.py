@@ -18,6 +18,17 @@ def read_json(path, default=None):
         return default
 
 
+_report_digests={}
+
+
+def report_digest(path,modified,size):
+    cached=_report_digests.get(path)
+    if cached is None or cached[:2]!=(modified,size):
+        cached=(modified,size,hashlib.sha256(Path(path).read_bytes()).hexdigest())
+        _report_digests[path]=cached
+    return cached[2]
+
+
 def background_results(run, league):
     """Overlay separately published estimates without changing trainer-owned state."""
     background=read_json(run/'background-league.json',{})
@@ -34,6 +45,24 @@ def background_results(run, league):
                 if entry.get('evaluation_due') is False:
                     entry['provisional']=record.get('provisional',True)
         league['background_note']=background['note']
+    joint=read_json(run/'paired-ratings.json',{})
+    if joint.get('config_sha256')==config_hash:
+        paths=list((run/'evaluation').glob('*-vs-*/report.json'))+list((run/'background-evaluation').glob('*-vs-*.json'))
+        current={}
+        for path in paths:
+            stat=path.stat()
+            current[path.relative_to(run).as_posix()]=report_digest(str(path),stat.st_mtime_ns,stat.st_size)
+        for path in set(_report_digests)-{str(path) for path in paths}:del _report_digests[path]
+        stale=current!=joint.get('reports')
+        for record in joint['checkpoints']:
+            number=record['id']
+            if number in entries and record.get('model_sha256')==hashes[number]:
+                entries[number].update(record)
+                entries[number]['rating_stale']=stale
+        league['rating_method']=joint['rating_method']
+        league['joint_rating_note']=joint['note']
+        league['rating_updated_at']=joint['updated_at']
+        league['rating_stale']=stale
     for path in sorted((run/'value-diagnostics').glob('*.json')):
         probe=read_json(path,{})
         number=probe.get('checkpoint')
