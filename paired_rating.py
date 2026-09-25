@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import time
+from functools import lru_cache
 
 import numpy as np
 from scipy.optimize import minimize
@@ -82,15 +83,26 @@ def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 def read(path):return json.loads(path.read_text())
 
 
+@lru_cache(maxsize=256)
+def model_digest(path,modified,size):
+    # Published models are immutable; invalidate verification when file metadata changes.
+    return sha(Path(path))
+
+
 def snapshot(run):
     config_hash=sha(run/'config.json');league=read(run/'league.json')
     hashes={c['id']:read(run/'checkpoints'/f"{c['id']:04d}"/'manifest.json')['files']['model.pt'] for c in league['checkpoints']}
-    reports=[];sources={}
+    for number,expected in hashes.items():
+        path=run/'checkpoints'/f'{number:04d}'/'model.pt';stat=path.stat()
+        if model_digest(str(path),stat.st_mtime_ns,stat.st_size)!=expected:raise ValueError('Rating checkpoint bytes changed')
+    reports=[];sources={};background_identity=None
     for path in sorted((run/'evaluation').glob('*-vs-*/report.json'))+sorted((run/'background-evaluation').glob('*-vs-*.json')):
         contents=path.read_bytes();report=json.loads(contents);a,b=report['candidate'],report['opponent']
         if a not in hashes or b not in hashes:continue
         digest=hashlib.sha256(contents).hexdigest()
         if 'background_identity' in report:
+            if background_identity is None:background_identity=report['background_identity']
+            if report['background_identity']!=background_identity:raise ValueError('Background worker identities differ')
             if report['background_identity']['config_sha256']!=config_hash or report['model_hashes']!={str(a):hashes[a],str(b):hashes[b]}:
                 raise ValueError('Background rating input identity changed')
         else:
