@@ -18,6 +18,11 @@ def read_json(path, default=None):
         return default
 
 
+@lru_cache(maxsize=512)
+def report_digest(path,modified,size):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def background_results(run, league):
     """Overlay separately published estimates without changing trainer-owned state."""
     background=read_json(run/'background-league.json',{})
@@ -37,7 +42,10 @@ def background_results(run, league):
     joint=read_json(run/'paired-ratings.json',{})
     if joint.get('config_sha256')==config_hash:
         paths=list((run/'evaluation').glob('*-vs-*/report.json'))+list((run/'background-evaluation').glob('*-vs-*.json'))
-        current={path.relative_to(run).as_posix():hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+        current={}
+        for path in paths:
+            stat=path.stat()
+            current[path.relative_to(run).as_posix()]=report_digest(str(path),stat.st_mtime_ns,stat.st_size)
         stale=current!=joint.get('reports')
         for record in joint['checkpoints']:
             number=record['id']
