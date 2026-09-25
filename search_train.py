@@ -61,11 +61,16 @@ def publish(path, identity, writer, metrics=None):
 def evaluation_protocol(args):
     return dict(max_plies=args.eval_max_plies,tactics=args.eval_tactics,
                 simulations=args.simulations,root_samples=args.root_samples,device=args.device,
-                opening_suite='standard-v1',source_sha256=source_fingerprint(source_identity()))
+                opening_suite='standard-v1',source_sha256=identity_fingerprint(source_identity()),
+                runtime_sha256=identity_fingerprint(runtime_identity()))
 
 
-def source_fingerprint(sources):
-    return hashlib.sha256(json.dumps(sources,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+def identity_fingerprint(value):
+    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+
+def runtime_identity():
+    return dict(torch=str(torch.__version__),cuda=torch.version.cuda)
 
 
 def pessimistic_promotion(report):
@@ -84,7 +89,7 @@ def outcome_rows(rows,winner):
     return rows
 
 
-def capture_history(run, previous_identity, config, target_sources, prior_history=None):
+def capture_history(run, previous_identity, config, target_sources, target_runtime, prior_history=None):
     """Bind an existing stopped run's immutable artifacts before changing its evaluator."""
     if json.loads((run/'status.json').read_text())['stage']!='finished':
         raise ValueError('Upgrade requires a finished checkpoint boundary')
@@ -145,10 +150,11 @@ def capture_history(run, previous_identity, config, target_sources, prior_histor
                 expected['protocol']=dict(max_plies=previous_identity['config']['eval_max_plies'],
                     tactics=previous_identity['config']['eval_tactics'],simulations=config['simulations'],
                     root_samples=config['root_samples'],device=previous_identity['config']['device'],
-                    opening_suite='standard-v1',source_sha256=source_fingerprint(previous_identity['sources']))
+                    opening_suite='standard-v1',source_sha256=identity_fingerprint(previous_identity['sources']),
+                    runtime_sha256=identity_fingerprint(previous_identity['runtime']))
             if evidence!=expected:raise ValueError('Historical comparison settings changed')
     history=dict(previous_identity=previous_identity,previous_config_sha256=digest(run/'config.json'),
-                 prepared_target=dict(config=config,sources=target_sources),
+                 prepared_target=dict(config=config,sources=target_sources,runtime=target_runtime),
                  through=numbers[-1],artifacts=artifacts)
     paired=run/'paired-ratings.json'
     if paired.exists():
@@ -190,7 +196,8 @@ def update_ratings(run, league, args, history):
             previous=dict(max_plies=old.get('eval_max_plies',old['max_plies']),
                           tactics=old.get('eval_tactics',False),simulations=old['simulations'],
                           root_samples=old['root_samples'],device=old['device'],opening_suite='standard-v1',
-                          source_sha256=source_fingerprint(history['previous_identity']['sources']))
+                          source_sha256=identity_fingerprint(history['previous_identity']['sources']),
+                          runtime_sha256=identity_fingerprint(history['previous_identity']['runtime']))
         for checkpoint in league['checkpoints']:
             older=history.get('prior_joint_ratings',{}).get(str(checkpoint['id']))
             elo=older['elo'] if older and older.get('elo') is not None else checkpoint.get('elo')
@@ -413,7 +420,7 @@ def main(args):
     torch.set_num_threads(2);torch.manual_seed(args.seed)
     config={k:v for k,v in vars(args).items() if k not in ('run','iterations','upgrade_run')}
     config['initial_model']=str(Path(args.initial_model).resolve());config['initial_sha256']=digest(Path(args.initial_model))
-    identity=dict(run=str(run),backbone=VALUE_SCHEMA,config=config,sources=source_identity(),runtime=dict(torch=str(torch.__version__),cuda=torch.version.cuda))
+    identity=dict(run=str(run),backbone=VALUE_SCHEMA,config=config,sources=source_identity(),runtime=runtime_identity())
     with (run/'training.lock').open('x') as stream:stream.write(str(os.getpid()))
     def event(stage,iteration,**data):
         record=dict(schema=SCHEMA,stage=stage,iteration=iteration,updated_at=time.time(),**data)
@@ -436,16 +443,16 @@ def main(args):
                 if history.get('previous_identity')!=existing:
                     raise ValueError('Prior run history changed before upgrade')
             if history.get('previous_identity')==existing and history.get('through')==len(json.loads((run/'league.json').read_text())['checkpoints'])-1:
-                if history.get('prepared_target')!=dict(config=config,sources=identity['sources']):
+                if history.get('prepared_target')!=dict(config=config,sources=identity['sources'],runtime=identity['runtime']):
                     raise ValueError('Prepared upgrade targets a different source or configuration')
-            elif existing['sources']!=identity['sources'] or existing['config']!=config:
+            elif existing['sources']!=identity['sources'] or existing['config']!=config or existing['runtime']!=identity['runtime']:
                 prior=history
                 if existing.get('history_sha256'):
                     if not history_path.exists() or digest(history_path)!=existing['history_sha256']:
                         raise ValueError('Prior upgrade history changed')
                 for lock in ('background-evaluation.lock','paired-ratings.lock'):
                     if (run/lock).exists():raise ValueError(f'Upgrade requires stopped worker: {lock}')
-                prepared=capture_history(run,existing,config,identity['sources'],prior)
+                prepared=capture_history(run,existing,config,identity['sources'],identity['runtime'],prior)
                 if prior:
                     sha=digest(history_path);name=f'history-{sha}.json';snapshot=run/name
                     if snapshot.exists():
