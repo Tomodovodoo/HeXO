@@ -3,6 +3,7 @@ import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import hashlib
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -44,6 +45,36 @@ def run_histories(run, config):
     return histories
 
 
+def validate_archived_games(report, path):
+    """Check saved scores against intact color-swapped games; archives lack a report seal."""
+    games=report['games'];target=report['target_games'];metrics=report['metrics']
+    if target<2 or target%2 or len(games)>target or len(games)%2:
+        raise ValueError(f'Invalid archived comparison length: {path}')
+    wins=losses=incomplete=pair_wins=pair_losses=ties=valid=0
+    for pair in range(len(games)//2):
+        first,second=games[2*pair:2*pair+2]
+        if any(game.get('index')!=2*pair+color or game.get('pair')!=pair or
+               game.get('challenger_color')!=color or game.get('seed')!=first.get('seed') or
+               game.get('winner') not in (-1,0,1) or game.get('moves',[])[:len(game.get('opening',[]))]!=game.get('opening')
+               for color,game in enumerate((first,second))) or first['opening']!=second['opening']:
+            raise ValueError(f'Invalid archived opening pair: {path}')
+        outcomes=[]
+        for game in (first,second):
+            if game['winner']<0:incomplete+=1
+            else:
+                success=game['winner']==game['challenger_color'];outcomes.append(success)
+                wins+=success;losses+=not success
+        if len(outcomes)==2:
+            valid+=1;pair_wins+=sum(outcomes)==2;pair_losses+=sum(outcomes)==0;ties+=sum(outcomes)==1
+    decisive=pair_wins+pair_losses
+    pair_p=sum(math.comb(decisive,k) for k in range(pair_wins,decisive+1))/2**decisive if decisive else 1
+    expected=dict(wins=wins,losses=losses,incomplete=incomplete,pending=0,played_games=len(games),
+                  planned_games=len(games),opening_pair_wins=pair_wins,opening_pair_losses=pair_losses,
+                  opening_pair_ties=ties,incomplete_pairs=len(games)//2-valid,opening_pair_p=pair_p)
+    if any(metrics.get(key)!=value for key,value in expected.items()):
+        raise ValueError(f'Archived comparison metrics disagree with games: {path}')
+
+
 def historical_background(run, entries, hashes, histories):
     from checkpoint_league import evaluation_schedule
     generations={history['previous_config_sha256']:history for history in histories
@@ -53,7 +84,7 @@ def historical_background(run, entries, hashes, histories):
         if entry['id']<=inherited_through:
             entry['inherited_checkpoint']=True
             if entry.get('evaluation_due') is False:
-                entry['historical_background_status']='No background comparison saved before migration'
+                entry['historical_background_status']='Not scheduled under the current protocol'
     seen={}
     for path in sorted((run/'background-evaluation').glob('*-vs-*.json')):
         report=read_json(path);identity=report['background_identity']
@@ -69,6 +100,7 @@ def historical_background(run, entries, hashes, histories):
             raise ValueError(f'Historical background comparison settings changed: {path}')
         if report['model_hashes']!={str(n):hashes[n] for n in (a,b)}:
             raise ValueError(f'Historical background models changed: {path}')
+        validate_archived_games(report,path)
         score={k:report['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
         score.update(played=len(report['games']),planned=report['target_games'])
         record=entries[a].setdefault('historical_background',{})
@@ -77,7 +109,7 @@ def historical_background(run, entries, hashes, histories):
         record['champion']=report['champion']
         seen.setdefault((a,identity['config_sha256']),set()).add(b)
         record['partial']=record.get('partial',False) or len(report['games'])<report['target_games']
-        record['source']='Historical CPU comparison'
+        record['source']='Archived CPU report (not migration-hash verified)'
         if b==0:record['anchor_score']=score
         if b==a-1:record['previous_score']=score
         if b==report['champion']:record.update(champion_score=score,versus_champion=b)
@@ -86,7 +118,8 @@ def historical_background(run, entries, hashes, histories):
         record=entries[number]['historical_background'];old=generations[config_sha]['previous_identity']['config']
         expected={opponent for opponent,_ in evaluation_schedule(number,record['champion'],old['eval_games'],old['reference_games'])}
         record['partial']=record['partial'] or opponents!=expected
-    for history in histories:
+    matched_record={}
+    for history in reversed(histories):
         old=history['previous_identity']['config']
         sources=history['previous_identity']['sources'];runtime=history['previous_identity']['runtime']
         fingerprint=lambda value:hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
@@ -96,10 +129,15 @@ def historical_background(run, entries, hashes, histories):
         for key,rating in history.get('prior_joint_ratings',{}).items():
             entry=entries.get(int(key))
             if entry is None:continue
-            for record in entry.get('historical_ratings',[]):
-                if record.get('source')=='paired joint rating' and record.get('protocol')==protocol and \
-                        record.get('elo')==rating.get('elo') and 'rating_pairs' not in record:
-                    record['rating_pairs']=rating.get('rating_pairs')
+            records=entry.get('historical_ratings',[]);last=matched_record.get(int(key),-1)
+            def matches(record):
+                return record.get('source')=='paired joint rating' and record.get('protocol')==protocol and \
+                       record.get('elo')==rating.get('elo')
+            index=next((i for i in range(last+1,len(records)) if matches(records[i])),None)
+            if index is None and last>=0 and matches(records[last]):index=last
+            if index is not None:
+                records[index]['rating_pairs']=rating.get('rating_pairs')
+                matched_record[int(key)]=index
 
 
 def background_results(run, league):
