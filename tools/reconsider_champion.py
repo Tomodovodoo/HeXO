@@ -3,6 +3,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -35,7 +36,16 @@ def bound_artifact(run, history, relative, verify_artifact):
 
 def reconsider(run, source, candidate, expected_champion, apply=False):
     run=run.resolve();source=source.resolve()
-    if (run/'training.lock').exists():raise ValueError('Stop the trainer before champion reconsideration')
+    lock=run/'training.lock'
+    try:
+        with lock.open('x') as stream:stream.write(str(os.getpid()))
+    except FileExistsError as error:
+        raise ValueError('Stop the trainer before champion reconsideration') from error
+    try:return reconsider_locked(run,source,candidate,expected_champion,apply)
+    finally:lock.unlink()
+
+
+def reconsider_locked(run, source, candidate, expected_champion, apply):
     config_path=run/'config.json';league_path=run/'league.json'
     config_sha=digest(config_path);league_sha=digest(league_path)
     config=read_json(config_path);league=read_json(league_path)
@@ -97,7 +107,7 @@ def reconsider(run, source, candidate, expected_champion, apply=False):
                 raw_score=raw,pessimistic_score=correction['pessimistic_score'],
                 report_sha256=correction['report_sha256'],history_sha256=config['history_sha256'])
     if apply:
-        if (run/'training.lock').exists() or digest(config_path)!=config_sha or digest(league_path)!=league_sha:
+        if digest(config_path)!=config_sha or digest(league_path)!=league_sha:
             raise ValueError('Run changed while champion correction was prepared')
         if digest(run/'history.json')!=config['history_sha256'] or digest(report_path)!=correction['report_sha256']:
             raise ValueError('Bound match evidence changed while champion correction was prepared')
