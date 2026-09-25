@@ -91,7 +91,8 @@ def outcome_rows(rows,winner):
 
 def capture_history(run, previous_identity, config, target_sources, target_runtime, prior_history=None):
     """Bind an existing stopped run's immutable artifacts before changing its evaluator."""
-    if json.loads((run/'status.json').read_text())['stage']!='finished':
+    status=json.loads((run/'status.json').read_text())
+    if status['stage']!='finished' and not (status['stage']=='failed' and status.get('iteration')==0):
         raise ValueError('Upgrade requires a finished checkpoint boundary')
     mutable={'reference_games','games','replay_positions','reuse_ratio','evaluate_every','actor_tactics',
              'eval_max_plies','eval_tactics'}

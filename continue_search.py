@@ -32,21 +32,37 @@ def saved_boundary(run,*,migration=False):
     if numbers!=list(range(len(numbers))):raise ValueError('Checkpoint league is not contiguous')
     latest=numbers[-1]
     if status['stage']!='finished':
-        if migration:raise ValueError('A source/configuration migration requires a finished boundary')
         identity=json.loads((run/'config.json').read_text())
-        if status.get('iteration')==latest and latest>0:
-            entry=next(c for c in league['checkpoints'] if c['id']==latest)
-            if not entry.get('evaluation_due') or entry.get('champion_score',{}).get('pessimistic_opening_pair_p') is None:
-                raise ValueError('Latest league checkpoint has no completed evaluation')
-            verify_artifact(run/'checkpoints'/f'{latest:04d}',dict(identity,checkpoint=latest))
-        else:
+        if migration:
+            if status['stage']!='failed' or status.get('iteration')!=0:
+                raise ValueError('A source/configuration migration requires a finished boundary')
+            events=run/'events.jsonl'
+            if not events.exists() or not any((event:=json.loads(line)).get('stage')=='finished' and event.get('iteration')==latest
+                                                for line in events.read_text().splitlines()):
+                raise ValueError('No prior finished event proves the migration boundary')
+        if status.get('iteration')==latest+1:
             pending=latest+1;checkpoint=run/'checkpoints'/f'{pending:04d}'
-            if status.get('iteration')!=pending or not checkpoint.exists():
+            if migration or not checkpoint.exists():
                 raise ValueError('Continuation requires a finished boundary or a published pending checkpoint')
             manifest=verify_artifact(checkpoint,dict(identity,checkpoint=pending))
             corpus=run/'corpus'/f'{pending:04d}'/'manifest.json'
             if manifest['metrics']['corpus_sha256']!=digest(corpus):
                 raise ValueError('Pending checkpoint consumed a different corpus')
+        elif status.get('iteration',latest+1)<=latest:
+            checkpoint=run/'checkpoints'/f'{latest:04d}'
+            history_path=run/'history.json'
+            history=json.loads(history_path.read_text()) if history_path.exists() and identity.get('history_sha256')==digest(history_path) else {}
+            inherited=history.get('artifacts',{}).get(f'checkpoints/{latest:04d}')
+            if inherited:
+                if digest(checkpoint/'manifest.json')!=inherited:raise ValueError('Inherited boundary checkpoint changed')
+                verify_artifact(checkpoint)
+            else:
+                verify_artifact(checkpoint,dict(identity,checkpoint=latest))
+            if not inherited and latest>0 and not migration:
+                entry=next(c for c in league['checkpoints'] if c['id']==latest)
+                if not entry.get('evaluation_due') or entry.get('champion_score',{}).get('pessimistic_opening_pair_p') is None:
+                    raise ValueError('Latest league checkpoint has no completed evaluation')
+        else:raise ValueError('Failed status is ahead of the saved league')
     if not (run/'checkpoints'/f'{latest:04d}'/'optimizer.pt').exists():
         raise ValueError('Latest saved Adam state is missing')
     return latest
