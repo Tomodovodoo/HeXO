@@ -35,6 +35,19 @@ def background_results(run, league):
     config_hash=hashlib.sha256((run/'config.json').read_bytes()).hexdigest()
     entries={c['id']:c for c in league.get('checkpoints',[])}
     hashes={n:read_json(run/'checkpoints'/f'{n:04d}'/'manifest.json',{}).get('files',{}).get('model.pt') for n in entries}
+    for number,entry in entries.items():
+        if not entry.get('pending'):continue
+        for path in sorted((run/'evaluation').glob(f'{number:04d}-vs-*/report.json')):
+            report=read_json(path);manifest=read_json(path.parent/'manifest.json');stat=path.stat()
+            a,b=report['candidate'],report['opponent']
+            if a!=number or manifest['files']['report.json']!=report_digest(str(path),stat.st_mtime_ns,stat.st_size) or any(
+                manifest['identity'][role]!=hashes.get(report[role]) for role in ('candidate','opponent')):
+                raise ValueError('Pending evaluation report identity changed')
+            score={k:report['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
+            if b==0:entry['anchor_score']=score
+            if b==number-1:entry['previous_score']=score
+            if b==league.get('champion'):entry.update(champion_score=score,versus_champion=b)
+            if b not in (0,number-1,league.get('champion')):entry['older_score']=dict(score,opponent=b)
     if background.get('config_sha256')==config_hash:
         for record in background['checkpoints']:
             number=record['id']

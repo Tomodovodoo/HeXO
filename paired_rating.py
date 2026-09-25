@@ -95,8 +95,14 @@ def model_digest(path,modified,size):
 
 
 def snapshot(run):
-    config_hash=sha(run/'config.json');league=read(run/'league.json')
+    config_hash=sha(run/'config.json');config=read(run/'config.json');league=read(run/'league.json')
     hashes={c['id']:read(run/'checkpoints'/f"{c['id']:04d}"/'manifest.json')['files']['model.pt'] for c in league['checkpoints']}
+    for path in sorted((run/'checkpoints').glob('[0-9][0-9][0-9][0-9]/manifest.json')):
+        number=int(path.parent.name)
+        if number in hashes:continue
+        manifest=read(path)
+        if manifest['identity']!=dict(config,checkpoint=number):raise ValueError('Pending checkpoint identity changed')
+        hashes[number]=manifest['files']['model.pt']
     model_paths=set()
     for number,expected in hashes.items():
         path=run/'checkpoints'/f'{number:04d}'/'model.pt';stat=path.stat()
