@@ -33,14 +33,20 @@ def saved_boundary(run,*,migration=False):
     latest=numbers[-1]
     if status['stage']!='finished':
         if migration:raise ValueError('A source/configuration migration requires a finished boundary')
-        pending=latest+1;checkpoint=run/'checkpoints'/f'{pending:04d}'
-        if status.get('iteration')!=pending or not checkpoint.exists():
-            raise ValueError('Continuation requires a finished boundary or a published pending checkpoint')
         identity=json.loads((run/'config.json').read_text())
-        manifest=verify_artifact(checkpoint,dict(identity,checkpoint=pending))
-        corpus=run/'corpus'/f'{pending:04d}'/'manifest.json'
-        if manifest['metrics']['corpus_sha256']!=digest(corpus):
-            raise ValueError('Pending checkpoint consumed a different corpus')
+        if status.get('iteration')==latest and latest>0:
+            entry=next(c for c in league['checkpoints'] if c['id']==latest)
+            if not entry.get('evaluation_due') or entry.get('champion_score',{}).get('pessimistic_opening_pair_p') is None:
+                raise ValueError('Latest league checkpoint has no completed evaluation')
+            verify_artifact(run/'checkpoints'/f'{latest:04d}',dict(identity,checkpoint=latest))
+        else:
+            pending=latest+1;checkpoint=run/'checkpoints'/f'{pending:04d}'
+            if status.get('iteration')!=pending or not checkpoint.exists():
+                raise ValueError('Continuation requires a finished boundary or a published pending checkpoint')
+            manifest=verify_artifact(checkpoint,dict(identity,checkpoint=pending))
+            corpus=run/'corpus'/f'{pending:04d}'/'manifest.json'
+            if manifest['metrics']['corpus_sha256']!=digest(corpus):
+                raise ValueError('Pending checkpoint consumed a different corpus')
     if not (run/'checkpoints'/f'{latest:04d}'/'optimizer.pt').exists():
         raise ValueError('Latest saved Adam state is missing')
     return latest
@@ -83,7 +89,7 @@ def main():
              'eval_max_plies':args.eval_max_plies,'eval_tactics':settings['eval_tactics'],
              'actor_tactics':settings['actor_tactics'],'source_changed':previous['sources']!=source_identity(),
              'runtime_changed':previous['runtime']!=runtime_identity(),
-             'resume_pending_checkpoint':latest+1 if json.loads((run/'status.json').read_text())['stage']!='finished' else None,
+             'resume_pending_checkpoint':latest+1 if json.loads((run/'status.json').read_text()).get('iteration')==latest+1 else None,
              'saved_model_sha256':digest(run/'checkpoints'/f'{latest:04d}'/'model.pt'),
              'saved_optimizer_sha256':digest(run/'checkpoints'/f'{latest:04d}'/'optimizer.pt')}
     print(json.dumps(planned,indent=2),flush=True)
