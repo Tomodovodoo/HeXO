@@ -9,8 +9,9 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from checkpoint_league import evaluation_schedule, rate_league, RATING_METHOD
+from checkpoint_league import evaluation_schedule
 from klent import digest
+from paired_rating import fit_ratings, METHOD as JOINT_METHOD, NOTE as JOINT_NOTE
 from search_train import play_games, source_identity, read_corpus, evaluation_protocol
 from relational_train import load_model
 from relational_model import NeuralEvaluator
@@ -105,8 +106,8 @@ def publish_ratings(run,worker_identity):
             if report['background_identity']!=worker_identity:raise ValueError('Background evaluation configuration changed')
             if report['model_hashes']!={str(n):model_hashes[n] for n in (report['candidate'],report['opponent'])}:
                 raise ValueError('Background model changed')
-    points,intervals=rate_league(ids,data,seed=worker_identity['seed'])
-    entries={n:dict(id=n,elo=points[n],elo_interval=intervals.get(n),model_sha256=model_hashes[n]) for n in ids}
+    ratings,diagnostics=fit_ratings(ids,data,seed=worker_identity['seed'])
+    entries={n:dict(record,model_sha256=model_hashes[n]) for n,record in ratings.items()}
     for report in data:
         if 'background_identity' not in report:continue
         if report['background_identity']!=worker_identity:raise ValueError('Background evaluation configuration changed')
@@ -132,8 +133,8 @@ def publish_ratings(run,worker_identity):
         completed={r['opponent']:len(r['games']) for r in candidate_reports}
         record['provisional']=any(completed.get(opponent,0)<count for opponent,count in expected.items())
     write_json(run/'background-league.json',dict(config_sha256=digest(run/'config.json'),updated_at=time.time(),
-        protocol=worker_identity['protocol'],checkpoints=list(entries.values()),rating_method=RATING_METHOD,
-        note='Separate CPU float32 estimates from background paired games. CUDA scheduled ratings use their own protocol. CPU estimates do not promote champions.'))
+        protocol=worker_identity['protocol'],checkpoints=list(entries.values()),rating_method=JOINT_METHOD,
+        diagnostics=diagnostics,note='Separate CPU float32 estimates from background paired games. CUDA scheduled ratings use their own protocol. CPU estimates do not promote champions. '+JOINT_NOTE))
 
 
 def next_comparison(run,identity,first):
