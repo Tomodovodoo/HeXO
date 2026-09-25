@@ -560,6 +560,6 @@ if __name__=='__main__':
         parser.add_argument('--'+name,type=int,default=default)
     parser.add_argument('--lr',type=float,default=.0001)
     args=parser.parse_args()
-    if min(args.replay_positions,args.reuse_ratio,args.evaluate_every,args.iterations,args.games,args.eval_games,args.reference_games,args.envs,args.simulations,args.root_samples,args.leaf_batch,args.batch,args.epochs,args.max_plies,args.eval_max_plies,args.max_nodes,args.max_edges,args.cache_positions)<1 or args.games<2 or args.eval_games%2 or args.reference_games%2 or args.reference_games>args.eval_games or not math.isfinite(args.lr) or args.lr<=0:
-        parser.error('Positive settings, at least two self-play games, and an even evaluation count required')
+    if min(args.replay_positions,args.reuse_ratio,args.evaluate_every,args.iterations,args.games,args.eval_games,args.reference_games,args.envs,args.simulations,args.root_samples,args.leaf_batch,args.batch,args.epochs,args.max_plies,args.max_nodes,args.max_edges,args.cache_positions)<1 or args.eval_max_plies<5 or args.games<2 or args.eval_games%2 or args.reference_games%2 or args.reference_games>args.eval_games or not math.isfinite(args.lr) or args.lr<=0:
+        parser.error('Positive settings, evaluation cap at least five, at least two self-play games, and an even evaluation count required')
     main(args)

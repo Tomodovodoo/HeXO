@@ -56,12 +56,13 @@ def main():
     parser.add_argument('--eval-tactics',action=argparse.BooleanOptionalAction,default=None)
     parser.add_argument('--plan',action='store_true',help='Check boundary and print the exact continuation plan')
     args=parser.parse_args();run=args.run.resolve()
+    if args.eval_max_plies<5:parser.error('Evaluation cap must fit the five-ply standard opening')
     previous=json.loads((run/'config.json').read_text())
     tactics=previous['config'].get('eval_tactics',False) if args.eval_tactics is None else args.eval_tactics
     settings=dict(previous['config'],eval_max_plies=args.eval_max_plies,eval_tactics=tactics,evaluate_every=1)
     first_upgrade=previous['sources']!=source_identity() or previous['config']!=settings
     latest=saved_boundary(run,migration=first_upgrade)
-    if args.through<=latest or args.eval_max_plies<1:parser.error('Through must exceed the saved checkpoint; evaluation cap must be positive')
+    if args.through<=latest:parser.error('Through must exceed the saved checkpoint')
     missing=[name for name in (*NUMBERS,'initial_model','device','lr') if name not in settings]
     if missing:raise ValueError(f'Run settings are incomplete: {missing}')
     if digest(Path(settings['initial_model']))!=previous['config']['initial_sha256']:
