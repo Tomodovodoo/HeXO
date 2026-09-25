@@ -14,6 +14,7 @@ from scipy.special import logsumexp
 import torch
 
 from checkpoint_league import paired_posteriors
+from train import write_json
 
 SCALE=400/math.log(10)
 METHOD='Joint paired-outcome likelihood; MAP Elo, importance-sampled 95% credible intervals'
@@ -123,7 +124,7 @@ def run_ratings(args):
             for n,record in ratings.items():record['model_sha256']=hashes[n]
             result=dict(config_sha256=config_hash,checkpoints=list(ratings.values()),updated_at=time.time(),
                 rating_method=METHOD,note=NOTE,diagnostics=diagnostics,reports=sources)
-            temporary=run/'paired-ratings.tmp';temporary.write_text(json.dumps(result,indent=2));temporary.replace(run/'paired-ratings.json')
+            write_json(run/'paired-ratings.json',result)
             print(json.dumps(dict(updated_at=result['updated_at'],checkpoints=len(ratings),**diagnostics)),flush=True)
             previous=signature
         if args.once:return
