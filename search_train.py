@@ -84,7 +84,7 @@ def outcome_rows(rows,winner):
     return rows
 
 
-def capture_history(run, previous_identity, config, prior_history=None):
+def capture_history(run, previous_identity, config, target_sources, prior_history=None):
     """Bind an existing stopped run's immutable artifacts before changing its evaluator."""
     if json.loads((run/'status.json').read_text())['stage']!='finished':
         raise ValueError('Upgrade requires a finished checkpoint boundary')
@@ -148,6 +148,7 @@ def capture_history(run, previous_identity, config, prior_history=None):
                     opening_suite='standard-v1',source_sha256=source_fingerprint(previous_identity['sources']))
             if evidence!=expected:raise ValueError('Historical comparison settings changed')
     history=dict(previous_identity=previous_identity,previous_config_sha256=digest(run/'config.json'),
+                 prepared_target=dict(config=config,sources=target_sources),
                  through=numbers[-1],artifacts=artifacts)
     paired=run/'paired-ratings.json'
     if paired.exists():
@@ -435,7 +436,8 @@ def main(args):
                 if history.get('previous_identity')!=existing:
                     raise ValueError('Prior run history changed before upgrade')
             if history.get('previous_identity')==existing and history.get('through')==len(json.loads((run/'league.json').read_text())['checkpoints'])-1:
-                pass  # Resume after a prepared history write.
+                if history.get('prepared_target')!=dict(config=config,sources=identity['sources']):
+                    raise ValueError('Prepared upgrade targets a different source or configuration')
             elif existing['sources']!=identity['sources'] or existing['config']!=config:
                 prior=history
                 if existing.get('history_sha256'):
@@ -443,7 +445,7 @@ def main(args):
                         raise ValueError('Prior upgrade history changed')
                 for lock in ('background-evaluation.lock','paired-ratings.lock'):
                     if (run/lock).exists():raise ValueError(f'Upgrade requires stopped worker: {lock}')
-                prepared=capture_history(run,existing,config,prior)
+                prepared=capture_history(run,existing,config,identity['sources'],prior)
                 if prior:
                     sha=digest(history_path);name=f'history-{sha}.json';snapshot=run/name
                     if snapshot.exists():

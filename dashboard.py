@@ -54,12 +54,9 @@ def background_results(run, league):
         for record in background['checkpoints']:
             number=record['id']
             if number in entries and record.get('model_sha256')==hashes[number]:
-                entry=entries[number]
-                entry.update(record)
-                # An opponent can acquire a rating before any of its own matches.
-                if entry.get('evaluation_due') is False:
-                    entry['provisional']=record.get('provisional',True)
+                entries[number]['cpu_estimate']=record
         league['background_note']=background['note']
+        league['background_protocol']=background.get('protocol')
     joint=read_json(run/'paired-ratings.json',{})
     if joint.get('config_sha256')==config_hash:
         paths=[]

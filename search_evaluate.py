@@ -94,9 +94,11 @@ def reports(run):
 
 def publish_ratings(run,worker_identity):
     league=read(run/'league.json');ids=[c['id'] for c in league['checkpoints']]
-    if league.get('rating_protocol') and worker_identity['protocol']!=league['rating_protocol']:
-        return  # CPU probes may continue, but CUDA league ratings keep their own protocol.
-    data=reports(run)
+    # CPU estimates are their own league. CUDA scheduled matches and older CPU
+    # worker generations must not enter this fit.
+    data=[read(path) for path in sorted((run/'background-evaluation').glob('*-vs-*.json'))]
+    data=[report for report in data if report.get('background_identity')==worker_identity]
+    if not data:return
     model_hashes={n:read(run/'checkpoints'/f'{n:04d}'/'manifest.json')['files']['model.pt'] for n in ids}
     for report in data:
         if 'background_identity' in report:
@@ -130,8 +132,8 @@ def publish_ratings(run,worker_identity):
         completed={r['opponent']:len(r['games']) for r in candidate_reports}
         record['provisional']=any(completed.get(opponent,0)<count for opponent,count in expected.items())
     write_json(run/'background-league.json',dict(config_sha256=digest(run/'config.json'),updated_at=time.time(),
-        checkpoints=list(entries.values()),rating_method=RATING_METHOD,
-        note='Approximate joint Elo from scheduled CUDA mixed-precision and background CPU float32 matches at the same search budget. CPU estimates do not promote champions. Intervals model paired-game sampling, not numerical-backend differences.'))
+        protocol=worker_identity['protocol'],checkpoints=list(entries.values()),rating_method=RATING_METHOD,
+        note='Separate CPU float32 estimates from background paired games. CUDA scheduled ratings use their own protocol. CPU estimates do not promote champions.'))
 
 
 def next_comparison(run,identity,first):
