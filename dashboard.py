@@ -18,6 +18,24 @@ def read_json(path, default=None):
         return default
 
 
+def background_results(run, league):
+    """Overlay separately published estimates without changing trainer-owned state."""
+    background=read_json(run/'background-league.json',{})
+    config_hash=hashlib.sha256((run/'config.json').read_bytes()).hexdigest()
+    entries={c['id']:c for c in league.get('checkpoints',[])}
+    hashes={n:read_json(run/'checkpoints'/f'{n:04d}'/'manifest.json',{}).get('files',{}).get('model.pt') for n in entries}
+    if background.get('config_sha256')==config_hash:
+        for record in background['checkpoints']:
+            number=record['id']
+            if number in entries and record.get('model_sha256')==hashes[number]:entries[number].update(record)
+        league['background_note']=background['note']
+    for path in sorted((run/'value-diagnostics').glob('*.json')):
+        probe=read_json(path,{})
+        number=probe.get('checkpoint')
+        if number in entries and probe.get('model_sha256')==hashes[number]:entries[number]['fresh_validation']=probe
+    return read_json(run/'background-status.json',{})
+
+
 @lru_cache(maxsize=32)
 def episode_counts(path, modified):
     episodes = read_json(Path(path), [])
@@ -211,7 +229,8 @@ class Handler(BaseHTTPRequestHandler):
                         manifest = read_json(path, {})
                         league.setdefault('checkpoints', []).append(dict(id=number, elo=None,
                             elo_interval=None, promoted=False, pending=True, loss=manifest.get('metrics')))
-                data = dict(kind='search', search=dict(name=self.run.name,
+                background_status=background_results(self.run,league)
+                data = dict(kind='search', search=dict(name=self.run.name,background_status=background_status,
                     config=search_config, status=read_json(self.run/'status.json', {}),
                     league=league, openings=[opening
                         for path in sorted((self.run/'evaluation').glob('*-vs-*/report.json'), reverse=True)[:16]

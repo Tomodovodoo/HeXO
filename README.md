@@ -690,6 +690,31 @@ Each collection defaults to 128 attempted games. Capped episodes have no trainin
 
 `--evaluate-every 4` runs internal matches periodically. Collection, fitting and evaluation remain synchronous on the single GPU, but evaluation no longer follows every fitting cycle. Intermediate checkpoints may be unrated until they participate in a later comparison. This is a throughput choice, not evidence that those checkpoints improved.
 
+Run `python search_evaluate.py --run runs/gumbel-policy-value-v1 --from-checkpoint 13 --threads 4`
+from a separate frozen checkout to evaluate intervening checkpoints while the GPU
+learner continues. It uses the same search budget and previous/champion/older/reference
+opponent allocation on CPU float32. Each complete color-swapped pair updates
+`background-league.json`; the dashboard overlays these estimates without modifying
+the trainer's league, champion, models, optimizer or corpus. Partial match sets are
+labeled provisional and report played/planned counts. A capped comparison does not
+provide a rating edge. CPU results show promotion evidence only after their full
+planned match set; actual champion promotion still uses scheduled GPU matches.
+
+The combined Elo estimate mixes CPU float32 and CUDA mixed-precision comparisons.
+Its approximate 95% credible interval measures paired-game sampling uncertainty,
+not possible backend differences. Background evaluation can lag checkpoint creation;
+queued checkpoints remain unrated until games supply evidence. Keep the worker source
+unchanged while it runs. It resumes saved pairs, rejects changed identities and owns
+an exclusive `background-evaluation.lock`.
+
+The worker also samples up to 32 terminal games from each next collection, taking
+three positions per game. It measures that collection's actor before it has trained
+on those games. Fresh validation policy cross-entropy uses recorded search targets;
+value MSE uses terminal outcomes, with a zero-value baseline of 1. These diagnostics
+are conditional on the actor's terminal games and are separate from Elo and training
+loss. They appear after the next corpus is complete. The dashboard labels historical
+held-out validation separately from fresh-collection validation.
+
 Exact cache keys now derive colored stones and turn phase from native legal histories without constructing another rules board. Full tuples still distinguish hash collisions. Persistent trees and model-versioned predictions retain their existing reuse semantics. Selective higher-budget targets and incremental neural trunks are not enabled.
 
 ### Moving internal opponents and league ratings
