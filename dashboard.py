@@ -81,7 +81,7 @@ def validate_archived_games(report, path):
 
 
 def historical_background(run, entries, hashes, histories):
-    from checkpoint_league import evaluation_schedule, PROMOTION_RULE
+    from checkpoint_league import evaluation_schedule, promotion_older, PROMOTION_RULE
     generations={history['previous_config_sha256']:history for history in histories
                  if 'previous_config_sha256' in history}
     inherited_through=max((history['through'] for history in histories),default=-1)
@@ -118,7 +118,10 @@ def historical_background(run, entries, hashes, histories):
         if b==0:record['anchor_score']=score
         if b==a-1:record['previous_score']=score
         if b==report['champion']:record.update(champion_score=score,versus_champion=b)
-        if b not in (0,a-1,report['champion']):record['older_score']=dict(score,opponent=b)
+        old_rule=history['previous_identity']['config'].get('promotion_rule')
+        if (old_rule==PROMOTION_RULE and b==promotion_older(a,report['champion'])) or \
+           (old_rule!=PROMOTION_RULE and b not in (0,a-1,report['champion'])):
+            record['older_score']=dict(score,opponent=b)
     for (number,config_sha),opponents in seen.items():
         record=entries[number]['historical_background'];old=generations[config_sha]['previous_identity']['config']
         expected={opponent for opponent,_ in evaluation_schedule(number,record['champion'],old['eval_games'],
