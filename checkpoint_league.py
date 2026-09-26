@@ -89,9 +89,17 @@ def rate_league(ids,reports,samples=2048,seed=1740):
 
 def evaluation_schedule(iteration, champion, games, reference_games):
     previous=iteration-1
-    second=champion if champion!=previous else max(0,min(previous-1,round(previous*.8)))
+    older=promotion_older(iteration,champion)
     opponents=[]
-    for opponent in (previous,second,0):
-        if opponent not in opponents:opponents.append(opponent)
-    return [(opponent, games if opponent in (previous,second) else reference_games)
+    for opponent in (previous,champion,older,0):
+        if opponent is not None and opponent not in opponents:opponents.append(opponent)
+    required={previous,champion,older}
+    return [(opponent, games if opponent in required else reference_games)
             for opponent in opponents]
+
+
+def promotion_older(iteration, champion):
+    """Nearest checkpoint about 20% behind the previous one, distinct from incumbent."""
+    previous=iteration-1;target=round(previous*.8)
+    choices=[number for number in range(previous) if number!=champion]
+    return min(choices,key=lambda number:(abs(number-target),number)) if choices else None

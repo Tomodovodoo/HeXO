@@ -19,9 +19,12 @@ from neural_search import NeuralSearch, SearchCoordinator, EvaluationCache
 from relational_model import RelationalNet, NeuralEvaluator
 from relational_train import load_model, save_model, precision, graph, work_batches, VALUE_SCHEMA
 from train import write_json, task_opening, paired_metrics
-from checkpoint_league import evaluation_schedule, rate_league, RATING_METHOD
+from checkpoint_league import evaluation_schedule, promotion_older, rate_league, RATING_METHOD
 
 SCHEMA = 'hexo-search-selfplay-v1'
+PROMOTION_RULE = 'incumbent-and-distinct-older-positive-with-caps-as-losses-v1'
+PROMOTION_PROTOCOL = dict(rule=PROMOTION_RULE, older_target_fraction=.8,
+    requires_full_matches=True, threshold='conservative wins > losses for incumbent and older')
 
 
 def source_identity():
@@ -79,7 +82,7 @@ def pessimistic_promotion(report):
     if len(records)!=planned:return False,None
     worst=[dict(game,winner=game['winner'] if game['winner']>=0 else 1-game['challenger_color']) for game in records]
     metrics=paired_metrics(worst,planned)
-    return metrics['wins']>metrics['losses'] and metrics['opening_pair_p']<.05,metrics
+    return metrics['wins']>metrics['losses'],metrics
 
 
 def outcome_rows(rows,winner):
@@ -96,7 +99,7 @@ def capture_history(run, previous_identity, config, target_sources, target_runti
     if status['stage']!='finished' and not recovering:
         raise ValueError('Upgrade requires a finished checkpoint boundary')
     mutable={'reference_games','games','replay_positions','reuse_ratio','evaluate_every','actor_tactics',
-             'eval_max_plies','eval_tactics'}
+             'eval_max_plies','eval_tactics','promotion_rule'}
     if {k:v for k,v in config.items() if k not in mutable}!={k:v for k,v in previous_identity['config'].items() if k not in mutable}:
         raise ValueError('Upgrade may change collection and replay scheduling, not model or evaluation settings')
     league=json.loads((run/'league.json').read_text())
@@ -428,6 +431,7 @@ def main(args):
     torch.set_num_threads(2);torch.manual_seed(args.seed)
     config={k:v for k,v in vars(args).items() if k not in ('run','iterations','upgrade_run')}
     config['initial_model']=str(Path(args.initial_model).resolve());config['initial_sha256']=digest(Path(args.initial_model))
+    config['promotion_rule']=PROMOTION_RULE
     identity=dict(run=str(run),backbone=VALUE_SCHEMA,config=config,sources=source_identity(),runtime=runtime_identity())
     with (run/'training.lock').open('x') as stream:stream.write(str(os.getpid()))
     def event(stage,iteration,**data):
@@ -485,6 +489,7 @@ def main(args):
                 return verify_artifact(path)
             return verify_artifact(path,expected)
         league=json.loads((run/'league.json').read_text()) if (run/'league.json').exists() else dict(champion=0,checkpoints=[dict(id=0,elo=0.,elo_interval=[0.,0.],promoted=True,reference=True)])
+        league['promotion_protocol']=PROMOTION_PROTOCOL
         zero=run/'checkpoints/0000'
         if not zero.exists():
             model=warm_start(args.initial_model,args.device,args.seed,config['initial_sha256']);optimizer=torch.optim.Adam(model.parameters(),lr=args.lr)
@@ -548,17 +553,24 @@ def main(args):
                 for opponent,games in evaluation_schedule(iteration,league['champion'],args.eval_games,args.reference_games):
                     comparisons[opponent]=evaluate(run,iteration,opponent,args,lambda data:event('validation-matches',iteration,opponent=opponent,**data),games,verify_run_artifact)
                 anchor=comparisons[0];versus=comparisons[league['champion']]['metrics']
-                promoted,worst=pessimistic_promotion(comparisons[league['champion']])
+                champion_won,worst=pessimistic_promotion(comparisons[league['champion']])
+                older=promotion_older(iteration,league['champion'])
+                older_won,older_worst=pessimistic_promotion(comparisons[older]) if older is not None else (False,None)
+                promoted=champion_won and older_won
                 entry.update(elo=anchor['elo'],elo_interval=anchor['elo_interval'],promoted=promoted,
+                    promotion_rule=PROMOTION_RULE,promotion_older=older,
                     anchor_score={k:anchor['metrics'][k] for k in ('wins','losses','incomplete')},versus_champion=league['champion'],
                     champion_score=dict({k:versus[k] for k in ('wins','losses','incomplete','opening_pair_p')},
                                         pessimistic_wins=worst['wins'] if worst else None,
                                         pessimistic_losses=worst['losses'] if worst else None,
                                         pessimistic_opening_pair_p=worst['opening_pair_p'] if worst else None))
                 entry['previous_score']={k:comparisons[iteration-1]['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
-                for opponent,comparison in comparisons.items():
-                    if opponent not in (0,iteration-1,league['champion']):
-                        entry['older_score']=dict(opponent=opponent,**{k:comparison['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')})
+                if older is not None:
+                    entry['older_score']=dict(opponent=older,
+                        **{k:comparisons[older]['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')},
+                        pessimistic_wins=older_worst['wins'] if older_worst else None,
+                        pessimistic_losses=older_worst['losses'] if older_worst else None,
+                        pessimistic_opening_pair_p=older_worst['opening_pair_p'] if older_worst else None)
                 if promoted:league['champion']=iteration
             league['checkpoints'].append(entry)
             update_ratings(run,league,args,history)
