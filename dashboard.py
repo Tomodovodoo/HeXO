@@ -11,6 +11,8 @@ import time
 from collections import deque
 from functools import lru_cache
 
+from rating_compat import audited_prior, scheduled_revision
+
 
 def read_json(path, default=None):
     try:
@@ -153,7 +155,8 @@ def background_results(run, league):
     """Overlay separately published estimates without changing trainer-owned state."""
     background=read_json(run/'background-league.json',{})
     config_hash=hashlib.sha256((run/'config.json').read_bytes()).hexdigest()
-    histories=run_histories(run,read_json(run/'config.json',{}))
+    config=read_json(run/'config.json',{})
+    histories=run_histories(run,config)
     entries={c['id']:c for c in league.get('checkpoints',[])}
     hashes={n:read_json(run/'checkpoints'/f'{n:04d}'/'manifest.json',{}).get('files',{}).get('model.pt') for n in entries}
     historical_background(run,entries,hashes,histories)
@@ -181,12 +184,15 @@ def background_results(run, league):
         league['background_protocol']=background.get('protocol')
     joint=read_json(run/'paired-ratings.json',{})
     if joint.get('config_sha256')==config_hash:
+        prior=audited_prior(run,config,league.get('rating_protocol')) if league.get('rating_protocol') else None
         paths=[]
         for path in list((run/'evaluation').glob('*-vs-*/report.json'))+list((run/'background-evaluation').glob('*-vs-*.json')):
             if league.get('rating_protocol'):
-                protocol=(read_json(path.parent/'manifest.json',{}).get('identity',{}).get('protocol')
-                          if path.name=='report.json' else read_json(path,{}).get('protocol'))
-                if protocol!=league['rating_protocol']:continue
+                if path.name=='report.json':
+                    revision=scheduled_revision(run,path,read_json(path),read_json(path.parent/'manifest.json'),
+                                                hashes,league['rating_protocol'],prior)
+                    if revision is None:continue
+                elif read_json(path,{}).get('protocol')!=league['rating_protocol']:continue
             paths.append(path)
         current={}
         for path in paths:
@@ -216,6 +222,7 @@ def background_results(run, league):
                         entry[key]['rating_coverage']=coverage
         league['rating_method']=joint['rating_method']
         league['joint_rating_note']=joint['note']
+        league['audited_compatible_reports']=joint.get('diagnostics',{}).get('audited_compatible_reports',0)
         league['rating_updated_at']=joint['updated_at']
         league['rating_stale']=stale
     for path in sorted((run/'value-diagnostics').glob('*.json')):

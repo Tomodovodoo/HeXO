@@ -729,7 +729,12 @@ Duplicate opponents are played once. Self-play training still uses
 the latest network on both sides with Gumbel search targets and terminal outcomes.
 
 Displayed joint Elo fits fully terminal color-swapped pairs from current-protocol
-comparisons, fixing checkpoint 0 at zero. Completed pairs contribute even when other
+comparisons, fixing checkpoint 0 at zero. The exact search-run4 (57df979) to
+search-run5 (79751dd) promotion-only migration also accepts prior CUDA reports
+after checking the hash-bound migration history, original report manifests,
+model hashes, unchanged evaluation settings and the two audited source maps.
+Their original protocols remain in the reports; CPU and earlier source revisions
+are excluded. Completed pairs contribute even when other
 pairs in that match cap; no outcome is invented for capped or unsaved games. Historical
 ratings can change when new results arrive. Raw match scores and reference-only
 estimates remain in `league.json`.

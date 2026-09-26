@@ -13,6 +13,7 @@ from scipy.special import logsumexp
 import torch
 
 from train import paired_metrics, write_json
+from rating_compat import audited_prior, scheduled_revision
 
 SCALE=400/math.log(10)
 METHOD='Joint likelihood of completed color-swapped pairs; conditional MAP Elo and 95% credible intervals'
@@ -141,6 +142,7 @@ def model_digest(path,modified,size):
 def snapshot(run):
     config_hash=sha(run/'config.json');config=read(run/'config.json');league=read(run/'league.json')
     protocol=league.get('rating_protocol')
+    prior=audited_prior(run,config,protocol) if protocol else None
     hashes={c['id']:read(run/'checkpoints'/f"{c['id']:04d}"/'manifest.json')['files']['model.pt'] for c in league['checkpoints']}
     for path in sorted((run/'checkpoints').glob('[0-9][0-9][0-9][0-9]/manifest.json')):
         number=int(path.parent.name)
@@ -154,7 +156,7 @@ def snapshot(run):
         model_paths.add(str(path))
         if model_digest(str(path),stat.st_mtime_ns,stat.st_size)!=expected:raise ValueError('Rating checkpoint bytes changed')
     for path in set(_model_digests)-model_paths:del _model_digests[path]
-    reports=[];sources={};background_identity=None
+    reports=[];sources={};background_identity=None;audited=0
     for path in sorted((run/'evaluation').glob('*-vs-*/report.json'))+sorted((run/'background-evaluation').glob('*-vs-*.json')):
         contents=path.read_bytes();report=json.loads(contents);a,b=report['candidate'],report['opponent']
         if a not in hashes or b not in hashes:continue
@@ -167,23 +169,28 @@ def snapshot(run):
                 raise ValueError('Background rating input identity changed')
         else:
             manifest=read(path.parent/'manifest.json')
-            if protocol and manifest['identity'].get('protocol')!=protocol:continue
+            revision=scheduled_revision(run,path,report,manifest,hashes,protocol,prior)
+            if protocol and revision is None:continue
             if manifest['files']['report.json']!=digest or any(manifest['identity'][role]!=hashes[report[role]] for role in ('candidate','opponent')):
                 raise ValueError('Scheduled rating input identity changed')
+            audited+=revision=='audited compatible'
         reports.append(report);sources[path.relative_to(run).as_posix()]=digest
-    return config_hash,hashes,reports,sources
+    return config_hash,hashes,reports,sources,audited
 
 
 def run_ratings(args):
     run=Path(args.run).resolve();torch.set_num_threads(1);previous=None
     while True:
-        config_hash,hashes,reports,sources=snapshot(run)
+        config_hash,hashes,reports,sources,audited=snapshot(run)
         signature=(config_hash,hashes,sources)
         if signature!=previous:
             ratings,diagnostics=fit_ratings(list(hashes),reports)
+            diagnostics['audited_compatible_reports']=audited
             for n,record in ratings.items():record['model_sha256']=hashes[n]
             result=dict(config_sha256=config_hash,checkpoints=list(ratings.values()),updated_at=time.time(),
-                rating_method=METHOD,note=NOTE,diagnostics=diagnostics,reports=sources)
+                rating_method=METHOD,note=NOTE+(' Includes original-protocol CUDA reports from the audited compatible '
+                    'run4-to-run5 evaluation revisions; their manifests and model hashes remain verified.' if audited else ''),
+                diagnostics=diagnostics,reports=sources)
             write_json(run/'paired-ratings.json',result)
             print(json.dumps(dict(updated_at=result['updated_at'],checkpoints=len(ratings),**diagnostics)),flush=True)
             previous=signature
