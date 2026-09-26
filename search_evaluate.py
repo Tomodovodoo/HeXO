@@ -117,7 +117,8 @@ def publish_ratings(run,worker_identity):
         if report['model_hashes']!={str(a):model_hashes[a],str(b):model_hashes[b]}:raise ValueError('Background model changed')
         record=entries[a];record['background']=True
         record['provisional']=record.get('provisional',False) or len(report['games'])<report['target_games'] or \
-            bool(record.get('rating_censored_pairs')) or bool(record.get('rating_unplayed_pairs'))
+            bool(record.get('rating_provisional')) or bool(record.get('rating_censored_pairs')) or \
+            bool(record.get('rating_unplayed_pairs'))
         score={k:report['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
         score.update(played=len(report['games']),planned=report['target_games'])
         score['rating_coverage']=coverage[a,b]

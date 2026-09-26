@@ -73,6 +73,9 @@ def fit_ratings(ids,reports,seed=1740,samples=32768):
             result[number].setdefault('rating_unplayed_pairs',0)
             result[number]['rating_censored_pairs']+=record['censored_pairs']
             result[number]['rating_unplayed_pairs']+=record['unplayed_pairs']
+    provisional=any(record['rated_pairs'] and (record['censored_pairs'] or record['unplayed_pairs']) and
+                    record['candidate'] in connected and record['opponent'] in connected for record in coverage)
+    for number in variables:result[number]['rating_provisional']=provisional
     edges=[e for e in edges if e[0] in connected]
     if not variables:return result,dict(effective_samples=0,comparison_coverage=coverage)
     matrix=np.zeros((len(edges),len(variables)))
