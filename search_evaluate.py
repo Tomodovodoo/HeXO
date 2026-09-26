@@ -108,15 +108,19 @@ def publish_ratings(run,worker_identity):
                 raise ValueError('Background model changed')
     ratings,diagnostics=fit_ratings(ids,data,seed=worker_identity['seed'])
     entries={n:dict(record,model_sha256=model_hashes[n]) for n,record in ratings.items()}
+    coverage={(item['candidate'],item['opponent']):item for item in diagnostics['comparison_coverage']
+              if item['origin']=='background'}
     for report in data:
         if 'background_identity' not in report:continue
         if report['background_identity']!=worker_identity:raise ValueError('Background evaluation configuration changed')
         a,b=report['candidate'],report['opponent']
         if report['model_hashes']!={str(a):model_hashes[a],str(b):model_hashes[b]}:raise ValueError('Background model changed')
         record=entries[a];record['background']=True
-        record['provisional']=record.get('provisional',False) or len(report['games'])<report['target_games']
+        record['provisional']=record.get('provisional',False) or len(report['games'])<report['target_games'] or \
+            bool(record.get('rating_censored_pairs')) or bool(record.get('rating_unplayed_pairs'))
         score={k:report['metrics'][k] for k in ('wins','losses','incomplete','opening_pair_p')}
         score.update(played=len(report['games']),planned=report['target_games'])
+        score['rating_coverage']=coverage[a,b]
         if b==a-1:record['previous_score']=score
         if b==report['champion']:
             record['champion_score']=score;record['versus_champion']=b
@@ -128,7 +132,7 @@ def publish_ratings(run,worker_identity):
         champion=candidate_reports[0]['champion']
         expected=dict(evaluation_schedule(number,champion,worker_identity['eval_games'],worker_identity['reference_games']))
         completed={r['opponent']:len(r['games']) for r in candidate_reports}
-        record['provisional']=any(completed.get(opponent,0)<count for opponent,count in expected.items())
+        record['provisional']=record['provisional'] or any(completed.get(opponent,0)<count for opponent,count in expected.items())
         older=promotion_older(number,champion)
         if older is None:record['background_decision']='No distinct older opponent'
         else:

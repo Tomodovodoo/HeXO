@@ -203,7 +203,10 @@ def background_results(run, league):
             for coverage in joint.get('diagnostics',{}).get('comparison_coverage',[]):
                 number=coverage['candidate'];opponent=coverage['opponent']
                 entry=entries.get(number)
-                if entry is None or coverage['origin']!='scheduled':continue
+                if entry is None:continue
+                if coverage['origin']=='background':entry=entry.get('cpu_estimate')
+                elif coverage['origin']!='scheduled':continue
+                if entry is None:continue
                 for key,matched in (('anchor_score',opponent==0),('previous_score',opponent==number-1),
                                     ('champion_score',opponent==entry.get('versus_champion')),
                                     ('older_score',opponent==entry.get('older_score',{}).get('opponent'))):
