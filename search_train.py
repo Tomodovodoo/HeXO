@@ -19,10 +19,9 @@ from neural_search import NeuralSearch, SearchCoordinator, EvaluationCache
 from relational_model import RelationalNet, NeuralEvaluator
 from relational_train import load_model, save_model, precision, graph, work_batches, VALUE_SCHEMA
 from train import write_json, task_opening, paired_metrics
-from checkpoint_league import evaluation_schedule, promotion_older, rate_league, RATING_METHOD
+from checkpoint_league import evaluation_schedule, promotion_older, rate_league, RATING_METHOD, PROMOTION_RULE
 
 SCHEMA = 'hexo-search-selfplay-v1'
-PROMOTION_RULE = 'incumbent-and-distinct-older-positive-with-caps-as-losses-v1'
 PROMOTION_PROTOCOL = dict(rule=PROMOTION_RULE, older_target_fraction=.8,
     requires_full_matches=True, threshold='conservative wins > losses for incumbent and older')
 
