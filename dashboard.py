@@ -199,6 +199,18 @@ def background_results(run, league):
             if number in entries and record.get('model_sha256')==hashes[number]:
                 entries[number].update(record)
                 entries[number]['rating_stale']=stale
+        if not stale:
+            for coverage in joint.get('diagnostics',{}).get('comparison_coverage',[]):
+                number=coverage['candidate'];opponent=coverage['opponent']
+                entry=entries.get(number)
+                if entry is None or coverage['origin']!='scheduled':continue
+                for key,matched in (('anchor_score',opponent==0),('previous_score',opponent==number-1),
+                                    ('champion_score',opponent==entry.get('versus_champion')),
+                                    ('older_score',opponent==entry.get('older_score',{}).get('opponent'))):
+                    if matched and entry.get(key) and entry[key]['wins']==coverage['known_wins'] and \
+                       entry[key]['losses']==coverage['known_losses'] and \
+                       entry[key]['incomplete']==coverage['capped_games']:
+                        entry[key]['rating_coverage']=coverage
         league['rating_method']=joint['rating_method']
         league['joint_rating_note']=joint['note']
         league['rating_updated_at']=joint['updated_at']
