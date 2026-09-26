@@ -3,6 +3,7 @@ import math
 import numpy as np
 
 RATING_METHOD = 'Bradley-Terry projection of paired-outcome posterior means; checkpoint 0 fixed at 0'
+PROMOTION_RULE = 'incumbent-and-distinct-older-positive-with-caps-as-losses-v1'
 
 
 def solve_ratings(ids, edges):
@@ -87,11 +88,26 @@ def rate_league(ids,reports,samples=2048,seed=1740):
     return point,intervals
 
 
-def evaluation_schedule(iteration, champion, games, reference_games):
+def evaluation_schedule(iteration, champion, games, reference_games, *, legacy=False):
     previous=iteration-1
-    second=champion if champion!=previous else max(0,min(previous-1,round(previous*.8)))
+    if legacy:
+        second=champion if champion!=previous else max(0,min(previous-1,round(previous*.8)))
+        opponents=[]
+        for opponent in (previous,second,0):
+            if opponent not in opponents:opponents.append(opponent)
+        return [(opponent,games if opponent in (previous,second) else reference_games)
+                for opponent in opponents]
+    older=promotion_older(iteration,champion)
     opponents=[]
-    for opponent in (previous,second,0):
-        if opponent not in opponents:opponents.append(opponent)
-    return [(opponent, games if opponent in (previous,second) else reference_games)
+    for opponent in (previous,champion,older,0):
+        if opponent is not None and opponent not in opponents:opponents.append(opponent)
+    required={previous,champion,older}
+    return [(opponent, games if opponent in required else reference_games)
             for opponent in opponents]
+
+
+def promotion_older(iteration, champion):
+    """Nearest checkpoint about 20% behind the previous one, distinct from incumbent."""
+    previous=iteration-1;target=round(previous*.8)
+    choices=[number for number in range(previous) if number!=champion]
+    return min(choices,key=lambda number:(abs(number-target),number)) if choices else None

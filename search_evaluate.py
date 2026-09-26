@@ -9,10 +9,10 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from checkpoint_league import evaluation_schedule
+from checkpoint_league import evaluation_schedule, promotion_older
 from klent import digest
 from paired_rating import fit_ratings, METHOD as JOINT_METHOD, NOTE as JOINT_NOTE
-from search_train import play_games, source_identity, read_corpus, evaluation_protocol
+from search_train import play_games, source_identity, read_corpus, evaluation_protocol, pessimistic_promotion
 from relational_train import load_model
 from relational_model import NeuralEvaluator
 from train import paired_metrics, task_opening, write_json
@@ -120,11 +120,8 @@ def publish_ratings(run,worker_identity):
         if b==a-1:record['previous_score']=score
         if b==report['champion']:
             record['champion_score']=score;record['versus_champion']=b
-            record['background_decision']=('Pending' if len(report['games'])<report['target_games'] else
-                'Capped / inconclusive' if score['incomplete'] else
-                'Promotion evidence' if score['wins']>score['losses'] and score['opening_pair_p']<.05 else 'No promotion evidence')
         if b==0:record['anchor_score']=score
-        if b not in (0,a-1,report['champion']):record['older_score']=dict(score,opponent=b)
+        if b==promotion_older(a,report['champion']):record['older_score']=dict(score,opponent=b)
     for number,record in entries.items():
         if not record.get('background'):continue
         candidate_reports=[r for r in data if r['candidate']==number and 'background_identity' in r]
@@ -132,6 +129,18 @@ def publish_ratings(run,worker_identity):
         expected=dict(evaluation_schedule(number,champion,worker_identity['eval_games'],worker_identity['reference_games']))
         completed={r['opponent']:len(r['games']) for r in candidate_reports}
         record['provisional']=any(completed.get(opponent,0)<count for opponent,count in expected.items())
+        older=promotion_older(number,champion)
+        if older is None:record['background_decision']='No distinct older opponent'
+        else:
+            wins=[]
+            for opponent,key in ((champion,'champion_score'),(older,'older_score')):
+                report=next((r for r in candidate_reports if r['opponent']==opponent),None)
+                if report is None or len(report['games'])<expected[opponent]:
+                    record['background_decision']='Pending';break
+                won,worst=pessimistic_promotion(report);wins.append(won)
+                record[key].update(pessimistic_wins=worst['wins'],pessimistic_losses=worst['losses'],
+                                   pessimistic_opening_pair_p=worst['opening_pair_p'])
+            else:record['background_decision']='Promotion evidence' if all(wins) else 'No promotion evidence'
     write_json(run/'background-league.json',dict(config_sha256=digest(run/'config.json'),updated_at=time.time(),
         protocol=worker_identity['protocol'],checkpoints=list(entries.values()),rating_method=JOINT_METHOD,
         diagnostics=diagnostics,note='Separate CPU float32 estimates from background paired games. CUDA scheduled ratings use their own protocol. CPU estimates do not promote champions. '+JOINT_NOTE))

@@ -15,6 +15,7 @@ import time
 
 from klent import digest
 from search_train import source_identity, runtime_identity, verify_artifact
+from checkpoint_league import PROMOTION_RULE
 
 
 NUMBERS = ('replay_positions','reuse_ratio','games','eval_games','reference_games','envs',
@@ -92,7 +93,8 @@ def main():
     if args.eval_max_plies<5:parser.error('Evaluation cap must fit the five-ply standard opening')
     previous=json.loads((run/'config.json').read_text())
     tactics=previous['config'].get('eval_tactics',False) if args.eval_tactics is None else args.eval_tactics
-    settings=dict(previous['config'],eval_max_plies=args.eval_max_plies,eval_tactics=tactics,evaluate_every=1)
+    settings=dict(previous['config'],eval_max_plies=args.eval_max_plies,eval_tactics=tactics,
+                  evaluate_every=1,promotion_rule=PROMOTION_RULE)
     first_upgrade=(previous['sources']!=source_identity() or previous['config']!=settings
                    or previous['runtime']!=runtime_identity())
     latest=saved_boundary(run,migration=first_upgrade)

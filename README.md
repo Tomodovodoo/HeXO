@@ -669,7 +669,7 @@ Terminal inference is rejected because the rules and search own terminal values.
 
 ## Search-trained policy/value self-play
 
-`search_train.py` trains the relational policy/value model from Gumbel MCTS self-play. The policy target is the full legal-action Gumbel completed-Q improved policy. The value target is the final game result from the player-to-move perspective. Capped games supply no outcome target. This path does not use KLENT action-Q targets or external bots for checkpoint selection.
+`search_train.py` trains the relational policy/value model from Gumbel MCTS self-play. The policy target is the full legal-action Gumbel completed-Q improved policy. The value target is the final game result from the player-to-move perspective. Capped games keep their policy targets but supply no outcome target. This path does not use KLENT action-Q targets or external bots for checkpoint selection.
 
 ```powershell
 python search_train.py --run runs/search-selfplay --initial-model path/to/model.pt --games 128 --eval-games 32 --evaluate-every 4 --replay-positions 200000 --reuse-ratio 4 --iterations 100 --device cuda
@@ -678,13 +678,13 @@ python dashboard.py --run runs/search-selfplay --port 8766
 
 A policy/Q warm start preserves its backbone and policy and initializes a new scalar value head at zero. Native trees batch neural leaves across games. Graph memory limits split whole positions without cropping legal actions. The collector enables immediate tactical constraints in search and its normalized policy targets. Ordinary Gumbel play also enables those constraints; deep proof search remains optional. The nominal 16 simulations are retained, including inexpensive exact backups. Evaluation keeps tactics disabled, preserving the original fixed protocol for measuring network progress.
 
-Checkpoint 0 is the internal Elo anchor at zero. Every fourth candidate by default plays equal-search-budget, color-swapped games against recent checkpoints, with a smaller allocation against the anchor. Other saved candidates remain available to self-play and future comparisons; an unmeasured rating is not invented. The dashboard shows all checkpoint ratings with uncertainty, losses, throughput and GPU telemetry. A positive paired test at p < 0.05 selects a new champion. Learning continues from the latest candidate regardless of champion selection. Ratings describe this internal league and search budget, not an external leaderboard. The p-value is per comparison, not a guarantee across indefinitely repeated runs.
+Checkpoint 0 is the internal Elo anchor at zero. Every fourth candidate by default plays equal-search-budget, color-swapped games against the previous checkpoint, incumbent champion, and a distinct checkpoint near 20% behind the previous one, plus a smaller anchor comparison when the anchor is not already required. Duplicate opponents are played once. Promotion requires full matches and more wins than losses against both the incumbent and selected older checkpoint after counting capped games as candidate losses for this decision. There is no p-value promotion gate. When early history has no distinct older checkpoint, promotion waits. Learning continues from the latest candidate regardless of champion selection. Ratings describe this internal league and search budget, not an external leaderboard.
 
 Rerun the same command to resume completed artifacts; only the requested iteration count may change. Saved corpora and optimizer checkpoints are verified. A partial fitting pass restarts from the preceding checkpoint rather than silently applying the same targets twice. Active run source files must remain unchanged.
 
 ### Recent replay and learning credit
 
-Each collection defaults to 128 attempted games. Capped episodes have no training rows. Up to 200,000 eligible positions are read from the most recent corpora, including earlier actors in the same run. The oldest admitted corpus is trimmed at the position limit. Corpus manifests bind actor hashes and targets; fitting records all source manifest hashes and the number of presentations by target age.
+Each collection defaults to 128 attempted games. Capped episodes keep searched policy rows; their value targets are masked. Up to 200,000 eligible positions are read from the most recent corpora, including earlier actors in the same run. The oldest admitted corpus is trimmed at the position limit. Corpus manifests bind actor hashes and targets; fitting records all source manifest hashes and the number of presentations by target age.
 
 `--reuse-ratio 4` permits exactly four example presentations per fresh admitted position. The learner samples shuffled passes across replay until that budget is spent, including a smaller final minibatch. It does not run repeated full replay epochs. The replay learner uses all eligible rows, so it has no compulsory 25% holdout; historical held-out losses remain visible and are not extended with training losses. Model weights and Adam state continue from the latest checkpoint.
 
@@ -697,8 +697,9 @@ opponent allocation on CPU float32. Each complete color-swapped pair updates
 `background-league.json`; the dashboard overlays these estimates without modifying
 the trainer's league, champion, models, optimizer or corpus. Partial match sets are
 labeled provisional and report played/planned counts. A capped comparison does not
-provide a rating edge. CPU results show promotion evidence only after their full
-planned match set; actual champion promotion still uses scheduled GPU matches.
+provide a rating edge. CPU results show promotion evidence only after full
+incumbent and distinct older matches both have winning conservative scores;
+actual champion promotion still uses scheduled GPU matches.
 
 The combined Elo estimate mixes CPU float32 and CUDA mixed-precision comparisons.
 Its approximate 95% credible interval measures paired-game sampling uncertainty,
@@ -719,10 +720,11 @@ Exact cache keys now derive colored stones and turn phase from native legal hist
 
 ### Moving internal opponents and league ratings
 
-Search-training evaluation uses `--eval-games 32` against the previous checkpoint
-and the current champion, plus `--reference-games 8` against checkpoint 0. When
-previous and champion coincide, the second opponent is approximately 20% earlier
-in training. Duplicate opponents are played once. Self-play training still uses
+Search-training evaluation uses `--eval-games 32` against the previous checkpoint,
+the current champion, and the checkpoint nearest 20% behind the previous one that
+is distinct from both. It uses `--reference-games 8` against checkpoint 0 unless
+that checkpoint is already required, in which case it gets the full allocation.
+Duplicate opponents are played once. Self-play training still uses
 the latest network on both sides with Gumbel search targets and terminal outcomes.
 
 League Elo fits all completed internal comparisons, fixing checkpoint 0 at zero.
