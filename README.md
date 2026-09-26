@@ -696,14 +696,15 @@ learner continues. It uses the same search budget and previous/champion/older/re
 opponent allocation on CPU float32. Each complete color-swapped pair updates
 `background-league.json`; the dashboard overlays these estimates without modifying
 the trainer's league, champion, models, optimizer or corpus. Partial match sets are
-labeled provisional and report played/planned counts. A capped comparison does not
-provide a rating edge. CPU results show promotion evidence only after full
+labeled provisional and report played/planned counts. Fully terminal opening pairs
+from a capped comparison still inform provisional Elo; pairs containing a cap do not.
+CPU results show promotion evidence only after full
 incumbent and distinct older matches both have winning conservative scores;
 actual champion promotion still uses scheduled GPU matches.
 
-The combined Elo estimate mixes CPU float32 and CUDA mixed-precision comparisons.
-Its approximate 95% credible interval measures paired-game sampling uncertainty,
-not possible backend differences. Background evaluation can lag checkpoint creation;
+CPU float32 and CUDA mixed-precision comparisons remain separate rating protocols.
+Their conditional 95% credible intervals do not account for backend differences or
+selection caused by capped games. Background evaluation can lag checkpoint creation;
 queued checkpoints remain unrated until games supply evidence. Keep the worker source
 unchanged while it runs. It resumes saved pairs, rejects changed identities and owns
 an exclusive `background-evaluation.lock`.
@@ -727,20 +728,20 @@ that checkpoint is already required, in which case it gets the full allocation.
 Duplicate opponents are played once. Self-play training still uses
 the latest network on both sides with Gumbel search targets and terminal outcomes.
 
-League Elo fits all completed internal comparisons, fixing checkpoint 0 at zero.
-The fit weights comparisons by their game counts, so most new evidence comes from
-recent opponents. Historical ratings can change when new results arrive. Raw
-match scores and reference-only estimates remain in `league.json`.
+Displayed joint Elo fits fully terminal color-swapped pairs from current-protocol
+comparisons, fixing checkpoint 0 at zero. Completed pairs contribute even when other
+pairs in that match cap; no outcome is invented for capped or unsaved games. Historical
+ratings can change when new results arrive. Raw match scores and reference-only
+estimates remain in `league.json`.
 
-The displayed 95% intervals are approximate Bayesian credible intervals. Each
-comparison records whether the candidate wins zero, one, or two games in each
-color-swapped opening pair. A Jeffreys Dirichlet prior over those three outcomes
-retains uncertainty even after a sweep or a set of split pairs. The dashboard uses
-2,048 posterior draws projected into Bradley-Terry ratings. These intervals are
-conditional on the paired-outcome model, not a guarantee of future performance.
+The displayed 95% intervals are approximate Bayesian credible intervals for the
+joint model conditional on pair completion. The dashboard labels them provisional
+where capped or unsaved pairs are present. Match score bounds run from known wins
+divided by planned games to known wins plus all unknown outcomes divided by planned
+games. These are deterministic observed-score bounds, not 95% sampling intervals.
 New comparisons use distinct opponent-specific seeds; older comparisons may
 share opening schedules, a dependence this approximation does not model across
-comparisons. Promotion continues to use the separately recorded paired test.
+comparisons. Promotion uses the separately recorded conservative two-opponent scores.
 
 For live sparse-checkpoint estimates, run `python paired_rating.py --run runs/gumbel-policy-value-v1`
 beside the evaluator. The dashboard prefers its `paired-ratings.json` output.
@@ -757,12 +758,15 @@ weak Normal(0, 1000 Elo) prior with checkpoint 0 fixed; `tau` has a Normal(log(2
 prior. The point estimate is the joint posterior mode. A multivariate Student-t proposal
 around that mode supplies 32,768 importance-weighted posterior samples for the 95%
 credible interval; publication requires at least 1,000 effective samples. The dashboard
-shows the number of rated pairs involving each checkpoint, including games as opponent.
+shows the number of rated and censored pairs involving each checkpoint, including
+games as opponent.
 
 These are model-dependent estimates. A single split pair means zero head-to-head Elo
 difference with large uncertainty; other observed matchups can still change the joint
-estimate. Capped comparisons are excluded, and CPU/CUDA differences and historical
-shared-opening dependence across comparisons remain outside this uncertainty model.
+estimate. Only fully terminal pairs enter the likelihood. Completion may depend on
+model strength, so conditional Elo and its credible interval can be biased for the
+full match. CPU/CUDA differences and historical shared-opening dependence across
+comparisons remain outside this uncertainty model.
 The rating worker reads saved results only and changes neither promotion nor training.
 
 To upgrade a completed older search run, reuse its original learning and search

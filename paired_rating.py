@@ -12,19 +12,52 @@ from scipy.optimize import minimize
 from scipy.special import logsumexp
 import torch
 
-from checkpoint_league import paired_posteriors
-from train import write_json
+from train import paired_metrics, write_json
 
 SCALE=400/math.log(10)
-METHOD='Joint paired-outcome likelihood; MAP Elo, importance-sampled 95% credible intervals'
-NOTE=('Actual paired counts, without per-match pseudo-wins. Checkpoint 0 fixes the origin. '
+METHOD='Joint likelihood of completed color-swapped pairs; conditional MAP Elo and 95% credible intervals'
+NOTE=('Provisional ratings use only pairs where both games finished. Capped or unplayed outcomes remain unknown; '
+      'game completion may depend on strength, so the point and credible interval can be selection-biased. '
+      'Observed-score bounds include every unknown outcome and are not 95% confidence intervals. '
+      'Actual paired counts have no per-match pseudo-wins. Checkpoint 0 fixes the origin. '
       'Ratings have independent Normal(0, 1000 Elo) priors. A shared fitted pair-dispersion parameter '
       'allows split pairs to be more or less common than independent games. Intervals are conditional '
-      'on this model and do not cover CPU/CUDA differences, cross-comparison opening dependence, or selection from capped matches.')
+      'on this model and do not cover CPU/CUDA differences or cross-comparison opening dependence.')
+
+
+def completed_pairs(ids,reports):
+    edges=[];coverage=[]
+    for report in reports:
+        a,b=report['candidate'],report['opponent']
+        if a not in ids or b not in ids:continue
+        if a==b:raise ValueError('A checkpoint cannot rate itself')
+        games=report['games'];metrics=report['metrics'];target=report.get('target_games',metrics['planned_games'])
+        if target<2 or target%2 or len(games)>target or len(games)%2 or \
+           metrics!=paired_metrics(games,metrics['planned_games']):
+            raise ValueError('Comparison games disagree with reported metrics')
+        pairs={}
+        for game in games:pairs.setdefault(game['pair'],[]).append(game)
+        counts=np.zeros(3);censored=0
+        for pair,games_in_pair in pairs.items():
+            if len(games_in_pair)!=2 or {g['challenger_color'] for g in games_in_pair}!={0,1} or \
+               games_in_pair[0]['opening']!=games_in_pair[1]['opening'] or \
+               games_in_pair[0]['seed']!=games_in_pair[1]['seed'] or \
+               any(g['winner'] not in (-1,0,1) for g in games_in_pair):
+                raise ValueError('Rating requires intact color-swapped opening pairs')
+            if any(g['winner']<0 for g in games_in_pair):censored+=1
+            else:counts[sum(g['winner']==g['challenger_color'] for g in games_in_pair)]+=1
+        rated=int(counts.sum());unplayed=(target-len(games))//2
+        known=metrics['wins'];unknown=target-known-metrics['losses']
+        coverage.append(dict(candidate=a,opponent=b,origin='background' if 'background_identity' in report else 'scheduled',
+            target_games=target,known_wins=known,known_losses=metrics['losses'],rated_pairs=rated,
+            censored_pairs=censored,unplayed_pairs=unplayed,capped_games=metrics['incomplete'],
+            observed_score_bounds=[known/target,(known+unknown)/target]))
+        if rated:edges.append((a,b,counts,2*rated))
+    return edges,coverage
 
 
 def fit_ratings(ids,reports,seed=1740,samples=32768):
-    edges=paired_posteriors(ids,reports)
+    edges,coverage=completed_pairs(ids,reports)
     connected={0}
     while True:
         before=set(connected)
@@ -34,16 +67,26 @@ def fit_ratings(ids,reports,seed=1740,samples=32768):
     variables=sorted(connected-{0});index={n:i for i,n in enumerate(variables)}
     result={n:dict(id=n,elo=None,elo_interval=None,rating_pairs=0) for n in ids}
     result[0].update(elo=0.,elo_interval=[0.,0.])
+    for record in coverage:
+        for number in (record['candidate'],record['opponent']):
+            result[number].setdefault('rating_censored_pairs',0)
+            result[number].setdefault('rating_unplayed_pairs',0)
+            result[number]['rating_censored_pairs']+=record['censored_pairs']
+            result[number]['rating_unplayed_pairs']+=record['unplayed_pairs']
+    provisional=any(record['rated_pairs'] and (record['censored_pairs'] or record['unplayed_pairs']) and
+                    record['candidate'] in connected and record['opponent'] in connected for record in coverage)
+    for number in variables:
+        result[number]['rating_provisional']=provisional or bool(result[number].get('rating_censored_pairs')) or \
+            bool(result[number].get('rating_unplayed_pairs'))
     edges=[e for e in edges if e[0] in connected]
-    if not variables:return result,dict(effective_samples=0)
+    if not variables:return result,dict(effective_samples=0,comparison_coverage=coverage)
     matrix=np.zeros((len(edges),len(variables)))
     for i,(a,b,alpha,n) in enumerate(edges):
         if a:matrix[i,index[a]]=1
         if b:matrix[i,index[b]]=-1
         result[a]['rating_pairs']+=int(n/2);result[b]['rating_pairs']+=int(n/2)
     matrix=torch.tensor(matrix,dtype=torch.float64)
-    # paired_posteriors validates records; remove its legacy .5/category prior.
-    counts=torch.tensor(np.array([e[2]-.5 for e in edges]),dtype=torch.float64)
+    counts=torch.tensor(np.array([e[2] for e in edges]),dtype=torch.float64)
     def loss(x):
         d=x[...,:-1]@matrix.T;tau=x[...,-1:]
         # p=logistic(d) remains the expected game score for any dispersion.
@@ -76,7 +119,8 @@ def fit_ratings(ids,reports,seed=1740,samples=32768):
         values=draws[:,i]*SCALE;order=np.argsort(values);cdf=np.cumsum(weights[order])
         interval=np.interp([.025,.975],cdf,values[order]).tolist()
         result[number].update(elo=float(optimum.x[i]*SCALE),elo_interval=interval)
-    return result,dict(effective_samples=ess,samples=samples,pair_dispersion=float(optimum.x[-1]))
+    return result,dict(effective_samples=ess,samples=samples,pair_dispersion=float(optimum.x[-1]),
+                       comparison_coverage=coverage)
 
 
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
