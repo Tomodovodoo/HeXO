@@ -15,7 +15,7 @@ import hexo
 from hexo import Game
 from relational_encoder import transform
 
-BUCKETS = (24, 32, 40, 48, 64, 96, 128)
+BUCKETS = (24, 32, 40, 48, 64, 96, 128, 192, 256)
 # own/opponent: stones of the side to move / the other side; legal: in-crop legal cells;
 # crop: 1 on the bbox of stones and legal cells (far mode: stones plus halo), 0 on bucket padding;
 # remaining_1/remaining_2: constant planes for 1 or 2 placements left this turn; turn_stone:
@@ -30,6 +30,10 @@ INVERSES = np.rint(np.linalg.inv(SYMMETRIES)).astype(np.int64)
 _AXIS_OF = np.array([[2 if m[0, j] and m[1, j] else int(m[1, j] != 0) for j in (0, 1)] for m in SYMMETRIES])
 _CELL = np.dtype([('q', '<i8'), ('r', '<i8'), ('player', '<i4')], align=True)
 assert _CELL.itemsize == C.sizeof(hexo.Cell)
+
+
+class SpanError(ValueError):
+    """The stones plus halo span more cells than the largest bucket."""
 
 
 @dataclass
@@ -132,7 +136,7 @@ def encode_game(game, history, *, symmetry=None, rng=None):
 
     symmetry=None picks the symmetry with the smallest crop (lowest id on ties);
     with `rng` it picks uniformly among symmetries that fit the same bucket.
-    Terminal positions raise ValueError.
+    Terminal positions raise ValueError, positions too wide even for far mode SpanError.
     """
     if game.winner >= 0:
         raise ValueError('Terminal positions are not encoded')
@@ -152,7 +156,7 @@ def encode_game(game, history, *, symmetry=None, rng=None):
         sides = _sides(moves, HALO)
         k = _choose(sides, symmetry, rng)
         if sides[k] > BUCKETS[-1]:
-            raise ValueError(f'Stones span {sides[k]} cells with halo; the largest bucket is {BUCKETS[-1]}')
+            raise SpanError(f'Stones span {sides[k]} cells with halo; the largest bucket is {BUCKETS[-1]}')
     size = _bucket(sides[k])
     t = points @ SYMMETRIES[k]
     low = t.min(0)-halo
@@ -191,17 +195,13 @@ def group_by_size(samples):
     return groups
 
 
-def batch(samples, planes_out=None):
-    """Stack samples of one bucket size. cells are padded with -1 beyond counts[b].
-
-    planes_out, if given, is a uint8 [>=B, C, S, S] array (e.g. a pinned staging
-    buffer) that receives the planes; its leading B rows are returned.
-    """
+def batch(samples):
+    """Stack samples of one bucket size; cells are padded with -1 beyond counts[b]."""
     size = samples[0].size
     if any(s.size != size for s in samples):
         raise ValueError('A batch must hold one bucket size')
     counts = np.array([len(s.cells) for s in samples], np.int64)
-    planes = np.stack([s.planes for s in samples], out=None if planes_out is None else planes_out[:len(samples)])
+    planes = np.stack([s.planes for s in samples])
     cells = np.full((len(samples), counts.max(initial=0)), -1, np.int64)
     cells[np.arange(cells.shape[1]) < counts[:, None]] = np.concatenate([s.cells for s in samples])
     return dict(planes=planes, cells=cells, counts=counts, size=size,

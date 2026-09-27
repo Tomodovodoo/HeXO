@@ -1,13 +1,10 @@
 """Dense self-play actor: many native Gumbel trees batched continuously onto one DenseEvaluator.
 
-Run contract (see dense_config for settings):
-  <run>/champion.json       {"checkpoint": "<variant>/<step:06d>", "ema_sha256", "updated_at"}; the actor plays
-                            that checkpoint's ema.pt, else the newest complete checkpoint, else --initial-model,
-                            else a fresh HexNet(config.model) seeded with config.seed.
-  <run>/checkpoints/<variant>/<step:06d>/  complete once manifest.json exists next to ema.pt.
-  <run>/shards/<ms:013d><pid%1000:03d>/    dense_data shards; rows carry no value targets (target null,
-                            weight 0): the learner derives them from episode root_values and winner.
-  <run>/actor-status[-k].json, <run>/events.jsonl.
+Run layout: dense_config. The actor plays the ema.pt of champion.json's checkpoint, else of the newest complete
+checkpoint, else --initial-model, else a fresh HexNet(config.model) seeded with config.seed. Shards are named
+<ms:013d><pid%1000:03d>; their rows carry no value targets (target null, weight 0): the learner derives them
+from episode root_values and winner. A game with a searched position wider than the largest crop ends capped with
+reason 'span' and an error event.
 
 Scheduling: every game owns one persistent NeuralSearch tree. Engine keeps all trees searching at once and
 starts a tree's next search as soon as its previous one finishes, so full (`full_sims`) and cheap
@@ -18,7 +15,6 @@ the new one; a shard may therefore mix actors (identity `actors`; `actor_sha256`
 import argparse
 from collections import deque
 from dataclasses import asdict
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -33,24 +29,18 @@ import dense_config
 import dense_data
 import hexcrop
 import hexnet
+from dense_config import log_event
 from hexo import Game
 from klent import digest
 from neural_search import EvaluationCache, NeuralSearch, checked, native
 from train import write_json
 
-# Crop cells per forward (48 positions at 48x48; larger crops get proportionally fewer; measured: same
-# throughput as 96 at about half the VRAM, ~0.67 GB per process for b6c96). A crop-size group
-# is padded into the next larger size present when that adds fewer than MERGE_CELLS cells: measured b6c96
-# bf16 forwards cost about 8 ms of launch overhead plus 0.23 us per cell on an RTX 3070 Ti.
+# Crop cells per forward: 48 positions at 48x48, proportionally fewer for larger crops (~0.67 GB per b6c96
+# process). A crop-size group is padded into the next larger size present when that adds fewer than
+# MERGE_CELLS cells: b6c96 bf16 forwards cost about 8 ms of launch overhead plus 0.23 us per cell on an
+# RTX 3070 Ti.
 MAX_CELLS, MERGE_CELLS = 48*48*48, 32768
 COLOR = ((np.arange(1 << 16)+1)//2) % 2
-
-
-def log_event(run, source, kind, message, **fields):
-    """Append one line to <run>/events.jsonl."""
-    with (Path(run)/'events.jsonl').open('a', encoding='utf-8') as stream:
-        stream.write(json.dumps(dict(time=time.time(), source=source, kind=kind, message=message, **fields),
-                                allow_nan=False)+'\n')
 
 
 def checkpoints(run):
@@ -94,14 +84,20 @@ class Position:
 class Evaluator(hexnet.DenseEvaluator):
     """DenseEvaluator over native int64 histories with a split submit/collect so the GPU runs one batch while
     the caller gathers the next. Predictions are fulfil-ready tuples (actions int64 [N, 2], logits float64 [N],
-    q float64 [N]). Small crop-size groups are padded into the next larger size present (top-left
-    placement; the network is invariant to where the crop sits in the canvas; see MERGE_CELLS) and every
-    forward is capped at MAX_CELLS crop cells."""
+    q float64 [N]), or None for a position wider than the largest crop (hexcrop.SpanError). Small crop-size
+    groups are padded into the next larger size present (top-left placement; the network is invariant to where
+    the crop sits in the canvas; see MERGE_CELLS) and every forward is capped at MAX_CELLS crop cells."""
 
     @torch.inference_mode()
     def submit(self, histories):
-        samples = [hexcrop.encode_game(Position(h), h) for h in histories]
-        groups = hexcrop.group_by_size(samples)
+        samples, groups = [], {}
+        for i, h in enumerate(histories):
+            try:
+                samples.append(hexcrop.encode_game(Position(h), h))
+            except hexcrop.SpanError:
+                samples.append(None)
+                continue
+            groups.setdefault(samples[i].size, []).append(i)
         sizes = sorted(groups)
         for small, large in zip(sizes, sizes[1:]):
             if len(groups[small])*(large*large-small*small) < MERGE_CELLS:
@@ -203,13 +199,14 @@ def root_value(result, player):
 class Engine:
     """Continuous, pipelined batched Gumbel search over slots.
 
-    A slot exposes `tree` (NeuralSearch whose model owns the evaluator), `model`, `budget`, `samples`, and
-    `searched(result) -> bool` which plays the move(s) and returns True after preparing its next search
-    (new tree/budget allowed) or False when its game is over. `step()` visits slots round-robin, draining
+    A slot exposes `tree` (NeuralSearch whose model owns the evaluator), `model`, `budget`, `samples`, `reason`
+    (None) and `searched(result) -> bool` which plays the move(s) and returns True after preparing its next
+    search (new tree/budget allowed) or False when its game is over. `step()` visits slots round-robin, draining
     each tree's ready leaf requests until `leaf_batch` evaluations are pending, launches them (one forward
     set per model, one evaluation per distinct position), then collects and fulfils the batch launched by
     the previous step, so the GPU works on one batch while the trees produce the next. It returns the
-    slots whose games finished.
+    slots whose games finished, including slots stopped because a searched position could not be encoded
+    (`reason` set to 'span'; none of their requests is fulfilled afterwards).
     """
 
     def __init__(self, leaf_batch):
@@ -258,7 +255,7 @@ class Engine:
                     self.hits += 1
                     progress = True
                 else:
-                    pending.setdefault(model, {}).setdefault(key, [history]).append((ptr, request))
+                    pending.setdefault(model, {}).setdefault(key, [history]).append((slot, ptr, request))
                     count += 1
         launched = []
         for model, positions in pending.items():
@@ -266,11 +263,24 @@ class Engine:
             launched.append((model, positions, keys, model.evaluator.submit([positions[k][0] for k in keys])))
             self.calls += 1
             self.evals += len(keys)
+        stopped = set()
         for model, positions, keys, handle in self.inflight:
             for key, prediction in zip(keys, model.evaluator.collect(handle)):
-                for ptr, request in positions[key][1:]:
-                    checked(native.hxg_fulfill(ptr, request, *prediction, len(prediction[0])))
+                if prediction is None:
+                    stopped.update(slot for slot, _, _ in positions[key][1:])
+                    continue
+                for slot, ptr, request in positions[key][1:]:
+                    if slot not in stopped:
+                        checked(native.hxg_fulfill(ptr, request, *prediction, len(prediction[0])))
                 model.cache.put(key, prediction)
+        if stopped:
+            for _, positions, _, _ in launched:
+                for waiting in positions.values():
+                    waiting[1:] = [w for w in waiting[1:] if w[0] not in stopped]
+            for slot in stopped:
+                slot.reason = 'span'
+                if slot in self.slots and slot not in done:
+                    done.append(slot)
         if not launched and not self.inflight and not progress and self.slots:
             raise RuntimeError('Native scheduler stalled without pending evaluations')
         self.inflight = launched
@@ -284,7 +294,7 @@ class SelfPlayGame:
     """One self-play game and its tree; records a row, root value and search kind for every placement."""
 
     def __init__(self, model, settings, seed):
-        self.model, self.settings, self.seed = model, settings, seed
+        self.model, self.settings, self.seed, self.reason = model, settings, seed, None
         self.rng = np.random.default_rng(seed)
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) if settings.opening_random_plies > 0 else 0
         self.tree = model.tree((), seed, settings.tactics)
@@ -300,8 +310,8 @@ class SelfPlayGame:
     def searched(self, result):
         game, actions = self.game, result['actions']
         player, ply = game.player, len(self.moves)
-        row = dict(ply=ply, player=player, remaining=game.remaining,
-                   legal_sha256=hashlib.sha256(actions.tobytes()).hexdigest(), policy=None)
+        row = dict(ply=ply, player=player, remaining=game.remaining, legal_sha256=dense_data.legal_digest(actions),
+                   policy=None)
         policy = result['policy']
         if self.is_full:
             if not np.isclose(policy.sum(), 1, atol=1e-6) or np.any(policy < 0):
@@ -327,7 +337,7 @@ class SelfPlayGame:
         """(episode, rows without `game`) after closing the native objects."""
         winner = self.game.winner
         self.game.close(); self.tree.close()
-        return dict(moves=self.moves, winner=winner, reason='six-in-a-row' if winner >= 0 else 'cap',
+        return dict(moves=self.moves, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
                     opening_plies=min(self.random_plies, len(self.moves)), actor=self.model.sha,
                     root_values=self.values, full_search=self.full), self.rows
 
@@ -404,6 +414,9 @@ def worker(args):
             before = engine.searches
             for slot in engine.step():
                 episode, items = slot.episode()
+                if episode['reason'] == 'span':
+                    log_event(run, 'actor', 'error', f'worker {args.worker}: game ended at ply {len(episode["moves"])}, '
+                              f'a searched position spans more than the largest crop', process=args.worker)
                 episodes.append(episode)
                 rows.extend(dict(r, game=len(episodes)-1) for r in items)
                 state['games_completed'] += 1; state['terminal'] += episode['winner'] >= 0; state['plies'] += len(episode['moves'])
@@ -417,34 +430,53 @@ def worker(args):
         status('finished')
     except BaseException as error:
         state['error'] = f'{type(error).__name__}: {error}'
-        status('error')
+        status('failed')
         log_event(run, 'actor', 'error', state['error'], process=args.worker)
         raise
 
 
+def published(run, worker, since):
+    """Games in shards written by actor worker `worker` at or after `since`."""
+    items = (dense_data.manifest(path) for path in dense_data.shard_dirs(run))
+    return sum(m['counts']['games'] for m in items if m['identity'].get('process') == worker and m['created_at'] >= since)
+
+
 def supervise(args):
-    """Run --processes workers as subprocesses of this script; restart a crashed worker after logging it."""
+    """Run --processes workers as subprocesses of this script; restart a crashed worker with the games it has
+    not published yet."""
     run = Path(args.run)
     dense_config.load(run)
     command = [sys.executable, str(Path(__file__).resolve()), '--run', str(run)]
-    command += ['--games', str(args.games)] if args.games is not None else []
     command += ['--initial-model', str(args.initial_model)] if args.initial_model else []
-    spawn = lambda k: subprocess.Popen(command+['--worker', str(k)])
+    remaining = dict.fromkeys(range(args.processes), args.games)
+
+    def spawn(k):
+        games = [] if remaining[k] is None else ['--games', str(remaining[k])]
+        return subprocess.Popen(command+games+['--worker', str(k)]), time.time()
+
     workers = {k: spawn(k) for k in range(args.processes)}
     log_event(run, 'actor', 'info', f'supervisor started {args.processes} workers')
     try:
         while workers:
             time.sleep(1)
-            for k, process in list(workers.items()):
+            for k, (process, started) in list(workers.items()):
                 code = process.poll()
+                if code is None:
+                    continue
+                del workers[k]
                 if code == 0:
-                    del workers[k]
-                elif code is not None:
-                    log_event(run, 'actor', 'error', f'worker {k} exited with code {code}; restarting in 10 s', process=k)
+                    continue
+                if remaining[k] is not None:
+                    remaining[k] -= published(run, k, started)
+                restart = remaining[k] is None or remaining[k] > 0
+                left = '' if remaining[k] is None else f' with {remaining[k]} games left'
+                log_event(run, 'actor', 'error', f'worker {k} exited with code {code}'
+                          + (f'; restarting in 10 s{left}' if restart else ''), process=k)
+                if restart:
                     time.sleep(10)
                     workers[k] = spawn(k)
     finally:
-        for process in workers.values():
+        for process, _ in workers.values():
             process.terminate()
 
 

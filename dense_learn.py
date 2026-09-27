@@ -1,12 +1,9 @@
-"""Dense learner: trains one HexNet variant on a run's shards and exports EMA checkpoints.
+"""Dense learner: trains one HexNet variant on a run's shards and exports EMA checkpoints (run layout: dense_config).
 
-Writes, under the run directory:
-  checkpoints/<variant>/<step:06d>/  model.pt (raw weights), ema.pt (what actors play; both hexnet.save_model),
-      optimizer.pt, manifest.json {variant, step, samples_seen, created_at, model_sha256, ema_sha256
-      (hexnet.model_digest), metrics, learner (effective LearnerSettings), model (ModelSettings), copied_from}
-  learner-status.json (variant main) or learner-status-<variant>.json, rewritten about every 2 s
-  events.jsonl lines {time, source: learner, kind: export|info|error|replace, message, ...}
-Reads league.json (evaluator-owned) for population replacement and never writes it.
+A checkpoint holds model.pt (raw weights) and ema.pt (what actors play), both hexnet.save_model, optimizer.pt and
+manifest.json {variant, step, samples_seen, created_at, model_sha256, ema_sha256 (hexnet.model_digest), metrics,
+learner (effective LearnerSettings), model (ModelSettings), copied_from}. Events have source 'learner' and kind
+export, info, error or replace. league.json is read for population replacement, never written.
 
 Every target is derived here from episodes (dense_data.examples), so td_lambda, bootstrap_weight and
 short_value_horizon are learner settings; batches are rendered by dense_data.Renderers worker processes
@@ -48,11 +45,6 @@ BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 
 
 def status_path(run, variant):
     return run/('learner-status.json' if variant == 'main' else f'learner-status-{variant}.json')
-
-
-def event(run, kind, message, **fields):
-    with (run/'events.jsonl').open('a', encoding='utf-8') as stream:
-        stream.write(json.dumps(dict(time=time.time(), source='learner', kind=kind, message=message, **fields), allow_nan=False)+'\n')
 
 
 def pad(bucket, quantum):
@@ -147,7 +139,7 @@ class Learner:
         `overrides`), else start from `initial` or random weights."""
         self.run, self.settings, self.config, self.overrides = run, settings, config, overrides or {}
         self.device = torch.device(config.device)
-        self.memory_format = torch.contiguous_format if config.model.line_length else torch.channels_last
+        self.memory_format = hexnet.memory_format(config.model)
         self.model = self.place(hexnet.HexNet(hexnet.HexNetConfig(**asdict(config.model))))
         self.step = self.samples_seen = self.optimizer_started = self.ema_updates = 0
         self.copied_from = None
@@ -188,7 +180,7 @@ class Learner:
         self.step, self.samples_seen = manifest['step'], manifest['samples_seen']
         self.optimizer_started, self.ema_updates = state['optimizer_started'], state['ema_updates']
         self.copied_from = manifest.get('copied_from')
-        event(self.run, 'info', f'{self.settings.variant} resumed from step {self.step}', variant=self.settings.variant, step=self.step)
+        dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} resumed from step {self.step}', variant=self.settings.variant, step=self.step)
 
     def lr(self):
         """Linear warmup over warmup_steps from the optimizer's start, then constant."""
@@ -248,8 +240,8 @@ class Learner:
         write_json(stage/'manifest.json', manifest)
         stage.rename(final)
         self.last_export = self.step
-        event(self.run, 'export', f'{s.variant} exported step {self.step}', variant=s.variant, step=self.step,
-              checkpoint=f'{s.variant}/{self.step}', metrics=manifest['metrics'])
+        dense_config.log_event(self.run, 'learner', 'export', f'{s.variant} exported step {self.step}', variant=s.variant, step=self.step,
+              checkpoint=f'{s.variant}/{self.step:06d}', metrics=manifest['metrics'])
         return manifest
 
     def maybe_replace(self, factor_rng):
@@ -280,13 +272,13 @@ class Learner:
         others = [c for v, c in latest.items() if v != s.variant]
         missing = [c['id'] for c in others if (c['id'], mine['id']) not in pairs]
         if missing:
-            event(self.run, 'info', f'{s.variant} replacement check at step {self.step}: no Elo difference entry for '
+            dense_config.log_event(self.run, 'learner', 'info', f'{s.variant} replacement check at step {self.step}: no Elo difference entry for '
                   f'{", ".join(missing)} against {mine["id"]}', variant=s.variant, step=self.step, missing=missing)
         leaders = [c for c in others if (c['id'], mine['id']) in pairs and pairs[c['id'], mine['id']][0] > s.replace_margin]
         if not leaders:
             return False
         source = max(leaders, key=lambda c: pairs[c['id'], mine['id']][2])
-        path = self.run/'checkpoints'/source['variant']/f'{source["step"]:06d}'
+        path = self.run/'checkpoints'/source['id']
         copied = json.loads((path/'manifest.json').read_text(encoding='utf-8'))['learner']
         self.load_weights(path/'model.pt')
         self.ema = copy.deepcopy(self.model)
@@ -296,9 +288,9 @@ class Learner:
         self.optimizer_started = self.last_copy = self.step
         self.ema_updates = 0
         lo, hi, delta = pairs[source['id'], mine['id']]
-        self.copied_from = dict(checkpoint=f'{source["variant"]}/{source["step"]}', at_step=self.step, mine=mine['id'],
+        self.copied_from = dict(checkpoint=source['id'], at_step=self.step, mine=mine['id'],
                                 elo_delta=delta, interval=[lo, hi], source_learner=copied, perturbed=asdict(self.settings))
-        event(self.run, 'replace', f'{s.variant} copied {self.copied_from["checkpoint"]} at step {self.step}',
+        dense_config.log_event(self.run, 'learner', 'replace', f'{s.variant} copied {self.copied_from["checkpoint"]} at step {self.step}',
               variant=s.variant, step=self.step, copied_from=self.copied_from, old=asdict(old), source_settings=copied,
               new=asdict(self.settings))
         return True
@@ -336,7 +328,7 @@ def main():
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers)
         stream = renderers()
         factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])
-        event(args.run, 'info', f'{s.variant} learner started at step {learner.step}', variant=s.variant, step=learner.step,
+        dense_config.log_event(args.run, 'learner', 'info', f'{s.variant} learner started at step {learner.step}', variant=s.variant, step=learner.step,
               learner=asdict(s))
         print(f'{"step":>6} {"policy":>7} {"value":>7} {"short":>7} {"opp":>7} {"future":>7} {"lr":>8} {"rows/s":>7} {"wait":>6} {"gpu":>6} {"mem":>6}', flush=True)
         sums = torch.zeros(len(HEADS), device=learner.device); count = 0
@@ -383,7 +375,7 @@ def main():
             write_status(stage='idle', samples_per_second=0.)
         raise
     except BaseException as error:
-        event(args.run, 'error', f'{s.variant} learner failed: {error!r}', variant=s.variant, step=learner.step)
+        dense_config.log_event(args.run, 'learner', 'error', f'{s.variant} learner failed: {error!r}', variant=s.variant, step=learner.step)
         if 'window' in locals():
             write_status(stage='failed', error=repr(error))
         raise

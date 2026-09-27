@@ -1,13 +1,15 @@
-"""Dense self-play data: shard format, KataGo-style replay window and batch rendering.
+"""Dense self-play data: shard format, KataGo-style replay window and batch rendering (run layout: dense_config).
 
-A shard is an immutable directory `<run>/shards/NNNNNN/` holding
+A shard is an immutable directory `<run>/shards/<name>/` (all digits; converted corpora use six, actors use
+millisecond time plus pid) holding
   episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search}]
   rows.json      [{game, ply, player, remaining, target, weight, legal_sha256}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
   manifest.json  schema, created_at, identity, actor, files (sha256), counts
-`row.game` indexes the shard's episode list. `episode.winner` is 0/1 for finished games and -1 for capped
-games; `episode.root_values` is null or one entry per ply (searched root value in [-1, 1] for the side to
+`row.game` indexes the shard's episode list. `episode.winner` is 0/1 for finished games ('six-in-a-row') and -1
+for capped games ('cap' at the ply limit, 'span' when a searched position does not fit the largest crop);
+`episode.root_values` is null or one entry per ply (searched root value in [-1, 1] for the side to
 move at that ply, or null). The learner derives every target from the episode (`examples`); the stored
 `row.target`/`row.weight` (p(win) or null, weight) are informational and optional.
 """
@@ -15,12 +17,11 @@ from collections import namedtuple
 import hashlib
 import json
 import multiprocessing
+from pathlib import Path
 import queue
 import tempfile
-import threading
 import time
 import traceback
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -35,6 +36,11 @@ FILES = ('episodes.json', 'rows.json', 'targets.npz')
 Ref = namedtuple('Ref', 'shard index row episode')
 Shard = namedtuple('Shard', 'episodes rows full held following')
 FUTURE = (6, 20)
+
+
+def legal_digest(actions):
+    """`legal_sha256` of a native legal list: sha256 of its int64 [N, 2] bytes."""
+    return hashlib.sha256(np.ascontiguousarray(actions, np.int64).tobytes()).hexdigest()
 
 
 def player_at(ply):
@@ -156,14 +162,6 @@ def shard_dirs(run_dir):
     return sorted(p for p in root.iterdir() if p.is_dir() and p.name.isdigit()) if root.exists() else []
 
 
-def stats(run_dir):
-    """Totals over every published shard (manifests only) plus the newest shard and its actor."""
-    paths = shard_dirs(run_dir); items = [manifest(p) for p in paths]
-    total = {k: sum(m['counts'][k] for m in items) for k in ('games', 'rows', 'policy_rows', 'terminal_games', 'capped_games')}
-    return dict(total, shards=len(items), newest_shard=paths[-1].name if items else None,
-                newest_actor=items[-1]['actor'] if items else None)
-
-
 def window_size(total, min_rows=20000, expand_per_row=.4, taper_exponent=.65):
     """KataGo shuffle window: every row up to min_rows, then min_rows*(1 + e*((N/min_rows)^t - 1)/t)."""
     if total <= min_rows:
@@ -180,15 +178,13 @@ class ReplayWindow:
     `total_full_rows`/`full_rows` only full-search rows. Rows of games selected by
     `holdout(episode, validation_fraction)` form the validation index and are never drawn for training.
     Episodes and rows of admitted shards stay in memory; policy vectors load per shard on first use and are
-    dropped with the shard. A lock serialises methods so a rendering thread can sample while the learner
-    calls `refresh()`.
+    dropped with the shard.
     """
 
     def __init__(self, run_dir, capacity_rows, min_rows=100000, expand_per_row=.4, taper_exponent=.65, validation_fraction=0.):
         self.run_dir = Path(run_dir); self.capacity_rows = capacity_rows; self.validation_fraction = validation_fraction
         self.shape = dict(min_rows=min_rows, expand_per_row=expand_per_row, taper_exponent=taper_exponent)
         self.manifests = {}; self.shards = {}; self.policies = {}; self.values = {}
-        self.lock = threading.RLock()
         self.refresh()
 
     def load(self, name):
@@ -202,36 +198,35 @@ class ReplayWindow:
 
     def refresh(self):
         """Rescan manifests, recompute the window and load newly admitted shards; returns window rows."""
-        with self.lock:
-            for path in shard_dirs(self.run_dir):
-                if path.name not in self.manifests:
-                    self.manifests[path.name] = manifest(path)
-            names = sorted(self.manifests)
-            self.total_rows = sum(self.manifests[n]['counts']['rows'] for n in names)
-            self.total_full_rows = sum(self.manifests[n]['counts']['policy_rows'] for n in names)
-            want = min(self.capacity_rows, window_size(self.total_full_rows, **self.shape))
-            admitted = []; have = 0
-            for name in reversed(names):
-                if have >= want:
-                    break
-                take = min(self.manifests[name]['counts']['policy_rows'], want-have)
-                admitted.append((name, take)); have += take
-            for name in set(self.shards) - {n for n, _ in admitted}:
-                del self.shards[name]; self.policies.pop(name, None)
-                self.values = {k: v for k, v in self.values.items() if k[0] != name}
-            for name, _ in admitted:
-                if name not in self.shards:
-                    self.shards[name] = self.load(name)
-            self.admitted = admitted[::-1]; self.full_rows = have
-            # Flat (shard, row) indices, oldest first, for uniform or recency-weighted sampling.
-            self.index = []; self.validation = []
-            for name, take in self.admitted:
-                shard = self.shards[name]; positions = np.flatnonzero(shard.full)
-                start = 0 if take >= len(positions) else int(positions[-take]) if take else len(shard.rows)
-                for i in range(start, len(shard.rows)):
-                    (self.validation if shard.held[shard.rows[i]['game']] else self.index).append((name, i))
-            self.rows = len(self.index)+len(self.validation)
-            return self.rows
+        for path in shard_dirs(self.run_dir):
+            if path.name not in self.manifests:
+                self.manifests[path.name] = manifest(path)
+        names = sorted(self.manifests)
+        self.total_rows = sum(self.manifests[n]['counts']['rows'] for n in names)
+        self.total_full_rows = sum(self.manifests[n]['counts']['policy_rows'] for n in names)
+        want = min(self.capacity_rows, window_size(self.total_full_rows, **self.shape))
+        admitted = []; have = 0
+        for name in reversed(names):
+            if have >= want:
+                break
+            take = min(self.manifests[name]['counts']['policy_rows'], want-have)
+            admitted.append((name, take)); have += take
+        for name in set(self.shards) - {n for n, _ in admitted}:
+            del self.shards[name]; self.policies.pop(name, None)
+            self.values = {k: v for k, v in self.values.items() if k[0] != name}
+        for name, _ in admitted:
+            if name not in self.shards:
+                self.shards[name] = self.load(name)
+        self.admitted = admitted[::-1]; self.full_rows = have
+        # Flat (shard, row) indices, oldest first, for uniform or recency-weighted sampling.
+        self.index = []; self.validation = []
+        for name, take in self.admitted:
+            shard = self.shards[name]; positions = np.flatnonzero(shard.full)
+            start = 0 if take >= len(positions) else int(positions[-take]) if take else len(shard.rows)
+            for i in range(start, len(shard.rows)):
+                (self.validation if shard.held[shard.rows[i]['game']] else self.index).append((name, i))
+        self.rows = len(self.index)+len(self.validation)
+        return self.rows
 
     def ref(self, name, i):
         shard = self.shards[name]
@@ -240,60 +235,38 @@ class ReplayWindow:
     def sample(self, rng, n, recency=0., validation=False):
         """n Refs drawn with replacement from the training (or validation) index; the k-th oldest of
         W rows has weight ((k+1)/W)^recency."""
-        with self.lock:
-            index = self.validation if validation else self.index
-            W = len(index)
-            if not W:
-                raise ValueError('Replay window is empty')
-            if recency:
-                w = (np.arange(1, W+1)/W)**recency
-                picks = rng.choice(W, n, p=w/w.sum())
-            else:
-                picks = rng.integers(W, size=n)
-            return [self.ref(*index[k]) for k in picks]
+        index = self.validation if validation else self.index
+        W = len(index)
+        if not W:
+            raise ValueError('Replay window is empty')
+        if recency:
+            w = (np.arange(1, W+1)/W)**recency
+            picks = rng.choice(W, n, p=w/w.sum())
+        else:
+            picks = rng.integers(W, size=n)
+        return [self.ref(*index[k]) for k in picks]
 
     def following(self, ref):
         """Ref of the same game's row at ply+1 in the same shard, or None."""
-        with self.lock:
-            i = self.shards[ref.shard].following[ref.index]
-            return None if i < 0 else self.ref(ref.shard, i)
+        i = self.shards[ref.shard].following[ref.index]
+        return None if i < 0 else self.ref(ref.shard, i)
 
     def policy(self, ref):
         """The row's policy vector (empty when the ply had no full search)."""
-        with self.lock:
-            if ref.shard not in self.policies:
-                self.policies[ref.shard] = load_policies(self.run_dir/'shards'/ref.shard, self.manifests[ref.shard]['counts']['rows'])
-            offsets, probabilities = self.policies[ref.shard]
-            return probabilities[offsets[ref.index]:offsets[ref.index+1]]
+        if ref.shard not in self.policies:
+            self.policies[ref.shard] = load_policies(self.run_dir/'shards'/ref.shard, self.manifests[ref.shard]['counts']['rows'])
+        offsets, probabilities = self.policies[ref.shard]
+        return probabilities[offsets[ref.index]:offsets[ref.index+1]]
 
     def value_targets(self, ref, lam, full_only):
         """value_targets of the ref's episode (full-search root values only with `full_only`), cached while
         its shard stays admitted."""
         key = (ref.shard, ref.row['game'], lam, full_only)
-        with self.lock:
-            if key not in self.values:
-                e = ref.episode
-                self.values[key] = value_targets([player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'],
-                                                 lam, e['full_search'] if full_only else None)
-            return self.values[key]
-
-
-def _check(ref, s):
-    if (s.player, s.remaining) != (ref.row['player'], ref.row['remaining']) \
-            or hashlib.sha256(s.actions.astype(np.int64).tobytes()).hexdigest() != ref.row['legal_sha256']:
-        raise ValueError(f'Replayed position disagrees with row: {ref.shard}/{ref.index}')
-
-
-def render(refs, rng, hexcrop):
-    """Encode each ref's position (history = episode moves before `row.ply`) under a random symmetry
-    (hexcrop picks uniformly among symmetries fitting the smallest bucket). The replayed side to move
-    and the hash of the native legal list must match the row."""
-    samples = []
-    for ref in refs:
-        s = hexcrop.encode(ref.episode['moves'][:ref.row['ply']], rng=rng)
-        _check(ref, s)
-        samples.append(s)
-    return samples
+        if key not in self.values:
+            e = ref.episode
+            self.values[key] = value_targets([player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'],
+                                             lam, e['full_search'] if full_only else None)
+        return self.values[key]
 
 
 def crop_index(s, points):
@@ -312,10 +285,11 @@ def target_options(settings):
                 cheap_value_weight=settings.cheap_value_weight, full_only=settings.bootstrap_full_only)
 
 
-def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=True):
+def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
-    Returns (samples, targets); each target is a dict of
+    The replayed side to move and legal list must match each row. Returns (samples, targets); each target is a
+    dict of
       policy, policy_weight: the row's improved policy (weight 0 when empty, i.e. a cheap-search row);
       value, value_weight: value_targets(..., lam, full_search if full_only) at the ply; weight 1 for finished
         games, `bootstrap_weight` for capped games with root values, 0 otherwise, times `cheap_value_weight`
@@ -337,7 +311,8 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         moves = np.asarray(e['moves'], np.int64).reshape(-1, 2); T = len(moves); me = player_at(t)
         game = Game(e['moves'][:t])
         s = hexcrop.encode_game(game, moves[:t], rng=rng)
-        _check(ref, s)
+        if (s.player, s.remaining) != (ref.row['player'], ref.row['remaining']) or legal_digest(s.actions) != ref.row['legal_sha256']:
+            raise ValueError(f'Replayed position disagrees with row: {ref.shard}/{ref.index}')
         policy = window.policy(ref)
         values, weights = window.value_targets(ref, lam, full_only)
         value_weight = weights[t]*(1. if e['winner'] >= 0 else bootstrap_weight)*(1. if len(policy) else cheap_value_weight)
@@ -358,7 +333,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         if nref is not None and len(p := window.policy(nref)):
             game.play(*e['moves'][t])
             actions = hexcrop.legal_array(game, moves[:t+1])
-            if len(actions) != len(p) or hashlib.sha256(actions.tobytes()).hexdigest() != nref.row['legal_sha256']:
+            if len(actions) != len(p) or legal_digest(actions) != nref.row['legal_sha256']:
                 raise ValueError(f'Next-ply legal list disagrees with row: {nref.shard}/{nref.index}')
             cells = crop_index(s, actions); p = np.where(cells >= 0, p, 0).astype(np.float32)
             if p.sum() > 0:
@@ -425,31 +400,6 @@ def batches(window, rng, batch_size, settings, validation=False):
         refs = window.sample(rng, batch_size, s.recency, validation)
         yield collate(*examples(window, refs, rng, **target_options(s)))
 
-
-class Prefetch:
-    """Drain an iterator in a daemon thread, keeping up to `depth` items ready; iterate to consume.
-    An exception in the producer is re-raised in the consumer."""
-
-    def __init__(self, iterator, depth=4):
-        self.queue = queue.Queue(depth)
-        self.thread = threading.Thread(target=self.run, args=(iterator,), daemon=True)
-        self.thread.start()
-
-    def run(self, iterator):
-        try:
-            for item in iterator:
-                self.queue.put(item)
-        except BaseException as error:
-            self.queue.put(error)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        item = self.queue.get()
-        if isinstance(item, BaseException):
-            raise item
-        return item
 
 
 def _render_worker(run, settings, seed, output):

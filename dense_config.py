@@ -1,14 +1,26 @@
 """Run configuration for the dense self-play stack; every tunable lives here.
 
-`config.json` in the run directory is the single source of settings for the
-actor, learner and evaluator processes. Learner variants override the `learner`
-section per process and record the effective values in each checkpoint manifest.
+Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval (evaluator) and dashboard.py:
+  config.json                          RunConfig, written once; the single source of settings for every process
+  shards/<name>/                       immutable self-play shards (format in dense_data); names sort oldest first
+  checkpoints/<variant>/<step:06d>/    model.pt, ema.pt, optimizer.pt, manifest.json (dense_learn); complete once
+                                       manifest.json exists; the checkpoint id is '<variant>/<step:06d>'
+  champion.json                        {checkpoint, ema_sha256, updated_at}: the checkpoint actors play (dense_eval)
+  league.json                          ratings, champion and Elo differences of variant heads (dense_eval)
+  evaluations/<a>-vs-<b>/report.json   paired match records, ids with '/' written as '-' (dense_eval)
+  actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s
+  learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s
+  events.jsonl                         one line per event: {time, source, kind, message, ...} (log_event)
+Learner variants override the `learner` section per process and record the effective values in each checkpoint
+manifest.
 """
 import argparse
 from dataclasses import dataclass, asdict, field, fields
 import json
 from pathlib import Path
 import time
+
+from train import write_json
 
 SCHEMA = 'hexo-dense-run-v1'
 
@@ -36,8 +48,7 @@ class ActorSettings:
     tactics: bool = True         # exact win/must-block classification inside the tree
     cache_positions: int = 4096
     shard_games: int = 32
-    opening_random_plies: float = 2.  # mean of an exponential; sampled from the raw policy
-    resign_disabled: bool = True
+    opening_random_plies: float = 2.  # mean of an exponential; sampled from the search policy
 
 
 @dataclass(frozen=True)
@@ -46,18 +57,18 @@ class LearnerSettings:
     batch: int = 256
     lr: float = 3e-4
     warmup_steps: int = 300
-    weight_decay: float = 1e-2      # decoupled; 1e-4 is effectively zero at lr 3e-4
+    weight_decay: float = 1e-2    # decoupled (AdamW), conv and linear weights only
     grad_clip: float = 1.
     ema: float = .999
-    samples_per_row: float = 4.  # train presentations per generated row (KataGo ~4)
-    window_min_rows: int = 100000    # KataGo minimum; counts full-search rows only
+    samples_per_row: float = 4.   # training presentations per generated row (KataGo ~4)
+    window_min_rows: int = 100000  # counts full-search rows only
     window_expand_per_row: float = .4
     window_taper: float = .65
     window_capacity: int = 2000000
     recency: float = 0.
     bootstrap_weight: float = 1.  # weight of TD(lambda) value rows from capped games; 0 = mask
-    bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only (A/B)
-    cheap_value_weight: float = .25   # value weight of cheap-search rows (KataGo: 0)
+    bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only
+    cheap_value_weight: float = .25    # value weight of cheap-search rows (KataGo: 0)
     td_lambda: float = .9
     short_value_horizon: int = 16
     value_weight: float = 1.5
@@ -105,6 +116,13 @@ class RunConfig:
 SECTIONS = dict(model=ModelSettings, actor=ActorSettings, learner=LearnerSettings, evaluation=EvaluationSettings)
 
 
+def log_event(run, source, kind, message, **fields):
+    """Append one line to <run>/events.jsonl."""
+    with (Path(run)/'events.jsonl').open('a', encoding='utf-8') as stream:
+        stream.write(json.dumps(dict(time=time.time(), source=source, kind=kind, message=message, **fields),
+                                allow_nan=False)+'\n')
+
+
 def from_dict(data):
     if data.get('schema') != SCHEMA:
         raise ValueError(f'Expected a {SCHEMA} configuration')
@@ -117,14 +135,12 @@ def load(run):
 
 
 def save(run, config):
-    run = Path(run)
-    run.mkdir(parents=True, exist_ok=True)
-    path = run/'config.json'
+    """Write <run>/config.json; an existing configuration is never replaced."""
+    path = Path(run)/'config.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise FileExistsError(f'{path} exists; runs never change configuration in place')
-    pending = path.with_suffix('.json.tmp')
-    pending.write_text(json.dumps(asdict(config), indent=2), encoding='utf-8')
-    pending.replace(path)
+    write_json(path, asdict(config))
     return config
 
 

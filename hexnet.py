@@ -26,6 +26,7 @@ SCHEMA = 'hexo-dense-policy-value-v1'
 AXES = ((1, 0), (0, 1), (1, -1))    # index directions (dx, dy)
 WINDOW = 6
 FEATURES = len(hexcrop.PLANES)+2*len(AXES)+4
+CACHED_SIZE = 128   # line matrices of the rare larger crops are rebuilt per call (~2 ms at 256)
 
 
 @dataclass(frozen=True)
@@ -125,18 +126,20 @@ class LineConv(nn.Module):
         self.cache = {}
 
     def matrices(self, size, dtype):
-        """Horizontal, vertical and skewed-diagonal matrices, cached under no_grad per weight storage and version."""
+        """Horizontal, vertical and skewed-diagonal matrices; under no_grad, sizes up to CACHED_SIZE are
+        cached per weight storage and version."""
         key = (size, dtype, self.weight.data_ptr(), self.weight._version)
-        if torch.is_grad_enabled() or key not in self.cache:
-            weight = self.weight.to(dtype)
-            # In skewed columns the (1, -1) step is one row up, so the diagonal taps reverse.
-            value = (_toeplitz(weight[:, 0], size), _toeplitz(weight[:, 1], size).transpose(1, 2),
-                     _toeplitz(weight[:, 2].flip(1), size).transpose(1, 2))
-            if torch.is_grad_enabled():
-                return value
+        cached = not torch.is_grad_enabled() and size <= CACHED_SIZE
+        if cached and key in self.cache:
+            return self.cache[key]
+        weight = self.weight.to(dtype)
+        # In skewed columns the (1, -1) step is one row up, so the diagonal taps reverse.
+        value = (_toeplitz(weight[:, 0], size), _toeplitz(weight[:, 1], size).transpose(1, 2),
+                 _toeplitz(weight[:, 2].flip(1), size).transpose(1, 2))
+        if cached:
             self.cache = {k: v for k, v in self.cache.items() if k[2:] == key[2:]}
             self.cache[key] = value
-        return self.cache[key]
+        return value
 
     def forward(self, x):
         h, w = x.shape[-2:]
@@ -338,6 +341,11 @@ def future_loss(future, target, mask, weight=None):
     return _weighted_mean(loss.sum((1, 2, 3))/(2*mask.sum((1, 2, 3))).clamp_min(1), weight)
 
 
+def memory_format(config):
+    """The line convolutions are matmuls that prefer NCHW; the plain trunk is faster channels_last."""
+    return torch.contiguous_format if config.line_length else torch.channels_last
+
+
 def model_digest(model):
     digest = hashlib.sha256(json.dumps(asdict(model.config), sort_keys=True).encode())
     for name, tensor in model.state_dict().items():
@@ -385,18 +393,9 @@ class DenseEvaluator:
         self.model_version = model_version or model_digest(model)
         self.device = torch.device(device)
         self.cuda = self.device.type == 'cuda'
-        # The line convolutions are matmuls that prefer NCHW; the plain trunk is faster channels_last.
-        self.memory_format = torch.contiguous_format if model.config.line_length else torch.channels_last
+        self.memory_format = memory_format(model.config)
         self.model = model.to(self.device, memory_format=self.memory_format).eval()
         self.max_batch = max_batch
-        self.staging = {}
-
-    def _stage(self, size):
-        if size not in self.staging:
-            buffer = torch.empty((self.max_batch, len(hexcrop.PLANES), size, size), dtype=torch.uint8,
-                                 pin_memory=self.cuda)
-            self.staging[size] = (buffer, buffer.numpy())
-        return self.staging[size]
 
     @torch.inference_mode()
     def evaluate(self, histories):
@@ -405,9 +404,9 @@ class DenseEvaluator:
         for size, indices in hexcrop.group_by_size(samples).items():
             for start in range(0, len(indices), self.max_batch):
                 chunk = indices[start:start+self.max_batch]
-                buffer, view = self._stage(size)
-                np.stack([samples[i].planes for i in chunk], out=view[:len(chunk)])
-                x = buffer[:len(chunk)].to(self.device, non_blocking=True)
+                host = torch.empty((len(chunk), len(hexcrop.PLANES), size, size), dtype=torch.uint8, pin_memory=self.cuda)
+                np.stack([samples[i].planes for i in chunk], out=host.numpy())
+                x = host.to(self.device, non_blocking=True)
                 x = x.to(memory_format=self.memory_format, dtype=torch.bfloat16 if self.cuda else torch.float32)
                 with torch.autocast(self.device.type, torch.bfloat16, enabled=self.cuda):
                     out = self.model(x, x[:, 3:4], aux=False)

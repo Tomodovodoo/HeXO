@@ -1,6 +1,6 @@
 """Dense checkpoint evaluator: paired league games, Bradley-Terry ratings, champion promotion, calibration.
 
-Subcommands
+Run layout: dense_config. Subcommands
   loop       rate every complete checkpoint (dense_selfplay.checkpoints order) once: colour-swapped opening
              pairs vs the previous checkpoint of its variant and vs the champion, every `anchor_every`-th
              evaluated checkpoint also vs Seal; writes evaluations/<a>-vs-<b>/report.json (skipped when present),
@@ -9,7 +9,8 @@ Subcommands
              the realised results.
   match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal.
 
-Scoring: a capped game is half a point for each side. Pair score = candidate points / 2 over its two games.
+Scoring: a capped game (at the ply limit, or reason 'span' when a searched position does not fit the largest crop) is
+half a point for each side. Pair score = candidate points / 2 over its two games.
 The comparison with the previous checkpoint of the variant plays `games` games. The comparison with the
 champion is a sequential test (see `sprt`) played in rounds of `games` games until it accepts H0 or H1 or
 reaches `sprt_max_games`; only H1 promotes. The first evaluated checkpoint becomes champion unopposed.
@@ -25,9 +26,10 @@ import time
 import numpy as np
 
 import dense_config
+from dense_config import log_event
 import dense_data
 from arena import Seal
-from dense_selfplay import Engine, checkpoints, load, log_event
+from dense_selfplay import Engine, checkpoints, load
 from hexo import Game
 from klent import digest
 from train import paired_metrics, task_opening, write_json
@@ -42,10 +44,12 @@ RATING_NOTE = ('Bradley-Terry over paired comparisons (caps count half a point t
 class MatchGame:
     """One evaluation game. sides[colour] is a dense_selfplay.Model or SEAL; model sides search `sims`
     placements with argmax play (one tree per distinct model, advanced on every placement); a Seal side
-    plays complete turns inline, validated with Game.legal. Ends at a win or `max_plies` placements."""
+    plays complete turns inline, validated with Game.legal. Ends at a win, `max_plies` placements or when the
+    Engine stops it (`reason` 'span')."""
 
     def __init__(self, sides, opening, seed, sims, samples, tactics, max_plies, record, seal=None, seal_ms=0):
         self.sides, self.max_plies, self.seal, self.seal_ms, self.record = sides, max_plies, seal, seal_ms, record
+        self.reason = None
         self.budget, self.samples = sims, samples
         self.game, self.moves = Game([tuple(m) for m in opening]), [list(m) for m in opening]
         self.trees = {}
@@ -95,7 +99,7 @@ class MatchGame:
         self.game.close()
         for tree in self.trees.values():
             tree.close()
-        return dict(self.record, winner=winner, reason='six-in-a-row' if winner >= 0 else 'cap',
+        return dict(self.record, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
                     plies=len(self.moves), moves=self.moves)
 
 
@@ -247,8 +251,8 @@ def solve(ids, anchor, edges):
 
 
 def rate(ids, anchor, reports, samples=2048, seed=1740):
-    """(point ratings, 95% intervals, posterior draws per rated id): checkpoint_league.rate_league adapted to
-    string ids and caps as half points; per comparison a Dirichlet(counts + 1/2) posterior over the pair
+    """(point ratings, 95% intervals, posterior draws per rated id), the model of checkpoint_league.rate_league
+    over string ids with caps as half points: per comparison a Dirichlet(counts + 1/2) posterior over the pair
     scores 0, 1/2, 1, 3/2, 2, each draw solved jointly so draws of different ids are paired."""
     comparisons = []
     for report in reports:
@@ -328,6 +332,11 @@ def evaluate_checkpoint(run, config, league, entry, models, seal):
         games = {o: paired_games(model(cid), SEAL if o == SEAL else model(o), n, cid, config, settings, seal,
                                  len(records[o])//2, candidate=cid, opponent=o) for o, n in todo.items()}
         results = play([g for items in games.values() for g in items], config.actor.leaf_batch)
+        for record in results:
+            if record['reason'] == 'span':
+                log_event(run, 'evaluator', 'error', f'{cid} vs {record["opponent"]} pair {record["pair"]}: game counted as '
+                          f'capped at ply {record["plies"]}, a searched position spans more than the largest crop',
+                          candidate=cid, opponent=record['opponent'])
         for o, items in games.items():
             records[o] += results[:len(items)]; results = results[len(items):]
         todo = {}
@@ -336,7 +345,8 @@ def evaluate_checkpoint(run, config, league, entry, models, seal):
     for opponent, items in records.items():
         report = make_report(cid, opponent, items, models, settings)
         if opponent == champion:
-            report['metrics']['sprt'] = dict(test(items), decision=test(items)['decision'] or 'max-games')
+            result = test(items)
+            report['metrics']['sprt'] = dict(result, decision=result['decision'] or 'max-games')
         report_path(run, cid, opponent).parent.mkdir(parents=True, exist_ok=True)
         write_json(report_path(run, cid, opponent), report)
         reports[opponent] = report
@@ -354,7 +364,7 @@ def evaluate_checkpoint(run, config, league, entry, models, seal):
     if promoted:
         league['champion'] = cid
         write_json(Path(run)/'champion.json', dict(checkpoint=cid, ema_sha256=digest(path/'ema.pt'), updated_at=time.time()))
-        log_event(run, 'evaluator', 'info', f'{cid} promoted to champion' + (f' over {champion}' if champion else ''),
+        log_event(run, 'evaluator', 'promotion', f'{cid} promoted to champion' + (f' over {champion}' if champion else ''),
                   checkpoint=cid, previous_champion=champion)
     write_league(run, league, config)
     print(f'{cid}: ' + ', '.join(f'vs {o} +{r["summary"]["wins"]} -{r["summary"]["losses"]} ={r["summary"]["capped"]}'

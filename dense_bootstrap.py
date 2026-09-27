@@ -1,10 +1,9 @@
-"""Convert gumbel-policy-value-v1 search corpora into dense shards (one shard per old corpus).
+"""Convert gumbel-policy-value-v1 search corpora into dense shards `<run>/shards/NNNNNN/`, one per old corpus.
 
 The old corpora record no root values, so capped games keep their policy rows with value weight 0.
 Opening plies and the rows dropped from early capped games are marked full_search=False.
 """
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
@@ -58,7 +57,8 @@ def convert(manifest, manifest_sha256, episodes, rows):
 
 
 def check(path):
-    """Replay every row of a written shard; its legal-move count and int64 hash must match the stored row."""
+    """Replay every row of a shard: side to move, legal-list hash and (for policy rows) policy length must match.
+    Returns the row count."""
     episodes, rows = dense_data.read_shard(path)
     by_game = {}
     for row in rows:
@@ -69,8 +69,9 @@ def check(path):
             while ply < row['ply']:
                 game.play(*moves[ply]); ply += 1
             actions = np.array(game.legal_moves(), np.int64).reshape(-1, 2)
-            if (game.player, game.remaining) != (row['player'], row['remaining']) or len(actions) != len(row['policy'])                     or hashlib.sha256(actions.tobytes()).hexdigest() != row['legal_sha256']:
-                raise ValueError(f'Converted row game {g} ply {row["ply"]} of {path} does not replay')
+            if (game.player, game.remaining) != (row['player'], row['remaining']) \
+                    or len(row['policy']) not in (0, len(actions)) or dense_data.legal_digest(actions) != row['legal_sha256']:
+                raise ValueError(f'Row game {g} ply {row["ply"]} of {path} does not replay')
         game.close()
     return len(rows)
 

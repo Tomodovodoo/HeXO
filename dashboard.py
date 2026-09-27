@@ -404,6 +404,7 @@ def dense_manifests(folder, pattern='*/manifest.json'):
 
 
 def dense_run(run, config, fresh=30):
+    """/api/run payload of a dense run (layout: dense_config); processes silent for `fresh` seconds are not live."""
     now = time.time()
     status = lambda path: (lambda value: value if isinstance(value, dict) else {})(read_json(path, {}))
     beat = lambda value: max(0, now-value['updated_at']) if isinstance(value.get('updated_at'), (int, float)) else None

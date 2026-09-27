@@ -5,33 +5,47 @@
 Stages: CPU unit tests (tests/test_dense.py); GPU throughput of the default b6c96 model (inference and
 training at batch 256 on bucket 32) against thresholds; bf16 vs fp32 agreement on real positions;
 DenseEvaluator behind a SearchCoordinator (32 trees, 2 placements); symmetry invariance of a pointwise
-model plus the real model's symmetry spread (diagnostic); and, once dense_selfplay.py, dense_learn.py and
-dense_eval.py exist, an end-to-end smoke run in a scratch run directory. Prints a table and exits 1 on
-any failure. Without --run a scratch run with a tiny configuration is created in the temp directory.
+model plus the real model's symmetry spread (diagnostic); and an end-to-end run of the actor, learner,
+evaluator and dashboard on a tiny configuration in a scratch run directory (GPU only). Prints a table and
+exits 1 on any failure.
 """
 import argparse
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from http.server import HTTPServer
 import json
-import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import threading
 import time
+import traceback
 import unittest
+import urllib.request
 
 import numpy as np
 import torch
 
+import dense_bootstrap
 import dense_config
 import dense_data
+import dense_learn
 import hexcrop
 import hexnet
 from neural_search import EvaluationCache, NeuralSearch, SearchCoordinator
+from train import write_json
 
 ROOT = Path(__file__).resolve().parent
-DRIVERS = ('dense_selfplay.py', 'dense_learn.py', 'dense_eval.py')
-TINY_MODEL = dense_config.ModelSettings(blocks=2, channels=32, pool_every=2, line_length=5, value_hidden=32, head_channels=16)
+E2E = dense_config.RunConfig(
+    model=dense_config.ModelSettings(blocks=2, channels=32, pool_every=2),
+    actor=dense_config.ActorSettings(games_in_flight=8, leaf_batch=64, full_sims=8, cheap_sims=4, root_samples=4,
+                                     max_plies=64, shard_games=4, cache_positions=1024),
+    learner=dense_config.LearnerSettings(batch=32, warmup_steps=5, samples_per_row=4., window_min_rows=64,
+                                         validation_fraction=.25, export_every=10),
+    evaluation=dense_config.EvaluationSettings(games=4, sims=8, root_samples=4, max_plies=64, anchor_every=1000,
+                                               anchor_games=2, seal_ms=10, sprt_max_games=8))
+E2E_SECONDS = 180.
 
 
 class Report:
@@ -58,22 +72,6 @@ class Report:
         print('  '.join('-'*w for w in widths))
         for r in self.rows:
             print(line(r))
-
-
-def scratch_run(run):
-    """Create (or reuse) a run directory holding a tiny configuration for the smoke stage."""
-    run = Path(run) if run else Path(tempfile.mkdtemp(prefix='dense-check-'))
-    if not (run/'config.json').exists():
-        config = dense_config.RunConfig(
-            created_at=time.time(), device='cuda' if torch.cuda.is_available() else 'cpu', model=TINY_MODEL,
-            actor=dense_config.ActorSettings(games_in_flight=4, leaf_batch=32, full_sims=8, cheap_sims=4, root_samples=4,
-                                             max_plies=24, shard_games=4, cache_positions=256),
-            learner=dense_config.LearnerSettings(batch=16, warmup_steps=5, window_min_rows=64, export_every=10,
-                                                 validation_fraction=.25, protect_steps=10, replace_interval=10),
-            evaluation=dense_config.EvaluationSettings(games=2, sims=8, root_samples=4, max_plies=24, anchor_every=0,
-                                                       anchor_games=0, seal_ms=10))
-        dense_config.save(run, config)
-    return run
 
 
 def unit_stage(report):
@@ -132,15 +130,12 @@ def timed(fn, warmup, iterations):
     return time.perf_counter()-start
 
 
-def memory_format(model):
-    return torch.contiguous_format if model.config.line_length else torch.channels_last
-
-
 def inference_stage(report, model, samples, args):
     device = torch.device('cuda')
-    net = copy.deepcopy(model).requires_grad_(False).to(device, memory_format=memory_format(model)).eval()
+    fmt = hexnet.memory_format(model.config)
+    net = copy.deepcopy(model).requires_grad_(False).to(device, memory_format=fmt).eval()
     b = hexcrop.batch(samples)
-    x = torch.from_numpy(b['planes']).to(device).to(dtype=torch.bfloat16, memory_format=memory_format(model))
+    x = torch.from_numpy(b['planes']).to(device).to(dtype=torch.bfloat16, memory_format=fmt)
 
     @torch.inference_mode()
     def step():
@@ -153,7 +148,7 @@ def inference_stage(report, model, samples, args):
 
 def training_stage(report, model, samples, args):
     device = torch.device('cuda')
-    fmt = memory_format(model)
+    fmt = hexnet.memory_format(model.config)
     net = copy.deepcopy(model).to(device, memory_format=fmt).train()
     optimizer = torch.optim.AdamW(net.parameters(), lr=1e-5, weight_decay=1e-4)
     b = hexcrop.batch(samples)
@@ -194,7 +189,7 @@ def legal_distribution(out, samples, device):
 
 def precision_stage(report, model, histories, args):
     device = torch.device('cuda')
-    fmt = memory_format(model)
+    fmt = hexnet.memory_format(model.config)
     fp32 = copy.deepcopy(model).requires_grad_(False).to(device, memory_format=fmt).eval()
     samples = [hexcrop.encode(h) for h in histories]
     agree = total = 0
@@ -280,37 +275,86 @@ def symmetry_stage(report, model, histories):
                f'{np.mean(spreads):.4f} / {np.max(spreads):.4f}', '', 'info')
 
 
-def e2e_smoke(report, run):
-    """TODO(dense_check e2e): fill in once dense_selfplay.py, dense_learn.py and dense_eval.py are final.
+def run_step(run, name, command, timeout):
+    """Run one driver to completion with its output in <run>/<name>.log; returns seconds, raises on failure."""
+    start = time.perf_counter()
+    with (run/f'{name}.log').open('w', encoding='utf-8') as log:
+        done = subprocess.run([sys.executable, *command], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
+    if done.returncode:
+        tail = (run/f'{name}.log').read_text(encoding='utf-8', errors='replace').splitlines()[-15:]
+        raise RuntimeError(f'{name} exited with {done.returncode}:\n'+'\n'.join(tail))
+    return time.perf_counter()-start
 
-    Planned steps, all inside the scratch `run` (tiny config from scratch_run):
-      1. one actor process: python dense_selfplay.py --run RUN --processes 1 --games 4  -> exactly 1 shard of 4 games
-         (dense_data.read_shard verifies; counts.games == 4; every row replays via dense_data.examples);
-      2. learner: python dense_learn.py --run RUN --steps 20 (export_every <= 20) -> checkpoints/<variant>/<step>/
-         with model.pt, ema.pt, manifest.json whose 'learner' equals the effective LearnerSettings and whose
-         model_sha256/ema_sha256 equal hexnet.model_digest of the saved files;
-      3. evaluator: python dense_eval.py --run RUN loop --once -> league.json and champion.json exist and parse.
-    Return normally after adding PASS/FAIL rows to `report`.
-    """
-    raise NotImplementedError
+
+def dashboard_kind(run):
+    """(kind, payload) that dashboard.py serves at /api/run for `run`."""
+    import dashboard
+    dashboard.Handler.run = Path(run).resolve()
+    server = HTTPServer(('127.0.0.1', 0), dashboard.Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with urllib.request.urlopen(f'http://127.0.0.1:{server.server_port}/api/run', timeout=30) as response:
+            data = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+    return data['kind'], data
 
 
 def e2e_stage(report, run):
-    missing = [name for name in DRIVERS if not (ROOT/name).exists()]
-    if missing:
-        print(f'  drivers not present, skipped ({", ".join(missing)} missing)')
-        report.add('e2e', 'smoke run', 'drivers not present, skipped', '', 'skip')
+    """Actor (8 games, 2 shards), learner (20 steps, exports at 10 and 20), one evaluator pass and the dashboard
+    on the E2E configuration in `run`, each checked against the files it must leave behind."""
+    if not torch.cuda.is_available():
+        print('  CUDA unavailable: end-to-end stage skipped')
+        report.add('e2e', 'end-to-end run', 'CUDA unavailable, skipped', '', 'skip')
         return
-    try:
-        e2e_smoke(report, run)
-    except NotImplementedError:
-        print('  drivers present but e2e_smoke is not implemented yet (see dense_check.e2e_smoke)')
-        report.add('e2e', 'smoke run', 'e2e_smoke not implemented', '', 'TODO')
+    start = time.perf_counter()
+    config = dense_config.save(run, replace(E2E, created_at=time.time()))
+    remaining = lambda: max(10., E2E_SECONDS+60-(time.perf_counter()-start))
+    seconds = run_step(run, 'actor', ['dense_selfplay.py', '--run', str(run), '--games', '8'], remaining())
+    shards = dense_data.shard_dirs(run)
+    manifests = [dense_data.verify(path) for path in shards]
+    rows = sum(dense_bootstrap.check(path) for path in shards)
+    games = [m['counts']['games'] for m in manifests]
+    report.add('e2e', 'actor: 8 games, replayed shard rows', f'{len(shards)} shards, {rows} rows in {seconds:.0f}s', '2 x 4 games',
+               'PASS' if games == [4, 4] else 'FAIL')
+    needed = config.learner.batch*20/config.learner.samples_per_row
+    if rows < needed:
+        report.add('e2e', 'learner', f'{rows} rows cannot pace 20 steps (needs {needed:.0f})', '', 'FAIL')
+        return
+    seconds = run_step(run, 'learner', ['dense_learn.py', '--run', str(run), '--steps', '20', '--workers', '1'], remaining())
+    saved = dense_learn.checkpoints(run, 'main')
+    good = [p.name for p in saved] == ['000010', '000020']
+    for path in saved:
+        manifest = json.loads((path/'manifest.json').read_text(encoding='utf-8'))
+        good &= manifest['learner'] == asdict(config.learner) and manifest['model'] == asdict(config.model)
+        good &= manifest['model_sha256'] == hexnet.model_digest(hexnet.load_model(path/'model.pt'))
+        good &= manifest['ema_sha256'] == hexnet.model_digest(hexnet.load_model(path/'ema.pt'))
+    report.add('e2e', 'learner: 20 steps, checkpoint manifests', f'{", ".join(p.name for p in saved)} in {seconds:.0f}s',
+               'main/000010, main/000020', 'PASS' if good else 'FAIL')
+    seconds = run_step(run, 'evaluator', ['dense_eval.py', 'loop', '--run', str(run), '--once'], remaining())
+    league = json.loads((run/'league.json').read_text(encoding='utf-8'))
+    champion = json.loads((run/'champion.json').read_text(encoding='utf-8'))
+    rated = [c['id'] for c in league['checkpoints'] if c['elo'] is not None]
+    good = len(rated) == 2 and 'differences' in league and champion['checkpoint'] in rated
+    report.add('e2e', 'evaluator: league, champion', f'{len(rated)} rated, champion {champion["checkpoint"]} in {seconds:.0f}s',
+               '2 rated', 'PASS' if good else 'FAIL')
+    events = [json.loads(line) for line in (run/'events.jsonl').read_text(encoding='utf-8').splitlines()]
+    kinds = {e['kind'] for e in events}
+    errors = [e['message'] for e in events if e['kind'] == 'error']
+    report.add('e2e', 'events: shard, export, match; no error', ', '.join(sorted(kinds)) + (f'; {errors[0]}' if errors else ''),
+               '', 'PASS' if {'shard', 'export', 'match'} <= kinds and not errors else 'FAIL')
+    kind, data = dashboard_kind(run)
+    good = kind == 'dense' and data['dense']['data']['shards'] == 2 and len(data['dense']['checkpoints']) == 2
+    report.add('e2e', 'dashboard /api/run', f'kind {kind}', 'dense', 'PASS' if good else 'FAIL')
+    elapsed = time.perf_counter()-start
+    report.gate('e2e', 'end-to-end seconds', elapsed, E2E_SECONDS, elapsed <= E2E_SECONDS)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('--run', help='scratch run directory (created with a tiny config when missing)')
+    parser.add_argument('--run', type=Path, help='new scratch run directory for the end-to-end stage and the report '
+                                                 '(default: a fresh temporary directory)')
     parser.add_argument('--shards', type=Path, default=ROOT/'runs'/'dense-v1'/'shards', help='real positions')
     parser.add_argument('--model', type=Path, help='hexnet checkpoint (default: randomly initialised b6c96)')
     parser.add_argument('--min-inference', type=float, default=3000.)
@@ -325,8 +369,11 @@ def main():
     parser.add_argument('--seed', type=int, default=1740)
     parser.add_argument('--skip-unit', action='store_true')
     args = parser.parse_args()
+    run = (args.run or Path(tempfile.mkdtemp(prefix='dense-check-'))).resolve()
+    if (run/'config.json').exists():
+        parser.error(f'{run} already holds a run; the end-to-end stage needs a new directory')
+    run.mkdir(parents=True, exist_ok=True)
     report = Report()
-    run = scratch_run(args.run)
     print(f'run: {run}')
     if not args.skip_unit:
         print('== CPU unit tests')
@@ -339,7 +386,7 @@ def main():
         torch.manual_seed(args.seed)
         rng = np.random.default_rng(args.seed)
         model = hexnet.load_model(args.model) if args.model else hexnet.HexNet(hexnet.HexNetConfig())
-        report.add('gpu', 'model', f'{args.model or "random init"} {asdict(model.config)["blocks"]}b'
+        report.add('gpu', 'model', f'{args.model or "random init"} {model.config.blocks}b'
                    f'{model.config.channels}c line {model.config.line_length}', '', 'info')
         histories = real_histories(args.shards, max(args.batch, 256), rng)
         samples = bucket_samples(histories, 32, max(args.batch, args.train_batch))
@@ -351,18 +398,19 @@ def main():
             try:
                 stage()
             except Exception as error:   # report and continue with the other stages
-                report.add('gpu', getattr(error, '__qualname__', type(error).__name__), str(error)[:80], '', 'FAIL')
-                import traceback
+                report.add('gpu', type(error).__name__, str(error)[:80], '', 'FAIL')
                 traceback.print_exc()
         report.add('gpu', 'peak allocated (whole process)', f'{torch.cuda.max_memory_allocated()/2**30:.2f} GiB', '', 'info')
     print('== end-to-end')
-    e2e_stage(report, run)
+    try:
+        e2e_stage(report, run)
+    except Exception as error:
+        report.add('e2e', type(error).__name__, str(error).splitlines()[0][:80], '', 'FAIL')
+        traceback.print_exc()
     report.table()
     out = run/'dense_check.json'
-    pending = out.with_name(out.name+'.tmp')
-    pending.write_text(json.dumps(dict(created_at=time.time(), args={k: str(v) for k, v in vars(args).items()},
-                                       rows=report.rows, failed=report.failed), indent=2), encoding='utf-8')
-    os.replace(pending, out)
+    write_json(out, dict(created_at=time.time(), args={k: str(v) for k, v in vars(args).items()}, rows=report.rows,
+                         failed=report.failed))
     print(f'\n{"FAILED" if report.failed else "OK"}; report: {out}')
     sys.exit(1 if report.failed else 0)
 

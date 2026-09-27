@@ -1,4 +1,5 @@
-"""CPU checks for the dense hex ResNet stack: hexcrop, hexnet, dense_config, dense_data, dense_bootstrap."""
+"""CPU checks for the dense hex ResNet stack: hexcrop, hexnet, dense_config, dense_data, dense_bootstrap and the
+actor/evaluator engine."""
 import argparse
 import copy
 from dataclasses import asdict, replace
@@ -9,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 import numpy as np
@@ -21,6 +23,8 @@ import hexnet
 import dense_config
 import dense_data
 import dense_bootstrap
+import dense_eval
+import dense_selfplay
 from neural_search import NeuralSearch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -175,10 +179,11 @@ class HexcropTests(unittest.TestCase):
             self.assertGreater(len(seen), 1)
 
     def test_far_mode_covers_every_legal_cell(self):
-        history = line_history(15)          # span 112: legal cells need 129, stones plus halo 121
+        self.assertEqual(hexcrop.encode(line_history(15)).size, 192)
+        history = line_history(31)          # span 240: legal cells need 257, stones plus halo 249
         for kwargs in ({}, {'rng': np.random.default_rng(1)}, {'symmetry': 5}):
             s = hexcrop.encode(history, **kwargs)
-            self.assertEqual(s.size, 128)
+            self.assertEqual(s.size, 256)
             self.assertGreater(s.far, 0)
             self.check_sample(history, s)
             qmin, rmin, ox, oy = s.offset
@@ -187,8 +192,8 @@ class HexcropTests(unittest.TestCase):
             inside = (xy >= 0).all(1) & (xy < s.size).all(1)
             inside[inside] = crop[xy[inside, 1], xy[inside, 0]] > 0
             np.testing.assert_array_equal(inside, s.cells >= 0)
-        with self.assertRaises(ValueError):
-            hexcrop.encode(line_history(17))  # stones plus halo exceed the largest bucket
+        with self.assertRaises(hexcrop.SpanError):
+            hexcrop.encode(line_history(33))  # stones plus halo exceed the largest bucket
 
     def test_point_inverts_every_crop_index(self):
         for history in (POSITIONS[20], line_history(6)):
@@ -318,6 +323,9 @@ class HexNetTests(unittest.TestCase):
             torch.testing.assert_close(conv(x), expected, atol=1e-5, rtol=1e-5)
             conv.weight.mul_(2)
             torch.testing.assert_close(conv(x), 2*expected, atol=1e-5, rtol=1e-5)   # cache follows updates
+            wide = torch.randn(1, 3, hexnet.CACHED_SIZE+1, hexnet.CACHED_SIZE+1)
+            torch.testing.assert_close(conv(wide), line_conv_reference(wide, conv.weight), atol=1e-5, rtol=1e-5)
+            self.assertEqual({k[0] for k in conv.cache}, {9})
 
     def test_masked_norm_ignores_padding(self):
         norm = hexnet.MaskedNorm(4).double()
@@ -810,7 +818,7 @@ class EvaluatorSearchTests(unittest.TestCase):
         self.evaluator = hexnet.DenseEvaluator(self.model, device='cpu')
 
     def test_evaluator_matches_model_including_far_cells(self):
-        histories = [POSITIONS[10], [], line_history(15), line_history(6)]
+        histories = [POSITIONS[10], [], line_history(31), line_history(6)]
         results = self.evaluator.evaluate(histories)
         for history, result in zip(histories, results):
             s = hexcrop.encode(history)
@@ -827,7 +835,7 @@ class EvaluatorSearchTests(unittest.TestCase):
         self.assertGreater(hexcrop.encode(histories[2]).far, 0)
 
     def test_native_search_returns_legal_actions_in_native_order(self):
-        for history in (POSITIONS[12], [(0, 0)], line_history(15)):
+        for history in (POSITIONS[12], [(0, 0)], line_history(31)):
             search = NeuralSearch(self.evaluator, self.evaluator.model_version, history=history, seed=1)
             try:
                 result = search.search(simulations=8, root_samples=4)
@@ -837,6 +845,32 @@ class EvaluatorSearchTests(unittest.TestCase):
             np.testing.assert_array_equal(result['actions'], actions)
             self.assertIn(tuple(result['action']), {tuple(a) for a in actions.tolist()})
             self.assertGreaterEqual(result['completed'], 8)
+
+
+class EngineTests(unittest.TestCase):
+    def setUp(self):
+        self.threads = torch.get_num_threads()
+        torch.set_num_threads(2)
+        self.addCleanup(torch.set_num_threads, self.threads)
+        torch.manual_seed(5)
+
+    def test_position_wider_than_the_largest_crop_ends_the_game(self):
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 64, 256)
+        openings = (line_history(33), POSITIONS[12])
+        games = [dense_eval.MatchGame([model, model], h, k, 8, 4, True, len(h)+2, dict(index=k)) for k, h in enumerate(openings)]
+        wide, narrow = dense_eval.play(games, 64)
+        self.assertEqual((wide['winner'], wide['reason'], wide['plies']), (-1, 'span', len(openings[0])))
+        self.assertNotEqual(narrow['reason'], 'span')
+        self.assertGreater(narrow['plies'], len(openings[1]))
+
+    def test_published_counts_one_worker_since_its_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            since = time.time()
+            write_games(Path(tmp)/'shards'/'000001', [(winning_game(), 0, None)], dict(actor_sha256='a'*64, process=1))
+            write_games(Path(tmp)/'shards'/'000002', [(winning_game(), 0, None)]*2, dict(actor_sha256='a'*64, process=0))
+            self.assertEqual(dense_selfplay.published(tmp, 1, since), 1)
+            self.assertEqual(dense_selfplay.published(tmp, 0, since), 2)
+            self.assertEqual(dense_selfplay.published(tmp, 1, time.time()+1), 0)
 
 
 if __name__ == '__main__':
