@@ -24,6 +24,7 @@ from pathlib import Path
 import time
 
 import numpy as np
+import torch
 
 import dense_config
 from dense_config import log_event
@@ -387,6 +388,10 @@ def loop(args):
                 except BaseException as error:
                     log_event(run, 'evaluator', 'error', f'{entry[0]}: {type(error).__name__}: {error}', checkpoint=entry[0])
                     raise
+                for name in [n for n in models if n not in (entry[0], league['champion'])]:
+                    del models[name]
+                if config.device == 'cuda':
+                    torch.cuda.empty_cache()
         if args.once:
             break
         time.sleep(args.poll)

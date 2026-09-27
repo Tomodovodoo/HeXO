@@ -339,8 +339,11 @@ def main():
     try:
         torch.manual_seed(config.seed+learner.step)
         variant_seed = zlib.crc32(s.variant.encode())
-        window = dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
-                                         s.window_taper, s.validation_fraction)
+        def replay():
+            s = learner.settings
+            return dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
+                                           s.window_taper, s.validation_fraction)
+        window = replay()
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers)
         stream = renderers()
         factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])
@@ -351,11 +354,11 @@ def main():
         last_status = last_refresh = time.time()
         while args.steps is None or learner.step < args.steps:
             if learner.maybe_replace(factor_rng):
-                stream.close(); stream = renderers()
+                stream.close(); stream = renderers(); window = replay(); last_refresh = time.time()
             s = learner.settings
             if time.time()-last_refresh > REFRESH_SECONDS:
                 window.refresh(); last_refresh = time.time()
-            if not window.rows or learner.samples_seen+s.batch > s.samples_per_row*window.total_rows:
+            if not window.index or learner.samples_seen+s.batch > s.samples_per_row*window.total_rows:
                 write_status(stage='waiting-for-data', samples_per_second=0.)
                 rate = []; time.sleep(5.); window.refresh(); last_refresh = time.time()
                 continue
