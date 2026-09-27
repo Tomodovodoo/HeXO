@@ -1,4 +1,6 @@
-"""Read-only local training dashboard for one run directory."""
+"""Local training dashboard: one run directory (--run), or every dense run under a root (--runs) with a
+multi-run comparison page at / and per-run detail at /?run=<name>. Read-only except metrics/gpu.jsonl, which the
+server appends to for dense runs with a live process (dense_config layout)."""
 import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
@@ -7,17 +9,20 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import threading
 import time
 from collections import deque
 from functools import lru_cache
+import urllib.parse
 
+import dense_config
 from rating_compat import audited_prior, scheduled_revision
 
 
 def read_json(path, default=None):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (OSError, ValueError):  # Missing, locked by a Windows rename, or mid-write.
         return default
 
 
@@ -368,8 +373,289 @@ def relational_run(run, declared_family=None):
         rating='UNRATED', model_identity_pending=not bool(manifest or provenance))
 
 
+def tail_events(path, limit, window=128000):
+    recent = []
+    try:
+        with path.open('rb') as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(max(0, size-window))
+            if size > window: stream.readline()
+            for line in stream:
+                try: recent.append(json.loads(line))
+                except ValueError: pass  # A writer may be appending the last line.
+    except OSError:
+        pass
+    return recent[-limit:]
+
+
+_dense_manifests = {}
+
+
+def dense_manifests(folder, pattern='*/manifest.json'):
+    """(path, manifest) pairs under numbered folders, re-read only when their mtime changes."""
+    found = []
+    for path in folder.glob(pattern):
+        if not path.parent.name.isdigit(): continue
+        try: modified = path.stat().st_mtime_ns
+        except OSError: continue
+        cached = _dense_manifests.get(path)
+        if cached is None or cached[0] != modified:
+            manifest = read_json(path)
+            if not isinstance(manifest, dict): continue
+            cached = _dense_manifests[path] = (modified, manifest)
+        found.append((path, cached[1]))
+    return sorted(found, key=lambda item: (item[0].parent.parent.name, int(item[0].parent.name)))
+
+
+def dense_run(run, config, fresh=30):
+    """/api/run payload of a dense run (layout: dense_config); processes silent for `fresh` seconds are not live."""
+    now = time.time()
+    status = lambda path: (lambda value: value if isinstance(value, dict) else {})(read_json(path, {}))
+    beat = lambda value: max(0, now-value['updated_at']) if isinstance(value.get('updated_at'), (int, float)) else None
+    actors = [dict(status(path), process=path.stem.removeprefix('actor-status').lstrip('-') or '0')
+              for path in sorted(run.glob('actor-status*.json'), key=lambda path: (len(path.stem), path.stem))]
+    for actor in actors: actor['heartbeat'] = beat(actor)
+    # Rates only count live processes; cumulative counters count every process.
+    live = [a for a in actors if a['heartbeat'] is not None and a['heartbeat'] <= fresh and a.get('stage') != 'failed']
+    total = lambda rows, key: sum(a.get(key) or 0 for a in rows)
+    def weighted(key, weight):
+        rows = [(a[key], a.get(weight) or 0) for a in live if isinstance(a.get(key), (int, float))]
+        mass = sum(w for _, w in rows)
+        return sum(v*w for v, w in rows)/mass if mass else (rows[0][0] if len(rows) == 1 else None)
+    actor = dict(processes=len(actors), live_processes=len(live),
+                 stage=actors[0].get('stage') if len(actors) == 1 else ', '.join(sorted({a.get('stage') or '?' for a in actors})) or None,
+                 placements_per_second=total(live, 'placements_per_second'), evals_per_second=total(live, 'evals_per_second'),
+                 active_games=total(live, 'active_games'), positions=total(actors, 'positions'),
+                 games_completed=total(actors, 'games_completed'), shards_written=total(actors, 'shards_written'),
+                 games_total=total(actors, 'games_total') if actors and all(a.get('games_total') is not None for a in actors) else None,
+                 mean_batch=weighted('mean_batch', 'evals_per_second'), terminal_fraction=weighted('terminal_fraction', 'games_completed'),
+                 mean_plies=weighted('mean_plies', 'games_completed'),
+                 checkpoint=actors[0].get('checkpoint') if actors else None, actor_sha256=actors[0].get('actor_sha256') if actors else None,
+                 error='; '.join(f"{a['process']}: {a['error']}" for a in actors if a.get('error')) or None,
+                 heartbeat=max((a['heartbeat'] for a in actors if a['heartbeat'] is not None), default=None))
+    learners = {}
+    for path in sorted(run.glob('learner-status*.json')):
+        learner = status(path)
+        variant = learner.get('variant') or path.stem.removeprefix('learner-status').lstrip('-') or 'main'
+        learners[variant] = dict(learner, variant=variant, heartbeat=beat(learner))
+    learners = dict(sorted(learners.items(), key=lambda item: (item[0] != 'main', item[0])))
+    keys = ('games', 'rows', 'policy_rows', 'terminal_games', 'capped_games')
+    data = dict.fromkeys(keys, 0)
+    shards = [manifest for _, manifest in dense_manifests(run/'shards')]
+    recent = {3600: 0, 21600: 0}
+    for shard in shards:
+        counts = shard.get('counts') or {}
+        for key in keys: data[key] += counts.get(key) or 0
+        for window in recent:
+            if now-(shard.get('created_at') or 0) <= window: recent[window] += counts.get('games') or 0
+    # A young run is averaged over its lifetime, not the full window.
+    age = now-config['created_at'] if isinstance(config.get('created_at'), (int, float)) else None
+    for window, games in recent.items():
+        span = max(60, min(window, age)) if age is not None else window
+        data[f'games_per_hour_{window//3600}h'] = games*3600/span
+    data.update(shards=len(shards), latest_shard_at=max((s.get('created_at') or 0 for s in shards), default=None))
+    checkpoints, per_variant = [], {}
+    for path, manifest in dense_manifests(run/'checkpoints', '*/*/manifest.json'):
+        variant, step = path.parent.parent.name, int(path.parent.name)
+        per_variant.setdefault(variant, []).append(dict(manifest, variant=variant, step=step, id=f'{variant}/{step:06d}'))
+    for rows in per_variant.values(): checkpoints += rows[-50:]  # Newest 50 per variant.
+    champion = status(run/'champion.json')
+    champion['age'] = beat(champion)
+    return dict(name=run.name, config=config, actor=actor, actors=actors, learners=learners, league=status(run/'league.json'),
+                champion=champion, checkpoints=checkpoints, data=data, now=now)
+
+
+_jsonl = {}
+
+
+def read_jsonl(path):
+    """Dict records of an append-only JSON-lines file. Only newly appended complete lines are parsed when the
+    (mtime, size) changes; malformed lines and a partial last line are skipped; a shrunk file is re-read."""
+    try: stat = path.stat()
+    except OSError: return []
+    cached = _jsonl.get(path)
+    if cached and cached[:2] == (stat.st_mtime_ns, stat.st_size): return cached[3]
+    offset, rows = (cached[2], cached[3]) if cached and stat.st_size >= cached[2] else (0, [])
+    try:
+        with path.open('rb') as stream:
+            stream.seek(offset)
+            chunk = stream.read()
+    except OSError: return rows
+    end = chunk.rfind(b'\n')+1
+    for line in chunk[:end].splitlines():
+        try: record = json.loads(line)
+        except ValueError: continue
+        if isinstance(record, dict): rows.append(record)
+    _jsonl[path] = (stat.st_mtime_ns, stat.st_size, offset+end, rows)
+    return rows
+
+
+def finite(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def dense_config_of(run):
+    config = read_json(run/'config.json', {})
+    return config if isinstance(config, dict) and config.get('schema') == dense_config.SCHEMA else None
+
+
+def heartbeats(run, now):
+    """({variant: learner status}, [actor status]) with 'age' seconds since each process's last heartbeat."""
+    def load(path):
+        value = read_json(path, {})
+        value = value if isinstance(value, dict) else {}
+        return dict(value, age=now-value['updated_at'] if finite(value.get('updated_at')) else None)
+    learners = {}
+    for path in run.glob('learner-status*.json'):
+        value = load(path)
+        learners[value.get('variant') or path.stem.removeprefix('learner-status').lstrip('-') or 'main'] = value
+    return learners, [load(path) for path in run.glob('actor-status*.json')]
+
+
+def live(run, fresh=30):
+    learners, actors = heartbeats(run, time.time())
+    return any(s['age'] is not None and s['age'] <= fresh and s.get('stage') not in ('failed', 'idle', 'finished')
+               for s in [*learners.values(), *actors])
+
+
+def rated(run):
+    """League checkpoints with an Elo, each with its manifest created_at when the checkpoint still exists."""
+    league = read_json(run/'league.json', {})
+    created = {f'{path.parent.parent.name}/{path.parent.name}': manifest.get('created_at')
+               for path, manifest in dense_manifests(run/'checkpoints', '*/*/manifest.json')}
+    return [dict(c, created_at=created.get(c.get('id'))) for c in (league.get('checkpoints') if isinstance(league, dict) else None) or []
+            if finite(c.get('elo')) and isinstance(c.get('step'), int)]
+
+
+def project(root, fresh=30):
+    """/api/project: every dense run directly under `root`, oldest first."""
+    now, runs = time.time(), []
+    for run in sorted(p for p in root.iterdir() if p.is_dir()):
+        config = dense_config_of(run)
+        if config is None: continue
+        learners, actors = heartbeats(run, now)
+        steps = {path.parent.parent.name: int(path.parent.name) for path, _ in dense_manifests(run/'checkpoints', '*/*/manifest.json')}
+        for path in (run/'metrics').glob('learner-*.jsonl'):
+            rows = read_jsonl(path)
+            variant = path.stem.removeprefix('learner-')
+            steps[variant] = max(steps.get(variant, 0), next((r['step'] for r in reversed(rows) if isinstance(r.get('step'), int)), 0))
+        for variant, status in learners.items():
+            steps[variant] = max(steps.get(variant, 0), status.get('step') or 0)
+        elo = {}
+        for c in rated(run):
+            if c['step'] >= elo.get(c['variant'], {'step': -1})['step']:
+                elo[c['variant']] = dict(id=c['id'], step=c['step'], elo=c['elo'], interval=c.get('elo_interval'))
+        ages = [a['age'] for a in actors if a['age'] is not None]
+        runs.append(dict(name=run.name, created_at=config.get('created_at'), live=live(run, fresh),
+                         variants=sorted(steps, key=lambda v: (v != 'main', v)), steps=steps, elo=elo,
+                         champion=read_json(run/'champion.json', {}).get('checkpoint'),
+                         learner_heartbeat={v: s['age'] for v, s in learners.items()},
+                         learner_stage={v: s.get('stage') for v, s in learners.items()},
+                         actor_heartbeat=min(ages, default=None), actor_processes=len(actors),
+                         logs=sorted(p.stem for p in (run/'metrics').glob('*.jsonl'))))
+    return dict(root=str(root), now=now, runs=runs)
+
+
+HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')
+LEARNER_METRICS = HEADS+('lr', 'samples_per_second', 'window_rows')+tuple('validation_'+h for h in HEADS)
+ACTOR_SUMMED = ('placements_per_second', 'evals_per_second', 'games_per_hour')
+ACTOR_METRICS = ACTOR_SUMMED+('terminal_fraction', 'mean_plies')
+GPU_METRICS = ('utilization', 'used_mib', 'watts', 'temperature')
+ACTOR_STALE = 90.  # seconds after which an actor's last metrics line no longer counts
+
+
+def downsample(points, max_points):
+    """At most max(4, max_points) points of x-sorted (x, y, ...) tuples: the first and last point, and the
+    lowest and highest y within each of equal-width x buckets, in x order."""
+    if len(points) <= max(4, max_points): return points
+    buckets = max(1, (max_points-2)//2)
+    x0, width = points[0][0], (points[-1][0]-points[0][0])/buckets or 1.
+    groups = {}
+    for p in points[1:-1]:
+        groups.setdefault(min(buckets-1, int((p[0]-x0)/width)), []).append(p)
+    kept = [points[0]]
+    for key in sorted(groups):
+        group = groups[key]
+        low, high = min(group, key=lambda p: p[1]), max(group, key=lambda p: p[1])
+        kept += sorted({id(low): low, id(high): high}.values(), key=lambda p: p[0])
+    return kept+[points[-1]]
+
+
+def actor_points(run):
+    """(time, {metric: value}) after each actor metrics line, combining every worker's latest line younger than
+    ACTOR_STALE: rates summed, terminal_fraction and mean_plies weighted by games completed. games_per_hour is
+    each worker's games_completed delta over the time between its consecutive lines."""
+    lines = sorted(((path.stem, r) for path in (run/'metrics').glob('actor-*.jsonl') for r in read_jsonl(path)
+                    if finite(r.get('time'))), key=lambda item: item[1]['time'])
+    latest, previous, out = {}, {}, []
+    for worker, r in lines:
+        last, previous[worker] = previous.get(worker), r
+        r = dict(r, games_per_hour=None)
+        if last and finite(r.get('games_completed')) and finite(last.get('games_completed')) and \
+                r['games_completed'] >= last['games_completed'] and r['time'] > last['time']:
+            r['games_per_hour'] = (r['games_completed']-last['games_completed'])*3600/(r['time']-last['time'])
+        latest[worker] = r
+        current = [v for v in latest.values() if r['time']-v['time'] <= ACTOR_STALE]
+        values = {m: sum(v[m] for v in current if finite(v.get(m))) for m in ACTOR_SUMMED}
+        if r['games_per_hour'] is None and not any(finite(v.get('games_per_hour')) for v in current):
+            values['games_per_hour'] = None
+        for m in ACTOR_METRICS[len(ACTOR_SUMMED):]:
+            rows = [(v[m], v.get('games_completed') or 0) for v in current if finite(v.get(m))]
+            mass = sum(w for _, w in rows)
+            values[m] = sum(x*w for x, w in rows)/mass if mass else None
+        out.append((r['time'], values))
+    return out
+
+
+def series(run, config, variant, metric, x='step', max_points=1000):
+    """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval) sorted by x and
+    downsampled; x is the learner step or hours since the run's created_at. Actor and GPU metrics have hours
+    only. Raises ValueError for an unknown metric or x."""
+    created = config.get('created_at') or 0.
+    hours = lambda t: (t-created)/3600
+    if x not in ('step', 'hours'): raise ValueError(f'unknown x {x!r}')
+    if metric in LEARNER_METRICS:
+        validation, key = metric.startswith('validation_'), metric.removeprefix('validation_')
+        kept = []
+        for r in read_jsonl(run/'metrics'/f'learner-{variant}.jsonl'):
+            if bool(r.get('validation')) != validation or not isinstance(r.get('step'), int) or not finite(r.get('time')): continue
+            while kept and kept[-1][0] >= r['step']: kept.pop()  # A resumed learner repeats steps after its last export.
+            kept.append((r['step'], r['time'], r.get(key)))
+        points = [(step if x == 'step' else hours(t), y) for step, t, y in kept if finite(y)]
+    elif metric == 'elo':
+        points = sorted((c['step'] if x == 'step' else hours(c['created_at']), c['elo'],
+                         *(c['elo_interval'] if isinstance(c.get('elo_interval'), list) else (c['elo'], c['elo'])))
+                        for c in rated(run) if c.get('variant') == variant and (x == 'step' or finite(c['created_at'])))
+    elif x != 'hours':
+        raise ValueError(f'{metric} has hours only')
+    elif metric in ACTOR_METRICS:
+        points = [(hours(t), values[metric]) for t, values in actor_points(run) if finite(values[metric])]
+    elif metric in GPU_METRICS:
+        points = sorted((hours(r['time']), r[metric]) for r in read_jsonl(run/'metrics'/'gpu.jsonl')
+                        if finite(r.get('time')) and finite(r.get(metric)))
+    else:
+        raise ValueError(f'unknown metric {metric!r}')
+    return dict(run=run.name, variant=variant, metric=metric, x=x, count=len(points),
+                points=[list(p) for p in downsample(points, max_points)])
+
+
+def sample_gpu(watched, period=10.):
+    """Refresh Handler.gpu_status every 2 s; about every `period` s append a metrics/gpu.jsonl line to each
+    run of watched()."""
+    last = 0.
+    while True:
+        gpu = Handler.gpu_status()['gpu']
+        if gpu and time.time()-last >= period:
+            last = time.time()
+            for run in watched():
+                dense_config.append_metrics(run, 'gpu', **{k: gpu[k] for k in GPU_METRICS})
+        time.sleep(2)
+
+
 class Handler(BaseHTTPRequestHandler):
     run = Path("runs/selfplay")
+    runs = None  # project root when started with --runs
     model_family = None
     hardware = {"time": 0, "gpu": None}
     hardware_history = deque(maxlen=300)
@@ -394,19 +680,53 @@ class Handler(BaseHTTPRequestHandler):
                 cls.hardware_history.append({"time": now, **gpu})
         return {**cls.hardware, "history": list(cls.hardware_history)}
 
+    def resolve(self, name):
+        """The run a request addresses: Handler.run without a name, else the directory `name` under Handler.runs."""
+        if name is None:
+            return None if self.runs else self.run
+        run = self.runs/name if self.runs and name == Path(name).name and not name.startswith('.') else None
+        if run is None or not (run/'config.json').is_file():
+            raise LookupError(name)
+        return run
+
     def do_GET(self):
-        if self.path == "/":
-            payload = (Path(__file__).parent / "web/training.html").read_bytes()
+        url = urllib.parse.urlsplit(self.path)
+        query = dict(urllib.parse.parse_qsl(url.query))
+        try:
+            run = self.resolve(query.get('run'))
+        except LookupError:
+            self.send_error(404, 'Unknown run')
+            return
+        if url.path == "/":
+            page = "project.html" if self.runs and run is None else "training.html"
+            payload = (Path(__file__).parent / "web" / page).read_bytes()
             content_type = "text/html; charset=utf-8"
-        elif self.path == "/openings.js":
+        elif url.path == "/openings.js":
             payload = (Path(__file__).parent / "web/openings.js").read_bytes()
             content_type = "text/javascript; charset=utf-8"
-        elif self.path == "/api/run":
-            summary = self.run / "summary.json"
-            events = self.run / "events.jsonl"
-            search_config = read_json(self.run/'config.json', {})
-            relational = relational_run(self.run, self.model_family)
-            if search_config.get('backbone') == 'hexo-relational-policy-value-v1':
+        elif url.path in ("/api/project", "/api/series") and self.runs:
+            try:
+                if url.path == "/api/project":
+                    data = project(self.runs)
+                else:
+                    config = dense_config_of(run) if run else None
+                    if config is None: raise ValueError('series need a dense run')
+                    data = series(run, config, query.get('variant', 'main'), query.get('metric', ''), query.get('x', 'step'),
+                                  max(10, min(20000, int(query.get('max_points', 1000)))))
+            except ValueError as error:
+                self.send_error(400, str(error))
+                return
+            payload = json.dumps(data, allow_nan=False).encode()
+            content_type = "application/json"
+        elif url.path == "/api/run" and run:
+            summary = run / "summary.json"
+            events = run / "events.jsonl"
+            search_config = read_json(run/'config.json', {})
+            dense = search_config.get('schema') == dense_config.SCHEMA
+            relational = None if dense else relational_run(run, self.model_family)
+            if dense:
+                data = dict(kind='dense', dense=dense_run(run, search_config), events=tail_events(events, 300))
+            elif search_config.get('backbone') == 'hexo-relational-policy-value-v1':
                 recent = []
                 if events.exists():
                     with events.open('rb') as stream:
@@ -417,24 +737,24 @@ class Handler(BaseHTTPRequestHandler):
                         for line in stream:
                             try: recent.append(json.loads(line))
                             except json.JSONDecodeError: pass
-                league = read_json(self.run/'league.json', {})
+                league = read_json(run/'league.json', {})
                 checkpoint_ids = {c['id'] for c in league.get('checkpoints', [])}
-                for path in sorted((self.run/'checkpoints').glob('[0-9][0-9][0-9][0-9]/manifest.json')):
+                for path in sorted((run/'checkpoints').glob('[0-9][0-9][0-9][0-9]/manifest.json')):
                     number = int(path.parent.name)
                     if number not in checkpoint_ids:
                         manifest = read_json(path, {})
                         league.setdefault('checkpoints', []).append(dict(id=number, elo=None,
                             elo_interval=None, promoted=False, pending=True, loss=manifest.get('metrics')))
-                background_status=background_results(self.run,league)
-                data = dict(kind='search', search=dict(name=self.run.name,background_status=background_status,
-                    config=search_config, status=read_json(self.run/'status.json', {}),
+                background_status=background_results(run,league)
+                data = dict(kind='search', search=dict(name=run.name,background_status=background_status,
+                    config=search_config, status=read_json(run/'status.json', {}),
                     league=league, openings=[opening
-                        for path in sorted((self.run/'evaluation').glob('*-vs-*/report.json'), reverse=True)[:16]
+                        for path in sorted((run/'evaluation').glob('*-vs-*/report.json'), reverse=True)[:16]
                         for opening in evaluation_openings(str(path), path.stat().st_mtime_ns)]), events=recent[-300:])
             elif relational:
                 data = {"kind": "relational", "relational": relational, "summary": None, "events": []}
             elif not summary.exists():
-                klent = klent_run(self.run)
+                klent = klent_run(run)
                 data = {"kind": "klent" if klent else "native", "klent": klent, "summary": None, "events": []}
             else:
                 recent = []
@@ -472,10 +792,15 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", default="runs/selfplay")
+    parser.add_argument("--runs", help='serve the multi-run comparison of every dense run under this directory')
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--model-family", choices=['relational-policy-q'], help='Identify a run before its first manifest is published')
     args = parser.parse_args()
     Handler.run = Path(args.run).resolve()
+    Handler.runs = Path(args.runs).resolve() if args.runs else None
     Handler.model_family = args.model_family
+    candidates = (lambda: [p for p in Handler.runs.iterdir() if p.is_dir()]) if Handler.runs else (lambda: [Handler.run])
+    threading.Thread(target=sample_gpu, args=(lambda: [r for r in candidates() if dense_config_of(r) and live(r)],),
+                     daemon=True).start()
     print(f"Training dashboard: http://127.0.0.1:{args.port}", flush=True)
     HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
