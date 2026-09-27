@@ -733,8 +733,8 @@ class DenseDataTests(unittest.TestCase):
                              [float(dense_data.player_at(t) == 0) for t in range(12)])
             self.assertTrue(all(t['value_weight'] == 1 for t in by_game[0]+by_game[2]))
             for t in by_game[0][:-1]:
-                if t['opponent_weight']:
-                    self.assertAlmostEqual(float(t['opponent_policy'].sum()), 1, places=5)
+                if t['next_weight']:
+                    self.assertAlmostEqual(float(t['next_policy'].sum()), 1, places=5)
 
 
 def old_corpus(path):

@@ -6,30 +6,49 @@ A shard is an immutable directory `<run>/shards/NNNNNN/` holding
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
   manifest.json  schema, created_at, identity, actor, files (sha256), counts
-`row.game` indexes the shard's episode list; `row.target` is p(win) for the side to move or null,
-and `row.weight` 0 masks the value loss.
+`row.game` indexes the shard's episode list. `episode.winner` is 0/1 for finished games and -1 for capped
+games; `episode.root_values` is null or one entry per ply (searched root value in [-1, 1] for the side to
+move at that ply, or null). The learner derives every target from the episode (`examples`); the stored
+`row.target`/`row.weight` (p(win) or null, weight) are informational and optional.
 """
 from collections import namedtuple
 import hashlib
 import json
+import multiprocessing
 import queue
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
 import torch
 
+import hexcrop
+from hexo import Game
 from klent import digest
 from train import write_json
 
 SCHEMA = 'hexo-dense-shard-v1'
 FILES = ('episodes.json', 'rows.json', 'targets.npz')
 Ref = namedtuple('Ref', 'shard index row episode')
+Shard = namedtuple('Shard', 'episodes rows full held following')
+FUTURE = (6, 20)
 
 
-def value_targets(players, root_values, winner, lam=.9):
+def player_at(ply):
+    """Side to move before placement `ply`: ply 0 is player 0's single stone, then two-stone turns."""
+    return ((ply+1)//2) % 2
+
+
+def holdout(episode, fraction):
+    """Stable validation membership: the game's moves hash below `fraction` of the 64-bit range."""
+    h = hashlib.sha256(json.dumps(episode['moves']).encode()).digest()
+    return int.from_bytes(h[:8], 'little') < fraction*2**64
+
+
+def value_targets(players, root_values, winner, lam=.9, full=None):
     """Return (targets, weights) per ply: p(win) for the side to move at each ply.
 
     Terminal games (winner 0/1): target 1.0 at plies where `players[t] == winner`, else 0.0, weight 1.
@@ -40,9 +59,12 @@ def value_targets(players, root_values, winner, lam=.9):
     i.e. G_t = (1-lam) * sum_{k=1}^{T-2-t} lam^(k-1) u_{t+k} + lam^(T-2-t) u_{T-1}. Plies with a null root
     value are skipped (G_t = G_{t+1}; a trailing null bootstraps from the last known value). The target is
     (1 + s_t G_t) / 2 with s_t = +1 for player 0, -1 for player 1. A capped game with no root values at all
-    gets target None and weight 0 everywhere.
+    gets target None and weight 0 everywhere. With `full` (per-ply bools, e.g. episode.full_search), root values
+    of plies where full[t] is False are treated as null, so the chain runs and bootstraps over full searches only.
     """
     T = len(players)
+    if full is not None and root_values is not None:
+        root_values = [v if f else None for v, f in zip(root_values, full, strict=True)]
     if winner >= 0:
         return [float(p == winner) for p in players], [1.]*T
     if root_values is None or all(v is None for v in root_values):
@@ -62,14 +84,15 @@ def value_targets(players, root_values, winner, lam=.9):
 
 def write_shard(path, identity, episodes, rows):
     """Atomically publish a shard. `identity` must carry `actor_sha256`; each row carries `policy`
-    (float array over the legal moves, or None/empty for no policy target) besides the stored fields."""
+    (float array over the legal moves, or None/empty for no policy target) besides the stored fields;
+    `target`/`weight` default to null/0."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise ValueError(f'Shard already exists: {path}')
     policies = [np.zeros(0, np.float32) if r.get('policy') is None else np.asarray(r['policy'], np.float32) for r in rows]
     for r, p in zip(rows, policies):
-        if not 0 <= r['game'] < len(episodes) or (r['target'] is not None and not 0 <= r['target'] <= 1):
+        if not 0 <= r['game'] < len(episodes) or (r.get('target') is not None and not 0 <= r['target'] <= 1):
             raise ValueError('Malformed shard row')
         if len(p) and (not np.isfinite(p).all() or np.any(p < 0) or not np.isclose(p.sum(), 1, atol=1e-4)):
             raise ValueError('Invalid policy target')
@@ -80,7 +103,7 @@ def write_shard(path, identity, episodes, rows):
         stage = Path(temporary)/'shard'
         stage.mkdir()
         write_json(stage/'episodes.json', episodes)
-        write_json(stage/'rows.json', [{k: r[k] for k in keys} for r in rows])
+        write_json(stage/'rows.json', [{**dict(target=None, weight=0.), **{k: r[k] for k in keys if k in r}} for r in rows])
         np.savez_compressed(stage/'targets.npz', offsets=np.cumsum([0]+[len(p) for p in policies]).astype(np.int64),
                             probabilities=np.concatenate(policies+[np.zeros(0, np.float32)]))
         manifest = dict(schema=SCHEMA, created_at=time.time(), identity=identity, actor=identity['actor_sha256'],
@@ -149,20 +172,33 @@ def window_size(total, min_rows=20000, expand_per_row=.4, taper_exponent=.65):
 
 
 class ReplayWindow:
-    """The newest min(capacity_rows, window_size(N_total)) rows, taken shard by shard from the newest shard.
+    """The rows of the newest shards holding min(capacity_rows, window_size(N_full)) full-search rows.
 
-    Shards are ordered by directory name. The oldest admitted shard contributes only its last rows.
-    Episodes and rows of admitted shards stay in memory; policy vectors load per shard on first use and
-    are dropped with the shard. A lock serialises methods so a background rendering thread can sample
-    while the learner calls `refresh()`.
+    Only full-search rows (rows with a policy) count toward N_full and the window size; cheap-search rows ride
+    along with their shard. Shards are ordered by directory name; the oldest admitted shard contributes its rows
+    from its take-th last full-search row onward. `total_rows`/`rows` count every row (all shards / window),
+    `total_full_rows`/`full_rows` only full-search rows. Rows of games selected by
+    `holdout(episode, validation_fraction)` form the validation index and are never drawn for training.
+    Episodes and rows of admitted shards stay in memory; policy vectors load per shard on first use and are
+    dropped with the shard. A lock serialises methods so a rendering thread can sample while the learner
+    calls `refresh()`.
     """
 
-    def __init__(self, run_dir, capacity_rows, min_rows=20000, expand_per_row=.4, taper_exponent=.65):
-        self.run_dir = Path(run_dir); self.capacity_rows = capacity_rows
+    def __init__(self, run_dir, capacity_rows, min_rows=100000, expand_per_row=.4, taper_exponent=.65, validation_fraction=0.):
+        self.run_dir = Path(run_dir); self.capacity_rows = capacity_rows; self.validation_fraction = validation_fraction
         self.shape = dict(min_rows=min_rows, expand_per_row=expand_per_row, taper_exponent=taper_exponent)
-        self.manifests = {}; self.shards = {}; self.policies = {}
-        self.lock = threading.Lock()
+        self.manifests = {}; self.shards = {}; self.policies = {}; self.values = {}
+        self.lock = threading.RLock()
         self.refresh()
+
+    def load(self, name):
+        path = self.run_dir/'shards'/name
+        episodes, rows = read_shard(path, policies=False)
+        with np.load(path/'targets.npz', allow_pickle=False) as data:
+            full = np.diff(data['offsets']) > 0
+        where = {(r['game'], r['ply']): i for i, r in enumerate(rows)}
+        return Shard(episodes, rows, full, [holdout(e, self.validation_fraction) for e in episodes],
+                     [where.get((r['game'], r['ply']+1), -1) for r in rows])
 
     def refresh(self):
         """Rescan manifests, recompute the window and load newly admitted shards; returns window rows."""
@@ -172,28 +208,41 @@ class ReplayWindow:
                     self.manifests[path.name] = manifest(path)
             names = sorted(self.manifests)
             self.total_rows = sum(self.manifests[n]['counts']['rows'] for n in names)
-            want = min(self.capacity_rows, window_size(self.total_rows, **self.shape))
+            self.total_full_rows = sum(self.manifests[n]['counts']['policy_rows'] for n in names)
+            want = min(self.capacity_rows, window_size(self.total_full_rows, **self.shape))
             admitted = []; have = 0
             for name in reversed(names):
                 if have >= want:
                     break
-                take = min(self.manifests[name]['counts']['rows'], want-have)
+                take = min(self.manifests[name]['counts']['policy_rows'], want-have)
                 admitted.append((name, take)); have += take
             for name in set(self.shards) - {n for n, _ in admitted}:
                 del self.shards[name]; self.policies.pop(name, None)
+                self.values = {k: v for k, v in self.values.items() if k[0] != name}
             for name, _ in admitted:
                 if name not in self.shards:
-                    self.shards[name] = read_shard(self.run_dir/'shards'/name, policies=False)
-            self.admitted = admitted[::-1]; self.rows = have
-            # Flat (shard, row) index, oldest first, for uniform or recency-weighted sampling.
-            self.index = [(name, i) for name, take in self.admitted
-                          for i in range(self.manifests[name]['counts']['rows']-take, self.manifests[name]['counts']['rows'])]
-            return have
+                    self.shards[name] = self.load(name)
+            self.admitted = admitted[::-1]; self.full_rows = have
+            # Flat (shard, row) indices, oldest first, for uniform or recency-weighted sampling.
+            self.index = []; self.validation = []
+            for name, take in self.admitted:
+                shard = self.shards[name]; positions = np.flatnonzero(shard.full)
+                start = 0 if take >= len(positions) else int(positions[-take]) if take else len(shard.rows)
+                for i in range(start, len(shard.rows)):
+                    (self.validation if shard.held[shard.rows[i]['game']] else self.index).append((name, i))
+            self.rows = len(self.index)+len(self.validation)
+            return self.rows
 
-    def sample(self, rng, n, recency=0.):
-        """n Refs drawn with replacement; the k-th oldest of W window rows has weight ((k+1)/W)^recency."""
+    def ref(self, name, i):
+        shard = self.shards[name]
+        return Ref(name, i, shard.rows[i], shard.episodes[shard.rows[i]['game']])
+
+    def sample(self, rng, n, recency=0., validation=False):
+        """n Refs drawn with replacement from the training (or validation) index; the k-th oldest of
+        W rows has weight ((k+1)/W)^recency."""
         with self.lock:
-            W = len(self.index)
+            index = self.validation if validation else self.index
+            W = len(index)
             if not W:
                 raise ValueError('Replay window is empty')
             if recency:
@@ -201,11 +250,13 @@ class ReplayWindow:
                 picks = rng.choice(W, n, p=w/w.sum())
             else:
                 picks = rng.integers(W, size=n)
-            out = []
-            for k in picks:
-                name, i = self.index[k]; episodes, rows = self.shards[name]
-                out.append(Ref(name, i, rows[i], episodes[rows[i]['game']]))
-            return out
+            return [self.ref(*index[k]) for k in picks]
+
+    def following(self, ref):
+        """Ref of the same game's row at ply+1 in the same shard, or None."""
+        with self.lock:
+            i = self.shards[ref.shard].following[ref.index]
+            return None if i < 0 else self.ref(ref.shard, i)
 
     def policy(self, ref):
         """The row's policy vector (empty when the ply had no full search)."""
@@ -215,6 +266,23 @@ class ReplayWindow:
             offsets, probabilities = self.policies[ref.shard]
             return probabilities[offsets[ref.index]:offsets[ref.index+1]]
 
+    def value_targets(self, ref, lam, full_only):
+        """value_targets of the ref's episode (full-search root values only with `full_only`), cached while
+        its shard stays admitted."""
+        key = (ref.shard, ref.row['game'], lam, full_only)
+        with self.lock:
+            if key not in self.values:
+                e = ref.episode
+                self.values[key] = value_targets([player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'],
+                                                 lam, e['full_search'] if full_only else None)
+            return self.values[key]
+
+
+def _check(ref, s):
+    if (s.player, s.remaining) != (ref.row['player'], ref.row['remaining']) \
+            or hashlib.sha256(s.actions.astype(np.int64).tobytes()).hexdigest() != ref.row['legal_sha256']:
+        raise ValueError(f'Replayed position disagrees with row: {ref.shard}/{ref.index}')
+
 
 def render(refs, rng, hexcrop):
     """Encode each ref's position (history = episode moves before `row.ply`) under a random symmetry
@@ -223,21 +291,85 @@ def render(refs, rng, hexcrop):
     samples = []
     for ref in refs:
         s = hexcrop.encode(ref.episode['moves'][:ref.row['ply']], rng=rng)
-        if (s.player, s.remaining) != (ref.row['player'], ref.row['remaining']) \
-                or hashlib.sha256(s.actions.astype(np.int64).tobytes()).hexdigest() != ref.row['legal_sha256']:
-            raise ValueError(f'Replayed position disagrees with row: {ref.shard}/{ref.index}')
+        _check(ref, s)
         samples.append(s)
     return samples
 
 
-def targets(window, refs):
-    """Per-ref (policy, policy_weight, value, value_weight); an empty policy slice gets policy_weight 0
-    and a null value target gets value 0.5 with value_weight 0."""
-    out = []
+def crop_index(s, points):
+    """Flat crop indices of original points [N, 2] under the sample's symmetry; -1 off the crop plane."""
+    qmin, rmin, ox, oy = s.offset
+    xy = points @ hexcrop.SYMMETRIES[s.symmetry] + (ox-qmin, oy-rmin)
+    x, y = xy[:, 0], xy[:, 1]
+    inside = (x >= 0) & (x < s.size) & (y >= 0) & (y < s.size)
+    inside[inside] = s.planes[3, y[inside], x[inside]] > 0
+    return np.where(inside, y*s.size+x, -1)
+
+
+def target_options(settings):
+    """examples() keyword arguments from a LearnerSettings."""
+    return dict(lam=settings.td_lambda, bootstrap_weight=settings.bootstrap_weight, horizon=settings.short_value_horizon,
+                cheap_value_weight=settings.cheap_value_weight, full_only=settings.bootstrap_full_only)
+
+
+def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=True):
+    """Render refs under random symmetries and derive every learner target from the episodes.
+
+    Returns (samples, targets); each target is a dict of
+      policy, policy_weight: the row's improved policy (weight 0 when empty, i.e. a cheap-search row);
+      value, value_weight: value_targets(..., lam, full_search if full_only) at the ply; weight 1 for finished
+        games, `bootstrap_weight` for capped games with root values, 0 otherwise, times `cheap_value_weight`
+        for cheap-search rows;
+      short_value, short_weight: p(win) of the side to move from the root value `horizon` plies later
+        (negated when that ply's mover is the opponent); the outcome when a finished game ends within the
+        horizon; weight 0 when that root value is null or a capped game ends first;
+      future uint8 [2, S, S]: crop-plane cells occupied after the next 6 / 20 placements (stones already on
+        the board included; truncated at the game end);
+      next_cells int64 [M], next_policy float32 [M], next_weight: the next ply's policy (the ply+1 row's
+        improved policy over the ply+1 native legal list: the opponent's reply after the second stone of a
+        turn, the same player's second stone after the first), each cell mapped into this crop (-1 off the
+        crop plane, mass dropped, the rest renormalised); weight 0 when ply+1 has no row with a policy or no
+        mass lands in the crop. The network's opponent_policy head is trained on it.
+    """
+    samples, out = [], []
     for ref in refs:
-        p = window.policy(ref); v = ref.row['target']
-        out.append((p, float(len(p) > 0), .5 if v is None else v, 0. if v is None else ref.row['weight']))
-    return out
+        e, t = ref.episode, ref.row['ply']
+        moves = np.asarray(e['moves'], np.int64).reshape(-1, 2); T = len(moves); me = player_at(t)
+        game = Game(e['moves'][:t])
+        s = hexcrop.encode_game(game, moves[:t], rng=rng)
+        _check(ref, s)
+        policy = window.policy(ref)
+        values, weights = window.value_targets(ref, lam, full_only)
+        value_weight = weights[t]*(1. if e['winner'] >= 0 else bootstrap_weight)*(1. if len(policy) else cheap_value_weight)
+        u = t+horizon; roots = e['root_values']
+        if u >= T:
+            short = (float(me == e['winner']), 1.) if e['winner'] >= 0 else (.5, 0.)
+        elif roots is not None and roots[u] is not None:
+            v = roots[u] if player_at(u) == me else -roots[u]
+            short = ((1+v)/2, 1.)
+        else:
+            short = (.5, 0.)
+        future = np.zeros((2, s.size, s.size), np.uint8)
+        occupied = crop_index(s, moves[:min(T, t+max(FUTURE))])
+        for k, h in enumerate(FUTURE):
+            cells = occupied[:min(T, t+h)]
+            future[k].reshape(-1)[cells[cells >= 0]] = 1
+        nref = window.following(ref); following = (np.zeros(0, np.int64), np.zeros(0, np.float32), 0.)
+        if nref is not None and len(p := window.policy(nref)):
+            game.play(*e['moves'][t])
+            actions = hexcrop.legal_array(game, moves[:t+1])
+            if len(actions) != len(p) or hashlib.sha256(actions.tobytes()).hexdigest() != nref.row['legal_sha256']:
+                raise ValueError(f'Next-ply legal list disagrees with row: {nref.shard}/{nref.index}')
+            cells = crop_index(s, actions); p = np.where(cells >= 0, p, 0).astype(np.float32)
+            if p.sum() > 0:
+                following = (cells, p/p.sum(), 1.)
+        game.close()
+        samples.append(s)
+        out.append(dict(policy=policy, policy_weight=float(len(policy) > 0),
+                        value=.5 if values[t] is None else values[t], value_weight=value_weight,
+                        short_value=short[0], short_weight=short[1], future=future,
+                        next_cells=following[0], next_policy=following[1], next_weight=following[2]))
+    return samples, out
 
 
 def collate(samples, targets):
@@ -246,7 +378,10 @@ def collate(samples, targets):
       mask bool [B,N] (True for the first counts[b] entries, far cells included); counts int64 [B];
       policy float32 [sum counts] in the order of cells[mask], row b at policy[offsets[b]:offsets[b+1]]
         (zeros where policy_weight is 0; far cells keep their target mass); offsets int64 [B+1];
-      policy_weight, value (p(win) of the side to move), value_weight float32 [B]; player, remaining int64 [B].
+      future uint8 [B,2,S,S]; next_cells int64 [B,M] (-1 off the crop and on padding),
+        next_counts int64 [B], next_policy float32 [B,M] (zero beyond counts);
+      policy_weight, value, value_weight, short_value, short_weight, next_weight, future_weight (ones)
+        float32 [B]; player, remaining int64 [B].
     """
     groups = {}
     for s, t in zip(samples, targets):
@@ -256,28 +391,39 @@ def collate(samples, targets):
         counts = np.array([len(s.cells) for s, _ in items], np.int64)
         cells = np.full((len(items), counts.max()), -1, np.int64)
         policy = []
-        for b, (s, (p, pw, _, _)) in enumerate(items):
+        for b, (s, t) in enumerate(items):
             cells[b, :counts[b]] = s.cells
-            if pw and len(p) != counts[b]:
+            if t['policy_weight'] and len(t['policy']) != counts[b]:
                 raise ValueError('Policy target length disagrees with legal moves')
-            policy.append(p if pw else np.zeros(counts[b], np.float32))
+            policy.append(t['policy'] if t['policy_weight'] else np.zeros(counts[b], np.float32))
+        next_counts = np.array([len(t['next_cells']) for _, t in items], np.int64)
+        next_cells = np.full((len(items), max(1, next_counts.max())), -1, np.int64)
+        next_policy = np.zeros(next_cells.shape, np.float32)
+        for b, (_, t) in enumerate(items):
+            next_cells[b, :next_counts[b]] = t['next_cells']
+            next_policy[b, :next_counts[b]] = t['next_policy']
+        column = lambda key: torch.tensor([t[key] for _, t in items], dtype=torch.float32)
         out[size] = dict(
             planes=torch.from_numpy(np.stack([s.planes for s, _ in items])),
             cells=torch.from_numpy(cells), mask=torch.from_numpy(np.arange(cells.shape[1]) < counts[:, None]),
             counts=torch.from_numpy(counts), offsets=torch.from_numpy(np.concatenate([[0], np.cumsum(counts)])),
             policy=torch.from_numpy(np.concatenate(policy).astype(np.float32)),
-            policy_weight=torch.tensor([t[1] for _, t in items], dtype=torch.float32),
-            value=torch.tensor([t[2] for _, t in items], dtype=torch.float32),
-            value_weight=torch.tensor([t[3] for _, t in items], dtype=torch.float32),
+            future=torch.from_numpy(np.stack([t['future'] for _, t in items])),
+            next_cells=torch.from_numpy(next_cells), next_counts=torch.from_numpy(next_counts),
+            next_policy=torch.from_numpy(next_policy),
+            **{k: column(k) for k in ('policy_weight', 'value', 'value_weight', 'short_value', 'short_weight', 'next_weight')},
+            future_weight=torch.ones(len(items)),
             player=torch.tensor([int(s.player) for s, _ in items]), remaining=torch.tensor([int(s.remaining) for s, _ in items]))
     return out
 
 
-def batches(window, rng, batch_size, hexcrop, recency=0.):
-    """Endless generator of collated {S: batch} dicts covering `batch_size` positions in total."""
+def batches(window, rng, batch_size, settings, validation=False):
+    """Endless generator of collated {S: batch} dicts covering `batch_size` positions in total.
+    `settings()` returns the current LearnerSettings, read per batch (recency and target_options)."""
     while True:
-        refs = window.sample(rng, batch_size, recency)
-        yield collate(render(refs, rng, hexcrop), targets(window, refs))
+        s = settings()
+        refs = window.sample(rng, batch_size, s.recency, validation)
+        yield collate(*examples(window, refs, rng, **target_options(s)))
 
 
 class Prefetch:
@@ -304,3 +450,54 @@ class Prefetch:
         if isinstance(item, BaseException):
             raise item
         return item
+
+
+def _render_worker(run, settings, seed, output):
+    """Worker process body: put numpy-packed `batches` from a private ReplayWindow (refreshed every 30 s)."""
+    try:
+        window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
+                              settings.window_taper, settings.validation_fraction)
+        rng = np.random.default_rng(seed); refreshed = time.time()
+        for batch in batches(window, rng, settings.batch, lambda: settings):
+            output.put({size: {k: v.numpy() for k, v in b.items()} for size, b in batch.items()})
+            if time.time()-refreshed > 30:
+                window.refresh(); refreshed = time.time()
+    except BaseException:
+        output.put(RuntimeError('Render worker failed:\n'+traceback.format_exc()))
+
+
+class Renderers:
+    """`batches` of the run rendered by `workers` spawned processes, each with its own ReplayWindow, so
+    rendering never holds the trainer's GIL. Settings (a LearnerSettings) are fixed per pool: close() it and
+    start another to change them. Iterate to consume {S: batch of torch tensors}; a worker's exception or
+    death is raised in the consumer."""
+
+    def __init__(self, run, settings, seed, workers=2, depth=3):
+        context = multiprocessing.get_context('spawn')
+        self.queue = context.Queue(depth*workers)
+        self.processes = [context.Process(target=_render_worker, args=(str(run), settings, [*seed, i], self.queue), daemon=True)
+                          for i in range(workers)]
+        for process in self.processes:
+            process.start()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            try:
+                item = self.queue.get(timeout=5)
+            except queue.Empty:
+                if not all(p.is_alive() for p in self.processes):
+                    raise RuntimeError('A render worker exited')
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            return {size: {k: torch.from_numpy(v) for k, v in b.items()} for size, b in item.items()}
+
+    def close(self):
+        for process in self.processes:
+            process.terminate()
+        for process in self.processes:
+            process.join()
+        self.queue.cancel_join_thread()
