@@ -102,6 +102,7 @@ $('s-rating-note').textContent=league.rating_method?`Blue Elo uses current-proto
 if(league.joint_rating_note)$('s-rating-note').textContent+=' '+league.joint_rating_note+' Updated '+new Date(league.rating_updated_at*1000).toLocaleTimeString()+'.';
 $('s-rating-note').textContent+=' '+(league.background_note||'')+' Archived CPU reports are checked for intact pairs and matching scores, but were not hash-bound by the migration.';
 if(league.rating_stale)$('s-rating-note').textContent='OUTDATED ESTIMATES: saved match results have changed since this rating calculation. Waiting for the rating worker. '+$('s-rating-note').textContent;
+const expandedCells=new Set([...$('s-checkpoints').querySelectorAll('details[open]')].map(d=>d.dataset.cell));
 $('s-checkpoints').replaceChildren();for(const p of [...cp].reverse()){
 const oldRating=p.historical_ratings?.at(-1),cpu=p.cpu_estimate,hist=p.historical_background,cpuShown=!Number.isFinite(p.elo)&&Number.isFinite(cpu?.elo),bounds=p.elo_interval||(cpuShown?cpu.elo_interval:oldRating&&!Number.isFinite(p.elo)?oldRating.elo_interval:null);
 const interval=bounds?`${bounds[0]===null?'-infinity':Math.round(bounds[0])} to ${bounds[1]===null?'+infinity':Math.round(bounds[1])}${cpuShown?' CPU':!Number.isFinite(p.elo)?' historical':''}`:league.rating_method&&!p.pending?'Not estimated':'Pending';
@@ -124,6 +125,7 @@ if(index===8)text=text.replace(/ \(fresh corpus.*$/, ' / fresh').replace(' (held
 text=text.replace('No historical result; not scheduled under current protocol','No archived result');
 if(text!==String(value)){
 const details=document.createElement('details'),summary=document.createElement('summary'),full=document.createElement('p');
+details.dataset.cell=`${p.id}:${index}`;details.open=expandedCells.has(details.dataset.cell);
 summary.textContent=text;full.textContent=value;details.append(summary,full);td.append(details);
 }else td.textContent=text;
 tr.append(td)}$('s-checkpoints').append(tr)}
