@@ -46,15 +46,18 @@ class LearnerSettings:
     batch: int = 256
     lr: float = 3e-4
     warmup_steps: int = 300
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-2      # decoupled; 1e-4 is effectively zero at lr 3e-4
+    grad_clip: float = 1.
     ema: float = .999
     samples_per_row: float = 4.  # train presentations per generated row (KataGo ~4)
-    window_min_rows: int = 20000
+    window_min_rows: int = 100000    # KataGo minimum; counts full-search rows only
     window_expand_per_row: float = .4
     window_taper: float = .65
     window_capacity: int = 2000000
     recency: float = 0.
     bootstrap_weight: float = 1.  # weight of TD(lambda) value rows from capped games; 0 = mask
+    bootstrap_full_only: bool = True  # chain TD(lambda) through full-search root values only
+    cheap_value_weight: float = .25   # value weight of cheap-search rows (KataGo: 0)
     td_lambda: float = .9
     short_value_horizon: int = 16
     value_weight: float = 1.5
@@ -77,8 +80,13 @@ class EvaluationSettings:
     max_plies: int = 256
     tactics: bool = True
     anchor_every: int = 5         # rate against external anchors every N checkpoints
-    anchor_games: int = 32
+    anchor_games: int = 100
     seal_ms: int = 100
+    sprt_elo0: float = 0.         # promotion SPRT bounds on candidate minus champion
+    sprt_elo1: float = 50.
+    sprt_alpha: float = .05
+    sprt_beta: float = .05
+    sprt_max_games: int = 400
     opening_suite: str = 'standard-v1'
 
 
