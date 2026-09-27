@@ -355,7 +355,7 @@ def main():
             s = learner.settings
             if time.time()-last_refresh > REFRESH_SECONDS:
                 window.refresh(); last_refresh = time.time()
-            if learner.samples_seen+s.batch > s.samples_per_row*window.total_rows:
+            if not window.rows or learner.samples_seen+s.batch > s.samples_per_row*window.total_rows:
                 write_status(stage='waiting-for-data', samples_per_second=0.)
                 rate = []; time.sleep(5.); window.refresh(); last_refresh = time.time()
                 continue

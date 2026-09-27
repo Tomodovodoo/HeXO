@@ -890,9 +890,9 @@ class EngineTests(unittest.TestCase):
             since = time.time()
             write_games(Path(tmp)/'shards'/'000001', [(winning_game(), 0, None)], dict(actor_sha256='a'*64, process=1))
             write_games(Path(tmp)/'shards'/'000002', [(winning_game(), 0, None)]*2, dict(actor_sha256='a'*64, process=0))
-            self.assertEqual(dense_selfplay.published(tmp, 1, since), 1)
-            self.assertEqual(dense_selfplay.published(tmp, 0, since), 2)
-            self.assertEqual(dense_selfplay.published(tmp, 1, time.time()+1), 0)
+            self.assertEqual(dense_selfplay.published(tmp, 1, since)['games_completed'], 1)
+            self.assertEqual(dense_selfplay.published(tmp, 0, since)['games_completed'], 2)
+            self.assertEqual(dense_selfplay.published(tmp, 1, time.time()+1)['games_completed'], 0)
 
 
 if __name__ == '__main__':

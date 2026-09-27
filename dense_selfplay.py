@@ -362,7 +362,7 @@ def worker(args):
               + (' - FRESH UNTRAINED NETWORK' if model.checkpoint == 'fresh' else ''), process=args.worker)
     print(f'Worker {args.worker}: {model.checkpoint} {model.sha[:12]}', flush=True)
     engine = Engine(settings.leaf_batch)
-    state = dict(games_completed=0, positions=0, shards_written=0, terminal=0, plies=0, error=None)
+    state = dict(published(run, args.worker), error=None)
     episodes, rows, started = [], [], 0
     window = deque([(time.perf_counter(), 0, 0)])
     since = dict(time=time.perf_counter(), positions=0, evals=0)
@@ -446,10 +446,16 @@ def worker(args):
         raise
 
 
-def published(run, worker, since):
-    """Games in shards written by actor worker `worker` at or after `since`."""
-    items = (dense_data.manifest(path) for path in dense_data.shard_dirs(run))
-    return sum(m['counts']['games'] for m in items if m['identity'].get('process') == worker and m['created_at'] >= since)
+def published(run, worker, since=0.):
+    """Cumulative counts from shards written by actor worker `worker` at or after `since`; every ply has a row,
+    so rows count both positions and plies."""
+    totals = dict(games_completed=0, positions=0, shards_written=0, terminal=0, plies=0)
+    for m in (dense_data.manifest(path) for path in dense_data.shard_dirs(run)):
+        if m['identity'].get('process') == worker and m['created_at'] >= since:
+            c = m['counts']
+            totals['games_completed'] += c['games']; totals['positions'] += c['rows']; totals['plies'] += c['rows']
+            totals['terminal'] += c['terminal_games']; totals['shards_written'] += 1
+    return totals
 
 
 def supervise(args):
@@ -478,7 +484,7 @@ def supervise(args):
                 if code == 0:
                     continue
                 if remaining[k] is not None:
-                    remaining[k] -= published(run, k, started)
+                    remaining[k] -= published(run, k, started)['games_completed']
                 restart = remaining[k] is None or remaining[k] > 0
                 left = '' if remaining[k] is None else f' with {remaining[k]} games left'
                 log_event(run, 'actor', 'error', f'worker {k} exited with code {code}'
