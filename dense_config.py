@@ -56,7 +56,7 @@ class LearnerSettings:
     window_capacity: int = 2000000
     recency: float = 0.
     bootstrap_weight: float = 1.  # weight of TD(lambda) value rows from capped games; 0 = mask
-    bootstrap_full_only: bool = True  # chain TD(lambda) through full-search root values only
+    bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only (A/B)
     cheap_value_weight: float = .25   # value weight of cheap-search rows (KataGo: 0)
     td_lambda: float = .9
     short_value_horizon: int = 16
