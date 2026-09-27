@@ -84,7 +84,7 @@ class MatchGame:
                 if not self.game.legal(q, r):
                     raise ValueError(f'Seal played an illegal placement {q}, {r}')
                 self.play(int(q), int(r))
-                if self.game.winner >= 0:
+                if self.over():
                     break
             if not self.over() and self.game.player == side:
                 raise ValueError('Seal did not complete its turn')
