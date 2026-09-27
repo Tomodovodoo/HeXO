@@ -57,7 +57,7 @@ function panelSeries(p){const out=[],seen=new Set();for(const r of selected()){i
 out.push({key:p.perRun?r.run.name:r.key,label:p.perRun?r.run.name:r.key,run:r.run,variant:p.perRun?'main':r.variant,index:r.index})}return out}
 const xOf=p=>p.xs.includes(state.x[p.id])?state.x[p.id]:p.xs[0];
 const cacheKey=(s,p)=>`${s.run.name}|${s.variant}|${p.metric}|${xOf(p)}`;
-async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k);if(hit&&(!s.run.live||hit.poll===project.now))continue;
+async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k);if(hit&&(hit.poll===project.now||(!s.run.live&&project.now-hit.poll<60)))continue;
 jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:p.metric,x:xOf(p),max_points:1000});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${p.metric} of ${s.label}: HTTP ${res.status}`);cache.set(k,{poll:project.now,points:(await res.json()).points})})}
 let failure=null;const worker=async()=>{while(jobs.length){try{await jobs.shift()()}catch(e){failure=e}}};await Promise.all(Array.from({length:6},worker));if(failure)throw failure}
 function ticks(lo,hi,n){const step0=(hi-lo)/n||1,mag=10**Math.floor(Math.log10(step0)),e=step0/mag,step=(e>=7.5?10:e>=3.5?5:e>=1.5?2:1)*mag,out=[];for(let v=Math.ceil(lo/step)*step;v<=hi+step*1e-9;v+=step)out.push(+v.toPrecision(12));return out}

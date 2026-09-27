@@ -467,6 +467,8 @@ def match(args):
             models[name] = load(run, config, source=(name, path))
     if args.a == args.b:
         raise ValueError('A match needs two distinct players')
+    if args.a == SEAL:
+        raise ValueError('Seal plays as --b; pass the checkpoint as --a')
     started = time.perf_counter()
     records = play(paired_games(models[args.a], SEAL if args.b == SEAL else models[args.b], args.games,
                                 f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None,
