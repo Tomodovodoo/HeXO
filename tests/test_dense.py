@@ -530,6 +530,28 @@ def pointwise_model(config):
 
 
 class DenseConfigTests(unittest.TestCase):
+    def test_metrics_log_series(self):
+        """Partial last lines are skipped until completed, resumed steps replace the rewound ones and
+        downsampling keeps the first, last and extreme points."""
+        import dashboard
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for step in (1, 2, 3, 2, 3, 4):
+                dense_config.append_metrics(run, 'learner-main', step=step, policy_ce=float(step))
+            path = run/'metrics'/'learner-main.jsonl'
+            with path.open('ab') as stream:
+                stream.write(b'{"time": 1, "step": 5, "policy')
+            config = dict(created_at=0.)
+            self.assertEqual(dashboard.series(run, config, 'main', 'policy_ce')['points'], [[1, 1.], [2, 2.], [3, 3.], [4, 4.]])
+            with path.open('ab') as stream:
+                stream.write(b'_ce": 5.0}\n')
+            self.assertEqual(dashboard.series(run, config, 'main', 'policy_ce')['points'][-1], [5, 5.])
+            points = [(x, 100. if x == 777 else math.sin(x)) for x in range(5000)]
+            kept = dashboard.downsample(points, 100)
+            self.assertLessEqual(len(kept), 100)
+            self.assertEqual((kept[0], kept[-1]), (points[0], points[-1]))
+            self.assertIn((777, 100.), kept)
+
     def test_round_trip_and_no_overwrite(self):
         config = dense_config.RunConfig(created_at=12.5, seed=3, device='cpu',
                                         model=dense_config.ModelSettings(blocks=2, aux_heads=False),

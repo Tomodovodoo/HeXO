@@ -41,6 +41,9 @@ from train import write_json
 # RTX 3070 Ti.
 MAX_CELLS, MERGE_CELLS = 48*48*48, 32768
 COLOR = ((np.arange(1 << 16)+1)//2) % 2
+METRICS_SECONDS = 30.
+METRICS = ('positions', 'games_completed', 'placements_per_second', 'evals_per_second', 'mean_batch',
+           'terminal_fraction', 'mean_plies', 'checkpoint')
 
 
 def checkpoints(run):
@@ -364,19 +367,27 @@ def worker(args):
     window = deque([(time.perf_counter(), 0, 0)])
     since = dict(time=time.perf_counter(), positions=0, evals=0)
 
+    logged = time.perf_counter()
+
     def status(stage):
+        """Rewrite the heartbeat; append a metrics line every METRICS_SECONDS and whenever the stage is not 'playing'."""
+        nonlocal logged
         now = time.perf_counter()
         window.append((now, state['positions'], engine.evals))
         while len(window) > 2 and now-window[1][0] > 60:
             window.popleft()
         t, p, e = window[0]
         g = state['games_completed']
-        write_json(status_path, dict(
+        fields = dict(
             stage=stage, updated_at=time.time(), checkpoint=model.checkpoint, actor_sha256=model.sha,
             games_completed=g, games_total=args.games, positions=state['positions'], active_games=len(engine.slots),
             placements_per_second=(state['positions']-p)/max(1e-9, now-t), evals_per_second=(engine.evals-e)/max(1e-9, now-t),
             mean_batch=engine.evals/max(1, engine.calls), terminal_fraction=state['terminal']/g if g else None,
-            mean_plies=state['plies']/g if g else None, shards_written=state['shards_written'], error=state['error']))
+            mean_plies=state['plies']/g if g else None, shards_written=state['shards_written'], error=state['error'])
+        write_json(status_path, fields)
+        if stage != 'playing' or now-logged >= METRICS_SECONDS:
+            logged = now
+            dense_config.append_metrics(run, f'actor-{args.worker}', **{k: fields[k] for k in METRICS})
 
     def publish():
         nonlocal model

@@ -175,5 +175,5 @@ const tr=el('tr');for(const [i,value] of values.entries()){const td=el('td',valu
 const events=(data.events||[]).slice(-30).reverse();$('feed').replaceChildren(...events.map(e=>el('div',`${new Date(e.time*1000).toLocaleTimeString()}  ${e.source||'?'}${e.variant?' '+e.variant:''} ${e.kind||''}: ${e.message??''}`,e.kind==='replace'||e.kind==='promotion'||e.kind==='error'?'event-'+e.kind:'')));if(!events.length)$('feed').textContent='No events yet.';
 $('truncated').textContent='Capped games (reaching the ply cap) supply policy targets but no outcome. Match results count capped games separately from wins and losses. Highlighted: population copies (blue) and promotions (green).';
 }
-async function poll(){try{let res=await fetch('/api/run');if(!res.ok)throw Error('Dashboard data unavailable');render(await res.json())}catch(e){$('error').textContent=e.message}setTimeout(poll,2000)}window.addEventListener('resize',()=>{if(latest)render(latest)});poll();
+async function poll(){try{let res=await fetch('/api/run'+location.search);if(!res.ok)throw Error('Dashboard data unavailable');render(await res.json())}catch(e){$('error').textContent=e.message}setTimeout(poll,2000)}window.addEventListener('resize',()=>{if(latest)render(latest)});poll();
 </script></html>

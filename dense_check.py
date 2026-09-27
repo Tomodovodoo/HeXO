@@ -1,6 +1,6 @@
 """Integration check for the dense HexNet stack; run before every training launch and after every change.
 
-  python dense_check.py [--run DIR] [--shards runs/dense-v1/shards] [--model ckpt.pt]
+  python dense_check.py [--run DIR] [--shards runs/dense-v1/shards] [--model ckpt.pt] [--skip-gpu]
 
 Stages: CPU unit tests (tests/test_dense.py); GPU throughput of the default b6c96 model (inference and
 training at batch 256 on bucket 32) against thresholds; bf16 vs fp32 agreement on real positions;
@@ -344,6 +344,12 @@ def e2e_stage(report, run):
     errors = [e['message'] for e in events if e['kind'] == 'error']
     report.add('e2e', 'events: shard, export, match; no error', ', '.join(sorted(kinds)) + (f'; {errors[0]}' if errors else ''),
                '', 'PASS' if {'shard', 'export', 'match'} <= kinds and not errors else 'FAIL')
+    lines = lambda name: [json.loads(line) for line in (run/'metrics'/f'{name}.jsonl').read_text(encoding='utf-8').splitlines()]
+    learner_log, actor_log = lines('learner-main'), lines('actor-0')
+    good = [r['step'] for r in learner_log if not r.get('validation')] == [20] and \
+        [r['step'] for r in learner_log if r.get('validation')] == [10, 20] and actor_log[-1]['games_completed'] == 8
+    report.add('e2e', 'metrics logs: learner, actor', f'{len(learner_log)} learner, {len(actor_log)} actor lines',
+               'step 20; validation 10, 20; 8 games', 'PASS' if good else 'FAIL')
     kind, data = dashboard_kind(run)
     good = kind == 'dense' and data['dense']['data']['shards'] == 2 and len(data['dense']['checkpoints']) == 2
     report.add('e2e', 'dashboard /api/run', f'kind {kind}', 'dense', 'PASS' if good else 'FAIL')
@@ -368,6 +374,7 @@ def main():
     parser.add_argument('--trees', type=int, default=32)
     parser.add_argument('--seed', type=int, default=1740)
     parser.add_argument('--skip-unit', action='store_true')
+    parser.add_argument('--skip-gpu', action='store_true', help='skip the GPU throughput, precision, search and symmetry stages')
     args = parser.parse_args()
     run = (args.run or Path(tempfile.mkdtemp(prefix='dense-check-'))).resolve()
     if (run/'config.json').exists():
@@ -379,9 +386,10 @@ def main():
         print('== CPU unit tests')
         unit_stage(report)
     print('== GPU')
-    if not torch.cuda.is_available():
-        print('  CUDA unavailable: GPU stages skipped')
-        report.add('gpu', 'all GPU stages', 'CUDA unavailable, skipped', '', 'skip')
+    if args.skip_gpu or not torch.cuda.is_available():
+        reason = '--skip-gpu' if args.skip_gpu else 'CUDA unavailable'
+        print(f'  {reason}: GPU stages skipped')
+        report.add('gpu', 'all GPU stages', f'{reason}, skipped', '', 'skip')
     else:
         torch.manual_seed(args.seed)
         rng = np.random.default_rng(args.seed)

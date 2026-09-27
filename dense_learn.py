@@ -3,7 +3,9 @@
 A checkpoint holds model.pt (raw weights) and ema.pt (what actors play), both hexnet.save_model, optimizer.pt and
 manifest.json {variant, step, samples_seen, created_at, model_sha256, ema_sha256 (hexnet.model_digest), metrics,
 learner (effective LearnerSettings), model (ModelSettings), copied_from}. Events have source 'learner' and kind
-export, info, error or replace. league.json is read for population replacement, never written.
+export, info, error or replace. league.json is read for population replacement, never written. metrics/learner-
+<variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
+falls on every tenth step) and one with the EMA validation losses per export.
 
 Every target is derived here from episodes (dense_data.examples), so td_lambda, bootstrap_weight and
 short_value_horizon are learner settings; batches are rendered by dense_data.Renderers worker processes
@@ -38,7 +40,8 @@ QUANTUM = 16  # bucket rows are padded to a multiple of this
 STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
-KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'export_every')
+KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'export_every', 'log_every')
+LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')))  # metrics log names
 # (low, high) for replacement perturbations; td_lambda and ema are perturbed through 1 - x.
 BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995), ema=(.99, .9999))
 
@@ -307,6 +310,7 @@ def main():
     config = dense_config.load(args.run)
     settings = dense_config.override(config.learner, args)
     overrides = {k: v for k, v in asdict(settings).items() if getattr(args, k, None) is not None}
+    torch.manual_seed(config.seed)
     learner = Learner(args.run, settings, config, args.initial, overrides)
     s = learner.settings
     status = dict(stage='training', variant=s.variant, error=None, samples_per_second=0.)
@@ -320,6 +324,18 @@ def main():
                       value_bce=(learner.metrics or {}).get('value_bce'))
         write_json(status_path(args.run, s.variant), status)
 
+    def speed():
+        elapsed = rate[-1][0]-rate[0][0] if rate else 0.
+        return sum(r[1] for r in rate[1:])/elapsed if elapsed > 0 else 0.
+
+    def export():
+        write_status(stage='exporting')
+        validation = learner.export(window)['metrics']['validation']
+        if validation:
+            dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
+                                        validation=True, **{LOGGED[h]: v for h, v in validation.items()})
+
+    rate = []
     try:
         torch.manual_seed(config.seed+learner.step)
         variant_seed = zlib.crc32(s.variant.encode())
@@ -332,7 +348,7 @@ def main():
               learner=asdict(s))
         print(f'{"step":>6} {"policy":>7} {"value":>7} {"short":>7} {"opp":>7} {"future":>7} {"lr":>8} {"rows/s":>7} {"wait":>6} {"gpu":>6} {"mem":>6}', flush=True)
         sums = torch.zeros(len(HEADS), device=learner.device); count = 0
-        last_status = last_refresh = time.time(); rate = []
+        last_status = last_refresh = time.time()
         while args.steps is None or learner.step < args.steps:
             if learner.maybe_replace(factor_rng):
                 stream.close(); stream = renderers()
@@ -348,27 +364,29 @@ def main():
             ready = time.perf_counter()
             losses = learner.train_step(batch)
             sums += losses; count += 1
-            if learner.step % 10 == 0 or learner.step % s.export_every == 0 or learner.step == args.steps:
+            logged = learner.step % s.log_every == 0
+            if learner.step % 10 == 0 or logged or learner.step % s.export_every == 0 or learner.step == args.steps:
                 values = (sums/count).tolist()
                 learner.metrics = dict(zip(HEADS, values))
                 sums.zero_(); count = 0
             finished = time.perf_counter()
             rate = (rate+[(finished, s.batch, ready-started, finished-ready)])[-50:]
+            if logged:
+                dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
+                                            lr=learner.lr(), **{LOGGED[h]: v for h, v in learner.metrics.items()},
+                                            samples_per_second=speed(), window_rows=window.rows)
             if learner.step % 10 == 0:
                 wait, gpu = np.mean([r[2] for r in rate]), np.mean([r[3] for r in rate])
                 memory = torch.cuda.max_memory_allocated()/2**30 if learner.device.type == 'cuda' else 0.
                 print(f'{learner.step:>6} ' + ' '.join(f'{v:>7.4f}' for v in learner.metrics.values())
                       + f' {learner.lr():>8.2e} {s.batch/(wait+gpu):>7.0f} {1000*wait:>6.0f} {1000*gpu:>6.0f} {memory:>5.2f}G', flush=True)
             if time.time()-last_status > STATUS_SECONDS:
-                elapsed = rate[-1][0]-rate[0][0]
-                write_status(stage='training', samples_per_second=sum(r[1] for r in rate[1:])/elapsed if elapsed > 0 else 0.)
+                write_status(stage='training', samples_per_second=speed())
                 last_status = time.time()
             if learner.step % s.export_every == 0:
-                write_status(stage='exporting')
-                learner.export(window)
+                export()
         if learner.last_export != learner.step:
-            write_status(stage='exporting')
-            learner.export(window)
+            export()
         write_status(stage='idle', samples_per_second=0.)
     except KeyboardInterrupt:
         if 'window' in locals():

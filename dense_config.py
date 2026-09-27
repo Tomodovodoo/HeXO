@@ -11,6 +11,15 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
   actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s
   learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s
   events.jsonl                         one line per event: {time, source, kind, message, ...} (log_event)
+  metrics/learner-<variant>.jsonl      {time, step, samples_seen, lr, policy_ce, value_bce, short_value_bce, next_ce,
+                                       future_bce, samples_per_second, window_rows} every log_every steps, plus
+                                       {time, step, samples_seen, <the five losses>, validation: true} per export
+  metrics/actor-<k>.jsonl              {time, positions, games_completed, placements_per_second, evals_per_second,
+                                       mean_batch, terminal_fraction, mean_plies, checkpoint} about every 30 s;
+                                       counters restart with the worker process (dense_selfplay)
+  metrics/gpu.jsonl                    {time, utilization, used_mib, watts, temperature} about every 10 s while a
+                                       dashboard watches the run (dashboard.py)
+Metrics logs are append-only, one JSON line per write (append_metrics); readers skip a partial last line.
 Learner variants override the `learner` section per process and record the effective values in each checkpoint
 manifest.
 """
@@ -77,6 +86,7 @@ class LearnerSettings:
     future_weight: float = .5
     validation_fraction: float = .03
     export_every: int = 500
+    log_every: int = 20           # steps per metrics/learner-<variant>.jsonl line
     protect_steps: int = 3000     # no replacement for this many steps after start or copy
     replace_interval: int = 2000  # steps between replacement checks
     replace_margin: float = 50.   # Elo the source must lead by beyond interval overlap
@@ -116,11 +126,22 @@ class RunConfig:
 SECTIONS = dict(model=ModelSettings, actor=ActorSettings, learner=LearnerSettings, evaluation=EvaluationSettings)
 
 
+def append_line(path, record):
+    """Append `record` to `path` as one JSON line in a single unbuffered write."""
+    with Path(path).open('ab', buffering=0) as stream:
+        stream.write((json.dumps(record, allow_nan=False)+'\n').encode())
+
+
 def log_event(run, source, kind, message, **fields):
     """Append one line to <run>/events.jsonl."""
-    with (Path(run)/'events.jsonl').open('a', encoding='utf-8') as stream:
-        stream.write(json.dumps(dict(time=time.time(), source=source, kind=kind, message=message, **fields),
-                                allow_nan=False)+'\n')
+    append_line(Path(run)/'events.jsonl', dict(time=time.time(), source=source, kind=kind, message=message, **fields))
+
+
+def append_metrics(run, name, **fields):
+    """Append {time, **fields} to <run>/metrics/<name>.jsonl."""
+    path = Path(run)/'metrics'/f'{name}.jsonl'
+    path.parent.mkdir(exist_ok=True)
+    append_line(path, dict(time=time.time(), **fields))
 
 
 def from_dict(data):
