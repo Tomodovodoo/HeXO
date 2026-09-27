@@ -363,6 +363,7 @@ def worker(args):
     print(f'Worker {args.worker}: {model.checkpoint} {model.sha[:12]}', flush=True)
     engine = Engine(settings.leaf_batch)
     state = dict(published(run, args.worker), error=None)
+    target = None if args.games is None else args.games+state['games_completed']
     episodes, rows, started = [], [], 0
     window = deque([(time.perf_counter(), 0, 0)])
     since = dict(time=time.perf_counter(), positions=0, evals=0)
@@ -380,7 +381,7 @@ def worker(args):
         g = state['games_completed']
         fields = dict(
             stage=stage, updated_at=time.time(), checkpoint=model.checkpoint, actor_sha256=model.sha,
-            games_completed=g, games_total=args.games, positions=state['positions'], active_games=len(engine.slots),
+            games_completed=g, games_total=target, positions=state['positions'], active_games=len(engine.slots),
             placements_per_second=(state['positions']-p)/max(1e-9, now-t), evals_per_second=(engine.evals-e)/max(1e-9, now-t),
             mean_batch=engine.evals/max(1, engine.calls), terminal_fraction=state['terminal']/g if g else None,
             mean_plies=state['plies']/g if g else None, shards_written=state['shards_written'], error=state['error'])
