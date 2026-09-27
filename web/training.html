@@ -22,7 +22,7 @@ details{margin-top:12px;font-size:12px;color:#65757f}summary{cursor:pointer}.leg
 <section><h2>Saved iterations</h2><div class="table-scroll"><table><thead><tr><th>Checkpoint</th><th>Natural / capped</th><th>Positions</th><th>Policy CE</th><th>Q MSE</th><th>Value MSE</th><th>Actor / V steps</th></tr></thead><tbody id="k-checkpoints"></tbody></table></div></section>
 <section><h2>Actor and version</h2><p id="k-actor"></p><dl id="k-version"></dl></section>
 </div>
-<section><h2>GPU activity</h2><div class="metrics"><div class="metric"><small>GPU utilization</small><strong id="gpu">N/A</strong></div><div class="metric"><small>GPU memory</small><strong id="vram">N/A</strong></div></div><canvas id="hardware" role="img" aria-label="Recent GPU utilization and memory usage percentages"></canvas><p id="hardware-detail">Device telemetry includes all processes on the GPU. Blue shows utilization; orange shows allocated memory as a share of capacity.</p></section>
+<section><h2>GPU activity</h2><div class="metrics"><div class="metric"><small>GPU utilization</small><strong id="gpu">N/A</strong></div><div class="metric"><small>GPU memory</small><strong id="vram">N/A</strong></div></div><p class="legend">Blue: utilization / Orange: memory</p><canvas id="hardware" role="img" aria-label="Recent GPU utilization and memory usage percentages"></canvas><p id="hardware-detail">Device telemetry includes all processes on the GPU. Blue shows utilization; orange shows allocated memory as a share of capacity.</p></section>
 <section><details><summary>Live events</summary><div id="feed">No events yet.</div><p id="truncated"></p></details></section></main>
 <script src="/openings.js"></script>
 <script>
@@ -102,6 +102,7 @@ $('s-rating-note').textContent=league.rating_method?`Blue Elo uses current-proto
 if(league.joint_rating_note)$('s-rating-note').textContent+=' '+league.joint_rating_note+' Updated '+new Date(league.rating_updated_at*1000).toLocaleTimeString()+'.';
 $('s-rating-note').textContent+=' '+(league.background_note||'')+' Archived CPU reports are checked for intact pairs and matching scores, but were not hash-bound by the migration.';
 if(league.rating_stale)$('s-rating-note').textContent='OUTDATED ESTIMATES: saved match results have changed since this rating calculation. Waiting for the rating worker. '+$('s-rating-note').textContent;
+const focusedCell=$('s-checkpoints').contains(document.activeElement)?document.activeElement.closest('details[data-cell]')?.dataset.cell:null;
 const expandedCells=new Set([...$('s-checkpoints').querySelectorAll('details[open]')].map(d=>d.dataset.cell));
 $('s-checkpoints').replaceChildren();for(const p of [...cp].reverse()){
 const oldRating=p.historical_ratings?.at(-1),cpu=p.cpu_estimate,hist=p.historical_background,cpuShown=!Number.isFinite(p.elo)&&Number.isFinite(cpu?.elo),bounds=p.elo_interval||(cpuShown?cpu.elo_interval:oldRating&&!Number.isFinite(p.elo)?oldRating.elo_interval:null);
@@ -116,7 +117,7 @@ const older=p.older_score||cpu?.older_score||hist?.older_score,olderWorst=older?
 const status=p.reference?'Initial':p.promotion_reconsideration?'Promoted on cap review (originally not promoted)':p.promotion_rule?(p.promoted?`Promoted: incumbent and #${p.promotion_older} won`:p.promotion_older===null?'Not promoted: no distinct older opponent':'Not promoted: both conservative wins required'):p.promoted?'Promoted':cpu?.background_decision?`${cpu.background_decision} (CPU estimate)`:hist?`Archived CPU sample${hist.partial?' (partial)':''}; not migration-hash verified; no current evaluation`:p.historical_background_status?'No archived result; not scheduled under current protocol':p.pending?'Evaluating':p.evaluation_due===false?'Background queued':'Not promoted';
 const values=[p.id,Number.isFinite(p.elo)?Math.round(p.elo)+(p.rating_provisional||p.rating_censored_pairs||p.rating_unplayed_pairs?' provisional':'')+(p.rating_stale?' outdated':'')+(p.rating_pairs!==undefined?' / '+p.rating_pairs+' rated pairs':'')+(p.rating_censored_pairs?' / '+p.rating_censored_pairs+' capped pairs':'')+(p.rating_unplayed_pairs?' / '+p.rating_unplayed_pairs+' unsaved pairs':''):cpuShown?Math.round(cpu.elo)+(cpu.provisional||cpu.rating_provisional||cpu.rating_censored_pairs||cpu.rating_unplayed_pairs?' provisional CPU estimate':' CPU estimate'):Number.isFinite(oldRating?.elo)?Math.round(oldRating.elo)+(oldRating.source==='paired joint rating'?' historical joint':' historical')+(Number.isInteger(oldRating.rating_pairs)?' / '+oldRating.rating_pairs+' rated pairs':''):'Unrated',interval,p.reference?'Reference':anchor,previousText+olderText,p.reference?'Reference':champion,status,p.loss?.train?`${p.loss.train.policy_ce.toFixed(3)} / ${p.loss.train.value_mse.toFixed(3)}`:'None',p.reference?'None':validation];
 const tr=document.createElement('tr');for(const [index,value] of values.entries()){
-const td=document.createElement('td');td.title=String(value);
+const td=document.createElement('td');
 let text=String(value);
 if(index===1)text=text.split(' / ')[0];
 if(index>=3&&index<=5)text=text.replace(/ \/ observed score .*?(?= \/ older #| \/ capped as losses:|$)/g,'').replace(/ \/ capped as losses: .*?(?= \/ older #|$)/g,'').replace(' / older #','\nOlder #');
@@ -129,6 +130,7 @@ details.dataset.cell=`${p.id}:${index}`;details.open=expandedCells.has(details.d
 summary.textContent=text;full.textContent=value;details.append(summary,full);td.append(details);
 }else td.textContent=text;
 tr.append(td)}$('s-checkpoints').append(tr)}
+if(focusedCell)$('s-checkpoints').querySelector(`details[data-cell="${focusedCell}"] > summary`)?.focus({preventScroll:true});
 $('feed').textContent=(data.events||[]).slice(-12).reverse().map(e=>`${new Date(e.updated_at*1000).toLocaleTimeString()} Iteration ${e.iteration}: ${e.stage}${e.completed!==undefined?' '+e.completed+'/'+e.total:''}${Number.isFinite(e.policy_ce)?' policy '+e.policy_ce.toFixed(3)+' value '+e.value_mse.toFixed(3):''}`).join('\n');
 $('truncated').textContent='Capped self-play games supply policy targets but no outcome target. Capped evaluation games remain censored in Elo and count as candidate losses only for the conservative champion decision.';
 }
