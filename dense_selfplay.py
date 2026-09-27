@@ -365,8 +365,8 @@ def worker(args):
     state = dict(published(run, args.worker), error=None)
     target = None if args.games is None else args.games+state['games_completed']
     episodes, rows, started = [], [], 0
-    window = deque([(time.perf_counter(), 0, 0)])
-    since = dict(time=time.perf_counter(), positions=0, evals=0)
+    window = deque([(time.perf_counter(), state['positions'], 0)])
+    since = dict(time=time.perf_counter(), positions=state['positions'], evals=0)
 
     logged = time.perf_counter()
 
