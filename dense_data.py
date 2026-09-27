@@ -2,16 +2,21 @@
 
 A shard is an immutable directory `<run>/shards/<name>/` (all digits; converted corpora use six, actors use
 millisecond time plus pid) holding
-  episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search}]
+  episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search, actors?, opponent?}]
   rows.json      [{game, ply, player, remaining, target, weight, legal_sha256}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
-  manifest.json  schema, created_at, identity, actor, files (sha256), counts
+  manifest.json  schema, created_at, identity, actor, files (sha256), counts (opponent_rows may be absent: 0)
 `row.game` indexes the shard's episode list. `episode.winner` is 0/1 for finished games ('six-in-a-row') and -1
 for capped games ('cap' at the ply limit, 'span' when a searched position does not fit the largest crop);
 `episode.root_values` is null or one entry per ply (searched root value in [-1, 1] for the side to
 move at that ply, or null). The learner derives every target from the episode (`examples`); the stored
 `row.target`/`row.weight` (p(win) or null, weight) are informational and optional.
+`episode.actor` is the sha256 of the evaluator being trained. Actor shards also record `actors` {"0": sha, "1": sha}
+per colour and `opponent` (null for self-play, else the checkpoint id of a frozen historical opponent, whose sha
+differs from `actor`). Every ply keeps a row so ply indexing stays contiguous, but a ply of the opponent's colour
+(`trained` False) has no policy, a null root value and full_search False; it never enters the replay window and
+does not count toward `total_rows`.
 """
 from collections import namedtuple
 import hashlib
@@ -52,6 +57,12 @@ def holdout(episode, fraction):
     """Stable validation membership: the game's moves hash below `fraction` of the 64-bit range."""
     h = hashlib.sha256(json.dumps(episode['moves']).encode()).digest()
     return int.from_bytes(h[:8], 'little') < fraction*2**64
+
+
+def trained(episode, ply):
+    """Whether `ply` was played by the evaluator being trained (always, unless the episode records per-colour actors)."""
+    actors = episode.get('actors')
+    return actors is None or actors[str(player_at(ply))] == episode['actor']
 
 
 def value_targets(players, root_values, winner, lam=.9, full=None):
@@ -104,6 +115,7 @@ def write_shard(path, identity, episodes, rows):
             raise ValueError('Invalid policy target')
     keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256')
     counts = dict(games=len(episodes), rows=len(rows), policy_rows=sum(len(p) > 0 for p in policies),
+                  opponent_rows=sum(not trained(episodes[r['game']], r['ply']) for r in rows),
                   terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes))
     with tempfile.TemporaryDirectory(dir=path.parent, prefix='pending-') as temporary:
         stage = Path(temporary)/'shard'
@@ -174,8 +186,8 @@ class ReplayWindow:
 
     Only full-search rows (rows with a policy) count toward N_full and the window size; cheap-search rows ride
     along with their shard. Shards are ordered by directory name; the oldest admitted shard contributes its rows
-    from its take-th last full-search row onward. `total_rows`/`rows` count every row (all shards / window),
-    `total_full_rows`/`full_rows` only full-search rows. Rows of games selected by
+    from its take-th last full-search row onward. `total_rows`/`rows` count every trained row (all shards /
+    window; see `trained`), `total_full_rows`/`full_rows` only full-search rows. Rows of games selected by
     `holdout(episode, validation_fraction)` form the validation index and are never drawn for training.
     Episodes and rows of admitted shards stay in memory; policy vectors load per shard on first use and are
     dropped with the shard.
@@ -202,7 +214,7 @@ class ReplayWindow:
             if path.name not in self.manifests:
                 self.manifests[path.name] = manifest(path)
         names = sorted(self.manifests)
-        self.total_rows = sum(self.manifests[n]['counts']['rows'] for n in names)
+        self.total_rows = sum(self.manifests[n]['counts']['rows']-self.manifests[n]['counts'].get('opponent_rows', 0) for n in names)
         self.total_full_rows = sum(self.manifests[n]['counts']['policy_rows'] for n in names)
         want = min(self.capacity_rows, window_size(self.total_full_rows, **self.shape))
         admitted = []; have = 0
@@ -224,7 +236,9 @@ class ReplayWindow:
             shard = self.shards[name]; positions = np.flatnonzero(shard.full)
             start = 0 if take >= len(positions) else int(positions[-take]) if take else len(shard.rows)
             for i in range(start, len(shard.rows)):
-                (self.validation if shard.held[shard.rows[i]['game']] else self.index).append((name, i))
+                row = shard.rows[i]
+                if trained(shard.episodes[row['game']], row['ply']):
+                    (self.validation if shard.held[row['game']] else self.index).append((name, i))
         self.rows = len(self.index)+len(self.validation)
         return self.rows
 

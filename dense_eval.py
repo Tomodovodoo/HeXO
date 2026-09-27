@@ -4,9 +4,10 @@ Run layout: dense_config. Subcommands
   loop       rate the newest unrated checkpoint of a variant (dense_selfplay.checkpoints order) against the
              champion; that variant's older unrated checkpoints enter league.json with skipped true and elo null
              and are never played (KataGo's gatekeeper: only the newest candidate meets the champion). Only when
-             no checkpoint waits does it play the optional comparisons, newest rated checkpoint first, one round
-             of `games` at a time: `previous_games` vs the previous rated checkpoint of the variant and, for every
-             `anchor_every`-th rated checkpoint, `anchor_games` vs Seal. A champion SPRT that sees a newer
+             no checkpoint waits does it play the optional comparisons (`Evaluator.optional`), one round of `games`
+             at a time: panels and idle rematches, then, newest rated checkpoint first, `previous_games` vs the
+             previous rated checkpoint of the variant and, for every `anchor_every`-th rated checkpoint,
+             `anchor_games` vs Seal. A champion SPRT that sees a newer
              checkpoint of its variant after an undecided round stops there (decision 'superseded', entry
              superseded true, no promotion); a bound crossed in that round still decides. All play is paced by `eval_share` (Pacer); --processes splits each round
              over worker subprocesses (each about 0.7 GB of VRAM: on an 8 GB card two workers leave room for
@@ -23,6 +24,18 @@ half a point for each side. Pair score = candidate points / 2 over its two games
 The comparison with the champion is a sequential test (see `sprt`) played in rounds of `games` games until it
 accepts H0 or H1 or reaches `sprt_max_games` (decision 'max-games'); only H1 promotes. The first rated
 checkpoint becomes champion unopposed.
+
+Panels: a checkpoint rated while a champion exists gets `panel_members` (at most 2 * extra_opponents + 1:
+p(1-p)-drawn and retained weaknesses) as entry `panel` {members, incumbent}; the incumbent is the champion it
+met. Its panel games and the champion's top-ups against the members are optional rounds. An SPRT H1 with a panel
+waits for it (entry `pending` true; a later pending candidate replaces an earlier one) and promotes unless the
+panel vetoes (`panel_result`) or the champion changed meanwhile. A complete panel records candidate_score,
+incumbent_score, z and veto in the entry and a 'panel' event.
+
+league.json: {champion, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
+superseded?, panel?, pending?}], differences, anchors, matrix, rating_note, updated_at}. `matrix` (`payoff`) holds
+only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
+written before `matrix` and `panel` existed lack those keys; the Evaluator adds `matrix` on start.
 """
 import argparse
 from dataclasses import asdict, replace
@@ -42,7 +55,7 @@ import dense_config
 from dense_config import log_event
 import dense_data
 from arena import Seal
-from dense_selfplay import Engine, checkpoints, load
+from dense_selfplay import Engine, checkpoints, expected, load
 from hexo import Game
 from klent import digest
 from train import paired_metrics, task_opening, write_json
@@ -50,6 +63,9 @@ from train import paired_metrics, task_opening, write_json
 SEAL = 'seal'
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
+PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'seal_ms')  # settings a reused report must share
+RECENT = 3                # latest rated checkpoints of a variant whose results define its weaknesses
+REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
 RATING_NOTE = ('Bradley-Terry over paired comparisons (caps count half a point to each side); each opening pair is one '
                'observation with a Jeffreys Dirichlet prior over the five pair scores 0..2 in half points; 95% '
                'credible intervals from posterior draws; the first evaluated checkpoint is fixed at 0. Seal is one '
@@ -289,13 +305,104 @@ def rate(ids, anchor, reports, samples=2048, seed=1740):
     return point, {name: np.quantile(v, [.025, .975]).tolist() if v else [0., 0.] for name, v in draws.items()}, draws
 
 
+_reports = {}
+
+
+def load_reports(run, settings=None):
+    """Every evaluations/*/report.json (cached per path and modification time); with `settings`, only the reports
+    played under its PROTOCOL."""
+    reports = []
+    for path in sorted((Path(run)/'evaluations').glob('*/report.json')):
+        stamp = path.stat().st_mtime_ns
+        if _reports.get(path, (None,))[0] != stamp:
+            _reports[path] = stamp, json.loads(path.read_text())
+        reports.append(_reports[path][1])
+    return [r for r in reports if settings is None or same_protocol(r, settings)]
+
+
+def same_protocol(report, settings):
+    return all(report['settings'].get(k) == getattr(settings, k) for k in PROTOCOL)
+
+
+def payoff(reports, ratings=None):
+    """Payoff matrix {a: {b: {wins, losses, capped, games, p}}}: a's results against b summed over every report in
+    which they met, in either role (matrix[b][a] mirrors matrix[a][b]); p is the Bradley-Terry expected score of a
+    against b under `ratings` (caps half a point), None when either is unrated or no ratings are given."""
+    matrix = {}
+    for r in reports:
+        s = r['summary']
+        for a, b, wins, losses in ((r['candidate'], r['opponent'], s['wins'], s['losses']),
+                                   (r['opponent'], r['candidate'], s['losses'], s['wins'])):
+            cell = matrix.setdefault(a, {}).setdefault(b, dict(wins=0, losses=0, capped=0, games=0))
+            cell['wins'] += wins; cell['losses'] += losses; cell['capped'] += s['capped']; cell['games'] += s['games']
+    for a, row in matrix.items():
+        for b, cell in row.items():
+            known = ratings is not None and ratings.get(a) is not None and ratings.get(b) is not None
+            cell['p'] = expected(ratings[a], ratings[b]) if known else None
+    return matrix
+
+
+def panel_members(league, candidate, exclude, count, rng):
+    """(weaknesses, drawn): panel opponents for a new `candidate` ('<variant>/<step>'), none of them in `exclude`.
+    Weaknesses are rated checkpoints against which the RECENT latest rated checkpoints of the candidate's variant
+    (older than the candidate) have together lost more decisive games than they won (league matrix), worst decisive
+    score first, at most count+1. Drawn are `count` further rated checkpoints sampled without replacement with
+    probability proportional to p(1-p) (KataGo's rating pairer), p the expected score against them of the
+    candidate's predecessor in its variant, else of the champion, else of Elo 0."""
+    variant, step = candidate.split('/')
+    rated = {c['id']: c for c in league['checkpoints'] if c.get('elo') is not None}
+    own = sorted((c for c in rated.values() if c['variant'] == variant and c['step'] < int(step)), key=lambda c: c['step'])
+    recent = [c['id'] for c in own[-RECENT:]]
+    matrix = league.get('matrix', {})
+    scores = {}
+    for other in rated:
+        cells = [matrix.get(r, {}).get(other, {}) for r in recent]
+        wins, losses = sum(c.get('wins', 0) for c in cells), sum(c.get('losses', 0) for c in cells)
+        if other not in exclude and other not in recent and losses > wins:
+            scores[other] = (wins-losses)/(wins+losses)
+    weak = sorted(scores, key=lambda k: (scores[k], k))[:count+1]
+    pool = [k for k in rated if k not in exclude and k not in weak]
+    reference = own[-1]['elo'] if own else rated.get(league.get('champion'), {}).get('elo', 0.)
+    p = np.array([expected(reference, rated[k]['elo']) for k in pool])
+    weights = p*(1-p)
+    n = min(count, int(np.count_nonzero(weights)))
+    return weak, rng.choice(pool, n, replace=False, p=weights/weights.sum()).tolist() if n else []
+
+
+def panel_result(members, candidate, incumbent, matrix):
+    """Panel veto. candidate_score and incumbent_score are the decisive win shares of each against the `members`
+    both have decisive games with (summed over those members); z is the two-proportion statistic with pooled
+    variance and `veto` holds when the candidate is worse at 95% (z < -1.96). Scores and z are None without
+    decisive games on either side."""
+    wc = nc = wi = ni = 0
+    for m in members:
+        c, i = matrix.get(candidate, {}).get(m, {}), matrix.get(incumbent, {}).get(m, {})
+        dc, di = c.get('wins', 0)+c.get('losses', 0), i.get('wins', 0)+i.get('losses', 0)
+        if dc and di:
+            wc += c['wins']; nc += dc; wi += i['wins']; ni += di
+    out = dict(members=list(members), candidate_score=wc/nc if nc else None, incumbent_score=wi/ni if ni else None,
+               z=None, veto=False)
+    if nc and ni:
+        pooled = (wc+wi)/(nc+ni)
+        se = math.sqrt(pooled*(1-pooled)*(1/nc+1/ni))
+        out['z'] = (wc/nc-wi/ni)/se if se else 0.
+        out['veto'] = out['z'] < -1.96
+    return out
+
+
+def rematch_pair(run, a, b):
+    """Report orientation for more a-b games: a-vs-b, unless that report holds an SPRT record (such a report only
+    grows through its own test), then b-vs-a."""
+    path = report_path(run, a, b)
+    return (b, a) if path.exists() and 'sprt' in json.loads(path.read_text())['metrics'] else (a, b)
+
+
 def write_league(run, league, config):
-    """Recompute ratings from every report among rated (not skipped) ids and Seal, then publish league.json;
-    skipped entries keep elo and elo_interval null."""
+    """Recompute ratings and the payoff matrix from every report among rated (not skipped) ids and Seal, then
+    publish league.json; skipped entries keep elo and elo_interval null."""
     run = Path(run)
     ids = [c['id'] for c in league['checkpoints'] if not c.get('skipped')]
-    reports = [json.loads(p.read_text()) for p in sorted((run/'evaluations').glob('*/report.json'))]
-    reports = [r for r in reports if r['candidate'] in ids and (r['opponent'] in ids or r['opponent'] == SEAL)]
+    reports = [r for r in load_reports(run) if r['candidate'] in ids and (r['opponent'] in ids or r['opponent'] == SEAL)]
     seal_games = sum(len(r['games']) for r in reports if r['opponent'] == SEAL)
     names = ids+([SEAL] if seal_games else [])
     point, intervals, draws = rate(names, ids[0], reports, seed=config.seed) if ids else ({}, {}, {})
@@ -312,6 +419,7 @@ def write_league(run, league, config):
              interval=np.quantile(np.subtract(draws[a], draws[b]), [.025, .975]).tolist() if draws[a] else [0., 0.])
         for i, a in enumerate(heads) for b in heads[i+1:]]
     league['anchors'] = {SEAL: dict(elo=point.get(SEAL), elo_interval=intervals.get(SEAL), games=seal_games)}
+    league['matrix'] = payoff(reports, point)
     league['rating_note'] = RATING_NOTE
     league['updated_at'] = time.time()
     write_json(run/'league.json', league)
@@ -380,7 +488,8 @@ class Evaluator:
     shares of its opening pairs over `processes` `pairs` subprocesses (each loads both models, about 0.7 GB
     of VRAM on CUDA); records, seeds and openings do not depend on `processes`. publish() maintains
     evaluator-status.json: {stage ('idle', 'playing', 'throttled' or 'failed'), updated_at, comparison
-    ({candidate, opponent, kind 'champion', 'previous' or 'anchor'} or null), games_played, games_planned
+    ({candidate, opponent, kind 'champion', 'previous', 'anchor', 'panel', 'incumbent', 'sprt' or
+    'replacement'} or null), games_played, games_planned
     (sprt_max_games for the champion), placements_per_second (current round, both sides, all processes),
     backlog (unrated checkpoint ids at the last step), processes, eval_share_used (Pacer.used), error}."""
 
@@ -388,6 +497,8 @@ class Evaluator:
         self.run, self.config, self.settings, self.pacer, self.processes = Path(run), config, settings, pacer, processes
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
+        if self.league['checkpoints'] and 'matrix' not in self.league:
+            write_league(self.run, self.league, self.config)
         self.models, self.partial, self.seal, self.written = {}, {}, None, 0.
         self.status = dict(stage='idle', updated_at=None, comparison=None, games_played=0, games_planned=0,
                            placements_per_second=None, backlog=[], processes=processes, eval_share_used=0., error=None)
@@ -517,6 +628,129 @@ class Evaluator:
                   candidate=cid, opponent=opponent, comparison=kind, **s, sprt=test, seconds=done['seconds'])
         return report
 
+    def extend(self, a, b, kind):
+        """One more round of `games` appended to the report a-vs-b (created when absent; its protocol must match),
+        rewritten with metrics.sprt recomputed for kind 'sprt'. Returns the report, or None when the round did
+        not run (a checkpoint became unrated)."""
+        path = report_path(self.run, a, b)
+        old = json.loads(path.read_text()) if path.exists() else None
+        if old and not same_protocol(old, self.settings):
+            raise ValueError(f'{path} was played under another protocol')
+        done = self.partial.setdefault((a, b), dict(records=list(old['games']) if old else [], seconds=0.))
+        before = len(done['records'])
+        self.round(a, b, kind, before+self.settings.games)
+        if len(done['records']) == before:
+            return None
+        shas = {name: digest(self.run/'checkpoints'/name/'ema.pt') for name in (a, b) if name != SEAL}
+        report = make_report(a, b, done['records'], shas, self.settings)
+        if kind == 'sprt':
+            result = self.test(done['records'])
+            report['metrics']['sprt'] = dict(result, decision=result['decision'] or 'max-games')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(path, report)
+        del self.partial[a, b]
+        s, test = report['summary'], report['metrics'].get('sprt')
+        log_event(self.run, 'evaluator', 'match', f'{a} vs {b} ({kind}): +{s["wins"]} -{s["losses"]} ={s["capped"]}'
+                  + (f' (SPRT {test["decision"]}, LLR {test["llr"]:.2f})' if test else ''),
+                  candidate=a, opponent=b, comparison=kind, **s, sprt=test, seconds=done['seconds'])
+        return report
+
+    def entry(self, cid):
+        return next((c for c in self.league['checkpoints'] if c['id'] == cid), None)
+
+    def record(self, a, b, report):
+        """Record report as a's match against b (replacing an earlier one) and republish the league."""
+        entry = self.entry(a)
+        if entry is not None:
+            entry['matches'] = [m for m in entry['matches'] if m['opponent'] != b]+[match_entry(b, report)]
+        write_league(self.run, self.league, self.config)
+
+    def promote(self, cid, previous, panel=None):
+        self.league['champion'] = cid
+        write_json(self.run/'champion.json', dict(checkpoint=cid, ema_sha256=digest(self.run/'checkpoints'/cid/'ema.pt'),
+                                                  updated_at=time.time()))
+        log_event(self.run, 'evaluator', 'promotion', f'{cid} promoted to champion' + (f' over {previous}' if previous else ''),
+                  checkpoint=cid, previous_champion=previous, panel=panel)
+
+    def accept(self, entry):
+        """An SPRT H1 of `entry` against the champion: promote now without panel members or with a judged panel
+        that did not veto, else wait for the panel (pending; an earlier pending candidate is dropped)."""
+        panel = entry.get('panel', {})
+        if not panel.get('members') or 'veto' in panel:
+            if panel.get('veto'):
+                log_event(self.run, 'evaluator', 'panel', f'{entry["id"]} not promoted: panel veto', candidate=entry['id'])
+            else:
+                self.promote(entry['id'], self.league['champion'], panel or None)
+            return
+        for c in self.league['checkpoints']:
+            if c.pop('pending', None):
+                log_event(self.run, 'evaluator', 'panel', f'{c["id"]} no longer awaits promotion: {entry["id"]} replaces it',
+                          candidate=c['id'])
+        entry['pending'] = True
+        log_event(self.run, 'evaluator', 'panel', f'{entry["id"]} passed its SPRT; promotion waits for its panel',
+                  candidate=entry['id'], members=entry['panel']['members'])
+
+    def needs(self, entry):
+        """The panel comparisons `entry` still lacks: [(a, b, kind, games)], its own games against each member
+        first, then the incumbent's top-ups to `games` protocol-matching games against the member."""
+        s, panel = self.settings, entry.get('panel', {})
+        incumbent, matrix = panel.get('incumbent'), payoff(load_reports(self.run, s))
+        out = [(entry['id'], m, 'panel', s.games) for m in panel.get('members', [])
+               if not report_path(self.run, entry['id'], m).exists()]
+        for m in panel.get('members', []):
+            short = s.games-matrix.get(incumbent, {}).get(m, {}).get('games', 0)
+            if short > 0 and not report_path(self.run, incumbent, m).exists():
+                out.append((incumbent, m, 'incumbent', short+short % 2))
+        return out
+
+    def settle(self):
+        """Judge every panel that became complete and is not judged yet; a pending candidate is promoted unless
+        vetoed or the champion changed since its SPRT."""
+        for entry in self.league['checkpoints']:
+            panel = entry.get('panel')
+            if not panel or 'veto' in panel or self.needs(entry):
+                continue
+            panel.update(panel_result(panel['members'], entry['id'], panel['incumbent'], payoff(load_reports(self.run, self.settings))))
+            score = lambda v: '-' if v is None else f'{v:.3f}'
+            log_event(self.run, 'evaluator', 'panel', f'{entry["id"]} vs panel of {len(panel["members"])}: decisive score '
+                      f'{score(panel["candidate_score"])}, incumbent {panel["incumbent"]} {score(panel["incumbent_score"])}'
+                      + (' - veto' if panel['veto'] else ''), candidate=entry['id'], **panel)
+            if entry.pop('pending', None):
+                if panel['veto'] or self.league['champion'] != panel['incumbent']:
+                    log_event(self.run, 'evaluator', 'panel', f'{entry["id"]} not promoted: ' + (
+                        'panel veto' if panel['veto'] else f'the champion is now {self.league["champion"]}'), candidate=entry['id'])
+                else:
+                    self.promote(entry['id'], panel['incumbent'], panel)
+            write_league(self.run, self.league, self.config)
+
+    def rematches(self):
+        """Idle rematches that can change a decision, first applicable only: the newest checkpoint of a variant
+        whose SPRT against the current champion ended 'max-games' continues (up to REMATCH_SPRT_LIMIT *
+        sprt_max_games games), then two variant heads whose Elo difference interval straddles +-replace_margin
+        play more (up to sprt_max_games between them). [(a, b, kind, games)]."""
+        s, champion = self.settings, self.league['champion']
+        heads = self.heads()
+        for c in heads:
+            path = report_path(self.run, c['id'], champion)
+            if c['id'] != champion and path.exists():
+                report = json.loads(path.read_text())
+                if report['metrics'].get('sprt', {}).get('decision') == 'max-games' and len(report['games']) < REMATCH_SPRT_LIMIT*s.sprt_max_games:
+                    return [(c['id'], champion, 'sprt', s.games)]
+        matrix, margin = payoff(load_reports(self.run, s)), self.config.learner.replace_margin
+        for d in self.league.get('differences', []):
+            lo, hi = d['interval']
+            if (lo < margin < hi or lo < -margin < hi) and matrix.get(d['a'], {}).get(d['b'], {}).get('games', 0) < s.sprt_max_games:
+                return [(*rematch_pair(self.run, d['a'], d['b']), 'replacement', s.games)]
+        return []
+
+    def heads(self):
+        """The newest rated entry of each variant, newest first."""
+        heads = {}
+        for c in self.league['checkpoints']:
+            if not c.get('skipped') and c['step'] >= heads.get(c['variant'], c)['step']:
+                heads[c['variant']] = c
+        return sorted(heads.values(), key=lambda c: -self.league['checkpoints'].index(c))
+
     def test(self, records):
         s = self.settings
         return sprt(records, s.sprt_elo0, s.sprt_elo1, s.sprt_alpha, s.sprt_beta)
@@ -539,23 +773,36 @@ class Evaluator:
             return
         reports = {} if report is None else {champion: report}
         decision = reports[champion]['metrics']['sprt']['decision'] if reports else None
-        promoted = champion is None or decision == 'H1'
-        self.league['checkpoints'].append(dict(id=cid, variant=variant, step=int(step), ema_sha256=digest(path/'ema.pt'),
-                                               elo=None, elo_interval=None, **({'superseded': True} if decision == 'superseded' else {}),
-                                               matches=[match_entry(o, r) for o, r in reports.items()]))
-        if promoted:
-            self.league['champion'] = cid
-            write_json(self.run/'champion.json', dict(checkpoint=cid, ema_sha256=digest(path/'ema.pt'), updated_at=time.time()))
-            log_event(self.run, 'evaluator', 'promotion', f'{cid} promoted to champion' + (f' over {champion}' if champion else ''),
-                      checkpoint=cid, previous_champion=champion)
+        members = []
+        if champion is not None and s.extra_opponents > 0:
+            previous = [c for c in self.league['checkpoints'] if c['variant'] == variant and c['step'] < int(step) and not c.get('skipped')]
+            exclude = {champion, *([max(previous, key=lambda c: c['step'])['id']] if previous else [])}
+            rng = np.random.default_rng(pair_seed(self.config.seed, 'panel', cid))
+            members = sum(panel_members(self.league, cid, exclude, s.extra_opponents, rng), [])
+        entry = dict(id=cid, variant=variant, step=int(step), ema_sha256=digest(path/'ema.pt'),
+                     elo=None, elo_interval=None, **({'superseded': True} if decision == 'superseded' else {}),
+                     **({'panel': dict(members=members, incumbent=champion)} if members else {}),
+                     matches=[match_entry(o, r) for o, r in reports.items()])
+        self.league['checkpoints'].append(entry)
+        if champion is None:
+            self.promote(cid, None)
+        elif decision == 'H1':
+            self.accept(entry)
+        promoted = self.league['champion'] == cid
         write_league(self.run, self.league, self.config)
         print(f'{cid}: ' + ', '.join(f'vs {o} +{r["summary"]["wins"]} -{r["summary"]["losses"]} ={r["summary"]["capped"]}'
                                       for o, r in reports.items()) + (' -> champion' if promoted else f' ({decision})' if decision else ''), flush=True)
 
     def optional(self):
-        """(league entry, opponent, kind, games) of the newest rated checkpoint missing its previous-checkpoint
-        comparison (when previous_games > 0) or its due Seal anchor (when anchor_games > 0), else None."""
+        """(league entry of the candidate side, opponent, kind, games) of the first optional comparison, else None:
+        the panel of a pending candidate ('panel', 'incumbent'), idle rematches (`rematches`, with idle_rematch),
+        the panels of the variant heads, newest first, then the newest rated checkpoint missing its
+        previous-checkpoint comparison (when previous_games > 0) or its due Seal anchor (when anchor_games > 0)."""
         s = self.settings
+        pending = [c for c in self.league['checkpoints'] if c.get('pending')]
+        for a, b, kind, games in [n for c in pending for n in self.needs(c)] + (self.rematches() if s.idle_rematch else []) \
+                + [n for c in self.heads() for n in self.needs(c)]:
+            return self.entry(a), b, kind, games
         rated = [c for c in self.league['checkpoints'] if not c.get('skipped')]
         for index in reversed(range(len(rated))):
             c = rated[index]
@@ -592,10 +839,16 @@ class Evaluator:
         if task is None:
             return False
         entry, opponent, kind, games = task
-        report = self.report(entry['id'], opponent, kind, games, lambda records: len(records) >= games)
+        if kind in ('sprt', 'replacement'):
+            report = self.extend(entry['id'], opponent, kind)
+        else:
+            report = self.report(entry['id'], opponent, kind, games, lambda records: len(records) >= games)
         if report is not None:
-            entry['matches'].append(match_entry(opponent, report))
-            write_league(self.run, self.league, self.config)
+            self.record(entry['id'], opponent, report)
+            if kind == 'sprt' and report['metrics']['sprt']['decision'] == 'H1' and self.league['champion'] == opponent:
+                self.accept(entry)
+                write_league(self.run, self.league, self.config)
+            self.settle()
         return True
 
 

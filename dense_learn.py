@@ -12,8 +12,8 @@ short_value_horizon are learner settings; batches are rendered by dense_data.Ren
 (--workers) with random hex symmetries. The loss of one optimizer step is, per head, the weighted mean
 over every row of the batch that has that target, summed with the head coefficients; each crop bucket is
 a separate forward pass whose gradients accumulate (buckets padded to QUANTUM rows with inert rows).
-Pacing: at most samples_per_row * (rows in all shards, cheap rows included) samples are presented; beyond that
-the learner waits. The window is sized in full-search rows (dense_data.ReplayWindow).
+Pacing: at most samples_per_row * (trained rows in all shards, cheap rows included; a historical opponent's
+plies are not trained, see dense_data.trained) samples are presented; beyond that the learner waits. The window is sized in full-search rows (dense_data.ReplayWindow).
 """
 import argparse
 import copy

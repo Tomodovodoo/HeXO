@@ -6,11 +6,13 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
   checkpoints/<variant>/<step:06d>/    model.pt, ema.pt, optimizer.pt, manifest.json (dense_learn); complete once
                                        manifest.json exists; the checkpoint id is '<variant>/<step:06d>'
   champion.json                        {checkpoint, ema_sha256, updated_at}: the checkpoint actors play (dense_eval)
-  league.json                          ratings, champion and Elo differences of variant heads; checkpoints the
-                                       evaluator passed over have skipped true and elo null (dense_eval)
+  league.json                          ratings, champion, Elo differences of variant heads, per-checkpoint panels
+                                       and the payoff matrix; checkpoints the evaluator passed over have skipped
+                                       true and elo null (dense_eval)
   evaluator-status.json                evaluator heartbeat and progress (dense_eval.Evaluator), rewritten about
                                        every 2 s while it plays
-  evaluations/<a>-vs-<b>/report.json   paired match records, ids with '/' written as '-' (dense_eval)
+  evaluations/<a>-vs-<b>/report.json   paired match records of a (candidate) against b, ids with '/' written as '-';
+                                       idle rematches append pairs to an existing report (dense_eval)
   actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s
   learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s
   events.jsonl                         one line per event: {time, source, kind, message, ...} (log_event)
@@ -61,6 +63,9 @@ class ActorSettings:
     cache_positions: int = 4096
     shard_games: int = 32
     opening_random_plies: float = 2.  # mean of an exponential; sampled from the search policy
+    historical_fraction: float = 0.   # share of games in flight against a frozen rated checkpoint
+    historical_weighting: str = 'pfsp'  # 'pfsp': weight (1-p)^2, p = champion's expected score; 'uniform'
+    historical_pool: int = 8          # distinct historical opponents loaded at once, redrawn per shard
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,8 @@ class EvaluationSettings:
     sprt_max_games: int = 200     # 'max-games' does not promote
     opening_suite: str = 'standard-v1'
     eval_share: float = .12       # ceiling on the evaluator's playing share of wall time (dense_eval.Pacer)
+    extra_opponents: int = 2      # panel opponents drawn per rated checkpoint with probability ~ p(1-p), idle only
+    idle_rematch: bool = True     # replay decision-relevant comparisons while no checkpoint awaits rating
 
 
 @dataclass(frozen=True)
@@ -178,6 +185,16 @@ def add_arguments(parser, section, prefix=''):
             parser.add_argument('--'+dest.replace('_', '-'), dest=dest, action=argparse.BooleanOptionalAction, default=None)
         else:
             parser.add_argument('--'+dest.replace('_', '-'), dest=dest, type=kind, default=None)
+
+
+def flags(section, args, prefix=''):
+    """The command-line flags that reproduce the non-None parsed values of one settings dataclass."""
+    out = []
+    for item in fields(section):
+        value, flag = getattr(args, prefix+item.name, None), (prefix+item.name).replace('_', '-')
+        if value is not None:
+            out += [f'--{"" if value else "no-"}{flag}'] if type(item.default) is bool else [f'--{flag}', str(value)]
+    return out
 
 
 def override(settings, args, prefix=''):
