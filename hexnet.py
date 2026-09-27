@@ -336,9 +336,10 @@ short_value_loss = value_loss
 
 def future_loss(future, target, mask, weight=None):
     """BCE of future occupancy logits [B, 2, S, S] against targets in [0, 1], averaged over
-    in-crop cells (mask [B, 1, S, S]) and both horizons per sample, then weighted over samples."""
+    in-crop cells (mask [B, 1, S, S]) per sample and horizon, then weighted by `weight` [B, 2]."""
     loss = F.binary_cross_entropy_with_logits(future, target, reduction='none')*mask
-    return _weighted_mean(loss.sum((1, 2, 3))/(2*mask.sum((1, 2, 3))).clamp_min(1), weight)
+    per = loss.sum((2, 3))/mask.sum((1, 2, 3)).clamp_min(1)[:, None]
+    return _weighted_mean(per.reshape(-1), None if weight is None else weight.reshape(-1))
 
 
 def memory_format(config):

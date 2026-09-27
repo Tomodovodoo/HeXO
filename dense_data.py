@@ -326,9 +326,11 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
             short = (.5, 0.)
         future = np.zeros((2, s.size, s.size), np.uint8)
         occupied = crop_index(s, moves[:min(T, t+max(FUTURE))])
+        known = np.zeros(2, np.float32)
         for k, h in enumerate(FUTURE):
             cells = occupied[:min(T, t+h)]
             future[k].reshape(-1)[cells[cells >= 0]] = 1
+            known[k] = e['winner'] >= 0 or t+h <= T
         nref = window.following(ref); following = (np.zeros(0, np.int64), np.zeros(0, np.float32), 0.)
         if nref is not None and len(p := window.policy(nref)):
             game.play(*e['moves'][t])
@@ -342,7 +344,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         samples.append(s)
         out.append(dict(policy=policy, policy_weight=float(len(policy) > 0),
                         value=.5 if values[t] is None else values[t], value_weight=value_weight,
-                        short_value=short[0], short_weight=short[1], future=future,
+                        short_value=short[0], short_weight=short[1], future=future, future_weight=known,
                         next_cells=following[0], next_policy=following[1], next_weight=following[2]))
     return samples, out
 
@@ -355,7 +357,8 @@ def collate(samples, targets):
         (zeros where policy_weight is 0; far cells keep their target mass); offsets int64 [B+1];
       future uint8 [B,2,S,S]; next_cells int64 [B,M] (-1 off the crop and on padding),
         next_counts int64 [B], next_policy float32 [B,M] (zero beyond counts);
-      policy_weight, value, value_weight, short_value, short_weight, next_weight, future_weight (ones)
+      policy_weight, value, value_weight, short_value, short_weight, next_weight; future_weight [B,2] per horizon
+      (0 where a capped game ends before the horizon)
         float32 [B]; player, remaining int64 [B].
     """
     groups = {}
@@ -387,7 +390,7 @@ def collate(samples, targets):
             next_cells=torch.from_numpy(next_cells), next_counts=torch.from_numpy(next_counts),
             next_policy=torch.from_numpy(next_policy),
             **{k: column(k) for k in ('policy_weight', 'value', 'value_weight', 'short_value', 'short_weight', 'next_weight')},
-            future_weight=torch.ones(len(items)),
+            future_weight=torch.from_numpy(np.stack([t['future_weight'] for _, t in items])),
             player=torch.tensor([int(s.player) for s, _ in items]), remaining=torch.tensor([int(s.remaining) for s, _ in items]))
     return out
 
@@ -408,6 +411,8 @@ def _render_worker(run, settings, seed, output):
         window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
                               settings.window_taper, settings.validation_fraction)
         rng = np.random.default_rng(seed); refreshed = time.time()
+        while not window.rows:
+            time.sleep(5); window.refresh(); refreshed = time.time()
         for batch in batches(window, rng, settings.batch, lambda: settings):
             output.put({size: {k: v.numpy() for k, v in b.items()} for size, b in batch.items()})
             if time.time()-refreshed > 30:

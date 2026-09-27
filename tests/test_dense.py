@@ -431,7 +431,7 @@ class HexNetTests(unittest.TestCase):
         losses = [hexnet.policy_loss(policy, far, cells, counts, target, zero),
                   hexnet.opponent_policy_loss(policy, cells, counts, target, zero),
                   hexnet.value_loss(value, torch.rand(3), zero), hexnet.short_value_loss(value, torch.rand(3), zero),
-                  hexnet.future_loss(future, torch.rand(3, 2, 4, 4), mask, zero)]
+                  hexnet.future_loss(future, torch.rand(3, 2, 4, 4), mask, torch.zeros(3, 2))]
         for loss in losses:
             self.assertEqual(float(loss), 0.)
         sum(losses).backward()
