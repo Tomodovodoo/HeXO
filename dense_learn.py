@@ -40,6 +40,8 @@ VALIDATION_ROWS = 2048
 QUANTUM = 16  # bucket rows are padded to a multiple of this
 STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
+# Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
+KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'export_every')
 # (low, high) for replacement perturbations; td_lambda and ema are perturbed through 1 - x.
 BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995), ema=(.99, .9999))
 
@@ -251,9 +253,13 @@ class Learner:
         return manifest
 
     def maybe_replace(self, factor_rng):
-        """Population replacement: copy a rated checkpoint of another variant that leads this variant's latest
-        rated checkpoint by more than replace_margin plus both interval half-widths. Checked before a step
-        is trained, so a copy is always followed by training and recorded in the next manifest."""
+        """Population replacement (exploit/explore). Candidates are the latest rated checkpoints of other variants;
+        a candidate qualifies when league["differences"] holds its pair with this variant's latest rated checkpoint
+        and the lower bound of the (candidate minus mine) Elo interval exceeds replace_margin. The best
+        qualifying candidate's raw weights and manifest learner settings are copied (KEEP fields stay this
+        learner's), the continuous settings are perturbed from the copied values, the optimizer is reset and
+        the EMA restarts from the copied weights. Checked before a step is trained, so a copy is always
+        followed by training and recorded in the next manifest."""
         s = self.settings
         if self.step % s.replace_interval or self.step-self.last_copy < s.protect_steps or not (self.run/'league.json').exists():
             return False
@@ -266,21 +272,35 @@ class Learner:
         # Compare only once a checkpoint trained after the last copy has been rated.
         if mine is None or (self.copied_from and mine['step'] <= self.copied_from['at_step']):
             return False
-        half = lambda c: (c['elo_interval'][1]-c['elo_interval'][0])/2
-        leaders = [c for v, c in latest.items() if v != s.variant and c['elo']-mine['elo'] > s.replace_margin+half(c)+half(mine)]
+        # (lo, hi, delta) of source minus mine, from either orientation of a difference entry.
+        pairs = {}
+        for d in league.get('differences', []):
+            pairs[d['a'], d['b']] = (d['interval'][0], d['interval'][1], d['elo_delta'])
+            pairs[d['b'], d['a']] = (-d['interval'][1], -d['interval'][0], -d['elo_delta'])
+        others = [c for v, c in latest.items() if v != s.variant]
+        missing = [c['id'] for c in others if (c['id'], mine['id']) not in pairs]
+        if missing:
+            event(self.run, 'info', f'{s.variant} replacement check at step {self.step}: no Elo difference entry for '
+                  f'{", ".join(missing)} against {mine["id"]}', variant=s.variant, step=self.step, missing=missing)
+        leaders = [c for c in others if (c['id'], mine['id']) in pairs and pairs[c['id'], mine['id']][0] > s.replace_margin]
         if not leaders:
             return False
-        source = max(leaders, key=lambda c: c['elo'])
-        self.load_weights(self.run/'checkpoints'/source['variant']/f'{source["step"]:06d}'/'model.pt')
+        source = max(leaders, key=lambda c: pairs[c['id'], mine['id']][2])
+        path = self.run/'checkpoints'/source['variant']/f'{source["step"]:06d}'
+        copied = json.loads((path/'manifest.json').read_text(encoding='utf-8'))['learner']
+        self.load_weights(path/'model.pt')
         self.ema = copy.deepcopy(self.model)
-        old, self.settings = s, perturb(s, factor_rng, s.perturb)
+        base = replace(dense_config.LearnerSettings(**copied), **{k: getattr(s, k) for k in KEEP})
+        old, self.settings = s, perturb(base, factor_rng, s.perturb)
         self.optimizer = make_optimizer(self.model, self.settings)
         self.optimizer_started = self.last_copy = self.step
         self.ema_updates = 0
-        self.copied_from = dict(checkpoint=f'{source["variant"]}/{source["step"]}', at_step=self.step,
-                                source_elo=source['elo'], own_elo=mine['elo'])
+        lo, hi, delta = pairs[source['id'], mine['id']]
+        self.copied_from = dict(checkpoint=f'{source["variant"]}/{source["step"]}', at_step=self.step, mine=mine['id'],
+                                elo_delta=delta, interval=[lo, hi], source_learner=copied, perturbed=asdict(self.settings))
         event(self.run, 'replace', f'{s.variant} copied {self.copied_from["checkpoint"]} at step {self.step}',
-              variant=s.variant, step=self.step, copied_from=self.copied_from, old=asdict(old), new=asdict(self.settings))
+              variant=s.variant, step=self.step, copied_from=self.copied_from, old=asdict(old), source_settings=copied,
+              new=asdict(self.settings))
         return True
 
 
