@@ -12,6 +12,9 @@ import copy
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
+import time
 import numpy as np
 import torch
 from torch import nn
@@ -150,19 +153,25 @@ class _MaskedBatchNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, mask, weight, bias, cells, eps):
         acc = torch.promote_types(x.dtype, torch.float32)
-        masked = x*mask
-        mean = masked.sum((0, 2, 3), dtype=acc)/cells
-        var = ((masked*x).sum((0, 2, 3), dtype=acc)/cells-mean*mean).clamp_min(0)
+        mean = (x*mask).sum((0, 2, 3), dtype=acc)/cells
+        # Centre on the mean rounded to x's dtype: x-shift is (near) exact in bf16, so a large channel
+        # mean neither cancels the variance (E[x^2]-mean^2 lost ~10% at mean/std 20) nor the output.
+        shift = mean.to(x.dtype)
+        delta = mean-shift.to(acc)
+        centred = x-shift[:, None, None]
+        var = ((centred*mask*centred).sum((0, 2, 3), dtype=acc)/cells-delta*delta).clamp_min(0)
         invstd = torch.rsqrt(var+eps)
         scale = weight*invstd
         ctx.save_for_backward(x, mask, weight, mean, invstd, cells)
-        return torch.addcmul((bias-mean*scale)[:, None, None].to(x.dtype), x, scale[:, None, None].to(x.dtype)), mean, var
+        return torch.addcmul((bias-delta*scale)[:, None, None].to(x.dtype), centred, scale[:, None, None].to(x.dtype)), mean, var
 
     @staticmethod
     def backward(ctx, grad, _mean, _var):
         x, mask, weight, mean, invstd, cells = ctx.saved_tensors
         acc = mean.dtype
-        xhat = (x-mean[:, None, None].to(x.dtype))*invstd[:, None, None].to(x.dtype)
+        shift = mean.to(x.dtype)
+        xhat = torch.addcmul(((shift.to(acc)-mean)*invstd)[:, None, None].to(x.dtype), x-shift[:, None, None],
+                             invstd[:, None, None].to(x.dtype))
         # Every output depends on the masked statistics: dL/dx = w*invstd*(dy - mask*(sum dy + xhat*sum dy*xhat)/n).
         db = grad.sum((0, 2, 3), dtype=acc)
         dw = (grad*xhat).sum((0, 2, 3), dtype=acc)
@@ -246,7 +255,7 @@ class HexNet(nn.Module):
             self.short_value = nn.Linear(c.value_hidden, 1)
 
     def forward(self, planes, mask, aux=True):
-        count = mask.sum((2, 3))
+        count = mask.sum((2, 3), dtype=torch.float32)    # a bf16 sum rounds counts above 256
         cells = count.sum()
         x = self.stem(torch.cat((planes, self.lines(planes[:, :1], planes[:, 1:2], mask)), 1)*mask)
         # Full-size masks in x's memory format keep the elementwise passes vectorized.
@@ -338,7 +347,18 @@ def model_digest(model):
 
 
 def save_model(path, model):
-    torch.save(dict(schema=SCHEMA, config=asdict(model.config), state=model.state_dict()), path)
+    """Write via a sibling temporary file and os.replace so readers never see a partial checkpoint."""
+    path = Path(path)
+    pending = path.with_name(path.name+'.tmp')
+    torch.save(dict(schema=SCHEMA, config=asdict(model.config), state=model.state_dict()), pending)
+    for attempt in range(8):
+        try:
+            os.replace(pending, path)
+            return
+        except PermissionError:     # Windows: a reader briefly holds the old file open
+            if os.name != 'nt' or attempt == 7:
+                raise
+            time.sleep(.05*(attempt+1))
 
 
 def load_model(path, device='cpu'):

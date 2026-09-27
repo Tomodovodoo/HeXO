@@ -120,19 +120,20 @@ def save(run, config):
     return config
 
 
-def add_arguments(parser, section):
-    """Expose one settings dataclass as --name flags; None means "keep the config value"."""
+def add_arguments(parser, section, prefix=''):
+    """Expose one settings dataclass as --name flags (dest prefix+name); None means "keep the config value"."""
     for item in fields(section):
-        kind = type(item.default)
+        kind, dest = type(item.default), prefix+item.name
         if kind is bool:
-            parser.add_argument('--'+item.name.replace('_', '-'), action=argparse.BooleanOptionalAction, default=None)
+            parser.add_argument('--'+dest.replace('_', '-'), dest=dest, action=argparse.BooleanOptionalAction, default=None)
         else:
-            parser.add_argument('--'+item.name.replace('_', '-'), type=kind, default=None)
+            parser.add_argument('--'+dest.replace('_', '-'), dest=dest, type=kind, default=None)
 
 
-def override(settings, args):
+def override(settings, args, prefix=''):
     """Apply non-None parsed flags onto a settings dataclass instance."""
-    values = {item.name: getattr(args, item.name) for item in fields(settings) if getattr(args, item.name, None) is not None}
+    values = {item.name: getattr(args, prefix+item.name) for item in fields(settings)
+              if getattr(args, prefix+item.name, None) is not None}
     return type(settings)(**{**asdict(settings), **values})
 
 
@@ -141,11 +142,13 @@ def main():
     parser.add_argument('--run', required=True)
     parser.add_argument('--seed', type=int, default=RunConfig.seed)
     parser.add_argument('--device', choices=['cpu', 'cuda'], default=RunConfig.device)
+    # actor and evaluation share root_samples/max_plies/tactics, so evaluation flags are --eval-*.
+    prefixes = dict(evaluation='eval_')
     for name, cls in SECTIONS.items():
         group = parser.add_argument_group(name)
-        add_arguments(group, cls)
+        add_arguments(group, cls, prefixes.get(name, ''))
     args = parser.parse_args()
-    parts = {name: override(cls(), args) for name, cls in SECTIONS.items()}
+    parts = {name: override(cls(), args, prefixes.get(name, '')) for name, cls in SECTIONS.items()}
     config = RunConfig(created_at=time.time(), seed=args.seed, device=args.device, **parts)
     save(args.run, config)
     print(json.dumps(asdict(config), indent=2))

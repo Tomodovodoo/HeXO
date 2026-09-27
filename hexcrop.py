@@ -112,9 +112,10 @@ def _choose(sides, symmetry, rng):
     if symmetry is not None:
         return symmetry
     best = int(np.argmin(sides))
-    if rng is None:
+    bucket = _bucket(sides[best])
+    if rng is None or bucket is None:   # None: nothing fits, the caller switches to far mode or raises
         return best
-    return int(rng.choice(np.flatnonzero(sides <= _bucket(sides[best]))))
+    return int(rng.choice(np.flatnonzero(sides <= bucket)))
 
 
 def encode(history, *, symmetry=None, rng=None):
