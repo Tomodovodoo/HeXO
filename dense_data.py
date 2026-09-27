@@ -411,7 +411,7 @@ def _render_worker(run, settings, seed, output):
         window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
                               settings.window_taper, settings.validation_fraction)
         rng = np.random.default_rng(seed); refreshed = time.time()
-        while not window.rows:
+        while not window.index:
             time.sleep(5); window.refresh(); refreshed = time.time()
         for batch in batches(window, rng, settings.batch, lambda: settings):
             output.put({size: {k: v.numpy() for k, v in b.items()} for size, b in batch.items()})
