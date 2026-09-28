@@ -1183,17 +1183,20 @@ class ValidationSourceTests(unittest.TestCase):
         """Games whose outcome is fixed only in their last 10 plies: a predictor that knows it there and says 0.5
         before has a curve near 0 at the end and near ln 2 far away; the horizon (curve crossing ln 2 / 2) is the step."""
         rng = np.random.default_rng(0)
-        remaining, bce = [], []
+        remaining, bce, target = [], [], []
         for _ in range(300):
             y, length = rng.integers(2), int(rng.integers(40, 121))
             for left in range(1, length+1):
                 q = .01+.98*y if left <= 10 else .5
-                remaining.append(left); bce.append(-math.log(q if y else 1-q))
-        c = dense_learn.remaining_curve(remaining, bce, np.zeros(len(bce)))
+                remaining.append(left); bce.append(-math.log(q if y else 1-q)); target.append(float(y))
+        c = dense_learn.remaining_curve(remaining, bce, target)
         curve = dict(zip(dense_learn.REMAINING_GRID, c['value_curve']))
+        excess = dict(zip(dense_learn.REMAINING_GRID, c['value_excess_curve']))
         self.assertEqual(len(c['value_curve']), 41)
-        self.assertEqual(c['value_excess_curve'], c['value_curve'])
         self.assertLess(curve[0], .1)
+        self.assertAlmostEqual(excess[0], curve[0]-math.log(2), delta=.02)
+        self.assertAlmostEqual(excess[100], 0., delta=.01)
+        self.assertIsNone(excess[160])
         self.assertEqual([curve[g] for g in range(0, 28, 4)], sorted(curve[g] for g in range(0, 28, 4)))
         self.assertAlmostEqual(curve[60], math.log(2), places=3)
         self.assertAlmostEqual(curve[100], math.log(2), places=3)
@@ -1201,8 +1204,10 @@ class ValidationSourceTests(unittest.TestCase):
         self.assertAlmostEqual(c['value_horizon'], 10.5, delta=1.)
         mask = np.array(remaining) <= 20
         self.assertAlmostEqual(c['value_bce_last20'], float(np.mean(np.array(bce)[mask])))
-        soft = dense_learn.remaining_curve([5, 5], [.8, .8], [.5, .5], grid=(5,))
-        self.assertEqual((soft['value_curve'], soft['value_excess_curve'], soft['value_horizon']), ([.8], [.3], 5.))
+        sure = dense_learn.remaining_curve([5, 5], [.8, .8], [1., 1.], grid=(5,))
+        self.assertEqual((sure['value_curve'], sure['value_excess_curve'], sure['value_horizon']), ([.8], [.8], 5.))
+        split = dense_learn.remaining_curve([5, 5], [.8, .8], [1., 0.], grid=(5,))
+        self.assertEqual(split['value_excess_curve'], [round(.8-math.log(2), 4)])
         empty = dense_learn.remaining_curve([], [], [])
         self.assertEqual((set(empty['value_curve']), empty['value_bce_last20'], empty['value_horizon']), ({None}, None, None))
 
@@ -1225,9 +1230,9 @@ class ValidationSourceTests(unittest.TestCase):
             held = sets.subsets['fresh', 'held']
             finished = [r for r in held if r.episode['winner'] >= 0]
             self.assertTrue(finished and len(finished) < len(held))
-            remaining, bce, entropy = learner.value_rows(sets, held)
+            remaining, bce, target = learner.value_rows(sets, held)
             self.assertEqual(sorted(remaining), sorted(len(r.episode['moves'])-r.row['ply'] for r in finished))
-            self.assertEqual(entropy.tolist(), [0.]*len(finished))
+            self.assertTrue(set(target.tolist()) <= {0., 1.})
             self.assertAlmostEqual(v['fresh_value_bce_last20'], float(bce.mean()))
             for source in dense_learn.CURVE_SOURCES:
                 for key in ('value_curve', 'value_excess_curve'):

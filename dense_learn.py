@@ -64,18 +64,23 @@ def validation_fields(metrics):
     return fields or None
 
 
-def remaining_curve(remaining, bce, entropy, grid=REMAINING_GRID, sigma=REMAINING_SIGMA):
+def remaining_curve(remaining, bce, target, grid=REMAINING_GRID, sigma=REMAINING_SIGMA):
     """Value loss against plies remaining over rows of finished games: {value_curve, value_excess_curve,
-    value_bce_last20, value_horizon}. The curves hold, per grid point g, the mean of the rows' BCE (resp. BCE minus
-    target entropy) weighted by exp(-(remaining-g)^2 / (2 sigma^2)), rounded to 4 decimals, or None where those
-    weights sum below 1. value_bce_last20 is the mean BCE of rows with remaining <= 20. value_horizon is the plies
-    remaining at which the BCE curve first exceeds HORIZON_BCE, linear between defined grid points (the grid point
-    itself when the curve starts above). Each scalar is None when undefined."""
-    r, b, e = (np.asarray(x, np.float64) for x in (remaining, bce, entropy))
+    value_bce_last20, value_horizon}. value_curve holds, per grid point g, the mean of the rows' BCE weighted by
+    exp(-(remaining-g)^2 / (2 sigma^2)); value_excess_curve subtracts the binary entropy of the equally weighted
+    mean target there (the loss of a predictor that only knows the outcome rate at that distance, so negative
+    values beat the base rate); both rounded to 4 decimals, or None where the weights sum below 1. value_bce_last20
+    is the mean BCE of rows with remaining <= 20. value_horizon is the plies remaining at which the BCE curve first
+    exceeds HORIZON_BCE, linear between defined grid points (the grid point itself when the curve starts above).
+    Each scalar is None when undefined."""
+    r, b, t = (np.asarray(x, np.float64) for x in (remaining, bce, target))
     g = np.asarray(grid, np.float64)
     k = np.exp(-.5*((g[:, None]-r[None])/sigma)**2)
     mass = k.sum(1)
-    curve, excess = (np.where(mass >= 1, k@y/np.maximum(mass, 1e-12), np.nan) for y in (b, b-e))
+    curve, rate = (np.where(mass >= 1, k@y/np.maximum(mass, 1e-12), np.nan) for y in (b, t))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        entropy = -np.nan_to_num(rate*np.log(rate))-np.nan_to_num((1-rate)*np.log(1-rate))
+    excess = np.where(np.isfinite(curve), curve-entropy, np.nan)
     horizon = None
     for i in range(len(g)):
         if curve[i] > HORIZON_BCE:
@@ -315,12 +320,12 @@ class Learner:
         return tuple(float(total[h]/mass[h]) if mass[h] > 0 else None for h in (0, 1))
 
     def value_rows(self, sets, refs):
-        """(plies remaining = len(moves) - ply, EMA value BCE, target binary entropy) as float arrays over the
+        """(plies remaining = len(moves) - ply, EMA value BCE, value target) as float arrays over the
         `refs` of finished games (winner >= 0), under symmetries drawn from a fixed seed."""
         s = self.settings
         refs = [r for r in refs if r.episode['winner'] >= 0]
         rng = np.random.default_rng(self.config.seed)
-        remaining, bce, entropy = [], [], []
+        remaining, bce, target = [], [], []
         with torch.no_grad():
             for k in range(0, len(refs), s.batch):
                 chunk = refs[k:k+s.batch]
@@ -331,8 +336,8 @@ class Learner:
                     logit = forward(self.ema, bucket['planes'], self.device, self.memory_format)[0]['value_logit'].float().cpu()
                     t = bucket['value']
                     bce += torch.nn.functional.binary_cross_entropy_with_logits(logit, t, reduction='none').tolist()
-                    entropy += (-torch.special.xlogy(t, t)-torch.special.xlogy(1-t, 1-t)).tolist()
-        return np.array(remaining, np.float64), np.array(bce), np.array(entropy)
+                    target += t.tolist()
+        return np.array(remaining, np.float64), np.array(bce), np.array(target)
 
     def validate_sources(self, sets):
         """Refresh `sets` (dense_data.ValidationSets) and return, per source, <source>_policy_ce and
