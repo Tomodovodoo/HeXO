@@ -408,113 +408,6 @@ def dense_manifests(folder, pattern='*/manifest.json'):
     return sorted(found, key=lambda item: (item[0].parent.parent.name, int(item[0].parent.name)))
 
 
-PLACEMENT_SHARE = .45  # assumed placements per evaluation game as a share of max_plies before any game is known
-HISTORY_REPORTS = 2     # newest evaluation reports per opponent type pooled for placements per game
-STEP_WINDOW = 900.      # seconds of learner metrics lines that price the current seconds per step
-_report_placements = {}
-
-
-def report_placements(run):
-    """[(created_at, seal opponent, games, placements after openings)] of every evaluations/*/report.json, oldest
-    first, each re-read only when its mtime changes."""
-    found = []
-    for path in (run/'evaluations').glob('*/report.json'):
-        try: modified = path.stat().st_mtime_ns
-        except OSError: continue
-        cached = _report_placements.get(path)
-        if cached is None or cached[0] != modified:
-            report = read_json(path)
-            games = report.get('games') if isinstance(report, dict) else None
-            if not isinstance(games, list) or not games: continue
-            cached = _report_placements[path] = (modified, (report.get('created_at') or 0, report.get('opponent') == 'seal',
-                                                            len(games), sum(g['plies']-len(g['opening']) for g in games)))
-        found.append(cached[1])
-    return sorted(found)
-
-
-def seconds_per_step(run, variant, window=STEP_WINDOW):
-    """Learner seconds per optimizer step: the summed time over the summed steps between consecutive training
-    lines of metrics/learner-<variant>.jsonl within `window` seconds of the newest one, counting only pairs whose
-    step increases (a restart repeats steps); None without such a pair."""
-    rows = [(r['time'], r['step']) for r in read_jsonl(run/'metrics'/f'learner-{variant}.jsonl')
-            if not r.get('validation') and isinstance(r.get('step'), int) and finite(r.get('time'))]
-    rows = [r for r in rows if r[0] >= rows[-1][0]-window] if rows else []
-    pairs = [(b[0]-a[0], b[1]-a[1]) for a, b in zip(rows, rows[1:]) if b[1] > a[1]]
-    return sum(t for t, _ in pairs)/sum(n for _, n in pairs) if pairs else None
-
-
-def evaluation_timing(run, evaluator, now):
-    """Wall-time estimates for the dense evaluator tile from evaluator-status.json (dense_eval.Evaluator) or None
-    without its settings. Evaluation games are of two types, vs Seal or vs a checkpoint.
-    - mean_placements(type): the current comparison's mean_placements when it has that type, else the pooled
-      mean of the newest HISTORY_REPORTS reports of that type (`report_placements`), else PLACEMENT_SHARE *
-      max_plies; mean_source names which ('comparison', 'reports', 'default') for the current type.
-    - Games are played in rounds of settings.round_games (else settings.games; the last one shorter). A round of n games runs
-      workers(n) = min(processes, n // 2) workers, which the Pacer charges per playing second, so its playing
-      time becomes wall time divided by min(1, eval_share / workers(n)), the Pacer's long-run ceiling.
-    - rate(type), placements per playing second of one worker, for the comparison's type: the current
-      placements_per_second / workers(round_games), else its worker_placements_per_second (e.g. while
-      throttled between rounds); for either type then placements / worker_seconds of the newest match event of
-      that type, else the comparison's rate. A round of n games plays at rate * workers(n).
-    - eval_share: the status's eval_share (the Pacer's actual share), else settings.eval_share.
-    elapsed: seconds since the comparison's started_at; expected: elapsed plus the wall time of the placements
-    left to its planned games: (round_first + round_games) * mean_placements - placements_played in the
-    current round, then later rounds up to games_planned; SPRT may stop earlier, so expected is the cap. Both
-    are None unless the stage is 'playing' or 'throttled' with a started_at. playing_fraction: the divisor of a
-    full round.
-    eval_seconds: wall time of one candidate's full evaluation from its first round: sprt_max_games vs the
-    champion plus, with anchor_on_promotion, anchor_games vs Seal (the candidate is assumed promoted).
-    release_seconds: export_steps (the step gap of the newest two checkpoints of the comparison's variant, else
-    main) * seconds_per_step; ratio = eval_seconds / release_seconds."""
-    settings = evaluator.get('settings')
-    if not isinstance(settings, dict): return None
-    comparison = evaluator.get('comparison') if isinstance(evaluator.get('comparison'), dict) else {}
-    current = comparison.get('opponent') == 'seal' if comparison else None
-    share = next((v for v in (evaluator.get('eval_share'), settings.get('eval_share')) if finite(v) and 0 < v <= 1), 1.)
-    size, processes = max(2, settings.get('round_games') or settings.get('games') or 2), max(1, evaluator.get('processes') or 1)
-    workers = lambda n: max(1, min(processes, n//2))
-    fraction = lambda n: min(1., share/workers(n))  # playing share of wall time in a round of n games
-    rounds = lambda games: [min(size, games-k) for k in range(0, max(0, games), size)]
-    seconds = lambda placements, n, speed: placements/(speed*workers(n))/fraction(n)  # wall time in a round of n games
-    live, finished = evaluator.get('placements_per_second'), evaluator.get('worker_placements_per_second')
-    pps = live/workers(evaluator.get('round_games') or size) if finite(live) and live > 0 else \
-        finished if finite(finished) and finished > 0 else None
-    reports = report_placements(run)
-    def mean(seal):
-        if seal == current and finite(evaluator.get('mean_placements')): return evaluator['mean_placements'], 'comparison'
-        newest = [r for r in reports if r[1] == seal][-HISTORY_REPORTS:]
-        if newest: return sum(r[3] for r in newest)/sum(r[2] for r in newest), 'reports'
-        return PLACEMENT_SHARE*(settings.get('max_plies') or 0), 'default'
-    events = [e for e in read_jsonl(run/'events.jsonl') if e.get('source') == 'evaluator' and e.get('kind') == 'match'
-              and finite(e.get('placements')) and finite(e.get('worker_seconds')) and e['placements'] > 0 and e['worker_seconds'] > 0]
-    def rate(seal):
-        if seal == current and pps: return pps
-        newest = [e for e in events if (e.get('opponent') == 'seal') == seal]
-        return newest[-1]['placements']/newest[-1]['worker_seconds'] if newest else pps
-    def wall(games, seal):
-        speed = rate(seal)
-        return sum(seconds(n*mean(seal)[0], n, speed) for n in rounds(games)) if speed else None
-    out = dict(elapsed=None, expected=None, mean_placements=None, mean_source=None)
-    if comparison and evaluator.get('stage') in ('playing', 'throttled') and finite(evaluator.get('started_at')):
-        placements, source = mean(current)
-        speed = rate(current)
-        first, count, planned = (evaluator.get(k) or 0 for k in ('round_first', 'round_games', 'games_planned'))
-        left = max(0., (first+count)*placements-(evaluator.get('placements_played') or 0))
-        out.update(elapsed=max(0., now-evaluator['started_at']), mean_placements=placements, mean_source=source)
-        if speed:
-            out['expected'] = out['elapsed']+seconds(left, count, speed)+sum(
-                seconds(n*placements, n, speed) for n in rounds(planned-first-count))
-    model, anchor = wall(settings.get('sprt_max_games') or 0, False), wall(settings.get('anchor_games') or 0, True)
-    eval_seconds = None if model is None else model+(anchor if anchor and settings.get('anchor_on_promotion', True) else 0.)
-    variant = comparison['candidate'].split('/')[0] if isinstance(comparison.get('candidate'), str) else 'main'
-    steps = [int(path.parent.name) for path, _ in dense_manifests(run/'checkpoints'/variant)]
-    export_steps = steps[-1]-steps[-2] if len(steps) > 1 else None
-    per_step = seconds_per_step(run, variant)
-    release = export_steps*per_step if export_steps and per_step else None
-    return dict(out, eval_seconds=eval_seconds, export_steps=export_steps, seconds_per_step=per_step, release_seconds=release,
-                ratio=eval_seconds/release if eval_seconds is not None and release else None, playing_fraction=fraction(size))
-
-
 def provisional(league, evaluator):
     """The league row of the checkpoint under evaluation, merged from evaluator-status.json (league.json stays the
     settled record): {id, opponent, wins, losses, capped, games, games_planned, elo, elo_interval} while the
@@ -593,7 +486,6 @@ def dense_run(run, config, fresh=30):
     champion['age'] = beat(champion)
     evaluator = status(run/'evaluator-status.json')
     evaluator['heartbeat'] = beat(evaluator)
-    evaluator['timing'] = evaluation_timing(run, evaluator, now)
     league = status(run/'league.json')
     evaluator['provisional'] = provisional(league, evaluator)
     return dict(name=run.name, config=config, actor=actor, actors=actors, learners=learners, evaluator=evaluator,

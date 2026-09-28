@@ -304,7 +304,7 @@ def dashboard_kind(run):
 
 def e2e_stage(report, run):
     """Actor (8 games, 2 shards), learner to step 10 and an evaluator pass, learner resumed to step 20 and a
-    second evaluator pass with two worker processes (it rates only a variant's newest unrated checkpoint), then
+    second evaluator pass (it rates only a variant's newest unrated checkpoint), then
     the dashboard; then an actor pass with historical opponents (historical_fraction 1/2), a learner export at
     step 30 and an evaluator pass that publishes the payoff matrix, on the E2E configuration in `run`, each
     checked against the files it must leave behind."""
@@ -329,8 +329,7 @@ def e2e_stage(report, run):
     seconds = 0.
     for steps in (10, 20):
         seconds += run_step(run, f'learner-{steps}', ['dense_learn.py', '--run', str(run), '--steps', str(steps), '--workers', '1'], remaining())
-        evaluated = run_step(run, f'evaluator-{steps}', ['dense_eval.py', 'loop', '--run', str(run), '--once',
-                                                         '--processes', str(steps//10)], remaining())
+        evaluated = run_step(run, f'evaluator-{steps}', ['dense_eval.py', 'loop', '--run', str(run), '--once'], remaining())
     saved = dense_learn.checkpoints(run, 'main')
     good = [p.name for p in saved] == ['000010', '000020']
     for path in saved:

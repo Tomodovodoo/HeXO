@@ -826,20 +826,29 @@ always score finished games against their hard outcome.
   candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
   and against panel members. Each pair also gets a matchup deviation (prior sd `matchup_prior_elo`, default 30),
   so a pair's own games outweigh the transitive picture when the two disagree. The candidate needs at least
-  `sprt_min_games` direct games, and its rating sd may be at most `uncertainty_parity` times the champion's.
+  `sprt_min_games` direct games, and its rating sd may be at most `uncertainty_parity` (1.5) times the champion's.
   It is promoted when it has the highest posterior rating and P(candidate - champion > `sprt_elo0`) is at least
   `promote_confidence`. It is rejected when that probability is at most 1 - `promote_confidence`. Neither
   happens while the direct-only and pooled estimates disagree beyond their intervals. `decision sprt` keeps the
   sequential test (`sprt_elo0` 0, `sprt_elo1` 25).
-- **Rounds.** Every comparison plays rounds of `round_games` (8) games, in colour-swapped opening pairs. While a
-  decision is pending, each round goes to the pairing whose round most reduces the posterior variance of the
-  decision's Elo difference: the direct games, or the candidate or champion against the previous champion or
-  Seal. A newer checkpoint of the variant ends the evaluation at the next round boundary, and the verdict at
-  that point settles it.
-- **Streaming.** `evaluator-status.json` carries the running tally of the current comparison and the pending
-  verdict. The dashboard shows both, including a provisional league row for the candidate.
+- **Continuous pool.** Like the actors, the evaluator keeps `pool_games` (64) games in flight on one engine. When
+  a game ends, the next opening of its pairing starts at once (both colours together), so the GPU batch stays
+  full. Each completed colour pair is written to its report immediately, so a restart loses only the games in
+  flight, and the evaluation resumes where it stopped.
+- **Direct games first.** While a promotion decision is pending, direct games against the champion take the
+  whole pool until `sprt_min_games` (64) of them are complete. After that, at most `evidence_share` (1/4) of
+  the pool may go to the evidence pairing whose games most reduce the posterior variance of the decision: the
+  candidate or champion against the previous champion or Seal. The pairing is re-chosen after every
+  completed colour pair. A newer checkpoint or a pairing change stops new games of the old pairing; its
+  running games finish and count. A superseded decision settles on all of them: the candidate is promoted when
+  P(candidate - champion > `sprt_elo0`) is at least `promote_confidence`, whether or not the other readiness
+  conditions hold (`decision sprt` settles the same way). On every start the evaluator re-applies the rule to
+  the reports on disk, and a rated checkpoint that already passes it is crowned at once.
+- **Streaming.** `evaluator-status.json` carries the pool composition, the running tally of the current
+  comparison (updated per finished game) and the pending verdict. The dashboard shows all three, including a
+  provisional league row for the candidate.
 - **Idle work.** After the decision, the evaluator plays the champion's Seal anchor, the adaptive panel (the
-  rated checkpoints closest to the champion) and other optional comparisons. It then fills rounds until the
+  rated checkpoints closest to the champion) and other optional comparisons. It then plays fill games until the
   next checkpoint appears: the champion against Seal until their interval is `anchor_target_halfwidth` narrow,
-  one round of the newest checkpoint against the previous champion, then the widest pair among the top
+  `games` of the newest checkpoint against the previous champion, then the widest pair among the top
   `fill_top`. Pairings where either side's expected score exceeds `max_expected_score` are never played.
