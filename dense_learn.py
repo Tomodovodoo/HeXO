@@ -6,7 +6,8 @@ learner (effective LearnerSettings), model (ModelSettings), copied_from}. Events
 export, info, error or replace. league.json is read for population replacement, never written. metrics/learner-
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
 falls on every tenth step) and one per export with validation_fields(metrics) of the manifest (Learner.export): EMA
-losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets). The EMA
+losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets), plus the value
+loss of finished held-out games against plies remaining (remaining_curve). The EMA
 averages parameters only; each export first recomputes its norm statistics (Learner.recalibrate), since the
 raw model's running statistics do not describe the EMA weights.
 
@@ -48,14 +49,46 @@ REFRESH_SECONDS = 30.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'export_every', 'log_every')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')))  # metrics log names
 # (low, high) for replacement perturbations; td_lambda and ema are perturbed through 1 - x.
+REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
+REMAINING_SIGMA = 6.
+HORIZON_BCE = .6
+CURVE_SOURCES = ('fresh', 'newest')
 BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995), ema=(.99, .9999))
 
 
 def validation_fields(metrics):
-    """The metrics-log fields of an export's manifest metrics: metrics.validation under LOGGED names plus
-    metrics.validation_sources; None when both are null."""
-    fields = {LOGGED[h]: v for h, v in (metrics['validation'] or {}).items()} | (metrics.get('validation_sources') or {})
+    """The metrics-log fields of an export's manifest metrics: metrics.validation under LOGGED names plus the
+    non-list entries of metrics.validation_sources (curves stay in the manifest); None when both are null."""
+    sources = {k: v for k, v in (metrics.get('validation_sources') or {}).items() if not isinstance(v, list)}
+    fields = {LOGGED[h]: v for h, v in (metrics['validation'] or {}).items()} | sources
     return fields or None
+
+
+def remaining_curve(remaining, bce, entropy, grid=REMAINING_GRID, sigma=REMAINING_SIGMA):
+    """Value loss against plies remaining over rows of finished games: {value_curve, value_excess_curve,
+    value_bce_last20, value_horizon}. The curves hold, per grid point g, the mean of the rows' BCE (resp. BCE minus
+    target entropy) weighted by exp(-(remaining-g)^2 / (2 sigma^2)), rounded to 4 decimals, or None where those
+    weights sum below 1. value_bce_last20 is the mean BCE of rows with remaining <= 20. value_horizon is the plies
+    remaining at which the BCE curve first exceeds HORIZON_BCE, linear between defined grid points (the grid point
+    itself when the curve starts above). Each scalar is None when undefined."""
+    r, b, e = (np.asarray(x, np.float64) for x in (remaining, bce, entropy))
+    g = np.asarray(grid, np.float64)
+    k = np.exp(-.5*((g[:, None]-r[None])/sigma)**2)
+    mass = k.sum(1)
+    curve, excess = (np.where(mass >= 1, k@y/np.maximum(mass, 1e-12), np.nan) for y in (b, b-e))
+    horizon = None
+    for i in range(len(g)):
+        if curve[i] > HORIZON_BCE:
+            if i and np.isfinite(curve[i-1]):
+                horizon = g[i-1]+(HORIZON_BCE-curve[i-1])/(curve[i]-curve[i-1])*(g[i]-g[i-1])
+            else:
+                horizon = g[i]
+            break
+    last = r <= 20
+    compact = lambda c: [round(float(v), 4) if np.isfinite(v) else None for v in c]
+    return dict(value_curve=compact(curve), value_excess_curve=compact(excess),
+                value_bce_last20=float(b[last].mean()) if last.any() else None,
+                value_horizon=None if horizon is None else round(float(horizon), 2))
 
 
 def status_path(run, variant):
@@ -83,14 +116,19 @@ def pad(bucket, quantum):
     return out
 
 
+def forward(model, planes, device, memory_format):
+    """(model outputs, mask [B,1,S,S]) for uint8 planes [B,8,S,S]; bf16 autocast on CUDA."""
+    planes = planes.to(device, non_blocking=True).float().contiguous(memory_format=memory_format)
+    mask = planes[:, 3:4]
+    with torch.autocast(device.type, torch.bfloat16, enabled=device.type == 'cuda'):
+        return model(planes, mask), mask
+
+
 def head_losses(model, batch, device, memory_format):
     """Per-head weighted means over one bucket and the bucket's weight sums, both [5] on device."""
     b = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-    planes = b['planes'].float().contiguous(memory_format=memory_format)
+    out, mask = forward(model, b['planes'], device, memory_format)
     future = b['future'].float()
-    mask = planes[:, 3:4]
-    with torch.autocast(device.type, torch.bfloat16, enabled=device.type == 'cuda'):
-        out = model(planes, mask)
     target = torch.zeros(b['mask'].shape, device=device).masked_scatter_(b['mask'], b['policy'])
     losses = [hexnet.policy_loss(out['policy'], out['far'], b['cells'], b['counts'], target, b['policy_weight']),
               hexnet.value_loss(out['value_logit'], b['value'], b['value_weight'])]
@@ -276,10 +314,31 @@ class Learner:
                 total += batch_losses(self.ema, batch, None, self.device, self.memory_format, False)*weights; mass += weights
         return tuple(float(total[h]/mass[h]) if mass[h] > 0 else None for h in (0, 1))
 
+    def value_rows(self, sets, refs):
+        """(plies remaining = len(moves) - ply, EMA value BCE, target binary entropy) as float arrays over the
+        `refs` of finished games (winner >= 0), under symmetries drawn from a fixed seed."""
+        s = self.settings
+        refs = [r for r in refs if r.episode['winner'] >= 0]
+        rng = np.random.default_rng(self.config.seed)
+        remaining, bce, entropy = [], [], []
+        with torch.no_grad():
+            for k in range(0, len(refs), s.batch):
+                chunk = refs[k:k+s.batch]
+                samples, targets = dense_data.examples(sets, chunk, rng, **dense_data.target_options(s))
+                order = sorted(range(len(chunk)), key=lambda i: samples[i].size)    # collate's row order
+                remaining += [len(chunk[i].episode['moves'])-chunk[i].row['ply'] for i in order]
+                for bucket in dense_data.collate(samples, targets).values():
+                    logit = forward(self.ema, bucket['planes'], self.device, self.memory_format)[0]['value_logit'].float().cpu()
+                    t = bucket['value']
+                    bce += torch.nn.functional.binary_cross_entropy_with_logits(logit, t, reduction='none').tolist()
+                    entropy += (-torch.special.xlogy(t, t)-torch.special.xlogy(1-t, 1-t)).tolist()
+        return np.array(remaining, np.float64), np.array(bce), np.array(entropy)
+
     def validate_sources(self, sets):
         """Refresh `sets` (dense_data.ValidationSets) and return, per source, <source>_policy_ce and
         <source>_value_bce on its held subset, <source>_train_* on its train subset, <source>_gap_* = held minus
-        train (None when either is), <source>_rows (held rows), plus newest_checkpoint."""
+        train (None when either is), <source>_rows (held rows), plus newest_checkpoint; for CURVE_SOURCES also the
+        remaining_curve of value_rows on the held subset as <source>_<key>, with its grid as remaining_grid."""
         sets.refresh()
         self.ema.eval()
         out = dict(newest_checkpoint=sets.newest_checkpoint)
@@ -289,6 +348,10 @@ class Learner:
                 out.update({f'{source}_{name}': v, f'{source}_train_{name}': w,
                             f'{source}_gap_{name}': None if v is None or w is None else v-w})
             out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
+        out['remaining_grid'] = list(REMAINING_GRID)
+        for source in CURVE_SOURCES:
+            curve = remaining_curve(*self.value_rows(sets, sets.subsets[source, 'held']))
+            out.update({f'{source}_{k}': v for k, v in curve.items()})
         return out
 
     def export(self, window, sets=None):

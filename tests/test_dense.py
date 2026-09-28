@@ -998,15 +998,15 @@ class DenseBootstrapTests(unittest.TestCase):
                 dense_bootstrap.read_corpus(source)
 
 
-def source_shard(path, seed, actor, origin='actor', checkpoint=None, games=6, policy_every=2, publisher=None):
-    """A shard of `games` random capped games; game g is played by actor[g % len(actor)] for a list, else by `actor`.
+def source_shard(path, seed, actor, origin='actor', checkpoint=None, games=6, policy_every=2, publisher=None, winner=-1):
+    """A shard of `games` random games recorded with `winner` (default capped); game g is played by actor[g % len(actor)] for a list, else by `actor`.
     The identity's actor_sha256 is `publisher`, default the last actor. Actor shards get a dense_selfplay-like identity."""
     rng = np.random.default_rng(seed)
     actors = actor if isinstance(actor, list) else [actor]
     episodes, rows = [], []
     for g in range(games):
         moves, _ = random_game(rng, 8)
-        e, r = episode_rows(moves, -1, [float(v) for v in rng.uniform(-1, 1, len(moves))], rng, policy_every)
+        e, r = episode_rows(moves, winner, [float(v) for v in rng.uniform(-1, 1, len(moves))], rng, policy_every)
         episodes.append(dict(e, actor=actors[g % len(actors)]))
         rows += [dict(x, game=g) for x in r]
     publisher = publisher or actors[-1]
@@ -1178,6 +1178,79 @@ class ValidationSourceTests(unittest.TestCase):
             dense_config.append_metrics(run, 'learner-main', step=10, validation=True, **fields)
             points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_newest_gap_policy_ce')['points']
             self.assertEqual(points, [[10, v['newest_gap_policy_ce']]])
+
+    def test_remaining_curve_on_outcomes_decided_in_the_last_ten_plies(self):
+        """Games whose outcome is fixed only in their last 10 plies: a predictor that knows it there and says 0.5
+        before has a curve near 0 at the end and near ln 2 far away; the smoothed curve crosses 0.6 a little over
+        one sigma past the step."""
+        rng = np.random.default_rng(0)
+        remaining, bce = [], []
+        for _ in range(300):
+            y, length = rng.integers(2), int(rng.integers(40, 121))
+            for left in range(1, length+1):
+                q = .01+.98*y if left <= 10 else .5
+                remaining.append(left); bce.append(-math.log(q if y else 1-q))
+        c = dense_learn.remaining_curve(remaining, bce, np.zeros(len(bce)))
+        curve = dict(zip(dense_learn.REMAINING_GRID, c['value_curve']))
+        self.assertEqual(len(c['value_curve']), 41)
+        self.assertEqual(c['value_excess_curve'], c['value_curve'])
+        self.assertLess(curve[0], .1)
+        self.assertEqual([curve[g] for g in range(0, 28, 4)], sorted(curve[g] for g in range(0, 28, 4)))
+        self.assertAlmostEqual(curve[60], math.log(2), places=3)
+        self.assertAlmostEqual(curve[100], math.log(2), places=3)
+        self.assertIsNone(curve[160])
+        self.assertTrue(10 < c['value_horizon'] < 20, c['value_horizon'])
+        mask = np.array(remaining) <= 20
+        self.assertAlmostEqual(c['value_bce_last20'], float(np.mean(np.array(bce)[mask])))
+        soft = dense_learn.remaining_curve([5, 5], [.8, .8], [.5, .5], grid=(5,))
+        self.assertEqual((soft['value_curve'], soft['value_excess_curve'], soft['value_horizon']), ([.8], [.3], 5.))
+        empty = dense_learn.remaining_curve([], [], [])
+        self.assertEqual((set(empty['value_curve']), empty['value_bce_last20'], empty['value_horizon']), ({None}, None, None))
+
+    def test_export_reports_value_by_plies_remaining(self):
+        import dashboard
+        torch.set_num_threads(2)
+        torch.manual_seed(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x', checkpoint='main/000010', games=8, winner=0)
+            source_shard(run/'shards'/'1000000000002', 3, 'x', checkpoint='main/000010', games=4)
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=.5))
+            learner = dense_learn.Learner(run, config.learner, config)
+            window = dense_data.ReplayWindow(run, 1000, 10, validation_fraction=.5)
+            sets = dense_data.ValidationSets(run, .5, config.seed, limit=40, quota=20)
+            metrics = learner.export(window, sets)['metrics']
+            v = metrics['validation_sources']
+            self.assertEqual(v['remaining_grid'], list(dense_learn.REMAINING_GRID))
+            held = sets.subsets['fresh', 'held']
+            finished = [r for r in held if r.episode['winner'] >= 0]
+            self.assertTrue(finished and len(finished) < len(held))
+            remaining, bce, entropy = learner.value_rows(sets, held)
+            self.assertEqual(sorted(remaining), sorted(len(r.episode['moves'])-r.row['ply'] for r in finished))
+            self.assertEqual(entropy.tolist(), [0.]*len(finished))
+            self.assertAlmostEqual(v['fresh_value_bce_last20'], float(bce.mean()))
+            for source in dense_learn.CURVE_SOURCES:
+                for key in ('value_curve', 'value_excess_curve'):
+                    self.assertEqual(len(v[f'{source}_{key}']), len(dense_learn.REMAINING_GRID))
+                self.assertIn(f'{source}_value_horizon', v)
+            self.assertNotIn('converted_value_curve', v)
+            fields = dense_learn.validation_fields(metrics)
+            self.assertFalse([k for k, x in fields.items() if isinstance(x, list)])
+            self.assertEqual(fields['fresh_value_bce_last20'], v['fresh_value_bce_last20'])
+            dense_config.append_metrics(run, 'learner-main', step=7, validation=True, **fields)
+            config = dict(created_at=0.)
+            self.assertEqual(dashboard.series(run, config, 'main', 'validation_fresh_value_bce_last20')['points'],
+                             [[7, v['fresh_value_bce_last20']]])
+            horizon = dashboard.series(run, config, 'main', 'validation_newest_value_horizon')['points']
+            self.assertEqual(horizon, [] if v['newest_value_horizon'] is None else [[7, v['newest_value_horizon']]])
+            curve = dashboard.series(run, config, 'main', 'fresh_value_curve', 'remaining')
+            self.assertEqual(curve['checkpoint'], 'main/000000')
+            self.assertEqual(curve['points'], [[g, y] for g, y in zip(v['remaining_grid'], v['fresh_value_curve']) if y is not None])
+            self.assertTrue(curve['points'])
+            self.assertEqual(dashboard.series(run, config, 'side', 'fresh_value_curve', 'remaining')['points'], [])
+            with self.assertRaises(ValueError):
+                dashboard.series(run, config, 'main', 'fresh_value_curve')
 
     def test_export_recalibrates_ema_norm_statistics(self):
         """The raw model drifts (here: perturbed weights) after the EMA was taken. The exported EMA must carry norm

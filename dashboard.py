@@ -562,7 +562,10 @@ def project(root, fresh=30):
 HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')
 SOURCES = ('converted', 'fresh', 'newest')  # dense_data.SOURCES
 SOURCE_METRICS = tuple(f'{s}_{k}{h}' for s in SOURCES for k in ('', 'train_', 'gap_') for h in ('policy_ce', 'value_bce'))
-LEARNER_METRICS = HEADS+('lr', 'samples_per_second', 'window_rows')+tuple('validation_'+h for h in HEADS+SOURCE_METRICS)
+CURVE_SOURCES = ('fresh', 'newest')  # dense_learn.CURVE_SOURCES
+HORIZON_METRICS = tuple(f'{s}_{k}' for s in CURVE_SOURCES for k in ('value_bce_last20', 'value_horizon'))
+CURVE_METRICS = tuple(f'{s}_{k}' for s in CURVE_SOURCES for k in ('value_curve', 'value_excess_curve'))
+LEARNER_METRICS = HEADS+('lr', 'samples_per_second', 'window_rows')+tuple('validation_'+h for h in HEADS+SOURCE_METRICS+HORIZON_METRICS)
 ACTOR_SUMMED = ('placements_per_second', 'evals_per_second', 'games_per_hour')
 ACTOR_METRICS = ACTOR_SUMMED+('terminal_fraction', 'mean_plies')
 GPU_METRICS = ('utilization', 'used_mib', 'watts', 'temperature')
@@ -616,9 +619,19 @@ def series(run, config, variant, metric, x='step', max_points=1000):
     """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval; seal_delta: the direct-match
     Elo minus Seal of each anchored checkpoint, league anchors.seal.matches) sorted by x and
     downsampled; x is the learner step or hours since the run's created_at. Actor and GPU metrics have hours
-    only. Raises ValueError for an unknown metric or x."""
+    only. CURVE_METRICS have x 'remaining' only: [[plies remaining, y], ...] of the newest checkpoint manifest of
+    `variant` holding that curve (metrics.validation_sources), whose id is added as `checkpoint` (None without one).
+    Raises ValueError for an unknown metric or x."""
     created = config.get('created_at') or 0.
     hours = lambda t: (t-created)/3600
+    if metric in CURVE_METRICS:
+        if x != 'remaining': raise ValueError(f'{metric} has x remaining only')
+        found = [(path, v) for path, m in dense_manifests(run/'checkpoints'/variant)
+                 if isinstance(v := (m.get('metrics') or {}).get('validation_sources'), dict) and isinstance(v.get(metric), list)]
+        path, v = found[-1] if found else (None, {})
+        points = [[g, y] for g, y in zip(v.get('remaining_grid') or [], v.get(metric) or []) if finite(y)]
+        return dict(run=run.name, variant=variant, metric=metric, x=x, count=len(points), points=points,
+                    checkpoint=path and f'{variant}/{path.parent.name}')
     if x not in ('step', 'hours'): raise ValueError(f'unknown x {x!r}')
     if metric in LEARNER_METRICS:
         validation, key = metric.startswith('validation_'), metric.removeprefix('validation_')
