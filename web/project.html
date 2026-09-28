@@ -69,8 +69,8 @@ if(p.sources)for(const[src,dash]of Object.entries(SOURCES))if(!p.from||p.from.in
 const xOf=p=>p.xs.includes(state.x[p.id])?state.x[p.id]:p.xs[0];
 const fromOf=p=>xOf(p)==='step'?state.fromStep:0;
 const cacheKey=(s,p)=>`${s.run.name}|${s.variant}|${s.metric}|${xOf(p)}`;
-async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k);if(hit&&hit.from===fromOf(p)&&(hit.poll===project.now||(!s.run.live&&project.now-hit.poll<60)))continue;
-jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:s.metric,x:xOf(p),max_points:1000,from_step:fromOf(p)});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${s.metric} of ${s.label}: HTTP ${res.status}`);cache.set(k,{poll:project.now,from:fromOf(p),points:(await res.json()).points})})}
+async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k),from=fromOf(p),x=xOf(p),now=project.now;if(hit&&hit.from===from&&(hit.poll===now||(!s.run.live&&now-hit.poll<60)))continue;
+jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:s.metric,x,max_points:1000,from_step:from});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${s.metric} of ${s.label}: HTTP ${res.status}`);cache.set(k,{poll:now,from,points:(await res.json()).points})})}
 let failure=null;const worker=async()=>{while(jobs.length){try{await jobs.shift()()}catch(e){failure=e}}};await Promise.all(Array.from({length:6},worker));if(failure)throw failure}
 function trace(pts,sx,sy,ctx){let gap=true;pts.forEach((q,i)=>{if(q[1]==null){gap=true;return}const x=sx(q[0]),y=sy(q[1]),alone=gap&&(i+1>=pts.length||pts[i+1][1]==null);if(alone){ctx.moveTo(x+1.5,y);ctx.arc(x,y,1.5,0,7)}else ctx[gap?'moveTo':'lineTo'](x,y);gap=false})}
 function ticks(lo,hi,n){const step0=(hi-lo)/n||1,mag=10**Math.floor(Math.log10(step0)),e=step0/mag,step=(e>=7.5?10:e>=3.5?5:e>=1.5?2:1)*mag,out=[];for(let v=Math.ceil(lo/step)*step;v<=hi+step*1e-9;v+=step)out.push(+v.toPrecision(12));return out}
