@@ -7,8 +7,9 @@ export, info, error or replace. league.json is read for population replacement, 
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
 falls on every tenth step) and one per export with validation_fields(metrics) of the manifest (Learner.export): EMA
 losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets), plus the value
-loss of finished held-out games against plies remaining (remaining_curve) and the policy and value losses against
-the ply from the start (ply_curve, ply_split). The EMA
+loss of finished held-out games against plies remaining (remaining_curve), the policy and value losses against
+the ply from the start (ply_curve, ply_split), both over (ply from the start, plies remaining) cells (surfaces) and
+the value regret against what the search knew (calibration_reference, value_regret). The EMA
 averages parameters only; each export first recomputes its norm statistics (Learner.recalibrate), since the
 raw model's running statistics do not describe the EMA weights.
 
@@ -62,13 +63,16 @@ PLY_SIGMA = 4.
 EARLY_PLY, LATE_PLY = 20, 60  # ply_split: early rows have ply < EARLY_PLY, late rows ply >= LATE_PLY
 HORIZON_BCE = math.log(2)/2  # midpoint between a perfect and a chance value head
 CURVE_SOURCES = ('fresh', 'newest')
+SURFACE_WIDTH, SURFACE_LIMIT, SURFACE_MIN = 16, 384, 8  # surfaces: cell width, axis limit, rows per reported cell
+REFERENCE_RIDGE, REFERENCE_STEPS = 1., 12  # calibration_reference: penalty toward the base rate, Newton steps
+NEAR_END, FAR_END = 20, 60  # value_regret: early rows have remaining < NEAR_END, late rows remaining >= FAR_END
 BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995), ema=(.99, .9999))
 
 
 def validation_fields(metrics):
     """The metrics-log fields of an export's manifest metrics: metrics.validation under LOGGED names plus the
-    non-list entries of metrics.validation_sources (curves stay in the manifest); None when both are null."""
-    sources = {k: v for k, v in (metrics.get('validation_sources') or {}).items() if not isinstance(v, list)}
+    scalar entries of metrics.validation_sources (curves and surfaces stay in the manifest); None when both are null."""
+    sources = {k: v for k, v in (metrics.get('validation_sources') or {}).items() if not isinstance(v, (list, dict))}
     fields = {LOGGED[h]: v for h, v in (metrics['validation'] or {}).items()} | sources
     return fields or None
 
@@ -85,6 +89,82 @@ def smoothed(x, ys, grid, sigma):
 def compact(curve):
     """A curve as a JSON list: values rounded to 4 decimals, None where not finite."""
     return [round(float(v), 4) if np.isfinite(v) else None for v in curve]
+
+
+def binary_entropy(rate):
+    """Elementwise binary entropy in nats of an outcome rate (0 at rates 0 and 1, nan stays nan)."""
+    rate = np.asarray(rate, np.float64)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where((rate <= 0) | (rate >= 1), 0., -rate*np.log(rate)-(1-rate)*np.log(1-rate))
+
+
+def surfaces(ply, remaining, columns, width=SURFACE_WIDTH, limit=SURFACE_LIMIT, min_cells=SURFACE_MIN):
+    """Per-cell means over `width`-ply cells in (ply from the start, plies remaining), each axis covering
+    [0, limit) (rows outside are dropped): (grid, means). grid is {ply_bins, remaining_bins (lower cell edges),
+    counts ([ply bin][remaining bin] row counts)}; means holds per column a float array [ply bin][remaining bin],
+    nan in cells with fewer than `min_cells` rows."""
+    n = -(-limit//width)
+    p, r = (np.asarray(x, np.float64)//width for x in (ply, remaining))
+    keep = (p >= 0) & (p < n) & (r >= 0) & (r < n)
+    index = (p[keep]*n+r[keep]).astype(np.int64)
+    counts = np.bincount(index, minlength=n*n).reshape(n, n)
+    means = [np.where(counts >= min_cells, np.bincount(index, np.asarray(y, np.float64)[keep], n*n).reshape(n, n)
+                      / np.maximum(counts, 1), np.nan) for y in columns]
+    bins = list(range(0, n*width, width))
+    return dict(ply_bins=bins, remaining_bins=bins, counts=counts.tolist()), means
+
+
+def searched_value(episode, ply):
+    """Root value in [-1, 1] for the side to move at `ply` from the newest full search at or before it (a root
+    value counts as full-search when the episode records no full_search flags), negated when that search's mover
+    differs; nan without one."""
+    roots, full = episode['root_values'], episode.get('full_search')
+    for t in range(ply, -1, -1) if roots is not None else ():
+        if roots[t] is not None and (full is None or full[t]):
+            return roots[t] if dense_data.player_at(t) == dense_data.player_at(ply) else -roots[t]
+    return math.nan
+
+
+def reference_basis(value, remaining):
+    """Calibration features per row: 1, x, x^2, z, z x, z x^2 with z = atanh(value clipped to +-0.995) and
+    x = log(1 + remaining) / log(1 + SURFACE_LIMIT)."""
+    z = np.arctanh(np.clip(np.asarray(value, np.float64), -.995, .995))
+    x = np.log1p(np.asarray(remaining, np.float64))/math.log1p(SURFACE_LIMIT)
+    return np.stack([np.ones_like(x), x, x*x, z, z*x, z*x*x], 1)
+
+
+def calibration_reference(fit_value, fit_remaining, fit_outcome, value, remaining, ridge=REFERENCE_RIDGE, steps=REFERENCE_STEPS):
+    """P(outcome = 1 | value, remaining) for the query rows from a logistic regression on reference_basis fitted
+    to the rows with a finite value among the fit rows: `steps` Newton steps from the base rate (the mean fit
+    outcome, clipped to [1e-3, 1 - 1e-3]) with an L2 penalty `ridge` on every weight but the intercept. Query rows
+    without a finite value, and every row when no fit row has one, get the base rate; None without fit rows."""
+    y = np.asarray(fit_outcome, np.float64)
+    if not len(y): return None
+    base = float(np.clip(y.mean(), 1e-3, 1-1e-3))
+    v = np.asarray(fit_value, np.float64); known = np.isfinite(v)
+    X, y = reference_basis(v[known], np.asarray(fit_remaining, np.float64)[known]), y[known]
+    w = np.zeros(X.shape[1]); w[0] = math.log(base/(1-base))
+    penalty = np.full(len(w), ridge); penalty[0] = 0.
+    for _ in range(steps if len(y) else 0):
+        p = 1/(1+np.exp(-X@w))
+        w -= np.linalg.solve(X.T@(X*(p*(1-p))[:, None])+np.diag(penalty)+1e-9*np.eye(len(w)), X.T@(p-y)+penalty*w)
+    q = np.asarray(value, np.float64); out = np.full(len(q), base)
+    ok = np.isfinite(q)
+    out[ok] = 1/(1+np.exp(-reference_basis(q[ok], np.asarray(remaining, np.float64)[ok])@w))
+    return out
+
+
+def value_regret(bce, outcome, reference, remaining):
+    """{value_regret, value_regret_early, value_regret_late}: the mean of bce minus the BCE of `reference` against
+    `outcome` over all rows, rows with remaining < NEAR_END and rows with remaining >= FAR_END; each None without
+    rows (all None without a reference)."""
+    keys = ('value_regret', 'value_regret_early', 'value_regret_late')
+    if reference is None: return dict.fromkeys(keys)
+    y, h = np.asarray(outcome, np.float64), np.asarray(remaining, np.float64)
+    r = np.clip(np.asarray(reference, np.float64), 1e-7, 1-1e-7)
+    regret = np.asarray(bce, np.float64)+y*np.log(r)+(1-y)*np.log(1-r)
+    return {k: float(regret[m].mean()) if m.any() else None
+            for k, m in zip(keys, (np.ones(len(h), bool), h < NEAR_END, h >= FAR_END))}
 
 
 def ply_curve(ply, loss, grid=PLY_GRID, sigma=PLY_SIGMA):
@@ -110,9 +190,7 @@ def remaining_curve(remaining, bce, target, grid=REMAINING_GRID, sigma=REMAINING
     r, b, t = (np.asarray(x, np.float64) for x in (remaining, bce, target))
     g = np.asarray(grid, np.float64)
     curve, rate = smoothed(r, (b, t), g, sigma)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        entropy = -np.nan_to_num(rate*np.log(rate))-np.nan_to_num((1-rate)*np.log(1-rate))
-    excess = np.where(np.isfinite(curve), curve-entropy, np.nan)
+    excess = curve-binary_entropy(rate)
     horizon = None
     for i in range(len(g)):
         if curve[i] > HORIZON_BCE:
@@ -379,8 +457,8 @@ class Learner:
     def row_losses(self, sets, refs):
         """Per-row EMA losses over `refs` under symmetries drawn from a fixed seed: float arrays with one entry per
         ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
-        finished (1. when winner >= 0, else 0.), value_bce, value (its target) and policy_ce (against the improved
-        policy; nan on rows without a policy target)."""
+        finished (1. when winner >= 0, else 0.), value_bce, value (its target), policy_ce (against the improved
+        policy; nan on rows without a policy target) and searched (searched_value at the row)."""
         s = self.settings
         rng = np.random.default_rng(self.config.seed)
         rows = []
@@ -398,9 +476,10 @@ class Learner:
                     losses += zip(bce.tolist(), b['value'].tolist(), torch.where(b['policy_weight'] > 0, ce, math.nan).tolist())
                 for i, loss in zip(order, losses):
                     ref = chunk[i]
-                    rows.append((ref.row['ply'], len(ref.episode['moves'])-ref.row['ply'], float(ref.episode['winner'] >= 0), *loss))
-        columns = np.array(rows, np.float64).reshape(-1, 6).T
-        return dict(zip(('ply', 'remaining', 'finished', 'value_bce', 'value', 'policy_ce'), columns))
+                    e, t = ref.episode, ref.row['ply']
+                    rows.append((t, len(e['moves'])-t, float(e['winner'] >= 0), *loss, searched_value(e, t)))
+        columns = np.array(rows, np.float64).reshape(-1, 7).T
+        return dict(zip(('ply', 'remaining', 'finished', 'value_bce', 'value', 'policy_ce', 'searched'), columns))
 
     def validate_sources(self, sets):
         """Refresh `sets` (dense_data.ValidationSets) and return, per source, <source>_policy_ce and
@@ -409,7 +488,13 @@ class Learner:
         row_losses of the held subset: the remaining_curve of the rows of finished games as <source>_<key> (grid:
         remaining_grid); <source>_value_bce_by_ply, the ply_curve of the same rows' value BCE, and
         <source>_policy_ce_curve, the ply_curve of the policy CE of rows with a policy target (grid: ply_grid);
-        <source>_policy_ce_early and <source>_policy_ce_late, the ply_split of that policy CE."""
+        <source>_policy_ce_early and <source>_policy_ce_late, the ply_split of that policy CE. Surfaces (surfaces
+        grid dicts, cells compact rows): <source>_value_surface adds `value`, the mean value BCE of the rows of
+        finished games, and <source>_value_excess_surface adds `excess`, that minus the binary entropy of the cell's
+        mean value target; <source>_policy_surface adds `policy`, the mean policy CE of rows with a policy target.
+        <source>_value_regret(_early, _late) is the value_regret of the held rows of finished games against the
+        calibration_reference fitted on the source's train rows of finished games (searched value, plies remaining,
+        outcome for the side to move)."""
         sets.refresh()
         self.ema.eval()
         out = dict(newest_checkpoint=sets.newest_checkpoint)
@@ -428,6 +513,16 @@ class Learner:
             out.update({f'{source}_value_bce_by_ply': ply_curve(r['ply'][f], r['value_bce'][f]),
                         f'{source}_policy_ce_curve': ply_curve(r['ply'][p], r['policy_ce'][p]),
                         f'{source}_policy_ce_early': early, f'{source}_policy_ce_late': late})
+            grid, (bce, rate) = surfaces(r['ply'][f], r['remaining'][f], (r['value_bce'][f], r['value'][f]))
+            out[f'{source}_value_surface'] = grid | dict(value=[compact(x) for x in bce])
+            out[f'{source}_value_excess_surface'] = grid | dict(excess=[compact(x) for x in bce-binary_entropy(rate)])
+            grid, (ce,) = surfaces(r['ply'][p], r['remaining'][p], (r['policy_ce'][p],))
+            out[f'{source}_policy_surface'] = grid | dict(policy=[compact(x) for x in ce])
+            fit = [(searched_value(e, t), len(e['moves'])-t, float(dense_data.player_at(t) == e['winner']))
+                   for e, t in ((ref.episode, ref.row['ply']) for ref in sets.subsets[source, 'train']) if e['winner'] >= 0]
+            fit = np.array(fit, np.float64).reshape(-1, 3).T
+            reference = calibration_reference(*fit, r['searched'][f], r['remaining'][f])
+            out.update({f'{source}_{k}': v for k, v in value_regret(r['value_bce'][f], r['value'][f], reference, r['remaining'][f]).items()})
         return out
 
     def export(self, window, sets=None):
