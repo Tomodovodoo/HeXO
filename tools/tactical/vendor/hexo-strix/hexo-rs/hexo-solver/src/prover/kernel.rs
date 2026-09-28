@@ -46,6 +46,11 @@ use std::rc::Rc;
 /// (attacker completions, defender completions) of one position.
 type NodeComps = (Vec<CellSet2>, Vec<CellSet2>);
 
+/// Memo entry caps. Both memos are pure caches, so clearing one when it fills
+/// only costs recomputation; without a cap a long search retains gigabytes.
+const COMPS_CAP: usize = 1 << 17;
+const GENCACHE_CAP: usize = 1 << 14;
+
 /// Result of classifying an OR (attacker-to-move) node.
 pub(crate) enum OrEval {
     /// The attacker completes six-in-a-row within the remaining placements.
@@ -226,6 +231,9 @@ impl KernelCtx {
         let atk_c = completions(&self.board, self.atk, self.wl, self.radius);
         let dfn_c = completions(&self.board, self.dfn, self.wl, self.radius);
         let v = Rc::new((atk_c, dfn_c));
+        if self.comps.len() >= COMPS_CAP {
+            self.comps.clear();
+        }
         self.comps.insert(h, Rc::clone(&v));
         v
     }
@@ -249,6 +257,9 @@ impl KernelCtx {
                 &comps.1,
                 self.wide,
             ));
+            if self.gencache.len() >= GENCACHE_CAP {
+                self.gencache.clear();
+            }
             self.gencache.insert(key, Rc::clone(&m));
             m
         };

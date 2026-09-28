@@ -36,6 +36,15 @@ pub struct Limits {
     pub cancel: Option<Arc<AtomicBool>>,
 }
 
+impl Limits {
+    /// True once the deadline has passed or the cancel flag is set.
+    #[inline]
+    pub(crate) fn expired(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+            || self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+}
+
 /// Independently verified winning-depth upper bounds supplied by a proof DAG.
 ///
 /// These are deliberately positive facts only: a hit may close an IDTT node when
@@ -1617,20 +1626,11 @@ fn tick(s: &mut SearchState) -> bool {
     s.nodes += 1;
     if s.nodes > s.budget {
         s.exceeded = true;
-    } else if (s.limits.deadline.is_some() || s.limits.cancel.is_some()) && s.nodes & 0x1FFF == 0 {
-        // Sample clock/atomic sparsely so they never dominate the ~10µs/node hot
-        // path. Only reachable when a limit is set (research prover); production
-        // callers pass `Limits::default()` and skip this branch entirely.
-        if let Some(dl) = s.limits.deadline
-            && Instant::now() >= dl
-        {
-            s.exceeded = true;
-        }
-        if let Some(c) = &s.limits.cancel
-            && c.load(Ordering::Relaxed)
-        {
-            s.exceeded = true;
-        }
+    } else if s.nodes & 0xF == 0 && s.limits.expired() {
+        // Every 16 nodes: a clock read is ~25ns against >=10µs per node, and a
+        // wide-generator node can take a millisecond, so sparser sampling lets
+        // the search run seconds past its deadline.
+        s.exceeded = true;
     }
     s.exceeded
 }

@@ -9,7 +9,7 @@
 //! node `(INF, 0)`, an unexpanded unknown `(1, 1)`.
 
 use super::kernel::{AndEval, KernelCtx, Node, OrEval};
-use crate::forcing::{CellSet2, WinDepthHints};
+use crate::forcing::{CellSet2, Limits, WinDepthHints};
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
 
@@ -254,6 +254,9 @@ pub(crate) struct PnSearch {
     /// node at its current horizon without expansion, mirroring the level-1
     /// `Dfpn::hint_val` check.
     hints: Option<Rc<WinDepthHints>>,
+    /// Wall-clock deadline and cancel flag, checked before every expansion so a
+    /// level-2 search never outlives its caller's budget.
+    limits: Limits,
 }
 
 impl PnSearch {
@@ -263,7 +266,13 @@ impl PnSearch {
             max_nodes: max_nodes.max(1),
             expansions: 0,
             hints: None,
+            limits: Limits::default(),
         }
+    }
+
+    /// Stop expanding once `limits` expire; the root keeps its unresolved numbers.
+    pub(crate) fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
     }
 
     /// Attach certificate-derived win-depth hints for a guided probe.
@@ -314,7 +323,7 @@ impl PnSearch {
             if root.pn == 0 || root.dn == 0 {
                 break;
             }
-            if self.expansions >= self.max_nodes {
+            if self.expansions >= self.max_nodes || self.limits.expired() {
                 break;
             }
             // Descend to the most-proving node, applying moves to the board.

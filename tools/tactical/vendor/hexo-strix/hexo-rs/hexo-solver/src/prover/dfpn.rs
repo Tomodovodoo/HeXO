@@ -100,7 +100,11 @@ impl<'a> Dfpn<'a> {
             kids: Vec::new(),
             max_depth: 0,
             pds_mode,
-            pn: PnSearch::new(cfg.pn2_nodes),
+            pn: {
+                let mut pn = PnSearch::new(cfg.pn2_nodes);
+                pn.set_limits(ctl.forcing_limits());
+                pn
+            },
             pn2_nodes: cfg.pn2_nodes,
             pn2_scale: cfg.pn2_scale,
             pn2_scale_inverse: cfg.pn2_scale_inverse,
@@ -230,7 +234,9 @@ impl<'a> Dfpn<'a> {
         }
         if self.nodes > self.budget || depth > MAX_PLY {
             self.exceeded = true;
-        } else if self.nodes & 0x1FFF == 0 && self.ctl.expired() {
+        } else if self.ctl.expired() {
+            // Checked on every level-1 node: each can run a level-2 search and
+            // wide move generation costing milliseconds.
             self.exceeded = true;
         }
         self.exceeded
