@@ -2116,17 +2116,18 @@ class Crash(Exception):
     """Raised by a scripted pool to stop the evaluator mid-session, as a killed process would."""
 
 
-def scripted(winner=lambda record: record['challenger_color'], hook=lambda pool, steps: None, moves=lambda record: 5):
-    """A dense_eval.Pool stand-in whose step() first calls hook(pool, steps so far) and then finishes the oldest
-    game in flight after moves(record) placements, won by colour winner(record) (-1: a cap; default the
-    candidate)."""
+def scripted(winner=lambda record: record['challenger_color'], hook=lambda pool, steps: None, moves=lambda record: 5,
+             order=lambda record: 0):
+    """A dense_eval.Pool stand-in whose step() first calls hook(pool, steps so far) and then finishes the game in
+    flight of least order(record) (the oldest among equals) after moves(record) placements, won by colour
+    winner(record) (-1: a cap; default the candidate)."""
     class Scripted(dense_eval.Pool):
         def step(self):
             self.steps = getattr(self, 'steps', 0)+1
             hook(self, self.steps)
             out, self.ready = self.ready, []
             if self.games:
-                lane, game = self.games.pop(next(iter(self.games)))
+                lane, game = self.games.pop(min(self.games, key=lambda k: order(self.games[k][1].record)))
                 self.engine.slots.remove(game)
                 game.game.close()
                 for tree in game.trees.values():
@@ -2708,6 +2709,17 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['kind'] for e in events if e['kind'] in ('decision', 'promotion')], ['decision', 'promotion'])
         self.assertIn('promote on review', events[-2]['message'])
+
+    def test_half_finished_pairs_hold_their_slots_against_the_budget(self):
+        """Every colour-0 game finishes before any colour-1 game: the finished halves still count against the
+        comparison's budget, so exactly sprt_max_games games are played."""
+        evaluator = self.start(sprt_max_games=8, pool_games=8)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, order=lambda r: r['challenger_color'])):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 8)
 
     def test_games_finished_on_creation_occupy_the_pool(self):
         pool = dense_eval.Pool(64)

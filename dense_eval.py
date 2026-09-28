@@ -744,11 +744,12 @@ class Evaluator:
         games finished}. want() -> {(a, b, kind): games in flight wanted, even}, asked at the start and after every
         completed colour pair; a finished game's slot is refilled before the next engine step, and a lane want()
         drops (or shrinks) starts no new games while its running games finish and count. Games in flight never
-        exceed pool_games, nor, per kind, the games wanted of that kind: a draining lane's games count against its
-        replacement's. The Pacer is charged for engine steps and for starting games (Seal plays its first turns
-        then). No game starts while the
-        Pacer's credit is negative; with nothing running the session then waits. Every completed pair is
-        persisted at once."""
+        exceed pool_games; a lane's games (in flight or finished while their colour partner runs) never exceed
+        the games it wants, nor per kind those wanted of that kind, so a draining lane's games count against its
+        replacement's and a half-finished pair's slot is not refilled past a budget. The Pacer is charged for
+        engine steps and for starting games (Seal plays its first turns then); no game starts while its credit
+        is negative, and with nothing running the session then waits. Every completed pair is persisted at
+        once."""
         pool, waiting, added = Pool(self.config.actor.leaf_batch), {}, {}
         placed = 0
         start, wall = self.pacer.clock(), time.time()
@@ -760,7 +761,7 @@ class Evaluator:
                 return  # the tally is computed only for a write
             main = next(iter(shown), None)
             a, b, kind = main or (None, None, None)
-            done = self.games(a, b)+[r for group in waiting.get((a, b), {}).values() for r in group] if a else []
+            done = self.games(a, b)+[r for group in waiting.get(main, {}).values() for r in group] if a else []
             live = placed+pool.moves()
             self.publish(True, stage=stage, comparison=dict(candidate=a, opponent=b, kind=kind) if a else None,
                          pool=[dict(candidate=x, opponent=y, kind=k, running=pool.running((x, y, k)), share=lanes.get((x, y, k), 0))
@@ -776,9 +777,12 @@ class Evaluator:
             ready = self.pacer.ready()
             if lanes and ready:
                 kinds = {kind: sum(n for lane, n in lanes.items() if lane[2] == kind) for _, _, kind in lanes}
+                halves = lambda match: sum(len(g) for held, groups in waiting.items() if match(held) for g in groups.values())
+                held = lambda lane: pool.running(lane)+halves(lambda h: h == lane)
+                kind_held = lambda kind: pool.running(kind=kind)+halves(lambda h: h[2] == kind)
                 tick = self.pacer.clock()  # starting games plays Seal's first turns: playing time
                 for lane, share in lanes.items():
-                    while pool.running(lane)+2 <= share and pool.running(kind=lane[2])+2 <= kinds[lane[2]] \
+                    while held(lane)+2 <= share and kind_held(lane[2])+2 <= kinds[lane[2]] \
                             and pool.running()+2 <= self.settings.pool_games:
                         self.start(pool, lane)
                 self.pacer.played(tick, self.pacer.clock())
@@ -797,10 +801,10 @@ class Evaluator:
                 placed += moves
                 count = added.setdefault(lane, [0, 0])
                 count[0] += 1; count[1] += moves
-                group = waiting.setdefault(lane[:2], {}).setdefault(record['pair'], [])
+                group = waiting.setdefault(lane, {}).setdefault(record['pair'], [])
                 group.append(record)
                 if len(group) == 2:
-                    del waiting[lane[:2]][record['pair']]
+                    del waiting[lane][record['pair']]
                     self.persist(*lane, sorted(group, key=lambda r: r['challenger_color']))
                     paired = True
             if paired:
