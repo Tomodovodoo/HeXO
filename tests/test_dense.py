@@ -359,6 +359,26 @@ class HexNetTests(unittest.TestCase):
         torch.testing.assert_close(norm(x.detach(), full, cells), F.batch_norm(
             x.detach(), norm.running_mean, norm.running_var, norm.weight, norm.bias, False, 0., norm.eps))
 
+    def test_masked_norm_cumulative_statistics_weight_cells(self):
+        """momentum None: a 1-row and a 7-row bucket give the statistics of one pass over all their cells."""
+        x = torch.randn(8, 3, 5, 5, dtype=torch.float64)*torch.tensor([1., 3, .5], dtype=torch.float64)[:, None, None]
+        x[0] += 10
+        mask = (torch.rand(8, 1, 5, 5) < .7).double()
+        full = mask.expand_as(x).contiguous()
+
+        def stats(parts):
+            norm = hexnet.MaskedNorm(3).double().train()
+            norm.momentum = None
+            with torch.no_grad():
+                for k in parts:
+                    norm(x[k], full[k], mask[k].sum())
+            return norm.running_mean, norm.running_var
+        split, whole = stats([slice(0, 1), slice(1, 8)]), stats([slice(0, 8)])
+        torch.testing.assert_close(split, whole)
+        cells = mask.sum()
+        mean = (x*mask).sum((0, 2, 3))/cells
+        torch.testing.assert_close(whole, (mean, (((x-mean[:, None, None])**2)*mask).sum((0, 2, 3))/(cells-1)))
+
     def test_masked_norm_bf16_statistics(self):
         x = (torch.randn(8, 4, 16, 16)+torch.tensor([0., 5, 20, 60])[:, None, None]).bfloat16()
         mask = torch.ones_like(x)
@@ -1016,6 +1036,48 @@ class ValidationSourceTests(unittest.TestCase):
             dense_config.append_metrics(run, 'learner-main', step=10, validation=True, **fields)
             points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_newest_gap_policy_ce')['points']
             self.assertEqual(points, [[10, v['newest_gap_policy_ce']]])
+
+    def test_export_recalibrates_ema_norm_statistics(self):
+        """The raw model drifts (here: perturbed weights) after the EMA was taken. The exported EMA must carry norm
+        statistics of its own weights, so its eval-mode losses match its train-mode (batch statistics) losses,
+        which the raw model's statistics do not achieve. Calibration rows are drawn with the training recency."""
+        torch.set_num_threads(2)
+        torch.manual_seed(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x', games=12)
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=16, validation_fraction=0., recency=.5))
+            learner = dense_learn.Learner(run, config.learner, config)
+            window = dense_data.ReplayWindow(run, 1000, 10)
+            rng, s = np.random.default_rng(3), learner.settings
+            batch = dense_data.collate(*dense_data.examples(window, window.sample(rng, 64), rng, **dense_data.target_options(s)))
+            learner.model.train()
+            with torch.no_grad():
+                for p in learner.model.parameters():
+                    p.normal_().mul_(.3)
+                learner.ema = copy.deepcopy(learner.model)
+                for p in learner.model.parameters():
+                    p.add_(torch.randn_like(p)*.3)
+                for _ in range(20):
+                    dense_learn.batch_losses(learner.model, batch, None, learner.device, learner.memory_format, False)
+            dense_learn.update_ema(learner.ema, learner.model, .999)
+
+            def gap(model):
+                with torch.no_grad():
+                    losses = [dense_learn.batch_losses(copy.deepcopy(model).train(mode), batch, None, learner.device,
+                                                       learner.memory_format, False)[:2] for mode in (False, True)]
+                return float((losses[0]-losses[1]).abs().max())
+            copied = copy.deepcopy(learner.ema)
+            for e, m in zip(copied.buffers(), learner.model.buffers()):
+                e.copy_(m)
+            with unittest.mock.patch.object(window, 'sample', wraps=window.sample) as sample:
+                learner.export(window)
+            self.assertTrue(sample.call_args_list and all(c.args[2] == .5 for c in sample.call_args_list))
+            ema = hexnet.load_model(run/'checkpoints'/'main'/'000000'/'ema.pt')
+            self.assertGreater(gap(copied), .05)
+            self.assertLess(gap(ema), .01)
+            self.assertEqual(learner.ema.blocks[0].norm1.momentum, .1)
 
     def test_export_without_held_out_games(self):
         """No held-out game in the window: metrics.validation stays null, the sources are still reported, and the

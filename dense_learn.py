@@ -6,7 +6,9 @@ learner (effective LearnerSettings), model (ModelSettings), copied_from}. Events
 export, info, error or replace. league.json is read for population replacement, never written. metrics/learner-
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
 falls on every tenth step) and one per export with validation_fields(metrics) of the manifest (Learner.export): EMA
-losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets).
+losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets). The EMA
+averages parameters only; each export first recomputes its norm statistics (Learner.recalibrate), since the
+raw model's running statistics do not describe the EMA weights.
 
 Every target is derived here from episodes (dense_data.examples), so td_lambda, bootstrap_weight and
 short_value_horizon are learner settings; batches are rendered by dense_data.Renderers worker processes
@@ -38,6 +40,7 @@ from train import write_json
 HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'opponent_ce', 'future_bce')
 WEIGHTS = ('policy_weight', 'value_weight', 'short_weight', 'next_weight', 'future_weight')
 VALIDATION_ROWS = 2048
+RECALIBRATION_ROWS = 4096
 QUANTUM = 16  # bucket rows are padded to a multiple of this
 STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
@@ -126,8 +129,6 @@ def make_optimizer(model, s):
 @torch.no_grad()
 def update_ema(ema, model, decay):
     torch._foreach_lerp_(list(ema.parameters()), list(model.parameters()), 1-decay)
-    for e, m in zip(ema.buffers(), model.buffers()):
-        e.copy_(m)
 
 
 def perturb(settings, factor_rng, amount):
@@ -226,6 +227,26 @@ class Learner:
         self.samples_seen += sum(len(b['counts']) for b in batch.values())
         return losses
 
+    def recalibrate(self, window):
+        """Set the EMA's norm running statistics to their cumulative mean over train-mode passes on
+        RECALIBRATION_ROWS training rows of the window, drawn like training batches (recency) with a fixed seed."""
+        if not window.index:
+            return
+        norms = [m for m in self.ema.modules() if isinstance(m, hexnet.MaskedNorm)]
+        momenta = [m.momentum for m in norms]
+        for m in norms:
+            m.reset_running_stats(); m.momentum = None
+        self.ema.train()
+        rng, s = np.random.default_rng([self.config.seed, 1]), self.settings
+        with torch.no_grad():
+            for _ in range(math.ceil(RECALIBRATION_ROWS/s.batch)):
+                refs = window.sample(rng, s.batch, s.recency)
+                batch = dense_data.collate(*dense_data.examples(window, refs, rng, **dense_data.target_options(s)))
+                batch_losses(self.ema, batch, None, self.device, self.memory_format, False)
+        for m, momentum in zip(norms, momenta):
+            m.momentum = momentum
+        self.ema.eval()
+
     def validate(self, window):
         """EMA losses (eval mode) on VALIDATION_ROWS held-out rows with a fixed sampling seed; None without held-out rows."""
         if not window.validation:
@@ -272,7 +293,7 @@ class Learner:
 
     def export(self, window, sets=None):
         """Write checkpoints/<variant>/<step:06d>/ atomically (staged in a hidden sibling, then renamed).
-        metrics.validation is validate(window) (the HEADS; null without held-out rows in the window) and
+        The EMA is recalibrated first; metrics.validation is validate(window) (the HEADS; null without held-out rows in the window) and
         metrics.validation_sources is validate_sources(sets) (null without `sets`)."""
         s = self.settings
         root = self.run/'checkpoints'/s.variant
@@ -280,6 +301,7 @@ class Learner:
         final, stage = root/f'{self.step:06d}', root/f'.pending-{self.step:06d}'
         if final.exists():
             raise FileExistsError(f'{final} already exists')
+        self.recalibrate(window)
         validation, sources = self.validate(window), None if sets is None else self.validate_sources(sets)
         shutil.rmtree(stage, ignore_errors=True); stage.mkdir()
         hexnet.save_model(stage/'model.pt', self.model)
