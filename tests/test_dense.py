@@ -925,6 +925,21 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertTrue(sets.subsets['newest', 'train'])
             self.assertTrue(all(r.episode['actor'] == 'y' for r in sets.subsets['newest', 'train']))
 
+    def test_retained_state_is_bounded(self):
+        """Many shards: full subsets stop consuming shards, and per shard only actor row counts are kept."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            sets = dense_data.ValidationSets(run, .5, 5, limit=6, quota=3)
+            for k in range(12):
+                source_shard(run/'shards'/f'{1000000000001+k}', k, 'x', checkpoint='main/000010')
+                sets.refresh()
+            self.assertEqual({k: len(p) for k, p in sets.picks.items() if k[0] != 'converted'},
+                             {(s, split): 6 for s in ('fresh', 'newest') for split in ('held', 'train')})
+            self.assertLessEqual(max(len(w) for w in sets.walked.values()), 6)
+            self.assertLessEqual(len(sets.entries), 2*6*len(sets.picks))
+            self.assertEqual(sorted(sets.actors), [f'{1000000000001+k}' for k in range(12)])
+            self.assertTrue(all(list(c) == ['x'] for c in sets.actors.values()))
+
     def test_newest_change_selects_a_cached_successor(self):
         """A row cached only as a chosen row's next-ply successor can be chosen after the newest actor changes."""
         with tempfile.TemporaryDirectory() as tmp:

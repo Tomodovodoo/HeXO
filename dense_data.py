@@ -289,29 +289,37 @@ class ValidationSets:
     such actor shard, the one first published latest as a manifest `actor` (unpublished ones rank oldest; ties go
     to the most rows). A shard written right after a checkpoint switch can hold only the previous model's games,
     so its manifest `actor` alone would leave the subset empty. `newest_checkpoint` is the identity `checkpoint`
-    of the first shard published by the newest actor (None when it never published one). Each source has a 'held' subset of full-search rows of games selected
-    by holdout(episode, fraction) and a 'train' subset of full-search rows of the other games. A subset walks
+    of the first shard published by the newest actor (None when it never published one). Each source has a 'held'
+    subset of full-search rows of games selected by holdout(episode, fraction) and a 'train' subset of full-search rows of the other games. A subset walks
     its source's shards in name order and takes from each at most `quota` rows, in the order of a permutation
     seeded by (seed, crc32(shard name)), until it holds `limit` rows. Shards are immutable and named in
     creation order, so a subset only grows, by rows of newer shards, until it is full, and a restart rebuilds
     it exactly; the 'newest' subsets start over when the newest actor changes. refresh() updates them.
     `subsets[source, split]` lists Refs; policy, value_targets and following serve examples() like
-    ReplayWindow. Only the chosen rows, their next-ply rows and their episodes stay in memory.
+    ReplayWindow. Retained between refreshes: the chosen rows with their next-ply rows and episodes, the names
+    of the shards each subset has consumed, and per scanned shard its full-search row count per episode actor
+    (`actors`); a shard's row candidates live for one refresh, so a new newest actor rescans the shards it
+    played.
     """
 
     def __init__(self, run_dir, fraction, seed, limit=1024, quota=64):
         self.run_dir, self.fraction, self.seed, self.limit, self.quota = Path(run_dir), fraction, seed, limit, quota
-        self.manifests = {}; self.candidates = {}; self.entries = {}; self.following_index = {}
+        self.manifests = {}; self.actors = {}; self.entries = {}; self.following_index = {}
         self.subsets = {(source, split): [] for source in SOURCES for split in ('held', 'train')}
+        self.picks = {key: [] for key in self.subsets}; self.walked = {key: set() for key in self.subsets}
         self.newest = self.newest_checkpoint = None
 
-    def scan(self, name):
-        """Cache a shard's full-search rows as permuted (index, held, actor) candidates."""
-        episodes, rows = read_shard(self.run_dir/'shards'/name)
-        full = [i for i, r in enumerate(rows) if len(r['policy'])]
-        held = [holdout(e, self.fraction) for e in episodes]
-        order = np.random.default_rng([self.seed, zlib.crc32(name.encode())]).permutation(len(full))
-        self.candidates[name] = [(i, held[rows[i]['game']], episodes[rows[i]['game']]['actor']) for i in (full[k] for k in order)]
+    def scan(self, name, scanned):
+        """A shard's full-search rows as permuted (index, held, actor) candidates, kept in `scanned` (one
+        refresh); records the shard's full-search rows per episode actor in `actors`."""
+        if name not in scanned:
+            episodes, rows = read_shard(self.run_dir/'shards'/name)
+            full = [i for i, r in enumerate(rows) if len(r['policy'])]
+            held = [holdout(e, self.fraction) for e in episodes]
+            order = np.random.default_rng([self.seed, zlib.crc32(name.encode())]).permutation(len(full))
+            scanned[name] = [(i, held[rows[i]['game']], episodes[rows[i]['game']]['actor']) for i in (full[k] for k in order)]
+            self.actors[name] = Counter(a for _, _, a in scanned[name])
+        return scanned[name]
 
     def refresh(self):
         """Rescan shard manifests and extend (for a new newest actor, rebuild) every subset."""
@@ -323,30 +331,34 @@ class ValidationSets:
         published = {}
         for n in actors:
             published.setdefault(self.manifests[n]['actor'], (len(published), self.manifests[n]['identity'].get('checkpoint')))
+        scanned, previous = {}, self.newest
         for name in reversed(actors):
-            if name not in self.candidates:
-                self.scan(name)
-            rows = Counter(a for _, _, a in self.candidates[name])
+            if name not in self.actors:
+                self.scan(name, scanned)
+            rows = self.actors[name]
             if rows:
                 self.newest = max(rows, key=lambda a: (published.get(a, (-1,))[0], rows[a]))
                 self.newest_checkpoint = published.get(self.newest, (None, None))[1]
                 break
-        played = lambda n: self.newest in self.manifests[n]['identity'].get('actors', [self.manifests[n]['actor']])
+        if self.newest != previous:
+            for split in ('held', 'train'):
+                self.picks['newest', split], self.walked['newest', split] = [], set()
+        played = lambda n: self.actors[n][self.newest] > 0 if n in self.actors else \
+            self.newest in self.manifests[n]['identity'].get('actors', [self.manifests[n]['actor']])
         shards = dict(converted=[n for n in names if origin(self.manifests[n]) == 'converted'], fresh=actors,
                       newest=[n for n in actors if played(n)])
-        picks = {}
-        for source, split in self.subsets:
-            chosen = []
+        for (source, split), chosen in self.picks.items():
+            walked = self.walked[source, split]
             for name in shards[source]:
                 if len(chosen) >= self.limit:
                     break
-                if name not in self.candidates:
-                    self.scan(name)
-                rows = [i for i, h, a in self.candidates[name] if h == (split == 'held') and (source != 'newest' or a == self.newest)]
+                if name in walked:
+                    continue
+                rows = [i for i, h, a in self.scan(name, scanned) if h == (split == 'held') and (source != 'newest' or a == self.newest)]
                 chosen += [(name, i) for i in rows[:min(self.quota, self.limit-len(chosen))]]
-            picks[source, split] = chosen
+                walked.add(name)
         entries, following, missing = {}, {}, {}
-        for name, i in {key for chosen in picks.values() for key in chosen}:
+        for name, i in {key for chosen in self.picks.values() for key in chosen}:
             if (name, i) in self.following_index:    # cached as a chosen row, not only as a successor
                 following[name, i] = j = self.following_index[name, i]
                 entries.update({(name, k): self.entries[name, k] for k in (i, j) if k is not None})
@@ -363,7 +375,7 @@ class ValidationSets:
                         row = {key: v for key, v in rows[k].items() if key != 'policy'}
                         entries[name, k] = (row, episodes[row['game']], rows[k]['policy'].copy())
         self.entries, self.following_index = entries, following
-        self.subsets = {key: [self.ref(*k) for k in chosen] for key, chosen in picks.items()}
+        self.subsets = {key: [self.ref(*k) for k in chosen] for key, chosen in self.picks.items()}
 
     def ref(self, name, i):
         row, episode, _ = self.entries[name, i]
