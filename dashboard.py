@@ -449,29 +449,33 @@ def evaluation_timing(run, evaluator, now):
     - mean_placements(type): the current comparison's mean_placements when it has that type, else the pooled
       mean of the newest HISTORY_REPORTS reports of that type (`report_placements`), else PLACEMENT_SHARE *
       max_plies; mean_source names which ('comparison', 'reports', 'default') for the current type.
-    - rate(type), placements per playing second: the current placements_per_second when the comparison has
-      that type, else placements / seconds of the newest match event of that type, else the current rate.
     - Games are played in rounds of settings.games (the last one shorter). A round of n games runs
-      min(processes, n // 2) workers, which the Pacer charges per playing second, so its playing time becomes
-      wall time divided by min(1, eval_share / workers), the Pacer's long-run ceiling.
+      workers(n) = min(processes, n // 2) workers, which the Pacer charges per playing second, so its playing
+      time becomes wall time divided by min(1, eval_share / workers(n)), the Pacer's long-run ceiling.
+    - rate(type), placements per playing second of one worker: the current placements_per_second /
+      workers(round_games) when the comparison has that type, else placements / worker_seconds of the newest
+      match event of that type, else the current one; a round of n games plays at rate * workers(n).
     elapsed: seconds since the comparison's started_at; expected: elapsed plus the wall time of the placements
     left to its planned games: (round_first + round_games) * mean_placements - placements_played in the
     current round, then later rounds up to games_planned; SPRT may stop earlier, so expected is the cap. Both
     are None unless the stage is 'playing' or 'throttled' with a started_at. playing_fraction: the divisor of a
     full round.
     eval_seconds: wall time of one candidate's full evaluation from its first round: sprt_max_games vs the
-    champion plus, with anchor_on_promotion, anchor_games vs Seal (the candidate is assumed promoted). release_seconds: export_steps
-    (the step gap of the newest two checkpoints of the comparison's variant, else main) * seconds_per_step;
-    ratio = eval_seconds / release_seconds."""
+    champion plus, with anchor_on_promotion, anchor_games vs Seal (the candidate is assumed promoted).
+    release_seconds: export_steps (the step gap of the newest two checkpoints of the comparison's variant, else
+    main) * seconds_per_step; ratio = eval_seconds / release_seconds."""
     settings = evaluator.get('settings')
     if not isinstance(settings, dict): return None
     comparison = evaluator.get('comparison') if isinstance(evaluator.get('comparison'), dict) else {}
     current = comparison.get('opponent') == 'seal' if comparison else None
-    pps = evaluator.get('placements_per_second') if finite(evaluator.get('placements_per_second')) and evaluator['placements_per_second'] > 0 else None
     share = settings.get('eval_share') if finite(settings.get('eval_share')) and 0 < settings['eval_share'] <= 1 else 1.
     size, processes = max(2, settings.get('games') or 2), max(1, evaluator.get('processes') or 1)
-    fraction = lambda n: min(1., share/max(1, min(processes, n//2)))  # playing share of wall time in a round of n games
+    workers = lambda n: max(1, min(processes, n//2))
+    fraction = lambda n: min(1., share/workers(n))  # playing share of wall time in a round of n games
     rounds = lambda games: [min(size, games-k) for k in range(0, max(0, games), size)]
+    seconds = lambda placements, n, speed: placements/(speed*workers(n))/fraction(n)  # wall time in a round of n games
+    pps = evaluator.get('placements_per_second')
+    pps = pps/workers(evaluator.get('round_games') or size) if finite(pps) and pps > 0 else None
     reports = report_placements(run)
     def mean(seal):
         if seal == current and finite(evaluator.get('mean_placements')): return evaluator['mean_placements'], 'comparison'
@@ -479,14 +483,14 @@ def evaluation_timing(run, evaluator, now):
         if newest: return sum(r[3] for r in newest)/sum(r[2] for r in newest), 'reports'
         return PLACEMENT_SHARE*(settings.get('max_plies') or 0), 'default'
     events = [e for e in read_jsonl(run/'events.jsonl') if e.get('source') == 'evaluator' and e.get('kind') == 'match'
-              and finite(e.get('placements')) and finite(e.get('seconds')) and e['placements'] > 0 and e['seconds'] > 0]
+              and finite(e.get('placements')) and finite(e.get('worker_seconds')) and e['placements'] > 0 and e['worker_seconds'] > 0]
     def rate(seal):
         if seal == current and pps: return pps
         newest = [e for e in events if (e.get('opponent') == 'seal') == seal]
-        return newest[-1]['placements']/newest[-1]['seconds'] if newest else pps
+        return newest[-1]['placements']/newest[-1]['worker_seconds'] if newest else pps
     def wall(games, seal):
         speed = rate(seal)
-        return sum(n*mean(seal)[0]/speed/fraction(n) for n in rounds(games)) if speed else None
+        return sum(seconds(n*mean(seal)[0], n, speed) for n in rounds(games)) if speed else None
     out = dict(elapsed=None, expected=None, mean_placements=None, mean_source=None)
     if comparison and evaluator.get('stage') in ('playing', 'throttled') and finite(evaluator.get('started_at')):
         placements, source = mean(current)
@@ -495,8 +499,8 @@ def evaluation_timing(run, evaluator, now):
         left = max(0., (first+count)*placements-(evaluator.get('placements_played') or 0))
         out.update(elapsed=max(0., now-evaluator['started_at']), mean_placements=placements, mean_source=source)
         if speed:
-            out['expected'] = out['elapsed']+left/speed/fraction(count)+sum(
-                n*placements/speed/fraction(n) for n in rounds(planned-first-count))
+            out['expected'] = out['elapsed']+seconds(left, count, speed)+sum(
+                seconds(n*placements, n, speed) for n in rounds(planned-first-count))
     model, anchor = wall(settings.get('sprt_max_games') or 0, False), wall(settings.get('anchor_games') or 0, True)
     eval_seconds = None if model is None else model+(anchor if anchor and settings.get('anchor_on_promotion', True) else 0.)
     variant = comparison['candidate'].split('/')[0] if isinstance(comparison.get('candidate'), str) else 'main'

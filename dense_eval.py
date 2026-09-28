@@ -521,8 +521,9 @@ class Evaluator:
     mean_placements (placements per game over the games of the comparison's finished rounds, null before
     any), placements_per_second (current round, both sides, all processes), settings (the effective
     EvaluationSettings), backlog (unrated checkpoint ids at the last step), processes, eval_share_used
-    (Pacer.used), vram (hexnet.vram() of this process; `pairs` workers are not included), error}. Match
-    events carry seconds and placements: the playing time and placements of the rounds this process added."""
+    (Pacer.used), vram (hexnet.vram() of this process; `pairs` workers are not included), error}. A round of
+    n games runs min(processes, n // 2) workers. Match events carry seconds, worker_seconds (seconds times the
+    round's workers) and placements over the rounds this process added."""
 
     def __init__(self, run, config, settings, pacer, processes=1):
         self.run, self.config, self.settings, self.pacer, self.processes = Path(run), config, settings, pacer, processes
@@ -587,11 +588,11 @@ class Evaluator:
 
     def round(self, cid, opponent, kind, planned):
         """After pacing, play the next min(games, planned - played) games of cid vs opponent, opening pairs
-        numbered on from earlier rounds; returns the comparison's {records, seconds, placements} so far (seconds
-        and placements of the rounds this process played, started_at from its first). A champion round
+        numbered on from earlier rounds; returns the comparison's {records, seconds, worker_seconds, placements}
+        so far (over the rounds this process played, started_at from its first). A champion round
         is not started once a newer checkpoint of the variant exists, nor an optional round while any
         checkpoint is unrated."""
-        done = self.partial.setdefault((cid, opponent), dict(records=[], seconds=0., placements=0))
+        done = self.partial.setdefault((cid, opponent), dict(records=[], seconds=0., worker_seconds=0., placements=0))
         records, placed = done['records'], placements(done['records'])
         count = min(self.settings.games, planned-len(records))
         comparison = lambda stage: self.publish(
@@ -613,8 +614,10 @@ class Evaluator:
                                  len(records)//2, count, self.seal, heartbeat)
         else:
             results = self.spread(cid, opponent, len(records)//2, count, heartbeat)
-        self.pacer.played(start, self.pacer.clock(), min(self.processes, count//2))
-        done['seconds'] += self.pacer.clock()-start
+        workers, seconds = min(self.processes, count//2), self.pacer.clock()-start
+        self.pacer.played(start, start+seconds, workers)
+        done['seconds'] += seconds
+        done['worker_seconds'] += workers*seconds
         for record in results:
             if record['reason'] == 'span':
                 log_event(self.run, 'evaluator', 'error', f'{cid} vs {opponent} pair {record["pair"]}: game counted as '
@@ -668,7 +671,7 @@ class Evaluator:
         log_event(self.run, 'evaluator', 'match', f'{cid} vs {opponent}: +{s["wins"]} -{s["losses"]} ={s["capped"]}'
                   + (f' (SPRT {test["decision"]}, LLR {test["llr"]:.2f})' if test else ''),
                   candidate=cid, opponent=opponent, comparison=kind, **s, sprt=test, seconds=done['seconds'],
-                  placements=done['placements'])
+                  worker_seconds=done['worker_seconds'], placements=done['placements'])
         return report
 
     def extend(self, a, b, kind, count):
@@ -679,7 +682,7 @@ class Evaluator:
         old = json.loads(path.read_text()) if path.exists() else None
         if old and not same_protocol(old, self.settings):
             raise ValueError(f'{path} was played under another protocol')
-        done = self.partial.setdefault((a, b), dict(records=list(old['games']) if old else [], seconds=0., placements=0))
+        done = self.partial.setdefault((a, b), dict(records=list(old['games']) if old else [], seconds=0., worker_seconds=0., placements=0))
         before = len(done['records'])
         self.round(a, b, kind, before+min(self.settings.games, count))
         if len(done['records']) == before:
@@ -696,7 +699,7 @@ class Evaluator:
         log_event(self.run, 'evaluator', 'match', f'{a} vs {b} ({kind}): +{s["wins"]} -{s["losses"]} ={s["capped"]}'
                   + (f' (SPRT {test["decision"]}, LLR {test["llr"]:.2f})' if test else ''),
                   candidate=a, opponent=b, comparison=kind, **s, sprt=test, seconds=done['seconds'],
-                  placements=done['placements'])
+                  worker_seconds=done['worker_seconds'], placements=done['placements'])
         return report
 
     def entry(self, cid):
