@@ -96,12 +96,6 @@ def orbit(moves):
     return len({tuple(frozenset(map(tuple, turn.tolist())) for turn in turns(points @ m)) for m in hexcrop.SYMMETRIES})
 
 
-def orderings(moves):
-    """Every play order of `moves` that permutes stones within a turn only."""
-    return [[tuple(p) for turn in order for p in turn]
-            for order in itertools.product(*(itertools.permutations(map(tuple, t)) for t in turns(list(moves))))]
-
-
 def policy(model, histories):
     """[({(q, r): probability}, P1 value)] of `model` (a dense_selfplay.Model) at each history: its policy and its
     value head's expected score for player 0."""
@@ -116,14 +110,28 @@ def policy(model, histories):
 
 
 def reach(model, positions):
-    """Per position (a move list), (probability, P1 value): the probability that `model`'s policy plays into its class,
-    summed over the play orders of `orderings` and multiplied by its `orbit` (the policy taken as symmetric; the
-    origin placement has probability 1), and the value head's P1 expected score at it."""
-    orders = [orderings(m) for m in positions]
-    prefixes = list(dict.fromkeys(tuple(o[:k]) for os in orders for o in os for k in range(1, len(o)+1)))
-    table = dict(zip(prefixes, policy(model, prefixes)))
-    return [(orbit(m)*sum(math.prod(table[tuple(o[:k])][0].get(o[k], 0.) for k in range(1, len(o))) for o in os),
-             table[tuple(os[0])][1]) for m, os in zip(positions, orders)]
+    """Per position (a move list), (probability, P1 value): the probability that `model`'s policy plays into its class
+    and the value head's P1 expected score at it. The probability is a product over turns of the turn's probability
+    summed over its (at most two) placement orders, times the class's `orbit` (the policy taken as symmetric; the
+    origin placement has probability 1). Summing per turn is exact because a finished turn's order is not part of the
+    network's input (hexcrop planes), so later turns do not depend on it; each turn is evaluated after the earlier
+    turns in their stored order."""
+    steps = []  # per position, per turn: [(history, placement) per order of the turn]
+    for m in positions:
+        m = [tuple(p) for p in m]
+        per, played = [], 1
+        for turn in turns(m)[1:]:
+            head = m[:played]
+            per.append([[(tuple(head+list(order[:i])), order[i]) for i in range(len(order))]
+                        for order in itertools.permutations(turn)])
+            played += len(turn)
+        steps.append(per)
+    histories = list(dict.fromkeys([h for per in steps for orders in per for order in orders for h, _ in order]
+                                   + [tuple(tuple(p) for p in m) for m in positions]))
+    table = dict(zip(histories, policy(model, histories)))
+    return [(orbit(m)*math.prod(sum(math.prod(table[h][0].get(move, 0.) for h, move in order) for order in orders)
+                                for orders in per), table[tuple(tuple(p) for p in m)][1])
+            for m, per in zip(positions, steps)]
 
 
 def tempered(p, temperature):
@@ -296,13 +304,17 @@ class Book:
 
     def draw(self, seed):
         """The moves of an opening drawn by `seed`: in proportion to `weight` in a frozen book, else uniformly, or with
-        book_weighting 'least_played' in proportion to 1 / (1 + its pairs). ValueError without openings."""
+        book_weighting 'least_played' in proportion to 1 / (1 + its pairs); played in one of the 12 symmetric
+        orientations, chosen uniformly by `seed`, so every image of a class is equally likely (a frozen weight of
+        orbit size makes every physical opening equally likely). ValueError without openings."""
         openings = self.openings()
         if not openings:
             raise ValueError(f'{self.path} has no opening; the evaluator refreshes a live book once a champion exists')
         w = np.array([n['weight'] if self.frozen else 1/(1+n['skew']['pairs']) if self.settings.book_weighting == 'least_played'
                       else 1. for n in openings], np.float64)
-        return [list(m) for m in openings[np.random.default_rng(seed).choice(len(openings), p=w/w.sum())]['moves']]
+        rng = np.random.default_rng(seed)
+        moves = np.array(openings[rng.choice(len(openings), p=w/w.sum())]['moves'], np.int64)
+        return (moves @ hexcrop.SYMMETRIES[rng.integers(len(hexcrop.SYMMETRIES))]).tolist()
 
     def add(self, moves, now):
         """The node of `moves`, adding it and its missing prefix nodes."""

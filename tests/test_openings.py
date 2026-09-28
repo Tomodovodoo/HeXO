@@ -69,6 +69,12 @@ def opening(book, moves, pairs=(0, 0, 0, 0, 0)):
     return node
 
 
+def orders(moves):
+    """Every play order of `moves` that permutes stones within a turn only."""
+    return [[tuple(p) for turn in order for p in turn] for order in
+            itertools.product(*(itertools.permutations(map(tuple, t)) for t in dense_openings.turns(list(moves))))]
+
+
 class CanonicalTests(unittest.TestCase):
     def test_every_symmetric_image_and_turn_order_has_one_key(self):
         rng = np.random.default_rng(0)
@@ -80,12 +86,12 @@ class CanonicalTests(unittest.TestCase):
             self.assertEqual(dense_openings.canonical(representative), (key, representative))
             for m in hexcrop.SYMMETRIES:
                 image = [tuple(int(v) for v in np.array(p) @ m) for p in moves]
-                for order in dense_openings.orderings(image):
+                for order in orders(image):
                     self.assertEqual(dense_openings.canonical(order)[0], key)
         self.assertEqual(dense_openings.orbit([(0, 0)]), 1)
         self.assertEqual(dense_openings.orbit([(0, 0), (1, 0), (-1, 0)]), 3)    # a line through the origin: 3 axes
         self.assertEqual(dense_openings.orbit([(0, 0), (1, 0), (2, 0)]), 6)
-        self.assertEqual(len(dense_openings.orderings([(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)])), 4)
+
         # The same stones split differently between turns are different positions.
         self.assertNotEqual(dense_openings.canonical([(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)])[0],
                             dense_openings.canonical([(0, 0), (1, 0), (0, 1), (2, 0), (0, 2)])[0])
@@ -317,6 +323,16 @@ class GenerationTests(unittest.TestCase):
         torch.manual_seed(3)
         self.model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', CHAMPION, 'cpu', 64, 256)
 
+    def test_reach_per_turn_equals_the_sum_over_every_play_order(self):
+        moves = [(0, 0), (1, 0), (2, -1), (0, 1), (-1, 2), (3, 0), (1, 1)]
+        histories = list(dict.fromkeys(tuple(o[:k]) for o in orders(moves) for k in range(1, len(moves))))
+        policy = dict(zip(histories, dense_openings.policy(self.model, histories)))
+        brute = dense_openings.orbit(moves)*sum(math.prod(policy[tuple(o[:k])][0].get(o[k], 0.) for k in range(1, len(o)))
+                                                for o in orders(moves))
+        [(p, value)] = dense_openings.reach(self.model, [moves])
+        self.assertAlmostEqual(p, brute, delta=1e-6*brute)
+        self.assertAlmostEqual(value, dense_openings.policy(self.model, [moves])[0][1])
+
     def test_search_and_policy_generation_with_a_tiny_model(self):
         for sims in (2, 0):
             with tempfile.TemporaryDirectory() as run:
@@ -365,6 +381,9 @@ class FrozenTests(unittest.TestCase):
             draws = Counter(dense_openings.canonical(book.draw(seed))[0] for seed in range(4770))
             top = max(classes, key=classes.get)
             self.assertLess(abs(draws[top]-10*classes[top]), 4*math.sqrt(10*classes[top]))
+            # Each draw is played in a seed-chosen orientation: every physical image of a class turns up.
+            images = {frozenset(map(tuple, m[1:])) for m in map(book.draw, range(4770)) if dense_openings.canonical(m)[0] == top}
+            self.assertEqual(len(images), classes[top])
             self.assertFalse(book.path.exists())                                # nothing written before a record
             book.record(pair(book.openings()[0]['moves'], 1))
             self.assertEqual(json.loads(book.path.read_text())['nodes'][0]['games'], 2)
