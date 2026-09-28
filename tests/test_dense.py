@@ -1065,8 +1065,12 @@ class EvaluatorLoopTests(unittest.TestCase):
 
     def test_worker_processes_play_the_same_games(self):
         self.export(10, 30)
-        rounds = [self.start(processes, games=6, max_plies=16).round('main/000030', 'main/000010', 'previous', 6)['records']
-                  for processes in (1, 2)]
+        rounds = []
+        for processes in (1, 2):
+            evaluator = self.start(processes, games=6, max_plies=16)
+            evaluator.league['checkpoints'] = [dict(id=cid, variant='main', step=int(cid.split('/')[1]), elo=None,
+                                                    elo_interval=None, matches=[]) for cid in ('main/000010', 'main/000030')]
+            rounds.append(evaluator.round('main/000030', 'main/000010', 'previous', 6)['records'])
         self.assertEqual([r['pair'] for r in rounds[1]], [0, 0, 1, 1, 2, 2])
         self.assertEqual(rounds[0], rounds[1])
 
