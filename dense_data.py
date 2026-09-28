@@ -2,7 +2,8 @@
 
 A shard is an immutable directory `<run>/shards/<name>/` (all digits; converted corpora use six, actors use
 millisecond time plus pid) holding
-  episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search, actors?, opponent?}]
+  episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search, actors?, opponent?,
+                  trained_side?}]
   rows.json      [{game, ply, player, remaining, target, weight, legal_sha256}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
@@ -13,9 +14,9 @@ for capped games ('cap' at the ply limit, 'span' when a searched position does n
 move at that ply, or null). The learner derives every target from the episode (`examples`); the stored
 `row.target`/`row.weight` (p(win) or null, weight) are informational and optional.
 `episode.actor` is the sha256 of the evaluator being trained. Actor shards also record `actors` {"0": sha, "1": sha}
-per colour and `opponent` (null for self-play, else the checkpoint id of a frozen historical opponent, whose sha
-differs from `actor`). Every ply keeps a row so ply indexing stays contiguous, but a ply of the opponent's colour
-(`trained` False) has no policy, a null root value and full_search False; it never enters the replay window and
+per colour, `opponent` (null for self-play, else the checkpoint id of a frozen historical opponent) and
+`trained_side` (null for self-play, else the colour the trained evaluator played). Every ply keeps a row so ply
+indexing stays contiguous, but a ply of the opponent's colour (`trained` False) has no policy, a null root value and full_search False; it never enters the replay window and
 does not count toward `total_rows`.
 """
 from collections import namedtuple
@@ -60,9 +61,9 @@ def holdout(episode, fraction):
 
 
 def trained(episode, ply):
-    """Whether `ply` was played by the evaluator being trained (always, unless the episode records per-colour actors)."""
-    actors = episode.get('actors')
-    return actors is None or actors[str(player_at(ply))] == episode['actor']
+    """Whether `ply` was played by the evaluator being trained: every ply unless the episode records a `trained_side`."""
+    side = episode.get('trained_side')
+    return side is None or player_at(ply) == side
 
 
 def value_targets(players, root_values, winner, lam=.9, full=None):

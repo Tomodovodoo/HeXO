@@ -376,7 +376,7 @@ class SelfPlayGame:
     def searched(self, result):
         game, actions = self.game, result['actions']
         player, ply = game.player, len(self.moves)
-        trained = self.sides[player] is self.sides[self.learner]
+        trained = self.opponent is None or player == self.learner
         row = dict(ply=ply, player=player, remaining=game.remaining, legal_sha256=dense_data.legal_digest(actions),
                    policy=None)
         policy = result['policy']
@@ -410,12 +410,14 @@ class SelfPlayGame:
         return dict(moves=self.moves, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
                     opening_plies=min(self.random_plies, len(self.moves)), actor=self.sides[self.learner].sha,
                     actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
+                    trained_side=None if self.opponent is None else self.learner,
                     root_values=self.values, full_search=self.full), self.rows
 
 
 class Historical:
-    """Frozen historical opponents of one actor worker. `redraw(champion)` re-reads league.json, draws
-    `historical_pool` opponents (draw_pool over opponent_weights; rated checkpoints with an ema.pt) and loads their
+    """Frozen historical opponents of one actor worker. `redraw(champion, sha)` re-reads league.json, draws
+    `historical_pool` opponents (draw_pool over opponent_weights; rated checkpoints with an ema.pt whose league
+    ema_sha256 differs from the champion's `sha`) and loads their
     ema.pt, keeping models drawn again; `next()` returns (opponent Model, champion colour) for the next historical
     game: opponents come in blocks of about target/BLOCKS consecutive games, so few opponent models share the
     Engine at once, and the champion's colour alternates over historical games only. `target` is the number of
@@ -429,11 +431,12 @@ class Historical:
         self.block = max(1, math.ceil(self.target/BLOCKS))
         self.models, self.weights, self.plan, self.started = {}, {}, deque(), 0
 
-    def redraw(self, champion):
+    def redraw(self, champion, sha):
         path = self.run/'league.json'
         league = json.loads(path.read_text()) if path.exists() else {}
+        same = {c['id'] for c in league.get('checkpoints', []) if c.get('ema_sha256') == sha}
         weights = {k: w for k, w in opponent_weights(league, champion, self.config.actor.historical_weighting).items()
-                   if (self.run/'checkpoints'/k/'ema.pt').exists()}
+                   if k not in same and (self.run/'checkpoints'/k/'ema.pt').exists()}
         pool = draw_pool(weights, self.config.actor.historical_pool, self.rng)
         self.models = {k: self.models.get(k) or load(self.run, self.config, source=(k, self.run/'checkpoints'/k/'ema.pt'))
                        for k in pool}
@@ -466,7 +469,7 @@ def worker(args):
     print(f'Worker {args.worker}: {model.checkpoint} {model.sha[:12]}', flush=True)
     historical = Historical(run, config, np.random.default_rng(seeds.spawn(1)[0]), args.games) if settings.historical_fraction > 0 else None
     if historical:
-        historical.redraw(model.checkpoint)
+        historical.redraw(model.checkpoint, model.sha)
     engine = Engine(settings.leaf_batch)
     state = dict(published(run, args.worker), error=None)
     target = None if args.games is None else args.games+state['games_completed']
@@ -526,7 +529,7 @@ def worker(args):
             log_event(run, 'actor', 'info', f'worker {args.worker} switched to {model.checkpoint} ({model.sha[:12]}); '
                       'games in progress finish with the previous model', process=args.worker)
         if historical:
-            historical.redraw(model.checkpoint)
+            historical.redraw(model.checkpoint, model.sha)
 
     try:
         last = 0.

@@ -1051,7 +1051,7 @@ class OpponentSchedulerTests(unittest.TestCase):
         config = replace(dense_config.RunConfig(), actor=dense_config.ActorSettings(games_in_flight=16, historical_fraction=.5))
         with tempfile.TemporaryDirectory() as tmp:
             historical = dense_selfplay.Historical(tmp, config, rng)
-            historical.redraw('main/000001')                          # no league yet: no opponents
+            historical.redraw('main/000001', 'a'*64)                  # no league yet: no opponents
             self.assertEqual(historical.models, {})
         self.assertEqual((historical.target, historical.block), (8, 4))
         historical.models, historical.weights = {'a': 'A', 'b': 'B'}, {'a': 1., 'b': 1.}
@@ -1064,15 +1064,33 @@ class OpponentSchedulerTests(unittest.TestCase):
         self.assertEqual(dense_selfplay.Historical('.', config, rng, games=8).target, 4)
         self.assertEqual(dense_selfplay.Historical('.', config, rng, games=100).target, 8)
 
+    def test_pool_excludes_opponents_with_the_champion_digest(self):
+        config = replace(dense_config.RunConfig(device='cpu'), model=dense_config.ModelSettings(**asdict(TINY)),
+                         actor=dense_config.ActorSettings(historical_fraction=.5))
+        with tempfile.TemporaryDirectory() as tmp:
+            for step in (1, 2):
+                path = Path(tmp)/'checkpoints'/'main'/f'{step:06d}'
+                path.mkdir(parents=True)
+                hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
+            (Path(tmp)/'league.json').write_text(json.dumps(dict(champion='main/000003', checkpoints=[
+                dict(id='main/000001', variant='main', step=1, elo=0., ema_sha256='c'*64),     # re-exported champion weights
+                dict(id='main/000002', variant='main', step=2, elo=0., ema_sha256='d'*64),
+                dict(id='main/000003', variant='main', step=3, elo=0., ema_sha256='c'*64)])))
+            historical = dense_selfplay.Historical(tmp, config, np.random.default_rng(0))
+            historical.redraw('main/000003', 'c'*64)
+            self.assertEqual(list(historical.models), ['main/000002'])
+
     def test_mixed_games_mask_the_opponent_plies(self):
         torch.manual_seed(8)
         champion = dense_selfplay.Model(hexnet.HexNet(TINY), 'c'*64, 'main/000002', 'cpu', 64, 256)
         opponent = dense_selfplay.Model(hexnet.HexNet(TINY), 'o'*64, 'main/000001', 'cpu', 64, 256)
+        twin = dense_selfplay.Model(hexnet.HexNet(TINY), 'c'*64, 'main/000001', 'cpu', 64, 256)   # same digest as the champion
         settings = dense_config.ActorSettings(full_sims=4, cheap_sims=2, root_samples=2, max_plies=14, full_fraction=.5,
                                               opening_random_plies=0.)
         games = [dense_selfplay.SelfPlayGame([champion, opponent], settings, 1, 0, 'main/000001'),
                  dense_selfplay.SelfPlayGame([opponent, champion], settings, 2, 1, 'main/000001'),
-                 dense_selfplay.SelfPlayGame([champion, champion], settings, 3)]
+                 dense_selfplay.SelfPlayGame([champion, champion], settings, 3),
+                 dense_selfplay.SelfPlayGame([twin, champion], settings, 4, 1, 'main/000001')]
         engine = dense_selfplay.Engine(64)
         for g in games:
             engine.add(g)
@@ -1085,14 +1103,15 @@ class OpponentSchedulerTests(unittest.TestCase):
             e, items = g.episode()
             episodes.append(e)
             rows += [dict(r, game=len(episodes)-1) for r in items]
-        mixed, swapped, plain = episodes
+        mixed, swapped, plain, twinned = episodes
+        self.assertEqual([e['trained_side'] for e in episodes], [0, 1, None, 1])
         self.assertEqual((mixed['actors'], mixed['actor'], mixed['opponent']), ({'0': 'c'*64, '1': 'o'*64}, 'c'*64, 'main/000001'))
         self.assertEqual((swapped['actors'], swapped['actor']), ({'0': 'o'*64, '1': 'c'*64}, 'c'*64))
         self.assertEqual((plain['actors'], plain['opponent']), ({'0': 'c'*64, '1': 'c'*64}, None))
         for g, e in enumerate(episodes):
             for r in (r for r in rows if r['game'] == g):
                 mine = dense_data.trained(e, r['ply'])
-                self.assertEqual(mine, g == 2 or dense_data.player_at(r['ply']) == [0, 1][g])
+                self.assertEqual(mine, g == 2 or dense_data.player_at(r['ply']) == [0, 1, None, 1][g])
                 if not mine:
                     self.assertIsNone(r['policy'])
                     self.assertIsNone(e['root_values'][r['ply']])
@@ -1114,7 +1133,7 @@ class OpponentSchedulerTests(unittest.TestCase):
                 if ref.episode['winner'] < 0:
                     self.assertTrue(t['value_weight'] == 0 or t['value'] is not None)
                 # The opponent's next ply never supplies an opponent-policy target.
-                if ref.row['game'] < 2 and ref.row['ply']+1 < len(ref.episode['moves']) and not dense_data.trained(ref.episode, ref.row['ply']+1):
+                if ref.row['game'] != 2 and ref.row['ply']+1 < len(ref.episode['moves']) and not dense_data.trained(ref.episode, ref.row['ply']+1):
                     self.assertEqual(t['next_weight'], 0.)
 
 
