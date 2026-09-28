@@ -331,7 +331,8 @@ class ReplayWindow:
         return None if i < 0 else self.ref(ref.shard, i)
 
     def policy(self, ref):
-        """The row's policy vector (empty when the ply had no full search)."""
+        """A copy of the row's policy vector (empty float32 when the ply had no full search); never a view, so
+        an evicted shard's arrays are freed while rendered batches still hold their rows' policies."""
         if ref.shard in self.policies:
             self.policies.move_to_end(ref.shard)
         else:
@@ -339,7 +340,8 @@ class ReplayWindow:
             while len(self.policies) > 1 and self.policy_bytes() > self.policy_budget:
                 self.policies.popitem(last=False)
         offsets, probabilities = self.policies[ref.shard]
-        return probabilities[offsets[ref.index]:offsets[ref.index+1]]
+        a, b = offsets[ref.index], offsets[ref.index+1]
+        return probabilities[a:b].copy() if b > a else np.zeros(0, np.float32)
 
     def policy_bytes(self):
         """Bytes held by the policy cache."""

@@ -896,6 +896,27 @@ class WindowMemoryTests(unittest.TestCase):
                     np.testing.assert_array_equal(tiny.policy(tiny.ref(n, i)), r['policy'])
                 self.assertEqual(list(tiny.policies), [n])
 
+    def test_held_policies_do_not_pin_evicted_shards(self):
+        import gc
+        import weakref
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 5, 6, 20)
+            window = dense_data.ReplayWindow(tmp, 10**6, 10**6, policy_cache_mb=1e-6)
+            _, _, data = reference_window(Path(tmp), 10**6, 10**6, 0.)
+            held, arrays = [], []
+            for ref in window.sample(np.random.default_rng(1), 200):
+                policy = window.policy(ref)
+                arrays += [weakref.ref(a) for a in window.policies[ref.shard]]
+                np.testing.assert_array_equal(policy, data[ref.shard][1][ref.index]['policy'])
+                self.assertEqual(policy.dtype, np.float32)
+                held.append(policy)
+            self.assertGreater(len({r.shard for r in window.sample(np.random.default_rng(1), 200)}), 1)
+            gc.collect()
+            cached = {id(a) for entry in window.policies.values() for a in entry}
+            self.assertTrue(all(r() is None or id(r()) in cached for r in arrays))
+            # A view keeps its buffer's owner (the npz member's bytes, not the array) alive: policies must own theirs.
+            self.assertTrue(all(p.base is None for p in held))
+
     def test_resident_bytes_per_row(self):
         import gc
         import tracemalloc
