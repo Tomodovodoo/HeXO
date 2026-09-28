@@ -16,7 +16,8 @@ Two kinds share one format and one code path (`Book`):
           refreshed; its statistics are kept in <run>/openings-<suite>.json. openings/standard-v1.json is
           train.opening_for's evaluation suite.
 
-File {schema, suite, frozen, refreshed_by, refreshed_at, migrated, nodes: [node]}, nodes ordered by depth then key.
+File {schema, suite, frozen, refreshed_by, refreshed_at, counted, imported, nodes: [node]}, nodes ordered by depth then
+key; counted maps `report_id` to the pairs of that report the book has counted (`Book.reconcile`).
 node {key, moves, depth, weight (frozen openings), status, reason, challenges, probability, visit_share, checkpoint,
       created_at, retired_at, champion_probability, champion_value, scored_by, games, p1_wins, p2_wins, capped, pairs,
       skew}:
@@ -57,6 +58,7 @@ ALTERNATIVES = 4    # lines sampled per generation start; the plausible one the 
 GROW_ROUNDS = 8     # generation rounds per refresh while settled openings are missing
 SCORE_BATCH = 512   # positions per policy call
 SKEW_EDGES = list(range(-200, 201, 25))  # histogram bins of `Book.stats`, the outer bins open-ended
+MAX_PLIES = 10      # longest book line: P2's sixth stone is the 11th placement, so no book position is terminal
 REASONS = ('probability', 'skew', 'replaced')
 
 
@@ -135,8 +137,11 @@ def reach(model, positions):
 
 
 def tempered(p, temperature):
-    """p^(1/temperature), normalised."""
-    w = np.asarray(p, np.float64)**(1/temperature)
+    """p^(1/temperature), normalised, computed in log space so that no temperature underflows or overflows the
+    weights; zeros keep weight 0."""
+    with np.errstate(divide='ignore'):
+        log = np.log(np.asarray(p, np.float64))/temperature
+    w = np.exp(log-log.max())
     return w/w.sum()
 
 
@@ -242,7 +247,8 @@ def book_path(run, suite):
 
 def check(settings):
     """Raise ValueError unless the opening settings are usable: opening_suite one of `suites`, opening_book empty
-    outside 'book' (the evaluator stamps it), 1 <= book_min_plies <= book_plies < max_plies, book_temperature > 0,
+    outside 'book' (the evaluator stamps it), 2 <= book_min_plies <= book_plies <= MAX_PLIES and book_plies <
+    max_plies (a one-placement opening is the empty start), book_temperature > 0,
     book_sims and book_max_skew >= 0, book_size and book_min_games >= 1, book_revisit_fraction in [0, 1],
     book_refresh_hours > 0, book_min_prob in [0, 1) and book_weighting 'uniform' or 'least_played'."""
     s = settings
@@ -250,26 +256,35 @@ def check(settings):
         raise ValueError(f'opening_suite must be one of {suites()}, not {s.opening_suite!r}')
     if s.opening_suite != LIVE and s.opening_book:
         raise ValueError("opening_book names a book state; it stays empty outside opening_suite 'book'")
-    if not 1 <= s.book_min_plies <= s.book_plies < s.max_plies or s.book_temperature <= 0 or min(s.book_sims, s.book_max_skew) < 0 \
+    if not 2 <= s.book_min_plies <= s.book_plies <= MAX_PLIES or s.book_plies >= s.max_plies or s.book_temperature <= 0 \
+            or min(s.book_sims, s.book_max_skew) < 0 \
             or min(s.book_size, s.book_min_games) < 1 or not 0 <= s.book_revisit_fraction <= 1 or s.book_refresh_hours <= 0 \
             or not 0 <= s.book_min_prob < 1 or s.book_weighting not in ('uniform', 'least_played'):
-        raise ValueError('need 1 <= book_min_plies <= book_plies < max_plies, book_temperature > 0, book_sims and '
+        raise ValueError(f'need 2 <= book_min_plies <= book_plies <= {MAX_PLIES}, book_plies < max_plies, '
+                         'book_temperature > 0, book_sims and '
                          'book_max_skew >= 0, book_size and book_min_games >= 1, book_revisit_fraction in [0, 1], '
                          "book_refresh_hours > 0, book_min_prob in [0, 1) and book_weighting 'uniform' or 'least_played'")
 
 
 def pairs_of(report):
-    """The complete colour pairs of an evaluator report: [[game, game]] grouped by pair seed."""
+    """The complete colour pairs of an evaluator report, [[game, game]] grouped by pair seed in the order the report
+    holds them (reports only append)."""
     groups = {}
     for g in report['games']:
         groups.setdefault(g['seed'], []).append(g)
     return [p for p in groups.values() if len(p) == 2]
 
 
+def report_id(report):
+    """A report's identity for `Book.reconcile`: its `id`, else (reports written before ids) candidate, opponent and
+    first pair seed."""
+    return report.get('id') or f"{report['candidate']}|{report['opponent']}|{report['games'][0]['seed'] if report['games'] else ''}"
+
+
 class Book:
     """The opening book of `suite` (default settings.opening_suite) in `run` (module contract) under EvaluationSettings
     `settings`. A missing live file is a book holding only the origin; a missing frozen file starts from the repo's
-    openings/<suite>.json. Nothing is written before `save`, `record`, `migrate` or `refresh`."""
+    openings/<suite>.json. Nothing is written before `save`, `record`, `reconcile` or `refresh`."""
 
     def __init__(self, run, settings, suite=None):
         self.settings, self.suite = settings, suite or settings.opening_suite
@@ -282,8 +297,8 @@ class Book:
                 raise ValueError(f'No frozen opening suite {self.suite!r}: {source} is missing')
             self.data = json.loads(source.read_text())
         else:
-            self.data = dict(schema=SCHEMA, suite=LIVE, frozen=False, refreshed_by=None, refreshed_at=None, migrated=False,
-                             nodes=[new_node([ORIGIN])])
+            self.data = dict(schema=SCHEMA, suite=LIVE, frozen=False, refreshed_by=None, refreshed_at=None, counted={},
+                             imported=False, nodes=[new_node([ORIGIN])])
         if self.data['schema'] != SCHEMA or self.data['suite'] != self.suite:
             raise ValueError(f'{self.path} is not a {SCHEMA} book of suite {self.suite!r}')
         self.nodes = {n['key']: n for n in self.data['nodes']}
@@ -340,31 +355,35 @@ class Book:
             node['pairs'][round(2*points)] += 1
             node['skew'] = skew(node['pairs'])
 
-    def record(self, pair):
-        """`tally` a completed colour pair (two game records of one opening, as dense_eval writes them) and rewrite the
-        file. Statuses wait for a refresh."""
+    def record(self, pair, report):
+        """`tally` a completed colour pair (two game records of one opening, as dense_eval writes them) that was just
+        appended to the report of `report_id` `report`, count it in `counted` and rewrite the file. Statuses wait for a
+        refresh."""
         self.tally(pair)
+        self.data['counted'][report] = self.data['counted'].get(report, 0)+1
         self.save()
 
-    def migrate(self, reports):
-        """Once per book file: `tally` every complete colour pair of `reports` (evaluator report dicts). A live book adds
-        the missing nodes of each opening first (status null: a refresh may make them openings); a frozen book counts
-        only the openings it holds. Returns the pairs counted."""
-        if self.data['migrated']:
-            return 0
-        counted = 0
+    def reconcile(self, reports):
+        """`tally` the pairs of `reports` (evaluator report dicts) that the book has not counted yet: per report, its
+        complete pairs beyond `counted` (so a pair written to its report but not to the book, as when the evaluator
+        stopped between the two writes, is counted once on the next start). Reports of the book's own suite count
+        always; a live book counts the reports of other suites too the first time (`imported`), adding the positions of
+        their openings (status null: a refresh may make them openings). Returns the pairs counted."""
+        added = 0
         for report in reports:
-            for pair in pairs_of(report):
-                moves = pair[0]['opening']
-                if self.frozen and canonical(moves)[0] not in self.nodes:
-                    continue
+            if report['settings'].get('opening_suite') != self.suite and (self.frozen or self.data['imported']):
+                continue
+            pairs = pairs_of(report)
+            key = report_id(report)
+            for pair in pairs[self.data['counted'].get(key, 0):]:
                 if not self.frozen:
-                    self.add(moves, self.data['refreshed_at'] or 0.)
+                    self.add(pair[0]['opening'], self.data['refreshed_at'] or 0.)
                 self.tally(pair)
-                counted += 1
-        self.data['migrated'] = True
+                added += 1
+            self.data['counted'][key] = max(len(pairs), self.data['counted'].get(key, 0))
+        self.data['imported'] = True
         self.save()
-        return counted
+        return added
 
     def score(self, model, checkpoint, nodes):
         """Set champion_probability, champion_value and scored_by of `nodes` under `model` (`reach`)."""
@@ -591,7 +610,7 @@ def main():
         from dense_selfplay import load
         model = load(args.run, replace(config, device=args.device),
                                     source=(champion, Path(args.run)/'checkpoints'/champion/'ema.pt'))
-        book.migrate(reports_of(args.run))
+        book.reconcile(reports_of(args.run))
         now = time.time()
         out = book.refresh(model, champion, np.random.default_rng(int(now)), now, config.actor.leaf_batch)
     elif args.command == 'prune':

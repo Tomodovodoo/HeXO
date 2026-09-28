@@ -108,6 +108,11 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(dense_openings.parents([(0, 0), (1, 0), (2, 0)]), sorted({key([(0, 0), (1, 0)]), key([(0, 0), (2, 0)])}))
         self.assertEqual(dense_openings.parents([(0, 0), (1, 0), (2, 0), (0, 1)]), [key([(0, 0), (1, 0), (2, 0)])])
 
+    def test_tempered_weights_survive_extreme_temperatures(self):
+        np.testing.assert_allclose(dense_openings.tempered([1e-5, 2e-5, 0.], 1e-3), [0., 1., 0.], atol=1e-12)
+        np.testing.assert_allclose(dense_openings.tempered([0., 3., 1.], .5), [0., .9, .1])
+        np.testing.assert_allclose(dense_openings.tempered([10**6, 10**6], 1e-3), [.5, .5])
+
     def test_reach_sums_turn_orders_and_images(self):
         moves = [(0, 0), (1, 0), (2, 0)]
         first = len(hexcrop.legal_array(None, np.array(moves[:1])))
@@ -148,10 +153,10 @@ class SkewTests(unittest.TestCase):
             deep = [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)]
             leaf = opening(book, deep)
             image = [[int(v) for v in np.array(p) @ hexcrop.SYMMETRIES[5]] for p in deep]
-            book.record(pair(image, 2))                                    # P1 won both
-            book.record([game(image, 0, 0), game(image, -1, 1)])           # 1.5
-            book.record(pair([(0, 0), (1, 0), (2, 0), (3, 0)], 1))         # shares the first three placements
-            book.record(pair([(0, 0), (5, 0), (6, 0)], 0))                  # not in the book
+            book.record(pair(image, 2), 'r')                               # P1 won both
+            book.record([game(image, 0, 0), game(image, -1, 1)], 'r')      # 1.5
+            book.record(pair([(0, 0), (1, 0), (2, 0), (3, 0)], 1), 'r')    # shares the first three placements
+            book.record(pair([(0, 0), (5, 0), (6, 0)], 0), 'r')             # not in the book
             saved = {n['key']: n for n in json.loads(book.path.read_text())['nodes']}
             node = lambda k: saved[dense_openings.canonical(deep[:k])[0]]
             self.assertEqual((node(5)['games'], node(5)['p1_wins'], node(5)['p2_wins'], node(5)['capped']), (4, 3, 0, 1))
@@ -265,14 +270,16 @@ class RefreshTests(unittest.TestCase):
             self.assertEqual(again['retired']['replaced'], 1)
             self.assertEqual(sum(n['challenges'] is None for n in book.openings()), 2)      # book_size settled
 
-    def test_migration_counts_report_pairs_once_and_refresh_adopts_them(self):
+    def test_reports_of_another_suite_are_imported_once_and_refresh_adopts_them(self):
         with tempfile.TemporaryDirectory() as run:
             played = [(0, 0), (1, 0), (-1, 0)]
             games = [dict(g, seed=7) for g in pair(played, 1)]+[dict(g, seed=8) for g in pair(played, 2)]
-            report = dict(games=games+[dict(game(played, 0, 0), seed=9)])              # seed 9 is a half pair
+            report = dict(candidate='a', opponent='b', settings=dict(opening_suite='standard-v1'),
+                          games=games+[dict(game(played, 0, 0), seed=9)])             # seed 9 is a half pair
             book = self.book(run, book_size=1, book_revisit_fraction=0.)
-            self.assertEqual(book.migrate([report]), 2)
-            self.assertEqual(book.migrate([report]), 0)
+            self.assertEqual(book.reconcile([report]), 2)
+            report['games'] += [dict(g, seed=10) for g in pair(played, 0)]
+            self.assertEqual(book.reconcile([report]), 0)                              # other suites: the first time only
             node = book.nodes[dense_openings.canonical(played)[0]]
             self.assertEqual((node['status'], node['pairs']), (None, [0, 0, 1, 0, 1]))
             book.refresh(Uniform(radius=2), CHAMPION, np.random.default_rng(0), now=1.)
@@ -385,17 +392,33 @@ class FrozenTests(unittest.TestCase):
             images = {frozenset(map(tuple, m[1:])) for m in map(book.draw, range(4770)) if dense_openings.canonical(m)[0] == top}
             self.assertEqual(len(images), classes[top])
             self.assertFalse(book.path.exists())                                # nothing written before a record
-            book.record(pair(book.openings()[0]['moves'], 1))
+            book.record(pair(book.openings()[0]['moves'], 1), 'r')
             self.assertEqual(json.loads(book.path.read_text())['nodes'][0]['games'], 2)
             self.assertEqual(json.loads((dense_openings.FROZEN/'standard-v1.json').read_text())['nodes'][0]['games'], 0)
 
-    def test_frozen_books_count_only_their_own_openings_on_migration(self):
+    def test_reconcile_counts_each_pair_of_the_own_suite_once(self):
+        """A pair the report holds but the book missed (the evaluator stopped between the two writes) is counted on the
+        next reconcile; recorded pairs are not counted twice; a frozen book adds no node and skips other suites."""
         with tempfile.TemporaryDirectory() as run:
             book = dense_openings.Book(run, dense_config.EvaluationSettings())
             inside = book.openings()[0]['moves']
-            games = [dict(g, seed=1) for g in pair(inside, 2)]+[dict(g, seed=2) for g in pair([(0, 0), (7, 0), (8, 0)], 2)]
-            self.assertEqual(book.migrate([dict(games=games)]), 1)
+            own = dict(id='r1', candidate='a', opponent='b', settings=dict(opening_suite='standard-v1'),
+                       games=[dict(g, seed=1) for g in pair(inside, 2)]+[dict(g, seed=2) for g in pair([(0, 0), (7, 0), (8, 0)], 2)])
+            other = dict(id='r2', candidate='a', opponent='c', settings=dict(opening_suite='book'),
+                         games=[dict(g, seed=1) for g in pair(inside, 2)])
+            self.assertEqual(book.reconcile([own, other]), 2)
             self.assertEqual(len(book.nodes), 50)
+            root = lambda: book.nodes[dense_openings.canonical([(0, 0)])[0]]['pairs']
+            self.assertEqual(root(), [0, 0, 0, 0, 2])
+            late = [dict(g, seed=3) for g in pair(inside, 0)]
+            own['games'] += late
+            book.record(late, 'r1')                                            # written to both: counted once
+            own['games'] += [dict(g, seed=4) for g in pair(inside, 1)]         # in the report only
+            reopened = dense_openings.Book(run, dense_config.EvaluationSettings())
+            self.assertEqual(reopened.reconcile([own, other]), 1)
+            self.assertEqual(reopened.nodes[dense_openings.canonical([(0, 0)])[0]]['pairs'], [1, 0, 1, 0, 2])
+            self.assertEqual(reopened.data['counted'], {'r1': 4})
+            self.assertEqual(dense_openings.report_id(dict(candidate='a', opponent='b', games=[dict(seed=5)])), 'a|b|5')
 
 
 class SummaryTests(unittest.TestCase):
@@ -442,7 +465,7 @@ class SettingsTests(unittest.TestCase):
         dense_openings.check(d)
         self.assertEqual(dense_openings.suites(), ('book', 'standard-v1'))
         for bad in (dict(opening_suite='mixed-v1'), dict(opening_book='abc'), dict(book_plies=0), dict(book_plies=256),
-                    dict(book_min_plies=6), dict(book_min_plies=0), dict(book_temperature=0.), dict(book_sims=-1),
+                    dict(book_min_plies=6), dict(book_min_plies=1), dict(book_plies=11), dict(book_temperature=0.), dict(book_sims=-1),
                     dict(book_size=0), dict(book_min_games=0), dict(book_revisit_fraction=1.5), dict(book_refresh_hours=0.),
                     dict(book_min_prob=1.), dict(book_max_skew=-1.), dict(book_weighting='other')):
             with self.assertRaises(ValueError, msg=bad):

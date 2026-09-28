@@ -4,7 +4,8 @@
  "frozen": true,
  "refreshed_by": null,
  "refreshed_at": null,
- "migrated": false,
+ "counted": {},
+ "imported": false,
  "nodes": [
   {
    "key": "0,0",
