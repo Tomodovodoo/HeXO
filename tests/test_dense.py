@@ -2365,7 +2365,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         """Panel members are re-derived (a stored list is ignored) and include only those within
         max_expected_score."""
         entry = lambda step, elo, **extra: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, matches=[], **extra)
-        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000001', matrix={}, ladder=[], checkpoints=[
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000001', matrix={}, ladder=[], ladder_top=3, checkpoints=[
             entry(1, 0.), entry(2, -400*math.log10(19)), entry(3, -400*math.log10(7/3)),
             entry(4, 0., panel=dict(members=['main/000002', 'main/000003'], incumbent='main/000001'))])))
         evaluator = self.start(extra_opponents=2)
@@ -2373,6 +2373,15 @@ class EvaluatorLoopTests(unittest.TestCase):
                          [('main/000004', 'main/000003', 'panel', 2), ('main/000001', 'main/000003', 'incumbent', 2)])
         evaluator.settings = replace(evaluator.settings, max_expected_score=1.)
         self.assertEqual(len(evaluator.needs(evaluator.entry('main/000004'))), 4)
+
+    def test_restart_rebuilds_the_ladder_for_a_new_fill_top(self):
+        evaluator = self.start()
+        for step in (10, 20):
+            self.export(step)
+            self.assertTrue(evaluator.step())
+        self.assertEqual((self.league()['ladder_top'], len(self.league()['ladder'])), (3, 1))
+        self.start(fill_top=1)
+        self.assertEqual((self.league()['ladder_top'], self.league()['ladder']), (1, []))
 
     def test_fill_is_off_without_idle_fill(self):
         evaluator = self.start(anchor_target_halfwidth=25.)

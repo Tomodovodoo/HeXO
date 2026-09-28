@@ -43,16 +43,16 @@ records members, candidate_score, incumbent_score, z and veto in the entry and a
 recent non-demoted, non-skipped predecessor along panel incumbents (`Evaluator.settle`).
 
 league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
-superseded?, panel?, demoted?}], differences, ladder, anchors, matrix, rating_note, updated_at}. differences and
-ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the fill_top best rated, not demoted
-checkpoints, a above b, intervals from the joint rating draws. anchors.seal is {elo,
+superseded?, panel?, demoted?}], differences, ladder, ladder_top, anchors, matrix, rating_note, updated_at}.
+differences and ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the ladder_top
+(fill_top) best rated, not demoted checkpoints, a above b, intervals from the joint rating draws. anchors.seal is {elo,
 elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
 latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, latest_delta the newest one's. reign_from
 is the number of checkpoint entries and reign_games the champion's Seal games when it was promoted or restored
 (absent: its own position + 1 and 0). `matrix` (`payoff`) holds
 only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
-written before `matrix`, `ladder` and `panel` existed lack those keys; the Evaluator adds `matrix` and `ladder` on
-start.
+written before `matrix`, `ladder` and `panel` existed lack those keys; the Evaluator adds `matrix` on start and
+rebuilds the ladder when its ladder_top differs from the effective fill_top.
 """
 import argparse
 from dataclasses import asdict, replace
@@ -468,8 +468,9 @@ def write_league(run, league, config, top=None):
     difference = lambda a, b: dict(a=a, b=b, elo_delta=point[a]-point[b], interval=np.quantile(
         np.subtract(draws[a], draws[b]), [.025, .975]).tolist() if draws[a] else [0., 0.])
     league['differences'] = [difference(a, b) for i, a in enumerate(heads) for b in heads[i+1:]]
+    league['ladder_top'] = config.evaluation.fill_top if top is None else top
     best = sorted((c['id'] for c in league['checkpoints'] if point.get(c['id']) is not None and not c.get('demoted')),
-                  key=lambda k: -point[k])[:config.evaluation.fill_top if top is None else top]
+                  key=lambda k: -point[k])[:league['ladder_top']]
     league['ladder'] = [difference(a, b) for i, a in enumerate(best) for b in best[i+1:]]
     anchored = sorted((r for r in reports if r['opponent'] == SEAL), key=lambda r: ids.index(r['candidate']))
     matches = [dict(checkpoint=r['candidate'], **{k: r['summary'][k] for k in ('wins', 'losses', 'capped', 'games', 'elo_delta')})
@@ -570,7 +571,7 @@ class Evaluator:
         self.run, self.config, self.settings, self.pacer, self.processes = Path(run), config, settings, pacer, processes
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
-        if self.league['checkpoints'] and not {'matrix', 'ladder'} <= self.league.keys():
+        if self.league['checkpoints'] and ('matrix' not in self.league or self.league.get('ladder_top') != settings.fill_top):
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         self.models, self.partial, self.seal, self.written, self.fill_target = {}, {}, None, 0., None
         self.status = dict(stage='idle', updated_at=None, comparison=None, started_at=None, games_played=0, games_planned=0,
