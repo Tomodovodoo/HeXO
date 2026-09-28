@@ -1,4 +1,4 @@
-"""Build the optional pinned native tactical library and record compiled identities."""
+"""Build the optional native tactical library (vendored hexo-strix solver) and record compiled identities."""
 import argparse
 import hashlib
 import json
@@ -17,7 +17,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cargo', default='cargo')
     args = parser.parse_args()
-    paths = ['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/check.rs']
+    vendored = sorted(path for path in (PACKAGE/'vendor').rglob('*') if path.suffix in ('.rs', '.toml'))
+    paths = ['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/check.rs'] + [path.relative_to(PACKAGE).as_posix() for path in vendored]
     before = {p: digest(PACKAGE/p) for p in paths}
     command = [args.cargo, 'build', '--release', '--locked', '--manifest-path', str(PACKAGE/'Cargo.toml')]
     subprocess.run(command, check=True)

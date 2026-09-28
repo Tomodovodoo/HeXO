@@ -1,16 +1,20 @@
 """Dense self-play actor: many native Gumbel trees batched continuously onto one DenseEvaluator.
 
-Run layout: dense_config. The actor plays the ema.pt of champion.json's checkpoint, else of the newest complete
-checkpoint, else --initial-model, else a fresh HexNet(config.model) seeded with config.seed. Shards are named
+Run layout: dense_config. The actor plays the ema.pt of the checkpoint `resolve` picks for actor.model_source:
+'newest_veto' (default) actor.json's checkpoint, the newest export unless the evaluator vetoed it
+(dense_eval.Evaluator.point); 'newest' the newest complete checkpoint of learner.variant; 'champion'
+champion.json's checkpoint. Each falls back to champion.json, the newest complete checkpoint, --initial-model and
+a fresh HexNet(config.model) seeded with config.seed, in that order. Shards are named
 <ms:013d><pid%1000:03d>; their rows carry no value targets (target null, weight 0): the learner derives them
 from episode root_values and winner. A game with a searched position wider than the largest crop ends capped with
 reason 'span' and an error event.
 
 Scheduling: every game owns one persistent NeuralSearch tree. Engine keeps all trees searching at once and
 starts a tree's next search as soon as its previous one finishes, so full (`full_sims`) and cheap
-(`cheap_sims`) searches share every GPU batch and no lockstep tail waits on the slowest tree. The champion
-is re-read after each shard: games in progress finish with the evaluator they started with, new games use
-the new one; a shard may therefore mix actors (identity `actors`; `actor_sha256` is the newest).
+(`cheap_sims`) searches share every GPU batch and no lockstep tail waits on the slowest tree. The model is
+re-resolved after each shard ('actor_model' event on a switch): games in progress finish with the evaluator they
+started with, new games use the new one; a shard may therefore mix actors (identity `actors`; `actor_sha256` is
+the newest).
 
 GPU sharing (Yield): CUDA contexts of separate processes time-slice the GPU, so every busy actor worker takes
 a share from the learner. Workers therefore pause between engine steps while a learner falls behind its
@@ -23,8 +27,8 @@ in-flight batch and heartbeat with stage 'paused'. Actor settings can be overrid
 --<setting> flags (the supervisor forwards them; shards record the effective values).
 
 Historical opponents (ActorSettings.historical_*): up to round(historical_fraction * min(games_in_flight, --games))
-games in flight pit the champion, alternating colours over historical games, against a frozen rated checkpoint
-(`Historical`); only the champion's plies become training rows (dense_data.trained).
+games in flight pit the played model (called the champion below), alternating colours over historical games,
+against a frozen rated checkpoint (`Historical`); only its plies become training rows (dense_data.trained).
 """
 import argparse
 from collections import deque
@@ -75,9 +79,18 @@ def checkpoints(run):
     return sorted(found, key=lambda c: (c[2]['created_at'], c[0]))
 
 
-def resolve(run, initial=None):
-    """(checkpoint id, ema path or None) the actor should play; see the module contract."""
+def resolve(run, initial=None, source='champion', variant='main'):
+    """(checkpoint id, ema path or None) the actor should play under model_source `source` with learner variant
+    `variant`; see the module contract."""
     run = Path(run)
+    if source not in ('champion', 'newest', 'newest_veto'):
+        raise ValueError(f'Unknown model_source {source!r}')
+    if source == 'newest_veto' and (run/'actor.json').exists():
+        checkpoint = json.loads((run/'actor.json').read_text())['checkpoint']
+        return checkpoint, run/'checkpoints'/checkpoint/'ema.pt'
+    own = [c for c in checkpoints(run) if c[0].split('/')[0] == variant] if source == 'newest' else []
+    if own:
+        return own[-1][0], own[-1][1]/'ema.pt'
     if (run/'champion.json').exists():
         checkpoint = json.loads((run/'champion.json').read_text())['checkpoint']
         return checkpoint, run/'checkpoints'/checkpoint/'ema.pt'
@@ -234,8 +247,8 @@ class Model:
 
 
 def load(run, config, initial=None, source=None):
-    """Model for `resolve(run, initial)` (or an explicit (checkpoint, path) `source`)."""
-    checkpoint, path = source or resolve(run, initial)
+    """Model for `resolve` under config.actor.model_source (or an explicit (checkpoint, path) `source`)."""
+    checkpoint, path = source or resolve(run, initial, config.actor.model_source, config.learner.variant)
     if path is None:
         torch.manual_seed(config.seed)
         net = hexnet.HexNet(hexnet.HexNetConfig(**asdict(config.model)))
@@ -598,10 +611,11 @@ def worker(args):
         print(json.dumps(fields), flush=True)
         since.update(time=now, positions=state['positions'], evals=engine.evals)
         episodes.clear(); rows.clear()
-        if resolve(run, args.initial_model)[0] != model.checkpoint:
-            model = load(run, config, args.initial_model)
-            log_event(run, 'actor', 'info', f'worker {args.worker} switched to {model.checkpoint} ({model.sha[:12]}); '
-                      'games in progress finish with the previous model', process=args.worker)
+        if resolve(run, args.initial_model, settings.model_source, config.learner.variant)[0] != model.checkpoint:
+            previous, model = model.checkpoint, load(run, config, args.initial_model)
+            log_event(run, 'actor', 'actor_model', f'worker {args.worker} switched from {previous} to {model.checkpoint} '
+                      f'({model.sha[:12]}, {settings.model_source}); games in progress finish with the previous model',
+                      process=args.worker, checkpoint=model.checkpoint, previous=previous, reason=settings.model_source)
         if historical:
             historical.redraw(model.checkpoint, model.sha)
 

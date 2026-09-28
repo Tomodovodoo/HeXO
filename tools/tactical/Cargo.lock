@@ -5,7 +5,6 @@ version = 4
 [[package]]
 name = "hexo-engine"
 version = "0.1.0"
-source = "git+https://github.com/SootyOwl/hexo-strix?rev=5a771e572553a8bd8e010112b2ce65f16e5afa1b#5a771e572553a8bd8e010112b2ce65f16e5afa1b"
 dependencies = [
  "rustc-hash",
 ]
@@ -13,7 +12,6 @@ dependencies = [
 [[package]]
 name = "hexo-solver"
 version = "0.1.0"
-source = "git+https://github.com/SootyOwl/hexo-strix?rev=5a771e572553a8bd8e010112b2ce65f16e5afa1b#5a771e572553a8bd8e010112b2ce65f16e5afa1b"
 dependencies = [
  "hexo-engine",
  "rustc-hash",

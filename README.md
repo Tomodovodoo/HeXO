@@ -2,18 +2,18 @@
 
 ## Native verified tactical strategies
 
-The optional `tactical_proof.NativeTactics` library runs wide Strix IDTT followed by PDS-PN at pinned revision `5a771e572553a8bd8e010112b2ce65f16e5afa1b`. IDTT principal variations are only hints. An exact positive requires a complete PDS-PN strategy DAG accepted by a separate raw-coordinate Rust checker. `independent_verify` also rechecks the exported strategy through the independent Python rules implementation.
+The optional `tactical_proof.NativeTactics` library runs wide Strix IDTT followed by PDS-PN. The solver crates are vendored in `tools/tactical/vendor/hexo-strix` from [SootyOwl/hexo-strix](https://github.com/SootyOwl/hexo-strix) at `5a771e572553a8bd8e010112b2ce65f16e5afa1b` (MIT) and changed locally; the history of that directory lists the changes. IDTT principal variations are only hints. An exact positive requires a complete PDS-PN strategy DAG accepted by a separate raw-coordinate Rust checker. `independent_verify` also rechecks the exported strategy through the independent Python rules implementation.
 
 ```sh
 python tools/build_tactical.py
 python -m unittest tests.test_tactical_proof -v
 ```
 
-This needs Rust/Cargo supporting edition 2024 and uses locked dependencies. The build manifest binds the native binary to its wrapper sources and Cargo lockfile. `NativeTactics().solve(game, ms=100)` returns `PROVEN_WIN` with `native_verified=true` and the complete current turn only after verification; unresolved searches return `UNKNOWN`, never a global loss. Partial-turn roots are supported. The exact board, player, remaining placements, fixed rules and verifier scope identify cached facts; neural model evaluations and visit counts are not stored here.
+This needs Rust/Cargo supporting edition 2024 and uses locked dependencies. The build manifest binds the native binary to its wrapper sources, the vendored sources and the Cargo lockfile. `NativeTactics().solve(game, ms=100)` returns `PROVEN_WIN` with `native_verified=true` and the complete current turn only after verification; unresolved searches return `UNKNOWN`, never a global loss. Partial-turn roots are supported. The exact board, player, remaining placements, fixed rules and verifier scope identify cached facts; neural model evaluations and visit counts are not stored here.
 
 The certificate checker covers both mandatory two-cell defenses and a mandatory single block followed by every legal free second placement. For singleton covers it enumerates the entire radius-eight frontier after the block, including newly legal fillers, and preserves a legal order for each resulting pair. `solve(game, root_moves=[first, second], ...)` can verify a proposed attacker turn by constructing all these defensive branches and proving every continuation with bounded PDS-PN. The default upstream generator still searches fully forcing attacks; entirely quiet defender nodes and unresolved continuations remain `UNKNOWN`. A legal open-three fixture yields a 1,295-node wide-search strategy accepted by both checkers, whereas tight IDTT finds no forcing win. On the development host, a fresh verified proof took about 0.7 seconds and cached re-verification about 18 ms; this is a tactical correctness result, not a strength result.
 
-Upstream certificate reconstruction does not honor its search deadline. One persistent native worker bounds how long callers wait and rejects overlapping requests as `UNKNOWN`; it may finish work after the caller times out. Reports expose background-worker state, completed-late counts, elapsed worker time and Windows thread CPU time. These are **not equal-compute tournament clocks**. Late or partial certificates never become exact search values. Primary neural MCTS integration remains a separate task. The optional candidate route proved a legal 27-stone fixture with one mandatory block and 745 distinct legal free-placement replies. Both independent checkers accepted its 45,063-node strategy, and deleting one reply invalidated it. That proof took about ten seconds on the development host; it is not a 100 ms tactical result. All legal free placements are covered when a positive is returned, but finding a strategy remains selective and budget-limited.
+The search checks its deadline on every PDS-PN level-1 node, before every level-2 expansion and every 16 IDTT nodes, and its position memos are capped. Upstream checked only every 8,192 nodes, so abandoned queries ran 10 to 40 seconds past a 2-second budget. With these checks they stop within about 10 ms, and a 15-second proof search peaks at 66 MB. Certificate reconstruction and verification scale with the proof, not the search. The kernel reads windows from the board's incremental window index, which also keeps each player's live windows (two or more stones, no opponent stone). The generator builds the wide builder list only when some threat cell can pair with a builder. That held at 16 of 20,187 generator calls in a six-turn win from dense-v1 self-play. Unexpanded attacker nodes are seeded with their threat-window count instead of a full move list, which cut generator calls to about 6,400 there. That win's 398-node proof takes 1.4 s instead of 14.7 s. The PDS-PN table is sized at one megabyte per 64 ms of budget, up to 16 MB, so a 5 ms query no longer spends 3 ms clearing a table. At 5 ms, 38 of 400 random dense-v1 turn starts had a verified forced win, at a mean cost of 1.2 ms per query. One persistent native worker bounds how long callers wait and rejects overlapping requests as `UNKNOWN`. Reports expose background-worker state, completed-late counts, elapsed worker time and Windows thread CPU time. These are **not equal-compute tournament clocks**. Late or partial certificates never become exact search values. Primary neural MCTS integration remains a separate task. The optional candidate route proved a legal 27-stone fixture with one mandatory block and 745 distinct legal free-placement replies. Both independent checkers accepted its 45,063-node strategy, and deleting one reply invalidated it. That proof took about ten seconds on the development host; it is not a 100 ms tactical result. All legal free placements are covered when a positive is returned, but finding a strategy remains selective and budget-limited.
 
 C++20 Hexo rules and search engine, Python interface, and local browser game.
 
@@ -813,3 +813,31 @@ With `--bootstrap-full-only`, all three chains (the capped TD chain, `td` and
 KataGo-style value-logit BCE against the hard outcome, with weight w. That head,
 `outcome_bce`, is always logged. The validation curves by plies remaining
 always score finished games against their hard outcome.
+
+## Dense evaluator
+
+`dense_eval.py loop` rates each new dense checkpoint against the champion and keeps the league in
+`league.json`; its module docstring is the full contract, and every setting is an `EvaluationSettings` field in
+`dense_config.py` (override per process with `--eval-*`).
+
+- **Promotion** (`decision`, default `posterior`). One Bradley-Terry posterior covers every rated checkpoint, the
+  candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
+  and against panel members. Each pair also gets a matchup deviation (prior sd `matchup_prior_elo`, default 30),
+  so a pair's own games outweigh the transitive picture when the two disagree. The candidate needs at least
+  `sprt_min_games` direct games, and its rating sd may be at most `uncertainty_parity` times the champion's.
+  It is promoted when it has the highest posterior rating and P(candidate - champion > `sprt_elo0`) is at least
+  `promote_confidence`. It is rejected when that probability is at most 1 - `promote_confidence`. Neither
+  happens while the direct-only and pooled estimates disagree beyond their intervals. `decision sprt` keeps the
+  sequential test (`sprt_elo0` 0, `sprt_elo1` 25).
+- **Rounds.** Every comparison plays rounds of `round_games` (8) games, in colour-swapped opening pairs. While a
+  decision is pending, each round goes to the pairing whose round most reduces the posterior variance of the
+  decision's Elo difference: the direct games, or the candidate or champion against the previous champion or
+  Seal. A newer checkpoint of the variant ends the evaluation at the next round boundary, and the verdict at
+  that point settles it.
+- **Streaming.** `evaluator-status.json` carries the running tally of the current comparison and the pending
+  verdict. The dashboard shows both, including a provisional league row for the candidate.
+- **Idle work.** After the decision, the evaluator plays the champion's Seal anchor, the adaptive panel (the
+  rated checkpoints closest to the champion) and other optional comparisons. It then fills rounds until the
+  next checkpoint appears: the champion against Seal until their interval is `anchor_target_halfwidth` narrow,
+  one round of the newest checkpoint against the previous champion, then the widest pair among the top
+  `fill_top`. Pairings where either side's expected score exceeds `max_expected_score` are never played.
