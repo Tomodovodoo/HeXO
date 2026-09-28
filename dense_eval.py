@@ -7,9 +7,13 @@ Run layout: dense_config. Subcommands
              no checkpoint waits it first plays the current champion's scheduled Seal anchor (`Evaluator.anchor`),
              then the optional comparisons (`Evaluator.optional`), one round of `games` at a time: panels and idle
              rematches, then, newest rated checkpoint first, `previous_games` vs the previous rated checkpoint of
-             the variant. A champion SPRT that sees a newer
+             the variant, then, with idle_fill, fill rounds until a checkpoint waits (`Evaluator.fill`): the
+             champion vs Seal until their Elo interval is anchor_target_halfwidth narrow, else the widest pair of
+             the league ladder. Fill games are ordinary reports; the champion's fill games vs Seal also count
+             toward its scheduled anchors. A champion SPRT that sees a newer
              checkpoint of its variant after an undecided round stops there (decision 'superseded', entry
-             superseded true, no promotion); a bound crossed in that round still decides. All play is paced by `eval_share` (Pacer); --processes splits each round
+             superseded true) and is settled on the games played (see Scoring); a bound crossed in that round
+             still decides. All play is paced by `eval_share` (Pacer); --processes splits each round
              over worker subprocesses (each about 0.35 GB of VRAM with b6c96 models); --eval-* flags override
              evaluation settings for this process (reports record the effective settings). Writes evaluations/<a>-vs-<b>/report.json (reused when present),
              league.json, champion.json on promotion, evaluator-status.json (Evaluator.publish) and events.
@@ -20,16 +24,12 @@ Run layout: dense_config. Subcommands
 
 Scoring: a capped game (at the ply limit, or reason 'span' when a searched position does not fit the largest crop) is
 half a point for each side. Pair score = candidate points / 2 over its two games.
-The comparison with the champion is a sequential test (see `sprt`) played in rounds of `games` games until it
-accepts H0 or H1 or reaches its planned games (decision 'max-games'); only H1 promotes. The first rated
+The comparison with the champion is a sequential test (see `sprt`) played in rounds of `sprt_round` games until
+it accepts H0 or H1, reaches `sprt_max_games` (decision 'max-games') or is superseded by a newer checkpoint of its
+variant, so a candidate's games end with the release cadence. H1 promotes; a superseded comparison is settled:
+it promotes when the paired 95% lower bound of its pair score (`summary` pair_score_lower) exceeds 1/2, recorded
+as metrics.sprt.settled {pair_score, pair_score_lower, promote} with a 'settle' event. The first rated
 checkpoint becomes champion unopposed.
-
-Game plan (`game_plan`, `Evaluator.plan`): a candidate's champion games fit `games_per_release` of the learner's
-release interval (dense_config.release_timing), priced by the evaluator's measured placements per wall second and
-placements per game, after reserving the promotion anchor's Seal games from that budget; rounded down to whole
-rounds, at least one round, at most sprt_max_games, and sprt_max_games while any input is unknown or
-games_per_release is 0. An SPRT stopped by its plan ends 'max-games', which idle rematches continue. The plan is
-published as evaluator status plan and logged as a 'plan' event whenever its games or bound change.
 
 Panels: a checkpoint rated while a champion exists gets `panel_members` (at most 2 * extra_opponents + 1:
 p(1-p)-drawn and retained weaknesses) as entry `panel` {members, incumbent}; the incumbent is the champion it
@@ -40,7 +40,9 @@ candidate_score, incumbent_score, z and veto in the entry and a 'panel' event. A
 recent non-demoted, non-skipped predecessor along panel incumbents (`Evaluator.settle`).
 
 league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
-superseded?, panel?, demoted?}], differences, anchors, matrix, rating_note, updated_at}. anchors.seal is {elo,
+superseded?, panel?, demoted?}], differences, ladder, anchors, matrix, rating_note, updated_at}. differences and
+ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the fill_top best rated, not demoted
+checkpoints, a above b, intervals from the joint rating draws. anchors.seal is {elo,
 elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
 latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, latest_delta the newest one's. reign_from
 is the number of checkpoint entries and reign_games the champion's Seal games when it was promoted or restored
@@ -49,7 +51,6 @@ only pairs that met; readers compute p for other rated pairs from the ratings (d
 written before `matrix` and `panel` existed lack those keys; the Evaluator adds `matrix` on start.
 """
 import argparse
-from collections import deque
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -79,7 +80,6 @@ STATUS_SECONDS = 2.
 PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'seal_ms')  # settings a reused report must share
 RECENT = 3                # latest rated checkpoints of a variant whose results define its weaknesses
 REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
-PLAN_ROUNDS = 4           # newest rounds per opponent type (checkpoint or Seal) that price a game plan
 RATING_NOTE = ('Bradley-Terry over paired comparisons (caps count half a point to each side); each opening pair is one '
                'observation with a Jeffreys Dirichlet prior over the five pair scores 0..2 in half points; 95% '
                'credible intervals from posterior draws; the first evaluated checkpoint is fixed at 0. Seal is one '
@@ -149,8 +149,8 @@ class MatchGame:
 
 
 def play(games, leaf_batch, heartbeat=lambda finished: None):
-    """Run MatchGames to completion in one engine; returns their records in input order. heartbeat(finished
-    games) is called after every engine step."""
+    """Run MatchGames to completion in one engine; returns their records in input order. heartbeat(records of
+    the finished games, in finishing order) is called after every engine step."""
     engine, records = Engine(leaf_batch), {}
     for game in games:
         if game.over():
@@ -160,7 +160,7 @@ def play(games, leaf_batch, heartbeat=lambda finished: None):
     while engine.slots:
         for game in engine.step():
             records[id(game)] = game.finish()
-        heartbeat(len(records))
+        heartbeat(list(records.values()))
     return [records[id(g)] for g in games]
 
 
@@ -243,6 +243,31 @@ def sprt(records, elo0, elo1, alpha, beta):
     lower, upper = math.log(beta/(1-alpha)), math.log((1-beta)/alpha)
     return dict(llr=llr, bound_lower=lower, bound_upper=upper, games=int(2*n), elo0=elo0, elo1=elo1, alpha=alpha, beta=beta,
                 pair_counts=counts.astype(int).tolist(), decision='H1' if llr >= upper else 'H0' if llr <= lower else None)
+
+
+def tally(records, test=None):
+    """Running score of a comparison's finished games: wins, losses, capped and games over all of them; over its
+    complete opening pairs: pairs, pair_score, pair_interval (`summary`'s paired Hoeffding 95% bounds, clipped to
+    [0, 1]), elo_delta and elo_interval (`summary`'s continuity-corrected Elo of the points at the score and at its
+    bounds), and llr, bound_lower and bound_upper of test(complete records) (an `sprt` result) when given. Pair
+    fields are None before the first complete pair."""
+    wins = sum(g['winner'] == g['challenger_color'] for g in records)
+    capped = sum(g['winner'] < 0 for g in records)
+    out = dict(wins=wins, losses=len(records)-wins-capped, capped=capped, games=len(records), pairs=0, pair_score=None,
+               pair_interval=None, elo_delta=None, elo_interval=None, llr=None, bound_lower=None, bound_upper=None)
+    seeds = [g['seed'] for g in records]
+    complete = [g for g in records if seeds.count(g['seed']) == 2]
+    if complete:
+        s, n = summary(complete), len(complete)
+        half = s['pair_score']-s['pair_score_lower']
+        bounds = [max(0., s['pair_score']-half), min(1., s['pair_score']+half)]
+        elo = lambda p: 400*math.log10((p*n+.5)/(n-p*n+.5))
+        out.update(pairs=n//2, pair_score=s['pair_score'], pair_interval=bounds, elo_delta=s['elo_delta'],
+                   elo_interval=[elo(p) for p in bounds])
+        if test:
+            result = test(complete)
+            out.update(llr=result['llr'], bound_lower=result['bound_lower'], bound_upper=result['bound_upper'])
+    return out
 
 
 def report_path(run, candidate, opponent):
@@ -425,9 +450,10 @@ def variant_heads(entries, rated=lambda c: True):
     return heads
 
 
-def write_league(run, league, config):
-    """Recompute ratings and the payoff matrix from every report among rated (not skipped) ids and Seal, then
-    publish league.json; skipped entries keep elo and elo_interval null."""
+def write_league(run, league, config, top=None):
+    """Recompute ratings, the payoff matrix and the ladder (`top` checkpoints, default config.evaluation.fill_top)
+    from every report among rated (not skipped) ids and Seal, then publish league.json; skipped entries keep elo
+    and elo_interval null."""
     run = Path(run)
     ids = [c['id'] for c in league['checkpoints'] if not c.get('skipped')]
     reports = [r for r in load_reports(run) if r['candidate'] in ids and (r['opponent'] in ids or r['opponent'] == SEAL)]
@@ -438,10 +464,12 @@ def write_league(run, league, config):
         c['elo'], c['elo_interval'] = point.get(c['id']), intervals.get(c['id'])
     # a-b intervals of the variant heads come from the same joint draws.
     heads = [c['id'] for _, c in sorted(variant_heads(league['checkpoints'], lambda c: point.get(c['id']) is not None).items())]
-    league['differences'] = [
-        dict(a=a, b=b, elo_delta=point[a]-point[b],
-             interval=np.quantile(np.subtract(draws[a], draws[b]), [.025, .975]).tolist() if draws[a] else [0., 0.])
-        for i, a in enumerate(heads) for b in heads[i+1:]]
+    difference = lambda a, b: dict(a=a, b=b, elo_delta=point[a]-point[b], interval=np.quantile(
+        np.subtract(draws[a], draws[b]), [.025, .975]).tolist() if draws[a] else [0., 0.])
+    league['differences'] = [difference(a, b) for i, a in enumerate(heads) for b in heads[i+1:]]
+    best = sorted((c['id'] for c in league['checkpoints'] if point.get(c['id']) is not None and not c.get('demoted')),
+                  key=lambda k: -point[k])[:config.evaluation.fill_top if top is None else top]
+    league['ladder'] = [difference(a, b) for i, a in enumerate(best) for b in best[i+1:]]
     anchored = sorted((r for r in reports if r['opponent'] == SEAL), key=lambda r: ids.index(r['candidate']))
     matches = [dict(checkpoint=r['candidate'], **{k: r['summary'][k] for k in ('wins', 'losses', 'capped', 'games', 'elo_delta')})
                for r in anchored]
@@ -493,8 +521,8 @@ class Pacer:
 def play_pairs(config, settings, candidate, opponent, first_pair, games, seal=None,
                heartbeat=lambda finished, placements: None):
     """Records of `games` paired games (paired_games, labelled by the candidate's checkpoint id, pairs numbered
-    from `first_pair`) of a candidate Model vs a Model or SEAL; heartbeat(finished games, placements played)
-    after every engine step."""
+    from `first_pair`) of a candidate Model vs a Model or SEAL; heartbeat(records of the finished games,
+    placements played) after every engine step."""
     name = lambda side: SEAL if side == SEAL else side.checkpoint
     matches = paired_games(candidate, opponent, games, candidate.checkpoint, config, settings, seal, first_pair,
                            candidate=candidate.checkpoint, opponent=name(opponent))
@@ -506,36 +534,6 @@ def play_pairs(config, settings, candidate, opponent, first_pair, games, seal=No
 def placements(records):
     """Placements played in `records` after their openings."""
     return sum(r['plies']-len(r['opening']) for r in records)
-
-
-def game_plan(settings, release, speed, mean, anchor_seconds=0.):
-    """Champion games planned for one candidate: {games, bound, adaptive, games_per_release, export_steps,
-    seconds_per_step, release_seconds, placements_per_second, mean_placements, anchor_seconds, budget_seconds}.
-    `release` is dense_config.release_timing, `speed` placements per wall second, `mean` placements per game and
-    `anchor_seconds` the wall time reserved for the promotion anchor. With games_per_release > 0 and every input
-    known (adaptive true), budget_seconds = games_per_release * release_seconds and games = (budget_seconds -
-    anchor_seconds) * speed / mean rounded down to a multiple of `games`, clamped to [min(games, sprt_max_games),
-    sprt_max_games]; bound names the limit that set it: 'budget', 'one_round' or 'sprt_max_games'. Otherwise
-    games = sprt_max_games with bound 'sprt_max_games' and adaptive false."""
-    s = settings
-    out = dict(games=s.sprt_max_games, bound='sprt_max_games', adaptive=False, games_per_release=s.games_per_release,
-               **release, placements_per_second=speed, mean_placements=mean, anchor_seconds=anchor_seconds, budget_seconds=None)
-    if not (s.games_per_release > 0 and release['release_seconds'] and speed and mean):
-        return out
-    budget = s.games_per_release*release['release_seconds']
-    fit = s.games*math.floor(max(0., budget-anchor_seconds)*speed/mean/s.games)
-    low = min(s.games, s.sprt_max_games)
-    return dict(out, games=min(s.sprt_max_games, max(low, fit)), adaptive=True, budget_seconds=budget,
-                bound='sprt_max_games' if fit >= s.sprt_max_games else 'one_round' if fit < low else 'budget')
-
-
-def describe_plan(plan):
-    """'<games> games (adaptive: release <m> min, <r> pl/s[, one round])', or '<games> games (cap)' when
-    sprt_max_games bound."""
-    if plan['bound'] == 'sprt_max_games':
-        return f'{plan["games"]} games (cap)'
-    return (f'{plan["games"]} games (adaptive: release {plan["release_seconds"]/60:.0f} min, '
-            f'{plan["placements_per_second"]:.1f} pl/s' + (', one round)' if plan['bound'] == 'one_round' else ')'))
 
 
 def match_entry(opponent, report):
@@ -551,11 +549,13 @@ class Evaluator:
     shares of its opening pairs over `processes` `pairs` subprocesses (each loads both models, about 0.35 GB
     of VRAM on CUDA); records, seeds and openings do not depend on `processes`. publish() maintains
     evaluator-status.json: {stage ('idle', 'playing', 'throttled' or 'failed'), updated_at, comparison
-    ({candidate, opponent, kind 'champion', 'previous', 'anchor', 'panel', 'incumbent', 'sprt' or
-    'replacement'} or null; while throttled, the comparison about to play), started_at (epoch seconds when the
+    ({candidate, opponent, kind 'champion', 'previous', 'anchor', 'panel', 'incumbent', 'sprt', 'replacement' or
+    'fill'} or null; while throttled, the comparison about to play), started_at (epoch seconds when the
     comparison's first round in this process began, null before it), games_played, games_planned
-    (the plan's games for the champion), plan (the newest `plan`, null before the first), round_first and round_games (games played before the current or waiting
-    round and its size), placements_played (the comparison's placements after openings, including unfinished
+    (sprt_max_games for the champion, which plays until superseded or that many), round_first and round_games
+    (games played before the current or waiting round and its size: sprt_round for the champion, else `games`),
+    tally (`tally` of the comparison's finished games, the current round's included, with the SPRT fields for
+    kinds 'champion' and 'sprt'; null while idle; refreshed with the status as games finish), placements_played (the comparison's placements after openings, including unfinished
     games of the current round),
     mean_placements (placements per game over the games of the comparison's finished rounds, null before
     any), placements_per_second (current round, both sides, all processes), worker_placements_per_second
@@ -570,11 +570,10 @@ class Evaluator:
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
         if self.league['checkpoints'] and 'matrix' not in self.league:
-            write_league(self.run, self.league, self.config)
-        self.models, self.partial, self.seal, self.written = {}, {}, None, 0.
-        self.rounds = {seal: deque(maxlen=PLAN_ROUNDS) for seal in (False, True)}  # (games, placements, worker seconds)
-        self.status = dict(stage='idle', updated_at=None, comparison=None, started_at=None, games_played=0, games_planned=0, plan=None,
-                           round_first=0, round_games=0, placements_played=0, mean_placements=None, placements_per_second=None,
+            write_league(self.run, self.league, self.config, self.settings.fill_top)
+        self.models, self.partial, self.seal, self.written, self.fill_target = {}, {}, None, 0., None
+        self.status = dict(stage='idle', updated_at=None, comparison=None, started_at=None, games_played=0, games_planned=0,
+                           tally=None, round_first=0, round_games=0, placements_played=0, mean_placements=None, placements_per_second=None,
                            worker_placements_per_second=None, settings=asdict(settings), eval_share=pacer.share,
                            backlog=[], processes=processes, eval_share_used=0., error=None)
 
@@ -600,8 +599,8 @@ class Evaluator:
                 self.models[name] = load(self.run, self.config, source=(name, self.run/'checkpoints'/name/'ema.pt'))
 
     def spread(self, cid, opponent, first_pair, games, heartbeat):
-        """play_pairs split over `processes` `pairs` subprocesses; records in pair order. heartbeat(finished,
-        placements) summed over the workers about every second."""
+        """play_pairs split over `processes` `pairs` subprocesses; records in pair order. heartbeat(finished
+        records, placements) over the workers' progress files about every second."""
         pairs, n = games//2, self.processes
         shares = [s for s in (pairs//n+(k < pairs % n) for k in range(n)) if s]
         with tempfile.TemporaryDirectory() as tmp:
@@ -618,7 +617,7 @@ class Evaluator:
                     break
                 time.sleep(1.)
                 progress = [json.loads(p.read_text()) for _, out in jobs if (p := out.with_suffix('.progress')).exists()]
-                heartbeat(sum(p['finished'] for p in progress), sum(p['placements'] for p in progress))
+                heartbeat([r for p in progress for r in p['records']], sum(p['placements'] for p in progress))
             if any(job.returncode for job, _ in jobs):
                 for job, _ in jobs:
                     if job.poll() is None:
@@ -628,17 +627,18 @@ class Evaluator:
             return [record for _, out in jobs for record in json.loads(out.read_text())]
 
     def round(self, cid, opponent, kind, planned):
-        """After pacing, play the next min(games, planned - played) games of cid vs opponent, opening pairs
-        numbered on from earlier rounds; returns the comparison's {records, seconds, worker_seconds, placements}
-        so far (over the rounds this process played, started_at from its first). A champion round
-        is not started once a newer checkpoint of the variant exists, nor an optional round while any
-        checkpoint is unrated."""
+        """After pacing, play the next min(round size, planned - played) games of cid vs opponent (round size
+        sprt_round for kind 'champion', else `games`), opening pairs numbered on from earlier rounds; returns the
+        comparison's {records, seconds, worker_seconds, placements} so far (over the rounds this process played,
+        started_at from its first). A champion round is not started once a newer checkpoint of the variant
+        exists, nor an optional round while any checkpoint is unrated."""
         done = self.partial.setdefault((cid, opponent), dict(records=[], seconds=0., worker_seconds=0., placements=0))
         records, placed = done['records'], placements(done['records'])
-        count = min(self.settings.games, planned-len(records))
+        count = min(self.settings.sprt_round if kind == 'champion' else self.settings.games, planned-len(records))
+        test = self.test if kind in ('champion', 'sprt') else None
         comparison = lambda stage: self.publish(
             True, stage=stage, comparison=dict(candidate=cid, opponent=opponent, kind=kind), started_at=done.get('started_at'),
-            games_played=len(records), games_planned=planned, round_first=len(records), round_games=count,
+            games_played=len(records), games_planned=planned, tally=tally(records, test), round_first=len(records), round_games=count,
             placements_played=placed, mean_placements=placed/len(records) if records else None, placements_per_second=None,
             worker_placements_per_second=done['placements']/done['worker_seconds'] if done['worker_seconds'] else None)
         self.pacer.wait(lambda: comparison('throttled'))
@@ -647,9 +647,11 @@ class Evaluator:
         start = self.pacer.clock()
         done.setdefault('started_at', time.time())
         comparison('playing')
-        heartbeat = lambda finished, live: self.publish(
-            games_played=len(records)+finished, placements_played=placed+live,
-            placements_per_second=live/max(self.pacer.clock()-start, 1e-9))
+        def heartbeat(finished, live):
+            due = time.monotonic()-self.written >= STATUS_SECONDS  # the tally is computed only for a write
+            self.publish(games_played=len(records)+len(finished), placements_played=placed+live,
+                         placements_per_second=live/max(self.pacer.clock()-start, 1e-9),
+                         **(dict(tally=tally(records+finished, test)) if due else {}))
         if self.processes == 1:
             self.use(cid, opponent)
             results = play_pairs(self.config, self.settings, self.models[cid], SEAL if opponent == SEAL else self.models[opponent],
@@ -668,8 +670,8 @@ class Evaluator:
         records += results
         played = placements(results)
         done['placements'] += played
-        self.rounds[opponent == SEAL].append((len(results), played, workers*seconds))
-        self.publish(True, games_played=len(records), placements_played=placed+played, mean_placements=(placed+played)/len(records),
+        self.publish(True, games_played=len(records), tally=tally(records, test), placements_played=placed+played,
+                     mean_placements=(placed+played)/len(records),
                      placements_per_second=played/max(self.pacer.clock()-start, 1e-9),
                      worker_placements_per_second=done['placements']/max(done['worker_seconds'], 1e-9))
         return done
@@ -685,44 +687,18 @@ class Evaluator:
         known = {c['id'] for c in self.league['checkpoints']}
         return any(e[0] != cid and e[0].split('/')[0] == cid.split('/')[0] and e[0] not in known for e in checkpoints(self.run))
 
-    def plan(self, cid):
-        """Champion games for candidate cid (`game_plan`), recomputed before and after every round: the release
-        interval of cid's variant, placements per wall second over the newest PLAN_ROUNDS rounds against
-        checkpoints (per worker second, times min(round workers, eval_share), the Pacer's ceiling) and their
-        placements per game. With anchor_on_promotion, anchor_games vs Seal are reserved from the budget (the
-        candidate is assumed promoted), priced by the newest Seal rounds, else like checkpoint games. Stored as
-        status plan and games_planned; a changed games or bound rewrites the status and logs a 'plan' event with
-        the plan's fields."""
-        s, share = self.settings, self.pacer.share
-        workers = max(1, min(self.processes, s.games//2))
-
-        def pace(seal):
-            games, placed, seconds = map(sum, zip(*self.rounds[seal])) if self.rounds[seal] else (0, 0, 0.)
-            return (placed/seconds*min(workers, share), placed/games) if placed and seconds else (None, None)
-        speed, mean = pace(False)
-        seal_speed, seal_mean = pace(True)
-        anchor = s.anchor_games*(seal_mean/seal_speed if seal_speed else mean/speed) if s.anchor_on_promotion and speed else 0.
-        plan = game_plan(s, dense_config.release_timing(self.run, cid.split('/')[0]), speed, mean, anchor)
-        old = self.status['plan']
-        changed = old is None or (old['games'], old['bound']) != (plan['games'], plan['bound'])
-        self.publish(changed, plan=plan, games_planned=plan['games'])
-        if changed:
-            log_event(self.run, 'evaluator', 'plan', f'{cid}: {describe_plan(plan)} vs the champion', candidate=cid, **plan)
-        return plan['games']
-
     def report(self, cid, opponent, kind, planned, complete):
-        """The report of cid vs opponent, reused when on disk; planned() gives the comparison's games before each
-        round. Otherwise the champion comparison plays rounds
+        """The report of cid vs opponent, reused when on disk. Otherwise the champion comparison plays rounds
         until complete(records) or, after an undecided round, a newer checkpoint of the variant exists (SPRT
-        decision 'superseded'; a bound crossed in that same round still counts, so a proven-better candidate is
-        promoted before the newer one is tested); optional comparisons play one round per call and return None
-        until complete. A
-        finished report is written and logged; a champion comparison superseded before any game returns None."""
+        decision 'superseded', settled as the module contract states; a bound crossed in that same round still
+        counts, so a proven-better candidate is promoted before the newer one is tested); optional comparisons
+        play one round per call and return None until complete. A finished report is written and logged (a
+        settlement also as a 'settle' event); a champion comparison superseded before any game returns None."""
         path = report_path(self.run, cid, opponent)
         if path.exists():
             return json.loads(path.read_text())
         while True:
-            done = self.round(cid, opponent, kind, planned())
+            done = self.round(cid, opponent, kind, planned)
             if complete(done['records']) or (kind == 'champion' and self.newer(cid)):
                 break
             if kind != 'champion':
@@ -734,10 +710,19 @@ class Evaluator:
         if kind == 'champion':
             result = self.test(done['records'])
             report['metrics']['sprt'] = dict(result, decision=result['decision'] or ('max-games' if complete(done['records']) else 'superseded'))
+        s = report['summary']
+        if kind == 'champion' and report['metrics']['sprt']['decision'] == 'superseded':
+            settled = report['metrics']['sprt']['settled'] = dict(
+                pair_score=s['pair_score'], pair_score_lower=s['pair_score_lower'], promote=s['pair_score_lower'] > .5)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json(path, report)
         del self.partial[cid, opponent]
-        s, test = report['summary'], report['metrics'].get('sprt')
+        test = report['metrics'].get('sprt')
+        if test and 'settled' in test:
+            log_event(self.run, 'evaluator', 'settle', f'{cid} vs {opponent} settled on supersession after {s["games"]} games: '
+                      f'+{s["wins"]} -{s["losses"]} ={s["capped"]}, pair score {s["pair_score"]:.3f}, 95% lower bound '
+                      f'{s["pair_score_lower"]:.3f}, LLR {test["llr"]:.2f}: ' + ('promoted' if settled['promote'] else 'not promoted'),
+                      candidate=cid, opponent=opponent, games=s['games'], llr=test['llr'], **settled)
         log_event(self.run, 'evaluator', 'match', f'{cid} vs {opponent}: +{s["wins"]} -{s["losses"]} ={s["capped"]}'
                   + (f' (SPRT {test["decision"]}, LLR {test["llr"]:.2f})' if test else ''),
                   candidate=cid, opponent=opponent, comparison=kind, **s, sprt=test, seconds=done['seconds'],
@@ -780,7 +765,7 @@ class Evaluator:
         entry = self.entry(a)
         if entry is not None:
             entry['matches'] = [m for m in entry['matches'] if m['opponent'] != b]+[match_entry(b, report)]
-        write_league(self.run, self.league, self.config)
+        write_league(self.run, self.league, self.config, self.settings.fill_top)
 
     def promote(self, cid, previous, panel=None):
         self.crown(cid)
@@ -833,7 +818,7 @@ class Evaluator:
                 log_event(self.run, 'evaluator', 'regression', f'{entry["id"]} demoted: its panel score is significantly below '
                           f'{panel["incumbent"]}\'s' + (f'; {restored} is champion again' if champion else ''),
                           checkpoint=entry['id'], restored=restored if champion else None, panel=panel)
-            write_league(self.run, self.league, self.config)
+            write_league(self.run, self.league, self.config, self.settings.fill_top)
 
     def rematches(self):
         """Idle rematches that can change a decision, first applicable only: the newest checkpoint of a variant
@@ -868,23 +853,24 @@ class Evaluator:
         return sprt(records, s.sprt_elo0, s.sprt_elo1, s.sprt_alpha, s.sprt_beta)
 
     def rate(self, entry):
-        """Play the champion SPRT of a chosen checkpoint (none for the first) up to its `plan`, add it to the league (superseded
-        true when a newer checkpoint cut its SPRT short) and promote on H1."""
+        """Play the champion SPRT of a chosen checkpoint (none for the first), add it to the league (superseded
+        true when a newer checkpoint cut its SPRT short) and promote on H1 or a promoting settlement."""
         cid, path, _ = entry
         variant, step = cid.split('/')
         champion, s = self.league['champion'], self.settings
         report = None if champion is None else self.report(
-            cid, champion, 'champion', lambda: self.plan(cid),
-            lambda records: self.test(records)['decision'] is not None or len(records) >= self.plan(cid))
+            cid, champion, 'champion', s.sprt_max_games,
+            lambda records: self.test(records)['decision'] is not None or len(records) >= s.sprt_max_games)
         if champion is not None and report is None:
             self.league['checkpoints'].append(dict(id=cid, variant=variant, step=int(step), skipped=True,
                                                    elo=None, elo_interval=None, matches=[]))
             log_event(self.run, 'evaluator', 'skip', f'skipped {cid}: a newer checkpoint appeared before its first champion round',
                       checkpoints=[cid], candidate=cid)
-            write_league(self.run, self.league, self.config)
+            write_league(self.run, self.league, self.config, self.settings.fill_top)
             return
         reports = {} if report is None else {champion: report}
-        decision = reports[champion]['metrics']['sprt']['decision'] if reports else None
+        test = reports[champion]['metrics']['sprt'] if reports else {}
+        decision = test.get('decision')
         members = []
         if champion is not None and s.extra_opponents > 0:
             previous = [c for c in self.league['checkpoints'] if c['variant'] == variant and c['step'] < int(step) and not c.get('skipped')]
@@ -898,10 +884,10 @@ class Evaluator:
         self.league['checkpoints'].append(entry)
         if champion is None:
             self.promote(cid, None)
-        elif decision == 'H1':
+        elif decision == 'H1' or test.get('settled', {}).get('promote'):
             self.promote(cid, champion)
         promoted = self.league['champion'] == cid
-        write_league(self.run, self.league, self.config)
+        write_league(self.run, self.league, self.config, self.settings.fill_top)
         print(f'{cid}: ' + ', '.join(f'vs {o} +{r["summary"]["wins"]} -{r["summary"]["losses"]} ={r["summary"]["capped"]}'
                                       for o, r in reports.items()) + (' -> champion' if promoted else f' ({decision})' if decision else ''), flush=True)
 
@@ -951,17 +937,45 @@ class Evaluator:
                 return c, previous, 'previous', s.previous_games
         return None
 
+    def fill(self):
+        """(league entry, opponent, 'fill', games) of the next fill round with idle_fill, else None. First the
+        champion vs Seal while anchor_target_halfwidth > 0 and the half-width of the 95% interval of their Elo
+        difference (`rate` over the champion's Seal report alone) exceeds it (no report yet counts as wide; a
+        report under another protocol is left alone), then the league ladder pair with the widest interval
+        whose report can grow (`rematch_pair`)."""
+        s, champion = self.settings, self.entry(self.league['champion'])
+        if not s.idle_fill or champion is None:
+            return None
+        report = self.sealed(champion['id'])
+        if s.anchor_target_halfwidth > 0 and (report is None or same_protocol(report, s)):
+            low, high = rate([champion['id'], SEAL], champion['id'], [report], seed=self.config.seed)[1][SEAL] if report \
+                else (-math.inf, math.inf)
+            if (high-low)/2 > s.anchor_target_halfwidth:
+                return champion, SEAL, 'fill', s.games
+        for d in sorted(self.league.get('ladder', []), key=lambda d: d['interval'][0]-d['interval'][1]):
+            if pair := rematch_pair(self.run, d['a'], d['b'], s):
+                return self.entry(pair[0]), pair[1], 'fill', s.games
+        return None
+
+    def filling(self, target):
+        """Log a 'fill' event when fill work starts, changes target ('seal' or '<a> vs <b>') or ends (None)."""
+        if target != self.fill_target:
+            log_event(self.run, 'evaluator', 'fill', f'fill: {target}' if target else f'fill ended: {self.fill_target}',
+                      target=target)
+            self.fill_target = target
+
     def step(self):
         """One unit of work; False when there is none. First judges every panel already complete on disk
         (`settle`, e.g. after a restart), so no candidate meets a regressed champion; then rates the newest
         unrated checkpoint of the variant whose newest unrated checkpoint is oldest, skipping that variant's older
-        unrated checkpoints, or else plays one round of the champion's Seal anchor (`anchor`) or else of an
-        optional comparison."""
+        unrated checkpoints, or else plays one round of the champion's Seal anchor (`anchor`), else of an
+        optional comparison, else of fill work (`fill`, which a new checkpoint interrupts before its next round)."""
         self.settle()
         known = {c['id'] for c in self.league['checkpoints']}
         unrated = [e for e in checkpoints(self.run) if e[0] not in known]
         self.status['backlog'] = [e[0] for e in unrated]
         if unrated:
+            self.filling(None)
             variant = lambda e: e[0].split('/')[0]
             heads = {variant(e): e for e in unrated}
             head = next(e for e in unrated if heads[variant(e)] is e)
@@ -969,25 +983,26 @@ class Evaluator:
             if skipped:
                 self.league['checkpoints'] += [dict(id=cid, variant=variant(head), step=int(cid.split('/')[1]), skipped=True,
                                                     elo=None, elo_interval=None, matches=[]) for cid in skipped]
-                write_league(self.run, self.league, self.config)
+                write_league(self.run, self.league, self.config, self.settings.fill_top)
                 log_event(self.run, 'evaluator', 'skip', f'skipped {", ".join(skipped)} for {head[0]}',
                           checkpoints=skipped, candidate=head[0])
             self.rate(head)
             return True
-        task = self.anchor() or self.optional()
+        task = self.anchor() or self.optional() or self.fill()
+        self.filling(None if task is None or task[2] != 'fill' else 'seal' if task[1] == SEAL else f'{task[0]["id"]} vs {task[1]}')
         if task is None:
             return False
         entry, opponent, kind, games = task
-        if kind in ('sprt', 'replacement', 'panel', 'incumbent', 'anchor'):
+        if kind in ('sprt', 'replacement', 'panel', 'incumbent', 'anchor', 'fill'):
             report = self.extend(entry['id'], opponent, kind, games)
         else:
-            report = self.report(entry['id'], opponent, kind, lambda: games, lambda records: len(records) >= games)
+            report = self.report(entry['id'], opponent, kind, games, lambda records: len(records) >= games)
         if report is not None:
             self.record(entry['id'], opponent, report)
             if kind == 'sprt' and report['metrics']['sprt']['decision'] == 'H1' and self.league['champion'] == opponent \
                     and not entry.get('demoted'):
                 self.promote(entry['id'], opponent)
-                write_league(self.run, self.league, self.config)
+                write_league(self.run, self.league, self.config, self.settings.fill_top)
             self.settle()
         return True
 
@@ -998,21 +1013,21 @@ def loop(args):
     settings = dense_config.override(config.evaluation, args, 'eval_')
     if args.processes < 1:
         raise ValueError('At least one evaluation worker process is required')
-    if any(getattr(settings, name) % 2 for name in ('games', 'previous_games', 'anchor_games', 'sprt_max_games')):
+    if any(getattr(settings, name) % 2 for name in ('games', 'previous_games', 'anchor_games', 'sprt_max_games', 'sprt_round')):
         raise ValueError('Evaluation game counts must be even: every opening is played with both colours')
-    if min(settings.games, settings.sprt_max_games) < 2 or any(0 < getattr(settings, name) < 2 or getattr(settings, name) < 0
+    if min(settings.games, settings.sprt_max_games, settings.sprt_round) < 2 or any(0 < getattr(settings, name) < 2 or getattr(settings, name) < 0
                                                                 for name in ('previous_games', 'anchor_games')):
-        raise ValueError('games and sprt_max_games need at least one opening pair; optional totals are 0 or at least 2')
-    if settings.games_per_release < 0:
-        raise ValueError('games_per_release must be at least 0')
+        raise ValueError('games, sprt_max_games and sprt_round need at least one opening pair; optional totals are 0 or at least 2')
     if settings.anchor_games and settings.anchor_every < 1:
         raise ValueError('anchor_every must be at least 1 while anchor games are enabled')
-    evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share), args.processes)
+    if settings.anchor_target_halfwidth < 0 or settings.fill_top < 0:
+        raise ValueError('anchor_target_halfwidth and fill_top must be at least 0')
+    evaluator =Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share), args.processes)
     try:
         while True:
             if evaluator.step():
                 continue
-            evaluator.publish(True, stage='idle', comparison=None)
+            evaluator.publish(True, stage='idle', comparison=None, tally=None)
             if args.once:
                 break
             time.sleep(args.poll)
@@ -1025,7 +1040,8 @@ def loop(args):
 
 def pairs(args):
     """Worker of Evaluator.spread: plays its share with --settings (EvaluationSettings as JSON), writes the
-    records to --out and {finished, placements} to <out>.progress about every STATUS_SECONDS."""
+    records to --out and {records of its finished games, placements} to <out>.progress about every
+    STATUS_SECONDS."""
     run = Path(args.run)
     config = dense_config.load(run)
     model = lambda name: load(run, config, source=(name, run/'checkpoints'/name/'ema.pt'))
@@ -1034,7 +1050,7 @@ def pairs(args):
     def heartbeat(finished, placements):
         if time.monotonic()-written[0] >= STATUS_SECONDS:
             written[0] = time.monotonic()
-            write_json(out.with_suffix('.progress'), dict(finished=finished, placements=placements))
+            write_json(out.with_suffix('.progress'), dict(records=finished, placements=placements))
     records = play_pairs(config, dense_config.EvaluationSettings(**json.loads(args.settings)), model(args.candidate),
                          SEAL if args.opponent == SEAL else model(args.opponent), args.first_pair, args.games,
                          Seal() if args.opponent == SEAL else None, heartbeat)
