@@ -45,7 +45,6 @@ import time
 import numpy as np
 
 import dense_config
-import dense_selfplay
 import hexcrop
 from train import write_json
 
@@ -111,7 +110,7 @@ def policy(model, histories):
         chunk = [np.asarray(h, np.int64).reshape(-1, 2) for h in histories[start:start+SCORE_BATCH]]
         for h, (actions, logits, q) in zip(chunk, model.evaluator.evaluate(chunk)):
             p = np.exp(logits-logits.max())
-            mover = dense_selfplay.COLOR[len(h)]
+            mover = (len(h)+1)//2 % 2
             out.append((dict(zip(map(tuple, actions.tolist()), p/p.sum())), float((1+q[0]*(1-2*mover))/2)))
     return out
 
@@ -167,7 +166,8 @@ def continuations(model, starts, settings, rng, leaf_batch=256):
             for line, (p, _) in zip(pending, policy(model, pending)):
                 line.append(list(p)[rng.choice(len(p), p=tempered(list(p.values()), s.book_temperature))])
         return lines, [[None]*(len(line)-n) for line, n in zip(lines, grown)]
-    engine = dense_selfplay.Engine(leaf_batch)
+    from dense_selfplay import Engine  # torch loads only where a search runs; readers such as the dashboard skip it
+    engine = Engine(leaf_batch)
     slots = [Line(model, line, s.book_plies, s.book_sims, s.root_samples, s.tactics, s.book_temperature,
                   int(rng.integers(2**31))) if len(line) < s.book_plies else None for line in lines]
     for slot in filter(None, slots):
@@ -576,7 +576,8 @@ def main():
     book = Book(args.run, settings)
     if args.command == 'refresh':
         champion = json.loads((Path(args.run)/'champion.json').read_text())['checkpoint']
-        model = dense_selfplay.load(args.run, replace(config, device=args.device),
+        from dense_selfplay import load
+        model = load(args.run, replace(config, device=args.device),
                                     source=(champion, Path(args.run)/'checkpoints'/champion/'ema.pt'))
         book.migrate(reports_of(args.run))
         now = time.time()

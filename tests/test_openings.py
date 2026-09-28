@@ -8,7 +8,8 @@ import itertools
 import json
 import math
 from pathlib import Path
-import random
+import subprocess
+import sys
 import tempfile
 import unittest
 import unittest.mock
@@ -393,6 +394,11 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(out['players']['seal']['p2_games'], 1)
             self.assertEqual(set(out['books']), {'book'})
             self.assertEqual(out['books']['book']['openings'], 1)
+
+
+    def test_reading_books_does_not_load_torch(self):
+        code = 'import sys, dense_openings; sys.exit("torch" in sys.modules)'
+        self.assertEqual(subprocess.run([sys.executable, '-c', code], cwd=Path(dense_openings.__file__).parent).returncode, 0)
 
 
 class SettingsTests(unittest.TestCase):
