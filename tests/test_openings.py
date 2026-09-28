@@ -306,6 +306,7 @@ class RefreshTests(unittest.TestCase):
             opening(uniform, fresh['moves']), opening(uniform, played['moves'])
             draws = Counter(dense_openings.canonical(uniform.draw(seed))[0] for seed in range(2000))
             self.assertLess(abs(draws[fresh['key']]-1000), 120)
+            self.assertNotEqual(uniform.digest(), book.digest())                # same openings, another draw rule
             with self.assertRaises(ValueError):
                 self.book(tempfile.mkdtemp(dir=run)).draw(1)
 

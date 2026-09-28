@@ -325,9 +325,12 @@ class Book:
         return sorted((n for n in self.nodes.values() if n['status'] == 'opening'), key=lambda n: n['key'])
 
     def digest(self):
-        """The state reports are played under: '' for a frozen book (its suite fixes its openings), else the sha256 of
-        the opening keys."""
-        return '' if self.frozen else hashlib.sha256(json.dumps([n['key'] for n in self.openings()]).encode()).hexdigest()
+        """The state reports are played under: '' for a frozen book (its suite fixes its openings and their weights),
+        else the sha256 of book_weighting and the opening keys, so a change of either names a new state."""
+        if self.frozen:
+            return ''
+        state = [self.settings.book_weighting, [n['key'] for n in self.openings()]]
+        return hashlib.sha256(json.dumps(state).encode()).hexdigest()
 
     def due(self, champion, now):
         """Whether a live book needs a refresh: `champion` did not make the newest one or book_refresh_hours passed."""
