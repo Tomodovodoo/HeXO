@@ -12,14 +12,16 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
                                        every 2 s while it plays
   evaluations/<a>-vs-<b>/report.json   paired match records, ids with '/' written as '-' (dense_eval)
   actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s
-  learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s
+  learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s;
+                                       samples_per_row_target is its effective learner.samples_per_row
   events.jsonl                         one line per event: {time, source, kind, message, ...} (log_event)
   metrics/learner-<variant>.jsonl      {time, step, samples_seen, lr, policy_ce, value_bce, short_value_bce, next_ce,
                                        future_bce, samples_per_second, window_rows} every log_every steps, plus
                                        {time, step, samples_seen, <the five losses>, validation: true} per export
   metrics/actor-<k>.jsonl              {time, positions, games_completed, placements_per_second, evals_per_second,
-                                       mean_batch, terminal_fraction, mean_plies, checkpoint} about every 30 s;
-                                       counters restart with the worker process (dense_selfplay)
+                                       mean_batch, terminal_fraction, mean_plies, checkpoint, paused_seconds} about
+                                       every 30 s and at every pause or resume; counters restart with the worker
+                                       process (dense_selfplay)
   metrics/gpu.jsonl                    {time, utilization, used_mib, watts, temperature} about every 10 s while a
                                        dashboard watches the run (dashboard.py)
 Metrics logs are append-only, one JSON line per write (append_metrics); readers skip a partial last line.
@@ -61,6 +63,11 @@ class ActorSettings:
     cache_positions: int = 4096
     shard_games: int = 32
     opening_random_plies: float = 2.  # mean of an exponential; sampled from the search policy
+    # Cooperative GPU sharing (dense_selfplay.Yield): workers stop searching while a training learner's
+    # samples_per_row is below yield_below * learner.samples_per_row and resume at yield_resume * it.
+    yield_below: float = .9       # 0 disables
+    yield_resume: float = .975
+    yield_check_seconds: float = 30.
 
 
 @dataclass(frozen=True)

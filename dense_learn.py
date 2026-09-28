@@ -359,7 +359,8 @@ def main():
         status.update(fields, updated_at=time.time(), step=learner.step, samples_seen=learner.samples_seen,
                       rows_available=window.total_rows, window_rows=window.rows, full_rows_available=window.total_full_rows,
                       window_full_rows=window.full_rows,
-                      samples_per_row=learner.samples_seen/max(1, window.total_rows), lr=learner.lr(),
+                      samples_per_row=learner.samples_seen/max(1, window.total_rows),
+                      samples_per_row_target=learner.settings.samples_per_row, lr=learner.lr(),
                       last_export_step=learner.last_export, policy_ce=(learner.metrics or {}).get('policy_ce'),
                       value_bce=(learner.metrics or {}).get('value_bce'))
         write_json(status_path(args.run, s.variant), status)

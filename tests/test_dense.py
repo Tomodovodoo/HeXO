@@ -1110,6 +1110,132 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(dense_selfplay.published(tmp, 1, time.time()+1)['games_completed'], 0)
 
 
+class YieldTests(unittest.TestCase):
+    """dense_selfplay.Yield: the actors' cooperative pause against fake learner heartbeats and a fake clock."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.run, self.clock, self.wall = Path(tmp.name), [0.], [1000.]
+
+    def heartbeat(self, rate, variant='main', stage='training', age=0., target=None):
+        name = 'learner-status.json' if variant == 'main' else f'learner-status-{variant}.json'
+        extra = {} if target is None else dict(samples_per_row_target=target)
+        (self.run/name).write_text(json.dumps(dict(stage=stage, variant=variant, samples_per_row=rate,
+                                                   updated_at=self.wall[0]-age, **extra)))
+
+    def gate(self, below=.9, resume=.975, check=30.):
+        return dense_selfplay.Yield(self.run, 4., below, resume, check, clock=lambda: self.clock[0], now=lambda: self.wall[0])
+
+    def advance(self, seconds):
+        self.clock[0] += seconds; self.wall[0] += seconds
+
+    def test_pause_and_resume_with_hysteresis(self):
+        gate = self.gate()
+        states = []
+        for rate in (3.8, 3.59, 3.7, 3.85, 3.9, 3.95, 3.8, 3.59):
+            self.heartbeat(rate)
+            self.advance(30.)
+            states.append(gate.paused())
+        # pause below 3.6, resume at 3.9, run on between the bounds in whichever state it was
+        self.assertEqual(states, [False, True, True, True, False, False, False, True])
+        self.assertIn('3.59', gate.reason)
+
+    def test_checks_the_heartbeat_only_every_check_seconds(self):
+        gate = self.gate(check=30.)
+        self.heartbeat(2.)
+        self.assertTrue(gate.paused())
+        self.heartbeat(4.)
+        self.advance(29.)
+        self.assertTrue(gate.paused())
+        self.advance(1.)
+        self.assertFalse(gate.paused())
+
+    def test_missing_stale_or_idle_learners_never_pause(self):
+        gate = self.gate(check=0.)
+        self.assertFalse(gate.paused())
+        self.assertEqual(gate.reason, 'no training learner heartbeat')
+        self.heartbeat(1., stage='waiting-for-data')
+        self.assertFalse(gate.paused())
+        self.heartbeat(1., age=dense_selfplay.STALE_SECONDS+1)
+        self.assertFalse(gate.paused())
+        (self.run/'learner-status.json').write_text('{"stage": "trai')  # torn write
+        self.assertFalse(gate.paused())
+        self.heartbeat(1.)
+        self.assertTrue(gate.paused())
+        (self.run/'learner-status.json').unlink()  # a paused actor resumes when the learner goes away
+        self.assertFalse(gate.paused())
+
+    def test_the_furthest_behind_training_learner_decides(self):
+        gate = self.gate(check=0.)
+        self.heartbeat(3.95)
+        self.heartbeat(3.0, variant='wide')
+        self.assertTrue(gate.paused())
+        self.assertIn('wide', gate.reason)
+        self.heartbeat(3.0, variant='wide', stage='failed')
+        self.assertFalse(gate.paused())
+
+    def test_each_learner_is_compared_with_its_own_target(self):
+        gate = self.gate(check=0.)  # config target 4
+        self.heartbeat(3.0, target=3.2)  # 0.94 of its own target: not behind, though below 0.9 * 4
+        self.assertFalse(gate.paused())
+        self.heartbeat(3.95, variant='wide', target=8.)  # 0.49 of its target: behind, though above 3.6
+        self.assertTrue(gate.paused())
+        self.assertIn('wide', gate.reason)
+        self.assertIn('pause below 7.20', gate.reason)
+        self.heartbeat(7.9, variant='wide', target=8.)
+        self.assertTrue(gate.paused())  # main at 0.94 of its target is below the resume bound
+        self.heartbeat(3.15, target=3.2)
+        self.assertFalse(gate.paused())
+        self.heartbeat(3.5)  # no samples_per_row_target: the config target applies
+        self.assertTrue(gate.paused())
+
+    def test_metrics_lines_on_every_stage_change_and_periodically(self):
+        due = dense_selfplay.metrics_due
+        self.assertTrue(due('paused', 'playing', 0.))
+        self.assertTrue(due('playing', 'paused', 0.))  # the resume is logged at once
+        self.assertFalse(due('paused', 'paused', dense_selfplay.METRICS_SECONDS-1))
+        self.assertTrue(due('paused', 'paused', dense_selfplay.METRICS_SECONDS))
+        self.assertFalse(due('playing', 'playing', 1.))
+
+    def test_learner_heartbeat_reports_its_effective_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)/'run'
+            made = subprocess.run([sys.executable, str(ROOT/'dense_config.py'), '--run', str(run), '--device', 'cpu',
+                                   '--blocks', '1', '--channels', '16'], capture_output=True, text=True, cwd=ROOT, timeout=60)
+            self.assertEqual(made.returncode, 0, made.stderr)
+            write_games(run/'shards'/'000001', [(winning_game(), 0, None)]*8)
+            done = subprocess.run([sys.executable, str(ROOT/'dense_learn.py'), '--run', str(run), '--steps', '1',
+                                   '--workers', '1', '--batch', '8', '--window-min-rows', '1', '--samples-per-row', '7.5',
+                                   '--validation-fraction', '0'],
+                                  capture_output=True, text=True, cwd=ROOT, timeout=300)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            status = json.loads((run/'learner-status.json').read_text())
+            self.assertEqual(status['samples_per_row_target'], 7.5)
+
+    def test_disabled_and_invalid_bounds(self):
+        self.heartbeat(0.)
+        self.assertFalse(self.gate(below=0.).paused())
+        with self.assertRaises(ValueError):
+            self.gate(below=.99, resume=.9)
+
+    def test_actor_flags_round_trip_through_the_worker_parser(self):
+        parser = argparse.ArgumentParser()
+        dense_config.add_arguments(parser, dense_config.ActorSettings)
+        args = parser.parse_args(['--games-in-flight', '256', '--no-tactics', '--yield-below', '0.8'])
+        flags = dense_selfplay.actor_flags(args)
+        self.assertEqual(flags, ['--games-in-flight', '256', '--no-tactics', '--yield-below', '0.8'])
+        settings = dense_config.override(dense_config.ActorSettings(), parser.parse_args(flags))
+        self.assertEqual((settings.games_in_flight, settings.tactics, settings.yield_below, settings.leaf_batch),
+                         (256, False, .8, dense_config.ActorSettings.leaf_batch))
+
+    def test_configs_written_before_the_yield_settings_load_with_the_defaults(self):
+        data = asdict(dense_config.RunConfig())
+        for name in ('yield_below', 'yield_resume', 'yield_check_seconds'):
+            del data['actor'][name]
+        self.assertEqual(dense_config.from_dict(data).actor.yield_below, dense_config.ActorSettings.yield_below)
+
+
 class PacerTests(unittest.TestCase):
     def test_share_ceiling_with_a_fake_clock(self):
         now, slept, ticks = [0.], [], []
