@@ -69,7 +69,6 @@ CURVE_SOURCES = ('fresh', 'newest')
 CALIBRATION_V = tuple(np.linspace(-1, 1, 9).tolist())  # calibration_report table grid
 CALIBRATION_H = tuple(range(0, 161, 8))
 SURFACE_WIDTH, SURFACE_LIMIT, SURFACE_MIN = 16, 384, 8  # surfaces: cell width, axis limit, rows per reported cell
-REFERENCE_RIDGE, REFERENCE_STEPS = 1., 12  # calibration_reference: penalty toward the base rate, Newton steps
 NEAR_END, FAR_END = 20, 60  # value_regret: early rows have remaining < NEAR_END, late rows remaining >= FAR_END
 # (low, high) for replacement perturbations; td_lambda, outcome_lambda and ema are perturbed through 1 - x.
 BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995),
@@ -133,33 +132,16 @@ def searched_value(episode, ply):
     return math.nan
 
 
-def reference_basis(value, remaining):
-    """Calibration features per row: 1, x, x^2, z, z x, z x^2 with z = atanh(value clipped to +-0.995) and
-    x = log(1 + remaining) / log(1 + SURFACE_LIMIT)."""
-    z = np.arctanh(np.clip(np.asarray(value, np.float64), -.995, .995))
-    x = np.log1p(np.asarray(remaining, np.float64))/math.log1p(SURFACE_LIMIT)
-    return np.stack([np.ones_like(x), x, x*x, z, z*x, z*x*x], 1)
-
-
-def calibration_reference(fit_value, fit_remaining, fit_outcome, value, remaining, ridge=REFERENCE_RIDGE, steps=REFERENCE_STEPS):
-    """P(outcome = 1 | value, remaining) for the query rows from a logistic regression on reference_basis fitted
-    to the rows with a finite value among the fit rows: `steps` Newton steps from the base rate (the mean fit
-    outcome, clipped to [1e-3, 1 - 1e-3]) with an L2 penalty `ridge` on every weight but the intercept. Query rows
-    without a finite value, and every row when no fit row has one, get the base rate; None without fit rows."""
+def calibration_reference(fit_value, fit_remaining, fit_outcome, value, remaining,
+                          ridge=dense_data.CALIBRATION_RIDGE, steps=dense_data.CALIBRATION_ITERATIONS):
+    """P(outcome = 1 | value, remaining) for the query rows from dense_data.fit_calibration_rows (the value target
+    map's basis, shrinkage and fit, with `ridge` and at most `steps` Newton steps) on the fit rows, with base the
+    mean fit outcome clipped to [1e-3, 1 - 1e-3]. Query rows without a finite value, and every row when no fit row
+    has one, get the base rate; None without fit rows."""
     y = np.asarray(fit_outcome, np.float64)
     if not len(y): return None
     base = float(np.clip(y.mean(), 1e-3, 1-1e-3))
-    v = np.asarray(fit_value, np.float64); known = np.isfinite(v)
-    X, y = reference_basis(v[known], np.asarray(fit_remaining, np.float64)[known]), y[known]
-    w = np.zeros(X.shape[1]); w[0] = math.log(base/(1-base))
-    penalty = np.full(len(w), ridge); penalty[0] = 0.
-    for _ in range(steps if len(y) else 0):
-        p = 1/(1+np.exp(-X@w))
-        w -= np.linalg.solve(X.T@(X*(p*(1-p))[:, None])+np.diag(penalty)+1e-9*np.eye(len(w)), X.T@(p-y)+penalty*w)
-    q = np.asarray(value, np.float64); out = np.full(len(q), base)
-    ok = np.isfinite(q)
-    out[ok] = 1/(1+np.exp(-reference_basis(q[ok], np.asarray(remaining, np.float64)[ok])@w))
-    return out
+    return dense_data.fit_calibration_rows(fit_value, fit_remaining, y, base, ridge, steps).predict(value, remaining)
 
 
 def value_regret(bce, outcome, reference, remaining):
