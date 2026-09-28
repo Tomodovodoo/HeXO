@@ -1017,6 +1017,46 @@ class ValidationSourceTests(unittest.TestCase):
             points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_newest_gap_policy_ce')['points']
             self.assertEqual(points, [[10, v['newest_gap_policy_ce']]])
 
+    def test_export_recalibrates_ema_norm_statistics(self):
+        """The raw model drifts (here: perturbed weights) after the EMA was taken. The exported EMA must carry norm
+        statistics of its own weights, so its eval-mode losses match its train-mode (batch statistics) losses,
+        which the raw model's statistics do not achieve."""
+        torch.set_num_threads(2)
+        torch.manual_seed(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x', games=12)
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=16, validation_fraction=0.))
+            learner = dense_learn.Learner(run, config.learner, config)
+            window = dense_data.ReplayWindow(run, 1000, 10)
+            rng, s = np.random.default_rng(3), learner.settings
+            batch = dense_data.collate(*dense_data.examples(window, window.sample(rng, 64), rng, **dense_data.target_options(s)))
+            learner.model.train()
+            with torch.no_grad():
+                for p in learner.model.parameters():
+                    p.normal_().mul_(.3)
+                learner.ema = copy.deepcopy(learner.model)
+                for p in learner.model.parameters():
+                    p.add_(torch.randn_like(p)*.3)
+                for _ in range(20):
+                    dense_learn.batch_losses(learner.model, batch, None, learner.device, learner.memory_format, False)
+            dense_learn.update_ema(learner.ema, learner.model, .999)
+
+            def gap(model):
+                with torch.no_grad():
+                    losses = [dense_learn.batch_losses(copy.deepcopy(model).train(mode), batch, None, learner.device,
+                                                       learner.memory_format, False)[:2] for mode in (False, True)]
+                return float((losses[0]-losses[1]).abs().max())
+            copied = copy.deepcopy(learner.ema)
+            for e, m in zip(copied.buffers(), learner.model.buffers()):
+                e.copy_(m)
+            learner.export(window)
+            ema = hexnet.load_model(run/'checkpoints'/'main'/'000000'/'ema.pt')
+            self.assertGreater(gap(copied), .05)
+            self.assertLess(gap(ema), .01)
+            self.assertEqual(learner.ema.blocks[0].norm1.momentum, .1)
+
     def test_export_without_held_out_games(self):
         """No held-out game in the window: metrics.validation stays null, the sources are still reported, and the
         dashboard series skips the null aggregate."""
