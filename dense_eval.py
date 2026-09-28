@@ -610,6 +610,8 @@ def loop(args):
     if min(settings.games, settings.sprt_max_games) < 2 or any(0 < getattr(settings, name) < 2 or getattr(settings, name) < 0
                                                                 for name in ('previous_games', 'anchor_games')):
         raise ValueError('games and sprt_max_games need at least one opening pair; optional totals are 0 or at least 2')
+    if settings.anchor_games and settings.anchor_every < 1:
+        raise ValueError('anchor_every must be at least 1 while anchor games are enabled')
     evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share), args.processes)
     try:
         while True:
