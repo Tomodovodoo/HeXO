@@ -1420,5 +1420,27 @@ class EvaluatorLoopTests(unittest.TestCase):
                          [('main/000030', None), ('main/000040', 'main/000010'), ('main/000040', None)])
         self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000010')
 
+    def test_restart_settles_panels_completed_on_disk(self):
+        self.export(10, 20, 40)
+        settings = self.start().settings
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000040', matrix={}, checkpoints=[
+            dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
+            dict(id='main/000020', variant='main', step=20, elo=0., matches=[]),
+            dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
+                 panel=dict(members=['main/000020'], incumbent='main/000010'))])))
+        for a, wins, losses in (('main/000040', 0, 20), ('main/000010', 15, 5)):     # written before the process exited
+            path = dense_eval.report_path(self.run, a, 'main/000020')
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(dict(candidate=a, opponent='main/000020', settings=asdict(settings), metrics={}, games=[],
+                                            summary=dict(wins=wins, losses=losses, capped=0, games=wins+losses))))
+        with unittest.mock.patch.object(dense_eval, 'write_league'):
+            evaluator = self.start()
+            self.assertEqual(evaluator.needs(evaluator.entry('main/000040')), [])       # nothing left to play
+            self.assertFalse(evaluator.step())
+        entry = evaluator.entry('main/000040')
+        self.assertTrue(entry['panel']['veto'] and entry['demoted'])
+        self.assertEqual(evaluator.league['champion'], 'main/000010')
+        self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000010')
+
 if __name__ == '__main__':
     unittest.main()
