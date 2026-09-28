@@ -1,5 +1,5 @@
-"""CPU checks for the dense hex ResNet stack: hexcrop, hexnet, dense_config, dense_data, dense_bootstrap and the
-actor/evaluator engine."""
+"""CPU checks for the dense hex ResNet stack: hexcrop, hexnet, dense_config, dense_data, dense_bootstrap, the
+learner's validation and the actor/evaluator engine."""
 import argparse
 import copy
 from dataclasses import asdict, replace
@@ -24,6 +24,7 @@ import dense_config
 import dense_data
 import dense_bootstrap
 import dense_eval
+import dense_learn
 import dense_selfplay
 from neural_search import NeuralSearch
 
@@ -807,8 +808,9 @@ class DenseBootstrapTests(unittest.TestCase):
             identity, new_episodes, new_rows = dense_bootstrap.convert(
                 manifest, dense_bootstrap.digest(source/'manifest.json'), episodes, rows)
             target = run/'shards'/'000001'
-            written = dense_data.write_shard(target, identity, new_episodes, new_rows)
-            self.assertEqual(written['actor'], 'b'*64)
+            written = dense_data.write_shard(target, identity, new_episodes, new_rows, 'converted')
+            self.assertEqual((written['actor'], written['origin']), ('b'*64, 'converted'))
+            self.assertEqual(dense_data.origin(dict(written, origin=None)), 'converted')    # inferred from the identity
             self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, terminal_games=1, capped_games=1))
             self.assertEqual(dense_bootstrap.check(target), 21)
             _, stored = dense_data.read_shard(target)
@@ -828,6 +830,219 @@ class DenseBootstrapTests(unittest.TestCase):
             (source/'rows.json').write_text('[]', encoding='utf-8')
             with self.assertRaises(ValueError):
                 dense_bootstrap.read_corpus(source)
+
+
+def source_shard(path, seed, actor, origin='actor', checkpoint=None, games=6, policy_every=2, publisher=None):
+    """A shard of `games` random capped games; game g is played by actor[g % len(actor)] for a list, else by `actor`.
+    The identity's actor_sha256 is `publisher`, default the last actor. Actor shards get a dense_selfplay-like identity."""
+    rng = np.random.default_rng(seed)
+    actors = actor if isinstance(actor, list) else [actor]
+    episodes, rows = [], []
+    for g in range(games):
+        moves, _ = random_game(rng, 8)
+        e, r = episode_rows(moves, -1, [float(v) for v in rng.uniform(-1, 1, len(moves))], rng, policy_every)
+        episodes.append(dict(e, actor=actors[g % len(actors)]))
+        rows += [dict(x, game=g) for x in r]
+    publisher = publisher or actors[-1]
+    identity = dict(source='gumbel-policy-value-v1', actor_sha256=publisher) if origin == 'converted' else \
+        dict(actor_sha256=publisher, actors=sorted(set(actors)), checkpoint=checkpoint)
+    return dense_data.write_shard(path, identity, episodes, rows, origin)
+
+
+class ValidationSourceTests(unittest.TestCase):
+    def test_origin_inference(self):
+        self.assertEqual(dense_data.origin(dict(origin='actor', identity=dict(source='x'))), 'actor')
+        self.assertEqual(dense_data.origin(dict(identity=dict(source='gumbel-policy-value-v1', actor_sha256='a'))), 'converted')
+        self.assertEqual(dense_data.origin(dict(identity=dict(actor_sha256='a', actors=['a'], checkpoint='main/000500'))), 'actor')
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(source_shard(Path(tmp)/'shards'/'1', 0, 'a')['origin'], 'actor')
+            with self.assertRaises(ValueError):
+                dense_data.write_shard(Path(tmp)/'shards'/'2', dict(actor_sha256='a'), [], [], 'other')
+
+    def test_fixed_subsets_per_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for k in (1, 2):
+                source_shard(run/'shards'/f'{k:06d}', k, 'old', 'converted')
+            source_shard(run/'shards'/'1000000000001', 3, 'x', checkpoint='main/000010')
+            sets = dense_data.ValidationSets(run, .5, 5, limit=10, quota=4)
+            sets.refresh()
+            def keys():
+                return {k: [(r.shard, r.index) for r in refs] for k, refs in sets.subsets.items()}
+            first = keys()
+            for (source, split), refs in sets.subsets.items():
+                self.assertTrue(refs, (source, split))
+                self.assertLessEqual(len(refs), 10)
+                for shard in {r.shard for r in refs}:
+                    self.assertLessEqual(sum(r.shard == shard for r in refs), 4)
+                for r in refs:
+                    self.assertEqual(dense_data.holdout(r.episode, .5), split == 'held')
+                    self.assertTrue(len(sets.policy(r)))
+                    self.assertEqual(len(r.shard) == 6, source == 'converted')
+            self.assertEqual((sets.newest, sets.newest_checkpoint), ('x', 'main/000010'))
+            self.assertEqual(first['fresh', 'held'], first['newest', 'held'])
+            again = dense_data.ValidationSets(run, .5, 5, limit=10, quota=4)
+            again.refresh()
+            self.assertEqual({k: [(r.shard, r.index) for r in refs] for k, refs in again.subsets.items()}, first)
+            # A newer shard of the same actor only appends; a new actor restarts only the newest subsets.
+            source_shard(run/'shards'/'1000000000002', 4, 'x', checkpoint='main/000010')
+            sets.refresh()
+            grown = keys()
+            for key, before in first.items():
+                self.assertEqual(grown[key][:len(before)], before)
+            self.assertEqual(grown['converted', 'held'], first['converted', 'held'])
+            source_shard(run/'shards'/'1000000000003', 5, 'y', checkpoint='main/000020')
+            sets.refresh()
+            self.assertEqual(sets.newest_checkpoint, 'main/000020')
+            self.assertEqual({r.shard for r in sets.subsets['newest', 'train']}, {'1000000000003'})
+            self.assertEqual(keys()['fresh', 'train'][:len(grown['fresh', 'train'])], grown['fresh', 'train'])
+            refs = sets.subsets['fresh', 'train']
+            samples, targets = dense_data.examples(sets, refs, np.random.default_rng(0))
+            for r, t in zip(refs, targets):
+                self.assertEqual(t['policy_weight'], 1.)
+                following = sets.following(r)
+                self.assertEqual(t['next_weight'] > 0, following is not None)
+                if following is not None:
+                    self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
+            dense_data.collate(samples, targets)
+
+    def test_newest_actor_comes_from_episodes(self):
+        """Right after a checkpoint switch the newest shard's publisher may have played none of its games."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 1, 'x', checkpoint='main/000010')
+            source_shard(run/'shards'/'1000000000002', 2, 'x', checkpoint='main/000020', publisher='y')
+            sets = dense_data.ValidationSets(run, .5, 5, limit=10, quota=4)
+            sets.refresh()
+            self.assertEqual((sets.newest, sets.newest_checkpoint), ('x', 'main/000010'))
+            for split in ('held', 'train'):
+                refs = sets.subsets['newest', split]
+                self.assertTrue(refs)
+                self.assertTrue(all(r.episode['actor'] == 'x' for r in refs))
+            source_shard(run/'shards'/'1000000000003', 3, ['x', 'y'], checkpoint='main/000020')
+            sets.refresh()
+            self.assertEqual((sets.newest, sets.newest_checkpoint), ('y', 'main/000020'))
+            self.assertTrue(sets.subsets['newest', 'train'])
+            self.assertTrue(all(r.episode['actor'] == 'y' for r in sets.subsets['newest', 'train']))
+
+    def test_lagging_worker_does_not_move_newest_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 1, 'x', checkpoint='main/000010')
+            source_shard(run/'shards'/'1000000000002', 2, 'y', checkpoint='main/000020')
+            sets = dense_data.ValidationSets(run, .5, 5, limit=10, quota=4)
+            sets.refresh()
+            self.assertEqual((sets.newest, sets.newest_checkpoint), ('y', 'main/000020'))
+            before = [(r.shard, r.index) for r in sets.subsets['newest', 'train']]
+            source_shard(run/'shards'/'1000000000003', 3, 'x', checkpoint='main/000010')    # the lagging worker
+            sets.refresh()
+            self.assertEqual((sets.newest, sets.newest_checkpoint), ('y', 'main/000020'))
+            self.assertEqual([(r.shard, r.index) for r in sets.subsets['newest', 'train']], before)
+            again = dense_data.ValidationSets(run, .5, 5, limit=10, quota=4)
+            again.refresh()
+            self.assertEqual(again.newest, 'y')
+
+    def test_retained_state_is_bounded(self):
+        """Many shards: full subsets stop consuming shards, and per shard only actor row counts are kept."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            sets = dense_data.ValidationSets(run, .5, 5, limit=6, quota=3)
+            for k in range(12):
+                source_shard(run/'shards'/f'{1000000000001+k}', k, 'x', checkpoint='main/000010')
+                sets.refresh()
+            self.assertEqual({k: len(p) for k, p in sets.picks.items() if k[0] != 'converted'},
+                             {(s, split): 6 for s in ('fresh', 'newest') for split in ('held', 'train')})
+            self.assertLessEqual(max(len(w) for w in sets.walked.values()), 6)
+            self.assertLessEqual(len(sets.entries), 2*6*len(sets.picks))
+            self.assertEqual(sorted(sets.actors), [f'{1000000000001+k}' for k in range(12)])
+            self.assertTrue(all(list(c) == ['x'] for c in sets.actors.values()))
+
+    def test_newest_change_selects_a_cached_successor(self):
+        """A row cached only as a chosen row's next-ply successor can be chosen after the newest actor changes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 1, ['x', 'y'], checkpoint='main/000010', games=8, policy_every=1,
+                         publisher='x')
+            source_shard(run/'shards'/'1000000000002', 2, 'x', checkpoint='main/000010', policy_every=1)
+            sets = dense_data.ValidationSets(run, .3, 5, limit=40, quota=12)
+            sets.refresh()
+            successors = set(sets.entries)-set(sets.following_index)
+            source_shard(run/'shards'/'1000000000003', 3, 'y', checkpoint='main/000020', policy_every=1)
+            sets.refresh()
+            self.assertEqual(sets.newest, 'y')
+            chosen = {(r.shard, r.index) for refs in sets.subsets.values() for r in refs}
+            self.assertTrue(successors & chosen)
+            for refs in sets.subsets.values():
+                for r in refs:
+                    following = sets.following(r)
+                    if following is not None:
+                        self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
+                        self.assertTrue(len(sets.policy(following)))
+
+    def test_export_logs_per_source_validation(self):
+        import dashboard
+        torch.set_num_threads(2)
+        torch.manual_seed(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'000001', 1, 'old', 'converted')
+            source_shard(run/'shards'/'1000000000001', 2, 'x', checkpoint='main/000010')
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=.5))
+            learner = dense_learn.Learner(run, config.learner, config)
+            window = dense_data.ReplayWindow(run, 1000, 10, validation_fraction=.5)
+            sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=6)
+            manifest = learner.export(window, sets)
+            self.assertEqual(set(manifest), {'variant', 'step', 'samples_seen', 'created_at', 'model_sha256', 'ema_sha256',
+                                             'metrics', 'learner', 'model', 'copied_from'})
+            aggregate, v = manifest['metrics']['validation'], manifest['metrics']['validation_sources']
+            self.assertEqual(v['newest_checkpoint'], 'main/000010')
+            for h in dense_learn.HEADS:
+                self.assertTrue(math.isfinite(aggregate[h]))
+            for source in dense_data.SOURCES:
+                self.assertEqual(v[f'{source}_rows'], len(sets.subsets[source, 'held']))
+                for name in ('policy_ce', 'value_bce'):
+                    self.assertAlmostEqual(v[f'{source}_gap_{name}'], v[f'{source}_{name}']-v[f'{source}_train_{name}'])
+            self.assertEqual((aggregate, v), (learner.validate(window), learner.validate_sources(sets)))
+            path = run/'checkpoints'/'main'/'000000'
+            self.assertEqual(sorted(p.name for p in path.iterdir()), ['ema.pt', 'manifest.json', 'model.pt', 'optimizer.pt'])
+            self.assertEqual(dense_learn.Learner(run, config.learner, config).step, 0)
+            fields = dense_learn.validation_fields(manifest['metrics'])
+            self.assertEqual(fields['next_ce'], aggregate['opponent_ce'])
+            dense_config.append_metrics(run, 'learner-main', step=10, validation=True, **fields)
+            points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_newest_gap_policy_ce')['points']
+            self.assertEqual(points, [[10, v['newest_gap_policy_ce']]])
+
+    def test_export_without_held_out_games(self):
+        """No held-out game in the window: metrics.validation stays null, the sources are still reported, and the
+        dashboard series skips the null aggregate."""
+        import dashboard
+        torch.set_num_threads(2)
+        torch.manual_seed(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x', checkpoint='main/000010')
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=0.))
+            learner = dense_learn.Learner(run, config.learner, config)
+            window = dense_data.ReplayWindow(run, 1000, 10)
+            first = learner.export(window)['metrics']
+            self.assertEqual((first['validation'], first['validation_sources']), (None, None))
+            self.assertIsNone(dense_learn.validation_fields(first))
+            learner.step = 1
+            sets = dense_data.ValidationSets(run, 0., config.seed, limit=12, quota=6)
+            metrics = learner.export(window, sets)['metrics']
+            self.assertIsNone(metrics['validation'])
+            self.assertEqual(metrics['validation_sources']['fresh_rows'], 0)
+            self.assertTrue(math.isfinite(metrics['validation_sources']['fresh_train_policy_ce']))
+            fields = dense_learn.validation_fields(metrics)
+            self.assertNotIn('policy_ce', fields)
+            dense_config.append_metrics(run, 'learner-main', step=1, validation=True, policy_ce=None, **fields)
+            config = dict(created_at=0.)
+            self.assertEqual(dashboard.series(run, config, 'main', 'validation_policy_ce')['points'], [])
+            self.assertEqual(dashboard.series(run, config, 'main', 'validation_fresh_policy_ce')['points'], [])
+            self.assertEqual(dashboard.series(run, config, 'main', 'validation_fresh_train_policy_ce')['points'],
+                             [[1, fields['fresh_train_policy_ce']]])
 
 
 class EvaluatorSearchTests(unittest.TestCase):

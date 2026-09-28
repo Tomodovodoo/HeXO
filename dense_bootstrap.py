@@ -1,4 +1,5 @@
-"""Convert gumbel-policy-value-v1 search corpora into dense shards `<run>/shards/NNNNNN/`, one per old corpus.
+"""Convert gumbel-policy-value-v1 search corpora into dense shards `<run>/shards/NNNNNN/` (origin 'converted'),
+one per old corpus.
 
 The old corpora record no root values, so capped games keep their policy rows with value weight 0.
 Opening plies and the rows dropped from early capped games are marked full_search=False.
@@ -95,7 +96,7 @@ def main():
         manifest, episodes, rows = read_corpus(source)
         identity, new_episodes, new_rows = convert(manifest, digest(source/'manifest.json'), episodes, rows)
         target = args.run/'shards'/f'{number:06d}'
-        counts = dense_data.write_shard(target, identity, new_episodes, new_rows)['counts']
+        counts = dense_data.write_shard(target, identity, new_episodes, new_rows, 'converted')['counts']
         check(target)
         mean = np.mean([len(e['moves']) for e in new_episodes])
         row = [counts[k] for k in ('games', 'rows', 'policy_rows', 'terminal_games', 'capped_games')]

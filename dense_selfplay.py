@@ -398,7 +398,7 @@ def worker(args):
         identity = dict(actor_sha256=model.sha, actors=actors, checkpoint=model.checkpoint, process=args.worker,
                         pid=os.getpid(), seed_entropy=str(entropy), model=asdict(model.config),
                         actor=asdict(settings), value_targets='not stored; derive from episode root_values and winner')
-        dense_data.write_shard(run/'shards'/name, identity, episodes, rows)
+        dense_data.write_shard(run/'shards'/name, identity, episodes, rows, 'actor')
         state['shards_written'] += 1
         games = len(episodes); terminal = sum(e['winner'] >= 0 for e in episodes)
         elapsed = now-since['time']
