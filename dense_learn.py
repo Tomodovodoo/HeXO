@@ -50,8 +50,8 @@ KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'valid
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')))  # metrics log names
 # (low, high) for replacement perturbations; td_lambda and ema are perturbed through 1 - x.
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
-REMAINING_SIGMA = 6.
-HORIZON_BCE = .6
+REMAINING_SIGMA = 4.
+HORIZON_BCE = math.log(2)/2  # midpoint between a perfect and a chance value head
 CURVE_SOURCES = ('fresh', 'newest')
 BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995), ema=(.99, .9999))
 

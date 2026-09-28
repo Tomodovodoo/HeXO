@@ -1181,8 +1181,7 @@ class ValidationSourceTests(unittest.TestCase):
 
     def test_remaining_curve_on_outcomes_decided_in_the_last_ten_plies(self):
         """Games whose outcome is fixed only in their last 10 plies: a predictor that knows it there and says 0.5
-        before has a curve near 0 at the end and near ln 2 far away; the smoothed curve crosses 0.6 a little over
-        one sigma past the step."""
+        before has a curve near 0 at the end and near ln 2 far away; the horizon (curve crossing ln 2 / 2) is the step."""
         rng = np.random.default_rng(0)
         remaining, bce = [], []
         for _ in range(300):
@@ -1199,7 +1198,7 @@ class ValidationSourceTests(unittest.TestCase):
         self.assertAlmostEqual(curve[60], math.log(2), places=3)
         self.assertAlmostEqual(curve[100], math.log(2), places=3)
         self.assertIsNone(curve[160])
-        self.assertTrue(10 < c['value_horizon'] < 20, c['value_horizon'])
+        self.assertAlmostEqual(c['value_horizon'], 10.5, delta=1.)
         mask = np.array(remaining) <= 20
         self.assertAlmostEqual(c['value_bce_last20'], float(np.mean(np.array(bce)[mask])))
         soft = dense_learn.remaining_curve([5, 5], [.8, .8], [.5, .5], grid=(5,))
