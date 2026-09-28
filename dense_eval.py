@@ -1354,6 +1354,8 @@ def loop(args):
         raise ValueError('anchor_every must be at least 1 while anchor games are enabled')
     if settings.anchor_target_halfwidth < 0 or settings.fill_top < 0 or not .5 <= settings.max_expected_score <= 1:
         raise ValueError('anchor_target_halfwidth and fill_top must be at least 0, max_expected_score in [0.5, 1]')
+    if settings.opening_suite not in ('standard-v1', 'mixed-v1'):
+        raise ValueError("the evaluator draws openings with train.task_opening: opening_suite 'standard-v1' or 'mixed-v1'")
     if args.once:
         settings = replace(settings, idle_fill=False)  # fill work never runs out
     evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share))

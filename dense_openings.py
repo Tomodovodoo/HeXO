@@ -583,8 +583,9 @@ def summary(run, reports, settings):
 
 
 def reports_of(run):
-    """Every evaluations/*/report.json of `run`."""
-    return [json.loads(p.read_text()) for p in sorted((Path(run)/'evaluations').glob('*/report.json'))]
+    """Every evaluation report of `run`: evaluations/*/report*.json, the reports archived beside a pairing's
+    report.json included."""
+    return [json.loads(p.read_text()) for p in sorted((Path(run)/'evaluations').glob('*/report*.json'))]
 
 
 def main():

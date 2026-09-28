@@ -499,7 +499,12 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(len(cli('stats', '--nodes')['stats']['depths']), 1)
             self.assertEqual(cli('prune')['removed'], 0)
             self.assertEqual(cli('stats', '--suite', 'standard-v1')['openings'], 47)
-
+        with tempfile.TemporaryDirectory() as tmp:
+            archived = Path(tmp)/'evaluations'/'a-vs-b'
+            archived.mkdir(parents=True)
+            for name in ('report.json', 'report-5.json'):
+                (archived/name).write_text(json.dumps(dict(name=name)))
+            self.assertEqual([r['name'] for r in dense_openings.reports_of(tmp)], ['report-5.json', 'report.json'])
 
 if __name__ == '__main__':
     unittest.main()
