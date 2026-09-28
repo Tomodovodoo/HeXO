@@ -3233,6 +3233,51 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertIn('main/027500 was skipped with 64 games against main/019500', next(e for e in events if e['kind'] == 'info')['message'])
 
+    def test_the_direct_tally_is_cumulative_over_every_report_of_the_pair_and_a_restart(self):
+        """main/037500's comparison with champion main/032500 is cut by a restart. The status tally, the decision's
+        direct record and the pending entry count every recorded game of the pair (its report, the reverse report
+        and the pool's completed pairs), before and after the restart, with pair score and LLR over all its pairs."""
+        self.export(30000, 32500, 37500)
+        self.start()
+        self.report('main/032500', 'main/030000', [1]*12+[0]*8)
+        self.report('main/037500', 'main/032500', [1, 1]*10+[0, 0]*5)          # +20 -10 before the restart
+        self.report('main/032500', 'main/037500', [1, 0]*3)                    # reverse role: +3 -3 for main/037500
+        entry = lambda step, elo: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, elo_interval=None, matches=[])
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/032500', checkpoints=[entry(30000, 0.), entry(32500, 60.)])))
+        settings = dict(decision='posterior', promote_confidence=.999999, sprt_max_games=400, pool_games=4, sprt_min_games=400)
+        status = lambda: json.loads((self.run/'evaluator-status.json').read_text())
+        record = lambda d: (d['games'], d['wins'], d['losses'])
+        self.assertEqual(record(self.start(**settings).verdict('main/037500', 'main/032500')['direct']), (36, 23, 13))
+
+        def crash(after):
+            def hook(pool, steps):
+                if steps > after:
+                    raise Crash
+            return hook
+        with unittest.mock.patch.object(dense_eval, 'STATUS_SECONDS', 0.), \
+                unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=crash(4))), self.assertRaises(Crash):
+            self.start(**settings).step()                                      # four games won, then the process dies
+        played = status()
+        self.assertEqual(record(played['tally']), (40, 27, 13))
+        self.assertEqual(record(played['decision']['direct']), (40, 27, 13))
+        self.assertEqual([record(p['direct']) for p in played['pending']], [(40, 27, 13)])
+        self.assertEqual(played['games_played'], 34)                           # the lane's own report
+
+        with unittest.mock.patch.object(dense_eval, 'STATUS_SECONDS', 0.), \
+                unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=crash(0))), self.assertRaises(Crash):
+            self.start(**settings).step()                                      # restarted: the count carries over
+        resumed = status()
+        self.assertEqual(record(resumed['tally']), (40, 27, 13))
+        self.assertEqual(record(resumed['decision']['direct']), (40, 27, 13))
+        self.assertEqual([record(p['direct']) for p in resumed['pending']], [(40, 27, 13)])
+        self.assertEqual(resumed['tally']['pairs'], 20)
+        pairs = [(1, 1)]*12+[(0, 0)]*5+[(1, 0)]*3
+        score = sum(map(sum, pairs))/len(pairs)/2
+        self.assertAlmostEqual(resumed['tally']['pair_score'], score)
+        s = self.start(**settings).settings
+        games = [dict(seed=k, challenger_color=c, winner=c if r else 1-c) for k, pair in enumerate(pairs) for c, r in enumerate(pair)]
+        self.assertAlmostEqual(resumed['tally']['llr'], dense_eval.sprt(games, s.sprt_elo0, s.sprt_elo1, s.sprt_alpha, s.sprt_beta)['llr'])
+
     def test_a_fresh_evaluator_promotes_a_rated_leader_from_existing_reports(self):
         """On start the promotion rule is re-applied to the reports on disk: main/025000, rated but not promoted,
         leads with +38 -11 =15 in 64 direct games against the champion and is crowned without a new game."""
