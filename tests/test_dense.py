@@ -669,6 +669,11 @@ class DenseConfigTests(unittest.TestCase):
         self.assertIsNone(dashboard.provisional(league, dict(status, comparison=dict(candidate='main/000010', opponent='seal'))))
         self.assertIsNone(dashboard.provisional(league, dict(status, stage='idle')))
         self.assertIsNone(dashboard.provisional(league, dict(status, tally=None)))
+        variant = dict(status, comparison=dict(candidate='main/000010@solver', opponent='main/000010', kind='variant'))
+        league['variants'] = [dict(id='main/000010@solver', checkpoint='main/000010', elo=30.)]
+        self.assertEqual(dashboard.provisional(league, variant)['elo'], 52.)        # pending: live against its checkpoint
+        league['variants'][0]['verdict'] = dict(decision='better')
+        self.assertIsNone(dashboard.provisional(league, variant))
 
     def test_tally(self):
         game = lambda pair, colour, winner: dict(seed=pair, challenger_color=colour, winner=winner)
@@ -2264,6 +2269,19 @@ class PosteriorTests(unittest.TestCase):
         self.assertGreater(post.difference('a', 'b')[0], direct/2)            # its own games dominate
         self.assertLess(post.difference('b', 'a')[0], -direct/2)
 
+    def test_a_fresh_candidate_is_centred_on_its_previous_export(self):
+        from dense_posterior import Posterior, parents
+        ids = ['main/000010', 'main/000020', 'main/000030', 'main/000040', 'main/000030@solver', 'side/000005', 'seal']
+        self.assertEqual(parents(ids), {'main/000020': 'main/000010', 'main/000030': 'main/000020', 'main/000040': 'main/000030',
+                                        'main/000030@solver': 'main/000030'})
+        # The champion main/000030 sits far above the anchor; the candidate splits 20-20 with it.
+        results = [('main/000020', 'main/000010', 380, 400), ('main/000030', 'main/000020', 380, 400),
+                   ('main/000040', 'main/000030', 20, 40)]
+        ids = ['main/000010', 'main/000020', 'main/000030', 'main/000040']
+        centred = Posterior(ids, ids[0], results, 30., parents(ids)).difference('main/000040', 'main/000030', False)[0]
+        self.assertLess(abs(centred), 3.)
+        self.assertLess(Posterior(ids, ids[0], results, 30.).difference('main/000040', 'main/000030', False)[0], centred-3)
+
     def test_value_of_information_prefers_the_pairing_that_resolves_delta(self):
         from dense_posterior import Posterior
         best = lambda post: min((('cand', 'champ'), ('cand', 'prev'), ('champ', 'prev')),
@@ -2850,6 +2868,137 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(self.league()['champion'], 'main/000010')
         report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
         self.assertEqual(report['metrics']['posterior']['decision'], 'reject')
+
+    def test_variant_ids_registration_and_cli(self):
+        self.assertEqual(dense_eval.split_id('main/032500@solver'), ('main/032500', 'solver'))
+        self.assertEqual(dense_eval.split_id('main/032500'), ('main/032500', None))
+        self.assertEqual(dense_eval.parse_settings(['sims=20', 'tactics=false', 'solver-root-nodes=135']),
+                         dict(sims=20, tactics=False, solver_root_nodes=135))
+        for bad in (['max_plies=10'], ['sims'], [], ['tactics=maybe'], ['sims=0']):
+            with self.assertRaises(ValueError):
+                dense_eval.parse_settings(bad)
+        evaluator = self.start(decision='posterior')
+        self.export(10, 20)
+        evaluator.step()                                                    # main/000020 champion, main/000010 skipped
+        for checkpoint, name, settings in (('main/000010', 'x', dict(sims=1)), ('main/000020', 'a@b', dict(sims=1)),
+                                           ('main/000020', 'x', dict(solver_finalists=2))):
+            with self.assertRaises(ValueError):
+                dense_eval.register(self.run, checkpoint, name, settings)
+        argv = ['dense_eval.py', 'variant', '--run', str(self.run), '--checkpoint', 'main/000020', '--name', 'solver',
+                '--set', 'solver_root_nodes=135', '--set', 'solver_finalists=2', '--set', 'solver_finalist_nodes=135',
+                '--set', 'solver_threat_nodes=135']
+        with unittest.mock.patch.object(sys, 'argv', argv), unittest.mock.patch('builtins.print'):
+            dense_eval.main()
+        settings = dict(solver_root_nodes=135, solver_finalists=2, solver_finalist_nodes=135, solver_threat_nodes=135)
+        self.assertEqual(self.league()['variants'], [])                     # only the evaluator writes league.json
+        entry = json.loads(dense_eval.requests(self.run)['main/000020@solver'].read_text())
+        self.assertEqual({k: entry[k] for k in ('id', 'checkpoint', 'name', 'settings', 'elo', 'matches')},
+                         dict(id='main/000020@solver', checkpoint='main/000020', name='solver', settings=settings, elo=None, matches=[]))
+        self.assertEqual(dense_eval.register(self.run, 'main/000020', 'solver', settings), entry)
+        with self.assertRaises(ValueError):
+            dense_eval.register(self.run, 'main/000020', 'solver', dict(sims=20))
+        dense_eval.write_league(self.run, evaluator.league, evaluator.config)   # the evaluator's next write adopts it
+        self.assertEqual([v['id'] for v in self.league()['variants']], ['main/000020@solver'])
+        self.assertEqual(dense_eval.requests(self.run), {})
+        self.assertEqual(dense_eval.register(self.run, 'main/000020', 'solver', settings)['id'], 'main/000020@solver')
+        self.assertEqual(dense_eval.requests(self.run), {})
+        with self.assertRaises(ValueError):
+            dense_eval.register(self.run, 'main/000020', 'solver', dict(sims=20))
+        self.assertEqual(evaluator.side('main/000020@solver').solver_threat_nodes, 135)
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([e['candidate'] for e in events if e['kind'] == 'variant'], ['main/000020@solver'])
+
+    def test_pool_games_give_each_side_its_settings(self):
+        evaluator = self.start(decision='posterior', sims=4, root_samples=4)
+        self.export(10)
+        evaluator.step()
+        dense_eval.register(self.run, 'main/000010', 'fast', dict(sims=2, solver_root_nodes=16))
+        dense_eval.adopt(evaluator.league, self.run)
+        a, b = 'main/000010@fast', 'main/000010'
+        evaluator.open(a, b)
+        evaluator.use(a, b)
+        self.assertIsNot(evaluator.models[a], evaluator.models[b])
+        started = []
+        evaluator.start(SimpleNamespace(add=lambda lane, games: started.extend(games)), (a, b, 'variant'))
+        self.assertEqual(sorted(g.record['challenger_color'] for g in started), [0, 1])
+        for game in started:
+            mine = game.record['challenger_color']
+            self.assertEqual((game.budgets[mine], game.budgets[1-mine]), (2, 4))
+            self.assertEqual((game.sample_counts[mine], game.sample_counts[1-mine]), (2, 4))   # root_samples at most sims
+            self.assertEqual((game.solvers[mine].root_nodes, game.solvers[1-mine].active), (16, False))
+            self.assertEqual(game.budget, game.budgets[game.game.player])
+            game.finish()
+        solver = evaluator.solver_status(None, [a, b])                       # the baseline's budgets are all 0
+        self.assertEqual((solver['root_nodes'], solver['sides'][a]['root_nodes'], list(solver['sides'])), (0, 16, [a]))
+        self.assertIsNone(evaluator.solver_status(None, [b, 'seal']))
+        for name in ('ab@test', 'ab/1'):
+            with self.assertRaises(ValueError):
+                dense_config.LearnerSettings(variant=name)
+
+    def test_variant_decisions_stop_on_p_and_never_promote(self):
+        """A variant is decided against its checkpoint by P(better) alone, well before sprt_max_games; it is rated
+        in the league but never becomes champion, leads a checkpoint verdict, enters the ladder or the actor pointer."""
+        evaluator = self.start(decision='posterior', sprt_max_games=40, sprt_min_games=4, pool_games=4, promote_confidence=.9)
+        self.export(10)
+        evaluator.step()
+        strong, base = 'main/000010@strong', 'main/000010'
+        dense_eval.register(self.run, base, 'strong', dict(sims=1))
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        league = self.league()
+        entry = league['variants'][0]
+        verdict = entry['verdict']
+        self.assertEqual({k: verdict[k] for k in ('decision', 'comparison', 'rule', 'threshold', 'candidate', 'opponent')},
+                         dict(decision='better', comparison='variant', rule='posterior', threshold=.9, candidate=strong, opponent=base))
+        self.assertGreaterEqual(verdict['p_better'], .9)
+        self.assertLess(verdict['direct']['games'], 40)
+        self.assertEqual(verdict['direct']['wins'], verdict['direct']['games'])
+        self.assertEqual([(m['opponent'], m['wins'], m['games']) for m in entry['matches']],
+                         [(base, verdict['direct']['games'], verdict['direct']['games'])])
+        self.assertGreater(entry['elo'], 0)
+        self.assertLess(entry['elo_interval'][0], entry['elo'])
+        report = json.loads(dense_eval.report_path(self.run, strong, base).read_text())
+        self.assertEqual((report['overrides'], report['metrics']['posterior']['decision']), ({strong: dict(sims=1)}, 'better'))
+        status = json.loads((self.run/'evaluator-status.json').read_text())
+        self.assertEqual((status['decision']['decision'], status['decision']['rule'], status['pending']), ('better', 'posterior', []))
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        decision = next(e for e in events if e['kind'] == 'decision')
+        self.assertIn(f'{strong} vs {base}: better after', decision['message'])
+        self.assertEqual((decision['rule'], decision['threshold'], len(decision['interval'])), ('posterior', .9, 2))
+        self.assertEqual(league['champion'], base)
+        self.assertNotIn(strong, {d[k] for d in league['ladder']+league['differences'] for k in ('a', 'b')})
+        self.assertEqual(json.loads((self.run/'actor.json').read_text())['checkpoint'], base)
+        self.assertFalse(evaluator.step())                                   # nothing pending
+        weak = 'main/000010@weak'
+        dense_eval.register(self.run, base, 'weak', dict(sims=1, tactics=False))
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(self.league()['variants'][1]['verdict']['decision'], 'worse')
+        self.export(20)
+        self.assertEqual(evaluator.verdict('main/000020', base)['leader'], base)  # the variant rated above it never leads
+
+    def test_a_variant_trial_yields_to_a_waiting_checkpoint(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=40, sprt_min_games=4, pool_games=2,
+                               promote_confidence=.999999)
+        self.export(10)
+        evaluator.step()
+        variant, base = 'main/000010@x', 'main/000010'
+        dense_eval.register(self.run, base, 'x', dict(sims=1))
+        hook = lambda pool, steps: self.export(20) if steps == 4 else None
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=hook, winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())
+        played = len(evaluator.games(variant, base))
+        self.assertTrue(0 < played < 40)
+        self.assertNotIn('verdict', self.league()['variants'][0])
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())                                # the checkpoint is rated first
+            pending = json.loads((self.run/'evaluator-status.json').read_text())['pending']
+            self.assertEqual([(p['candidate'], p['kind'], p['direct']['games']) for p in pending], [(variant, 'variant', played)])
+            self.assertIsNotNone(pending[0]['p_better'])
+            self.assertIn('main/000020', [c['id'] for c in self.league()['checkpoints']])
+            self.assertTrue(evaluator.step())                                # then the trial resumes
+        self.assertEqual(self.league()['variants'][0]['verdict']['decision'], 'max-games')
+        self.assertEqual(len(evaluator.games(variant, base)), 40)
 
     def pending(self, **evaluation):
         """A posterior evaluator whose champion main/000020 beat main/000010, with main/000030 unrated; the
@@ -3517,7 +3666,8 @@ class EvaluatorLoopTests(unittest.TestCase):
         reports = dense_eval.load_reports(self.run)
         post = dense_eval.Posterior([f'main/{s:06d}' for s in (10, 20, 30, 40, 50)], 'main/000010',
                                     [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
-                                      r['summary']['games']) for r in reports], 20.)
+                                      r['summary']['games']) for r in reports], 20.,
+                                    dense_eval.parents([f'main/{s:06d}' for s in (10, 20, 30, 40, 50)]))
         mean, sd = post.difference('main/000020', 'main/000010')
         calibration = league['calibration']
         self.assertEqual(calibration['count'], 1)

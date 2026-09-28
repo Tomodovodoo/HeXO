@@ -243,7 +243,8 @@ class InjectionPoints(unittest.TestCase):
         config = dense_config.RunConfig()
         model = tiny_model()
         mine, theirs = Budgets(root_nodes=NODES), Budgets()
-        games = dense_eval.paired_games(model, model, 2, 'test', config, config.evaluation, None, budgets=(mine, theirs))
+        sides = (replace(config.evaluation, solver_root_nodes=NODES), config.evaluation)
+        games = dense_eval.paired_games(model, model, 2, 'test', config, config.evaluation, None, sides=sides)
         for game in games:
             colour = game.record['challenger_color']
             self.assertEqual((game.solvers[colour], game.solvers[1-colour]), (mine, theirs))
