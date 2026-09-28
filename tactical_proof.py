@@ -154,7 +154,7 @@ class IsolatedTactics:
             line = self.lines.get(timeout=max(0.0, deadline-time.perf_counter()))
         except queue.Empty:
             return 'timeout'
-        return 'exit' if line is None else line if line == 'oversize' else json.loads(line)
+        return 'exit' if line is None else line
 
     def solve(self, game, **budgets):
         return self.history([cell[:2] for cell in game.cells], **budgets)
@@ -279,12 +279,15 @@ def _assign(job, pid):
 
 
 def _pump(stream, lines):
-    """Forward worker lines; a line over RESPONSE_LIMIT becomes 'oversize' and ends the stream."""
+    """Forward decoded worker lines, so decoding counts against the reader's deadline.
+
+    A line over RESPONSE_LIMIT becomes 'oversize' and ends the stream.
+    """
     while line := stream.readline(RESPONSE_LIMIT+1):
         if not line.endswith('\n'):
             lines.put('oversize')
             break
-        lines.put(line)
+        lines.put(json.loads(line))
     lines.put(None)
 
 
