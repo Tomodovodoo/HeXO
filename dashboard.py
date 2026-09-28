@@ -450,9 +450,9 @@ def evaluation_timing(run, evaluator, now):
     - mean_placements(type): the current comparison's mean_placements when it has that type, else the pooled
       mean of the newest HISTORY_REPORTS reports of that type (`report_placements`), else PLACEMENT_SHARE *
       max_plies; mean_source names which ('comparison', 'reports', 'default') for the current type.
-    - rate(type), placements per wall second: the current placements_per_second for the comparison's type; for
-      either type then placements / worker_seconds of the newest match event of that type, else the comparison's
-      rate.
+    - rate(type), placements per wall second: for the comparison's type, the current placements_per_second times
+      its lane's share of the games in flight (pool: evidence lanes share the pool); for either type then
+      placements / worker_seconds of the newest match event of that type, else the comparison's rate.
     elapsed: seconds since the comparison's started_at; expected: elapsed plus the wall time of its games left to
     games_planned (games_planned - games_played) at mean_placements each; a decision may stop earlier, so expected
     is the cap. Both are None unless the stage is 'playing' or 'throttled' with a started_at.
@@ -464,8 +464,10 @@ def evaluation_timing(run, evaluator, now):
     if not isinstance(settings, dict): return None
     comparison = evaluator.get('comparison') if isinstance(evaluator.get('comparison'), dict) else {}
     current = comparison.get('opponent') == 'seal' if comparison else None
-    live = evaluator.get('placements_per_second')
-    pps = live if finite(live) and live > 0 else None
+    live, lanes = evaluator.get('placements_per_second'), [l for l in evaluator.get('pool') or [] if isinstance(l, dict)]
+    running = [l.get('running') or 0 for l in lanes]
+    share = running[0]/sum(running) if lanes and sum(running) else 1.
+    pps = live*share if finite(live) and live > 0 and share > 0 else None
     reports = report_placements(run)
     def mean(seal):
         if seal == current and finite(evaluator.get('mean_placements')): return evaluator['mean_placements'], 'comparison'

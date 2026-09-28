@@ -36,16 +36,17 @@ transitive picture). Delta = r_candidate - r_champion + their deviation. After a
 games, while the candidate's rating sd about the league mean is at most uncertainty_parity times the champion's and
 the direct-only and pooled 95% intervals overlap, the candidate is promoted when it has the highest posterior rating
 of the rated checkpoints and P(delta > sprt_elo0) >= promote_confidence, and rejected when that probability is at
-most 1 - promote_confidence (`Evaluator.verdict`), re-judged after every completed colour pair. Direct games fill
+most 1 - promote_confidence (`Evaluator.verdict`), re-judged after every completed colour pair; until then direct
+games keep playing. Direct games fill
 the pool until sprt_min_games are complete; after that at most evidence_share of the pool may go to the evidence
 pairing that most reduces Var(delta) (value of information: the candidate or champion vs the previous champion or
-Seal, `Evaluator.evidence`), up to sprt_max_games direct games; supersession settles on the verdict once the games
-in flight have finished ('superseded' unless it promotes). Evidence games are ordinary reports, kind 'evidence'.
+Seal, `Evaluator.evidence`), up to sprt_max_games direct games. Supersession settles once the games in flight have
+finished: the candidate is promoted when P(delta > sprt_elo0) >= promote_confidence, however the readiness
+conditions stand, else 'superseded'. Evidence games are ordinary reports, kind 'evidence'.
 With 'sprt', the comparison with the champion is a sequential test (see `sprt`) until it accepts H0 or H1, reaches
 `sprt_max_games` (decision 'max-games') or is superseded by a newer checkpoint of its variant. H1 promotes; a
-superseded comparison is settled: it promotes when the paired 95% lower bound of its pair score (`summary`
-pair_score_lower) exceeds 1/2, recorded as metrics.sprt.settled {pair_score, pair_score_lower, promote} with a
-'settle' event. The first rated checkpoint becomes champion unopposed.
+superseded comparison is settled on the same posterior: it promotes when P(delta > sprt_elo0) >= promote_confidence,
+recorded as metrics.sprt.settled {pair_score, p_better, promote} with a 'settle' event. The first rated checkpoint becomes champion unopposed.
 
 Panels: a checkpoint rated while a champion exists (with extra_opponents > 0) gets entry `panel` {incumbent}, the
 champion it met. Its members are re-derived from the current ladder whenever the panel is scheduled or judged:
@@ -568,8 +569,10 @@ class Pool:
         return out
 
     def running(self, lane=None, kind=None):
-        """Games in flight: of `lane`, else of lanes (a, b, kind) of `kind`, else all."""
-        return sum(held == lane if lane else held[2] == kind if kind else True for held, _ in self.games.values())
+        """Games in flight, including those that finished on creation and wait for step(): of `lane`, else of
+        lanes (a, b, kind) of `kind`, else all."""
+        held = [lane for lane, _ in self.games.values()]+[lane for lane, _ in self.ready]
+        return sum(h == lane if lane else h[2] == kind if kind else True for h in held)
 
     def moves(self):
         return sum(len(game.moves)-len(game.record['opening']) for _, game in self.games.values())
@@ -583,6 +586,15 @@ def even(games):
 def placements(records):
     """Placements played in `records` after their openings."""
     return sum(r['plies']-len(r['opening']) for r in records)
+
+
+def public(verdict):
+    """A `verdict` for status, reports and events: without its posterior, and without the numbers of a candidate
+    that has no direct game yet (delta, delta_sd, p_better and pooled None)."""
+    out = {k: v for k, v in verdict.items() if k != 'posterior'}
+    if not out['direct']['games']:
+        out.update(delta=None, delta_sd=None, p_better=None, pooled=None)
+    return out
 
 
 def match_entry(opponent, report):
@@ -991,10 +1003,11 @@ class Evaluator:
     def decide(self, cid, champion):
         """Posterior mode: a session whose lanes (`lanes`) follow the verdict after every completed colour pair
         until `verdict` decides, sprt_max_games direct games are complete or a newer checkpoint of cid's variant
-        exists; the games in flight then finish and count and the final verdict settles it. Returns ({opponent:
-        report of cid against it}, verdict with decision 'promote', 'reject', 'max-games' or 'superseded'), or
-        ({}, None) without a direct game. The verdict (without its posterior) is published as status decision,
-        stored as the direct report's metrics.posterior and logged as a 'decision' event."""
+        exists; the games in flight then finish and count and the final verdict settles it: superseded, cid is
+        promoted when p_better >= promote_confidence (settled true), readiness aside. Returns ({opponent: report of
+        cid against it}, verdict with decision 'promote', 'reject', 'max-games' or 'superseded'), or ({}, None)
+        without a direct game. The verdict (`public`) is published as status decision, stored as the direct
+        report's metrics.posterior and logged as a 'decision' event."""
         s = self.settings
 
         def want():
@@ -1002,7 +1015,7 @@ class Evaluator:
             if verdict['decision'] or verdict['direct']['games'] >= s.sprt_max_games or self.newer(cid):
                 return {}
             lanes = self.lanes(verdict, cid, champion)
-            self.publish(decision=dict({k: v for k, v in verdict.items() if k != 'posterior'}, next=[list(l[:2]) for l in lanes]))
+            self.publish(decision=dict(public(verdict), next=[list(l[:2]) for l in lanes]))
             return lanes
         added = self.session(want, s.sprt_max_games)
         for (a, b, _), games in added.items():
@@ -1012,7 +1025,9 @@ class Evaluator:
         if not verdict['direct']['games']:
             return {}, None
         superseded = self.newer(cid)
-        verdict = {k: v for k, v in verdict.items() if k != 'posterior'}
+        verdict = public(verdict)
+        if not verdict['decision'] and superseded and verdict['p_better'] >= s.promote_confidence:
+            verdict.update(decision='promote', settled=True)
         verdict['decision'] = verdict['decision'] or ('superseded' if superseded else 'max-games')
         path = report_path(self.run, cid, champion)
         report = json.loads(path.read_text())
@@ -1032,7 +1047,8 @@ class Evaluator:
         """SPRT mode: a session of cid vs the champion until the SPRT decides, sprt_max_games games are complete
         or a newer checkpoint of cid's variant exists (the games in flight finish and count). Returns ({champion:
         report}, metrics.sprt) with decision 'H1', 'H0', 'max-games' or 'superseded', settled as the module
-        contract states ('settle' event), or ({}, None) without a game."""
+        contract states ('settle' event: promoted when the posterior p_better of `verdict` is at least
+        promote_confidence), or ({}, None) without a game."""
         s = self.settings
 
         def want():
@@ -1049,11 +1065,12 @@ class Evaluator:
         test = report['metrics']['sprt'] = dict(result, decision=result['decision'] or ('max-games' if n >= s.sprt_max_games else 'superseded'))
         summary_ = report['summary']
         if test['decision'] == 'superseded':
-            settled = test['settled'] = dict(pair_score=summary_['pair_score'], pair_score_lower=summary_['pair_score_lower'],
-                                             promote=summary_['pair_score_lower'] > .5)
+            p_better = self.verdict(cid, champion)['p_better']
+            settled = test['settled'] = dict(pair_score=summary_['pair_score'], p_better=p_better,
+                                             promote=p_better >= s.promote_confidence)
             log_event(self.run, 'evaluator', 'settle', f'{cid} vs {champion} settled on supersession after {n} games: '
                       f'+{summary_["wins"]} -{summary_["losses"]} ={summary_["capped"]}, pair score {summary_["pair_score"]:.3f}, '
-                      f'95% lower bound {summary_["pair_score_lower"]:.3f}, LLR {test["llr"]:.2f}: '
+                      f'P(delta > {s.sprt_elo0:g}) {p_better:.3f}, LLR {test["llr"]:.2f}: '
                       + ('promoted' if settled['promote'] else 'not promoted'),
                       candidate=cid, opponent=champion, games=n, llr=test['llr'], **settled)
         write_json(path, report)

@@ -661,6 +661,8 @@ class DenseConfigTests(unittest.TestCase):
             self.assertAlmostEqual(timing['eval_seconds'], 10*15/2.+4*5/10.)
             self.assertAlmostEqual(timing['release_seconds'], 1500.)
             self.assertAlmostEqual(timing['ratio'], timing['eval_seconds']/1500.)
+            shared = dict(status, pool=[dict(running=48), dict(running=16)])   # evidence takes 1/4 of the pool's placements
+            self.assertAlmostEqual(dashboard.evaluation_timing(run, shared, 1000.)['expected'], 100.+6*15/(2.*.75))
             timing = dashboard.evaluation_timing(run, dict(status, mean_placements=12.), 1000.)
             self.assertEqual(timing['mean_source'], 'comparison')
             self.assertAlmostEqual(timing['expected'], 100.+6*12/2.)
@@ -2622,6 +2624,51 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['target'] for e in events if e['kind'] == 'fill'],
                          ['seal', 'generalization main/000030 vs main/000010', *targets, None])
+
+    def report(self, a, b, results):
+        """Write report a-vs-b of colour pairs whose candidate results (1 win, 0 loss, .5 cap) are `results`."""
+        records = [dict(candidate=a, opponent=b, pair=k//2, seed=dense_eval.pair_seed(1740, a, k//2), opening=[[0, 0]],
+                        challenger_color=k % 2, winner=k % 2 if r == 1 else 1-k % 2 if r == 0 else -1, reason='six-in-a-row',
+                        plies=6, moves=[]) for k, r in enumerate(results)]
+        shas = {name: dense_eval.digest(self.run/'checkpoints'/name/'ema.pt') for name in (a, b)}
+        path = dense_eval.report_path(self.run, a, b)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(dense_eval.make_report(a, b, records, shas, dense_config.load(self.run).evaluation)))
+
+    def test_a_superseded_candidate_that_clearly_beats_the_champion_is_promoted(self):
+        """The live case: main/025000 beat champion main/019500 +38 -11 =15 in 64 games while the champion had 300
+        games of its own; main/027500 arrives before the verdict is ready, and the settlement promotes on the
+        posterior P(delta > 0), not on the Hoeffding pair-score bound (0.47 here)."""
+        self.export(17000, 19500, 25000, 27500)
+        self.start(decision='posterior', sprt_max_games=200, pool_games=64, sprt_min_games=64)       # writes config.json
+        self.report('main/019500', 'main/017000', [1]*170+[0]*130)
+        self.report('main/025000', 'main/019500', [1, 1]*19+[0, 0]*5+[0, .5]+[.5]*14)
+        entry = lambda step, elo: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, elo_interval=None, matches=[])
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/019500', checkpoints=[entry(17000, 0.), entry(19500, 0.)])))
+        evaluator = self.start(decision='posterior', sprt_max_games=200, pool_games=64, sprt_min_games=64)
+        summary = json.loads(dense_eval.report_path(self.run, 'main/025000', 'main/019500').read_text())['summary']
+        self.assertEqual((summary['wins'], summary['losses'], summary['capped']), (38, 11, 15))
+        self.assertLess(summary['pair_score_lower'], .5)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        league = self.league()
+        self.assertEqual(league['champion'], 'main/025000')
+        verdict = evaluator.entry('main/025000')['verdict']
+        self.assertEqual((verdict['decision'], verdict['settled'], verdict['direct']['games']), ('promote', True, 64))
+        self.assertGreaterEqual(verdict['p_better'], .9)
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertIn('main/025000 vs main/019500: promote (settled on supersession) after 64 direct games',
+                      next(e for e in events if e['kind'] == 'decision')['message'])
+        fresh = dense_eval.public(evaluator.verdict('main/027500', 'main/025000'))   # no direct game yet: no numbers
+        self.assertEqual((fresh['direct']['games'], fresh['delta'], fresh['p_better'], fresh['pooled']), (0, None, None, None))
+
+    def test_games_finished_on_creation_occupy_the_pool(self):
+        pool = dense_eval.Pool(64)
+        lane = ('a', 'b', 'evidence')
+        pool.ready.append((lane, {}))                                      # e.g. Seal won inside MatchGame.__init__
+        self.assertEqual((pool.running(), pool.running(lane), pool.running(kind='evidence')), (1, 1, 1))
+        self.assertEqual(pool.step(), [(lane, {})])
+        self.assertEqual(pool.running(), 0)
 
     def test_draining_lanes_count_against_the_pool_and_their_kind(self):
         """Switching the evidence pairing every pair never lifts the games in flight above pool_games, nor the

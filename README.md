@@ -791,7 +791,7 @@ optimizer files, and records the new source identity. Normal later resumes omit
   candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
   and against panel members. Each pair also gets a matchup deviation (prior sd `matchup_prior_elo`, default 30),
   so a pair's own games outweigh the transitive picture when the two disagree. The candidate needs at least
-  `sprt_min_games` direct games, and its rating sd may be at most `uncertainty_parity` times the champion's.
+  `sprt_min_games` direct games, and its rating sd may be at most `uncertainty_parity` (1.5) times the champion's.
   It is promoted when it has the highest posterior rating and P(candidate - champion > `sprt_elo0`) is at least
   `promote_confidence`. It is rejected when that probability is at most 1 - `promote_confidence`. Neither
   happens while the direct-only and pooled estimates disagree beyond their intervals. `decision sprt` keeps the
@@ -805,7 +805,9 @@ optimizer files, and records the new source identity. Normal later resumes omit
   the pool may go to the evidence pairing whose games most reduce the posterior variance of the decision: the
   candidate or champion against the previous champion or Seal. The pairing is re-chosen after every
   completed colour pair. A newer checkpoint or a pairing change stops new games of the old pairing; its
-  running games finish and count, and a superseded decision settles on all of them.
+  running games finish and count. A superseded decision settles on all of them: the candidate is promoted when
+  P(candidate - champion > `sprt_elo0`) is at least `promote_confidence`, whether or not the other readiness
+  conditions hold (`decision sprt` settles the same way).
 - **Streaming.** `evaluator-status.json` carries the pool composition, the running tally of the current
   comparison (updated per finished game) and the pending verdict. The dashboard shows all three, including a
   provisional league row for the candidate.
