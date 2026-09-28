@@ -378,10 +378,10 @@ _reports = {}
 
 
 def load_reports(run, settings=None):
-    """Every evaluations/*/report.json (cached per path and modification time); with `settings`, only the reports
-    played under its PROTOCOL."""
+    """Every evaluations/*/report*.json: each pairing's report.json and the reports `Evaluator.open` archived beside it
+    (cached per path and modification time); with `settings`, only the reports played under its PROTOCOL."""
     reports = []
-    for path in sorted((Path(run)/'evaluations').glob('*/report.json')):
+    for path in sorted((Path(run)/'evaluations').glob('*/report*.json')):
         stamp = path.stat().st_mtime_ns
         if _reports.get(path, (None,))[0] != stamp:
             _reports[path] = stamp, json.loads(path.read_text())
@@ -725,8 +725,8 @@ class Evaluator:
     def open(self, a, b):
         """Load report a-vs-b for appending and number its next opening pair after the highest one it holds, so a
         restart resumes the pairing; the report keeps its id (dense_openings.report_id). A report played under another
-        protocol is kept as report-<created_at>.json beside it (outside load_reports) with an 'info' event, and a new
-        one starts with a new id."""
+        protocol is kept as report-<created_at>.json beside it (still pooled by load_reports) with an 'info' event, and
+        a new one starts with a new id."""
         if (a, b) in self.book:
             return
         path = report_path(self.run, a, b)

@@ -671,6 +671,24 @@ class EvaluatorBookTests(unittest.TestCase):
         report = json.loads(dense_eval.report_path(self.run, 'main/000020', CHAMPION).read_text())
         self.assertEqual((len(report['games']), self.saved()['counted'][report['id']], root()['games']), (4, 2, 4))
 
+    def test_reports_archived_on_a_protocol_change_stay_in_the_pooled_league(self):
+        self.export(10)
+        evaluator = self.start(opening_suite='standard-v1')
+        evaluator.step()
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            evaluator.step()
+        path = dense_eval.report_path(self.run, 'main/000020', CHAMPION)
+        report = json.loads(path.read_text())
+        report['settings']['sims'] = 99                                     # played under another protocol
+        path.write_text(json.dumps(report))
+        evaluator.open('main/000020', CHAMPION)
+        self.assertEqual(len(list(path.parent.glob('report-*.json'))), 1)
+        dense_eval.write_league(self.run, evaluator.league, evaluator.config)
+        league = json.loads((self.run/'league.json').read_text())
+        self.assertEqual(league['matrix']['main/000020'][CHAMPION]['games'], len(report['games']))
+        self.assertIsNotNone(next(c for c in league['checkpoints'] if c['id'] == 'main/000020')['elo'])
+
     def test_the_standard_suite_is_a_frozen_book_with_its_statistics_in_the_run(self):
         self.export(10)
         played = dense_openings.Book(self.run, dense_config.EvaluationSettings()).openings()[0]['moves']
