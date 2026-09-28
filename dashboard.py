@@ -672,9 +672,11 @@ HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')
 SOURCES = ('converted', 'fresh', 'newest')  # dense_data.SOURCES
 SOURCE_METRICS = tuple(f'{s}_{k}{h}' for s in SOURCES for k in ('', 'train_', 'gap_') for h in ('policy_ce', 'value_bce'))
 CURVE_SOURCES = ('fresh', 'newest')  # dense_learn.CURVE_SOURCES
-HORIZON_METRICS = tuple(f'{s}_{k}' for s in CURVE_SOURCES for k in ('value_bce_last20', 'value_horizon'))
-CURVE_METRICS = tuple(f'{s}_{k}' for s in CURVE_SOURCES for k in ('value_curve', 'value_excess_curve'))
-LEARNER_METRICS = HEADS+('lr', 'samples_per_second', 'window_rows')+tuple('validation_'+h for h in HEADS+SOURCE_METRICS+HORIZON_METRICS)
+CURVE_SCALARS = tuple(f'{s}_{k}' for s in CURVE_SOURCES
+                      for k in ('value_bce_last20', 'value_horizon', 'policy_ce_early', 'policy_ce_late'))
+CURVE_AXES = dict(value_curve='remaining', value_excess_curve='remaining', policy_ce_curve='ply', value_bce_by_ply='ply')
+CURVE_METRICS = {f'{s}_{k}': x for s in CURVE_SOURCES for k, x in CURVE_AXES.items()}  # metric: its only x (grid <x>_grid)
+LEARNER_METRICS = HEADS+('lr', 'samples_per_second', 'window_rows')+tuple('validation_'+h for h in HEADS+SOURCE_METRICS+CURVE_SCALARS)
 ACTOR_SUMMED = ('placements_per_second', 'evals_per_second', 'games_per_hour')
 ACTOR_METRICS = ACTOR_SUMMED+('terminal_fraction', 'mean_plies')
 GPU_METRICS = ('utilization', 'used_mib', 'watts', 'temperature')
@@ -728,18 +730,18 @@ def series(run, config, variant, metric, x='step', max_points=1000):
     """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval; seal_delta: the direct-match
     Elo minus Seal of each anchored checkpoint, league anchors.seal.matches) sorted by x and
     downsampled; x is the learner step or hours since the run's created_at. Actor and GPU metrics have hours
-    only. CURVE_METRICS have x 'remaining' only: [[plies remaining, y or null where unsupported], ...] over every grid
-    point (not downsampled) of the newest checkpoint manifest of
+    only. CURVE_METRICS have their own x only ('remaining' or 'ply'): [[grid point, y or null where unsupported], ...]
+    over every point of the manifest's <x>_grid (not downsampled) of the newest checkpoint manifest of
     `variant` holding that curve (metrics.validation_sources), whose id is added as `checkpoint` (None without one).
     Raises ValueError for an unknown metric or x."""
     created = config.get('created_at') or 0.
     hours = lambda t: (t-created)/3600
     if metric in CURVE_METRICS:
-        if x != 'remaining': raise ValueError(f'{metric} has x remaining only')
+        if x != CURVE_METRICS[metric]: raise ValueError(f'{metric} has x {CURVE_METRICS[metric]} only')
         found = [(path, v) for path, m in dense_manifests(run/'checkpoints'/variant)
                  if isinstance(v := (m.get('metrics') or {}).get('validation_sources'), dict) and isinstance(v.get(metric), list)]
         path, v = found[-1] if found else (None, {})
-        points = [[g, y if finite(y) else None] for g, y in zip(v.get('remaining_grid') or [], v.get(metric) or [])]
+        points = [[g, y if finite(y) else None] for g, y in zip(v.get(f'{x}_grid') or [], v.get(metric) or [])]
         return dict(run=run.name, variant=variant, metric=metric, x=x, count=len(points), points=points,
                     checkpoint=path and f'{variant}/{path.parent.name}')
     if x not in ('step', 'hours'): raise ValueError(f'unknown x {x!r}')

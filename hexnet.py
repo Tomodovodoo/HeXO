@@ -343,14 +343,19 @@ def _weighted_mean(loss, weight):
 
 
 def _cross_entropy(policy, far, cells, counts, target_probs, weight):
+    return _weighted_mean(policy_row_losses(policy, far, cells, counts, target_probs), weight)
+
+
+def policy_row_losses(policy, far, cells, counts, target_probs):
+    """Per-row cross-entropy [B] of target_probs [B, N] (zero beyond counts) against the legal-set softmax;
+    0 for a row with no included entry (e.g. only far cells without a far logit)."""
     logits, valid = action_logits(policy, far, cells, counts)
-    # Rows with no included entry (e.g. only far cells without a far logit) give 0, not NaN.
     log_probs = logits.log_softmax(1).masked_fill(~valid, 0)
-    return _weighted_mean(-(target_probs*log_probs).sum(1), weight)
+    return -(target_probs*log_probs).sum(1)
 
 
 def policy_loss(policy, far, cells, counts, target_probs, weight=None):
-    """Cross-entropy of target_probs [B, N] (zero beyond counts) against the legal-set softmax.
+    """Weighted mean of policy_row_losses.
 
     cells/counts are hexcrop.batch outputs; far cells share the far logit.
     """
