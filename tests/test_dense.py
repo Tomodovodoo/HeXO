@@ -1722,6 +1722,30 @@ class ValidationSourceTests(unittest.TestCase):
         self.assertEqual([dense_learn.searched_value(episode, t) for t in range(4)], [.2, -.2, .4, -.4])
         self.assertTrue(math.isnan(dense_learn.searched_value(dict(root_values=None), 3)))
 
+    def test_value_target_map_and_regret_reference_share_one_fit(self):
+        """The same finished games as value target map input (fit_calibration) and as regret reference fit rows
+        (one row per ply: carried value, plies remaining, outcome for the side to move) give the same map."""
+        rng = np.random.default_rng(7)
+        games = []
+        for _ in range(250):
+            T, winner = int(rng.integers(30, 120)), int(rng.integers(2))
+            sign = np.where([dense_data.player_at(t) == winner for t in range(T)], 1., -1.)
+            roots = [None if rng.random() < .2 else float(np.clip(sign[t]*rng.uniform(0, 1)+rng.normal(0, .5), -1, 1))
+                     for t in range(T)]
+            games.append((roots, rng.random(T) < .8, winner))
+        fit = dense_data.fit_calibration(games)
+        rows = np.concatenate([np.stack([dense_data.carried_values(roots, full), len(roots)-np.arange(len(roots)),
+                                         [float(dense_data.player_at(t) == winner) for t in range(len(roots))]])
+                               for roots, full, winner in games], 1)
+        v, h = np.append(rng.uniform(-1, 1, 500), [np.nan, -1., 1.]), np.append(rng.integers(0, 400, 500), [5, 5, 5])
+        reference = dense_learn.calibration_reference(*rows, v, h)
+        self.assertEqual(fit, dense_data.fit_calibration_rows(*rows, fit.base))
+        self.assertTrue(np.allclose(reference, fit.predict(v, h), rtol=0, atol=1e-12))
+        self.assertEqual(reference[500], fit.base)
+        self.assertLess(reference[501], .5); self.assertGreater(reference[502], .5)
+        prior = dense_data.fit_calibration_rows([np.nan]*3, [5, 9, 40], [1., 0., 1.], .25)
+        self.assertTrue(np.allclose(prior.predict([-1., 0., 1.], [2, 50, 300]), .25))
+
     def test_surface_endpoint_returns_the_newest_grid(self):
         import dashboard
         from http.server import HTTPServer
