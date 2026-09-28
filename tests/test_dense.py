@@ -3492,7 +3492,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.start()
         self.report('main/000020', 'main/000010', [1, 1, 0, 1]*4)
         entry = lambda step: dict(id=f'main/{step:06d}', variant='main', step=step, elo=0., elo_interval=None, matches=[])
-        evaluator = self.start(decision='posterior', sprt_min_games=16)
+        evaluator = self.start(decision='posterior', sprt_min_games=16, matchup_prior_elo=20.)       # not config.json's
         evaluator.league = league = dict(champion='main/000010', checkpoints=[entry(10), entry(20)])
         verdict = dense_eval.public(evaluator.verdict('main/000020', 'main/000010'))
         snapshot = evaluator.snapshot('main/000020', 'main/000010')
@@ -3512,7 +3512,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         reports = dense_eval.load_reports(self.run)
         post = dense_eval.Posterior([f'main/{s:06d}' for s in (10, 20, 30, 40, 50)], 'main/000010',
                                     [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
-                                      r['summary']['games']) for r in reports], config.evaluation.matchup_prior_elo)
+                                      r['summary']['games']) for r in reports], 20.)
         mean, sd = post.difference('main/000020', 'main/000010')
         calibration = league['calibration']
         self.assertEqual(calibration['count'], 1)

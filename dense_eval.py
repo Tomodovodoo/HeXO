@@ -64,7 +64,7 @@ checkpoint until the next export.
 
 league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
 superseded?, panel?, demoted?, verdict? (the posterior verdict that rated or promoted it on review, with its
-`Evaluator.snapshot`: opponent, protocol and reports)}], differences, ladder, ladder_top, anchors,
+`Evaluator.snapshot`: opponent, protocol, matchup_prior and reports)}], differences, ladder, ladder_top, anchors,
 matrix, calibration, rating_note, updated_at}. calibration (`calibration`) compares the delta sd the posterior
 stated at each verdict with how far delta moved once later games of that checkpoint came in.
 differences and ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the ladder_top
@@ -510,12 +510,13 @@ def variant_heads(entries, rated=lambda c: True):
     return heads
 
 
-def calibration(league, reports, matchup_prior):
+def calibration(league, reports):
     """Diagnostic of the posterior's stated uncertainty; no decision reads it. For every checkpoint whose posterior
-    verdict holds its opponent, protocol and reports (`Evaluator.snapshot`), whose direct report under that protocol
-    is still current and which has at least CALIBRATION_LATER later comparisons (reports with it under that protocol
-    that are new or have grown since the verdict), shift = delta now - delta at the verdict, both r_cid - r_opponent
-    + their matchup deviation over the reports of that protocol. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
+    verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports), whose direct report under
+    that protocol is still current and which has at least CALIBRATION_LATER later comparisons (reports with it under
+    that protocol that are new or have grown since the verdict), shift = delta now - delta at the verdict, both
+    r_cid - r_opponent + their matchup deviation over the reports of that protocol with the verdict's matchup
+    prior. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
     resolved). Returns {count, predicted_sd (mean delta_sd at the verdicts), expected_rms (root mean sd_then^2 -
     sd_now^2), realised_rms (root mean shift^2)}, the three None without a counted verdict: realised_rms well below
     expected_rms means the posterior overstates its variance."""
@@ -524,7 +525,7 @@ def calibration(league, reports, matchup_prior):
     posteriors, then, now, shifts = {}, [], [], []
     for entry in league['checkpoints']:
         verdict, cid = entry.get('verdict') or {}, entry['id']
-        if not {'opponent', 'protocol', 'reports'} <= verdict.keys() or verdict.get('delta_sd') is None \
+        if not {'opponent', 'protocol', 'matchup_prior', 'reports'} <= verdict.keys() or verdict.get('delta_sd') is None \
                 or cid not in rated or verdict['opponent'] not in rated:
             continue
         key = protocol(verdict['protocol'])
@@ -535,11 +536,12 @@ def calibration(league, reports, matchup_prior):
                     for r in group)
         if later < CALIBRATION_LATER:
             continue
-        if key not in posteriors:
+        model = key, verdict['matchup_prior']
+        if model not in posteriors:
             ids = rated+([SEAL] if any(SEAL in (r['candidate'], r['opponent']) for r in group) else [])
-            posteriors[key] = Posterior(ids, ids[0], [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
-                                                       r['summary']['games']) for r in group], matchup_prior)
-        mean, sd = posteriors[key].difference(cid, verdict['opponent'])
+            posteriors[model] = Posterior(ids, ids[0], [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
+                                                         r['summary']['games']) for r in group], verdict['matchup_prior'])
+        mean, sd = posteriors[model].difference(cid, verdict['opponent'])
         then.append(verdict['delta_sd']); now.append(sd); shifts.append(mean-verdict['delta'])
     root = lambda values: math.sqrt(max(0., float(np.mean(values)))) if values else None
     return dict(count=len(shifts), predicted_sd=float(np.mean(then)) if then else None,
@@ -573,7 +575,7 @@ def write_league(run, league, config, top=None):
     league['anchors'] = {SEAL: dict(elo=point.get(SEAL), elo_interval=intervals.get(SEAL), games=seal_games, matches=matches,
                                     latest_delta=matches[-1]['elo_delta'] if matches else None)}
     league['matrix'] = payoff(reports, point)
-    league['calibration'] = calibration(league, reports, config.evaluation.matchup_prior_elo)
+    league['calibration'] = calibration(league, reports)
     league['rating_note'] = RATING_NOTE
     league['updated_at'] = time.time()
     write_json(run/'league.json', league)
@@ -1076,9 +1078,10 @@ class Evaluator:
 
     def snapshot(self, cid, champion):
         """What a decided verdict records for `calibration`: {opponent (the champion), protocol ({PROTOCOL setting:
-        value}), reports ({report name: games} of cid's protocol-matching reports now)}."""
+        value}), matchup_prior (the effective matchup_prior_elo), reports ({report name: games} of cid's
+        protocol-matching reports now)}."""
         s = self.settings
-        return dict(opponent=champion, protocol={k: getattr(s, k) for k in PROTOCOL},
+        return dict(opponent=champion, protocol={k: getattr(s, k) for k in PROTOCOL}, matchup_prior=s.matchup_prior_elo,
                     reports={report_name(r): len(r['games']) for r in load_reports(self.run, s) if cid in (r['candidate'], r['opponent'])})
 
     def evidence(self, verdict, cid, champion, games):
