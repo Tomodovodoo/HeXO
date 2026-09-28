@@ -546,7 +546,7 @@ class Pool:
     """A continuous pool of MatchGames on one Engine, the evaluator's counterpart of the actors' games in flight.
     Games belong to lanes (any hashable pairing key); add(lane, games) starts them at once, step() advances the
     engine once and returns [(lane, record)] of the games that finished, so a finished game's slot can be refilled
-    before the next step. running(lane) counts a lane's games in flight (all lanes with None); moves() is the
+    before the next step. running() counts games in flight (`running`); moves() is the
     placements played after their openings by the games in flight."""
 
     def __init__(self, leaf_batch):
@@ -567,8 +567,9 @@ class Pool:
                 out.append((self.games.pop(id(game))[0], game.finish()))
         return out
 
-    def running(self, lane=None):
-        return sum(lane is None or held == lane for held, _ in self.games.values())
+    def running(self, lane=None, kind=None):
+        """Games in flight: of `lane`, else of lanes (a, b, kind) of `kind`, else all."""
+        return sum(held == lane if lane else held[2] == kind if kind else True for held, _ in self.games.values())
 
     def moves(self):
         return sum(len(game.moves)-len(game.record['opening']) for _, game in self.games.values())
@@ -727,7 +728,9 @@ class Evaluator:
         """Play the pool until want() asks for nothing and the games in flight have finished; returns {lane:
         games finished}. want() -> {(a, b, kind): games in flight wanted, even}, asked at the start and after every
         completed colour pair; a finished game's slot is refilled before the next engine step, and a lane want()
-        drops (or shrinks) starts no new games while its running games finish and count. No game starts while the
+        drops (or shrinks) starts no new games while its running games finish and count. Games in flight never
+        exceed pool_games, nor, per kind, the games wanted of that kind: a draining lane's games count against its
+        replacement's. No game starts while the
         Pacer's credit is negative; with nothing running the session then waits. Every completed pair is
         persisted at once."""
         pool, waiting, added = Pool(self.config.actor.leaf_batch), {}, {}
@@ -755,8 +758,10 @@ class Evaluator:
             shown.update(lanes)
             ready = self.pacer.ready()
             if lanes and ready:
+                kinds = {kind: sum(n for lane, n in lanes.items() if lane[2] == kind) for _, _, kind in lanes}
                 for lane, share in lanes.items():
-                    while pool.running(lane)+2 <= share:
+                    while pool.running(lane)+2 <= share and pool.running(kind=lane[2])+2 <= kinds[lane[2]] \
+                            and pool.running()+2 <= self.settings.pool_games:
                         self.start(pool, lane)
             if not pool.running():
                 if lanes and not ready:

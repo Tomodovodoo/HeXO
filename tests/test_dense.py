@@ -657,28 +657,25 @@ class DenseConfigTests(unittest.TestCase):
             timing = dashboard.evaluation_timing(run, status, 1000.)
             self.assertEqual({k: timing[k] for k in ('elapsed', 'mean_placements', 'mean_source', 'export_steps', 'seconds_per_step')},
                              dict(elapsed=100., mean_placements=15., mean_source='reports', export_steps=1500, seconds_per_step=1.))
-            self.assertAlmostEqual(timing['expected'], 100.+6*15/2./.5)
-            self.assertAlmostEqual(timing['eval_seconds'], (10*15/2.+4*5/10.)/.5)
+            self.assertAlmostEqual(timing['expected'], 100.+6*15/2.)              # wall rates: pacing is inside them
+            self.assertAlmostEqual(timing['eval_seconds'], 10*15/2.+4*5/10.)
             self.assertAlmostEqual(timing['release_seconds'], 1500.)
             self.assertAlmostEqual(timing['ratio'], timing['eval_seconds']/1500.)
-            self.assertEqual(timing['playing_fraction'], .5)
             timing = dashboard.evaluation_timing(run, dict(status, mean_placements=12.), 1000.)
             self.assertEqual(timing['mean_source'], 'comparison')
-            self.assertAlmostEqual(timing['expected'], 100.+6*12/2./.5)
-            timing = dashboard.evaluation_timing(run, dict(status, eval_share=1.), 1000.)  # --once: no pacing
-            self.assertAlmostEqual(timing['expected'], 100.+6*15/2.)
+            self.assertAlmostEqual(timing['expected'], 100.+6*12/2.)
             timing = dashboard.evaluation_timing(run, dict(status, stage='throttled', started_at=None), 1000.)
             self.assertEqual((timing['elapsed'], timing['expected']), (None, None))  # the next comparison waits to start
             timing = dashboard.evaluation_timing(run, dict(status, placements_per_second=None), 1000.)
             self.assertIsNone(timing['expected'])                                      # no rate for checkpoint games yet
             self.assertAlmostEqual(dashboard.evaluation_timing(run, dict(status, comparison=dict(status['comparison'], opponent='seal')),
-                                                               1000.)['expected'], 100.+6*5/2./.5)   # 5 per Seal game
+                                                               1000.)['expected'], 100.+6*5/2.)   # 5 per Seal game
             timing = dashboard.evaluation_timing(run, dict(status, settings=dict(settings, anchor_on_promotion=False)), 1000.)
-            self.assertAlmostEqual(timing['eval_seconds'], 10*15/2./.5)
+            self.assertAlmostEqual(timing['eval_seconds'], 10*15/2.)
             shutil.rmtree(run/'evaluations')
             timing = dashboard.evaluation_timing(run, dict(status, stage='idle'), 1000.)
             self.assertEqual((timing['elapsed'], timing['expected']), (None, None))
-            self.assertAlmostEqual(timing['eval_seconds'], (10*45/2.+4*45/10.)/.5)  # .45 * max_plies per game
+            self.assertAlmostEqual(timing['eval_seconds'], 10*45/2.+4*45/10.)  # .45 * max_plies per game
             self.assertIsNone(dashboard.evaluation_timing(run, dict(status, settings=None), 1000.))
 
     def test_provisional_league_row(self):
@@ -711,6 +708,14 @@ class DenseConfigTests(unittest.TestCase):
         self.assertAlmostEqual(t['elo_delta'], 400*math.log10(3/2))
         self.assertIsNone(dense_eval.tally(records[:1])['pair_score'])
         self.assertIsNone(dense_eval.tally(records)['llr'])
+
+    def test_configs_with_retired_settings_load(self):
+        data = asdict(dense_config.RunConfig(created_at=1.))
+        data['evaluation'].update(round_games=8, model_cache=6)
+        self.assertEqual(dense_config.from_dict(data), dense_config.RunConfig(created_at=1.))
+        data['evaluation']['typo_games'] = 1
+        with self.assertRaises(TypeError):
+            dense_config.from_dict(data)
 
     def test_round_trip_and_no_overwrite(self):
         config = dense_config.RunConfig(created_at=12.5, seed=3, device='cpu',
@@ -2617,6 +2622,27 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['target'] for e in events if e['kind'] == 'fill'],
                          ['seal', 'generalization main/000030 vs main/000010', *targets, None])
+
+    def test_draining_lanes_count_against_the_pool_and_their_kind(self):
+        """Switching the evidence pairing every pair never lifts the games in flight above pool_games, nor the
+        evidence games above the evidence wanted, while the old pairing drains."""
+        evaluator = self.start(pool_games=8)
+        self.export(10, 20, 30, 40)
+        evaluator.league['checkpoints'] = [dict(id=f'main/{k:06d}', variant='main', step=k, elo=None, elo_interval=None,
+                                                matches=[]) for k in (10, 20, 30, 40)]
+        rivals, calls, seen = ['main/000020', 'main/000030'], [0], []
+        def want():
+            calls[0] += 1
+            if calls[0] > 12:
+                return {}
+            return {('main/000040', 'main/000010', 'champion'): 4, ('main/000040', rivals[calls[0] % 2], 'evidence'): 4}
+        def watch(pool, steps):
+            seen.append((pool.running(), pool.running(kind='evidence')))
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=watch)):
+            evaluator.session(want, 0)
+        self.assertEqual(max(total for total, _ in seen), 8)
+        self.assertEqual(max(evidence for _, evidence in seen), 4)
+        self.assertTrue(all(evaluator.games('main/000040', r) for r in rivals))
 
     def test_models_stay_loaded_while_their_pairing_is_in_the_pool(self):
         evaluator = self.start()

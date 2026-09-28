@@ -446,15 +446,13 @@ def seconds_per_step(run, variant, window=STEP_WINDOW):
 def evaluation_timing(run, evaluator, now):
     """Wall-time estimates for the dense evaluator tile from evaluator-status.json (dense_eval.Evaluator) or None
     without its settings. Evaluation games are of two types, vs Seal or vs a checkpoint, all played in one
-    continuous pool whose playing time the Pacer holds to eval_share of wall time.
+    continuous pool; its rates are measured over wall time, the Pacer's waits included.
     - mean_placements(type): the current comparison's mean_placements when it has that type, else the pooled
       mean of the newest HISTORY_REPORTS reports of that type (`report_placements`), else PLACEMENT_SHARE *
       max_plies; mean_source names which ('comparison', 'reports', 'default') for the current type.
-    - rate(type), placements per playing second: the current placements_per_second for the comparison's type;
-      for either type then placements / worker_seconds of the newest match event of that type, else the
-      comparison's rate.
-    - eval_share: the status's eval_share (the Pacer's actual share), else settings.eval_share; playing_fraction
-      = min(1, eval_share) turns playing time into wall time.
+    - rate(type), placements per wall second: the current placements_per_second for the comparison's type; for
+      either type then placements / worker_seconds of the newest match event of that type, else the comparison's
+      rate.
     elapsed: seconds since the comparison's started_at; expected: elapsed plus the wall time of its games left to
     games_planned (games_planned - games_played) at mean_placements each; a decision may stop earlier, so expected
     is the cap. Both are None unless the stage is 'playing' or 'throttled' with a started_at.
@@ -466,8 +464,6 @@ def evaluation_timing(run, evaluator, now):
     if not isinstance(settings, dict): return None
     comparison = evaluator.get('comparison') if isinstance(evaluator.get('comparison'), dict) else {}
     current = comparison.get('opponent') == 'seal' if comparison else None
-    share = next((v for v in (evaluator.get('eval_share'), settings.get('eval_share')) if finite(v) and 0 < v <= 1), 1.)
-    fraction = min(1., share)
     live = evaluator.get('placements_per_second')
     pps = live if finite(live) and live > 0 else None
     reports = report_placements(run)
@@ -484,14 +480,14 @@ def evaluation_timing(run, evaluator, now):
         return newest[-1]['placements']/newest[-1]['worker_seconds'] if newest else pps
     def wall(games, seal):
         speed = rate(seal)
-        return games*mean(seal)[0]/speed/fraction if speed else None
+        return games*mean(seal)[0]/speed if speed else None
     out = dict(elapsed=None, expected=None, mean_placements=None, mean_source=None)
     if comparison and evaluator.get('stage') in ('playing', 'throttled') and finite(evaluator.get('started_at')):
         placements, source = mean(current)
         out.update(elapsed=max(0., now-evaluator['started_at']), mean_placements=placements, mean_source=source)
         left = max(0, (evaluator.get('games_planned') or 0)-(evaluator.get('games_played') or 0))
         if rate(current):
-            out['expected'] = out['elapsed']+left*placements/rate(current)/fraction
+            out['expected'] = out['elapsed']+left*placements/rate(current)
     model, anchor = wall(settings.get('sprt_max_games') or 0, False), wall(settings.get('anchor_games') or 0, True)
     eval_seconds = None if model is None else model+(anchor if anchor and settings.get('anchor_on_promotion', True) else 0.)
     variant = comparison['candidate'].split('/')[0] if isinstance(comparison.get('candidate'), str) else 'main'
@@ -500,7 +496,7 @@ def evaluation_timing(run, evaluator, now):
     per_step = seconds_per_step(run, variant)
     release = export_steps*per_step if export_steps and per_step else None
     return dict(out, eval_seconds=eval_seconds, export_steps=export_steps, seconds_per_step=per_step, release_seconds=release,
-                ratio=eval_seconds/release if eval_seconds is not None and release else None, playing_fraction=fraction)
+                ratio=eval_seconds/release if eval_seconds is not None and release else None)
 
 
 def provisional(league, evaluator):

@@ -169,6 +169,7 @@ class RunConfig:
 
 
 SECTIONS = dict(model=ModelSettings, actor=ActorSettings, learner=LearnerSettings, evaluation=EvaluationSettings)
+RETIRED = dict(evaluation=('round_games', 'model_cache'))  # settings of earlier versions, ignored when a config is read
 
 
 def append_line(path, record):
@@ -192,7 +193,7 @@ def append_metrics(run, name, **fields):
 def from_dict(data):
     if data.get('schema') != SCHEMA:
         raise ValueError(f'Expected a {SCHEMA} configuration')
-    parts = {name: cls(**data[name]) for name, cls in SECTIONS.items()}
+    parts = {name: cls(**{k: v for k, v in data[name].items() if k not in RETIRED.get(name, ())}) for name, cls in SECTIONS.items()}
     return RunConfig(**{k: v for k, v in data.items() if k not in SECTIONS}, **parts)
 
 
