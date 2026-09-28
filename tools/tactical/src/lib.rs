@@ -16,9 +16,12 @@ const REVISION:&str="5a771e572553a8bd8e010112b2ce65f16e5afa1b";
 /// PDS-PN table size: one MiB per this many budgeted nodes, clamped to 1..=16 MiB.
 const NODES_PER_TT_MB:u64=2048;
 // Exact state keys, never Zobrist hashes. Rules/scope are fixed by this library version.
-// The budgets are part of the key: a search is a function of position and budget.
-type Key=(Vec<((i32,i32),u8)>,u8,u8,u64,u64);
-static CACHE:OnceLock<Mutex<BTreeMap<Key,ProofCertificate>>>=OnceLock::new();
+// The budgets (and the IDTT depth when IDTT runs) are part of the key: a search is a
+// function of position and budgets. A hit replays the search's certificate, work and
+// IDTT verdict, so it is indistinguishable from a fresh search except for `cache_hit`.
+type Key=(Vec<((i32,i32),u8)>,u8,u8,u64,u64,u8);
+type Solved=(ProofCertificate,u64,Option<String>);
+static CACHE:OnceLock<Mutex<BTreeMap<Key,Solved>>>=OnceLock::new();
 /// Whose forced win is asked: the side to move, or its opponent given a fresh
 /// two-placement turn on the current stones (a flipped-turn threat query).
 #[derive(Deserialize,Clone,Copy,PartialEq,Default)]
@@ -81,7 +84,8 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
     let board=check::replay(&req.history)?;
     let ply=if req.attacker==Attacker::Opponent {check::flip(req.history.len())} else {req.history.len()};
     let (side,remaining)=check::phase(ply);
-    let key=(board.iter().map(|(&p,&s)|(p,s)).collect(),side,remaining,req.nodes,req.idtt_nodes);
+    let key=(board.iter().map(|(&p,&s)|(p,s)).collect(),side,remaining,req.nodes,req.idtt_nodes,
+        if req.idtt_nodes>0 {req.depth} else {0});
     let scope=json!({"rules":{"win_length":6,"placement_radius":8,"match_move_cap":null},
         "defenses":"all legal two-stone covers including complete free-second frontier; quiet defender nodes unsupported",
         "attacks":"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN","checker_version":3,
@@ -92,11 +96,14 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
     let cache=CACHE.get_or_init(||Mutex::new(BTreeMap::new()));
     let mut cache_hit=false;
     let mut probe_verdict=None;
+    let mut cached_nodes=None;
     let cert=if let Some(cert)=req.certificate.clone() {Some(cert)} else if let Some(moves)=&req.root_moves {
         Some(complete_candidate(&board,ply,moves,&req,&ctl,&meter)?)
     } else {
         let saved=cache.lock().map_err(|_|"cache lock")?.get(&key).cloned();
-        if saved.is_some() {cache_hit=true;saved} else {
+        if let Some((cert,used,verdict))=saved {
+            cache_hit=true;cached_nodes=Some(used);probe_verdict=verdict;Some(cert)
+        } else {
             let pos=position(&board,side,remaining);
             let cfg=ProverConfig{driver:DriverKind::Pdspn,wide:true,depth_cap:req.depth,
                 node_budget:req.nodes,tt_mb:(req.nodes/NODES_PER_TT_MB).clamp(1,16) as usize,pn2_nodes:1000,..Default::default()};
@@ -109,16 +116,16 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
         }
     };
     let mut response=json!({"status":"UNKNOWN","native_verified":false,"moves":[],"certificate":null,
-        "revision":REVISION,"scope":scope,"cache_hit":cache_hit,"idtt_verdict":probe_verdict,
+        "revision":REVISION,"scope":scope,"cache_hit":cache_hit,"idtt_verdict":probe_verdict.clone(),
         "attacker":if req.attacker==Attacker::Opponent {"opponent"} else {"mover"},
-        "reason":"no verified strategy","nodes_used":meter.spent().min(req.nodes),"proof_turns":null,"elapsed_ms":0.0});
+        "reason":"no verified strategy","nodes_used":cached_nodes.unwrap_or(meter.spent().min(req.nodes)),"proof_turns":null,"elapsed_ms":0.0});
     if let Some(cert)=cert {
         match check::verify(&req.history,ply,&cert,deadline,50000) {
             Ok((moves,turns))=>{
                 if !cache_hit && req.certificate.is_none() && req.root_moves.is_none() {
                     let mut guard=cache.lock().map_err(|_|"cache lock")?;
                     if guard.len()>=128 {guard.clear();}
-                    guard.insert(key,cert.clone());
+                    guard.insert(key,(cert.clone(),meter.spent().min(req.nodes),probe_verdict));
                 }
                 response["status"]=json!("PROVEN_WIN");response["native_verified"]=json!(true);
                 response["moves"]=json!(moves);response["proof_turns"]=json!(turns);

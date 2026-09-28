@@ -37,7 +37,10 @@ class NativeStrategy(unittest.TestCase):
         self.assertEqual(independent_verify(result['certificate'], OPEN_THREE), 'PROVEN_WIN')
         cached = self.engine.history(OPEN_THREE, nodes=100000, ms=5000, idtt_nodes=1000)
         self.assertTrue(cached['cache_hit'])
-        self.assertEqual(cached['status'], 'PROVEN_WIN')
+        for field in ('status', 'certificate', 'nodes_used', 'idtt_verdict', 'proof_turns'):
+            self.assertEqual(cached[field], result[field], field)
+        shallow = self.engine.history(OPEN_THREE, nodes=100000, ms=5000, idtt_nodes=1000, depth=2)
+        self.assertFalse(shallow['cache_hit'])
         for mutation in ['missing', 'duplicate', 'cycle', 'coordinate']:
             cert = copy.deepcopy(result['certificate'])
             if mutation in ('missing', 'duplicate'):
