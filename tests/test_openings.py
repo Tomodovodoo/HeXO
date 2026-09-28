@@ -307,6 +307,10 @@ class RefreshTests(unittest.TestCase):
             draws = Counter(dense_openings.canonical(uniform.draw(seed))[0] for seed in range(2000))
             self.assertLess(abs(draws[fresh['key']]-1000), 120)
             self.assertNotEqual(uniform.digest(), book.digest())                # same openings, another draw rule
+            uniform.save()
+            view = dense_openings.Book(run, suite='book')                   # a reader sees the file's own rule
+            self.assertEqual((view.data['weighting'], view.digest()), ('uniform', uniform.digest()))
+            self.assertEqual(dense_openings.summary(run, [])['books']['book']['digest'], uniform.digest())
             with self.assertRaises(ValueError):
                 self.book(tempfile.mkdtemp(dir=run)).draw(1)
 
@@ -440,7 +444,7 @@ class SummaryTests(unittest.TestCase):
             book.save()
             played = [dict(g, seed=1) for g in pair(node['moves'], 1.5)]
             report = dict(candidate='main/000020', opponent='seal', settings=asdict(settings()), games=played)
-            out = dense_openings.summary(run, [report], settings())
+            out = dense_openings.summary(run, [report])
             self.assertEqual((out['games'], out['p1_wins'], out['p2_wins'], out['capped']), (2, 1, 0, 1))
             self.assertEqual(out['players']['main/000020'], dict(p1_games=1, p1_wins=1, p2_games=1, p2_wins=0,
                                                                  mean_abs_skew=abs(node['skew']['elo'])))

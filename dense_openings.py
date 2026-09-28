@@ -16,8 +16,9 @@ Two kinds share one format and one code path (`Book`):
           refreshed; its statistics are kept in <run>/openings-<suite>.json. openings/standard-v1.json is
           train.opening_for's evaluation suite.
 
-File {schema, suite, frozen, refreshed_by, refreshed_at, counted, imported, nodes: [node]}, nodes ordered by depth then
-key; counted maps `report_id` to the pairs of that report the book has counted (`Book.reconcile`).
+File {schema, suite, frozen, refreshed_by, refreshed_at, counted, imported, weighting (live), nodes: [node]}, nodes
+ordered by depth then key; counted maps `report_id` to the pairs of that report the book has counted
+(`Book.reconcile`) and weighting is the live book's draw rule (EvaluationSettings.book_weighting).
 node {key, moves, depth, weight (frozen openings), status, reason, challenges, probability, visit_share, checkpoint,
       created_at, retired_at, champion_probability, champion_value, scored_by, games, p1_wins, p2_wins, capped, pairs,
       skew}:
@@ -301,9 +302,12 @@ def stamp(run):
 class Book:
     """The opening book of `suite` (default settings.opening_suite) in `run` (module contract) under EvaluationSettings
     `settings`. A missing live file is a book holding only the origin; a missing frozen file starts from the repo's
-    openings/<suite>.json. Nothing is written before `save`, `record`, `reconcile` or `refresh`."""
+    openings/<suite>.json. A live book's draw rule is part of its state (file field `weighting`): opening it with
+    `settings` adopts settings.book_weighting; without settings the book is a view of the file for reading (stats,
+    graph, digest), whose draw rule and refresh need settings. Nothing is written before `save`, `record`,
+    `reconcile` or `refresh`."""
 
-    def __init__(self, run, settings, suite=None):
+    def __init__(self, run, settings=None, suite=None):
         self.settings, self.suite = settings, suite or settings.opening_suite
         self.path, self.frozen = book_path(run, self.suite), self.suite != LIVE
         if self.path.exists():
@@ -315,9 +319,11 @@ class Book:
             self.data = json.loads(source.read_text())
         else:
             self.data = dict(schema=SCHEMA, suite=LIVE, frozen=False, refreshed_by=None, refreshed_at=None, counted={},
-                             imported=False, nodes=[new_node([ORIGIN])])
+                             imported=False, weighting='uniform', nodes=[new_node([ORIGIN])])
         if self.data['schema'] != SCHEMA or self.data['suite'] != self.suite:
             raise ValueError(f'{self.path} is not a {SCHEMA} book of suite {self.suite!r}')
+        if settings and not self.frozen:
+            self.data['weighting'] = settings.book_weighting
         self.nodes = {n['key']: n for n in self.data['nodes']}
 
     def openings(self):
@@ -326,10 +332,10 @@ class Book:
 
     def digest(self):
         """The state reports are played under: '' for a frozen book (its suite fixes its openings and their weights),
-        else the sha256 of book_weighting and the opening keys, so a change of either names a new state."""
+        else the sha256 of its draw rule (`weighting`) and the opening keys, so a change of either names a new state."""
         if self.frozen:
             return ''
-        state = [self.settings.book_weighting, [n['key'] for n in self.openings()]]
+        state = [self.data['weighting'], [n['key'] for n in self.openings()]]
         return hashlib.sha256(json.dumps(state).encode()).hexdigest()
 
     def due(self, champion, now):
@@ -345,7 +351,7 @@ class Book:
         openings = self.openings()
         if not openings:
             raise ValueError(f'{self.path} has no opening; the evaluator refreshes a live book once a champion exists')
-        w = np.array([n['weight'] if self.frozen else 1/(1+n['skew']['pairs']) if self.settings.book_weighting == 'least_played'
+        w = np.array([n['weight'] if self.frozen else 1/(1+n['skew']['pairs']) if self.data['weighting'] == 'least_played'
                       else 1. for n in openings], np.float64)
         rng = np.random.default_rng(seed)
         moves = np.array(openings[rng.choice(len(openings), p=w/w.sum())]['moves'], np.int64)
@@ -570,17 +576,17 @@ class Book:
         write_json(self.path, self.data)
 
 
-def books(run, settings):
-    """{suite: Book} of the book files in `run`."""
-    return {suite: Book(run, settings, suite) for suite in suites() if book_path(run, suite).exists()}
+def books(run):
+    """{suite: Book} of the book files in `run`, as views for reading."""
+    return {suite: Book(run, suite=suite) for suite in suites() if book_path(run, suite).exists()}
 
 
-def summary(run, reports, settings):
+def summary(run, reports):
     """league.json `openings` over `reports` and the book files of `run`: {games, p1_wins, p2_wins, capped, players:
     {id: {p1_games, p1_wins, p2_games, p2_wins, mean_abs_skew}}, books: {suite: `Book.stats`}}, each report's candidate
     and opponent (Seal as 'seal') a player. mean_abs_skew is a player's mean |skew elo| over its games whose opening
     node, in the book of the report's suite, has pairs (null without any)."""
-    found = books(run, settings)
+    found = books(run)
     out = dict(games=0, p1_wins=0, p2_wins=0, capped=0, players={}, books={k: b.stats() for k, b in found.items()})
     skews = {}
     for report in reports:
