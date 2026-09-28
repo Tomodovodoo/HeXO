@@ -1112,7 +1112,7 @@ class Evaluator:
             return {(cid, champion, 'champion'): even(min(s.pool_games, s.sprt_max_games-len(games)))}
         self.session(want, s.sprt_max_games)
         path = report_path(self.run, cid, champion)
-        if not path.exists():
+        if not self.games(cid, champion):  # no game under the active protocol
             return {}, None
         report = json.loads(path.read_text())
         result, n = self.test(report['games']), len(report['games'])

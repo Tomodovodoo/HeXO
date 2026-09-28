@@ -2751,6 +2751,26 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual((report['settings']['sims'], len(report['games'])), (3, 6))
         self.assertEqual(len(json.loads(path.with_name(f'report-{int(created)}.json').read_text())['games']), 2)
 
+    def test_an_old_protocol_report_never_rates_a_candidate_without_games(self):
+        evaluator = self.start(sprt_max_games=6)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.export(20)
+        def crash(pool, steps):
+            if steps == 3:
+                raise Crash
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=crash)), self.assertRaises(Crash):
+            evaluator.step()
+        evaluator = self.start(sprt_max_games=6, sims=3)
+        newer = evaluator.newer
+        def export_then_check(cid):
+            if not (self.run/'checkpoints'/'main'/'000030').exists():
+                self.export(30)
+            return newer(cid)
+        evaluator.newer = export_then_check
+        evaluator.rate(next(e for e in dense_eval.checkpoints(self.run) if e[0] == 'main/000020'))
+        self.assertEqual((evaluator.entry('main/000020')['skipped'], self.league()['champion']), (True, 'main/000010'))
+
     def test_half_finished_pairs_hold_their_slots_against_the_budget(self):
         """Every colour-0 game finishes before any colour-1 game: the finished halves still count against the
         comparison's budget, so exactly sprt_max_games games are played."""
