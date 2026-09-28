@@ -627,7 +627,7 @@ class DenseConfigTests(unittest.TestCase):
             settings = dict(asdict(dense_config.EvaluationSettings()), eval_share=.5, sprt_max_games=10, anchor_games=4,
                             max_plies=100)
             status = dict(stage='playing', comparison=dict(candidate='main/002000', opponent='main/000500', kind='champion'),
-                          started_at=900., games_planned=10, placements_played=40, mean_placements=None,
+                          started_at=900., games_planned=10, round_first=0, round_games=10, placements_played=40, mean_placements=None,
                           placements_per_second=2., settings=settings)
             timing = dashboard.evaluation_timing(run, status, 1000.)
             self.assertEqual({k: timing[k] for k in ('elapsed', 'mean_placements', 'mean_source', 'export_steps', 'seconds_per_step')},
@@ -642,6 +642,10 @@ class DenseConfigTests(unittest.TestCase):
             timing = dashboard.evaluation_timing(run, dict(status, processes=4), 1000.)    # Pacer weight 4: 1/8 of wall time
             self.assertEqual(timing['playing_fraction'], .125)
             self.assertAlmostEqual(timing['expected'], 100.+(10*15-40)/2./.125)
+            rounds = dict(status, settings=dict(settings, games=4), processes=2, round_first=4, round_games=4, placements_played=80)
+            timing = dashboard.evaluation_timing(run, rounds, 1000.)  # rounds of 4, 4, 2 games on 2, 2, 1 workers
+            self.assertAlmostEqual(timing['expected'], 100.+(8*15-80)/2./.25+2*15/2./.5)
+            self.assertAlmostEqual(timing['eval_seconds'], 2*4*15/2./.25+2*15/2./.5+4*5/10./.25)
             timing = dashboard.evaluation_timing(run, dict(status, stage='throttled', started_at=None), 1000.)
             self.assertEqual((timing['elapsed'], timing['expected']), (None, None))  # the next comparison waits to start
             timing = dashboard.evaluation_timing(run, dict(status, settings=dict(settings, anchor_on_promotion=False)), 1000.)
@@ -1952,8 +1956,8 @@ class EvaluatorLoopTests(unittest.TestCase):
             seen.append(json.loads((self.run/'evaluator-status.json').read_text()))
         evaluator.pacer.wait = wait
         self.assertTrue(evaluator.step())
-        self.assertEqual([(s['stage'], s['comparison']['candidate'], s['started_at'] is None, s['games_played']) for s in seen],
-                         [('throttled', 'main/000020', True, 0), ('throttled', 'main/000020', False, 2)])
+        self.assertEqual([(s['stage'], s['comparison']['candidate'], s['started_at'] is None, s['round_first'], s['round_games'])
+                          for s in seen], [('throttled', 'main/000020', True, 0, 2), ('throttled', 'main/000020', False, 2, 2)])
 
     def test_previous_comparison_plays_in_rounds_while_idle(self):
         self.export(10, 30, 50)
