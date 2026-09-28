@@ -646,6 +646,10 @@ class DenseConfigTests(unittest.TestCase):
             timing = dashboard.evaluation_timing(run, rounds, 1000.)  # rounds of 4, 4, 2 games on 2, 2, 1 workers, 1 / s each
             self.assertAlmostEqual(timing['expected'], 100.+(8*15-80)/2./.25+2*15/1./.5)
             self.assertAlmostEqual(timing['eval_seconds'], 2*4*15/2./.25+2*15/1./.5+4*5/20./.25)
+            between = dict(status, stage='throttled', placements_per_second=None, worker_placements_per_second=2.)
+            self.assertAlmostEqual(dashboard.evaluation_timing(run, between, 1000.)['expected'], 100.+(10*15-40)/2./.5)
+            timing = dashboard.evaluation_timing(run, dict(status, eval_share=1.), 1000.)  # --once: no pacing
+            self.assertAlmostEqual(timing['expected'], 100.+(10*15-40)/2.)
             timing = dashboard.evaluation_timing(run, dict(status, stage='throttled', started_at=None), 1000.)
             self.assertEqual((timing['elapsed'], timing['expected']), (None, None))  # the next comparison waits to start
             timing = dashboard.evaluation_timing(run, dict(status, settings=dict(settings, anchor_on_promotion=False)), 1000.)
@@ -1957,8 +1961,10 @@ class EvaluatorLoopTests(unittest.TestCase):
             seen.append(json.loads((self.run/'evaluator-status.json').read_text()))
         evaluator.pacer.wait = wait
         self.assertTrue(evaluator.step())
-        self.assertEqual([(s['stage'], s['comparison']['candidate'], s['started_at'] is None, s['round_first'], s['round_games'])
-                          for s in seen], [('throttled', 'main/000020', True, 0, 2), ('throttled', 'main/000020', False, 2, 2)])
+        self.assertEqual([(s['stage'], s['comparison']['candidate'], s['started_at'] is None, s['round_first'], s['round_games'],
+                           s['worker_placements_per_second'] is None) for s in seen],
+                         [('throttled', 'main/000020', True, 0, 2, True), ('throttled', 'main/000020', False, 2, 2, False)])
+        self.assertEqual(seen[0]['eval_share'], 1.)
 
     def test_previous_comparison_plays_in_rounds_while_idle(self):
         self.export(10, 30, 50)

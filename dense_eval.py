@@ -519,8 +519,9 @@ class Evaluator:
     round and its size), placements_played (the comparison's placements after openings, including unfinished
     games of the current round),
     mean_placements (placements per game over the games of the comparison's finished rounds, null before
-    any), placements_per_second (current round, both sides, all processes), settings (the effective
-    EvaluationSettings), backlog (unrated checkpoint ids at the last step), processes, eval_share_used
+    any), placements_per_second (current round, both sides, all processes), worker_placements_per_second
+    (placements / worker_seconds over the comparison's rounds this process finished, null before any), settings
+    (the effective EvaluationSettings), eval_share (the Pacer's share: 1 with --once), backlog (unrated checkpoint ids at the last step), processes, eval_share_used
     (Pacer.used), vram (hexnet.vram() of this process; `pairs` workers are not included), error}. A round of
     n games runs min(processes, n // 2) workers. Match events carry seconds, worker_seconds (seconds times the
     round's workers) and placements over the rounds this process added."""
@@ -533,8 +534,8 @@ class Evaluator:
             write_league(self.run, self.league, self.config)
         self.models, self.partial, self.seal, self.written = {}, {}, None, 0.
         self.status = dict(stage='idle', updated_at=None, comparison=None, started_at=None, games_played=0, games_planned=0,
-                           round_first=0, round_games=0,
-                           placements_played=0, mean_placements=None, placements_per_second=None, settings=asdict(settings),
+                           round_first=0, round_games=0, placements_played=0, mean_placements=None, placements_per_second=None,
+                           worker_placements_per_second=None, settings=asdict(settings), eval_share=pacer.share,
                            backlog=[], processes=processes, eval_share_used=0., error=None)
 
     def publish(self, force=False, **fields):
@@ -598,7 +599,8 @@ class Evaluator:
         comparison = lambda stage: self.publish(
             True, stage=stage, comparison=dict(candidate=cid, opponent=opponent, kind=kind), started_at=done.get('started_at'),
             games_played=len(records), games_planned=planned, round_first=len(records), round_games=count,
-            placements_played=placed, mean_placements=placed/len(records) if records else None, placements_per_second=None)
+            placements_played=placed, mean_placements=placed/len(records) if records else None, placements_per_second=None,
+            worker_placements_per_second=done['placements']/done['worker_seconds'] if done['worker_seconds'] else None)
         self.pacer.wait(lambda: comparison('throttled'))
         if self.newer(cid) if kind == 'champion' else self.backlog():
             return done
@@ -627,7 +629,8 @@ class Evaluator:
         played = placements(results)
         done['placements'] += played
         self.publish(True, games_played=len(records), placements_played=placed+played, mean_placements=(placed+played)/len(records),
-                     placements_per_second=played/max(self.pacer.clock()-start, 1e-9))
+                     placements_per_second=played/max(self.pacer.clock()-start, 1e-9),
+                     worker_placements_per_second=done['placements']/max(done['worker_seconds'], 1e-9))
         return done
 
     def backlog(self):

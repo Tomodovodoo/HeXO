@@ -452,9 +452,11 @@ def evaluation_timing(run, evaluator, now):
     - Games are played in rounds of settings.games (the last one shorter). A round of n games runs
       workers(n) = min(processes, n // 2) workers, which the Pacer charges per playing second, so its playing
       time becomes wall time divided by min(1, eval_share / workers(n)), the Pacer's long-run ceiling.
-    - rate(type), placements per playing second of one worker: the current placements_per_second /
-      workers(round_games) when the comparison has that type, else placements / worker_seconds of the newest
-      match event of that type, else the current one; a round of n games plays at rate * workers(n).
+    - rate(type), placements per playing second of one worker, for the comparison's type: the current
+      placements_per_second / workers(round_games), else its worker_placements_per_second (e.g. while
+      throttled between rounds); for either type then placements / worker_seconds of the newest match event of
+      that type, else the comparison's rate. A round of n games plays at rate * workers(n).
+    - eval_share: the status's eval_share (the Pacer's actual share), else settings.eval_share.
     elapsed: seconds since the comparison's started_at; expected: elapsed plus the wall time of the placements
     left to its planned games: (round_first + round_games) * mean_placements - placements_played in the
     current round, then later rounds up to games_planned; SPRT may stop earlier, so expected is the cap. Both
@@ -468,14 +470,15 @@ def evaluation_timing(run, evaluator, now):
     if not isinstance(settings, dict): return None
     comparison = evaluator.get('comparison') if isinstance(evaluator.get('comparison'), dict) else {}
     current = comparison.get('opponent') == 'seal' if comparison else None
-    share = settings.get('eval_share') if finite(settings.get('eval_share')) and 0 < settings['eval_share'] <= 1 else 1.
+    share = next((v for v in (evaluator.get('eval_share'), settings.get('eval_share')) if finite(v) and 0 < v <= 1), 1.)
     size, processes = max(2, settings.get('games') or 2), max(1, evaluator.get('processes') or 1)
     workers = lambda n: max(1, min(processes, n//2))
     fraction = lambda n: min(1., share/workers(n))  # playing share of wall time in a round of n games
     rounds = lambda games: [min(size, games-k) for k in range(0, max(0, games), size)]
     seconds = lambda placements, n, speed: placements/(speed*workers(n))/fraction(n)  # wall time in a round of n games
-    pps = evaluator.get('placements_per_second')
-    pps = pps/workers(evaluator.get('round_games') or size) if finite(pps) and pps > 0 else None
+    live, finished = evaluator.get('placements_per_second'), evaluator.get('worker_placements_per_second')
+    pps = live/workers(evaluator.get('round_games') or size) if finite(live) and live > 0 else \
+        finished if finite(finished) and finished > 0 else None
     reports = report_placements(run)
     def mean(seal):
         if seal == current and finite(evaluator.get('mean_placements')): return evaluator['mean_placements'], 'comparison'
