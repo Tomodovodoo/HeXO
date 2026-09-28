@@ -702,22 +702,30 @@ class DenseConfigTests(unittest.TestCase):
         parser = argparse.ArgumentParser()
         dense_config.add_arguments(parser, dense_config.LearnerSettings)
         base = dense_config.LearnerSettings()
-        self.assertEqual((base.outcome_lambda, base.outcome_weight, base.validation_rows, base.validation_quota), (1., 0., 8192, 128))
-        self.assertEqual(dense_data.target_options(base)['outcome_lam'], 1.)
-        args = parser.parse_args(['--outcome-lambda', '0.98', '--bootstrap-full-only', '--outcome-weight', '0.5',
-                                  '--validation-rows', '4096', '--validation-quota', '64'])
+        self.assertEqual((base.value_target, base.outcome_lambda, base.outcome_weight, base.calibration_games, base.validation_rows,
+                          base.validation_quota), ('outcome', .98, 0., 4000, 8192, 128))
+        fit = dense_data.Calibration((0.,)*dense_data.CALIBRATION_FEATURES, .5)
+        pick = lambda s, c=fit: {k: v for k, v in dense_data.target_options(s, c).items() if k in ('outcome_lam', 'calibration', 'full_only')}
+        self.assertEqual(pick(base), dict(outcome_lam=1., calibration=None, full_only=False))
+        args = parser.parse_args(['--value-target', 'td', '--outcome-lambda', '0.95', '--bootstrap-full-only', '--outcome-weight', '0.5',
+                                  '--validation-rows', '4096', '--validation-quota', '64', '--calibration-games', '1000'])
         got = dense_config.override(base, args)
-        self.assertEqual((got.outcome_lambda, got.bootstrap_full_only, got.outcome_weight, got.validation_rows, got.validation_quota),
-                         (.98, True, .5, 4096, 64))
-        self.assertEqual({k: v for k, v in dense_data.target_options(got).items() if k in ('outcome_lam', 'full_only')},
-                         dict(outcome_lam=.98, full_only=True))
+        self.assertEqual((got.value_target, got.outcome_lambda, got.bootstrap_full_only, got.outcome_weight, got.validation_rows,
+                          got.validation_quota, got.calibration_games), ('td', .95, True, .5, 4096, 64, 1000))
+        self.assertEqual(pick(got), dict(outcome_lam=.95, calibration=None, full_only=True))
+        calibrated = dense_config.override(got, parser.parse_args(['--value-target', 'calibrated']))
+        self.assertEqual(pick(calibrated), dict(outcome_lam=1., calibration=fit, full_only=True))
+        self.assertEqual(pick(calibrated, None), dict(outcome_lam=1., calibration=None, full_only=True))
+        with self.assertRaises(ValueError):
+            dense_config.override(base, parser.parse_args(['--value-target', 'soft']))
         # Manifests written before these settings load with the defaults.
-        old = {k: v for k, v in asdict(base).items() if k not in ('outcome_lambda', 'outcome_weight', 'validation_rows', 'validation_quota')}
+        old = {k: v for k, v in asdict(base).items() if k not in ('value_target', 'outcome_lambda', 'outcome_weight', 'calibration_games',
+                                                                   'validation_rows', 'validation_quota')}
         self.assertEqual(dense_config.LearnerSettings(**old), base)
         rng = np.random.default_rng(0)
-        self.assertEqual(dense_learn.perturb(base, rng, .2).outcome_lambda, 1.)
+        self.assertEqual(dense_learn.perturb(replace(base, outcome_lambda=1.), rng, .2).outcome_lambda, 1.)
         for _ in range(20):
-            x = dense_learn.perturb(got, rng, .2).outcome_lambda
+            x = dense_learn.perturb(base, rng, .2).outcome_lambda
             self.assertTrue(.98-.02*.2-1e-12 <= x <= .98+.02*.2+1e-12)
         self.assertIn('validation_rows', dense_learn.KEEP)
 
@@ -831,6 +839,67 @@ class DenseDataTests(unittest.TestCase):
                          dense_data.value_targets(players, roots, -1, .8, full))
         with self.assertRaises(ValueError):
             dense_data.value_targets(players, roots[:3], 0, outcome_lam=.9)
+
+    def test_carried_values(self):
+        self.assertTrue(np.array_equal(dense_data.carried_values([None, .5, None, None]), [np.nan, .5, .5, -.5], equal_nan=True))
+        self.assertTrue(np.allclose(dense_data.carried_values([.3, .5, np.nan, None], [True, False, True, True]), [.3, -.3, -.3, .3]))
+
+    def test_calibration_learns_where_search_values_inform(self):
+        """Root values carry the outcome only in the last 20 plies: the map is ~z there and ~the base rate earlier."""
+        rng = np.random.default_rng(4)
+        games = []
+        for _ in range(600):
+            T, winner = int(rng.integers(60, 160)), int(rng.integers(2))
+            sign = np.where([dense_data.player_at(t) == winner for t in range(T)], 1., -1.)
+            late = T-np.arange(T) <= 20
+            roots = np.where(late, np.clip(.8*sign+rng.normal(0, .1, T), -1, 1), rng.uniform(-1, 1, T))
+            games.append((roots, rng.random(T) < .7, winner))
+        self.assertIsNone(dense_data.fit_calibration(games[:199]))
+        fit = dense_data.fit_calibration(games)
+        self.assertEqual(fit, dense_data.fit_calibration(games))
+        self.assertAlmostEqual(fit.base, .5, delta=.03)
+        near = fit.predict([.8, -.8], [5, 5])
+        self.assertGreater(near[0], .95); self.assertLess(near[1], .05)
+        for v in (-.8, 0., .8):
+            self.assertAlmostEqual(float(fit.predict([v], [100])[0]), fit.base, delta=.05)
+        self.assertEqual(fit.predict([np.nan], [5]).tolist(), [fit.base])
+        self.assertEqual(dense_data.unpack_calibration(dense_data.pack_calibration(fit)), fit)
+        self.assertIsNone(dense_data.unpack_calibration(dense_data.pack_calibration(None)))
+        # Finished games get the map at (carried v, plies remaining); capped games keep their TD chain.
+        roots, full, winner = games[0]
+        roots = [None if not f else float(v) for v, f in zip(roots, full)]
+        players = [dense_data.player_at(t) for t in range(len(roots))]
+        targets, weights = dense_data.value_targets(players, roots, winner, calibration=fit)
+        self.assertEqual(targets, fit.predict(dense_data.carried_values(roots), len(roots)-np.arange(len(roots))).tolist())
+        self.assertEqual(weights, [1.]*len(roots))
+        self.assertEqual(dense_data.value_targets(players, roots, -1, calibration=fit), dense_data.value_targets(players, roots, -1))
+        self.assertEqual(dense_data.value_targets(players, None, winner, calibration=fit)[0], [fit.base]*len(roots))
+
+    def test_learner_fits_the_calibration_from_the_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            synthetic_run(run, 4, 90, 30)
+            window = dense_data.ReplayWindow(run, 100000, 10**6)
+            games = window.finished_games(10**6)
+            episodes = [e for p in dense_data.shard_dirs(run) for e in dense_data.read_shard(p, policies=False)[0]]
+            self.assertEqual(len(games), sum(e['winner'] >= 0 for e in episodes))
+            newest = [e for e in episodes if e['winner'] >= 0][-1]
+            self.assertEqual((games[0][2], len(games[0][0])), (newest['winner'], len(newest['moves'])))
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)))
+            learner = dense_learn.Learner(run/'learner', replace(config.learner, calibration_games=220, bootstrap_full_only=True), config)
+            learner.calibrate(window)
+            games = window.finished_games(220)
+            self.assertEqual(learner.calibration, dense_data.fit_calibration([(r, f, w) for r, f, w in games]))
+            report = learner.calibration_report
+            self.assertEqual((report["games"], report["fitted"], len(report["coef"])), (220, True, dense_data.CALIBRATION_FEATURES))
+            self.assertEqual(np.array(report['table']['p']).shape, (len(dense_learn.CALIBRATION_H), len(dense_learn.CALIBRATION_V)))
+            self.assertEqual(learner.targets()['calibration'], None)    # value_target 'outcome'
+            learner.settings = replace(learner.settings, value_target='calibrated')
+            self.assertEqual(learner.targets()['calibration'], learner.calibration)
+            learner.settings = replace(learner.settings, calibration_games=150)
+            learner.calibrate(window)
+            self.assertEqual((learner.calibration, learner.calibration_report), (None, dict(games=150, fitted=False)))
+            self.assertEqual(learner.targets()['calibration'], None)
 
     def test_outcome_targets_in_examples(self):
         moves = winning_game()
@@ -1367,8 +1436,11 @@ class ValidationSourceTests(unittest.TestCase):
                                              'metrics', 'learner', 'model', 'copied_from'})
             aggregate, v = manifest['metrics']['validation'], manifest['metrics']['validation_sources']
             self.assertEqual(v['newest_checkpoint'], 'main/000010')
-            for h in dense_learn.HEADS:
+            for h in ('policy_ce', 'value_bce', 'opponent_ce', 'future_bce'):
                 self.assertTrue(math.isfinite(aggregate[h]))
+            # Capped 8-ply games: no short-value row (the game ends within the horizon) and no outcome row.
+            self.assertEqual((aggregate['short_value_bce'], aggregate['outcome_bce']), (None, None))
+            self.assertEqual(manifest['metrics']['calibration'], dict(games=0, fitted=False))
             for source in dense_data.SOURCES:
                 self.assertEqual(v[f'{source}_rows'], len(sets.subsets[source, 'held']))
                 for name in ('policy_ce', 'value_bce'):
@@ -1382,8 +1454,12 @@ class ValidationSourceTests(unittest.TestCase):
             dense_config.append_metrics(run, 'learner-main', step=10, validation=True, **fields)
             points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_newest_gap_policy_ce')['points']
             self.assertEqual(points, [[10, v['newest_gap_policy_ce']]])
-            points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_outcome_bce')['points']
-            self.assertEqual(points, [[10, aggregate['outcome_bce']]])
+            dense_config.append_metrics(run, 'learner-main', step=20, outcome_bce=.5)
+            self.assertEqual(dashboard.series(run, dict(created_at=0.), 'main', 'outcome_bce')['points'], [[20, .5]])
+            self.assertIn('validation_outcome_bce', dashboard.LEARNER_METRICS)
+            refs = window.sample(np.random.default_rng(0), 8)
+            losses = learner.train_step(dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0))))
+            self.assertTrue(math.isnan(losses[2]) and math.isnan(losses[5]) and torch.isfinite(losses[:2]).all())
 
     def test_remaining_curve_on_outcomes_decided_in_the_last_ten_plies(self):
         """Games whose outcome is fixed only in their last 10 plies: a predictor that knows it there and says 0.5

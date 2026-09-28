@@ -23,6 +23,7 @@ value and full_search False; it never enters the replay window and does not coun
 from collections import Counter, OrderedDict, namedtuple
 import hashlib
 import json
+import math
 import zlib
 import multiprocessing
 from pathlib import Path
@@ -47,6 +48,13 @@ Shard = namedtuple('Shard', 'game ply player remaining legal full following star
 FUTURE = (6, 20)
 ORIGINS = ('converted', 'actor')
 SOURCES = ('converted', 'fresh', 'newest')
+# Calibration map basis (calibration_features): hat functions of log2(plies remaining) centred on H_KNOTS, and the
+# root value's logit with |v| clipped to V_CLIP.
+H_KNOTS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+V_CLIP = .99
+CALIBRATION_FEATURES = 2*len(H_KNOTS)
+CALIBRATION_MIN_GAMES = 200
+CALIBRATION_RIDGE = 1.
 
 
 def legal_digest(actions):
@@ -71,7 +79,81 @@ def trained(episode, ply):
     return side is None or player_at(ply) == side
 
 
-def value_targets(players, root_values, winner, lam=.9, full=None, outcome_lam=1.):
+def calibration_features(v, h):
+    """Tensor-product basis [N, CALIBRATION_FEATURES] = [B_k(h), s * B_k(h)] for the degree-1 B-splines (hats) B_k
+    of log2(h) centred on log2(H_KNOTS[k]) (h clamped to the knot range; the hats sum to 1) and s = log((1+v)/(1-v)),
+    the logit of (1+v)/2 with |v| clipped to V_CLIP. The logit of the map is a(h) + b(h) s, with a and b piecewise
+    linear in log2(h)."""
+    x = np.clip(np.log2(np.maximum(np.asarray(h, np.float64), 1)), 0, len(H_KNOTS)-1)
+    hats = np.maximum(0, 1-np.abs(x[:, None]-np.arange(len(H_KNOTS))))
+    v = np.clip(np.asarray(v, np.float64), -V_CLIP, V_CLIP)
+    return np.concatenate([hats, np.log((1+v)/(1-v))[:, None]*hats], 1)
+
+
+class Calibration(namedtuple('Calibration', 'coef base')):
+    """A fitted map P(side to move wins | v, h): sigmoid(calibration_features(v, h) @ coef), and `base` (the
+    fitted games' win rate of the side to move) where v is unknown (NaN). Hashable: coef is a tuple."""
+    __slots__ = ()
+
+    def predict(self, v, h):
+        v, h = np.asarray(v, np.float64), np.asarray(h, np.float64)
+        p, known = np.full(v.shape, self.base), np.isfinite(v)
+        if known.any():
+            p[known] = 1/(1+np.exp(-calibration_features(v[known], h[known]) @ np.asarray(self.coef)))
+        return p
+
+
+def pack_calibration(calibration):
+    """A Calibration (or None) as CALIBRATION_FEATURES+1 floats [base, *coef]; None packs as NaNs."""
+    return [math.nan]*(CALIBRATION_FEATURES+1) if calibration is None else [calibration.base, *calibration.coef]
+
+
+def unpack_calibration(values):
+    values = list(values)
+    return None if math.isnan(values[0]) else Calibration(tuple(values[1:]), values[0])
+
+
+def carried_values(roots, full=None):
+    """Per ply, the side to move's value from the latest known root value at or before that ply (negated when
+    that ply's mover differs), NaN before the first. `roots` holds side-to-move root values with None or NaN
+    for null; with `full`, plies where full[t] is False count as null."""
+    u = np.array([math.nan if v is None else v for v in roots], np.float64)
+    if full is not None:
+        u[~np.asarray(full, bool)] = math.nan
+    sign = 1-2*((np.arange(len(u))+1)//2 % 2)
+    u *= sign
+    last = np.maximum.accumulate(np.where(np.isfinite(u), np.arange(len(u)), -1))
+    return np.where(last >= 0, u[np.maximum(last, 0)], math.nan)*sign
+
+
+def fit_calibration(games, min_games=CALIBRATION_MIN_GAMES, ridge=CALIBRATION_RIDGE, iterations=25):
+    """Fit a Calibration to finished games [(roots, full or None, winner)] (roots as for carried_values), or
+    None for fewer than `min_games` games. Every ply t of a game of T plies with a carried value v_t is a
+    row (v_t, h_t = T - t, z_t = 1 if the side to move won); a logistic regression on calibration_features
+    is fitted by Newton's method with an L2 penalty `ridge` toward the base rate (the mean z_t over every ply):
+    toward a(h) = logit(base rate) and b(h) = 0, the value of the map where the rows carry no information.
+    Deterministic."""
+    if len(games) < min_games:
+        return None
+    v, h, z, every = [], [], [], []
+    for roots, full, winner in games:
+        T = len(roots); won = (((np.arange(T)+1)//2 % 2) == winner).astype(np.float64)
+        carried = carried_values(roots, full); known = np.isfinite(carried)
+        v.append(carried[known]); h.append((T-np.arange(T))[known]); z.append(won[known]); every.append(won)
+    base = float(np.concatenate(every).mean())
+    X, y = calibration_features(np.concatenate(v), np.concatenate(h)), np.concatenate(z)
+    prior = np.zeros(CALIBRATION_FEATURES); prior[:len(H_KNOTS)] = math.log(max(base, 1e-6)/max(1-base, 1e-6))
+    coef = prior.copy()
+    for _ in range(iterations):
+        p = 1/(1+np.exp(-X @ coef))
+        step = np.linalg.solve((X*(p*(1-p))[:, None]).T @ X + ridge*np.eye(CALIBRATION_FEATURES), X.T @ (p-y) + ridge*(coef-prior))
+        coef -= step
+        if np.abs(step).max() < 1e-8:
+            break
+    return Calibration(tuple(coef.tolist()), base)
+
+
+def value_targets(players, root_values, winner, lam=.9, full=None, outcome_lam=1., calibration=None):
     """Return (targets, weights) per ply: p(win) for the side to move at each ply.
 
     Root values v_t in [-1, 1] from the side to move at ply t are put in player 0's frame, u_t = v_t if
@@ -80,10 +162,12 @@ def value_targets(players, root_values, winner, lam=.9, full=None, outcome_lam=1
         G_t = (1 - l) * u_{t+1} + l * G_{t+1}
     skipping plies with a null root value (G_t = G_{t+1} when u_{t+1} is null). The target is (1 + s_t G_t) / 2
     with s_t = +1 for player 0, -1 for player 1. Every weight is 1 unless stated otherwise.
-    Terminal games (winner 0/1): with outcome_lam >= 1 the target is 1.0 at plies where `players[t] == winner`,
-    else 0.0. With outcome_lam < 1, l = outcome_lam and the chain starts from the outcome z = +1 if winner == 0
-    else -1, G_{T-1} = z, so G_t = (1-l) * sum_{k=1}^{T-1-t} l^(k-1) u_{t+k} + l^(T-1-t) z when no root value is
-    null: the last ply's target is exactly the outcome, and earlier ones blend in the searched values.
+    Terminal games (winner 0/1) with a `calibration`: calibration.predict(v_t, T - t), v_t = carried_values of the
+    (full-filtered) root values, the base rate where v_t is unknown. Otherwise, with outcome_lam >= 1 the target
+    is 1.0 at plies where `players[t] == winner`, else 0.0. With outcome_lam < 1, l = outcome_lam and the chain
+    starts from the outcome z = +1 if winner == 0 else -1, G_{T-1} = z, so
+    G_t = (1-l) * sum_{k=1}^{T-1-t} l^(k-1) u_{t+k} + l^(T-1-t) z when no root value is null: the last ply's
+    target is exactly the outcome, and earlier ones blend in the searched values.
     Capped games (winner -1): l = lam and the chain bootstraps from the last known root value, G_{T-1} = u_{T-1}
     (a trailing null bootstraps from the last known value); with no root values at all, target None and
     weight 0 everywhere.
@@ -93,6 +177,8 @@ def value_targets(players, root_values, winner, lam=.9, full=None, outcome_lam=1
     T = len(players)
     if full is not None and root_values is not None:
         root_values = [v if f else None for v, f in zip(root_values, full, strict=True)]
+    if winner >= 0 and calibration is not None:
+        return calibration.predict(carried_values(root_values or [None]*T), T-np.arange(T)).tolist(), [1.]*T
     if winner >= 0 and (outcome_lam >= 1 or root_values is None):
         return [float(p == winner) for p in players], [1.]*T
     if winner < 0 and (root_values is None or all(v is None for v in root_values)):
@@ -113,10 +199,10 @@ def value_targets(players, root_values, winner, lam=.9, full=None, outcome_lam=1
     return [(1 + (g if p == 0 else -g))/2 for p, g in zip(players, G)], [1.]*T
 
 
-def episode_value_targets(e, lam, full_only, outcome_lam=1.):
+def episode_value_targets(e, lam, full_only, outcome_lam=1., calibration=None):
     """value_targets of episode `e` (full-search root values only with `full_only`)."""
     return value_targets([player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'],
-                         lam, e['full_search'] if full_only else None, outcome_lam)
+                         lam, e['full_search'] if full_only else None, outcome_lam, calibration)
 
 
 def write_shard(path, identity, episodes, rows, origin='actor'):
@@ -240,7 +326,7 @@ class ReplayWindow:
     held-out flag; per ply its move, root value (NaN for null) and full_search flag. A Ref's row dict and its
     episode dict {moves, winner, root_values, full_search, trained_side} are rebuilt on demand. Policy vectors
     load per shard on first use into an LRU bounded by `policy_cache_mb` (the shard in use is always kept);
-    value targets are cached for the VALUE_CACHE most recently used (episode, lam, full_only) keys.
+    value targets are cached for the VALUE_CACHE most recently used (episode, target options) keys.
     """
 
     VALUE_CACHE = 4096
@@ -325,6 +411,19 @@ class ReplayWindow:
                        full_search=s.searched[a:b].tolist() if s.has_search[g] else None)
         return Ref(name, i, row, episode)
 
+    def finished_games(self, n):
+        """The newest `n` finished games of the admitted shards outside the validation split, newest first, as
+        (root values with NaN for null, full_search flags, winner) arrays."""
+        out = []
+        for name, _ in reversed(self.admitted):
+            s = self.shards[name]
+            for g in reversed(np.flatnonzero((s.winner >= 0) & ~s.held).tolist()):
+                if len(out) >= n:
+                    return out
+                a, b = int(s.start[g]), int(s.start[g+1])
+                out.append((s.roots[a:b], s.searched[a:b], int(s.winner[g])))
+        return out
+
     def sample(self, rng, n, recency=0., validation=False):
         """n Refs drawn with replacement from the training (or validation) index; the k-th oldest of
         W rows has weight ((k+1)/W)^recency."""
@@ -361,13 +460,13 @@ class ReplayWindow:
         """Bytes held by the policy cache."""
         return sum(o.nbytes+p.nbytes for o, p in self.policies.values())
 
-    def value_targets(self, ref, lam, full_only, outcome_lam=1.):
+    def value_targets(self, ref, lam, full_only, outcome_lam=1., calibration=None):
         """episode_value_targets of the ref's episode, cached."""
-        key = (ref.shard, ref.row['game'], lam, full_only, outcome_lam)
+        key = (ref.shard, ref.row['game'], lam, full_only, outcome_lam, calibration)
         if key in self.values:
             self.values.move_to_end(key)
         else:
-            self.values[key] = episode_value_targets(ref.episode, lam, full_only, outcome_lam)
+            self.values[key] = episode_value_targets(ref.episode, lam, full_only, outcome_lam, calibration)
             if len(self.values) > self.VALUE_CACHE:
                 self.values.popitem(last=False)
         return self.values[key]
@@ -484,8 +583,8 @@ class ValidationSets:
         j = self.following_index[ref.shard, ref.index]
         return None if j is None else self.ref(ref.shard, j)
 
-    def value_targets(self, ref, lam, full_only, outcome_lam=1.):
-        return episode_value_targets(ref.episode, lam, full_only, outcome_lam)
+    def value_targets(self, ref, lam, full_only, outcome_lam=1., calibration=None):
+        return episode_value_targets(ref.episode, lam, full_only, outcome_lam, calibration)
 
 
 def crop_index(s, points):
@@ -498,22 +597,25 @@ def crop_index(s, points):
     return np.where(inside, y*s.size+x, -1)
 
 
-def target_options(settings):
-    """examples() keyword arguments from a LearnerSettings."""
+def target_options(settings, calibration=None):
+    """examples() keyword arguments from a LearnerSettings and the current Calibration: finished games get
+    outcome_lambda only with value_target 'td' and `calibration` only with 'calibrated' (hard outcomes while
+    it is None)."""
     return dict(lam=settings.td_lambda, bootstrap_weight=settings.bootstrap_weight, horizon=settings.short_value_horizon,
                 cheap_value_weight=settings.cheap_value_weight, full_only=settings.bootstrap_full_only,
-                outcome_lam=settings.outcome_lambda)
+                outcome_lam=settings.outcome_lambda if settings.value_target == 'td' else 1.,
+                calibration=calibration if settings.value_target == 'calibrated' else None)
 
 
 def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False,
-             outcome_lam=1.):
+             outcome_lam=1., calibration=None):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
     The replayed side to move and legal list must match each row. Returns (samples, targets); each target is a
     dict of
       policy, policy_weight: the row's improved policy (weight 0 when empty, i.e. a cheap-search row);
-      value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam) at the ply; weight 1
-        for finished games, `bootstrap_weight` for capped games with root values, 0 otherwise, times
+      value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam, calibration) at the ply;
+        weight 1 for finished games, `bootstrap_weight` for capped games with root values, 0 otherwise, times
         `cheap_value_weight` for cheap-search rows;
       outcome, outcome_weight: 1. when the side to move won a finished game, else 0.; weight value_weight for
         finished games, 0 for capped games (outcome .5);
@@ -537,7 +639,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         if (s.player, s.remaining) != (ref.row['player'], ref.row['remaining']) or legal_digest(s.actions) != ref.row['legal_sha256']:
             raise ValueError(f'Replayed position disagrees with row: {ref.shard}/{ref.index}')
         policy = window.policy(ref)
-        values, weights = window.value_targets(ref, lam, full_only, outcome_lam)
+        values, weights = window.value_targets(ref, lam, full_only, outcome_lam, calibration)
         value_weight = weights[t]*(1. if e['winner'] >= 0 else bootstrap_weight)*(1. if len(policy) else cheap_value_weight)
         u = t+horizon; roots = e['root_values']
         if u >= T:
@@ -622,25 +724,27 @@ def collate(samples, targets):
     return out
 
 
-def batches(window, rng, batch_size, settings, validation=False):
+def batches(window, rng, batch_size, settings, validation=False, calibration=lambda: None):
     """Endless generator of collated {S: batch} dicts covering `batch_size` positions in total.
-    `settings()` returns the current LearnerSettings, read per batch (recency and target_options)."""
+    `settings()` and `calibration()` return the current LearnerSettings and Calibration, read per batch
+    (recency and target_options)."""
     while True:
         s = settings()
         refs = window.sample(rng, batch_size, s.recency, validation)
-        yield collate(*examples(window, refs, rng, **target_options(s)))
+        yield collate(*examples(window, refs, rng, **target_options(s, calibration())))
 
 
 
-def _render_worker(run, settings, seed, output):
-    """Worker process body: put numpy-packed `batches` from a private ReplayWindow (refreshed every 30 s)."""
+def _render_worker(run, settings, seed, output, calibration):
+    """Worker process body: put numpy-packed `batches` from a private ReplayWindow (refreshed every 30 s), with
+    the Calibration packed in the shared array `calibration`."""
     try:
         window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
                               settings.window_taper, settings.validation_fraction, settings.policy_cache_mb)
         rng = np.random.default_rng(seed); refreshed = time.time()
         while not window.index:
             time.sleep(5); window.refresh(); refreshed = time.time()
-        for batch in batches(window, rng, settings.batch, lambda: settings):
+        for batch in batches(window, rng, settings.batch, lambda: settings, calibration=lambda: unpack_calibration(calibration[:])):
             output.put({size: {k: v.numpy() for k, v in b.items()} for size, b in batch.items()})
             if time.time()-refreshed > 30:
                 window.refresh(); refreshed = time.time()
@@ -651,16 +755,22 @@ def _render_worker(run, settings, seed, output):
 class Renderers:
     """`batches` of the run rendered by `workers` spawned processes, each with its own ReplayWindow, so
     rendering never holds the trainer's GIL. Settings (a LearnerSettings) are fixed per pool: close() it and
-    start another to change them. Iterate to consume {S: batch of torch tensors}; a worker's exception or
+    start another to change them; set_calibration() replaces the Calibration of batches rendered from then on. Iterate to consume {S: batch of torch tensors}; a worker's exception or
     death is raised in the consumer."""
 
-    def __init__(self, run, settings, seed, workers=2, depth=3):
+    def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None):
         context = multiprocessing.get_context('spawn')
         self.queue = context.Queue(depth*workers)
-        self.processes = [context.Process(target=_render_worker, args=(str(run), settings, [*seed, i], self.queue), daemon=True)
+        self.calibration = context.Array('d', CALIBRATION_FEATURES+1)
+        self.set_calibration(calibration)
+        self.processes = [context.Process(target=_render_worker, args=(str(run), settings, [*seed, i], self.queue, self.calibration),
+                                          daemon=True)
                           for i in range(workers)]
         for process in self.processes:
             process.start()
+
+    def set_calibration(self, calibration):
+        self.calibration[:] = pack_calibration(calibration)
 
     def __iter__(self):
         return self
