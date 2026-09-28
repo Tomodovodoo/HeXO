@@ -428,10 +428,16 @@ class Evaluator:
                                                '--out', str(out)]), out))
                 pair += share
             while any(job.poll() is None for job, _ in jobs):
+                if any(job.returncode for job, _ in jobs):
+                    break
                 time.sleep(1.)
                 progress = [json.loads(p.read_text()) for _, out in jobs if (p := out.with_suffix('.progress')).exists()]
                 heartbeat(sum(p['finished'] for p in progress), sum(p['placements'] for p in progress))
             if any(job.returncode for job, _ in jobs):
+                for job, _ in jobs:
+                    if job.poll() is None:
+                        job.terminate()
+                    job.wait()
                 raise RuntimeError(f'evaluation worker exit codes {[job.returncode for job, _ in jobs]}')
             return [record for _, out in jobs for record in json.loads(out.read_text())]
 
