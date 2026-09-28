@@ -7,8 +7,8 @@ export, info, error or replace. league.json is read for population replacement, 
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
 falls on every tenth step) and one per export with validation_fields(metrics) of the manifest (Learner.export): EMA
 losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets), plus the value
-loss of finished held-out games against plies remaining (remaining_curve) and the policy and value losses against
-the ply from the start (ply_curve, ply_split). The EMA
+loss of finished held-out games against their hard outcome by plies remaining (remaining_curve) and the policy and
+value losses against the ply from the start (ply_curve, ply_split). The EMA
 averages parameters only; each export first recomputes its norm statistics (Learner.recalibrate), since the
 raw model's running statistics do not describe the EMA weights.
 
@@ -16,9 +16,10 @@ VRAM: each export ends by returning the caching allocator's unused blocks to the
 recalibration and validation raise the peak above what training needs. vram_reserved_mb > 0 caps the allocator
 (Learner.cap_vram); learner-status.json and the metrics lines carry vram {allocated_mb, reserved_mb} (zeros off CUDA).
 
-Every target is derived here from episodes (dense_data.examples), so td_lambda, bootstrap_weight and
-short_value_horizon are learner settings; batches are rendered by dense_data.Renderers worker processes
-(--workers) with random hex symmetries. The loss of one optimizer step is, per head, the weighted mean
+Every target is derived here from episodes (dense_data.examples), so td_lambda, outcome_lambda, bootstrap_weight
+and short_value_horizon are learner settings; outcome_weight weighs a second value-logit loss, the BCE against the
+hard outcome of finished games (head outcome_bce, always logged), KataGo-style. Batches are rendered by
+dense_data.Renderers worker processes (--workers) with random hex symmetries. The loss of one optimizer step is, per head, the weighted mean
 over every row of the batch that has that target, summed with the head coefficients; each crop bucket is
 a separate forward pass whose gradients accumulate (buckets padded to QUANTUM rows with inert rows).
 Pacing: at most samples_per_row * (trained rows in all shards, cheap rows included; a historical opponent's
@@ -43,18 +44,17 @@ import dense_data
 import hexnet
 from train import write_json
 
-HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'opponent_ce', 'future_bce')
-WEIGHTS = ('policy_weight', 'value_weight', 'short_weight', 'next_weight', 'future_weight')
+HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'opponent_ce', 'future_bce', 'outcome_bce')
+WEIGHTS = ('policy_weight', 'value_weight', 'short_weight', 'next_weight', 'future_weight', 'outcome_weight')
 VALIDATION_ROWS = 2048
 RECALIBRATION_ROWS = 4096
 QUANTUM = 16  # bucket rows are padded to a multiple of this
 STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
-KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'export_every', 'log_every',
-        'vram_reserved_mb')
-LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')))  # metrics log names
-# (low, high) for replacement perturbations; td_lambda and ema are perturbed through 1 - x.
+KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
+        'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb')
+LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
 PLY_GRID = tuple(range(0, 385, 8))  # plies from the start at which by-ply curves are sampled
@@ -62,7 +62,10 @@ PLY_SIGMA = 4.
 EARLY_PLY, LATE_PLY = 20, 60  # ply_split: early rows have ply < EARLY_PLY, late rows ply >= LATE_PLY
 HORIZON_BCE = math.log(2)/2  # midpoint between a perfect and a chance value head
 CURVE_SOURCES = ('fresh', 'newest')
-BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995), ema=(.99, .9999))
+# (low, high) for replacement perturbations; td_lambda, outcome_lambda and ema are perturbed through 1 - x.
+BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995),
+              outcome_lambda=(0., 1.), ema=(.99, .9999))
+COMPLEMENTED = ('td_lambda', 'outcome_lambda', 'ema')
 
 
 def validation_fields(metrics):
@@ -127,6 +130,11 @@ def remaining_curve(remaining, bce, target, grid=REMAINING_GRID, sigma=REMAINING
                 value_horizon=None if horizon is None else round(float(horizon), 2))
 
 
+def validation_sets(run, settings, seed):
+    """The run's dense_data.ValidationSets sized by LearnerSettings validation_rows (limit) and validation_quota."""
+    return dense_data.ValidationSets(run, settings.validation_fraction, seed, settings.validation_rows, settings.validation_quota)
+
+
 def status_path(run, variant):
     return run/('learner-status.json' if variant == 'main' else f'learner-status-{variant}.json')
 
@@ -161,7 +169,8 @@ def forward(model, planes, device, memory_format):
 
 
 def head_losses(model, batch, device, memory_format):
-    """Per-head weighted means over one bucket and the bucket's weight sums, both [5] on device."""
+    """Per-head weighted means over one bucket and the bucket's weight sums, both [len(HEADS)] on device.
+    outcome_bce is the value logit's BCE against the hard outcome of finished games."""
     b = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
     out, mask = forward(model, b['planes'], device, memory_format)
     future = b['future'].float()
@@ -175,11 +184,12 @@ def head_losses(model, batch, device, memory_format):
                    hexnet.future_loss(out['future'], future, mask, b['future_weight'])]
     else:
         losses += [torch.zeros((), device=device)]*3
+    losses.append(hexnet.value_loss(out['value_logit'], b['outcome'], b['outcome_weight']))
     return torch.stack(losses), torch.stack([b[k].sum() for k in WEIGHTS])
 
 
 def batch_losses(model, batch, coefficients, device, memory_format, train):
-    """Head losses [5] of a collated {S: bucket} batch; with `train`, backpropagates the combined loss
+    """Head losses [len(HEADS)] of a collated {S: bucket} batch; with `train`, backpropagates the combined loss
     bucket by bucket (each bucket's head mean scaled by its share of that head's batch weight)."""
     totals = torch.stack([sum(b[k].sum() for b in batch.values()) for k in WEIGHTS]).to(device).clamp_min(1e-8)
     logged = torch.zeros(len(HEADS), device=device)
@@ -206,12 +216,12 @@ def update_ema(ema, model, decay):
 
 
 def perturb(settings, factor_rng, amount):
-    """Multiply lr, weight_decay, bootstrap_weight, 1-td_lambda and 1-ema by factors in [1-amount, 1+amount],
-    clipped to BOUNDS."""
+    """Multiply each BOUNDS setting (1 - x for COMPLEMENTED ones) by a factor in [1-amount, 1+amount], clipped to
+    BOUNDS."""
     values = {}
     for name, (low, high) in BOUNDS.items():
         x, f = getattr(settings, name), factor_rng.uniform(1-amount, 1+amount)
-        values[name] = float(np.clip(1-(1-x)*f if name in ('td_lambda', 'ema') else x*f, low, high))
+        values[name] = float(np.clip(1-(1-x)*f if name in COMPLEMENTED else x*f, low, high))
     return replace(settings, **values)
 
 
@@ -310,7 +320,8 @@ class Learner:
 
     def coefficients(self):
         s = self.settings
-        return torch.tensor([1., s.value_weight, s.short_value_weight, s.opponent_policy_weight, s.future_weight], device=self.device)
+        return torch.tensor([1., s.value_weight, s.short_value_weight, s.opponent_policy_weight, s.future_weight, s.outcome_weight],
+                            device=self.device)
 
     def train_step(self, batch):
         self.model.train()
@@ -379,8 +390,9 @@ class Learner:
     def row_losses(self, sets, refs):
         """Per-row EMA losses over `refs` under symmetries drawn from a fixed seed: float arrays with one entry per
         ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
-        finished (1. when winner >= 0, else 0.), value_bce, value (its target) and policy_ce (against the improved
-        policy; nan on rows without a policy target)."""
+        finished (1. when winner >= 0, else 0.), value_bce, value (its target), outcome_bce, outcome (the hard
+        outcome; .5 for capped games) and policy_ce (against the improved policy; nan on rows without a policy
+        target)."""
         s = self.settings
         rng = np.random.default_rng(self.config.seed)
         rows = []
@@ -394,21 +406,23 @@ class Learner:
                     out = forward(self.ema, b['planes'], self.device, self.memory_format)[0]
                     target = torch.zeros(b['mask'].shape).masked_scatter_(b['mask'], b['policy'])
                     ce = hexnet.policy_row_losses(out['policy'].float().cpu(), out['far'].float().cpu(), b['cells'], b['counts'], target)
-                    bce = torch.nn.functional.binary_cross_entropy_with_logits(out['value_logit'].float().cpu(), b['value'], reduction='none')
-                    losses += zip(bce.tolist(), b['value'].tolist(), torch.where(b['policy_weight'] > 0, ce, math.nan).tolist())
+                    logit = out['value_logit'].float().cpu()
+                    bce = [torch.nn.functional.binary_cross_entropy_with_logits(logit, b[k], reduction='none') for k in ('value', 'outcome')]
+                    losses += zip(bce[0].tolist(), b['value'].tolist(), bce[1].tolist(), b['outcome'].tolist(),
+                                  torch.where(b['policy_weight'] > 0, ce, math.nan).tolist())
                 for i, loss in zip(order, losses):
                     ref = chunk[i]
                     rows.append((ref.row['ply'], len(ref.episode['moves'])-ref.row['ply'], float(ref.episode['winner'] >= 0), *loss))
-        columns = np.array(rows, np.float64).reshape(-1, 6).T
-        return dict(zip(('ply', 'remaining', 'finished', 'value_bce', 'value', 'policy_ce'), columns))
+        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce')
+        return dict(zip(keys, np.array(rows, np.float64).reshape(-1, len(keys)).T))
 
     def validate_sources(self, sets):
         """Refresh `sets` (dense_data.ValidationSets) and return, per source, <source>_policy_ce and
         <source>_value_bce on its held subset, <source>_train_* on its train subset, <source>_gap_* = held minus
         train (None when either is), <source>_rows (held rows), plus newest_checkpoint. For CURVE_SOURCES, over the
-        row_losses of the held subset: the remaining_curve of the rows of finished games as <source>_<key> (grid:
-        remaining_grid); <source>_value_bce_by_ply, the ply_curve of the same rows' value BCE, and
-        <source>_policy_ce_curve, the ply_curve of the policy CE of rows with a policy target (grid: ply_grid);
+        row_losses of the held subset: the remaining_curve of the outcome BCE of the rows of finished games as
+        <source>_<key> (grid: remaining_grid); <source>_value_bce_by_ply, the ply_curve of the same rows' outcome
+        BCE, and <source>_policy_ce_curve, the ply_curve of the policy CE of rows with a policy target (grid: ply_grid);
         <source>_policy_ce_early and <source>_policy_ce_late, the ply_split of that policy CE."""
         sets.refresh()
         self.ema.eval()
@@ -423,9 +437,9 @@ class Learner:
         for source in CURVE_SOURCES:
             r = self.row_losses(sets, sets.subsets[source, 'held'])
             f, p = r['finished'] > 0, np.isfinite(r['policy_ce'])
-            out.update({f'{source}_{k}': v for k, v in remaining_curve(r['remaining'][f], r['value_bce'][f], r['value'][f]).items()})
+            out.update({f'{source}_{k}': v for k, v in remaining_curve(r['remaining'][f], r['outcome_bce'][f], r['outcome'][f]).items()})
             early, late = ply_split(r['ply'][p], r['policy_ce'][p])
-            out.update({f'{source}_value_bce_by_ply': ply_curve(r['ply'][f], r['value_bce'][f]),
+            out.update({f'{source}_value_bce_by_ply': ply_curve(r['ply'][f], r['outcome_bce'][f]),
                         f'{source}_policy_ce_curve': ply_curve(r['ply'][p], r['policy_ce'][p]),
                         f'{source}_policy_ce_early': early, f'{source}_policy_ce_late': late})
         return out
@@ -554,13 +568,13 @@ def main():
             return dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
                                            s.window_taper, s.validation_fraction, s.policy_cache_mb)
         window = replay()
-        sets = dense_data.ValidationSets(args.run, s.validation_fraction, config.seed)
+        sets = validation_sets(args.run, s, config.seed)
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers)
         stream = renderers()
         factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])
         dense_config.log_event(args.run, 'learner', 'info', f'{s.variant} learner started at step {learner.step}', variant=s.variant, step=learner.step,
               learner=asdict(s))
-        print(f'{"step":>6} {"policy":>7} {"value":>7} {"short":>7} {"opp":>7} {"future":>7} {"lr":>8} {"rows/s":>7} {"wait":>6} {"gpu":>6} {"mem":>6}', flush=True)
+        print(f'{"step":>6} {"policy":>7} {"value":>7} {"short":>7} {"opp":>7} {"future":>7} {"outcome":>7} {"lr":>8} {"rows/s":>7} {"wait":>6} {"gpu":>6} {"mem":>6}', flush=True)
         sums = torch.zeros(len(HEADS), device=learner.device); count = 0
         last_status = last_refresh = time.time()
         while args.steps is None or learner.step < args.steps:

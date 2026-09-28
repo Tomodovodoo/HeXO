@@ -71,38 +71,52 @@ def trained(episode, ply):
     return side is None or player_at(ply) == side
 
 
-def value_targets(players, root_values, winner, lam=.9, full=None):
+def value_targets(players, root_values, winner, lam=.9, full=None, outcome_lam=1.):
     """Return (targets, weights) per ply: p(win) for the side to move at each ply.
 
-    Terminal games (winner 0/1): target 1.0 at plies where `players[t] == winner`, else 0.0, weight 1.
-    Capped games (winner -1): root values v_t in [-1, 1] from the side to move at ply t are first put in
-    player 0's frame, u_t = v_t if players[t] == 0 else -v_t, then the TD(lambda) return with zero reward,
-    gamma 1 and a bootstrap from the final root value is
-        G_{T-1} = u_{T-1},   G_t = (1 - lam) * u_{t+1} + lam * G_{t+1}
-    i.e. G_t = (1-lam) * sum_{k=1}^{T-2-t} lam^(k-1) u_{t+k} + lam^(T-2-t) u_{T-1}. Plies with a null root
-    value are skipped (G_t = G_{t+1}; a trailing null bootstraps from the last known value). The target is
-    (1 + s_t G_t) / 2 with s_t = +1 for player 0, -1 for player 1. A capped game with no root values at all
-    gets target None and weight 0 everywhere. With `full` (per-ply bools, e.g. episode.full_search), root values
-    of plies where full[t] is False are treated as null, so the chain runs and bootstraps over full searches only.
+    Root values v_t in [-1, 1] from the side to move at ply t are put in player 0's frame, u_t = v_t if
+    players[t] == 0 else -v_t, and a TD(lambda) return with zero reward and gamma 1 runs backwards from the
+    last ply T-1:
+        G_t = (1 - l) * u_{t+1} + l * G_{t+1}
+    skipping plies with a null root value (G_t = G_{t+1} when u_{t+1} is null). The target is (1 + s_t G_t) / 2
+    with s_t = +1 for player 0, -1 for player 1. Every weight is 1 unless stated otherwise.
+    Terminal games (winner 0/1): with outcome_lam >= 1 the target is 1.0 at plies where `players[t] == winner`,
+    else 0.0. With outcome_lam < 1, l = outcome_lam and the chain starts from the outcome z = +1 if winner == 0
+    else -1, G_{T-1} = z, so G_t = (1-l) * sum_{k=1}^{T-1-t} l^(k-1) u_{t+k} + l^(T-1-t) z when no root value is
+    null: the last ply's target is exactly the outcome, and earlier ones blend in the searched values.
+    Capped games (winner -1): l = lam and the chain bootstraps from the last known root value, G_{T-1} = u_{T-1}
+    (a trailing null bootstraps from the last known value); with no root values at all, target None and
+    weight 0 everywhere.
+    With `full` (per-ply bools, e.g. episode.full_search), root values of plies where full[t] is False are
+    treated as null, so the chain runs and bootstraps over full searches only.
     """
     T = len(players)
     if full is not None and root_values is not None:
         root_values = [v if f else None for v, f in zip(root_values, full, strict=True)]
-    if winner >= 0:
+    if winner >= 0 and (outcome_lam >= 1 or root_values is None):
         return [float(p == winner) for p in players], [1.]*T
-    if root_values is None or all(v is None for v in root_values):
+    if winner < 0 and (root_values is None or all(v is None for v in root_values)):
         return [None]*T, [0.]*T
     if len(root_values) != T:
         raise ValueError('Root values must cover every ply')
     u = [None if v is None else (v if p == 0 else -v) for p, v in zip(players, root_values)]
+    if winner >= 0:
+        lam, g = outcome_lam, 1. if winner == 0 else -1.
+    else:
+        g = next(x for x in reversed(u) if x is not None)
     G = [0.]*T
-    g = next(x for x in reversed(u) if x is not None)
     G[T-1] = g
     for t in range(T-2, -1, -1):
         if u[t+1] is not None:
             g = (1-lam)*u[t+1] + lam*g
         G[t] = g
     return [(1 + (g if p == 0 else -g))/2 for p, g in zip(players, G)], [1.]*T
+
+
+def episode_value_targets(e, lam, full_only, outcome_lam=1.):
+    """value_targets of episode `e` (full-search root values only with `full_only`)."""
+    return value_targets([player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'],
+                         lam, e['full_search'] if full_only else None, outcome_lam)
 
 
 def write_shard(path, identity, episodes, rows, origin='actor'):
@@ -347,15 +361,13 @@ class ReplayWindow:
         """Bytes held by the policy cache."""
         return sum(o.nbytes+p.nbytes for o, p in self.policies.values())
 
-    def value_targets(self, ref, lam, full_only):
-        """value_targets of the ref's episode (full-search root values only with `full_only`)."""
-        key = (ref.shard, ref.row['game'], lam, full_only)
+    def value_targets(self, ref, lam, full_only, outcome_lam=1.):
+        """episode_value_targets of the ref's episode, cached."""
+        key = (ref.shard, ref.row['game'], lam, full_only, outcome_lam)
         if key in self.values:
             self.values.move_to_end(key)
         else:
-            e = ref.episode
-            self.values[key] = value_targets([player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'],
-                                             lam, e['full_search'] if full_only else None)
+            self.values[key] = episode_value_targets(ref.episode, lam, full_only, outcome_lam)
             if len(self.values) > self.VALUE_CACHE:
                 self.values.popitem(last=False)
         return self.values[key]
@@ -384,7 +396,7 @@ class ValidationSets:
     played.
     """
 
-    def __init__(self, run_dir, fraction, seed, limit=1024, quota=64):
+    def __init__(self, run_dir, fraction, seed, limit, quota):
         self.run_dir, self.fraction, self.seed, self.limit, self.quota = Path(run_dir), fraction, seed, limit, quota
         self.manifests = {}; self.actors = {}; self.entries = {}; self.following_index = {}
         self.subsets = {(source, split): [] for source in SOURCES for split in ('held', 'train')}
@@ -472,10 +484,8 @@ class ValidationSets:
         j = self.following_index[ref.shard, ref.index]
         return None if j is None else self.ref(ref.shard, j)
 
-    def value_targets(self, ref, lam, full_only):
-        e = ref.episode
-        return value_targets([player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'],
-                             lam, e['full_search'] if full_only else None)
+    def value_targets(self, ref, lam, full_only, outcome_lam=1.):
+        return episode_value_targets(ref.episode, lam, full_only, outcome_lam)
 
 
 def crop_index(s, points):
@@ -491,18 +501,22 @@ def crop_index(s, points):
 def target_options(settings):
     """examples() keyword arguments from a LearnerSettings."""
     return dict(lam=settings.td_lambda, bootstrap_weight=settings.bootstrap_weight, horizon=settings.short_value_horizon,
-                cheap_value_weight=settings.cheap_value_weight, full_only=settings.bootstrap_full_only)
+                cheap_value_weight=settings.cheap_value_weight, full_only=settings.bootstrap_full_only,
+                outcome_lam=settings.outcome_lambda)
 
 
-def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False):
+def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False,
+             outcome_lam=1.):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
     The replayed side to move and legal list must match each row. Returns (samples, targets); each target is a
     dict of
       policy, policy_weight: the row's improved policy (weight 0 when empty, i.e. a cheap-search row);
-      value, value_weight: value_targets(..., lam, full_search if full_only) at the ply; weight 1 for finished
-        games, `bootstrap_weight` for capped games with root values, 0 otherwise, times `cheap_value_weight`
-        for cheap-search rows;
+      value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam) at the ply; weight 1
+        for finished games, `bootstrap_weight` for capped games with root values, 0 otherwise, times
+        `cheap_value_weight` for cheap-search rows;
+      outcome, outcome_weight: 1. when the side to move won a finished game, else 0.; weight value_weight for
+        finished games, 0 for capped games (outcome .5);
       short_value, short_weight: p(win) of the side to move from the root value `horizon` plies later
         (negated when that ply's mover is the opponent); the outcome when a finished game ends within the
         horizon; weight 0 when that root value is null or a capped game ends first;
@@ -523,7 +537,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         if (s.player, s.remaining) != (ref.row['player'], ref.row['remaining']) or legal_digest(s.actions) != ref.row['legal_sha256']:
             raise ValueError(f'Replayed position disagrees with row: {ref.shard}/{ref.index}')
         policy = window.policy(ref)
-        values, weights = window.value_targets(ref, lam, full_only)
+        values, weights = window.value_targets(ref, lam, full_only, outcome_lam)
         value_weight = weights[t]*(1. if e['winner'] >= 0 else bootstrap_weight)*(1. if len(policy) else cheap_value_weight)
         u = t+horizon; roots = e['root_values']
         if u >= T:
@@ -553,6 +567,8 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         samples.append(s)
         out.append(dict(policy=policy, policy_weight=float(len(policy) > 0),
                         value=.5 if values[t] is None else values[t], value_weight=value_weight,
+                        outcome=float(me == e['winner']) if e['winner'] >= 0 else .5,
+                        outcome_weight=value_weight if e['winner'] >= 0 else 0.,
                         short_value=short[0], short_weight=short[1], future=future, future_weight=known,
                         next_cells=following[0], next_policy=following[1], next_weight=following[2]))
     return samples, out
@@ -566,7 +582,8 @@ def collate(samples, targets):
         (zeros where policy_weight is 0; far cells keep their target mass); offsets int64 [B+1];
       future uint8 [B,2,S,S]; next_cells int64 [B,M] (-1 off the crop and on padding),
         next_counts int64 [B], next_policy float32 [B,M] (zero beyond counts);
-      policy_weight, value, value_weight, short_value, short_weight, next_weight; future_weight [B,2] per horizon
+      policy_weight, value, value_weight, outcome, outcome_weight, short_value, short_weight, next_weight;
+      future_weight [B,2] per horizon
       (0 where a capped game ends before the horizon)
         float32 [B]; player, remaining int64 [B].
     """
@@ -598,7 +615,8 @@ def collate(samples, targets):
             future=torch.from_numpy(np.stack([t['future'] for _, t in items])),
             next_cells=torch.from_numpy(next_cells), next_counts=torch.from_numpy(next_counts),
             next_policy=torch.from_numpy(next_policy),
-            **{k: column(k) for k in ('policy_weight', 'value', 'value_weight', 'short_value', 'short_weight', 'next_weight')},
+            **{k: column(k) for k in ('policy_weight', 'value', 'value_weight', 'outcome', 'outcome_weight', 'short_value',
+                                      'short_weight', 'next_weight')},
             future_weight=torch.from_numpy(np.stack([t['future_weight'] for _, t in items])),
             player=torch.tensor([int(s.player) for s, _ in items]), remaining=torch.tensor([int(s.remaining) for s, _ in items]))
     return out

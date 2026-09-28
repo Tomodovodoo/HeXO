@@ -98,12 +98,18 @@ class LearnerSettings:
     bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only
     cheap_value_weight: float = .25    # value weight of cheap-search rows (KataGo: 0)
     td_lambda: float = .9
+    # Finished games: 1 = hard outcome targets; < 1 = TD(lambda) from the outcome through the root values
+    # (dense_data.value_targets), KataGo-style; honours bootstrap_full_only like the capped-game chain.
+    outcome_lambda: float = 1.
+    outcome_weight: float = 0.    # coefficient of an extra value-logit BCE against the hard outcome (finished games)
     short_value_horizon: int = 16
     value_weight: float = 1.5
     short_value_weight: float = .5
     opponent_policy_weight: float = .15
     future_weight: float = .5
     validation_fraction: float = .03
+    validation_rows: int = 8192   # rows per per-source validation subset (dense_data.ValidationSets limit)
+    validation_quota: int = 128   # rows each shard may contribute to a subset (ValidationSets quota)
     export_every: int = 500
     log_every: int = 20           # steps per metrics/learner-<variant>.jsonl line
     protect_steps: int = 3000     # no replacement for this many steps after start or copy

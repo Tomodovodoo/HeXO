@@ -12,6 +12,7 @@ import sys
 import tempfile
 import shutil
 import time
+from collections import Counter
 from types import SimpleNamespace
 import unittest
 import unittest.mock
@@ -697,6 +698,29 @@ class DenseConfigTests(unittest.TestCase):
         evaluation = dense_config.override(dense_config.EvaluationSettings(), args, 'eval_')
         self.assertEqual((evaluation.root_samples, evaluation.tactics), (4, False))
 
+    def test_learner_target_and_validation_flags(self):
+        parser = argparse.ArgumentParser()
+        dense_config.add_arguments(parser, dense_config.LearnerSettings)
+        base = dense_config.LearnerSettings()
+        self.assertEqual((base.outcome_lambda, base.outcome_weight, base.validation_rows, base.validation_quota), (1., 0., 8192, 128))
+        self.assertEqual(dense_data.target_options(base)['outcome_lam'], 1.)
+        args = parser.parse_args(['--outcome-lambda', '0.98', '--bootstrap-full-only', '--outcome-weight', '0.5',
+                                  '--validation-rows', '4096', '--validation-quota', '64'])
+        got = dense_config.override(base, args)
+        self.assertEqual((got.outcome_lambda, got.bootstrap_full_only, got.outcome_weight, got.validation_rows, got.validation_quota),
+                         (.98, True, .5, 4096, 64))
+        self.assertEqual({k: v for k, v in dense_data.target_options(got).items() if k in ('outcome_lam', 'full_only')},
+                         dict(outcome_lam=.98, full_only=True))
+        # Manifests written before these settings load with the defaults.
+        old = {k: v for k, v in asdict(base).items() if k not in ('outcome_lambda', 'outcome_weight', 'validation_rows', 'validation_quota')}
+        self.assertEqual(dense_config.LearnerSettings(**old), base)
+        rng = np.random.default_rng(0)
+        self.assertEqual(dense_learn.perturb(base, rng, .2).outcome_lambda, 1.)
+        for _ in range(20):
+            x = dense_learn.perturb(got, rng, .2).outcome_lambda
+            self.assertTrue(.98-.02*.2-1e-12 <= x <= .98+.02*.2+1e-12)
+        self.assertIn('validation_rows', dense_learn.KEEP)
+
     def test_command_line_creates_a_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)/'run'
@@ -775,6 +799,85 @@ class DenseDataTests(unittest.TestCase):
         self.assertEqual(dense_data.value_targets(players, None, -1), ([None]*7, [0.]*7))
         with self.assertRaises(ValueError):
             dense_data.value_targets(players, [.1]*6, -1)
+
+    def test_outcome_lambda_targets(self):
+        players = [dense_data.player_at(t) for t in range(4)]
+        self.assertEqual(players, [0, 1, 1, 0])
+        roots = [.2, -.4, .6, .8]                       # side to move's frame
+        u = [.2, .4, -.6, .8]                           # player 0's frame
+        for winner in (0, 1):
+            hard = dense_data.value_targets(players, None, winner)
+            self.assertEqual(dense_data.value_targets(players, roots, winner, outcome_lam=1.), hard)
+            self.assertEqual(dense_data.value_targets(players, None, winner, outcome_lam=.9), hard)
+            lam, z = .9, 1. if winner == 0 else -1.
+            targets, weights = dense_data.value_targets(players, roots, winner, outcome_lam=lam)
+            self.assertEqual(weights, [1.]*4)
+            self.assertEqual(targets[3], hard[0][3])    # the last ply is exactly the outcome
+            for t in range(4):
+                g = (1-lam)*sum(lam**(k-1)*u[t+k] for k in range(1, 4-t)) + lam**(3-t)*z
+                s = 1 if players[t] == 0 else -1
+                self.assertAlmostEqual(targets[t], (1+s*g)/2)
+                searched = [(1+s*u[k])/2 for k in range(t+1, 4)]
+                self.assertTrue(min([hard[0][t], *searched]) <= targets[t] <= max([hard[0][t], *searched]))
+            self.assertNotEqual(targets[:3], hard[0][:3])
+        # bootstrap_full_only: a cheap ply's root value is skipped, exactly like a null one.
+        full = [True, True, False, True]
+        cheap = dense_data.value_targets(players, roots, 0, full=full, outcome_lam=.9)[0]
+        self.assertEqual(cheap, dense_data.value_targets(players, [.2, -.4, None, .8], 0, outcome_lam=.9)[0])
+        self.assertAlmostEqual(cheap[1], (1-(.1*.8+.9))/2)
+        self.assertNotEqual(cheap, dense_data.value_targets(players, roots, 0, outcome_lam=.9)[0])
+        # Capped games ignore outcome_lam.
+        self.assertEqual(dense_data.value_targets(players, roots, -1, .8, full, outcome_lam=.5),
+                         dense_data.value_targets(players, roots, -1, .8, full))
+        with self.assertRaises(ValueError):
+            dense_data.value_targets(players, roots[:3], 0, outcome_lam=.9)
+
+    def test_outcome_targets_in_examples(self):
+        moves = winning_game()
+        roots = [float(v) for v in np.random.default_rng(3).uniform(-1, 1, len(moves))]
+        with tempfile.TemporaryDirectory() as tmp:
+            write_games(Path(tmp)/'shards'/'000001', [(moves, 0, roots), (moves[:8], -1, roots[:8])])
+            window = dense_data.ReplayWindow(tmp, capacity_rows=1000)
+            refs = [window.ref('000001', i) for i in range(len(window.index))]
+            hard = dense_data.examples(window, refs, np.random.default_rng(0))[1]
+            soft = dense_data.examples(window, refs, np.random.default_rng(0), outcome_lam=.9)[1]
+            for ref, h, t in zip(refs, hard, soft):
+                e, ply = ref.episode, ref.row['ply']
+                if e['winner'] < 0:
+                    self.assertEqual((t['value'], t['outcome_weight']), (h['value'], 0.))
+                    continue
+                won = float(dense_data.player_at(ply) == 0)
+                self.assertEqual((h['value'], h['outcome'], t['outcome'], t['outcome_weight']), (won, won, won, t['value_weight']))
+                self.assertEqual(t['value'], dense_data.episode_value_targets(e, .9, False, .9)[0][ply])
+                self.assertEqual(t['value'] == won, ply == len(moves)-1)
+
+    def test_outcome_weight_adds_a_value_term(self):
+        torch.manual_seed(0)
+        model = hexnet.HexNet(TINY)
+        moves = winning_game()
+        roots = [float(v) for v in np.random.default_rng(3).uniform(-1, 1, len(moves))]
+        with tempfile.TemporaryDirectory() as tmp:
+            write_games(Path(tmp)/'shards'/'000001', [(moves, 0, roots)])
+            window = dense_data.ReplayWindow(tmp, capacity_rows=1000)
+            refs = [window.ref('000001', i) for i in range(len(window.index))]
+            batch = dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0), outcome_lam=.9))
+        base = dense_config.LearnerSettings()
+        def run(settings):
+            learner = SimpleNamespace(settings=settings, device=torch.device('cpu'))
+            coefficients = dense_learn.Learner.coefficients(learner)
+            m = copy.deepcopy(model)
+            logged = dense_learn.batch_losses(m, batch, coefficients, learner.device, torch.contiguous_format, True)
+            return logged, (logged*coefficients).sum().item(), [p.grad.clone() for p in m.parameters() if p.grad is not None]
+        off, loss_off, grad_off = run(base)
+        on, loss_on, grad_on = run(replace(base, outcome_weight=.5))
+        self.assertEqual(len(off), len(dense_learn.HEADS))
+        self.assertTrue(torch.equal(off, on))
+        self.assertGreater(off[-1].item(), 0)
+        self.assertNotAlmostEqual(off[-1].item(), off[1].item())    # soft value target, hard outcome
+        self.assertAlmostEqual(loss_off, (off[:-1]*torch.tensor([1., base.value_weight, base.short_value_weight,
+                                                                   base.opponent_policy_weight, base.future_weight])).sum().item(), places=5)
+        self.assertAlmostEqual(loss_on-loss_off, .5*off[-1].item(), places=5)
+        self.assertFalse(all(torch.allclose(a, b) for a, b in zip(grad_off, grad_on)))
 
     def test_shard_round_trip_and_tamper(self):
         rng = np.random.default_rng(2)
@@ -1158,6 +1261,21 @@ class ValidationSourceTests(unittest.TestCase):
                     self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
             dense_data.collate(samples, targets)
 
+    def test_learner_settings_size_the_subsets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for k in (1, 2, 3):
+                source_shard(run/'shards'/f'10000000000{k:02d}', k, 'x', games=12, policy_every=1)
+            settings = dense_config.LearnerSettings(validation_fraction=.5, validation_rows=9, validation_quota=4)
+            sets = dense_learn.validation_sets(run, settings, 5)
+            sets.refresh()
+            self.assertEqual((sets.limit, sets.quota), (9, 4))
+            for (source, _), refs in sets.subsets.items():
+                if source == 'converted':
+                    continue
+                self.assertEqual(len(refs), 9)
+                self.assertEqual(sorted(Counter(r.shard for r in refs).values()), [1, 4, 4])
+
     def test_newest_actor_comes_from_episodes(self):
         """Right after a checkpoint switch the newest shard's publisher may have played none of its games."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1344,13 +1462,14 @@ class ValidationSourceTests(unittest.TestCase):
             f, p = r['finished'] > 0, np.isfinite(r['policy_ce'])
             self.assertEqual(sorted(r['remaining'][f]), sorted(len(x.episode['moves'])-x.row['ply'] for x in finished))
             self.assertEqual(sorted(r['ply']), sorted(x.row['ply'] for x in held))
-            self.assertTrue(set(r['value'][f].tolist()) <= {0., 1.})
-            self.assertAlmostEqual(v['fresh_value_bce_last20'], float(r['value_bce'][f].mean()))
+            self.assertTrue(set(r['outcome'][f].tolist()) <= {0., 1.})
+            self.assertTrue(np.array_equal(r['value'][f], r['outcome'][f]) and np.array_equal(r['value_bce'][f], r['outcome_bce'][f]))
+            self.assertAlmostEqual(v['fresh_value_bce_last20'], float(r['outcome_bce'][f].mean()))
             self.assertTrue(p.all())
             self.assertAlmostEqual(float(r['policy_ce'][p].mean()), v['fresh_policy_ce'], delta=1e-4)
             self.assertEqual(v['ply_grid'], list(dense_learn.PLY_GRID))
             self.assertEqual(v['fresh_policy_ce_curve'], dense_learn.ply_curve(r['ply'][p], r['policy_ce'][p]))
-            self.assertEqual(v['fresh_value_bce_by_ply'], dense_learn.ply_curve(r['ply'][f], r['value_bce'][f]))
+            self.assertEqual(v['fresh_value_bce_by_ply'], dense_learn.ply_curve(r['ply'][f], r['outcome_bce'][f]))
             self.assertEqual((v['fresh_policy_ce_early'], v['fresh_policy_ce_late']), dense_learn.ply_split(r['ply'][p], r['policy_ce'][p]))
             self.assertIsNotNone(v['fresh_policy_ce_early'])
             for source in dense_learn.CURVE_SOURCES:
