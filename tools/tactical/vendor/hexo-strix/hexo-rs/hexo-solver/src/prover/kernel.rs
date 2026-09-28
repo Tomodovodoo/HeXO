@@ -49,7 +49,7 @@ type NodeComps = (Vec<CellSet2>, Vec<CellSet2>);
 /// Memo entry caps. Both memos are pure caches, so clearing one when it fills
 /// only costs recomputation; without a cap a long search retains gigabytes.
 const COMPS_CAP: usize = 1 << 17;
-const GENCACHE_CAP: usize = 1 << 14;
+const GENCACHE_CAP: usize = 1 << 16;
 
 /// Result of classifying an OR (attacker-to-move) node.
 pub(crate) enum OrEval {
@@ -161,6 +161,9 @@ impl KernelCtx {
         if radius < wl as i32 - 1 {
             board.enable_reach(radius);
         }
+        // Every node scans the board's windows; the incremental index visits each
+        // structural window once instead of re-walking strips around every stone.
+        board.configure_windows(wl, true);
         for &(c, p) in stones {
             board.place(c, p);
         }
