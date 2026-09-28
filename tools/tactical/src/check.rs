@@ -10,6 +10,11 @@ pub const LIMIT: i32 = 1_000_000;
 pub fn phase(n: usize) -> (u8,u8) {
     if n == 0 {(0,1)} else {(((n+1)/2%2) as u8, if n%2==0 {1} else {2})}
 }
+/// The first ply after `n` at which the side not to move at `n` starts a fresh
+/// two-placement turn: the phase of a flipped-turn query on the same stones.
+pub fn flip(n: usize) -> usize {
+    n+1+n%2
+}
 pub fn won(board: &Board, at: Point, side: u8) -> bool {
     AXES.iter().any(|&(dq,dr)| {
         let mut count=1;
@@ -113,27 +118,33 @@ pub fn defenses(b:&Board, attacker:u8, deadline:Instant) -> Result<BTreeMap<Vec<
     Ok(result)
 }
 
-pub fn verify(history:&[Point], cert:&ProofCertificate, deadline:Instant, max_nodes:usize) -> Result<Vec<Point>,String> {
+/// Check `cert` as a strategy for the side to move at ply `start` on the stones of
+/// `history` (`start` is `history.len()`, or `flip(history.len())` for a flipped-turn
+/// query). Returns the root action and the most attacker turns on any certificate
+/// path, counting the completing turn (an immediate win is 1 turn).
+pub fn verify(history:&[Point], start:usize, cert:&ProofCertificate, deadline:Instant, max_nodes:usize) -> Result<(Vec<Point>,u32),String> {
     if cert.version!=1 || cert.width!="wide" || cert.nodes.len()>max_nodes {return Err("certificate format/size".into());}
+    if start!=history.len() && start!=flip(history.len()) {return Err("invalid certificate root phase".into());}
     let board=replay(history)?;
-    let attacker=phase(history.len()).0;
+    let attacker=phase(start).0;
     struct Checker<'a> {cert:&'a ProofCertificate, attacker:u8, deadline:Instant, left:usize, stack:BTreeSet<u32>}
     impl Checker<'_> {
-        fn walk(&mut self,id:u32,b:&Board,n:usize) -> Result<(),String> {
+        fn walk(&mut self,id:u32,b:&Board,n:usize) -> Result<u32,String> {
             check(self.deadline)?;
             if self.left==0 || self.stack.len()>=128 || !self.stack.insert(id) {return Err("certificate work limit/cycle/depth".into());}
             self.left-=1;
             let node=self.cert.nodes.get(id as usize).ok_or("invalid certificate edge")?;
             let (side,remaining)=phase(n);
-            match node {
+            let turns=match node {
                 ProofNode::ImmediateWin{action} => {
                     if side!=self.attacker || !apply(b,n,action)?.2 {return Err("false immediate win".into());}
+                    1
                 }
                 ProofNode::AttackerMove{action,child,..} => {
                     if side!=self.attacker {return Err("attacker phase mismatch".into());}
                     let (next,ply,terminal)=apply(b,n,action)?;
                     if terminal {return Err("terminal move must use immediate-win leaf".into());}
-                    self.walk(*child,&next,ply)?;
+                    1+self.walk(*child,&next,ply)?
                 }
                 ProofNode::DefenderReplies{responses} => {
                     if side==self.attacker || remaining!=2 {return Err("defender phase mismatch".into());}
@@ -141,31 +152,33 @@ pub fn verify(history:&[Point], cert:&ProofCertificate, deadline:Instant, max_no
                     let required=defenses(b,self.attacker,self.deadline)?;
                     if required.is_empty() {return Err("defenses supplied for unstoppable position".into());}
                     if responses.len()!=required.len() {return Err("missing defense branch including free-second coverage".into());}
-                    let mut seen=BTreeSet::new();
+                    let mut seen=BTreeSet::new();let mut deepest=0;
                     for reply in responses {
                         let mut key=reply.action.clone();key.sort();
                         if !required.contains_key(&key) || !seen.insert(key) {return Err("invalid/duplicate defense".into());}
                         let (next,ply,terminal)=apply(b,n,&reply.action)?;
                         if terminal {return Err("defender wins".into());}
-                        self.walk(reply.child,&next,ply)?;
+                        deepest=deepest.max(self.walk(reply.child,&next,ply)?);
                     }
                     if seen!=required.keys().cloned().collect() {return Err("missing defense branch including free-second coverage".into());}
+                    deepest
                 }
                 ProofNode::Unstoppable{..} => {
                     if side==self.attacker || remaining!=2 {return Err("unstoppable phase mismatch".into());}
                     if !completions(b,side,remaining,self.deadline)?.is_empty() {return Err("defender counterwin".into());}
                     let threats=completions(b,self.attacker,2,self.deadline)?;
                     if threats.is_empty() || !covers(&threats,self.deadline)?.is_empty() {return Err("false unstoppable".into());}
+                    1
                 }
-            }
-            self.stack.remove(&id);Ok(())
+            };
+            self.stack.remove(&id);Ok(turns)
         }
     }
     let mut checker=Checker{cert,attacker,deadline,left:max_nodes,stack:BTreeSet::new()};
-    checker.walk(cert.root,&board,history.len())?;
+    let turns=checker.walk(cert.root,&board,start)?;
     check(deadline)?;
     match &cert.nodes[cert.root as usize] {
-        ProofNode::ImmediateWin{action}|ProofNode::AttackerMove{action,..}=>Ok(action.clone()),
+        ProofNode::ImmediateWin{action}|ProofNode::AttackerMove{action,..}=>Ok((action.clone(),turns)),
         _=>Err("root must be attacker action".into())
     }
 }

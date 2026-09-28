@@ -572,7 +572,7 @@ fn deadline_is_honored() {
     // dfpn must bail to BUDGET_EXCEEDED rather than fabricate a verdict.
     let cfg = ProverConfig { tt_mb: 8, node_budget: u64::MAX, ..ProverConfig::default() };
     // Deadline of 0s => `Ctl::expired()` true immediately after the first sample.
-    let ctl = Ctl { deadline: Some(std::time::Instant::now()), cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) };
+    let ctl = Ctl { deadline: Some(std::time::Instant::now()), cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), meter: None };
     let p = pos(HU01JK4, P2, 2);
     let r = dfpn::solve(&p, &cfg, &ctl);
     // Either it solved instantly (fast) or it honored the deadline; it must never

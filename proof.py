@@ -188,6 +188,9 @@ def verify(certificate, history, *, deadline=None):
     """Independent raw-board checker; return certified root status or raise ValueError.
 
     history is supplied by the caller, not accepted solely from the certificate.
+    With "flipped": true the root is a flipped-turn position: the history's stones
+    with the side NOT to move starting a fresh two-placement turn; the status is
+    then relative to that side.
     Reconstructs legal turns and independently enumerates ALL size-1/2 covers.
     Does not call native code or the solver's completion/cover functions.
     """
@@ -304,9 +307,14 @@ def verify(certificate, history, *, deadline=None):
         require([list(p) for p in history] == certificate["history"])
         attacker = certificate["attacker"]
         require(type(attacker) is int and attacker in (0, 1))
+        flipped = certificate.get("flipped", False)
+        require(type(flipped) is bool)
         state = {}, 0, -1
         for point in history:
             state = play(*state, point)
+        if flipped:
+            board, n, winner = state
+            state = board, n+1+n % 2, winner
         root = phase(state[1])[0]
         walk(certificate["tree"], state)
         return PROVEN_WIN if root == attacker else PROVEN_LOSS

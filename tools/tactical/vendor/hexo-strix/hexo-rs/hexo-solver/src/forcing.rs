@@ -21,7 +21,7 @@ use hexo_engine::types::{Coord, Player};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Research-only search cutoffs threaded into `SearchState` (`idtt` prover driver
@@ -34,6 +34,7 @@ use std::time::Instant;
 pub struct Limits {
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<AtomicBool>>,
+    pub meter: Option<Meter>,
 }
 
 impl Limits {
@@ -42,6 +43,39 @@ impl Limits {
     pub(crate) fn expired(&self) -> bool {
         self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
             || self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    /// Charge one node expansion to the shared meter; true once it is exhausted.
+    #[inline]
+    pub(crate) fn charge(&self) -> bool {
+        self.meter.as_ref().is_some_and(Meter::charge)
+    }
+}
+
+/// One total-work budget shared by every search a query runs (IDTT nodes, PDS-PN
+/// level-1 nodes and level-2 expansions). Each expansion charges one unit before it
+/// runs and the search stops once the total passes `limit`, so the work done, and
+/// hence the result, is a function of the position and the limit alone.
+#[derive(Clone, Debug)]
+pub struct Meter {
+    spent: Arc<AtomicU64>,
+    limit: u64,
+}
+
+impl Meter {
+    pub fn new(limit: u64) -> Meter {
+        Meter { spent: Arc::new(AtomicU64::new(0)), limit }
+    }
+
+    /// Units charged so far, including refused charges after exhaustion.
+    pub fn spent(&self) -> u64 {
+        self.spent.load(Ordering::Relaxed)
+    }
+
+    /// Record one expansion; true when it exceeds the limit.
+    #[inline]
+    pub fn charge(&self) -> bool {
+        self.spent.fetch_add(1, Ordering::Relaxed) >= self.limit
     }
 }
 
@@ -1732,7 +1766,7 @@ fn winning_move_store(s: &mut SearchState, hash: u64, placements: u8, budget: u8
 
 fn tick(s: &mut SearchState) -> bool {
     s.nodes += 1;
-    if s.nodes > s.budget {
+    if s.nodes > s.budget || s.limits.charge() {
         s.exceeded = true;
     } else if s.nodes & 0xF == 0 && s.limits.expired() {
         // Every 16 nodes: a clock read is ~25ns against >=10µs per node, and a
@@ -2448,8 +2482,9 @@ fn solve_ex_support(
             // PV probes run on the winning search's warm state, but without its
             // research-only deadline/cancel cutoffs — the pre-refactor probes
             // always used cutoff-free fresh states, and a deadline that expired
-            // mid-solve must not blank the PV of an already-proven win.
-            s.limits = Limits::default();
+            // mid-solve must not blank the PV of an already-proven win. The work
+            // meter stays: a query's total work includes these probes.
+            s.limits = Limits { meter: s.limits.meter.take(), ..Limits::default() };
             // Compute on the pristine (post-solve_from, pre-extract_pv) board: extract_pv
             // permanently applies the winning line to `board`, so first_winning_move must
             // run first or it would be probing an already-won position.
