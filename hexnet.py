@@ -184,17 +184,28 @@ class _MaskedBatchNorm(torch.autograd.Function):
 
 
 class MaskedNorm(nn.BatchNorm2d):
-    """BatchNorm whose training statistics cover only in-crop cells (mask is full-size, 0/1); momentum None
-    keeps running statistics as the cumulative mean over batches, as nn.BatchNorm2d does."""
+    """BatchNorm whose training statistics cover only in-crop cells (mask is full-size, 0/1); with momentum None
+    the running statistics are the mean and unbiased variance over every in-crop cell since reset_running_stats."""
+    def reset_running_stats(self):
+        super().reset_running_stats()
+        self.cells_seen = 0.
+
     def forward(self, x, mask, cells):
         if not self.training:
             return super().forward(x)
         y, mean, var = _MaskedBatchNorm.apply(x, mask, self.weight, self.bias, cells, self.eps)
         with torch.no_grad():
             self.num_batches_tracked += 1
-            w = 1/float(self.num_batches_tracked) if self.momentum is None else self.momentum
-            self.running_mean.lerp_(mean, w)
-            self.running_var.lerp_(var*cells/(cells-1).clamp_min(1), w)
+            if self.momentum is None:
+                seen, self.cells_seen = self.cells_seen, self.cells_seen+float(cells)
+                w, delta = float(cells)/self.cells_seen, mean-self.running_mean
+                biased = self.running_var*max(seen-1, 0)/max(seen, 1)
+                biased = biased*(1-w)+var*w+delta.square()*w*(1-w)
+                self.running_mean.add_(delta*w)
+                self.running_var.copy_(biased*self.cells_seen/max(self.cells_seen-1, 1))
+            else:
+                self.running_mean.lerp_(mean, self.momentum)
+                self.running_var.lerp_(var*cells/(cells-1).clamp_min(1), self.momentum)
         return y
 
 

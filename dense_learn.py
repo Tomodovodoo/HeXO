@@ -229,7 +229,7 @@ class Learner:
 
     def recalibrate(self, window):
         """Set the EMA's norm running statistics to their cumulative mean over train-mode passes on
-        RECALIBRATION_ROWS training rows of the window (fixed sampling seed)."""
+        RECALIBRATION_ROWS training rows of the window, drawn like training batches (recency) with a fixed seed."""
         if not window.index:
             return
         norms = [m for m in self.ema.modules() if isinstance(m, hexnet.MaskedNorm)]
@@ -240,7 +240,7 @@ class Learner:
         rng, s = np.random.default_rng([self.config.seed, 1]), self.settings
         with torch.no_grad():
             for _ in range(math.ceil(RECALIBRATION_ROWS/s.batch)):
-                refs = window.sample(rng, s.batch)
+                refs = window.sample(rng, s.batch, s.recency)
                 batch = dense_data.collate(*dense_data.examples(window, refs, rng, **dense_data.target_options(s)))
                 batch_losses(self.ema, batch, None, self.device, self.memory_format, False)
         for m, momentum in zip(norms, momenta):
