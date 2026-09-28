@@ -26,6 +26,7 @@ import dense_config
 import dense_data
 import dense_bootstrap
 import dense_eval
+import dense_learn
 import dense_selfplay
 from neural_search import NeuralSearch
 
@@ -1441,6 +1442,20 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(entry['panel']['veto'] and entry['demoted'])
         self.assertEqual(evaluator.league['champion'], 'main/000010')
         self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000010')
+
+    def test_demoted_checkpoints_are_not_variant_heads(self):
+        league = dict(champion='main/000010', checkpoints=[
+            dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
+            dict(id='main/000020', variant='main', step=20, elo=90., matches=[], demoted=True),
+            dict(id='main/000030', variant='main', step=30, skipped=True, elo=None, matches=[]),
+            dict(id='side/000010', variant='side', step=10, elo=10., matches=[])])
+        self.assertEqual({v: c['id'] for v, c in dense_learn.latest_rated(league).items()},
+                         {'main': 'main/000010', 'side': 'side/000010'})
+        rated = lambda names, anchor, reports, seed: ({n: 0. for n in names}, {n: [0., 0.] for n in names}, {n: [0.] for n in names})
+        self.start()
+        with unittest.mock.patch.object(dense_eval, 'rate', rated), unittest.mock.patch.object(dense_eval, 'write_json'):
+            dense_eval.write_league(self.run, league, dense_config.load(self.run))
+        self.assertEqual([(d['a'], d['b']) for d in league['differences']], [('main/000010', 'side/000010')])
 
 if __name__ == '__main__':
     unittest.main()

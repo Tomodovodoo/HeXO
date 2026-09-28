@@ -131,6 +131,15 @@ def perturb(settings, factor_rng, amount):
     return replace(settings, **values)
 
 
+def latest_rated(league):
+    """{variant: league entry} of each variant's newest rated checkpoint that was not demoted for a regression."""
+    latest = {}
+    for c in league['checkpoints']:
+        if c.get('elo') is not None and not c.get('demoted') and c['step'] >= latest.get(c['variant'], {'step': -1})['step']:
+            latest[c['variant']] = c
+    return latest
+
+
 def checkpoints(run, variant):
     root = run/'checkpoints'/variant
     return sorted((p for p in root.iterdir() if p.is_dir() and p.name.isdigit()), key=lambda p: int(p.name)) if root.exists() else []
@@ -248,21 +257,18 @@ class Learner:
         return manifest
 
     def maybe_replace(self, factor_rng):
-        """Population replacement (exploit/explore). Candidates are the latest rated checkpoints of other variants;
-        a candidate qualifies when league["differences"] holds its pair with this variant's latest rated checkpoint
-        and the lower bound of the (candidate minus mine) Elo interval exceeds replace_margin. The best
-        qualifying candidate's raw weights and manifest learner settings are copied (KEEP fields stay this
-        learner's), the continuous settings are perturbed from the copied values, the optimizer is reset and
-        the EMA restarts from the copied weights. Checked before a step is trained, so a copy is always
-        followed by training and recorded in the next manifest."""
+        """Population replacement (exploit/explore). Candidates are the latest rated, not demoted checkpoints of
+        other variants (`latest_rated`); a candidate qualifies when league["differences"] holds its pair with
+        this variant's latest such checkpoint and the lower bound of the (candidate minus mine) Elo interval
+        exceeds replace_margin. The best qualifying candidate's raw weights and manifest learner settings are
+        copied (KEEP fields stay this learner's), the continuous settings are perturbed from the copied values,
+        the optimizer is reset and the EMA restarts from the copied weights. Checked before a step is trained,
+        so a copy is always followed by training and recorded in the next manifest."""
         s = self.settings
         if self.step % s.replace_interval or self.step-self.last_copy < s.protect_steps or not (self.run/'league.json').exists():
             return False
         league = json.loads((self.run/'league.json').read_text(encoding='utf-8'))
-        latest = {}
-        for c in league['checkpoints']:
-            if c.get('elo') is not None and c['step'] >= latest.get(c['variant'], {'step': -1})['step']:
-                latest[c['variant']] = c
+        latest = latest_rated(league)
         mine = latest.get(s.variant)
         # Compare only once a checkpoint trained after the last copy has been rated.
         if mine is None or (self.copied_from and mine['step'] <= self.copied_from['at_step']):

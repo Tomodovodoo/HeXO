@@ -413,10 +413,10 @@ def write_league(run, league, config):
     point, intervals, draws = rate(names, ids[0], reports, seed=config.seed) if ids else ({}, {}, {})
     for c in league['checkpoints']:
         c['elo'], c['elo_interval'] = point.get(c['id']), intervals.get(c['id'])
-    # Latest rated checkpoint of each variant; a-b intervals come from the same joint draws.
+    # Latest rated, not demoted checkpoint of each variant; a-b intervals come from the same joint draws.
     latest = {}
     for c in league['checkpoints']:
-        if point.get(c['id']) is not None and c['step'] >= latest.get(c['variant'], c)['step']:
+        if point.get(c['id']) is not None and not c.get('demoted') and c['step'] >= latest.get(c['variant'], c)['step']:
             latest[c['variant']] = c
     heads = [c['id'] for _, c in sorted(latest.items())]
     league['differences'] = [
