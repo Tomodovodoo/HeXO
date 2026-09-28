@@ -617,7 +617,8 @@ class Evaluator:
     for kinds 'champion' and 'sprt'; refreshed with the status as games finish; null while idle), decision (the
     newest posterior `verdict` without its posterior, with next [[a, b], ...] lanes while pending; null before
     any), placements_played and placements_per_second (the session's placements after openings, including the
-    games in flight, and per second), mean_placements (per finished game of the session, null before any),
+    games in flight, and per second), mean_placements (per finished game of the main lane in the session, null
+    before any),
     settings (the effective EvaluationSettings), eval_share (the Pacer's share: 1 with --once), backlog (unrated
     checkpoint ids at the last step), eval_share_used (Pacer.used), vram (hexnet.vram()), error}. Match events,
     one per lane at the end of a session, carry the lane's games and placements, the session's seconds and
@@ -692,11 +693,13 @@ class Evaluator:
             del self.models[name]
 
     def games(self, a, b):
-        """The games of report a-vs-b: the session's copy when it is open, else the file ([] without one)."""
+        """The games of report a-vs-b: the session's copy when it is open, else the file's when it was played
+        under the current protocol ([] without one or under another protocol)."""
         if (a, b) in self.book:
             return self.book[a, b]
         path = report_path(self.run, a, b)
-        return json.loads(path.read_text())['games'] if path.exists() else []
+        report = json.loads(path.read_text()) if path.exists() else None
+        return report['games'] if report and same_protocol(report, self.settings) else []
 
     def open(self, a, b):
         """Load report a-vs-b for appending (its protocol must match) and number its next opening pair after the
@@ -747,7 +750,7 @@ class Evaluator:
         Pacer's credit is negative; with nothing running the session then waits. Every completed pair is
         persisted at once."""
         pool, waiting, added = Pool(self.config.actor.leaf_batch), {}, {}
-        placed = finished = 0
+        placed = 0
         start, wall = self.pacer.clock(), time.time()
         lanes = want()
         shown = dict(lanes)
@@ -755,14 +758,15 @@ class Evaluator:
         def show(stage, force=False):
             if not force and time.monotonic()-self.written < STATUS_SECONDS:
                 return  # the tally is computed only for a write
-            a, b, kind = next(iter(shown), (None, None, None))
+            main = next(iter(shown), None)
+            a, b, kind = main or (None, None, None)
             done = self.games(a, b)+[r for group in waiting.get((a, b), {}).values() for r in group] if a else []
             live = placed+pool.moves()
             self.publish(True, stage=stage, comparison=dict(candidate=a, opponent=b, kind=kind) if a else None,
                          pool=[dict(candidate=x, opponent=y, kind=k, running=pool.running((x, y, k)), share=lanes.get((x, y, k), 0))
                                for x, y, k in shown], started_at=wall, games_played=len(done), games_planned=planned,
                          tally=tally(done, self.test if kind in ('champion', 'sprt') else None), placements_played=live,
-                         mean_placements=placed/finished if finished else None,
+                         mean_placements=added[main][1]/added[main][0] if main in added else None,
                          placements_per_second=live/max(self.pacer.clock()-start, 1e-9))
         while True:
             for a, b, _ in lanes:
@@ -790,7 +794,7 @@ class Evaluator:
             paired = False
             for lane, record in results:
                 moves = record['plies']-len(record['opening'])
-                placed, finished = placed+moves, finished+1
+                placed += moves
                 count = added.setdefault(lane, [0, 0])
                 count[0] += 1; count[1] += moves
                 group = waiting.setdefault(lane[:2], {}).setdefault(record['pair'], [])
@@ -1253,7 +1257,7 @@ class Evaluator:
         unrated = [e for e in checkpoints(self.run) if e[0] not in known]
         self.status['backlog'] = [e[0] for e in unrated]
         champion = self.league['champion']
-        resumed = [e for e in unrated if champion and report_path(self.run, e[0], champion).exists()]
+        resumed = [e for e in unrated if champion and self.games(e[0], champion)]
         if resumed:
             self.filling(None)
             self.rate(resumed[0])

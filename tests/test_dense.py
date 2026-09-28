@@ -2116,9 +2116,10 @@ class Crash(Exception):
     """Raised by a scripted pool to stop the evaluator mid-session, as a killed process would."""
 
 
-def scripted(winner=lambda record: record['challenger_color'], hook=lambda pool, steps: None):
+def scripted(winner=lambda record: record['challenger_color'], hook=lambda pool, steps: None, moves=lambda record: 5):
     """A dense_eval.Pool stand-in whose step() first calls hook(pool, steps so far) and then finishes the oldest
-    game in flight after five placements, won by colour winner(record) (-1: a cap; default the candidate)."""
+    game in flight after moves(record) placements, won by colour winner(record) (-1: a cap; default the
+    candidate)."""
     class Scripted(dense_eval.Pool):
         def step(self):
             self.steps = getattr(self, 'steps', 0)+1
@@ -2131,7 +2132,7 @@ def scripted(winner=lambda record: record['challenger_color'], hook=lambda pool,
                 for tree in game.trees.values():
                     tree.close()
                 out.append((lane, dict(game.record, winner=winner(game.record), reason='six-in-a-row',
-                                       plies=len(game.record['opening'])+5, moves=[])))
+                                       plies=len(game.record['opening'])+moves(game.record), moves=[])))
             return out
     return Scripted
 
@@ -2692,6 +2693,10 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator = self.start(decision='sprt', sprt_min_games=64)
         evaluator.review()
         self.assertEqual(evaluator.league['champion'], 'main/019500')                 # the rule applies in posterior mode
+        evaluator = self.start(decision='posterior', sprt_min_games=64, sims=3)
+        self.assertEqual(evaluator.games('main/025000', 'main/019500'), [])          # another protocol's games do not count
+        evaluator.review()
+        self.assertEqual(evaluator.league['champion'], 'main/019500')
         evaluator = self.start(decision='posterior', sprt_min_games=66, anchor_games=2)
         evaluator.review()
         self.assertEqual(evaluator.league['champion'], 'main/019500')                 # too few direct games
@@ -2727,8 +2732,11 @@ class EvaluatorLoopTests(unittest.TestCase):
             return {('main/000040', 'main/000010', 'champion'): 4, ('main/000040', rivals[calls[0] % 2], 'evidence'): 4}
         def watch(pool, steps):
             seen.append((pool.running(), pool.running(kind='evidence')))
-        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=watch)):
+        long = lambda record: 30 if record['opponent'] == 'main/000010' else 5   # main lane games are longer
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=watch, moves=long)):
             evaluator.session(want, 0)
+        status = json.loads((self.run/'evaluator-status.json').read_text())
+        self.assertEqual((status['comparison']['opponent'], status['mean_placements']), ('main/000010', 30.))
         self.assertEqual(max(total for total, _ in seen), 8)
         self.assertEqual(max(evidence for _, evidence in seen), 4)
         self.assertTrue(all(evaluator.games('main/000040', r) for r in rivals))
