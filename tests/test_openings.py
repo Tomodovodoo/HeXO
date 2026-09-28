@@ -689,6 +689,27 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual(league['matrix']['main/000020'][CHAMPION]['games'], len(report['games']))
         self.assertIsNotNone(next(c for c in league['checkpoints'] if c['id'] == 'main/000020')['elo'])
 
+    def test_a_seal_anchor_owed_across_a_protocol_change_is_played_under_the_new_one(self):
+        """The champion's Seal games count toward its anchor under every protocol; an anchor still owed after a
+        change (such as a book refresh) archives the old report and continues under the new protocol."""
+        self.export(10)
+        evaluator = self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            evaluator.step()                                                # the first champion, unopposed
+            self.assertEqual(evaluator.anchor()[3], 4)
+            evaluator.session(lambda: {} if len(evaluator.games(CHAMPION, 'seal')) >= 2 else {(CHAMPION, 'seal', 'anchor'): 2}, 2)
+        path = dense_eval.report_path(self.run, CHAMPION, 'seal')
+        report = json.loads(path.read_text())
+        report['settings']['sims'] = 99                                     # now another protocol's report
+        path.write_text(json.dumps(report))
+        self.assertEqual(evaluator.anchor()[3], 2)                          # its games still count
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        self.assertIsNone(evaluator.anchor())
+        self.assertEqual(len(json.loads(path.read_text())['games']), 2)     # a new report under the current protocol
+        self.assertEqual(len(list(path.parent.glob('report-*.json'))), 1)
+        self.assertEqual(json.loads((self.run/'league.json').read_text())['anchors']['seal']['games'], 4)
+
     def test_the_standard_suite_is_a_frozen_book_with_its_statistics_in_the_run(self):
         self.export(10)
         played = dense_openings.Book(self.run, dense_config.EvaluationSettings()).openings()[0]['moves']

@@ -1199,26 +1199,27 @@ class Evaluator:
         path = report_path(self.run, cid, SEAL)
         return json.loads(path.read_text()) if path.is_file() else None
 
+    def seal_reports(self, cid):
+        """cid's reports against Seal under every protocol: its report.json and those archived beside it."""
+        return [r for r in load_reports(self.run) if r['candidate'] == cid and r['opponent'] == SEAL]
+
     def crown(self, cid):
         """Make cid champion and start its reign: reign_from and reign_games (league contract)."""
-        report = self.sealed(cid)
-        self.league.update(champion=cid, reign_from=len(self.league['checkpoints']), reign_games=len(report['games']) if report else 0)
+        self.league.update(champion=cid, reign_from=len(self.league['checkpoints']),
+                           reign_games=sum(len(r['games']) for r in self.seal_reports(cid)))
 
     def anchor(self):
         """(champion entry, SEAL, 'anchor', games left) while the current champion owes Seal games, else None. In
         its current reign it owes anchor_games once (anchor_on_promotion) and anchor_games more per `anchor_every`
-        checkpoints rated during the reign (entries from `reign_from` on), counted against the games its
-        champion-vs-Seal report gained since reign_games; a report under another protocol is left alone. A newer
-        champion supersedes the old one's unfinished anchor."""
+        checkpoints rated during the reign (entries from `reign_from` on), counted against the games its Seal reports
+        (`seal_reports`, every protocol) gained since reign_games, so an anchor owed when the protocol changes (a book
+        refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor."""
         s, champion = self.settings, self.entry(self.league['champion'])
         if not s.anchor_games or champion is None:
             return None
         entries = self.league['checkpoints']
         later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])
-        report = self.sealed(champion['id'])
-        if report and not same_protocol(report, s):
-            return None
-        played = len(report['games'])-self.league.get('reign_games', 0) if report else 0
+        played = sum(len(r['games']) for r in self.seal_reports(champion['id']))-self.league.get('reign_games', 0)
         left = s.anchor_games*(s.anchor_on_promotion+later//s.anchor_every)-played
         return (champion, SEAL, 'anchor', left) if left > 0 else None
 
@@ -1250,17 +1251,17 @@ class Evaluator:
     def fill(self):
         """(league entry, opponent, kind, games) of the next fill work with idle_fill, else None; only `close`
         pairings, `games` each. (1) The champion vs Seal ('fill') while anchor_target_halfwidth > 0 and the
-        half-width of the 95% interval of their Elo difference (`rate` over the champion's Seal report alone)
-        exceeds it (no report yet counts as wide; a report under another protocol is left alone). (2) Once, the
+        half-width of the 95% interval of their Elo difference (`rate` over the champion's Seal reports alone,
+        `seal_reports`) exceeds it (no report yet counts as wide). (2) Once, the
         newest rated, not demoted checkpoint vs the previous champion ('generalization'): the champion that the
         champion it met had met (`met` twice), when the two have no games yet. (3) The league ladder pair with
         the widest interval whose report can grow (`rematch_pair`, 'fill')."""
         s, champion = self.settings, self.entry(self.league['champion'])
         if not s.idle_fill or champion is None:
             return None
-        report = self.sealed(champion['id'])
-        if s.anchor_target_halfwidth > 0 and (report is None or same_protocol(report, s)) and self.close(champion['id'], SEAL):
-            low, high = rate([champion['id'], SEAL], champion['id'], [report], seed=self.config.seed)[1][SEAL] if report \
+        reports = self.seal_reports(champion['id'])
+        if s.anchor_target_halfwidth > 0 and self.close(champion['id'], SEAL):
+            low, high = rate([champion['id'], SEAL], champion['id'], reports, seed=self.config.seed)[1][SEAL] if reports \
                 else (-math.inf, math.inf)
             if (high-low)/2 > s.anchor_target_halfwidth:
                 return champion, SEAL, 'fill', s.games
