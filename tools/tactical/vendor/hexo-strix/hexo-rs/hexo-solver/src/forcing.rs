@@ -825,6 +825,18 @@ pub(crate) type ThreatIndex = FxHashMap<Coord, Vec<ThreatEntry>>;
 
 /// Near-complete lines (enemy-free windows with wl-4..wl-3 stones), indexed by gap
 /// cell — so a move's B is a table lookup, not a rescan.
+/// Number of threat-band windows (`wl-4..=wl-3` stones, no enemy): a cheap
+/// stand-in for an OR node's branching factor before its moves are generated.
+pub(crate) fn threat_window_count(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> usize {
+    let l = wl as i32;
+    let mut count = 0usize;
+    scan_windows(board, player, wl, radius, l - 4, l - 3, &mut |_, _, _, _| {
+        count += 1;
+        false
+    });
+    count
+}
+
 fn threat_table(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> ThreatIndex {
     let l = wl as i32;
     let mut index: ThreatIndex = FxHashMap::default();

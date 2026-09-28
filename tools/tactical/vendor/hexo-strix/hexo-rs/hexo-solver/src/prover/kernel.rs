@@ -35,7 +35,7 @@
 //! placements)` is therefore sound with no graph-history-interaction handling.
 
 use crate::forcing::{
-    CellSet2, SolverBoard, attacker_turns_with, completions, futile_defender_pair, min_covers2,
+    CellSet2, SolverBoard, attacker_turns_with, completions, futile_defender_pair, min_covers2, threat_window_count,
     MAX_WL,
 };
 use hexo_engine::game::{GameConfig, GameState};
@@ -271,6 +271,20 @@ impl KernelCtx {
         } else {
             OrEval::Moves(moves)
         }
+    }
+
+    /// Child-initialisation view of an OR node: `None` for an immediate win,
+    /// otherwise the memoised move count when known, else the threat-window count
+    /// (0 only when the memo proves there is no forcing move).
+    pub(crate) fn or_estimate(&mut self, placements: u8) -> Option<u32> {
+        let comps = self.node_comps();
+        if comps.0.iter().any(|c| c.len() as u8 <= placements) {
+            return None;
+        }
+        if let Some(v) = self.gencache.get(&(self.board.hash, placements)) {
+            return Some(v.len() as u32);
+        }
+        Some(threat_window_count(&self.board, self.atk, self.wl, self.radius).max(1) as u32)
     }
 
     /// Classify an AND (defender-to-move) node on the post-attacker-move board.
