@@ -5,8 +5,8 @@ manifest.json {variant, step, samples_seen, created_at, model_sha256, ema_sha256
 learner (effective LearnerSettings), model (ModelSettings), copied_from}. Events have source 'learner' and kind
 export, info, error or replace. league.json is read for population replacement, never written. metrics/learner-
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
-falls on every tenth step) and one per export with the manifest's metrics.validation (Learner.export): EMA losses
-on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets).
+falls on every tenth step) and one per export with validation_fields(metrics) of the manifest (Learner.export): EMA
+losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets).
 
 Every target is derived here from episodes (dense_data.examples), so td_lambda, bootstrap_weight and
 short_value_horizon are learner settings; batches are rendered by dense_data.Renderers worker processes
@@ -45,6 +45,13 @@ KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'valid
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')))  # metrics log names
 # (low, high) for replacement perturbations; td_lambda and ema are perturbed through 1 - x.
 BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995), ema=(.99, .9999))
+
+
+def validation_fields(metrics):
+    """The metrics-log fields of an export's manifest metrics: metrics.validation under LOGGED names plus
+    metrics.validation_sources; None when both are null."""
+    fields = {LOGGED[h]: v for h, v in (metrics['validation'] or {}).items()} | (metrics.get('validation_sources') or {})
+    return fields or None
 
 
 def status_path(run, variant):
@@ -255,17 +262,15 @@ class Learner:
 
     def export(self, window, sets=None):
         """Write checkpoints/<variant>/<step:06d>/ atomically (staged in a hidden sibling, then renamed).
-        metrics.validation holds validate(window) (the HEADS, None without held-out rows) updated with
-        validate_sources(sets) when `sets` is given; it is None when neither applies."""
+        metrics.validation is validate(window) (the HEADS; null without held-out rows in the window) and
+        metrics.validation_sources is validate_sources(sets) (null without `sets`)."""
         s = self.settings
         root = self.run/'checkpoints'/s.variant
         root.mkdir(parents=True, exist_ok=True)
         final, stage = root/f'{self.step:06d}', root/f'.pending-{self.step:06d}'
         if final.exists():
             raise FileExistsError(f'{final} already exists')
-        validation = self.validate(window)
-        if sets is not None:
-            validation = dict(validation or dict.fromkeys(HEADS), **self.validate_sources(sets))
+        validation, sources = self.validate(window), None if sets is None else self.validate_sources(sets)
         shutil.rmtree(stage, ignore_errors=True); stage.mkdir()
         hexnet.save_model(stage/'model.pt', self.model)
         hexnet.save_model(stage/'ema.pt', self.ema)
@@ -273,7 +278,7 @@ class Learner:
                         ema_updates=self.ema_updates), stage/'optimizer.pt')
         manifest = dict(variant=s.variant, step=self.step, samples_seen=self.samples_seen, created_at=time.time(),
                         model_sha256=hexnet.model_digest(self.model), ema_sha256=hexnet.model_digest(self.ema),
-                        metrics=dict(self.metrics or {h: None for h in HEADS}, validation=validation),
+                        metrics=dict(self.metrics or {h: None for h in HEADS}, validation=validation, validation_sources=sources),
                         learner=asdict(s), model=asdict(self.config.model), copied_from=self.copied_from)
         write_json(stage/'manifest.json', manifest)
         stage.rename(final)
@@ -365,10 +370,10 @@ def main():
 
     def export():
         write_status(stage='exporting')
-        validation = learner.export(window, sets)['metrics']['validation']
-        if validation:
+        fields = validation_fields(learner.export(window, sets)['metrics'])
+        if fields:
             dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
-                                        validation=True, **{LOGGED.get(h, h): v for h, v in validation.items()})
+                                        validation=True, **fields)
 
     rate = []
     try:

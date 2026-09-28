@@ -995,22 +995,54 @@ class ValidationSourceTests(unittest.TestCase):
             manifest = learner.export(window, sets)
             self.assertEqual(set(manifest), {'variant', 'step', 'samples_seen', 'created_at', 'model_sha256', 'ema_sha256',
                                              'metrics', 'learner', 'model', 'copied_from'})
-            v = manifest['metrics']['validation']
+            aggregate, v = manifest['metrics']['validation'], manifest['metrics']['validation_sources']
             self.assertEqual(v['newest_checkpoint'], 'main/000010')
             for h in dense_learn.HEADS:
-                self.assertTrue(math.isfinite(v[h]))
+                self.assertTrue(math.isfinite(aggregate[h]))
             for source in dense_data.SOURCES:
                 self.assertEqual(v[f'{source}_rows'], len(sets.subsets[source, 'held']))
                 for name in ('policy_ce', 'value_bce'):
                     self.assertAlmostEqual(v[f'{source}_gap_{name}'], v[f'{source}_{name}']-v[f'{source}_train_{name}'])
-            self.assertEqual(v, learner.validate(window) | learner.validate_sources(sets))
+            self.assertEqual((aggregate, v), (learner.validate(window), learner.validate_sources(sets)))
             path = run/'checkpoints'/'main'/'000000'
             self.assertEqual(sorted(p.name for p in path.iterdir()), ['ema.pt', 'manifest.json', 'model.pt', 'optimizer.pt'])
             self.assertEqual(dense_learn.Learner(run, config.learner, config).step, 0)
-            dense_config.append_metrics(run, 'learner-main', step=10, validation=True,
-                                        **{dense_learn.LOGGED.get(h, h): x for h, x in v.items()})
+            fields = dense_learn.validation_fields(manifest['metrics'])
+            self.assertEqual(fields['next_ce'], aggregate['opponent_ce'])
+            dense_config.append_metrics(run, 'learner-main', step=10, validation=True, **fields)
             points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_newest_gap_policy_ce')['points']
             self.assertEqual(points, [[10, v['newest_gap_policy_ce']]])
+
+    def test_export_without_held_out_games(self):
+        """No held-out game in the window: metrics.validation stays null, the sources are still reported, and the
+        dashboard series skips the null aggregate."""
+        import dashboard
+        torch.set_num_threads(2)
+        torch.manual_seed(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x', checkpoint='main/000010')
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=0.))
+            learner = dense_learn.Learner(run, config.learner, config)
+            window = dense_data.ReplayWindow(run, 1000, 10)
+            first = learner.export(window)['metrics']
+            self.assertEqual((first['validation'], first['validation_sources']), (None, None))
+            self.assertIsNone(dense_learn.validation_fields(first))
+            learner.step = 1
+            sets = dense_data.ValidationSets(run, 0., config.seed, limit=12, quota=6)
+            metrics = learner.export(window, sets)['metrics']
+            self.assertIsNone(metrics['validation'])
+            self.assertEqual(metrics['validation_sources']['fresh_rows'], 0)
+            self.assertTrue(math.isfinite(metrics['validation_sources']['fresh_train_policy_ce']))
+            fields = dense_learn.validation_fields(metrics)
+            self.assertNotIn('policy_ce', fields)
+            dense_config.append_metrics(run, 'learner-main', step=1, validation=True, policy_ce=None, **fields)
+            config = dict(created_at=0.)
+            self.assertEqual(dashboard.series(run, config, 'main', 'validation_policy_ce')['points'], [])
+            self.assertEqual(dashboard.series(run, config, 'main', 'validation_fresh_policy_ce')['points'], [])
+            self.assertEqual(dashboard.series(run, config, 'main', 'validation_fresh_train_policy_ce')['points'],
+                             [[1, fields['fresh_train_policy_ce']]])
 
 
 class EvaluatorSearchTests(unittest.TestCase):
