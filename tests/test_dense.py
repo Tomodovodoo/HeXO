@@ -1024,6 +1024,24 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(league['checkpoints'][0]['elo'], 0.)
         self.assertEqual(evaluator.optional()[0]['id'], 'main/000030')
 
+    def test_newer_checkpoint_before_the_first_round_skips_the_candidate(self):
+        evaluator = self.start(sprt_max_games=8)
+        self.export(10)
+        evaluator.step()
+        self.export(30)
+        wait = evaluator.pacer.wait
+        def export_during_wait(*args):
+            wait(*args)
+            if not (self.run/'checkpoints'/'main'/'000040').exists():
+                self.export(40)
+        evaluator.pacer.wait = export_during_wait
+        self.assertTrue(evaluator.step())
+        self.assertFalse(dense_eval.report_path(self.run, 'main/000030', 'main/000010').exists())
+        entry = self.league()['checkpoints'][-1]
+        self.assertEqual((entry['id'], entry.get('skipped'), entry['matches']), ('main/000030', True, []))
+        self.assertTrue(evaluator.step())
+        self.assertTrue(dense_eval.report_path(self.run, 'main/000040', 'main/000010').exists())
+
     def test_newer_checkpoint_supersedes_a_running_sprt_after_its_round(self):
         evaluator = self.start(sprt_max_games=8)
         self.export(10)

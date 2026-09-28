@@ -477,7 +477,7 @@ class Evaluator:
         """The report of cid vs opponent, reused when on disk. Otherwise the champion comparison plays rounds
         until complete(records) or, after a round, a newer checkpoint of the variant exists (SPRT decision
         'superseded'); optional comparisons play one round per call and return None until complete. A
-        finished report is written and logged."""
+        finished report is written and logged; a champion comparison superseded before any game returns None."""
         path = report_path(self.run, cid, opponent)
         if path.exists():
             return json.loads(path.read_text())
@@ -487,6 +487,8 @@ class Evaluator:
                 break
             if kind != 'champion':
                 return None
+        if not done['records']:
+            return None
         shas = {name: digest(self.run/'checkpoints'/name/'ema.pt') for name in (cid, opponent) if name != SEAL}
         report = make_report(cid, opponent, done['records'], shas, self.settings)
         if kind == 'champion':
@@ -511,9 +513,17 @@ class Evaluator:
         cid, path, _ = entry
         variant, step = cid.split('/')
         champion, s = self.league['champion'], self.settings
-        reports = {} if champion is None else {champion: self.report(
+        report = None if champion is None else self.report(
             cid, champion, 'champion', s.sprt_max_games,
-            lambda records: self.test(records)['decision'] is not None or len(records) >= s.sprt_max_games)}
+            lambda records: self.test(records)['decision'] is not None or len(records) >= s.sprt_max_games)
+        if champion is not None and report is None:
+            self.league['checkpoints'].append(dict(id=cid, variant=variant, step=int(step), skipped=True,
+                                                   elo=None, elo_interval=None, matches=[]))
+            log_event(self.run, 'evaluator', 'skip', f'skipped {cid}: a newer checkpoint appeared before its first champion round',
+                      checkpoints=[cid], candidate=cid)
+            write_league(self.run, self.league, self.config)
+            return
+        reports = {} if report is None else {champion: report}
         decision = reports[champion]['metrics']['sprt']['decision'] if reports else None
         promoted = champion is None or decision == 'H1'
         self.league['checkpoints'].append(dict(id=cid, variant=variant, step=int(step), ema_sha256=digest(path/'ema.pt'),
