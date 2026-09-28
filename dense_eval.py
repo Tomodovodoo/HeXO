@@ -25,7 +25,11 @@ Run layout: dense_config. Subcommands
              promotion, evaluator-status.json (Evaluator.publish) and events.
   calibrate  continue capped self-play games with the champion and score TD(lambda) value targets against
              the realised results.
-  match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal.
+  match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal; per-side
+             solver budgets (--a-solver-*, --b-solver-*, default the evaluation settings') allow one checkpoint
+             against itself with different solver settings, e.g. champion+solver vs champion.
+  variant    register a variant (`register`): a rated checkpoint with overridden search settings, decided by the
+             loop against that checkpoint.
 
 Scoring: a capped game (at the ply limit, or reason 'span' when a searched position does not fit the largest crop) is
 half a point for each side. Pair score = candidate points / 2 over its two games; decisions use completed pairs.
@@ -33,11 +37,10 @@ Promotion (`decision`): 'posterior' (default) decides on the league-wide posteri
 ratings of every rated checkpoint, the candidate and Seal from every protocol-matching report, with a per-pair
 matchup deviation of prior sd matchup_prior_elo so a pair's own games dominate when they disagree with the
 transitive picture). Delta = r_candidate - r_champion + their deviation. After at least sprt_min_games direct
-games, while the candidate's rating sd about the league mean is at most uncertainty_parity times the champion's and
-the direct-only and pooled 95% intervals overlap, the candidate is promoted when it has the highest posterior rating
-of the rated checkpoints and P(delta > sprt_elo0) >= promote_confidence, and rejected when that probability is at
-most 1 - promote_confidence (`Evaluator.verdict`), re-judged after every completed colour pair; until then direct
-games keep playing. On start the rule is re-applied to the existing reports (`Evaluator.review`). Direct games fill
+games, while the direct-only and pooled 95% intervals overlap, the candidate is promoted when it has the highest
+posterior rating of the rated checkpoints and P(delta > sprt_elo0) >= promote_confidence, and rejected when that
+probability is at most 1 - promote_confidence (`Evaluator.verdict`), re-judged after every completed colour pair;
+until then direct games keep playing. On start the rule is re-applied to the existing reports (`Evaluator.review`). Direct games fill
 the pool until sprt_min_games are complete; after that at most evidence_share of the pool may go to the evidence
 pairing that most reduces Var(delta) (value of information: the candidate or champion vs the previous champion or
 Seal, `Evaluator.evidence`), up to sprt_max_games direct games. Supersession settles once the games in flight have
@@ -47,6 +50,18 @@ With 'sprt', the comparison with the champion is a sequential test (see `sprt`) 
 `sprt_max_games` (decision 'max-games') or is superseded by a newer checkpoint of its variant. H1 promotes; a
 superseded comparison is settled on the same posterior: it promotes when P(delta > sprt_elo0) >= promote_confidence,
 recorded as metrics.sprt.settled {pair_score, p_better, promote} with a 'settle' event. The first rated checkpoint becomes champion unopposed.
+
+Variants: an A/B test of search settings played by the evaluator's own machinery. A variant is a league entry with id
+`<checkpoint>@<name>` (`split_id`): the weights of a rated checkpoint (its base) searched with `settings`, overrides
+of the per-side PROTOCOL fields (SIDE; `side_settings`). Every pool game gives each side its own settings; reports
+with a variant side record its overrides as `overrides` {id: settings}. A variant with no verdict is a pending
+decision 'variant vs base' (comparison kind 'variant', `Evaluator.trial`), played once no checkpoint awaits rating
+and before anchor, optional and fill work; direct games fill the pool, evidence pairings follow the posterior rule's
+value of information, and the decision is the posterior rule without the leader condition: 'better' when P(r_variant
+- r_base + deviation > sprt_elo0) >= promote_confidence, 'worse' when it is at most 1 - promote_confidence (after
+sprt_min_games direct games with agreeing direct and pooled intervals, as for checkpoints), 'max-games' at
+sprt_max_games. Variants are rated jointly with the checkpoints but never become champion, never lead a posterior
+verdict, and never enter panels, the ladder, differences, the actor pointer or its veto.
 
 Panels: a checkpoint rated while a champion exists (with extra_opponents > 0) gets entry `panel` {incumbent}, the
 champion it met. Its members are re-derived from the current ladder whenever the panel is scheduled or judged:
@@ -62,7 +77,13 @@ actors with model_source 'newest_veto': the newest export of learner.variant unl
 checkpoint until the next export.
 
 league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
-superseded?, panel?, demoted?, verdict? (the posterior verdict that rated it)}], differences, ladder, ladder_top, anchors, matrix, rating_note, updated_at}.
+superseded?, panel?, demoted?, verdict? (the posterior verdict that rated or promoted it on review, with its
+`Evaluator.snapshot`: opponent, protocol, matchup_prior and reports)}], variants: [{id, checkpoint, name, settings,
+registered_at, elo, elo_interval, matches, verdict? (its final verdict)}], differences, ladder, ladder_top, anchors,
+matrix, calibration, rating_note, updated_at}. calibration (`calibration`) compares the delta sd the posterior
+stated at each verdict with how far delta moved once later games of that checkpoint came in. The evaluator is
+league.json's only writer: `register` leaves a request in variant-requests/, which the evaluator adopts into
+`variants` (`adopt`).
 differences and ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the ladder_top
 (fill_top) best rated, not demoted checkpoints, a above b, intervals from the joint rating draws. anchors.seal is {elo,
 elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
@@ -70,8 +91,8 @@ latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, lates
 is the number of checkpoint entries and reign_games the champion's Seal games when it was promoted or restored
 (absent: its own position + 1 and 0). `matrix` (`payoff`) holds
 only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
-written before `matrix`, `ladder` and `panel` existed lack those keys; the Evaluator adds `matrix` on start and
-rebuilds the ladder when its ladder_top differs from the effective fill_top.
+written before `matrix`, `ladder`, `panel` and `calibration` existed lack those keys; the Evaluator adds `matrix`
+and `calibration` on start and rebuilds the ladder when its ladder_top differs from the effective fill_top.
 """
 import argparse
 from dataclasses import asdict, replace
@@ -87,7 +108,8 @@ import torch
 import dense_config
 from dense_config import log_event
 import dense_data
-from dense_posterior import Posterior
+from dense_posterior import Posterior, parents
+from dense_solver import Budgets
 import hexnet
 from arena import Seal
 from dense_selfplay import Engine, checkpoints, expected, load, resolve
@@ -98,8 +120,16 @@ from train import paired_metrics, task_opening, write_json
 SEAL = 'seal'
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
-PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'seal_ms')  # settings a reused report must share
+# Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
+PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'seal_ms', 'solver_root_nodes',
+            'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes')
+PROTOCOL_DEFAULTS = dict(solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0, solver_threat_nodes=0)
+# The PROTOCOL fields of one side's search, which a variant may override; max_plies, opening_suite and seal_ms
+# belong to the game.
+SIDE = ('sims', 'root_samples', 'tactics', 'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes',
+        'solver_threat_nodes')
 REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
+CALIBRATION_LATER = 3     # later comparisons of a decided checkpoint before `calibration` counts its verdict
 RATING_NOTE = ('Bradley-Terry over paired comparisons (caps count half a point to each side); each opening pair is one '
                'observation with a Jeffreys Dirichlet prior over the five pair scores 0..2 in half points; 95% '
                'credible intervals from posterior draws; the first evaluated checkpoint is fixed at 0. Seal is one '
@@ -110,18 +140,31 @@ class MatchGame:
     """One evaluation game. sides[colour] is a dense_selfplay.Model or SEAL; model sides search `sims`
     placements with argmax play (one tree per distinct model, advanced on every placement); a Seal side
     plays complete turns inline, validated with Game.legal. Ends at a win, `max_plies` placements or when the
-    Engine stops it (`reason` 'span')."""
+    Engine stops it (`reason` 'span'). sims, samples and tactics are one value for both colours or a pair per
+    colour; solvers[colour] is that colour's dense_solver.Budgets (None: off). A model playing both colours shares
+    one tree, searched with colour 0's tactics."""
 
-    def __init__(self, sides, opening, seed, sims, samples, tactics, max_plies, record, seal=None, seal_ms=0):
+    def __init__(self, sides, opening, seed, sims, samples, tactics, max_plies, record, seal=None, seal_ms=0,
+                 solvers=(None, None)):
         self.sides, self.max_plies, self.seal, self.seal_ms, self.record = sides, max_plies, seal, seal_ms, record
+        self.solvers = solvers
         self.reason = None
-        self.budget, self.samples = sims, samples
+        per = lambda value: tuple(value) if isinstance(value, (tuple, list)) else (value, value)
+        self.budgets, self.sample_counts, tactics = per(sims), per(samples), per(tactics)
         self.game, self.moves = Game([tuple(m) for m in opening]), [list(m) for m in opening]
         self.trees = {}
         for colour, side in enumerate(sides):
             if side != SEAL and id(side) not in self.trees:
-                self.trees[id(side)] = side.tree([tuple(m) for m in opening], seed*2+colour, tactics)
+                self.trees[id(side)] = side.tree([tuple(m) for m in opening], seed*2+colour, tactics[colour])
         self.seal_turns()
+
+    @property
+    def budget(self):
+        return self.budgets[self.game.player]
+
+    @property
+    def samples(self):
+        return self.sample_counts[self.game.player]
 
     @property
     def model(self):
@@ -130,6 +173,10 @@ class MatchGame:
     @property
     def tree(self):
         return self.trees[id(self.model)]
+
+    @property
+    def solver(self):
+        return self.solvers[self.game.player]
 
     def over(self):
         return self.game.winner >= 0 or len(self.moves) >= self.max_plies
@@ -172,15 +219,18 @@ def play(games, leaf_batch, heartbeat=lambda finished: None):
     """Run MatchGames to completion in one engine; returns their records in input order. heartbeat(records of
     the finished games, in finishing order) is called after every engine step."""
     engine, records = Engine(leaf_batch), {}
-    for game in games:
-        if game.over():
-            records[id(game)] = game.finish()
-        else:
-            engine.add(game)
-    while engine.slots:
-        for game in engine.step():
-            records[id(game)] = game.finish()
-        heartbeat(list(records.values()))
+    try:
+        for game in games:
+            if game.over():
+                records[id(game)] = game.finish()
+            else:
+                engine.add(game)
+        while engine.slots:
+            for game in engine.step():
+                records[id(game)] = game.finish()
+            heartbeat(list(records.values()))
+    finally:
+        engine.close()
     return [records[id(g)] for g in games]
 
 
@@ -188,9 +238,12 @@ def pair_seed(run_seed, label, pair):
     return int.from_bytes(hashlib.sha256(f'{run_seed}/{label}/{pair}'.encode()).digest()[:4], 'little')
 
 
-def paired_games(challenger, rival, games, label, config, settings, seal, first_pair=0, **record):
+def paired_games(challenger, rival, games, label, config, settings, seal, first_pair=0, sides=None, **record):
     """`games` MatchGames: games/2 openings (train.task_opening from run seed, `label` and pair index, pairs
-    numbered from `first_pair`), each played once with the candidate as colour 0 and once as colour 1."""
+    numbered from `first_pair`), each played once with the candidate as colour 0 and once as colour 1. `sides` is
+    (challenger's, rival's) EvaluationSettings of their search (sims, root_samples, tactics and solver budgets),
+    by default both `settings`; openings, max_plies and seal_ms come from `settings`."""
+    sides = sides or (settings, settings)
     if games < 2 or games % 2:
         raise ValueError('Paired matches need an even game count of at least two')
     out = []
@@ -198,11 +251,100 @@ def paired_games(challenger, rival, games, label, config, settings, seal, first_
         seed = pair_seed(config.seed, label, pair)
         opening = task_opening(seed, True, settings.max_plies, settings.opening_suite)['opening']
         for colour in (0, 1):
-            sides = [rival, rival]; sides[colour] = challenger
-            out.append(MatchGame(sides, opening, seed, settings.sims, settings.root_samples, settings.tactics,
-                                 settings.max_plies, dict(record, pair=pair, seed=seed, opening=[list(m) for m in opening],
-                                 challenger_color=colour), seal, settings.seal_ms))
+            players, search = [rival, rival], [sides[1], sides[1]]
+            players[colour], search[colour] = challenger, sides[0]
+            out.append(MatchGame(players, opening, seed, [s.sims for s in search], [s.root_samples for s in search],
+                                 [s.tactics for s in search], settings.max_plies,
+                                 dict(record, pair=pair, seed=seed, opening=[list(m) for m in opening], challenger_color=colour),
+                                 seal, settings.seal_ms, [Budgets.of(s) for s in search]))
     return out
+
+
+def split_id(cid):
+    """(checkpoint, variant name) of league id cid: `<checkpoint>@<name>` for a variant, name None for a
+    checkpoint."""
+    checkpoint, _, name = cid.partition('@')
+    return checkpoint, name or None
+
+
+def side_settings(settings, overrides):
+    """One side's EvaluationSettings: `settings` with `overrides` (SIDE fields); root_samples, unless overridden,
+    is at most the side's sims."""
+    out = replace(settings, **overrides)
+    return out if 'root_samples' in overrides else replace(out, root_samples=min(out.root_samples, out.sims))
+
+
+def parse_settings(assignments):
+    """{field: value} of `key=value` strings over SIDE, typed like the EvaluationSettings field (booleans: true,
+    false, 1, 0); a variant must override at least one field."""
+    defaults, out = dense_config.EvaluationSettings(), {}
+    for text in assignments:
+        key, sep, value = text.partition('=')
+        key = key.strip().replace('-', '_')
+        if not sep or key not in SIDE:
+            raise ValueError(f'{text!r}: variant settings are key=value over {", ".join(SIDE)}')
+        kind = type(getattr(defaults, key))
+        if kind is bool:
+            if value.strip().lower() not in ('true', 'false', '1', '0'):
+                raise ValueError(f'{text!r}: {key} is true or false')
+            out[key] = value.strip().lower() in ('true', '1')
+        else:
+            out[key] = kind(value)
+    if not out:
+        raise ValueError('A variant overrides at least one setting')
+    if out.get('sims', 1) < 1 or out.get('root_samples', 1) < 1:
+        raise ValueError('sims and root_samples are at least 1')
+    return out
+
+
+def requests(run):
+    """{variant id: path} of the registrations waiting in <run>/variant-requests (`register`)."""
+    return {json.loads(path.read_text())['id']: path for path in sorted((Path(run)/'variant-requests').glob('*.json'))}
+
+
+def adopt(league, run):
+    """Append to league['variants'] the registrations waiting in <run>/variant-requests (`requests`) whose id it
+    lacks, in registration order; the entries already in `league` stay as they are. Returns how many were added.
+    `write_league` removes the request files once league.json holds them."""
+    known = {v['id'] for v in league.setdefault('variants', [])}
+    new = [json.loads(path.read_text()) for cid, path in requests(run).items() if cid not in known]
+    league['variants'] += sorted(new, key=lambda v: v['registered_at'])
+    return len(new)
+
+
+def register(run, checkpoint, name, settings):
+    """Register variant `<checkpoint>@<name>` of a rated league checkpoint with overrides `settings`
+    (`parse_settings`) and log a 'variant' event; returns its entry. The registration is written as
+    <run>/variant-requests/<id>.json, never to league.json: the evaluator, league.json's only writer, adopts it
+    (`adopt`) on its next step. The name is letters, digits, '.', '_' or '-'. An id is immutable: registering it
+    again (in the league or waiting) with the same settings returns the existing entry, with other settings raises
+    ValueError."""
+    run = Path(run)
+    if not name or not all(ch.isalnum() or ch in '._-' for ch in name):
+        raise ValueError(f'{name!r}: a variant name is letters, digits, ".", "_" or "-"')
+    path = run/'league.json'
+    league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
+    base = next((c for c in league['checkpoints'] if c['id'] == checkpoint), None)
+    if base is None or base.get('skipped') or base.get('elo') is None:
+        raise ValueError(f'{checkpoint} is not a rated league checkpoint')
+    config = dense_config.load(run)
+    Budgets.of(side_settings(config.evaluation, settings))
+    cid = f'{checkpoint}@{name}'
+    waiting = requests(run)
+    existing = next((v for v in league.get('variants', []) if v['id'] == cid), None) \
+        or (json.loads(waiting[cid].read_text()) if cid in waiting else None)
+    if existing is not None:
+        if existing['settings'] != settings:
+            raise ValueError(f'{cid} is registered with settings {existing["settings"]}; register another name')
+        return existing
+    entry = dict(id=cid, checkpoint=checkpoint, name=name, settings=settings, registered_at=time.time(), elo=None,
+                 elo_interval=None, matches=[])
+    target = run/'variant-requests'/f'{cid.replace("/", "-")}.json'
+    target.parent.mkdir(exist_ok=True)
+    write_json(target, entry)
+    log_event(run, 'evaluator', 'variant', f'{cid} registered: ' + ', '.join(f'{k}={v}' for k, v in settings.items()),
+              candidate=cid, checkpoint=checkpoint, settings=settings)
+    return entry
 
 
 def pair_scores(records):
@@ -265,6 +407,21 @@ def sprt(records, elo0, elo1, alpha, beta):
                 pair_counts=counts.astype(int).tolist(), decision='H1' if llr >= upper else 'H0' if llr <= lower else None)
 
 
+def ready(settings, games, disagree):
+    """Whether a posterior verdict may decide: at least sprt_min_games direct games and the direct and pooled
+    intervals do not `disagree`. No uncertainty bound beyond that: P(better) already carries the sd of delta."""
+    return games >= settings.sprt_min_games and not disagree
+
+
+def judge(settings, games, disagree, leader, p_better):
+    """The posterior decision once `ready`: 'promote' when the candidate is the pooled `leader` and p_better
+    (P(delta > sprt_elo0)) >= promote_confidence, 'reject' when p_better <= 1 - promote_confidence, else None."""
+    if not ready(settings, games, disagree):
+        return None
+    return 'promote' if leader and p_better >= settings.promote_confidence else \
+        'reject' if p_better <= 1-settings.promote_confidence else None
+
+
 def tally(records, test=None):
     """Running score of a comparison's finished games: wins, losses, capped and games over all of them; over its
     complete opening pairs: pairs, pair_score, pair_interval (`summary`'s paired Hoeffding 95% bounds, clipped to
@@ -290,15 +447,35 @@ def tally(records, test=None):
     return out
 
 
+def oriented(games, candidate, side):
+    """`games` of a report whose candidate is `candidate`, seen from `side` (either player): challenger_color is
+    side's colour, and seed is (candidate, seed) so pairs of different reports never merge in `tally`."""
+    flip = side != candidate
+    return [dict(g, seed=(candidate, g['seed']), challenger_color=1-g['challenger_color'] if flip else g['challenger_color'])
+            for g in games]
+
+
 def report_path(run, candidate, opponent):
     return Path(run)/'evaluations'/f'{candidate.replace("/", "-")}-vs-{opponent.replace("/", "-")}'/'report.json'
 
 
-def make_report(candidate, opponent, records, shas, settings):
-    """Report of a finished comparison; `shas` maps checkpoint ids to their ema.pt digests."""
+def games_digest(games):
+    """Identity of a report's game list: a digest of each game's pair, colour, winner and length, in order."""
+    rows = [(g['pair'], g['challenger_color'], g['winner'], g['plies']) for g in games]
+    return hashlib.sha256(json.dumps(rows).encode()).hexdigest()[:16]
+
+
+def report_name(report):
+    """The directory name of `report` under evaluations/."""
+    return report_path('', report['candidate'], report['opponent']).parent.name
+
+
+def make_report(candidate, opponent, records, shas, settings, overrides=None):
+    """Report of a finished comparison; `shas` maps checkpoint ids to their ema.pt digests; `overrides` ({id:
+    settings} of its variant sides) is stored when not empty."""
     return dict(candidate=candidate, opponent=opponent, created_at=time.time(),
                 candidate_sha256=shas[candidate], opponent_sha256=SEAL if opponent == SEAL else shas[opponent],
-                settings=asdict(settings),
+                settings=asdict(settings), **({'overrides': overrides} if overrides else {}),
                 metrics=paired_metrics(records), summary=summary(records), games=records)
 
 
@@ -380,7 +557,7 @@ def load_reports(run, settings=None):
 
 
 def same_protocol(report, settings):
-    return all(report['settings'].get(k) == getattr(settings, k) for k in PROTOCOL)
+    return all(report['settings'].get(k, PROTOCOL_DEFAULTS.get(k)) == getattr(settings, k) for k in PROTOCOL)
 
 
 def payoff(reports, ratings=None):
@@ -469,17 +646,64 @@ def variant_heads(entries, rated=lambda c: True):
     return heads
 
 
+def calibration(league, reports):
+    """Diagnostic of the posterior's stated uncertainty; no decision reads it. For every checkpoint whose posterior
+    verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports), whose snapshotted reports
+    (every input of the verdict's posterior, the direct one among them) all still begin with the games it was decided
+    on (`games_digest` of that prefix: extended at most, not replaced) and which has at least CALIBRATION_LATER later
+    comparisons (reports with it under that protocol that are new or have grown since the verdict), shift = delta
+    now - delta at the verdict, both r_cid - r_opponent + their matchup deviation over the reports of that protocol
+    with the verdict's matchup prior. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
+    resolved). Returns {count, predicted_sd (mean delta_sd at the verdicts), expected_rms (root mean sd_then^2 -
+    sd_now^2), realised_rms (root mean shift^2)}, the three None without a counted verdict: realised_rms well below
+    expected_rms means the posterior overstates its variance."""
+    rated = [c['id'] for c in league['checkpoints']+league.get('variants', []) if c.get('elo') is not None and not c.get('skipped')]
+    protocol = lambda settings: tuple(settings.get(k, PROTOCOL_DEFAULTS.get(k)) for k in PROTOCOL)
+    posteriors, then, now, shifts = {}, [], [], []
+    for entry in league['checkpoints']:
+        verdict, cid = entry.get('verdict') or {}, entry['id']
+        if not {'opponent', 'protocol', 'matchup_prior', 'reports'} <= verdict.keys() or verdict.get('delta_sd') is None \
+                or cid not in rated or verdict['opponent'] not in rated:
+            continue
+        key = protocol(verdict['protocol'])
+        group = [r for r in reports if protocol(r['settings']) == key]
+        named = {report_name(r): r for r in group}
+        direct = report_path('', cid, verdict['opponent']).parent.name
+        intact = lambda name, snap: name in named and len(named[name]['games']) >= snap['games'] \
+            and games_digest(named[name]['games'][:snap['games']]) == snap['digest']
+        if direct not in verdict['reports'] or not all(intact(*item) for item in verdict['reports'].items()):
+            continue
+        later = sum(cid in (r['candidate'], r['opponent']) and len(r['games']) > verdict['reports'].get(name, {}).get('games', 0)
+                    for name, r in named.items())
+        if later < CALIBRATION_LATER:
+            continue
+        model = key, verdict['matchup_prior']
+        if model not in posteriors:
+            ids = rated+([SEAL] if any(SEAL in (r['candidate'], r['opponent']) for r in group) else [])
+            posteriors[model] = Posterior(ids, ids[0], [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
+                                                         r['summary']['games']) for r in group], verdict['matchup_prior'], parents(ids))
+        mean, sd = posteriors[model].difference(cid, verdict['opponent'])
+        then.append(verdict['delta_sd']); now.append(sd); shifts.append(mean-verdict['delta'])
+    root = lambda values: math.sqrt(max(0., float(np.mean(values)))) if values else None
+    return dict(count=len(shifts), predicted_sd=float(np.mean(then)) if then else None,
+                expected_rms=root([a*a-b*b for a, b in zip(then, now)]), realised_rms=root([x*x for x in shifts]))
+
+
 def write_league(run, league, config, top=None):
-    """Recompute ratings, the payoff matrix and the ladder (`top` checkpoints, default config.evaluation.fill_top)
-    from every report among rated (not skipped) ids and Seal, then publish league.json; skipped entries keep elo
-    and elo_interval null."""
+    """Adopt waiting variant registrations (`adopt`; their request files are removed after the write), recompute ratings, the payoff matrix and the ladder (`top`
+    checkpoints, default config.evaluation.fill_top) from every report among rated (not skipped) ids, the variants
+    of those ids and Seal, then publish league.json; skipped entries keep elo and elo_interval null. The ladder and
+    differences hold checkpoints only."""
     run = Path(run)
+    adopt(league, run)
     ids = [c['id'] for c in league['checkpoints'] if not c.get('skipped')]
-    reports = [r for r in load_reports(run) if r['candidate'] in ids and (r['opponent'] in ids or r['opponent'] == SEAL)]
+    variants = [v for v in league['variants'] if v['checkpoint'] in ids]
+    rated = ids+[v['id'] for v in variants]
+    reports = [r for r in load_reports(run) if r['candidate'] in rated and (r['opponent'] in rated or r['opponent'] == SEAL)]
     seal_games = sum(len(r['games']) for r in reports if r['opponent'] == SEAL)
-    names = ids+([SEAL] if seal_games else [])
+    names = rated+([SEAL] if seal_games else [])
     point, intervals, draws = rate(names, ids[0], reports, seed=config.seed) if ids else ({}, {}, {})
-    for c in league['checkpoints']:
+    for c in league['checkpoints']+league['variants']:
         c['elo'], c['elo_interval'] = point.get(c['id']), intervals.get(c['id'])
     # a-b intervals of the variant heads come from the same joint draws.
     heads = [c['id'] for _, c in sorted(variant_heads(league['checkpoints'], lambda c: point.get(c['id']) is not None).items())]
@@ -490,15 +714,20 @@ def write_league(run, league, config, top=None):
     best = sorted((c['id'] for c in league['checkpoints'] if point.get(c['id']) is not None and not c.get('demoted')),
                   key=lambda k: -point[k])[:league['ladder_top']]
     league['ladder'] = [difference(a, b) for i, a in enumerate(best) for b in best[i+1:]]
-    anchored = sorted((r for r in reports if r['opponent'] == SEAL), key=lambda r: ids.index(r['candidate']))
+    anchored = sorted((r for r in reports if r['opponent'] == SEAL and r['candidate'] in ids), key=lambda r: ids.index(r['candidate']))
     matches = [dict(checkpoint=r['candidate'], **{k: r['summary'][k] for k in ('wins', 'losses', 'capped', 'games', 'elo_delta')})
                for r in anchored]
     league['anchors'] = {SEAL: dict(elo=point.get(SEAL), elo_interval=intervals.get(SEAL), games=seal_games, matches=matches,
                                     latest_delta=matches[-1]['elo_delta'] if matches else None)}
     league['matrix'] = payoff(reports, point)
+    league['calibration'] = calibration(league, reports)
     league['rating_note'] = RATING_NOTE
     league['updated_at'] = time.time()
     write_json(run/'league.json', league)
+    adopted = {v['id'] for v in league['variants']}
+    for cid, path in requests(run).items():
+        if cid in adopted:
+            path.unlink()
 
 
 class Pacer:
@@ -548,10 +777,19 @@ class Pool:
     Games belong to lanes (any hashable pairing key); add(lane, games) starts them at once, step() advances the
     engine once and returns [(lane, record)] of the games that finished, so a finished game's slot can be refilled
     before the next step. running() counts games in flight (`running`); moves() is the
-    placements played after their openings by the games in flight."""
+    placements played after their openings by the games in flight. close() stops the engine's solver."""
 
     def __init__(self, leaf_batch):
         self.engine, self.games, self.ready = Engine(leaf_batch), {}, []
+        self.started = time.perf_counter()
+
+    def solver(self):
+        """dense_solver.Solver.summary of the pool's queries so far, None before its first solver search."""
+        solver = self.engine.solver
+        return solver.summary(time.perf_counter()-self.started) if solver else None
+
+    def close(self):
+        self.engine.close()
 
     def add(self, lane, games):
         for game in games:
@@ -597,6 +835,16 @@ def public(verdict):
     return out
 
 
+def brief(cid, opponent, kind, verdict=None):
+    """One status `pending` entry: {candidate, opponent, kind, p_better, delta, delta_sd, direct {games, wins,
+    losses, capped}} of `verdict` (`public` rules: the numbers are None without a direct game), without a verdict
+    the numbers None and the direct record 0."""
+    shown = public(verdict) if verdict else {}
+    direct = shown.get('direct', {})
+    return dict(candidate=cid, opponent=opponent, kind=kind, p_better=shown.get('p_better'), delta=shown.get('delta'),
+                delta_sd=shown.get('delta_sd'), direct={k: direct.get(k, 0) for k in ('games', 'wins', 'losses', 'capped')})
+
+
 def match_entry(opponent, report):
     s = report['summary']
     return dict(opponent=opponent, wins=s['wins'], losses=s['losses'], capped=s['capped'], games=s['games'],
@@ -608,19 +856,27 @@ class Evaluator:
     """The `loop` evaluator of one run (module contract) with `settings` in place of config.evaluation.
     step() does one unit of work, played as a `session` of the continuous pool (`Pool`, pool_games in flight).
     publish() maintains evaluator-status.json: {stage ('idle', 'playing', 'throttled' or 'failed'), updated_at,
-    comparison ({candidate, opponent, kind 'champion', 'evidence', 'previous', 'anchor', 'panel', 'incumbent',
-    'sprt', 'replacement', 'fill' or 'generalization'} of the session's main lane, or null), pool ([{candidate,
+    comparison ({candidate, opponent, kind 'champion', 'variant', 'evidence', 'previous', 'anchor', 'panel',
+    'incumbent', 'sprt', 'replacement', 'fill' or 'generalization'} of the session's main lane, or null), pool ([{candidate,
     opponent, kind, running, share}] per lane: games in flight and the games in flight it wants), started_at
     (epoch seconds when the session began), games_played (the main lane's report games plus its finished games
     whose colour partner still runs), games_planned (sprt_max_games for the champion, which plays until decided,
-    superseded or that many; else the comparison's target), tally (`tally` of those games, with the SPRT fields
-    for kinds 'champion' and 'sprt'; refreshed with the status as games finish; null while idle), decision (the
-    newest posterior `verdict` without its posterior, with next [[a, b], ...] lanes while pending; null before
-    any), placements_played and placements_per_second (the session's placements after openings, including the
+    superseded or that many; else the comparison's target), tally (`tally` of every recorded game of the main
+    lane's pair, `direct`, plus its finished games whose colour partner still runs, with the SPRT fields for kinds
+    'champion' and 'sprt'; refreshed with the status as games finish; null while idle), decision (the
+    newest `verdict` of a checkpoint or variant decision, `public`, with candidate, opponent and, while pending,
+    next [[a, b], ...] lanes; null before any), pending ([`brief`] of every pending decision: the unrated
+    checkpoints against the champion, then the variants without a verdict against their checkpoints; refreshed
+    every step and, for the one being decided, after every completed colour pair; it leaves once decided),
+    placements_played and
+    placements_per_second (the session's placements after openings, including the
     games in flight, and per second), mean_placements (per finished game of the main lane in the session, null
     before any),
     settings (the effective EvaluationSettings), eval_share (the Pacer's share: 1 with --once), backlog (unrated
-    checkpoint ids at the last step), eval_share_used (Pacer.used), vram (hexnet.vram()), error}. Match events,
+    checkpoint ids at the last step), eval_share_used (Pacer.used), vram (hexnet.vram()), error, solver (the solver
+    settings' dense_solver.Budgets, `sides` {player: Budgets} of the session's players with their own budgets
+    (variants), and the session's query statistics, Pool.solver, as `queries`; None while every budget in use is
+    0)}. Match events,
     one per lane at the end of a session, carry the lane's games and placements, the session's seconds and
     worker_seconds (seconds times the lane's share of the session's placements)."""
 
@@ -628,14 +884,27 @@ class Evaluator:
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
-        if self.league['checkpoints'] and ('matrix' not in self.league or self.league.get('ladder_top') != settings.fill_top):
+        if self.league['checkpoints'] and ('matrix' not in self.league or 'calibration' not in self.league
+                                           or self.league.get('ladder_top') != settings.fill_top):
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         self.models, self.seal, self.written, self.fill_target, self.deciding, self.reviewed = {}, None, 0., None, None, False
         self.book, self.next, self.shas = {}, {}, {}
         self.status = dict(stage='idle', updated_at=None, comparison=None, pool=[], started_at=None, games_played=0,
-                           games_planned=0, tally=None, decision=None, placements_played=0, mean_placements=None,
+                           games_planned=0, tally=None, decision=None, pending=[], placements_played=0, mean_placements=None,
                            placements_per_second=None, settings=asdict(settings), eval_share=pacer.share, backlog=[],
-                           eval_share_used=0., error=None)
+                           eval_share_used=0., error=None, solver=self.solver_status(None))
+
+    def solver_status(self, pool, names=()):
+        """The status `solver` field for `pool` (None: no session) playing the players `names`: the evaluation
+        settings' Budgets, `sides` {name: Budgets} of the players whose own budgets (`side`) differ from them, and
+        `queries`; None while every budget in use is 0."""
+        budgets = Budgets.of(self.settings)
+        sides = {name: Budgets.of(self.side(name)) for name in dict.fromkeys(names) if name != SEAL}
+        sides = {name: b for name, b in sides.items() if b != budgets}
+        if not budgets.active and not any(b.active for b in sides.values()):
+            return None
+        return dict(asdict(budgets), sides={name: asdict(b) for name, b in sides.items()},
+                    queries=pool.solver() if pool else None)
 
     def publish(self, force=False, **fields):
         """Update the status; rewrite the file when forced or STATUS_SECONDS after the last write."""
@@ -650,7 +919,7 @@ class Evaluator:
         """Rewrite actor.json {checkpoint, reason, updated_at, vetoed} and log an 'actor_model' event when its
         checkpoint or vetoed list changes. The checkpoint is the newest complete checkpoint of config.learner.variant
         (reason 'newest'); once that checkpoint is demoted or the Elo interval (`tally`) of its games against the
-        champion it met (`met`, else the current champion; games count once their colour pair is complete) lies entirely below
+        champion it met (`met`, else the current champion; its `direct` games, counted once their colour pair is complete) lies entirely below
         veto_margin, it joins `vetoed` (the last 16 kept) for good and the checkpoint is the highest-rated one
         neither demoted, skipped nor vetoed (else the champion) until a newer export. Without a checkpoint of the
         variant nothing is written."""
@@ -663,7 +932,7 @@ class Evaluator:
         rival = self.met(newest) or self.league['champion']
         why = None
         if newest not in vetoed and rival not in (None, newest):
-            interval = tally(self.games(newest, rival))['elo_interval']
+            interval = tally(self.direct(newest, rival))['elo_interval']
             if entry.get('demoted'):
                 why = 'demoted by its panel'
             elif interval and interval[1] < self.settings.veto_margin:
@@ -682,15 +951,28 @@ class Evaluator:
                       previous=pointer['checkpoint'], reason=reason, vetoed=vetoed)
 
     def use(self, *names):
-        """Keep exactly the named checkpoints loaded (Seal once, lazily); games in flight hold their own models,
-        so a dropped model lives until its last game finishes."""
+        """Keep exactly the named checkpoints and variants loaded (Seal once, lazily), a variant as its own model
+        instance of its checkpoint's weights; games in flight hold their own models, so a dropped model lives
+        until its last game finishes."""
         for name in names:
             if name == SEAL:
                 self.seal = self.seal or Seal()
             elif name not in self.models:
-                self.models[name] = load(self.run, self.config, source=(name, self.run/'checkpoints'/name/'ema.pt'))
+                self.models[name] = load(self.run, self.config, source=(name, self.weights(name)))
         for name in [n for n in self.models if n not in names]:
             del self.models[name]
+
+    def weights(self, name):
+        """The ema.pt of checkpoint or variant `name`."""
+        return self.run/'checkpoints'/split_id(name)[0]/'ema.pt'
+
+    def overrides(self, name):
+        """The settings overrides of variant `name`, {} for a checkpoint or Seal."""
+        return (self.entry(name) or {}).get('settings', {}) if split_id(name)[1] else {}
+
+    def side(self, name):
+        """The EvaluationSettings that `name` searches with (`side_settings`)."""
+        return side_settings(self.settings, self.overrides(name))
 
     def games(self, a, b):
         """The games of report a-vs-b: the session's copy when it is open, else the file's when it was played
@@ -700,6 +982,11 @@ class Evaluator:
         path = report_path(self.run, a, b)
         report = json.loads(path.read_text()) if path.exists() else None
         return report['games'] if report and same_protocol(report, self.settings) else []
+
+    def direct(self, a, b):
+        """Every recorded game of a against b under the current protocol, from a's side (`oriented`): the games of
+        report a-vs-b and of report b-vs-a (`games`, so an open report includes the session's completed pairs)."""
+        return oriented(self.games(a, b), a, a)+oriented(self.games(b, a), b, a)
 
     def open(self, a, b):
         """Load report a-vs-b for appending and number its next opening pair after the highest one it holds, so a
@@ -719,11 +1006,12 @@ class Evaluator:
         self.next[a, b] = max((g['pair'] for g in self.book[a, b]), default=-1)+1
 
     def start(self, pool, lane):
-        """Start the next opening pair of lane (a, b, kind) in `pool`: both colours at once (`paired_games`)."""
+        """Start the next opening pair of lane (a, b, kind) in `pool`: both colours at once (`paired_games`), each
+        side searching with its own settings (`side`)."""
         a, b, _ = lane
         pair, self.next[a, b] = self.next[a, b], self.next[a, b]+1
         pool.add(lane, paired_games(self.models[a], SEAL if b == SEAL else self.models[b], 2, a, self.config, self.settings,
-                                    self.seal, pair, candidate=a, opponent=b))
+                                    self.seal, pair, (self.side(a), self.side(b)), candidate=a, opponent=b))
 
     def persist(self, a, b, kind, pair):
         """Append a completed colour pair to report a-vs-b and rewrite it (kind 'sprt' recomputes metrics.sprt,
@@ -731,8 +1019,9 @@ class Evaluator:
         records = self.book[a, b] = self.book[a, b]+pair
         for name in (a, b):
             if name != SEAL and name not in self.shas:
-                self.shas[name] = digest(self.run/'checkpoints'/name/'ema.pt')
-        report = make_report(a, b, records, self.shas, self.settings)
+                self.shas[name] = digest(self.weights(name))
+        report = make_report(a, b, records, self.shas, self.settings,
+                             {name: self.overrides(name) for name in (a, b) if self.overrides(name)})
         if kind == 'sprt':
             result = self.test(records)
             report['metrics']['sprt'] = dict(result, decision=result['decision'] or 'max-games')
@@ -766,14 +1055,17 @@ class Evaluator:
                 return  # the tally is computed only for a write
             main = next(iter(shown), None)
             a, b, kind = main or (None, None, None)
-            done = self.games(a, b)+[r for group in waiting.get(main, {}).values() for r in group] if a else []
+            halves = [r for group in waiting.get(main, {}).values() for r in group]
+            played = len(self.games(a, b))+len(halves) if a else 0
+            done = self.direct(a, b)+oriented(halves, a, a) if a else []
             live = placed+pool.moves()
             self.publish(True, stage=stage, comparison=dict(candidate=a, opponent=b, kind=kind) if a else None,
                          pool=[dict(candidate=x, opponent=y, kind=k, running=pool.running((x, y, k)), share=lanes.get((x, y, k), 0))
-                               for x, y, k in shown], started_at=wall, games_played=len(done), games_planned=planned,
+                               for x, y, k in shown], started_at=wall, games_played=played, games_planned=planned,
                          tally=tally(done, self.test if kind in ('champion', 'sprt') else None), placements_played=live,
                          mean_placements=added[main][1]/added[main][0] if main in added else None,
-                         placements_per_second=live/max(self.pacer.clock()-start, 1e-9))
+                         placements_per_second=live/max(self.pacer.clock()-start, 1e-9),
+                         solver=self.solver_status(pool, [name for lane in shown for name in lane[:2]]))
         while True:
             for a, b, _ in lanes:
                 self.open(a, b)
@@ -816,6 +1108,7 @@ class Evaluator:
             if paired:
                 lanes = want()
         show('playing', True)
+        pool.close()
         seconds = self.pacer.clock()-start
         for (a, b, kind), (games, moves) in added.items():
             records = self.games(a, b)
@@ -838,8 +1131,13 @@ class Evaluator:
         known = {c['id'] for c in self.league['checkpoints']}
         return any(e[0] != cid and e[0].split('/')[0] == cid.split('/')[0] and e[0] not in known for e in checkpoints(self.run))
 
+    def variants(self):
+        """The league's variant entries (league contract), in registration order."""
+        return self.league.setdefault('variants', [])
+
     def entry(self, cid):
-        return next((c for c in self.league['checkpoints'] if c['id'] == cid), None)
+        """The league entry of checkpoint or variant cid, or None."""
+        return next((c for c in self.league['checkpoints']+self.variants() if c['id'] == cid), None)
 
     def close(self, a, b):
         """Whether the league's current Elo of a and b (Seal: anchors.seal.elo) makes their pairing `informative`
@@ -950,36 +1248,62 @@ class Evaluator:
         return sprt(records, s.sprt_elo0, s.sprt_elo1, s.sprt_alpha, s.sprt_beta)
 
     def verdict(self, cid, champion):
-        """The posterior decision on candidate cid against the champion (module contract), from every
-        protocol-matching report among the league's rated ids, cid and Seal: {decision ('promote', 'reject' or
-        None), delta and delta_sd (r_cid - r_champion + their matchup deviation), p_better (P(delta >
-        sprt_elo0)), pooled (95% interval of r_cid - r_champion without it), direct {games, elo, interval}
-        (`tally` of their own games), disagree (the direct and pooled intervals do not overlap), spread (rating sd
-        of cid and of the champion about the league mean), leader (the rated or candidate checkpoint of highest
-        posterior rating)}, plus `posterior` (the Posterior) for pairing."""
+        """The posterior decision on candidate cid against the champion (module contract), or on variant cid
+        against its checkpoint `champion`, from every protocol-matching report among the league's rated
+        checkpoints and variants, cid, the opponent and Seal, each rating's prior centred on its parent's
+        (dense_posterior.parents), so a candidate without games sits at its previous export: {decision ('promote', 'reject' or None; for a
+        variant 'better', 'worse' or None), rule and threshold (the rule in force: 'posterior' with
+        promote_confidence, or with decision 'sprt' for a checkpoint 'sprt' with sprt_elo1), comparison ('champion' or
+        'variant'), delta and delta_sd (r_cid - r_champion + their matchup deviation), p_better (P(delta >
+        sprt_elo0)), pooled (95% interval of r_cid - r_champion without it), direct {games, wins, losses, capped,
+        elo, interval} (`tally` of their `direct` games), disagree (the direct and pooled intervals do not overlap),
+        spread (rating sd of cid and of the champion about the league mean), leader (the rated or candidate
+        checkpoint of highest posterior rating; variants never lead)}, plus `posterior` (the Posterior) for
+        pairing. A variant needs no lead."""
         s = self.settings
-        rated = [c['id'] for c in self.league['checkpoints'] if c.get('elo') is not None and not c.get('skipped')]
-        ids = list(dict.fromkeys(rated+[champion, cid]))
-        reports = [r for r in load_reports(self.run, s) if r['candidate'] in ids+[SEAL] and r['opponent'] in ids+[SEAL]]
-        if any(SEAL in (r['candidate'], r['opponent']) for r in reports):
-            ids.append(SEAL)
+        ids, reports = self.inputs(cid, champion)
         post = Posterior(ids, ids[0], [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
-                                       r['summary']['games']) for r in reports], s.matchup_prior_elo)
+                                       r['summary']['games']) for r in reports], s.matchup_prior_elo, parents(ids))
         mean, sd = post.difference(cid, champion)
         pooled_mean, pooled_sd = post.difference(cid, champion, False)
         pooled = [pooled_mean-1.96*pooled_sd, pooled_mean+1.96*pooled_sd]
-        t = tally(self.games(cid, champion))
+        t = tally(self.direct(cid, champion))
         interval = t['elo_interval']
         disagree = bool(interval) and (interval[1] < pooled[0] or interval[0] > pooled[1])
         spread = [post.spread(cid), post.spread(champion)]
-        leader = max((i for i in ids if i != SEAL and not (self.entry(i) or {}).get('demoted')), key=post.rating)
+        leader = max((i for i in ids if i != SEAL and not split_id(i)[1] and not (self.entry(i) or {}).get('demoted')),
+                     key=post.rating)
         p_better = .5*math.erfc((s.sprt_elo0-mean)/(max(sd, 1e-9)*math.sqrt(2)))
-        ready = t['games'] >= s.sprt_min_games and spread[0] <= spread[1]*s.uncertainty_parity and not disagree
-        decision = 'promote' if ready and leader == cid and p_better >= s.promote_confidence else \
-            'reject' if ready and p_better <= 1-s.promote_confidence else None
-        return dict(decision=decision, delta=mean, delta_sd=sd, p_better=p_better, pooled=pooled,
-                    direct=dict(games=t['games'], elo=t['elo_delta'], interval=interval), disagree=disagree,
-                    spread=spread, leader=leader, posterior=post)
+        if split_id(cid)[1]:
+            kind, rule, threshold = 'variant', 'posterior', s.promote_confidence
+            decision = dict(promote='better', reject='worse').get(judge(s, t['games'], disagree, True, p_better))
+        else:
+            kind, rule = 'champion', s.decision
+            threshold = s.sprt_elo1 if rule == 'sprt' else s.promote_confidence
+            decision = judge(s, t['games'], disagree, leader == cid, p_better)
+        return dict(decision=decision, rule=rule, threshold=threshold, comparison=kind, delta=mean, delta_sd=sd,
+                    p_better=p_better, pooled=pooled, direct=dict(games=t['games'], wins=t['wins'], losses=t['losses'],
+                    capped=t['capped'], elo=t['elo_delta'], interval=interval), disagree=disagree, spread=spread,
+                    leader=leader, posterior=post)
+
+    def inputs(self, cid, champion):
+        """(ids, reports) of the `verdict` posterior on cid against the champion: the league's rated ids, the
+        champion, cid and Seal when it has a report among them; every protocol-matching report among those."""
+        rated = [c['id'] for c in self.league['checkpoints']+self.variants() if c.get('elo') is not None and not c.get('skipped')]
+        ids = list(dict.fromkeys(rated+[champion, cid]))
+        reports = [r for r in load_reports(self.run, self.settings) if r['candidate'] in ids+[SEAL] and r['opponent'] in ids+[SEAL]]
+        if any(SEAL in (r['candidate'], r['opponent']) for r in reports):
+            ids.append(SEAL)
+        return ids, reports
+
+    def snapshot(self, cid, champion):
+        """What a decided verdict records for `calibration`: {opponent (the champion), protocol ({PROTOCOL setting:
+        value}), matchup_prior (the effective matchup_prior_elo), reports ({report name: {games, digest
+        (`games_digest`)}} of every report the verdict's posterior uses, `inputs`)}."""
+        s = self.settings
+        return dict(opponent=champion, protocol={k: getattr(s, k) for k in PROTOCOL}, matchup_prior=s.matchup_prior_elo,
+                    reports={report_name(r): dict(games=len(r['games']), digest=games_digest(r['games']))
+                             for r in self.inputs(cid, champion)[1]})
 
     def evidence(self, verdict, cid, champion, games):
         """(a, b) of the evidence pairing for a pending posterior decision, or None: of cid and the champion each
@@ -1004,15 +1328,15 @@ class Evaluator:
         return best if best and after(best) < after((cid, champion)) else None
 
     def lanes(self, verdict, cid, champion):
-        """The pool's lanes for a pending posterior decision: direct games of cid vs the champion fill the pool
-        (never beyond sprt_max_games direct games) until sprt_min_games of them are complete and while the direct
-        and pooled estimates disagree; after that an `evidence` pairing that beats direct games gets
-        evidence_share of the pool and the direct games the rest."""
+        """The pool's lanes for a pending posterior decision: direct games of cid vs the champion (lane kind
+        verdict['comparison']) fill the pool (never beyond sprt_max_games direct games) until sprt_min_games of them are
+        complete and while the direct and pooled estimates disagree; after that an `evidence` pairing that beats
+        direct games gets evidence_share of the pool and the direct games the rest."""
         s, direct = self.settings, verdict['direct']['games']
         room = even(min(s.pool_games, s.sprt_max_games-direct))
         share = even(s.pool_games*s.evidence_share)
         other = self.evidence(verdict, cid, champion, share) if share and direct >= s.sprt_min_games and not verdict['disagree'] else None
-        lanes = {(cid, champion, 'champion'): min(room, s.pool_games-share) if other else room}
+        lanes = {(cid, champion, verdict['comparison']): min(room, s.pool_games-share) if other else room}
         if other:
             lanes[(*other, 'evidence')] = share
         return {lane: n for lane, n in lanes.items() if n >= 2}
@@ -1024,16 +1348,17 @@ class Evaluator:
         and the final verdict settles it: superseded, cid is
         promoted when p_better >= promote_confidence (settled true), readiness aside. Returns ({opponent: report of
         cid against it}, verdict with decision 'promote', 'reject', 'max-games' or 'superseded'), or ({}, None)
-        without a direct game. The verdict (`public`) is published as status decision, stored as the direct
+        without a game in its report against the champion. The verdict (`public`) is published as status decision, stored as the direct
         report's metrics.posterior and logged as a 'decision' event."""
         s = self.settings
 
         def want():
             verdict = self.verdict(cid, champion)
+            self.refresh(cid, champion, verdict)
             if verdict['decision'] or verdict['direct']['games'] >= s.sprt_max_games or self.newer(cid):
                 return {}
             lanes = self.lanes(verdict, cid, champion)
-            self.publish(decision=dict(public(verdict), candidate=cid, next=[list(l[:2]) for l in lanes]))
+            self.publish(decision=dict(public(verdict), candidate=cid, opponent=champion, next=[list(l[:2]) for l in lanes]))
             return lanes
         while True:  # the games in flight can undo a verdict that stopped the session: then play on
             added = self.session(want, s.sprt_max_games)
@@ -1043,10 +1368,10 @@ class Evaluator:
             verdict = self.verdict(cid, champion)
             if verdict['decision'] or not added or verdict['direct']['games'] >= s.sprt_max_games or self.newer(cid):
                 break
-        if not verdict['direct']['games']:
+        if not self.games(cid, champion):
             return {}, None
         superseded = self.newer(cid)
-        verdict = dict(public(verdict), candidate=cid)
+        verdict = dict(public(verdict), candidate=cid, **self.snapshot(cid, champion))
         if not verdict['decision'] and superseded and verdict['p_better'] >= s.promote_confidence:
             verdict.update(decision='promote', settled=True)
         verdict['decision'] = verdict['decision'] or ('superseded' if superseded else 'max-games')
@@ -1054,43 +1379,106 @@ class Evaluator:
         report = json.loads(path.read_text())
         report['metrics']['posterior'] = verdict
         write_json(path, report)
-        self.publish(True, decision=verdict)
+        self.publish(True, decision=verdict, pending=[p for p in self.status['pending'] if p['candidate'] != cid])
         direct, g = verdict['direct'], lambda v: f'{v:+.0f}' if v is not None else '-'
         log_event(self.run, 'evaluator', 'decision', f'{cid} vs {champion}: {verdict["decision"]}'
                   + (' (settled on supersession)' if superseded else '') + f' after {direct["games"]} direct games: '
                   f'P(delta > {s.sprt_elo0:g}) {verdict["p_better"]:.3f}, delta {g(verdict["delta"])} +- {verdict["delta_sd"]:.0f}, '
                   f'direct {g(direct["elo"])}, pooled [{verdict["pooled"][0]:+.0f}, {verdict["pooled"][1]:+.0f}]',
-                  opponent=champion, **verdict)
+                  **verdict)
         found = {r['opponent']: r for r in load_reports(self.run, s) if r['candidate'] == cid}
         return {champion: found[champion], **found}, verdict
+
+    def refresh(self, cid, opponent, verdict):
+        """Replace cid's entry of status `pending` by `brief` of its current `verdict`."""
+        self.status['pending'] = [brief(cid, opponent, verdict['comparison'], verdict) if p['candidate'] == cid else p
+                                  for p in self.status['pending']]
+
+    def queue(self, unrated):
+        """Set status `pending` (class contract) for the unrated checkpoint ids `unrated`; a verdict is computed
+        only for a pairing with direct games."""
+        champion = self.league['champion']
+        pairs = [(cid, champion, 'champion') for cid in unrated] + \
+            [(v['id'], v['checkpoint'], 'variant') for v in self.variants() if 'verdict' not in v]
+        self.status['pending'] = [brief(cid, opponent, kind, self.verdict(cid, opponent) if opponent and self.direct(cid, opponent) else None)
+                                  for cid, opponent, kind in pairs]
+
+    def trial(self, entry):
+        """Decide the pending variant `entry` against its checkpoint (module contract): a session like `decide`'s
+        whose lanes (`lanes`, kind 'variant') follow the verdict after every completed colour pair until it
+        decides ('better' or 'worse'), sprt_max_games direct games are complete, or a checkpoint awaits rating;
+        the games in flight then finish and count (play resumes when they leave the verdict undecided). Stopped
+        for a waiting checkpoint the variant stays pending and resumes on a later step; otherwise the final
+        verdict (`public`, decision 'better', 'worse' or 'max-games', with candidate and opponent) is stored as
+        the entry's verdict and the direct report's metrics.posterior, published as status decision and logged
+        as a 'decision' event with P(better), delta, delta_sd and its 95% interval. Every report played is
+        recorded in the league (`record`)."""
+        s, cid, base = self.settings, entry['id'], entry['checkpoint']
+
+        def want():
+            verdict = self.verdict(cid, base)
+            self.refresh(cid, base, verdict)
+            if verdict['decision'] or verdict['direct']['games'] >= s.sprt_max_games or self.backlog():
+                return {}
+            lanes = self.lanes(verdict, cid, base)
+            self.publish(decision=dict(public(verdict), candidate=cid, opponent=base, next=[list(l[:2]) for l in lanes]))
+            return lanes
+        while True:
+            added = self.session(want, s.sprt_max_games)
+            for (a, b, _), games in added.items():
+                if games:
+                    self.record(a, b, json.loads(report_path(self.run, a, b).read_text()))
+            verdict = self.verdict(cid, base)
+            if verdict['decision'] or not added or verdict['direct']['games'] >= s.sprt_max_games or self.backlog():
+                break
+        if not verdict['decision'] and verdict['direct']['games'] < s.sprt_max_games:
+            return
+        verdict = dict(public(verdict), candidate=cid, opponent=base)
+        verdict['decision'] = verdict['decision'] or 'max-games'
+        path = report_path(self.run, cid, base)
+        report = json.loads(path.read_text())
+        report['metrics']['posterior'] = verdict
+        write_json(path, report)
+        entry['verdict'] = verdict
+        self.record(cid, base, report)
+        self.publish(True, decision=verdict, pending=[p for p in self.status['pending'] if p['candidate'] != cid])
+        low, high = verdict['delta']-1.96*verdict['delta_sd'], verdict['delta']+1.96*verdict['delta_sd']
+        log_event(self.run, 'evaluator', 'decision', f'{cid} vs {base}: {verdict["decision"]} after {verdict["direct"]["games"]} '
+                  f'direct games: P(delta > {s.sprt_elo0:g}) {verdict["p_better"]:.3f}, delta {verdict["delta"]:+.0f} +- '
+                  f'{verdict["delta_sd"]:.0f} [{low:+.0f}, {high:+.0f}]', interval=[low, high], **verdict)
 
     def review(self):
         """Posterior mode, once per evaluator (so after every restart or settings change): re-apply the promotion
         rule to the existing reports. Of the rated checkpoints, neither skipped nor demoted, with at least
-        sprt_min_games direct games against the champion (their report against it), those whose `verdict`
-        meets uncertainty parity, P(delta > sprt_elo0) >= promote_confidence and agreeing direct and pooled
-        intervals are eligible; the one of highest posterior rating among them is promoted ('decision' event
-        'promote on review', then the 'promotion' event; its Seal anchor is scheduled as for any promotion). A
-        higher-rated checkpoint without those direct games does not block it: it has not met the champion."""
+        sprt_min_games direct games against the champion (`direct`), those whose `verdict`
+        is `ready` with P(delta > sprt_elo0) >= promote_confidence are eligible; the one of highest posterior
+        rating among them is promoted when it also out-rates the champion and every other checkpoint with those
+        direct games ('decision' event 'promote on review', then the 'promotion' event; its Seal anchor is scheduled
+        as for any promotion), and its entry keeps that verdict with its `snapshot`. A higher-rated checkpoint
+        without those direct games does not block it: it has not met the champion."""
         s, champion = self.settings, self.league['champion']
         if s.decision != 'posterior' or champion is None:
             return
-        eligible = []
+        eligible, met = [], [champion]
         for c in self.league['checkpoints']:
             if c['id'] == champion or c.get('elo') is None or c.get('skipped') or c.get('demoted') \
-                    or len(self.games(c['id'], champion)) < s.sprt_min_games:
+                    or len(self.direct(c['id'], champion)) < s.sprt_min_games:
                 continue
+            met.append(c['id'])
             verdict = self.verdict(c['id'], champion)
-            if verdict['spread'][0] <= verdict['spread'][1]*s.uncertainty_parity and not verdict['disagree'] \
+            if ready(s, verdict['direct']['games'], verdict['disagree']) \
                     and verdict['p_better'] >= s.promote_confidence:
                 eligible.append((verdict['posterior'].rating(c['id']), c['id'], verdict))
         if not eligible:
             return
         _, cid, verdict = max(eligible)
-        verdict = dict(public(verdict), candidate=cid, decision='promote', review=True)
+        if max(met, key=verdict['posterior'].rating) != cid:
+            return
+        verdict = dict(public(verdict), candidate=cid, decision='promote', review=True, **self.snapshot(cid, champion))
         log_event(self.run, 'evaluator', 'decision', f'{cid} vs {champion}: promote on review of the existing reports '
                   f'({verdict["direct"]["games"]} direct games, P(delta > {s.sprt_elo0:g}) {verdict["p_better"]:.3f})',
-                  opponent=champion, **verdict)
+                  **verdict)
+        self.entry(cid)['verdict'] = verdict
         self.promote(cid, champion)
         write_league(self.run, self.league, self.config, self.settings.fill_top)
 
@@ -1100,8 +1488,16 @@ class Evaluator:
         before them stays the decision). Returns ({champion:
         report}, metrics.sprt) with decision 'H1', 'H0', 'max-games' or 'superseded', settled as the module
         contract states ('settle' event: promoted when the posterior p_better of `verdict` is at least
-        promote_confidence), or ({}, None) without a game."""
+        promote_confidence), or ({}, None) without a game. The status decision is the posterior `verdict` of
+        the direct games with the SPRT's decision (None while pending), published after every completed colour
+        pair and at the end."""
         s, decided = self.settings, []
+
+        def shown(decision=None):
+            """The status decision: the posterior `verdict` numbers with the SPRT's decision (None while pending)."""
+            verdict = self.verdict(cid, champion)
+            self.refresh(cid, champion, verdict)
+            return dict(public(verdict), decision=decision, candidate=cid, opponent=champion)
 
         def want():
             games = self.games(cid, champion)
@@ -1109,6 +1505,8 @@ class Evaluator:
                 decided.append(decision)
             if decided or len(games) >= s.sprt_max_games or self.newer(cid):
                 return {}
+            if games:
+                self.publish(decision=dict(shown(), next=[[cid, champion]]))
             return {(cid, champion, 'champion'): even(min(s.pool_games, s.sprt_max_games-len(games)))}
         self.session(want, s.sprt_max_games)
         path = report_path(self.run, cid, champion)
@@ -1118,16 +1516,19 @@ class Evaluator:
         result, n = self.test(report['games']), len(report['games'])
         decision = decided[0] if decided else 'superseded' if n < s.sprt_max_games and self.newer(cid) else 'max-games'
         test = report['metrics']['sprt'] = dict(result, decision=decision)
+        final = shown(decision)
+        self.publish(True, decision=final, pending=[p for p in self.status['pending'] if p['candidate'] != cid])
         summary_ = report['summary']
         if test['decision'] == 'superseded':
-            p_better = self.verdict(cid, champion)['p_better']
+            p_better = final['p_better']
             settled = test['settled'] = dict(pair_score=summary_['pair_score'], p_better=p_better,
                                              promote=p_better >= s.promote_confidence)
             log_event(self.run, 'evaluator', 'settle', f'{cid} vs {champion} settled on supersession after {n} games: '
                       f'+{summary_["wins"]} -{summary_["losses"]} ={summary_["capped"]}, pair score {summary_["pair_score"]:.3f}, '
                       f'P(delta > {s.sprt_elo0:g}) {p_better:.3f}, LLR {test["llr"]:.2f}: '
                       + ('promoted' if settled['promote'] else 'not promoted'),
-                      candidate=cid, opponent=champion, games=n, llr=test['llr'], **settled)
+                      candidate=cid, opponent=champion, games=n, llr=test['llr'], rule=final['rule'],
+                      threshold=final['threshold'], **settled)
         write_json(path, report)
         return {champion: report}, test
 
@@ -1266,7 +1667,8 @@ class Evaluator:
         restart resumes there, or settles on its games when superseded). Then, on the first step, the promotion
         rule is re-applied to the existing reports (`review`). Then it rates the newest unrated checkpoint of the
         variant whose newest unrated checkpoint is oldest, skipping that variant's older unrated checkpoints (none
-        of them has games against the champion), or else plays a session of the champion's Seal anchor
+        of them has games against the champion), or else decides the first pending variant (`trial`, in
+        registration order; waiting registrations are adopted into league.json first), or else plays a session of the champion's Seal anchor
         (`anchor`), else of an optional comparison, else of fill work (`fill`), each until its games are complete
         or a checkpoint waits (the games in flight then finish and count)."""
         self.settle()
@@ -1278,9 +1680,12 @@ class Evaluator:
                       f'against {champion}; it is rated on them', candidate=c['id'])
         if revived:
             write_league(self.run, self.league, self.config, self.settings.fill_top)
+        if adopt(self.league, self.run):
+            write_league(self.run, self.league, self.config, self.settings.fill_top)
         known = {c['id'] for c in self.league['checkpoints']}
         unrated = [e for e in checkpoints(self.run) if e[0] not in known]
         self.status['backlog'] = [e[0] for e in unrated]
+        self.queue(self.status['backlog'])
         resumed = [e for e in unrated if champion and self.games(e[0], champion)]
         if resumed:
             self.filling(None)
@@ -1303,6 +1708,11 @@ class Evaluator:
                           checkpoints=skipped, candidate=head[0])
             self.rate(head)
             return True
+        for entry in self.variants():
+            if 'verdict' not in entry:
+                self.filling(None)
+                self.trial(entry)
+                return True
         task = self.anchor() or self.optional() or self.fill()
         self.filling(None if task is None or task[2] not in ('fill', 'generalization') else 'seal' if task[1] == SEAL
                      else f'{"generalization " if task[2] == "generalization" else ""}{task[0]["id"]} vs {task[1]}')
@@ -1347,15 +1757,16 @@ def loop(args):
     if not 0 <= settings.evidence_share < 1:
         raise ValueError('evidence_share must be in [0, 1)')
     if settings.decision not in ('posterior', 'sprt') or not .5 < settings.promote_confidence < 1 \
-            or settings.uncertainty_parity <= 0 or settings.matchup_prior_elo < 0 or settings.sprt_min_games < 2:
-        raise ValueError("decision is 'posterior' or 'sprt', promote_confidence in (0.5, 1), uncertainty_parity > 0, "
-                         'matchup_prior_elo >= 0 and sprt_min_games at least one opening pair')
+            or settings.matchup_prior_elo < 0 or settings.sprt_min_games < 2:
+        raise ValueError("decision is 'posterior' or 'sprt', promote_confidence in (0.5, 1), matchup_prior_elo >= 0 "
+                         'and sprt_min_games at least one opening pair')
     if settings.anchor_games and settings.anchor_every < 1:
         raise ValueError('anchor_every must be at least 1 while anchor games are enabled')
     if settings.anchor_target_halfwidth < 0 or settings.fill_top < 0 or not .5 <= settings.max_expected_score <= 1:
         raise ValueError('anchor_target_halfwidth and fill_top must be at least 0, max_expected_score in [0.5, 1]')
     if settings.opening_suite not in ('standard-v1', 'mixed-v1'):
         raise ValueError("the evaluator draws openings with train.task_opening: opening_suite 'standard-v1' or 'mixed-v1'")
+    Budgets.of(settings)
     if args.once:
         settings = replace(settings, idle_fill=False)  # fill work never runs out
     evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share))
@@ -1441,26 +1852,37 @@ def calibrate(args):
 
 
 def match(args):
+    """Paired match of --a against --b; each side has its own model instance, trees and solver budgets."""
     run = Path(args.run)
     config = dense_config.load(run)
     settings = config.evaluation
     if args.sims:
         settings = replace(settings, sims=args.sims, root_samples=min(settings.root_samples, args.sims))
-    models = {}
-    for name in (args.a, args.b):
-        if name != SEAL and name not in models:
-            path = Path(name) if Path(name).is_file() else run/'checkpoints'/name/'ema.pt'
-            models[name] = load(run, config, source=(name, path))
-    if args.a == args.b:
-        raise ValueError('A match needs two distinct players')
+    sides = {side: replace(settings, **{'solver_'+f: getattr(args, f'{side}_solver_{f}') for f in asdict(Budgets())
+                                        if getattr(args, f'{side}_solver_{f}') is not None}) for side in 'ab'}
+    budgets = {side: Budgets.of(s) for side, s in sides.items()}
     if args.a == SEAL:
         raise ValueError('Seal plays as --b; pass the checkpoint as --a')
+    if args.a == args.b and budgets['a'] == budgets['b']:
+        raise ValueError('A match needs two distinct players: other checkpoints or other solver budgets')
+    models = {}
+    for side, name in (('a', args.a), ('b', args.b)):
+        if name != SEAL:
+            path = Path(name) if Path(name).is_file() else run/'checkpoints'/name/'ema.pt'
+            models[side] = load(run, config, source=(name, path))
     started = time.perf_counter()
-    records = play(paired_games(models[args.a], SEAL if args.b == SEAL else models[args.b], args.games,
+    records = play(paired_games(models['a'], SEAL if args.b == SEAL else models['b'], args.games,
                                 f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None,
-                                candidate=args.a, opponent=args.b), config.actor.leaf_batch)
-    report = make_report(args.a, args.b, records, {n: m.sha for n, m in models.items()}, settings)
-    print(json.dumps(dict(summary=report['summary'], metrics=report['metrics'], seconds=time.perf_counter()-started), indent=2))
+                                sides=(sides['a'], sides['b']), candidate=args.a, opponent=args.b),
+                   config.actor.leaf_batch)
+    report = make_report(args.a, args.b, records, {m.checkpoint: m.sha for m in models.values()}, settings)
+    print(json.dumps(dict(summary=report['summary'], metrics=report['metrics'], seconds=time.perf_counter()-started,
+                          solver={side: asdict(b) for side, b in budgets.items()}), indent=2))
+
+
+def variant(args):
+    """Register --checkpoint@--name with the --set overrides (`register`) and print its entry."""
+    print(json.dumps(register(args.run, args.checkpoint, args.name, parse_settings(args.set)), indent=2))
 
 
 def main():
@@ -1475,8 +1897,15 @@ def main():
     p.add_argument('--extra', type=int, default=256)
     p = sub.add_parser('match'); p.add_argument('--run', required=True); p.add_argument('--a', required=True)
     p.add_argument('--b', required=True); p.add_argument('--games', type=int, default=32); p.add_argument('--sims', type=int)
+    for side in 'ab':
+        for name in asdict(Budgets()):
+            p.add_argument(f'--{side}-solver-{name.replace("_", "-")}', dest=f'{side}_solver_{name}', type=int,
+                           help=f'solver_{name} of --{side} (default: the evaluation setting)')
+    p = sub.add_parser('variant'); p.add_argument('--run', required=True); p.add_argument('--checkpoint', required=True)
+    p.add_argument('--name', required=True)
+    p.add_argument('--set', action='append', default=[], metavar='KEY=VALUE', help=f'one of {", ".join(SIDE)}; repeatable')
     args = parser.parse_args()
-    dict(loop=loop, calibrate=calibrate, match=match)[args.command](args)
+    dict(loop=loop, calibrate=calibrate, match=match, variant=variant)[args.command](args)
 
 
 if __name__ == '__main__':
