@@ -183,6 +183,7 @@ class EvaluationSettings:
     fill_top: int = 3             # then fill the widest Elo-difference interval among this many top-rated checkpoints
     veto_margin: float = -30.     # actor.json skips the newest checkpoint once its Elo interval vs its champion lies below this
     max_expected_score: float = .85  # panel, optional and fill pairings only while either side's expected score is at most this
+    rebase_on_promotion: bool = True  # a variant registered against the champion follows a new champion until it starts
     # Solver node budgets of both sides of every evaluation game, as ActorSettings.solver_*; 0 = off.
     solver_root_nodes: int = 0
     solver_finalists: int = 0

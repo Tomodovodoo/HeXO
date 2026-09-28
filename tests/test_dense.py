@@ -3000,6 +3000,59 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(self.league()['variants'][0]['verdict']['decision'], 'max-games')
         self.assertEqual(len(evaluator.games(variant, base)), 40)
 
+    def crown(self, evaluator, step):
+        """Make exported checkpoint main/<step> a rated league entry and the champion, as a promotion would."""
+        evaluator.league['checkpoints'].append(dict(id=f'main/{step:06d}', variant='main', step=step, elo=0., matches=[]))
+        evaluator.crown(f'main/{step:06d}')
+
+    def test_a_champion_variant_binds_when_its_comparison_starts(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=4, sprt_min_games=4, pool_games=2)
+        with self.assertRaises(ValueError):
+            dense_eval.register(self.run, 'champion', 'solver', dict(sims=1))  # no champion yet
+        self.export(10, 20, 30)
+        evaluator.step()                                                    # main/000030 champion
+        entry = dense_eval.register(self.run, 'champion', 'solver', dict(sims=1))
+        self.assertEqual((entry['id'], entry['checkpoint'], entry['base']), ('champion@solver', None, 'champion'))
+        self.assertEqual(dense_eval.adopt(evaluator.league, self.run), 1)
+        self.assertTrue(evaluator.bind())                                    # follows the champion until it starts
+        self.assertEqual(evaluator.variants()[0]['id'], 'main/000030@solver')
+        self.crown(evaluator, 20)
+        self.assertTrue(evaluator.bind())
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())
+        entry = self.league()['variants'][0]
+        self.assertEqual((entry['id'], entry['checkpoint'], entry['registered_as']), ('main/000020@solver', 'main/000020', 'champion@solver'))
+        self.assertIn('bound_at', entry)
+        self.assertEqual(entry['matches'][0]['opponent'], 'main/000020')
+        self.assertEqual(dense_eval.requests(self.run), {})
+        self.crown(evaluator, 30)
+        self.assertFalse(evaluator.bind())                                   # started: the binding stays
+        self.assertEqual(evaluator.variants()[0]['id'], 'main/000020@solver')
+        self.assertEqual(dense_eval.register(self.run, 'champion', 'solver', dict(sims=1))['id'], 'main/000020@solver')
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([e['candidate'] for e in events if e['kind'] == 'variant'],
+                         ['champion@solver', 'main/000030@solver', 'main/000020@solver'])
+
+    def test_a_pending_variant_of_the_champion_rebases_on_promotion(self):
+        evaluator = self.start(decision='posterior')
+        self.export(10, 20)
+        evaluator.step()                                                    # main/000020 champion
+        dense_eval.register(self.run, 'main/000020', 'x', dict(sims=1))
+        dense_eval.adopt(evaluator.league, self.run)
+        self.assertFalse(evaluator.bind())
+        self.export(30)
+        self.crown(evaluator, 30)
+        evaluator.settings = replace(evaluator.settings, rebase_on_promotion=False)
+        self.assertFalse(evaluator.bind())
+        evaluator.settings = replace(evaluator.settings, rebase_on_promotion=True)
+        self.assertTrue(evaluator.bind())
+        self.assertEqual((evaluator.variants()[0]['id'], evaluator.variants()[0]['checkpoint']), ('main/000030@x', 'main/000030'))
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertIn('main/000020@x now plays as main/000030@x', events[-1]['message'])
+        evaluator.league['variants'].append(dict(id='main/000020@y', checkpoint='main/000020', name='y', settings=dict(sims=1),
+                                                 base='main/000020', on_champion=False, matches=[]))
+        self.assertFalse(evaluator.bind())                                   # registered against a non-champion: stays
+
     def pending(self, **evaluation):
         """A posterior evaluator whose champion main/000020 beat main/000010, with main/000030 unrated; the
         verdict of main/000030 is kept pending (promote_confidence .999999) so the lanes can be inspected."""
