@@ -1444,7 +1444,9 @@ class EvaluatorLoopTests(unittest.TestCase):
                          [('main/000030', None), ('main/000040', 'main/000010'), ('main/000040', None)])
         self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000010')
 
-    def test_restart_settles_panels_completed_on_disk(self):
+    def vetoed_on_disk(self):
+        """A league whose champion main/000040 has a complete, vetoing panel on disk (incumbent main/000010), as
+        left by an evaluator that exited before settling it."""
         self.export(10, 20, 40)
         settings = self.start().settings
         (self.run/'league.json').write_text(json.dumps(dict(champion='main/000040', matrix={}, checkpoints=[
@@ -1452,11 +1454,14 @@ class EvaluatorLoopTests(unittest.TestCase):
             dict(id='main/000020', variant='main', step=20, elo=0., matches=[]),
             dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
                  panel=dict(members=['main/000020'], incumbent='main/000010'))])))
-        for a, wins, losses in (('main/000040', 0, 20), ('main/000010', 15, 5)):     # written before the process exited
+        for a, wins, losses in (('main/000040', 0, 20), ('main/000010', 15, 5)):
             path = dense_eval.report_path(self.run, a, 'main/000020')
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps(dict(candidate=a, opponent='main/000020', settings=asdict(settings), metrics={}, games=[],
                                             summary=dict(wins=wins, losses=losses, capped=0, games=wins+losses))))
+
+    def test_restart_settles_panels_completed_on_disk(self):
+        self.vetoed_on_disk()
         with unittest.mock.patch.object(dense_eval, 'write_league'):
             evaluator = self.start()
             self.assertEqual(evaluator.needs(evaluator.entry('main/000040')), [])       # nothing left to play
@@ -1465,6 +1470,17 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(entry['panel']['veto'] and entry['demoted'])
         self.assertEqual(evaluator.league['champion'], 'main/000010')
         self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000010')
+
+    def test_restart_settles_before_rating_a_new_checkpoint(self):
+        self.vetoed_on_disk()
+        self.export(50)
+        with unittest.mock.patch.object(dense_eval, 'write_league'):
+            evaluator = self.start()
+            self.assertTrue(evaluator.step())
+        self.assertTrue(evaluator.entry('main/000040')['demoted'])
+        self.assertTrue(dense_eval.report_path(self.run, 'main/000050', 'main/000010').exists())    # the restored champion
+        self.assertFalse(dense_eval.report_path(self.run, 'main/000050', 'main/000040').exists())
+        self.assertEqual([m['opponent'] for m in evaluator.entry('main/000050')['matches']], ['main/000010'])
 
     def test_demoted_checkpoints_are_not_variant_heads(self):
         league = dict(champion='main/000010', checkpoints=[

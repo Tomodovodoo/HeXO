@@ -822,9 +822,11 @@ class Evaluator:
         return None
 
     def step(self):
-        """One unit of work; False when there is none. Rates the newest unrated checkpoint of the variant whose
-        newest unrated checkpoint is oldest, skipping that variant's older unrated checkpoints; otherwise judges
-        every panel already complete on disk (`settle`) and plays one round of an optional comparison."""
+        """One unit of work; False when there is none. First judges every panel already complete on disk
+        (`settle`, e.g. after a restart), so no candidate meets a regressed champion; then rates the newest
+        unrated checkpoint of the variant whose newest unrated checkpoint is oldest, skipping that variant's older
+        unrated checkpoints, or else plays one round of an optional comparison."""
+        self.settle()
         known = {c['id'] for c in self.league['checkpoints']}
         unrated = [e for e in checkpoints(self.run) if e[0] not in known]
         self.status['backlog'] = [e[0] for e in unrated]
@@ -841,7 +843,6 @@ class Evaluator:
                           checkpoints=skipped, candidate=head[0])
             self.rate(head)
             return True
-        self.settle()  # panels completed on disk before a restart
         task = self.optional()
         if task is None:
             return False
