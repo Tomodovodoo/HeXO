@@ -165,7 +165,6 @@ class EvaluationSettings:
     seal_ms: int = 100
     decision: str = 'posterior'   # promotion rule: 'posterior' (dense_eval.Evaluator.verdict) or 'sprt'
     promote_confidence: float = .9  # posterior: P(candidate - champion > sprt_elo0) needed to promote (1 - it rejects)
-    uncertainty_parity: float = 1.5  # posterior: the candidate's rating sd may be at most this times the champion's
     matchup_prior_elo: float = 30.  # posterior: prior sd of a pair's deviation from the transitive rating difference
     sprt_min_games: int = 64      # direct games vs the champion before any decision or evidence game
     sprt_elo0: float = 0.         # promotion SPRT bounds on candidate minus champion
@@ -202,7 +201,7 @@ class RunConfig:
 
 
 SECTIONS = dict(model=ModelSettings, actor=ActorSettings, learner=LearnerSettings, evaluation=EvaluationSettings)
-RETIRED = dict(evaluation=('round_games', 'model_cache'))  # settings of earlier versions, ignored when a config is read
+RETIRED = dict(evaluation=('round_games', 'model_cache', 'uncertainty_parity'))  # settings of earlier versions, ignored when a config is read
 
 
 def append_line(path, record):

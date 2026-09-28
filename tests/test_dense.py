@@ -689,11 +689,24 @@ class DenseConfigTests(unittest.TestCase):
 
     def test_configs_with_retired_settings_load(self):
         data = asdict(dense_config.RunConfig(created_at=1.))
-        data['evaluation'].update(round_games=8, model_cache=6)
+        data['evaluation'].update(round_games=8, model_cache=6, uncertainty_parity=1.5)
         self.assertEqual(dense_config.from_dict(data), dense_config.RunConfig(created_at=1.))
         data['evaluation']['typo_games'] = 1
         with self.assertRaises(TypeError):
             dense_config.from_dict(data)
+
+    def test_posterior_judge_needs_only_leadership_games_and_confidence(self):
+        """The live main/032500 vs main/030000 verdict (100 direct games, P(better) .99994, the pooled leader, rating
+        sd 56 against the champion's 33) promotes: the candidate's sd is no condition. So does a small real edge
+        once P(better) clears promote_confidence."""
+        s = dense_config.EvaluationSettings()
+        self.assertEqual(dense_eval.judge(s, 100, False, True, .99994), 'promote')
+        self.assertEqual(dense_eval.judge(s, 200, False, True, .91), 'promote')
+        self.assertIsNone(dense_eval.judge(s, 200, False, True, .89))
+        self.assertEqual(dense_eval.judge(s, 100, False, False, .01), 'reject')
+        self.assertIsNone(dense_eval.judge(s, 100, False, False, .99994))     # not the leader
+        self.assertIsNone(dense_eval.judge(s, 62, False, True, .99994))       # too few direct games
+        self.assertIsNone(dense_eval.judge(s, 100, True, True, .99994))       # direct and pooled disagree
 
     def test_round_trip_and_no_overwrite(self):
         config = dense_config.RunConfig(created_at=12.5, seed=3, device='cpu',
@@ -2803,7 +2816,7 @@ class EvaluatorLoopTests(unittest.TestCase):
     def test_posterior_decision_promotes_a_clear_winner(self):
         """Posterior mode: rounds go to the direct pairing (no other evidence), the verdict promotes once the
         candidate leads with P(delta > 0) >= promote_confidence; status, report and event carry the verdict."""
-        evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9, uncertainty_parity=1.5)
+        evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9)
         self.export(10)
         evaluator.step()
         self.export(20)
@@ -2846,7 +2859,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual((len(report['games']), report['metrics']['posterior']['decision']), (10, 'max-games'))
 
     def test_posterior_decision_rejects_a_clear_loser(self):
-        evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9, uncertainty_parity=1.5)
+        evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9)
         self.export(10)
         evaluator.step()
         self.export(20)
@@ -3096,15 +3109,15 @@ class EvaluatorLoopTests(unittest.TestCase):
 
     def test_a_superseded_candidate_that_clearly_beats_the_champion_is_promoted(self):
         """The live case: main/025000 beat champion main/019500 +38 -11 =15 in 64 games while the champion had 300
-        games of its own; main/027500 arrives before the verdict is ready, and the settlement promotes on the
-        posterior P(delta > 0), not on the Hoeffding pair-score bound (0.47 here)."""
+        games of its own; main/027500 arrives before the verdict is ready (64 of sprt_min_games 128 direct games), and
+        the settlement promotes on the posterior P(delta > 0), not on the Hoeffding pair-score bound (0.47 here)."""
         self.export(17000, 19500, 25000, 27500)
         self.start(decision='posterior', sprt_max_games=200, pool_games=64, sprt_min_games=64)       # writes config.json
         self.report('main/019500', 'main/017000', [1]*170+[0]*130)
         self.report('main/025000', 'main/019500', [1, 1]*19+[0, 0]*5+[0, .5]+[.5]*14)
         entry = lambda step, elo: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, elo_interval=None, matches=[])
         (self.run/'league.json').write_text(json.dumps(dict(champion='main/019500', checkpoints=[entry(17000, 0.), entry(19500, 0.)])))
-        evaluator = self.start(decision='posterior', sprt_max_games=200, pool_games=64, sprt_min_games=64)
+        evaluator = self.start(decision='posterior', sprt_max_games=200, pool_games=64, sprt_min_games=128)
         summary = json.loads(dense_eval.report_path(self.run, 'main/025000', 'main/019500').read_text())['summary']
         self.assertEqual((summary['wins'], summary['losses'], summary['capped']), (38, 11, 15))
         self.assertLess(summary['pair_score_lower'], .5)
@@ -3219,7 +3232,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         leads with +38 -11 =15 in 64 direct games against the champion and is crowned without a new game."""
         self.export(17000, 19500, 25000)
         self.start()
-        self.report('main/019500', 'main/017000', [1]*12+[0]*8)                     # parity 1.38, as live (1.45)
+        self.report('main/019500', 'main/017000', [1]*12+[0]*8)                     # the champion beat its predecessor
         self.report('main/025000', 'main/019500', [1, 1]*19+[0, 0]*5+[0, .5]+[.5]*14)
         entry = lambda step, elo: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, elo_interval=None, matches=[])
         (self.run/'league.json').write_text(json.dumps(dict(champion='main/019500', checkpoints=[
@@ -3235,6 +3248,11 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator.review()
         self.assertEqual(evaluator.league['champion'], 'main/019500')                 # too few direct games
         evaluator = self.start(decision='posterior', sprt_min_games=64, anchor_games=2)
+        verdict, ratings = evaluator.verdict, {'main/017000': 0., 'main/019500': 50., 'main/025000': 40.}
+        with unittest.mock.patch.object(evaluator, 'verdict', lambda cid, champion: dict(
+                verdict(cid, champion), posterior=SimpleNamespace(rating=ratings.get))):
+            evaluator.review()
+        self.assertEqual(evaluator.league['champion'], 'main/019500')                 # P(better) alone, not out-rating it
         evaluator.review()
         self.assertEqual((self.league()['champion'], json.loads((self.run/'champion.json').read_text())['checkpoint']),
                          ('main/025000', 'main/025000'))
@@ -3242,6 +3260,9 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['kind'] for e in events if e['kind'] in ('decision', 'promotion')], ['decision', 'promotion'])
         self.assertIn('promote on review', events[-2]['message'])
+        verdict = next(c for c in self.league()['checkpoints'] if c['id'] == 'main/025000')['verdict']
+        self.assertEqual((verdict['review'], verdict['opponent'], verdict['reports']['main-025000-vs-main-019500']['games']),
+                         (True, 'main/019500', 64))
 
     def test_a_restart_under_another_protocol_starts_the_candidate_afresh(self):
         evaluator = self.start(sprt_max_games=6)
@@ -3345,7 +3366,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         """Panel members are re-derived (a stored list is ignored) and include only those within
         max_expected_score."""
         entry = lambda step, elo, **extra: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, matches=[], **extra)
-        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000001', matrix={}, ladder=[], ladder_top=3, checkpoints=[
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000001', matrix={}, ladder=[], ladder_top=3, calibration={}, checkpoints=[
             entry(1, 0.), entry(2, -400*math.log10(19)), entry(3, -400*math.log10(7/3)),
             entry(4, 0., panel=dict(members=['main/000002', 'main/000003'], incumbent='main/000001'))])))
         evaluator = self.start(extra_opponents=2)
@@ -3611,6 +3632,63 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual([c['id'] for c in evaluator.heads()], ['main/000030'])
         entry, opponent, kind, games = evaluator.optional()
         self.assertEqual((entry['id'], opponent, kind, games), ('main/000030', 'main/000020', 'panel', 2))
+
+    def test_calibration_compares_the_stated_sd_with_the_later_shift(self):
+        """league.json calibration counts a verdict once its checkpoint has three later comparisons: the delta sd it
+        stated, the RMS a calibrated posterior expects (sd then^2 - sd now^2) and the realised shift of delta."""
+        self.export(10, 20, 30, 40, 50)
+        self.start()
+        self.report('main/000020', 'main/000010', [1, 1, 0, 1]*4)
+        entry = lambda step: dict(id=f'main/{step:06d}', variant='main', step=step, elo=0., elo_interval=None, matches=[])
+        evaluator = self.start(decision='posterior', sprt_min_games=16, matchup_prior_elo=20.)       # not config.json's
+        evaluator.league = league = dict(champion='main/000010', checkpoints=[entry(10), entry(20)])
+        verdict = dense_eval.public(evaluator.verdict('main/000020', 'main/000010'))
+        snapshot = evaluator.snapshot('main/000020', 'main/000010')
+        self.assertEqual({k: v['games'] for k, v in snapshot['reports'].items()}, {'main-000020-vs-main-000010': 16})
+        league['checkpoints'][1]['verdict'] = dict(verdict, candidate='main/000020', **snapshot)
+        config = dense_config.load(self.run)
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration'], dict(count=0, predicted_sd=None, expected_rms=None, realised_rms=None))
+        for step, results in ((30, [0, 0, 1, 0]*2), (40, [0, 1]*4)):
+            league['checkpoints'].append(entry(step))
+            self.report(f'main/{step:06d}', 'main/000020', results)
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration']['count'], 0)                            # two later comparisons
+        league['checkpoints'].append(entry(50))
+        self.report('main/000020', 'main/000050', [1, 0]*4)
+        dense_eval.write_league(self.run, league, config)
+        reports = dense_eval.load_reports(self.run)
+        post = dense_eval.Posterior([f'main/{s:06d}' for s in (10, 20, 30, 40, 50)], 'main/000010',
+                                    [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
+                                      r['summary']['games']) for r in reports], 20.,
+                                    dense_eval.parents([f'main/{s:06d}' for s in (10, 20, 30, 40, 50)]))
+        mean, sd = post.difference('main/000020', 'main/000010')
+        calibration = league['calibration']
+        self.assertEqual(calibration['count'], 1)
+        self.assertAlmostEqual(calibration['predicted_sd'], verdict['delta_sd'])
+        self.assertAlmostEqual(calibration['expected_rms'], math.sqrt(verdict['delta_sd']**2-sd**2))
+        self.assertAlmostEqual(calibration['realised_rms'], abs(mean-verdict['delta']))
+        self.assertGreater(calibration['realised_rms'], 0.)
+        reports = league['checkpoints'][1]['verdict']['reports']
+        digest = reports['main-000020-vs-main-000010']['digest']
+        reports['main-000020-vs-main-000010']['digest'] = '0'*16
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration']['count'], 0)                            # the direct report was replaced
+        reports['main-000020-vs-main-000010']['digest'] = digest
+        reports['main-000030-vs-main-000040'] = dict(games=2, digest='0'*16)
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration']['count'], 0)                            # an input report is gone
+        del reports['main-000030-vs-main-000040']
+        self.report('main/000020', 'main/000010', [1, 1, 0, 1]*4+[1, 0])              # extended: still counted
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration']['count'], 1)
+        league['checkpoints'][1]['verdict']['protocol']['sims'] += 1                  # decided under another protocol
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration']['count'], 0)
+        del league['calibration']
+        (self.run/'league.json').write_text(json.dumps(league))
+        self.start()
+        self.assertIn('calibration', self.league())                                    # added on start
 
 if __name__ == '__main__':
     unittest.main()
