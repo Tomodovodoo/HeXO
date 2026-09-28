@@ -45,9 +45,11 @@ def check_budgets(ms, nodes, idtt_nodes, depth, attacker):
         raise ValueError('Invalid tactical budgets')
 
 
-def unknown_result(reason, start):
+def unknown_result(reason, start, attacker, build_hash=None):
+    """An UNKNOWN result with every documented field; `build_hash` is None when no library answered."""
     return dict(status=UNKNOWN, native_verified=False, moves=[], certificate=None, proof_turns=None,
-                nodes_used=0, reason=reason, elapsed_ms=(time.perf_counter()-start)*1000)
+                nodes_used=0, attacker=attacker, build_hash=build_hash, reason=reason,
+                elapsed_ms=(time.perf_counter()-start)*1000)
 
 
 class NativeTactics:
@@ -82,7 +84,7 @@ class NativeTactics:
                 certificate=None, root_moves=None):
         check_budgets(ms, nodes, idtt_nodes, depth, attacker)
         start = time.perf_counter()
-        unknown = lambda reason: unknown_result(reason, start)
+        unknown = lambda reason: unknown_result(reason, start, attacker, self.metadata['binary_sha256'])
         if not self.lock.acquire(timeout=ms/1000):
             return unknown('lock deadline')
         try:
@@ -107,8 +109,7 @@ class NativeTactics:
                 self.lib.hexo_tactical_free(output)
             if time.perf_counter()-start >= ms/1000:
                 result.update(unknown('deadline'), nodes_used=result['nodes_used'])
-            result.update(elapsed_ms=(time.perf_counter()-start)*1000, attacker=attacker,
-                          build_hash=self.metadata['binary_sha256'])
+            result['elapsed_ms'] = (time.perf_counter()-start)*1000
             return result
         finally:
             self.lock.release()
@@ -127,8 +128,9 @@ class IsolatedTactics:
     `package`.
 
     `history` takes the same budgets and `attacker` as `NativeTactics.history`, and its results
-    carry the same `nodes_used`, `proof_turns` and `build_hash`. A verdict depends on the node
-    budget only; a kill at the hard deadline is a failure to investigate, not a verdict.
+    carry the same `nodes_used`, `proof_turns`, `attacker` and `build_hash` (None when no worker
+    answered). A verdict depends on the node budget only; a kill at the hard deadline is a
+    failure to investigate, not a verdict.
     Results carry `certificate=None` and the strategy as undecoded JSON text in
     `certificate_json` (up to ~6 MiB for a 45,000-node strategy); decoding it is left to the
     caller, outside the deadline.
@@ -192,56 +194,57 @@ class IsolatedTactics:
         check_budgets(ms, nodes, idtt_nodes, depth, attacker)
         start = time.perf_counter()
         hard = start+(ms+self.grace_ms)/1000
+        unknown = lambda reason, build_hash=None: unknown_result(reason, start, attacker, build_hash)
         if not self.lock.acquire(timeout=ms/1000):
-            return unknown_result('lock deadline', start)
+            return unknown('lock deadline')
         try:
             self.stats['queries'] += 1
             if self.replacement:
                 self.replacement.join(timeout=max(0.0, start+ms/1000-time.perf_counter()))
                 if self.replacement.is_alive():
-                    return unknown_result('tactical worker restarting', start)
+                    return unknown('tactical worker restarting')
                 self.replacement = None
             if not self.ready:
                 line = self._line(min(start+ms/1000, self.started+self.startup_ms/1000))
                 if line == 'timeout':
                     if time.perf_counter() >= self.started+self.startup_ms/1000:
                         self._retire(killed=True)
-                        return unknown_result('tactical worker not ready; replaced', start)
-                    return unknown_result('tactical worker starting', start)
+                        return unknown('tactical worker not ready; replaced')
+                    return unknown('tactical worker starting')
                 if line in ('exit', 'oversize') or 'error' in line:
                     self._retire(killed=False)
                     reason = line if isinstance(line, str) else line['error']
-                    return unknown_result(f'tactical worker failed to start: {reason}', start)
+                    return unknown(f'tactical worker failed to start: {reason}')
                 self.ready = True
             remaining = math.floor(ms-(time.perf_counter()-start)*1000)
             if remaining < 1:
-                return unknown_result('deadline', start)
+                return unknown('deadline')
             request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
                            attacker=attacker, certificate=certificate, root_moves=root_moves)
             payload = json.dumps(request, separators=(',', ':'))
             if len(payload) > REQUEST_LIMIT:
-                return unknown_result('request size limit', start)
+                return unknown('request size limit')
             self.process.stdin.write(payload+'\n')
             self.process.stdin.flush()
             result = self._line(hard)
             if result == 'timeout':
                 self._retire(killed=True)
-                return unknown_result('hard deadline; tactical worker killed', start)
+                return unknown('hard deadline; tactical worker killed')
             if result == 'exit':
                 self._retire(killed=False)
-                return unknown_result('tactical worker exited (memory cap or crash)', start)
+                return unknown('tactical worker exited (memory cap or crash)')
             if result == 'oversize':
                 self._retire(killed=True)
-                return unknown_result('response size limit', start)
+                return unknown('response size limit')
             if result.get('background_worker_busy'):
                 self._retire(killed=True)
             if time.perf_counter()-start >= ms/1000:
-                result.update(unknown_result('deadline', start), nodes_used=result.get('nodes_used', 0))
+                result.update(unknown('deadline', result.get('build_hash')), nodes_used=result.get('nodes_used', 0))
             result['elapsed_ms'] = (time.perf_counter()-start)*1000
             return result
         except OSError:
             self._retire(killed=False)
-            return unknown_result('tactical worker pipe closed', start)
+            return unknown('tactical worker pipe closed')
         finally:
             self.lock.release()
 

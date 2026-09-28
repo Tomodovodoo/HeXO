@@ -52,6 +52,7 @@ class Isolation(unittest.TestCase):
         self.assertLess(time.perf_counter()-start, 0.45)
         self.assertEqual(hung['status'], 'UNKNOWN')
         self.assertIn('hard deadline', hung['reason'])
+        self.assertEqual((hung['attacker'], hung['build_hash'], hung['nodes_used']), ('mover', None, 0))
         self.assertEqual(self.tactics.stats['kills'], 1)
         self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
 

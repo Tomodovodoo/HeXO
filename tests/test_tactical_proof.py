@@ -125,8 +125,9 @@ class NativeStrategy(unittest.TestCase):
 
     def test_deadline_and_unknown_are_not_loss(self):
         start = time.perf_counter()
-        result = self.engine.history([[0,0]], ms=1, nodes=1)
+        result = self.engine.history([[0,0]], ms=1, nodes=1, attacker='opponent')
         self.assertEqual(result['status'], 'UNKNOWN')
+        self.assertEqual((result['attacker'], result['build_hash']), ('opponent', self.engine.metadata['binary_sha256']))
         self.assertFalse(result['native_verified'])
         self.assertLess(time.perf_counter()-start, 0.25)
         # Let the sole native worker finish before another test needs it.
