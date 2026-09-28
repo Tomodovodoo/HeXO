@@ -26,8 +26,8 @@ Run layout: dense_config. Subcommands
              draws its openings from the opening book of opening_suite (dense_openings: the live book 'book' or a
              frozen suite such as 'standard-v1'); each completed pair is recorded on the book's nodes, a live book is
              refreshed between steps (`Evaluator.refresh_openings`), and reports are reused only under the book state
-             they were played in (`same_protocol`). On start the book counts the pairs its file misses from the
-             existing reports (dense_openings.Book.reconcile; reports carry an `id` for it).
+             they were played in (`same_protocol`). On start every report gets an `id` if it lacks one
+             (dense_openings.stamp) and the book counts the pairs its file misses (dense_openings.Book.reconcile).
   calibrate  continue capped self-play games with the champion and score TD(lambda) value targets against
              the realised results.
   match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal.
@@ -644,7 +644,7 @@ class Evaluator:
 
     def __init__(self, run, config, settings, pacer):
         self.openings = dense_openings.Book(run, settings)
-        self.openings.reconcile(load_reports(run))
+        self.openings.reconcile(dense_openings.stamp(run))
         settings = replace(settings, opening_book=self.openings.digest())
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
         path = self.run/'league.json'
