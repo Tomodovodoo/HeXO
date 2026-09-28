@@ -104,6 +104,10 @@ class IsolatedTactics:
     ends the child and the query returns UNKNOWN. A child not ready `startup_ms` after it
     was started is replaced. `engine` names the `module:Class` constructed in the child with
     `package`.
+
+    Results carry `certificate=None` and the strategy as undecoded JSON text in
+    `certificate_json` (up to ~6 MiB for a 45,000-node strategy); decoding it is left to the
+    caller, outside the deadline.
     """
 
     def __init__(self, package=PACKAGE, *, grace_ms=100, memory_mb=1536, startup_ms=10000,
@@ -279,16 +283,22 @@ def _assign(job, pid):
 
 
 def _pump(stream, lines):
-    """Forward decoded worker lines, so decoding counts against the reader's deadline.
+    """Forward worker results: a small decoded header plus, when present, the raw certificate line.
 
     A line over RESPONSE_LIMIT becomes 'oversize' and ends the stream.
     """
-    while line := stream.readline(RESPONSE_LIMIT+1):
-        if not line.endswith('\n'):
-            lines.put('oversize')
-            break
-        lines.put(json.loads(line))
-    lines.put(None)
+    def read():
+        line = stream.readline(RESPONSE_LIMIT+1)
+        return line if line.endswith('\n') else ('oversize' if line else None)
+    while (line := read()) not in (None, 'oversize'):
+        result = json.loads(line)
+        if result.pop('has_certificate', False):
+            line = read()
+            if line in (None, 'oversize'):
+                break
+            result['certificate_json'] = line[:-1]
+        lines.put(result)
+    lines.put(line)
 
 
 def _serve(engine, package, memory_mb):
@@ -313,7 +323,11 @@ def _serve(engine, package, memory_mb):
         request = json.loads(line)
         result = tactics.history(request.pop('history'), **request)
         result.pop('build', None)
+        certificate = result.pop('certificate', None)
+        result.update(certificate=None, has_certificate=certificate is not None)
         print(json.dumps(result, separators=(',', ':')), flush=True)
+        if certificate is not None:
+            print(json.dumps(certificate, separators=(',', ':')), flush=True)
 
 
 def independent_verify(certificate, history):

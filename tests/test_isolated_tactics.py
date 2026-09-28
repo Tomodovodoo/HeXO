@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import time
@@ -22,7 +23,8 @@ class ScriptedTactics:
             time.sleep(60)  # ignores its deadline
         if mode == (3, 3):
             self.hoard.append(bytearray(512*2**20))
-        return dict(status='UNKNOWN', native_verified=False, moves=[], certificate=None, reason='scripted',
+        certificate = dict(version=1, nodes=[dict(kind='immediate_win', action=[[5, 0]])]) if mode == (5, 5) else None
+        return dict(status='UNKNOWN', native_verified=False, moves=[], certificate=certificate, reason='scripted',
                     pid=os.getpid(), ms=ms, background_worker_busy=mode == (2, 2),
                     padding='x'*(17*2**20) if mode == (4, 4) else '')
 
@@ -91,6 +93,12 @@ class Isolation(unittest.TestCase):
         pid = self.tactics.history([[0, 0]], ms=10000)['pid']
         self.assertEqual(self.tactics.history([[4, 4]], ms=10000)['reason'], 'response size limit')
         self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
+
+    def test_certificate_arrives_undecoded(self):
+        result = self.tactics.history([[5, 5]], ms=10000)
+        self.assertIsNone(result['certificate'])
+        self.assertEqual(json.loads(result['certificate_json'])['nodes'][0]['kind'], 'immediate_win')
+        self.assertNotIn('certificate_json', self.tactics.history([[0, 0]], ms=10000))
 
     def test_invalid_budget_rejected_in_parent(self):
         with self.assertRaises(ValueError):
