@@ -513,8 +513,8 @@ class Evaluator:
     of VRAM on CUDA); records, seeds and openings do not depend on `processes`. publish() maintains
     evaluator-status.json: {stage ('idle', 'playing', 'throttled' or 'failed'), updated_at, comparison
     ({candidate, opponent, kind 'champion', 'previous', 'anchor', 'panel', 'incumbent', 'sprt' or
-    'replacement'} or null), started_at (epoch seconds when the comparison's first round in this process
-    began), games_played, games_planned (sprt_max_games for the champion), placements_played (the
+    'replacement'} or null; while throttled, the comparison about to play), started_at (epoch seconds when the
+    comparison's first round in this process began, null before it), games_played, games_planned (sprt_max_games for the champion), placements_played (the
     comparison's placements after openings, including unfinished games of the current round),
     mean_placements (placements per game over the games of the comparison's finished rounds, null before
     any), placements_per_second (current round, both sides, all processes), settings (the effective
@@ -589,16 +589,17 @@ class Evaluator:
         is not started once a newer checkpoint of the variant exists, nor an optional round while any
         checkpoint is unrated."""
         done = self.partial.setdefault((cid, opponent), dict(records=[], seconds=0., placements=0))
-        records = done['records']
-        self.pacer.wait(lambda: self.publish(True, stage='throttled'))
+        records, placed = done['records'], placements(done['records'])
+        comparison = lambda stage: self.publish(
+            True, stage=stage, comparison=dict(candidate=cid, opponent=opponent, kind=kind), started_at=done.get('started_at'),
+            games_played=len(records), games_planned=planned, placements_played=placed,
+            mean_placements=placed/len(records) if records else None, placements_per_second=None)
+        self.pacer.wait(lambda: comparison('throttled'))
         if self.newer(cid) if kind == 'champion' else self.backlog():
             return done
-        count, start, placed = min(self.settings.games, planned-len(records)), self.pacer.clock(), placements(records)
+        count, start = min(self.settings.games, planned-len(records)), self.pacer.clock()
         done.setdefault('started_at', time.time())
-        self.publish(True, stage='playing', comparison=dict(candidate=cid, opponent=opponent, kind=kind),
-                     started_at=done['started_at'], games_played=len(records), games_planned=planned,
-                     placements_played=placed, mean_placements=placed/len(records) if records else None,
-                     placements_per_second=None)
+        comparison('playing')
         heartbeat = lambda finished, live: self.publish(
             games_played=len(records)+finished, placements_played=placed+live,
             placements_per_second=live/max(self.pacer.clock()-start, 1e-9))

@@ -451,10 +451,12 @@ def evaluation_timing(run, evaluator, now):
       max_plies; mean_source names which ('comparison', 'reports', 'default') for the current type.
     - rate(type), placements per playing second: the current placements_per_second when the comparison has
       that type, else placements / seconds of the newest match event of that type, else the current rate.
-    - Playing time becomes wall time divided by settings.eval_share, the Pacer's long-run ceiling.
+    - Playing time becomes wall time divided by min(1, eval_share / processes): the Pacer charges each playing
+      second at the worker count, so its long-run ceiling on playing wall time is eval_share / processes.
     elapsed: seconds since the comparison's started_at; expected: elapsed plus the wall time of the placements
     left to its planned games (games_planned * mean_placements - placements_played); SPRT may stop earlier, so
-    expected is the cap. Both are None unless the stage is 'playing' or 'throttled'.
+    expected is the cap. Both are None unless the stage is 'playing' or 'throttled' with a started_at.
+    playing_fraction: the divisor above.
     eval_seconds: wall time of one candidate's full evaluation: sprt_max_games vs the champion plus, with
     anchor_on_promotion, anchor_games vs Seal (the candidate is assumed promoted). release_seconds: export_steps
     (the step gap of the newest two checkpoints of the comparison's variant, else main) * seconds_per_step;
@@ -465,6 +467,7 @@ def evaluation_timing(run, evaluator, now):
     current = comparison.get('opponent') == 'seal' if comparison else None
     pps = evaluator.get('placements_per_second') if finite(evaluator.get('placements_per_second')) and evaluator['placements_per_second'] > 0 else None
     share = settings.get('eval_share') if finite(settings.get('eval_share')) and 0 < settings['eval_share'] <= 1 else 1.
+    share = min(1., share/max(1, evaluator.get('processes') or 1))  # playing share of wall time
     reports = report_placements(run)
     def mean(seal):
         if seal == current and finite(evaluator.get('mean_placements')): return evaluator['mean_placements'], 'comparison'
@@ -495,7 +498,7 @@ def evaluation_timing(run, evaluator, now):
     per_step = seconds_per_step(run, variant)
     release = export_steps*per_step if export_steps and per_step else None
     return dict(out, eval_seconds=eval_seconds, export_steps=export_steps, seconds_per_step=per_step, release_seconds=release,
-                ratio=eval_seconds/release if eval_seconds is not None and release else None, eval_share=share)
+                ratio=eval_seconds/release if eval_seconds is not None and release else None, playing_fraction=share)
 
 
 def dense_run(run, config, fresh=30):

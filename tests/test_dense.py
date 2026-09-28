@@ -639,6 +639,11 @@ class DenseConfigTests(unittest.TestCase):
             timing = dashboard.evaluation_timing(run, dict(status, mean_placements=12.), 1000.)
             self.assertEqual(timing['mean_source'], 'comparison')
             self.assertAlmostEqual(timing['expected'], 100.+(10*12-40)/2./.5)
+            timing = dashboard.evaluation_timing(run, dict(status, processes=4), 1000.)    # Pacer weight 4: 1/8 of wall time
+            self.assertEqual(timing['playing_fraction'], .125)
+            self.assertAlmostEqual(timing['expected'], 100.+(10*15-40)/2./.125)
+            timing = dashboard.evaluation_timing(run, dict(status, stage='throttled', started_at=None), 1000.)
+            self.assertEqual((timing['elapsed'], timing['expected']), (None, None))  # the next comparison waits to start
             timing = dashboard.evaluation_timing(run, dict(status, settings=dict(settings, anchor_on_promotion=False)), 1000.)
             self.assertAlmostEqual(timing['eval_seconds'], 10*15/2./.5)
             shutil.rmtree(run/'evaluations')
@@ -1933,6 +1938,22 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['placements'] for e in events if e['kind'] == 'match'], [placed])
         self.assertEqual([e['checkpoints'] for e in events if e['kind'] == 'skip'], [['main/000010', 'main/000020'], ['main/000040']])
+
+    def test_throttled_status_names_the_waiting_comparison(self):
+        """While pacing delays a round, the status shows the comparison about to play: no started_at before its
+        first round, the first round's started_at before later ones."""
+        evaluator = self.start(sprt_max_games=4)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.export(20)
+        seen = []
+        def wait(tick):
+            tick()
+            seen.append(json.loads((self.run/'evaluator-status.json').read_text()))
+        evaluator.pacer.wait = wait
+        self.assertTrue(evaluator.step())
+        self.assertEqual([(s['stage'], s['comparison']['candidate'], s['started_at'] is None, s['games_played']) for s in seen],
+                         [('throttled', 'main/000020', True, 0), ('throttled', 'main/000020', False, 2)])
 
     def test_previous_comparison_plays_in_rounds_while_idle(self):
         self.export(10, 30, 50)
