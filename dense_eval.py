@@ -512,9 +512,9 @@ def variant_heads(entries, rated=lambda c: True):
 
 def calibration(league, reports):
     """Diagnostic of the posterior's stated uncertainty; no decision reads it. For every checkpoint whose posterior
-    verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports), whose direct report under
-    that protocol is still current and which has at least CALIBRATION_LATER later comparisons (reports with it under
-    that protocol that are new or have grown since the verdict), shift = delta now - delta at the verdict, both
+    verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports), whose direct report is still
+    the one it was decided on (same created_at) and which has at least CALIBRATION_LATER later comparisons (reports
+    with it under that protocol that are new, replaced or have grown since the verdict), shift = delta now - delta at the verdict, both
     r_cid - r_opponent + their matchup deviation over the reports of that protocol with the verdict's matchup
     prior. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
     resolved). Returns {count, predicted_sd (mean delta_sd at the verdicts), expected_rms (root mean sd_then^2 -
@@ -530,10 +530,10 @@ def calibration(league, reports):
             continue
         key = protocol(verdict['protocol'])
         group = [r for r in reports if protocol(r['settings']) == key]
-        if not any((r['candidate'], r['opponent']) == (cid, verdict['opponent']) for r in group):
+        seen = lambda r: (lambda s: s['games'] if s and s['created_at'] == r['created_at'] else 0)(verdict['reports'].get(report_name(r)))
+        if not any((r['candidate'], r['opponent']) == (cid, verdict['opponent']) and seen(r) for r in group):
             continue
-        later = sum(cid in (r['candidate'], r['opponent']) and len(r['games']) > verdict['reports'].get(report_name(r), 0)
-                    for r in group)
+        later = sum(cid in (r['candidate'], r['opponent']) and len(r['games']) > seen(r) for r in group)
         if later < CALIBRATION_LATER:
             continue
         model = key, verdict['matchup_prior']
@@ -1078,11 +1078,12 @@ class Evaluator:
 
     def snapshot(self, cid, champion):
         """What a decided verdict records for `calibration`: {opponent (the champion), protocol ({PROTOCOL setting:
-        value}), matchup_prior (the effective matchup_prior_elo), reports ({report name: games} of cid's
+        value}), matchup_prior (the effective matchup_prior_elo), reports ({report name: {created_at, games}} of cid's
         protocol-matching reports now)}."""
         s = self.settings
         return dict(opponent=champion, protocol={k: getattr(s, k) for k in PROTOCOL}, matchup_prior=s.matchup_prior_elo,
-                    reports={report_name(r): len(r['games']) for r in load_reports(self.run, s) if cid in (r['candidate'], r['opponent'])})
+                    reports={report_name(r): dict(created_at=r['created_at'], games=len(r['games']))
+                             for r in load_reports(self.run, s) if cid in (r['candidate'], r['opponent'])})
 
     def evidence(self, verdict, cid, champion, games):
         """(a, b) of the evidence pairing for a pending posterior decision, or None: of cid and the champion each

@@ -3113,7 +3113,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual([e['kind'] for e in events if e['kind'] in ('decision', 'promotion')], ['decision', 'promotion'])
         self.assertIn('promote on review', events[-2]['message'])
         verdict = next(c for c in self.league()['checkpoints'] if c['id'] == 'main/025000')['verdict']
-        self.assertEqual((verdict['review'], verdict['opponent'], verdict['reports']['main-025000-vs-main-019500']),
+        self.assertEqual((verdict['review'], verdict['opponent'], verdict['reports']['main-025000-vs-main-019500']['games']),
                          (True, 'main/019500', 64))
 
     def test_a_restart_under_another_protocol_starts_the_candidate_afresh(self):
@@ -3496,7 +3496,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator.league = league = dict(champion='main/000010', checkpoints=[entry(10), entry(20)])
         verdict = dense_eval.public(evaluator.verdict('main/000020', 'main/000010'))
         snapshot = evaluator.snapshot('main/000020', 'main/000010')
-        self.assertEqual(snapshot['reports'], {'main-000020-vs-main-000010': 16})
+        self.assertEqual({k: v['games'] for k, v in snapshot['reports'].items()}, {'main-000020-vs-main-000010': 16})
         league['checkpoints'][1]['verdict'] = dict(verdict, candidate='main/000020', **snapshot)
         config = dense_config.load(self.run)
         dense_eval.write_league(self.run, league, config)
@@ -3520,6 +3520,10 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertAlmostEqual(calibration['expected_rms'], math.sqrt(verdict['delta_sd']**2-sd**2))
         self.assertAlmostEqual(calibration['realised_rms'], abs(mean-verdict['delta']))
         self.assertGreater(calibration['realised_rms'], 0.)
+        league['checkpoints'][1]['verdict']['reports']['main-000020-vs-main-000010']['created_at'] -= 1
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration']['count'], 0)                            # the direct report was replaced
+        league['checkpoints'][1]['verdict']['reports']['main-000020-vs-main-000010']['created_at'] += 1
         league['checkpoints'][1]['verdict']['protocol']['sims'] += 1                  # decided under another protocol
         dense_eval.write_league(self.run, league, config)
         self.assertEqual(league['calibration']['count'], 0)
