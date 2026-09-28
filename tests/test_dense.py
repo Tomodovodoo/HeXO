@@ -581,6 +581,27 @@ def pointwise_model(config):
 
 
 class DenseConfigTests(unittest.TestCase):
+    def test_pages_serve_from_step_control(self):
+        """The project page and a dense run page carry the "from step" header control."""
+        import dashboard
+        from http.server import ThreadingHTTPServer
+        import threading
+        import urllib.request
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp)/'r').mkdir()
+            (Path(tmp)/'r'/'config.json').write_text('{}')
+            handler = type('Handler', (dashboard.Handler,), dict(runs=Path(tmp)))
+            server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                for query in ('', '?run=r'):
+                    with urllib.request.urlopen(f'http://127.0.0.1:{server.server_port}/{query}') as response:
+                        page = response.read().decode()
+                    self.assertIn('from step <input id="from-step" type="number"', page)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_metrics_log_series(self):
         """Partial last lines are skipped until completed, resumed steps replace the rewound ones and
         downsampling keeps the first, last and extreme points."""
@@ -597,6 +618,8 @@ class DenseConfigTests(unittest.TestCase):
             with path.open('ab') as stream:
                 stream.write(b'_ce": 5.0}\n')
             self.assertEqual(dashboard.series(run, config, 'main', 'policy_ce')['points'][-1], [5, 5.])
+            self.assertEqual(dashboard.series(run, config, 'main', 'policy_ce', from_step=4)['points'], [[4, 4.], [5, 5.]])
+            self.assertEqual(len(dashboard.series(run, config, 'main', 'policy_ce', 'hours', from_step=4)['points']), 5)
             points = [(x, 100. if x == 777 else math.sin(x)) for x in range(5000)]
             kept = dashboard.downsample(points, 100)
             self.assertLessEqual(len(kept), 100)

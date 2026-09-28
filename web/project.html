@@ -1,7 +1,7 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HeXO | Run comparison</title>
 <style>
 :root{--page:#0d0d0d;--surface:#1a1a19;--raised:#232321;--ink:#fff;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--ring:rgba(255,255,255,.1);--accent:#3987e5;font-family:system-ui,sans-serif;color:var(--ink2);background:var(--page);color-scheme:dark}
-*{box-sizing:border-box}body{margin:0;background:var(--page)}header{border-bottom:1px solid var(--ring);padding:18px 32px;display:flex;gap:24px;align-items:baseline;flex-wrap:wrap}h1{font-size:22px;letter-spacing:-.6px;margin:0;color:var(--ink)}header span{font-size:14px;color:var(--muted)}header .smooth{font-size:13px;display:flex;gap:8px;align-items:center}header .smooth input{width:140px;accent-color:var(--accent)}header output{font-variant-numeric:tabular-nums;min-width:2.5em}#status{margin-left:auto;font-size:13px}#status.error{color:#e66767}
+*{box-sizing:border-box}body{margin:0;background:var(--page)}header{border-bottom:1px solid var(--ring);padding:18px 32px;display:flex;gap:24px;align-items:baseline;flex-wrap:wrap}h1{font-size:22px;letter-spacing:-.6px;margin:0;color:var(--ink)}header span{font-size:14px;color:var(--muted)}header .smooth{font-size:13px;display:flex;gap:8px;align-items:center}header .smooth input{width:140px;accent-color:var(--accent)}header .smooth #from-step{width:80px;font:inherit}header output{font-variant-numeric:tabular-nums;min-width:2.5em}#status{margin-left:auto;font-size:13px}#status.error{color:#e66767}
 main{max-width:1400px;margin:auto;padding:24px 32px}h2{font-size:16px;margin:0;color:var(--ink)}section.runs{background:var(--surface);border:1px solid var(--ring);border-radius:8px;padding:16px 18px;margin-bottom:20px}
 .bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.bar small{color:var(--muted)}button{font:inherit;font-size:12px;color:var(--ink2);background:var(--raised);border:1px solid var(--ring);border-radius:5px;padding:3px 9px;cursor:pointer}button:hover{color:var(--ink)}button[aria-pressed=true]{color:var(--ink);border-color:var(--accent)}
 .table-scroll{overflow-x:auto;max-height:340px;overflow-y:auto}table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}th{position:sticky;top:0;background:var(--surface);text-align:left;font-weight:500;color:var(--muted);font-size:12px}th,td{padding:5px 10px 5px 0;border-bottom:1px solid var(--grid);white-space:nowrap}td.name{color:var(--ink)}a{color:#7fb2f0}.live{color:#0ca30c}.stale{color:var(--muted)}
@@ -13,7 +13,7 @@ canvas{display:block;width:100%;height:260px;touch-action:pan-y}.tip{position:ab
 .panel.full{position:fixed;inset:12px;z-index:10;display:flex;flex-direction:column;box-shadow:0 0 0 100vmax rgba(0,0,0,.85)}.panel.full canvas{flex:1;height:auto;min-height:0}.panel.full .legend{max-height:none}.panel.full .panel-head h2 button{cursor:zoom-out}
 @media(max-width:760px){main{padding:16px}header{padding:14px 16px}.grid{grid-template-columns:1fr}canvas{height:220px}}
 </style>
-<header><h1>HeXO</h1><span>Dense run comparison</span><label class="smooth">Smoothing <input id="smooth" type="range" min="0" max="0.99" step="0.01"> <output id="smooth-value"></output></label><div id="status" role="status">Connecting...</div></header>
+<header><h1>HeXO</h1><span>Dense run comparison</span><label class="smooth">Smoothing <input id="smooth" type="range" min="0" max="0.99" step="0.01"> <output id="smooth-value"></output></label><label class="smooth">from step <input id="from-step" type="number" min="0" step="500"></label><div id="status" role="status">Connecting...</div></header>
 <main>
 <section class="runs"><div class="bar"><h2>Runs</h2><small id="showing"></small><button id="first">First 10</button><button id="none">None</button></div>
 <div class="table-scroll"><table><thead><tr><th></th><th></th><th>Run</th><th>Variant</th><th>Step</th><th>Elo (95%)</th><th>Champion</th><th>Learner</th><th>Actors</th><th>Detail</th></tr></thead><tbody id="rows"></tbody></table></div></section>
@@ -40,7 +40,7 @@ const PANELS=[
 {id:'gph',title:'Games per hour',metric:'games_per_hour',smooth:true,xs:['hours'],perRun:true,zero:true,note:'From games completed between metrics lines, summed over workers'},
 {id:'gpu',title:'GPU utilization (%)',metric:'utilization',smooth:true,xs:['hours'],perRun:true,zero:true,max:100,note:'Whole device, sampled by the dashboard while the run is live'},
 {id:'mem',title:'GPU memory (GiB)',metric:'used_mib',smooth:true,xs:['hours'],perRun:true,zero:true,scale:1/1024,note:'Whole device, sampled by the dashboard while the run is live'}];
-let project=null,rows=[],cache=new Map(),state={selected:null,x:{},log:{},full:null,smooth:.6};
+let project=null,rows=[],cache=new Map(),state={selected:null,x:{},log:{},full:null,smooth:.6,fromStep:2500};
 try{Object.assign(state,JSON.parse(localStorage.getItem('hexo-project')||'{}'))}catch(e){}
 const save=()=>{try{localStorage.setItem('hexo-project',JSON.stringify(state))}catch(e){}};
 const selected=()=>state.selected?rows.filter(r=>state.selected.includes(r.key)):rows.slice(0,10);
@@ -67,9 +67,10 @@ if(p.metric)out.push({key:p.perRun?r.run.name:r.key,label:p.perRun?r.run.name:r.
 if(p.pair)out.push({key:`${r.key}|${p.pair.metric}`,label:`${r.key} ${p.pair.label}`,run:r.run,variant:r.variant,index:r.index,metric:p.pair.metric,dash:p.pair.dash});
 if(p.sources)for(const[src,dash]of Object.entries(SOURCES))if(!p.from||p.from.includes(src))out.push({key:`${r.key}|${src}`,label:`${r.key} · ${p.sources.startsWith('gap')?'gap':'held-out'} ${src}`,run:r.run,variant:r.variant,index:r.index,metric:`${p.prefix??'validation_'}${src}_${p.sources}`,dash})}return out}
 const xOf=p=>p.xs.includes(state.x[p.id])?state.x[p.id]:p.xs[0];
+const fromOf=p=>xOf(p)==='step'?state.fromStep:0;
 const cacheKey=(s,p)=>`${s.run.name}|${s.variant}|${s.metric}|${xOf(p)}`;
-async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k);if(hit&&(hit.poll===project.now||(!s.run.live&&project.now-hit.poll<60)))continue;
-jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:s.metric,x:xOf(p),max_points:1000});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${s.metric} of ${s.label}: HTTP ${res.status}`);cache.set(k,{poll:project.now,points:(await res.json()).points})})}
+async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k),from=fromOf(p),x=xOf(p),now=project.now;if(hit&&hit.from===from&&(hit.poll===now||(!s.run.live&&now-hit.poll<60)))continue;
+jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:s.metric,x,max_points:1000,from_step:from});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${s.metric} of ${s.label}: HTTP ${res.status}`);const points=(await res.json()).points,cur=cache.get(k);if(from===fromOf(p)&&!(cur?.from===from&&cur.poll>now))cache.set(k,{poll:now,from,points})})}
 let failure=null;const worker=async()=>{while(jobs.length){try{await jobs.shift()()}catch(e){failure=e}}};await Promise.all(Array.from({length:6},worker));if(failure)throw failure}
 function trace(pts,sx,sy,ctx){let gap=true;pts.forEach((q,i)=>{if(q[1]==null){gap=true;return}const x=sx(q[0]),y=sy(q[1]),alone=gap&&(i+1>=pts.length||pts[i+1][1]==null);if(alone){ctx.moveTo(x+1.5,y);ctx.arc(x,y,1.5,0,7)}else ctx[gap?'moveTo':'lineTo'](x,y);gap=false})}
 function ticks(lo,hi,n){const step0=(hi-lo)/n||1,mag=10**Math.floor(Math.log10(step0)),e=step0/mag,step=(e>=7.5?10:e>=3.5?5:e>=1.5?2:1)*mag,out=[];for(let v=Math.ceil(lo/step)*step;v<=hi+step*1e-9;v+=step)out.push(+v.toPrecision(12));return out}
@@ -85,7 +86,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&state.full){state.f
 function layout(){for(const p of PANELS)p.el.classList.toggle('full',state.full===p.id);document.body.style.overflow=state.full?'hidden':'';PANELS.forEach(p=>draw(p))}
 function draw(p,hover){const el=p.el,c=el.querySelector('canvas'),ctx=c.getContext('2d'),ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight,x=xOf(p),log=p.log&&state.log[p.id];
 c.width=w*ratio;c.height=h*ratio;ctx.setTransform(ratio,0,0,ratio,0,0);el.querySelectorAll('.tools button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.x?b.dataset.x===x:!!log));
-const series=panelSeries(p).map(s=>{const raw=(cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale&&v!=null?v*p.scale:v)).filter(q=>q[1]==null||!log||q[1]>0);return {...s,raw,points:p.smooth&&state.smooth>0?ema(raw,state.smooth):raw}});
+const series=panelSeries(p).map(s=>{const raw=(cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale&&v!=null?v*p.scale:v)).filter(q=>(q[1]==null||!log||q[1]>0)&&(x!=='step'||q[0]>=state.fromStep));return {...s,raw,points:p.smooth&&state.smooth>0?ema(raw,state.smooth):raw}});
 const legend=el.querySelector('.legend');legend.replaceChildren(...series.map(s=>{const e=document.createElement('span');e.append(swatch(s.index,s.dash),s.label);return e}));
 const total=p.perRun?new Set(rows.map(r=>r.run.name)).size:rows.length,shown=new Set(series.map(s=>s.index)).size;el.querySelector('.showing').textContent=shown<total?`Showing first ${shown} of ${total} runs`:`Showing ${shown} runs`;
 const tip=el.querySelector('.tip');tip.hidden=true;const all=series.flatMap(s=>s.raw).filter(q=>q[1]!=null);ctx.font='11px system-ui';
@@ -121,5 +122,6 @@ rows=project.runs.flatMap(run=>run.variants.map(variant=>({key:`${run.name}/${va
 if(!rows.length){$('status').textContent=`No dense runs in ${project.root}`}await refresh()}catch(e){$('status').className='error';$('status').textContent=e.message}setTimeout(poll,5000)}
 $('first').onclick=()=>{state.selected=null;save();refresh()};$('none').onclick=()=>{state.selected=[];save();refresh()};
 $('smooth').value=state.smooth;$('smooth-value').textContent=state.smooth.toFixed(2);$('smooth').oninput=e=>{state.smooth=+e.target.value;$('smooth-value').textContent=state.smooth.toFixed(2);save();PANELS.forEach(p=>draw(p))};
+$('from-step').value=state.fromStep;let refetch;$('from-step').oninput=e=>{state.fromStep=Math.max(0,Math.floor(+e.target.value)||0);save();PANELS.forEach(p=>draw(p));clearTimeout(refetch);refetch=setTimeout(()=>project&&refresh(),400)};
 buildPanels();layout();let resizing;window.addEventListener('resize',()=>{clearTimeout(resizing);resizing=setTimeout(()=>PANELS.forEach(p=>draw(p)),100)});poll();
 </script>
