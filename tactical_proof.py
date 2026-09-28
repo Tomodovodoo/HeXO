@@ -5,27 +5,47 @@ An optional root candidate expands those obligations explicitly; quiet defender
 nodes remain UNKNOWN. A single native worker limits caller wait; reconstruction
 may finish in the background. Late results are not exposed as exact values.
 """
+import contextlib
 import ctypes as C
 import hashlib
+import importlib
 import json
 import math
 from pathlib import Path
+import queue
+import subprocess
 import sys
 import threading
 import time
 
 PROVEN_WIN, UNKNOWN = 'PROVEN_WIN', 'UNKNOWN'
 PACKAGE = Path(__file__).resolve().parent/'tools/tactical'
+REQUEST_LIMIT = 8*1024*1024
+# Worker responses above this are discarded unparsed; the verifier's 50,000-node certificate cap stays well below it.
+RESPONSE_LIMIT = 16*1024*1024
+
+
+def check_budgets(ms, idtt_ms, nodes, depth):
+    if (type(ms) is not int or not 1 <= ms <= 60000 or type(idtt_ms) is not int
+            or not 0 <= idtt_ms < ms or type(nodes) is not int or not 1 <= nodes <= 10000000
+            or type(depth) is not int or not 1 <= depth <= 64):
+        raise ValueError('Invalid tactical budgets')
+
+
+def unknown_result(reason, start):
+    return dict(status=UNKNOWN, native_verified=False, moves=[], certificate=None,
+                reason=reason, elapsed_ms=(time.perf_counter()-start)*1000)
 
 
 class NativeTactics:
-    def __init__(self):
+    def __init__(self, package=PACKAGE):
+        package = Path(package)
         name = 'hexo_tactical.dll' if sys.platform == 'win32' else ('libhexo_tactical.dylib' if sys.platform == 'darwin' else 'libhexo_tactical.so')
-        binary = PACKAGE/'target/release'/name
+        binary = package/'target/release'/name
         self.metadata = json.loads(binary.with_suffix(binary.suffix+'.json').read_text(encoding='utf-8'))
         digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
         if (digest(binary) != self.metadata['binary_sha256'] or
-                any(digest(PACKAGE/p) != value for p, value in self.metadata['sources'].items())):
+                any(digest(package/p) != value for p, value in self.metadata['sources'].items())):
             raise ValueError('Tactical build identity changed; rebuild the native library')
         self.lib = C.CDLL(str(binary))
         self.lib.hexo_tactical_query.argtypes = [C.c_char_p]
@@ -39,13 +59,9 @@ class NativeTactics:
                             nodes=nodes, depth=depth, certificate=certificate, root_moves=root_moves)
 
     def history(self, history, *, ms=100, idtt_ms=20, nodes=100000, depth=8, certificate=None, root_moves=None):
-        if (type(ms) is not int or not 1 <= ms <= 60000 or type(idtt_ms) is not int
-                or not 0 <= idtt_ms < ms or type(nodes) is not int or not 1 <= nodes <= 10000000
-                or type(depth) is not int or not 1 <= depth <= 64):
-            raise ValueError('Invalid tactical budgets')
+        check_budgets(ms, idtt_ms, nodes, depth)
         start = time.perf_counter()
-        unknown = lambda reason: dict(status=UNKNOWN, native_verified=False, moves=[], certificate=None,
-                                     reason=reason, elapsed_ms=(time.perf_counter()-start)*1000)
+        unknown = lambda reason: unknown_result(reason, start)
         if not self.lock.acquire(timeout=ms/1000):
             return unknown('lock deadline')
         try:
@@ -59,7 +75,7 @@ class NativeTactics:
             if root_moves is not None:
                 request['root_moves'] = root_moves
             payload = json.dumps(request, separators=(',', ':')).encode()
-            if len(payload) > 8*1024*1024:
+            if len(payload) > REQUEST_LIMIT:
                 return unknown('request size limit')
             output = self.lib.hexo_tactical_query(payload)
             if not output:
@@ -75,6 +91,243 @@ class NativeTactics:
             return result
         finally:
             self.lock.release()
+
+
+class IsolatedTactics:
+    """A tactical engine in a disposable child process with a hard deadline and a memory cap.
+
+    `history` returns within `ms + grace_ms`. A child that has not answered by then, or that
+    reports abandoned native work still running, is killed at once; reaping it and starting
+    its replacement happen off the caller's clock, and the next query waits for the
+    replacement only within its own budget. No query competes with an earlier one. The
+    child's private memory is capped at `memory_mb` before it loads the engine; exceeding it
+    ends the child and the query returns UNKNOWN. A child not ready `startup_ms` after it
+    was started is replaced. `engine` names the `module:Class` constructed in the child with
+    `package`.
+
+    Results carry `certificate=None` and the strategy as undecoded JSON text in
+    `certificate_json` (up to ~6 MiB for a 45,000-node strategy); decoding it is left to the
+    caller, outside the deadline.
+    """
+
+    def __init__(self, package=PACKAGE, *, grace_ms=100, memory_mb=1536, startup_ms=10000,
+                 engine='tactical_proof:NativeTactics'):
+        self.command = [sys.executable, str(Path(__file__).resolve()), 'serve', engine, str(Path(package).resolve()),
+                        str(memory_mb)]
+        self.grace_ms, self.startup_ms = grace_ms, startup_ms
+        self.stats = dict(queries=0, spawns=0, kills=0, exits=0)
+        self.lock = threading.Lock()
+        self.job = _memory_job(memory_mb) if sys.platform == 'win32' else None
+        self.replacement = None
+        self._spawn()
+
+    def _spawn(self):
+        process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   text=True, encoding='utf-8', bufsize=1)
+        try:
+            if self.job:
+                _assign(self.job, process.pid)
+            # The child loads the engine only after this line, so the cap already applies.
+            process.stdin.write('go\n')
+            process.stdin.flush()
+        except OSError:
+            process.kill()
+            raise
+        lines = queue.Queue()
+        self.pump = threading.Thread(target=_pump, args=(process.stdout, lines), daemon=True)
+        self.pump.start()
+        self.process, self.lines, self.ready = process, lines, False
+        self.started = time.perf_counter()
+        self.stats['spawns'] += 1
+
+    def _retire(self, killed):
+        """Kill the child now; reap it and start its replacement in the background."""
+        self.stats['kills' if killed else 'exits'] += 1
+        self.process.kill()
+        self.ready = False
+        self.replacement = threading.Thread(target=self._replace, args=(self.process, self.pump), daemon=True)
+        self.replacement.start()
+
+    def _replace(self, process, pump):
+        _reap(process, pump)
+        with contextlib.suppress(OSError):  # the next query's write fails and retires it again
+            self._spawn()
+
+    def _line(self, deadline):
+        try:
+            line = self.lines.get(timeout=max(0.0, deadline-time.perf_counter()))
+        except queue.Empty:
+            return 'timeout'
+        return 'exit' if line is None else line
+
+    def solve(self, game, **budgets):
+        return self.history([cell[:2] for cell in game.cells], **budgets)
+
+    def history(self, history, *, ms=100, idtt_ms=20, nodes=100000, depth=8, certificate=None, root_moves=None):
+        check_budgets(ms, idtt_ms, nodes, depth)
+        start = time.perf_counter()
+        hard = start+(ms+self.grace_ms)/1000
+        if not self.lock.acquire(timeout=ms/1000):
+            return unknown_result('lock deadline', start)
+        try:
+            self.stats['queries'] += 1
+            if self.replacement:
+                self.replacement.join(timeout=max(0.0, start+ms/1000-time.perf_counter()))
+                if self.replacement.is_alive():
+                    return unknown_result('tactical worker restarting', start)
+                self.replacement = None
+            if not self.ready:
+                line = self._line(min(start+ms/1000, self.started+self.startup_ms/1000))
+                if line == 'timeout':
+                    if time.perf_counter() >= self.started+self.startup_ms/1000:
+                        self._retire(killed=True)
+                        return unknown_result('tactical worker not ready; replaced', start)
+                    return unknown_result('tactical worker starting', start)
+                if line in ('exit', 'oversize') or 'error' in line:
+                    self._retire(killed=False)
+                    reason = line if isinstance(line, str) else line['error']
+                    return unknown_result(f'tactical worker failed to start: {reason}', start)
+                self.ready = True
+            remaining = math.floor(ms-(time.perf_counter()-start)*1000)
+            if remaining < 1:
+                return unknown_result('deadline', start)
+            request = dict(history=history, ms=remaining, idtt_ms=min(idtt_ms, remaining-1), nodes=nodes, depth=depth,
+                           certificate=certificate, root_moves=root_moves)
+            payload = json.dumps(request, separators=(',', ':'))
+            if len(payload) > REQUEST_LIMIT:
+                return unknown_result('request size limit', start)
+            self.process.stdin.write(payload+'\n')
+            self.process.stdin.flush()
+            result = self._line(hard)
+            if result == 'timeout':
+                self._retire(killed=True)
+                return unknown_result('hard deadline; tactical worker killed', start)
+            if result == 'exit':
+                self._retire(killed=False)
+                return unknown_result('tactical worker exited (memory cap or crash)', start)
+            if result == 'oversize':
+                self._retire(killed=True)
+                return unknown_result('response size limit', start)
+            if result.get('background_worker_busy'):
+                self._retire(killed=True)
+            if time.perf_counter()-start >= ms/1000:
+                result.update(unknown_result('deadline', start))
+            result['elapsed_ms'] = (time.perf_counter()-start)*1000
+            return result
+        except OSError:
+            self._retire(killed=False)
+            return unknown_result('tactical worker pipe closed', start)
+        finally:
+            self.lock.release()
+
+    def close(self):
+        with self.lock:
+            if self.replacement:
+                self.replacement.join()
+                self.replacement = None
+            if self.process:
+                self.process.kill()
+                _reap(self.process, self.pump)
+                self.process = None
+            if self.job:
+                C.windll.kernel32.CloseHandle(self.job)
+                self.job = None
+
+
+def _reap(process, pump):
+    process.wait()
+    pump.join()
+    with contextlib.suppress(OSError):
+        process.stdin.close()
+    process.stdout.close()
+
+
+class _BasicLimits(C.Structure):
+    _fields_ = [('PerProcessUserTimeLimit', C.c_int64), ('PerJobUserTimeLimit', C.c_int64), ('LimitFlags', C.c_uint32),
+                ('MinimumWorkingSetSize', C.c_size_t), ('MaximumWorkingSetSize', C.c_size_t),
+                ('ActiveProcessLimit', C.c_uint32), ('Affinity', C.c_size_t), ('PriorityClass', C.c_uint32),
+                ('SchedulingClass', C.c_uint32)]
+
+
+class _ExtendedLimits(C.Structure):
+    _fields_ = [('BasicLimitInformation', _BasicLimits), ('IoInfo', C.c_uint64*6), ('ProcessMemoryLimit', C.c_size_t),
+                ('JobMemoryLimit', C.c_size_t), ('PeakProcessMemoryUsed', C.c_size_t), ('PeakJobMemoryUsed', C.c_size_t)]
+
+
+def _memory_job(memory_mb):
+    """Windows job object: per-process committed-memory cap; members die when the owner closes it."""
+    kernel32 = C.windll.kernel32
+    kernel32.CreateJobObjectW.restype = C.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [C.c_void_p, C.c_int, C.c_void_p, C.c_uint32]
+    kernel32.AssignProcessToJobObject.argtypes = [C.c_void_p, C.c_void_p]
+    kernel32.CloseHandle.argtypes = [C.c_void_p]
+    job = kernel32.CreateJobObjectW(None, None)
+    limits = _ExtendedLimits()
+    limits.BasicLimitInformation.LimitFlags = 0x100 | 0x2000  # PROCESS_MEMORY | KILL_ON_JOB_CLOSE
+    limits.ProcessMemoryLimit = memory_mb*2**20
+    if not job or not kernel32.SetInformationJobObject(job, 9, C.byref(limits), C.sizeof(limits)):
+        raise OSError('Unable to create the tactical worker job object')
+    return job
+
+
+def _assign(job, pid):
+    kernel32 = C.windll.kernel32
+    kernel32.OpenProcess.restype = C.c_void_p
+    handle = kernel32.OpenProcess(0x0101, False, pid)  # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+    try:
+        if not handle or not kernel32.AssignProcessToJobObject(job, handle):
+            raise OSError('Unable to apply the tactical worker memory cap')
+    finally:
+        if handle:
+            kernel32.CloseHandle(handle)
+
+
+def _pump(stream, lines):
+    """Forward worker results: a small decoded header plus, when present, the raw certificate line.
+
+    A line over RESPONSE_LIMIT becomes 'oversize' and ends the stream.
+    """
+    def read():
+        line = stream.readline(RESPONSE_LIMIT+1)
+        return line if line.endswith('\n') else ('oversize' if line else None)
+    while (line := read()) not in (None, 'oversize'):
+        result = json.loads(line)
+        if result.pop('has_certificate', False):
+            line = read()
+            if line in (None, 'oversize'):
+                break
+            result['certificate_json'] = line[:-1]
+        lines.put(result)
+    lines.put(line)
+
+
+def _serve(engine, package, memory_mb):
+    """Child side of IsolatedTactics: one JSON request per stdin line, one JSON result per stdout line.
+
+    On POSIX the child caps its own address space before loading the engine; the
+    parent never runs code between fork and exec.
+    """
+    sys.stdin.readline()  # the parent has applied the job-object cap (Windows)
+    if sys.platform != 'win32':
+        import resource
+        cap = int(memory_mb)*2**20
+        resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+    module, name = engine.split(':')
+    try:
+        tactics = getattr(importlib.import_module(module), name)(package)
+    except Exception as error:
+        print(json.dumps(dict(error=f'{type(error).__name__}: {error}')), flush=True)
+        return
+    print(json.dumps(dict(ready=True)), flush=True)
+    for line in sys.stdin:
+        request = json.loads(line)
+        result = tactics.history(request.pop('history'), **request)
+        result.pop('build', None)
+        certificate = result.pop('certificate', None)
+        result.update(certificate=None, has_certificate=certificate is not None)
+        print(json.dumps(result, separators=(',', ':')), flush=True)
+        if certificate is not None:
+            print(json.dumps(certificate, separators=(',', ':')), flush=True)
 
 
 def independent_verify(certificate, history):
@@ -105,3 +358,7 @@ def independent_verify(certificate, history):
     attacker = ((n+1)//2) % 2 if n else 0
     converted = dict(version=1, history=[list(p) for p in history], attacker=attacker, tree=expand(certificate['root'], set()))
     return verify(converted, history, deadline=time.perf_counter()+10)
+
+
+if __name__ == '__main__' and sys.argv[1:2] == ['serve']:
+    _serve(*sys.argv[2:5])
