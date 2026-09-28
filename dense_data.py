@@ -131,7 +131,8 @@ def fit_calibration_rows(v, h, z, base, ridge=CALIBRATION_RIDGE, iterations=CALI
     """The Calibration with `base` fitted to rows (v, h, z): a logistic regression of z on calibration_features(v, h)
     over the rows with a finite v, by at most `iterations` Newton steps (stopping once no coefficient moves by 1e-8)
     from, and with an L2 penalty `ridge` toward, the map that carries no information: a(h) = logit(base) and
-    b(h) = 0. Without rows with a finite v the map is that prior. Deterministic."""
+    b(h) = 0. Without rows with a finite v the map is that prior. Each Newton system carries an extra 1e-9 on its
+    diagonal, so ridge = 0 stays solvable when the rows leave the basis rank-deficient. Deterministic."""
     v, h, z = (np.asarray(x, np.float64) for x in (v, h, z))
     known = np.isfinite(v)
     X, y = calibration_features(v[known], h[known]), z[known]
@@ -139,7 +140,7 @@ def fit_calibration_rows(v, h, z, base, ridge=CALIBRATION_RIDGE, iterations=CALI
     coef = prior.copy()
     for _ in range(iterations):
         p = 1/(1+np.exp(-X @ coef))
-        step = np.linalg.solve((X*(p*(1-p))[:, None]).T @ X + ridge*np.eye(CALIBRATION_FEATURES), X.T @ (p-y) + ridge*(coef-prior))
+        step = np.linalg.solve((X*(p*(1-p))[:, None]).T @ X + (ridge+1e-9)*np.eye(CALIBRATION_FEATURES), X.T @ (p-y) + ridge*(coef-prior))
         coef -= step
         if np.abs(step).max() < 1e-8:
             break

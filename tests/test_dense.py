@@ -1747,6 +1747,8 @@ class ValidationSourceTests(unittest.TestCase):
         self.assertTrue(np.allclose(reference, fit.predict(v, h), rtol=0, atol=1e-12))
         self.assertEqual(reference[500], fit.base)
         self.assertLess(reference[501], .5); self.assertGreater(reference[502], .5)
+        few = dense_learn.calibration_reference([.5, -.5, .2], [5, 5, 5], [1., 0., 1.], [.5, 0.], [5, 100], ridge=0.)
+        self.assertTrue(np.all(np.isfinite(few)))
         prior = dense_data.fit_calibration_rows([np.nan]*3, [5, 9, 40], [1., 0., 1.], .25)
         self.assertTrue(np.allclose(prior.predict([-1., 0., 1.], [2, 50, 300]), .25))
 
