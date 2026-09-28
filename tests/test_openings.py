@@ -270,14 +270,33 @@ class RefreshTests(unittest.TestCase):
             again = tight.refresh(Uniform(radius=1), 'main/000020', np.random.default_rng(1), now=1.)
             self.assertEqual((again['challengers'], again['added']), (0, 0))
             rival = next(n for n in challengers if n['challenges'] == first['key'])
+            twin = next(n for n in challengers if n['challenges'] == second['key'])
             for points in (1.5, 1.5, 1, 1):
                 book.tally(pair(first['moves'], points))                       # the incumbent leans toward P1
                 book.tally(pair(rival['moves'], 1))
+                book.tally(pair(second['moves'], points))                      # a tie: the incumbent stays
+                book.tally(pair(twin['moves'], points))
             again = book.refresh(Uniform(radius=2), 'main/000020', np.random.default_rng(5), now=2.)
             self.assertEqual((first['status'], first['reason']), ('retired', 'replaced'))
             self.assertIsNone(rival['challenges'])
-            self.assertEqual(again['retired']['replaced'], 1)
+            self.assertEqual((second['status'], twin['status'], twin['reason']), ('opening', 'retired', 'replaced'))
+            self.assertEqual(again['retired']['replaced'], 2)
             self.assertEqual(sum(n['challenges'] is None for n in book.openings()), 2)      # book_size settled
+
+    def test_generation_passes_implausible_prefixes_for_a_plausible_deeper_one(self):
+        """A completed turn sums both placement orders, so a deeper prefix can clear book_min_prob where a shallower
+        one does not; generation takes the first prefix that is both unused and plausible."""
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run, book_min_prob=.1)
+            line = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+            opening(book, line[:3])                                            # depth three is taken
+            scores = {dense_openings.canonical(line[:4])[0]: (1e-3, .5), dense_openings.canonical(line[:5])[0]: (.5, .5)}
+            with unittest.mock.patch.object(dense_openings, 'continuations',
+                                            lambda model, starts, s, rng, leaf_batch: ([list(line)]*len(starts), [[None]*4]*len(starts))), \
+                    unittest.mock.patch.object(dense_openings, 'reach',
+                                               lambda model, positions: [scores[dense_openings.canonical(m)[0]] for m in positions]):
+                self.assertEqual(book.generate(None, CHAMPION, [([(0, 0)], 3, None)], np.random.default_rng(0), 0.), 1)
+            self.assertEqual(sorted(n['depth'] for n in book.openings()), [3, 5])
 
     def test_reports_of_another_suite_are_imported_once_and_refresh_adopts_them(self):
         with tempfile.TemporaryDirectory() as run:

@@ -425,8 +425,8 @@ class Book:
         """Refresh a live book with the champion `model` (checkpoint id `checkpoint`), in order:
         1. score every opening (`reach`) and retire each one `judge` rejects;
         2. settle contests: once a challenger and the opening it challenges both have book_min_games pairs, the one
-           of larger `worst` |skew| retires ('replaced') and the other is settled; a challenger whose opponent retired
-           is settled;
+           of larger `worst` |skew| retires ('replaced'; the challenger on a tie) and the other is settled; a challenger
+           whose opponent retired is settled;
         3. challenge a random book_revisit_fraction of the settled openings: each gets one challenger at its own
            depth, sampled from its parent position (`generate`);
         4. while fewer than book_size openings are settled, add settled replacements: first the imported positions
@@ -454,7 +454,7 @@ class Book:
             if rival['status'] != 'opening':
                 node['challenges'] = None
             elif min(node['skew']['pairs'], rival['skew']['pairs']) >= s.book_min_games:
-                loser, winner = (node, rival) if worst(node) > worst(rival) else (rival, node)
+                loser, winner = (node, rival) if worst(node) >= worst(rival) else (rival, node)
                 self.retire(loser, 'replaced', now)
                 retired['replaced'] += 1
                 winner['challenges'] = None
@@ -499,9 +499,9 @@ class Book:
     def generate(self, model, checkpoint, starts, rng, now, leaf_batch=256):
         """New openings, one per start (moves, depth, challenged key or None) where possible: ALTERNATIVES lines continue
         the start's moves to book_plies (`continuations`); on each line the opening is the shortest prefix of at least
-        `depth` placements (and longer than the start) whose position is not, and never was, an opening and was not
-        taken by an earlier start; of the lines whose opening is plausible (policy probability at least
-        book_min_prob) the shallowest wins, among equals the one whose value-head P1 expected score is nearest 1/2.
+        `depth` placements (and longer than the start) whose position is not, and never was, an opening, was not
+        taken by an earlier start and is plausible (policy probability at least book_min_prob); of the lines with
+        one, the shallowest wins, among equals the one whose value-head P1 expected score is nearest 1/2.
         It records probability and visit_share (the product of the visit shares of the placements the search sampled
         after the start; null in policy mode). A challenger (third field set) competes with that opening: it is taken
         at exactly `depth` placements (a line whose position there is used is discarded, never extended), so the two
@@ -526,8 +526,9 @@ class Book:
         for k, (_, _, challenged) in enumerate(starts):
             fit = []
             for options in prefixes[k*ALTERNATIVES:(k+1)*ALTERNATIVES]:
-                key, moves, share = next((o for o in options if o[0] not in taken), (None, None, None))
-                if key is not None and scores[key][0] >= s.book_min_prob:
+                key, moves, share = next((o for o in options if o[0] not in taken and scores[o[0]][0] >= s.book_min_prob),
+                                         (None, None, None))
+                if key is not None:
                     fit.append((len(moves), abs(scores[key][1]-.5), key, moves, share))
             if not fit:
                 continue
