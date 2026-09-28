@@ -854,3 +854,20 @@ always score finished games against their hard outcome.
   next checkpoint appears: the champion against Seal until their interval is `anchor_target_halfwidth` narrow,
   `games` of the newest checkpoint against the previous champion, then the widest pair among the top
   `fill_top`. Pairings where either side's expected score exceeds `max_expected_score` are never played.
+- **Opening books** (`dense_openings.py`). Every pairing, Seal anchors included, draws its colour-swapped openings from
+  the book of `opening_suite`. Each completed pair is recorded on every node its opening passed through, so the
+  statistics of a node cover its whole subtree. A book is a DAG of symmetry-reduced positions, and a frozen suite
+  is a book file too: `openings/standard-v1.json` is the old evaluation suite with its original distribution.
+  With `--eval-opening-suite book`, the live book `openings.json` holds `book_size` (512) settled openings of 3 to
+  `book_plies` (5) placements. Each is the shortest plausible, unused prefix of a line sampled at
+  `book_temperature` from the visit counts of `book_sims` (16) searches. At every champion change and every
+  `book_refresh_hours` (6) the champion re-scores the openings. It retires the implausible ones (policy
+  probability below `book_min_prob`) and the skewed ones (first-player skew interval beyond ±`book_max_skew`
+  Elo after `book_min_games` pairs); a skewed opening makes way for a child. The champion also challenges
+  `book_revisit_fraction` of the settled openings with alternatives at the same depth, and the more balanced one
+  stays. Retired openings are replaced until the target is met again. On first use a book counts the existing
+  reports' pairs, and the first refresh adopts the plausible, balanced positions among them. A report is reused
+  only under the book state it was played in: a refresh that changes the openings starts comparisons afresh.
+  `league.json` `openings` holds P1/P2 results overall and per player, and each book's counts, depths and skew
+  histogram. `/api/openings` serves the DAG with its statistics. `python dense_openings.py refresh|stats|prune
+  --run R` refreshes, inspects or prunes a book; run the writing commands while the evaluator is stopped.

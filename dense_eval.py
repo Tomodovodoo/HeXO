@@ -22,7 +22,12 @@ Run layout: dense_config. Subcommands
              finish and count. All play is paced by `eval_share` (Pacer: no new game while its credit is
              negative); --eval-* flags override evaluation settings for this process (reports record the
              effective settings). Writes evaluations/<a>-vs-<b>/report.json, league.json, champion.json on
-             promotion, evaluator-status.json (Evaluator.publish) and events.
+             promotion, evaluator-status.json (Evaluator.publish) and events. Every pairing, Seal anchors included,
+             draws its openings from the opening book of opening_suite (dense_openings: the live book 'book' or a
+             frozen suite such as 'standard-v1'); each completed pair is recorded on the book's nodes, a live book is
+             refreshed between steps (`Evaluator.refresh_openings`), and reports are reused only under the book state
+             they were played in (`same_protocol`). A book file is created on first use and first counts the pairs
+             of the existing reports (dense_openings.Book.migrate).
   calibrate  continue capped self-play games with the champion and score TD(lambda) value targets against
              the realised results.
   match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal.
@@ -62,7 +67,8 @@ actors with model_source 'newest_veto': the newest export of learner.variant unl
 checkpoint until the next export.
 
 league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
-superseded?, panel?, demoted?, verdict? (the posterior verdict that rated it)}], differences, ladder, ladder_top, anchors, matrix, rating_note, updated_at}.
+superseded?, panel?, demoted?, verdict? (the posterior verdict that rated it)}], differences, ladder, ladder_top, anchors, matrix, openings
+(dense_openings.summary: P1/P2 results overall and per player, and the state of each opening book), rating_note, updated_at}.
 differences and ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the ladder_top
 (fill_top) best rated, not demoted checkpoints, a above b, intervals from the joint rating draws. anchors.seal is {elo,
 elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
@@ -87,18 +93,19 @@ import torch
 import dense_config
 from dense_config import log_event
 import dense_data
+import dense_openings
 from dense_posterior import Posterior
 import hexnet
 from arena import Seal
 from dense_selfplay import Engine, checkpoints, expected, load, resolve
 from hexo import Game
 from klent import digest
-from train import paired_metrics, task_opening, write_json
+from train import paired_metrics, write_json
 
 SEAL = 'seal'
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
-PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'seal_ms')  # settings a reused report must share
+PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'opening_book', 'seal_ms')  # settings a reused report must share
 REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
 RATING_NOTE = ('Bradley-Terry over paired comparisons (caps count half a point to each side); each opening pair is one '
                'observation with a Jeffreys Dirichlet prior over the five pair scores 0..2 in half points; 95% '
@@ -188,15 +195,16 @@ def pair_seed(run_seed, label, pair):
     return int.from_bytes(hashlib.sha256(f'{run_seed}/{label}/{pair}'.encode()).digest()[:4], 'little')
 
 
-def paired_games(challenger, rival, games, label, config, settings, seal, first_pair=0, **record):
-    """`games` MatchGames: games/2 openings (train.task_opening from run seed, `label` and pair index, pairs
-    numbered from `first_pair`), each played once with the candidate as colour 0 and once as colour 1."""
+def paired_games(challenger, rival, games, label, config, settings, seal, book, first_pair=0, **record):
+    """`games` MatchGames: games/2 openings drawn from `book` (dense_openings.Book.draw) by the seed of run seed,
+    `label` and pair index (pairs numbered from `first_pair`), each played once with the candidate as colour 0 and
+    once as colour 1."""
     if games < 2 or games % 2:
         raise ValueError('Paired matches need an even game count of at least two')
     out = []
     for pair in range(first_pair, first_pair+games//2):
         seed = pair_seed(config.seed, label, pair)
-        opening = task_opening(seed, True, settings.max_plies, settings.opening_suite)['opening']
+        opening = book.draw(seed)
         for colour in (0, 1):
             sides = [rival, rival]; sides[colour] = challenger
             out.append(MatchGame(sides, opening, seed, settings.sims, settings.root_samples, settings.tactics,
@@ -380,7 +388,12 @@ def load_reports(run, settings=None):
 
 
 def same_protocol(report, settings):
-    return all(report['settings'].get(k) == getattr(settings, k) for k in PROTOCOL)
+    """Whether `report` was played under the PROTOCOL of `settings`. Under the live book that includes opening_book
+    (dense_openings.Book.digest of its openings), which changes only at a book refresh: a report is reused while the
+    book keeps its openings, and a refresh that changes them starts every comparison afresh. A frozen suite's name
+    fixes its openings (opening_book ''); a report written before opening_book existed was played under one."""
+    played = {'opening_book': '', **report['settings']}
+    return all(played.get(k) == getattr(settings, k) for k in PROTOCOL)
 
 
 def payoff(reports, ratings=None):
@@ -496,6 +509,7 @@ def write_league(run, league, config, top=None):
     league['anchors'] = {SEAL: dict(elo=point.get(SEAL), elo_interval=intervals.get(SEAL), games=seal_games, matches=matches,
                                     latest_delta=matches[-1]['elo_delta'] if matches else None)}
     league['matrix'] = payoff(reports, point)
+    league['openings'] = dense_openings.summary(run, reports, config.evaluation)
     league['rating_note'] = RATING_NOTE
     league['updated_at'] = time.time()
     write_json(run/'league.json', league)
@@ -625,6 +639,9 @@ class Evaluator:
     worker_seconds (seconds times the lane's share of the session's placements)."""
 
     def __init__(self, run, config, settings, pacer):
+        self.openings = dense_openings.Book(run, settings)
+        self.openings.migrate(load_reports(run))
+        settings = replace(settings, opening_book=self.openings.digest())
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
@@ -723,11 +740,12 @@ class Evaluator:
         a, b, _ = lane
         pair, self.next[a, b] = self.next[a, b], self.next[a, b]+1
         pool.add(lane, paired_games(self.models[a], SEAL if b == SEAL else self.models[b], 2, a, self.config, self.settings,
-                                    self.seal, pair, candidate=a, opponent=b))
+                                    self.seal, self.openings, pair, candidate=a, opponent=b))
 
     def persist(self, a, b, kind, pair):
         """Append a completed colour pair to report a-vs-b and rewrite it (kind 'sprt' recomputes metrics.sprt,
-        decision or 'max-games'), so a restart loses only the games in flight; a game stopped by 'span' is logged."""
+        decision or 'max-games'), so a restart loses only the games in flight, then record it in the opening book; a
+        game stopped by 'span' is logged."""
         records = self.book[a, b] = self.book[a, b]+pair
         for name in (a, b):
             if name != SEAL and name not in self.shas:
@@ -739,6 +757,7 @@ class Evaluator:
         path = report_path(self.run, a, b)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json(path, report)
+        self.openings.record(pair)
         for record in pair:
             if record['reason'] == 'span':
                 log_event(self.run, 'evaluator', 'error', f'{a} vs {b} pair {record["pair"]}: game counted as capped at ply '
@@ -1258,12 +1277,31 @@ class Evaluator:
                       target=target)
             self.fill_target = target
 
+    def refresh_openings(self):
+        """Refresh a live book with the champion's model when it is due (dense_openings.Book.due: the champion
+        changed or book_refresh_hours passed), stamp settings.opening_book with its new digest, log a 'book' event
+        and republish the league."""
+        champion, now = self.league['champion'], time.time()
+        if champion is None or not self.openings.due(champion, now):
+            return
+        self.use(champion)
+        rng = np.random.default_rng(pair_seed(self.config.seed, f'book/{champion}', int(now)))
+        result = self.openings.refresh(self.models[champion], champion, rng, now, self.config.actor.leaf_batch)
+        self.settings = replace(self.settings, opening_book=result['digest'])
+        self.status['settings'] = asdict(self.settings)
+        log_event(self.run, 'evaluator', 'book', f'opening book refreshed by {champion}: {result["added"]} added, retired '
+                  + ', '.join(f'{n} {r}' for r, n in result['retired'].items()) + f'; {result["openings"]} openings, '
+                  f'{result["challengers"]} of them challengers', checkpoint=champion, **result)
+        write_league(self.run, self.league, self.config, self.settings.fill_top)
+
     def step(self):
         """One unit of work; False when there is none. First judges every panel already complete on disk
         (`settle`, e.g. after a restart), so no candidate meets a regressed champion. A checkpoint with games
         against the champion is never left skipped: a skipped league entry with such games is removed again
         ('info' event), and an unrated checkpoint with such games is rated first (an evaluation cut short by a
-        restart resumes there, or settles on its games when superseded). Then, on the first step, the promotion
+        restart resumes there, or settles on its games when superseded). Otherwise a due refresh of the live opening
+        book runs (`refresh_openings`; never while such a candidate waits, as it would restart its games). Then, on
+        the first step, the promotion
         rule is re-applied to the existing reports (`review`). Then it rates the newest unrated checkpoint of the
         variant whose newest unrated checkpoint is oldest, skipping that variant's older unrated checkpoints (none
         of them has games against the champion), or else plays a session of the champion's Seal anchor
@@ -1282,6 +1320,8 @@ class Evaluator:
         unrated = [e for e in checkpoints(self.run) if e[0] not in known]
         self.status['backlog'] = [e[0] for e in unrated]
         resumed = [e for e in unrated if champion and self.games(e[0], champion)]
+        if not resumed:
+            self.refresh_openings()
         if resumed:
             self.filling(None)
             self.rate(resumed[0])
@@ -1354,8 +1394,7 @@ def loop(args):
         raise ValueError('anchor_every must be at least 1 while anchor games are enabled')
     if settings.anchor_target_halfwidth < 0 or settings.fill_top < 0 or not .5 <= settings.max_expected_score <= 1:
         raise ValueError('anchor_target_halfwidth and fill_top must be at least 0, max_expected_score in [0.5, 1]')
-    if settings.opening_suite not in ('standard-v1', 'mixed-v1'):
-        raise ValueError("the evaluator draws openings with train.task_opening: opening_suite 'standard-v1' or 'mixed-v1'")
+    dense_openings.check(settings)
     if args.once:
         settings = replace(settings, idle_fill=False)  # fill work never runs out
     evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share))
@@ -1455,9 +1494,11 @@ def match(args):
         raise ValueError('A match needs two distinct players')
     if args.a == SEAL:
         raise ValueError('Seal plays as --b; pass the checkpoint as --a')
+    book = dense_openings.Book(run, settings)
+    settings = replace(settings, opening_book=book.digest())
     started = time.perf_counter()
     records = play(paired_games(models[args.a], SEAL if args.b == SEAL else models[args.b], args.games,
-                                f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None,
+                                f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None, book,
                                 candidate=args.a, opponent=args.b), config.actor.leaf_batch)
     report = make_report(args.a, args.b, records, {n: m.sha for n, m in models.items()}, settings)
     print(json.dumps(dict(summary=report['summary'], metrics=report['metrics'], seconds=time.perf_counter()-started), indent=2))

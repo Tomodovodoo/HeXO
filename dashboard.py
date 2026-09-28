@@ -16,6 +16,7 @@ from functools import lru_cache
 import urllib.parse
 
 import dense_config
+import dense_openings
 from rating_compat import audited_prior, scheduled_revision
 
 
@@ -526,6 +527,13 @@ def dense_config_of(run):
     return config if isinstance(config, dict) and config.get('schema') == dense_config.SCHEMA else None
 
 
+def openings(run, config):
+    """/api/openings: {suite: dense_openings.Book.graph} of every opening book file of a dense run: the DAG's nodes
+    with their statistics, its edges and the book's stats."""
+    settings = dense_config.from_dict(config).evaluation
+    return {suite: book.graph() for suite, book in dense_openings.books(run, settings).items()}
+
+
 def heartbeats(run, now):
     """({variant: learner status}, [actor status]) with 'age' seconds since each process's last heartbeat."""
     def load(path):
@@ -790,6 +798,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400, str(error))
                 return
             payload = json.dumps(data, allow_nan=False).encode()
+            content_type = "application/json"
+        elif url.path == "/api/openings" and run:
+            config = dense_config_of(run)
+            if config is None:
+                self.send_error(400, 'opening books belong to dense runs')
+                return
+            payload = json.dumps(openings(run, config), allow_nan=False).encode()
             content_type = "application/json"
         elif url.path == "/api/run" and run:
             summary = run / "summary.json"
