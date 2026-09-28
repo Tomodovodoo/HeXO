@@ -1402,11 +1402,17 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertTrue(any(y is not None for row in v['fresh_value_surface']['value'] for y in row))
             self.assertNotIn('converted_value_curve', v)
             self.assertNotIn('converted_value_surface', v)
+            for source in dense_learn.CURVE_SOURCES:
+                for key in ('value_regret', 'value_regret_early', 'value_regret_late'):
+                    self.assertIn(f'{source}_{key}', v)
+            self.assertIsNotNone(v['fresh_value_regret'])
+            self.assertTrue(np.isfinite(r['searched']).all())
             self.assertNotIn('converted_policy_ce_curve', v)
             fields = dense_learn.validation_fields(metrics)
             self.assertFalse([k for k, x in fields.items() if isinstance(x, (list, dict))])
             self.assertEqual(fields['fresh_value_bce_last20'], v['fresh_value_bce_last20'])
             self.assertEqual(fields['fresh_policy_ce_early'], v['fresh_policy_ce_early'])
+            self.assertEqual(fields['fresh_value_regret'], v['fresh_value_regret'])
             dense_config.append_metrics(run, 'learner-main', step=7, validation=True, **fields)
             config = dict(created_at=0.)
             self.assertEqual(dashboard.series(run, config, 'main', 'validation_fresh_value_bce_last20')['points'],
@@ -1454,6 +1460,34 @@ class ValidationSourceTests(unittest.TestCase):
         self.assertTrue(np.isnan(excess[2, 0]))
         few = dense_learn.surfaces(ply, remaining, (loss,), min_cells=3)[1][0]
         self.assertEqual(few[2, 0], 9.)
+
+    def test_value_regret_against_the_calibrated_search(self):
+        """Outcomes drawn from a known function of the searched value and plies remaining: a net predicting that
+        probability has regret near zero; one that is confidently wrong far from the end has positive late regret."""
+        rng = np.random.default_rng(0)
+        def rows(n):
+            v, h = rng.uniform(-1, 1, n), rng.integers(1, 200, n).astype(float)
+            p = 1/(1+np.exp(-np.arctanh(np.clip(v, -.995, .995))*(3-np.log1p(h)/3)))
+            v[:n//20] = np.nan
+            p[:n//20] = .5
+            return v, h, (rng.random(n) < p).astype(float), p
+        fv, fh, fy, _ = rows(20000)
+        v, h, y, truth = rows(20000)
+        reference = dense_learn.calibration_reference(fv, fh, fy, v, h)
+        self.assertAlmostEqual(float(reference[0]), float(np.clip(fy.mean(), 1e-3, 1-1e-3)))
+        bce = lambda q: -(y*np.log(q)+(1-y)*np.log(1-q))
+        matched = dense_learn.value_regret(bce(truth), y, reference, h)
+        for k in ('value_regret', 'value_regret_early', 'value_regret_late'):
+            self.assertLess(abs(matched[k]), .02, k)
+        wrong = np.where(h >= 60, np.where(truth > .5, .01, .99), truth)
+        off = dense_learn.value_regret(bce(wrong), y, reference, h)
+        self.assertGreater(off['value_regret_late'], .5)
+        self.assertLess(abs(off['value_regret_early']), .02)
+        self.assertEqual(dense_learn.value_regret([.1], [1.], None, [5]), dict.fromkeys(matched))
+        self.assertIsNone(dense_learn.calibration_reference([], [], [], [0.], [5]))
+        episode = dict(root_values=[.2, None, .4, .6], full_search=[True, True, True, False])
+        self.assertEqual([dense_learn.searched_value(episode, t) for t in range(4)], [.2, -.2, .4, -.4])
+        self.assertTrue(math.isnan(dense_learn.searched_value(dict(root_values=None), 3)))
 
     def test_surface_endpoint_returns_the_newest_grid(self):
         import dashboard
