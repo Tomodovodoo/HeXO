@@ -14,7 +14,9 @@ struct Node { int player=0,exact_winner=-1;bool expanded=false,pending=false;dou
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1;std::vector<std::vector<Cell>> own,threats; };
 struct Tree {
  Board board;std::unique_ptr<Node> root=std::make_unique<Node>();std::map<int,Path> requests;
- std::mt19937_64 rng;int budget=0,started=0,completed=0,next_id=1,samples=0;bool tactics=false;std::vector<int> sequence;
+ std::mt19937_64 rng;int budget=0,started=0,completed=0,next_id=1,samples=0,last=0;bool tactics=false,hold=false;std::vector<int> sequence;
+ // Root actions sampled first in the opening phase of the current search; ordering only (set_priority).
+ std::vector<Cell> priority;
  explicit Tree(uint64_t seed):rng(seed){}
  std::vector<double> transformed(Node& node) {
   double weighted=0,mass=0;int total=0,maximum=0;
@@ -25,10 +27,13 @@ struct Tree {
   for(auto& x:q)x=(x-a)/range*(50+maximum)*0.1;
   return q;
  }
+ // `last` is the simulation index where the final candidate count begins (the last halving boundary), or the
+ // budget when the schedule never halves.
  void schedule(int count) {
-  sequence.clear();int m=std::min({samples,budget,count});if(!m)return;
-  std::vector<int> v(m);int considered=m,rounds=std::max(1,int(std::ceil(std::log2(m))));
-  while(int(sequence.size())<budget){int extra=std::max(1,budget/(rounds*considered));for(int k=0;k<extra && int(sequence.size())<budget;++k)for(int i=0;i<considered;++i){sequence.push_back(v[i]++);if(int(sequence.size())==budget)break;}considered=m==1?1:std::max(2,considered/2);}
+  sequence.clear();last=budget;int m=std::min({samples,budget,count});if(!m)return;
+  std::vector<int> v(m);int considered=m,previous=-1,halving=0,rounds=std::max(1,int(std::ceil(std::log2(m))));
+  while(int(sequence.size())<budget){if(considered!=previous){halving=int(sequence.size());previous=considered;}int extra=std::max(1,budget/(rounds*considered));for(int k=0;k<extra && int(sequence.size())<budget;++k)for(int i=0;i<considered;++i){sequence.push_back(v[i]++);if(int(sequence.size())==budget)break;}considered=m==1?1:std::max(2,considered/2);}
+  if(halving)last=halving;
  }
  // Leaf data classify needs, taken while the tree's board stands at the leaf.
  void capture(Path& path) {
@@ -41,27 +46,44 @@ struct Tree {
  void classify(const Path& path,Node& node) {
   const auto& own=path.own;const auto& threats=path.threats;
   auto contains=[](const std::vector<Cell>& completion,Cell c){return std::find(completion.begin(),completion.end(),c)!=completion.end();};
-  bool winning=false,safe=false;
   for(auto& edge:node.edges){
    // Every completion cell is within five of an existing stone, hence legal.
    bool win=false;
    for(auto& completion:own)if(completion.size()<size_t(path.remaining) || contains(completion,edge.action))win=true;
-   if(win){edge.exact_winner=path.player;winning=true;continue;}
+   if(win){edge.exact_winner=path.player;continue;}
    auto first=std::find_if(threats.begin(),threats.end(),[&](const auto& completion){return !contains(completion,edge.action);});
    bool cover=first==threats.end();
    if(!cover && path.remaining==2)for(auto second:*first){
     bool all=true;for(auto& completion:threats)if(!contains(completion,edge.action) && !contains(completion,second))all=false;
     if(all){cover=true;break;}
    }
-   if(!cover)edge.exact_winner=1-path.player;else safe=true;
+   if(!cover)edge.exact_winner=1-path.player;
   }
-  if(winning)node.exact_winner=path.player;
-  else if(!safe)node.exact_winner=1-path.player;
-  for(auto& edge:node.edges)edge.eligible=winning?edge.exact_winner==path.player:(!safe || edge.exact_winner<0);
+  settle(node);
+ }
+ // Node verdict and eligibility from its edges' exact winners: a winning edge makes the node won and leaves only
+ // winning edges eligible; with no edge left undecided the node is lost and every edge stays eligible; otherwise
+ // the lost edges are ineligible.
+ void settle(Node& node) {
+  bool winning=false,safe=false;
+  for(auto& edge:node.edges){if(edge.exact_winner==node.player)winning=true;else if(edge.exact_winner<0)safe=true;}
+  if(winning)node.exact_winner=node.player;
+  else if(!safe)node.exact_winner=1-node.player;
+  for(auto& edge:node.edges)edge.eligible=winning?edge.exact_winner==node.player:(!safe || edge.exact_winner<0);
+ }
+ // Records an externally proven winner of the root edge `action`: its value becomes exact (Q = +-1 for the
+ // root's mover) and the root is settled, so a lost edge leaves the remaining halving rounds and the final
+ // selection. A root that is already exact is left unchanged.
+ void mark(Cell action,int winner) {
+  if(!root->expanded || (winner!=0 && winner!=1))throw std::runtime_error("Mark needs an expanded root and a winner");
+  auto edge=std::find_if(root->edges.begin(),root->edges.end(),[&](const Edge& e){return e.action==action;});
+  if(edge==root->edges.end())throw std::runtime_error("Mark action is not a root edge");
+  if(root->exact_winner>=0)return;
+  edge->exact_winner=winner;edge->sum=winner==root->player?edge->visits:-edge->visits;settle(*root);
  }
  void begin(int simulations,int sample) {
   if(!requests.empty()||simulations<1||sample<1)throw std::runtime_error("Invalid search budget or pending requests");
-  budget=simulations;samples=sample;started=completed=0;
+  budget=simulations;samples=sample;started=completed=0;hold=false;priority.clear();
   schedule(root->expanded?int(std::count_if(root->edges.begin(),root->edges.end(),[](auto& e){return e.eligible;})):int(board.legal_moves().size()));
   for(auto& e:root->edges){e.epoch=0;double u=std::generate_canonical<double,53>(rng);e.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));}
  }
@@ -70,8 +92,12 @@ struct Tree {
   for(auto i=path.edges.rbegin();i!=path.edges.rend();++i){auto& [node,index]=*i;auto& edge=node->edges[index];if(player!=node->player)value=-value;player=node->player;edge.sum+=value;++edge.visits;--edge.pending;}
   if(!path.edges.empty())++completed;
  }
+ // Next leaf request id; 0 when nothing can be requested now, -1 after a simulation that ended on an exact edge or
+ // node, and -3 while a hold is armed and the search stands, with no request pending, at `last`.
  int request() {
-  if(board.winner>=0||started>=budget)return 0;
+  if(board.winner>=0)return 0;
+  if(hold && started==last)return requests.empty()?-3:0;
+  if(started>=budget)return 0;
   // Descends by make on the tree's own board; Restore undoes every placement on return.
   Restore restore(board);Node* node=root.get();Path path;path.leaf=node;
   for(auto& u:board.history)path.history.push_back(u.c);
@@ -81,7 +107,11 @@ struct Tree {
     int considered=sequence[started];
     // Finish each visit layer before its values decide the next halving round.
     if(started && considered!=sequence[started-1] && !requests.empty())return 0;
-    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch!=considered)continue;double score=e.gumbel+e.logit+(considered?q[i]:0);if(score>best){best=score;chosen=i;}}
+    auto first=[&](const Edge& e){return considered==0 && std::find(priority.begin(),priority.end(),e.action)!=priority.end();};
+    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch!=considered)continue;double score=e.gumbel+e.logit+(considered?q[i]:0)+(first(e)?1e6:0);if(score>best){best=score;chosen=i;}}
+    // Marked-lost candidates can leave a round short of candidates; the best of the latest-eliminated ones step in.
+    int reached=-1;
+    if(chosen<0)for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch>considered)continue;double score=e.gumbel+e.logit+q[i];if(e.epoch>reached || (e.epoch==reached && score>best)){reached=e.epoch;best=score;chosen=i;}}
    } else {
     double maxlog=-1e300,total=0;int visits=0;for(int i=0;i<int(q.size());++i){q[i]=node->edges[i].eligible?q[i]+node->edges[i].logit:-std::numeric_limits<double>::infinity();maxlog=std::max(maxlog,q[i]);visits+=node->edges[i].visits+node->edges[i].pending;}
     for(auto& x:q){x=std::exp(x-maxlog);total+=x;}
@@ -134,7 +164,7 @@ struct Tree {
   }
  }
  void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].pending;if(!path.edges.empty()){--root->edges[path.edges.front().second].epoch;--started;}}requests.clear();}
- void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::unique_ptr<Node> next;
+ void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::unique_ptr<Node> next;priority.clear();hold=false;
   for(auto& e:root->edges)if(e.action==action){next=std::move(e.child);break;}
   board.make(action);root=next?std::move(next):std::make_unique<Node>();root->player=board.player;budget=started=completed=0;
  }
@@ -158,7 +188,14 @@ HX_API int hxg_fulfill(void* p,int id,const int64_t* a,const double* logits,cons
 HX_API int hxg_prove(void* p,int id,const int64_t* h,int n,int player,int remaining,const int64_t* moves,int count){try{static_cast<gumbel::Tree*>(p)->prove(id,h,n,player,remaining,moves,count);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API void hxg_cancel(void* p){static_cast<gumbel::Tree*>(p)->cancel();}
 HX_API int hxg_advance(void* p,int64_t q,int64_t r){try{static_cast<gumbel::Tree*>(p)->advance({q,r});return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double* scores){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto q=t.transformed(n);int max_epoch=0;for(auto& e:n.edges)max_epoch=std::max(max_epoch,e.epoch);for(int i=0;i<int(n.edges.size());++i){auto& e=n.edges[i];if(actions){actions[2*i]=e.action.q;actions[2*i+1]=e.action.r;visits[i]=e.visits;values[i]=e.exact_winner>=0?(e.exact_winner==n.player?1:-1):e.visits?e.sum/e.visits:n.value;scores[i]=e.eligible && max_epoch && e.epoch==max_epoch?e.gumbel+e.logit+q[i]:-std::numeric_limits<double>::infinity();}}return int(n.edges.size());}
+HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double* scores){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto q=t.transformed(n);int max_epoch=0;for(auto& e:n.edges)if(e.eligible)max_epoch=std::max(max_epoch,e.epoch);for(int i=0;i<int(n.edges.size());++i){auto& e=n.edges[i];if(actions){actions[2*i]=e.action.q;actions[2*i+1]=e.action.r;visits[i]=e.visits;values[i]=e.exact_winner>=0?(e.exact_winner==n.player?1:-1):e.visits?e.sum/e.visits:n.value;scores[i]=e.eligible && max_epoch && e.epoch==max_epoch?e.gumbel+e.logit+q[i]:-std::numeric_limits<double>::infinity();}}return int(n.edges.size());}
 HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto q=t.transformed(n);double maximum=-1e300,total=0;for(int i=0;i<int(q.size());++i){q[i]=n.edges[i].eligible?q[i]+n.edges[i].logit:-std::numeric_limits<double>::infinity();maximum=std::max(maximum,q[i]);}for(auto& v:q){v=std::exp(v-maximum);total+=v;}if(out)for(int i=0;i<int(q.size());++i)out[i]=q[i]/total;return int(q.size());}
 HX_API int hxg_completed(void* p){return static_cast<gumbel::Tree*>(p)->completed;}
+// Arms (enabled != 0) or clears the hold of the current search: hxg_next returns -3 once the search reaches its last
+// halving boundary (the end of the search when it never halves) with no request pending, until the hold is cleared.
+HX_API int hxg_hold(void* p,int enabled){static_cast<gumbel::Tree*>(p)->hold=enabled!=0;return 1;}
+// Root actions (n cells, int64 q/r pairs) the opening phase of the current search samples before any other.
+HX_API int hxg_priority(void* p,const int64_t* cells,int n){auto& t=*static_cast<gumbel::Tree*>(p);t.priority.clear();for(int i=0;i<n;++i)t.priority.push_back({cells[2*i],cells[2*i+1]});return 1;}
+// Caller must hold a verified proof that `winner` wins after root edge (q, r); see Tree::mark.
+HX_API int hxg_mark_exact(void* p,int64_t q,int64_t r,int winner){try{static_cast<gumbel::Tree*>(p)->mark({q,r},winner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 }

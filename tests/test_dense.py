@@ -1153,7 +1153,7 @@ class WindowMemoryTests(unittest.TestCase):
                 for ref in refs:
                     episodes, rows = data[ref.shard]
                     row, e = rows[ref.index], episodes[rows[ref.index]['game']]
-                    self.assertEqual(ref.row, {k: row[k] for k in ('game', 'ply', 'player', 'remaining', 'legal_sha256')})
+                    self.assertEqual(ref.row, {k: row.get(k, 0) for k in ('game', 'ply', 'player', 'remaining', 'proven', 'legal_sha256')})
                     self.assertEqual(ref.episode, {k: e[k] for k in ('moves', 'winner', 'root_values', 'full_search', 'trained_side')})
                     np.testing.assert_array_equal(window.policy(ref), row['policy'])
                     for lam, full_only in ((.9, False), (.5, True)):
@@ -1275,7 +1275,8 @@ class DenseBootstrapTests(unittest.TestCase):
             written = dense_data.write_shard(target, identity, new_episodes, new_rows, 'converted')
             self.assertEqual((written['actor'], written['origin']), ('b'*64, 'converted'))
             self.assertEqual(dense_data.origin(dict(written, origin=None)), 'converted')    # inferred from the identity
-            self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, opponent_rows=0, terminal_games=1, capped_games=1))
+            self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, opponent_rows=0, terminal_games=1, capped_games=1,
+                                                 proven_rows=0))
             self.assertEqual(dense_bootstrap.check(target), 21)
             _, stored = dense_data.read_shard(target)
             self.assertEqual({r['game'] for r in stored}, {0, 1})

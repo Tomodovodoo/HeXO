@@ -82,6 +82,16 @@ class ActorSettings:
     yield_below: float = .9       # 0 disables
     yield_resume: float = .975
     yield_check_seconds: float = 30.
+    # Solver points inside the search (dense_solver), node budgets; 0 = off. root: forced-win check at each turn
+    # start, a proof decides the turn played; finalists: defence check of the k best mid-turn candidates at the last
+    # halving boundary, a proven opponent win eliminates the candidate; threat: the opponent's forced win on a
+    # flipped turn orders the root samples. solver_async: one awaited worker process instead of in-process queries
+    # (identical results).
+    solver_root_nodes: int = 0
+    solver_finalists: int = 0
+    solver_finalist_nodes: int = 0
+    solver_threat_nodes: int = 0
+    solver_async: bool = True
 
 
 VALUE_TARGETS = ('outcome', 'td', 'calibrated')
@@ -120,6 +130,7 @@ class LearnerSettings:
     short_value_weight: float = .5
     opponent_policy_weight: float = .15
     future_weight: float = .5
+    proven_value_weight: float = 2.  # value weight of rows the solver proved; their target is the proven value
     validation_fraction: float = .03
     validation_rows: int = 8192   # rows per per-source validation subset (dense_data.ValidationSets limit)
     validation_quota: int = 128   # rows each shard may contribute to a subset (ValidationSets quota)
@@ -171,6 +182,11 @@ class EvaluationSettings:
     fill_top: int = 3             # then fill the widest Elo-difference interval among this many top-rated checkpoints
     veto_margin: float = -30.     # actor.json skips the newest checkpoint once its Elo interval vs its champion lies below this
     max_expected_score: float = .85  # panel, optional and fill pairings only while either side's expected score is at most this
+    # Solver node budgets of both sides of every evaluation game, as ActorSettings.solver_*; 0 = off.
+    solver_root_nodes: int = 0
+    solver_finalists: int = 0
+    solver_finalist_nodes: int = 0
+    solver_threat_nodes: int = 0
 
 
 @dataclass(frozen=True)

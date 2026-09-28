@@ -25,7 +25,9 @@ Run layout: dense_config. Subcommands
              promotion, evaluator-status.json (Evaluator.publish) and events.
   calibrate  continue capped self-play games with the champion and score TD(lambda) value targets against
              the realised results.
-  match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal.
+  match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal; per-side
+             solver budgets (--a-solver-*, --b-solver-*, default the evaluation settings') allow one checkpoint
+             against itself with different solver settings, e.g. champion+solver vs champion.
 
 Scoring: a capped game (at the ply limit, or reason 'span' when a searched position does not fit the largest crop) is
 half a point for each side. Pair score = candidate points / 2 over its two games; decisions use completed pairs.
@@ -88,6 +90,7 @@ import dense_config
 from dense_config import log_event
 import dense_data
 from dense_posterior import Posterior
+from dense_solver import Budgets
 import hexnet
 from arena import Seal
 from dense_selfplay import Engine, checkpoints, expected, load, resolve
@@ -98,7 +101,10 @@ from train import paired_metrics, task_opening, write_json
 SEAL = 'seal'
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
-PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'seal_ms')  # settings a reused report must share
+# Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
+PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'seal_ms', 'solver_root_nodes',
+            'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes')
+PROTOCOL_DEFAULTS = dict(solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0, solver_threat_nodes=0)
 REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
 RATING_NOTE = ('Bradley-Terry over paired comparisons (caps count half a point to each side); each opening pair is one '
                'observation with a Jeffreys Dirichlet prior over the five pair scores 0..2 in half points; 95% '
@@ -110,10 +116,12 @@ class MatchGame:
     """One evaluation game. sides[colour] is a dense_selfplay.Model or SEAL; model sides search `sims`
     placements with argmax play (one tree per distinct model, advanced on every placement); a Seal side
     plays complete turns inline, validated with Game.legal. Ends at a win, `max_plies` placements or when the
-    Engine stops it (`reason` 'span')."""
+    Engine stops it (`reason` 'span'). solvers[colour] is that colour's dense_solver.Budgets (None: off)."""
 
-    def __init__(self, sides, opening, seed, sims, samples, tactics, max_plies, record, seal=None, seal_ms=0):
+    def __init__(self, sides, opening, seed, sims, samples, tactics, max_plies, record, seal=None, seal_ms=0,
+                 solvers=(None, None)):
         self.sides, self.max_plies, self.seal, self.seal_ms, self.record = sides, max_plies, seal, seal_ms, record
+        self.solvers = solvers
         self.reason = None
         self.budget, self.samples = sims, samples
         self.game, self.moves = Game([tuple(m) for m in opening]), [list(m) for m in opening]
@@ -130,6 +138,10 @@ class MatchGame:
     @property
     def tree(self):
         return self.trees[id(self.model)]
+
+    @property
+    def solver(self):
+        return self.solvers[self.game.player]
 
     def over(self):
         return self.game.winner >= 0 or len(self.moves) >= self.max_plies
@@ -172,15 +184,18 @@ def play(games, leaf_batch, heartbeat=lambda finished: None):
     """Run MatchGames to completion in one engine; returns their records in input order. heartbeat(records of
     the finished games, in finishing order) is called after every engine step."""
     engine, records = Engine(leaf_batch), {}
-    for game in games:
-        if game.over():
-            records[id(game)] = game.finish()
-        else:
-            engine.add(game)
-    while engine.slots:
-        for game in engine.step():
-            records[id(game)] = game.finish()
-        heartbeat(list(records.values()))
+    try:
+        for game in games:
+            if game.over():
+                records[id(game)] = game.finish()
+            else:
+                engine.add(game)
+        while engine.slots:
+            for game in engine.step():
+                records[id(game)] = game.finish()
+            heartbeat(list(records.values()))
+    finally:
+        engine.close()
     return [records[id(g)] for g in games]
 
 
@@ -188,9 +203,11 @@ def pair_seed(run_seed, label, pair):
     return int.from_bytes(hashlib.sha256(f'{run_seed}/{label}/{pair}'.encode()).digest()[:4], 'little')
 
 
-def paired_games(challenger, rival, games, label, config, settings, seal, first_pair=0, **record):
+def paired_games(challenger, rival, games, label, config, settings, seal, first_pair=0, budgets=None, **record):
     """`games` MatchGames: games/2 openings (train.task_opening from run seed, `label` and pair index, pairs
-    numbered from `first_pair`), each played once with the candidate as colour 0 and once as colour 1."""
+    numbered from `first_pair`), each played once with the candidate as colour 0 and once as colour 1. `budgets`
+    is (challenger's, rival's) dense_solver.Budgets, by default both Budgets.of(settings)."""
+    budgets = budgets or (Budgets.of(settings),)*2
     if games < 2 or games % 2:
         raise ValueError('Paired matches need an even game count of at least two')
     out = []
@@ -198,10 +215,11 @@ def paired_games(challenger, rival, games, label, config, settings, seal, first_
         seed = pair_seed(config.seed, label, pair)
         opening = task_opening(seed, True, settings.max_plies, settings.opening_suite)['opening']
         for colour in (0, 1):
-            sides = [rival, rival]; sides[colour] = challenger
+            sides, solvers = [rival, rival], [budgets[1]]*2
+            sides[colour], solvers[colour] = challenger, budgets[0]
             out.append(MatchGame(sides, opening, seed, settings.sims, settings.root_samples, settings.tactics,
                                  settings.max_plies, dict(record, pair=pair, seed=seed, opening=[list(m) for m in opening],
-                                 challenger_color=colour), seal, settings.seal_ms))
+                                 challenger_color=colour), seal, settings.seal_ms, solvers))
     return out
 
 
@@ -380,7 +398,7 @@ def load_reports(run, settings=None):
 
 
 def same_protocol(report, settings):
-    return all(report['settings'].get(k) == getattr(settings, k) for k in PROTOCOL)
+    return all(report['settings'].get(k, PROTOCOL_DEFAULTS.get(k)) == getattr(settings, k) for k in PROTOCOL)
 
 
 def payoff(reports, ratings=None):
@@ -548,10 +566,19 @@ class Pool:
     Games belong to lanes (any hashable pairing key); add(lane, games) starts them at once, step() advances the
     engine once and returns [(lane, record)] of the games that finished, so a finished game's slot can be refilled
     before the next step. running() counts games in flight (`running`); moves() is the
-    placements played after their openings by the games in flight."""
+    placements played after their openings by the games in flight. close() stops the engine's solver."""
 
     def __init__(self, leaf_batch):
         self.engine, self.games, self.ready = Engine(leaf_batch), {}, []
+        self.started = time.perf_counter()
+
+    def solver(self):
+        """dense_solver.Solver.summary of the pool's queries so far, None before its first solver search."""
+        solver = self.engine.solver
+        return solver.summary(time.perf_counter()-self.started) if solver else None
+
+    def close(self):
+        self.engine.close()
 
     def add(self, lane, games):
         for game in games:
@@ -620,7 +647,9 @@ class Evaluator:
     games in flight, and per second), mean_placements (per finished game of the main lane in the session, null
     before any),
     settings (the effective EvaluationSettings), eval_share (the Pacer's share: 1 with --once), backlog (unrated
-    checkpoint ids at the last step), eval_share_used (Pacer.used), vram (hexnet.vram()), error}. Match events,
+    checkpoint ids at the last step), eval_share_used (Pacer.used), vram (hexnet.vram()), error, solver (the solver
+    settings in use, dense_solver.Budgets, with the session's query statistics, Pool.solver, as `queries`; None
+    while every budget is 0)}. Match events,
     one per lane at the end of a session, carry the lane's games and placements, the session's seconds and
     worker_seconds (seconds times the lane's share of the session's placements)."""
 
@@ -635,7 +664,12 @@ class Evaluator:
         self.status = dict(stage='idle', updated_at=None, comparison=None, pool=[], started_at=None, games_played=0,
                            games_planned=0, tally=None, decision=None, placements_played=0, mean_placements=None,
                            placements_per_second=None, settings=asdict(settings), eval_share=pacer.share, backlog=[],
-                           eval_share_used=0., error=None)
+                           eval_share_used=0., error=None, solver=self.solver_status(None))
+
+    def solver_status(self, pool):
+        """The status `solver` field for `pool` (None: no session)."""
+        budgets = Budgets.of(self.settings)
+        return dict(asdict(budgets), queries=pool.solver() if pool else None) if budgets.active else None
 
     def publish(self, force=False, **fields):
         """Update the status; rewrite the file when forced or STATUS_SECONDS after the last write."""
@@ -773,7 +807,7 @@ class Evaluator:
                                for x, y, k in shown], started_at=wall, games_played=len(done), games_planned=planned,
                          tally=tally(done, self.test if kind in ('champion', 'sprt') else None), placements_played=live,
                          mean_placements=added[main][1]/added[main][0] if main in added else None,
-                         placements_per_second=live/max(self.pacer.clock()-start, 1e-9))
+                         placements_per_second=live/max(self.pacer.clock()-start, 1e-9), solver=self.solver_status(pool))
         while True:
             for a, b, _ in lanes:
                 self.open(a, b)
@@ -816,6 +850,7 @@ class Evaluator:
             if paired:
                 lanes = want()
         show('playing', True)
+        pool.close()
         seconds = self.pacer.clock()-start
         for (a, b, kind), (games, moves) in added.items():
             records = self.games(a, b)
@@ -1354,6 +1389,7 @@ def loop(args):
         raise ValueError('anchor_every must be at least 1 while anchor games are enabled')
     if settings.anchor_target_halfwidth < 0 or settings.fill_top < 0 or not .5 <= settings.max_expected_score <= 1:
         raise ValueError('anchor_target_halfwidth and fill_top must be at least 0, max_expected_score in [0.5, 1]')
+    Budgets.of(settings)
     if args.once:
         settings = replace(settings, idle_fill=False)  # fill work never runs out
     evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share))
@@ -1439,26 +1475,31 @@ def calibrate(args):
 
 
 def match(args):
+    """Paired match of --a against --b; each side has its own model instance, trees and solver budgets."""
     run = Path(args.run)
     config = dense_config.load(run)
     settings = config.evaluation
     if args.sims:
         settings = replace(settings, sims=args.sims, root_samples=min(settings.root_samples, args.sims))
-    models = {}
-    for name in (args.a, args.b):
-        if name != SEAL and name not in models:
-            path = Path(name) if Path(name).is_file() else run/'checkpoints'/name/'ema.pt'
-            models[name] = load(run, config, source=(name, path))
-    if args.a == args.b:
-        raise ValueError('A match needs two distinct players')
+    budgets = {side: Budgets(**{f: getattr(args, f'{side}_solver_{f}') if getattr(args, f'{side}_solver_{f}') is not None
+                                else getattr(settings, 'solver_'+f) for f in asdict(Budgets())}) for side in 'ab'}
     if args.a == SEAL:
         raise ValueError('Seal plays as --b; pass the checkpoint as --a')
+    if args.a == args.b and budgets['a'] == budgets['b']:
+        raise ValueError('A match needs two distinct players: other checkpoints or other solver budgets')
+    models = {}
+    for side, name in (('a', args.a), ('b', args.b)):
+        if name != SEAL:
+            path = Path(name) if Path(name).is_file() else run/'checkpoints'/name/'ema.pt'
+            models[side] = load(run, config, source=(name, path))
     started = time.perf_counter()
-    records = play(paired_games(models[args.a], SEAL if args.b == SEAL else models[args.b], args.games,
+    records = play(paired_games(models['a'], SEAL if args.b == SEAL else models['b'], args.games,
                                 f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None,
-                                candidate=args.a, opponent=args.b), config.actor.leaf_batch)
-    report = make_report(args.a, args.b, records, {n: m.sha for n, m in models.items()}, settings)
-    print(json.dumps(dict(summary=report['summary'], metrics=report['metrics'], seconds=time.perf_counter()-started), indent=2))
+                                budgets=(budgets['a'], budgets['b']), candidate=args.a, opponent=args.b),
+                   config.actor.leaf_batch)
+    report = make_report(args.a, args.b, records, {m.checkpoint: m.sha for m in models.values()}, settings)
+    print(json.dumps(dict(summary=report['summary'], metrics=report['metrics'], seconds=time.perf_counter()-started,
+                          solver={side: asdict(b) for side, b in budgets.items()}), indent=2))
 
 
 def main():
@@ -1473,6 +1514,10 @@ def main():
     p.add_argument('--extra', type=int, default=256)
     p = sub.add_parser('match'); p.add_argument('--run', required=True); p.add_argument('--a', required=True)
     p.add_argument('--b', required=True); p.add_argument('--games', type=int, default=32); p.add_argument('--sims', type=int)
+    for side in 'ab':
+        for name in asdict(Budgets()):
+            p.add_argument(f'--{side}-solver-{name.replace("_", "-")}', dest=f'{side}_solver_{name}', type=int,
+                           help=f'solver_{name} of --{side} (default: the evaluation setting)')
     args = parser.parse_args()
     dict(loop=loop, calibrate=calibrate, match=match)[args.command](args)
 

@@ -52,6 +52,18 @@ def unknown_result(reason, start, attacker, build_hash=None):
                 elapsed_ms=(time.perf_counter()-start)*1000)
 
 
+def library(package=PACKAGE):
+    """Path of the built native library of `package`; its identity record is the same path plus '.json'."""
+    name = 'hexo_tactical.dll' if sys.platform == 'win32' else ('libhexo_tactical.dylib' if sys.platform == 'darwin' else 'libhexo_tactical.so')
+    return Path(package)/'target/release'/name
+
+
+def build_hash(package=PACKAGE):
+    """The recorded SHA-256 of `package`'s built library: the `build_hash` its results carry."""
+    binary = library(package)
+    return json.loads(binary.with_suffix(binary.suffix+'.json').read_text(encoding='utf-8'))['binary_sha256']
+
+
 class NativeTactics:
     """In-process native solver; one query at a time.
 
@@ -63,8 +75,7 @@ class NativeTactics:
 
     def __init__(self, package=PACKAGE):
         package = Path(package)
-        name = 'hexo_tactical.dll' if sys.platform == 'win32' else ('libhexo_tactical.dylib' if sys.platform == 'darwin' else 'libhexo_tactical.so')
-        binary = package/'target/release'/name
+        binary = library(package)
         self.metadata = json.loads(binary.with_suffix(binary.suffix+'.json').read_text(encoding='utf-8'))
         digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
         if (digest(binary) != self.metadata['binary_sha256'] or
