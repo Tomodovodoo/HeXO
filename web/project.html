@@ -31,6 +31,8 @@ const PANELS=[
 {id:'vgap',title:'Policy CE gap',sources:'gap_policy_ce',xs:['step','hours'],note:'Per source: fixed held-out rows minus fixed training rows, EMA weights'},
 {id:'vgapvalue',title:'Value BCE gap',sources:'gap_value_bce',xs:['step','hours'],note:'Per source: fixed held-out rows minus fixed training rows, EMA weights'},
 {id:'vcurve',title:'Value loss by plies remaining',sources:'value_curve',prefix:'',from:['fresh','newest'],xs:['remaining'],zero:true,ref:Math.LN2,note:'Latest checkpoint, EMA weights: value BCE of held-out rows of finished games, Gaussian smoothing over 4 plies. Faint line: 0.693 (no information)'},
+{id:'pcurve',title:'Policy CE by ply',sources:'policy_ce_curve',prefix:'',from:['fresh','newest'],xs:['ply'],zero:true,note:'Latest checkpoint, EMA weights: policy CE of held-out full-search rows, Gaussian smoothing over 4 plies'},
+{id:'vply',title:'Value BCE by ply',sources:'value_bce_by_ply',prefix:'',from:['fresh','newest'],xs:['ply'],zero:true,ref:Math.LN2,note:'Latest checkpoint, EMA weights: value BCE of held-out rows of finished games, Gaussian smoothing over 4 plies. Faint line: 0.693 (no information)'},
 {id:'horizon',title:'Value horizon',sources:'value_horizon',from:['fresh','newest'],xs:['step','hours'],zero:true,note:'Plies remaining at which the smoothed held-out value BCE first exceeds ln 2 / 2 = 0.347 (halfway between perfect and chance)'},
 {id:'elo',title:'Elo',metric:'elo',xs:['step','hours'],band:true,pair:{metric:'seal_delta',label:'champion - Seal',dash:[2,3]},note:'Each run has its own league scale (first rated checkpoint = 0); shading is the 95% interval. Dotted: direct-match Elo of each anchored champion minus Seal'},
 {id:'sps',title:'Samples / s',metric:'samples_per_second',smooth:true,xs:['step','hours'],zero:true},
@@ -45,7 +47,7 @@ const selected=()=>state.selected?rows.filter(r=>state.selected.includes(r.key))
 const style=(i,dash)=>({color:COLORS[i%COLORS.length],dash:dash||(i>=COLORS.length?[6,4]:[])});
 const fmt=v=>{if(!Number.isFinite(v))return'-';const a=Math.abs(v);return a>=1e4?Math.round(v).toLocaleString():a>=100?v.toFixed(0):a>=10?v.toFixed(1):a>=.01||a===0?v.toPrecision(4):v.toExponential(2)};
 const ema=(pts,w)=>{let m=0,n=0;return pts.map(q=>{m=m*w+(1-w)*q[1];n++;return [q[0],m/(1-w**n),...q.slice(2)]})};
-const XLABEL={step:'Step',hours:'Time (hours)',remaining:'Plies remaining'},xfmt=(x,v)=>x==='hours'?v.toFixed(2)+' h':x==='remaining'?`${Math.round(v)} plies`:`${Math.round(v)}`;
+const XLABEL={step:'Step',hours:'Time (hours)',remaining:'Plies remaining',ply:'Ply'},xfmt=(x,v)=>x==='hours'?v.toFixed(2)+' h':x==='remaining'?`${Math.round(v)} plies`:x==='ply'?`ply ${Math.round(v)}`:`${Math.round(v)}`;
 const tick=v=>Math.abs(v)>=1e-3||v===0?v.toLocaleString(undefined,{maximumFractionDigits:6}):v.toExponential(1);
 const age=s=>s==null?'-':s<90?`${Math.round(s)} s`:s<5400?`${Math.round(s/60)} min`:s<172800?`${(s/3600).toFixed(1)} h`:`${Math.round(s/86400)} d`;
 function swatch(i,dash){const s=style(i,dash),e=document.createElementNS('http://www.w3.org/2000/svg','svg');e.setAttribute('class','swatch');e.setAttribute('width',22);e.setAttribute('height',4);

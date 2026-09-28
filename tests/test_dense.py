@@ -1328,6 +1328,30 @@ class ValidationSourceTests(unittest.TestCase):
         empty = dense_learn.remaining_curve([], [], [])
         self.assertEqual((set(empty['value_curve']), empty['value_bce_last20'], empty['value_horizon']), ({None}, None, None))
 
+    def test_policy_curve_rises_when_the_policy_is_sharp_early_and_flat_late(self):
+        """Improved policies that are sharp before ply 40 and flat over 30 cells after, matched exactly by the
+        network: the by-ply policy CE is the target entropy, near 0 early and near ln 30 late, rising in between,
+        and None where no row lies within reach of a grid point."""
+        plies = np.arange(300).repeat(3)
+        n = 30
+        target = torch.full((len(plies), n), 1/n)
+        sharp = torch.tensor(plies < 40)
+        target[sharp] = .001/n
+        target[sharp, 0] += .999
+        cells = torch.arange(n).repeat(len(plies), 1)
+        ce = hexnet.policy_row_losses(target.log(), None, cells, torch.full((len(plies),), n), target).numpy()
+        curve = dict(zip(dense_learn.PLY_GRID, dense_learn.ply_curve(plies, ce)))
+        self.assertEqual(len(curve), 49)
+        self.assertLess(curve[0], .05)
+        self.assertAlmostEqual(curve[96], math.log(n), places=3)
+        ys = [curve[g] for g in range(0, 300, 8)]
+        self.assertEqual(ys, sorted(ys))
+        self.assertIsNone(curve[384])
+        early, late = dense_learn.ply_split(plies, ce)
+        self.assertAlmostEqual(early, float(ce[plies < 20].mean()))
+        self.assertAlmostEqual(late, math.log(n), places=4)
+        self.assertEqual(dense_learn.ply_split([30], [1.]), (None, None))
+
     def test_export_reports_value_by_plies_remaining(self):
         import dashboard
         torch.set_num_threads(2)
@@ -1347,22 +1371,40 @@ class ValidationSourceTests(unittest.TestCase):
             held = sets.subsets['fresh', 'held']
             finished = [r for r in held if r.episode['winner'] >= 0]
             self.assertTrue(finished and len(finished) < len(held))
-            remaining, bce, target = learner.value_rows(sets, held)
-            self.assertEqual(sorted(remaining), sorted(len(r.episode['moves'])-r.row['ply'] for r in finished))
-            self.assertTrue(set(target.tolist()) <= {0., 1.})
-            self.assertAlmostEqual(v['fresh_value_bce_last20'], float(bce.mean()))
+            r = learner.row_losses(sets, held)
+            f, p = r['finished'] > 0, np.isfinite(r['policy_ce'])
+            self.assertEqual(sorted(r['remaining'][f]), sorted(len(x.episode['moves'])-x.row['ply'] for x in finished))
+            self.assertEqual(sorted(r['ply']), sorted(x.row['ply'] for x in held))
+            self.assertTrue(set(r['value'][f].tolist()) <= {0., 1.})
+            self.assertAlmostEqual(v['fresh_value_bce_last20'], float(r['value_bce'][f].mean()))
+            self.assertTrue(p.all())
+            self.assertAlmostEqual(float(r['policy_ce'][p].mean()), v['fresh_policy_ce'], delta=1e-4)
+            self.assertEqual(v['ply_grid'], list(dense_learn.PLY_GRID))
+            self.assertEqual(v['fresh_policy_ce_curve'], dense_learn.ply_curve(r['ply'][p], r['policy_ce'][p]))
+            self.assertEqual(v['fresh_value_bce_by_ply'], dense_learn.ply_curve(r['ply'][f], r['value_bce'][f]))
+            self.assertEqual((v['fresh_policy_ce_early'], v['fresh_policy_ce_late']), dense_learn.ply_split(r['ply'][p], r['policy_ce'][p]))
+            self.assertIsNotNone(v['fresh_policy_ce_early'])
             for source in dense_learn.CURVE_SOURCES:
                 for key in ('value_curve', 'value_excess_curve'):
                     self.assertEqual(len(v[f'{source}_{key}']), len(dense_learn.REMAINING_GRID))
-                self.assertIn(f'{source}_value_horizon', v)
+                for key in ('policy_ce_curve', 'value_bce_by_ply'):
+                    self.assertEqual(len(v[f'{source}_{key}']), len(dense_learn.PLY_GRID))
+                for key in ('value_horizon', 'policy_ce_early', 'policy_ce_late'):
+                    self.assertIn(f'{source}_{key}', v)
             self.assertNotIn('converted_value_curve', v)
+            self.assertNotIn('converted_policy_ce_curve', v)
             fields = dense_learn.validation_fields(metrics)
             self.assertFalse([k for k, x in fields.items() if isinstance(x, list)])
             self.assertEqual(fields['fresh_value_bce_last20'], v['fresh_value_bce_last20'])
+            self.assertEqual(fields['fresh_policy_ce_early'], v['fresh_policy_ce_early'])
             dense_config.append_metrics(run, 'learner-main', step=7, validation=True, **fields)
             config = dict(created_at=0.)
             self.assertEqual(dashboard.series(run, config, 'main', 'validation_fresh_value_bce_last20')['points'],
                              [[7, v['fresh_value_bce_last20']]])
+            self.assertEqual(dashboard.series(run, config, 'main', 'validation_fresh_policy_ce_early')['points'],
+                             [[7, v['fresh_policy_ce_early']]])
+            late = dashboard.series(run, config, 'main', 'validation_newest_policy_ce_late')['points']
+            self.assertEqual(late, [] if v['newest_policy_ce_late'] is None else [[7, v['newest_policy_ce_late']]])
             horizon = dashboard.series(run, config, 'main', 'validation_newest_value_horizon')['points']
             self.assertEqual(horizon, [] if v['newest_value_horizon'] is None else [[7, v['newest_value_horizon']]])
             curve = dashboard.series(run, config, 'main', 'fresh_value_curve', 'remaining')
@@ -1372,6 +1414,14 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual(dashboard.series(run, config, 'side', 'fresh_value_curve', 'remaining')['points'], [])
             with self.assertRaises(ValueError):
                 dashboard.series(run, config, 'main', 'fresh_value_curve')
+            for key in ('policy_ce_curve', 'value_bce_by_ply'):
+                curve = dashboard.series(run, config, 'main', f'fresh_{key}', 'ply')
+                self.assertEqual(curve['points'], [list(q) for q in zip(v['ply_grid'], v[f'fresh_{key}'])])
+                self.assertTrue(any(y is not None for _, y in curve['points']))
+                self.assertTrue(any(y is None for _, y in curve['points']))
+                with self.assertRaises(ValueError):
+                    dashboard.series(run, config, 'main', f'fresh_{key}', 'remaining')
+            json.dumps(curve, allow_nan=False)
 
     def test_value_curve_series_keeps_unsupported_gaps(self):
         """A curve supported on two separate ranges keeps null points between them in the response, so the chart
