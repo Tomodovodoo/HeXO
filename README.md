@@ -780,3 +780,31 @@ The trainer requires a finished checkpoint boundary and an exclusive run lock.
 It verifies and binds the old manifests in `history.json`, preserves model and
 optimizer files, and records the new source identity. Normal later resumes omit
 `--upgrade-run`. Never change the source checkout of an active trainer.
+
+## Dense evaluator
+
+`dense_eval.py loop` rates each new dense checkpoint against the champion and keeps the league in
+`league.json`; its module docstring is the full contract, and every setting is an `EvaluationSettings` field in
+`dense_config.py` (override per process with `--eval-*`).
+
+- **Promotion** (`decision`, default `posterior`). One Bradley-Terry posterior covers every rated checkpoint, the
+  candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
+  and against panel members. Each pair also gets a matchup deviation (prior sd `matchup_prior_elo`, default 30),
+  so a pair's own games outweigh the transitive picture when the two disagree. The candidate needs at least
+  `sprt_min_games` direct games, and its rating sd may be at most `uncertainty_parity` times the champion's.
+  It is promoted when it has the highest posterior rating and P(candidate - champion > `sprt_elo0`) is at least
+  `promote_confidence`. It is rejected when that probability is at most 1 - `promote_confidence`. Neither
+  happens while the direct-only and pooled estimates disagree beyond their intervals. `decision sprt` keeps the
+  sequential test (`sprt_elo0` 0, `sprt_elo1` 25).
+- **Rounds.** Every comparison plays rounds of `round_games` (8) games, in colour-swapped opening pairs. While a
+  decision is pending, each round goes to the pairing whose round most reduces the posterior variance of the
+  decision's Elo difference: the direct games, or the candidate or champion against the previous champion or
+  Seal. A newer checkpoint of the variant ends the evaluation at the next round boundary, and the verdict at
+  that point settles it.
+- **Streaming.** `evaluator-status.json` carries the running tally of the current comparison and the pending
+  verdict. The dashboard shows both, including a provisional league row for the candidate.
+- **Idle work.** After the decision, the evaluator plays the champion's Seal anchor, the adaptive panel (the
+  rated checkpoints closest to the champion) and other optional comparisons. It then fills rounds until the
+  next checkpoint appears: the champion against Seal until their interval is `anchor_target_halfwidth` narrow,
+  one round of the newest checkpoint against the previous champion, then the widest pair among the top
+  `fill_top`. Pairings where either side's expected score exceeds `max_expected_score` are never played.
