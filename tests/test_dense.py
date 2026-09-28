@@ -1055,10 +1055,14 @@ class OpponentSchedulerTests(unittest.TestCase):
             self.assertEqual(historical.models, {})
         self.assertEqual((historical.target, historical.block), (8, 4))
         historical.models, historical.weights = {'a': 'A', 'b': 'B'}, {'a': 1., 'b': 1.}
-        drawn = [historical.next() for _ in range(40)]
+        drawn, colours = zip(*(historical.next() for _ in range(40)))
         self.assertEqual(set(drawn), {'A', 'B'})
         for k in range(0, 40, 4):
             self.assertEqual(len(set(drawn[k:k+4])), 1)               # blocks of target/BLOCKS games per opponent
+        self.assertEqual(colours, (0, 1)*20)                           # alternating over historical games only
+        # A run shorter than games_in_flight keeps the fraction: 8 games, half historical.
+        self.assertEqual(dense_selfplay.Historical('.', config, rng, games=8).target, 4)
+        self.assertEqual(dense_selfplay.Historical('.', config, rng, games=100).target, 8)
 
     def test_mixed_games_mask_the_opponent_plies(self):
         torch.manual_seed(8)

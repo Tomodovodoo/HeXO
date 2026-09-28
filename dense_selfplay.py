@@ -12,9 +12,9 @@ starts a tree's next search as soon as its previous one finishes, so full (`full
 is re-read after each shard: games in progress finish with the evaluator they started with, new games use
 the new one; a shard may therefore mix actors (identity `actors`; `actor_sha256` is the newest).
 
-Historical opponents (ActorSettings.historical_*): up to round(historical_fraction * games_in_flight) games in
-flight pit the champion, alternating colours, against a frozen rated checkpoint (`Historical`); only the
-champion's plies become training rows (dense_data.trained). Settings flags given to the actor override config.json
+Historical opponents (ActorSettings.historical_*): up to round(historical_fraction * min(games_in_flight, --games))
+games in flight pit the champion, alternating colours over historical games, against a frozen rated checkpoint
+(`Historical`); only the champion's plies become training rows (dense_data.trained). Settings flags given to the actor override config.json
 for its processes and are recorded in each shard's identity.
 """
 import argparse
@@ -416,16 +416,18 @@ class SelfPlayGame:
 class Historical:
     """Frozen historical opponents of one actor worker. `redraw(champion)` re-reads league.json, draws
     `historical_pool` opponents (draw_pool over opponent_weights; rated checkpoints with an ema.pt) and loads their
-    ema.pt, keeping models drawn again; `next()` returns the opponent Model of the next historical game from blocks
-    of about target/BLOCKS consecutive games per opponent, so few opponent models share the Engine at once. `target`
-    is the number of historical games to keep in flight."""
+    ema.pt, keeping models drawn again; `next()` returns (opponent Model, champion colour) for the next historical
+    game: opponents come in blocks of about target/BLOCKS consecutive games, so few opponent models share the
+    Engine at once, and the champion's colour alternates over historical games only. `target` is the number of
+    historical games to keep in flight: round(historical_fraction * min(games_in_flight, games)), `games` being the
+    worker's game budget (None: endless), so a short run keeps the fraction too."""
 
-    def __init__(self, run, config, rng):
+    def __init__(self, run, config, rng, games=None):
         self.run, self.config, self.rng = Path(run), config, rng
         s = config.actor
-        self.target = round(s.games_in_flight*s.historical_fraction)
+        self.target = round(s.historical_fraction*min(s.games_in_flight, s.games_in_flight if games is None else games))
         self.block = max(1, math.ceil(self.target/BLOCKS))
-        self.models, self.weights, self.plan = {}, {}, deque()
+        self.models, self.weights, self.plan, self.started = {}, {}, deque(), 0
 
     def redraw(self, champion):
         path = self.run/'league.json'
@@ -441,7 +443,8 @@ class Historical:
     def next(self):
         if not self.plan:
             self.plan.extend(opponent_block(self.weights, self.block, self.rng))
-        return self.models[self.plan.popleft()]
+        self.started += 1
+        return self.models[self.plan.popleft()], (self.started-1) % 2
 
 
 def shard_name():
@@ -461,7 +464,7 @@ def worker(args):
     log_event(run, 'actor', 'info', f'worker {args.worker} playing {model.checkpoint} ({model.sha[:12]})'
               + (' - FRESH UNTRAINED NETWORK' if model.checkpoint == 'fresh' else ''), process=args.worker)
     print(f'Worker {args.worker}: {model.checkpoint} {model.sha[:12]}', flush=True)
-    historical = Historical(run, config, np.random.default_rng(seeds.spawn(1)[0])) if settings.historical_fraction > 0 else None
+    historical = Historical(run, config, np.random.default_rng(seeds.spawn(1)[0]), args.games) if settings.historical_fraction > 0 else None
     if historical:
         historical.redraw(model.checkpoint)
     engine = Engine(settings.leaf_batch)
@@ -531,7 +534,7 @@ def worker(args):
             while len(engine.slots) < settings.games_in_flight and (args.games is None or started < args.games):
                 seed = seeds.spawn(1)[0].generate_state(1, np.uint64)[0].item()
                 if historical and historical.models and sum(g.opponent is not None for g in engine.slots) < historical.target:
-                    opponent, learner = historical.next(), started % 2
+                    opponent, learner = historical.next()
                     sides = [model, opponent] if learner == 0 else [opponent, model]
                     engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint))
                 else:
