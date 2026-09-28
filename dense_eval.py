@@ -106,7 +106,7 @@ import torch
 import dense_config
 from dense_config import log_event
 import dense_data
-from dense_posterior import Posterior
+from dense_posterior import Posterior, parents
 from dense_solver import Budgets
 import hexnet
 from arena import Seal
@@ -1136,7 +1136,8 @@ class Evaluator:
     def verdict(self, cid, champion):
         """The posterior decision on candidate cid against the champion (module contract), or on variant cid
         against its checkpoint `champion`, from every protocol-matching report among the league's rated
-        checkpoints and variants, cid, the opponent and Seal: {decision ('promote', 'reject' or None; for a
+        checkpoints and variants, cid, the opponent and Seal, each rating's prior centred on its parent's
+        (dense_posterior.parents), so a candidate without games sits at its previous export: {decision ('promote', 'reject' or None; for a
         variant 'better', 'worse' or None), rule and threshold (the rule in force: 'posterior' with
         promote_confidence, or with decision 'sprt' for a checkpoint 'sprt' with sprt_elo1), comparison ('champion' or
         'variant'), delta and delta_sd (r_cid - r_champion + their matchup deviation), p_better (P(delta >
@@ -1153,7 +1154,7 @@ class Evaluator:
         if any(SEAL in (r['candidate'], r['opponent']) for r in reports):
             ids.append(SEAL)
         post = Posterior(ids, ids[0], [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
-                                       r['summary']['games']) for r in reports], s.matchup_prior_elo)
+                                       r['summary']['games']) for r in reports], s.matchup_prior_elo, parents(ids))
         mean, sd = post.difference(cid, champion)
         pooled_mean, pooled_sd = post.difference(cid, champion, False)
         pooled = [pooled_mean-1.96*pooled_sd, pooled_mean+1.96*pooled_sd]

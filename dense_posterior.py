@@ -1,7 +1,9 @@
 """Posterior over league ratings with per-pair matchup deviations, and the value of information of the next round.
 
 Model: a report is n games of a against b with a's points w (a capped game is half a point). Every id but the
-anchor has a rating r (Elo) with a N(0, RATING_PRIOR^2) prior; the anchor is fixed at 0. Every pair that met has
+anchor has a rating r (Elo) with a N(r_parent, RATING_PRIOR^2) prior, its parent being the nearest earlier rated
+checkpoint of its variant (for a variant `<checkpoint>@name`, that checkpoint), N(0, RATING_PRIOR^2) without one; the
+anchor is fixed at 0. Every pair that met has
 a matchup deviation d_ab ~ N(0, matchup_prior^2) (none when matchup_prior is 0), and a's expected score against b
 is 1 / (1 + 10^(-(r_a - r_b + d_ab) / 400)), so a pair's own games outweigh the transitive picture when the two
 disagree. `Posterior` finds the mode by Newton's method and approximates the posterior by the Gaussian with the
@@ -17,10 +19,32 @@ K = math.log(10)/400
 RATING_PRIOR = 1000.
 
 
-class Posterior:
-    """Laplace posterior of `ids` (anchor fixed at 0) from results [(a, b, points of a, games)], summed per pair."""
+def parents(ids):
+    """{id: parent id} over league ids (module contract): a variant `<checkpoint>@<name>` -> its checkpoint when
+    that is in `ids`; a checkpoint `<variant>/<step>` -> the checkpoint of `ids` of the same variant with the
+    highest smaller step. Other ids (Seal) and the first checkpoint of a variant have none."""
+    out, lines = {}, {}
+    for name in ids:
+        checkpoint, at, _ = name.partition('@')
+        variant, slash, step = checkpoint.partition('/')
+        if at:
+            if checkpoint in ids:
+                out[name] = checkpoint
+        elif slash and step.isdigit():
+            lines.setdefault(variant, []).append((int(step), name))
+    for line in lines.values():
+        line.sort()
+        out.update({later: earlier for (_, earlier), (_, later) in zip(line, line[1:])})
+    return out
 
-    def __init__(self, ids, anchor, results, matchup_prior):
+
+class Posterior:
+    """Laplace posterior of `ids` (anchor fixed at 0) from results [(a, b, points of a, games)], summed per pair.
+    `parents` {id: parent id} centres an id's N(., RATING_PRIOR^2) prior on its parent's rating (the prior is on
+    r_id - r_parent), so an id without games sits at its parent's rating; an id without a parent in `ids` keeps
+    the prior centred on 0."""
+
+    def __init__(self, ids, anchor, results, matchup_prior, parents=None):
         self.anchor, self.sigma = anchor, matchup_prior
         self.ids = list(dict.fromkeys(ids))
         totals = {}
@@ -33,21 +57,26 @@ class Posterior:
         self.index = {i: k for k, i in enumerate(free)}
         if matchup_prior > 0:
             self.index.update({p: len(free)+k for k, p in enumerate(self.pairs)})
-        precision = np.array([RATING_PRIOR**-2]*len(free)+[matchup_prior**-2 if matchup_prior > 0 else 0.]*(len(self.index)-len(free)))
+        prior = np.diag([0.]*len(free)+[matchup_prior**-2 if matchup_prior > 0 else 0.]*(len(self.index)-len(free)))
+        parents = parents or {}
+        for name in free:
+            parent = parents.get(name)
+            v = self.vector(name, parent, False) if parent in self.ids and parent != name else self.vector(name, anchor, False)
+            prior += RATING_PRIOR**-2*np.outer(v, v)
         design = np.array([self.vector(a, b) for a, b in self.pairs]).reshape(len(self.pairs), len(self.index))
         w, n = (np.array([v[i] for v in self.pairs.values()]) for i in (0, 1))
         x = np.zeros(len(self.index))
         for _ in range(100):
             p = 1/(1+np.exp(-np.clip(K*(design@x), -700, 700)))
-            gradient = K*design.T@(n*p-w)+precision*x
-            hessian = K*K*design.T@(design*(n*p*(1-p))[:, None])+np.diag(precision)
+            gradient = K*design.T@(n*p-w)+prior@x
+            hessian = K*K*design.T@(design*(n*p*(1-p))[:, None])+prior
             step = np.linalg.solve(hessian, gradient)
             x -= step
             if np.max(np.abs(step)) < 1e-6:
                 break
         p = 1/(1+np.exp(-np.clip(K*(design@x), -700, 700)))
         self.mode = x
-        self.cov = np.linalg.inv(K*K*design.T@(design*(n*p*(1-p))[:, None])+np.diag(precision))
+        self.cov = np.linalg.inv(K*K*design.T@(design*(n*p*(1-p))[:, None])+prior)
 
     def vector(self, a, b, matchup=True, extra=()):
         """Weights of r_a - r_b (+ d_ab with matchup) over the parameters, then over `extra` new pairs."""

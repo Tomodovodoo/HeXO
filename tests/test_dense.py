@@ -2256,6 +2256,19 @@ class PosteriorTests(unittest.TestCase):
         self.assertGreater(post.difference('a', 'b')[0], direct/2)            # its own games dominate
         self.assertLess(post.difference('b', 'a')[0], -direct/2)
 
+    def test_a_fresh_candidate_is_centred_on_its_previous_export(self):
+        from dense_posterior import Posterior, parents
+        ids = ['main/000010', 'main/000020', 'main/000030', 'main/000040', 'main/000030@solver', 'side/000005', 'seal']
+        self.assertEqual(parents(ids), {'main/000020': 'main/000010', 'main/000030': 'main/000020', 'main/000040': 'main/000030',
+                                        'main/000030@solver': 'main/000030'})
+        # The champion main/000030 sits far above the anchor; the candidate splits 20-20 with it.
+        results = [('main/000020', 'main/000010', 380, 400), ('main/000030', 'main/000020', 380, 400),
+                   ('main/000040', 'main/000030', 20, 40)]
+        ids = ['main/000010', 'main/000020', 'main/000030', 'main/000040']
+        centred = Posterior(ids, ids[0], results, 30., parents(ids)).difference('main/000040', 'main/000030', False)[0]
+        self.assertLess(abs(centred), 3.)
+        self.assertLess(Posterior(ids, ids[0], results, 30.).difference('main/000040', 'main/000030', False)[0], centred-3)
+
     def test_value_of_information_prefers_the_pairing_that_resolves_delta(self):
         from dense_posterior import Posterior
         best = lambda post: min((('cand', 'champ'), ('cand', 'prev'), ('champ', 'prev')),
