@@ -854,3 +854,15 @@ always score finished games against their hard outcome.
   next checkpoint appears: the champion against Seal until their interval is `anchor_target_halfwidth` narrow,
   `games` of the newest checkpoint against the previous champion, then the widest pair among the top
   `fill_top`. Pairings where either side's expected score exceeds `max_expected_score` are never played.
+- **Variants.** An A/B test of search settings runs through the same pool, reports and posterior. A variant is
+  a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`,
+  `solver_*`), league id `<checkpoint>@<name>`:
+
+  ```text
+  python dense_eval.py variant --run runs/dense-v1 --checkpoint main/032500 --name solver --set solver_root_nodes=135 --set solver_finalists=2 --set solver_finalist_nodes=135 --set solver_threat_nodes=135
+  ```
+
+  The running evaluator picks it up once no checkpoint waits and decides it against its checkpoint: 'better'
+  once P(variant - checkpoint > `sprt_elo0`) reaches `promote_confidence`, 'worse' once it falls to 1 -
+  `promote_confidence`, 'max-games' at `sprt_max_games`. Variants are rated in the league and shown in the
+  checkpoint history, but they never become champion and never reach the actors.
