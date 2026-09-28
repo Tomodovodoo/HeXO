@@ -12,6 +12,7 @@ import sys
 import tempfile
 import shutil
 import time
+from types import SimpleNamespace
 import unittest
 import unittest.mock
 
@@ -1433,6 +1434,41 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertLess(gap(ema), .01)
             self.assertEqual(learner.ema.blocks[0].norm1.momentum, .1)
 
+    def test_vram_cap_and_release_on_cuda(self):
+        """vram_reserved_mb caps the allocator at that share of the device, installed from the resumed settings
+        before any weights are placed; export releases the cache once after its recalibration and validation
+        passes; neither touches CUDA on the CPU."""
+        torch.set_num_threads(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x')
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=0., vram_reserved_mb=2048))
+            with unittest.mock.patch.object(torch.cuda, 'set_per_process_memory_fraction') as cap,                  unittest.mock.patch.object(torch.cuda, 'empty_cache') as empty:
+                learner = dense_learn.Learner(run, config.learner, config)
+                window = dense_data.ReplayWindow(run, 1000, 10)
+                with unittest.mock.patch.object(learner, 'release', wraps=learner.release) as release,                      unittest.mock.patch.object(learner, 'validate', wraps=learner.validate) as validate:
+                    validate.side_effect = lambda w: release.assert_not_called()
+                    learner.export(window)
+                release.assert_called_once_with()
+                cap.assert_not_called(); empty.assert_not_called()
+                self.assertEqual(learner.vram(), dict(allocated_mb=0, reserved_mb=0))
+                learner.device = torch.device('cuda', 0)
+                with unittest.mock.patch.object(torch.cuda, 'get_device_properties', return_value=SimpleNamespace(total_memory=8*2**30)):
+                    learner.cap_vram()
+                    cap.assert_called_once_with(.25, learner.device)
+                    learner.release()
+                    empty.assert_called_once_with()
+                    learner.settings = replace(learner.settings, vram_reserved_mb=9000)
+                    with self.assertRaises(ValueError):
+                        learner.cap_vram()
+            seen = []
+            def cap_vram(resumed):
+                seen.append((hasattr(resumed, 'model'), resumed.settings.vram_reserved_mb, resumed.settings.batch))
+            with unittest.mock.patch.object(dense_learn.Learner, 'cap_vram', autospec=True, side_effect=cap_vram):
+                dense_learn.Learner(run, replace(config.learner, vram_reserved_mb=0), config, overrides=dict(batch=4))
+            self.assertEqual(seen, [(False, 2048, 4)])  # before any weights exist, with the resumed settings
+
     def test_export_without_held_out_games(self):
         """No held-out game in the window: metrics.validation stays null, the sources are still reported, and the
         dashboard series skips the null aggregate."""
@@ -1647,11 +1683,17 @@ class YieldTests(unittest.TestCase):
             write_games(run/'shards'/'000001', [(winning_game(), 0, None)]*8)
             done = subprocess.run([sys.executable, str(ROOT/'dense_learn.py'), '--run', str(run), '--steps', '1',
                                    '--workers', '1', '--batch', '8', '--window-min-rows', '1', '--samples-per-row', '7.5',
-                                   '--validation-fraction', '0'],
+                                   '--validation-fraction', '0', '--log-every', '1', '--vram-reserved-mb', '1500'],
                                   capture_output=True, text=True, cwd=ROOT, timeout=300)
             self.assertEqual(done.returncode, 0, done.stderr)
             status = json.loads((run/'learner-status.json').read_text())
             self.assertEqual(status['samples_per_row_target'], 7.5)
+            zeros = dict(allocated_mb=0, reserved_mb=0)
+            self.assertEqual(status['vram'], zeros)
+            lines = [json.loads(line) for line in (run/'metrics'/'learner-main.jsonl').read_text().splitlines()]
+            self.assertEqual([(r.get('validation', False), r['vram']) for r in lines], [(False, zeros), (True, zeros)])
+            manifest = json.loads((run/'checkpoints'/'main'/'000001'/'manifest.json').read_text())
+            self.assertEqual(manifest['learner']['vram_reserved_mb'], 1500)
 
     def test_disabled_and_invalid_bounds(self):
         self.heartbeat(0.)
