@@ -412,7 +412,7 @@ def main():
         def replay():
             s = learner.settings
             return dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
-                                           s.window_taper, s.validation_fraction)
+                                           s.window_taper, s.validation_fraction, s.policy_cache_mb)
         window = replay()
         sets = dense_data.ValidationSets(args.run, s.validation_fraction, config.seed)
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers)

@@ -89,6 +89,7 @@ class LearnerSettings:
     window_expand_per_row: float = .4
     window_taper: float = .65
     window_capacity: int = 2000000
+    policy_cache_mb: float = 512.  # per-process LRU budget for the window's policy vectors (dense_data.ReplayWindow)
     recency: float = 0.
     bootstrap_weight: float = 1.  # weight of TD(lambda) value rows from capped games; 0 = mask
     bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only
