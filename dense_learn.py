@@ -11,6 +11,10 @@ loss of finished held-out games against plies remaining (remaining_curve). The E
 averages parameters only; each export first recomputes its norm statistics (Learner.recalibrate), since the
 raw model's running statistics do not describe the EMA weights.
 
+VRAM: each export ends by returning the caching allocator's unused blocks to the driver (Learner.release), since
+recalibration and validation raise the peak above what training needs. vram_reserved_mb > 0 caps the allocator
+(Learner.cap_vram); learner-status.json and the metrics lines carry vram {allocated_mb, reserved_mb} (zeros off CUDA).
+
 Every target is derived here from episodes (dense_data.examples), so td_lambda, bootstrap_weight and
 short_value_horizon are learner settings; batches are rendered by dense_data.Renderers worker processes
 (--workers) with random hex symmetries. The loss of one optimizer step is, per head, the weighted mean
@@ -46,7 +50,8 @@ QUANTUM = 16  # bucket rows are padded to a multiple of this
 STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
-KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'export_every', 'log_every')
+KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'export_every', 'log_every',
+        'vram_reserved_mb')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')))  # metrics log names
 # (low, high) for replacement perturbations; td_lambda and ema are perturbed through 1 - x.
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
@@ -219,6 +224,29 @@ class Learner:
         self.start_step = self.last_copy = self.step
         self.last_export = self.step if saved else None
         self.metrics = None
+        self.cap_vram()
+
+    def cap_vram(self):
+        """With settings.vram_reserved_mb > 0 on CUDA, cap this process's caching allocator at that many MB
+        (torch.cuda.set_per_process_memory_fraction): the allocator frees cached blocks and retries before growing
+        past it, and an allocation that still does not fit raises torch.OutOfMemoryError instead of spilling into
+        shared system memory. Raises ValueError when the cap exceeds the device's memory."""
+        mb = self.settings.vram_reserved_mb
+        if mb <= 0 or self.device.type != 'cuda':
+            return
+        total = torch.cuda.get_device_properties(self.device).total_memory
+        if mb*2**20 > total:
+            raise ValueError(f'vram_reserved_mb {mb} exceeds the device memory of {total//2**20} MB')
+        torch.cuda.set_per_process_memory_fraction(mb*2**20/total, self.device)
+
+    def release(self):
+        """Return the caching allocator's unused blocks to the driver (torch.cuda.empty_cache); a no-op off CUDA."""
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+    def vram(self):
+        """{allocated_mb, reserved_mb} of this process's caching allocator (hexnet.vram), zeros off CUDA."""
+        return hexnet.vram() if self.device.type == 'cuda' else dict(allocated_mb=0, reserved_mb=0)
 
     def place(self, model):
         return model.to(self.device, memory_format=self.memory_format)
@@ -362,7 +390,7 @@ class Learner:
     def export(self, window, sets=None):
         """Write checkpoints/<variant>/<step:06d>/ atomically (staged in a hidden sibling, then renamed).
         The EMA is recalibrated first; metrics.validation is validate(window) (the HEADS; null without held-out rows in the window) and
-        metrics.validation_sources is validate_sources(sets) (null without `sets`)."""
+        metrics.validation_sources is validate_sources(sets) (null without `sets`). The cache is released after these passes."""
         s = self.settings
         root = self.run/'checkpoints'/s.variant
         root.mkdir(parents=True, exist_ok=True)
@@ -371,6 +399,7 @@ class Learner:
             raise FileExistsError(f'{final} already exists')
         self.recalibrate(window)
         validation, sources = self.validate(window), None if sets is None else self.validate_sources(sets)
+        self.release()
         shutil.rmtree(stage, ignore_errors=True); stage.mkdir()
         hexnet.save_model(stage/'model.pt', self.model)
         hexnet.save_model(stage/'ema.pt', self.ema)
@@ -459,7 +488,7 @@ def main():
                       samples_per_row=learner.samples_seen/max(1, window.total_rows),
                       samples_per_row_target=learner.settings.samples_per_row, lr=learner.lr(),
                       last_export_step=learner.last_export, policy_ce=(learner.metrics or {}).get('policy_ce'),
-                      value_bce=(learner.metrics or {}).get('value_bce'))
+                      value_bce=(learner.metrics or {}).get('value_bce'), vram=learner.vram())
         write_json(status_path(args.run, s.variant), status)
 
     def speed():
@@ -471,7 +500,7 @@ def main():
         fields = validation_fields(learner.export(window, sets)['metrics'])
         if fields:
             dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
-                                        validation=True, **fields)
+                                        validation=True, vram=learner.vram(), **fields)
 
     rate = []
     try:
@@ -516,7 +545,7 @@ def main():
             if logged:
                 dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
                                             lr=learner.lr(), **{LOGGED[h]: v for h, v in learner.metrics.items()},
-                                            samples_per_second=speed(), window_rows=window.rows)
+                                            samples_per_second=speed(), window_rows=window.rows, vram=learner.vram())
             if learner.step % 10 == 0:
                 wait, gpu = np.mean([r[2] for r in rate]), np.mean([r[3] for r in rate])
                 memory = torch.cuda.max_memory_allocated()/2**30 if learner.device.type == 'cuda' else 0.

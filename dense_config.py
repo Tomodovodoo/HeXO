@@ -16,11 +16,13 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
   actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s;
                                        vram is hexnet.vram() of that process
   learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s;
-                                       samples_per_row_target is its effective learner.samples_per_row
+                                       samples_per_row_target is its effective learner.samples_per_row; vram
+                                       is dense_learn.Learner.vram()
   events.jsonl                         one line per event: {time, source, kind, message, ...} (log_event)
   metrics/learner-<variant>.jsonl      {time, step, samples_seen, lr, policy_ce, value_bce, short_value_bce, next_ce,
-                                       future_bce, samples_per_second, window_rows} every log_every steps, plus
-                                       {time, step, samples_seen, <the five losses>, validation: true} per export
+                                       future_bce, samples_per_second, window_rows, vram} every log_every steps,
+                                       plus {time, step, samples_seen, vram, validation: true, <validation fields>}
+                                       per export
   metrics/actor-<k>.jsonl              {time, positions, games_completed, placements_per_second, evals_per_second,
                                        mean_batch, terminal_fraction, mean_plies, checkpoint, paused_seconds} about
                                        every 30 s and at every pause or resume; counters restart with the worker
@@ -108,6 +110,9 @@ class LearnerSettings:
     replace_interval: int = 2000  # steps between replacement checks
     replace_margin: float = 50.   # Elo the source must lead by beyond interval overlap
     perturb: float = .2           # relative perturbation of copied continuous settings
+    # Cap in MB on the learner's CUDA caching allocator (dense_learn.Learner.cap_vram); 0 = unlimited. Reaching it
+    # raises out-of-memory instead of spilling into shared system memory (the intended failure on Windows).
+    vram_reserved_mb: int = 0
 
 
 @dataclass(frozen=True)
