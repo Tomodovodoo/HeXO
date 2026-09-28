@@ -14,7 +14,7 @@ for capped games ('cap' at the ply limit, 'span' when a searched position does n
 move at that ply, or null). The learner derives every target from the episode (`examples`); the stored
 `row.target`/`row.weight` (p(win) or null, weight) are informational and optional.
 """
-from collections import namedtuple
+from collections import Counter, namedtuple
 import hashlib
 import json
 import zlib
@@ -285,8 +285,11 @@ class ValidationSets:
     """Fixed per-source row subsets for validation, independent of the replay window.
 
     Sources (SOURCES): 'converted' draws from converted shards, 'fresh' from actor shards and 'newest' from the
-    actor-shard episodes played by the newest actor (`actor` of the newest actor shard by name, whose identity
-    `checkpoint` is `newest_checkpoint`). Each source has a 'held' subset of full-search rows of games selected
+    actor-shard episodes played by the newest actor: among the episode actors with full-search rows in the newest
+    such actor shard, the one first published latest as a manifest `actor` (unpublished ones rank oldest; ties go
+    to the most rows). A shard written right after a checkpoint switch can hold only the previous model's games,
+    so its manifest `actor` alone would leave the subset empty. `newest_checkpoint` is the identity `checkpoint`
+    of the first shard published by the newest actor (None when it never published one). Each source has a 'held' subset of full-search rows of games selected
     by holdout(episode, fraction) and a 'train' subset of full-search rows of the other games. A subset walks
     its source's shards in name order and takes from each at most `quota` rows, in the order of a permutation
     seeded by (seed, crc32(shard name)), until it holds `limit` rows. Shards are immutable and named in
@@ -317,8 +320,17 @@ class ValidationSets:
                 self.manifests[path.name] = manifest(path)
         names = sorted(self.manifests)
         actors = [n for n in names if origin(self.manifests[n]) == 'actor']
-        if actors:
-            self.newest, self.newest_checkpoint = self.manifests[actors[-1]]['actor'], self.manifests[actors[-1]]['identity'].get('checkpoint')
+        published = {}
+        for n in actors:
+            published.setdefault(self.manifests[n]['actor'], (len(published), self.manifests[n]['identity'].get('checkpoint')))
+        for name in reversed(actors):
+            if name not in self.candidates:
+                self.scan(name)
+            rows = Counter(a for _, _, a in self.candidates[name])
+            if rows:
+                self.newest = max(rows, key=lambda a: (published.get(a, (-1,))[0], rows[a]))
+                self.newest_checkpoint = published.get(self.newest, (None, None))[1]
+                break
         played = lambda n: self.newest in self.manifests[n]['identity'].get('actors', [self.manifests[n]['actor']])
         shards = dict(converted=[n for n in names if origin(self.manifests[n]) == 'converted'], fresh=actors,
                       newest=[n for n in actors if played(n)])

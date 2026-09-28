@@ -832,9 +832,9 @@ class DenseBootstrapTests(unittest.TestCase):
                 dense_bootstrap.read_corpus(source)
 
 
-def source_shard(path, seed, actor, origin='actor', checkpoint=None, games=6, policy_every=2):
-    """A shard of `games` random capped games; game g is played by actor[g % len(actor)] for a list, else by `actor`
-    (the identity's actor_sha256 is the last one). Actor shards get a dense_selfplay-like identity."""
+def source_shard(path, seed, actor, origin='actor', checkpoint=None, games=6, policy_every=2, publisher=None):
+    """A shard of `games` random capped games; game g is played by actor[g % len(actor)] for a list, else by `actor`.
+    The identity's actor_sha256 is `publisher`, default the last actor. Actor shards get a dense_selfplay-like identity."""
     rng = np.random.default_rng(seed)
     actors = actor if isinstance(actor, list) else [actor]
     episodes, rows = [], []
@@ -843,8 +843,9 @@ def source_shard(path, seed, actor, origin='actor', checkpoint=None, games=6, po
         e, r = episode_rows(moves, -1, [float(v) for v in rng.uniform(-1, 1, len(moves))], rng, policy_every)
         episodes.append(dict(e, actor=actors[g % len(actors)]))
         rows += [dict(x, game=g) for x in r]
-    identity = dict(source='gumbel-policy-value-v1', actor_sha256=actors[-1]) if origin == 'converted' else \
-        dict(actor_sha256=actors[-1], actors=sorted(set(actors)), checkpoint=checkpoint)
+    publisher = publisher or actors[-1]
+    identity = dict(source='gumbel-policy-value-v1', actor_sha256=publisher) if origin == 'converted' else \
+        dict(actor_sha256=publisher, actors=sorted(set(actors)), checkpoint=checkpoint)
     return dense_data.write_shard(path, identity, episodes, rows, origin)
 
 
@@ -904,6 +905,25 @@ class ValidationSourceTests(unittest.TestCase):
                 if following is not None:
                     self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
             dense_data.collate(samples, targets)
+
+    def test_newest_actor_comes_from_episodes(self):
+        """Right after a checkpoint switch the newest shard's publisher may have played none of its games."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 1, 'x', checkpoint='main/000010')
+            source_shard(run/'shards'/'1000000000002', 2, 'x', checkpoint='main/000020', publisher='y')
+            sets = dense_data.ValidationSets(run, .5, 5, limit=10, quota=4)
+            sets.refresh()
+            self.assertEqual((sets.newest, sets.newest_checkpoint), ('x', 'main/000010'))
+            for split in ('held', 'train'):
+                refs = sets.subsets['newest', split]
+                self.assertTrue(refs)
+                self.assertTrue(all(r.episode['actor'] == 'x' for r in refs))
+            source_shard(run/'shards'/'1000000000003', 3, ['x', 'y'], checkpoint='main/000020')
+            sets.refresh()
+            self.assertEqual((sets.newest, sets.newest_checkpoint), ('y', 'main/000020'))
+            self.assertTrue(sets.subsets['newest', 'train'])
+            self.assertTrue(all(r.episode['actor'] == 'y' for r in sets.subsets['newest', 'train']))
 
     def test_newest_change_selects_a_cached_successor(self):
         """A row cached only as a chosen row's next-ply successor can be chosen after the newest actor changes."""
