@@ -232,7 +232,7 @@ impl<'a> Dfpn<'a> {
         if depth > self.max_depth {
             self.max_depth = depth;
         }
-        if self.nodes > self.budget || depth > MAX_PLY {
+        if self.nodes > self.budget || depth > MAX_PLY || self.ctl.meter.as_ref().is_some_and(|m| m.charge()) {
             self.exceeded = true;
         } else if self.ctl.expired() {
             // Checked on every level-1 node: each can run a level-2 search and

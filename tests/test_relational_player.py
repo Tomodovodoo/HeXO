@@ -4,6 +4,7 @@ import numpy as np
 
 from hexo import Game
 from relational_player import RelationalPlayer
+from tactical_proof import MAX_NODES
 
 
 class DirectPlayer(unittest.TestCase):
@@ -106,7 +107,7 @@ class DirectPlayer(unittest.TestCase):
             self.assertEqual(result['proof_scope'], 'verified-root-and-tree-tactics')
             self.assertEqual(result['proof_budget_ms'], 1000)
             self.assertEqual(actor.tree.proof_ms, 1000)
-            actor.prover.solve.assert_called_once_with(unittest.mock.ANY, ms=250, idtt_ms=20)
+            actor.prover.solve.assert_called_once_with(unittest.mock.ANY, ms=250, nodes=MAX_NODES)
             actor.prover.history.assert_called()
             self.assertTrue(all(call.kwargs['ms'] <= 250 for call in actor.prover.history.call_args_list))
         finally:

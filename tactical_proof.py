@@ -4,6 +4,17 @@ Certificates cover every legal defense, including a free second placement.
 An optional root candidate expands those obligations explicitly; quiet defender
 nodes remain UNKNOWN. A single native worker limits caller wait; reconstruction
 may finish in the background. Late results are not exposed as exact values.
+
+Budgets: `nodes` bounds the total native search work (IDTT nodes plus PDS-PN
+level-1 nodes and level-2 expansions; `idtt_nodes` of it go to the optional IDTT
+probe), so a verdict and its certificate depend only on (position, attacker,
+nodes, idtt_nodes, build). `ms` is a safety cap: a query that reaches it returns
+UNKNOWN with reason 'deadline'.
+
+`attacker='mover'` asks whether the side to move has a forced win.
+`attacker='opponent'` asks whether its opponent, moving now with a fresh
+two-placement turn on the current stones, has one; `threat_cells` of that
+certificate names the threatening first turn.
 """
 import contextlib
 import ctypes as C
@@ -20,24 +31,36 @@ import time
 
 PROVEN_WIN, UNKNOWN = 'PROVEN_WIN', 'UNKNOWN'
 PACKAGE = Path(__file__).resolve().parent/'tools/tactical'
+MAX_NODES = 10000000
+DEFAULT_NODES, DEFAULT_MS = 2500, 1000
 REQUEST_LIMIT = 8*1024*1024
 # Worker responses above this are discarded unparsed; the verifier's 50,000-node certificate cap stays well below it.
 RESPONSE_LIMIT = 16*1024*1024
 
 
-def check_budgets(ms, idtt_ms, nodes, depth):
-    if (type(ms) is not int or not 1 <= ms <= 60000 or type(idtt_ms) is not int
-            or not 0 <= idtt_ms < ms or type(nodes) is not int or not 1 <= nodes <= 10000000
-            or type(depth) is not int or not 1 <= depth <= 64):
+def check_budgets(ms, nodes, idtt_nodes, depth, attacker):
+    if (type(ms) is not int or not 1 <= ms <= 60000 or type(nodes) is not int or not 1 <= nodes <= MAX_NODES
+            or type(idtt_nodes) is not int or not 0 <= idtt_nodes < nodes
+            or type(depth) is not int or not 1 <= depth <= 64 or attacker not in ('mover', 'opponent')):
         raise ValueError('Invalid tactical budgets')
 
 
-def unknown_result(reason, start):
-    return dict(status=UNKNOWN, native_verified=False, moves=[], certificate=None,
-                reason=reason, elapsed_ms=(time.perf_counter()-start)*1000)
+def unknown_result(reason, start, attacker, build_hash=None):
+    """An UNKNOWN result with every documented field; `build_hash` is None when no library answered."""
+    return dict(status=UNKNOWN, native_verified=False, moves=[], certificate=None, proof_turns=None,
+                nodes_used=0, attacker=attacker, build_hash=build_hash, reason=reason,
+                elapsed_ms=(time.perf_counter()-start)*1000)
 
 
 class NativeTactics:
+    """In-process native solver; one query at a time.
+
+    Every result carries `status`, `moves` (the verified first turn), `certificate`,
+    `nodes_used` (search work charged against `nodes`), `proof_turns` (most attacker
+    turns on any certificate path, the completing turn included; None unless
+    PROVEN_WIN), `attacker` and `build_hash` (SHA-256 of the loaded library).
+    """
+
     def __init__(self, package=PACKAGE):
         package = Path(package)
         name = 'hexo_tactical.dll' if sys.platform == 'win32' else ('libhexo_tactical.dylib' if sys.platform == 'darwin' else 'libhexo_tactical.so')
@@ -54,22 +77,22 @@ class NativeTactics:
         self.lib.hexo_tactical_free.restype = None
         self.lock = threading.Lock()
 
-    def solve(self, game, *, ms=100, idtt_ms=20, nodes=100000, depth=8, certificate=None, root_moves=None):
-        return self.history([cell[:2] for cell in game.cells], ms=ms, idtt_ms=idtt_ms,
-                            nodes=nodes, depth=depth, certificate=certificate, root_moves=root_moves)
+    def solve(self, game, **budgets):
+        return self.history([cell[:2] for cell in game.cells], **budgets)
 
-    def history(self, history, *, ms=100, idtt_ms=20, nodes=100000, depth=8, certificate=None, root_moves=None):
-        check_budgets(ms, idtt_ms, nodes, depth)
+    def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
+                certificate=None, root_moves=None):
+        check_budgets(ms, nodes, idtt_nodes, depth, attacker)
         start = time.perf_counter()
-        unknown = lambda reason: unknown_result(reason, start)
+        unknown = lambda reason: unknown_result(reason, start, attacker, self.metadata['binary_sha256'])
         if not self.lock.acquire(timeout=ms/1000):
             return unknown('lock deadline')
         try:
             remaining = math.floor(ms-(time.perf_counter()-start)*1000)
             if remaining < 1:
                 return unknown('deadline')
-            request = dict(history=history, ms=remaining, idtt_ms=min(idtt_ms, remaining-1),
-                           nodes=nodes, depth=depth)
+            request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
+                           attacker=attacker)
             if certificate is not None:
                 request['certificate'] = certificate
             if root_moves is not None:
@@ -81,13 +104,12 @@ class NativeTactics:
             if not output:
                 return unknown('null native response')
             try:
-                result = json.loads(C.string_at(output))
+                result = unknown('native error') | json.loads(C.string_at(output))
             finally:
                 self.lib.hexo_tactical_free(output)
             if time.perf_counter()-start >= ms/1000:
-                result.update(unknown('deadline'))
+                result.update(unknown('deadline'), nodes_used=result['nodes_used'])
             result['elapsed_ms'] = (time.perf_counter()-start)*1000
-            result['build'] = self.metadata
             return result
         finally:
             self.lock.release()
@@ -105,6 +127,10 @@ class IsolatedTactics:
     was started is replaced. `engine` names the `module:Class` constructed in the child with
     `package`.
 
+    `history` takes the same budgets and `attacker` as `NativeTactics.history`, and its results
+    carry the same `nodes_used`, `proof_turns`, `attacker` and `build_hash` (None when no worker
+    answered). A verdict depends on the node budget only; a kill at the hard deadline is a
+    failure to investigate, not a verdict.
     Results carry `certificate=None` and the strategy as undecoded JSON text in
     `certificate_json` (up to ~6 MiB for a 45,000-node strategy); decoding it is left to the
     caller, outside the deadline.
@@ -163,60 +189,62 @@ class IsolatedTactics:
     def solve(self, game, **budgets):
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
-    def history(self, history, *, ms=100, idtt_ms=20, nodes=100000, depth=8, certificate=None, root_moves=None):
-        check_budgets(ms, idtt_ms, nodes, depth)
+    def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
+                certificate=None, root_moves=None):
+        check_budgets(ms, nodes, idtt_nodes, depth, attacker)
         start = time.perf_counter()
         hard = start+(ms+self.grace_ms)/1000
+        unknown = lambda reason, build_hash=None: unknown_result(reason, start, attacker, build_hash)
         if not self.lock.acquire(timeout=ms/1000):
-            return unknown_result('lock deadline', start)
+            return unknown('lock deadline')
         try:
             self.stats['queries'] += 1
             if self.replacement:
                 self.replacement.join(timeout=max(0.0, start+ms/1000-time.perf_counter()))
                 if self.replacement.is_alive():
-                    return unknown_result('tactical worker restarting', start)
+                    return unknown('tactical worker restarting')
                 self.replacement = None
             if not self.ready:
                 line = self._line(min(start+ms/1000, self.started+self.startup_ms/1000))
                 if line == 'timeout':
                     if time.perf_counter() >= self.started+self.startup_ms/1000:
                         self._retire(killed=True)
-                        return unknown_result('tactical worker not ready; replaced', start)
-                    return unknown_result('tactical worker starting', start)
+                        return unknown('tactical worker not ready; replaced')
+                    return unknown('tactical worker starting')
                 if line in ('exit', 'oversize') or 'error' in line:
                     self._retire(killed=False)
                     reason = line if isinstance(line, str) else line['error']
-                    return unknown_result(f'tactical worker failed to start: {reason}', start)
+                    return unknown(f'tactical worker failed to start: {reason}')
                 self.ready = True
             remaining = math.floor(ms-(time.perf_counter()-start)*1000)
             if remaining < 1:
-                return unknown_result('deadline', start)
-            request = dict(history=history, ms=remaining, idtt_ms=min(idtt_ms, remaining-1), nodes=nodes, depth=depth,
-                           certificate=certificate, root_moves=root_moves)
+                return unknown('deadline')
+            request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
+                           attacker=attacker, certificate=certificate, root_moves=root_moves)
             payload = json.dumps(request, separators=(',', ':'))
             if len(payload) > REQUEST_LIMIT:
-                return unknown_result('request size limit', start)
+                return unknown('request size limit')
             self.process.stdin.write(payload+'\n')
             self.process.stdin.flush()
             result = self._line(hard)
             if result == 'timeout':
                 self._retire(killed=True)
-                return unknown_result('hard deadline; tactical worker killed', start)
+                return unknown('hard deadline; tactical worker killed')
             if result == 'exit':
                 self._retire(killed=False)
-                return unknown_result('tactical worker exited (memory cap or crash)', start)
+                return unknown('tactical worker exited (memory cap or crash)')
             if result == 'oversize':
                 self._retire(killed=True)
-                return unknown_result('response size limit', start)
+                return unknown('response size limit')
             if result.get('background_worker_busy'):
                 self._retire(killed=True)
             if time.perf_counter()-start >= ms/1000:
-                result.update(unknown_result('deadline', start))
+                result.update(unknown('deadline', result.get('build_hash')), nodes_used=result.get('nodes_used', 0))
             result['elapsed_ms'] = (time.perf_counter()-start)*1000
             return result
         except OSError:
             self._retire(killed=False)
-            return unknown_result('tactical worker pipe closed', start)
+            return unknown('tactical worker pipe closed')
         finally:
             self.lock.release()
 
@@ -322,7 +350,6 @@ def _serve(engine, package, memory_mb):
     for line in sys.stdin:
         request = json.loads(line)
         result = tactics.history(request.pop('history'), **request)
-        result.pop('build', None)
         certificate = result.pop('certificate', None)
         result.update(certificate=None, has_certificate=certificate is not None)
         print(json.dumps(result, separators=(',', ':')), flush=True)
@@ -330,8 +357,24 @@ def _serve(engine, package, memory_mb):
             print(json.dumps(certificate, separators=(',', ':')), flush=True)
 
 
-def independent_verify(certificate, history):
-    """Second checker via proof.py, independent of both native search and verifier."""
+def threat_cells(certificate):
+    """The cells of a certificate's first attacking turn, as (q, r) tuples.
+
+    For a verified attacker='opponent' certificate these are the placements of the
+    opponent's forced win if it moved now; they equal the result's `moves`.
+    """
+    node = certificate['nodes'][certificate['root']]
+    if node['kind'] not in ('immediate_win', 'attacker_move'):
+        raise ValueError('Certificate root is not an attacking turn')
+    return [tuple(cell) for cell in node['action']]
+
+
+def independent_verify(certificate, history, attacker='mover'):
+    """Second checker via proof.py, independent of both native search and verifier.
+
+    `attacker` is the query's attacker: 'opponent' checks the certificate on the
+    flipped-turn position. Returns PROVEN_WIN or raises ValueError.
+    """
     from proof import verify
     work = 0
     def expand(index, stack):
@@ -354,9 +397,13 @@ def independent_verify(certificate, history):
         raise ValueError('Unknown certificate node')
     if certificate['version'] != 1 or certificate['width'] != 'wide':
         raise ValueError('Unsupported certificate schema')
+    if attacker not in ('mover', 'opponent'):
+        raise ValueError('Unknown attacker')
     n = len(history)
-    attacker = ((n+1)//2) % 2 if n else 0
-    converted = dict(version=1, history=[list(p) for p in history], attacker=attacker, tree=expand(certificate['root'], set()))
+    flipped = attacker == 'opponent'
+    start = n+1+n % 2 if flipped else n
+    converted = dict(version=1, history=[list(p) for p in history], attacker=((start+1)//2) % 2 if start else 0,
+                     flipped=flipped, tree=expand(certificate['root'], set()))
     return verify(converted, history, deadline=time.perf_counter()+10)
 
 

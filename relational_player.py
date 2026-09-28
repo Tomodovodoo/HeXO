@@ -97,8 +97,9 @@ class RelationalPlayer:
         proof = None
         try:
             if self.prover is not None:
+                from tactical_proof import MAX_NODES
                 proof_ms = min(self.proof_ms, max(1, int(budget/4)))
-                proof = self.prover.solve(local, ms=proof_ms, idtt_ms=min(20, proof_ms-1))
+                proof = self.prover.solve(local, ms=proof_ms, nodes=MAX_NODES)
                 if proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified'):
                     for action in proof['moves']:
                         if local.winner >= 0 or local.player != side:

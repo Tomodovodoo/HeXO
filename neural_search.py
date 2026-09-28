@@ -122,7 +122,7 @@ class NeuralSearch:
         if self.proof_solver is None:
             raise ValueError('A native certificate verifier is required')
         result = self.proof_solver.history(history, ms=self.proof_ms if milliseconds is None else milliseconds,
-                                          idtt_ms=0, certificate=certificate)
+                                          certificate=certificate)
         if result.get('status') != 'PROVEN_WIN' or not result.get('native_verified'):
             return False
         moves = result.get('moves', [])
@@ -236,7 +236,7 @@ class SearchCoordinator:
                                 allowance = proof_budget()
                                 if allowance:
                                     proof_start = time.perf_counter()
-                                    proof = search.proof_solver.history(history, ms=allowance, idtt_ms=0)
+                                    proof = search.proof_solver.history(history, ms=allowance)
                                     proof_spent[i] += (time.perf_counter()-proof_start)*1000
                                     if finished(i):
                                         continue

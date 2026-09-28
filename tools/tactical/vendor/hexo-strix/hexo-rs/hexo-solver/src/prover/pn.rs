@@ -323,7 +323,7 @@ impl PnSearch {
             if root.pn == 0 || root.dn == 0 {
                 break;
             }
-            if self.expansions >= self.max_nodes || self.limits.expired() {
+            if self.expansions >= self.max_nodes || self.limits.charge() || self.limits.expired() {
                 break;
             }
             // Descend to the most-proving node, applying moves to the board.

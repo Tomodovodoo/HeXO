@@ -174,6 +174,8 @@ pub fn minimum_defenses_after_attack(
 pub struct Ctl {
     pub deadline: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
+    /// Optional total-work budget shared with every search run under this control.
+    pub meter: Option<crate::forcing::Meter>,
 }
 
 impl Ctl {
@@ -183,7 +185,7 @@ impl Ctl {
         } else {
             None
         };
-        Ctl { deadline, cancel: Arc::new(AtomicBool::new(false)) }
+        Ctl { deadline, cancel: Arc::new(AtomicBool::new(false)), meter: None }
     }
 
     /// True once the deadline has passed or another thread cancelled the search.
@@ -198,6 +200,7 @@ impl Ctl {
         crate::forcing::Limits {
             deadline: self.deadline,
             cancel: Some(Arc::clone(&self.cancel)),
+            meter: self.meter.clone(),
         }
     }
 }
@@ -371,6 +374,7 @@ pub fn guided_idtt(
         let limits = crate::forcing::Limits {
             deadline: prepass_deadline,
             cancel: Some(Arc::clone(&ctl.cancel)),
+            meter: ctl.meter.clone(),
         };
         let (outcome, stats) = solve_limited_guided_verdict(
             &game,
