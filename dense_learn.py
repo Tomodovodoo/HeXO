@@ -5,7 +5,8 @@ manifest.json {variant, step, samples_seen, created_at, model_sha256, ema_sha256
 learner (effective LearnerSettings), model (ModelSettings), copied_from}. Events have source 'learner' and kind
 export, info, error or replace. league.json is read for population replacement, never written. metrics/learner-
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
-falls on every tenth step) and one with the EMA validation losses per export.
+falls on every tenth step) and one per export with the manifest's metrics.validation (Learner.export): EMA losses
+on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets).
 
 Every target is derived here from episodes (dense_data.examples), so td_lambda, bootstrap_weight and
 short_value_horizon are learner settings; batches are rendered by dense_data.Renderers worker processes
@@ -223,14 +224,48 @@ class Learner:
                 total += batch_losses(self.ema, batch, None, self.device, self.memory_format, False); n += 1
         return dict(zip(HEADS, (total/n).tolist()))
 
-    def export(self, window):
-        """Write checkpoints/<variant>/<step:06d>/ atomically (staged in a hidden sibling, then renamed)."""
+    def subset_losses(self, sets, refs):
+        """EMA (policy_ce, value_bce) over `refs` of `sets`, each the weighted mean over every row with that
+        target, under symmetries drawn from a fixed seed (a row keeps its symmetry while rows are appended);
+        None for a head without target weight."""
+        s = self.settings
+        rng = np.random.default_rng(self.config.seed)
+        total = torch.zeros(len(HEADS), device=self.device); mass = torch.zeros(len(HEADS), device=self.device)
+        with torch.no_grad():
+            for k in range(0, len(refs), s.batch):
+                batch = dense_data.collate(*dense_data.examples(sets, refs[k:k+s.batch], rng, **dense_data.target_options(s)))
+                weights = torch.stack([sum(b[w].sum() for b in batch.values()) for w in WEIGHTS]).to(self.device)
+                total += batch_losses(self.ema, batch, None, self.device, self.memory_format, False)*weights; mass += weights
+        return tuple(float(total[h]/mass[h]) if mass[h] > 0 else None for h in (0, 1))
+
+    def validate_sources(self, sets):
+        """Refresh `sets` (dense_data.ValidationSets) and return, per source, <source>_policy_ce and
+        <source>_value_bce on its held subset, <source>_train_* on its train subset, <source>_gap_* = held minus
+        train (None when either is), <source>_rows (held rows), plus newest_checkpoint."""
+        sets.refresh()
+        self.ema.eval()
+        out = dict(newest_checkpoint=sets.newest_checkpoint)
+        for source in dense_data.SOURCES:
+            held, train = (self.subset_losses(sets, sets.subsets[source, split]) for split in ('held', 'train'))
+            for name, v, w in zip(('policy_ce', 'value_bce'), held, train):
+                out.update({f'{source}_{name}': v, f'{source}_train_{name}': w,
+                            f'{source}_gap_{name}': None if v is None or w is None else v-w})
+            out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
+        return out
+
+    def export(self, window, sets=None):
+        """Write checkpoints/<variant>/<step:06d>/ atomically (staged in a hidden sibling, then renamed).
+        metrics.validation holds validate(window) (the HEADS, None without held-out rows) updated with
+        validate_sources(sets) when `sets` is given; it is None when neither applies."""
         s = self.settings
         root = self.run/'checkpoints'/s.variant
         root.mkdir(parents=True, exist_ok=True)
         final, stage = root/f'{self.step:06d}', root/f'.pending-{self.step:06d}'
         if final.exists():
             raise FileExistsError(f'{final} already exists')
+        validation = self.validate(window)
+        if sets is not None:
+            validation = dict(validation or dict.fromkeys(HEADS), **self.validate_sources(sets))
         shutil.rmtree(stage, ignore_errors=True); stage.mkdir()
         hexnet.save_model(stage/'model.pt', self.model)
         hexnet.save_model(stage/'ema.pt', self.ema)
@@ -238,7 +273,7 @@ class Learner:
                         ema_updates=self.ema_updates), stage/'optimizer.pt')
         manifest = dict(variant=s.variant, step=self.step, samples_seen=self.samples_seen, created_at=time.time(),
                         model_sha256=hexnet.model_digest(self.model), ema_sha256=hexnet.model_digest(self.ema),
-                        metrics=dict(self.metrics or {h: None for h in HEADS}, validation=self.validate(window)),
+                        metrics=dict(self.metrics or {h: None for h in HEADS}, validation=validation),
                         learner=asdict(s), model=asdict(self.config.model), copied_from=self.copied_from)
         write_json(stage/'manifest.json', manifest)
         stage.rename(final)
@@ -330,10 +365,10 @@ def main():
 
     def export():
         write_status(stage='exporting')
-        validation = learner.export(window)['metrics']['validation']
+        validation = learner.export(window, sets)['metrics']['validation']
         if validation:
             dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
-                                        validation=True, **{LOGGED[h]: v for h, v in validation.items()})
+                                        validation=True, **{LOGGED.get(h, h): v for h, v in validation.items()})
 
     rate = []
     try:
@@ -344,6 +379,7 @@ def main():
             return dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
                                            s.window_taper, s.validation_fraction)
         window = replay()
+        sets = dense_data.ValidationSets(args.run, s.validation_fraction, config.seed)
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers)
         stream = renderers()
         factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])

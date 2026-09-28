@@ -5,7 +5,7 @@
 main{max-width:1400px;margin:auto;padding:24px 32px}h2{font-size:16px;margin:0;color:var(--ink)}section.runs{background:var(--surface);border:1px solid var(--ring);border-radius:8px;padding:16px 18px;margin-bottom:20px}
 .bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.bar small{color:var(--muted)}button{font:inherit;font-size:12px;color:var(--ink2);background:var(--raised);border:1px solid var(--ring);border-radius:5px;padding:3px 9px;cursor:pointer}button:hover{color:var(--ink)}button[aria-pressed=true]{color:var(--ink);border-color:var(--accent)}
 .table-scroll{overflow-x:auto;max-height:340px;overflow-y:auto}table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}th{position:sticky;top:0;background:var(--surface);text-align:left;font-weight:500;color:var(--muted);font-size:12px}th,td{padding:5px 10px 5px 0;border-bottom:1px solid var(--grid);white-space:nowrap}td.name{color:var(--ink)}a{color:#7fb2f0}.live{color:#0ca30c}.stale{color:var(--muted)}
-.swatch{display:inline-block;width:22px;height:0;border-top:3px solid;vertical-align:middle}.swatch.dash{border-top-style:dashed}
+.swatch{flex:none;vertical-align:middle}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.panel{background:var(--surface);border:1px solid var(--ring);border-radius:8px;padding:12px 14px 10px;position:relative;min-width:0}
 .panel-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.panel-head h2 button{all:unset;cursor:zoom-in;font-size:15px;font-weight:600;color:var(--ink)}.panel-head h2 button:focus-visible{outline:2px solid var(--accent)}.panel-head .tools{margin-left:auto;display:flex;gap:4px}
 .showing{font-size:11px;color:var(--muted);text-align:center;margin:4px 0 2px}.note{font-size:11px;color:var(--muted);margin:2px 0 0}.legend{display:flex;flex-wrap:wrap;justify-content:center;gap:2px 14px;font-size:11px;margin:4px 0 6px;max-height:48px;overflow:hidden}.legend span{display:inline-flex;gap:5px;align-items:center}
@@ -22,11 +22,14 @@ canvas{display:block;width:100%;height:260px;touch-action:pan-y}.tip{position:ab
 <script>
 const $=id=>document.getElementById(id);
 const COLORS=['#3987e5','#d95926','#199e70','#c98500','#d55181','#008300','#9085e9','#e66767'];
+const SOURCES={converted:[7,4],fresh:[2,3],newest:[10,3,2,3]};
 const PANELS=[
 {id:'policy',title:'Policy CE',metric:'policy_ce',smooth:true,xs:['step','hours'],log:true},
 {id:'value',title:'Value BCE',metric:'value_bce',smooth:true,xs:['step','hours'],log:true},
-{id:'vpolicy',title:'Validation policy CE',metric:'validation_policy_ce',xs:['step','hours'],log:true,note:'EMA weights on held-out rows, one point per export'},
-{id:'vvalue',title:'Validation value BCE',metric:'validation_value_bce',xs:['step','hours'],log:true,note:'EMA weights on held-out rows, one point per export'},
+{id:'vpolicy',title:'Validation policy CE',metric:'validation_policy_ce',sources:'policy_ce',xs:['step','hours'],log:true,note:'EMA weights, one point per export. Solid: held-out rows of the window; dashed: fixed held-out rows per source'},
+{id:'vvalue',title:'Validation value BCE',metric:'validation_value_bce',sources:'value_bce',xs:['step','hours'],log:true,note:'EMA weights, one point per export. Solid: held-out rows of the window; dashed: fixed held-out rows per source'},
+{id:'vgap',title:'Policy CE gap',sources:'gap_policy_ce',xs:['step','hours'],note:'Per source: fixed held-out rows minus fixed training rows, EMA weights'},
+{id:'vgapvalue',title:'Value BCE gap',sources:'gap_value_bce',xs:['step','hours'],note:'Per source: fixed held-out rows minus fixed training rows, EMA weights'},
 {id:'elo',title:'Elo',metric:'elo',xs:['step','hours'],band:true,note:'Each run has its own league scale (first rated checkpoint = 0); shading is the 95% interval'},
 {id:'sps',title:'Samples / s',metric:'samples_per_second',smooth:true,xs:['step','hours'],zero:true},
 {id:'pps',title:'Placements / s',metric:'placements_per_second',smooth:true,xs:['hours'],perRun:true,zero:true,note:'All actor workers of a run'},
@@ -37,12 +40,13 @@ let project=null,rows=[],cache=new Map(),state={selected:null,x:{},log:{},full:n
 try{Object.assign(state,JSON.parse(localStorage.getItem('hexo-project')||'{}'))}catch(e){}
 const save=()=>{try{localStorage.setItem('hexo-project',JSON.stringify(state))}catch(e){}};
 const selected=()=>state.selected?rows.filter(r=>state.selected.includes(r.key)):rows.slice(0,10);
-const style=i=>({color:COLORS[i%COLORS.length],dash:i>=COLORS.length?[6,4]:[]});
+const style=(i,dash)=>({color:COLORS[i%COLORS.length],dash:dash||(i>=COLORS.length?[6,4]:[])});
 const fmt=v=>{if(!Number.isFinite(v))return'-';const a=Math.abs(v);return a>=1e4?Math.round(v).toLocaleString():a>=100?v.toFixed(0):a>=10?v.toFixed(1):a>=.01||a===0?v.toPrecision(4):v.toExponential(2)};
 const ema=(pts,w)=>{let m=0,n=0;return pts.map(q=>{m=m*w+(1-w)*q[1];n++;return [q[0],m/(1-w**n),...q.slice(2)]})};
 const tick=v=>Math.abs(v)>=1e-3||v===0?v.toLocaleString(undefined,{maximumFractionDigits:6}):v.toExponential(1);
 const age=s=>s==null?'-':s<90?`${Math.round(s)} s`:s<5400?`${Math.round(s/60)} min`:s<172800?`${(s/3600).toFixed(1)} h`:`${Math.round(s/86400)} d`;
-function swatch(i){const s=style(i),e=document.createElement('span');e.className='swatch'+(s.dash.length?' dash':'');e.style.borderColor=s.color;return e}
+function swatch(i,dash){const s=style(i,dash),e=document.createElementNS('http://www.w3.org/2000/svg','svg');e.setAttribute('class','swatch');e.setAttribute('width',22);e.setAttribute('height',4);
+e.innerHTML=`<line x1="0" y1="2" x2="22" y2="2" stroke="${s.color}" stroke-width="3" stroke-dasharray="${s.dash.join(' ')||'none'}"/>`;return e}
 function cell(tr,content,cls){const td=document.createElement('td');if(content instanceof Node)td.append(content);else td.textContent=content;if(cls)td.className=cls;tr.append(td);return td}
 function renderTable(){const body=$('rows'),chosen=new Set(selected().map(r=>r.key));body.replaceChildren();
 for(const r of rows){const tr=document.createElement('tr'),box=document.createElement('input');box.type='checkbox';box.checked=chosen.has(r.key);box.setAttribute('aria-label',`Show ${r.key}`);
@@ -54,11 +58,12 @@ cell(tr,r.run.actor_processes?`${r.run.actor_processes} proc, ${age(r.run.actor_
 const a=document.createElement('a');a.href='/?run='+encodeURIComponent(r.run.name);a.textContent='Open';cell(tr,a);body.append(tr)}
 const n=selected().length;$('showing').textContent=state.selected?`Showing ${n} of ${rows.length} runs`:`Showing first ${Math.min(10,rows.length)} runs`}
 function panelSeries(p){const out=[],seen=new Set();for(const r of selected()){if(p.perRun){if(seen.has(r.run.name))continue;seen.add(r.run.name)}
-out.push({key:p.perRun?r.run.name:r.key,label:p.perRun?r.run.name:r.key,run:r.run,variant:p.perRun?'main':r.variant,index:r.index})}return out}
+if(p.metric)out.push({key:p.perRun?r.run.name:r.key,label:p.perRun?r.run.name:r.key,run:r.run,variant:p.perRun?'main':r.variant,index:r.index,metric:p.metric});
+if(p.sources)for(const[src,dash]of Object.entries(SOURCES))out.push({key:`${r.key}|${src}`,label:`${r.key} ${src}`,run:r.run,variant:r.variant,index:r.index,metric:`validation_${src}_${p.sources}`,dash})}return out}
 const xOf=p=>p.xs.includes(state.x[p.id])?state.x[p.id]:p.xs[0];
-const cacheKey=(s,p)=>`${s.run.name}|${s.variant}|${p.metric}|${xOf(p)}`;
+const cacheKey=(s,p)=>`${s.run.name}|${s.variant}|${s.metric}|${xOf(p)}`;
 async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k);if(hit&&(hit.poll===project.now||(!s.run.live&&project.now-hit.poll<60)))continue;
-jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:p.metric,x:xOf(p),max_points:1000});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${p.metric} of ${s.label}: HTTP ${res.status}`);cache.set(k,{poll:project.now,points:(await res.json()).points})})}
+jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:s.metric,x:xOf(p),max_points:1000});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${s.metric} of ${s.label}: HTTP ${res.status}`);cache.set(k,{poll:project.now,points:(await res.json()).points})})}
 let failure=null;const worker=async()=>{while(jobs.length){try{await jobs.shift()()}catch(e){failure=e}}};await Promise.all(Array.from({length:6},worker));if(failure)throw failure}
 function ticks(lo,hi,n){const step0=(hi-lo)/n||1,mag=10**Math.floor(Math.log10(step0)),e=step0/mag,step=(e>=7.5?10:e>=3.5?5:e>=1.5?2:1)*mag,out=[];for(let v=Math.ceil(lo/step)*step;v<=hi+step*1e-9;v+=step)out.push(+v.toPrecision(12));return out}
 function logTicks(lo,hi){const out=[];for(let d=Math.floor(Math.log10(lo));d<=Math.ceil(Math.log10(hi));d++)for(const m of[1,2,5]){const v=m*10**d;if(v>=lo&&v<=hi)out.push(v)}return out.length>=3?out:ticks(lo,hi,4).filter(v=>v>0)}
@@ -74,8 +79,8 @@ function layout(){for(const p of PANELS)p.el.classList.toggle('full',state.full=
 function draw(p,hover){const el=p.el,c=el.querySelector('canvas'),ctx=c.getContext('2d'),ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight,x=xOf(p),log=p.log&&state.log[p.id];
 c.width=w*ratio;c.height=h*ratio;ctx.setTransform(ratio,0,0,ratio,0,0);el.querySelectorAll('.tools button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.x?b.dataset.x===x:!!log));
 const series=panelSeries(p).map(s=>{const raw=(cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale?v*p.scale:v)).filter(q=>!log||q[1]>0);return {...s,raw,points:p.smooth&&state.smooth>0?ema(raw,state.smooth):raw}});
-const legend=el.querySelector('.legend');legend.replaceChildren(...series.map(s=>{const e=document.createElement('span');e.append(swatch(s.index),s.label);return e}));
-const total=p.perRun?new Set(rows.map(r=>r.run.name)).size:rows.length;el.querySelector('.showing').textContent=series.length<total?`Showing first ${series.length} of ${total} runs`:`Showing ${series.length} runs`;
+const legend=el.querySelector('.legend');legend.replaceChildren(...series.map(s=>{const e=document.createElement('span');e.append(swatch(s.index,s.dash),s.label);return e}));
+const total=p.perRun?new Set(rows.map(r=>r.run.name)).size:rows.length,shown=new Set(series.map(s=>s.index)).size;el.querySelector('.showing').textContent=shown<total?`Showing first ${shown} of ${total} runs`:`Showing ${shown} runs`;
 const tip=el.querySelector('.tip');tip.hidden=true;const all=series.flatMap(s=>s.raw);ctx.font='11px system-ui';
 if(!all.length){ctx.fillStyle='#898781';ctx.fillText(series.length?'No measurements yet':'No runs selected',16,h/2);return}
 let x0=Math.min(...all.map(q=>q[0])),x1=Math.max(...all.map(q=>q[0])),ys=all.flatMap(q=>q.slice(1)).filter(v=>!log||v>0),y0=Math.min(...ys),y1=Math.max(...ys);
@@ -87,7 +92,7 @@ for(const v of log?logTicks(y0,y1):ticks(y0,y1,5)){const yy=Math.round(sy(v))+.5
 ctx.textAlign='center';ctx.textBaseline='top';for(const v of ticks(x0,x1,Math.max(2,Math.floor((w-L-R)/70)))){const xx=Math.round(sx(v))+.5;ctx.beginPath();ctx.moveTo(xx,T);ctx.lineTo(xx,h-B);ctx.stroke();ctx.fillText(tick(v),xx,h-B+6)}
 ctx.strokeStyle='#383835';ctx.beginPath();ctx.moveTo(L,h-B+.5);ctx.lineTo(w-R,h-B+.5);ctx.stroke();ctx.textAlign='right';ctx.fillText(x==='step'?'Step':'Time (hours)',w-R,h-B+17);
 ctx.save();ctx.beginPath();ctx.rect(L,T-4,w-L-R,h-T-B+8);ctx.clip();
-for(const s of series){const st=style(s.index),pts=s.points;if(!pts.length)continue;
+for(const s of series){const st=style(s.index,s.dash),pts=s.points;if(!pts.length)continue;
 if(s.raw!==pts){ctx.globalAlpha=.25;ctx.strokeStyle=st.color;ctx.lineWidth=1;ctx.beginPath();s.raw.forEach((q,i)=>ctx[i?'lineTo':'moveTo'](sx(q[0]),sy(q[1])));ctx.stroke();ctx.globalAlpha=1}
 if(p.band&&pts.length){ctx.globalAlpha=.16;ctx.fillStyle=st.color;ctx.beginPath();pts.forEach((q,i)=>ctx[i?'lineTo':'moveTo'](sx(q[0]),sy(q[3])));[...pts].reverse().forEach(q=>ctx.lineTo(sx(q[0]),sy(q[2])));ctx.fill();ctx.globalAlpha=1}
 ctx.strokeStyle=st.color;ctx.setLineDash(st.dash);ctx.lineWidth=1.75;ctx.lineJoin='round';ctx.beginPath();pts.forEach((q,i)=>ctx[i?'lineTo':'moveTo'](sx(q[0]),sy(q[1])));ctx.stroke();ctx.setLineDash([]);
@@ -97,9 +102,9 @@ const at=x0+(hover[0]-L)/(w-L-R)*(x1-x0),tol=(x1-x0)*.02,hits=[];
 for(const s of series){const pts=s.points;if(!pts.length||at<pts[0][0]-tol||at>pts.at(-1)[0]+tol)continue;let lo=0,hi=pts.length-1;while(hi-lo>1){const m=(lo+hi)>>1;pts[m][0]<at?lo=m:hi=m}hits.push({s,q:Math.abs(pts[lo][0]-at)<=Math.abs(pts[hi][0]-at)?pts[lo]:pts[hi]})}
 ctx.strokeStyle='#c3c2b7';ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(Math.round(hover[0])+.5,T);ctx.lineTo(Math.round(hover[0])+.5,h-B);ctx.stroke();ctx.setLineDash([]);
 if(!hits.length)return;hits.sort((a,b)=>b.q[1]-a.q[1]);const near=hits.reduce((a,b)=>Math.abs(sy(b.q[1])-hover[1])<Math.abs(sy(a.q[1])-hover[1])?b:a);
-for(const {s,q} of hits){ctx.fillStyle=style(s.index).color;ctx.strokeStyle='#1a1a19';ctx.lineWidth=2;ctx.beginPath();ctx.arc(sx(q[0]),sy(q[1]),q===near.q?5:3.5,0,7);ctx.fill();ctx.stroke()}
+for(const {s,q} of hits){ctx.fillStyle=style(s.index,s.dash).color;ctx.strokeStyle='#1a1a19';ctx.lineWidth=2;ctx.beginPath();ctx.arc(sx(q[0]),sy(q[1]),q===near.q?5:3.5,0,7);ctx.fill();ctx.stroke()}
 tip.replaceChildren();const head=document.createElement('b');head.textContent=x==='step'?`Step ${Math.round(at).toLocaleString()}`:`${at.toFixed(2)} h`;tip.append(head);
-for(const hit of hits){const row=document.createElement('div');if(hit===near)row.className='near';const t=document.createElement('span');t.textContent=`${hit.s.label}${x==='step'?'':''}: ${fmt(hit.q[1])}${p.band?` [${fmt(hit.q[2])}, ${fmt(hit.q[3])}]`:''} @ ${x==='step'?Math.round(hit.q[0]):hit.q[0].toFixed(2)+' h'}`;row.append(swatch(hit.s.index),t);tip.append(row)}
+for(const hit of hits){const row=document.createElement('div');if(hit===near)row.className='near';const t=document.createElement('span');t.textContent=`${hit.s.label}${x==='step'?'':''}: ${fmt(hit.q[1])}${p.band?` [${fmt(hit.q[2])}, ${fmt(hit.q[3])}]`:''} @ ${x==='step'?Math.round(hit.q[0]):hit.q[0].toFixed(2)+' h'}`;row.append(swatch(hit.s.index,hit.s.dash),t);tip.append(row)}
 tip.hidden=false;const box=el.getBoundingClientRect(),cb=c.getBoundingClientRect(),left=cb.left-box.left+hover[0],top=cb.top-box.top+Math.max(0,hover[1]-tip.offsetHeight/2);
 tip.style.left=`${left+14+tip.offsetWidth>box.width?Math.max(4,left-14-tip.offsetWidth):left+14}px`;tip.style.top=`${Math.min(top,box.height-tip.offsetHeight-4)}px`}
 async function refresh(){renderTable();try{await fetchSeries();$('status').className='';$('status').textContent=`${project.runs.length} dense runs in ${project.root}, updated ${new Date(project.now*1000).toLocaleTimeString()}`}catch(e){$('status').className='error';$('status').textContent=e.message}PANELS.forEach(p=>draw(p))}
