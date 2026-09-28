@@ -88,9 +88,11 @@ class CanonicalTests(unittest.TestCase):
                 image = [tuple(int(v) for v in np.array(p) @ m) for p in moves]
                 for order in orders(image):
                     self.assertEqual(dense_openings.canonical(order)[0], key)
-        self.assertEqual(dense_openings.orbit([(0, 0)]), 1)
-        self.assertEqual(dense_openings.orbit([(0, 0), (1, 0), (-1, 0)]), 3)    # a line through the origin: 3 axes
-        self.assertEqual(dense_openings.orbit([(0, 0), (1, 0), (2, 0)]), 6)
+        count = lambda m: len(dense_openings.images(m))
+        self.assertEqual(count([(0, 0)]), 1)
+        self.assertEqual(count([(0, 0), (1, 0), (-1, 0)]), 3)                  # a line through the origin: 3 axes
+        self.assertEqual(count([(0, 0), (1, 0), (2, 0)]), 6)
+        self.assertEqual(dense_openings.images([(0, 0), (1, 0), (2, 0)])[0], [(0, 0), (1, 0), (2, 0)])
 
         # The same stones split differently between turns are different positions.
         self.assertNotEqual(dense_openings.canonical([(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)])[0],
@@ -274,7 +276,7 @@ class RefreshTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as run:
             played = [(0, 0), (1, 0), (-1, 0)]
             games = [dict(g, seed=7) for g in pair(played, 1)]+[dict(g, seed=8) for g in pair(played, 2)]
-            report = dict(candidate='a', opponent='b', settings=dict(opening_suite='standard-v1'),
+            report = dict(id='r0', candidate='a', opponent='b', settings=dict(opening_suite='standard-v1'),
                           games=games+[dict(game(played, 0, 0), seed=9)])             # seed 9 is a half pair
             book = self.book(run, book_size=1, book_revisit_fraction=0.)
             self.assertEqual(book.reconcile([report]), 2)
@@ -332,13 +334,14 @@ class GenerationTests(unittest.TestCase):
 
     def test_reach_per_turn_equals_the_sum_over_every_play_order(self):
         moves = [(0, 0), (1, 0), (2, -1), (0, 1), (-1, 2), (3, 0), (1, 1)]
-        histories = list(dict.fromkeys(tuple(o[:k]) for o in orders(moves) for k in range(1, len(moves))))
+        sequences = [o for image in dense_openings.images(moves) for o in orders(image)]
+        histories = list(dict.fromkeys(tuple(o[:k]) for o in sequences for k in range(1, len(moves)+1)))
         policy = dict(zip(histories, dense_openings.policy(self.model, histories)))
-        brute = dense_openings.orbit(moves)*sum(math.prod(policy[tuple(o[:k])][0].get(o[k], 0.) for k in range(1, len(o)))
-                                                for o in orders(moves))
+        brute = sum(math.prod(policy[tuple(o[:k])][0].get(o[k], 0.) for k in range(1, len(o))) for o in sequences)
         [(p, value)] = dense_openings.reach(self.model, [moves])
         self.assertAlmostEqual(p, brute, delta=1e-6*brute)
-        self.assertAlmostEqual(value, dense_openings.policy(self.model, [moves])[0][1])
+        self.assertLessEqual(p, 1.)
+        self.assertAlmostEqual(value, np.mean([policy[tuple(i)][1] for i in dense_openings.images(moves)]))
 
     def test_search_and_policy_generation_with_a_tiny_model(self):
         for sims in (2, 0):
@@ -377,7 +380,7 @@ class FrozenTests(unittest.TestCase):
             self.assertTrue(book.frozen)
             self.assertEqual({n['key']: n['weight'] for n in book.openings()}, dict(classes))
             for n in book.openings():
-                self.assertEqual(n['weight'], dense_openings.orbit(n['moves']))
+                self.assertEqual(n['weight'], len(dense_openings.images(n['moves'])))
             for seed in range(200):
                 self.assertIn(dense_openings.canonical(train.opening_for(seed, True))[0], classes)
             self.assertEqual(book.digest(), '')
@@ -418,7 +421,7 @@ class FrozenTests(unittest.TestCase):
             self.assertEqual(reopened.reconcile([own, other]), 1)
             self.assertEqual(reopened.nodes[dense_openings.canonical([(0, 0)])[0]]['pairs'], [1, 0, 1, 0, 2])
             self.assertEqual(reopened.data['counted'], {'r1': 4})
-            self.assertEqual(dense_openings.report_id(dict(candidate='a', opponent='b', games=[dict(seed=5)])), 'a|b|5')
+
 
 
 class SummaryTests(unittest.TestCase):
@@ -499,12 +502,22 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(len(cli('stats', '--nodes')['stats']['depths']), 1)
             self.assertEqual(cli('prune')['removed'], 0)
             self.assertEqual(cli('stats', '--suite', 'standard-v1')['openings'], 47)
-        with tempfile.TemporaryDirectory() as tmp:
-            archived = Path(tmp)/'evaluations'/'a-vs-b'
-            archived.mkdir(parents=True)
+
+    def test_stamp_gives_legacy_and_archived_reports_distinct_ids_once(self):
+        """An archived report and its pairing's current report.json can hold the same games (a pairing reopened under
+        another protocol restarts its pair numbering); each gets its own id, so reconcile counts both."""
+        with tempfile.TemporaryDirectory() as run:
+            folder = Path(run)/'evaluations'/'a-vs-b'
+            folder.mkdir(parents=True)
+            games = [dict(g, seed=1) for g in pair([(0, 0), (1, 0), (-1, 0)], 2)]
             for name in ('report.json', 'report-5.json'):
-                (archived/name).write_text(json.dumps(dict(name=name)))
-            self.assertEqual([r['name'] for r in dense_openings.reports_of(tmp)], ['report-5.json', 'report.json'])
+                (folder/name).write_text(json.dumps(dict(candidate='a', opponent='b', settings=dict(opening_suite='book'),
+                                                         games=games)))
+            first = dense_openings.stamp(run)
+            self.assertEqual(len({r['id'] for r in first}), 2)
+            self.assertEqual([r['id'] for r in dense_openings.stamp(run)], [r['id'] for r in first])
+            book = dense_openings.Book(run, settings())
+            self.assertEqual(book.reconcile(first), 2)
 
 if __name__ == '__main__':
     unittest.main()

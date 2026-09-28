@@ -42,6 +42,7 @@ import json
 import math
 from pathlib import Path
 import time
+import uuid
 
 import numpy as np
 
@@ -92,11 +93,15 @@ def parents(moves):
     return sorted({canonical(head+last[:i]+last[i+1:])[0] for i in range(len(last))})
 
 
-def orbit(moves):
-    """How many distinct positions the 12 symmetries map `moves` to (orderings within a turn not distinguished)."""
+def images(moves):
+    """The distinct positions the 12 symmetries map `moves` to (turns as stone sets), each as the image of `moves` in
+    its play order."""
     points = np.asarray(moves, np.int64).reshape(-1, 2)
-    return len({tuple(frozenset(map(tuple, turn.tolist())) for turn in turns(points @ m)) for m in hexcrop.SYMMETRIES})
-
+    out = {}
+    for m in hexcrop.SYMMETRIES:
+        image = [tuple(p) for p in (points @ m).tolist()]
+        out.setdefault(tuple(frozenset(turn) for turn in turns(image)), image)
+    return list(out.values())
 
 def policy(model, histories):
     """[({(q, r): probability}, P1 value)] of `model` (a dense_selfplay.Model) at each history: its policy and its
@@ -112,29 +117,30 @@ def policy(model, histories):
 
 
 def reach(model, positions):
-    """Per position (a move list), (probability, P1 value): the probability that `model`'s policy plays into its class
-    and the value head's P1 expected score at it. The probability is a product over turns of the turn's probability
-    summed over its (at most two) placement orders, times the class's `orbit` (the policy taken as symmetric; the
-    origin placement has probability 1). Summing per turn is exact because a finished turn's order is not part of the
-    network's input (hexcrop planes), so later turns do not depend on it; each turn is evaluated after the earlier
-    turns in their stored order."""
-    steps = []  # per position, per turn: [(history, placement) per order of the turn]
+    """Per position (a move list), (probability, P1 value): the probability that `model`'s policy plays into its class,
+    summed over the class's distinct symmetric `images`, and the value head's P1 expected score averaged over them.
+    An image's probability is a product over turns of the turn's probability summed over its (at most two) placement
+    orders (the origin placement has probability 1). Summing per turn is exact because a finished turn's order is not
+    part of the network's input (hexcrop planes), so later turns do not depend on it; each turn is evaluated after
+    the earlier turns in their stored order."""
+    steps = []  # per position, per image: (image, per turn: [(history, placement) per order of the turn])
     for m in positions:
-        m = [tuple(p) for p in m]
-        per, played = [], 1
-        for turn in turns(m)[1:]:
-            head = m[:played]
-            per.append([[(tuple(head+list(order[:i])), order[i]) for i in range(len(order))]
-                        for order in itertools.permutations(turn)])
-            played += len(turn)
-        steps.append(per)
-    histories = list(dict.fromkeys([h for per in steps for orders in per for order in orders for h, _ in order]
-                                   + [tuple(tuple(p) for p in m) for m in positions]))
+        per_image = []
+        for image in images(m):
+            per, played = [], 1
+            for turn in turns(image)[1:]:
+                head = image[:played]
+                per.append([[(tuple(head+list(order[:i])), order[i]) for i in range(len(order))]
+                            for order in itertools.permutations(turn)])
+                played += len(turn)
+            per_image.append((tuple(image), per))
+        steps.append(per_image)
+    histories = list(dict.fromkeys([h for per_image in steps for image, per in per_image
+                                    for h in [image]+[h for orders in per for order in orders for h, _ in order]]))
     table = dict(zip(histories, policy(model, histories)))
-    return [(orbit(m)*math.prod(sum(math.prod(table[h][0].get(move, 0.) for h, move in order) for order in orders)
-                                for orders in per), table[tuple(tuple(p) for p in m)][1])
-            for m, per in zip(positions, steps)]
-
+    turn = lambda orders: sum(math.prod(table[h][0].get(move, 0.) for h, move in order) for order in orders)
+    return [(sum(math.prod(map(turn, per)) for _, per in per_image), float(np.mean([table[image][1] for image, _ in per_image])))
+            for per_image in steps]
 
 def tempered(p, temperature):
     """p^(1/temperature), normalised, computed in log space so that no temperature underflows or overflows the
@@ -276,10 +282,21 @@ def pairs_of(report):
 
 
 def report_id(report):
-    """A report's identity for `Book.reconcile`: its `id`, else (reports written before ids) candidate, opponent and
-    first pair seed."""
-    return report.get('id') or f"{report['candidate']}|{report['opponent']}|{report['games'][0]['seed'] if report['games'] else ''}"
+    """A report's identity for `Book.reconcile`: its `id` (`stamp` gives every report one)."""
+    return report['id']
 
+
+def stamp(run):
+    """Every evaluation report of `run` (evaluations/*/report*.json, the reports archived beside a pairing's
+    report.json included), after writing a new unique `id` into each one that lacks it (reports written before ids)."""
+    reports = []
+    for path in sorted((Path(run)/'evaluations').glob('*/report*.json')):
+        report = json.loads(path.read_text())
+        if 'id' not in report:
+            report['id'] = uuid.uuid4().hex
+            write_json(path, report)
+        reports.append(report)
+    return reports
 
 class Book:
     """The opening book of `suite` (default settings.opening_suite) in `run` (module contract) under EvaluationSettings
@@ -321,7 +338,7 @@ class Book:
         """The moves of an opening drawn by `seed`: in proportion to `weight` in a frozen book, else uniformly, or with
         book_weighting 'least_played' in proportion to 1 / (1 + its pairs); played in one of the 12 symmetric
         orientations, chosen uniformly by `seed`, so every image of a class is equally likely (a frozen weight of
-        orbit size makes every physical opening equally likely). ValueError without openings."""
+        class's number of images makes every physical opening equally likely). ValueError without openings."""
         openings = self.openings()
         if not openings:
             raise ValueError(f'{self.path} has no opening; the evaluator refreshes a live book once a champion exists')
@@ -582,15 +599,10 @@ def summary(run, reports, settings):
     return out
 
 
-def reports_of(run):
-    """Every evaluation report of `run`: evaluations/*/report*.json, the reports archived beside a pairing's
-    report.json included."""
-    return [json.loads(p.read_text()) for p in sorted((Path(run)/'evaluations').glob('*/report*.json'))]
-
-
 def main():
     parser = argparse.ArgumentParser(description='Inspect or maintain a dense run\'s opening books. refresh and prune '
-                                                 'write the book: run them while the evaluator is stopped.')
+                                                 'write the book (refresh also stamps report ids, stamp): run '
+                                                 'them while the evaluator is stopped.')
     sub = parser.add_subparsers(dest='command', required=True)
     for name in ('refresh', 'stats', 'prune'):
         p = sub.add_parser(name)
@@ -611,7 +623,7 @@ def main():
         from dense_selfplay import load
         model = load(args.run, replace(config, device=args.device),
                                     source=(champion, Path(args.run)/'checkpoints'/champion/'ema.pt'))
-        book.reconcile(reports_of(args.run))
+        book.reconcile(stamp(args.run))
         now = time.time()
         out = book.refresh(model, champion, np.random.default_rng(int(now)), now, config.actor.leaf_batch)
     elif args.command == 'prune':
