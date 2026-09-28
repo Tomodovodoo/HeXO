@@ -80,8 +80,8 @@ checkpoint until the next export.
 league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
 superseded?, panel?, demoted?, verdict? (the posterior verdict that rated it)}], variants: [{id, checkpoint, name,
 settings, registered_at, elo, elo_interval, matches, verdict? (its final verdict)}], differences, ladder, ladder_top,
-anchors, matrix, rating_note, updated_at}. `variants` is written by `register` from another process as well: every
-league write first adopts the variants registered on disk since (`adopt`).
+anchors, matrix, rating_note, updated_at}. The evaluator is league.json's only writer: `register` leaves a request in
+variant-requests/, which the evaluator adopts into `variants` (`adopt`).
 differences and ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the ladder_top
 (fill_top) best rated, not demoted checkpoints, a above b, intervals from the joint rating draws. anchors.seal is {elo,
 elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
@@ -294,20 +294,28 @@ def parse_settings(assignments):
     return out
 
 
+def requests(run):
+    """{variant id: path} of the registrations waiting in <run>/variant-requests (`register`)."""
+    return {json.loads(path.read_text())['id']: path for path in sorted((Path(run)/'variant-requests').glob('*.json'))}
+
+
 def adopt(league, run):
-    """Append to league['variants'] the variants of <run>/league.json that it lacks (registered by another process
-    since `league` was read); the entries already in `league` stay as they are."""
-    path = Path(run)/'league.json'
-    disk = json.loads(path.read_text()).get('variants', []) if path.exists() else []
+    """Append to league['variants'] the registrations waiting in <run>/variant-requests (`requests`) whose id it
+    lacks, in registration order; the entries already in `league` stay as they are. Returns how many were added.
+    `write_league` removes the request files once league.json holds them."""
     known = {v['id'] for v in league.setdefault('variants', [])}
-    league['variants'] += [v for v in disk if v['id'] not in known]
+    new = [json.loads(path.read_text()) for cid, path in requests(run).items() if cid not in known]
+    league['variants'] += sorted(new, key=lambda v: v['registered_at'])
+    return len(new)
 
 
 def register(run, checkpoint, name, settings):
     """Register variant `<checkpoint>@<name>` of a rated league checkpoint with overrides `settings`
-    (`parse_settings`) in <run>/league.json and log a 'variant' event; returns its entry. The name is letters,
-    digits, '.', '_' or '-'. An id is immutable: registering it again with the same settings returns the existing
-    entry, with other settings raises ValueError. Safe while the evaluator runs (`adopt`)."""
+    (`parse_settings`) and log a 'variant' event; returns its entry. The registration is written as
+    <run>/variant-requests/<id>.json, never to league.json: the evaluator, league.json's only writer, adopts it
+    (`adopt`) on its next step. The name is letters, digits, '.', '_' or '-'. An id is immutable: registering it
+    again (in the league or waiting) with the same settings returns the existing entry, with other settings raises
+    ValueError."""
     run = Path(run)
     if not name or not all(ch.isalnum() or ch in '._-' for ch in name):
         raise ValueError(f'{name!r}: a variant name is letters, digits, ".", "_" or "-"')
@@ -319,15 +327,18 @@ def register(run, checkpoint, name, settings):
     config = dense_config.load(run)
     Budgets.of(side_settings(config.evaluation, settings))
     cid = f'{checkpoint}@{name}'
-    existing = next((v for v in league.get('variants', []) if v['id'] == cid), None)
+    waiting = requests(run)
+    existing = next((v for v in league.get('variants', []) if v['id'] == cid), None) \
+        or (json.loads(waiting[cid].read_text()) if cid in waiting else None)
     if existing is not None:
         if existing['settings'] != settings:
             raise ValueError(f'{cid} is registered with settings {existing["settings"]}; register another name')
         return existing
     entry = dict(id=cid, checkpoint=checkpoint, name=name, settings=settings, registered_at=time.time(), elo=None,
                  elo_interval=None, matches=[])
-    league.setdefault('variants', []).append(entry)
-    write_json(path, league)
+    target = run/'variant-requests'/f'{cid.replace("/", "-")}.json'
+    target.parent.mkdir(exist_ok=True)
+    write_json(target, entry)
     log_event(run, 'evaluator', 'variant', f'{cid} registered: ' + ', '.join(f'{k}={v}' for k, v in settings.items()),
               candidate=cid, checkpoint=checkpoint, settings=settings)
     return entry
@@ -599,7 +610,7 @@ def variant_heads(entries, rated=lambda c: True):
 
 
 def write_league(run, league, config, top=None):
-    """Adopt variants registered on disk (`adopt`), recompute ratings, the payoff matrix and the ladder (`top`
+    """Adopt waiting variant registrations (`adopt`; their request files are removed after the write), recompute ratings, the payoff matrix and the ladder (`top`
     checkpoints, default config.evaluation.fill_top) from every report among rated (not skipped) ids, the variants
     of those ids and Seal, then publish league.json; skipped entries keep elo and elo_interval null. The ladder and
     differences hold checkpoints only."""
@@ -632,6 +643,10 @@ def write_league(run, league, config, top=None):
     league['rating_note'] = RATING_NOTE
     league['updated_at'] = time.time()
     write_json(run/'league.json', league)
+    adopted = {v['id'] for v in league['variants']}
+    for cid, path in requests(run).items():
+        if cid in adopted:
+            path.unlink()
 
 
 class Pacer:
@@ -1539,7 +1554,7 @@ class Evaluator:
         rule is re-applied to the existing reports (`review`). Then it rates the newest unrated checkpoint of the
         variant whose newest unrated checkpoint is oldest, skipping that variant's older unrated checkpoints (none
         of them has games against the champion), or else decides the first pending variant (`trial`, in
-        registration order; variants registered on disk are adopted first), or else plays a session of the champion's Seal anchor
+        registration order; waiting registrations are adopted into league.json first), or else plays a session of the champion's Seal anchor
         (`anchor`), else of an optional comparison, else of fill work (`fill`), each until its games are complete
         or a checkpoint waits (the games in flight then finish and count)."""
         self.settle()
@@ -1551,7 +1566,8 @@ class Evaluator:
                       f'against {champion}; it is rated on them', candidate=c['id'])
         if revived:
             write_league(self.run, self.league, self.config, self.settings.fill_top)
-        adopt(self.league, self.run)
+        if adopt(self.league, self.run):
+            write_league(self.run, self.league, self.config, self.settings.fill_top)
         known = {c['id'] for c in self.league['checkpoints']}
         unrated = [e for e in checkpoints(self.run) if e[0] not in known]
         self.status['backlog'] = [e[0] for e in unrated]

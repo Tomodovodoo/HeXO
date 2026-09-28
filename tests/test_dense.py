@@ -2877,14 +2877,20 @@ class EvaluatorLoopTests(unittest.TestCase):
         with unittest.mock.patch.object(sys, 'argv', argv), unittest.mock.patch('builtins.print'):
             dense_eval.main()
         settings = dict(solver_root_nodes=135, solver_finalists=2, solver_finalist_nodes=135, solver_threat_nodes=135)
-        entry = self.league()['variants'][0]
+        self.assertEqual(self.league()['variants'], [])                     # only the evaluator writes league.json
+        entry = json.loads(dense_eval.requests(self.run)['main/000020@solver'].read_text())
         self.assertEqual({k: entry[k] for k in ('id', 'checkpoint', 'name', 'settings', 'elo', 'matches')},
                          dict(id='main/000020@solver', checkpoint='main/000020', name='solver', settings=settings, elo=None, matches=[]))
         self.assertEqual(dense_eval.register(self.run, 'main/000020', 'solver', settings), entry)
         with self.assertRaises(ValueError):
             dense_eval.register(self.run, 'main/000020', 'solver', dict(sims=20))
-        dense_eval.write_league(self.run, evaluator.league, evaluator.config)   # a running evaluator's write keeps it
+        dense_eval.write_league(self.run, evaluator.league, evaluator.config)   # the evaluator's next write adopts it
         self.assertEqual([v['id'] for v in self.league()['variants']], ['main/000020@solver'])
+        self.assertEqual(dense_eval.requests(self.run), {})
+        self.assertEqual(dense_eval.register(self.run, 'main/000020', 'solver', settings)['id'], 'main/000020@solver')
+        self.assertEqual(dense_eval.requests(self.run), {})
+        with self.assertRaises(ValueError):
+            dense_eval.register(self.run, 'main/000020', 'solver', dict(sims=20))
         self.assertEqual(evaluator.side('main/000020@solver').solver_threat_nodes, 135)
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['candidate'] for e in events if e['kind'] == 'variant'], ['main/000020@solver'])
