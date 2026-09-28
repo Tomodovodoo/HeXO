@@ -940,6 +940,10 @@ class DenseDataTests(unittest.TestCase):
             self.assertEqual(len(games), sum(e['winner'] >= 0 for e in episodes))
             newest = [e for e in episodes if e['winner'] >= 0][-1]
             self.assertEqual((games[0][2], len(games[0][0])), (newest['winner'], len(newest['moves'])))
+            cut = dense_data.ReplayWindow(run, 1500, 10**6)    # the row budget cuts through an admitted shard
+            self.assertGreater(cut.starts[cut.admitted[0][0]], 0)
+            inside = {(n, int(cut.shards[n].game[i])) for n, i in cut.index if cut.shards[n].winner[cut.shards[n].game[i]] >= 0}
+            self.assertEqual(len(cut.finished_games(10**6)), len(inside))
             config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)))
             learner = dense_learn.Learner(run/'learner', replace(config.learner, calibration_games=220, bootstrap_full_only=True), config)
             learner.calibrate(window)

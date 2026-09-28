@@ -386,9 +386,10 @@ class ReplayWindow:
                 self.shards[name] = self.load(name)
         self.admitted = admitted[::-1]; self.full_rows = have
         parts = ([], []), ([], [])    # (shard ids, rows) of the training and validation index
+        self.starts = {}
         for k, (name, take) in enumerate(self.admitted):
             s = self.shards[name]; positions = np.flatnonzero(s.full)
-            start = 0 if take >= len(positions) else int(positions[-take]) if take else len(s.game)
+            start = self.starts[name] = 0 if take >= len(positions) else int(positions[-take]) if take else len(s.game)
             i = np.arange(start, len(s.game), dtype=np.int32)
             side = s.side[s.game[i]]
             i = i[(side < 0) | ((s.ply[i].astype(np.int32)+1)//2 % 2 == side)]
@@ -412,12 +413,13 @@ class ReplayWindow:
         return Ref(name, i, row, episode)
 
     def finished_games(self, n):
-        """The newest `n` finished games of the admitted shards outside the validation split, newest first, as
-        (root values with NaN for null, full_search flags, winner) arrays."""
+        """The newest `n` finished games outside the validation split with a row inside the window (at or after
+        its shard's cutoff row), newest first, as (root values with NaN for null, full_search flags, winner) arrays."""
         out = []
         for name, _ in reversed(self.admitted):
             s = self.shards[name]
-            for g in reversed(np.flatnonzero((s.winner >= 0) & ~s.held).tolist()):
+            inside = np.zeros(len(s.winner), bool); inside[s.game[self.starts[name]:]] = True
+            for g in reversed(np.flatnonzero(inside & (s.winner >= 0) & ~s.held).tolist()):
                 if len(out) >= n:
                     return out
                 a, b = int(s.start[g]), int(s.start[g+1])
