@@ -2,6 +2,7 @@
 learner's validation and the actor/evaluator engine."""
 import argparse
 import copy
+import dataclasses
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -580,6 +581,27 @@ def pointwise_model(config):
 
 
 class DenseConfigTests(unittest.TestCase):
+    def test_pages_serve_from_step_control(self):
+        """The project page and a dense run page carry the "from step" header control."""
+        import dashboard
+        from http.server import ThreadingHTTPServer
+        import threading
+        import urllib.request
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp)/'r').mkdir()
+            (Path(tmp)/'r'/'config.json').write_text('{}')
+            handler = type('Handler', (dashboard.Handler,), dict(runs=Path(tmp)))
+            server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                for query in ('', '?run=r'):
+                    with urllib.request.urlopen(f'http://127.0.0.1:{server.server_port}/{query}') as response:
+                        page = response.read().decode()
+                    self.assertIn('from step <input id="from-step" type="number"', page)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_metrics_log_series(self):
         """Partial last lines are skipped until completed, resumed steps replace the rewound ones and
         downsampling keeps the first, last and extreme points."""
@@ -596,6 +618,8 @@ class DenseConfigTests(unittest.TestCase):
             with path.open('ab') as stream:
                 stream.write(b'_ce": 5.0}\n')
             self.assertEqual(dashboard.series(run, config, 'main', 'policy_ce')['points'][-1], [5, 5.])
+            self.assertEqual(dashboard.series(run, config, 'main', 'policy_ce', from_step=4)['points'], [[4, 4.], [5, 5.]])
+            self.assertEqual(len(dashboard.series(run, config, 'main', 'policy_ce', 'hours', from_step=4)['points']), 5)
             points = [(x, 100. if x == 777 else math.sin(x)) for x in range(5000)]
             kept = dashboard.downsample(points, 100)
             self.assertLessEqual(len(kept), 100)
@@ -1876,6 +1900,71 @@ class YieldTests(unittest.TestCase):
         self.assertEqual(dense_config.from_dict(data).actor.yield_below, dense_config.ActorSettings.yield_below)
 
 
+class ActorModelTests(unittest.TestCase):
+    """dense_selfplay.resolve per model_source and the worker's switch between games."""
+
+    def setUp(self):
+        self.threads = torch.get_num_threads()
+        torch.set_num_threads(2)
+        self.addCleanup(torch.set_num_threads, self.threads)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.run = Path(tmp.name)
+
+    def export(self, cid, created_at):
+        path = self.run/'checkpoints'/cid
+        path.mkdir(parents=True)
+        hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
+        (path/'manifest.json').write_text(json.dumps(dict(created_at=created_at)))
+
+    def pick(self, source):
+        return dense_selfplay.resolve(self.run, None, source, 'main')[0]
+
+    def test_sources(self):
+        self.assertEqual(dense_config.ActorSettings().model_source, 'newest_veto')
+        data = asdict(dense_config.RunConfig())
+        del data['actor']['model_source'], data['evaluation']['veto_margin']
+        loaded = dense_config.from_dict(data)
+        self.assertEqual((loaded.actor.model_source, loaded.evaluation.veto_margin), ('newest_veto', -30.))
+        self.export('main/000010', 1.)
+        self.export('main/000020', 2.)
+        self.export('wide/000030', 3.)
+        self.assertEqual([self.pick(s) for s in ('champion', 'newest', 'newest_veto')], ['wide/000030', 'main/000020', 'wide/000030'])
+        (self.run/'champion.json').write_text(json.dumps(dict(checkpoint='main/000010')))
+        self.assertEqual([self.pick(s) for s in ('champion', 'newest', 'newest_veto')], ['main/000010', 'main/000020', 'main/000010'])
+        (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000020', reason='newest', vetoed=[])))
+        self.assertEqual([self.pick(s) for s in ('champion', 'newest', 'newest_veto')], ['main/000010', 'main/000020', 'main/000020'])
+        with self.assertRaises(ValueError):
+            self.pick('latest')
+
+    def test_worker_switches_between_games(self):
+        """The pointer moves as the first shard is written: the game started before it keeps the first model, the
+        next game plays the second, and the switch is an 'actor_model' event."""
+        self.export('main/000010', 1.)
+        self.export('main/000020', 2.)
+        config = dense_config.RunConfig(
+            device='cpu', model=dense_config.ModelSettings(**{k: getattr(TINY, k) for k in (
+                'blocks', 'channels', 'pool_every', 'line_length', 'value_hidden', 'head_channels')}),
+            actor=dense_config.ActorSettings(games_in_flight=1, leaf_batch=64, full_sims=2, cheap_sims=2, root_samples=2,
+                                             max_plies=6, cache_positions=256, shard_games=1, opening_random_plies=0.))
+        dense_config.save(self.run, config)
+        pointer = lambda cid: (self.run/'actor.json').write_text(json.dumps(dict(checkpoint=cid, reason='newest', vetoed=[])))
+        pointer('main/000010')
+        write_shard = dense_data.write_shard
+
+        def publish(path, identity, *args):
+            pointer('main/000020')
+            return write_shard(path, identity, *args)
+        with unittest.mock.patch.object(dense_data, 'write_shard', publish):
+            dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
+        shards = [dense_data.manifest(path)['identity'] for path in dense_data.shard_dirs(self.run)]
+        self.assertEqual([s['checkpoint'] for s in shards], ['main/000010', 'main/000020'])
+        self.assertEqual(json.loads((self.run/'actor-status.json').read_text())['checkpoint'], 'main/000020')
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([(e['previous'], e['checkpoint']) for e in events if e['kind'] == 'actor_model'],
+                         [('main/000010', 'main/000020')])
+
+
 class PacerTests(unittest.TestCase):
     def test_share_ceiling_with_a_fake_clock(self):
         now, slept, ticks = [0.], [], []
@@ -1923,6 +2012,44 @@ def league_of(elos, champion=None, matrix=None):
     if matrix is not None:
         league['matrix'] = matrix
     return league
+
+
+class PosteriorTests(unittest.TestCase):
+    """dense_posterior.Posterior on synthetic results (a, b, points of a, games)."""
+
+    def test_pooled_and_direct_estimates(self):
+        from dense_posterior import Posterior
+        results = [('a', 'b', 12, 20), ('a', 'c', 30, 40), ('b', 'c', 20, 40)]
+        direct = Posterior(['a', 'b', 'c'], 'c', results, 1e4)          # a free deviation: a-b from its own games
+        pooled = Posterior(['a', 'b', 'c'], 'c', results, 0.)           # transitive Bradley-Terry
+        mean, sd = direct.difference('a', 'b')
+        self.assertAlmostEqual(mean, 400*math.log10(12/8), delta=2)
+        pooled_mean, pooled_sd = pooled.difference('a', 'b')
+        self.assertTrue(400*math.log10(12/8) < pooled_mean < 400*math.log10(3))  # pulled toward the indirect a-c-b path
+        self.assertLess(pooled_sd, sd)
+        self.assertEqual(Posterior(['a', 'b', 'c'], 'c', results, 30.).difference('a', 'b', False)[0] > 0, True)
+
+    def test_direct_games_dominate_a_non_transitive_triangle(self):
+        from dense_posterior import Posterior
+        results = [('a', 'b', 900, 1000), ('b', 'c', 900, 1000), ('c', 'a', 900, 1000)]
+        post = Posterior(['a', 'b', 'c'], 'c', results, 30.)
+        direct = 400*math.log10(9)
+        self.assertAlmostEqual(post.difference('a', 'b', False)[0], 0., delta=1)  # the transitive picture: a tie
+        self.assertGreater(post.difference('a', 'b')[0], direct/2)            # its own games dominate
+        self.assertLess(post.difference('b', 'a')[0], -direct/2)
+
+    def test_value_of_information_prefers_the_pairing_that_resolves_delta(self):
+        from dense_posterior import Posterior
+        best = lambda post: min((('cand', 'champ'), ('cand', 'prev'), ('champ', 'prev')),
+                                key=lambda pair: post.after(('cand', 'champ', True), pair, 8))
+        # No indirect evidence about the candidate: only direct games inform delta.
+        post = Posterior(['champ', 'prev', 'cand'], 'champ', [('champ', 'prev', 5, 10)], 30.)
+        self.assertEqual(best(post), ('cand', 'champ'))
+        # The candidate is lopsided against the champion (p ~ .95) but even with the well-measured previous
+        # champion: a round against it resolves delta faster than another lopsided direct round.
+        results = [('prev', 'champ', 950, 1000), ('cand', 'champ', 38, 40)]
+        post = Posterior(['champ', 'prev', 'cand'], 'champ', results, 1.)
+        self.assertEqual(best(post), ('cand', 'prev'))
 
 
 class OpponentSchedulerTests(unittest.TestCase):
@@ -2099,7 +2226,8 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.run = Path(tmp.name)
 
     def start(self, processes=1, **evaluation):
-        settings = dict(games=2, sims=2, root_samples=2, max_plies=8, anchor_games=0, sprt_max_games=2, extra_opponents=0,
+        settings = dict(games=2, sims=2, root_samples=2, max_plies=8, anchor_games=0, sprt_max_games=2, extra_opponents=0, decision='sprt',
+                        sprt_min_games=2,
                         idle_rematch=False, idle_fill=False)
         config = dense_config.RunConfig(
             device='cpu', model=dense_config.ModelSettings(**{k: getattr(TINY, k) for k in (
@@ -2396,6 +2524,66 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertIn('settled on supersession after 16 games', settle['message'])
         self.assertEqual((settle['promote'], settle['games']), (True, 16))
 
+    def test_posterior_decision_promotes_a_clear_winner(self):
+        """Posterior mode: rounds go to the direct pairing (no other evidence), the verdict promotes once the
+        candidate leads with P(delta > 0) >= promote_confidence; status, report and event carry the verdict."""
+        evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9, uncertainty_parity=1.5)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'play_pairs', self.winning([])):
+            self.assertTrue(evaluator.step())
+        league = self.league()
+        self.assertEqual(league['champion'], 'main/000020')
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        verdict = report['metrics']['posterior']
+        self.assertEqual((verdict['decision'], verdict['leader'], verdict['direct']['games']), ('promote', 'main/000020', len(report['games'])))
+        self.assertGreaterEqual(verdict['p_better'], .9)
+        self.assertLessEqual(len(report['games']), 12)
+        status = json.loads((self.run/'evaluator-status.json').read_text())
+        self.assertEqual(status['decision']['decision'], 'promote')
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        decision = next(e for e in events if e['kind'] == 'decision')
+        self.assertIn('main/000020 vs main/000010: promote after', decision['message'])
+        self.assertEqual(dense_eval.rematch_pair(self.run, 'main/000020', 'main/000010', evaluator.settings),
+                         ('main/000010', 'main/000020'))                        # the decided report never grows
+
+    def test_loop_logs_the_promotion_rule_of_a_legacy_config(self):
+        self.start()
+        config = json.loads((self.run/'config.json').read_text())
+        del config['evaluation']['decision']
+        (self.run/'config.json').write_text(json.dumps(config))
+        flags = {f'eval_{f.name}': None for f in dataclasses.fields(dense_config.EvaluationSettings)}
+        dense_eval.loop(argparse.Namespace(run=str(self.run), once=True, poll=0., processes=1, **flags))
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([e['message'] for e in events if e['kind'] == 'info'],
+                         ['promotion rule: posterior (default; config.json predates the setting)'])
+
+    def test_posterior_direct_games_stop_at_sprt_max_games(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=10, round_games=8)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        def drawn(config, settings, candidate, opponent, first_pair, games, seal=None, heartbeat=lambda *_: None):
+            return [dict(r, winner=-1) for r in self.winning([])(config, settings, candidate, opponent, first_pair, games, seal)]
+        with unittest.mock.patch.object(dense_eval, 'play_pairs', drawn):
+            self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        self.assertEqual((len(report['games']), report['metrics']['posterior']['decision']), (10, 'max-games'))
+
+    def test_posterior_decision_rejects_a_clear_loser(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9, uncertainty_parity=1.5)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        def losing(config, settings, candidate, opponent, first_pair, games, seal=None, heartbeat=lambda *_: None):
+            return [dict(r, winner=1-r['winner']) for r in self.winning([])(config, settings, candidate, opponent, first_pair, games, seal)]
+        with unittest.mock.patch.object(dense_eval, 'play_pairs', losing):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(self.league()['champion'], 'main/000010')
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        self.assertEqual(report['metrics']['posterior']['decision'], 'reject')
+
     def test_fill_order_seal_then_generalization_then_the_widest_ladder_pair(self):
         """Fill priority: the champion vs Seal while their interval is wide, then one round of the newest rated
         checkpoint vs the previous champion, then the widest ladder pair; a waiting checkpoint interrupts."""
@@ -2459,6 +2647,54 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator.use('main/000030', 'main/000010')                 # main/000020 is least recently used
         self.assertEqual(set(evaluator.models), {'main/000010', 'main/000030'})
         self.assertIs(evaluator.models['main/000010'], first)
+
+    def pointer(self):
+        return json.loads((self.run/'actor.json').read_text())
+
+    def test_pointer_follows_newest_exports(self):
+        evaluator = self.start()
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        evaluator.publish(True)
+        self.assertEqual((self.pointer()['checkpoint'], self.pointer()['reason']), ('main/000010', 'newest'))
+        self.export(20)
+        evaluator.publish(True)                                    # before main/000020 plays a game
+        self.assertEqual(self.pointer()['checkpoint'], 'main/000020')
+        self.assertTrue(evaluator.step())
+        self.assertEqual((self.pointer()['checkpoint'], self.pointer()['vetoed']), ('main/000020', []))
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([(e['previous'], e['checkpoint']) for e in events if e['kind'] == 'actor_model'],
+                         [(None, 'main/000010'), ('main/000010', 'main/000020')])
+
+    def test_veto_falls_back_to_the_best_rated_until_the_next_export(self):
+        self.export(10, 20, 30)
+        evaluator = self.start()
+        evaluator.league = dict(champion='main/000010', checkpoints=[
+            dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
+            dict(id='main/000020', variant='main', step=20, elo=50., matches=[], panel=dict(incumbent='main/000010')),
+            dict(id='main/000030', variant='main', step=30, elo=-300., matches=[], panel=dict(incumbent='main/000010'))])
+        evaluator.publish(True)
+        self.assertEqual(self.pointer()['checkpoint'], 'main/000030')
+        path = dense_eval.report_path(self.run, 'main/000030', 'main/000010')
+        path.parent.mkdir(parents=True)
+        games = [dict(seed=k//2, challenger_color=k % 2, winner=1-k % 2) for k in range(128)]
+        path.write_text(json.dumps(dict(candidate='main/000030', opponent='main/000010', settings=asdict(evaluator.settings), games=games)))
+        evaluator.publish(True)
+        pointer = self.pointer()
+        self.assertEqual((pointer['checkpoint'], pointer['vetoed']), ('main/000020', ['main/000030']))
+        self.assertIn('main/000030 vetoed: Elo', pointer['reason'])
+        self.export(40)
+        evaluator.publish(True)
+        self.assertEqual((self.pointer()['checkpoint'], self.pointer()['vetoed']), ('main/000040', ['main/000030']))
+        evaluator.league['checkpoints'].append(dict(id='main/000040', variant='main', step=40, elo=80., matches=[], demoted=True,
+                                                    panel=dict(incumbent='main/000010')))
+        evaluator.publish(True)
+        pointer = self.pointer()
+        self.assertEqual((pointer['checkpoint'], pointer['vetoed']), ('main/000020', ['main/000030', 'main/000040']))
+        self.assertIn('demoted', pointer['reason'])
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([e['checkpoint'] for e in events if e['kind'] == 'actor_model'],
+                         ['main/000030', 'main/000020', 'main/000040', 'main/000020'])
 
     def test_evaluation_defaults(self):
         s = dense_config.EvaluationSettings()

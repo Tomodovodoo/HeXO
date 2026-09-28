@@ -752,11 +752,11 @@ def actor_points(run):
     return out
 
 
-def series(run, config, variant, metric, x='step', max_points=1000):
+def series(run, config, variant, metric, x='step', max_points=1000, from_step=0):
     """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval; seal_delta: the direct-match
     Elo minus Seal of each anchored checkpoint, league anchors.seal.matches) sorted by x and
-    downsampled; x is the learner step or hours since the run's created_at. Actor and GPU metrics have hours
-    only. CURVE_METRICS have their own x only ('remaining' or 'ply'): [[grid point, y or null where unsupported], ...]
+    downsampled after dropping steps below from_step when x is 'step'; x is the learner step or hours since
+    the run's created_at. Actor and GPU metrics have hours only. CURVE_METRICS have their own x only ('remaining' or 'ply'): [[grid point, y or null where unsupported], ...]
     over every point of the manifest's <x>_grid (not downsampled) of the newest checkpoint manifest of
     `variant` holding that curve (metrics.validation_sources), whose id is added as `checkpoint` (None without one).
     Raises ValueError for an unknown metric or x."""
@@ -799,6 +799,7 @@ def series(run, config, variant, metric, x='step', max_points=1000):
                         if finite(r.get('time')) and finite(r.get(metric)))
     else:
         raise ValueError(f'unknown metric {metric!r}')
+    if x == 'step': points = [p for p in points if p[0] >= from_step]
     return dict(run=run.name, variant=variant, metric=metric, x=x, count=len(points),
                 points=[list(p) for p in downsample(points, max_points)])
 
@@ -891,7 +892,8 @@ class Handler(BaseHTTPRequestHandler):
                     if config is None: raise ValueError('series need a dense run')
                     variant, metric = query.get('variant', 'main'), query.get('metric', '')
                     data = surface(run, variant, metric) if url.path == "/api/surface" else series(
-                        run, config, variant, metric, query.get('x', 'step'), max(10, min(20000, int(query.get('max_points', 1000)))))
+                        run, config, variant, metric, query.get('x', 'step'), max(10, min(20000, int(query.get('max_points', 1000)))),
+                        int(query.get('from_step', 0)))
             except ValueError as error:
                 self.send_error(400, str(error))
                 return

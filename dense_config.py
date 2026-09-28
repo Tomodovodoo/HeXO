@@ -5,7 +5,10 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
   shards/<name>/                       immutable self-play shards (format in dense_data); names sort oldest first
   checkpoints/<variant>/<step:06d>/    model.pt, ema.pt, optimizer.pt, manifest.json (dense_learn); complete once
                                        manifest.json exists; the checkpoint id is '<variant>/<step:06d>'
-  champion.json                        {checkpoint, ema_sha256, updated_at}: the checkpoint actors play (dense_eval)
+  champion.json                        {checkpoint, ema_sha256, updated_at}: the promoted checkpoint (dense_eval);
+                                       actors play it with actor.model_source 'champion'
+  actor.json                           {checkpoint, reason, updated_at, vetoed}: the checkpoint actors play with
+                                       model_source 'newest_veto' (dense_eval.Evaluator.point)
   league.json                          ratings, champion, Elo differences of variant heads, per-checkpoint panels
                                        and the payoff matrix; checkpoints the evaluator passed over have skipped
                                        true and elo null (dense_eval)
@@ -68,6 +71,9 @@ class ActorSettings:
     cache_positions: int = 4096
     shard_games: int = 32
     opening_random_plies: float = 2.  # mean of an exponential; sampled from the search policy
+    # Checkpoint the actor plays (dense_selfplay.resolve): 'champion' (champion.json), 'newest' (newest complete
+    # checkpoint of learner.variant) or 'newest_veto' (actor.json: newest unless the evaluator vetoed it).
+    model_source: str = 'newest_veto'
     historical_fraction: float = 0.   # share of games in flight against a frozen rated checkpoint
     historical_weighting: str = 'pfsp'  # 'pfsp': weight (1-p)^2, p = champion's expected score; 'uniform'
     historical_pool: int = 8          # distinct historical opponents loaded at once, redrawn per shard
@@ -129,6 +135,11 @@ class EvaluationSettings:
     anchor_games: int = 100       # champion vs Seal, played before optional work; 0 = never
     anchor_on_promotion: bool = True  # every new champion owes anchor_games vs Seal
     seal_ms: int = 100
+    decision: str = 'posterior'   # promotion rule: 'posterior' (dense_eval.Evaluator.verdict) or 'sprt'
+    promote_confidence: float = .9  # posterior: P(candidate - champion > sprt_elo0) needed to promote (1 - it rejects)
+    uncertainty_parity: float = 1.  # posterior: the candidate's rating sd may be at most this times the champion's
+    matchup_prior_elo: float = 30.  # posterior: prior sd of a pair's deviation from the transitive rating difference
+    sprt_min_games: int = 8       # direct games vs the champion before any decision
     sprt_elo0: float = 0.         # promotion SPRT bounds on candidate minus champion
     sprt_elo1: float = 25.
     sprt_alpha: float = .05
@@ -141,6 +152,7 @@ class EvaluationSettings:
     idle_fill: bool = True        # after all other work, play fill rounds until a checkpoint awaits rating
     anchor_target_halfwidth: float = 25.  # fill Seal games until the champion-Seal Elo interval is this narrow; 0 = never
     fill_top: int = 3             # then fill the widest Elo-difference interval among this many top-rated checkpoints
+    veto_margin: float = -30.     # actor.json skips the newest checkpoint once its Elo interval vs its champion lies below this
     max_expected_score: float = .85  # panel, optional and fill pairings only while either side's expected score is at most this
 
 
