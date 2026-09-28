@@ -1404,8 +1404,9 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual(learner.ema.blocks[0].norm1.momentum, .1)
 
     def test_vram_cap_and_release_on_cuda(self):
-        """vram_reserved_mb caps the allocator at that share of the device; export releases the cache once after
-        its recalibration and validation passes; neither touches CUDA on the CPU."""
+        """vram_reserved_mb caps the allocator at that share of the device, installed from the resumed settings
+        before any weights are placed; export releases the cache once after its recalibration and validation
+        passes; neither touches CUDA on the CPU."""
         torch.set_num_threads(2)
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
@@ -1430,6 +1431,12 @@ class ValidationSourceTests(unittest.TestCase):
                     learner.settings = replace(learner.settings, vram_reserved_mb=9000)
                     with self.assertRaises(ValueError):
                         learner.cap_vram()
+            seen = []
+            def cap_vram(resumed):
+                seen.append((hasattr(resumed, 'model'), resumed.settings.vram_reserved_mb, resumed.settings.batch))
+            with unittest.mock.patch.object(dense_learn.Learner, 'cap_vram', autospec=True, side_effect=cap_vram):
+                dense_learn.Learner(run, replace(config.learner, vram_reserved_mb=0), config, overrides=dict(batch=4))
+            self.assertEqual(seen, [(False, 2048, 4)])  # before any weights exist, with the resumed settings
 
     def test_export_without_held_out_games(self):
         """No held-out game in the window: metrics.validation stays null, the sources are still reported, and the

@@ -206,16 +206,22 @@ def checkpoints(run, variant):
 class Learner:
     def __init__(self, run, settings, config, initial=None, overrides=None):
         """Resume from the newest checkpoint of settings.variant if any (its saved settings under the explicit
-        `overrides`), else start from `initial` or random weights."""
+        `overrides`), else start from `initial` or random weights. The VRAM cap of the effective settings is
+        installed before any CUDA allocation."""
         self.run, self.settings, self.config, self.overrides = run, settings, config, overrides or {}
         self.device = torch.device(config.device)
         self.memory_format = hexnet.memory_format(config.model)
+        saved = checkpoints(run, settings.variant)
+        manifest = json.loads((saved[-1]/'manifest.json').read_text(encoding='utf-8')) if saved else None
+        if saved:
+            # Settings saved by the last export (including replacement perturbations) under explicit CLI overrides.
+            self.settings = replace(dense_config.LearnerSettings(**manifest['learner']), **self.overrides)
+        self.cap_vram()
         self.model = self.place(hexnet.HexNet(hexnet.HexNetConfig(**asdict(config.model))))
         self.step = self.samples_seen = self.optimizer_started = self.ema_updates = 0
         self.copied_from = None
-        saved = checkpoints(run, settings.variant)
         if saved:
-            self.resume(saved[-1])
+            self.resume(saved[-1], manifest)
         else:
             if initial:
                 self.load_weights(initial)
@@ -224,7 +230,6 @@ class Learner:
         self.start_step = self.last_copy = self.step
         self.last_export = self.step if saved else None
         self.metrics = None
-        self.cap_vram()
 
     def cap_vram(self):
         """With settings.vram_reserved_mb > 0 on CUDA, cap this process's caching allocator at that many MB
@@ -257,15 +262,13 @@ class Learner:
             raise ValueError(f'{path} has model {source.config}, the run uses {self.model.config}')
         self.model.load_state_dict(source.state_dict())
 
-    def resume(self, path):
-        manifest = json.loads((path/'manifest.json').read_text(encoding='utf-8'))
+    def resume(self, path, manifest):
+        """Load the weights, optimizer and counters of checkpoint `path` (whose manifest settings are already applied)."""
         self.model = self.place(hexnet.load_model(path/'model.pt'))
         self.ema = self.place(hexnet.load_model(path/'ema.pt'))
         if self.model.config != hexnet.HexNetConfig(**asdict(self.config.model)):
             raise ValueError(f'{path} does not match the run model settings')
         state = torch.load(path/'optimizer.pt', map_location=self.device, weights_only=True)
-        # Settings saved by the last export (including replacement perturbations) under explicit CLI overrides.
-        self.settings = replace(dense_config.LearnerSettings(**manifest['learner']), **self.overrides)
         self.optimizer = make_optimizer(self.model, self.settings)
         self.optimizer.load_state_dict(state['optimizer'])
         for group, decay in zip(self.optimizer.param_groups, (self.settings.weight_decay, 0.)):
