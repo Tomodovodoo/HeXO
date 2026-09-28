@@ -117,7 +117,9 @@ class LearnerSettings:
 
 @dataclass(frozen=True)
 class EvaluationSettings:
-    games: int = 64               # games per round of every comparison, colour-swapped opening pairs
+    games: int = 64               # games of each optional comparison (panel top-up, fill), colour-swapped opening pairs
+    round_games: int = 8          # games per round of every comparison; supersession, backlog and pairing are checked between rounds
+    model_cache: int = 6          # checkpoints the evaluator keeps loaded, least recently used dropped first
     previous_games: int = 0       # vs the previous rated checkpoint of the variant, only while idle; 0 = never
     sims: int = 64
     root_samples: int = 16
@@ -128,7 +130,7 @@ class EvaluationSettings:
     anchor_on_promotion: bool = True  # every new champion owes anchor_games vs Seal
     seal_ms: int = 100
     sprt_elo0: float = 0.         # promotion SPRT bounds on candidate minus champion
-    sprt_elo1: float = 50.
+    sprt_elo1: float = 25.
     sprt_alpha: float = .05
     sprt_beta: float = .05
     sprt_max_games: int = 200     # 'max-games' does not promote
@@ -136,6 +138,10 @@ class EvaluationSettings:
     eval_share: float = .12       # ceiling on the evaluator's playing share of wall time (dense_eval.Pacer)
     extra_opponents: int = 2      # panel opponents drawn per rated checkpoint with probability ~ p(1-p), idle only
     idle_rematch: bool = True     # replay decision-relevant comparisons while no checkpoint awaits rating
+    idle_fill: bool = True        # after all other work, play fill rounds until a checkpoint awaits rating
+    anchor_target_halfwidth: float = 25.  # fill Seal games until the champion-Seal Elo interval is this narrow; 0 = never
+    fill_top: int = 3             # then fill the widest Elo-difference interval among this many top-rated checkpoints
+    max_expected_score: float = .85  # panel, optional and fill pairings only while either side's expected score is at most this
 
 
 @dataclass(frozen=True)

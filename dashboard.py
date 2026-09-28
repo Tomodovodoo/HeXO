@@ -449,7 +449,7 @@ def evaluation_timing(run, evaluator, now):
     - mean_placements(type): the current comparison's mean_placements when it has that type, else the pooled
       mean of the newest HISTORY_REPORTS reports of that type (`report_placements`), else PLACEMENT_SHARE *
       max_plies; mean_source names which ('comparison', 'reports', 'default') for the current type.
-    - Games are played in rounds of settings.games (the last one shorter). A round of n games runs
+    - Games are played in rounds of settings.round_games (else settings.games; the last one shorter). A round of n games runs
       workers(n) = min(processes, n // 2) workers, which the Pacer charges per playing second, so its playing
       time becomes wall time divided by min(1, eval_share / workers(n)), the Pacer's long-run ceiling.
     - rate(type), placements per playing second of one worker, for the comparison's type: the current
@@ -471,7 +471,7 @@ def evaluation_timing(run, evaluator, now):
     comparison = evaluator.get('comparison') if isinstance(evaluator.get('comparison'), dict) else {}
     current = comparison.get('opponent') == 'seal' if comparison else None
     share = next((v for v in (evaluator.get('eval_share'), settings.get('eval_share')) if finite(v) and 0 < v <= 1), 1.)
-    size, processes = max(2, settings.get('games') or 2), max(1, evaluator.get('processes') or 1)
+    size, processes = max(2, settings.get('round_games') or settings.get('games') or 2), max(1, evaluator.get('processes') or 1)
     workers = lambda n: max(1, min(processes, n//2))
     fraction = lambda n: min(1., share/workers(n))  # playing share of wall time in a round of n games
     rounds = lambda games: [min(size, games-k) for k in range(0, max(0, games), size)]
@@ -513,6 +513,27 @@ def evaluation_timing(run, evaluator, now):
     release = export_steps*per_step if export_steps and per_step else None
     return dict(out, eval_seconds=eval_seconds, export_steps=export_steps, seconds_per_step=per_step, release_seconds=release,
                 ratio=eval_seconds/release if eval_seconds is not None and release else None, playing_fraction=fraction(size))
+
+
+def provisional(league, evaluator):
+    """The league row of the checkpoint under evaluation, merged from evaluator-status.json (league.json stays the
+    settled record): {id, opponent, wins, losses, capped, games, games_planned, elo, elo_interval} while the
+    evaluator is playing or throttled with a tally for a candidate that has no league entry, else None. elo and
+    elo_interval are the opponent's league Elo (Seal: anchors.seal.elo) plus the tally's elo_delta and
+    elo_interval, None while either is unknown."""
+    comparison, tally = evaluator.get('comparison'), evaluator.get('tally')
+    if evaluator.get('stage') not in ('playing', 'throttled') or not isinstance(comparison, dict) or not isinstance(tally, dict):
+        return None
+    entries = {c.get('id'): c for c in league.get('checkpoints') or [] if isinstance(c, dict)}
+    if comparison.get('candidate') in entries:
+        return None
+    opponent = comparison.get('opponent')
+    base = ((league.get('anchors') or {}).get('seal') or {}).get('elo') if opponent == 'seal' else (entries.get(opponent) or {}).get('elo')
+    interval = tally.get('elo_interval')
+    known = finite(base) and finite(tally.get('elo_delta'))
+    return dict(id=comparison.get('candidate'), opponent=opponent, **{k: tally.get(k) for k in ('wins', 'losses', 'capped', 'games')},
+                games_planned=evaluator.get('games_planned'), elo=base+tally['elo_delta'] if known else None,
+                elo_interval=[base+v for v in interval] if known and isinstance(interval, list) and all(map(finite, interval)) else None)
 
 
 def dense_run(run, config, fresh=30):
@@ -573,8 +594,10 @@ def dense_run(run, config, fresh=30):
     evaluator = status(run/'evaluator-status.json')
     evaluator['heartbeat'] = beat(evaluator)
     evaluator['timing'] = evaluation_timing(run, evaluator, now)
+    league = status(run/'league.json')
+    evaluator['provisional'] = provisional(league, evaluator)
     return dict(name=run.name, config=config, actor=actor, actors=actors, learners=learners, evaluator=evaluator,
-                league=status(run/'league.json'), champion=champion, checkpoints=checkpoints, data=data, now=now)
+                league=league, champion=champion, checkpoints=checkpoints, data=data, now=now)
 
 
 _jsonl = {}
