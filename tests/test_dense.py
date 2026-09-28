@@ -731,9 +731,9 @@ class DenseDataTests(unittest.TestCase):
                 write_games(Path(tmp)/'shards'/f'{k:06d}', [(moves, -1, None)])
             window = dense_data.ReplayWindow(tmp, capacity_rows=1000, min_rows=12)
             self.assertEqual(window.rows, 18)
-            self.assertEqual(window.index, [('000002', i) for i in range(2, 10)]+[('000003', i) for i in range(10)])
+            self.assertEqual(list(window.index), [('000002', i) for i in range(2, 10)]+[('000003', i) for i in range(10)])
             capped = dense_data.ReplayWindow(tmp, capacity_rows=5, min_rows=12)
-            self.assertEqual(capped.index, [('000003', i) for i in range(5, 10)])
+            self.assertEqual(list(capped.index), [('000003', i) for i in range(5, 10)])
             counts = {}
             for ref in window.sample(np.random.default_rng(0), 36000):
                 counts[(ref.shard, ref.index)] = counts.get((ref.shard, ref.index), 0)+1
@@ -790,6 +790,148 @@ class DenseDataTests(unittest.TestCase):
             for t in by_game[0][:-1]:
                 if t['next_weight']:
                     self.assertAlmostEqual(float(t['next_policy'].sum()), 1, places=5)
+
+
+def synthetic_run(run, shards, games, plies, seed=0):
+    """Shards of fake games (positions are never replayed): random moves, digests, root values (some null),
+    trained sides and winners; every other ply has a short policy; rows are stored in shuffled order."""
+    rng = np.random.default_rng(seed)
+    for k in range(shards):
+        episodes, rows = [], []
+        for g in range(games):
+            T = int(rng.integers(plies//2, plies+1)); side = [None, None, 0, 1][int(rng.integers(4))]
+            roots = None if g % 5 == 0 else [None if rng.random() < .2 else float(rng.uniform(-1, 1)) for _ in range(T)]
+            episodes.append(dict(moves=rng.integers(-50, 50, (T, 2)).tolist(), winner=int(rng.integers(-1, 2)), reason='test',
+                                 opening_plies=0, actor='a'*64, root_values=roots, trained_side=side,
+                                 full_search=[bool(t % 2 == 0) for t in range(T)]))
+            for t in range(T):
+                p = rng.random(int(rng.integers(1, 4))) if t % 2 == 0 else None
+                rows.append(dict(game=g, ply=t, player=dense_data.player_at(t), remaining=1 if t == 0 else 2-(t+1) % 2,
+                                 legal_sha256=rng.bytes(32).hex(), policy=None if p is None else p/p.sum()))
+        rows = [rows[i] for i in rng.permutation(len(rows))]
+        dense_data.write_shard(Path(run)/'shards'/f'{k+1:06d}', dict(actor_sha256='a'*64), episodes, rows)
+
+
+def reference_window(run, capacity, min_rows, fraction):
+    """(training index, validation index, {name: (episodes, rows)}) of the window by a direct walk of the shards."""
+    data = {p.name: dense_data.read_shard(p) for p in dense_data.shard_dirs(run)}
+    full = {n: [i for i, r in enumerate(rows) if len(r['policy'])] for n, (_, rows) in data.items()}
+    want = min(capacity, dense_data.window_size(sum(map(len, full.values())), min_rows))
+    admitted, have = [], 0
+    for name in sorted(data, reverse=True):
+        if have >= want:
+            break
+        take = min(len(full[name]), want-have); admitted.insert(0, (name, take)); have += take
+    index, held = [], []
+    for name, take in admitted:
+        episodes, rows = data[name]
+        start = 0 if take >= len(full[name]) else full[name][-take] if take else len(rows)
+        for i in range(start, len(rows)):
+            e = episodes[rows[i]['game']]
+            if dense_data.trained(e, rows[i]['ply']):
+                (held if dense_data.holdout(e, fraction) else index).append((name, i))
+    return index, held, data
+
+
+class WindowMemoryTests(unittest.TestCase):
+    def test_sampling_matches_the_reference_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 6, 8, 30)
+            window = dense_data.ReplayWindow(tmp, 10**6, 150, validation_fraction=.2)
+            index, held, data = reference_window(Path(tmp), 10**6, 150, .2)
+            self.assertEqual((list(window.index), list(window.validation)), (index, held))
+            self.assertLess(len(window.shards), 6)
+            self.assertEqual(window.rows, len(index)+len(held))
+            for recency, validation in ((0., False), (2., False), (0., True)):
+                keys = held if validation else index
+                rng = np.random.default_rng(9)
+                if recency:
+                    w = (np.arange(1, len(keys)+1)/len(keys))**recency
+                    picks = rng.choice(len(keys), 500, p=w/w.sum())
+                else:
+                    picks = rng.integers(len(keys), size=500)
+                refs = window.sample(np.random.default_rng(9), 500, recency, validation)
+                self.assertEqual([(r.shard, r.index) for r in refs], [keys[k] for k in picks])
+                for ref in refs:
+                    episodes, rows = data[ref.shard]
+                    row, e = rows[ref.index], episodes[rows[ref.index]['game']]
+                    self.assertEqual(ref.row, {k: row[k] for k in ('game', 'ply', 'player', 'remaining', 'legal_sha256')})
+                    self.assertEqual(ref.episode, {k: e[k] for k in ('moves', 'winner', 'root_values', 'full_search', 'trained_side')})
+                    np.testing.assert_array_equal(window.policy(ref), row['policy'])
+                    for lam, full_only in ((.9, False), (.5, True)):
+                        self.assertEqual(window.value_targets(ref, lam, full_only), dense_data.value_targets(
+                            [dense_data.player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'], lam,
+                            e['full_search'] if full_only else None))
+
+    def test_following_row_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 2, 6, 20)
+            window = dense_data.ReplayWindow(tmp, 10**6, 10**6)
+            for name, (_, rows) in reference_window(Path(tmp), 10**6, 10**6, 0.)[2].items():
+                where = {(r['game'], r['ply']): i for i, r in enumerate(rows)}
+                for i, r in enumerate(rows):
+                    following = window.following(window.ref(name, i))
+                    j = where.get((r['game'], r['ply']+1))
+                    self.assertEqual(None if following is None else following.index, j)
+                    if j is not None:
+                        self.assertEqual((following.row['game'], following.row['ply']), (r['game'], r['ply']+1))
+
+    def test_policy_cache_evicts_least_recently_used_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 3, 6, 20)
+            names = [p.name for p in dense_data.shard_dirs(tmp)]
+            sizes = {n: sum(a.nbytes for a in dense_data.load_policies(Path(tmp)/'shards'/n, len(dense_data.read_shard(Path(tmp)/'shards'/n)[1])))
+                     for n in names}
+            budget = (sorted(sizes.values())[-1]+sorted(sizes.values())[-2]+1)/2**20
+            window = dense_data.ReplayWindow(tmp, 10**6, 10**6, policy_cache_mb=budget)
+            _, _, data = reference_window(Path(tmp), 10**6, 10**6, 0.)
+            first = {n: window.ref(n, int(np.flatnonzero([len(r['policy']) for r in data[n][1]])[0])) for n in names}
+            for n in (names[0], names[1], names[0], names[2]):
+                np.testing.assert_array_equal(window.policy(first[n]), data[n][1][first[n].index]['policy'])
+            self.assertEqual(list(window.policies), [names[0], names[2]])
+            self.assertLessEqual(window.policy_bytes(), budget*2**20)
+            tiny = dense_data.ReplayWindow(tmp, 10**6, 10**6, policy_cache_mb=1e-6)
+            for n in names:
+                for i, r in enumerate(data[n][1]):
+                    np.testing.assert_array_equal(tiny.policy(tiny.ref(n, i)), r['policy'])
+                self.assertEqual(list(tiny.policies), [n])
+
+    def test_held_policies_do_not_pin_evicted_shards(self):
+        import gc
+        import weakref
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 5, 6, 20)
+            window = dense_data.ReplayWindow(tmp, 10**6, 10**6, policy_cache_mb=1e-6)
+            _, _, data = reference_window(Path(tmp), 10**6, 10**6, 0.)
+            held, arrays = [], []
+            for ref in window.sample(np.random.default_rng(1), 200):
+                policy = window.policy(ref)
+                arrays += [weakref.ref(a) for a in window.policies[ref.shard]]
+                np.testing.assert_array_equal(policy, data[ref.shard][1][ref.index]['policy'])
+                self.assertEqual(policy.dtype, np.float32)
+                held.append(policy)
+            self.assertGreater(len({r.shard for r in window.sample(np.random.default_rng(1), 200)}), 1)
+            gc.collect()
+            cached = {id(a) for entry in window.policies.values() for a in entry}
+            self.assertTrue(all(r() is None or id(r()) in cached for r in arrays))
+            # A view keeps its buffer's owner (the npz member's bytes, not the array) alive: policies must own theirs.
+            self.assertTrue(all(p.base is None for p in held))
+
+    def test_resident_bytes_per_row(self):
+        import gc
+        import tracemalloc
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 40, 20, 130, seed=1)
+            gc.collect(); tracemalloc.start()
+            try:
+                before = tracemalloc.get_traced_memory()[0]
+                window = dense_data.ReplayWindow(tmp, 10**7, 10**7, validation_fraction=.03)
+                gc.collect()
+                used = tracemalloc.get_traced_memory()[0]-before
+            finally:
+                tracemalloc.stop()
+            self.assertGreater(window.rows, 50000)
+            self.assertLess(used/window.rows, 150)
 
 
 def old_corpus(path):

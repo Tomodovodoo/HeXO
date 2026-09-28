@@ -20,7 +20,7 @@ per colour, `opponent` (null for self-play, else the checkpoint id of a frozen h
 indexing stays contiguous, but a ply of the opponent's colour (`trained` False) has no policy, a null root
 value and full_search False; it never enters the replay window and does not count toward `total_rows`.
 """
-from collections import Counter, namedtuple
+from collections import Counter, OrderedDict, namedtuple
 import hashlib
 import json
 import zlib
@@ -42,7 +42,8 @@ from train import write_json
 SCHEMA = 'hexo-dense-shard-v1'
 FILES = ('episodes.json', 'rows.json', 'targets.npz')
 Ref = namedtuple('Ref', 'shard index row episode')
-Shard = namedtuple('Shard', 'episodes rows full held following')
+Shard = namedtuple('Shard', 'game ply player remaining legal full following start moves roots searched has_roots has_search '
+                             'winner side held')
 FUTURE = (6, 20)
 ORIGINS = ('converted', 'actor')
 SOURCES = ('converted', 'fresh', 'newest')
@@ -194,6 +195,22 @@ def window_size(total, min_rows=20000, expand_per_row=.4, taper_exponent=.65):
     return int(min_rows*(1 + expand_per_row*((total/min_rows)**taper_exponent - 1)/taper_exponent))
 
 
+class Rows:
+    """An ordered list of (shard name, row index) pairs stored as two int32 arrays over a list of shard names."""
+
+    def __init__(self, names, shard, row):
+        self.names, self.shard, self.row = names, shard, row
+
+    def __len__(self):
+        return len(self.row)
+
+    def __getitem__(self, k):
+        return self.names[self.shard[k]], int(self.row[k])
+
+    def __iter__(self):
+        return (self[k] for k in range(len(self)))
+
+
 class ReplayWindow:
     """The rows of the newest shards holding min(capacity_rows, window_size(N_full)) full-search rows.
 
@@ -202,14 +219,24 @@ class ReplayWindow:
     from its take-th last full-search row onward. `total_rows`/`rows` count every trained row (all shards /
     window; see `trained`), `total_full_rows`/`full_rows` only full-search rows. Rows of games selected by
     `holdout(episode, validation_fraction)` form the validation index and are never drawn for training.
-    Episodes and rows of admitted shards stay in memory; policy vectors load per shard on first use and are
-    dropped with the shard.
+    `index`/`validation` are Rows, oldest first.
+
+    Memory: each admitted shard is held as numpy arrays (Shard): per row its game, ply, player, remaining,
+    raw legal digest, next-ply row and full-search flag; per game its ply offset, winner, trained side and
+    held-out flag; per ply its move, root value (NaN for null) and full_search flag. A Ref's row dict and its
+    episode dict {moves, winner, root_values, full_search, trained_side} are rebuilt on demand. Policy vectors
+    load per shard on first use into an LRU bounded by `policy_cache_mb` (the shard in use is always kept);
+    value targets are cached for the VALUE_CACHE most recently used (episode, lam, full_only) keys.
     """
 
-    def __init__(self, run_dir, capacity_rows, min_rows=100000, expand_per_row=.4, taper_exponent=.65, validation_fraction=0.):
+    VALUE_CACHE = 4096
+
+    def __init__(self, run_dir, capacity_rows, min_rows=100000, expand_per_row=.4, taper_exponent=.65, validation_fraction=0.,
+                 policy_cache_mb=512.):
         self.run_dir = Path(run_dir); self.capacity_rows = capacity_rows; self.validation_fraction = validation_fraction
         self.shape = dict(min_rows=min_rows, expand_per_row=expand_per_row, taper_exponent=taper_exponent)
-        self.manifests = {}; self.shards = {}; self.policies = {}; self.values = {}
+        self.policy_budget = policy_cache_mb*2**20
+        self.manifests = {}; self.shards = {}; self.policies = OrderedDict(); self.values = OrderedDict()
         self.refresh()
 
     def load(self, name):
@@ -217,9 +244,23 @@ class ReplayWindow:
         episodes, rows = read_shard(path, policies=False)
         with np.load(path/'targets.npz', allow_pickle=False) as data:
             full = np.diff(data['offsets']) > 0
-        where = {(r['game'], r['ply']): i for i, r in enumerate(rows)}
-        return Shard(episodes, rows, full, [holdout(e, self.validation_fraction) for e in episodes],
-                     [where.get((r['game'], r['ply']+1), -1) for r in rows])
+        game = np.array([r['game'] for r in rows], np.int32); ply = np.array([r['ply'] for r in rows], np.int32)
+        where = {(g, t): i for i, (g, t) in enumerate(zip(game.tolist(), ply.tolist()))}
+        per_ply = lambda key: [v for e in episodes for v in (e.get(key) or [None]*len(e['moves']))]
+        return Shard(
+            game=game, ply=ply.astype(np.int16), player=np.array([r['player'] for r in rows], np.int8),
+            remaining=np.array([r['remaining'] for r in rows], np.int8),
+            legal=np.frombuffer(bytes.fromhex(''.join(r['legal_sha256'] for r in rows)), np.uint8).reshape(-1, 32),
+            full=full, following=np.array([where.get((g, t+1), -1) for g, t in zip(game.tolist(), ply.tolist())], np.int32),
+            start=np.cumsum([0]+[len(e['moves']) for e in episodes]).astype(np.int32),
+            moves=np.array([m for e in episodes for m in e['moves']], np.int32).reshape(-1, 2),
+            roots=np.array([np.nan if v is None else v for v in per_ply('root_values')], np.float64),
+            searched=np.array([bool(f) for f in per_ply('full_search')], bool),
+            has_roots=np.array([e['root_values'] is not None for e in episodes], bool),
+            has_search=np.array([e.get('full_search') is not None for e in episodes], bool),
+            winner=np.array([e['winner'] for e in episodes], np.int8),
+            side=np.array([-1 if e.get('trained_side') is None else e['trained_side'] for e in episodes], np.int8),
+            held=np.array([holdout(e, self.validation_fraction) for e in episodes], bool))
 
     def refresh(self):
         """Rescan manifests, recompute the window and load newly admitted shards; returns window rows."""
@@ -238,26 +279,37 @@ class ReplayWindow:
             admitted.append((name, take)); have += take
         for name in set(self.shards) - {n for n, _ in admitted}:
             del self.shards[name]; self.policies.pop(name, None)
-            self.values = {k: v for k, v in self.values.items() if k[0] != name}
+            for key in [k for k in self.values if k[0] == name]:
+                del self.values[key]
         for name, _ in admitted:
             if name not in self.shards:
                 self.shards[name] = self.load(name)
         self.admitted = admitted[::-1]; self.full_rows = have
-        # Flat (shard, row) indices, oldest first, for uniform or recency-weighted sampling.
-        self.index = []; self.validation = []
-        for name, take in self.admitted:
-            shard = self.shards[name]; positions = np.flatnonzero(shard.full)
-            start = 0 if take >= len(positions) else int(positions[-take]) if take else len(shard.rows)
-            for i in range(start, len(shard.rows)):
-                row = shard.rows[i]
-                if trained(shard.episodes[row['game']], row['ply']):
-                    (self.validation if shard.held[row['game']] else self.index).append((name, i))
+        parts = ([], []), ([], [])    # (shard ids, rows) of the training and validation index
+        for k, (name, take) in enumerate(self.admitted):
+            s = self.shards[name]; positions = np.flatnonzero(s.full)
+            start = 0 if take >= len(positions) else int(positions[-take]) if take else len(s.game)
+            i = np.arange(start, len(s.game), dtype=np.int32)
+            side = s.side[s.game[i]]
+            i = i[(side < 0) | ((s.ply[i].astype(np.int32)+1)//2 % 2 == side)]
+            held = s.held[s.game[i]]
+            for split, (ids, rows) in enumerate(parts):
+                ids.append(np.full(int((held == split).sum()), k, np.int32)); rows.append(i[held == split])
+        names = [name for name, _ in self.admitted]
+        flat = lambda arrays: np.concatenate(arrays) if arrays else np.zeros(0, np.int32)
+        self.index, self.validation = (Rows(names, flat(ids), flat(rows)) for ids, rows in parts)
         self.rows = len(self.index)+len(self.validation)
         return self.rows
 
     def ref(self, name, i):
-        shard = self.shards[name]
-        return Ref(name, i, shard.rows[i], shard.episodes[shard.rows[i]['game']])
+        """Ref of row i of admitted shard `name`."""
+        s = self.shards[name]; g = int(s.game[i]); a, b = int(s.start[g]), int(s.start[g+1])
+        row = dict(game=g, ply=int(s.ply[i]), player=int(s.player[i]), remaining=int(s.remaining[i]),
+                   legal_sha256=s.legal[i].tobytes().hex())
+        episode = dict(moves=s.moves[a:b].tolist(), winner=int(s.winner[g]), trained_side=None if s.side[g] < 0 else int(s.side[g]),
+                       root_values=[None if v != v else v for v in s.roots[a:b].tolist()] if s.has_roots[g] else None,
+                       full_search=s.searched[a:b].tolist() if s.has_search[g] else None)
+        return Ref(name, i, row, episode)
 
     def sample(self, rng, n, recency=0., validation=False):
         """n Refs drawn with replacement from the training (or validation) index; the k-th oldest of
@@ -275,24 +327,37 @@ class ReplayWindow:
 
     def following(self, ref):
         """Ref of the same game's row at ply+1 in the same shard, or None."""
-        i = self.shards[ref.shard].following[ref.index]
+        i = int(self.shards[ref.shard].following[ref.index])
         return None if i < 0 else self.ref(ref.shard, i)
 
     def policy(self, ref):
-        """The row's policy vector (empty when the ply had no full search)."""
-        if ref.shard not in self.policies:
-            self.policies[ref.shard] = load_policies(self.run_dir/'shards'/ref.shard, self.manifests[ref.shard]['counts']['rows'])
+        """A copy of the row's policy vector (empty float32 when the ply had no full search); never a view, so
+        an evicted shard's arrays are freed while rendered batches still hold their rows' policies."""
+        if ref.shard in self.policies:
+            self.policies.move_to_end(ref.shard)
+        else:
+            self.policies[ref.shard] = load_policies(self.run_dir/'shards'/ref.shard, len(self.shards[ref.shard].game))
+            while len(self.policies) > 1 and self.policy_bytes() > self.policy_budget:
+                self.policies.popitem(last=False)
         offsets, probabilities = self.policies[ref.shard]
-        return probabilities[offsets[ref.index]:offsets[ref.index+1]]
+        a, b = offsets[ref.index], offsets[ref.index+1]
+        return probabilities[a:b].copy() if b > a else np.zeros(0, np.float32)
+
+    def policy_bytes(self):
+        """Bytes held by the policy cache."""
+        return sum(o.nbytes+p.nbytes for o, p in self.policies.values())
 
     def value_targets(self, ref, lam, full_only):
-        """value_targets of the ref's episode (full-search root values only with `full_only`), cached while
-        its shard stays admitted."""
+        """value_targets of the ref's episode (full-search root values only with `full_only`)."""
         key = (ref.shard, ref.row['game'], lam, full_only)
-        if key not in self.values:
+        if key in self.values:
+            self.values.move_to_end(key)
+        else:
             e = ref.episode
             self.values[key] = value_targets([player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'],
                                              lam, e['full_search'] if full_only else None)
+            if len(self.values) > self.VALUE_CACHE:
+                self.values.popitem(last=False)
         return self.values[key]
 
 
@@ -553,7 +618,7 @@ def _render_worker(run, settings, seed, output):
     """Worker process body: put numpy-packed `batches` from a private ReplayWindow (refreshed every 30 s)."""
     try:
         window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
-                              settings.window_taper, settings.validation_fraction)
+                              settings.window_taper, settings.validation_fraction, settings.policy_cache_mb)
         rng = np.random.default_rng(seed); refreshed = time.time()
         while not window.index:
             time.sleep(5); window.refresh(); refreshed = time.time()
