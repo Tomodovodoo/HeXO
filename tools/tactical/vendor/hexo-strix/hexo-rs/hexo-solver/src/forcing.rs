@@ -77,6 +77,11 @@ impl Meter {
     pub fn charge(&self) -> bool {
         self.spent.fetch_add(1, Ordering::Relaxed) >= self.limit
     }
+
+    /// Record `units` already spent under a separately metered sub-budget.
+    pub fn add(&self, units: u64) {
+        self.spent.fetch_add(units, Ordering::Relaxed);
+    }
 }
 
 /// Independently verified winning-depth upper bounds supplied by a proof DAG.

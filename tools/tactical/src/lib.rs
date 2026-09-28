@@ -108,7 +108,11 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
             let cfg=ProverConfig{driver:DriverKind::Pdspn,wide:true,depth_cap:req.depth,
                 node_budget:req.nodes,tt_mb:(req.nodes/NODES_PER_TT_MB).clamp(1,16) as usize,pn2_nodes:1000,..Default::default()};
             if req.idtt_nodes>0 {
-                let probe=prover::idtt(&pos,&ProverConfig{node_budget:req.idtt_nodes,..cfg.clone()},&ctl);
+                // A dedicated meter bounds the whole probe, PV reconstruction included.
+                let share=Meter::new(req.idtt_nodes);
+                let probe=prover::idtt(&pos,&ProverConfig{node_budget:req.idtt_nodes,..cfg.clone()},
+                    &Ctl{meter:Some(share.clone()),..ctl.clone()});
+                meter.add(share.spent().min(req.idtt_nodes));
                 probe_verdict=Some(format!("{:?}",probe.verdict));
             }
             // Only PDS-PN emits an all-defense DAG. An IDTT PV is never enough.
@@ -252,6 +256,18 @@ mod tests {
         let (pos,cfg,ctl,meter)=setup(1_000_000);
         prover::idtt(&pos,&cfg,&ctl);
         assert!(meter.spent()>0,"IDTT nodes are charged");
+    }
+    #[test]
+    fn idtt_probe_spends_only_its_share() {
+        let query=|idtt_nodes:u64| {
+            let req=serde_json::from_value(json!({"history":OPEN_THREE,"ms":60000,"nodes":1_000_000,
+                "idtt_nodes":idtt_nodes,"depth":8})).unwrap();
+            run(req,Instant::now()).unwrap()
+        };
+        let (plain,probed)=(query(0),query(3));
+        assert_eq!(plain["certificate"],probed["certificate"]);
+        let extra=probed["nodes_used"].as_u64().unwrap()-plain["nodes_used"].as_u64().unwrap();
+        assert!(extra<=3,"IDTT spent {extra} units of a 3-unit share");
     }
     #[test]
     fn exhausted_meter_stops_the_search() {
