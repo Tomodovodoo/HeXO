@@ -35,11 +35,10 @@ Promotion (`decision`): 'posterior' (default) decides on the league-wide posteri
 ratings of every rated checkpoint, the candidate and Seal from every protocol-matching report, with a per-pair
 matchup deviation of prior sd matchup_prior_elo so a pair's own games dominate when they disagree with the
 transitive picture). Delta = r_candidate - r_champion + their deviation. After at least sprt_min_games direct
-games, while the candidate's rating sd about the league mean is at most uncertainty_parity times the champion's and
-the direct-only and pooled 95% intervals overlap, the candidate is promoted when it has the highest posterior rating
-of the rated checkpoints and P(delta > sprt_elo0) >= promote_confidence, and rejected when that probability is at
-most 1 - promote_confidence (`Evaluator.verdict`), re-judged after every completed colour pair; until then direct
-games keep playing. On start the rule is re-applied to the existing reports (`Evaluator.review`). Direct games fill
+games, while the direct-only and pooled 95% intervals overlap, the candidate is promoted when it has the highest
+posterior rating of the rated checkpoints and P(delta > sprt_elo0) >= promote_confidence, and rejected when that
+probability is at most 1 - promote_confidence (`Evaluator.verdict`), re-judged after every completed colour pair;
+until then direct games keep playing. On start the rule is re-applied to the existing reports (`Evaluator.review`). Direct games fill
 the pool until sprt_min_games are complete; after that at most evidence_share of the pool may go to the evidence
 pairing that most reduces Var(delta) (value of information: the candidate or champion vs the previous champion or
 Seal, `Evaluator.evidence`), up to sprt_max_games direct games. Supersession settles once the games in flight have
@@ -281,6 +280,21 @@ def sprt(records, elo0, elo1, alpha, beta):
     lower, upper = math.log(beta/(1-alpha)), math.log((1-beta)/alpha)
     return dict(llr=llr, bound_lower=lower, bound_upper=upper, games=int(2*n), elo0=elo0, elo1=elo1, alpha=alpha, beta=beta,
                 pair_counts=counts.astype(int).tolist(), decision='H1' if llr >= upper else 'H0' if llr <= lower else None)
+
+
+def ready(settings, games, disagree):
+    """Whether a posterior verdict may decide: at least sprt_min_games direct games and the direct and pooled
+    intervals do not `disagree`. No uncertainty bound beyond that: P(better) already carries the sd of delta."""
+    return games >= settings.sprt_min_games and not disagree
+
+
+def judge(settings, games, disagree, leader, p_better):
+    """The posterior decision once `ready`: 'promote' when the candidate is the pooled `leader` and p_better
+    (P(delta > sprt_elo0)) >= promote_confidence, 'reject' when p_better <= 1 - promote_confidence, else None."""
+    if not ready(settings, games, disagree):
+        return None
+    return 'promote' if leader and p_better >= settings.promote_confidence else \
+        'reject' if p_better <= 1-settings.promote_confidence else None
 
 
 def tally(records, test=None):
@@ -1009,9 +1023,7 @@ class Evaluator:
         spread = [post.spread(cid), post.spread(champion)]
         leader = max((i for i in ids if i != SEAL and not (self.entry(i) or {}).get('demoted')), key=post.rating)
         p_better = .5*math.erfc((s.sprt_elo0-mean)/(max(sd, 1e-9)*math.sqrt(2)))
-        ready = t['games'] >= s.sprt_min_games and spread[0] <= spread[1]*s.uncertainty_parity and not disagree
-        decision = 'promote' if ready and leader == cid and p_better >= s.promote_confidence else \
-            'reject' if ready and p_better <= 1-s.promote_confidence else None
+        decision = judge(s, t['games'], disagree, leader == cid, p_better)
         return dict(decision=decision, delta=mean, delta_sd=sd, p_better=p_better, pooled=pooled,
                     direct=dict(games=t['games'], elo=t['elo_delta'], interval=interval), disagree=disagree,
                     spread=spread, leader=leader, posterior=post)
@@ -1103,25 +1115,29 @@ class Evaluator:
         """Posterior mode, once per evaluator (so after every restart or settings change): re-apply the promotion
         rule to the existing reports. Of the rated checkpoints, neither skipped nor demoted, with at least
         sprt_min_games direct games against the champion (their report against it), those whose `verdict`
-        meets uncertainty parity, P(delta > sprt_elo0) >= promote_confidence and agreeing direct and pooled
-        intervals are eligible; the one of highest posterior rating among them is promoted ('decision' event
-        'promote on review', then the 'promotion' event; its Seal anchor is scheduled as for any promotion). A
-        higher-rated checkpoint without those direct games does not block it: it has not met the champion."""
+        is `ready` with P(delta > sprt_elo0) >= promote_confidence are eligible; the one of highest posterior
+        rating among them is promoted when it also out-rates the champion and every other checkpoint with those
+        direct games ('decision' event 'promote on review', then the 'promotion' event; its Seal anchor is scheduled
+        as for any promotion). A higher-rated checkpoint without those direct games does not block it: it has not
+        met the champion."""
         s, champion = self.settings, self.league['champion']
         if s.decision != 'posterior' or champion is None:
             return
-        eligible = []
+        eligible, met = [], [champion]
         for c in self.league['checkpoints']:
             if c['id'] == champion or c.get('elo') is None or c.get('skipped') or c.get('demoted') \
                     or len(self.games(c['id'], champion)) < s.sprt_min_games:
                 continue
+            met.append(c['id'])
             verdict = self.verdict(c['id'], champion)
-            if verdict['spread'][0] <= verdict['spread'][1]*s.uncertainty_parity and not verdict['disagree'] \
+            if ready(s, verdict['direct']['games'], verdict['disagree']) \
                     and verdict['p_better'] >= s.promote_confidence:
                 eligible.append((verdict['posterior'].rating(c['id']), c['id'], verdict))
         if not eligible:
             return
         _, cid, verdict = max(eligible)
+        if max(met, key=verdict['posterior'].rating) != cid:
+            return
         verdict = dict(public(verdict), candidate=cid, decision='promote', review=True)
         log_event(self.run, 'evaluator', 'decision', f'{cid} vs {champion}: promote on review of the existing reports '
                   f'({verdict["direct"]["games"]} direct games, P(delta > {s.sprt_elo0:g}) {verdict["p_better"]:.3f})',
@@ -1382,9 +1398,9 @@ def loop(args):
     if not 0 <= settings.evidence_share < 1:
         raise ValueError('evidence_share must be in [0, 1)')
     if settings.decision not in ('posterior', 'sprt') or not .5 < settings.promote_confidence < 1 \
-            or settings.uncertainty_parity <= 0 or settings.matchup_prior_elo < 0 or settings.sprt_min_games < 2:
-        raise ValueError("decision is 'posterior' or 'sprt', promote_confidence in (0.5, 1), uncertainty_parity > 0, "
-                         'matchup_prior_elo >= 0 and sprt_min_games at least one opening pair')
+            or settings.matchup_prior_elo < 0 or settings.sprt_min_games < 2:
+        raise ValueError("decision is 'posterior' or 'sprt', promote_confidence in (0.5, 1), matchup_prior_elo >= 0 "
+                         'and sprt_min_games at least one opening pair')
     if settings.anchor_games and settings.anchor_every < 1:
         raise ValueError('anchor_every must be at least 1 while anchor games are enabled')
     if settings.anchor_target_halfwidth < 0 or settings.fill_top < 0 or not .5 <= settings.max_expected_score <= 1:

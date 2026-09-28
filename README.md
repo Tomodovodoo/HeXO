@@ -828,7 +828,7 @@ always score finished games against their hard outcome.
   candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
   and against panel members. Each pair also gets a matchup deviation (prior sd `matchup_prior_elo`, default 30),
   so a pair's own games outweigh the transitive picture when the two disagree. The candidate needs at least
-  `sprt_min_games` direct games, and its rating sd may be at most `uncertainty_parity` (1.5) times the champion's.
+  `sprt_min_games` direct games. No separate bound applies to its rating sd: P(better) already accounts for it.
   It is promoted when it has the highest posterior rating and P(candidate - champion > `sprt_elo0`) is at least
   `promote_confidence`. It is rejected when that probability is at most 1 - `promote_confidence`. Neither
   happens while the direct-only and pooled estimates disagree beyond their intervals. `decision sprt` keeps the
