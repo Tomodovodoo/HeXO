@@ -76,8 +76,8 @@ latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, lates
 is the number of checkpoint entries and reign_games the champion's Seal games when it was promoted or restored
 (absent: its own position + 1 and 0). `matrix` (`payoff`) holds
 only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
-written before `matrix`, `ladder` and `panel` existed lack those keys; the Evaluator adds `matrix` on start and
-rebuilds the ladder when its ladder_top differs from the effective fill_top.
+written before `matrix`, `ladder`, `panel` and `openings` existed lack those keys; the Evaluator adds `matrix` on start, and
+rebuilds the league when its ladder_top differs from the effective fill_top or its book counted pairs it had missed.
 """
 import argparse
 from dataclasses import asdict, replace
@@ -644,12 +644,12 @@ class Evaluator:
 
     def __init__(self, run, config, settings, pacer):
         self.openings = dense_openings.Book(run, settings)
-        self.openings.reconcile(dense_openings.stamp(run))
+        missed = self.openings.reconcile(dense_openings.stamp(run))
         settings = replace(settings, opening_book=self.openings.digest())
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
-        if self.league['checkpoints'] and ('matrix' not in self.league or self.league.get('ladder_top') != settings.fill_top):
+        if self.league['checkpoints'] and (missed or 'matrix' not in self.league or self.league.get('ladder_top') != settings.fill_top):
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         self.models, self.seal, self.written, self.fill_target, self.deciding, self.reviewed = {}, None, 0., None, None, False
         self.book, self.next, self.ids, self.shas = {}, {}, {}, {}

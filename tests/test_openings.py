@@ -667,9 +667,11 @@ class EvaluatorBookTests(unittest.TestCase):
                 evaluator.step()
         report = json.loads(dense_eval.report_path(self.run, 'main/000020', CHAMPION).read_text())
         self.assertEqual((len(report['games']), self.saved()['counted'].get(report['id'], 0)), (2, 0))
+        published = json.loads((self.run/'league.json').read_text())['updated_at']
         restarted = self.start(sprt_max_games=4)
         root = lambda: restarted.openings.nodes[dense_openings.canonical([(0, 0)])[0]]
         self.assertEqual((root()['games'], root()['pairs'][4]), (2, 1))
+        self.assertGreater(json.loads((self.run/'league.json').read_text())['updated_at'], published)    # republished
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 0)):
             restarted.step()                                                # resumes the report and keeps its id
         report = json.loads(dense_eval.report_path(self.run, 'main/000020', CHAMPION).read_text())
