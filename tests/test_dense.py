@@ -1832,55 +1832,21 @@ class OpponentSchedulerTests(unittest.TestCase):
         self.assertEqual(matrix['seal']['main/000002']['wins'], 6)
         self.assertIsNone(dense_eval.payoff(reports)['main/000001']['main/000002']['p'])
 
-    def test_panel_draws_proportional_to_p_one_minus_p(self):
-        elos = {'main/000001': 0., 'main/000002': 0., 'main/000003': 200., 'main/000004': 800., 'main/000005': -400.}
+    def test_panel_picks_the_closest_rated_checkpoints(self):
+        """Members are the rated checkpoints closest to the current champion (Elo 0) by p(1-p), ties toward wider
+        intervals and newer entries; lopsided ones (expected .95) are excluded; the set follows the ratings."""
+        elos = {'main/000001': 0., 'main/000002': -400*math.log10(19), 'main/000003': -400*math.log10(7/3),
+                'main/000004': 30., 'main/000005': -30., 'main/000006': 150., 'main/000007': None}
         league = league_of(elos, 'main/000001')
-        rng = np.random.default_rng(0)
-        counts = dict.fromkeys(elos, 0)
-        for _ in range(4000):
-            weak, drawn = dense_eval.panel_members(league, 'main/000006', {'main/000005'}, 1, rng)
-            self.assertEqual(weak, [])
-            counts[drawn[0]] += 1
-        # The predecessor main/000005 (Elo -400) is the reference: p(1-p) under its expected score.
-        p = {k: dense_selfplay.expected(-400., e) for k, e in elos.items() if k != 'main/000005'}
-        w = {k: v*(1-v) for k, v in p.items()}
-        for k in w:
-            self.assertAlmostEqual(counts[k]/4000, w[k]/sum(w.values()), delta=.03, msg=k)
-        self.assertEqual(counts['main/000005'], 0)
-        _, drawn = dense_eval.panel_members(league, 'main/000006', set(), 10, rng)
-        self.assertEqual(sorted(drawn), sorted(elos))
-
-    def test_panel_skips_uninformative_members(self):
-        """The champion (Elo 0) is the reference: expected .95 against main/000002 is skipped, .7 against
-        main/000003 is played."""
-        elos = {'main/000001': 0., 'main/000002': -400*math.log10(19), 'main/000003': -400*math.log10(7/3)}
-        league = league_of(elos, 'main/000001')
-        weak, drawn = dense_eval.panel_members(league, 'side/000001', {'main/000001'}, 5, np.random.default_rng(0), .85)
-        self.assertEqual((weak, drawn), ([], ['main/000003']))
-        self.assertEqual(len(dense_eval.panel_members(league, 'side/000001', {'main/000001'}, 5, np.random.default_rng(0))[1]), 2)
-
-    def test_weakness_retention(self):
-        elos = {f'main/{k:06d}': float(10*k) for k in range(1, 9)} | {'side/000001': 0., 'side/000002': 5.}
-        matrix = {}
-
-        def met(a, b, wins, losses):
-            matrix.setdefault(a, {})[b] = dict(wins=wins, losses=losses, capped=0, games=wins+losses)
-        # The three latest main checkpoints before main/000009 are 6, 7, 8.
-        met('main/000008', 'side/000001', 1, 5); met('main/000007', 'side/000001', 2, 1)   # 3-6: weakness
-        met('main/000006', 'side/000002', 0, 1)                                              # 0-1: worst
-        met('main/000008', 'main/000002', 1, 3); met('main/000006', 'main/000002', 3, 0)     # 4-3: not a weakness
-        met('main/000005', 'main/000001', 0, 9)                                              # not recent
-        met('main/000007', 'main/000003', 0, 4)
-        league = league_of(elos, 'main/000001', matrix)
-        weak, drawn = dense_eval.panel_members(league, 'main/000009', {'main/000008', 'main/000001'}, 1, np.random.default_rng(1))
-        self.assertEqual(weak, ['main/000003', 'side/000002'])      # capped at count+1, worst first, ties by id
-        self.assertEqual(len(drawn), 1)
-        self.assertNotIn(drawn[0], weak+['main/000008', 'main/000001', 'main/000009'])
-        weak, _ = dense_eval.panel_members(league, 'main/000009', {'main/000008'}, 3, np.random.default_rng(1))
-        self.assertEqual(weak, ['main/000003', 'side/000002', 'side/000001'])
-        # A league written before the matrix existed has no weaknesses.
-        del league['matrix']
-        self.assertEqual(dense_eval.panel_members(league, 'main/000009', set(), 3, np.random.default_rng(1))[0], [])
+        members = lambda count, cap=.85: dense_eval.panel_members(league, 'main/000008', 'main/000006', count, cap)
+        self.assertEqual(members(5), ['main/000005', 'main/000004', 'main/000003'])   # 4 and 5 tie: newer first
+        league['checkpoints'][3]['elo_interval'] = [-100., 160.]
+        self.assertEqual(members(2), ['main/000004', 'main/000005'])                  # the wider interval breaks the tie
+        league['checkpoints'][3]['elo'], league['checkpoints'][4]['elo'] = -250., -300.  # ratings moved
+        self.assertEqual(members(1), ['main/000003'])
+        league['checkpoints'][4]['demoted'] = True
+        self.assertEqual(members(5), ['main/000003', 'main/000004'])                  # main/000002 (expected .95) never
+        self.assertIn('main/000002', members(5, 1.))
 
     def test_panel_veto_arithmetic(self):
         cell = lambda w, l: dict(wins=w, losses=l, capped=3, games=w+l+3)
@@ -2025,13 +1991,13 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.run = Path(tmp.name)
 
     def start(self, processes=1, **evaluation):
-        settings = dict(games=2, sims=2, root_samples=2, max_plies=8, anchor_games=0, sprt_max_games=2, sprt_round=2, extra_opponents=0,
+        settings = dict(games=2, sims=2, root_samples=2, max_plies=8, anchor_games=0, sprt_max_games=2, extra_opponents=0,
                         idle_rematch=False, idle_fill=False)
         config = dense_config.RunConfig(
             device='cpu', model=dense_config.ModelSettings(**{k: getattr(TINY, k) for k in (
                 'blocks', 'channels', 'pool_every', 'line_length', 'value_hidden', 'head_channels')}),
             actor=dense_config.ActorSettings(leaf_batch=64, cache_positions=256),
-            evaluation=dense_config.EvaluationSettings(**{**settings, **evaluation}))
+            evaluation=dense_config.EvaluationSettings(**{**settings, 'round_games': evaluation.get('games', 2), **evaluation}))
         if not (self.run/'config.json').exists():
             dense_config.save(self.run, config)
         return dense_eval.Evaluator(self.run, config, config.evaluation, dense_eval.Pacer(1.), processes)
@@ -2180,7 +2146,7 @@ class EvaluatorLoopTests(unittest.TestCase):
     def test_late_promotion_and_restoration_owe_anchors_from_their_reign(self):
         self.vetoed_on_disk()
         with unittest.mock.patch.object(dense_eval, 'write_league'):
-            evaluator = self.start(anchor_every=1, anchor_games=2)
+            evaluator = self.start(anchor_every=1, anchor_games=2, extra_opponents=1)
             evaluator.settle()
         self.assertEqual((evaluator.league['champion'], evaluator.league['reign_from']), ('main/000010', 3))
         self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
@@ -2291,7 +2257,7 @@ class EvaluatorLoopTests(unittest.TestCase):
     def test_superseded_sprt_settles_on_its_games_and_streams_the_tally(self):
         """16-game champion rounds; a newer checkpoint after the first stops the SPRT, which promotes because the
         paired 95% lower bound of its pair score exceeds 1/2; the status tally follows every finished game."""
-        evaluator = self.start(sprt_max_games=64, sprt_round=16, sprt_alpha=1e-9, sprt_beta=1e-9)
+        evaluator = self.start(sprt_max_games=64, round_games=16, sprt_alpha=1e-9, sprt_beta=1e-9)
         self.export(10)
         evaluator.step()
         self.export(30)
@@ -2322,48 +2288,83 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertIn('settled on supersession after 16 games', settle['message'])
         self.assertEqual((settle['promote'], settle['games']), (True, 16))
 
-    def test_fill_plays_seal_then_the_widest_ladder_pair_until_a_checkpoint_waits(self):
+    def test_fill_order_seal_then_generalization_then_the_widest_ladder_pair(self):
+        """Fill priority: the champion vs Seal while their interval is wide, then one round of the newest rated
+        checkpoint vs the previous champion, then the widest ladder pair; a waiting checkpoint interrupts."""
         evaluator = self.start(idle_fill=True, anchor_target_halfwidth=1e-3, seal_ms=5, fill_top=3)
         self.export(10)
         self.assertTrue(evaluator.step())
+        test = evaluator.test
+        evaluator.test = lambda records: dict(test(records), decision='H1')
         self.export(20)
-        self.assertTrue(evaluator.step())                          # main/000020 meets the champion
-        champion = self.league()['champion']
+        self.assertTrue(evaluator.step())                          # main/000020 beats main/000010
+        evaluator.test = test
+        self.export(30)
+        self.assertTrue(evaluator.step())                          # main/000030 meets main/000020
+        self.assertEqual(self.league()['champion'], 'main/000020')
         self.assertEqual(evaluator.fill()[1:], ('seal', 'fill', 2))  # no Seal games yet: the interval is unbounded
         self.assertTrue(evaluator.step())
-        self.assertEqual(len(evaluator.sealed(champion)['games']), 2)
+        self.assertEqual(len(evaluator.sealed('main/000020')['games']), 2)
         status = json.loads((self.run/'evaluator-status.json').read_text())
         self.assertEqual((status['comparison']['kind'], status['comparison']['opponent']), ('fill', 'seal'))
         evaluator.settings = replace(evaluator.settings, anchor_target_halfwidth=1e9)
-        ladder = self.league()['ladder']
-        self.assertEqual({frozenset((d['a'], d['b'])) for d in ladder}, {frozenset(('main/000010', 'main/000020'))})
-        entry, opponent, kind, games = evaluator.fill()
-        self.assertEqual(({entry['id'], opponent}, kind), ({'main/000010', 'main/000020'}, 'fill'))
+        entry, opponent, kind, _ = evaluator.fill()
+        self.assertEqual((entry['id'], opponent, kind), ('main/000030', 'main/000010', 'generalization'))
+        self.assertTrue(evaluator.step())
+        self.assertIn('main/000010', self.league()['matrix']['main/000030'])
+        self.assertEqual({frozenset((d['a'], d['b'])) for d in self.league()['ladder']},
+                         {frozenset(p) for p in (('main/000010', 'main/000020'), ('main/000010', 'main/000030'), ('main/000020', 'main/000030'))})
+        entry, opponent, kind, _ = evaluator.fill()                # generalization is played once
+        self.assertEqual(kind, 'fill')
+        self.assertNotEqual(opponent, 'seal')
+        growable = [d for d in self.league()['ladder'] if dense_eval.rematch_pair(self.run, d['a'], d['b'], evaluator.settings)]
+        self.assertEqual({entry['id'], opponent}, {max(growable, key=lambda d: d['interval'][1]-d['interval'][0])[k] for k in 'ab'})
         self.assertTrue(evaluator.step())
         self.assertTrue(dense_eval.report_path(self.run, entry['id'], opponent).exists())
+        targets = [f'{entry["id"]} vs {opponent}']
+        entry, opponent, _, _ = evaluator.fill()                   # re-chosen from the updated ladder
+        targets = list(dict.fromkeys(targets+[f'{entry["id"]} vs {opponent}']))
+        path = dense_eval.report_path(self.run, entry['id'], opponent)
+        before = len(json.loads(path.read_text())['games']) if path.exists() else 0
         wait = evaluator.pacer.wait
         def export_during_wait(*args):
             wait(*args)
-            if not (self.run/'checkpoints'/'main'/'000030').exists():
-                self.export(30)
+            if not (self.run/'checkpoints'/'main'/'000040').exists():
+                self.export(40)
         evaluator.pacer.wait = export_during_wait
-        before = len(json.loads(dense_eval.report_path(self.run, entry['id'], opponent).read_text())['games'])
         self.assertTrue(evaluator.step())                          # the waiting checkpoint interrupts the fill round
-        self.assertEqual(len(json.loads(dense_eval.report_path(self.run, entry['id'], opponent).read_text())['games']), before)
+        self.assertEqual(len(json.loads(path.read_text())['games']) if path.exists() else 0, before)
         evaluator.pacer.wait = wait
         self.assertTrue(evaluator.step())
-        self.assertIn('main/000030', {c['id'] for c in self.league()['checkpoints']})
+        self.assertIn('main/000040', {c['id'] for c in self.league()['checkpoints']})
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['target'] for e in events if e['kind'] == 'fill'],
-                         ['seal', f'{entry["id"]} vs {opponent}', None])
+                         ['seal', 'generalization main/000030 vs main/000010', *targets, None])
+
+    def test_models_stay_cached_across_pairings(self):
+        evaluator = self.start(model_cache=2)
+        self.export(10, 20, 30)
+        evaluator.use('main/000010', 'main/000020')
+        first = evaluator.models['main/000010']
+        evaluator.use('main/000020', 'main/000010')
+        self.assertIs(evaluator.models['main/000010'], first)       # no reload
+        evaluator.use('main/000030', 'main/000010')                 # main/000020 is least recently used
+        self.assertEqual(set(evaluator.models), {'main/000010', 'main/000030'})
+        self.assertIs(evaluator.models['main/000010'], first)
+
+    def test_evaluation_defaults(self):
+        s = dense_config.EvaluationSettings()
+        self.assertEqual((s.sprt_elo0, s.sprt_elo1, s.round_games, s.model_cache, s.idle_fill, s.max_expected_score),
+                         (0., 25., 8, 6, True, .85))
 
     def test_existing_panels_skip_uninformative_members(self):
-        """A panel chosen earlier plays only the members within max_expected_score of each side."""
+        """Panel members are re-derived (a stored list is ignored) and include only those within
+        max_expected_score."""
         entry = lambda step, elo, **extra: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, matches=[], **extra)
         (self.run/'league.json').write_text(json.dumps(dict(champion='main/000001', matrix={}, ladder=[], checkpoints=[
             entry(1, 0.), entry(2, -400*math.log10(19)), entry(3, -400*math.log10(7/3)),
             entry(4, 0., panel=dict(members=['main/000002', 'main/000003'], incumbent='main/000001'))])))
-        evaluator = self.start()
+        evaluator = self.start(extra_opponents=2)
         self.assertEqual(evaluator.needs(evaluator.entry('main/000004')),
                          [('main/000004', 'main/000003', 'panel', 2), ('main/000001', 'main/000003', 'incumbent', 2)])
         evaluator.settings = replace(evaluator.settings, max_expected_score=1.)
@@ -2392,7 +2393,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         for step in (10, 20, 30):
             self.export(step)
             self.assertTrue(evaluator.step())
-        self.assertNotIn('panel', self.league()['checkpoints'][-1])       # only previous and champion were rated
+        self.assertEqual(self.league()['checkpoints'][-1]['panel'], dict(incumbent='main/000010'))
         # A league.json from before the matrix: a new evaluator adds it.
         league = self.league(); del league['matrix']
         (self.run/'league.json').write_text(json.dumps(league))
@@ -2401,7 +2402,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.export(40)
         self.assertTrue(evaluator.step())                                  # the champion SPRT only
         entry = self.league()['checkpoints'][-1]
-        self.assertEqual(entry['panel'], dict(members=['main/000020'], incumbent='main/000010'))
+        self.assertEqual(entry['panel'], dict(incumbent='main/000010'))
         self.assertEqual([m['opponent'] for m in entry['matches']], ['main/000010'])
         sprt = json.loads(dense_eval.report_path(self.run, 'main/000040', 'main/000010').read_text())
         self.assertEqual((sprt['metrics']['sprt']['decision'], len(sprt['games'])), ('max-games', 2))
@@ -2410,19 +2411,23 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(evaluator.step())
         sprt = json.loads(dense_eval.report_path(self.run, 'main/000040', 'main/000010').read_text())
         self.assertEqual(([g['pair'] for g in sprt['games']], sprt['metrics']['sprt']['games']), ([0, 0, 1, 1], 4))
-        self.assertEqual(evaluator.optional()[1:], ('main/000020', 'panel', 2))
+        member = evaluator.optional()[1]
+        self.assertEqual(evaluator.optional()[1:], (member, 'panel', 2))
+        self.assertIn(member, {'main/000020', 'main/000030'})
         self.export(50)
-        self.assertEqual(evaluator.round('main/000040', 'main/000020', 'panel', 2)['records'], [])   # unrated: no optional round
+        self.assertEqual(evaluator.round('main/000040', member, 'panel', 2)['records'], [])   # unrated: no optional round
         shutil.rmtree(self.run/'checkpoints'/'main'/'000050')
-        self.assertTrue(evaluator.step())
+        for _ in range(8):                                                 # members follow the ratings as games land
+            if not evaluator.step():
+                break
         league = self.league()
         panel = league['checkpoints'][-1]['panel']
         self.assertEqual(set(panel), {'members', 'incumbent', 'candidate_score', 'incumbent_score', 'z', 'veto'})
-        self.assertEqual(league['matrix']['main/000040']['main/000020']['games'], 2)
-        self.assertEqual([m['opponent'] for m in league['checkpoints'][-1]['matches']], ['main/000010', 'main/000020'])
+        self.assertTrue(panel['members'] and set(panel['members']) <= {'main/000020', 'main/000030'})
+        self.assertTrue(all(league['matrix']['main/000040'][m]['games'] >= 2 for m in panel['members']))
         self.assertFalse(evaluator.step())
         kinds = [e.get('comparison') for e in map(json.loads, (self.run/'events.jsonl').read_text().splitlines()) if e['kind'] == 'match']
-        self.assertEqual(kinds[-2:], ['sprt', 'panel'])
+        self.assertEqual((kinds[-1], kinds.count('sprt')), ('panel', 1))
 
     def test_h1_promotes_before_any_panel_game(self):
         evaluator = self.start(extra_opponents=1)
@@ -2437,9 +2442,11 @@ class EvaluatorLoopTests(unittest.TestCase):
         league = self.league()
         self.assertEqual(league['champion'], 'main/000040')
         self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000040')
-        self.assertEqual(league['checkpoints'][-1]['panel'], dict(members=['main/000020'], incumbent='main/000010'))
-        self.assertFalse(dense_eval.report_path(self.run, 'main/000040', 'main/000020').exists())
-        self.assertEqual(evaluator.optional()[1:], ('main/000020', 'panel', 2))   # the champion's panel comes first
+        self.assertEqual(league['checkpoints'][-1]['panel'], dict(incumbent='main/000010'))
+        entry, member, kind, games = evaluator.optional()                        # the champion's panel comes first
+        self.assertEqual((entry['id'], kind, games), ('main/000040', 'panel', 2))
+        self.assertIn(member, {'main/000020', 'main/000030'})
+        self.assertFalse(dense_eval.report_path(self.run, 'main/000040', member).exists())
 
     def test_panel_regression_demotes_the_champion(self):
         self.export(10, 20, 30, 40)
@@ -2448,9 +2455,9 @@ class EvaluatorLoopTests(unittest.TestCase):
                                        summary=dict(wins=w, losses=l, capped=0, games=w+l), metrics={}, games=[])
         for regressed in (True, False):
             evaluator.league = dict(champion='main/000040', checkpoints=[
-                dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20, 30)])
+                dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20)])
             evaluator.league['checkpoints'].append(dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
-                                                        panel=dict(members=['main/000020'], incumbent='main/000010')))
+                                                        panel=dict(incumbent='main/000010')))
             reports = [cell('main/000040', 'main/000020', 0 if regressed else 2, 20 if regressed else 0),
                        cell('main/000010', 'main/000020', 15, 5)]
             with unittest.mock.patch.object(dense_eval, 'write_league'), \
@@ -2501,11 +2508,11 @@ class EvaluatorLoopTests(unittest.TestCase):
 
     def test_incumbent_tops_up_an_undersized_report(self):
         self.export(10, 20, 40)
-        evaluator = self.start(games=4)
+        evaluator = self.start(games=4, extra_opponents=1)
         evaluator.league = dict(champion='main/000040', checkpoints=[
             dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20)])
         evaluator.league['checkpoints'].append(dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
-                                                    panel=dict(members=['main/000020'], incumbent='main/000010')))
+                                                    panel=dict(incumbent='main/000010')))
         evaluator.extend('main/000010', 'main/000020', 'incumbent', 2)             # e.g. played before --eval-games 4
         entry = evaluator.league['checkpoints'][-1]
         self.assertEqual(evaluator.needs(entry), [('main/000040', 'main/000020', 'panel', 4),
@@ -2526,7 +2533,7 @@ class EvaluatorLoopTests(unittest.TestCase):
                                     summary=dict(wins=w, losses=l, capped=0, games=w+l), metrics={}, games=[])
         reports = [cell('main/000010', 15, 5), cell('main/000030', 5, 15), cell('main/000040', 0, 20)]
         for chained in (True, False):
-            panel = lambda incumbent: dict(members=['main/000020'], incumbent=incumbent)
+            panel = lambda incumbent: dict(incumbent=incumbent)
             evaluator.league = dict(champion='main/000040', checkpoints=[
                 dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
                 dict(id='main/000020', variant='main', step=20, elo=0., matches=[]),
@@ -2555,7 +2562,7 @@ class EvaluatorLoopTests(unittest.TestCase):
             dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
             dict(id='main/000020', variant='main', step=20, elo=0., matches=[]),
             dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
-                 panel=dict(members=['main/000020'], incumbent='main/000010'))])))
+                 panel=dict(incumbent='main/000010'))])))
         for a, wins, losses in (('main/000040', 0, 20), ('main/000010', 15, 5)):
             path = dense_eval.report_path(self.run, a, 'main/000020')
             path.parent.mkdir(parents=True)
@@ -2565,7 +2572,7 @@ class EvaluatorLoopTests(unittest.TestCase):
     def test_restart_settles_panels_completed_on_disk(self):
         self.vetoed_on_disk()
         with unittest.mock.patch.object(dense_eval, 'write_league'):
-            evaluator = self.start()
+            evaluator = self.start(extra_opponents=1)
             self.assertEqual(evaluator.needs(evaluator.entry('main/000040')), [])       # nothing left to play
             self.assertFalse(evaluator.step())
         entry = evaluator.entry('main/000040')
@@ -2577,7 +2584,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.vetoed_on_disk()
         self.export(50)
         with unittest.mock.patch.object(dense_eval, 'write_league'):
-            evaluator = self.start()
+            evaluator = self.start(extra_opponents=1)
             self.assertTrue(evaluator.step())
         self.assertTrue(evaluator.entry('main/000040')['demoted'])
         self.assertTrue(dense_eval.report_path(self.run, 'main/000050', 'main/000010').exists())    # the restored champion
@@ -2603,8 +2610,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator.league = dict(champion='main/000010', checkpoints=[
             dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
             dict(id='main/000020', variant='main', step=20, elo=0., matches=[]),
-            dict(id='main/000030', variant='main', step=30, elo=0., matches=[],
-                 panel=dict(members=['main/000020'], incumbent='main/000010')),
+            dict(id='main/000030', variant='main', step=30, elo=0., matches=[], panel=dict(incumbent='main/000010')),
             dict(id='main/000040', variant='main', step=40, elo=0., matches=[], demoted=True,
                  panel=dict(members=['main/000020'], incumbent='main/000030', veto=True))])
         self.assertEqual([c['id'] for c in evaluator.heads()], ['main/000030'])

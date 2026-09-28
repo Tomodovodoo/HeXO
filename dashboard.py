@@ -449,7 +449,7 @@ def evaluation_timing(run, evaluator, now):
     - mean_placements(type): the current comparison's mean_placements when it has that type, else the pooled
       mean of the newest HISTORY_REPORTS reports of that type (`report_placements`), else PLACEMENT_SHARE *
       max_plies; mean_source names which ('comparison', 'reports', 'default') for the current type.
-    - Games are played in rounds of settings.games (the last one shorter). A round of n games runs
+    - Games are played in rounds of settings.round_games (else settings.games; the last one shorter). A round of n games runs
       workers(n) = min(processes, n // 2) workers, which the Pacer charges per playing second, so its playing
       time becomes wall time divided by min(1, eval_share / workers(n)), the Pacer's long-run ceiling.
     - rate(type), placements per playing second of one worker, for the comparison's type: the current
@@ -471,7 +471,7 @@ def evaluation_timing(run, evaluator, now):
     comparison = evaluator.get('comparison') if isinstance(evaluator.get('comparison'), dict) else {}
     current = comparison.get('opponent') == 'seal' if comparison else None
     share = next((v for v in (evaluator.get('eval_share'), settings.get('eval_share')) if finite(v) and 0 < v <= 1), 1.)
-    size, processes = max(2, settings.get('games') or 2), max(1, evaluator.get('processes') or 1)
+    size, processes = max(2, settings.get('round_games') or settings.get('games') or 2), max(1, evaluator.get('processes') or 1)
     workers = lambda n: max(1, min(processes, n//2))
     fraction = lambda n: min(1., share/workers(n))  # playing share of wall time in a round of n games
     rounds = lambda games: [min(size, games-k) for k in range(0, max(0, games), size)]

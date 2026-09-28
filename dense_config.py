@@ -117,7 +117,9 @@ class LearnerSettings:
 
 @dataclass(frozen=True)
 class EvaluationSettings:
-    games: int = 64               # games per round of every comparison, colour-swapped opening pairs
+    games: int = 64               # games of each optional comparison (panel top-up, fill), colour-swapped opening pairs
+    round_games: int = 8          # games per round of every comparison; supersession, backlog and pairing are checked between rounds
+    model_cache: int = 6          # checkpoints the evaluator keeps loaded, least recently used dropped first
     previous_games: int = 0       # vs the previous rated checkpoint of the variant, only while idle; 0 = never
     sims: int = 64
     root_samples: int = 16
@@ -128,11 +130,10 @@ class EvaluationSettings:
     anchor_on_promotion: bool = True  # every new champion owes anchor_games vs Seal
     seal_ms: int = 100
     sprt_elo0: float = 0.         # promotion SPRT bounds on candidate minus champion
-    sprt_elo1: float = 50.
+    sprt_elo1: float = 25.
     sprt_alpha: float = .05
     sprt_beta: float = .05
     sprt_max_games: int = 200     # 'max-games' does not promote
-    sprt_round: int = 16          # champion SPRT games per round; a newer checkpoint is noticed between rounds
     opening_suite: str = 'standard-v1'
     eval_share: float = .12       # ceiling on the evaluator's playing share of wall time (dense_eval.Pacer)
     extra_opponents: int = 2      # panel opponents drawn per rated checkpoint with probability ~ p(1-p), idle only
