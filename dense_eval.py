@@ -42,6 +42,10 @@ records members, candidate_score, incumbent_score, z and veto in the entry and a
 `demoted` ('regression' event) and never promoted or restored again; a vetoed champion is replaced by its most
 recent non-demoted, non-skipped predecessor along panel incumbents (`Evaluator.settle`).
 
+Actor pointer: whenever the status file is written the evaluator keeps actor.json (`Evaluator.point`), the model of
+actors with model_source 'newest_veto': the newest export of learner.variant unless vetoed, then the best-rated
+checkpoint until the next export.
+
 league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
 superseded?, panel?, demoted?}], differences, ladder, ladder_top, anchors, matrix, rating_note, updated_at}.
 differences and ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the ladder_top
@@ -73,7 +77,7 @@ from dense_config import log_event
 import dense_data
 import hexnet
 from arena import Seal
-from dense_selfplay import Engine, checkpoints, expected, load
+from dense_selfplay import Engine, checkpoints, expected, load, resolve
 from hexo import Game
 from klent import digest
 from train import paired_metrics, task_opening, write_json
@@ -586,6 +590,44 @@ class Evaluator:
             self.written = time.monotonic()
             write_json(self.run/'evaluator-status.json',
                        dict(self.status, updated_at=time.time(), eval_share_used=self.pacer.used(), vram=hexnet.vram()))
+            self.point()
+
+    def point(self):
+        """Rewrite actor.json {checkpoint, reason, updated_at, vetoed} and log an 'actor_model' event when its
+        checkpoint or vetoed list changes. The checkpoint is the newest complete checkpoint of config.learner.variant
+        (reason 'newest'); once that checkpoint is demoted or the Elo interval (`tally`) of its games against the
+        champion it met (`met`, else the current champion; running rounds count once finished) lies entirely below
+        veto_margin, it joins `vetoed` (the last 16 kept) for good and the checkpoint is the highest-rated one
+        neither demoted, skipped nor vetoed (else the champion) until a newer export. Without a checkpoint of the
+        variant nothing is written."""
+        own = [e[0] for e in checkpoints(self.run) if e[0].split('/')[0] == self.config.learner.variant]
+        if not own:
+            return
+        path, newest = self.run/'actor.json', own[-1]
+        pointer = json.loads(path.read_text()) if path.exists() else dict(checkpoint=None, vetoed=[])
+        vetoed, entry = list(pointer['vetoed']), self.entry(newest) or {}
+        rival = self.met(newest) or self.league['champion']
+        why = None
+        if newest not in vetoed and rival not in (None, newest):
+            records = next((r['games'] for r in load_reports(self.run) if (r['candidate'], r['opponent']) == (newest, rival)),
+                           self.partial.get((newest, rival), {}).get('records', []))
+            interval = tally(records)['elo_interval']
+            if entry.get('demoted'):
+                why = 'demoted by its panel'
+            elif interval and interval[1] < self.settings.veto_margin:
+                why = f'Elo {interval[0]:+.0f} to {interval[1]:+.0f} vs {rival}, below {self.settings.veto_margin:+.0f}'
+            if why:
+                vetoed = (vetoed+[newest])[-16:]
+        checkpoint, reason = newest, 'newest'
+        if newest in vetoed:
+            rated = [c for c in self.league['checkpoints'] if c.get('elo') is not None and not c.get('demoted')
+                     and not c.get('skipped') and c['id'] not in vetoed]
+            checkpoint = max(rated, key=lambda c: c['elo'])['id'] if rated else self.league['champion']
+            reason = f'{newest} vetoed' + (f': {why}' if why else '') + f'; best-rated {checkpoint}'
+        if checkpoint != pointer['checkpoint'] or vetoed != pointer['vetoed']:
+            write_json(path, dict(checkpoint=checkpoint, reason=reason, updated_at=time.time(), vetoed=vetoed))
+            log_event(self.run, 'evaluator', 'actor_model', f'actors play {checkpoint}: {reason}', checkpoint=checkpoint,
+                      previous=pointer['checkpoint'], reason=reason, vetoed=vetoed)
 
     def use(self, *names):
         """Load the named checkpoints (Seal once, lazily); `models` keeps at most model_cache checkpoints, least
@@ -1098,7 +1140,7 @@ def calibrate(args):
     value and the masked baseline (p = 1/2) against the realised result, overall and per continuation length."""
     run = Path(args.run)
     config = dense_config.load(run)
-    model = load(run, config)
+    model = load(run, config, source=resolve(run))
     chosen = []
     for path in reversed(dense_data.shard_dirs(run)):
         episodes, _ = dense_data.read_shard(path, policies=False)
