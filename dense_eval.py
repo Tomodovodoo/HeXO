@@ -29,9 +29,9 @@ Panels: a checkpoint rated while a champion exists gets `panel_members` (at most
 p(1-p)-drawn and retained weaknesses) as entry `panel` {members, incumbent}; the incumbent is the champion it
 met. Its panel games and the incumbent's top-ups against the members are optional rounds, the current
 champion's first. SPRT H1 promotes at once; the panel is a post-hoc regression check: a complete panel records
-candidate_score, incumbent_score, z and veto in the entry and a 'panel' event, and when the vetoed checkpoint is
-the champion it promoted over its incumbent, that incumbent is restored as champion ('regression' event, entry
-`demoted` true), and a demoted checkpoint is never promoted again.
+candidate_score, incumbent_score, z and veto in the entry and a 'panel' event. A vetoed checkpoint is marked
+`demoted` ('regression' event) and never promoted or restored again; a vetoed champion is replaced by its most
+recent non-demoted, non-skipped predecessor along panel incumbents (`Evaluator.settle`).
 
 league.json: {champion, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
 superseded?, panel?, demoted?}], differences, anchors, matrix, rating_note, updated_at}. `matrix` (`payoff`) holds
@@ -692,8 +692,11 @@ class Evaluator:
         return out
 
     def settle(self):
-        """Judge every panel that became complete and is not judged yet; a vetoed champion is demoted: its panel
-        incumbent (the champion it replaced) is restored."""
+        """Judge every panel that became complete and is not judged yet. A vetoed checkpoint is marked demoted
+        (never promoted or restored again) with a 'regression' event; when it is the champion, the champion becomes
+        its most recent predecessor, following panel incumbents, that is neither demoted nor skipped, and stays
+        unchanged when there is none."""
+        entries = {c['id']: c for c in self.league['checkpoints']}
         for entry in self.league['checkpoints']:
             panel = entry.get('panel')
             if not panel or 'veto' in panel or self.needs(entry):
@@ -703,14 +706,21 @@ class Evaluator:
             log_event(self.run, 'evaluator', 'panel', f'{entry["id"]} vs panel of {len(panel["members"])}: decisive score '
                       f'{score(panel["candidate_score"])}, incumbent {panel["incumbent"]} {score(panel["incumbent_score"])}'
                       + (' - veto' if panel['veto'] else ''), candidate=entry['id'], **panel)
-            if panel['veto'] and self.league['champion'] == entry['id']:
+            if panel['veto']:
                 entry['demoted'] = True
-                self.league['champion'] = panel['incumbent']
-                write_json(self.run/'champion.json', dict(checkpoint=panel['incumbent'], updated_at=time.time(),
-                                                          ema_sha256=digest(self.run/'checkpoints'/panel['incumbent']/'ema.pt')))
-                log_event(self.run, 'evaluator', 'regression', f'{entry["id"]} demoted: its panel score is significantly '
-                          f'below {panel["incumbent"]}\'s, which is champion again', checkpoint=entry['id'],
-                          restored=panel['incumbent'], panel=panel)
+                restored, seen = panel['incumbent'], {entry['id']}
+                while restored in entries and restored not in seen and (entries[restored].get('demoted') or entries[restored].get('skipped')):
+                    seen.add(restored)
+                    restored = entries[restored].get('panel', {}).get('incumbent')
+                restored = restored if restored in entries and restored not in seen else None
+                if self.league['champion'] == entry['id'] and restored:
+                    self.league['champion'] = restored
+                    write_json(self.run/'champion.json', dict(checkpoint=restored, updated_at=time.time(),
+                                                              ema_sha256=digest(self.run/'checkpoints'/restored/'ema.pt')))
+                champion = self.league['champion'] == restored
+                log_event(self.run, 'evaluator', 'regression', f'{entry["id"]} demoted: its panel score is significantly below '
+                          f'{panel["incumbent"]}\'s' + (f'; {restored} is champion again' if champion else ''),
+                          checkpoint=entry['id'], restored=restored if champion else None, panel=panel)
             write_league(self.run, self.league, self.config)
 
     def rematches(self):

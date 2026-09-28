@@ -1393,5 +1393,32 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(evaluator.needs(entry), [])
         self.assertIn('veto', entry['panel'])                                        # judged once complete
 
+    def test_successive_vetoed_champions_restore_the_last_sound_predecessor(self):
+        self.export(10, 20, 30, 40)
+        evaluator = self.start(extra_opponents=1)
+        cell = lambda a, w, l: dict(candidate=a, opponent='main/000020', settings=asdict(evaluator.settings),
+                                    summary=dict(wins=w, losses=l, capped=0, games=w+l), metrics={}, games=[])
+        reports = [cell('main/000010', 15, 5), cell('main/000030', 5, 15), cell('main/000040', 0, 20)]
+        for chained in (True, False):
+            panel = lambda incumbent: dict(members=['main/000020'], incumbent=incumbent)
+            evaluator.league = dict(champion='main/000040', checkpoints=[
+                dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
+                dict(id='main/000020', variant='main', step=20, elo=0., matches=[]),
+                dict(id='main/000030', variant='main', step=30, elo=0., matches=[], **({'panel': panel('main/000010')} if chained else {})),
+                dict(id='main/000040', variant='main', step=40, elo=0., matches=[], panel=panel('main/000030'))])
+            if not chained:
+                evaluator.league['checkpoints'][2]['demoted'] = True       # vetoed earlier, predecessor unknown
+            with unittest.mock.patch.object(dense_eval, 'write_league'), \
+                    unittest.mock.patch.object(dense_eval, 'load_reports', lambda *args: reports), \
+                    unittest.mock.patch.object(dense_eval, 'report_path', lambda run, a, b: self.run):
+                evaluator.settle()                                          # one pass judges both panels, oldest first
+            entries = {c['id']: c for c in evaluator.league['checkpoints']}
+            self.assertTrue(entries['main/000030']['demoted'] and entries['main/000040']['demoted'])
+            self.assertEqual(evaluator.league['champion'], 'main/000010' if chained else 'main/000040')
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines() if '"regression"' in line]
+        self.assertEqual([(e['checkpoint'], e['restored']) for e in events],
+                         [('main/000030', None), ('main/000040', 'main/000010'), ('main/000040', None)])
+        self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000010')
+
 if __name__ == '__main__':
     unittest.main()
