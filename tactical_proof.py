@@ -104,8 +104,9 @@ class IsolatedTactics:
 
     def __init__(self, package=PACKAGE, *, grace_ms=100, memory_mb=1536, startup_ms=10000,
                  engine='tactical_proof:NativeTactics'):
-        self.command = [sys.executable, str(Path(__file__).resolve()), 'serve', engine, str(Path(package).resolve())]
-        self.grace_ms, self.memory_mb, self.startup_ms = grace_ms, memory_mb, startup_ms
+        self.command = [sys.executable, str(Path(__file__).resolve()), 'serve', engine, str(Path(package).resolve()),
+                        str(memory_mb)]
+        self.grace_ms, self.startup_ms = grace_ms, startup_ms
         self.stats = dict(queries=0, spawns=0, kills=0, exits=0)
         self.lock = threading.Lock()
         self.job = _memory_job(memory_mb) if sys.platform == 'win32' else None
@@ -113,13 +114,8 @@ class IsolatedTactics:
         self._spawn()
 
     def _spawn(self):
-        limit = None
-        if sys.platform != 'win32':
-            import resource
-            cap = self.memory_mb*2**20
-            limit = lambda: resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
         process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   text=True, encoding='utf-8', bufsize=1, preexec_fn=limit)
+                                   text=True, encoding='utf-8', bufsize=1)
         if self.job:
             try:
                 _assign(self.job, process.pid)
@@ -259,8 +255,16 @@ def _pump(stream, lines):
     lines.put(None)
 
 
-def _serve(engine, package):
-    """Child side of IsolatedTactics: one JSON request per stdin line, one JSON result per stdout line."""
+def _serve(engine, package, memory_mb):
+    """Child side of IsolatedTactics: one JSON request per stdin line, one JSON result per stdout line.
+
+    On POSIX the child caps its own address space before loading the engine; the
+    parent never runs code between fork and exec.
+    """
+    if sys.platform != 'win32':
+        import resource
+        cap = int(memory_mb)*2**20
+        resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
     module, name = engine.split(':')
     try:
         tactics = getattr(importlib.import_module(module), name)(package)
@@ -306,4 +310,4 @@ def independent_verify(certificate, history):
 
 
 if __name__ == '__main__' and sys.argv[1:2] == ['serve']:
-    _serve(*sys.argv[2:4])
+    _serve(*sys.argv[2:5])
