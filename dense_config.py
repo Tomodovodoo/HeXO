@@ -13,7 +13,8 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
                                        every 2 s while it plays
   evaluations/<a>-vs-<b>/report.json   paired match records of a (candidate) against b, ids with '/' written as '-';
                                        idle rematches append pairs to an existing report (dense_eval)
-  actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s
+  actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s;
+                                       vram is hexnet.vram() of that process
   learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s;
                                        samples_per_row_target is its effective learner.samples_per_row
   events.jsonl                         one line per event: {time, source, kind, message, ...} (log_event)

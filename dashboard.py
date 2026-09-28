@@ -431,6 +431,7 @@ def dense_run(run, config, fresh=30):
                  games_total=total(actors, 'games_total') if actors and all(a.get('games_total') is not None for a in actors) else None,
                  mean_batch=weighted('mean_batch', 'evals_per_second'), terminal_fraction=weighted('terminal_fraction', 'games_completed'),
                  mean_plies=weighted('mean_plies', 'games_completed'),
+                 vram_reserved_mb=[a['vram'].get('reserved_mb') for a in live if isinstance(a.get('vram'), dict)],
                  checkpoint=actors[0].get('checkpoint') if actors else None, actor_sha256=actors[0].get('actor_sha256') if actors else None,
                  error='; '.join(f"{a['process']}: {a['error']}" for a in actors if a.get('error')) or None,
                  heartbeat=max((a['heartbeat'] for a in actors if a['heartbeat'] is not None), default=None))

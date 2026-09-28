@@ -325,10 +325,36 @@ class HexNetTests(unittest.TestCase):
         with torch.no_grad():
             torch.testing.assert_close(conv(x), expected, atol=1e-5, rtol=1e-5)
             conv.weight.mul_(2)
-            torch.testing.assert_close(conv(x), 2*expected, atol=1e-5, rtol=1e-5)   # cache follows updates
-            wide = torch.randn(1, 3, hexnet.CACHED_SIZE+1, hexnet.CACHED_SIZE+1)
+            torch.testing.assert_close(conv(x), 2*expected, atol=1e-5, rtol=1e-5)   # matrices follow updates
+            wide = torch.randn(1, 3, 130, 130)
             torch.testing.assert_close(conv(wide), line_conv_reference(wide, conv.weight), atol=1e-5, rtol=1e-5)
-            self.assertEqual({k[0] for k in conv.cache}, {9})
+
+    def test_line_conv_inference_matrices_match_training_matrices(self):
+        conv = hexnet.LineConv(4, 11)
+        with torch.no_grad():
+            conv.weight.normal_()
+        for size in (7, 11, 24, 48, 131):
+            trained = conv.matrices(size, torch.float32)       # grad enabled: the _toeplitz path
+            with torch.no_grad():
+                gathered = conv.matrices(size, torch.float32)
+                for old, new in zip(trained, gathered):
+                    self.assertEqual(new.shape, (4, size, size))
+                    torch.testing.assert_close(new, old.detach(), atol=1e-5, rtol=0)
+                x = torch.randn(5, 4, size, size)
+                expected = line_conv_reference(x, conv.weight)
+                torch.testing.assert_close(conv(x), expected, atol=1e-5, rtol=1e-5)
+                with unittest.mock.patch.object(hexnet, 'LINE_CHUNK_CELLS', 2*size*size):    # chunks of 2, 2, 1
+                    y = x.clone()
+                    self.assertIs(conv.add_to(y), y)
+                torch.testing.assert_close(y, x+expected, atol=1e-5, rtol=1e-5)
+
+    def test_inference_forward_matches_training_path(self):
+        model = hexnet.HexNet(TINY).eval()
+        planes = torch.from_numpy(np.stack([hexcrop.encode(h).planes for h in same_bucket(3)])).float()
+        with torch.no_grad():
+            expected = model(planes, planes[:, 3:4])
+        for key, value in model(planes, planes[:, 3:4]).items():   # grad enabled: full-size masks, no chunks
+            torch.testing.assert_close(value.detach(), expected[key], atol=1e-5, rtol=1e-5)
 
     def test_masked_norm_ignores_padding(self):
         norm = hexnet.MaskedNorm(4).double()
@@ -1278,6 +1304,26 @@ class EvaluatorSearchTests(unittest.TestCase):
             np.testing.assert_allclose(result['q'], np.tanh(float(out['value_logit'][0])/2), rtol=1e-5, atol=1e-6)
             self.assertEqual((result['player'], result['remaining']), (s.player, s.remaining))
         self.assertGreater(hexcrop.encode(histories[2]).far, 0)
+
+    def test_actor_evaluator_reuses_one_staging_set_per_pending_batch(self):
+        evaluator = dense_selfplay.Evaluator(self.model, 'cpu', 'tiny', 64)
+        histories = [np.asarray(h, np.int64).reshape(-1, 2) for h in [POSITIONS[10], POSITIONS[12], line_history(31)]]
+        expected = evaluator.evaluate(histories)
+        self.assertEqual(len(evaluator.free), 1)
+        staging = evaluator.free[0]
+        self.assertEqual({kind for kind, _ in staging}, {'planes', 'out'})    # one input and one output buffer per size
+        pointers = {k: v.data_ptr() for k, v in staging.items()}
+        # Pipelined like Engine: a second batch is submitted before the first is collected.
+        first, second = evaluator.submit(histories), evaluator.submit(histories[::-1])
+        self.assertIs(first[-1], staging)
+        self.assertIsNot(second[-1], staging)
+        for got, want in zip(evaluator.collect(first)+evaluator.collect(second)[::-1], expected+expected):
+            for a, b in zip(got, want):
+                np.testing.assert_array_equal(a, b)
+        self.assertEqual(len(evaluator.free), 2)
+        evaluator.evaluate(histories)
+        self.assertEqual(len(evaluator.free), 2)
+        self.assertEqual({k: v.data_ptr() for k, v in staging.items()}, pointers)
 
     def test_native_search_returns_legal_actions_in_native_order(self):
         for history in (POSITIONS[12], [(0, 0)], line_history(31)):
