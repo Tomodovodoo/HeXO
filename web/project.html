@@ -60,7 +60,7 @@ const n=selected().length;$('showing').textContent=state.selected?`Showing ${n} 
 function panelSeries(p){const out=[],seen=new Set();for(const r of selected()){if(p.perRun){if(seen.has(r.run.name))continue;seen.add(r.run.name)}
 if(p.metric)out.push({key:p.perRun?r.run.name:r.key,label:p.perRun?r.run.name:r.key,run:r.run,variant:p.perRun?'main':r.variant,index:r.index,metric:p.metric});
 if(p.pair)out.push({key:`${r.key}|${p.pair.metric}`,label:`${r.key} ${p.pair.label}`,run:r.run,variant:r.variant,index:r.index,metric:p.pair.metric,dash:p.pair.dash});
-if(p.sources)for(const[src,dash]of Object.entries(SOURCES))out.push({key:`${r.key}|${src}`,label:`${r.key} · held-out ${src}`,run:r.run,variant:r.variant,index:r.index,metric:`validation_${src}_${p.sources}`,dash})}return out}
+if(p.sources)for(const[src,dash]of Object.entries(SOURCES))out.push({key:`${r.key}|${src}`,label:`${r.key} · ${p.sources.startsWith('gap')?'gap':'held-out'} ${src}`,run:r.run,variant:r.variant,index:r.index,metric:`validation_${src}_${p.sources}`,dash})}return out}
 const xOf=p=>p.xs.includes(state.x[p.id])?state.x[p.id]:p.xs[0];
 const cacheKey=(s,p)=>`${s.run.name}|${s.variant}|${s.metric}|${xOf(p)}`;
 async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k);if(hit&&(hit.poll===project.now||(!s.run.live&&project.now-hit.poll<60)))continue;
