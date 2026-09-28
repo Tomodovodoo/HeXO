@@ -9,7 +9,9 @@ namespace gumbel {
 struct Node;
 struct Edge { Cell action;double logit=0,prior=0,sum=0,gumbel=0;int visits=0,pending=0,epoch=0,exact_winner=-1;bool eligible=true;std::unique_ptr<Node> child; };
 struct Node { int player=0,exact_winner=-1;bool expanded=false,pending=false;double value=0;std::vector<Edge> edges; };
-struct Path { Node* leaf;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history; };
+// A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
+// (own) and the opponent's (threats), both restricted to fully legal ones.
+struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1;std::vector<std::vector<Cell>> own,threats; };
 struct Tree {
  Board board;std::unique_ptr<Node> root=std::make_unique<Node>();std::map<int,Path> requests;
  std::mt19937_64 rng;int budget=0,started=0,completed=0,next_id=1,samples=0;bool tactics=false;std::vector<int> sequence;
@@ -28,30 +30,34 @@ struct Tree {
   std::vector<int> v(m);int considered=m,rounds=std::max(1,int(std::ceil(std::log2(m))));
   while(int(sequence.size())<budget){int extra=std::max(1,budget/(rounds*considered));for(int k=0;k<extra && int(sequence.size())<budget;++k)for(int i=0;i<considered;++i){sequence.push_back(v[i]++);if(int(sequence.size())==budget)break;}considered=m==1?1:std::max(2,considered/2);}
  }
- void classify(Board& position,Node& node) {
-  auto own=position.completions(position.player,position.remaining);
-  auto threats=position.completions(1-position.player);
-  auto illegal=[&](const auto& c){return !std::all_of(c.begin(),c.end(),[&](Cell p){return position.legal(p);});};
-  std::erase_if(own,illegal);std::erase_if(threats,illegal);
+ // Leaf data classify needs, taken while the tree's board stands at the leaf.
+ void capture(Path& path) {
+  path.legal=board.legal_moves();path.player=board.player;path.remaining=board.remaining;
+  if(!tactics)return;
+  path.own=board.completions(board.player,board.remaining);path.threats=board.completions(1-board.player);
+  auto illegal=[&](const auto& c){return !std::all_of(c.begin(),c.end(),[&](Cell p){return board.legal(p);});};
+  std::erase_if(path.own,illegal);std::erase_if(path.threats,illegal);
+ }
+ void classify(const Path& path,Node& node) {
+  const auto& own=path.own;const auto& threats=path.threats;
+  auto contains=[](const std::vector<Cell>& completion,Cell c){return std::find(completion.begin(),completion.end(),c)!=completion.end();};
   bool winning=false,safe=false;
   for(auto& edge:node.edges){
    // Every completion cell is within five of an existing stone, hence legal.
    bool win=false;
-   for(auto& completion:own)if(completion.size()<size_t(position.remaining) || std::find(completion.begin(),completion.end(),edge.action)!=completion.end())win=true;
-   if(win){edge.exact_winner=position.player;winning=true;continue;}
-   std::vector<std::vector<Cell>> uncovered;
-   for(auto& completion:threats)if(std::find(completion.begin(),completion.end(),edge.action)==completion.end())uncovered.push_back(completion);
-   bool cover=uncovered.empty();
-   if(!cover && position.remaining==2)for(auto second:uncovered.front()){
-    if(!position.legal(second))continue;
-    bool all=true;for(auto& completion:uncovered)if(std::find(completion.begin(),completion.end(),second)==completion.end())all=false;
+   for(auto& completion:own)if(completion.size()<size_t(path.remaining) || contains(completion,edge.action))win=true;
+   if(win){edge.exact_winner=path.player;winning=true;continue;}
+   auto first=std::find_if(threats.begin(),threats.end(),[&](const auto& completion){return !contains(completion,edge.action);});
+   bool cover=first==threats.end();
+   if(!cover && path.remaining==2)for(auto second:*first){
+    bool all=true;for(auto& completion:threats)if(!contains(completion,edge.action) && !contains(completion,second))all=false;
     if(all){cover=true;break;}
    }
-   if(!cover)edge.exact_winner=1-position.player;else safe=true;
+   if(!cover)edge.exact_winner=1-path.player;else safe=true;
   }
-  if(winning)node.exact_winner=position.player;
-  else if(!safe)node.exact_winner=1-position.player;
-  for(auto& edge:node.edges)edge.eligible=winning?edge.exact_winner==position.player:(!safe || edge.exact_winner<0);
+  if(winning)node.exact_winner=path.player;
+  else if(!safe)node.exact_winner=1-path.player;
+  for(auto& edge:node.edges)edge.eligible=winning?edge.exact_winner==path.player:(!safe || edge.exact_winner<0);
  }
  void begin(int simulations,int sample) {
   if(!requests.empty()||simulations<1||sample<1)throw std::runtime_error("Invalid search budget or pending requests");
@@ -66,7 +72,8 @@ struct Tree {
  }
  int request() {
   if(board.winner>=0||started>=budget)return 0;
-  Board position=board;Node* node=root.get();Path path{node,{}, {}};
+  // Descends by make on the tree's own board; Restore undoes every placement on return.
+  Restore restore(board);Node* node=root.get();Path path;path.leaf=node;
   for(auto& u:board.history)path.history.push_back(u.c);
   while(node->expanded){
    auto q=transformed(*node);int chosen=-1;double best=-1e300;
@@ -82,27 +89,29 @@ struct Tree {
    }
    if(chosen<0)return 0;
    auto& edge=node->edges[chosen];if(edge.child && edge.child->pending)return 0;
-   path.edges.emplace_back(node,chosen);position.make(edge.action);path.history.push_back(edge.action);
-   if(!edge.child){edge.child=std::make_unique<Node>();edge.child->player=position.player;}
+   path.edges.emplace_back(node,chosen);board.make(edge.action);path.history.push_back(edge.action);
+   if(!edge.child){edge.child=std::make_unique<Node>();edge.child->player=board.player;}
    node=edge.child.get();path.leaf=node;
-   if(position.winner>=0 || edge.exact_winner>=0 || node->exact_winner>=0){int winner=position.winner>=0?position.winner:edge.exact_winner>=0?edge.exact_winner:node->exact_winner;for(auto [parent,index]:path.edges)++parent->edges[index].pending;++root->edges[path.edges.front().second].epoch;++started;backup(path,winner==node->player?1:-1);return -1;}
+   if(board.winner>=0 || edge.exact_winner>=0 || node->exact_winner>=0){int winner=board.winner>=0?board.winner:edge.exact_winner>=0?edge.exact_winner:node->exact_winner;for(auto [parent,index]:path.edges)++parent->edges[index].pending;++root->edges[path.edges.front().second].epoch;++started;backup(path,winner==node->player?1:-1);return -1;}
   }
   if(node->pending)return 0;
-  node->pending=true;node->player=position.player;
+  node->pending=true;node->player=board.player;capture(path);
   for(auto [parent,index]:path.edges)++parent->edges[index].pending;
   if(!path.edges.empty()){++root->edges[path.edges.front().second].epoch;++started;}
   int id=next_id++;requests.emplace(id,std::move(path));return id;
  }
  void fulfill(int id,const int64_t* actions,const double* logits,const double* values,int count,int exact=-1,Cell witness={}){
   auto found=requests.find(id);if(found==requests.end())throw std::runtime_error("Unknown request");auto& path=found->second;
-  Board position;for(auto c:path.history){if(!position.legal(c))throw std::runtime_error("Invalid history");position.make(c);}auto legal=position.legal_moves();
+  const auto& legal=path.legal;
   if(count!=int(legal.size())||count<1)throw std::runtime_error("Incomplete legal actions");
   double maximum=-1e300;for(int i=0;i<count;++i){if(legal[i]!=Cell{actions[2*i],actions[2*i+1]}||!std::isfinite(logits[i])||!std::isfinite(values[i])||std::abs(values[i])>1)throw std::runtime_error("Invalid evaluation");maximum=std::max(maximum,logits[i]);}
-  auto& node=*path.leaf;double total=0;for(int i=0;i<count;++i)total+=std::exp(logits[i]-maximum);
-  node.value=0;for(int i=0;i<count;++i){Edge edge;edge.action=legal[i];edge.logit=logits[i]-maximum;edge.prior=std::exp(edge.logit)/total;node.value+=edge.prior*values[i];double u=std::generate_canonical<double,53>(rng);edge.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));node.edges.push_back(std::move(edge));}
-  if(tactics)classify(position,node);
+  auto& node=*path.leaf;double total=0;std::vector<double> weights(count);for(int i=0;i<count;++i)total+=weights[i]=std::exp(logits[i]-maximum);
+  // Only root edges read their Gumbel noise and begin() redraws it, so interior edges just advance the stream.
+  const bool at_root=&node==root.get();
+  node.value=0;node.edges.reserve(count);for(int i=0;i<count;++i){Edge edge;edge.action=legal[i];edge.logit=logits[i]-maximum;edge.prior=weights[i]/total;node.value+=edge.prior*values[i];double u=std::generate_canonical<double,53>(rng);if(at_root)edge.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));node.edges.push_back(std::move(edge));}
+  if(tactics)classify(path,node);
   if(exact>=0){node.exact_winner=exact;for(auto& edge:node.edges){edge.eligible=edge.action==witness;if(edge.eligible)edge.exact_winner=exact;}}
-  node.expanded=true;node.pending=false;if(&node==root.get())schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);requests.erase(found);
+  node.expanded=true;node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);requests.erase(found);
  }
  void prove(int id,const int64_t* history,int count,int player,int remaining,const int64_t* moves,int move_count){
   auto found=requests.find(id);if(found==requests.end())throw std::runtime_error("Unknown proof request");
@@ -141,6 +150,8 @@ HX_API int hxg_exact(void* p){auto& t=*static_cast<gumbel::Tree*>(p);return t.bo
 HX_API int hxg_begin(void* p,int simulations,int sample){try{static_cast<gumbel::Tree*>(p)->begin(simulations,sample);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxg_next(void* p){try{return static_cast<gumbel::Tree*>(p)->request();}catch(const std::exception& e){gumbel::error=e.what();return -2;}}
 HX_API int hxg_history(void* p,int id,int64_t* out){auto& h=static_cast<gumbel::Tree*>(p)->requests.at(id).history;if(out)for(int i=0;i<int(h.size());++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}
+// Legal moves of a pending request in sorted (q, r) order, the actions hxg_fulfill must be given.
+HX_API int hxg_legal(void* p,int id,int64_t* out){auto& l=static_cast<gumbel::Tree*>(p)->requests.at(id).legal;if(out)for(int i=0;i<int(l.size());++i){out[2*i]=l[i].q;out[2*i+1]=l[i].r;}return int(l.size());}
 HX_API int hxg_fulfill(void* p,int id,const int64_t* a,const double* logits,const double* q,int n){try{static_cast<gumbel::Tree*>(p)->fulfill(id,a,logits,q,n);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Caller must independently verify the strategy certificate before this entry.
 // Exact history and placement phase prevent applying it to a different request.
