@@ -602,8 +602,11 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual((league['books']['book']['openings'], league['books']['book']['retired']['skew']), (2, 1))
         seat = league['players']['main/000020']
         self.assertEqual((seat['p1_games']+seat['p2_games'], seat['p1_wins']), (len(games), seat['p1_games']))
-        self.assertNotEqual(self.start(book_weighting='least_played').settings.opening_book, digest)   # another draw rule
-
+        other = self.start(book_weighting='least_played')                 # another draw rule than config.json's
+        self.assertNotEqual(other.settings.opening_book, digest)
+        dense_eval.write_league(self.run, other.league, other.config)
+        published = json.loads((self.run/'league.json').read_text())['openings']['books']['book']['digest']
+        self.assertEqual(published, other.settings.opening_book)
     def test_a_promotion_refreshes_the_book_before_the_next_candidate(self):
         self.export(10)
         evaluator = self.start(sprt_max_games=40)
@@ -735,7 +738,7 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual(next(n for n in self.saved('openings-standard-v1.json')['nodes'] if n['depth'] == 1)['games'],
                          2+len(games))
         self.assertFalse((self.run/'openings.json').exists())
-        graph = dashboard.openings(self.run, json.loads((self.run/'config.json').read_text()))
+        graph = dashboard.openings(self.run)
         self.assertEqual(set(graph), {'standard-v1'})
         self.assertEqual(graph['standard-v1']['stats']['openings'], 47)
         self.assertIn([dense_openings.canonical([(0, 0)])[0], dense_openings.canonical(played[:2])[0]], graph['standard-v1']['edges'])

@@ -527,11 +527,10 @@ def dense_config_of(run):
     return config if isinstance(config, dict) and config.get('schema') == dense_config.SCHEMA else None
 
 
-def openings(run, config):
+def openings(run):
     """/api/openings: {suite: dense_openings.Book.graph} of every opening book file of a dense run: the DAG's nodes
     with their statistics, its edges and the book's stats."""
-    settings = dense_config.from_dict(config).evaluation
-    return {suite: book.graph() for suite, book in dense_openings.books(run, settings).items()}
+    return {suite: book.graph() for suite, book in dense_openings.books(run).items()}
 
 
 def heartbeats(run, now):
@@ -800,11 +799,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.dumps(data, allow_nan=False).encode()
             content_type = "application/json"
         elif url.path == "/api/openings" and run:
-            config = dense_config_of(run)
-            if config is None:
+            if dense_config_of(run) is None:
                 self.send_error(400, 'opening books belong to dense runs')
                 return
-            payload = json.dumps(openings(run, config), allow_nan=False).encode()
+            payload = json.dumps(openings(run), allow_nan=False).encode()
             content_type = "application/json"
         elif url.path == "/api/run" and run:
             summary = run / "summary.json"

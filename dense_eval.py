@@ -513,7 +513,7 @@ def write_league(run, league, config, top=None):
     league['anchors'] = {SEAL: dict(elo=point.get(SEAL), elo_interval=intervals.get(SEAL), games=seal_games, matches=matches,
                                     latest_delta=matches[-1]['elo_delta'] if matches else None)}
     league['matrix'] = payoff(reports, point)
-    league['openings'] = dense_openings.summary(run, reports, config.evaluation)
+    league['openings'] = dense_openings.summary(run, reports)
     league['rating_note'] = RATING_NOTE
     league['updated_at'] = time.time()
     write_json(run/'league.json', league)
