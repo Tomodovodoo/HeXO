@@ -129,6 +129,11 @@ class EvaluationSettings:
     anchor_games: int = 100       # champion vs Seal, played before optional work; 0 = never
     anchor_on_promotion: bool = True  # every new champion owes anchor_games vs Seal
     seal_ms: int = 100
+    decision: str = 'posterior'   # promotion rule: 'posterior' (dense_eval.Evaluator.verdict) or 'sprt'
+    promote_confidence: float = .9  # posterior: P(candidate - champion > sprt_elo0) needed to promote (1 - it rejects)
+    uncertainty_parity: float = 1.  # posterior: the candidate's rating sd may be at most this times the champion's
+    matchup_prior_elo: float = 30.  # posterior: prior sd of a pair's deviation from the transitive rating difference
+    sprt_min_games: int = 8       # direct games vs the champion before any decision
     sprt_elo0: float = 0.         # promotion SPRT bounds on candidate minus champion
     sprt_elo1: float = 25.
     sprt_alpha: float = .05

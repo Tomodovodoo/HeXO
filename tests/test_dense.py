@@ -1821,6 +1821,44 @@ def league_of(elos, champion=None, matrix=None):
     return league
 
 
+class PosteriorTests(unittest.TestCase):
+    """dense_posterior.Posterior on synthetic results (a, b, points of a, games)."""
+
+    def test_pooled_and_direct_estimates(self):
+        from dense_posterior import Posterior
+        results = [('a', 'b', 12, 20), ('a', 'c', 30, 40), ('b', 'c', 20, 40)]
+        direct = Posterior(['a', 'b', 'c'], 'c', results, 1e4)          # a free deviation: a-b from its own games
+        pooled = Posterior(['a', 'b', 'c'], 'c', results, 0.)           # transitive Bradley-Terry
+        mean, sd = direct.difference('a', 'b')
+        self.assertAlmostEqual(mean, 400*math.log10(12/8), delta=2)
+        pooled_mean, pooled_sd = pooled.difference('a', 'b')
+        self.assertTrue(400*math.log10(12/8) < pooled_mean < 400*math.log10(3))  # pulled toward the indirect a-c-b path
+        self.assertLess(pooled_sd, sd)
+        self.assertEqual(Posterior(['a', 'b', 'c'], 'c', results, 30.).difference('a', 'b', False)[0] > 0, True)
+
+    def test_direct_games_dominate_a_non_transitive_triangle(self):
+        from dense_posterior import Posterior
+        results = [('a', 'b', 900, 1000), ('b', 'c', 900, 1000), ('c', 'a', 900, 1000)]
+        post = Posterior(['a', 'b', 'c'], 'c', results, 30.)
+        direct = 400*math.log10(9)
+        self.assertAlmostEqual(post.difference('a', 'b', False)[0], 0., delta=1)  # the transitive picture: a tie
+        self.assertGreater(post.difference('a', 'b')[0], direct/2)            # its own games dominate
+        self.assertLess(post.difference('b', 'a')[0], -direct/2)
+
+    def test_value_of_information_prefers_the_pairing_that_resolves_delta(self):
+        from dense_posterior import Posterior
+        best = lambda post: min((('cand', 'champ'), ('cand', 'prev'), ('champ', 'prev')),
+                                key=lambda pair: post.after(('cand', 'champ', True), pair, 8))
+        # No indirect evidence about the candidate: only direct games inform delta.
+        post = Posterior(['champ', 'prev', 'cand'], 'champ', [('champ', 'prev', 5, 10)], 30.)
+        self.assertEqual(best(post), ('cand', 'champ'))
+        # The candidate is lopsided against the champion (p ~ .95) but even with the well-measured previous
+        # champion: a round against it resolves delta faster than another lopsided direct round.
+        results = [('prev', 'champ', 950, 1000), ('cand', 'champ', 38, 40)]
+        post = Posterior(['champ', 'prev', 'cand'], 'champ', results, 1.)
+        self.assertEqual(best(post), ('cand', 'prev'))
+
+
 class OpponentSchedulerTests(unittest.TestCase):
     def test_payoff_matrix_from_reports(self):
         reports = [fake_report('main/000002', 'main/000001', 5, 2, 1), fake_report('main/000001', 'main/000002', 3, 3, 2),
@@ -1995,7 +2033,8 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.run = Path(tmp.name)
 
     def start(self, processes=1, **evaluation):
-        settings = dict(games=2, sims=2, root_samples=2, max_plies=8, anchor_games=0, sprt_max_games=2, extra_opponents=0,
+        settings = dict(games=2, sims=2, root_samples=2, max_plies=8, anchor_games=0, sprt_max_games=2, extra_opponents=0, decision='sprt',
+                        sprt_min_games=2,
                         idle_rematch=False, idle_fill=False)
         config = dense_config.RunConfig(
             device='cpu', model=dense_config.ModelSettings(**{k: getattr(TINY, k) for k in (
@@ -2291,6 +2330,41 @@ class EvaluatorLoopTests(unittest.TestCase):
         settle = next(e for e in events if e['kind'] == 'settle')
         self.assertIn('settled on supersession after 16 games', settle['message'])
         self.assertEqual((settle['promote'], settle['games']), (True, 16))
+
+    def test_posterior_decision_promotes_a_clear_winner(self):
+        """Posterior mode: rounds go to the direct pairing (no other evidence), the verdict promotes once the
+        candidate leads with P(delta > 0) >= promote_confidence; status, report and event carry the verdict."""
+        evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9, uncertainty_parity=1.5)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'play_pairs', self.winning([])):
+            self.assertTrue(evaluator.step())
+        league = self.league()
+        self.assertEqual(league['champion'], 'main/000020')
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        verdict = report['metrics']['posterior']
+        self.assertEqual((verdict['decision'], verdict['leader'], verdict['direct']['games']), ('promote', 'main/000020', len(report['games'])))
+        self.assertGreaterEqual(verdict['p_better'], .9)
+        self.assertLessEqual(len(report['games']), 12)
+        status = json.loads((self.run/'evaluator-status.json').read_text())
+        self.assertEqual(status['decision']['decision'], 'promote')
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        decision = next(e for e in events if e['kind'] == 'decision')
+        self.assertIn('main/000020 vs main/000010: promote after', decision['message'])
+
+    def test_posterior_decision_rejects_a_clear_loser(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9, uncertainty_parity=1.5)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        def losing(config, settings, candidate, opponent, first_pair, games, seal=None, heartbeat=lambda *_: None):
+            return [dict(r, winner=1-r['winner']) for r in self.winning([])(config, settings, candidate, opponent, first_pair, games, seal)]
+        with unittest.mock.patch.object(dense_eval, 'play_pairs', losing):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(self.league()['champion'], 'main/000010')
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        self.assertEqual(report['metrics']['posterior']['decision'], 'reject')
 
     def test_fill_order_seal_then_generalization_then_the_widest_ladder_pair(self):
         """Fill priority: the champion vs Seal while their interval is wide, then one round of the newest rated
