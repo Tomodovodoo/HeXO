@@ -290,6 +290,25 @@ struct Board {
     std::vector<Cell> legal_moves() const {
         if(winner>=0) return {};
         if(cells.empty()) return {{0,0}};
+        constexpr int64_t limit=1000000000000LL;
+        int64_t q0=limit,q1=-limit,r0=limit,r1=-limit;
+        for(auto [c,_]:cells) {q0=std::min(q0,c.q);q1=std::max(q1,c.q);r0=std::min(r0,c.r);r1=std::max(r1,c.r);}
+        const int64_t width=q1-q0+17,height=r1-r0+17;
+        if(width<=int64_t(1)<<22 && height<=int64_t(1)<<22 && width*height<=int64_t(1)<<22) {
+            // Dense (q, r)-major grid over the stones' box plus radius 8: row-major scanning is the sorted order.
+            std::vector<uint8_t> grid(size_t(width*height));
+            for(auto [c,_]:cells) for(int q=-8;q<=8;++q) {
+                auto row=grid.data()+(c.q-q0+8+q)*height+(c.r-r0+8);
+                for(int r=std::max(-8,-q-8);r<=std::min(8,-q+8);++r) row[r]=1;
+            }
+            for(auto [c,_]:cells) grid[size_t((c.q-q0+8)*height+c.r-r0+8)]=0;
+            std::vector<Cell> result;
+            for(int64_t i=0;i<width;++i) for(int64_t j=0;j<height;++j) if(grid[size_t(i*height+j)]) {
+                Cell p{q0-8+i,r0-8+j};
+                if(std::abs(p.q)<=limit && std::abs(p.r)<=limit) result.push_back(p);
+            }
+            return result;
+        }
         std::unordered_set<Cell,CellHash> out;
         for(auto [c,_]:cells) for(int q=-8;q<=8;++q)
             for(int r=std::max(-8,-q-8);r<=std::min(8,-q+8);++r) {

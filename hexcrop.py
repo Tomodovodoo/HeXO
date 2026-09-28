@@ -28,6 +28,7 @@ SYMMETRIES = np.array([[transform((1, 0), k), transform((0, 1), k)] for k in ran
 INVERSES = np.rint(np.linalg.inv(SYMMETRIES)).astype(np.int64)
 # Transformed x and y are +-q, +-r or +-(q+r): index 0, 1 or 2 into the ranges of (q, r, q+r).
 _AXIS_OF = np.array([[2 if m[0, j] and m[1, j] else int(m[1, j] != 0) for j in (0, 1)] for m in SYMMETRIES])
+_POSITIVE = np.array([[(m[0, j] or m[1, j]) > 0 for j in (0, 1)] for m in SYMMETRIES])  # +q, +r or +(q+r)
 _CELL = np.dtype([('q', '<i8'), ('r', '<i8'), ('player', '<i4')], align=True)
 assert _CELL.itemsize == C.sizeof(hexo.Cell)
 
@@ -100,12 +101,21 @@ def legal_array(game, moves):
     return np.stack((q+low[0], r+low[1]), 1)
 
 
-def _sides(points, halo=0):
-    """Required square side per symmetry, [12]."""
-    q, r = points[:, 0], points[:, 1]
-    s = q+r
-    ranges = np.array([np.ptp(q), np.ptp(r), np.ptp(s)])
-    return ranges[_AXIS_OF].max(1)+1+2*halo
+def _bounds(*arrays):
+    """(low, high), each int64 [3], of q, r and q+r over the [n, 2] point arrays."""
+    qrs = np.empty((3, sum(map(len, arrays))), np.int64)
+    start = 0
+    for a in arrays:
+        qrs[:2, start:start+len(a)] = a.T
+        start += len(a)
+    np.add(qrs[0], qrs[1], out=qrs[2])
+    return qrs.min(1), qrs.max(1)
+
+
+def _sides(points, halo=0, bounds=None):
+    """Required square side per symmetry, [12]; `bounds` is _bounds(points) when already known."""
+    low, high = _bounds(points) if bounds is None else bounds
+    return (high-low)[_AXIS_OF].max(1)+1+2*halo
 
 
 def _bucket(side):
@@ -131,8 +141,9 @@ def encode(history, *, symmetry=None, rng=None):
         game.close()
 
 
-def encode_game(game, history, *, symmetry=None, rng=None):
-    """Encode the position of `game`, whose placements are `history`.
+def encode_game(game, history, *, symmetry=None, rng=None, actions=None):
+    """Encode the position of `game`, whose placements are `history`; `actions` [N, 2], when given, must be its
+    legal moves in native order (legal_array is skipped).
 
     symmetry=None picks the symmetry with the smallest crop (lowest id on ties);
     with `rng` it picks uniformly among symmetries that fit the same bucket.
@@ -144,23 +155,24 @@ def encode_game(game, history, *, symmetry=None, rng=None):
         raise ValueError('Symmetry must be in 0..11')
     player, remaining = game.player, game.remaining
     moves = np.asarray(history, dtype=np.int64).reshape(-1, 2)
-    actions = legal_array(game, moves)
+    actions = legal_array(game, moves) if actions is None else actions
     n = len(moves)
-    points = np.concatenate((moves, actions))
-    sides = _sides(points)
+    bounds = _bounds(moves, actions)
+    sides = _sides(None, bounds=bounds)
     k = _choose(sides, symmetry, rng)
     halo = 0
     if sides[k] > BUCKETS[-1]:
         # Far mode: crop the stones plus a halo; legal cells outside are pooled.
-        halo, points = HALO, moves
-        sides = _sides(moves, HALO)
+        halo, bounds = HALO, _bounds(moves)
+        sides = _sides(None, HALO, bounds)
         k = _choose(sides, symmetry, rng)
         if sides[k] > BUCKETS[-1]:
             raise SpanError(f'Stones span {sides[k]} cells with halo; the largest bucket is {BUCKETS[-1]}')
     size = _bucket(sides[k])
-    t = points @ SYMMETRIES[k]
-    low = t.min(0)-halo
-    extent = t.max(0)+halo-low+1
+    # Transformed x and y are +-q, +-r or +-(q+r), so their bounds follow from `bounds`.
+    axis, positive = _AXIS_OF[k], _POSITIVE[k]
+    low = np.where(positive, bounds[0][axis], -bounds[1][axis])-halo
+    extent = np.where(positive, bounds[1][axis], -bounds[0][axis])+halo-low+1
     ox, oy = (size-extent)//2
     shift = np.array([ox, oy])-low
     xy = moves @ SYMMETRIES[k]+shift

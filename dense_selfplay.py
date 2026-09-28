@@ -171,11 +171,12 @@ class Evaluator(hexnet.DenseEvaluator):
         self.free = []
 
     @torch.inference_mode()
-    def submit(self, histories):
+    def submit(self, histories, legal=None):
+        """Launch the forwards for `histories`; `legal[i]`, when given, is history i's native legal list."""
         samples, groups = [], {}
         for i, h in enumerate(histories):
             try:
-                samples.append(hexcrop.encode_game(Position(h), h))
+                samples.append(hexcrop.encode_game(Position(h), h, actions=None if legal is None else legal[i]))
             except hexcrop.SpanError:
                 samples.append(None)
                 continue
@@ -206,7 +207,8 @@ class Evaluator(hexnet.DenseEvaluator):
                     out = self.model(x, x[:, 3:4], aux=False)
                 packed = torch.cat((out['policy'], out['far'][:, None], out['value_logit'][:, None]), 1)
                 chunks.append((size, chunk, result[start:start+len(chunk)].copy_(packed, non_blocking=True)))
-        event = torch.cuda.Event() if self.cuda else None
+        # A blocking-sync event parks collect() in the driver instead of spinning a core while the GPU works.
+        event = torch.cuda.Event(blocking=True) if self.cuda else None
         if event:
             event.record()
         return samples, chunks, event, staging
@@ -339,12 +341,17 @@ class Engine:
                     self.hits += 1
                     progress = True
                 else:
-                    pending.setdefault(model, {}).setdefault(key, [history]).append((slot, ptr, request))
+                    if key not in pending.setdefault(model, {}):
+                        legal = np.empty((native.hxg_legal(ptr, request, None), 2), np.int64)
+                        native.hxg_legal(ptr, request, legal.ctypes.data)
+                        pending[model][key] = [(history, legal)]
+                    pending[model][key].append((slot, ptr, request))
                     count += 1
         launched = []
         for model, positions in pending.items():
             keys = list(positions)
-            launched.append((model, positions, keys, model.evaluator.submit([positions[k][0] for k in keys])))
+            histories, legal = zip(*(positions[k][0] for k in keys))
+            launched.append((model, positions, keys, model.evaluator.submit(histories, legal)))
             self.calls += 1
             self.evals += len(keys)
         stopped = set()
