@@ -1306,17 +1306,22 @@ class Evaluator:
             return False
         entry, opponent, kind, games = task
         a, s = entry['id'], self.settings
-        target = games if kind == 'previous' else len(self.games(a, opponent))+games
+        target, decided = games if kind == 'previous' else len(self.games(a, opponent))+games, []
 
         def want():
             done = self.games(a, opponent)
-            if self.backlog() or len(done) >= target or (kind == 'sprt' and self.test(done)['decision']):
+            if kind == 'sprt' and done and (decision := self.test(done)['decision']):
+                decided.append(decision)  # an idle SPRT rematch keeps the first bound it crosses
+            if self.backlog() or len(done) >= target or decided:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
         self.session(want, target)
         path = report_path(self.run, a, opponent)
         if path.exists():
             report = json.loads(path.read_text())
+            if decided:
+                report['metrics']['sprt']['decision'] = decided[0]
+                write_json(path, report)
             self.record(a, opponent, report)
             if kind == 'sprt' and report['metrics']['sprt']['decision'] == 'H1' and self.league['champion'] == opponent \
                     and not entry.get('demoted'):

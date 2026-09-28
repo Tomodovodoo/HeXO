@@ -2651,6 +2651,21 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual((len(report['games']), report['metrics']['sprt']['decision']), (4, 'H1'))   # the pair in flight drains
         self.assertEqual(self.league()['champion'], 'main/000020')
 
+    def test_an_idle_sprt_rematch_keeps_the_bound_it_crossed(self):
+        evaluator = self.start(sprt_max_games=2, pool_games=4, games=4, idle_rematch=True)
+        for step in (10, 20):
+            self.export(step)
+            self.assertTrue(evaluator.step())
+        self.assertEqual(evaluator.optional()[1:], ('main/000010', 'sprt', 2))
+        test = evaluator.test
+        evaluator.test = lambda records: dict(test(records), decision='H1' if len(records) == 4 else None)
+        evaluator.settings = replace(evaluator.settings, sprt_max_games=4)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        self.assertEqual((len(report['games']), report['metrics']['sprt']['decision']), (6, 'H1'))   # a drained pair after H1
+        self.assertEqual(self.league()['champion'], 'main/000020')
+
     def test_a_candidate_with_direct_games_is_never_left_skipped(self):
         """The live case after a restart: main/027500 completed 64 games against champion main/019500 (+42 -10
         =12) but an older evaluator marked it skipped when main/030000 appeared. A fresh evaluator rates it on
