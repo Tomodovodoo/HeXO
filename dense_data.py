@@ -55,6 +55,7 @@ V_CLIP = .99
 CALIBRATION_FEATURES = 2*len(H_KNOTS)
 CALIBRATION_MIN_GAMES = 200
 CALIBRATION_RIDGE = 1.
+CALIBRATION_ITERATIONS = 25
 
 
 def legal_digest(actions):
@@ -126,7 +127,7 @@ def carried_values(roots, full=None):
     return np.where(last >= 0, u[np.maximum(last, 0)], math.nan)*sign
 
 
-def fit_calibration_rows(v, h, z, base, ridge=CALIBRATION_RIDGE, iterations=25):
+def fit_calibration_rows(v, h, z, base, ridge=CALIBRATION_RIDGE, iterations=CALIBRATION_ITERATIONS):
     """The Calibration with `base` fitted to rows (v, h, z): a logistic regression of z on calibration_features(v, h)
     over the rows with a finite v, by at most `iterations` Newton steps (stopping once no coefficient moves by 1e-8)
     from, and with an L2 penalty `ridge` toward, the map that carries no information: a(h) = logit(base) and
@@ -145,10 +146,11 @@ def fit_calibration_rows(v, h, z, base, ridge=CALIBRATION_RIDGE, iterations=25):
     return Calibration(tuple(coef.tolist()), base)
 
 
-def fit_calibration(games, min_games=CALIBRATION_MIN_GAMES):
-    """fit_calibration_rows on finished games [(roots, full or None, winner)] (roots as for carried_values), or
-    None for fewer than `min_games` games. Every ply t of a game of T plies is a row (v_t = carried value, NaN
-    before the first, h_t = T - t, z_t = 1 if the side to move won); base is the mean z_t over every ply."""
+def fit_calibration(games, min_games=CALIBRATION_MIN_GAMES, ridge=CALIBRATION_RIDGE, iterations=CALIBRATION_ITERATIONS):
+    """fit_calibration_rows (with `ridge` and `iterations`) on finished games [(roots, full or None, winner)]
+    (roots as for carried_values), or None for fewer than `min_games` games. Every ply t of a game of T plies is a
+    row (v_t = carried value, NaN before the first, h_t = T - t, z_t = 1 if the side to move won); base is the mean
+    z_t over every ply."""
     if len(games) < min_games:
         return None
     v, h, z = [], [], []
@@ -156,7 +158,7 @@ def fit_calibration(games, min_games=CALIBRATION_MIN_GAMES):
         T = len(roots)
         v.append(carried_values(roots, full)); h.append(T-np.arange(T)); z.append((((np.arange(T)+1)//2 % 2) == winner).astype(np.float64))
     z = np.concatenate(z)
-    return fit_calibration_rows(np.concatenate(v), np.concatenate(h), z, float(z.mean()))
+    return fit_calibration_rows(np.concatenate(v), np.concatenate(h), z, float(z.mean()), ridge, iterations)
 
 
 def value_targets(players, root_values, winner, lam=.9, full=None, outcome_lam=1., calibration=None):

@@ -132,15 +132,16 @@ def searched_value(episode, ply):
     return math.nan
 
 
-def calibration_reference(fit_value, fit_remaining, fit_outcome, value, remaining):
-    """P(outcome = 1 | value, remaining) for the query rows from dense_data.fit_calibration_rows on the fit rows
-    (the value target map's basis, shrinkage and fit) with base the mean fit outcome clipped to [1e-3, 1 - 1e-3].
-    Query rows without a finite value, and every row when no fit row has one, get the base rate; None without fit
-    rows."""
+def calibration_reference(fit_value, fit_remaining, fit_outcome, value, remaining,
+                          ridge=dense_data.CALIBRATION_RIDGE, steps=dense_data.CALIBRATION_ITERATIONS):
+    """P(outcome = 1 | value, remaining) for the query rows from dense_data.fit_calibration_rows (the value target
+    map's basis, shrinkage and fit, with `ridge` and at most `steps` Newton steps) on the fit rows, with base the
+    mean fit outcome clipped to [1e-3, 1 - 1e-3]. Query rows without a finite value, and every row when no fit row
+    has one, get the base rate; None without fit rows."""
     y = np.asarray(fit_outcome, np.float64)
     if not len(y): return None
     base = float(np.clip(y.mean(), 1e-3, 1-1e-3))
-    return dense_data.fit_calibration_rows(fit_value, fit_remaining, y, base).predict(value, remaining)
+    return dense_data.fit_calibration_rows(fit_value, fit_remaining, y, base, ridge, steps).predict(value, remaining)
 
 
 def value_regret(bce, outcome, reference, remaining):
