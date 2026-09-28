@@ -2662,6 +2662,48 @@ class EvaluatorLoopTests(unittest.TestCase):
         fresh = dense_eval.public(evaluator.verdict('main/027500', 'main/025000'))   # no direct game yet: no numbers
         self.assertEqual((fresh['direct']['games'], fresh['delta'], fresh['p_better'], fresh['pooled']), (0, None, None, None))
 
+    def test_starting_games_is_charged_to_the_pacer(self):
+        """Seal plays its first turns while a game is built, so the time spent starting games counts as playing."""
+        evaluator = self.start(sprt_max_games=4)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        now, charged, start = [evaluator.pacer.clock()], [], evaluator.start
+        evaluator.pacer.clock = lambda: now[0]
+        evaluator.pacer.played = lambda a, b, weight=1: charged.append(b-a)
+        def slow(pool, lane):
+            now[0] += 5.
+            start(pool, lane)
+        evaluator.start = slow
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            evaluator.step()
+        self.assertEqual(sum(charged), 10.)                                 # two pairs started, 5 s each
+
+    def test_a_fresh_evaluator_promotes_a_rated_leader_from_existing_reports(self):
+        """On start the promotion rule is re-applied to the reports on disk: main/025000, rated but not promoted,
+        leads with +38 -11 =15 in 64 direct games against the champion and is crowned without a new game."""
+        self.export(17000, 19500, 25000)
+        self.start()
+        self.report('main/019500', 'main/017000', [1]*12+[0]*8)                     # parity 1.38, as live (1.45)
+        self.report('main/025000', 'main/019500', [1, 1]*19+[0, 0]*5+[0, .5]+[.5]*14)
+        entry = lambda step, elo: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, elo_interval=None, matches=[])
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/019500', checkpoints=[
+            entry(17000, 0.), entry(19500, 60.), entry(25000, 200.)])))
+        evaluator = self.start(decision='sprt', sprt_min_games=64)
+        evaluator.review()
+        self.assertEqual(evaluator.league['champion'], 'main/019500')                 # the rule applies in posterior mode
+        evaluator = self.start(decision='posterior', sprt_min_games=66, anchor_games=2)
+        evaluator.review()
+        self.assertEqual(evaluator.league['champion'], 'main/019500')                 # too few direct games
+        evaluator = self.start(decision='posterior', sprt_min_games=64, anchor_games=2)
+        evaluator.review()
+        self.assertEqual((self.league()['champion'], json.loads((self.run/'champion.json').read_text())['checkpoint']),
+                         ('main/025000', 'main/025000'))
+        self.assertEqual(evaluator.anchor()[0]['id'], 'main/025000')                  # its Seal anchor is scheduled
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([e['kind'] for e in events if e['kind'] in ('decision', 'promotion')], ['decision', 'promotion'])
+        self.assertIn('promote on review', events[-2]['message'])
+
     def test_games_finished_on_creation_occupy_the_pool(self):
         pool = dense_eval.Pool(64)
         lane = ('a', 'b', 'evidence')

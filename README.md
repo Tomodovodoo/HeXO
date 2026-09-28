@@ -807,7 +807,8 @@ optimizer files, and records the new source identity. Normal later resumes omit
   completed colour pair. A newer checkpoint or a pairing change stops new games of the old pairing; its
   running games finish and count. A superseded decision settles on all of them: the candidate is promoted when
   P(candidate - champion > `sprt_elo0`) is at least `promote_confidence`, whether or not the other readiness
-  conditions hold (`decision sprt` settles the same way).
+  conditions hold (`decision sprt` settles the same way). On every start the evaluator re-applies the rule to
+  the reports on disk, and a rated checkpoint that already passes it is crowned at once.
 - **Streaming.** `evaluator-status.json` carries the pool composition, the running tally of the current
   comparison (updated per finished game) and the pending verdict. The dashboard shows all three, including a
   provisional league row for the candidate.

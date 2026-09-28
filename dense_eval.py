@@ -37,7 +37,7 @@ games, while the candidate's rating sd about the league mean is at most uncertai
 the direct-only and pooled 95% intervals overlap, the candidate is promoted when it has the highest posterior rating
 of the rated checkpoints and P(delta > sprt_elo0) >= promote_confidence, and rejected when that probability is at
 most 1 - promote_confidence (`Evaluator.verdict`), re-judged after every completed colour pair; until then direct
-games keep playing. Direct games fill
+games keep playing. On start the rule is re-applied to the existing reports (`Evaluator.review`). Direct games fill
 the pool until sprt_min_games are complete; after that at most evidence_share of the pool may go to the evidence
 pairing that most reduces Var(delta) (value of information: the candidate or champion vs the previous champion or
 Seal, `Evaluator.evidence`), up to sprt_max_games direct games. Supersession settles once the games in flight have
@@ -629,7 +629,7 @@ class Evaluator:
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
         if self.league['checkpoints'] and ('matrix' not in self.league or self.league.get('ladder_top') != settings.fill_top):
             write_league(self.run, self.league, self.config, self.settings.fill_top)
-        self.models, self.seal, self.written, self.fill_target, self.deciding = {}, None, 0., None, None
+        self.models, self.seal, self.written, self.fill_target, self.deciding, self.reviewed = {}, None, 0., None, None, False
         self.book, self.next, self.shas = {}, {}, {}
         self.status = dict(stage='idle', updated_at=None, comparison=None, pool=[], started_at=None, games_played=0,
                            games_planned=0, tally=None, decision=None, placements_played=0, mean_placements=None,
@@ -742,7 +742,8 @@ class Evaluator:
         completed colour pair; a finished game's slot is refilled before the next engine step, and a lane want()
         drops (or shrinks) starts no new games while its running games finish and count. Games in flight never
         exceed pool_games, nor, per kind, the games wanted of that kind: a draining lane's games count against its
-        replacement's. No game starts while the
+        replacement's. The Pacer is charged for engine steps and for starting games (Seal plays its first turns
+        then). No game starts while the
         Pacer's credit is negative; with nothing running the session then waits. Every completed pair is
         persisted at once."""
         pool, waiting, added = Pool(self.config.actor.leaf_batch), {}, {}
@@ -771,10 +772,12 @@ class Evaluator:
             ready = self.pacer.ready()
             if lanes and ready:
                 kinds = {kind: sum(n for lane, n in lanes.items() if lane[2] == kind) for _, _, kind in lanes}
+                tick = self.pacer.clock()  # starting games plays Seal's first turns: playing time
                 for lane, share in lanes.items():
                     while pool.running(lane)+2 <= share and pool.running(kind=lane[2])+2 <= kinds[lane[2]] \
                             and pool.running()+2 <= self.settings.pool_games:
                         self.start(pool, lane)
+                self.pacer.played(tick, self.pacer.clock())
             if not pool.running():
                 if lanes and not ready:
                     self.pacer.wait(lambda: show('throttled', True))
@@ -1043,6 +1046,35 @@ class Evaluator:
         found = {r['opponent']: r for r in load_reports(self.run, s) if r['candidate'] == cid}
         return {champion: found[champion], **found}, verdict
 
+    def review(self):
+        """Posterior mode, once per evaluator (so after every restart or settings change): re-apply the promotion
+        rule to the existing reports. Of the rated checkpoints, neither skipped nor demoted, with at least
+        sprt_min_games direct games against the champion (their report against it), those whose `verdict`
+        meets uncertainty parity, P(delta > sprt_elo0) >= promote_confidence and agreeing direct and pooled
+        intervals are eligible; the one of highest posterior rating is promoted ('decision' event 'promote on
+        review', then the 'promotion' event; its Seal anchor is scheduled as for any promotion)."""
+        s, champion = self.settings, self.league['champion']
+        if s.decision != 'posterior' or champion is None:
+            return
+        eligible = []
+        for c in self.league['checkpoints']:
+            if c['id'] == champion or c.get('elo') is None or c.get('skipped') or c.get('demoted') \
+                    or len(self.games(c['id'], champion)) < s.sprt_min_games:
+                continue
+            verdict = self.verdict(c['id'], champion)
+            if verdict['spread'][0] <= verdict['spread'][1]*s.uncertainty_parity and not verdict['disagree'] \
+                    and verdict['p_better'] >= s.promote_confidence:
+                eligible.append((verdict['posterior'].rating(c['id']), c['id'], verdict))
+        if not eligible:
+            return
+        _, cid, verdict = max(eligible)
+        verdict = dict(public(verdict), decision='promote', review=True)
+        log_event(self.run, 'evaluator', 'decision', f'{cid} vs {champion}: promote on review of the existing reports '
+                  f'({verdict["direct"]["games"]} direct games, P(delta > {s.sprt_elo0:g}) {verdict["p_better"]:.3f})',
+                  candidate=cid, opponent=champion, **verdict)
+        self.promote(cid, champion)
+        write_league(self.run, self.league, self.config, self.settings.fill_top)
+
     def sequential(self, cid, champion):
         """SPRT mode: a session of cid vs the champion until the SPRT decides, sprt_max_games games are complete
         or a newer checkpoint of cid's variant exists (the games in flight finish and count). Returns ({champion:
@@ -1205,13 +1237,17 @@ class Evaluator:
 
     def step(self):
         """One unit of work; False when there is none. First judges every panel already complete on disk
-        (`settle`, e.g. after a restart), so no candidate meets a regressed champion; then rates the newest
+        (`settle`, e.g. after a restart), so no candidate meets a regressed champion, and on the first step
+        re-applies the promotion rule to the existing reports (`review`); then rates the newest
         unrated checkpoint of the variant whose newest unrated checkpoint is oldest, skipping that variant's older
         unrated checkpoints (an unrated checkpoint whose report against the champion exists first: an evaluation
         cut short by a restart resumes there, or settles when superseded), or else plays a session of the
         champion's Seal anchor (`anchor`), else of an optional comparison, else of fill work (`fill`), each until
         its games are complete or a checkpoint waits (the games in flight then finish and count)."""
         self.settle()
+        if not self.reviewed:
+            self.reviewed = True
+            self.review()
         known = {c['id'] for c in self.league['checkpoints']}
         unrated = [e for e in checkpoints(self.run) if e[0] not in known]
         self.status['backlog'] = [e[0] for e in unrated]
