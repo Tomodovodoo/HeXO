@@ -332,6 +332,30 @@ class HexNetTests(unittest.TestCase):
             wide = torch.randn(1, 3, 130, 130)
             torch.testing.assert_close(conv(wide), line_conv_reference(wide, conv.weight), atol=1e-5, rtol=1e-5)
 
+    def test_line_conv_gradients_match_direct_sum(self):
+        conv = hexnet.LineConv(3, 5)
+        with torch.no_grad():
+            conv.weight.normal_()
+        x = torch.randn(4, 3, 9, 9, dtype=torch.float64, requires_grad=True)
+        grad = torch.randn(4, 3, 9, 9, dtype=torch.float64)
+        conv.double()
+        got = torch.autograd.grad(conv(x), (x, conv.weight), grad)
+        expected = torch.autograd.grad(line_conv_reference(x, conv.weight), (x, conv.weight), grad)
+        for g, e in zip(got, expected):
+            torch.testing.assert_close(g, e)
+
+    def test_line_conv_under_autocast_with_float_input(self):
+        conv = hexnet.LineConv(3, 5)
+        with torch.no_grad():
+            conv.weight.normal_()
+        x = torch.randn(2, 3, 9, 9)
+        expected = line_conv_reference(x, conv.weight.detach())
+        for grad in (True, False):
+            with torch.set_grad_enabled(grad), torch.autocast('cpu', torch.bfloat16):
+                got = conv(x)
+            self.assertEqual(got.dtype, torch.bfloat16)
+            torch.testing.assert_close(got.float(), expected, atol=.1, rtol=.02)
+
     def test_line_conv_inference_matrices_match_training_matrices(self):
         conv = hexnet.LineConv(4, 11)
         with torch.no_grad():

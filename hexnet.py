@@ -27,7 +27,7 @@ AXES = ((1, 0), (0, 1), (1, -1))    # index directions (dx, dy)
 WINDOW = 6
 FEATURES = len(hexcrop.PLANES)+2*len(AXES)+4
 # Inference line convolutions run in batch chunks of at most this many crop cells: their matmul temporaries
-# (about six chunk-sized activations, ~60 MB at 96 channels) then stay below the 3x3 convolutions' layout
+# (about four chunk-sized activations, ~45 MB at 96 channels) then stay below the 3x3 convolutions' layout
 # copies at dense_selfplay.MAX_CELLS; smaller chunks save no peak memory and add launches.
 LINE_CHUNK_CELLS = 55296
 
@@ -104,15 +104,12 @@ def _toeplitz(weight, n):
     return torch.where((d >= 0) & (d < length), weight[:, d.clamp(0, length-1)], 0)
 
 
-def _skew(x):
-    """[..., H, W] -> [..., H, H+W-1] with out[y, x+y] = x[y, x]: anti-diagonals become columns."""
-    h, w = x.shape[-2:]
-    return F.pad(x, (0, h)).flatten(-2)[..., :h*(w+h-1)].unflatten(-1, (h, w+h-1))
-
-
-def _unskew(x, w):
-    h = x.shape[-2]
-    return F.pad(x.flatten(-2), (0, h)).unflatten(-1, (h, w+h))[..., :w]
+def _skewed(x):
+    """View of a [C, H, B, H+W-1] buffer as [C, H, B, W] with view[c, y, b, x] = buffer[c, y, b, x+y]: in the
+    buffer the anti-diagonals of every image are columns."""
+    c, h, b, wide = x.shape
+    w = wide-h+1
+    return x.as_strided((c, h, b, w), (h*b*wide, b*wide+1, wide, 1), x.storage_offset())
 
 
 class LineConv(nn.Module):
@@ -123,6 +120,8 @@ class LineConv(nn.Module):
     kernels are slow at these sizes, so each axis is a per-channel Toeplitz
     matmul; the anti-diagonal runs as a column matmul on a skewed copy. The
     matrices are rebuilt on every call (no per-size cache holds GPU memory).
+    The matmuls run in a [C, H, B, W] layout, where each is one bmm over the
+    channels: a [B, C] batched matmul would copy the matrices B times.
     """
     def __init__(self, channels, length):
         super().__init__()
@@ -141,8 +140,21 @@ class LineConv(nn.Module):
         return tuple(taps.gather(2, index.expand(-1, taps.shape[1], -1)).unflatten(2, (size, size)))
 
     def lines(self, x, matrices):
+        """The line convolution of x [B, C, H, W] with matrices from self.matrices, as a [B, C, H, W] view."""
         horizontal, vertical, diagonal = matrices
-        return torch.matmul(x, horizontal)+torch.matmul(vertical, x)+_unskew(torch.matmul(diagonal, _skew(x)), x.shape[-1])
+        b, c, h, w = x.shape
+        # The skewed copy (two activations wide) is freed before the planar copy is made, so the temporaries
+        # peak near four chunk-sized activations (see LINE_CHUNK_CELLS).
+        skewed = x.new_zeros(c, h, b, h+w-1)
+        _skewed(skewed).copy_(x.permute(1, 2, 0, 3))
+        diagonal = torch.bmm(diagonal, skewed.view(c, h, b*(h+w-1))).view(c, h, b, h+w-1)
+        del skewed
+        planar = x.permute(1, 2, 0, 3).contiguous()     # [C, H, B, W]: the rows of every image side by side
+        out = torch.bmm(planar.view(c, h*b, w), horizontal).view(c, h, b*w)
+        # In place: autocast leaves baddbmm_ alone, so its operands take the dtype autocast gave the bmm.
+        out.baddbmm_(vertical.to(out.dtype), planar.view(c, h, b*w).to(out.dtype))
+        del planar
+        return out.view(c, h, b, w).add_(_skewed(diagonal)).permute(2, 0, 1, 3)
 
     def forward(self, x):
         return self.lines(x, self.matrices(x.shape[-2], x.dtype))
