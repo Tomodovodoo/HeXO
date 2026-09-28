@@ -577,7 +577,7 @@ class EvaluatorBookTests(unittest.TestCase):
         book = dense_openings.Book(self.run, settings())
         drawn = [opening(book, [(0, 0), (1, 0), (-1, 0)]), opening(book, [(0, 0), (1, 0), (1, -1), (2, 0)])]
         book.retire(opening(book, [(0, 0), (3, 0), (2, 1)]), 'skew', 0.)
-        book.data.update(refreshed_by=CHAMPION, refreshed_at=time.time(), migrated=True)
+        book.data.update(refreshed_by=CHAMPION, refreshed_at=time.time(), imported=True)
         book.save()
         self.export(10)
         evaluator = self.start()
@@ -652,6 +652,25 @@ class EvaluatorBookTests(unittest.TestCase):
         evaluator.step()
         self.assertGreater(self.saved()['refreshed_at'], state['refreshed_at'])
 
+    def test_a_pair_the_book_missed_before_a_stop_is_counted_on_restart(self):
+        self.export(10)
+        evaluator = self.start(sprt_max_games=4)
+        evaluator.step()
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 0)), \
+                unittest.mock.patch.object(dense_openings.Book, 'record', side_effect=Crash):
+            with self.assertRaises(Crash):                                  # stopped after the report write
+                evaluator.step()
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', CHAMPION).read_text())
+        self.assertEqual((len(report['games']), self.saved()['counted'].get(report['id'], 0)), (2, 0))
+        restarted = self.start(sprt_max_games=4)
+        root = lambda: restarted.openings.nodes[dense_openings.canonical([(0, 0)])[0]]
+        self.assertEqual((root()['games'], root()['pairs'][4]), (2, 1))
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 0)):
+            restarted.step()                                                # resumes the report and keeps its id
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', CHAMPION).read_text())
+        self.assertEqual((len(report['games']), self.saved()['counted'][report['id']], root()['games']), (4, 2, 4))
+
     def test_the_standard_suite_is_a_frozen_book_with_its_statistics_in_the_run(self):
         self.export(10)
         played = dense_openings.Book(self.run, dense_config.EvaluationSettings()).openings()[0]['moves']
@@ -664,7 +683,7 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual(evaluator.settings.opening_book, '')
         self.assertTrue(dense_eval.same_protocol(old, evaluator.settings))   # written before opening_book existed
         counted = self.saved('openings-standard-v1.json')
-        self.assertTrue(counted['migrated'])
+        self.assertEqual(counted['counted'], {dense_openings.report_id(old): 1})
         self.assertEqual(next(n for n in counted['nodes'] if n['depth'] == 1)['pairs'], [0, 0, 0, 0, 1])
         self.assertTrue(evaluator.step())
         self.export(20)

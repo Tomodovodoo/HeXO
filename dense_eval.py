@@ -26,8 +26,8 @@ Run layout: dense_config. Subcommands
              draws its openings from the opening book of opening_suite (dense_openings: the live book 'book' or a
              frozen suite such as 'standard-v1'); each completed pair is recorded on the book's nodes, a live book is
              refreshed between steps (`Evaluator.refresh_openings`), and reports are reused only under the book state
-             they were played in (`same_protocol`). A book file is created on first use and first counts the pairs
-             of the existing reports (dense_openings.Book.migrate).
+             they were played in (`same_protocol`). On start the book counts the pairs its file misses from the
+             existing reports (dense_openings.Book.reconcile; reports carry an `id` for it).
   calibrate  continue capped self-play games with the champion and score TD(lambda) value targets against
              the realised results.
   match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal.
@@ -86,6 +86,7 @@ import json
 import math
 from pathlib import Path
 import time
+import uuid
 
 import numpy as np
 import torch
@@ -302,9 +303,10 @@ def report_path(run, candidate, opponent):
     return Path(run)/'evaluations'/f'{candidate.replace("/", "-")}-vs-{opponent.replace("/", "-")}'/'report.json'
 
 
-def make_report(candidate, opponent, records, shas, settings):
-    """Report of a finished comparison; `shas` maps checkpoint ids to their ema.pt digests."""
-    return dict(candidate=candidate, opponent=opponent, created_at=time.time(),
+def make_report(candidate, opponent, records, shas, settings, report_id=None):
+    """Report of a finished comparison; `shas` maps checkpoint ids to their ema.pt digests and `report_id` is the
+    report's `id` (a new one when None), kept while pairs are appended."""
+    return dict(id=report_id or uuid.uuid4().hex, candidate=candidate, opponent=opponent, created_at=time.time(),
                 candidate_sha256=shas[candidate], opponent_sha256=SEAL if opponent == SEAL else shas[opponent],
                 settings=asdict(settings),
                 metrics=paired_metrics(records), summary=summary(records), games=records)
@@ -485,7 +487,9 @@ def variant_heads(entries, rated=lambda c: True):
 def write_league(run, league, config, top=None):
     """Recompute ratings, the payoff matrix and the ladder (`top` checkpoints, default config.evaluation.fill_top)
     from every report among rated (not skipped) ids and Seal, then publish league.json; skipped entries keep elo
-    and elo_interval null."""
+    and elo_interval null. The ratings pool the reports of every protocol, opening-book states included, so a
+    refresh never empties the ladder; the promotion posterior, panels and rematches use protocol-matching reports only
+    (`same_protocol`)."""
     run = Path(run)
     ids = [c['id'] for c in league['checkpoints'] if not c.get('skipped')]
     reports = [r for r in load_reports(run) if r['candidate'] in ids and (r['opponent'] in ids or r['opponent'] == SEAL)]
@@ -640,7 +644,7 @@ class Evaluator:
 
     def __init__(self, run, config, settings, pacer):
         self.openings = dense_openings.Book(run, settings)
-        self.openings.migrate(load_reports(run))
+        self.openings.reconcile(load_reports(run))
         settings = replace(settings, opening_book=self.openings.digest())
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
         path = self.run/'league.json'
@@ -648,7 +652,7 @@ class Evaluator:
         if self.league['checkpoints'] and ('matrix' not in self.league or self.league.get('ladder_top') != settings.fill_top):
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         self.models, self.seal, self.written, self.fill_target, self.deciding, self.reviewed = {}, None, 0., None, None, False
-        self.book, self.next, self.shas = {}, {}, {}
+        self.book, self.next, self.ids, self.shas = {}, {}, {}, {}
         self.status = dict(stage='idle', updated_at=None, comparison=None, pool=[], started_at=None, games_played=0,
                            games_planned=0, tally=None, decision=None, placements_played=0, mean_placements=None,
                            placements_per_second=None, settings=asdict(settings), eval_share=pacer.share, backlog=[],
@@ -720,8 +724,9 @@ class Evaluator:
 
     def open(self, a, b):
         """Load report a-vs-b for appending and number its next opening pair after the highest one it holds, so a
-        restart resumes the pairing. A report played under another protocol is kept as report-<created_at>.json
-        beside it (outside load_reports) with an 'info' event, and a new one starts."""
+        restart resumes the pairing; the report keeps its id (dense_openings.report_id). A report played under another
+        protocol is kept as report-<created_at>.json beside it (outside load_reports) with an 'info' event, and a new
+        one starts with a new id."""
         if (a, b) in self.book:
             return
         path = report_path(self.run, a, b)
@@ -734,6 +739,7 @@ class Evaluator:
             old = None
         self.book[a, b] = list(old['games']) if old else []
         self.next[a, b] = max((g['pair'] for g in self.book[a, b]), default=-1)+1
+        self.ids[a, b] = dense_openings.report_id(old) if old else uuid.uuid4().hex
 
     def start(self, pool, lane):
         """Start the next opening pair of lane (a, b, kind) in `pool`: both colours at once (`paired_games`)."""
@@ -750,14 +756,14 @@ class Evaluator:
         for name in (a, b):
             if name != SEAL and name not in self.shas:
                 self.shas[name] = digest(self.run/'checkpoints'/name/'ema.pt')
-        report = make_report(a, b, records, self.shas, self.settings)
+        report = make_report(a, b, records, self.shas, self.settings, self.ids[a, b])
         if kind == 'sprt':
             result = self.test(records)
             report['metrics']['sprt'] = dict(result, decision=result['decision'] or 'max-games')
         path = report_path(self.run, a, b)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json(path, report)
-        self.openings.record(pair)
+        self.openings.record(pair, self.ids[a, b])
         for record in pair:
             if record['reason'] == 'span':
                 log_event(self.run, 'evaluator', 'error', f'{a} vs {b} pair {record["pair"]}: game counted as capped at ply '
@@ -1280,13 +1286,17 @@ class Evaluator:
     def refresh_openings(self):
         """Refresh a live book with the champion's model when it is due (dense_openings.Book.due: the champion
         changed or book_refresh_hours passed), stamp settings.opening_book with its new digest, log a 'book' event
-        and republish the league."""
+        and republish the league. A new digest drops the open pairings' cached games, so each reopens (`open`) under
+        the new state."""
         champion, now = self.league['champion'], time.time()
         if champion is None or not self.openings.due(champion, now):
             return
         self.use(champion)
         rng = np.random.default_rng(pair_seed(self.config.seed, f'book/{champion}', int(now)))
         result = self.openings.refresh(self.models[champion], champion, rng, now, self.config.actor.leaf_batch)
+        if result['digest'] != self.settings.opening_book:
+            for cache in (self.book, self.next, self.ids):
+                cache.clear()
         self.settings = replace(self.settings, opening_book=result['digest'])
         self.status['settings'] = asdict(self.settings)
         log_event(self.run, 'evaluator', 'book', f'opening book refreshed by {champion}: {result["added"]} added, retired '

@@ -865,8 +865,9 @@ always score finished games against their hard outcome.
   probability below `book_min_prob`) and the skewed ones (first-player skew interval beyond ±`book_max_skew`
   Elo after `book_min_games` pairs); a skewed opening makes way for a child. The champion also challenges
   `book_revisit_fraction` of the settled openings with alternatives at the same depth, and the more balanced one
-  stays. Retired openings are replaced until the target is met again. On first use a book counts the existing
-  reports' pairs, and the first refresh adopts the plausible, balanced positions among them. A report is reused
+  stays. Retired openings are replaced until the target is met again. On start a book counts every report pair it
+  has not counted yet (the first time, a live book imports the other suites' reports too), and a refresh adopts
+  the plausible, balanced positions among them. A report is reused
   only under the book state it was played in: a refresh that changes the openings starts comparisons afresh.
   `league.json` `openings` holds P1/P2 results overall and per player, and each book's counts, depths and skew
   histogram. `/api/openings` serves the DAG with its statistics. `python dense_openings.py refresh|stats|prune
