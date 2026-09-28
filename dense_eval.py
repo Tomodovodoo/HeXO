@@ -702,14 +702,19 @@ class Evaluator:
         return report['games'] if report and same_protocol(report, self.settings) else []
 
     def open(self, a, b):
-        """Load report a-vs-b for appending (its protocol must match) and number its next opening pair after the
-        highest one it holds, so a restart resumes the pairing."""
+        """Load report a-vs-b for appending and number its next opening pair after the highest one it holds, so a
+        restart resumes the pairing. A report played under another protocol is kept as report-<created_at>.json
+        beside it (outside load_reports) with an 'info' event, and a new one starts."""
         if (a, b) in self.book:
             return
         path = report_path(self.run, a, b)
         old = json.loads(path.read_text()) if path.exists() else None
         if old and not same_protocol(old, self.settings):
-            raise ValueError(f'{path} was played under another protocol')
+            kept = path.with_name(f'report-{int(old["created_at"])}.json')
+            path.replace(kept)
+            log_event(self.run, 'evaluator', 'info', f'{a} vs {b}: the report played under another protocol is kept as '
+                      f'{kept.name}; a new one starts', candidate=a, opponent=b)
+            old = None
         self.book[a, b] = list(old['games']) if old else []
         self.next[a, b] = max((g['pair'] for g in self.book[a, b]), default=-1)+1
 

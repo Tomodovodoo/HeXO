@@ -2710,6 +2710,25 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual([e['kind'] for e in events if e['kind'] in ('decision', 'promotion')], ['decision', 'promotion'])
         self.assertIn('promote on review', events[-2]['message'])
 
+    def test_a_restart_under_another_protocol_starts_the_candidate_afresh(self):
+        evaluator = self.start(sprt_max_games=6)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.export(20)
+        def crash(pool, steps):
+            if steps == 3:
+                raise Crash
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=crash)), self.assertRaises(Crash):
+            evaluator.step()
+        path = dense_eval.report_path(self.run, 'main/000020', 'main/000010')
+        created = json.loads(path.read_text())['created_at']
+        evaluator = self.start(sprt_max_games=6, sims=3)                        # e.g. restarted with --eval-sims 3
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())
+        report = json.loads(path.read_text())
+        self.assertEqual((report['settings']['sims'], len(report['games'])), (3, 6))
+        self.assertEqual(len(json.loads(path.with_name(f'report-{int(created)}.json').read_text())['games']), 2)
+
     def test_half_finished_pairs_hold_their_slots_against_the_budget(self):
         """Every colour-0 game finishes before any colour-1 game: the finished halves still count against the
         comparison's budget, so exactly sprt_max_games games are played."""
