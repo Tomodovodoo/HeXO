@@ -10,9 +10,8 @@ Run layout: dense_config. Subcommands
              the variant. A champion SPRT that sees a newer
              checkpoint of its variant after an undecided round stops there (decision 'superseded', entry
              superseded true, no promotion); a bound crossed in that round still decides. All play is paced by `eval_share` (Pacer); --processes splits each round
-             over worker subprocesses (each about 0.7 GB of VRAM: on an 8 GB card two workers leave room for
-             three actor processes, not four); --eval-* flags override evaluation settings for this process
-             (reports record the effective settings). Writes evaluations/<a>-vs-<b>/report.json (reused when present),
+             over worker subprocesses (each about 0.35 GB of VRAM with b6c96 models); --eval-* flags override
+             evaluation settings for this process (reports record the effective settings). Writes evaluations/<a>-vs-<b>/report.json (reused when present),
              league.json, champion.json on promotion, evaluator-status.json (Evaluator.publish) and events.
   calibrate  continue capped self-play games with the champion and score TD(lambda) value targets against
              the realised results.
@@ -59,6 +58,7 @@ import torch
 import dense_config
 from dense_config import log_event
 import dense_data
+import hexnet
 from arena import Seal
 from dense_selfplay import Engine, checkpoints, expected, load
 from hexo import Game
@@ -504,13 +504,14 @@ def match_entry(opponent, report):
 class Evaluator:
     """The `loop` evaluator of one run (module contract) with `settings` in place of config.evaluation.
     step() does one unit of work. Each round runs in this process (processes 1) or is split into contiguous
-    shares of its opening pairs over `processes` `pairs` subprocesses (each loads both models, about 0.7 GB
+    shares of its opening pairs over `processes` `pairs` subprocesses (each loads both models, about 0.35 GB
     of VRAM on CUDA); records, seeds and openings do not depend on `processes`. publish() maintains
     evaluator-status.json: {stage ('idle', 'playing', 'throttled' or 'failed'), updated_at, comparison
     ({candidate, opponent, kind 'champion', 'previous', 'anchor', 'panel', 'incumbent', 'sprt' or
     'replacement'} or null), games_played, games_planned
     (sprt_max_games for the champion), placements_per_second (current round, both sides, all processes),
-    backlog (unrated checkpoint ids at the last step), processes, eval_share_used (Pacer.used), error}."""
+    backlog (unrated checkpoint ids at the last step), processes, eval_share_used (Pacer.used), vram
+    (hexnet.vram() of this process; `pairs` workers are not included), error}."""
 
     def __init__(self, run, config, settings, pacer, processes=1):
         self.run, self.config, self.settings, self.pacer, self.processes = Path(run), config, settings, pacer, processes
@@ -528,7 +529,7 @@ class Evaluator:
         if force or time.monotonic()-self.written >= STATUS_SECONDS:
             self.written = time.monotonic()
             write_json(self.run/'evaluator-status.json',
-                       dict(self.status, updated_at=time.time(), eval_share_used=self.pacer.used()))
+                       dict(self.status, updated_at=time.time(), eval_share_used=self.pacer.used(), vram=hexnet.vram()))
 
     def use(self, *names):
         """Load the named checkpoints (Seal once, lazily) and release every other model."""
@@ -1031,7 +1032,7 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('loop'); p.add_argument('--run', required=True); p.add_argument('--once', action='store_true')
     p.add_argument('--poll', type=float, default=30.)
-    p.add_argument('--processes', type=int, default=1, help='worker processes per round (about 0.7 GB of VRAM each)')
+    p.add_argument('--processes', type=int, default=1, help='worker processes per round (about 0.35 GB of VRAM each)')
     dense_config.add_arguments(p.add_argument_group('evaluation overrides for this process'), dense_config.EvaluationSettings, 'eval_')
     p = sub.add_parser('pairs', help='internal: one worker of loop --processes')
     for flag in ('--run', '--candidate', '--opponent', '--settings', '--out'):

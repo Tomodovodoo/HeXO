@@ -26,7 +26,10 @@ SCHEMA = 'hexo-dense-policy-value-v1'
 AXES = ((1, 0), (0, 1), (1, -1))    # index directions (dx, dy)
 WINDOW = 6
 FEATURES = len(hexcrop.PLANES)+2*len(AXES)+4
-CACHED_SIZE = 128   # line matrices of the rare larger crops are rebuilt per call (~2 ms at 256)
+# Inference line convolutions run in batch chunks of at most this many crop cells: their matmul temporaries
+# (about six chunk-sized activations, ~60 MB at 96 channels) then stay below the 3x3 convolutions' layout
+# copies at dense_selfplay.MAX_CELLS; smaller chunks save no peak memory and add launches.
+LINE_CHUNK_CELLS = 55296
 
 
 @dataclass(frozen=True)
@@ -118,33 +121,53 @@ class LineConv(nn.Module):
     out[c, y, x] = sum_a sum_i weight[c, a, i] * in[c, y+(i-L//2)*dy_a, x+(i-L//2)*dx_a]
     for the index directions (dx, dy) = (1, 0), (0, 1), (1, -1). cuDNN depthwise
     kernels are slow at these sizes, so each axis is a per-channel Toeplitz
-    matmul; the anti-diagonal runs as a column matmul on a skewed copy.
+    matmul; the anti-diagonal runs as a column matmul on a skewed copy. The
+    matrices are rebuilt on every call (no per-size cache holds GPU memory).
     """
     def __init__(self, channels, length):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(channels, len(AXES), length))
-        self.cache = {}
 
     def matrices(self, size, dtype):
-        """Horizontal, vertical and skewed-diagonal matrices; under no_grad, sizes up to CACHED_SIZE are
-        cached per weight storage and version."""
-        key = (size, dtype, self.weight.data_ptr(), self.weight._version)
-        cached = not torch.is_grad_enabled() and size <= CACHED_SIZE
-        if cached and key in self.cache:
-            return self.cache[key]
+        """Horizontal, vertical and skewed-diagonal [C, size, size] matrices. With grad enabled they are built
+        from _toeplitz (index backward); otherwise by one gather from the zero-padded taps."""
         weight = self.weight.to(dtype)
-        # In skewed columns the (1, -1) step is one row up, so the diagonal taps reverse.
-        value = (_toeplitz(weight[:, 0], size), _toeplitz(weight[:, 1], size).transpose(1, 2),
-                 _toeplitz(weight[:, 2].flip(1), size).transpose(1, 2))
-        if cached:
-            self.cache = {k: v for k, v in self.cache.items() if k[2:] == key[2:]}
-            self.cache[key] = value
-        return value
+        if torch.is_grad_enabled():
+            # In skewed columns the (1, -1) step is one row up, so the diagonal taps reverse.
+            return (_toeplitz(weight[:, 0], size), _toeplitz(weight[:, 1], size).transpose(1, 2),
+                    _toeplitz(weight[:, 2].flip(1), size).transpose(1, 2))
+        taps = F.pad(weight.transpose(0, 1), (0, 1))     # [3, C, L+1], index L is zero
+        index = _band_index(size, weight.shape[-1], weight.device)
+        return tuple(taps.gather(2, index.expand(-1, taps.shape[1], -1)).unflatten(2, (size, size)))
+
+    def lines(self, x, matrices):
+        horizontal, vertical, diagonal = matrices
+        return torch.matmul(x, horizontal)+torch.matmul(vertical, x)+_unskew(torch.matmul(diagonal, _skew(x)), x.shape[-1])
 
     def forward(self, x):
-        h, w = x.shape[-2:]
-        horizontal, vertical, diagonal = self.matrices(h, x.dtype)
-        return torch.matmul(x, horizontal)+torch.matmul(vertical, x)+_unskew(torch.matmul(diagonal, _skew(x)), w)
+        return self.lines(x, self.matrices(x.shape[-2], x.dtype))
+
+    def add_to(self, x):
+        """x += self(x) in place without autograd, in batch chunks of at most LINE_CHUNK_CELLS crop cells."""
+        matrices = self.matrices(x.shape[-2], x.dtype)
+        for part in x.split(max(1, LINE_CHUNK_CELLS//(x.shape[-2]*x.shape[-1]))):
+            part += self.lines(part, matrices)
+        return x
+
+
+_BAND_INDEX = {}
+
+
+def _band_index(size, length, device):
+    """[3, 1, size*size] int64 tap indices of LineConv.matrices for one size; `length` (a zero tap) outside
+    the band. Rows: horizontal M[i, j] = w[i-j+c], vertical w[j-i+c], skewed diagonal w[L-1-c+i-j]."""
+    key = (size, length, device)
+    if key not in _BAND_INDEX:
+        i = torch.arange(size, device=device)
+        d, c = i[:, None]-i[None, :], length//2
+        index = torch.stack((d+c, c-d, length-1-c+d))
+        _BAND_INDEX[key] = torch.where((index >= 0) & (index < length), index, length).flatten(1)[:, None]
+    return _BAND_INDEX[key]
 
 
 class _MaskedBatchNorm(torch.autograd.Function):
@@ -236,7 +259,7 @@ class Block(nn.Module):
         if self.line is not None:
             y = y*mask
             # Recomputing the line matmuls in backward keeps training memory near the plain ResNet's.
-            y = y+(checkpoint(self.line, y, use_reentrant=False) if torch.is_grad_enabled() else self.line(y))
+            y = y+checkpoint(self.line, y, use_reentrant=False) if torch.is_grad_enabled() else self.line.add_to(y)
         return x+self.conv2(act(self.norm2(y, mask, cells), ceiling))
 
 
@@ -274,8 +297,12 @@ class HexNet(nn.Module):
         count = mask.sum((2, 3), dtype=torch.float32)    # a bf16 sum rounds counts above 256
         cells = count.sum()
         x = self.stem(torch.cat((planes, self.lines(planes[:, :1], planes[:, 1:2], mask)), 1)*mask)
-        # Full-size masks in x's memory format keep the elementwise passes vectorized.
-        mask = torch.empty_like(x).copy_(mask.expand_as(x))
+        if torch.is_grad_enabled() or not x.is_contiguous():
+            # Full-size masks in x's memory format keep the elementwise passes vectorized.
+            mask = torch.empty_like(x).copy_(mask.expand_as(x))
+        else:
+            # NCHW inference broadcasts over the outer channel dim at full speed; two fewer activations.
+            mask = mask.to(x.dtype, memory_format=torch.contiguous_format)
         ceiling = torch.where(mask > 0, math.inf, 0).to(x.dtype)
         for block in self.blocks:
             x = block(x, mask, ceiling, count, cells)
@@ -395,6 +422,26 @@ def load_model(path, device='cpu'):
     return model.to(device)
 
 
+def staging_buffer(buffers, key, rows, shape, dtype, pin):
+    """The first `rows` rows of the host buffer buffers[key] [capacity, *shape]: one reusable (pinned) staging
+    buffer per key, reallocated when it holds fewer rows. Pinned blocks are rounded up to a power of two by
+    torch's host allocator, so a pinned buffer takes every row that fits in its block."""
+    buffer = buffers.get(key)
+    if buffer is None or buffer.shape[0] < rows:
+        row = math.prod(shape)*dtype.itemsize
+        capacity = max(rows, (1 << (rows*row-1).bit_length())//row) if pin else rows
+        buffer = buffers[key] = torch.empty((capacity, *shape), dtype=dtype, pin_memory=pin)
+    return buffer[:rows]
+
+
+def vram():
+    """This process's CUDA caching allocator in MB, {'allocated_mb', 'reserved_mb'}, or None before CUDA is used.
+    The CUDA context (about 0.3 GB) comes on top of reserved."""
+    if not torch.cuda.is_initialized():
+        return None
+    return dict(allocated_mb=round(torch.cuda.memory_allocated()/2**20), reserved_mb=round(torch.cuda.memory_reserved()/2**20))
+
+
 class DenseEvaluator:
     """Frozen bf16 evaluator with the NeuralEvaluator contract consumed by neural_search.
 
@@ -410,6 +457,7 @@ class DenseEvaluator:
         self.memory_format = memory_format(model.config)
         self.model = model.to(self.device, memory_format=self.memory_format).eval()
         self.max_batch = max_batch
+        self.staging = {}
 
     @torch.inference_mode()
     def evaluate(self, histories):
@@ -418,7 +466,7 @@ class DenseEvaluator:
         for size, indices in hexcrop.group_by_size(samples).items():
             for start in range(0, len(indices), self.max_batch):
                 chunk = indices[start:start+self.max_batch]
-                host = torch.empty((len(chunk), len(hexcrop.PLANES), size, size), dtype=torch.uint8, pin_memory=self.cuda)
+                host = staging_buffer(self.staging, size, len(chunk), (len(hexcrop.PLANES), size, size), torch.uint8, self.cuda)
                 np.stack([samples[i].planes for i in chunk], out=host.numpy())
                 x = host.to(self.device, non_blocking=True)
                 x = x.to(memory_format=self.memory_format, dtype=torch.bfloat16 if self.cuda else torch.float32)

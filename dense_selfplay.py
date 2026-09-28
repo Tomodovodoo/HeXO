@@ -50,8 +50,8 @@ from klent import digest
 from neural_search import EvaluationCache, NeuralSearch, checked, native
 from train import write_json
 
-# Crop cells per forward: 48 positions at 48x48, proportionally fewer for larger crops (~0.67 GB per b6c96
-# process). A crop-size group is padded into the next larger size present when that adds fewer than
+# Crop cells per forward: 48 positions at 48x48, proportionally fewer for larger crops (a b6c96 forward peaks
+# near 0.14 GB; about 0.33 GB per process with the CUDA context). A crop-size group is padded into the next larger size present when that adds fewer than
 # MERGE_CELLS cells: b6c96 bf16 forwards cost about 8 ms of launch overhead plus 0.23 us per cell on an
 # RTX 3070 Ti.
 MAX_CELLS, MERGE_CELLS = 48*48*48, 32768
@@ -149,7 +149,13 @@ class Evaluator(hexnet.DenseEvaluator):
     the caller gathers the next. Predictions are fulfil-ready tuples (actions int64 [N, 2], logits float64 [N],
     q float64 [N]), or None for a position wider than the largest crop (hexcrop.SpanError). Small crop-size
     groups are padded into the next larger size present (top-left placement; the network is invariant to where
-    the crop sits in the canvas; see MERGE_CELLS) and every forward is capped at MAX_CELLS crop cells."""
+    the crop sits in the canvas; see MERGE_CELLS) and every forward is capped at MAX_CELLS crop cells.
+    Host staging: each handle owns one set of pinned buffers (an input and an output buffer per crop size, grown
+    to the largest group seen) that collect returns to `free`, so the pipelined Engine cycles two sets."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.free = []
 
     @torch.inference_mode()
     def submit(self, histories):
@@ -165,34 +171,35 @@ class Evaluator(hexnet.DenseEvaluator):
         for small, large in zip(sizes, sizes[1:]):
             if len(groups[small])*(large*large-small*small) < MERGE_CELLS:
                 groups[large] = groups.pop(small)+groups[large]
-        chunks = []
+        chunks, staging = [], self.free.pop() if self.free else {}
         for size, indices in groups.items():
+            host = hexnet.staging_buffer(staging, ('planes', size), len(indices), (len(hexcrop.PLANES), size, size),
+                                         torch.uint8, self.cuda)
+            result = hexnet.staging_buffer(staging, ('out', size), len(indices), (size*size+2,), torch.float32, self.cuda)
+            view = host.numpy()
+            for j, i in enumerate(indices):
+                planes = samples[i].planes
+                if planes.shape[-1] == size:
+                    view[j] = planes
+                else:
+                    view[j] = 0
+                    view[j, :, :planes.shape[-1], :planes.shape[-1]] = planes
             step = max(1, min(self.max_batch, MAX_CELLS//(size*size)))
             for start in range(0, len(indices), step):
                 chunk = indices[start:start+step]
-                host = torch.empty((len(chunk), len(hexcrop.PLANES), size, size), dtype=torch.uint8, pin_memory=self.cuda)
-                view = host.numpy()
-                for j, i in enumerate(chunk):
-                    planes = samples[i].planes
-                    if planes.shape[-1] == size:
-                        view[j] = planes
-                    else:
-                        view[j] = 0
-                        view[j, :, :planes.shape[-1], :planes.shape[-1]] = planes
-                x = host.to(self.device, non_blocking=True)
+                x = host[start:start+len(chunk)].to(self.device, non_blocking=True)
                 x = x.to(memory_format=self.memory_format, dtype=torch.bfloat16 if self.cuda else torch.float32)
                 with torch.autocast(self.device.type, torch.bfloat16, enabled=self.cuda):
                     out = self.model(x, x[:, 3:4], aux=False)
                 packed = torch.cat((out['policy'], out['far'][:, None], out['value_logit'][:, None]), 1)
-                result = torch.empty(packed.shape, dtype=torch.float32, pin_memory=self.cuda)
-                chunks.append((size, chunk, result.copy_(packed, non_blocking=True)))
+                chunks.append((size, chunk, result[start:start+len(chunk)].copy_(packed, non_blocking=True)))
         event = torch.cuda.Event() if self.cuda else None
         if event:
             event.record()
-        return samples, chunks, event
+        return samples, chunks, event, staging
 
     def collect(self, handle):
-        samples, chunks, event = handle
+        samples, chunks, event, staging = handle
         if event:
             event.synchronize()
         result = [None]*len(samples)
@@ -207,6 +214,7 @@ class Evaluator(hexnet.DenseEvaluator):
                 if s.far:
                     logits[cells < 0] = row[-2]-np.log(s.far)
                 result[i] = (s.actions, logits, np.full(len(logits), np.tanh(row[-1]/2), np.float64))
+        self.free.append(staging)
         return result
 
     def evaluate(self, histories):
@@ -559,7 +567,7 @@ def worker(args):
             mean_batch=engine.evals/max(1, engine.calls), terminal_fraction=state['terminal']/g if g else None,
             mean_plies=state['plies']/g if g else None, shards_written=state['shards_written'],
             paused_seconds=paused_total+(time.perf_counter()-paused_since if paused_since is not None else 0.),
-            error=state['error'])
+            vram=hexnet.vram(), error=state['error'])
         write_json(status_path, fields)
         if metrics_due(stage, stage_logged, now-logged):
             logged, stage_logged = now, stage
