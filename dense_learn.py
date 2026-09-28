@@ -268,7 +268,7 @@ class Learner:
         total = torch.cuda.get_device_properties(self.device).total_memory
         if mb*2**20 > total:
             raise ValueError(f'vram_reserved_mb {mb} exceeds the device memory of {total//2**20} MB')
-        torch.cuda.set_per_process_memory_fraction(mb*2**20/total, self.device)
+        torch.cuda.set_per_process_memory_fraction(mb*2**20/total, torch.cuda.current_device() if self.device.index is None else self.device.index)
 
     def release(self):
         """Return the caching allocator's unused blocks to the driver (torch.cuda.empty_cache); a no-op off CUDA."""

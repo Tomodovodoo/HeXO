@@ -1473,9 +1473,13 @@ class ValidationSourceTests(unittest.TestCase):
                 cap.assert_not_called(); empty.assert_not_called()
                 self.assertEqual(learner.vram(), dict(allocated_mb=0, reserved_mb=0))
                 learner.device = torch.device('cuda', 0)
-                with unittest.mock.patch.object(torch.cuda, 'get_device_properties', return_value=SimpleNamespace(total_memory=8*2**30)):
+                with unittest.mock.patch.object(torch.cuda, 'get_device_properties', return_value=SimpleNamespace(total_memory=8*2**30)),                      unittest.mock.patch.object(torch.cuda, 'current_device', return_value=1):
                     learner.cap_vram()
-                    cap.assert_called_once_with(.25, learner.device)
+                    cap.assert_called_once_with(.25, 0)
+                    learner.device = torch.device('cuda')
+                    learner.cap_vram()
+                    cap.assert_called_with(.25, 1)
+                    learner.device = torch.device('cuda', 0)
                     learner.release()
                     empty.assert_called_once_with()
                     learner.settings = replace(learner.settings, vram_reserved_mb=9000)
