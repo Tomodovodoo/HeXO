@@ -21,8 +21,15 @@ Run layout: dense_config. Subcommands
 Scoring: a capped game (at the ply limit, or reason 'span' when a searched position does not fit the largest crop) is
 half a point for each side. Pair score = candidate points / 2 over its two games.
 The comparison with the champion is a sequential test (see `sprt`) played in rounds of `games` games until it
-accepts H0 or H1 or reaches `sprt_max_games` (decision 'max-games'); only H1 promotes. The first rated
+accepts H0 or H1 or reaches its planned games (decision 'max-games'); only H1 promotes. The first rated
 checkpoint becomes champion unopposed.
+
+Game plan (`game_plan`, `Evaluator.plan`): a candidate's champion games fit `games_per_release` of the learner's
+release interval (dense_config.release_timing), priced by the evaluator's measured placements per wall second and
+placements per game, after reserving the promotion anchor's Seal games from that budget; rounded down to whole
+rounds, at least one round, at most sprt_max_games, and sprt_max_games while any input is unknown or
+games_per_release is 0. An SPRT stopped by its plan ends 'max-games', which idle rematches continue. The plan is
+published as evaluator status plan and logged as a 'plan' event whenever its games or bound change.
 
 Panels: a checkpoint rated while a champion exists gets `panel_members` (at most 2 * extra_opponents + 1:
 p(1-p)-drawn and retained weaknesses) as entry `panel` {members, incumbent}; the incumbent is the champion it
@@ -42,6 +49,7 @@ only pairs that met; readers compute p for other rated pairs from the ratings (d
 written before `matrix` and `panel` existed lack those keys; the Evaluator adds `matrix` on start.
 """
 import argparse
+from collections import deque
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -71,6 +79,7 @@ STATUS_SECONDS = 2.
 PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'seal_ms')  # settings a reused report must share
 RECENT = 3                # latest rated checkpoints of a variant whose results define its weaknesses
 REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
+PLAN_ROUNDS = 4           # newest rounds per opponent type (checkpoint or Seal) that price a game plan
 RATING_NOTE = ('Bradley-Terry over paired comparisons (caps count half a point to each side); each opening pair is one '
                'observation with a Jeffreys Dirichlet prior over the five pair scores 0..2 in half points; 95% '
                'credible intervals from posterior draws; the first evaluated checkpoint is fixed at 0. Seal is one '
@@ -499,6 +508,36 @@ def placements(records):
     return sum(r['plies']-len(r['opening']) for r in records)
 
 
+def game_plan(settings, release, speed, mean, anchor_seconds=0.):
+    """Champion games planned for one candidate: {games, bound, adaptive, games_per_release, export_steps,
+    seconds_per_step, release_seconds, placements_per_second, mean_placements, anchor_seconds, budget_seconds}.
+    `release` is dense_config.release_timing, `speed` placements per wall second, `mean` placements per game and
+    `anchor_seconds` the wall time reserved for the promotion anchor. With games_per_release > 0 and every input
+    known (adaptive true), budget_seconds = games_per_release * release_seconds and games = (budget_seconds -
+    anchor_seconds) * speed / mean rounded down to a multiple of `games`, clamped to [min(games, sprt_max_games),
+    sprt_max_games]; bound names the limit that set it: 'budget', 'one_round' or 'sprt_max_games'. Otherwise
+    games = sprt_max_games with bound 'sprt_max_games' and adaptive false."""
+    s = settings
+    out = dict(games=s.sprt_max_games, bound='sprt_max_games', adaptive=False, games_per_release=s.games_per_release,
+               **release, placements_per_second=speed, mean_placements=mean, anchor_seconds=anchor_seconds, budget_seconds=None)
+    if not (s.games_per_release > 0 and release['release_seconds'] and speed and mean):
+        return out
+    budget = s.games_per_release*release['release_seconds']
+    fit = s.games*math.floor(max(0., budget-anchor_seconds)*speed/mean/s.games)
+    low = min(s.games, s.sprt_max_games)
+    return dict(out, games=min(s.sprt_max_games, max(low, fit)), adaptive=True, budget_seconds=budget,
+                bound='sprt_max_games' if fit >= s.sprt_max_games else 'one_round' if fit < low else 'budget')
+
+
+def describe_plan(plan):
+    """'<games> games (adaptive: release <m> min, <r> pl/s[, one round])', or '<games> games (cap)' when
+    sprt_max_games bound."""
+    if plan['bound'] == 'sprt_max_games':
+        return f'{plan["games"]} games (cap)'
+    return (f'{plan["games"]} games (adaptive: release {plan["release_seconds"]/60:.0f} min, '
+            f'{plan["placements_per_second"]:.1f} pl/s' + (', one round)' if plan['bound'] == 'one_round' else ')'))
+
+
 def match_entry(opponent, report):
     s = report['summary']
     return dict(opponent=opponent, wins=s['wins'], losses=s['losses'], capped=s['capped'], games=s['games'],
@@ -515,7 +554,7 @@ class Evaluator:
     ({candidate, opponent, kind 'champion', 'previous', 'anchor', 'panel', 'incumbent', 'sprt' or
     'replacement'} or null; while throttled, the comparison about to play), started_at (epoch seconds when the
     comparison's first round in this process began, null before it), games_played, games_planned
-    (sprt_max_games for the champion), round_first and round_games (games played before the current or waiting
+    (the plan's games for the champion), plan (the newest `plan`, null before the first), round_first and round_games (games played before the current or waiting
     round and its size), placements_played (the comparison's placements after openings, including unfinished
     games of the current round),
     mean_placements (placements per game over the games of the comparison's finished rounds, null before
@@ -533,7 +572,8 @@ class Evaluator:
         if self.league['checkpoints'] and 'matrix' not in self.league:
             write_league(self.run, self.league, self.config)
         self.models, self.partial, self.seal, self.written = {}, {}, None, 0.
-        self.status = dict(stage='idle', updated_at=None, comparison=None, started_at=None, games_played=0, games_planned=0,
+        self.rounds = {seal: deque(maxlen=PLAN_ROUNDS) for seal in (False, True)}  # (games, placements, worker seconds)
+        self.status = dict(stage='idle', updated_at=None, comparison=None, started_at=None, games_played=0, games_planned=0, plan=None,
                            round_first=0, round_games=0, placements_played=0, mean_placements=None, placements_per_second=None,
                            worker_placements_per_second=None, settings=asdict(settings), eval_share=pacer.share,
                            backlog=[], processes=processes, eval_share_used=0., error=None)
@@ -628,6 +668,7 @@ class Evaluator:
         records += results
         played = placements(results)
         done['placements'] += played
+        self.rounds[opponent == SEAL].append((len(results), played, workers*seconds))
         self.publish(True, games_played=len(records), placements_played=placed+played, mean_placements=(placed+played)/len(records),
                      placements_per_second=played/max(self.pacer.clock()-start, 1e-9),
                      worker_placements_per_second=done['placements']/max(done['worker_seconds'], 1e-9))
@@ -644,8 +685,34 @@ class Evaluator:
         known = {c['id'] for c in self.league['checkpoints']}
         return any(e[0] != cid and e[0].split('/')[0] == cid.split('/')[0] and e[0] not in known for e in checkpoints(self.run))
 
+    def plan(self, cid):
+        """Champion games for candidate cid (`game_plan`), recomputed before and after every round: the release
+        interval of cid's variant, placements per wall second over the newest PLAN_ROUNDS rounds against
+        checkpoints (per worker second, times min(round workers, eval_share), the Pacer's ceiling) and their
+        placements per game. With anchor_on_promotion, anchor_games vs Seal are reserved from the budget (the
+        candidate is assumed promoted), priced by the newest Seal rounds, else like checkpoint games. Stored as
+        status plan and games_planned; a changed games or bound rewrites the status and logs a 'plan' event with
+        the plan's fields."""
+        s, share = self.settings, self.pacer.share
+        workers = max(1, min(self.processes, s.games//2))
+
+        def pace(seal):
+            games, placed, seconds = map(sum, zip(*self.rounds[seal])) if self.rounds[seal] else (0, 0, 0.)
+            return (placed/seconds*min(workers, share), placed/games) if placed and seconds else (None, None)
+        speed, mean = pace(False)
+        seal_speed, seal_mean = pace(True)
+        anchor = s.anchor_games*(seal_mean/seal_speed if seal_speed else mean/speed) if s.anchor_on_promotion and speed else 0.
+        plan = game_plan(s, dense_config.release_timing(self.run, cid.split('/')[0]), speed, mean, anchor)
+        old = self.status['plan']
+        changed = old is None or (old['games'], old['bound']) != (plan['games'], plan['bound'])
+        self.publish(changed, plan=plan, games_planned=plan['games'])
+        if changed:
+            log_event(self.run, 'evaluator', 'plan', f'{cid}: {describe_plan(plan)} vs the champion', candidate=cid, **plan)
+        return plan['games']
+
     def report(self, cid, opponent, kind, planned, complete):
-        """The report of cid vs opponent, reused when on disk. Otherwise the champion comparison plays rounds
+        """The report of cid vs opponent, reused when on disk; planned() gives the comparison's games before each
+        round. Otherwise the champion comparison plays rounds
         until complete(records) or, after an undecided round, a newer checkpoint of the variant exists (SPRT
         decision 'superseded'; a bound crossed in that same round still counts, so a proven-better candidate is
         promoted before the newer one is tested); optional comparisons play one round per call and return None
@@ -655,7 +722,7 @@ class Evaluator:
         if path.exists():
             return json.loads(path.read_text())
         while True:
-            done = self.round(cid, opponent, kind, planned)
+            done = self.round(cid, opponent, kind, planned())
             if complete(done['records']) or (kind == 'champion' and self.newer(cid)):
                 break
             if kind != 'champion':
@@ -801,14 +868,14 @@ class Evaluator:
         return sprt(records, s.sprt_elo0, s.sprt_elo1, s.sprt_alpha, s.sprt_beta)
 
     def rate(self, entry):
-        """Play the champion SPRT of a chosen checkpoint (none for the first), add it to the league (superseded
+        """Play the champion SPRT of a chosen checkpoint (none for the first) up to its `plan`, add it to the league (superseded
         true when a newer checkpoint cut its SPRT short) and promote on H1."""
         cid, path, _ = entry
         variant, step = cid.split('/')
         champion, s = self.league['champion'], self.settings
         report = None if champion is None else self.report(
-            cid, champion, 'champion', s.sprt_max_games,
-            lambda records: self.test(records)['decision'] is not None or len(records) >= s.sprt_max_games)
+            cid, champion, 'champion', lambda: self.plan(cid),
+            lambda records: self.test(records)['decision'] is not None or len(records) >= self.plan(cid))
         if champion is not None and report is None:
             self.league['checkpoints'].append(dict(id=cid, variant=variant, step=int(step), skipped=True,
                                                    elo=None, elo_interval=None, matches=[]))
@@ -914,7 +981,7 @@ class Evaluator:
         if kind in ('sprt', 'replacement', 'panel', 'incumbent', 'anchor'):
             report = self.extend(entry['id'], opponent, kind, games)
         else:
-            report = self.report(entry['id'], opponent, kind, games, lambda records: len(records) >= games)
+            report = self.report(entry['id'], opponent, kind, lambda: games, lambda records: len(records) >= games)
         if report is not None:
             self.record(entry['id'], opponent, report)
             if kind == 'sprt' and report['metrics']['sprt']['decision'] == 'H1' and self.league['champion'] == opponent \
@@ -936,6 +1003,8 @@ def loop(args):
     if min(settings.games, settings.sprt_max_games) < 2 or any(0 < getattr(settings, name) < 2 or getattr(settings, name) < 0
                                                                 for name in ('previous_games', 'anchor_games')):
         raise ValueError('games and sprt_max_games need at least one opening pair; optional totals are 0 or at least 2')
+    if settings.games_per_release < 0:
+        raise ValueError('games_per_release must be at least 0')
     if settings.anchor_games and settings.anchor_every < 1:
         raise ValueError('anchor_every must be at least 1 while anchor games are enabled')
     evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share), args.processes)

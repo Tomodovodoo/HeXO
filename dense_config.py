@@ -34,12 +34,14 @@ manifest.
 import argparse
 from dataclasses import dataclass, asdict, field, fields
 import json
+import math
 from pathlib import Path
 import time
 
 from train import write_json
 
 SCHEMA = 'hexo-dense-run-v1'
+STEP_WINDOW = 900.  # seconds of learner metrics lines that price the current seconds per step
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,7 @@ class EvaluationSettings:
     eval_share: float = .12       # ceiling on the evaluator's playing share of wall time (dense_eval.Pacer)
     extra_opponents: int = 2      # panel opponents drawn per rated checkpoint with probability ~ p(1-p), idle only
     idle_rematch: bool = True     # replay decision-relevant comparisons while no checkpoint awaits rating
+    games_per_release: float = .8  # plan a candidate's champion games to fit this share of the release interval; 0 = off
 
 
 @dataclass(frozen=True)
@@ -164,6 +167,59 @@ def append_metrics(run, name, **fields):
     path = Path(run)/'metrics'/f'{name}.jsonl'
     path.parent.mkdir(exist_ok=True)
     append_line(path, dict(time=time.time(), **fields))
+
+
+_jsonl = {}
+
+
+def read_jsonl(path):
+    """Dict records of an append-only JSON-lines file. Only newly appended complete lines are parsed when the
+    (mtime, size) changes; malformed lines and a partial last line are skipped; a shrunk file is re-read."""
+    path = Path(path)
+    try: stat = path.stat()
+    except OSError: return []
+    cached = _jsonl.get(path)
+    if cached and cached[:2] == (stat.st_mtime_ns, stat.st_size): return cached[3]
+    offset, rows = (cached[2], cached[3]) if cached and stat.st_size >= cached[2] else (0, [])
+    try:
+        with path.open('rb') as stream:
+            stream.seek(offset)
+            chunk = stream.read()
+    except OSError: return rows
+    end = chunk.rfind(b'\n')+1
+    for line in chunk[:end].splitlines():
+        try: record = json.loads(line)
+        except ValueError: continue
+        if isinstance(record, dict): rows.append(record)
+    _jsonl[path] = (stat.st_mtime_ns, stat.st_size, offset+end, rows)
+    return rows
+
+
+def finite(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def seconds_per_step(run, variant, window=STEP_WINDOW):
+    """Learner seconds per optimizer step: the summed time over the summed steps between consecutive training
+    lines of metrics/learner-<variant>.jsonl within `window` seconds of the newest one, counting only pairs whose
+    step increases (a restart repeats steps); None without such a pair."""
+    rows = [(r['time'], r['step']) for r in read_jsonl(Path(run)/'metrics'/f'learner-{variant}.jsonl')
+            if not r.get('validation') and isinstance(r.get('step'), int) and finite(r.get('time'))]
+    rows = [r for r in rows if r[0] >= rows[-1][0]-window] if rows else []
+    pairs = [(b[0]-a[0], b[1]-a[1]) for a, b in zip(rows, rows[1:]) if b[1] > a[1]]
+    return sum(t for t, _ in pairs)/sum(n for _, n in pairs) if pairs else None
+
+
+def release_timing(run, variant):
+    """{export_steps, seconds_per_step, release_seconds} of a learner variant: export_steps is the step gap of its
+    newest two complete checkpoints (numbered folders with manifest.json), release_seconds = export_steps *
+    `seconds_per_step`; each None when unknown. The dashboard and the evaluator's game plan share this number."""
+    folder = Path(run)/'checkpoints'/variant
+    steps = sorted(int(p.parent.name) for p in folder.glob('*/manifest.json') if p.parent.name.isdigit())
+    export_steps = steps[-1]-steps[-2] if len(steps) > 1 else None
+    per_step = seconds_per_step(run, variant)
+    return dict(export_steps=export_steps, seconds_per_step=per_step,
+                release_seconds=export_steps*per_step if export_steps and per_step else None)
 
 
 def from_dict(data):

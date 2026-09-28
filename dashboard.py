@@ -16,6 +16,7 @@ from functools import lru_cache
 import urllib.parse
 
 import dense_config
+from dense_config import finite, read_jsonl
 from rating_compat import audited_prior, scheduled_revision
 
 
@@ -410,7 +411,6 @@ def dense_manifests(folder, pattern='*/manifest.json'):
 
 PLACEMENT_SHARE = .45  # assumed placements per evaluation game as a share of max_plies before any game is known
 HISTORY_REPORTS = 2     # newest evaluation reports per opponent type pooled for placements per game
-STEP_WINDOW = 900.      # seconds of learner metrics lines that price the current seconds per step
 _report_placements = {}
 
 
@@ -432,17 +432,6 @@ def report_placements(run):
     return sorted(found)
 
 
-def seconds_per_step(run, variant, window=STEP_WINDOW):
-    """Learner seconds per optimizer step: the summed time over the summed steps between consecutive training
-    lines of metrics/learner-<variant>.jsonl within `window` seconds of the newest one, counting only pairs whose
-    step increases (a restart repeats steps); None without such a pair."""
-    rows = [(r['time'], r['step']) for r in read_jsonl(run/'metrics'/f'learner-{variant}.jsonl')
-            if not r.get('validation') and isinstance(r.get('step'), int) and finite(r.get('time'))]
-    rows = [r for r in rows if r[0] >= rows[-1][0]-window] if rows else []
-    pairs = [(b[0]-a[0], b[1]-a[1]) for a, b in zip(rows, rows[1:]) if b[1] > a[1]]
-    return sum(t for t, _ in pairs)/sum(n for _, n in pairs) if pairs else None
-
-
 def evaluation_timing(run, evaluator, now):
     """Wall-time estimates for the dense evaluator tile from evaluator-status.json (dense_eval.Evaluator) or None
     without its settings. Evaluation games are of two types, vs Seal or vs a checkpoint.
@@ -462,10 +451,10 @@ def evaluation_timing(run, evaluator, now):
     current round, then later rounds up to games_planned; SPRT may stop earlier, so expected is the cap. Both
     are None unless the stage is 'playing' or 'throttled' with a started_at. playing_fraction: the divisor of a
     full round.
-    eval_seconds: wall time of one candidate's full evaluation from its first round: sprt_max_games vs the
-    champion plus, with anchor_on_promotion, anchor_games vs Seal (the candidate is assumed promoted).
-    release_seconds: export_steps (the step gap of the newest two checkpoints of the comparison's variant, else
-    main) * seconds_per_step; ratio = eval_seconds / release_seconds."""
+    eval_seconds: wall time of one candidate's full evaluation from its first round: the status plan's games
+    (else sprt_max_games) vs the champion plus, with anchor_on_promotion, anchor_games vs Seal (the candidate is
+    assumed promoted). export_steps, seconds_per_step and release_seconds: dense_config.release_timing of the
+    comparison's variant, else main; ratio = eval_seconds / release_seconds."""
     settings = evaluator.get('settings')
     if not isinstance(settings, dict): return None
     comparison = evaluator.get('comparison') if isinstance(evaluator.get('comparison'), dict) else {}
@@ -504,15 +493,14 @@ def evaluation_timing(run, evaluator, now):
         if speed:
             out['expected'] = out['elapsed']+seconds(left, count, speed)+sum(
                 seconds(n*placements, n, speed) for n in rounds(planned-first-count))
-    model, anchor = wall(settings.get('sprt_max_games') or 0, False), wall(settings.get('anchor_games') or 0, True)
+    plan = evaluator.get('plan') if isinstance(evaluator.get('plan'), dict) else {}
+    champion = plan['games'] if finite(plan.get('games')) else settings.get('sprt_max_games') or 0
+    model, anchor = wall(champion, False), wall(settings.get('anchor_games') or 0, True)
     eval_seconds = None if model is None else model+(anchor if anchor and settings.get('anchor_on_promotion', True) else 0.)
     variant = comparison['candidate'].split('/')[0] if isinstance(comparison.get('candidate'), str) else 'main'
-    steps = [int(path.parent.name) for path, _ in dense_manifests(run/'checkpoints'/variant)]
-    export_steps = steps[-1]-steps[-2] if len(steps) > 1 else None
-    per_step = seconds_per_step(run, variant)
-    release = export_steps*per_step if export_steps and per_step else None
-    return dict(out, eval_seconds=eval_seconds, export_steps=export_steps, seconds_per_step=per_step, release_seconds=release,
-                ratio=eval_seconds/release if eval_seconds is not None and release else None, playing_fraction=fraction(size))
+    release = dense_config.release_timing(run, variant)
+    ratio = eval_seconds/release['release_seconds'] if eval_seconds is not None and release['release_seconds'] else None
+    return dict(out, eval_seconds=eval_seconds, **release, ratio=ratio, playing_fraction=fraction(size))
 
 
 def dense_run(run, config, fresh=30):
@@ -575,35 +563,6 @@ def dense_run(run, config, fresh=30):
     evaluator['timing'] = evaluation_timing(run, evaluator, now)
     return dict(name=run.name, config=config, actor=actor, actors=actors, learners=learners, evaluator=evaluator,
                 league=status(run/'league.json'), champion=champion, checkpoints=checkpoints, data=data, now=now)
-
-
-_jsonl = {}
-
-
-def read_jsonl(path):
-    """Dict records of an append-only JSON-lines file. Only newly appended complete lines are parsed when the
-    (mtime, size) changes; malformed lines and a partial last line are skipped; a shrunk file is re-read."""
-    try: stat = path.stat()
-    except OSError: return []
-    cached = _jsonl.get(path)
-    if cached and cached[:2] == (stat.st_mtime_ns, stat.st_size): return cached[3]
-    offset, rows = (cached[2], cached[3]) if cached and stat.st_size >= cached[2] else (0, [])
-    try:
-        with path.open('rb') as stream:
-            stream.seek(offset)
-            chunk = stream.read()
-    except OSError: return rows
-    end = chunk.rfind(b'\n')+1
-    for line in chunk[:end].splitlines():
-        try: record = json.loads(line)
-        except ValueError: continue
-        if isinstance(record, dict): rows.append(record)
-    _jsonl[path] = (stat.st_mtime_ns, stat.st_size, offset+end, rows)
-    return rows
-
-
-def finite(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def dense_config_of(run):
