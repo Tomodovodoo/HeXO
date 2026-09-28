@@ -21,11 +21,16 @@ lacks it) among the learners that are training drops below `yield_below` and res
 actors sleep). A missing, stale or non-training heartbeat never pauses. Paused workers keep their trees and
 in-flight batch and heartbeat with stage 'paused'. Actor settings can be overridden per process with
 --<setting> flags (the supervisor forwards them; shards record the effective values).
+
+Historical opponents (ActorSettings.historical_*): up to round(historical_fraction * min(games_in_flight, --games))
+games in flight pit the champion, alternating colours over historical games, against a frozen rated checkpoint
+(`Historical`); only the champion's plies become training rows (dense_data.trained).
 """
 import argparse
 from collections import deque
 from dataclasses import asdict, fields, replace
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -52,6 +57,8 @@ from train import write_json
 MAX_CELLS, MERGE_CELLS = 48*48*48, 32768
 COLOR = ((np.arange(1 << 16)+1)//2) % 2
 METRICS_SECONDS = 30.
+PRIOR_GAMES = 16.  # weight, in games, of the Elo prediction when PFSP blends in a recorded score
+BLOCKS = 2          # historical opponents in flight at once, about: blocks of target/BLOCKS games per opponent
 METRICS = ('positions', 'games_completed', 'placements_per_second', 'evals_per_second', 'mean_batch',
            'terminal_fraction', 'mean_plies', 'checkpoint', 'paused_seconds')
 STALE_SECONDS = 120.  # learner heartbeats older than this are ignored by Yield
@@ -78,6 +85,48 @@ def resolve(run, initial=None):
     if found:
         return found[-1][0], found[-1][1]/'ema.pt'
     return ('initial', Path(initial)) if initial else ('fresh', None)
+
+
+def expected(a, b):
+    """Bradley-Terry expected score of Elo `a` against Elo `b`."""
+    return 1/(1+10**((b-a)/400))
+
+
+def opponent_weights(league, champion, weighting):
+    """{checkpoint id: sampling weight} over the league's rated checkpoints other than `champion`. 'uniform': 1 each.
+    'pfsp' (prioritised fictitious self-play, hard-opponent form): (1-p)^2, p the champion's expected score against
+    the checkpoint: the Elo prediction (1/2 while the champion is unrated) blended with the champion's recorded
+    score in the league matrix (caps half a point) as (PRIOR_GAMES*p_elo + points)/(PRIOR_GAMES + games)."""
+    checkpoints = league.get('checkpoints', [])
+    rated = {c['id']: c['elo'] for c in checkpoints if c.get('elo') is not None and c['id'] != champion}
+    if weighting == 'uniform':
+        return dict.fromkeys(rated, 1.)
+    if weighting != 'pfsp':
+        raise ValueError(f'Unknown historical weighting {weighting!r}')
+    mine = next((c.get('elo') for c in checkpoints if c['id'] == champion), None)
+    row, weights = league.get('matrix', {}).get(champion, {}), {}
+    for k, elo in rated.items():
+        cell = row.get(k, {})
+        points = cell.get('wins', 0)+cell.get('capped', 0)/2
+        p = (PRIOR_GAMES*(.5 if mine is None else expected(mine, elo))+points)/(PRIOR_GAMES+cell.get('games', 0))
+        weights[k] = (1-p)**2
+    return weights
+
+
+def draw_pool(weights, size, rng):
+    """Up to `size` distinct ids drawn without replacement with probability proportional to weight."""
+    ids = [k for k, w in weights.items() if w > 0]
+    if not ids:
+        return []
+    w = np.array([weights[k] for k in ids])
+    return rng.choice(ids, min(size, len(ids)), replace=False, p=w/w.sum()).tolist()
+
+
+def opponent_block(weights, block, rng):
+    """`block` consecutive historical games against one opponent drawn with probability proportional to weight."""
+    ids = list(weights)
+    w = np.array([weights[k] for k in ids])
+    return [ids[rng.choice(len(ids), p=w/w.sum())]]*block
 
 
 class Position:
@@ -305,15 +354,28 @@ class Engine:
 
 
 class SelfPlayGame:
-    """One self-play game and its tree; records a row, root value and search kind for every placement."""
+    """One actor game; records a row, root value and search kind for every placement. `sides[colour]` is the Model
+    playing that colour: the trained model twice for self-play, else the trained model as sides[learner] and a
+    frozen checkpoint `opponent` (its id) as the other, whose plies keep rows without a policy, with a null root
+    value and full_search False (dense_data.trained). Each distinct model owns one tree, advanced on every
+    placement; both sides use the same playout-cap randomization and opening sampling."""
 
-    def __init__(self, model, settings, seed):
-        self.model, self.settings, self.seed, self.reason = model, settings, seed, None
+    def __init__(self, sides, settings, seed, learner=0, opponent=None):
+        self.sides, self.settings, self.seed, self.reason = sides, settings, seed, None
+        self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) if settings.opening_random_plies > 0 else 0
-        self.tree = model.tree((), seed, settings.tactics)
+        self.trees = {model: model.tree((), seed+k, settings.tactics) for k, model in enumerate(dict.fromkeys(sides))}
         self.game, self.moves, self.rows, self.values, self.full = Game(), [], [], [], []
         self.plan()
+
+    @property
+    def model(self):
+        return self.sides[self.game.player]
+
+    @property
+    def tree(self):
+        return self.trees[self.model]
 
     def plan(self):
         s = self.settings
@@ -324,23 +386,25 @@ class SelfPlayGame:
     def searched(self, result):
         game, actions = self.game, result['actions']
         player, ply = game.player, len(self.moves)
+        trained = self.opponent is None or player == self.learner
         row = dict(ply=ply, player=player, remaining=game.remaining, legal_sha256=dense_data.legal_digest(actions),
                    policy=None)
         policy = result['policy']
-        if self.is_full:
+        if self.is_full and trained:
             if not np.isclose(policy.sum(), 1, atol=1e-6) or np.any(policy < 0):
                 raise ValueError('Search policy is not a distribution')
             row['policy'] = policy.astype(np.float32)
         self.rows.append(row)
-        self.values.append(root_value(result, player))
-        self.full.append(self.is_full)
+        self.values.append(root_value(result, player) if trained else None)
+        self.full.append(self.is_full and trained)
         if ply < self.random_plies:
             action = actions[self.rng.choice(len(policy), p=policy/policy.sum())].tolist()
         else:
             action = result['action']
         q, r = int(action[0]), int(action[1])
         game.play(q, r)
-        self.tree.advance((q, r))
+        for tree in self.trees.values():
+            tree.advance((q, r))
         self.moves.append([q, r])
         if game.winner >= 0 or len(self.moves) >= self.settings.max_plies:
             return False
@@ -350,10 +414,50 @@ class SelfPlayGame:
     def episode(self):
         """(episode, rows without `game`) after closing the native objects."""
         winner = self.game.winner
-        self.game.close(); self.tree.close()
+        self.game.close()
+        for tree in self.trees.values():
+            tree.close()
         return dict(moves=self.moves, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
-                    opening_plies=min(self.random_plies, len(self.moves)), actor=self.model.sha,
+                    opening_plies=min(self.random_plies, len(self.moves)), actor=self.sides[self.learner].sha,
+                    actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
+                    trained_side=None if self.opponent is None else self.learner,
                     root_values=self.values, full_search=self.full), self.rows
+
+
+class Historical:
+    """Frozen historical opponents of one actor worker. `redraw(champion, sha)` re-reads league.json, draws
+    `historical_pool` opponents (draw_pool over opponent_weights; rated checkpoints with an ema.pt whose league
+    ema_sha256 differs from the champion's `sha`) and loads their
+    ema.pt, keeping models drawn again; `next()` returns (opponent Model, champion colour) for the next historical
+    game: opponents come in blocks of about target/BLOCKS consecutive games, so few opponent models share the
+    Engine at once, and the champion's colour alternates over historical games only. `target` is the number of
+    historical games to keep in flight: round(historical_fraction * min(games_in_flight, games)), `games` being the
+    worker's game budget (None: endless), so a short run keeps the fraction too."""
+
+    def __init__(self, run, config, rng, games=None):
+        self.run, self.config, self.rng = Path(run), config, rng
+        s = config.actor
+        self.target = round(s.historical_fraction*min(s.games_in_flight, s.games_in_flight if games is None else games))
+        self.block = max(1, math.ceil(self.target/BLOCKS))
+        self.models, self.weights, self.plan, self.started = {}, {}, deque(), 0
+
+    def redraw(self, champion, sha):
+        path = self.run/'league.json'
+        league = json.loads(path.read_text()) if path.exists() else {}
+        same = {c['id'] for c in league.get('checkpoints', []) if c.get('ema_sha256') == sha}
+        weights = {k: w for k, w in opponent_weights(league, champion, self.config.actor.historical_weighting).items()
+                   if k not in same and (self.run/'checkpoints'/k/'ema.pt').exists()}
+        pool = draw_pool(weights, self.config.actor.historical_pool, self.rng)
+        self.models = {k: self.models.get(k) or load(self.run, self.config, source=(k, self.run/'checkpoints'/k/'ema.pt'))
+                       for k in pool}
+        self.weights = {k: weights[k] for k in pool}
+        self.plan.clear()
+
+    def next(self):
+        if not self.plan:
+            self.plan.extend(opponent_block(self.weights, self.block, self.rng))
+        self.started += 1
+        return self.models[self.plan.popleft()], (self.started-1) % 2
 
 
 def metrics_due(stage, logged_stage, elapsed):
@@ -424,6 +528,9 @@ def worker(args):
     log_event(run, 'actor', 'info', f'worker {args.worker} playing {model.checkpoint} ({model.sha[:12]})'
               + (' - FRESH UNTRAINED NETWORK' if model.checkpoint == 'fresh' else ''), process=args.worker)
     print(f'Worker {args.worker}: {model.checkpoint} {model.sha[:12]}', flush=True)
+    historical = Historical(run, config, np.random.default_rng(seeds.spawn(1)[0]), args.games) if settings.historical_fraction > 0 else None
+    if historical:
+        historical.redraw(model.checkpoint, model.sha)
     engine = Engine(settings.leaf_batch)
     state = dict(published(run, args.worker), error=None)
     target = None if args.games is None else args.games+state['games_completed']
@@ -463,7 +570,12 @@ def worker(args):
         now = time.perf_counter()
         name = shard_name()
         actors = sorted({e['actor'] for e in episodes})
-        identity = dict(actor_sha256=model.sha, actors=actors, checkpoint=model.checkpoint, process=args.worker,
+        opponents = {}
+        for e in episodes:
+            if e['opponent']:
+                opponents[e['opponent']] = opponents.get(e['opponent'], 0)+1
+        identity = dict(actor_sha256=model.sha, actors=actors, opponents=sorted(opponents), checkpoint=model.checkpoint,
+                        process=args.worker,
                         pid=os.getpid(), seed_entropy=str(entropy), model=asdict(model.config),
                         actor=asdict(settings), value_targets='not stored; derive from episode root_values and winner')
         dense_data.write_shard(run/'shards'/name, identity, episodes, rows, 'actor')
@@ -473,7 +585,7 @@ def worker(args):
         fields = dict(shard=name, games=games, rows=len(rows), terminal_fraction=terminal/games,
                       mean_plies=sum(len(e['moves']) for e in episodes)/games,
                       placements_per_second=(state['positions']-since['positions'])/elapsed,
-                      evals_per_second=(engine.evals-since['evals'])/elapsed, process=args.worker)
+                      evals_per_second=(engine.evals-since['evals'])/elapsed, process=args.worker, opponents=opponents)
         log_event(run, 'actor', 'shard', f'shard {name}: {games} games, {len(rows)} rows', **fields)
         print(json.dumps(fields), flush=True)
         since.update(time=now, positions=state['positions'], evals=engine.evals)
@@ -482,12 +594,20 @@ def worker(args):
             model = load(run, config, args.initial_model)
             log_event(run, 'actor', 'info', f'worker {args.worker} switched to {model.checkpoint} ({model.sha[:12]}); '
                       'games in progress finish with the previous model', process=args.worker)
+        if historical:
+            historical.redraw(model.checkpoint, model.sha)
 
     try:
         last = 0.
         while True:
             while len(engine.slots) < settings.games_in_flight and (args.games is None or started < args.games):
-                engine.add(SelfPlayGame(model, settings, seeds.spawn(1)[0].generate_state(1, np.uint64)[0].item()))
+                seed = seeds.spawn(1)[0].generate_state(1, np.uint64)[0].item()
+                if historical and historical.models and sum(g.opponent is not None for g in engine.slots) < historical.target:
+                    opponent, learner = historical.next()
+                    sides = [model, opponent] if learner == 0 else [opponent, model]
+                    engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint))
+                else:
+                    engine.add(SelfPlayGame([model, model], settings, seed))
                 started += 1
             if not engine.slots:
                 break

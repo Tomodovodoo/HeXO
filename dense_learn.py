@@ -13,8 +13,9 @@ short_value_horizon are learner settings; batches are rendered by dense_data.Ren
 (--workers) with random hex symmetries. The loss of one optimizer step is, per head, the weighted mean
 over every row of the batch that has that target, summed with the head coefficients; each crop bucket is
 a separate forward pass whose gradients accumulate (buckets padded to QUANTUM rows with inert rows).
-Pacing: at most samples_per_row * (rows in all shards, cheap rows included) samples are presented; beyond that
-the learner waits. The window is sized in full-search rows (dense_data.ReplayWindow).
+Pacing: at most samples_per_row * (trained rows in all shards, cheap rows included; a historical opponent's
+plies are not trained, see dense_data.trained) samples are presented; beyond that the learner waits. The window
+is sized in full-search rows (dense_data.ReplayWindow).
 """
 import argparse
 import copy
@@ -137,6 +138,15 @@ def perturb(settings, factor_rng, amount):
         x, f = getattr(settings, name), factor_rng.uniform(1-amount, 1+amount)
         values[name] = float(np.clip(1-(1-x)*f if name in ('td_lambda', 'ema') else x*f, low, high))
     return replace(settings, **values)
+
+
+def latest_rated(league):
+    """{variant: league entry} of each variant's newest rated checkpoint that was not demoted for a regression."""
+    latest = {}
+    for c in league['checkpoints']:
+        if c.get('elo') is not None and not c.get('demoted') and c['step'] >= latest.get(c['variant'], {'step': -1})['step']:
+            latest[c['variant']] = c
+    return latest
 
 
 def checkpoints(run, variant):
@@ -288,21 +298,18 @@ class Learner:
         return manifest
 
     def maybe_replace(self, factor_rng):
-        """Population replacement (exploit/explore). Candidates are the latest rated checkpoints of other variants;
-        a candidate qualifies when league["differences"] holds its pair with this variant's latest rated checkpoint
-        and the lower bound of the (candidate minus mine) Elo interval exceeds replace_margin. The best
-        qualifying candidate's raw weights and manifest learner settings are copied (KEEP fields stay this
-        learner's), the continuous settings are perturbed from the copied values, the optimizer is reset and
-        the EMA restarts from the copied weights. Checked before a step is trained, so a copy is always
-        followed by training and recorded in the next manifest."""
+        """Population replacement (exploit/explore). Candidates are the latest rated, not demoted checkpoints of
+        other variants (`latest_rated`); a candidate qualifies when league["differences"] holds its pair with
+        this variant's latest such checkpoint and the lower bound of the (candidate minus mine) Elo interval
+        exceeds replace_margin. The best qualifying candidate's raw weights and manifest learner settings are
+        copied (KEEP fields stay this learner's), the continuous settings are perturbed from the copied values,
+        the optimizer is reset and the EMA restarts from the copied weights. Checked before a step is trained,
+        so a copy is always followed by training and recorded in the next manifest."""
         s = self.settings
         if self.step % s.replace_interval or self.step-self.last_copy < s.protect_steps or not (self.run/'league.json').exists():
             return False
         league = json.loads((self.run/'league.json').read_text(encoding='utf-8'))
-        latest = {}
-        for c in league['checkpoints']:
-            if c.get('elo') is not None and c['step'] >= latest.get(c['variant'], {'step': -1})['step']:
-                latest[c['variant']] = c
+        latest = latest_rated(league)
         mine = latest.get(s.variant)
         # Compare only once a checkpoint trained after the last copy has been rated.
         if mine is None or (self.copied_from and mine['step'] <= self.copied_from['at_step']):

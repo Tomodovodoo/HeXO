@@ -10,8 +10,10 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import shutil
 import time
 import unittest
+import unittest.mock
 
 import numpy as np
 import torch
@@ -579,6 +581,8 @@ class DenseConfigTests(unittest.TestCase):
         self.assertEqual((got.tactics, got.full_fraction, got.full_sims), (False, .5, 32))
         self.assertIsInstance(got.full_fraction, float)
         self.assertTrue(dense_config.override(got, parser.parse_args(['--tactics'])).tactics)
+        self.assertEqual(dense_selfplay.actor_flags(parser.parse_args(['--historical-weighting', 'uniform'])),
+                         ['--historical-weighting', 'uniform'])
         prefixed = argparse.ArgumentParser()
         dense_config.add_arguments(prefixed, dense_config.ActorSettings)
         dense_config.add_arguments(prefixed, dense_config.EvaluationSettings, 'eval_')
@@ -811,7 +815,7 @@ class DenseBootstrapTests(unittest.TestCase):
             written = dense_data.write_shard(target, identity, new_episodes, new_rows, 'converted')
             self.assertEqual((written['actor'], written['origin']), ('b'*64, 'converted'))
             self.assertEqual(dense_data.origin(dict(written, origin=None)), 'converted')    # inferred from the identity
-            self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, terminal_games=1, capped_games=1))
+            self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, opponent_rows=0, terminal_games=1, capped_games=1))
             self.assertEqual(dense_bootstrap.check(target), 21)
             _, stored = dense_data.read_shard(target)
             self.assertEqual({r['game'] for r in stored}, {0, 1})
@@ -1270,6 +1274,207 @@ class PacerTests(unittest.TestCase):
             dense_eval.Pacer(0.)
 
 
+def fake_report(candidate, opponent, wins, losses, capped, settings=None):
+    games = wins+losses+capped
+    return dict(candidate=candidate, opponent=opponent, settings=asdict(settings or dense_config.EvaluationSettings()),
+                summary=dict(wins=wins, losses=losses, capped=capped, games=games), metrics={}, games=[])
+
+
+def league_of(elos, champion=None, matrix=None):
+    """A league.json dict with checkpoints '<variant>/<step:06d>' -> Elo (None: unrated)."""
+    league = dict(champion=champion, checkpoints=[dict(id=k, variant=k.split('/')[0], step=int(k.split('/')[1]), elo=e, matches=[])
+                                                  for k, e in elos.items()])
+    if matrix is not None:
+        league['matrix'] = matrix
+    return league
+
+
+class OpponentSchedulerTests(unittest.TestCase):
+    def test_payoff_matrix_from_reports(self):
+        reports = [fake_report('main/000002', 'main/000001', 5, 2, 1), fake_report('main/000001', 'main/000002', 3, 3, 2),
+                   fake_report('main/000002', 'seal', 1, 6, 1)]
+        ratings = {'main/000001': 0., 'main/000002': 100., 'seal': None}
+        matrix = dense_eval.payoff(reports, ratings)
+        self.assertEqual({k: v for k, v in matrix['main/000002']['main/000001'].items() if k != 'p'},
+                         dict(wins=8, losses=5, capped=3, games=16))
+        self.assertEqual(matrix['main/000001']['main/000002']['wins'], 5)
+        self.assertAlmostEqual(matrix['main/000002']['main/000001']['p'], 1/(1+10**(-100/400)))
+        self.assertAlmostEqual(matrix['main/000001']['main/000002']['p']+matrix['main/000002']['main/000001']['p'], 1)
+        self.assertIsNone(matrix['seal']['main/000002']['p'])
+        self.assertEqual(matrix['seal']['main/000002']['wins'], 6)
+        self.assertIsNone(dense_eval.payoff(reports)['main/000001']['main/000002']['p'])
+
+    def test_panel_draws_proportional_to_p_one_minus_p(self):
+        elos = {'main/000001': 0., 'main/000002': 0., 'main/000003': 200., 'main/000004': 800., 'main/000005': -400.}
+        league = league_of(elos, 'main/000001')
+        rng = np.random.default_rng(0)
+        counts = dict.fromkeys(elos, 0)
+        for _ in range(4000):
+            weak, drawn = dense_eval.panel_members(league, 'main/000006', {'main/000005'}, 1, rng)
+            self.assertEqual(weak, [])
+            counts[drawn[0]] += 1
+        # The predecessor main/000005 (Elo -400) is the reference: p(1-p) under its expected score.
+        p = {k: dense_selfplay.expected(-400., e) for k, e in elos.items() if k != 'main/000005'}
+        w = {k: v*(1-v) for k, v in p.items()}
+        for k in w:
+            self.assertAlmostEqual(counts[k]/4000, w[k]/sum(w.values()), delta=.03, msg=k)
+        self.assertEqual(counts['main/000005'], 0)
+        _, drawn = dense_eval.panel_members(league, 'main/000006', set(), 10, rng)
+        self.assertEqual(sorted(drawn), sorted(elos))
+
+    def test_weakness_retention(self):
+        elos = {f'main/{k:06d}': float(10*k) for k in range(1, 9)} | {'side/000001': 0., 'side/000002': 5.}
+        matrix = {}
+
+        def met(a, b, wins, losses):
+            matrix.setdefault(a, {})[b] = dict(wins=wins, losses=losses, capped=0, games=wins+losses)
+        # The three latest main checkpoints before main/000009 are 6, 7, 8.
+        met('main/000008', 'side/000001', 1, 5); met('main/000007', 'side/000001', 2, 1)   # 3-6: weakness
+        met('main/000006', 'side/000002', 0, 1)                                              # 0-1: worst
+        met('main/000008', 'main/000002', 1, 3); met('main/000006', 'main/000002', 3, 0)     # 4-3: not a weakness
+        met('main/000005', 'main/000001', 0, 9)                                              # not recent
+        met('main/000007', 'main/000003', 0, 4)
+        league = league_of(elos, 'main/000001', matrix)
+        weak, drawn = dense_eval.panel_members(league, 'main/000009', {'main/000008', 'main/000001'}, 1, np.random.default_rng(1))
+        self.assertEqual(weak, ['main/000003', 'side/000002'])      # capped at count+1, worst first, ties by id
+        self.assertEqual(len(drawn), 1)
+        self.assertNotIn(drawn[0], weak+['main/000008', 'main/000001', 'main/000009'])
+        weak, _ = dense_eval.panel_members(league, 'main/000009', {'main/000008'}, 3, np.random.default_rng(1))
+        self.assertEqual(weak, ['main/000003', 'side/000002', 'side/000001'])
+        # A league written before the matrix existed has no weaknesses.
+        del league['matrix']
+        self.assertEqual(dense_eval.panel_members(league, 'main/000009', set(), 3, np.random.default_rng(1))[0], [])
+
+    def test_panel_veto_arithmetic(self):
+        cell = lambda w, l: dict(wins=w, losses=l, capped=3, games=w+l+3)
+        matrix = {'cand': {'x': cell(10, 30), 'y': cell(5, 15), 'z': cell(9, 0)},
+                  'inc': {'x': cell(25, 15), 'y': cell(12, 8)}}
+        got = dense_eval.panel_result(['x', 'y', 'z'], 'cand', 'inc', matrix)
+        wc, nc, wi, ni = 15, 60, 37, 60                                  # z has no incumbent games: excluded
+        pooled = (wc+wi)/(nc+ni)
+        z = (wc/nc-wi/ni)/math.sqrt(pooled*(1-pooled)*(2/60))
+        self.assertAlmostEqual(got['candidate_score'], .25)
+        self.assertAlmostEqual(got['incumbent_score'], 37/60)
+        self.assertAlmostEqual(got['z'], z)
+        self.assertTrue(got['veto'])
+        self.assertEqual(got['members'], ['x', 'y', 'z'])
+        close = dense_eval.panel_result(['x'], 'cand', 'inc', {'cand': {'x': cell(18, 22)}, 'inc': {'x': cell(22, 18)}})
+        self.assertGreater(close['z'], -1.96)
+        self.assertFalse(close['veto'])
+        empty = dense_eval.panel_result(['x'], 'cand', 'inc', {'cand': {'x': cell(3, 1)}})
+        self.assertEqual((empty['incumbent_score'], empty['z'], empty['veto']), (None, None, False))
+
+    def test_pfsp_weights(self):
+        elos = {'main/000001': 0., 'main/000002': 100., 'main/000003': 100., 'side/000001': None}
+        matrix = {'main/000003': {'main/000002': dict(wins=0, losses=16, capped=0, games=16)}}
+        league = league_of(elos, 'main/000003', matrix)
+        weights = dense_selfplay.opponent_weights(league, 'main/000003', 'pfsp')
+        self.assertEqual(set(weights), {'main/000001', 'main/000002'})
+        self.assertAlmostEqual(weights['main/000001'], (1-dense_selfplay.expected(100., 0.))**2)
+        self.assertAlmostEqual(weights['main/000002'], (1-(16*.5+0)/32)**2)     # a recorded 0-16 raises the weight
+        self.assertEqual(dense_selfplay.opponent_weights(league, 'main/000003', 'uniform'), {'main/000001': 1., 'main/000002': 1.})
+        self.assertEqual(dense_selfplay.opponent_weights({}, 'fresh', 'pfsp'), {})
+        unrated = dense_selfplay.opponent_weights(league_of(elos, 'side/000001'), 'side/000001', 'pfsp')
+        self.assertEqual(set(unrated.values()), {.25})
+        with self.assertRaises(ValueError):
+            dense_selfplay.opponent_weights(league, 'main/000003', 'other')
+
+    def test_opponent_pool_and_grouping(self):
+        rng = np.random.default_rng(2)
+        weights = {'a': 1., 'b': 3., 'c': 0., 'd': 2.}
+        pool = dense_selfplay.draw_pool(weights, 2, rng)
+        self.assertEqual(len(set(pool)), 2)
+        self.assertNotIn('c', pool)
+        self.assertEqual(sorted(dense_selfplay.draw_pool(weights, 8, rng)), ['a', 'b', 'd'])
+        config = replace(dense_config.RunConfig(), actor=dense_config.ActorSettings(games_in_flight=16, historical_fraction=.5))
+        with tempfile.TemporaryDirectory() as tmp:
+            historical = dense_selfplay.Historical(tmp, config, rng)
+            historical.redraw('main/000001', 'a'*64)                  # no league yet: no opponents
+            self.assertEqual(historical.models, {})
+        self.assertEqual((historical.target, historical.block), (8, 4))
+        historical.models, historical.weights = {'a': 'A', 'b': 'B'}, {'a': 1., 'b': 1.}
+        drawn, colours = zip(*(historical.next() for _ in range(40)))
+        self.assertEqual(set(drawn), {'A', 'B'})
+        for k in range(0, 40, 4):
+            self.assertEqual(len(set(drawn[k:k+4])), 1)               # blocks of target/BLOCKS games per opponent
+        self.assertEqual(colours, (0, 1)*20)                           # alternating over historical games only
+        # A run shorter than games_in_flight keeps the fraction: 8 games, half historical.
+        self.assertEqual(dense_selfplay.Historical('.', config, rng, games=8).target, 4)
+        self.assertEqual(dense_selfplay.Historical('.', config, rng, games=100).target, 8)
+
+    def test_pool_excludes_opponents_with_the_champion_digest(self):
+        config = replace(dense_config.RunConfig(device='cpu'), model=dense_config.ModelSettings(**asdict(TINY)),
+                         actor=dense_config.ActorSettings(historical_fraction=.5))
+        with tempfile.TemporaryDirectory() as tmp:
+            for step in (1, 2):
+                path = Path(tmp)/'checkpoints'/'main'/f'{step:06d}'
+                path.mkdir(parents=True)
+                hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
+            (Path(tmp)/'league.json').write_text(json.dumps(dict(champion='main/000003', checkpoints=[
+                dict(id='main/000001', variant='main', step=1, elo=0., ema_sha256='c'*64),     # re-exported champion weights
+                dict(id='main/000002', variant='main', step=2, elo=0., ema_sha256='d'*64),
+                dict(id='main/000003', variant='main', step=3, elo=0., ema_sha256='c'*64)])))
+            historical = dense_selfplay.Historical(tmp, config, np.random.default_rng(0))
+            historical.redraw('main/000003', 'c'*64)
+            self.assertEqual(list(historical.models), ['main/000002'])
+
+    def test_mixed_games_mask_the_opponent_plies(self):
+        torch.manual_seed(8)
+        champion = dense_selfplay.Model(hexnet.HexNet(TINY), 'c'*64, 'main/000002', 'cpu', 64, 256)
+        opponent = dense_selfplay.Model(hexnet.HexNet(TINY), 'o'*64, 'main/000001', 'cpu', 64, 256)
+        twin = dense_selfplay.Model(hexnet.HexNet(TINY), 'c'*64, 'main/000001', 'cpu', 64, 256)   # same digest as the champion
+        settings = dense_config.ActorSettings(full_sims=4, cheap_sims=2, root_samples=2, max_plies=14, full_fraction=.5,
+                                              opening_random_plies=0.)
+        games = [dense_selfplay.SelfPlayGame([champion, opponent], settings, 1, 0, 'main/000001'),
+                 dense_selfplay.SelfPlayGame([opponent, champion], settings, 2, 1, 'main/000001'),
+                 dense_selfplay.SelfPlayGame([champion, champion], settings, 3),
+                 dense_selfplay.SelfPlayGame([twin, champion], settings, 4, 1, 'main/000001')]
+        engine = dense_selfplay.Engine(64)
+        for g in games:
+            engine.add(g)
+        finished = []
+        while engine.slots:
+            finished += engine.step()
+        self.assertEqual(engine.calls >= 2, True)
+        episodes, rows = [], []
+        for g in games:
+            e, items = g.episode()
+            episodes.append(e)
+            rows += [dict(r, game=len(episodes)-1) for r in items]
+        mixed, swapped, plain, twinned = episodes
+        self.assertEqual([e['trained_side'] for e in episodes], [0, 1, None, 1])
+        self.assertEqual((mixed['actors'], mixed['actor'], mixed['opponent']), ({'0': 'c'*64, '1': 'o'*64}, 'c'*64, 'main/000001'))
+        self.assertEqual((swapped['actors'], swapped['actor']), ({'0': 'o'*64, '1': 'c'*64}, 'c'*64))
+        self.assertEqual((plain['actors'], plain['opponent']), ({'0': 'c'*64, '1': 'c'*64}, None))
+        for g, e in enumerate(episodes):
+            for r in (r for r in rows if r['game'] == g):
+                mine = dense_data.trained(e, r['ply'])
+                self.assertEqual(mine, g == 2 or dense_data.player_at(r['ply']) == [0, 1, None, 1][g])
+                if not mine:
+                    self.assertIsNone(r['policy'])
+                    self.assertIsNone(e['root_values'][r['ply']])
+                    self.assertFalse(e['full_search'][r['ply']])
+            self.assertEqual([r['ply'] for r in rows if r['game'] == g], list(range(len(e['moves']))))
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = dense_data.write_shard(Path(tmp)/'shards'/'000001', dict(actor_sha256='c'*64), episodes, rows)
+            skipped = sum(not dense_data.trained(episodes[r['game']], r['ply']) for r in rows)
+            self.assertGreater(skipped, 0)
+            self.assertEqual(manifest['counts']['opponent_rows'], skipped)
+            self.assertEqual(dense_bootstrap.check(Path(tmp)/'shards'/'000001'), len(rows))
+            window = dense_data.ReplayWindow(tmp, capacity_rows=1000, min_rows=1000)
+            self.assertEqual(window.total_rows, len(rows)-skipped)
+            refs = [window.ref(*k) for k in window.index]
+            self.assertEqual(len(refs), len(rows)-skipped)
+            self.assertTrue(all(dense_data.trained(r.episode, r.row['ply']) for r in refs))
+            _, targets = dense_data.examples(window, refs, np.random.default_rng(0))
+            for ref, t in zip(refs, targets):
+                if ref.episode['winner'] < 0:
+                    self.assertTrue(t['value_weight'] == 0 or t['value'] is not None)
+                # The opponent's next ply never supplies an opponent-policy target.
+                if ref.row['game'] != 2 and ref.row['ply']+1 < len(ref.episode['moves']) and not dense_data.trained(ref.episode, ref.row['ply']+1):
+                    self.assertEqual(t['next_weight'], 0.)
+
+
 class EvaluatorLoopTests(unittest.TestCase):
     """Evaluator.step on a CPU run of TINY checkpoints with two-sim, eight-ply games."""
 
@@ -1283,7 +1488,8 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.run = Path(tmp.name)
 
     def start(self, processes=1, **evaluation):
-        settings = dict(games=2, sims=2, root_samples=2, max_plies=8, anchor_games=0, sprt_max_games=2)
+        settings = dict(games=2, sims=2, root_samples=2, max_plies=8, anchor_games=0, sprt_max_games=2, extra_opponents=0,
+                        idle_rematch=False)
         config = dense_config.RunConfig(
             device='cpu', model=dense_config.ModelSettings(**{k: getattr(TINY, k) for k in (
                 'blocks', 'channels', 'pool_every', 'line_length', 'value_hidden', 'head_channels')}),
@@ -1340,6 +1546,8 @@ class EvaluatorLoopTests(unittest.TestCase):
             dict(id='main/000050', variant='main', step=50, elo=None, matches=[match('main/000010')])])
         (self.run/'league.json').write_text(json.dumps(old))
         evaluator = self.start(previous_games=4)
+        old = self.league()                                      # rewritten once on start with the payoff matrix
+        self.assertIn('matrix', old)
         self.assertEqual(evaluator.optional()[1:], ('main/000030', 'previous', 4))
         self.assertTrue(evaluator.step())
         self.assertEqual(len(evaluator.partial['main/000050', 'main/000030']['records']), 2)
@@ -1415,6 +1623,229 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual([r['pair'] for r in rounds[1]], [0, 0, 1, 1, 2, 2])
         self.assertEqual(rounds[0], rounds[1])
 
+    def test_panel_and_sprt_rematch_are_optional_rounds(self):
+        evaluator = self.start(extra_opponents=1, idle_rematch=True)
+        for step in (10, 20, 30):
+            self.export(step)
+            self.assertTrue(evaluator.step())
+        self.assertNotIn('panel', self.league()['checkpoints'][-1])       # only previous and champion were rated
+        # A league.json from before the matrix: a new evaluator adds it.
+        league = self.league(); del league['matrix']
+        (self.run/'league.json').write_text(json.dumps(league))
+        evaluator = self.start(extra_opponents=1, idle_rematch=True)
+        self.assertIn('main/000030', self.league()['matrix'])
+        self.export(40)
+        self.assertTrue(evaluator.step())                                  # the champion SPRT only
+        entry = self.league()['checkpoints'][-1]
+        self.assertEqual(entry['panel'], dict(members=['main/000020'], incumbent='main/000010'))
+        self.assertEqual([m['opponent'] for m in entry['matches']], ['main/000010'])
+        sprt = json.loads(dense_eval.report_path(self.run, 'main/000040', 'main/000010').read_text())
+        self.assertEqual((sprt['metrics']['sprt']['decision'], len(sprt['games'])), ('max-games', 2))
+        # Idle: the undecided SPRT continues by one round first, then the panel game, then nothing.
+        self.assertEqual(evaluator.optional()[1:], ('main/000010', 'sprt', 2))
+        self.assertTrue(evaluator.step())
+        sprt = json.loads(dense_eval.report_path(self.run, 'main/000040', 'main/000010').read_text())
+        self.assertEqual(([g['pair'] for g in sprt['games']], sprt['metrics']['sprt']['games']), ([0, 0, 1, 1], 4))
+        self.assertEqual(evaluator.optional()[1:], ('main/000020', 'panel', 2))
+        self.export(50)
+        self.assertEqual(evaluator.round('main/000040', 'main/000020', 'panel', 2)['records'], [])   # unrated: no optional round
+        shutil.rmtree(self.run/'checkpoints'/'main'/'000050')
+        self.assertTrue(evaluator.step())
+        league = self.league()
+        panel = league['checkpoints'][-1]['panel']
+        self.assertEqual(set(panel), {'members', 'incumbent', 'candidate_score', 'incumbent_score', 'z', 'veto'})
+        self.assertEqual(league['matrix']['main/000040']['main/000020']['games'], 2)
+        self.assertEqual([m['opponent'] for m in league['checkpoints'][-1]['matches']], ['main/000010', 'main/000020'])
+        self.assertFalse(evaluator.step())
+        kinds = [e.get('comparison') for e in map(json.loads, (self.run/'events.jsonl').read_text().splitlines()) if e['kind'] == 'match']
+        self.assertEqual(kinds[-2:], ['sprt', 'panel'])
+
+    def test_h1_promotes_before_any_panel_game(self):
+        evaluator = self.start(extra_opponents=1)
+        for step in (10, 20, 30):
+            self.export(step)
+            self.assertTrue(evaluator.step())
+        self.assertEqual(self.league()['champion'], 'main/000010')
+        test = evaluator.test
+        evaluator.test = lambda records: dict(test(records), decision='H1')
+        self.export(40)
+        self.assertTrue(evaluator.step())
+        league = self.league()
+        self.assertEqual(league['champion'], 'main/000040')
+        self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000040')
+        self.assertEqual(league['checkpoints'][-1]['panel'], dict(members=['main/000020'], incumbent='main/000010'))
+        self.assertFalse(dense_eval.report_path(self.run, 'main/000040', 'main/000020').exists())
+        self.assertEqual(evaluator.optional()[1:], ('main/000020', 'panel', 2))   # the champion's panel comes first
+
+    def test_panel_regression_demotes_the_champion(self):
+        self.export(10, 20, 30, 40)
+        evaluator = self.start(extra_opponents=1)
+        cell = lambda a, b, w, l: dict(candidate=a, opponent=b, settings=asdict(evaluator.settings),
+                                       summary=dict(wins=w, losses=l, capped=0, games=w+l), metrics={}, games=[])
+        for regressed in (True, False):
+            evaluator.league = dict(champion='main/000040', checkpoints=[
+                dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20, 30)])
+            evaluator.league['checkpoints'].append(dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
+                                                        panel=dict(members=['main/000020'], incumbent='main/000010')))
+            reports = [cell('main/000040', 'main/000020', 0 if regressed else 2, 20 if regressed else 0),
+                       cell('main/000010', 'main/000020', 15, 5)]
+            with unittest.mock.patch.object(dense_eval, 'write_league'), \
+                    unittest.mock.patch.object(dense_eval, 'load_reports', lambda *args: reports), \
+                    unittest.mock.patch.object(dense_eval, 'report_path', lambda run, a, b: self.run):
+                evaluator.settle()
+            entry = evaluator.league['checkpoints'][-1]
+            self.assertEqual((entry['panel']['veto'], entry.get('demoted', False)), (regressed, regressed))
+            self.assertEqual(evaluator.league['champion'], 'main/000010' if regressed else 'main/000040')
+        self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000010')
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([(e['checkpoint'], e['restored']) for e in events if e['kind'] == 'regression'], [('main/000040', 'main/000010')])
+
+    def test_rematch_rounds_stop_at_their_budget(self):
+        evaluator = self.start(games=4, idle_rematch=True)
+        for step in (10, 20):
+            self.export(step)
+            self.assertTrue(evaluator.step())
+        path = dense_eval.report_path(self.run, 'main/000020', 'main/000010')
+        self.assertEqual(len(json.loads(path.read_text())['games']), 2)             # sprt_max_games 2
+        self.assertEqual(evaluator.optional()[1:], ('main/000010', 'sprt', 2))      # REMATCH_SPRT_LIMIT * 2 - 2 left
+        self.assertTrue(evaluator.step())
+        self.assertEqual(len(json.loads(path.read_text())['games']), 4)             # not 2 + games
+        self.assertIsNone(evaluator.optional())
+        # A replacement rematch is offered only the games left below sprt_max_games.
+        evaluator = self.start(games=4, sprt_max_games=6, idle_rematch=True)
+        evaluator.league['checkpoints'] = []
+        evaluator.league['differences'] = [dict(a='main/000020', b='side/000010', elo_delta=0., interval=[-100., 100.])]
+        played = dict(candidate='side/000010', opponent='main/000020', settings=asdict(evaluator.settings),
+                      summary=dict(wins=1, losses=1, capped=0, games=2), metrics={}, games=[])
+        with unittest.mock.patch.object(dense_eval, 'load_reports', lambda *args: [played]):
+            self.assertEqual(evaluator.rematches(), [('main/000020', 'side/000010', 'replacement', 4)])
+
+    def test_rematches_skip_reports_of_another_protocol(self):
+        evaluator = self.start(idle_rematch=True)
+        for step in (10, 20):
+            self.export(step)
+            self.assertTrue(evaluator.step())
+        path = dense_eval.report_path(self.run, 'main/000020', 'main/000010')
+        report = json.loads(path.read_text())
+        self.assertEqual(evaluator.rematches(), [('main/000020', 'main/000010', 'sprt', 2)])
+        path.write_text(json.dumps(dict(report, settings=dict(report['settings'], sims=64))))   # an --eval-sims restart
+        self.assertEqual(evaluator.rematches(), [])
+        self.assertIsNone(dense_eval.rematch_pair(self.run, 'main/000020', 'main/000010', evaluator.settings)) \
+            if (dense_eval.report_path(self.run, 'main/000010', 'main/000020').exists()) else None
+        self.assertEqual(dense_eval.rematch_pair(self.run, 'main/000020', 'main/000010', evaluator.settings),
+                         ('main/000010', 'main/000020'))
+
+    def test_incumbent_tops_up_an_undersized_report(self):
+        self.export(10, 20, 40)
+        evaluator = self.start(games=4)
+        evaluator.league = dict(champion='main/000040', checkpoints=[
+            dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20)])
+        evaluator.league['checkpoints'].append(dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
+                                                    panel=dict(members=['main/000020'], incumbent='main/000010')))
+        evaluator.extend('main/000010', 'main/000020', 'incumbent', 2)             # e.g. played before --eval-games 4
+        entry = evaluator.league['checkpoints'][-1]
+        self.assertEqual(evaluator.needs(entry), [('main/000040', 'main/000020', 'panel', 4),
+                                                  ('main/000010', 'main/000020', 'incumbent', 2)])
+        evaluator.extend('main/000040', 'main/000020', 'panel', 4)
+        self.assertEqual(evaluator.needs(entry), [('main/000010', 'main/000020', 'incumbent', 2)])  # not complete yet
+        self.assertEqual(evaluator.optional()[1:], ('main/000020', 'incumbent', 2))
+        self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'main/000020').read_text())
+        self.assertEqual([g['pair'] for g in report['games']], [0, 0, 1, 1])
+        self.assertEqual(evaluator.needs(entry), [])
+        self.assertIn('veto', entry['panel'])                                        # judged once complete
+
+    def test_successive_vetoed_champions_restore_the_last_sound_predecessor(self):
+        self.export(10, 20, 30, 40)
+        evaluator = self.start(extra_opponents=1)
+        cell = lambda a, w, l: dict(candidate=a, opponent='main/000020', settings=asdict(evaluator.settings),
+                                    summary=dict(wins=w, losses=l, capped=0, games=w+l), metrics={}, games=[])
+        reports = [cell('main/000010', 15, 5), cell('main/000030', 5, 15), cell('main/000040', 0, 20)]
+        for chained in (True, False):
+            panel = lambda incumbent: dict(members=['main/000020'], incumbent=incumbent)
+            evaluator.league = dict(champion='main/000040', checkpoints=[
+                dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
+                dict(id='main/000020', variant='main', step=20, elo=0., matches=[]),
+                dict(id='main/000030', variant='main', step=30, elo=0., matches=[], **({'panel': panel('main/000010')} if chained else {})),
+                dict(id='main/000040', variant='main', step=40, elo=0., matches=[], panel=panel('main/000030'))])
+            if not chained:
+                evaluator.league['checkpoints'][2]['demoted'] = True       # vetoed earlier, predecessor unknown
+            with unittest.mock.patch.object(dense_eval, 'write_league'), \
+                    unittest.mock.patch.object(dense_eval, 'load_reports', lambda *args: reports), \
+                    unittest.mock.patch.object(dense_eval, 'report_path', lambda run, a, b: self.run):
+                evaluator.settle()                                          # one pass judges both panels, oldest first
+            entries = {c['id']: c for c in evaluator.league['checkpoints']}
+            self.assertTrue(entries['main/000030']['demoted'] and entries['main/000040']['demoted'])
+            self.assertEqual(evaluator.league['champion'], 'main/000010' if chained else 'main/000040')
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines() if '"regression"' in line]
+        self.assertEqual([(e['checkpoint'], e['restored']) for e in events],
+                         [('main/000030', None), ('main/000040', 'main/000010'), ('main/000040', None)])
+        self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000010')
+
+    def vetoed_on_disk(self):
+        """A league whose champion main/000040 has a complete, vetoing panel on disk (incumbent main/000010), as
+        left by an evaluator that exited before settling it."""
+        self.export(10, 20, 40)
+        settings = self.start().settings
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000040', matrix={}, checkpoints=[
+            dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
+            dict(id='main/000020', variant='main', step=20, elo=0., matches=[]),
+            dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
+                 panel=dict(members=['main/000020'], incumbent='main/000010'))])))
+        for a, wins, losses in (('main/000040', 0, 20), ('main/000010', 15, 5)):
+            path = dense_eval.report_path(self.run, a, 'main/000020')
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(dict(candidate=a, opponent='main/000020', settings=asdict(settings), metrics={}, games=[],
+                                            summary=dict(wins=wins, losses=losses, capped=0, games=wins+losses))))
+
+    def test_restart_settles_panels_completed_on_disk(self):
+        self.vetoed_on_disk()
+        with unittest.mock.patch.object(dense_eval, 'write_league'):
+            evaluator = self.start()
+            self.assertEqual(evaluator.needs(evaluator.entry('main/000040')), [])       # nothing left to play
+            self.assertFalse(evaluator.step())
+        entry = evaluator.entry('main/000040')
+        self.assertTrue(entry['panel']['veto'] and entry['demoted'])
+        self.assertEqual(evaluator.league['champion'], 'main/000010')
+        self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000010')
+
+    def test_restart_settles_before_rating_a_new_checkpoint(self):
+        self.vetoed_on_disk()
+        self.export(50)
+        with unittest.mock.patch.object(dense_eval, 'write_league'):
+            evaluator = self.start()
+            self.assertTrue(evaluator.step())
+        self.assertTrue(evaluator.entry('main/000040')['demoted'])
+        self.assertTrue(dense_eval.report_path(self.run, 'main/000050', 'main/000010').exists())    # the restored champion
+        self.assertFalse(dense_eval.report_path(self.run, 'main/000050', 'main/000040').exists())
+        self.assertEqual([m['opponent'] for m in evaluator.entry('main/000050')['matches']], ['main/000010'])
+
+    def test_demoted_checkpoints_are_not_variant_heads(self):
+        league = dict(champion='main/000010', checkpoints=[
+            dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
+            dict(id='main/000020', variant='main', step=20, elo=90., matches=[], demoted=True),
+            dict(id='main/000030', variant='main', step=30, skipped=True, elo=None, matches=[]),
+            dict(id='side/000010', variant='side', step=10, elo=10., matches=[])])
+        self.assertEqual({v: c['id'] for v, c in dense_learn.latest_rated(league).items()},
+                         {'main': 'main/000010', 'side': 'side/000010'})
+        rated = lambda names, anchor, reports, seed: ({n: 0. for n in names}, {n: [0., 0.] for n in names}, {n: [0.] for n in names})
+        self.start()
+        with unittest.mock.patch.object(dense_eval, 'rate', rated), unittest.mock.patch.object(dense_eval, 'write_json'):
+            dense_eval.write_league(self.run, league, dense_config.load(self.run))
+        self.assertEqual([(d['a'], d['b']) for d in league['differences']], [('main/000010', 'side/000010')])
+
+    def test_panel_of_the_head_below_a_demoted_checkpoint_is_scheduled(self):
+        evaluator = self.start(extra_opponents=1)
+        evaluator.league = dict(champion='main/000010', checkpoints=[
+            dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
+            dict(id='main/000020', variant='main', step=20, elo=0., matches=[]),
+            dict(id='main/000030', variant='main', step=30, elo=0., matches=[],
+                 panel=dict(members=['main/000020'], incumbent='main/000010')),
+            dict(id='main/000040', variant='main', step=40, elo=0., matches=[], demoted=True,
+                 panel=dict(members=['main/000020'], incumbent='main/000030', veto=True))])
+        self.assertEqual([c['id'] for c in evaluator.heads()], ['main/000030'])
+        entry, opponent, kind, games = evaluator.optional()
+        self.assertEqual((entry['id'], opponent, kind, games), ('main/000030', 'main/000020', 'panel', 2))
 
 if __name__ == '__main__':
     unittest.main()

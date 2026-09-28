@@ -6,8 +6,9 @@ Stages: CPU unit tests (tests/test_dense.py); GPU throughput of the default b6c9
 training at batch 256 on bucket 32) against thresholds; bf16 vs fp32 agreement on real positions;
 DenseEvaluator behind a SearchCoordinator (32 trees, 2 placements); symmetry invariance of a pointwise
 model plus the real model's symmetry spread (diagnostic); and an end-to-end run of the actor, learner,
-evaluator and dashboard on a tiny configuration in a scratch run directory (GPU only). Prints a table and
-exits 1 on any failure.
+evaluator and dashboard on a tiny configuration in a scratch run directory, then a second actor pass with
+historical opponents and a third checkpoint rated with an evaluator panel (GPU only). Prints a table and exits 1
+on any failure.
 """
 import argparse
 import copy
@@ -40,12 +41,12 @@ ROOT = Path(__file__).resolve().parent
 E2E = dense_config.RunConfig(
     model=dense_config.ModelSettings(blocks=2, channels=32, pool_every=2),
     actor=dense_config.ActorSettings(games_in_flight=8, leaf_batch=64, full_sims=8, cheap_sims=4, root_samples=4,
-                                     max_plies=64, shard_games=4, cache_positions=1024),
+                                     max_plies=64, shard_games=4, cache_positions=1024, historical_fraction=.5),
     learner=dense_config.LearnerSettings(batch=32, warmup_steps=5, samples_per_row=4., window_min_rows=64,
                                          validation_fraction=.25, export_every=10),
     evaluation=dense_config.EvaluationSettings(games=4, sims=8, root_samples=4, max_plies=64, anchor_every=1000,
-                                               anchor_games=2, seal_ms=10, sprt_max_games=8))
-E2E_SECONDS = 180.
+                                               anchor_games=2, seal_ms=10, sprt_max_games=8, extra_opponents=1))
+E2E_SECONDS = 300.
 
 
 class Report:
@@ -304,7 +305,9 @@ def dashboard_kind(run):
 def e2e_stage(report, run):
     """Actor (8 games, 2 shards), learner to step 10 and an evaluator pass, learner resumed to step 20 and a
     second evaluator pass with two worker processes (it rates only a variant's newest unrated checkpoint), then
-    the dashboard, on the E2E configuration in `run`, each checked against the files it must leave behind."""
+    the dashboard; then an actor pass with historical opponents (historical_fraction 1/2), a learner export at
+    step 30 and an evaluator pass that publishes the payoff matrix, on the E2E configuration in `run`, each
+    checked against the files it must leave behind."""
     if not torch.cuda.is_available():
         print('  CUDA unavailable: end-to-end stage skipped')
         report.add('e2e', 'end-to-end run', 'CUDA unavailable, skipped', '', 'skip')
@@ -357,6 +360,25 @@ def e2e_stage(report, run):
     kind, data = dashboard_kind(run)
     good = kind == 'dense' and data['dense']['data']['shards'] == 2 and len(data['dense']['checkpoints']) == 2
     report.add('e2e', 'dashboard /api/run', f'kind {kind}', 'dense', 'PASS' if good else 'FAIL')
+    seconds = run_step(run, 'actor-historical', ['dense_selfplay.py', '--run', str(run), '--games', '8'], remaining())
+    fresh = [path for path in dense_data.shard_dirs(run) if path not in shards]
+    episodes = [e for path in fresh for e in dense_data.read_shard(path, policies=False)[0]]
+    mixed = [e for e in episodes if e['opponent']]
+    opponents = {c['id']: c['ema_sha256'] for c in league['checkpoints'] if c['id'] != champion['checkpoint']}
+    good = len(mixed) == 4 and sum(dense_bootstrap.check(path) for path in fresh) > 0 and all(
+        e['opponent'] in opponents and sorted(e['actors'].values()) == sorted([e['actor'], opponents[e['opponent']]])
+        and e['actor'] != opponents[e['opponent']] for e in mixed)
+    report.add('e2e', 'actor: historical games, per-side actors', f'{len(mixed)} of {len(episodes)} games vs '
+               f'{sorted({e["opponent"] for e in mixed})} in {seconds:.0f}s', '4 of 8', 'PASS' if good else 'FAIL')
+    seconds = run_step(run, 'learner-30', ['dense_learn.py', '--run', str(run), '--steps', '30', '--workers', '1'], remaining())
+    seconds += run_step(run, 'evaluator-30', ['dense_eval.py', 'loop', '--run', str(run), '--once'], remaining())
+    league = json.loads((run/'league.json').read_text(encoding='utf-8'))
+    rated = {c['id'] for c in league['checkpoints'] if c['elo'] is not None}
+    matrix = league.get('matrix', {}).get('main/000030', {})
+    good = rated == {'main/000010', 'main/000020', 'main/000030'} and league['champion'] in matrix and all(
+        cell['p'] is not None for b, cell in matrix.items() if b in rated)
+    report.add('e2e', 'learner step 30, evaluator matrix', f'{len(rated)} rated, main/000030 met {sorted(matrix)} in {seconds:.0f}s',
+               '3 rated, matrix row', 'PASS' if good else 'FAIL')
     elapsed = time.perf_counter()-start
     report.gate('e2e', 'end-to-end seconds', elapsed, E2E_SECONDS, elapsed <= E2E_SECONDS)
 
