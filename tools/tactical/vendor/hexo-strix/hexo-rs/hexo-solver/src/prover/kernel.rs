@@ -35,7 +35,7 @@
 //! placements)` is therefore sound with no graph-history-interaction handling.
 
 use crate::forcing::{
-    CellSet2, SolverBoard, attacker_turns_with, completions, futile_defender_pair, min_covers2,
+    CellSet2, SolverBoard, attacker_turns_with, completions, futile_defender_pair, min_covers2, threat_window_count,
     MAX_WL,
 };
 use hexo_engine::game::{GameConfig, GameState};
@@ -49,7 +49,7 @@ type NodeComps = (Vec<CellSet2>, Vec<CellSet2>);
 /// Memo entry caps. Both memos are pure caches, so clearing one when it fills
 /// only costs recomputation; without a cap a long search retains gigabytes.
 const COMPS_CAP: usize = 1 << 17;
-const GENCACHE_CAP: usize = 1 << 14;
+const GENCACHE_CAP: usize = 1 << 16;
 
 /// Result of classifying an OR (attacker-to-move) node.
 pub(crate) enum OrEval {
@@ -161,6 +161,9 @@ impl KernelCtx {
         if radius < wl as i32 - 1 {
             board.enable_reach(radius);
         }
+        // Every node scans the board's windows; the incremental index visits each
+        // structural window once instead of re-walking strips around every stone.
+        board.configure_windows(wl, true);
         for &(c, p) in stones {
             board.place(c, p);
         }
@@ -268,6 +271,20 @@ impl KernelCtx {
         } else {
             OrEval::Moves(moves)
         }
+    }
+
+    /// Child-initialisation view of an OR node: `None` for an immediate win,
+    /// otherwise the memoised move count when known, else the threat-window count
+    /// (0 only when the memo proves there is no forcing move).
+    pub(crate) fn or_estimate(&mut self, placements: u8) -> Option<u32> {
+        let comps = self.node_comps();
+        if comps.0.iter().any(|c| c.len() as u8 <= placements) {
+            return None;
+        }
+        if let Some(v) = self.gencache.get(&(self.board.hash, placements)) {
+            return Some(v.len() as u32);
+        }
+        Some(threat_window_count(&self.board, self.atk, self.wl, self.radius).max(1) as u32)
     }
 
     /// Classify an AND (defender-to-move) node on the post-attacker-move board.

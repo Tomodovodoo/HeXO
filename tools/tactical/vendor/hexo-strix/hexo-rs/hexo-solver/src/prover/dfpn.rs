@@ -135,7 +135,7 @@ impl<'a> Dfpn<'a> {
         // Adaptive leaf budget: scale the level-2 node cap by the branching
         // factor at the seed node ("number of options at this level"). The
         // "1 and n" init already encodes the branching factor — OR nodes seed
-        // dn = m_moves, AND nodes seed pn = c_covers — so read it back from
+        // dn = `or_estimate`, AND nodes seed pn = c_covers — so read it back from
         // `eval_child_at` and normalize so a branching factor of `pn2_scale`
         // keeps the configured `pn2_nodes` unchanged. 0 disables scaling.
         if self.pn2_scale > 0 {
@@ -204,7 +204,7 @@ impl<'a> Dfpn<'a> {
     /// using **immediate evaluation with the "1 and n" initialization** (Allis;
     /// the paper's speed-critical heuristic): terminals resolve to `(0, INF)` /
     /// `(INF, 0)` at generation, and an unexpanded internal node is seeded from its
-    /// branching factor — an OR (attacker) node to `(1, m_moves)`, an AND
+    /// branching factor — an OR (attacker) node to `(1, or_estimate)`, an AND
     /// (defender) node to `(c_covers, 1)`. This gives df-pn tree-shape information
     /// immediately instead of the shapeless `(1, 1)`, which is the difference
     /// between diving into deep non-winning forcing lines and going straight at

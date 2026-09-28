@@ -158,6 +158,13 @@ const COMPS_CAP: usize = if cfg!(target_arch = "wasm32") { 1 << 18 } else { 1 <<
 const WINNING_MOVES_CAP: usize = if cfg!(target_arch = "wasm32") { 1 << 17 } else { 1 << 19 };
 
 const WIN_AXES: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
+
+thread_local! {
+    /// Grid-indexed visit marks for `wide_partner_cells` (epoch-stamped, never cleared per call).
+    static STAMP: std::cell::RefCell<(Vec<u32>, u32)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
+}
+/// Unit steps walking a hex ring clockwise from its (-d, +d) corner.
+const RING_STEPS: [(i32, i32); 6] = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)];
 /// Max supported win_length: strip-scan buffers are stack arrays of 2*MAX_WL-1.
 pub const MAX_WL: usize = 16;
 const STRIP: usize = 2 * MAX_WL - 1;
@@ -328,7 +335,7 @@ impl SolverBoard {
         }
         self.stones.clear();
         self.hash = 0;
-        self.windows.states.clear();
+        self.windows.clear();
         if self.reach_radius >= 0 {
             self.reach.fill(0);
         }
@@ -343,8 +350,8 @@ impl SolverBoard {
 
     /// Enable or disable incremental length-`wl` window maintenance while
     /// retaining the map allocation across independent leaf probes.
-    fn configure_windows(&mut self, wl: u8, enabled: bool) {
-        self.windows.states.clear();
+    pub(crate) fn configure_windows(&mut self, wl: u8, enabled: bool) {
+        self.windows.clear();
         self.windows.wl = wl;
         self.windows.enabled = enabled;
     }
@@ -545,14 +552,45 @@ impl WindowState {
     }
 }
 
+/// Own-stone count from which a window is kept in `WindowIndex::live`: every
+/// scan except the builder-score one wants at least this many.
+const LIVE_MIN_STONES: u32 = 2;
+
 #[derive(Clone, Default)]
 struct WindowIndex {
     wl: u8,
     enabled: bool,
     states: FxHashMap<(Coord, u8), WindowState>,
+    /// Per player (P1, P2): windows holding at least `LIVE_MIN_STONES` of that
+    /// player's stones and none of the opponent's.
+    live: [FxHashSet<(Coord, u8)>; 2],
 }
 
 impl WindowIndex {
+    fn clear(&mut self) {
+        self.states.clear();
+        self.live[0].clear();
+        self.live[1].clear();
+    }
+
+    /// Keep `live` in step with one window's state change.
+    #[inline]
+    fn track(&mut self, key: (Coord, u8), before: WindowState, after: WindowState) {
+        let live = |mine: u16, enemy: u16| enemy == 0 && mine.count_ones() >= LIVE_MIN_STONES;
+        for (side, was, now) in [
+            (0, live(before.p1, before.p2), live(after.p1, after.p2)),
+            (1, live(before.p2, before.p1), live(after.p2, after.p1)),
+        ] {
+            if was != now {
+                if now {
+                    self.live[side].insert(key);
+                } else {
+                    self.live[side].remove(&key);
+                }
+            }
+        }
+    }
+
     /// Apply one stone delta to the 3*wl windows containing `coord`.
     #[inline]
     fn update(&mut self, coord: Coord, player: Player, placed: bool) {
@@ -568,24 +606,32 @@ impl WindowIndex {
                 );
                 let key = (start, axis as u8);
                 let bit = 1u16 << offset;
-                if placed {
+                let (before, after) = if placed {
                     let state = self.states.entry(key).or_default();
+                    let before = *state;
                     match player {
                         Player::P1 => state.p1 |= bit,
                         Player::P2 => state.p2 |= bit,
                     }
+                    (before, *state)
                 } else if let std::collections::hash_map::Entry::Occupied(mut occupied) =
                     self.states.entry(key)
                 {
                     let state = occupied.get_mut();
+                    let before = *state;
                     match player {
                         Player::P1 => state.p1 &= !bit,
                         Player::P2 => state.p2 &= !bit,
                     }
-                    if state.p1 == 0 && state.p2 == 0 {
+                    let after = *state;
+                    if after.p1 == 0 && after.p2 == 0 {
                         occupied.remove();
                     }
-                }
+                    (before, after)
+                } else {
+                    continue;
+                };
+                self.track(key, before, after);
             }
         }
     }
@@ -634,7 +680,15 @@ fn scan_windows_incremental(
     let enforce = radius < l - 1;
     let full = if wl == 16 { u16::MAX } else { (1u16 << wl) - 1 };
     let mut empties = [(0i32, 0i32); MAX_WL];
-    for (&(start, axis), &state) in &board.windows.states {
+    let index = &board.windows;
+    // Scans needing two or more stones read the player's live set, a small
+    // fraction of all windows touching a stone.
+    let live = pc_lo >= LIVE_MIN_STONES as i32;
+    let side = usize::from(player == Player::P2);
+    let mut all = index.states.iter().take(if live { 0 } else { usize::MAX });
+    let mut live_only =
+        index.live[side].iter().take(if live { usize::MAX } else { 0 }).map(|key| (key, &index.states[key]));
+    for (&(start, axis), &state) in std::iter::from_fn(|| all.next().or_else(|| live_only.next())) {
         let (mine, enemy) = state.masks(player);
         if mine == 0 || enemy != 0 {
             continue;
@@ -771,6 +825,18 @@ pub(crate) type ThreatIndex = FxHashMap<Coord, Vec<ThreatEntry>>;
 
 /// Near-complete lines (enemy-free windows with wl-4..wl-3 stones), indexed by gap
 /// cell — so a move's B is a table lookup, not a rescan.
+/// Number of threat-band windows (`wl-4..=wl-3` stones, no enemy): a cheap
+/// stand-in for an OR node's branching factor before its moves are generated.
+pub(crate) fn threat_window_count(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> usize {
+    let l = wl as i32;
+    let mut count = 0usize;
+    scan_windows(board, player, wl, radius, l - 4, l - 3, &mut |_, _, _, _| {
+        count += 1;
+        false
+    });
+    count
+}
+
 fn threat_table(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> ThreatIndex {
     let l = wl as i32;
     let mut index: ThreatIndex = FxHashMap::default();
@@ -807,41 +873,33 @@ pub(crate) fn has_full_line(board: &SolverBoard, player: Player, wl: u8, radius:
     found
 }
 
-/// One-pass fusion of `threat_table` and the wide builder-score scan: a single
-/// strip walk over enemy-free windows with pc in `[1, wl-1]` accumulates the
-/// builder score of every gap cell (+pc per visit = `pc²` per window — see
-/// `wide_partner_cells` for why that ordering is right), and inserts
-/// `ThreatEntry`s for windows in the threat band `[wl-4, wl-3]` exactly as
-/// `threat_table` does. The wider pc filter only ADDS callback invocations
-/// (every visited window contains the strip's center stone, so pc >= 1
-/// always); the threat-band windows are visited in the same order with the
-/// same dedup, so the index is identical to `threat_table`'s. Wide-mode only:
-/// tight callers keep the narrower scan and pay nothing for scoring.
+/// `threat_table` plus the wide builder scores: every gap cell of an enemy-free
+/// window with `pc` in `[1, wl-1]` attacker stones gains `pc²` for that window
+/// (see `wide_partner_cells` for why that ordering is right).
 pub(crate) fn threat_table_scored(
     board: &SolverBoard,
     player: Player,
     wl: u8,
     radius: i32,
 ) -> (ThreatIndex, FxHashMap<Coord, u32>) {
+    (threat_table(board, player, wl, radius), builder_scores(board, player, wl, radius))
+}
+
+/// Wide builder score of every gap cell; see `threat_table_scored`.
+fn builder_scores(board: &SolverBoard, player: Player, wl: u8, radius: i32) -> FxHashMap<Coord, u32> {
     let l = wl as i32;
-    let mut index: ThreatIndex = FxHashMap::default();
     let mut scores: FxHashMap<Coord, u32> = FxHashMap::default();
-    let mut seen: FxHashSet<(Coord, u8)> = FxHashSet::default();
-    scan_windows(board, player, wl, radius, 1, l - 1, &mut |start, ai, pc, empties| {
+    // The strip walk meets a window once per own stone (pc visits of +pc); the
+    // incremental index meets it once, so it adds pc² directly.
+    let incremental = board.windows.enabled && board.windows.wl == wl;
+    scan_windows(board, player, wl, radius, 1, l - 1, &mut |_, _, pc, empties| {
+        let score = if incremental { u32::from(pc) * u32::from(pc) } else { u32::from(pc) };
         for &e in empties {
-            *scores.entry(e).or_insert(0) += pc as u32;
-        }
-        if (l - 4..=l - 3).contains(&(pc as i32)) && seen.insert((start, ai as u8)) {
-            debug_assert!(empties.len() <= 4 && empties.windows(2).all(|w| w[0] < w[1]));
-            let mut e = ThreatEntry { pc, len: empties.len() as u8, cells: [(0, 0); 4] };
-            e.cells[..empties.len()].copy_from_slice(empties);
-            for &c in empties {
-                index.entry(c).or_default().push(e);
-            }
+            *scores.entry(e).or_insert(0) += score;
         }
         false
     });
-    (index, scores)
+    scores
 }
 
 /// B after playing `mv` (exact up to 4; 4 means ">= 4"), read from the threat
@@ -1190,26 +1248,62 @@ pub(crate) fn wide_partner_cells(
         .filter(|&&(_, o)| o == attacker)
         .map(|&(c, _)| c)
         .collect();
+    // Dedup through a per-thread grid stamp instead of sorting every axis
+    // visit; the final sort below fixes the order (its last key is the coord).
     let mut cells: Vec<Coord> = Vec::new();
-    for &s in &own {
-        for &(dq, dr) in WIN_AXES.iter() {
-            for k in 1..l {
-                for c in [(s.0 + k * dq, s.1 + k * dr), (s.0 - k * dq, s.1 - k * dr)] {
-                    if board.get(c).is_none() && (!enforce || board.within_radius(c, radius)) {
-                        cells.push(c);
+    STAMP.with(|stamp| {
+        let (marks, epoch) = &mut *stamp.borrow_mut();
+        if marks.len() < board.grid.len() {
+            marks.resize(board.grid.len(), 0);
+        }
+        *epoch = epoch.wrapping_add(1);
+        if *epoch == 0 {
+            marks.fill(0);
+            *epoch = 1;
+        }
+        let mut outside: Vec<Coord> = Vec::new();
+        for &s in &own {
+            for &(dq, dr) in WIN_AXES.iter() {
+                for k in 1..l {
+                    for c in [(s.0 + k * dq, s.1 + k * dr), (s.0 - k * dq, s.1 - k * dr)] {
+                        if board.get(c).is_some() || (enforce && !board.within_radius(c, radius)) {
+                            continue;
+                        }
+                        match board.idx(c) {
+                            Some(i) if marks[i] == *epoch => {}
+                            Some(i) => {
+                                marks[i] = *epoch;
+                                cells.push(c);
+                            }
+                            None => outside.push(c),
+                        }
                     }
                 }
             }
         }
-    }
-    cells.sort_unstable();
-    cells.dedup();
+        outside.sort_unstable();
+        outside.dedup();
+        cells.extend(outside);
+    });
+    // Distance to the nearest own stone by ring search: every candidate lies
+    // within `wl-1` of an own stone, and most within one or two rings.
+    let nearest = |c: Coord| -> i32 {
+        for d in 1..l {
+            let mut cell = (c.0 - d, c.1 + d);
+            for &(dq, dr) in RING_STEPS.iter() {
+                for _ in 0..d {
+                    if board.get(cell) == Some(attacker) {
+                        return d;
+                    }
+                    cell = (cell.0 + dq, cell.1 + dr);
+                }
+            }
+        }
+        own.iter().map(|&s| hex_dist(c, s)).min().unwrap_or(i32::MAX)
+    };
     let mut scored: Vec<(Coord, u32, i32)> = cells
         .into_iter()
-        .map(|c| {
-            let dist = own.iter().map(|&s| hex_dist(c, s)).min().unwrap_or(i32::MAX);
-            (c, scores.get(&c).copied().unwrap_or(0), dist)
-        })
+        .map(|c| (c, scores.get(&c).copied().unwrap_or(0), nearest(c)))
         .collect();
     // Most-threatening-first, then closest-to-own-stones; coord ascending last
     // keeps search order deterministic (never let scan order into tie-breaking).
@@ -1267,13 +1361,7 @@ fn attacker_turns_with_ordering(
     proof_ordering: bool,
 ) -> Vec<CellSet2> {
     let enforce = radius < wl as i32 - 1;
-    // Wide mode fuses the builder-score accumulation into the threat-table
-    // strip walk (one scan instead of two); tight keeps the narrower scan.
-    let (index, wide_scores) = if wide {
-        threat_table_scored(board, attacker, wl, radius)
-    } else {
-        (threat_table(board, attacker, wl, radius), FxHashMap::default())
-    };
+    let index = threat_table(board, attacker, wl, radius);
     let mut hot: Vec<Coord> = index.keys().copied().collect();
     hot.sort_unstable();
     // Per-hot-cell forcing potential, used to skip candidates that provably
@@ -1350,17 +1438,27 @@ fn attacker_turns_with_ordering(
         // `h_strong + a_strong + min(h_weak, a_weak) < 2` reduces to when
         // a_strong = a_weak = 0 — the prefilter already admits wide pairs exactly,
         // no gating or exemption needed.
-        if wide {
+        // Builders only pair with a hot cell completing two entries alone, so
+        // without one the builder scan cannot add a move and is skipped.
+        if wide && potential.iter().any(|p| p.0 >= 2) {
             // partners is coord-sorted (coord is the tuple's leading key, coords
             // are unique), so `existing` is sorted for the binary_search dedup.
             let existing: Vec<Coord> = partners.iter().map(|p| p.0).collect();
+            let wide_scores = builder_scores(board, attacker, wl, radius);
             let mut wide_cells = wide_partner_cells(board, attacker, wl, radius, &wide_scores);
             wide_cells.retain(|(c, _, _)| existing.binary_search(c).is_err());
             partners.extend(wide_cells.into_iter().map(|(c, _, _)| (c, false, 0, 0)));
         }
+        // A cell completing fewer than two entries alone can only pair forcingly
+        // with a hot partner, so it scans those (in partner order) and skips the rest.
+        let hot_partners: Vec<(Coord, bool, u32, u32)> = partners.iter().copied().filter(|p| p.1).collect();
         for (hi, &h) in hot.iter().enumerate() {
             let (h_strong, h_weak) = potential[hi];
-            for &(a, a_hot, a_strong, a_weak) in partners.iter() {
+            // A partner outside every threat window changes no entry of the
+            // index, so the pair's B and cover count are those of `h` alone.
+            let mut alone: Option<(u8, u32)> = None;
+            let candidates = if h_strong >= 2 { &partners } else { &hot_partners };
+            for &(a, a_hot, a_strong, a_weak) in candidates.iter() {
                 if a == h || (a_hot && a < h) {
                     continue;
                 }
@@ -1388,9 +1486,19 @@ fn attacker_turns_with_ordering(
                         continue;
                     }
                 }
-                let b = move_b_with(&index, mv.cells(), wl, &mut scratch);
+                let (b, covers) = match alone {
+                    Some(known) if !a_hot => known,
+                    _ => {
+                        let cells = if a_hot { mv.cells() } else { std::slice::from_ref(&h) };
+                        let b = move_b_with(&index, cells, wl, &mut scratch);
+                        let known = (b, if b == 2 { two_cover_count(&scratch) } else { 0 });
+                        if !a_hot {
+                            alone = Some(known);
+                        }
+                        known
+                    }
+                };
                 if b >= 2 {
-                    let covers = if b == 2 { two_cover_count(&scratch) } else { 0 };
                     scored.push((b, covers, h_strong, mv));
                 }
             }

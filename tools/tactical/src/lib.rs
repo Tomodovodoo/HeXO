@@ -88,7 +88,7 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
                 attacker:if side==0{Player::P1}else{Player::P2},placements_remaining:remaining,
                 config:PosConfig{win_length:6,placement_radius:8,max_moves:u32::MAX}};
             let cfg=ProverConfig{driver:DriverKind::Pdspn,wide:true,depth_cap:req.depth,
-                node_budget:req.nodes,tt_mb:16,pn2_nodes:1000,..Default::default()};
+                node_budget:req.nodes,tt_mb:(req.ms as usize/64).clamp(1,16),pn2_nodes:1000,..Default::default()};
             if req.idtt_ms>0 {
                 let ctl=control((Instant::now()+Duration::from_millis(req.idtt_ms as u64)).min(deadline));
                 let probe=prover::idtt(&pos,&cfg,&ctl);

@@ -44,14 +44,14 @@ pub(crate) fn eval_child_at(
     remaining: Option<u8>,
 ) -> (u32, u32, bool) {
     match node {
-        Node::Or { placements } => match k.or_eval(placements) {
-            OrEval::WinNow if remaining != Some(0) => (0, INF, true),
-            OrEval::WinNow => (INF, 0, true),
-            OrEval::Loss => (INF, 0, true),
-            OrEval::Moves(_) if remaining.is_some_and(|turns| turns < 2) => {
-                (INF, 0, true)
-            }
-            OrEval::Moves(m) => (1, (m.len() as u32).clamp(1, INF - 1), false),
+        // OR children are seeded from `or_estimate`, not full move generation:
+        // most are never expanded, and generation dominated the search.
+        Node::Or { placements } => match k.or_estimate(placements) {
+            None if remaining != Some(0) => (0, INF, true),
+            None => (INF, 0, true),
+            Some(0) => (INF, 0, true),
+            Some(_) if remaining.is_some_and(|turns| turns < 2) => (INF, 0, true),
+            Some(n) => (1, n.clamp(1, INF - 1), false),
         },
         Node::And if remaining == Some(0) => (INF, 0, true),
         Node::And => match k.and_eval() {
