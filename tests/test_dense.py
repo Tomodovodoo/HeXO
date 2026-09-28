@@ -1615,6 +1615,22 @@ class EvaluatorLoopTests(unittest.TestCase):
                              [[at, report['elo_delta']]])
         self.assertEqual(dashboard.series(self.run, dict(created_at=0.), 'side', 'seal_delta')['points'], [])
 
+    def test_late_promotion_and_restoration_owe_anchors_from_their_reign(self):
+        self.vetoed_on_disk()
+        with unittest.mock.patch.object(dense_eval, 'write_league'):
+            evaluator = self.start(anchor_every=1, anchor_games=2)
+            evaluator.settle()
+        self.assertEqual((evaluator.league['champion'], evaluator.league['reign_from']), ('main/000010', 3))
+        self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
+        self.export(30)
+        evaluator.league = dict(champion='main/000010', checkpoints=[
+            dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20, 30, 40)])
+        self.assertEqual(evaluator.anchor()[3], 8)                  # legacy league: from the champion's entry on
+        evaluator.promote('main/000020', 'main/000010')             # e.g. an idle SPRT rematch reaching H1
+        self.assertEqual((evaluator.league['reign_from'], evaluator.anchor()[3]), (4, 2))
+        evaluator.league['checkpoints'].append(dict(id='main/000050', variant='main', step=50, elo=0., matches=[]))
+        self.assertEqual(evaluator.anchor()[3], 4)
+
     def test_anchor_rounds_resume_across_restarts(self):
         evaluator = self.anchored()
         evaluator.step()

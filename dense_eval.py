@@ -33,10 +33,11 @@ candidate_score, incumbent_score, z and veto in the entry and a 'panel' event. A
 `demoted` ('regression' event) and never promoted or restored again; a vetoed champion is replaced by its most
 recent non-demoted, non-skipped predecessor along panel incumbents (`Evaluator.settle`).
 
-league.json: {champion, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
+league.json: {champion, reign_from, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
 superseded?, panel?, demoted?}], differences, anchors, matrix, rating_note, updated_at}. anchors.seal is {elo,
 elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
-latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, latest_delta the newest one's. `matrix` (`payoff`) holds
+latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, latest_delta the newest one's. reign_from
+is the number of checkpoint entries when the champion was promoted or restored (absent: its own position + 1). `matrix` (`payoff`) holds
 only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
 written before `matrix` and `panel` existed lack those keys; the Evaluator adds `matrix` on start.
 """
@@ -683,7 +684,7 @@ class Evaluator:
         write_league(self.run, self.league, self.config)
 
     def promote(self, cid, previous, panel=None):
-        self.league['champion'] = cid
+        self.league['champion'], self.league['reign_from'] = cid, len(self.league['checkpoints'])
         write_json(self.run/'champion.json', dict(checkpoint=cid, ema_sha256=digest(self.run/'checkpoints'/cid/'ema.pt'),
                                                   updated_at=time.time()))
         log_event(self.run, 'evaluator', 'promotion', f'{cid} promoted to champion' + (f' over {previous}' if previous else ''),
@@ -726,7 +727,7 @@ class Evaluator:
                     restored = entries[restored].get('panel', {}).get('incumbent')
                 restored = restored if restored in entries and restored not in seen else None
                 if self.league['champion'] == entry['id'] and restored:
-                    self.league['champion'] = restored
+                    self.league['champion'], self.league['reign_from'] = restored, len(self.league['checkpoints'])
                     write_json(self.run/'champion.json', dict(checkpoint=restored, updated_at=time.time(),
                                                               ema_sha256=digest(self.run/'checkpoints'/restored/'ema.pt')))
                 champion = self.league['champion'] == restored
@@ -808,13 +809,13 @@ class Evaluator:
     def anchor(self):
         """(champion entry, SEAL, 'anchor', games left) while the current champion owes Seal games, else None. It
         owes anchor_games once for its promotion (anchor_on_promotion) and anchor_games more per `anchor_every`
-        checkpoints rated after its entry, counted against the games of its champion-vs-Seal report; a report
+        checkpoints rated during its reign (entries from `reign_from` on), counted against the games of its champion-vs-Seal report; a report
         under another protocol is left alone. A newer champion supersedes the old one's unfinished anchor."""
         s, champion = self.settings, self.entry(self.league['champion'])
         if not s.anchor_games or champion is None:
             return None
         entries = self.league['checkpoints']
-        later = sum(not c.get('skipped') for c in entries[entries.index(champion)+1:])
+        later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])
         path = report_path(self.run, champion['id'], SEAL)
         report = json.loads(path.read_text()) if path.exists() else None
         if report and not same_protocol(report, s):
