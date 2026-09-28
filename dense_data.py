@@ -414,7 +414,8 @@ class ReplayWindow:
 
     def finished_games(self, n):
         """The newest `n` finished games outside the validation split with a row inside the window (at or after
-        its shard's cutoff row), newest first, as (root values with NaN for null, full_search flags, winner) arrays."""
+        its shard's cutoff row), newest first, as (root values with NaN for null, full_search flags or None when the
+        episode records none, winner)."""
         out = []
         for name, _ in reversed(self.admitted):
             s = self.shards[name]
@@ -423,7 +424,7 @@ class ReplayWindow:
                 if len(out) >= n:
                     return out
                 a, b = int(s.start[g]), int(s.start[g+1])
-                out.append((s.roots[a:b], s.searched[a:b], int(s.winner[g])))
+                out.append((s.roots[a:b], s.searched[a:b] if s.has_search[g] else None, int(s.winner[g])))
         return out
 
     def sample(self, rng, n, recency=0., validation=False):

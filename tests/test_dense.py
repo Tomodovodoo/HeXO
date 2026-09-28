@@ -940,6 +940,14 @@ class DenseDataTests(unittest.TestCase):
             self.assertEqual(len(games), sum(e['winner'] >= 0 for e in episodes))
             newest = [e for e in episodes if e['winner'] >= 0][-1]
             self.assertEqual((games[0][2], len(games[0][0])), (newest['winner'], len(newest['moves'])))
+            episodes, rows = [], []
+            for g, (moves, winner) in enumerate([(winning_game(), 0)]):
+                e, r = episode_rows(moves, winner, [.5]*len(moves))
+                episodes.append(dict(e, full_search=None)); rows += [dict(x, game=g) for x in r]
+            dense_data.write_shard(run/'shards'/'000009', dict(actor_sha256='a'*64), episodes, rows)
+            unflagged = dense_data.ReplayWindow(run, 100000, 10**6).finished_games(1)[0]
+            self.assertEqual((unflagged[1], unflagged[2], len(unflagged[0])), (None, 0, len(winning_game())))
+            shutil.rmtree(run/'shards'/'000009')
             cut = dense_data.ReplayWindow(run, 1500, 10**6)    # the row budget cuts through an admitted shard
             self.assertGreater(cut.starts[cut.admitted[0][0]], 0)
             inside = {(n, int(cut.shards[n].game[i])) for n, i in cut.index if cut.shards[n].winner[cut.shards[n].game[i]] >= 0}
