@@ -1622,6 +1622,18 @@ class EvaluatorLoopTests(unittest.TestCase):
             evaluator.settle()
         self.assertEqual((evaluator.league['champion'], evaluator.league['reign_from']), ('main/000010', 3))
         self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
+        # Restored with 200 Seal games from an earlier reign: a fresh anchor per anchor_every rated checkpoints.
+        report = dense_eval.report_path(self.run, 'main/000010', 'seal')
+        report.parent.mkdir(parents=True)
+        report.write_text(json.dumps(dict(candidate='main/000010', opponent='seal', settings=asdict(evaluator.settings),
+                                          games=[{}]*200)))
+        evaluator.crown('main/000010')
+        self.assertEqual((evaluator.league['reign_games'], evaluator.anchor()[3]), (200, 2))
+        evaluator.league['checkpoints'].append(dict(id='main/000050', variant='main', step=50, elo=0., matches=[]))
+        self.assertEqual(evaluator.anchor()[3], 4)
+        report.write_text(json.dumps(dict(json.loads(report.read_text()), games=[{}]*204)))
+        self.assertIsNone(evaluator.anchor())
+        report.unlink()
         self.export(30)
         evaluator.league = dict(champion='main/000010', checkpoints=[
             dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20, 30, 40)])
