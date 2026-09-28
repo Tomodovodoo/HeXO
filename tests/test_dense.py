@@ -3218,7 +3218,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         """Panel members are re-derived (a stored list is ignored) and include only those within
         max_expected_score."""
         entry = lambda step, elo, **extra: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, matches=[], **extra)
-        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000001', matrix={}, ladder=[], ladder_top=3, checkpoints=[
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000001', matrix={}, ladder=[], ladder_top=3, calibration={}, checkpoints=[
             entry(1, 0.), entry(2, -400*math.log10(19)), entry(3, -400*math.log10(7/3)),
             entry(4, 0., panel=dict(members=['main/000002', 'main/000003'], incumbent='main/000001'))])))
         evaluator = self.start(extra_opponents=2)
@@ -3524,9 +3524,18 @@ class EvaluatorLoopTests(unittest.TestCase):
         dense_eval.write_league(self.run, league, config)
         self.assertEqual(league['calibration']['count'], 0)                            # the direct report was replaced
         league['checkpoints'][1]['verdict']['reports']['main-000020-vs-main-000010']['created_at'] += 1
+        reports = league['checkpoints'][1]['verdict']['reports']
+        reports['main-000030-vs-main-000020'] = dict(created_at=0., games=2)
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration']['count'], 0)                            # an input report was replaced
+        del reports['main-000030-vs-main-000020']
         league['checkpoints'][1]['verdict']['protocol']['sims'] += 1                  # decided under another protocol
         dense_eval.write_league(self.run, league, config)
         self.assertEqual(league['calibration']['count'], 0)
+        del league['calibration']
+        (self.run/'league.json').write_text(json.dumps(league))
+        self.start()
+        self.assertIn('calibration', self.league())                                    # added on start
 
 if __name__ == '__main__':
     unittest.main()

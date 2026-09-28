@@ -74,8 +74,8 @@ latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, lates
 is the number of checkpoint entries and reign_games the champion's Seal games when it was promoted or restored
 (absent: its own position + 1 and 0). `matrix` (`payoff`) holds
 only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
-written before `matrix`, `ladder` and `panel` existed lack those keys; the Evaluator adds `matrix` on start and
-rebuilds the ladder when its ladder_top differs from the effective fill_top.
+written before `matrix`, `ladder`, `panel` and `calibration` existed lack those keys; the Evaluator adds `matrix`
+and `calibration` on start and rebuilds the ladder when its ladder_top differs from the effective fill_top.
 """
 import argparse
 from dataclasses import asdict, replace
@@ -512,9 +512,10 @@ def variant_heads(entries, rated=lambda c: True):
 
 def calibration(league, reports):
     """Diagnostic of the posterior's stated uncertainty; no decision reads it. For every checkpoint whose posterior
-    verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports), whose direct report is still
-    the one it was decided on (same created_at) and which has at least CALIBRATION_LATER later comparisons (reports
-    with it under that protocol that are new, replaced or have grown since the verdict), shift = delta now - delta at the verdict, both
+    verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports), whose snapshotted reports
+    (the direct one among them) are all still the ones it was decided on (same created_at, so extended at most) and
+    which has at least CALIBRATION_LATER later comparisons (reports with it under that protocol that are new or
+    have grown since the verdict), shift = delta now - delta at the verdict, both
     r_cid - r_opponent + their matchup deviation over the reports of that protocol with the verdict's matchup
     prior. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
     resolved). Returns {count, predicted_sd (mean delta_sd at the verdicts), expected_rms (root mean sd_then^2 -
@@ -530,10 +531,13 @@ def calibration(league, reports):
             continue
         key = protocol(verdict['protocol'])
         group = [r for r in reports if protocol(r['settings']) == key]
-        seen = lambda r: (lambda s: s['games'] if s and s['created_at'] == r['created_at'] else 0)(verdict['reports'].get(report_name(r)))
-        if not any((r['candidate'], r['opponent']) == (cid, verdict['opponent']) and seen(r) for r in group):
+        named = {report_name(r): r for r in group}
+        direct = report_path('', cid, verdict['opponent']).parent.name
+        if direct not in verdict['reports'] or any(name not in named or named[name]['created_at'] != snap['created_at']
+                                                   for name, snap in verdict['reports'].items()):
             continue
-        later = sum(cid in (r['candidate'], r['opponent']) and len(r['games']) > seen(r) for r in group)
+        later = sum(cid in (r['candidate'], r['opponent']) and len(r['games']) > verdict['reports'].get(name, {}).get('games', 0)
+                    for name, r in named.items())
         if later < CALIBRATION_LATER:
             continue
         model = key, verdict['matchup_prior']
@@ -719,7 +723,8 @@ class Evaluator:
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
-        if self.league['checkpoints'] and ('matrix' not in self.league or self.league.get('ladder_top') != settings.fill_top):
+        if self.league['checkpoints'] and ('matrix' not in self.league or 'calibration' not in self.league
+                                           or self.league.get('ladder_top') != settings.fill_top):
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         self.models, self.seal, self.written, self.fill_target, self.deciding, self.reviewed = {}, None, 0., None, None, False
         self.book, self.next, self.shas = {}, {}, {}
