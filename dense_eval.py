@@ -597,6 +597,10 @@ def loop(args):
     run = Path(args.run)
     config = dense_config.load(run)
     settings = dense_config.override(config.evaluation, args, 'eval_')
+    if args.processes < 1:
+        raise ValueError('At least one evaluation worker process is required')
+    if any(getattr(settings, name) % 2 for name in ('games', 'previous_games', 'anchor_games', 'sprt_max_games')):
+        raise ValueError('Evaluation game counts must be even: every opening is played with both colours')
     evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share), args.processes)
     try:
         while True:
