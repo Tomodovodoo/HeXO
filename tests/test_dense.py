@@ -1616,12 +1616,28 @@ class ValidationSourceTests(unittest.TestCase):
                     self.assertEqual(len(v[f'{source}_{key}']), len(dense_learn.PLY_GRID))
                 for key in ('value_horizon', 'policy_ce_early', 'policy_ce_late'):
                     self.assertIn(f'{source}_{key}', v)
+            for source in dense_learn.CURVE_SOURCES:
+                for key, field in (('value_surface', 'value'), ('value_excess_surface', 'excess'), ('policy_surface', 'policy')):
+                    grid = v[f'{source}_{key}']
+                    self.assertEqual(set(grid), {'ply_bins', 'remaining_bins', 'counts', field})
+                    self.assertEqual(len(grid[field]), len(grid['ply_bins']))
+            fg, (bce,) = dense_learn.surfaces(r['ply'][f], r['remaining'][f], (r['value_bce'][f],))
+            self.assertEqual(v['fresh_value_surface'], fg | dict(value=[dense_learn.compact(x) for x in bce]))
+            self.assertEqual(sum(map(sum, v['fresh_policy_surface']['counts'])), int(p.sum()))
+            self.assertTrue(any(y is not None for row in v['fresh_value_surface']['value'] for y in row))
             self.assertNotIn('converted_value_curve', v)
+            self.assertNotIn('converted_value_surface', v)
+            for source in dense_learn.CURVE_SOURCES:
+                for key in ('value_regret', 'value_regret_early', 'value_regret_late'):
+                    self.assertIn(f'{source}_{key}', v)
+            self.assertIsNotNone(v['fresh_value_regret'])
+            self.assertTrue(np.isfinite(r['searched']).all())
             self.assertNotIn('converted_policy_ce_curve', v)
             fields = dense_learn.validation_fields(metrics)
-            self.assertFalse([k for k, x in fields.items() if isinstance(x, list)])
+            self.assertFalse([k for k, x in fields.items() if isinstance(x, (list, dict))])
             self.assertEqual(fields['fresh_value_bce_last20'], v['fresh_value_bce_last20'])
             self.assertEqual(fields['fresh_policy_ce_early'], v['fresh_policy_ce_early'])
+            self.assertEqual(fields['fresh_value_regret'], v['fresh_value_regret'])
             dense_config.append_metrics(run, 'learner-main', step=7, validation=True, **fields)
             config = dict(created_at=0.)
             self.assertEqual(dashboard.series(run, config, 'main', 'validation_fresh_value_bce_last20')['points'],
@@ -1647,6 +1663,94 @@ class ValidationSourceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     dashboard.series(run, config, 'main', f'fresh_{key}', 'remaining')
             json.dumps(curve, allow_nan=False)
+
+    def test_surfaces_bin_rows_into_cells(self):
+        """Rows land in the (ply // 16, remaining // 16) cell; cells under min_cells rows are nan but keep their
+        count; rows beyond the limit are dropped; the excess subtracts the entropy of the cell's outcome rate."""
+        ply = [0]*8+[20]*8+[40]*3+[400]
+        remaining = [15]*8+[33]*8+[5]*3+[0]
+        loss = [.5]*8+[1., 2.]*4+[9.]*3+[9.]
+        target = [1.]*8+[1., 0.]*4+[0.]*4
+        grid, (mean, rate) = dense_learn.surfaces(ply, remaining, (loss, target))
+        self.assertEqual(grid['ply_bins'], list(range(0, 384, 16)))
+        self.assertEqual(grid['remaining_bins'], grid['ply_bins'])
+        counts = np.array(grid['counts'])
+        self.assertEqual(counts.shape, (24, 24))
+        self.assertEqual((counts[0, 0], counts[1, 2], counts[2, 0], counts.sum()), (8, 8, 3, 19))
+        self.assertEqual((mean[0, 0], mean[1, 2]), (.5, 1.5))
+        self.assertTrue(np.isnan(mean[2, 0]) and np.isnan(mean[5, 5]))
+        excess = mean-dense_learn.binary_entropy(rate)
+        self.assertAlmostEqual(excess[0, 0], .5)
+        self.assertAlmostEqual(excess[1, 2], 1.5-math.log(2))
+        self.assertTrue(np.isnan(excess[2, 0]))
+        few = dense_learn.surfaces(ply, remaining, (loss,), min_cells=3)[1][0]
+        self.assertEqual(few[2, 0], 9.)
+
+    def test_value_regret_against_the_calibrated_search(self):
+        """Outcomes drawn from a known function of the searched value and plies remaining: a net predicting that
+        probability has regret near zero; one that is confidently wrong far from the end has positive late regret."""
+        rng = np.random.default_rng(0)
+        def rows(n):
+            v, h = rng.uniform(-1, 1, n), rng.integers(1, 200, n).astype(float)
+            p = 1/(1+np.exp(-np.arctanh(np.clip(v, -.995, .995))*(3-np.log1p(h)/3)))
+            v[:n//20] = np.nan
+            p[:n//20] = .5
+            return v, h, (rng.random(n) < p).astype(float), p
+        fv, fh, fy, _ = rows(20000)
+        v, h, y, truth = rows(20000)
+        reference = dense_learn.calibration_reference(fv, fh, fy, v, h)
+        self.assertAlmostEqual(float(reference[0]), float(np.clip(fy.mean(), 1e-3, 1-1e-3)))
+        bce = lambda q: -(y*np.log(q)+(1-y)*np.log(1-q))
+        matched = dense_learn.value_regret(bce(truth), y, reference, h)
+        for k in ('value_regret', 'value_regret_early', 'value_regret_late'):
+            self.assertLess(abs(matched[k]), .02, k)
+        wrong = np.where(h >= 60, np.where(truth > .5, .01, .99), truth)
+        off = dense_learn.value_regret(bce(wrong), y, reference, h)
+        self.assertGreater(off['value_regret_late'], .5)
+        self.assertLess(abs(off['value_regret_early']), .02)
+        self.assertEqual(dense_learn.value_regret([.1], [1.], None, [5]), dict.fromkeys(matched))
+        self.assertIsNone(dense_learn.calibration_reference([], [], [], [0.], [5]))
+        episode = dict(root_values=[.2, None, .4, .6], full_search=[True, True, True, False])
+        self.assertEqual([dense_learn.searched_value(episode, t) for t in range(4)], [.2, -.2, .4, -.4])
+        self.assertTrue(math.isnan(dense_learn.searched_value(dict(root_values=None), 3)))
+
+    def test_surface_endpoint_returns_the_newest_grid(self):
+        import dashboard
+        from http.server import HTTPServer
+        from urllib.error import HTTPError
+        from urllib.request import urlopen
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root/'r'
+            run.mkdir()
+            (run/'config.json').write_text(json.dumps(dict(schema=dense_config.SCHEMA, created_at=0.)))
+            bins = [0, 16]
+            for step, value in ((5, .9), (10, .4)):
+                path = run/'checkpoints'/'main'/f'{step:06d}'
+                path.mkdir(parents=True)
+                grid = dict(ply_bins=bins, remaining_bins=bins, counts=[[9, 2], [0, 12]], value=[[value, None], [None, .7]])
+                (path/'manifest.json').write_text(json.dumps(dict(step=step, metrics=dict(validation_sources=dict(newest_value_surface=grid)))))
+            out = dashboard.surface(run, 'main', 'newest_value_surface')
+            self.assertEqual(out['checkpoint'], 'main/000010')
+            self.assertEqual((out['ply_bins'], out['remaining_bins'], out['counts']), (bins, bins, [[9, 2], [0, 12]]))
+            self.assertEqual(out['values'], [[.4, None], [None, .7]])
+            empty = dashboard.surface(run, 'main', 'fresh_policy_surface')
+            self.assertEqual((empty['checkpoint'], empty['values'], empty['counts']), (None, [], []))
+            with self.assertRaises(ValueError):
+                dashboard.surface(run, 'main', 'fresh_value_curve')
+            server = HTTPServer(('127.0.0.1', 0), type('Handler', (dashboard.Handler,), dict(runs=root)))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                url = f'http://127.0.0.1:{server.server_port}/api/surface?run=r&variant=main&metric='
+                with urlopen(url+'newest_value_surface', timeout=5) as response:
+                    self.assertEqual(json.loads(response.read()), out)
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(url+'nope', timeout=5)
+                self.assertEqual(error.exception.code, 400)
+                error.exception.close()
+            finally:
+                server.shutdown(); server.server_close()
 
     def test_value_curve_series_keeps_unsupported_gaps(self):
         """A curve supported on two separate ranges keeps null points between them in the response, so the chart
