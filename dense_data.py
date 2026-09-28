@@ -335,7 +335,7 @@ class ValidationSets:
             picks[source, split] = chosen
         entries, following, missing = {}, {}, {}
         for name, i in {key for chosen in picks.values() for key in chosen}:
-            if (name, i) in self.entries:
+            if (name, i) in self.following_index:    # cached as a chosen row, not only as a successor
                 following[name, i] = j = self.following_index[name, i]
                 entries.update({(name, k): self.entries[name, k] for k in (i, j) if k is not None})
             else:

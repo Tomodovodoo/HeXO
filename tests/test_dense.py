@@ -832,17 +832,19 @@ class DenseBootstrapTests(unittest.TestCase):
                 dense_bootstrap.read_corpus(source)
 
 
-def source_shard(path, seed, actor, origin='actor', checkpoint=None, games=6):
-    """A shard of `games` random capped games played by `actor`; actor shards get a dense_selfplay-like identity."""
+def source_shard(path, seed, actor, origin='actor', checkpoint=None, games=6, policy_every=2):
+    """A shard of `games` random capped games; game g is played by actor[g % len(actor)] for a list, else by `actor`
+    (the identity's actor_sha256 is the last one). Actor shards get a dense_selfplay-like identity."""
     rng = np.random.default_rng(seed)
+    actors = actor if isinstance(actor, list) else [actor]
     episodes, rows = [], []
     for g in range(games):
         moves, _ = random_game(rng, 8)
-        e, r = episode_rows(moves, -1, [float(v) for v in rng.uniform(-1, 1, len(moves))], rng, policy_every=2)
-        episodes.append(dict(e, actor=actor))
+        e, r = episode_rows(moves, -1, [float(v) for v in rng.uniform(-1, 1, len(moves))], rng, policy_every)
+        episodes.append(dict(e, actor=actors[g % len(actors)]))
         rows += [dict(x, game=g) for x in r]
-    identity = dict(source='gumbel-policy-value-v1', actor_sha256=actor) if origin == 'converted' else \
-        dict(actor_sha256=actor, actors=[actor], checkpoint=checkpoint)
+    identity = dict(source='gumbel-policy-value-v1', actor_sha256=actors[-1]) if origin == 'converted' else \
+        dict(actor_sha256=actors[-1], actors=sorted(set(actors)), checkpoint=checkpoint)
     return dense_data.write_shard(path, identity, episodes, rows, origin)
 
 
@@ -902,6 +904,27 @@ class ValidationSourceTests(unittest.TestCase):
                 if following is not None:
                     self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
             dense_data.collate(samples, targets)
+
+    def test_newest_change_selects_a_cached_successor(self):
+        """A row cached only as a chosen row's next-ply successor can be chosen after the newest actor changes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 1, ['x', 'y'], checkpoint='main/000010', games=8, policy_every=1)
+            source_shard(run/'shards'/'1000000000002', 2, 'x', checkpoint='main/000010', policy_every=1)
+            sets = dense_data.ValidationSets(run, .3, 5, limit=40, quota=12)
+            sets.refresh()
+            successors = set(sets.entries)-set(sets.following_index)
+            source_shard(run/'shards'/'1000000000003', 3, 'y', checkpoint='main/000020', policy_every=1)
+            sets.refresh()
+            self.assertEqual(sets.newest, 'y')
+            chosen = {(r.shard, r.index) for refs in sets.subsets.values() for r in refs}
+            self.assertTrue(successors & chosen)
+            for refs in sets.subsets.values():
+                for r in refs:
+                    following = sets.following(r)
+                    if following is not None:
+                        self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
+                        self.assertTrue(len(sets.policy(following)))
 
     def test_export_logs_per_source_validation(self):
         import dashboard
