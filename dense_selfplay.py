@@ -22,9 +22,12 @@ pacing: they re-read the learner heartbeats every `yield_check_seconds`, pause o
 samples_per_row to that learner's own samples_per_row_target (config learner.samples_per_row when a heartbeat
 lacks it) among the learners that are training drops below `yield_below` and resume once it reaches
 `yield_resume` (hysteresis, so the learner does not reach its own waiting point while the
-actors sleep). A missing, stale or non-training heartbeat never pauses. Paused workers keep their trees and
-in-flight batch and heartbeat with stage 'paused'. Actor settings can be overridden per process with
---<setting> flags (the supervisor forwards them; shards record the effective values).
+actors sleep). With phase_follow they also pause while a fresh heartbeat of a phased learner (phase_rows > 0)
+shows its training phase (stage 'training' or 'exporting') and play while it idles ('phase-idle'), so actors and
+learner alternate on the GPU; the pacing rule alone cannot do that, since it pauses on a backlog of
+(1 - yield_below) * rows_available rather than phase_rows. A missing, stale or non-training heartbeat never
+pauses. Paused workers keep their trees and in-flight batch and heartbeat with stage 'paused'. Actor settings can
+be overridden per process with --<setting> flags (the supervisor forwards them; shards record the effective values).
 
 Historical opponents (ActorSettings.historical_*): up to round(historical_fraction * min(games_in_flight, --games))
 games in flight pit the played model (called the champion below), alternating colours over historical games,
@@ -544,19 +547,21 @@ def metrics_due(stage, logged_stage, elapsed):
 
 
 class Yield:
-    """Cooperative pause of the actor workers while a learner is behind its pacing (module contract).
-    paused() re-reads <run>/learner-status*.json at most every `check_seconds` and returns the current state;
-    `reason` describes the last decision."""
+    """Cooperative pause of the actor workers (module contract): paused while the pacing rule holds (`below`,
+    `resume`; below 0 disables it) or, with `follow`, while a phased learner is in its training phase. paused()
+    re-reads <run>/learner-status*.json at most every `check_seconds` and returns the current state; `reason`
+    describes the last decision."""
 
-    def __init__(self, run, target, below, resume, check_seconds, clock=time.monotonic, now=time.time):
+    def __init__(self, run, target, below, resume, check_seconds, follow=False, clock=time.monotonic, now=time.time):
         if below and not 0 < below <= resume:
             raise ValueError('yield_below must be 0 (off) or in (0, yield_resume]')
         self.run, self.target, self.below, self.resume, self.check_seconds = Path(run), target, below, resume, check_seconds
-        self.clock, self.now, self.checked, self.state, self.reason = clock, now, None, False, 'not checked'
+        self.follow, self.clock, self.now, self.checked = follow, clock, now, None
+        self.state, self.behind, self.reason = False, False, 'not checked'
 
-    def lowest(self):
-        """(samples_per_row / its target, samples_per_row, target, variant) of the furthest-behind training learner
-        with a fresh heartbeat, or None. The target is the heartbeat's samples_per_row_target, else `target`."""
+    def training(self):
+        """The fresh heartbeats of learners that are training or exporting, 'variant' filled in from the file name
+        where missing."""
         found = []
         for path in sorted(self.run.glob('learner-status*.json')):
             try:
@@ -564,28 +569,42 @@ class Yield:
             except (OSError, ValueError):
                 continue
             fresh = self.now()-float(status.get('updated_at') or 0) <= STALE_SECONDS
-            if fresh and status.get('stage') in ('training', 'exporting') and status.get('samples_per_row') is not None:
+            if fresh and status.get('stage') in ('training', 'exporting'):
+                found.append(dict(status, variant=status.get('variant', path.stem)))
+        return found
+
+    def lowest(self, statuses):
+        """(samples_per_row / its target, samples_per_row, target, variant) of the furthest-behind learner among
+        `statuses`, or None. The target is the heartbeat's samples_per_row_target, else `target`."""
+        found = []
+        for status in statuses:
+            if status.get('samples_per_row') is not None:
                 rate, target = float(status['samples_per_row']), float(status.get('samples_per_row_target') or self.target)
-                found.append((rate/target, rate, target, status.get('variant', path.stem)))
+                found.append((rate/target, rate, target, status['variant']))
         return min(found) if found else None
 
     def paused(self):
-        if not self.below:
+        if not self.below and not self.follow:
             return False
         if self.checked is not None and self.clock()-self.checked < self.check_seconds:
             return self.state
         self.checked = self.clock()
-        lowest = self.lowest()
+        statuses = self.training()
+        lowest = self.lowest(statuses) if self.below else None
         if lowest is None:
-            self.state, self.reason = False, 'no training learner heartbeat'
-            return False
-        ratio, rate, target, variant = lowest
-        if self.state and ratio >= self.resume:
-            self.state = False
-        elif not self.state and ratio < self.below:
-            self.state = True
-        self.reason = (f'learner {variant} at {rate:.2f} samples/row; pause below {self.below*target:.2f}, '
-                       f'resume at {self.resume*target:.2f}')
+            self.behind, self.reason = False, 'no training learner heartbeat'
+        else:
+            ratio, rate, target, variant = lowest
+            if self.behind and ratio >= self.resume:
+                self.behind = False
+            elif not self.behind and ratio < self.below:
+                self.behind = True
+            self.reason = (f'learner {variant} at {rate:.2f} samples/row; pause below {self.below*target:.2f}, '
+                           f'resume at {self.resume*target:.2f}')
+        phased = [s['variant'] for s in statuses if (s.get('phase_rows') or 0) > 0] if self.follow else []
+        if phased:
+            self.reason = f'learner {", ".join(phased)} in its training phase'
+        self.state = self.behind or bool(phased)
         return self.state
 
 
@@ -618,7 +637,8 @@ def worker(args):
     since = dict(time=time.perf_counter(), positions=state['positions'], evals=0)
 
     logged, stage_logged = time.perf_counter(), 'playing'
-    gate = Yield(run, config.learner.samples_per_row, settings.yield_below, settings.yield_resume, settings.yield_check_seconds)
+    gate = Yield(run, config.learner.samples_per_row, settings.yield_below, settings.yield_resume, settings.yield_check_seconds,
+                 settings.phase_follow)
     paused_since, paused_total = None, 0.
 
     def status(stage):

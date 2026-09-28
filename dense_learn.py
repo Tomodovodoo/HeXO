@@ -28,7 +28,10 @@ over every row of the batch that has that target, summed with the head coefficie
 a separate forward pass whose gradients accumulate (buckets padded to QUANTUM rows with inert rows).
 Pacing: at most samples_per_row * (trained rows in all shards, cheap rows included; a historical opponent's
 plies are not trained, see dense_data.trained) samples are presented; beyond that the learner waits. The window
-is sized in full-search rows (dense_data.ReplayWindow).
+is sized in full-search rows (dense_data.ReplayWindow). With phase_rows > 0 the learner alternates phases (Phase):
+it idles until the untrained backlog (backlog) reaches phase_rows, then trains until the pacing limit, so actors
+following the phase (ActorSettings.phase_follow) have the GPU to themselves while it idles; exports still fall on
+every export_every-th step.
 """
 import argparse
 import copy
@@ -57,7 +60,7 @@ STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
-        'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb')
+        'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
@@ -215,6 +218,33 @@ def validation_sets(run, settings, seed):
 
 def status_path(run, variant):
     return run/('learner-status.json' if variant == 'main' else f'learner-status-{variant}.json')
+
+
+def backlog(samples_seen, total_rows, samples_per_row):
+    """Untrained backlog in rows: the part of the pacing budget samples_per_row * total_rows not yet presented,
+    divided by samples_per_row, i.e. total_rows - samples_seen / samples_per_row: the rows still below the target if
+    every samples_per_row presented samples had brought one whole row up to it. The learner cannot take another
+    batch once it falls below batch / samples_per_row."""
+    return total_rows-samples_seen/samples_per_row
+
+
+class Phase:
+    """Phased training schedule. due(phase_rows, backlog_rows, paced) says whether the learner trains now, where
+    `paced` means the pacing limit forbids the next batch. phase_rows 0: always due (the pacing limit alone decides).
+    phase_rows > 0: a training phase starts once backlog_rows reaches phase_rows and lasts until `paced`; between
+    phases the learner idles. `training` is the current phase."""
+
+    def __init__(self):
+        self.training = False
+
+    def due(self, phase_rows, backlog_rows, paced):
+        if phase_rows <= 0:
+            return True
+        if paced:
+            self.training = False
+        elif backlog_rows >= phase_rows:
+            self.training = True
+        return self.training
 
 
 def pad(bucket, quantum):
@@ -660,7 +690,9 @@ def main():
                       rows_available=window.total_rows, window_rows=window.rows, full_rows_available=window.total_full_rows,
                       window_full_rows=window.full_rows,
                       samples_per_row=learner.samples_seen/max(1, window.total_rows),
-                      samples_per_row_target=learner.settings.samples_per_row, lr=learner.lr(),
+                      samples_per_row_target=learner.settings.samples_per_row, phase_rows=learner.settings.phase_rows,
+                      backlog_rows=backlog(learner.samples_seen, window.total_rows, learner.settings.samples_per_row),
+                      lr=learner.lr(),
                       last_export_step=learner.last_export, policy_ce=(learner.metrics or {}).get('policy_ce'),
                       value_bce=(learner.metrics or {}).get('value_bce'), vram=learner.vram())
         write_json(status_path(args.run, s.variant), status)
@@ -697,13 +729,19 @@ def main():
         print(f'{"step":>6} {"policy":>7} {"value":>7} {"short":>7} {"opp":>7} {"future":>7} {"outcome":>7} {"lr":>8} {"rows/s":>7} {"wait":>6} {"gpu":>6} {"mem":>6}', flush=True)
         sums = torch.zeros(len(HEADS), device=learner.device); counts = torch.zeros(len(HEADS), device=learner.device)
         last_status = last_refresh = time.time()
+        phase = Phase()
         while args.steps is None or learner.step < args.steps:
             if learner.maybe_replace(factor_rng):
                 stream.close(); window = replay(); learner.calibrate(window); stream = renderers(); last_refresh = time.time()
             s = learner.settings
             if time.time()-last_refresh > REFRESH_SECONDS:
                 window.refresh(); last_refresh = time.time()
-            if not window.index or learner.samples_seen+s.batch > s.samples_per_row*window.total_rows:
+            paced = learner.samples_seen+s.batch > s.samples_per_row*window.total_rows
+            if window.index and not phase.due(s.phase_rows, backlog(learner.samples_seen, window.total_rows, s.samples_per_row), paced):
+                write_status(stage='phase-idle', samples_per_second=0.)
+                rate = []; time.sleep(5.); window.refresh(); last_refresh = time.time()
+                continue
+            if not window.index or paced:
                 write_status(stage='waiting-for-data', samples_per_second=0.)
                 rate = []; time.sleep(5.); window.refresh(); last_refresh = time.time()
                 continue
