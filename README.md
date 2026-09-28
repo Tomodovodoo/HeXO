@@ -833,10 +833,6 @@ always score finished games against their hard outcome.
   `promote_confidence`. It is rejected when that probability is at most 1 - `promote_confidence`. Neither
   happens while the direct-only and pooled estimates disagree beyond their intervals. `decision sprt` keeps the
   sequential test (`sprt_elo0` 0, `sprt_elo1` 25).
-- **Calibration diagnostic.** Each posterior verdict records the sd of delta it stated. Once the checkpoint has
-  three later comparisons, `league.json` `calibration` compares the realised RMS shift of delta with what a
-  calibrated posterior expects (root mean of sd then squared minus sd now squared). A realised RMS well below the
-  expected one means the posterior overstates its variance. No decision reads it.
 - **Continuous pool.** Like the actors, the evaluator keeps `pool_games` (64) games in flight on one engine. When
   a game ends, the next opening of its pairing starts at once (both colours together), so the GPU batch stays
   full. Each completed colour pair is written to its report immediately, so a restart loses only the games in

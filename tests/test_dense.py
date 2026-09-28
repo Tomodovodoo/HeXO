@@ -3112,9 +3112,6 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['kind'] for e in events if e['kind'] in ('decision', 'promotion')], ['decision', 'promotion'])
         self.assertIn('promote on review', events[-2]['message'])
-        verdict = next(c for c in self.league()['checkpoints'] if c['id'] == 'main/025000')['verdict']
-        self.assertEqual((verdict['review'], verdict['opponent'], verdict['reports']['main-025000-vs-main-019500']['games']),
-                         (True, 'main/019500', 64))
 
     def test_a_restart_under_another_protocol_starts_the_candidate_afresh(self):
         evaluator = self.start(sprt_max_games=6)
@@ -3218,7 +3215,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         """Panel members are re-derived (a stored list is ignored) and include only those within
         max_expected_score."""
         entry = lambda step, elo, **extra: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, matches=[], **extra)
-        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000001', matrix={}, ladder=[], ladder_top=3, calibration={}, checkpoints=[
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000001', matrix={}, ladder=[], ladder_top=3, checkpoints=[
             entry(1, 0.), entry(2, -400*math.log10(19)), entry(3, -400*math.log10(7/3)),
             entry(4, 0., panel=dict(members=['main/000002', 'main/000003'], incumbent='main/000001'))])))
         evaluator = self.start(extra_opponents=2)
@@ -3484,62 +3481,6 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual([c['id'] for c in evaluator.heads()], ['main/000030'])
         entry, opponent, kind, games = evaluator.optional()
         self.assertEqual((entry['id'], opponent, kind, games), ('main/000030', 'main/000020', 'panel', 2))
-
-    def test_calibration_compares_the_stated_sd_with_the_later_shift(self):
-        """league.json calibration counts a verdict once its checkpoint has three later comparisons: the delta sd it
-        stated, the RMS a calibrated posterior expects (sd then^2 - sd now^2) and the realised shift of delta."""
-        self.export(10, 20, 30, 40, 50)
-        self.start()
-        self.report('main/000020', 'main/000010', [1, 1, 0, 1]*4)
-        entry = lambda step: dict(id=f'main/{step:06d}', variant='main', step=step, elo=0., elo_interval=None, matches=[])
-        evaluator = self.start(decision='posterior', sprt_min_games=16, matchup_prior_elo=20.)       # not config.json's
-        evaluator.league = league = dict(champion='main/000010', checkpoints=[entry(10), entry(20)])
-        verdict = dense_eval.public(evaluator.verdict('main/000020', 'main/000010'))
-        snapshot = evaluator.snapshot('main/000020', 'main/000010')
-        self.assertEqual({k: v['games'] for k, v in snapshot['reports'].items()}, {'main-000020-vs-main-000010': 16})
-        league['checkpoints'][1]['verdict'] = dict(verdict, candidate='main/000020', **snapshot)
-        config = dense_config.load(self.run)
-        dense_eval.write_league(self.run, league, config)
-        self.assertEqual(league['calibration'], dict(count=0, predicted_sd=None, expected_rms=None, realised_rms=None))
-        for step, results in ((30, [0, 0, 1, 0]*2), (40, [0, 1]*4)):
-            league['checkpoints'].append(entry(step))
-            self.report(f'main/{step:06d}', 'main/000020', results)
-        dense_eval.write_league(self.run, league, config)
-        self.assertEqual(league['calibration']['count'], 0)                            # two later comparisons
-        league['checkpoints'].append(entry(50))
-        self.report('main/000020', 'main/000050', [1, 0]*4)
-        dense_eval.write_league(self.run, league, config)
-        reports = dense_eval.load_reports(self.run)
-        post = dense_eval.Posterior([f'main/{s:06d}' for s in (10, 20, 30, 40, 50)], 'main/000010',
-                                    [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
-                                      r['summary']['games']) for r in reports], 20.)
-        mean, sd = post.difference('main/000020', 'main/000010')
-        calibration = league['calibration']
-        self.assertEqual(calibration['count'], 1)
-        self.assertAlmostEqual(calibration['predicted_sd'], verdict['delta_sd'])
-        self.assertAlmostEqual(calibration['expected_rms'], math.sqrt(verdict['delta_sd']**2-sd**2))
-        self.assertAlmostEqual(calibration['realised_rms'], abs(mean-verdict['delta']))
-        self.assertGreater(calibration['realised_rms'], 0.)
-        reports = league['checkpoints'][1]['verdict']['reports']
-        digest = reports['main-000020-vs-main-000010']['digest']
-        reports['main-000020-vs-main-000010']['digest'] = '0'*16
-        dense_eval.write_league(self.run, league, config)
-        self.assertEqual(league['calibration']['count'], 0)                            # the direct report was replaced
-        reports['main-000020-vs-main-000010']['digest'] = digest
-        reports['main-000030-vs-main-000040'] = dict(games=2, digest='0'*16)
-        dense_eval.write_league(self.run, league, config)
-        self.assertEqual(league['calibration']['count'], 0)                            # an input report is gone
-        del reports['main-000030-vs-main-000040']
-        self.report('main/000020', 'main/000010', [1, 1, 0, 1]*4+[1, 0])              # extended: still counted
-        dense_eval.write_league(self.run, league, config)
-        self.assertEqual(league['calibration']['count'], 1)
-        league['checkpoints'][1]['verdict']['protocol']['sims'] += 1                  # decided under another protocol
-        dense_eval.write_league(self.run, league, config)
-        self.assertEqual(league['calibration']['count'], 0)
-        del league['calibration']
-        (self.run/'league.json').write_text(json.dumps(league))
-        self.start()
-        self.assertIn('calibration', self.league())                                    # added on start
 
 if __name__ == '__main__':
     unittest.main()
