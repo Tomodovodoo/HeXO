@@ -23,7 +23,8 @@ class ScriptedTactics:
         if mode == (3, 3):
             self.hoard.append(bytearray(512*2**20))
         return dict(status='UNKNOWN', native_verified=False, moves=[], certificate=None, reason='scripted',
-                    pid=os.getpid(), ms=ms, background_worker_busy=mode == (2, 2))
+                    pid=os.getpid(), ms=ms, background_worker_busy=mode == (2, 2),
+                    padding='x'*(17*2**20) if mode == (4, 4) else '')
 
 
 class Isolation(unittest.TestCase):
@@ -85,6 +86,11 @@ class Isolation(unittest.TestCase):
         result = self.tactics.history([[0, 0]], ms=1000, certificate=dict(padding='x'*(9*2**20)))
         self.assertEqual(result['reason'], 'request size limit')
         self.assertEqual(self.tactics.history([[0, 0]], ms=1000)['reason'], 'scripted')
+
+    def test_oversized_response_is_discarded(self):
+        pid = self.tactics.history([[0, 0]], ms=10000)['pid']
+        self.assertEqual(self.tactics.history([[4, 4]], ms=10000)['reason'], 'response size limit')
+        self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
 
     def test_invalid_budget_rejected_in_parent(self):
         with self.assertRaises(ValueError):

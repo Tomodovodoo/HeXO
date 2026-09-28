@@ -21,6 +21,8 @@ import time
 PROVEN_WIN, UNKNOWN = 'PROVEN_WIN', 'UNKNOWN'
 PACKAGE = Path(__file__).resolve().parent/'tools/tactical'
 REQUEST_LIMIT = 8*1024*1024
+# Worker responses above this are discarded unparsed; the verifier's 50,000-node certificate cap stays well below it.
+RESPONSE_LIMIT = 16*1024*1024
 
 
 def check_budgets(ms, idtt_ms, nodes, depth):
@@ -152,7 +154,7 @@ class IsolatedTactics:
             line = self.lines.get(timeout=max(0.0, deadline-time.perf_counter()))
         except queue.Empty:
             return 'timeout'
-        return 'exit' if line is None else json.loads(line)
+        return 'exit' if line is None else line if line == 'oversize' else json.loads(line)
 
     def solve(self, game, **budgets):
         return self.history([cell[:2] for cell in game.cells], **budgets)
@@ -177,9 +179,10 @@ class IsolatedTactics:
                         self._retire(killed=True)
                         return unknown_result('tactical worker not ready; replaced', start)
                     return unknown_result('tactical worker starting', start)
-                if line == 'exit' or 'error' in line:
+                if line in ('exit', 'oversize') or 'error' in line:
                     self._retire(killed=False)
-                    return unknown_result(f"tactical worker failed to start: {line if line == 'exit' else line['error']}", start)
+                    reason = line if isinstance(line, str) else line['error']
+                    return unknown_result(f'tactical worker failed to start: {reason}', start)
                 self.ready = True
             remaining = math.floor(ms-(time.perf_counter()-start)*1000)
             if remaining < 1:
@@ -198,6 +201,9 @@ class IsolatedTactics:
             if result == 'exit':
                 self._retire(killed=False)
                 return unknown_result('tactical worker exited (memory cap or crash)', start)
+            if result == 'oversize':
+                self._retire(killed=True)
+                return unknown_result('response size limit', start)
             if result.get('background_worker_busy'):
                 self._retire(killed=True)
             if time.perf_counter()-start >= ms/1000:
@@ -273,7 +279,11 @@ def _assign(job, pid):
 
 
 def _pump(stream, lines):
-    for line in stream:
+    """Forward worker lines; a line over RESPONSE_LIMIT becomes 'oversize' and ends the stream."""
+    while line := stream.readline(RESPONSE_LIMIT+1):
+        if not line.endswith('\n'):
+            lines.put('oversize')
+            break
         lines.put(line)
     lines.put(None)
 
