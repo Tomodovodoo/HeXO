@@ -925,6 +925,23 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertTrue(sets.subsets['newest', 'train'])
             self.assertTrue(all(r.episode['actor'] == 'y' for r in sets.subsets['newest', 'train']))
 
+    def test_lagging_worker_does_not_move_newest_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 1, 'x', checkpoint='main/000010')
+            source_shard(run/'shards'/'1000000000002', 2, 'y', checkpoint='main/000020')
+            sets = dense_data.ValidationSets(run, .5, 5, limit=10, quota=4)
+            sets.refresh()
+            self.assertEqual((sets.newest, sets.newest_checkpoint), ('y', 'main/000020'))
+            before = [(r.shard, r.index) for r in sets.subsets['newest', 'train']]
+            source_shard(run/'shards'/'1000000000003', 3, 'x', checkpoint='main/000010')    # the lagging worker
+            sets.refresh()
+            self.assertEqual((sets.newest, sets.newest_checkpoint), ('y', 'main/000020'))
+            self.assertEqual([(r.shard, r.index) for r in sets.subsets['newest', 'train']], before)
+            again = dense_data.ValidationSets(run, .5, 5, limit=10, quota=4)
+            again.refresh()
+            self.assertEqual(again.newest, 'y')
+
     def test_retained_state_is_bounded(self):
         """Many shards: full subsets stop consuming shards, and per shard only actor row counts are kept."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -944,7 +961,8 @@ class ValidationSourceTests(unittest.TestCase):
         """A row cached only as a chosen row's next-ply successor can be chosen after the newest actor changes."""
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
-            source_shard(run/'shards'/'1000000000001', 1, ['x', 'y'], checkpoint='main/000010', games=8, policy_every=1)
+            source_shard(run/'shards'/'1000000000001', 1, ['x', 'y'], checkpoint='main/000010', games=8, policy_every=1,
+                         publisher='x')
             source_shard(run/'shards'/'1000000000002', 2, 'x', checkpoint='main/000010', policy_every=1)
             sets = dense_data.ValidationSets(run, .3, 5, limit=40, quota=12)
             sets.refresh()

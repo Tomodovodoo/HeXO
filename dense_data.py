@@ -285,12 +285,14 @@ class ValidationSets:
     """Fixed per-source row subsets for validation, independent of the replay window.
 
     Sources (SOURCES): 'converted' draws from converted shards, 'fresh' from actor shards and 'newest' from the
-    actor-shard episodes played by the newest actor: among the episode actors with full-search rows in the newest
-    such actor shard, the one first published latest as a manifest `actor` (unpublished ones rank oldest; ties go
-    to the most rows). A shard written right after a checkpoint switch can hold only the previous model's games,
-    so its manifest `actor` alone would leave the subset empty. `newest_checkpoint` is the identity `checkpoint`
+    actor-shard episodes played by the newest actor: among the episode actors with full-search rows in any actor
+    shard, the one whose first shard as manifest `actor` comes latest in name order (never-published actors rank
+    oldest; ties go to the most rows). It only moves to a higher-ranked actor, so a lagging worker's shard of an
+    older model cannot move it back, and a shard written right after a checkpoint switch that holds only the
+    previous model's games does not leave the subset empty. `newest_checkpoint` is the identity `checkpoint`
     of the first shard published by the newest actor (None when it never published one). Each source has a 'held'
-    subset of full-search rows of games selected by holdout(episode, fraction) and a 'train' subset of full-search rows of the other games. A subset walks
+    subset of full-search rows of games selected by holdout(episode, fraction) and a 'train' subset of full-search
+    rows of the other games. A subset walks
     its source's shards in name order and takes from each at most `quota` rows, in the order of a permutation
     seeded by (seed, crc32(shard name)), until it holds `limit` rows. Shards are immutable and named in
     creation order, so a subset only grows, by rows of newer shards, until it is full, and a restart rebuilds
@@ -332,14 +334,15 @@ class ValidationSets:
         for n in actors:
             published.setdefault(self.manifests[n]['actor'], (len(published), self.manifests[n]['identity'].get('checkpoint')))
         scanned, previous = {}, self.newest
-        for name in reversed(actors):
+        rows = Counter()
+        for name in actors:
             if name not in self.actors:
                 self.scan(name, scanned)
-            rows = self.actors[name]
-            if rows:
-                self.newest = max(rows, key=lambda a: (published.get(a, (-1,))[0], rows[a]))
-                self.newest_checkpoint = published.get(self.newest, (None, None))[1]
-                break
+            rows += self.actors[name]
+        rank = lambda a: (published.get(a, (-1,))[0], rows[a])
+        if rows and (self.newest is None or rank(max(rows, key=rank))[0] > rank(self.newest)[0]):
+            self.newest = max(rows, key=rank)
+            self.newest_checkpoint = published.get(self.newest, (None, None))[1]
         if self.newest != previous:
             for split in ('held', 'train'):
                 self.picks['newest', split], self.walked['newest', split] = [], set()
