@@ -95,11 +95,13 @@ class IsolatedTactics:
     """A tactical engine in a disposable child process with a hard deadline and a memory cap.
 
     `history` returns within `ms + grace_ms`. A child that has not answered by then, or that
-    reports abandoned native work still running, is killed and replaced by a fresh one, so no
-    query ever waits for or competes with an earlier one. The child's private memory is capped
-    at `memory_mb`; exceeding it ends the child and the query returns UNKNOWN. A child not
-    ready `startup_ms` after it was started is replaced. `engine` names the `module:Class`
-    constructed in the child with `package`.
+    reports abandoned native work still running, is killed at once; reaping it and starting
+    its replacement happen off the caller's clock, and the next query waits for the
+    replacement only within its own budget. No query competes with an earlier one. The
+    child's private memory is capped at `memory_mb` before it loads the engine; exceeding it
+    ends the child and the query returns UNKNOWN. A child not ready `startup_ms` after it
+    was started is replaced. `engine` names the `module:Class` constructed in the child with
+    `package`.
     """
 
     def __init__(self, package=PACKAGE, *, grace_ms=100, memory_mb=1536, startup_ms=10000,
@@ -110,18 +112,21 @@ class IsolatedTactics:
         self.stats = dict(queries=0, spawns=0, kills=0, exits=0)
         self.lock = threading.Lock()
         self.job = _memory_job(memory_mb) if sys.platform == 'win32' else None
-        self.process = None
+        self.replacement = None
         self._spawn()
 
     def _spawn(self):
         process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    text=True, encoding='utf-8', bufsize=1)
-        if self.job:
-            try:
+        try:
+            if self.job:
                 _assign(self.job, process.pid)
-            except OSError:
-                process.kill()
-                raise
+            # The child loads the engine only after this line, so the cap already applies.
+            process.stdin.write('go\n')
+            process.stdin.flush()
+        except OSError:
+            process.kill()
+            raise
         lines = queue.Queue()
         self.pump = threading.Thread(target=_pump, args=(process.stdout, lines), daemon=True)
         self.pump.start()
@@ -129,18 +134,18 @@ class IsolatedTactics:
         self.started = time.perf_counter()
         self.stats['spawns'] += 1
 
-    def _stop(self):
-        self.process.kill()
-        self.process.wait()
-        self.pump.join()
-        with contextlib.suppress(OSError):
-            self.process.stdin.close()
-        self.process.stdout.close()
-
-    def _restart(self, killed):
+    def _retire(self, killed):
+        """Kill the child now; reap it and start its replacement in the background."""
         self.stats['kills' if killed else 'exits'] += 1
-        self._stop()
-        self._spawn()
+        self.process.kill()
+        self.ready = False
+        self.replacement = threading.Thread(target=self._replace, args=(self.process, self.pump), daemon=True)
+        self.replacement.start()
+
+    def _replace(self, process, pump):
+        _reap(process, pump)
+        with contextlib.suppress(OSError):  # the next query's write fails and retires it again
+            self._spawn()
 
     def _line(self, deadline):
         try:
@@ -160,15 +165,20 @@ class IsolatedTactics:
             return unknown_result('lock deadline', start)
         try:
             self.stats['queries'] += 1
+            if self.replacement:
+                self.replacement.join(timeout=max(0.0, start+ms/1000-time.perf_counter()))
+                if self.replacement.is_alive():
+                    return unknown_result('tactical worker restarting', start)
+                self.replacement = None
             if not self.ready:
                 line = self._line(min(start+ms/1000, self.started+self.startup_ms/1000))
                 if line == 'timeout':
                     if time.perf_counter() >= self.started+self.startup_ms/1000:
-                        self._restart(killed=True)
+                        self._retire(killed=True)
                         return unknown_result('tactical worker not ready; replaced', start)
                     return unknown_result('tactical worker starting', start)
                 if line == 'exit' or 'error' in line:
-                    self._restart(killed=False)
+                    self._retire(killed=False)
                     return unknown_result(f"tactical worker failed to start: {line if line == 'exit' else line['error']}", start)
                 self.ready = True
             remaining = math.floor(ms-(time.perf_counter()-start)*1000)
@@ -183,30 +193,43 @@ class IsolatedTactics:
             self.process.stdin.flush()
             result = self._line(hard)
             if result == 'timeout':
-                self._restart(killed=True)
+                self._retire(killed=True)
                 return unknown_result('hard deadline; tactical worker killed', start)
             if result == 'exit':
-                self._restart(killed=False)
+                self._retire(killed=False)
                 return unknown_result('tactical worker exited (memory cap or crash)', start)
             if result.get('background_worker_busy'):
-                self._restart(killed=True)
+                self._retire(killed=True)
             if time.perf_counter()-start >= ms/1000:
                 result.update(unknown_result('deadline', start))
             result['elapsed_ms'] = (time.perf_counter()-start)*1000
             return result
         except OSError:
-            self._restart(killed=False)
+            self._retire(killed=False)
             return unknown_result('tactical worker pipe closed', start)
         finally:
             self.lock.release()
 
     def close(self):
-        if self.process:
-            self._stop()
-            self.process = None
-        if self.job:
-            C.windll.kernel32.CloseHandle(self.job)
-            self.job = None
+        with self.lock:
+            if self.replacement:
+                self.replacement.join()
+                self.replacement = None
+            if self.process:
+                self.process.kill()
+                _reap(self.process, self.pump)
+                self.process = None
+            if self.job:
+                C.windll.kernel32.CloseHandle(self.job)
+                self.job = None
+
+
+def _reap(process, pump):
+    process.wait()
+    pump.join()
+    with contextlib.suppress(OSError):
+        process.stdin.close()
+    process.stdout.close()
 
 
 class _BasicLimits(C.Structure):
@@ -261,6 +284,7 @@ def _serve(engine, package, memory_mb):
     On POSIX the child caps its own address space before loading the engine; the
     parent never runs code between fork and exec.
     """
+    sys.stdin.readline()  # the parent has applied the job-object cap (Windows)
     if sys.platform != 'win32':
         import resource
         cap = int(memory_mb)*2**20

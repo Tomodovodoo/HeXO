@@ -14,7 +14,7 @@ class ScriptedTactics:
     def __init__(self, package):
         if Path(package).name == 'slow-start':
             time.sleep(60)
-        self.hoard = []
+        self.hoard = [bytearray(512*2**20)] if Path(package).name == 'greedy-start' else []
 
     def history(self, history, *, ms, **budgets):
         mode = tuple(history[0]) if history else (0, 0)
@@ -46,7 +46,7 @@ class Isolation(unittest.TestCase):
         pid = self.tactics.history([[0, 0]], ms=10000)['pid']
         start = time.perf_counter()
         hung = self.tactics.history([[1, 1]], ms=200)
-        self.assertLess(time.perf_counter()-start, 1.0)
+        self.assertLess(time.perf_counter()-start, 0.45)
         self.assertEqual(hung['status'], 'UNKNOWN')
         self.assertIn('hard deadline', hung['reason'])
         self.assertEqual(self.tactics.stats['kills'], 1)
@@ -73,6 +73,13 @@ class Isolation(unittest.TestCase):
             self.assertEqual(stuck.stats['kills'], 1)
         finally:
             stuck.close()
+
+    def test_memory_cap_applies_before_the_engine_loads(self):
+        greedy = IsolatedTactics('greedy-start', engine=ENGINE, memory_mb=256)
+        try:
+            self.assertIn('MemoryError', greedy.history([[0, 0]], ms=10000)['reason'])
+        finally:
+            greedy.close()
 
     def test_oversized_request_is_not_sent(self):
         result = self.tactics.history([[0, 0]], ms=1000, certificate=dict(padding='x'*(9*2**20)))
