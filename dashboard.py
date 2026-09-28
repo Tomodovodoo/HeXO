@@ -668,7 +668,7 @@ def project(root, fresh=30):
     return dict(root=str(root), now=now, runs=runs)
 
 
-HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')
+HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')  # dense_learn.LOGGED
 SOURCES = ('converted', 'fresh', 'newest')  # dense_data.SOURCES
 SOURCE_METRICS = tuple(f'{s}_{k}{h}' for s in SOURCES for k in ('', 'train_', 'gap_') for h in ('policy_ce', 'value_bce'))
 CURVE_SOURCES = ('fresh', 'newest')  # dense_learn.CURVE_SOURCES

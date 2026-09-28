@@ -1382,6 +1382,8 @@ class ValidationSourceTests(unittest.TestCase):
             dense_config.append_metrics(run, 'learner-main', step=10, validation=True, **fields)
             points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_newest_gap_policy_ce')['points']
             self.assertEqual(points, [[10, v['newest_gap_policy_ce']]])
+            points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_outcome_bce')['points']
+            self.assertEqual(points, [[10, aggregate['outcome_bce']]])
 
     def test_remaining_curve_on_outcomes_decided_in_the_last_ten_plies(self):
         """Games whose outcome is fixed only in their last 10 plies: a predictor that knows it there and says 0.5
