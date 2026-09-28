@@ -444,11 +444,12 @@ class Evaluator:
     def round(self, cid, opponent, kind, planned):
         """After pacing, play the next min(games, planned - played) games of cid vs opponent, opening pairs
         numbered on from earlier rounds; returns the comparison's {records, seconds} so far. A champion round
-        is not started once a newer checkpoint of the variant exists."""
+        is not started once a newer checkpoint of the variant exists, nor an optional round while any
+        checkpoint is unrated."""
         done = self.partial.setdefault((cid, opponent), dict(records=[], seconds=0.))
         records = done['records']
         self.pacer.wait(lambda: self.publish(True, stage='throttled'))
-        if kind == 'champion' and self.newer(cid):
+        if self.newer(cid) if kind == 'champion' else self.backlog():
             return done
         count, start = min(self.settings.games, planned-len(records)), self.pacer.clock()
         self.publish(True, stage='playing', comparison=dict(candidate=cid, opponent=opponent, kind=kind),
@@ -472,6 +473,11 @@ class Evaluator:
         placements = sum(r['plies']-len(r['opening']) for r in results)
         self.publish(True, games_played=len(records), placements_per_second=placements/max(self.pacer.clock()-start, 1e-9))
         return done
+
+    def backlog(self):
+        """Whether any unrated checkpoint exists."""
+        known = {c['id'] for c in self.league['checkpoints']}
+        return any(e[0] not in known for e in checkpoints(self.run))
 
     def newer(self, cid):
         """Whether an unrated checkpoint of cid's variant other than cid exists (it is newer: cid was chosen as
@@ -601,6 +607,9 @@ def loop(args):
         raise ValueError('At least one evaluation worker process is required')
     if any(getattr(settings, name) % 2 for name in ('games', 'previous_games', 'anchor_games', 'sprt_max_games')):
         raise ValueError('Evaluation game counts must be even: every opening is played with both colours')
+    if min(settings.games, settings.sprt_max_games) < 2 or any(0 < getattr(settings, name) < 2 or getattr(settings, name) < 0
+                                                                for name in ('previous_games', 'anchor_games')):
+        raise ValueError('games and sprt_max_games need at least one opening pair; optional totals are 0 or at least 2')
     evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share), args.processes)
     try:
         while True:
