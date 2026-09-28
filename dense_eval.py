@@ -1441,9 +1441,11 @@ class Evaluator:
         verdict (`public`, decision 'better', 'worse' or 'max-games', with candidate and opponent) is stored as
         the entry's verdict and the direct report's metrics.posterior, published as status decision and logged
         as a 'decision' event with P(better), delta, delta_sd and its 95% interval. Every report played is
-        recorded in the league (`record`). The first trial of an entry fixes its binding: bound_at (epoch seconds)
-        is recorded and `bind` leaves it alone from then on."""
+        recorded in the league (`record`). The first trial of an entry binds it to the champion of that moment
+        (`bind`, after any promotion earlier in the step) and fixes the binding: bound_at (epoch seconds) is
+        recorded and `bind` leaves it alone from then on."""
         if 'bound_at' not in entry:
+            self.bind()
             entry['bound_at'] = time.time()
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         s, cid, base = self.settings, entry['id'], entry['checkpoint']

@@ -3033,6 +3033,19 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual([e['candidate'] for e in events if e['kind'] == 'variant'],
                          ['champion@solver', 'main/000030@solver', 'main/000020@solver'])
 
+    def test_a_review_promotion_rebinds_a_variant_before_it_starts(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=4, sprt_min_games=4, pool_games=2)
+        self.export(10, 20, 30)
+        evaluator.step()                                                    # main/000030 champion
+        dense_eval.register(self.run, 'champion', 'solver', dict(sims=1))
+        evaluator.reviewed = False
+        evaluator.review = lambda: self.crown(evaluator, 20)                 # the startup review promotes main/000020
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())
+        entry = self.league()['variants'][0]
+        self.assertEqual((entry['id'], entry['checkpoint'], entry['matches'][0]['opponent']),
+                         ('main/000020@solver', 'main/000020', 'main/000020'))
+
     def test_a_pending_variant_of_the_champion_rebases_on_promotion(self):
         evaluator = self.start(decision='posterior')
         self.export(10, 20)
