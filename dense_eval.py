@@ -1051,8 +1051,9 @@ class Evaluator:
         rule to the existing reports. Of the rated checkpoints, neither skipped nor demoted, with at least
         sprt_min_games direct games against the champion (their report against it), those whose `verdict`
         meets uncertainty parity, P(delta > sprt_elo0) >= promote_confidence and agreeing direct and pooled
-        intervals are eligible; the one of highest posterior rating is promoted ('decision' event 'promote on
-        review', then the 'promotion' event; its Seal anchor is scheduled as for any promotion)."""
+        intervals are eligible; the one of highest posterior rating among them is promoted ('decision' event
+        'promote on review', then the 'promotion' event; its Seal anchor is scheduled as for any promotion). A
+        higher-rated checkpoint without those direct games does not block it: it has not met the champion."""
         s, champion = self.settings, self.league['champion']
         if s.decision != 'posterior' or champion is None:
             return
