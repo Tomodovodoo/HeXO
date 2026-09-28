@@ -602,6 +602,7 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual((league['books']['book']['openings'], league['books']['book']['retired']['skew']), (2, 1))
         seat = league['players']['main/000020']
         self.assertEqual((seat['p1_games']+seat['p2_games'], seat['p1_wins']), (len(games), seat['p1_games']))
+        self.assertNotEqual(self.start(book_weighting='least_played').settings.opening_book, digest)   # another draw rule
 
     def test_a_promotion_refreshes_the_book_before_the_next_candidate(self):
         self.export(10)
