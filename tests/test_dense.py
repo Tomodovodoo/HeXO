@@ -2666,6 +2666,21 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual((len(report['games']), report['metrics']['sprt']['decision']), (6, 'H1'))   # a drained pair after H1
         self.assertEqual(self.league()['champion'], 'main/000020')
 
+    def test_a_posterior_verdict_undone_by_draining_games_plays_on(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=12, pool_games=4)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        verdict, calls = evaluator.verdict, [0]
+        def flicker(cid, champion):                                    # decided on exactly one look, then undecided
+            calls[0] += 1
+            return dict(verdict(cid, champion), decision='promote' if calls[0] == 2 else None)
+        evaluator.verdict = flicker
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        self.assertEqual((len(report['games']), report['metrics']['posterior']['decision']), (12, 'max-games'))
+
     def test_a_candidate_with_direct_games_is_never_left_skipped(self):
         """The live case after a restart: main/027500 completed 64 games against champion main/019500 (+42 -10
         =12) but an older evaluator marked it skipped when main/030000 appeared. A fresh evaluator rates it on

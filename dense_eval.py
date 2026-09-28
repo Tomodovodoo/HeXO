@@ -1020,7 +1020,8 @@ class Evaluator:
     def decide(self, cid, champion):
         """Posterior mode: a session whose lanes (`lanes`) follow the verdict after every completed colour pair
         until `verdict` decides, sprt_max_games direct games are complete or a newer checkpoint of cid's variant
-        exists; the games in flight then finish and count and the final verdict settles it: superseded, cid is
+        exists; the games in flight then finish and count (play resumes when they leave the verdict undecided)
+        and the final verdict settles it: superseded, cid is
         promoted when p_better >= promote_confidence (settled true), readiness aside. Returns ({opponent: report of
         cid against it}, verdict with decision 'promote', 'reject', 'max-games' or 'superseded'), or ({}, None)
         without a direct game. The verdict (`public`) is published as status decision, stored as the direct
@@ -1034,11 +1035,14 @@ class Evaluator:
             lanes = self.lanes(verdict, cid, champion)
             self.publish(decision=dict(public(verdict), candidate=cid, next=[list(l[:2]) for l in lanes]))
             return lanes
-        added = self.session(want, s.sprt_max_games)
-        for (a, b, _), games in added.items():
-            if a != cid and games:
-                self.record(a, b, json.loads(report_path(self.run, a, b).read_text()))
-        verdict = self.verdict(cid, champion)
+        while True:  # the games in flight can undo a verdict that stopped the session: then play on
+            added = self.session(want, s.sprt_max_games)
+            for (a, b, _), games in added.items():
+                if a != cid and games:
+                    self.record(a, b, json.loads(report_path(self.run, a, b).read_text()))
+            verdict = self.verdict(cid, champion)
+            if verdict['decision'] or not added or verdict['direct']['games'] >= s.sprt_max_games or self.newer(cid):
+                break
         if not verdict['direct']['games']:
             return {}, None
         superseded = self.newer(cid)
