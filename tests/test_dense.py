@@ -3105,6 +3105,11 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator.review()
         self.assertEqual(evaluator.league['champion'], 'main/019500')                 # too few direct games
         evaluator = self.start(decision='posterior', sprt_min_games=64, anchor_games=2)
+        verdict, ratings = evaluator.verdict, {'main/017000': 0., 'main/019500': 50., 'main/025000': 40.}
+        with unittest.mock.patch.object(evaluator, 'verdict', lambda cid, champion: dict(
+                verdict(cid, champion), posterior=SimpleNamespace(rating=ratings.get))):
+            evaluator.review()
+        self.assertEqual(evaluator.league['champion'], 'main/019500')                 # P(better) alone, not out-rating it
         evaluator.review()
         self.assertEqual((self.league()['champion'], json.loads((self.run/'champion.json').read_text())['checkpoint']),
                          ('main/025000', 'main/025000'))

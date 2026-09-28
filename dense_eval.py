@@ -1116,17 +1116,19 @@ class Evaluator:
         rule to the existing reports. Of the rated checkpoints, neither skipped nor demoted, with at least
         sprt_min_games direct games against the champion (their report against it), those whose `verdict`
         is `ready` with P(delta > sprt_elo0) >= promote_confidence are eligible; the one of highest posterior
-        rating among them is promoted ('decision' event 'promote on review', then the 'promotion' event; its Seal
-        anchor is scheduled as for any promotion). A higher-rated checkpoint without those direct games does not
-        block it: it has not met the champion."""
+        rating among them is promoted when it also out-rates the champion and every other checkpoint with those
+        direct games ('decision' event 'promote on review', then the 'promotion' event; its Seal anchor is scheduled
+        as for any promotion). A higher-rated checkpoint without those direct games does not block it: it has not
+        met the champion."""
         s, champion = self.settings, self.league['champion']
         if s.decision != 'posterior' or champion is None:
             return
-        eligible = []
+        eligible, met = [], [champion]
         for c in self.league['checkpoints']:
             if c['id'] == champion or c.get('elo') is None or c.get('skipped') or c.get('demoted') \
                     or len(self.games(c['id'], champion)) < s.sprt_min_games:
                 continue
+            met.append(c['id'])
             verdict = self.verdict(c['id'], champion)
             if ready(s, verdict['direct']['games'], verdict['disagree']) \
                     and verdict['p_better'] >= s.promote_confidence:
@@ -1134,6 +1136,8 @@ class Evaluator:
         if not eligible:
             return
         _, cid, verdict = max(eligible)
+        if max(met, key=verdict['posterior'].rating) != cid:
+            return
         verdict = dict(public(verdict), candidate=cid, decision='promote', review=True)
         log_event(self.run, 'evaluator', 'decision', f'{cid} vs {champion}: promote on review of the existing reports '
                   f'({verdict["direct"]["games"]} direct games, P(delta > {s.sprt_elo0:g}) {verdict["p_better"]:.3f})',
