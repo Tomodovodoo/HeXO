@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import time
 import unittest
 
@@ -11,6 +12,8 @@ class ScriptedTactics:
     """Child-side stand-in for NativeTactics; the first history cell selects a behaviour."""
 
     def __init__(self, package):
+        if Path(package).name == 'slow-start':
+            time.sleep(60)
         self.hoard = []
 
     def history(self, history, *, ms, **budgets):
@@ -60,6 +63,21 @@ class Isolation(unittest.TestCase):
         self.assertEqual(result['status'], 'UNKNOWN')
         self.assertIn('exited', result['reason'])
         self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['reason'], 'scripted')
+
+    def test_worker_that_never_starts_is_replaced(self):
+        stuck = IsolatedTactics('slow-start', engine=ENGINE, startup_ms=300)
+        try:
+            self.assertIn('starting', stuck.history([[0, 0]], ms=100)['reason'])
+            time.sleep(0.25)
+            self.assertIn('replaced', stuck.history([[0, 0]], ms=1000)['reason'])
+            self.assertEqual(stuck.stats['kills'], 1)
+        finally:
+            stuck.close()
+
+    def test_oversized_request_is_not_sent(self):
+        result = self.tactics.history([[0, 0]], ms=1000, certificate=dict(padding='x'*(9*2**20)))
+        self.assertEqual(result['reason'], 'request size limit')
+        self.assertEqual(self.tactics.history([[0, 0]], ms=1000)['reason'], 'scripted')
 
     def test_invalid_budget_rejected_in_parent(self):
         with self.assertRaises(ValueError):

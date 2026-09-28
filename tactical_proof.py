@@ -20,6 +20,7 @@ import time
 
 PROVEN_WIN, UNKNOWN = 'PROVEN_WIN', 'UNKNOWN'
 PACKAGE = Path(__file__).resolve().parent/'tools/tactical'
+REQUEST_LIMIT = 8*1024*1024
 
 
 def check_budgets(ms, idtt_ms, nodes, depth):
@@ -72,7 +73,7 @@ class NativeTactics:
             if root_moves is not None:
                 request['root_moves'] = root_moves
             payload = json.dumps(request, separators=(',', ':')).encode()
-            if len(payload) > 8*1024*1024:
+            if len(payload) > REQUEST_LIMIT:
                 return unknown('request size limit')
             output = self.lib.hexo_tactical_query(payload)
             if not output:
@@ -96,13 +97,15 @@ class IsolatedTactics:
     `history` returns within `ms + grace_ms`. A child that has not answered by then, or that
     reports abandoned native work still running, is killed and replaced by a fresh one, so no
     query ever waits for or competes with an earlier one. The child's private memory is capped
-    at `memory_mb`; exceeding it ends the child and the query returns UNKNOWN. `engine` names
-    the `module:Class` constructed in the child with `package`.
+    at `memory_mb`; exceeding it ends the child and the query returns UNKNOWN. A child not
+    ready `startup_ms` after it was started is replaced. `engine` names the `module:Class`
+    constructed in the child with `package`.
     """
 
-    def __init__(self, package=PACKAGE, *, grace_ms=100, memory_mb=1536, engine='tactical_proof:NativeTactics'):
+    def __init__(self, package=PACKAGE, *, grace_ms=100, memory_mb=1536, startup_ms=10000,
+                 engine='tactical_proof:NativeTactics'):
         self.command = [sys.executable, str(Path(__file__).resolve()), 'serve', engine, str(Path(package).resolve())]
-        self.grace_ms, self.memory_mb = grace_ms, memory_mb
+        self.grace_ms, self.memory_mb, self.startup_ms = grace_ms, memory_mb, startup_ms
         self.stats = dict(queries=0, spawns=0, kills=0, exits=0)
         self.lock = threading.Lock()
         self.job = _memory_job(memory_mb) if sys.platform == 'win32' else None
@@ -127,6 +130,7 @@ class IsolatedTactics:
         self.pump = threading.Thread(target=_pump, args=(process.stdout, lines), daemon=True)
         self.pump.start()
         self.process, self.lines, self.ready = process, lines, False
+        self.started = time.perf_counter()
         self.stats['spawns'] += 1
 
     def _stop(self):
@@ -161,8 +165,11 @@ class IsolatedTactics:
         try:
             self.stats['queries'] += 1
             if not self.ready:
-                line = self._line(start+ms/1000)
+                line = self._line(min(start+ms/1000, self.started+self.startup_ms/1000))
                 if line == 'timeout':
+                    if time.perf_counter() >= self.started+self.startup_ms/1000:
+                        self._restart(killed=True)
+                        return unknown_result('tactical worker not ready; replaced', start)
                     return unknown_result('tactical worker starting', start)
                 if line == 'exit' or 'error' in line:
                     self._restart(killed=False)
@@ -173,7 +180,10 @@ class IsolatedTactics:
                 return unknown_result('deadline', start)
             request = dict(history=history, ms=remaining, idtt_ms=min(idtt_ms, remaining-1), nodes=nodes, depth=depth,
                            certificate=certificate, root_moves=root_moves)
-            self.process.stdin.write(json.dumps(request, separators=(',', ':'))+'\n')
+            payload = json.dumps(request, separators=(',', ':'))
+            if len(payload) > REQUEST_LIMIT:
+                return unknown_result('request size limit', start)
+            self.process.stdin.write(payload+'\n')
             self.process.stdin.flush()
             result = self._line(hard)
             if result == 'timeout':
