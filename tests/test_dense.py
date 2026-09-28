@@ -1245,11 +1245,30 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual(horizon, [] if v['newest_value_horizon'] is None else [[7, v['newest_value_horizon']]])
             curve = dashboard.series(run, config, 'main', 'fresh_value_curve', 'remaining')
             self.assertEqual(curve['checkpoint'], 'main/000000')
-            self.assertEqual(curve['points'], [[g, y] for g, y in zip(v['remaining_grid'], v['fresh_value_curve']) if y is not None])
-            self.assertTrue(curve['points'])
+            self.assertEqual(curve['points'], [list(q) for q in zip(v['remaining_grid'], v['fresh_value_curve'])])
+            self.assertTrue(any(y is not None for _, y in curve['points']))
             self.assertEqual(dashboard.series(run, config, 'side', 'fresh_value_curve', 'remaining')['points'], [])
             with self.assertRaises(ValueError):
                 dashboard.series(run, config, 'main', 'fresh_value_curve')
+
+    def test_value_curve_series_keeps_unsupported_gaps(self):
+        """A curve supported on two separate ranges keeps null points between them in the response, so the chart
+        breaks the line there instead of bridging the gap."""
+        import dashboard
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            grid = list(dense_learn.REMAINING_GRID)
+            curve = [.1, .2, None, None, None, .6, .65]+[None]*(len(grid)-7)
+            for step, values in ((5, [.9]*len(grid)), (10, curve)):
+                path = run/'checkpoints'/'main'/f'{step:06d}'
+                path.mkdir(parents=True)
+                (path/'manifest.json').write_text(json.dumps(dict(step=step, metrics=dict(
+                    validation_sources=dict(remaining_grid=grid, newest_value_curve=values)))))
+            out = dashboard.series(run, dict(created_at=0.), 'main', 'newest_value_curve', 'remaining')
+            self.assertEqual(out['checkpoint'], 'main/000010')
+            self.assertEqual(out['points'], [[g, y] for g, y in zip(grid, curve)])
+            self.assertEqual([y for _, y in out['points'][1:6]], [.2, None, None, None, .6])
+            json.dumps(out, allow_nan=False)
 
     def test_export_recalibrates_ema_norm_statistics(self):
         """The raw model drifts (here: perturbed weights) after the EMA was taken. The exported EMA must carry norm

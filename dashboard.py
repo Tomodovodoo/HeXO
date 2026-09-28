@@ -619,7 +619,8 @@ def series(run, config, variant, metric, x='step', max_points=1000):
     """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval; seal_delta: the direct-match
     Elo minus Seal of each anchored checkpoint, league anchors.seal.matches) sorted by x and
     downsampled; x is the learner step or hours since the run's created_at. Actor and GPU metrics have hours
-    only. CURVE_METRICS have x 'remaining' only: [[plies remaining, y], ...] of the newest checkpoint manifest of
+    only. CURVE_METRICS have x 'remaining' only: [[plies remaining, y or null where unsupported], ...] over every grid
+    point (not downsampled) of the newest checkpoint manifest of
     `variant` holding that curve (metrics.validation_sources), whose id is added as `checkpoint` (None without one).
     Raises ValueError for an unknown metric or x."""
     created = config.get('created_at') or 0.
@@ -629,7 +630,7 @@ def series(run, config, variant, metric, x='step', max_points=1000):
         found = [(path, v) for path, m in dense_manifests(run/'checkpoints'/variant)
                  if isinstance(v := (m.get('metrics') or {}).get('validation_sources'), dict) and isinstance(v.get(metric), list)]
         path, v = found[-1] if found else (None, {})
-        points = [[g, y] for g, y in zip(v.get('remaining_grid') or [], v.get(metric) or []) if finite(y)]
+        points = [[g, y if finite(y) else None] for g, y in zip(v.get('remaining_grid') or [], v.get(metric) or [])]
         return dict(run=run.name, variant=variant, metric=metric, x=x, count=len(points), points=points,
                     checkpoint=path and f'{variant}/{path.parent.name}')
     if x not in ('step', 'hours'): raise ValueError(f'unknown x {x!r}')

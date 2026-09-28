@@ -69,6 +69,7 @@ const cacheKey=(s,p)=>`${s.run.name}|${s.variant}|${s.metric}|${xOf(p)}`;
 async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k);if(hit&&(hit.poll===project.now||(!s.run.live&&project.now-hit.poll<60)))continue;
 jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:s.metric,x:xOf(p),max_points:1000});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${s.metric} of ${s.label}: HTTP ${res.status}`);cache.set(k,{poll:project.now,points:(await res.json()).points})})}
 let failure=null;const worker=async()=>{while(jobs.length){try{await jobs.shift()()}catch(e){failure=e}}};await Promise.all(Array.from({length:6},worker));if(failure)throw failure}
+function trace(pts,sx,sy,ctx){let gap=true;for(const q of pts){if(q[1]==null){gap=true;continue}ctx[gap?'moveTo':'lineTo'](sx(q[0]),sy(q[1]));gap=false}}
 function ticks(lo,hi,n){const step0=(hi-lo)/n||1,mag=10**Math.floor(Math.log10(step0)),e=step0/mag,step=(e>=7.5?10:e>=3.5?5:e>=1.5?2:1)*mag,out=[];for(let v=Math.ceil(lo/step)*step;v<=hi+step*1e-9;v+=step)out.push(+v.toPrecision(12));return out}
 function logTicks(lo,hi){const out=[];for(let d=Math.floor(Math.log10(lo));d<=Math.ceil(Math.log10(hi));d++)for(const m of[1,2,5]){const v=m*10**d;if(v>=lo&&v<=hi)out.push(v)}return out.length>=3?out:ticks(lo,hi,4).filter(v=>v>0)}
 function buildPanels(){const grid=$('grid');for(const p of PANELS){const el=document.createElement('section');el.className='panel';el.id='panel-'+p.id;
@@ -82,10 +83,10 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&state.full){state.f
 function layout(){for(const p of PANELS)p.el.classList.toggle('full',state.full===p.id);document.body.style.overflow=state.full?'hidden':'';PANELS.forEach(p=>draw(p))}
 function draw(p,hover){const el=p.el,c=el.querySelector('canvas'),ctx=c.getContext('2d'),ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight,x=xOf(p),log=p.log&&state.log[p.id];
 c.width=w*ratio;c.height=h*ratio;ctx.setTransform(ratio,0,0,ratio,0,0);el.querySelectorAll('.tools button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.x?b.dataset.x===x:!!log));
-const series=panelSeries(p).map(s=>{const raw=(cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale?v*p.scale:v)).filter(q=>!log||q[1]>0);return {...s,raw,points:p.smooth&&state.smooth>0?ema(raw,state.smooth):raw}});
+const series=panelSeries(p).map(s=>{const raw=(cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale&&v!=null?v*p.scale:v)).filter(q=>q[1]==null||!log||q[1]>0);return {...s,raw,points:p.smooth&&state.smooth>0?ema(raw,state.smooth):raw}});
 const legend=el.querySelector('.legend');legend.replaceChildren(...series.map(s=>{const e=document.createElement('span');e.append(swatch(s.index,s.dash),s.label);return e}));
 const total=p.perRun?new Set(rows.map(r=>r.run.name)).size:rows.length,shown=new Set(series.map(s=>s.index)).size;el.querySelector('.showing').textContent=shown<total?`Showing first ${shown} of ${total} runs`:`Showing ${shown} runs`;
-const tip=el.querySelector('.tip');tip.hidden=true;const all=series.flatMap(s=>s.raw);ctx.font='11px system-ui';
+const tip=el.querySelector('.tip');tip.hidden=true;const all=series.flatMap(s=>s.raw).filter(q=>q[1]!=null);ctx.font='11px system-ui';
 if(!all.length){ctx.fillStyle='#898781';ctx.fillText(series.length?'No measurements yet':'No runs selected',16,h/2);return}
 let x0=Math.min(...all.map(q=>q[0])),x1=Math.max(...all.map(q=>q[0])),ys=all.flatMap(q=>q.slice(1)).filter(v=>!log||v>0),y0=Math.min(...ys),y1=Math.max(...ys);
 if(p.zero&&!log)y0=Math.min(0,y0);if(p.ref!=null){y0=Math.min(y0,p.ref);y1=Math.max(y1,p.ref)}if(p.max!=null)y1=Math.max(y1,p.max);if(x1===x0){x0-=1;x1+=1}if(y1===y0){y0-=Math.abs(y0)*.1||1;y1+=Math.abs(y1)*.1||1}
@@ -98,13 +99,13 @@ ctx.strokeStyle='#383835';ctx.beginPath();ctx.moveTo(L,h-B+.5);ctx.lineTo(w-R,h-
 ctx.save();ctx.beginPath();ctx.rect(L,T-4,w-L-R,h-T-B+8);ctx.clip();
 if(p.ref!=null){const yy=Math.round(sy(p.ref))+.5;ctx.globalAlpha=.35;ctx.strokeStyle='#c3c2b7';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(L,yy);ctx.lineTo(w-R,yy);ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=1}
 for(const s of series){const st=style(s.index,s.dash),pts=s.points;if(!pts.length)continue;
-if(s.raw!==pts){ctx.globalAlpha=.25;ctx.strokeStyle=st.color;ctx.lineWidth=1;ctx.beginPath();s.raw.forEach((q,i)=>ctx[i?'lineTo':'moveTo'](sx(q[0]),sy(q[1])));ctx.stroke();ctx.globalAlpha=1}
+if(s.raw!==pts){ctx.globalAlpha=.25;ctx.strokeStyle=st.color;ctx.lineWidth=1;ctx.beginPath();trace(s.raw,sx,sy,ctx);ctx.stroke();ctx.globalAlpha=1}
 if(p.band&&pts[0].length>3){ctx.globalAlpha=.16;ctx.fillStyle=st.color;ctx.beginPath();pts.forEach((q,i)=>ctx[i?'lineTo':'moveTo'](sx(q[0]),sy(q[3])));[...pts].reverse().forEach(q=>ctx.lineTo(sx(q[0]),sy(q[2])));ctx.fill();ctx.globalAlpha=1}
-ctx.strokeStyle=st.color;ctx.setLineDash(st.dash);ctx.lineWidth=1.75;ctx.lineJoin='round';ctx.beginPath();pts.forEach((q,i)=>ctx[i?'lineTo':'moveTo'](sx(q[0]),sy(q[1])));ctx.stroke();ctx.setLineDash([]);
-if(p.band||pts.length<40){ctx.fillStyle=st.color;for(const q of pts){ctx.beginPath();ctx.arc(sx(q[0]),sy(q[1]),p.band?3:2,0,7);ctx.fill()}}}
+ctx.strokeStyle=st.color;ctx.setLineDash(st.dash);ctx.lineWidth=1.75;ctx.lineJoin='round';ctx.beginPath();trace(pts,sx,sy,ctx);ctx.stroke();ctx.setLineDash([]);
+if(p.band||pts.length<40){ctx.fillStyle=st.color;for(const q of pts){if(q[1]==null)continue;ctx.beginPath();ctx.arc(sx(q[0]),sy(q[1]),p.band?3:2,0,7);ctx.fill()}}}
 ctx.restore();if(!hover||hover[0]<L||hover[0]>w-R)return;
 const at=x0+(hover[0]-L)/(w-L-R)*(x1-x0),tol=(x1-x0)*.02,hits=[];
-for(const s of series){const pts=s.points;if(!pts.length||at<pts[0][0]-tol||at>pts.at(-1)[0]+tol)continue;let lo=0,hi=pts.length-1;while(hi-lo>1){const m=(lo+hi)>>1;pts[m][0]<at?lo=m:hi=m}hits.push({s,q:Math.abs(pts[lo][0]-at)<=Math.abs(pts[hi][0]-at)?pts[lo]:pts[hi]})}
+for(const s of series){const pts=s.points.filter(q=>q[1]!=null);if(!pts.length||at<pts[0][0]-tol||at>pts.at(-1)[0]+tol)continue;let lo=0,hi=pts.length-1;while(hi-lo>1){const m=(lo+hi)>>1;pts[m][0]<at?lo=m:hi=m}hits.push({s,q:Math.abs(pts[lo][0]-at)<=Math.abs(pts[hi][0]-at)?pts[lo]:pts[hi]})}
 ctx.strokeStyle='#c3c2b7';ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(Math.round(hover[0])+.5,T);ctx.lineTo(Math.round(hover[0])+.5,h-B);ctx.stroke();ctx.setLineDash([]);
 if(!hits.length)return;hits.sort((a,b)=>b.q[1]-a.q[1]);const near=hits.reduce((a,b)=>Math.abs(sy(b.q[1])-hover[1])<Math.abs(sy(a.q[1])-hover[1])?b:a);
 for(const {s,q} of hits){ctx.fillStyle=style(s.index,s.dash).color;ctx.strokeStyle='#1a1a19';ctx.lineWidth=2;ctx.beginPath();ctx.arc(sx(q[0]),sy(q[1]),q===near.q?5:3.5,0,7);ctx.fill();ctx.stroke()}
