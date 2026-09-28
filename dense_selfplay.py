@@ -46,12 +46,13 @@ import torch
 
 import dense_config
 import dense_data
+import dense_solver
 import hexcrop
 import hexnet
 from dense_config import log_event
 from hexo import Game
 from klent import digest
-from neural_search import EvaluationCache, NeuralSearch, checked, native
+from neural_search import HOLD, EvaluationCache, NeuralSearch, checked, native
 from train import write_json
 
 # Crop cells per forward: 48 positions at 48x48, proportionally fewer for larger crops (a b6c96 forward peaks
@@ -275,7 +276,10 @@ def position_key(history):
 
 
 def root_value(result, player):
-    """Side-to-move value of a finished search: exact +-1, else the visit-weighted mean child value."""
+    """Side-to-move value of a finished search: the solver's exact value when it proved one (result `proven`), else
+    exact +-1 when the tree root is exact, else the visit-weighted mean child value."""
+    if result.get('proven'):
+        return float(result['proven'])
     if result['exact_winner'] >= 0:
         return 1. if result['exact_winner'] == player else -1.
     visits = result['visits']
@@ -285,23 +289,44 @@ def root_value(result, player):
 class Engine:
     """Continuous, pipelined batched Gumbel search over slots.
 
-    A slot exposes `tree` (NeuralSearch whose model owns the evaluator), `model`, `budget`, `samples`, `reason`
-    (None) and `searched(result) -> bool` which plays the move(s) and returns True after preparing its next
-    search (new tree/budget allowed) or False when its game is over. `step()` visits slots round-robin, draining
-    each tree's ready leaf requests until `leaf_batch` evaluations are pending, launches them (one forward
-    set per model, one evaluation per distinct position), then collects and fulfils the batch launched by
-    the previous step, so the GPU works on one batch while the trees produce the next. It returns the
-    slots whose games finished, including slots stopped because a searched position could not be encoded
-    (`reason` set to 'span'; none of their requests is fulfilled afterwards).
+    A slot exposes `tree` (NeuralSearch whose model owns the evaluator), `model`, `budget`, `samples`, `solver`
+    (dense_solver.Budgets of the side to move, or None), `reason` (None) and `searched(result) -> bool` which plays
+    the move(s) and returns True after preparing its next search (new tree/budget allowed) or False when its game
+    is over. `step()` visits slots round-robin, draining each tree's ready leaf requests until `leaf_batch`
+    evaluations are pending, launches them (one forward set per model, one evaluation per distinct position), then
+    collects and fulfils the batch launched by the previous step, so the GPU works on one batch while the trees
+    produce the next. It returns the slots whose games finished, including slots stopped because a searched
+    position could not be encoded (`reason` set to 'span'; none of their requests is fulfilled afterwards).
+
+    Solver (dense_solver): a slot with active budgets gets a dense_solver.Plan on the Engine's Solver (created on
+    first use; `solver_async` picks its backend). A search that submits queries leaves its slot until the next
+    visit, which awaits the verdicts before the search goes on; the root verdict is awaited before `searched`,
+    whose result then carries `proven`, `proof_turns`, `solver_nodes` and `pruned` (and the proof's action)
+    (dense_solver.Plan.finish). close() stops the Solver.
     """
 
-    def __init__(self, leaf_batch):
+    def __init__(self, leaf_batch, solver_async=True):
         self.leaf_batch, self.slots, self.cursor, self.inflight = leaf_batch, [], 0, []
         self.evals = self.calls = self.hits = self.searches = 0
+        self.solver_async, self.solver, self.plans = solver_async, None, {}
+
+    def begin(self, slot):
+        """Start the slot's next search; True when it must wait for solver verdicts until the next visit."""
+        checked(native.hxg_begin(slot.tree.ptr, slot.budget, slot.samples))
+        plan = self.plans.get(id(slot))
+        if plan is None and slot.solver is not None and slot.solver.active:
+            self.solver = self.solver or dense_solver.Solver(self.solver_async)
+            plan = self.plans[id(slot)] = dense_solver.Plan(self.solver)
+        return plan is not None and plan.begin(slot)
 
     def add(self, slot):
-        checked(native.hxg_begin(slot.tree.ptr, slot.budget, slot.samples))
+        self.begin(slot)
         self.slots.append(slot)
+
+    def close(self):
+        if self.solver:
+            self.solver.close()
+            self.solver = None
 
     def step(self):
         pending, count, done, progress = {}, 0, [], False
@@ -311,20 +336,34 @@ class Engine:
                 break
             slot = slots[self.cursor % len(slots)]
             self.cursor += 1
+            plan = self.plans.get(id(slot))
+            if plan:
+                plan.ready(slot)
             ptr = slot.tree.ptr
             while True:
-                if native.hxg_completed(ptr) >= slot.budget:
+                request = native.hxg_next(ptr)
+                if request == HOLD:
+                    progress = True
+                    if plan.hold(slot):
+                        break
+                    continue
+                if request == 0:
+                    if native.hxg_completed(ptr) < slot.budget:
+                        break
                     progress = True
                     self.searches += 1
-                    if not slot.searched(slot.tree.result(0, 0, 0, 0)):
+                    result = slot.tree.result(0, 0, 0, 0)
+                    if plan:
+                        plan.finish(slot, result)
+                    if not slot.searched(result):
                         done.append(slot)
                         break
                     ptr = slot.tree.ptr
-                    checked(native.hxg_begin(ptr, slot.budget, slot.samples))
+                    waiting = self.begin(slot)
+                    plan = self.plans.get(id(slot))
+                    if waiting:
+                        break
                     continue
-                request = native.hxg_next(ptr)
-                if request == 0:
-                    break
                 if request == -1:
                     progress = True
                     continue
@@ -378,6 +417,8 @@ class Engine:
         if done:
             finished = set(map(id, done))
             self.slots = [s for s in self.slots if id(s) not in finished]
+            for key in finished:
+                self.plans.pop(key, None)
         return done
 
 
@@ -386,10 +427,14 @@ class SelfPlayGame:
     playing that colour: the trained model twice for self-play, else the trained model as sides[learner] and a
     frozen checkpoint `opponent` (its id) as the other, whose plies keep rows without a policy, with a null root
     value and full_search False (dense_data.trained). Each distinct model owns one tree, advanced on every
-    placement; both sides use the same playout-cap randomization and opening sampling."""
+    placement; both sides use the same playout-cap randomization, opening sampling and solver budgets (`solver`,
+    from the settings' solver_* fields). With the solver active every row records `proven`, `proof_turns` and
+    `solver_nodes` (Engine), a proof's move is played even on an opening ply, and the episode records `solver`
+    (dense_solver.record)."""
 
     def __init__(self, sides, settings, seed, learner=0, opponent=None):
         self.sides, self.settings, self.seed, self.reason = sides, settings, seed, None
+        self.solver = dense_solver.Budgets.of(settings)
         self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) if settings.opening_random_plies > 0 else 0
@@ -422,10 +467,12 @@ class SelfPlayGame:
             if not np.isclose(policy.sum(), 1, atol=1e-6) or np.any(policy < 0):
                 raise ValueError('Search policy is not a distribution')
             row['policy'] = policy.astype(np.float32)
+        if self.solver.active:
+            row.update(proven=result['proven'], proof_turns=result['proof_turns'], solver_nodes=result['solver_nodes'])
         self.rows.append(row)
         self.values.append(root_value(result, player) if trained else None)
         self.full.append(self.is_full and trained)
-        if ply < self.random_plies:
+        if ply < self.random_plies and result.get('proven', 0) <= 0:
             action = actions[self.rng.choice(len(policy), p=policy/policy.sum())].tolist()
         else:
             action = result['action']
@@ -445,11 +492,14 @@ class SelfPlayGame:
         self.game.close()
         for tree in self.trees.values():
             tree.close()
-        return dict(moves=self.moves, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
-                    opening_plies=min(self.random_plies, len(self.moves)), actor=self.sides[self.learner].sha,
-                    actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
-                    trained_side=None if self.opponent is None else self.learner,
-                    root_values=self.values, full_search=self.full), self.rows
+        episode = dict(moves=self.moves, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
+                       opening_plies=min(self.random_plies, len(self.moves)), actor=self.sides[self.learner].sha,
+                       actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
+                       trained_side=None if self.opponent is None else self.learner,
+                       root_values=self.values, full_search=self.full)
+        if self.solver.active:
+            episode['solver'] = dense_solver.record(self.solver)
+        return episode, self.rows
 
 
 class Historical:
@@ -559,7 +609,8 @@ def worker(args):
     historical = Historical(run, config, np.random.default_rng(seeds.spawn(1)[0]), args.games) if settings.historical_fraction > 0 else None
     if historical:
         historical.redraw(model.checkpoint, model.sha)
-    engine = Engine(settings.leaf_batch)
+    engine = Engine(settings.leaf_batch, settings.solver_async)
+    began, solver_failures = time.perf_counter(), 0
     state = dict(published(run, args.worker), error=None)
     target = None if args.games is None else args.games+state['games_completed']
     episodes, rows, started = [], [], 0
@@ -573,7 +624,7 @@ def worker(args):
     def status(stage):
         """Rewrite the heartbeat; append a metrics line whenever the stage changes and otherwise every
         METRICS_SECONDS."""
-        nonlocal logged, stage_logged
+        nonlocal logged, stage_logged, solver_failures
         now = time.perf_counter()
         window.append((now, state['positions'], engine.evals))
         while len(window) > 2 and now-window[1][0] > 60:
@@ -587,8 +638,13 @@ def worker(args):
             mean_batch=engine.evals/max(1, engine.calls), terminal_fraction=state['terminal']/g if g else None,
             mean_plies=state['plies']/g if g else None, shards_written=state['shards_written'],
             paused_seconds=paused_total+(time.perf_counter()-paused_since if paused_since is not None else 0.),
-            vram=hexnet.vram(), error=state['error'])
+            vram=hexnet.vram(), error=state['error'],
+            solver=engine.solver.summary(now-began) if engine.solver else None)
         write_json(status_path, fields)
+        if fields['solver'] and fields['solver']['failures'] > solver_failures:
+            solver_failures = fields['solver']['failures']
+            log_event(run, 'actor', 'error', f'worker {args.worker}: {solver_failures} solver queries failed, last: '
+                      f'{fields["solver"]["last_failure"]}', process=args.worker)
         if metrics_due(stage, stage_logged, now-logged):
             logged, stage_logged = now, stage
             dense_config.append_metrics(run, f'actor-{args.worker}', **{k: fields[k] for k in METRICS})
@@ -675,6 +731,8 @@ def worker(args):
         status('failed')
         log_event(run, 'actor', 'error', state['error'], process=args.worker)
         raise
+    finally:
+        engine.close()
 
 
 def published(run, worker, since=0.):

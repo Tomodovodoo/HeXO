@@ -155,10 +155,11 @@ def tempered(p, temperature):
 class Line:
     """A dense_selfplay.Engine slot that continues `start` by `sims`-simulation Gumbel searches of `model`, each
     placement sampled from the root visit counts at `temperature` (from the search policy when no visit was made),
-    until it holds `plies` placements; `shares` holds each sampled placement's visit share (None without visits)."""
+    until it holds `plies` placements; `shares` holds each sampled placement's visit share (None without visits).
+    Book lines are searched without the tactical solver (`solver` None)."""
 
     def __init__(self, model, start, plies, sims, samples, tactics, temperature, seed):
-        self.model, self.plies, self.temperature, self.reason = model, plies, temperature, None
+        self.model, self.plies, self.temperature, self.reason, self.solver = model, plies, temperature, None, None
         self.budget, self.samples = sims, min(samples, sims)
         self.rng, self.moves, self.shares = np.random.default_rng(seed), [tuple(m) for m in start], []
         self.tree = model.tree(list(self.moves), seed, tactics)
@@ -194,6 +195,7 @@ def continuations(model, starts, settings, rng, leaf_batch=256):
         engine.add(slot)
     while engine.slots:
         engine.step()
+    engine.close()
     for slot in filter(None, slots):
         slot.tree.close()
     return [slot.moves if slot else line for slot, line in zip(slots, lines)], [slot.shares if slot else [] for slot in slots]

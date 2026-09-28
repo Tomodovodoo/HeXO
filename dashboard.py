@@ -412,14 +412,15 @@ def dense_manifests(folder, pattern='*/manifest.json'):
 def provisional(league, evaluator):
     """The league row of the checkpoint under evaluation, merged from evaluator-status.json (league.json stays the
     settled record): {id, opponent, wins, losses, capped, games, games_planned, elo, elo_interval} while the
-    evaluator is playing or throttled with a tally for a candidate that has no league entry, else None. elo and
-    elo_interval are the opponent's league Elo (Seal: anchors.seal.elo) plus the tally's elo_delta and
-    elo_interval, None while either is unknown."""
+    evaluator is playing or throttled with a tally for a candidate that has no checkpoint entry and is no decided
+    variant (one with a verdict), else None. elo and elo_interval are the opponent's league Elo (Seal:
+    anchors.seal.elo) plus the tally's elo_delta and elo_interval, None while either is unknown."""
     comparison, tally = evaluator.get('comparison'), evaluator.get('tally')
     if evaluator.get('stage') not in ('playing', 'throttled') or not isinstance(comparison, dict) or not isinstance(tally, dict):
         return None
     entries = {c.get('id'): c for c in league.get('checkpoints') or [] if isinstance(c, dict)}
-    if comparison.get('candidate') in entries:
+    decided = {v.get('id') for v in league.get('variants') or [] if isinstance(v, dict) and v.get('verdict')}
+    if comparison.get('candidate') in entries or comparison.get('candidate') in decided:
         return None
     opponent = comparison.get('opponent')
     base = ((league.get('anchors') or {}).get('seal') or {}).get('elo') if opponent == 'seal' else (entries.get(opponent) or {}).get('elo')

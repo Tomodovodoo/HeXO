@@ -29,6 +29,10 @@ bind('hxg_completed', C.c_int, ptr)
 bind('hxg_tactics', C.c_int, ptr, C.c_int)
 bind('hxg_exact', C.c_int, ptr)
 bind('hxg_prove', C.c_int, ptr, C.c_int, ints, C.c_int, C.c_int, C.c_int, ints, C.c_int)
+bind('hxg_hold', C.c_int, ptr, C.c_int)
+bind('hxg_priority', C.c_int, ptr, ints, C.c_int)
+bind('hxg_mark_exact', C.c_int, ptr, C.c_int64, C.c_int64, C.c_int)
+HOLD = -3  # hxg_next: the search waits at its armed hold
 
 def checked(ok):
     if not ok:

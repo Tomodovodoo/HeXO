@@ -4,7 +4,7 @@ A shard is an immutable directory `<run>/shards/<name>/` (all digits; converted 
 millisecond time plus pid) holding
   episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search, actors?, opponent?,
                   trained_side?}]
-  rows.json      [{game, ply, player, remaining, target, weight, legal_sha256}]
+  rows.json      [{game, ply, player, remaining, target, weight, legal_sha256, proven?, proof_turns?, solver_nodes?}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
   manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows may be absent: 0)
@@ -13,7 +13,10 @@ millisecond time plus pid) holding
 for capped games ('cap' at the ply limit, 'span' when a searched position does not fit the largest crop);
 `episode.root_values` is null or one entry per ply (searched root value in [-1, 1] for the side to
 move at that ply, or null). The learner derives every target from the episode (`examples`); the stored
-`row.target`/`row.weight` (p(win) or null, weight) are informational and optional.
+`row.target`/`row.weight` (p(win) or null, weight) are informational and optional. Rows of games played with the
+solver (episode `solver`, dense_solver.record) carry `proven` (+1 / -1: the side to move wins / loses by a verified
+proof, 0: unproven), `proof_turns` (attacker turns of that proof, 0 when unproven) and `solver_nodes` (solver work
+spent on the ply's search); absent means 0. The manifest counts the proven rows as `proven_rows`.
 `episode.actor` is the sha256 of the evaluator being trained. Actor shards also record `actors` {"0": sha, "1": sha}
 per colour, `opponent` (null for self-play, else the checkpoint id of a frozen historical opponent) and
 `trained_side` (null for self-play, else the colour the trained evaluator played). Every ply keeps a row so ply
@@ -43,8 +46,8 @@ from train import write_json
 SCHEMA = 'hexo-dense-shard-v1'
 FILES = ('episodes.json', 'rows.json', 'targets.npz')
 Ref = namedtuple('Ref', 'shard index row episode')
-Shard = namedtuple('Shard', 'game ply player remaining legal full following start moves roots searched has_roots has_search '
-                             'winner side held')
+Shard = namedtuple('Shard', 'game ply player remaining proven legal full following start moves roots searched has_roots '
+                             'has_search winner side held')
 FUTURE = (6, 20)
 ORIGINS = ('converted', 'actor')
 SOURCES = ('converted', 'fresh', 'newest')
@@ -230,10 +233,11 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
             raise ValueError('Malformed shard row')
         if len(p) and (not np.isfinite(p).all() or np.any(p < 0) or not np.isclose(p.sum(), 1, atol=1e-4)):
             raise ValueError('Invalid policy target')
-    keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256')
+    keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256', 'proven', 'proof_turns', 'solver_nodes')
     counts = dict(games=len(episodes), rows=len(rows), policy_rows=sum(len(p) > 0 for p in policies),
                   opponent_rows=sum(not trained(episodes[r['game']], r['ply']) for r in rows),
-                  terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes))
+                  terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes),
+                  proven_rows=sum(bool(r.get('proven')) for r in rows))
     with tempfile.TemporaryDirectory(dir=path.parent, prefix='pending-') as temporary:
         stage = Path(temporary)/'shard'
         stage.mkdir()
@@ -330,7 +334,7 @@ class ReplayWindow:
     `holdout(episode, validation_fraction)` form the validation index and are never drawn for training.
     `index`/`validation` are Rows, oldest first.
 
-    Memory: each admitted shard is held as numpy arrays (Shard): per row its game, ply, player, remaining,
+    Memory: each admitted shard is held as numpy arrays (Shard): per row its game, ply, player, remaining, proven,
     raw legal digest, next-ply row and full-search flag; per game its ply offset, winner, trained side and
     held-out flag; per ply its move, root value (NaN for null) and full_search flag. A Ref's row dict and its
     episode dict {moves, winner, root_values, full_search, trained_side} are rebuilt on demand. Policy vectors
@@ -359,6 +363,7 @@ class ReplayWindow:
         return Shard(
             game=game, ply=ply.astype(np.int16), player=np.array([r['player'] for r in rows], np.int8),
             remaining=np.array([r['remaining'] for r in rows], np.int8),
+            proven=np.array([r.get('proven', 0) for r in rows], np.int8),
             legal=np.frombuffer(bytes.fromhex(''.join(r['legal_sha256'] for r in rows)), np.uint8).reshape(-1, 32),
             full=full, following=np.array([where.get((g, t+1), -1) for g, t in zip(game.tolist(), ply.tolist())], np.int32),
             start=np.cumsum([0]+[len(e['moves']) for e in episodes]).astype(np.int32),
@@ -415,7 +420,7 @@ class ReplayWindow:
         """Ref of row i of admitted shard `name`."""
         s = self.shards[name]; g = int(s.game[i]); a, b = int(s.start[g]), int(s.start[g+1])
         row = dict(game=g, ply=int(s.ply[i]), player=int(s.player[i]), remaining=int(s.remaining[i]),
-                   legal_sha256=s.legal[i].tobytes().hex())
+                   proven=int(s.proven[i]), legal_sha256=s.legal[i].tobytes().hex())
         episode = dict(moves=s.moves[a:b].tolist(), winner=int(s.winner[g]), trained_side=None if s.side[g] < 0 else int(s.side[g]),
                        root_values=[None if v != v else v for v in s.roots[a:b].tolist()] if s.has_roots[g] else None,
                        full_search=s.searched[a:b].tolist() if s.has_search[g] else None)
@@ -616,11 +621,12 @@ def target_options(settings, calibration=None):
     return dict(lam=settings.td_lambda, bootstrap_weight=settings.bootstrap_weight, horizon=settings.short_value_horizon,
                 cheap_value_weight=settings.cheap_value_weight, full_only=settings.bootstrap_full_only,
                 outcome_lam=settings.outcome_lambda if settings.value_target == 'td' else 1.,
-                calibration=calibration if settings.value_target == 'calibrated' else None)
+                calibration=calibration if settings.value_target == 'calibrated' else None,
+                proven_weight=settings.proven_value_weight)
 
 
 def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False,
-             outcome_lam=1., calibration=None):
+             outcome_lam=1., calibration=None, proven_weight=2.):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
     The replayed side to move and legal list must match each row. Returns (samples, targets); each target is a
@@ -628,7 +634,8 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
       policy, policy_weight: the row's improved policy (weight 0 when empty, i.e. a cheap-search row);
       value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam, calibration) at the ply;
         weight 1 for finished games, `bootstrap_weight` for capped games with root values, 0 otherwise, times
-        `cheap_value_weight` for cheap-search rows;
+        `cheap_value_weight` for cheap-search rows; a row with a nonzero `proven` instead gets the proven value
+        (1. for +1, 0. for -1) with weight `proven_weight`;
       outcome, outcome_weight: 1. when the side to move won a finished game, else 0.; weight value_weight for
         finished games, 0 for capped games (outcome .5);
       short_value, short_weight: p(win) of the side to move from the root value `horizon` plies later
@@ -653,6 +660,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         policy = window.policy(ref)
         values, weights = window.value_targets(ref, lam, full_only, outcome_lam, calibration)
         value_weight = weights[t]*(1. if e['winner'] >= 0 else bootstrap_weight)*(1. if len(policy) else cheap_value_weight)
+        proven = ref.row.get('proven', 0)
         u = t+horizon; roots = e['root_values']
         if u >= T:
             short = (float(me == e['winner']), 1.) if e['winner'] >= 0 else (.5, 0.)
@@ -680,7 +688,8 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         game.close()
         samples.append(s)
         out.append(dict(policy=policy, policy_weight=float(len(policy) > 0),
-                        value=.5 if values[t] is None else values[t], value_weight=value_weight,
+                        value=float(proven > 0) if proven else .5 if values[t] is None else values[t],
+                        value_weight=proven_weight if proven else value_weight,
                         outcome=float(me == e['winner']) if e['winner'] >= 0 else .5,
                         outcome_weight=value_weight if e['winner'] >= 0 else 0.,
                         short_value=short[0], short_weight=short[1], future=future, future_weight=known,

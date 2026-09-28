@@ -828,11 +828,15 @@ always score finished games against their hard outcome.
   candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
   and against panel members. Each pair also gets a matchup deviation (prior sd `matchup_prior_elo`, default 30),
   so a pair's own games outweigh the transitive picture when the two disagree. The candidate needs at least
-  `sprt_min_games` direct games, and its rating sd may be at most `uncertainty_parity` (1.5) times the champion's.
+  `sprt_min_games` direct games. No separate bound applies to its rating sd: P(better) already accounts for it.
   It is promoted when it has the highest posterior rating and P(candidate - champion > `sprt_elo0`) is at least
   `promote_confidence`. It is rejected when that probability is at most 1 - `promote_confidence`. Neither
   happens while the direct-only and pooled estimates disagree beyond their intervals. `decision sprt` keeps the
   sequential test (`sprt_elo0` 0, `sprt_elo1` 25).
+- **Calibration diagnostic.** Each posterior verdict records the sd of delta it stated. Once the checkpoint has
+  three later comparisons, `league.json` `calibration` compares the realised RMS shift of delta with what a
+  calibrated posterior expects (root mean of sd then squared minus sd now squared). A realised RMS well below the
+  expected one means the posterior overstates its variance. No decision reads it.
 - **Continuous pool.** Like the actors, the evaluator keeps `pool_games` (64) games in flight on one engine. When
   a game ends, the next opening of its pairing starts at once (both colours together), so the GPU batch stays
   full. Each completed colour pair is written to its report immediately, so a restart loses only the games in
@@ -847,13 +851,25 @@ always score finished games against their hard outcome.
   conditions hold (`decision sprt` settles the same way). On every start the evaluator re-applies the rule to
   the reports on disk, and a rated checkpoint that already passes it is crowned at once.
 - **Streaming.** `evaluator-status.json` carries the pool composition, the running tally of the current
-  comparison (updated per finished game) and the pending verdict. The dashboard shows all three, including a
+  comparison (every recorded game of the pair, in either role and across restarts, updated per finished game) and the pending verdict. The dashboard shows all three, including a
   provisional league row for the candidate.
 - **Idle work.** After the decision, the evaluator plays the champion's Seal anchor, the adaptive panel (the
   rated checkpoints closest to the champion) and other optional comparisons. It then plays fill games until the
   next checkpoint appears: the champion against Seal until their interval is `anchor_target_halfwidth` narrow,
   `games` of the newest checkpoint against the previous champion, then the widest pair among the top
   `fill_top`. Pairings where either side's expected score exceeds `max_expected_score` are never played.
+- **Variants.** An A/B test of search settings runs through the same pool, reports and posterior. A variant is
+  a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`,
+  `solver_*`), league id `<checkpoint>@<name>`:
+
+  ```text
+  python dense_eval.py variant --run runs/dense-v1 --checkpoint main/032500 --name solver --set solver_root_nodes=135 --set solver_finalists=2 --set solver_finalist_nodes=135 --set solver_threat_nodes=135
+  ```
+
+  The running evaluator picks it up once no checkpoint waits and decides it against its checkpoint: 'better'
+  once P(variant - checkpoint > `sprt_elo0`) reaches `promote_confidence`, 'worse' once it falls to 1 -
+  `promote_confidence`, 'max-games' at `sprt_max_games`. Variants are rated in the league and shown in the
+  checkpoint history, but they never become champion and never reach the actors.
 - **Opening books** (`dense_openings.py`). Every pairing, Seal anchors included, draws its colour-swapped openings from
   the book of `opening_suite`. Each completed pair is recorded on every node its opening passed through, so the
   statistics of a node cover its whole subtree. A book is a DAG of symmetry-reduced positions, and a frozen suite
