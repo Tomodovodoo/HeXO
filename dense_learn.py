@@ -7,7 +7,8 @@ export, info, error or replace. league.json is read for population replacement, 
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
 falls on every tenth step) and one per export with validation_fields(metrics) of the manifest (Learner.export): EMA
 losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets), plus the value
-loss of finished held-out games against plies remaining (remaining_curve). The EMA
+loss of finished held-out games against plies remaining (remaining_curve) and the policy and value losses against
+the ply from the start (ply_curve, ply_split). The EMA
 averages parameters only; each export first recomputes its norm statistics (Learner.recalibrate), since the
 raw model's running statistics do not describe the EMA weights.
 
@@ -56,6 +57,9 @@ LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce'
 # (low, high) for replacement perturbations; td_lambda and ema are perturbed through 1 - x.
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
+PLY_GRID = tuple(range(0, 385, 8))  # plies from the start at which by-ply curves are sampled
+PLY_SIGMA = 4.
+EARLY_PLY, LATE_PLY = 20, 60  # ply_split: early rows have ply < EARLY_PLY, late rows ply >= LATE_PLY
 HORIZON_BCE = math.log(2)/2  # midpoint between a perfect and a chance value head
 CURVE_SOURCES = ('fresh', 'newest')
 BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995), ema=(.99, .9999))
@@ -69,6 +73,31 @@ def validation_fields(metrics):
     return fields or None
 
 
+def smoothed(x, ys, grid, sigma):
+    """Per y in `ys`, a float array holding per grid point g the mean of y weighted by exp(-(x-g)^2 / (2 sigma^2)),
+    nan where the weights sum below 1."""
+    x, g = np.asarray(x, np.float64), np.asarray(grid, np.float64)
+    k = np.exp(-.5*((g[:, None]-x[None])/sigma)**2)
+    mass = k.sum(1)
+    return [np.where(mass >= 1, k@np.asarray(y, np.float64)/np.maximum(mass, 1e-12), np.nan) for y in ys]
+
+
+def compact(curve):
+    """A curve as a JSON list: values rounded to 4 decimals, None where not finite."""
+    return [round(float(v), 4) if np.isfinite(v) else None for v in curve]
+
+
+def ply_curve(ply, loss, grid=PLY_GRID, sigma=PLY_SIGMA):
+    """Loss against the ply from the start, smoothed like remaining_curve: a compact list over `grid`."""
+    return compact(smoothed(ply, [loss], grid, sigma)[0])
+
+
+def ply_split(ply, loss):
+    """(mean loss of rows with ply < EARLY_PLY, mean loss of rows with ply >= LATE_PLY), each None without rows."""
+    ply, loss = np.asarray(ply, np.float64), np.asarray(loss, np.float64)
+    return tuple(float(loss[m].mean()) if m.any() else None for m in (ply < EARLY_PLY, ply >= LATE_PLY))
+
+
 def remaining_curve(remaining, bce, target, grid=REMAINING_GRID, sigma=REMAINING_SIGMA):
     """Value loss against plies remaining over rows of finished games: {value_curve, value_excess_curve,
     value_bce_last20, value_horizon}. value_curve holds, per grid point g, the mean of the rows' BCE weighted by
@@ -80,9 +109,7 @@ def remaining_curve(remaining, bce, target, grid=REMAINING_GRID, sigma=REMAINING
     Each scalar is None when undefined."""
     r, b, t = (np.asarray(x, np.float64) for x in (remaining, bce, target))
     g = np.asarray(grid, np.float64)
-    k = np.exp(-.5*((g[:, None]-r[None])/sigma)**2)
-    mass = k.sum(1)
-    curve, rate = (np.where(mass >= 1, k@y/np.maximum(mass, 1e-12), np.nan) for y in (b, t))
+    curve, rate = smoothed(r, (b, t), g, sigma)
     with np.errstate(divide='ignore', invalid='ignore'):
         entropy = -np.nan_to_num(rate*np.log(rate))-np.nan_to_num((1-rate)*np.log(1-rate))
     excess = np.where(np.isfinite(curve), curve-entropy, np.nan)
@@ -95,7 +122,6 @@ def remaining_curve(remaining, bce, target, grid=REMAINING_GRID, sigma=REMAINING
                 horizon = g[i]
             break
     last = r <= 20
-    compact = lambda c: [round(float(v), 4) if np.isfinite(v) else None for v in c]
     return dict(value_curve=compact(curve), value_excess_curve=compact(excess),
                 value_bce_last20=float(b[last].mean()) if last.any() else None,
                 value_horizon=None if horizon is None else round(float(horizon), 2))
@@ -350,31 +376,40 @@ class Learner:
                 total += batch_losses(self.ema, batch, None, self.device, self.memory_format, False)*weights; mass += weights
         return tuple(float(total[h]/mass[h]) if mass[h] > 0 else None for h in (0, 1))
 
-    def value_rows(self, sets, refs):
-        """(plies remaining = len(moves) - ply, EMA value BCE, value target) as float arrays over the
-        `refs` of finished games (winner >= 0), under symmetries drawn from a fixed seed."""
+    def row_losses(self, sets, refs):
+        """Per-row EMA losses over `refs` under symmetries drawn from a fixed seed: float arrays with one entry per
+        ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
+        finished (1. when winner >= 0, else 0.), value_bce, value (its target) and policy_ce (against the improved
+        policy; nan on rows without a policy target)."""
         s = self.settings
-        refs = [r for r in refs if r.episode['winner'] >= 0]
         rng = np.random.default_rng(self.config.seed)
-        remaining, bce, target = [], [], []
+        rows = []
         with torch.no_grad():
             for k in range(0, len(refs), s.batch):
                 chunk = refs[k:k+s.batch]
                 samples, targets = dense_data.examples(sets, chunk, rng, **dense_data.target_options(s))
                 order = sorted(range(len(chunk)), key=lambda i: samples[i].size)    # collate's row order
-                remaining += [len(chunk[i].episode['moves'])-chunk[i].row['ply'] for i in order]
-                for bucket in dense_data.collate(samples, targets).values():
-                    logit = forward(self.ema, bucket['planes'], self.device, self.memory_format)[0]['value_logit'].float().cpu()
-                    t = bucket['value']
-                    bce += torch.nn.functional.binary_cross_entropy_with_logits(logit, t, reduction='none').tolist()
-                    target += t.tolist()
-        return np.array(remaining, np.float64), np.array(bce), np.array(target)
+                losses = []
+                for b in dense_data.collate(samples, targets).values():
+                    out = forward(self.ema, b['planes'], self.device, self.memory_format)[0]
+                    target = torch.zeros(b['mask'].shape).masked_scatter_(b['mask'], b['policy'])
+                    ce = hexnet.policy_row_losses(out['policy'].float().cpu(), out['far'].float().cpu(), b['cells'], b['counts'], target)
+                    bce = torch.nn.functional.binary_cross_entropy_with_logits(out['value_logit'].float().cpu(), b['value'], reduction='none')
+                    losses += zip(bce.tolist(), b['value'].tolist(), torch.where(b['policy_weight'] > 0, ce, math.nan).tolist())
+                for i, loss in zip(order, losses):
+                    ref = chunk[i]
+                    rows.append((ref.row['ply'], len(ref.episode['moves'])-ref.row['ply'], float(ref.episode['winner'] >= 0), *loss))
+        columns = np.array(rows, np.float64).reshape(-1, 6).T
+        return dict(zip(('ply', 'remaining', 'finished', 'value_bce', 'value', 'policy_ce'), columns))
 
     def validate_sources(self, sets):
         """Refresh `sets` (dense_data.ValidationSets) and return, per source, <source>_policy_ce and
         <source>_value_bce on its held subset, <source>_train_* on its train subset, <source>_gap_* = held minus
-        train (None when either is), <source>_rows (held rows), plus newest_checkpoint; for CURVE_SOURCES also the
-        remaining_curve of value_rows on the held subset as <source>_<key>, with its grid as remaining_grid."""
+        train (None when either is), <source>_rows (held rows), plus newest_checkpoint. For CURVE_SOURCES, over the
+        row_losses of the held subset: the remaining_curve of the rows of finished games as <source>_<key> (grid:
+        remaining_grid); <source>_value_bce_by_ply, the ply_curve of the same rows' value BCE, and
+        <source>_policy_ce_curve, the ply_curve of the policy CE of rows with a policy target (grid: ply_grid);
+        <source>_policy_ce_early and <source>_policy_ce_late, the ply_split of that policy CE."""
         sets.refresh()
         self.ema.eval()
         out = dict(newest_checkpoint=sets.newest_checkpoint)
@@ -384,10 +419,15 @@ class Learner:
                 out.update({f'{source}_{name}': v, f'{source}_train_{name}': w,
                             f'{source}_gap_{name}': None if v is None or w is None else v-w})
             out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
-        out['remaining_grid'] = list(REMAINING_GRID)
+        out.update(remaining_grid=list(REMAINING_GRID), ply_grid=list(PLY_GRID))
         for source in CURVE_SOURCES:
-            curve = remaining_curve(*self.value_rows(sets, sets.subsets[source, 'held']))
-            out.update({f'{source}_{k}': v for k, v in curve.items()})
+            r = self.row_losses(sets, sets.subsets[source, 'held'])
+            f, p = r['finished'] > 0, np.isfinite(r['policy_ce'])
+            out.update({f'{source}_{k}': v for k, v in remaining_curve(r['remaining'][f], r['value_bce'][f], r['value'][f]).items()})
+            early, late = ply_split(r['ply'][p], r['policy_ce'][p])
+            out.update({f'{source}_value_bce_by_ply': ply_curve(r['ply'][f], r['value_bce'][f]),
+                        f'{source}_policy_ce_curve': ply_curve(r['ply'][p], r['policy_ce'][p]),
+                        f'{source}_policy_ce_early': early, f'{source}_policy_ce_late': late})
         return out
 
     def export(self, window, sets=None):
