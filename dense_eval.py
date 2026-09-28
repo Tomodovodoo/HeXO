@@ -330,6 +330,12 @@ def report_path(run, candidate, opponent):
     return Path(run)/'evaluations'/f'{candidate.replace("/", "-")}-vs-{opponent.replace("/", "-")}'/'report.json'
 
 
+def games_digest(games):
+    """Identity of a report's game list: a digest of each game's pair, colour, winner and length, in order."""
+    rows = [(g['pair'], g['challenger_color'], g['winner'], g['plies']) for g in games]
+    return hashlib.sha256(json.dumps(rows).encode()).hexdigest()[:16]
+
+
 def report_name(report):
     """The directory name of `report` under evaluations/."""
     return report_path('', report['candidate'], report['opponent']).parent.name
@@ -513,8 +519,8 @@ def variant_heads(entries, rated=lambda c: True):
 def calibration(league, reports):
     """Diagnostic of the posterior's stated uncertainty; no decision reads it. For every checkpoint whose posterior
     verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports), whose snapshotted reports
-    (the direct one among them) are all still the ones it was decided on (same created_at, so extended at most) and
-    which has at least CALIBRATION_LATER later comparisons (reports with it under that protocol that are new or
+    (every input of the verdict's posterior, the direct one among them) all still begin with the games it was decided
+    on (`games_digest` of that prefix: extended at most, not replaced) and which has at least CALIBRATION_LATER later comparisons (reports with it under that protocol that are new or
     have grown since the verdict), shift = delta now - delta at the verdict, both
     r_cid - r_opponent + their matchup deviation over the reports of that protocol with the verdict's matchup
     prior. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
@@ -533,8 +539,9 @@ def calibration(league, reports):
         group = [r for r in reports if protocol(r['settings']) == key]
         named = {report_name(r): r for r in group}
         direct = report_path('', cid, verdict['opponent']).parent.name
-        if direct not in verdict['reports'] or any(name not in named or named[name]['created_at'] != snap['created_at']
-                                                   for name, snap in verdict['reports'].items()):
+        intact = lambda name, snap: name in named and len(named[name]['games']) >= snap['games'] \
+            and games_digest(named[name]['games'][:snap['games']]) == snap['digest']
+        if direct not in verdict['reports'] or not all(intact(*item) for item in verdict['reports'].items()):
             continue
         later = sum(cid in (r['candidate'], r['opponent']) and len(r['games']) > verdict['reports'].get(name, {}).get('games', 0)
                     for name, r in named.items())
@@ -1060,11 +1067,7 @@ class Evaluator:
         of cid and of the champion about the league mean), leader (the rated or candidate checkpoint of highest
         posterior rating)}, plus `posterior` (the Posterior) for pairing."""
         s = self.settings
-        rated = [c['id'] for c in self.league['checkpoints'] if c.get('elo') is not None and not c.get('skipped')]
-        ids = list(dict.fromkeys(rated+[champion, cid]))
-        reports = [r for r in load_reports(self.run, s) if r['candidate'] in ids+[SEAL] and r['opponent'] in ids+[SEAL]]
-        if any(SEAL in (r['candidate'], r['opponent']) for r in reports):
-            ids.append(SEAL)
+        ids, reports = self.inputs(cid, champion)
         post = Posterior(ids, ids[0], [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
                                        r['summary']['games']) for r in reports], s.matchup_prior_elo)
         mean, sd = post.difference(cid, champion)
@@ -1081,14 +1084,24 @@ class Evaluator:
                     direct=dict(games=t['games'], elo=t['elo_delta'], interval=interval), disagree=disagree,
                     spread=spread, leader=leader, posterior=post)
 
+    def inputs(self, cid, champion):
+        """(ids, reports) of the `verdict` posterior on cid against the champion: the league's rated ids, the
+        champion, cid and Seal when it has a report among them; every protocol-matching report among those."""
+        rated = [c['id'] for c in self.league['checkpoints'] if c.get('elo') is not None and not c.get('skipped')]
+        ids = list(dict.fromkeys(rated+[champion, cid]))
+        reports = [r for r in load_reports(self.run, self.settings) if r['candidate'] in ids+[SEAL] and r['opponent'] in ids+[SEAL]]
+        if any(SEAL in (r['candidate'], r['opponent']) for r in reports):
+            ids.append(SEAL)
+        return ids, reports
+
     def snapshot(self, cid, champion):
         """What a decided verdict records for `calibration`: {opponent (the champion), protocol ({PROTOCOL setting:
-        value}), matchup_prior (the effective matchup_prior_elo), reports ({report name: {created_at, games}} of cid's
-        protocol-matching reports now)}."""
+        value}), matchup_prior (the effective matchup_prior_elo), reports ({report name: {games, digest
+        (`games_digest`)}} of every report the verdict's posterior uses, `inputs`)}."""
         s = self.settings
         return dict(opponent=champion, protocol={k: getattr(s, k) for k in PROTOCOL}, matchup_prior=s.matchup_prior_elo,
-                    reports={report_name(r): dict(created_at=r['created_at'], games=len(r['games']))
-                             for r in load_reports(self.run, s) if cid in (r['candidate'], r['opponent'])})
+                    reports={report_name(r): dict(games=len(r['games']), digest=games_digest(r['games']))
+                             for r in self.inputs(cid, champion)[1]})
 
     def evidence(self, verdict, cid, champion, games):
         """(a, b) of the evidence pairing for a pending posterior decision, or None: of cid and the champion each

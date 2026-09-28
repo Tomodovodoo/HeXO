@@ -3520,15 +3520,19 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertAlmostEqual(calibration['expected_rms'], math.sqrt(verdict['delta_sd']**2-sd**2))
         self.assertAlmostEqual(calibration['realised_rms'], abs(mean-verdict['delta']))
         self.assertGreater(calibration['realised_rms'], 0.)
-        league['checkpoints'][1]['verdict']['reports']['main-000020-vs-main-000010']['created_at'] -= 1
+        reports = league['checkpoints'][1]['verdict']['reports']
+        digest = reports['main-000020-vs-main-000010']['digest']
+        reports['main-000020-vs-main-000010']['digest'] = '0'*16
         dense_eval.write_league(self.run, league, config)
         self.assertEqual(league['calibration']['count'], 0)                            # the direct report was replaced
-        league['checkpoints'][1]['verdict']['reports']['main-000020-vs-main-000010']['created_at'] += 1
-        reports = league['checkpoints'][1]['verdict']['reports']
-        reports['main-000030-vs-main-000020'] = dict(created_at=0., games=2)
+        reports['main-000020-vs-main-000010']['digest'] = digest
+        reports['main-000030-vs-main-000040'] = dict(games=2, digest='0'*16)
         dense_eval.write_league(self.run, league, config)
-        self.assertEqual(league['calibration']['count'], 0)                            # an input report was replaced
-        del reports['main-000030-vs-main-000020']
+        self.assertEqual(league['calibration']['count'], 0)                            # an input report is gone
+        del reports['main-000030-vs-main-000040']
+        self.report('main/000020', 'main/000010', [1, 1, 0, 1]*4+[1, 0])              # extended: still counted
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration']['count'], 1)
         league['checkpoints'][1]['verdict']['protocol']['sims'] += 1                  # decided under another protocol
         dense_eval.write_league(self.run, league, config)
         self.assertEqual(league['calibration']['count'], 0)
