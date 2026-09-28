@@ -63,8 +63,8 @@ actors with model_source 'newest_veto': the newest export of learner.variant unl
 checkpoint until the next export.
 
 league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
-superseded?, panel?, demoted?, verdict? (the posterior verdict that rated it, with its opponent and reports:
-{report name: games} of the candidate's protocol-matching reports then)}], differences, ladder, ladder_top, anchors,
+superseded?, panel?, demoted?, verdict? (the posterior verdict that rated or promoted it on review, with its
+`Evaluator.snapshot`: opponent, protocol and reports)}], differences, ladder, ladder_top, anchors,
 matrix, calibration, rating_note, updated_at}. calibration (`calibration`) compares the delta sd the posterior
 stated at each verdict with how far delta moved once later games of that checkpoint came in.
 differences and ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the ladder_top
@@ -512,25 +512,25 @@ def variant_heads(entries, rated=lambda c: True):
 
 def calibration(league, reports, matchup_prior):
     """Diagnostic of the posterior's stated uncertainty; no decision reads it. For every checkpoint whose posterior
-    verdict holds its opponent and reports (`Evaluator.decide`) and which has at least CALIBRATION_LATER later
-    comparisons (reports with it, under the protocol of its direct report, that are new or have grown since the
-    verdict), shift = delta now - delta at the verdict, both r_cid - r_opponent + their matchup deviation over those
-    reports. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
+    verdict holds its opponent, protocol and reports (`Evaluator.snapshot`), whose direct report under that protocol
+    is still current and which has at least CALIBRATION_LATER later comparisons (reports with it under that protocol
+    that are new or have grown since the verdict), shift = delta now - delta at the verdict, both r_cid - r_opponent
+    + their matchup deviation over the reports of that protocol. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
     resolved). Returns {count, predicted_sd (mean delta_sd at the verdicts), expected_rms (root mean sd_then^2 -
     sd_now^2), realised_rms (root mean shift^2)}, the three None without a counted verdict: realised_rms well below
     expected_rms means the posterior overstates its variance."""
     rated = [c['id'] for c in league['checkpoints'] if c.get('elo') is not None and not c.get('skipped')]
-    protocol = lambda r: tuple(r['settings'].get(k, PROTOCOL_DEFAULTS.get(k)) for k in PROTOCOL)
-    named = {report_name(r): r for r in reports}
+    protocol = lambda settings: tuple(settings.get(k, PROTOCOL_DEFAULTS.get(k)) for k in PROTOCOL)
     posteriors, then, now, shifts = {}, [], [], []
     for entry in league['checkpoints']:
         verdict, cid = entry.get('verdict') or {}, entry['id']
-        direct = named.get(report_path('', cid, verdict.get('opponent', '')).parent.name)
-        if 'reports' not in verdict or verdict.get('delta_sd') is None or direct is None \
+        if not {'opponent', 'protocol', 'reports'} <= verdict.keys() or verdict.get('delta_sd') is None \
                 or cid not in rated or verdict['opponent'] not in rated:
             continue
-        key = protocol(direct)
-        group = [r for r in reports if protocol(r) == key]
+        key = protocol(verdict['protocol'])
+        group = [r for r in reports if protocol(r['settings']) == key]
+        if not any((r['candidate'], r['opponent']) == (cid, verdict['opponent']) for r in group):
+            continue
         later = sum(cid in (r['candidate'], r['opponent']) and len(r['games']) > verdict['reports'].get(report_name(r), 0)
                     for r in group)
         if later < CALIBRATION_LATER:
@@ -1074,6 +1074,13 @@ class Evaluator:
                     direct=dict(games=t['games'], elo=t['elo_delta'], interval=interval), disagree=disagree,
                     spread=spread, leader=leader, posterior=post)
 
+    def snapshot(self, cid, champion):
+        """What a decided verdict records for `calibration`: {opponent (the champion), protocol ({PROTOCOL setting:
+        value}), reports ({report name: games} of cid's protocol-matching reports now)}."""
+        s = self.settings
+        return dict(opponent=champion, protocol={k: getattr(s, k) for k in PROTOCOL},
+                    reports={report_name(r): len(r['games']) for r in load_reports(self.run, s) if cid in (r['candidate'], r['opponent'])})
+
     def evidence(self, verdict, cid, champion, games):
         """(a, b) of the evidence pairing for a pending posterior decision, or None: of cid and the champion each
         vs the previous champion (`met` of the champion) and vs Seal, the one whose `games` most reduce the
@@ -1139,8 +1146,7 @@ class Evaluator:
         if not verdict['direct']['games']:
             return {}, None
         superseded = self.newer(cid)
-        verdict = dict(public(verdict), candidate=cid, opponent=champion,
-                       reports={report_name(r): len(r['games']) for r in load_reports(self.run, s) if cid in (r['candidate'], r['opponent'])})
+        verdict = dict(public(verdict), candidate=cid, **self.snapshot(cid, champion))
         if not verdict['decision'] and superseded and verdict['p_better'] >= s.promote_confidence:
             verdict.update(decision='promote', settled=True)
         verdict['decision'] = verdict['decision'] or ('superseded' if superseded else 'max-games')
@@ -1164,8 +1170,8 @@ class Evaluator:
         sprt_min_games direct games against the champion (their report against it), those whose `verdict`
         is `ready` with P(delta > sprt_elo0) >= promote_confidence are eligible; the one of highest posterior
         rating among them is promoted ('decision' event 'promote on review', then the 'promotion' event; its Seal
-        anchor is scheduled as for any promotion). A higher-rated checkpoint without those direct games does not
-        block it: it has not met the champion."""
+        anchor is scheduled as for any promotion) and its entry keeps that verdict with its `snapshot`. A
+        higher-rated checkpoint without those direct games does not block it: it has not met the champion."""
         s, champion = self.settings, self.league['champion']
         if s.decision != 'posterior' or champion is None:
             return
@@ -1181,10 +1187,11 @@ class Evaluator:
         if not eligible:
             return
         _, cid, verdict = max(eligible)
-        verdict = dict(public(verdict), candidate=cid, decision='promote', review=True)
+        verdict = dict(public(verdict), candidate=cid, decision='promote', review=True, **self.snapshot(cid, champion))
         log_event(self.run, 'evaluator', 'decision', f'{cid} vs {champion}: promote on review of the existing reports '
                   f'({verdict["direct"]["games"]} direct games, P(delta > {s.sprt_elo0:g}) {verdict["p_better"]:.3f})',
-                  opponent=champion, **verdict)
+                  **verdict)
+        self.entry(cid)['verdict'] = verdict
         self.promote(cid, champion)
         write_league(self.run, self.league, self.config, self.settings.fill_top)
 
