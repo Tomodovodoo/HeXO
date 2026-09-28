@@ -437,10 +437,13 @@ class Evaluator:
 
     def round(self, cid, opponent, kind, planned):
         """After pacing, play the next min(games, planned - played) games of cid vs opponent, opening pairs
-        numbered on from earlier rounds; returns the comparison's {records, seconds} so far."""
+        numbered on from earlier rounds; returns the comparison's {records, seconds} so far. A champion round
+        is not started once a newer checkpoint of the variant exists."""
         done = self.partial.setdefault((cid, opponent), dict(records=[], seconds=0.))
         records = done['records']
         self.pacer.wait(lambda: self.publish(True, stage='throttled'))
+        if kind == 'champion' and self.newer(cid):
+            return done
         count, start = min(self.settings.games, planned-len(records)), self.pacer.clock()
         self.publish(True, stage='playing', comparison=dict(candidate=cid, opponent=opponent, kind=kind),
                      games_played=len(records), games_planned=planned, placements_per_second=None)
