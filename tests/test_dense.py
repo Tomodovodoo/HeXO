@@ -1338,5 +1338,60 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([(e['checkpoint'], e['restored']) for e in events if e['kind'] == 'regression'], [('main/000040', 'main/000010')])
 
+    def test_rematch_rounds_stop_at_their_budget(self):
+        evaluator = self.start(games=4, idle_rematch=True)
+        for step in (10, 20):
+            self.export(step)
+            self.assertTrue(evaluator.step())
+        path = dense_eval.report_path(self.run, 'main/000020', 'main/000010')
+        self.assertEqual(len(json.loads(path.read_text())['games']), 2)             # sprt_max_games 2
+        self.assertEqual(evaluator.optional()[1:], ('main/000010', 'sprt', 2))      # REMATCH_SPRT_LIMIT * 2 - 2 left
+        self.assertTrue(evaluator.step())
+        self.assertEqual(len(json.loads(path.read_text())['games']), 4)             # not 2 + games
+        self.assertIsNone(evaluator.optional())
+        # A replacement rematch is offered only the games left below sprt_max_games.
+        evaluator = self.start(games=4, sprt_max_games=6, idle_rematch=True)
+        evaluator.league['checkpoints'] = []
+        evaluator.league['differences'] = [dict(a='main/000020', b='side/000010', elo_delta=0., interval=[-100., 100.])]
+        played = dict(candidate='side/000010', opponent='main/000020', settings=asdict(evaluator.settings),
+                      summary=dict(wins=1, losses=1, capped=0, games=2), metrics={}, games=[])
+        with unittest.mock.patch.object(dense_eval, 'load_reports', lambda *args: [played]):
+            self.assertEqual(evaluator.rematches(), [('main/000020', 'side/000010', 'replacement', 4)])
+
+    def test_rematches_skip_reports_of_another_protocol(self):
+        evaluator = self.start(idle_rematch=True)
+        for step in (10, 20):
+            self.export(step)
+            self.assertTrue(evaluator.step())
+        path = dense_eval.report_path(self.run, 'main/000020', 'main/000010')
+        report = json.loads(path.read_text())
+        self.assertEqual(evaluator.rematches(), [('main/000020', 'main/000010', 'sprt', 2)])
+        path.write_text(json.dumps(dict(report, settings=dict(report['settings'], sims=64))))   # an --eval-sims restart
+        self.assertEqual(evaluator.rematches(), [])
+        self.assertIsNone(dense_eval.rematch_pair(self.run, 'main/000020', 'main/000010', evaluator.settings)) \
+            if (dense_eval.report_path(self.run, 'main/000010', 'main/000020').exists()) else None
+        self.assertEqual(dense_eval.rematch_pair(self.run, 'main/000020', 'main/000010', evaluator.settings),
+                         ('main/000010', 'main/000020'))
+
+    def test_incumbent_tops_up_an_undersized_report(self):
+        self.export(10, 20, 40)
+        evaluator = self.start(games=4)
+        evaluator.league = dict(champion='main/000040', checkpoints=[
+            dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20)])
+        evaluator.league['checkpoints'].append(dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
+                                                    panel=dict(members=['main/000020'], incumbent='main/000010')))
+        evaluator.extend('main/000010', 'main/000020', 'incumbent', 2)             # e.g. played before --eval-games 4
+        entry = evaluator.league['checkpoints'][-1]
+        self.assertEqual(evaluator.needs(entry), [('main/000040', 'main/000020', 'panel', 4),
+                                                  ('main/000010', 'main/000020', 'incumbent', 2)])
+        evaluator.extend('main/000040', 'main/000020', 'panel', 4)
+        self.assertEqual(evaluator.needs(entry), [('main/000010', 'main/000020', 'incumbent', 2)])  # not complete yet
+        self.assertEqual(evaluator.optional()[1:], ('main/000020', 'incumbent', 2))
+        self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'main/000020').read_text())
+        self.assertEqual([g['pair'] for g in report['games']], [0, 0, 1, 1])
+        self.assertEqual(evaluator.needs(entry), [])
+        self.assertIn('veto', entry['panel'])                                        # judged once complete
+
 if __name__ == '__main__':
     unittest.main()

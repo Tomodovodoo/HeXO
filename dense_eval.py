@@ -391,11 +391,15 @@ def panel_result(members, candidate, incumbent, matrix):
     return out
 
 
-def rematch_pair(run, a, b):
-    """Report orientation for more a-b games: a-vs-b, unless that report holds an SPRT record (such a report only
-    grows through its own test), then b-vs-a."""
-    path = report_path(run, a, b)
-    return (b, a) if path.exists() and 'sprt' in json.loads(path.read_text())['metrics'] else (a, b)
+def rematch_pair(run, a, b, settings):
+    """Report orientation for more a-b games: a-vs-b, else b-vs-a, skipping a report that holds an SPRT record
+    (it only grows through its own test) or was played under another protocol; None when neither can grow."""
+    for x, y in ((a, b), (b, a)):
+        path = report_path(run, x, y)
+        report = json.loads(path.read_text()) if path.exists() else None
+        if report is None or (same_protocol(report, settings) and 'sprt' not in report['metrics']):
+            return x, y
+    return None
 
 
 def write_league(run, league, config):
@@ -629,17 +633,17 @@ class Evaluator:
                   candidate=cid, opponent=opponent, comparison=kind, **s, sprt=test, seconds=done['seconds'])
         return report
 
-    def extend(self, a, b, kind):
-        """One more round of `games` appended to the report a-vs-b (created when absent; its protocol must match),
-        rewritten with metrics.sprt recomputed for kind 'sprt'. Returns the report, or None when the round did
-        not run (a checkpoint became unrated)."""
+    def extend(self, a, b, kind, count):
+        """One more round of min(games, count) games appended to the report a-vs-b (created when absent; its
+        protocol must match), rewritten with metrics.sprt recomputed for kind 'sprt'. Returns the report, or None
+        when the round did not run (a checkpoint became unrated)."""
         path = report_path(self.run, a, b)
         old = json.loads(path.read_text()) if path.exists() else None
         if old and not same_protocol(old, self.settings):
             raise ValueError(f'{path} was played under another protocol')
         done = self.partial.setdefault((a, b), dict(records=list(old['games']) if old else [], seconds=0.))
         before = len(done['records'])
-        self.round(a, b, kind, before+self.settings.games)
+        self.round(a, b, kind, before+min(self.settings.games, count))
         if len(done['records']) == before:
             return None
         shas = {name: digest(self.run/'checkpoints'/name/'ema.pt') for name in (a, b) if name != SEAL}
@@ -674,16 +678,17 @@ class Evaluator:
                   checkpoint=cid, previous_champion=previous, panel=panel)
 
     def needs(self, entry):
-        """The panel comparisons `entry` still lacks: [(a, b, kind, games)], its own games against each member
-        first, then the incumbent's top-ups to `games` protocol-matching games against the member."""
+        """The panel comparisons `entry` still lacks: [(a, b, kind, games)] topping up its own ('panel') and then
+        the incumbent's ('incumbent') protocol-matching games against each member to `games`, appended to an
+        existing report where `rematch_pair` allows (a member no report can grow for is left as it is)."""
         s, panel = self.settings, entry.get('panel', {})
-        incumbent, matrix = panel.get('incumbent'), payoff(load_reports(self.run, s))
-        out = [(entry['id'], m, 'panel', s.games) for m in panel.get('members', [])
-               if not report_path(self.run, entry['id'], m).exists()]
-        for m in panel.get('members', []):
-            short = s.games-matrix.get(incumbent, {}).get(m, {}).get('games', 0)
-            if short > 0 and not report_path(self.run, incumbent, m).exists():
-                out.append((incumbent, m, 'incumbent', short+short % 2))
+        matrix, out = payoff(load_reports(self.run, s)), []
+        for side, kind in ((entry['id'], 'panel'), (panel.get('incumbent'), 'incumbent')):
+            for m in panel.get('members', []):
+                short = s.games-matrix.get(side, {}).get(m, {}).get('games', 0)
+                pair = rematch_pair(self.run, side, m, s) if short > 0 else None
+                if pair:
+                    out.append((*pair, kind, short+short % 2))
         return out
 
     def settle(self):
@@ -712,20 +717,23 @@ class Evaluator:
         """Idle rematches that can change a decision, first applicable only: the newest checkpoint of a variant
         whose SPRT against the current champion ended 'max-games' continues (up to REMATCH_SPRT_LIMIT *
         sprt_max_games games), then two variant heads whose Elo difference interval straddles +-replace_margin
-        play more (up to sprt_max_games between them). [(a, b, kind, games)]."""
+        play more (up to sprt_max_games between them); reports under another protocol are left alone.
+        [(a, b, kind, games left)]."""
         s, champion = self.settings, self.league['champion']
         heads = self.heads()
         for c in heads:
             path = report_path(self.run, c['id'], champion)
-            if c['id'] != champion and path.exists():
-                report = json.loads(path.read_text())
-                if report['metrics'].get('sprt', {}).get('decision') == 'max-games' and len(report['games']) < REMATCH_SPRT_LIMIT*s.sprt_max_games:
-                    return [(c['id'], champion, 'sprt', s.games)]
+            report = json.loads(path.read_text()) if c['id'] != champion and path.exists() else None
+            if report and same_protocol(report, s) and report['metrics'].get('sprt', {}).get('decision') == 'max-games' \
+                    and len(report['games']) < REMATCH_SPRT_LIMIT*s.sprt_max_games:
+                return [(c['id'], champion, 'sprt', REMATCH_SPRT_LIMIT*s.sprt_max_games-len(report['games']))]
         matrix, margin = payoff(load_reports(self.run, s)), self.config.learner.replace_margin
         for d in self.league.get('differences', []):
             lo, hi = d['interval']
-            if (lo < margin < hi or lo < -margin < hi) and matrix.get(d['a'], {}).get(d['b'], {}).get('games', 0) < s.sprt_max_games:
-                return [(*rematch_pair(self.run, d['a'], d['b']), 'replacement', s.games)]
+            played = matrix.get(d['a'], {}).get(d['b'], {}).get('games', 0)
+            pair = rematch_pair(self.run, d['a'], d['b'], s)
+            if (lo < margin < hi or lo < -margin < hi) and played < s.sprt_max_games and pair:
+                return [(*pair, 'replacement', s.sprt_max_games-played)]
         return []
 
     def heads(self):
@@ -824,8 +832,8 @@ class Evaluator:
         if task is None:
             return False
         entry, opponent, kind, games = task
-        if kind in ('sprt', 'replacement'):
-            report = self.extend(entry['id'], opponent, kind)
+        if kind in ('sprt', 'replacement', 'panel', 'incumbent'):
+            report = self.extend(entry['id'], opponent, kind, games)
         else:
             report = self.report(entry['id'], opponent, kind, games, lambda records: len(records) >= games)
         if report is not None:
