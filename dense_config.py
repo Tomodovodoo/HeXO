@@ -124,8 +124,8 @@ class LearnerSettings:
 @dataclass(frozen=True)
 class EvaluationSettings:
     games: int = 64               # games of each optional comparison (panel top-up, fill), colour-swapped opening pairs
-    round_games: int = 8          # games per round of every comparison; supersession, backlog and pairing are checked between rounds
-    model_cache: int = 6          # checkpoints the evaluator keeps loaded, least recently used dropped first
+    pool_games: int = 64          # evaluation games in flight; a finished game is replaced at once
+    evidence_share: float = .25   # posterior: most of the pool evidence games may take while a decision is pending
     previous_games: int = 0       # vs the previous rated checkpoint of the variant, only while idle; 0 = never
     sims: int = 64
     root_samples: int = 16
@@ -139,7 +139,7 @@ class EvaluationSettings:
     promote_confidence: float = .9  # posterior: P(candidate - champion > sprt_elo0) needed to promote (1 - it rejects)
     uncertainty_parity: float = 1.  # posterior: the candidate's rating sd may be at most this times the champion's
     matchup_prior_elo: float = 30.  # posterior: prior sd of a pair's deviation from the transitive rating difference
-    sprt_min_games: int = 8       # direct games vs the champion before any decision
+    sprt_min_games: int = 64      # direct games vs the champion before any decision or evidence game
     sprt_elo0: float = 0.         # promotion SPRT bounds on candidate minus champion
     sprt_elo1: float = 25.
     sprt_alpha: float = .05
@@ -149,7 +149,7 @@ class EvaluationSettings:
     eval_share: float = .12       # ceiling on the evaluator's playing share of wall time (dense_eval.Pacer)
     extra_opponents: int = 2      # panel opponents drawn per rated checkpoint with probability ~ p(1-p), idle only
     idle_rematch: bool = True     # replay decision-relevant comparisons while no checkpoint awaits rating
-    idle_fill: bool = True        # after all other work, play fill rounds until a checkpoint awaits rating
+    idle_fill: bool = True        # after all other work, play fill games until a checkpoint awaits rating
     anchor_target_halfwidth: float = 25.  # fill Seal games until the champion-Seal Elo interval is this narrow; 0 = never
     fill_top: int = 3             # then fill the widest Elo-difference interval among this many top-rated checkpoints
     veto_margin: float = -30.     # actor.json skips the newest checkpoint once its Elo interval vs its champion lies below this

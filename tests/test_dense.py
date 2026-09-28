@@ -652,31 +652,27 @@ class DenseConfigTests(unittest.TestCase):
             settings = dict(asdict(dense_config.EvaluationSettings()), eval_share=.5, sprt_max_games=10, anchor_games=4,
                             max_plies=100)
             status = dict(stage='playing', comparison=dict(candidate='main/002000', opponent='main/000500', kind='champion'),
-                          started_at=900., games_planned=10, round_first=0, round_games=10, placements_played=40, mean_placements=None,
+                          started_at=900., games_planned=10, games_played=4, placements_played=40, mean_placements=None,
                           placements_per_second=2., settings=settings)
             timing = dashboard.evaluation_timing(run, status, 1000.)
             self.assertEqual({k: timing[k] for k in ('elapsed', 'mean_placements', 'mean_source', 'export_steps', 'seconds_per_step')},
                              dict(elapsed=100., mean_placements=15., mean_source='reports', export_steps=1500, seconds_per_step=1.))
-            self.assertAlmostEqual(timing['expected'], 100.+(10*15-40)/2./.5)
+            self.assertAlmostEqual(timing['expected'], 100.+6*15/2./.5)
             self.assertAlmostEqual(timing['eval_seconds'], (10*15/2.+4*5/10.)/.5)
             self.assertAlmostEqual(timing['release_seconds'], 1500.)
             self.assertAlmostEqual(timing['ratio'], timing['eval_seconds']/1500.)
+            self.assertEqual(timing['playing_fraction'], .5)
             timing = dashboard.evaluation_timing(run, dict(status, mean_placements=12.), 1000.)
             self.assertEqual(timing['mean_source'], 'comparison')
-            self.assertAlmostEqual(timing['expected'], 100.+(10*12-40)/2./.5)
-            timing = dashboard.evaluation_timing(run, dict(status, processes=4), 1000.)    # Pacer weight 4: 1/8 of wall time
-            self.assertEqual(timing['playing_fraction'], .125)
-            self.assertAlmostEqual(timing['expected'], 100.+(10*15-40)/2./.125)
-            rounds = dict(status, settings=dict(settings, games=4), processes=2, round_first=4, round_games=4, placements_played=80)
-            timing = dashboard.evaluation_timing(run, rounds, 1000.)  # rounds of 4, 4, 2 games on 2, 2, 1 workers, 1 / s each
-            self.assertAlmostEqual(timing['expected'], 100.+(8*15-80)/2./.25+2*15/1./.5)
-            self.assertAlmostEqual(timing['eval_seconds'], 2*4*15/2./.25+2*15/1./.5+4*5/20./.25)
-            between = dict(status, stage='throttled', placements_per_second=None, worker_placements_per_second=2.)
-            self.assertAlmostEqual(dashboard.evaluation_timing(run, between, 1000.)['expected'], 100.+(10*15-40)/2./.5)
+            self.assertAlmostEqual(timing['expected'], 100.+6*12/2./.5)
             timing = dashboard.evaluation_timing(run, dict(status, eval_share=1.), 1000.)  # --once: no pacing
-            self.assertAlmostEqual(timing['expected'], 100.+(10*15-40)/2.)
+            self.assertAlmostEqual(timing['expected'], 100.+6*15/2.)
             timing = dashboard.evaluation_timing(run, dict(status, stage='throttled', started_at=None), 1000.)
             self.assertEqual((timing['elapsed'], timing['expected']), (None, None))  # the next comparison waits to start
+            timing = dashboard.evaluation_timing(run, dict(status, placements_per_second=None), 1000.)
+            self.assertIsNone(timing['expected'])                                      # no rate for checkpoint games yet
+            self.assertAlmostEqual(dashboard.evaluation_timing(run, dict(status, comparison=dict(status['comparison'], opponent='seal')),
+                                                               1000.)['expected'], 100.+6*5/2./.5)   # 5 per Seal game
             timing = dashboard.evaluation_timing(run, dict(status, settings=dict(settings, anchor_on_promotion=False)), 1000.)
             self.assertAlmostEqual(timing['eval_seconds'], 10*15/2./.5)
             shutil.rmtree(run/'evaluations')
@@ -2109,6 +2105,30 @@ class OpponentSchedulerTests(unittest.TestCase):
                     self.assertEqual(t['next_weight'], 0.)
 
 
+class Crash(Exception):
+    """Raised by a scripted pool to stop the evaluator mid-session, as a killed process would."""
+
+
+def scripted(winner=lambda record: record['challenger_color'], hook=lambda pool, steps: None):
+    """A dense_eval.Pool stand-in whose step() first calls hook(pool, steps so far) and then finishes the oldest
+    game in flight after five placements, won by colour winner(record) (-1: a cap; default the candidate)."""
+    class Scripted(dense_eval.Pool):
+        def step(self):
+            self.steps = getattr(self, 'steps', 0)+1
+            hook(self, self.steps)
+            out, self.ready = self.ready, []
+            if self.games:
+                lane, game = self.games.pop(next(iter(self.games)))
+                self.engine.slots.remove(game)
+                game.game.close()
+                for tree in game.trees.values():
+                    tree.close()
+                out.append((lane, dict(game.record, winner=winner(game.record), reason='six-in-a-row',
+                                       plies=len(game.record['opening'])+5, moves=[])))
+            return out
+    return Scripted
+
+
 class EvaluatorLoopTests(unittest.TestCase):
     """Evaluator.step on a CPU run of TINY checkpoints with two-sim, eight-ply games."""
 
@@ -2121,18 +2141,18 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.run = Path(tmp.name)
 
-    def start(self, processes=1, **evaluation):
-        settings = dict(games=2, sims=2, root_samples=2, max_plies=8, anchor_games=0, sprt_max_games=2, extra_opponents=0, decision='sprt',
-                        sprt_min_games=2,
-                        idle_rematch=False, idle_fill=False)
+    def start(self, **evaluation):
+        """An Evaluator of two-sim, eight-ply games whose pool holds one colour pair (pool_games 2) unless set."""
+        settings = dict(games=2, pool_games=2, sims=2, root_samples=2, max_plies=8, anchor_games=0, sprt_max_games=2,
+                        extra_opponents=0, decision='sprt', sprt_min_games=2, idle_rematch=False, idle_fill=False)
         config = dense_config.RunConfig(
             device='cpu', model=dense_config.ModelSettings(**{k: getattr(TINY, k) for k in (
                 'blocks', 'channels', 'pool_every', 'line_length', 'value_hidden', 'head_channels')}),
             actor=dense_config.ActorSettings(leaf_batch=64, cache_positions=256),
-            evaluation=dense_config.EvaluationSettings(**{**settings, 'round_games': evaluation.get('games', 2), **evaluation}))
+            evaluation=dense_config.EvaluationSettings(**{**settings, **evaluation}))
         if not (self.run/'config.json').exists():
             dense_config.save(self.run, config)
-        return dense_eval.Evaluator(self.run, config, config.evaluation, dense_eval.Pacer(1.), processes)
+        return dense_eval.Evaluator(self.run, config, config.evaluation, dense_eval.Pacer(1.))
 
     def export(self, *steps):
         for step in steps:
@@ -2178,25 +2198,24 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual((match['placements'], match['worker_seconds']), (placed, match['seconds']))
         self.assertEqual([e['checkpoints'] for e in events if e['kind'] == 'skip'], [['main/000010', 'main/000020'], ['main/000040']])
 
-    def test_throttled_status_names_the_waiting_comparison(self):
-        """While pacing delays a round, the status shows the comparison about to play: no started_at before its
-        first round, the first round's started_at before later ones."""
+    def test_throttled_status_names_the_waiting_pairing(self):
+        """While pacing holds back the first games, the status shows the pairing about to play with none running."""
         evaluator = self.start(sprt_max_games=4)
         self.export(10)
         self.assertTrue(evaluator.step())
         self.export(20)
-        seen = []
+        ready, seen = iter([False]), []
+        evaluator.pacer.ready = lambda: next(ready, True)
         def wait(tick):
             tick()
             seen.append(json.loads((self.run/'evaluator-status.json').read_text()))
         evaluator.pacer.wait = wait
         self.assertTrue(evaluator.step())
-        self.assertEqual([(s['stage'], s['comparison']['candidate'], s['started_at'] is None, s['round_first'], s['round_games'],
-                           s['worker_placements_per_second'] is None) for s in seen],
-                         [('throttled', 'main/000020', True, 0, 2, True), ('throttled', 'main/000020', False, 2, 2, False)])
-        self.assertEqual(seen[0]['eval_share'], 1.)
+        self.assertEqual([(s['stage'], s['comparison']['candidate'], s['pool'][0]['running'], s['pool'][0]['share'], s['eval_share'])
+                          for s in seen], [('throttled', 'main/000020', 0, 2, 1.)])
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 4)
 
-    def test_previous_comparison_plays_in_rounds_while_idle(self):
+    def test_previous_comparison_plays_while_idle(self):
         self.export(10, 30, 50)
         match = lambda opponent: dict(opponent=opponent, wins=1, losses=1, capped=0, games=2)
         # An older league: entries without `skipped`, main/000010 still champion.
@@ -2206,12 +2225,8 @@ class EvaluatorLoopTests(unittest.TestCase):
             dict(id='main/000050', variant='main', step=50, elo=None, matches=[match('main/000010')])])
         (self.run/'league.json').write_text(json.dumps(old))
         evaluator = self.start(previous_games=4)
-        old = self.league()                                      # rewritten once on start with the payoff matrix
-        self.assertIn('matrix', old)
+        self.assertIn('matrix', self.league())                  # rewritten once on start with the payoff matrix
         self.assertEqual(evaluator.optional()[1:], ('main/000030', 'previous', 4))
-        self.assertTrue(evaluator.step())
-        self.assertEqual(len(evaluator.partial['main/000050', 'main/000030']['records']), 2)
-        self.assertEqual(self.league(), old)
         self.assertTrue(evaluator.step())
         league = self.league()
         self.assertEqual([m['opponent'] for m in league['checkpoints'][-1]['matches']], ['main/000010', 'main/000030'])
@@ -2255,11 +2270,10 @@ class EvaluatorLoopTests(unittest.TestCase):
         path = dense_eval.report_path(self.run, 'main/000010', 'seal')
         self.assertFalse(path.exists())
         self.assertEqual(evaluator.optional()[1:], ('main/000010', 'sprt', 2))
-        for played in (2, 4):
-            self.assertTrue(evaluator.step())
-            self.assertEqual(len(json.loads(path.read_text())['games']), played)
-            status = json.loads((self.run/'evaluator-status.json').read_text())
-            self.assertEqual(status['comparison'], dict(candidate='main/000010', opponent='seal', kind='anchor'))
+        self.assertTrue(evaluator.step())                                   # all 4 anchor games in one session
+        self.assertEqual(len(json.loads(path.read_text())['games']), 4)
+        status = json.loads((self.run/'evaluator-status.json').read_text())
+        self.assertEqual(status['comparison'], dict(candidate='main/000010', opponent='seal', kind='anchor'))
         self.assertIsNone(evaluator.anchor())
         league = self.league()
         seal, report = league['anchors']['seal'], json.loads(path.read_text())['summary']
@@ -2303,10 +2317,17 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator.league['checkpoints'].append(dict(id='main/000050', variant='main', step=50, elo=0., matches=[]))
         self.assertEqual(evaluator.anchor()[3], 4)
 
-    def test_anchor_rounds_resume_across_restarts(self):
+    def test_a_restart_loses_only_the_games_in_flight(self):
+        """Every completed colour pair is on disk at once: an evaluator killed mid-session resumes the pairing."""
         evaluator = self.anchored()
-        evaluator.step()
-        evaluator.step()
+        self.assertTrue(evaluator.step())                                   # main/000020's SPRT
+        def crash(pool, steps):
+            if steps == 3:                                                  # pair 0 is persisted, pair 1 is in flight
+                raise Crash
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=crash)), self.assertRaises(Crash):
+            evaluator.step()
+        report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())
+        self.assertEqual([g['pair'] for g in report['games']], [0, 0])
         evaluator = self.start(anchor_games=4, seal_ms=5, idle_rematch=True)
         self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
         self.assertTrue(evaluator.step())
@@ -2314,34 +2335,57 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual([g['pair'] for g in report['games']], [0, 0, 1, 1])
         self.assertIsNone(evaluator.anchor())
 
+    def test_a_restart_resumes_the_candidate_it_was_rating(self):
+        evaluator = self.start(sprt_max_games=6)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.export(20)
+        def crash(pool, steps):
+            if steps == 3:
+                raise Crash
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=crash)), self.assertRaises(Crash):
+            evaluator.step()
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
+        self.export(30)                                                     # a newer export while it was down
+        evaluator = self.start(sprt_max_games=6)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())                               # settles main/000020 on its 2 games
+        entry = evaluator.entry('main/000020')
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        self.assertEqual((entry.get('skipped'), entry.get('superseded'), len(report['games'])), (None, True, 2))
+        self.assertEqual(report['metrics']['sprt']['decision'], 'superseded')
+
     def test_newer_champion_supersedes_an_unfinished_anchor(self):
         evaluator = self.anchored()
         evaluator.step()
-        evaluator.step()                                                    # 2 of main/000010's 4 anchor games
+        def export(pool, steps):
+            if steps == 2 and not (self.run/'checkpoints'/'main'/'000030').exists():
+                self.export(30)                                             # stops the anchor after its first pair
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=export)):
+            evaluator.step()                                                # 2 of main/000010's 4 anchor games
         test = evaluator.test
         evaluator.test = lambda records: dict(test(records), decision='H1')
-        self.export(30)
         self.assertTrue(evaluator.step())
         self.assertEqual(self.league()['champion'], 'main/000030')
         entry, opponent, kind, games = evaluator.anchor()
         self.assertEqual((entry['id'], opponent, kind, games), ('main/000030', 'seal', 'anchor', 4))
         self.assertTrue(evaluator.step())
         seal = self.league()['anchors']['seal']
-        self.assertEqual([(m['checkpoint'], m['games']) for m in seal['matches']], [('main/000010', 2), ('main/000030', 2)])
+        self.assertEqual([(m['checkpoint'], m['games']) for m in seal['matches']], [('main/000010', 2), ('main/000030', 4)])
         self.assertEqual(seal['latest_delta'], seal['matches'][-1]['elo_delta'])
         self.assertEqual(len(json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())['games']), 2)
 
-    def test_newer_checkpoint_before_the_first_round_skips_the_candidate(self):
+    def test_newer_checkpoint_before_the_first_game_skips_the_candidate(self):
         evaluator = self.start(sprt_max_games=8)
         self.export(10)
         evaluator.step()
         self.export(30)
-        wait = evaluator.pacer.wait
-        def export_during_wait(*args):
-            wait(*args)
+        newer = evaluator.newer
+        def export_then_check(cid):
             if not (self.run/'checkpoints'/'main'/'000040').exists():
                 self.export(40)
-        evaluator.pacer.wait = export_during_wait
+            return newer(cid)
+        evaluator.newer = export_then_check
         self.assertTrue(evaluator.step())
         self.assertFalse(dense_eval.report_path(self.run, 'main/000030', 'main/000010').exists())
         entry = self.league()['checkpoints'][-1]
@@ -2349,76 +2393,71 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(evaluator.step())
         self.assertTrue(dense_eval.report_path(self.run, 'main/000040', 'main/000010').exists())
 
-    def test_newer_checkpoint_supersedes_a_running_sprt_after_its_round(self):
-        evaluator = self.start(sprt_max_games=8)
+    def test_supersession_drains_the_pool_and_counts_its_games(self):
+        """A newer export stops new games; the games in flight finish and count, none is discarded."""
+        evaluator = self.start(sprt_max_games=40, pool_games=8)
         self.export(10)
         evaluator.step()
         self.export(30)
-        played = evaluator.round
-        def round_then_export(*args):
-            done = played(*args)
-            if not (self.run/'checkpoints'/'main'/'000040').exists():
+        def export(pool, steps):
+            if steps == 3 and not (self.run/'checkpoints'/'main'/'000040').exists():
                 self.export(40)
-            return done
-        evaluator.round = round_then_export
-        self.assertTrue(evaluator.step())
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=export)):
+            self.assertTrue(evaluator.step())
         report = json.loads(dense_eval.report_path(self.run, 'main/000030', 'main/000010').read_text())
-        self.assertEqual((report['metrics']['sprt']['decision'], len(report['games'])), ('superseded', 2))
+        started = evaluator.next['main/000030', 'main/000010']
+        self.assertEqual((report['metrics']['sprt']['decision'], len(report['games'])), ('superseded', 2*started))
+        self.assertEqual(sorted({g['pair'] for g in report['games']}), list(range(started)))
+        self.assertGreater(started, 4)                                     # refilled pairs, then drained ones
         entry = self.league()['checkpoints'][-1]
         self.assertEqual((entry['id'], entry.get('superseded'), self.league()['champion']), ('main/000030', True, 'main/000010'))
-        self.assertTrue(evaluator.step())
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())
         report = json.loads(dense_eval.report_path(self.run, 'main/000040', 'main/000010').read_text())
-        self.assertEqual((report['metrics']['sprt']['decision'], len(report['games'])), ('max-games', 8))
+        self.assertEqual((report['metrics']['sprt']['decision'], len(report['games'])), ('max-games', 40))
 
-    def winning(self, streamed):
-        """A dense_eval.play_pairs stand-in in which the candidate wins every game after five placements, calling
-        heartbeat after each game and appending the status file each heartbeat wrote to `streamed`."""
-        def play_pairs(config, settings, candidate, opponent, first_pair, games, seal=None, heartbeat=lambda *_: None):
-            records = []
-            for pair in range(first_pair, first_pair+games//2):
-                seed = dense_eval.pair_seed(config.seed, candidate.checkpoint, pair)
-                for colour in (0, 1):
-                    records.append(dict(candidate=candidate.checkpoint, opponent=getattr(opponent, 'checkpoint', opponent),
-                                        pair=pair, seed=seed, opening=[[0, 0]], challenger_color=colour, winner=colour,
-                                        reason='six-in-a-row', plies=6, moves=[]))
-                    heartbeat(list(records), 5*len(records))
-                    streamed.append(json.loads((self.run/'evaluator-status.json').read_text()))
-            return records
-        return play_pairs
+    def test_the_pool_refills_as_games_finish(self):
+        """Games stream one at a time: a finished game's slot is refilled before the next step, and the status
+        tally and games played follow every finished game."""
+        evaluator = self.start(sprt_max_games=20, pool_games=6, sprt_alpha=1e-9, sprt_beta=1e-9)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        seen = []
+        def watch(pool, steps):
+            if steps > 1:
+                status = json.loads((self.run/'evaluator-status.json').read_text())
+                seen.append((pool.running(), status['games_played'], status['tally']['wins'], status['pool'][0]['running']))
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=watch)), \
+                unittest.mock.patch.object(dense_eval, 'STATUS_SECONDS', 0.):
+            self.assertTrue(evaluator.step())
+        self.assertEqual([s[1] for s in seen], list(range(1, 20)))            # one more finished game per step
+        self.assertEqual([s[2] for s in seen], list(range(1, 20)))
+        self.assertTrue(all(s[0] >= 5 for s in seen[:13]))                 # kept full until the budget runs out
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 20)
 
-    def test_superseded_sprt_settles_on_its_games_and_streams_the_tally(self):
-        """16-game champion rounds; a newer checkpoint after the first stops the SPRT, which promotes because the
-        paired 95% lower bound of its pair score exceeds 1/2; the status tally follows every finished game."""
-        evaluator = self.start(sprt_max_games=64, round_games=16, sprt_alpha=1e-9, sprt_beta=1e-9)
+    def test_superseded_sprt_settles_on_its_games(self):
+        """A newer checkpoint stops the SPRT; the settlement promotes because the paired 95% lower bound of its pair
+        score exceeds 1/2."""
+        evaluator = self.start(sprt_max_games=64, pool_games=16, sprt_alpha=1e-9, sprt_beta=1e-9)
         self.export(10)
         evaluator.step()
         self.export(30)
-        played, streamed = evaluator.round, []
-        def round_then_export(*args):
-            done = played(*args)
-            if not (self.run/'checkpoints'/'main'/'000040').exists():
+        def export(pool, steps):
+            if steps == 16 and not (self.run/'checkpoints'/'main'/'000040').exists():
                 self.export(40)
-            return done
-        evaluator.round = round_then_export
-        with unittest.mock.patch.object(dense_eval, 'play_pairs', self.winning(streamed)), \
-                unittest.mock.patch.object(dense_eval, 'STATUS_SECONDS', 0.):
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=export)):
             self.assertTrue(evaluator.step())
-        self.assertEqual([s['games_played'] for s in streamed], list(range(1, 17)))
-        self.assertEqual([(s['tally']['wins'], s['tally']['pairs']) for s in streamed[:4]], [(1, 0), (2, 1), (3, 1), (4, 2)])
-        final = streamed[-1]['tally']
-        self.assertEqual((final['wins'], final['losses'], final['capped'], final['games'], final['pair_score']), (16, 0, 0, 16, 1.))
-        self.assertAlmostEqual(final['pair_interval'][0], 1-math.sqrt(math.log(40)/16))
-        self.assertEqual((final['bound_upper'], streamed[-1]['games_planned']), (math.log((1-1e-9)/1e-9), 64))
-        self.assertLess(final['elo_interval'][0], final['elo_delta'])
         report = json.loads(dense_eval.report_path(self.run, 'main/000030', 'main/000010').read_text())
-        test = report['metrics']['sprt']
-        self.assertEqual((test['decision'], len(report['games']), test['settled']['promote']), ('superseded', 16, True))
+        test, n = report['metrics']['sprt'], len(report['games'])
+        self.assertEqual((test['decision'], test['settled']['promote'], n % 2), ('superseded', True, 0))
+        self.assertGreater(n, 16)
         league = self.league()
         self.assertEqual((league['champion'], league['checkpoints'][-1].get('superseded')), ('main/000030', True))
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         settle = next(e for e in events if e['kind'] == 'settle')
-        self.assertIn('settled on supersession after 16 games', settle['message'])
-        self.assertEqual((settle['promote'], settle['games']), (True, 16))
+        self.assertIn(f'settled on supersession after {n} games', settle['message'])
+        self.assertEqual((settle['promote'], settle['games']), (True, n))
 
     def test_posterior_decision_promotes_a_clear_winner(self):
         """Posterior mode: rounds go to the direct pairing (no other evidence), the verdict promotes once the
@@ -2427,7 +2466,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.export(10)
         evaluator.step()
         self.export(20)
-        with unittest.mock.patch.object(dense_eval, 'play_pairs', self.winning([])):
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
             self.assertTrue(evaluator.step())
         league = self.league()
         self.assertEqual(league['champion'], 'main/000020')
@@ -2456,13 +2495,11 @@ class EvaluatorLoopTests(unittest.TestCase):
                          ['promotion rule: posterior (default; config.json predates the setting)'])
 
     def test_posterior_direct_games_stop_at_sprt_max_games(self):
-        evaluator = self.start(decision='posterior', sprt_max_games=10, round_games=8)
+        evaluator = self.start(decision='posterior', sprt_max_games=10, pool_games=8)
         self.export(10)
         evaluator.step()
         self.export(20)
-        def drawn(config, settings, candidate, opponent, first_pair, games, seal=None, heartbeat=lambda *_: None):
-            return [dict(r, winner=-1) for r in self.winning([])(config, settings, candidate, opponent, first_pair, games, seal)]
-        with unittest.mock.patch.object(dense_eval, 'play_pairs', drawn):
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
             self.assertTrue(evaluator.step())
         report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
         self.assertEqual((len(report['games']), report['metrics']['posterior']['decision']), (10, 'max-games'))
@@ -2472,13 +2509,64 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.export(10)
         evaluator.step()
         self.export(20)
-        def losing(config, settings, candidate, opponent, first_pair, games, seal=None, heartbeat=lambda *_: None):
-            return [dict(r, winner=1-r['winner']) for r in self.winning([])(config, settings, candidate, opponent, first_pair, games, seal)]
-        with unittest.mock.patch.object(dense_eval, 'play_pairs', losing):
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
             self.assertTrue(evaluator.step())
         self.assertEqual(self.league()['champion'], 'main/000010')
         report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
         self.assertEqual(report['metrics']['posterior']['decision'], 'reject')
+
+    def pending(self, **evaluation):
+        """A posterior evaluator whose champion main/000020 beat main/000010, with main/000030 unrated; the
+        verdict of main/000030 is kept pending (promote_confidence .999999) so the lanes can be inspected."""
+        evaluator = self.start(decision='posterior', promote_confidence=.999999, sprt_max_games=400, pool_games=16,
+                               sprt_min_games=8, **evaluation)
+        self.export(10)
+        evaluator.step()
+        test = evaluator.test
+        evaluator.settings = replace(evaluator.settings, decision='sprt')
+        evaluator.test = lambda records: dict(test(records), decision='H1')
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            evaluator.step()
+        evaluator.test, evaluator.settings = test, replace(evaluator.settings, decision='posterior')
+        self.assertEqual(self.league()['champion'], 'main/000020')
+        self.export(30)
+        return evaluator
+
+    def test_direct_games_take_the_pool_until_sprt_min_games(self):
+        evaluator = self.pending()
+        evaluator.evidence = lambda *args: ('main/000030', 'main/000010')  # evidence always looks better
+        lanes = lambda: evaluator.lanes(evaluator.verdict('main/000030', 'main/000020'), 'main/000030', 'main/000020')
+        self.assertEqual(lanes(), {('main/000030', 'main/000020', 'champion'): 16})
+        seen = []
+        def watch(pool, steps):
+            seen.append({k: pool.running(k) for k in {held for held, _ in pool.games.values()}})
+            if steps == 40:
+                raise Crash
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=watch)), self.assertRaises(Crash):
+            evaluator.step()
+        direct = [i for i, lanes in enumerate(seen) if any(k[2] == 'evidence' for k in lanes)]
+        self.assertTrue(direct)
+        self.assertGreaterEqual(direct[0], 8)                           # no evidence game before 8 complete direct games
+        self.assertEqual(lanes(), {('main/000030', 'main/000020', 'champion'): 12, ('main/000030', 'main/000010', 'evidence'): 4})
+
+    def test_evidence_never_exceeds_its_share(self):
+        evaluator = self.pending(evidence_share=.25)
+        evaluator.evidence = lambda *args: ('main/000030', 'main/000010')
+        report = dense_eval.report_path(self.run, 'main/000030', 'main/000020')
+        seen = []
+        def watch(pool, steps):
+            lanes = {held for held, _ in pool.games.values()}
+            seen.append(sum(pool.running(k) for k in lanes if k[2] == 'evidence'))
+            if steps == 80:
+                raise Crash
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=watch)), self.assertRaises(Crash):
+            evaluator.step()
+        self.assertEqual(max(seen), 4)                                  # 1/4 of 16 games in flight
+        self.assertGreater(len(json.loads(report.read_text())['games']), 8)
+        evaluator.settings = replace(evaluator.settings, evidence_share=0.)
+        verdict = evaluator.verdict('main/000030', 'main/000020')
+        self.assertEqual(evaluator.lanes(verdict, 'main/000030', 'main/000020'), {('main/000030', 'main/000020', 'champion'): 16})
 
     def test_fill_order_seal_then_generalization_then_the_widest_ladder_pair(self):
         """Fill priority: the champion vs Seal while their interval is wide, then one round of the newest rated
@@ -2518,84 +2606,33 @@ class EvaluatorLoopTests(unittest.TestCase):
         targets = list(dict.fromkeys(targets+[f'{entry["id"]} vs {opponent}']))
         path = dense_eval.report_path(self.run, entry['id'], opponent)
         before = len(json.loads(path.read_text())['games']) if path.exists() else 0
-        wait = evaluator.pacer.wait
-        def export_during_wait(*args):
-            wait(*args)
-            if not (self.run/'checkpoints'/'main'/'000040').exists():
+        def export(pool, steps):
+            if steps == 1 and not (self.run/'checkpoints'/'main'/'000040').exists():
                 self.export(40)
-        evaluator.pacer.wait = export_during_wait
-        self.assertTrue(evaluator.step())                          # the waiting checkpoint interrupts the fill round
-        self.assertEqual(len(json.loads(path.read_text())['games']) if path.exists() else 0, before)
-        evaluator.pacer.wait = wait
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=export)):
+            self.assertTrue(evaluator.step())                      # a new export drains the fill work
+        self.assertEqual(len(json.loads(path.read_text())['games']), before+2)   # the pair in flight counts
         self.assertTrue(evaluator.step())
         self.assertIn('main/000040', {c['id'] for c in self.league()['checkpoints']})
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['target'] for e in events if e['kind'] == 'fill'],
                          ['seal', 'generalization main/000030 vs main/000010', *targets, None])
 
-    def test_models_stay_cached_across_pairings(self):
-        evaluator = self.start(model_cache=2)
+    def test_models_stay_loaded_while_their_pairing_is_in_the_pool(self):
+        evaluator = self.start()
         self.export(10, 20, 30)
         evaluator.use('main/000010', 'main/000020')
         first = evaluator.models['main/000010']
         evaluator.use('main/000020', 'main/000010')
         self.assertIs(evaluator.models['main/000010'], first)       # no reload
-        evaluator.use('main/000030', 'main/000010')                 # main/000020 is least recently used
+        evaluator.use('main/000030', 'main/000010')                 # main/000020 has no lane left
         self.assertEqual(set(evaluator.models), {'main/000010', 'main/000030'})
         self.assertIs(evaluator.models['main/000010'], first)
 
-    def pointer(self):
-        return json.loads((self.run/'actor.json').read_text())
-
-    def test_pointer_follows_newest_exports(self):
-        evaluator = self.start()
-        self.export(10)
-        self.assertTrue(evaluator.step())
-        evaluator.publish(True)
-        self.assertEqual((self.pointer()['checkpoint'], self.pointer()['reason']), ('main/000010', 'newest'))
-        self.export(20)
-        evaluator.publish(True)                                    # before main/000020 plays a game
-        self.assertEqual(self.pointer()['checkpoint'], 'main/000020')
-        self.assertTrue(evaluator.step())
-        self.assertEqual((self.pointer()['checkpoint'], self.pointer()['vetoed']), ('main/000020', []))
-        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
-        self.assertEqual([(e['previous'], e['checkpoint']) for e in events if e['kind'] == 'actor_model'],
-                         [(None, 'main/000010'), ('main/000010', 'main/000020')])
-
-    def test_veto_falls_back_to_the_best_rated_until_the_next_export(self):
-        self.export(10, 20, 30)
-        evaluator = self.start()
-        evaluator.league = dict(champion='main/000010', checkpoints=[
-            dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
-            dict(id='main/000020', variant='main', step=20, elo=50., matches=[], panel=dict(incumbent='main/000010')),
-            dict(id='main/000030', variant='main', step=30, elo=-300., matches=[], panel=dict(incumbent='main/000010'))])
-        evaluator.publish(True)
-        self.assertEqual(self.pointer()['checkpoint'], 'main/000030')
-        path = dense_eval.report_path(self.run, 'main/000030', 'main/000010')
-        path.parent.mkdir(parents=True)
-        games = [dict(seed=k//2, challenger_color=k % 2, winner=1-k % 2) for k in range(128)]
-        path.write_text(json.dumps(dict(candidate='main/000030', opponent='main/000010', settings=asdict(evaluator.settings), games=games)))
-        evaluator.publish(True)
-        pointer = self.pointer()
-        self.assertEqual((pointer['checkpoint'], pointer['vetoed']), ('main/000020', ['main/000030']))
-        self.assertIn('main/000030 vetoed: Elo', pointer['reason'])
-        self.export(40)
-        evaluator.publish(True)
-        self.assertEqual((self.pointer()['checkpoint'], self.pointer()['vetoed']), ('main/000040', ['main/000030']))
-        evaluator.league['checkpoints'].append(dict(id='main/000040', variant='main', step=40, elo=80., matches=[], demoted=True,
-                                                    panel=dict(incumbent='main/000010')))
-        evaluator.publish(True)
-        pointer = self.pointer()
-        self.assertEqual((pointer['checkpoint'], pointer['vetoed']), ('main/000020', ['main/000030', 'main/000040']))
-        self.assertIn('demoted', pointer['reason'])
-        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
-        self.assertEqual([e['checkpoint'] for e in events if e['kind'] == 'actor_model'],
-                         ['main/000030', 'main/000020', 'main/000040', 'main/000020'])
-
     def test_evaluation_defaults(self):
         s = dense_config.EvaluationSettings()
-        self.assertEqual((s.sprt_elo0, s.sprt_elo1, s.round_games, s.model_cache, s.idle_fill, s.max_expected_score),
-                         (0., 25., 8, 6, True, .85))
+        self.assertEqual((s.sprt_elo0, s.sprt_elo1, s.pool_games, s.sprt_min_games, s.evidence_share, s.idle_fill,
+                          s.max_expected_score), (0., 25., 64, 64, .25, True, .85))
 
     def test_existing_panels_skip_uninformative_members(self):
         """Panel members are re-derived (a stored list is ignored) and include only those within
@@ -2626,16 +2663,19 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertIsNone(evaluator.fill())
         self.assertFalse(evaluator.step())
 
-    def test_worker_processes_play_the_same_games(self):
+    def test_pool_size_does_not_change_the_games(self):
         self.export(10, 30)
-        rounds = []
-        for processes in (1, 2):
-            evaluator = self.start(processes, games=6, max_plies=16)
+        played = []
+        for pool in (2, 6):
+            shutil.rmtree(self.run/'evaluations', ignore_errors=True)
+            evaluator = self.start(games=6, pool_games=pool, max_plies=16)
             evaluator.league['checkpoints'] = [dict(id=cid, variant='main', step=int(cid.split('/')[1]), elo=None,
                                                     elo_interval=None, matches=[]) for cid in ('main/000010', 'main/000030')]
-            rounds.append(evaluator.round('main/000030', 'main/000010', 'previous', 6)['records'])
-        self.assertEqual([r['pair'] for r in rounds[1]], [0, 0, 1, 1, 2, 2])
-        self.assertEqual(rounds[0], rounds[1])
+            lane = ('main/000030', 'main/000010', 'previous')
+            evaluator.session(lambda: {lane: even for even in [min(pool, 6-len(evaluator.games(*lane[:2])))] if even}, 6)
+            played.append(sorted(evaluator.games(*lane[:2]), key=lambda r: (r['pair'], r['challenger_color'])))
+        self.assertEqual([r['pair'] for r in played[1]], [0, 0, 1, 1, 2, 2])
+        self.assertEqual(played[0], played[1])
 
     def test_panel_and_sprt_rematch_are_optional_rounds(self):
         evaluator = self.start(extra_opponents=1, idle_rematch=True)
@@ -2663,9 +2703,6 @@ class EvaluatorLoopTests(unittest.TestCase):
         member = evaluator.optional()[1]
         self.assertEqual(evaluator.optional()[1:], (member, 'panel', 2))
         self.assertIn(member, {'main/000020', 'main/000030'})
-        self.export(50)
-        self.assertEqual(evaluator.round('main/000040', member, 'panel', 2)['records'], [])   # unrated: no optional round
-        shutil.rmtree(self.run/'checkpoints'/'main'/'000050')
         for _ in range(8):                                                 # members follow the ratings as games land
             if not evaluator.step():
                 break
@@ -2762,11 +2799,13 @@ class EvaluatorLoopTests(unittest.TestCase):
             dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20)])
         evaluator.league['checkpoints'].append(dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
                                                     panel=dict(incumbent='main/000010')))
-        evaluator.extend('main/000010', 'main/000020', 'incumbent', 2)             # e.g. played before --eval-games 4
+        lane = ('main/000010', 'main/000020', 'incumbent')                          # e.g. played before --eval-games 4
+        evaluator.session(lambda: {} if evaluator.games(*lane[:2]) else {lane: 2}, 2)
         entry = evaluator.league['checkpoints'][-1]
         self.assertEqual(evaluator.needs(entry), [('main/000040', 'main/000020', 'panel', 4),
                                                   ('main/000010', 'main/000020', 'incumbent', 2)])
-        evaluator.extend('main/000040', 'main/000020', 'panel', 4)
+        lane = ('main/000040', 'main/000020', 'panel')
+        evaluator.session(lambda: {} if len(evaluator.games(*lane[:2])) >= 4 else {lane: 2}, 4)
         self.assertEqual(evaluator.needs(entry), [('main/000010', 'main/000020', 'incumbent', 2)])  # not complete yet
         self.assertEqual(evaluator.optional()[1:], ('main/000020', 'incumbent', 2))
         self.assertTrue(evaluator.step())
