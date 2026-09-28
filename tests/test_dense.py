@@ -601,6 +601,65 @@ class DenseConfigTests(unittest.TestCase):
             self.assertEqual((kept[0], kept[-1]), (points[0], points[-1]))
             self.assertIn((777, 100.), kept)
 
+    def test_evaluation_timing(self):
+        """Elapsed / expected wall time of the current comparison at its planned games and one full evaluation
+        against the release interval: placements per game from the comparison, then the newest reports of the
+        opponent type, then PLACEMENT_SHARE * max_plies; Seal games priced by the newest Seal match event."""
+        import dashboard
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for step, created in ((500, 1.), (2000, 2.)):
+                path = run/'checkpoints'/'main'/f'{step:06d}'
+                path.mkdir(parents=True)
+                (path/'manifest.json').write_text(json.dumps(dict(variant='main', step=step, created_at=created)))
+            (run/'metrics').mkdir()
+            for line in (dict(time=-5000., step=0), dict(time=1000., step=1000), dict(time=1010., step=1010),
+                         dict(time=1020., step=1020), dict(time=1025., step=1020, validation=True),
+                         dict(time=1030., step=1015), dict(time=1040., step=1025)):
+                dense_config.append_line(run/'metrics'/'learner-main.jsonl', line)
+            self.assertEqual(dashboard.seconds_per_step(run, 'main'), 1.)          # restart pair and old line left out
+            game = lambda plies: dict(plies=plies, opening=[[0, 0], [1, 0], [0, 1]])
+            for name, opponent, plies in (('a-vs-b', 'main/000500', (13, 23)), ('c-vs-seal', 'seal', (8, 8))):
+                (run/'evaluations'/name).mkdir(parents=True)
+                (run/'evaluations'/name/'report.json').write_text(json.dumps(dict(
+                    opponent=opponent, created_at=1., games=[game(p) for p in plies])))
+            dense_config.log_event(run, 'evaluator', 'match', 'c vs seal', opponent='seal', seconds=5., worker_seconds=5., placements=50)
+            settings = dict(asdict(dense_config.EvaluationSettings()), eval_share=.5, sprt_max_games=10, anchor_games=4,
+                            max_plies=100)
+            status = dict(stage='playing', comparison=dict(candidate='main/002000', opponent='main/000500', kind='champion'),
+                          started_at=900., games_planned=10, round_first=0, round_games=10, placements_played=40, mean_placements=None,
+                          placements_per_second=2., settings=settings)
+            timing = dashboard.evaluation_timing(run, status, 1000.)
+            self.assertEqual({k: timing[k] for k in ('elapsed', 'mean_placements', 'mean_source', 'export_steps', 'seconds_per_step')},
+                             dict(elapsed=100., mean_placements=15., mean_source='reports', export_steps=1500, seconds_per_step=1.))
+            self.assertAlmostEqual(timing['expected'], 100.+(10*15-40)/2./.5)
+            self.assertAlmostEqual(timing['eval_seconds'], (10*15/2.+4*5/10.)/.5)
+            self.assertAlmostEqual(timing['release_seconds'], 1500.)
+            self.assertAlmostEqual(timing['ratio'], timing['eval_seconds']/1500.)
+            timing = dashboard.evaluation_timing(run, dict(status, mean_placements=12.), 1000.)
+            self.assertEqual(timing['mean_source'], 'comparison')
+            self.assertAlmostEqual(timing['expected'], 100.+(10*12-40)/2./.5)
+            timing = dashboard.evaluation_timing(run, dict(status, processes=4), 1000.)    # Pacer weight 4: 1/8 of wall time
+            self.assertEqual(timing['playing_fraction'], .125)
+            self.assertAlmostEqual(timing['expected'], 100.+(10*15-40)/2./.125)
+            rounds = dict(status, settings=dict(settings, games=4), processes=2, round_first=4, round_games=4, placements_played=80)
+            timing = dashboard.evaluation_timing(run, rounds, 1000.)  # rounds of 4, 4, 2 games on 2, 2, 1 workers, 1 / s each
+            self.assertAlmostEqual(timing['expected'], 100.+(8*15-80)/2./.25+2*15/1./.5)
+            self.assertAlmostEqual(timing['eval_seconds'], 2*4*15/2./.25+2*15/1./.5+4*5/20./.25)
+            between = dict(status, stage='throttled', placements_per_second=None, worker_placements_per_second=2.)
+            self.assertAlmostEqual(dashboard.evaluation_timing(run, between, 1000.)['expected'], 100.+(10*15-40)/2./.5)
+            timing = dashboard.evaluation_timing(run, dict(status, eval_share=1.), 1000.)  # --once: no pacing
+            self.assertAlmostEqual(timing['expected'], 100.+(10*15-40)/2.)
+            timing = dashboard.evaluation_timing(run, dict(status, stage='throttled', started_at=None), 1000.)
+            self.assertEqual((timing['elapsed'], timing['expected']), (None, None))  # the next comparison waits to start
+            timing = dashboard.evaluation_timing(run, dict(status, settings=dict(settings, anchor_on_promotion=False)), 1000.)
+            self.assertAlmostEqual(timing['eval_seconds'], 10*15/2./.5)
+            shutil.rmtree(run/'evaluations')
+            timing = dashboard.evaluation_timing(run, dict(status, stage='idle'), 1000.)
+            self.assertEqual((timing['elapsed'], timing['expected']), (None, None))
+            self.assertAlmostEqual(timing['eval_seconds'], (10*45/2.+4*45/10.)/.5)  # .45 * max_plies per game
+            self.assertIsNone(dashboard.evaluation_timing(run, dict(status, settings=None), 1000.))
+
     def test_round_trip_and_no_overwrite(self):
         config = dense_config.RunConfig(created_at=12.5, seed=3, device='cpu',
                                         model=dense_config.ModelSettings(blocks=2, aux_heads=False),
@@ -1879,8 +1938,33 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertGreater(status['placements_per_second'], 0)
         self.assertTrue(0 < status['eval_share_used'] <= 1)
         self.assertGreater(status['updated_at'], 0)
+        self.assertLessEqual(status['started_at'], status['updated_at'])
+        self.assertEqual(status['settings'], asdict(evaluator.settings))
+        games = json.loads(dense_eval.report_path(self.run, 'main/000050', 'main/000030').read_text())['games']
+        placed = sum(g['plies']-len(g['opening']) for g in games)
+        self.assertEqual((status['placements_played'], status['mean_placements']), (placed, placed/2))
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        match = next(e for e in events if e['kind'] == 'match')
+        self.assertEqual((match['placements'], match['worker_seconds']), (placed, match['seconds']))
         self.assertEqual([e['checkpoints'] for e in events if e['kind'] == 'skip'], [['main/000010', 'main/000020'], ['main/000040']])
+
+    def test_throttled_status_names_the_waiting_comparison(self):
+        """While pacing delays a round, the status shows the comparison about to play: no started_at before its
+        first round, the first round's started_at before later ones."""
+        evaluator = self.start(sprt_max_games=4)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.export(20)
+        seen = []
+        def wait(tick):
+            tick()
+            seen.append(json.loads((self.run/'evaluator-status.json').read_text()))
+        evaluator.pacer.wait = wait
+        self.assertTrue(evaluator.step())
+        self.assertEqual([(s['stage'], s['comparison']['candidate'], s['started_at'] is None, s['round_first'], s['round_games'],
+                           s['worker_placements_per_second'] is None) for s in seen],
+                         [('throttled', 'main/000020', True, 0, 2, True), ('throttled', 'main/000020', False, 2, 2, False)])
+        self.assertEqual(seen[0]['eval_share'], 1.)
 
     def test_previous_comparison_plays_in_rounds_while_idle(self):
         self.export(10, 30, 50)
