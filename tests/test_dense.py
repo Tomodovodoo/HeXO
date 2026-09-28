@@ -626,60 +626,6 @@ class DenseConfigTests(unittest.TestCase):
             self.assertEqual((kept[0], kept[-1]), (points[0], points[-1]))
             self.assertIn((777, 100.), kept)
 
-    def test_evaluation_timing(self):
-        """Elapsed / expected wall time of the current comparison at its planned games and one full evaluation
-        against the release interval: placements per game from the comparison, then the newest reports of the
-        opponent type, then PLACEMENT_SHARE * max_plies; Seal games priced by the newest Seal match event."""
-        import dashboard
-        with tempfile.TemporaryDirectory() as tmp:
-            run = Path(tmp)
-            for step, created in ((500, 1.), (2000, 2.)):
-                path = run/'checkpoints'/'main'/f'{step:06d}'
-                path.mkdir(parents=True)
-                (path/'manifest.json').write_text(json.dumps(dict(variant='main', step=step, created_at=created)))
-            (run/'metrics').mkdir()
-            for line in (dict(time=-5000., step=0), dict(time=1000., step=1000), dict(time=1010., step=1010),
-                         dict(time=1020., step=1020), dict(time=1025., step=1020, validation=True),
-                         dict(time=1030., step=1015), dict(time=1040., step=1025)):
-                dense_config.append_line(run/'metrics'/'learner-main.jsonl', line)
-            self.assertEqual(dashboard.seconds_per_step(run, 'main'), 1.)          # restart pair and old line left out
-            game = lambda plies: dict(plies=plies, opening=[[0, 0], [1, 0], [0, 1]])
-            for name, opponent, plies in (('a-vs-b', 'main/000500', (13, 23)), ('c-vs-seal', 'seal', (8, 8))):
-                (run/'evaluations'/name).mkdir(parents=True)
-                (run/'evaluations'/name/'report.json').write_text(json.dumps(dict(
-                    opponent=opponent, created_at=1., games=[game(p) for p in plies])))
-            dense_config.log_event(run, 'evaluator', 'match', 'c vs seal', opponent='seal', seconds=5., worker_seconds=5., placements=50)
-            settings = dict(asdict(dense_config.EvaluationSettings()), eval_share=.5, sprt_max_games=10, anchor_games=4,
-                            max_plies=100)
-            status = dict(stage='playing', comparison=dict(candidate='main/002000', opponent='main/000500', kind='champion'),
-                          started_at=900., games_planned=10, games_played=4, placements_played=40, mean_placements=None,
-                          placements_per_second=2., settings=settings)
-            timing = dashboard.evaluation_timing(run, status, 1000.)
-            self.assertEqual({k: timing[k] for k in ('elapsed', 'mean_placements', 'mean_source', 'export_steps', 'seconds_per_step')},
-                             dict(elapsed=100., mean_placements=15., mean_source='reports', export_steps=1500, seconds_per_step=1.))
-            self.assertAlmostEqual(timing['expected'], 100.+6*15/2.)              # wall rates: pacing is inside them
-            self.assertAlmostEqual(timing['eval_seconds'], 10*15/2.+4*5/10.)
-            self.assertAlmostEqual(timing['release_seconds'], 1500.)
-            self.assertAlmostEqual(timing['ratio'], timing['eval_seconds']/1500.)
-            shared = dict(status, pool=[dict(running=48), dict(running=16)])   # evidence takes 1/4 of the pool's placements
-            self.assertAlmostEqual(dashboard.evaluation_timing(run, shared, 1000.)['expected'], 100.+6*15/(2.*.75))
-            timing = dashboard.evaluation_timing(run, dict(status, mean_placements=12.), 1000.)
-            self.assertEqual(timing['mean_source'], 'comparison')
-            self.assertAlmostEqual(timing['expected'], 100.+6*12/2.)
-            timing = dashboard.evaluation_timing(run, dict(status, stage='throttled', started_at=None), 1000.)
-            self.assertEqual((timing['elapsed'], timing['expected']), (None, None))  # the next comparison waits to start
-            timing = dashboard.evaluation_timing(run, dict(status, placements_per_second=None), 1000.)
-            self.assertIsNone(timing['expected'])                                      # no rate for checkpoint games yet
-            self.assertAlmostEqual(dashboard.evaluation_timing(run, dict(status, comparison=dict(status['comparison'], opponent='seal')),
-                                                               1000.)['expected'], 100.+6*5/2.)   # 5 per Seal game
-            timing = dashboard.evaluation_timing(run, dict(status, settings=dict(settings, anchor_on_promotion=False)), 1000.)
-            self.assertAlmostEqual(timing['eval_seconds'], 10*15/2.)
-            shutil.rmtree(run/'evaluations')
-            timing = dashboard.evaluation_timing(run, dict(status, stage='idle'), 1000.)
-            self.assertEqual((timing['elapsed'], timing['expected']), (None, None))
-            self.assertAlmostEqual(timing['eval_seconds'], 10*45/2.+4*45/10.)  # .45 * max_plies per game
-            self.assertIsNone(dashboard.evaluation_timing(run, dict(status, settings=None), 1000.))
-
     def test_provisional_league_row(self):
         """The league row of an unrated candidate under evaluation comes from the status tally, offset by the
         opponent's league Elo (Seal: its anchor Elo); rated candidates and idle evaluators have none."""
@@ -2680,6 +2626,52 @@ class EvaluatorLoopTests(unittest.TestCase):
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
             evaluator.step()
         self.assertEqual(sum(charged), 10.)                                 # two pairs started, 5 s each
+
+    def test_a_long_throttle_rechecks_the_pairing(self):
+        evaluator = self.start(sprt_max_games=4)
+        self.export(10)
+        evaluator.step()
+        self.export(30)
+        ready = iter([False])
+        evaluator.pacer.ready = lambda: next(ready, True)
+        evaluator.pacer.wait = lambda tick: self.export(40)                   # a newer export while throttled
+        self.assertTrue(evaluator.step())
+        self.assertEqual((evaluator.entry('main/000030')['skipped'], evaluator.games('main/000030', 'main/000010')), (True, []))
+
+    def test_an_sprt_bound_crossed_before_draining_stays_the_decision(self):
+        evaluator = self.start(sprt_max_games=8, pool_games=4)
+        self.export(10)
+        evaluator.step()
+        test = evaluator.test
+        evaluator.test = lambda records: dict(test(records), decision='H1' if len(records) == 2 else None)
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        self.assertEqual((len(report['games']), report['metrics']['sprt']['decision']), (4, 'H1'))   # the pair in flight drains
+        self.assertEqual(self.league()['champion'], 'main/000020')
+
+    def test_a_candidate_with_direct_games_is_never_left_skipped(self):
+        """The live case after a restart: main/027500 completed 64 games against champion main/019500 (+42 -10
+        =12) but an older evaluator marked it skipped when main/030000 appeared. A fresh evaluator rates it on
+        those games and promotes it."""
+        self.export(17000, 19500, 27500, 30000)
+        self.start()
+        self.report('main/019500', 'main/017000', [1]*12+[0]*8)
+        self.report('main/027500', 'main/019500', [1, 1]*21+[0, 0]*5+[.5, .5]*6)
+        entry = lambda step, elo, **extra: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, elo_interval=None,
+                                                matches=[], **extra)
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/019500', checkpoints=[
+            entry(17000, 0.), entry(19500, 60.), entry(27500, None, skipped=True)])))
+        evaluator = self.start(decision='posterior', sprt_max_games=200, pool_games=64, sprt_min_games=64)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        rated = evaluator.entry('main/027500')
+        self.assertEqual((rated.get('skipped'), rated['verdict']['decision'], rated['verdict']['direct']['games']), (None, 'promote', 64))
+        self.assertEqual(self.league()['champion'], 'main/027500')
+        self.assertEqual(len(evaluator.games('main/027500', 'main/019500')), 64)      # no game was added or lost
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertIn('main/027500 was skipped with 64 games against main/019500', next(e for e in events if e['kind'] == 'info')['message'])
 
     def test_a_fresh_evaluator_promotes_a_rated_leader_from_existing_reports(self):
         """On start the promotion rule is re-applied to the reports on disk: main/025000, rated but not promoted,

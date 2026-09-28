@@ -753,8 +753,8 @@ class Evaluator:
         the games it wants, nor per kind those wanted of that kind, so a draining lane's games count against its
         replacement's and a half-finished pair's slot is not refilled past a budget. The Pacer is charged for
         engine steps and for starting games (Seal plays its first turns then); no game starts while its credit
-        is negative, and with nothing running the session then waits. Every completed pair is persisted at
-        once."""
+        is negative, and with nothing running the session then waits and asks want() again. Every completed
+        pair is persisted at once."""
         pool, waiting, added = Pool(self.config.actor.leaf_batch), {}, {}
         placed = 0
         start, wall = self.pacer.clock(), time.time()
@@ -794,6 +794,7 @@ class Evaluator:
             if not pool.running():
                 if lanes and not ready:
                     self.pacer.wait(lambda: show('throttled', True))
+                    lanes = want()  # the wait may have outlasted the pairing (a newer checkpoint)
                     continue
                 break
             show('playing')
@@ -1031,7 +1032,7 @@ class Evaluator:
             if verdict['decision'] or verdict['direct']['games'] >= s.sprt_max_games or self.newer(cid):
                 return {}
             lanes = self.lanes(verdict, cid, champion)
-            self.publish(decision=dict(public(verdict), next=[list(l[:2]) for l in lanes]))
+            self.publish(decision=dict(public(verdict), candidate=cid, next=[list(l[:2]) for l in lanes]))
             return lanes
         added = self.session(want, s.sprt_max_games)
         for (a, b, _), games in added.items():
@@ -1041,7 +1042,7 @@ class Evaluator:
         if not verdict['direct']['games']:
             return {}, None
         superseded = self.newer(cid)
-        verdict = public(verdict)
+        verdict = dict(public(verdict), candidate=cid)
         if not verdict['decision'] and superseded and verdict['p_better'] >= s.promote_confidence:
             verdict.update(decision='promote', settled=True)
         verdict['decision'] = verdict['decision'] or ('superseded' if superseded else 'max-games')
@@ -1055,7 +1056,7 @@ class Evaluator:
                   + (' (settled on supersession)' if superseded else '') + f' after {direct["games"]} direct games: '
                   f'P(delta > {s.sprt_elo0:g}) {verdict["p_better"]:.3f}, delta {g(verdict["delta"])} +- {verdict["delta_sd"]:.0f}, '
                   f'direct {g(direct["elo"])}, pooled [{verdict["pooled"][0]:+.0f}, {verdict["pooled"][1]:+.0f}]',
-                  candidate=cid, opponent=champion, **verdict)
+                  opponent=champion, **verdict)
         found = {r['opponent']: r for r in load_reports(self.run, s) if r['candidate'] == cid}
         return {champion: found[champion], **found}, verdict
 
@@ -1082,24 +1083,27 @@ class Evaluator:
         if not eligible:
             return
         _, cid, verdict = max(eligible)
-        verdict = dict(public(verdict), decision='promote', review=True)
+        verdict = dict(public(verdict), candidate=cid, decision='promote', review=True)
         log_event(self.run, 'evaluator', 'decision', f'{cid} vs {champion}: promote on review of the existing reports '
                   f'({verdict["direct"]["games"]} direct games, P(delta > {s.sprt_elo0:g}) {verdict["p_better"]:.3f})',
-                  candidate=cid, opponent=champion, **verdict)
+                  opponent=champion, **verdict)
         self.promote(cid, champion)
         write_league(self.run, self.league, self.config, self.settings.fill_top)
 
     def sequential(self, cid, champion):
         """SPRT mode: a session of cid vs the champion until the SPRT decides, sprt_max_games games are complete
-        or a newer checkpoint of cid's variant exists (the games in flight finish and count). Returns ({champion:
+        or a newer checkpoint of cid's variant exists (the games in flight finish and count; a bound crossed
+        before them stays the decision). Returns ({champion:
         report}, metrics.sprt) with decision 'H1', 'H0', 'max-games' or 'superseded', settled as the module
         contract states ('settle' event: promoted when the posterior p_better of `verdict` is at least
         promote_confidence), or ({}, None) without a game."""
-        s = self.settings
+        s, decided = self.settings, []
 
         def want():
             games = self.games(cid, champion)
-            if games and self.test(games)['decision'] or len(games) >= s.sprt_max_games or self.newer(cid):
+            if games and (decision := self.test(games)['decision']):
+                decided.append(decision)
+            if decided or len(games) >= s.sprt_max_games or self.newer(cid):
                 return {}
             return {(cid, champion, 'champion'): even(min(s.pool_games, s.sprt_max_games-len(games)))}
         self.session(want, s.sprt_max_games)
@@ -1108,7 +1112,8 @@ class Evaluator:
             return {}, None
         report = json.loads(path.read_text())
         result, n = self.test(report['games']), len(report['games'])
-        test = report['metrics']['sprt'] = dict(result, decision=result['decision'] or ('max-games' if n >= s.sprt_max_games else 'superseded'))
+        decision = decided[0] if decided else 'superseded' if n < s.sprt_max_games and self.newer(cid) else 'max-games'
+        test = report['metrics']['sprt'] = dict(result, decision=decision)
         summary_ = report['summary']
         if test['decision'] == 'superseded':
             p_better = self.verdict(cid, champion)['p_better']
@@ -1251,26 +1256,35 @@ class Evaluator:
 
     def step(self):
         """One unit of work; False when there is none. First judges every panel already complete on disk
-        (`settle`, e.g. after a restart), so no candidate meets a regressed champion, and on the first step
-        re-applies the promotion rule to the existing reports (`review`); then rates the newest
-        unrated checkpoint of the variant whose newest unrated checkpoint is oldest, skipping that variant's older
-        unrated checkpoints (an unrated checkpoint whose report against the champion exists first: an evaluation
-        cut short by a restart resumes there, or settles when superseded), or else plays a session of the
-        champion's Seal anchor (`anchor`), else of an optional comparison, else of fill work (`fill`), each until
-        its games are complete or a checkpoint waits (the games in flight then finish and count)."""
+        (`settle`, e.g. after a restart), so no candidate meets a regressed champion. A checkpoint with games
+        against the champion is never left skipped: a skipped league entry with such games is removed again
+        ('info' event), and an unrated checkpoint with such games is rated first (an evaluation cut short by a
+        restart resumes there, or settles on its games when superseded). Then, on the first step, the promotion
+        rule is re-applied to the existing reports (`review`). Then it rates the newest unrated checkpoint of the
+        variant whose newest unrated checkpoint is oldest, skipping that variant's older unrated checkpoints (none
+        of them has games against the champion), or else plays a session of the champion's Seal anchor
+        (`anchor`), else of an optional comparison, else of fill work (`fill`), each until its games are complete
+        or a checkpoint waits (the games in flight then finish and count)."""
         self.settle()
-        if not self.reviewed:
-            self.reviewed = True
-            self.review()
+        champion = self.league['champion']
+        revived = [c for c in self.league['checkpoints'] if c.get('skipped') and champion and self.games(c['id'], champion)]
+        for c in revived:
+            self.league['checkpoints'].remove(c)
+            log_event(self.run, 'evaluator', 'info', f'{c["id"]} was skipped with {len(self.games(c["id"], champion))} games '
+                      f'against {champion}; it is rated on them', candidate=c['id'])
+        if revived:
+            write_league(self.run, self.league, self.config, self.settings.fill_top)
         known = {c['id'] for c in self.league['checkpoints']}
         unrated = [e for e in checkpoints(self.run) if e[0] not in known]
         self.status['backlog'] = [e[0] for e in unrated]
-        champion = self.league['champion']
         resumed = [e for e in unrated if champion and self.games(e[0], champion)]
         if resumed:
             self.filling(None)
             self.rate(resumed[0])
             return True
+        if not self.reviewed:
+            self.reviewed = True
+            self.review()
         if unrated:
             self.filling(None)
             variant = lambda e: e[0].split('/')[0]
