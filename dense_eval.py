@@ -7,8 +7,8 @@ Run layout: dense_config. Subcommands
              no checkpoint waits does it play the optional comparisons, newest rated checkpoint first, one round
              of `games` at a time: `previous_games` vs the previous rated checkpoint of the variant and, for every
              `anchor_every`-th rated checkpoint, `anchor_games` vs Seal. A champion SPRT that sees a newer
-             checkpoint of its variant after a round stops there (decision 'superseded', entry superseded
-             true, no promotion). All play is paced by `eval_share` (Pacer); --processes splits each round
+             checkpoint of its variant after an undecided round stops there (decision 'superseded', entry
+             superseded true, no promotion); a bound crossed in that round still decides. All play is paced by `eval_share` (Pacer); --processes splits each round
              over worker subprocesses (each about 0.7 GB of VRAM: on an 8 GB card two workers leave room for
              three actor processes, not four); --eval-* flags override evaluation settings for this process
              (reports record the effective settings). Writes evaluations/<a>-vs-<b>/report.json (reused when present),
@@ -427,8 +427,8 @@ class Evaluator:
                                                '--games', str(2*share), '--settings', json.dumps(asdict(self.settings)),
                                                '--out', str(out)]), out))
                 pair += share
-            while any(job.poll() is None for job, _ in jobs):
-                if any(job.returncode for job, _ in jobs):
+            while None in (states := [job.poll() for job, _ in jobs]):
+                if any(states):
                     break
                 time.sleep(1.)
                 progress = [json.loads(p.read_text()) for _, out in jobs if (p := out.with_suffix('.progress')).exists()]
@@ -481,8 +481,10 @@ class Evaluator:
 
     def report(self, cid, opponent, kind, planned, complete):
         """The report of cid vs opponent, reused when on disk. Otherwise the champion comparison plays rounds
-        until complete(records) or, after a round, a newer checkpoint of the variant exists (SPRT decision
-        'superseded'); optional comparisons play one round per call and return None until complete. A
+        until complete(records) or, after an undecided round, a newer checkpoint of the variant exists (SPRT
+        decision 'superseded'; a bound crossed in that same round still counts, so a proven-better candidate is
+        promoted before the newer one is tested); optional comparisons play one round per call and return None
+        until complete. A
         finished report is written and logged; a champion comparison superseded before any game returns None."""
         path = report_path(self.run, cid, opponent)
         if path.exists():
