@@ -443,12 +443,13 @@ def panel_result(members, candidate, incumbent, matrix):
 
 
 def rematch_pair(run, a, b, settings):
-    """Report orientation for more a-b games: a-vs-b, else b-vs-a, skipping a report that holds an SPRT record
-    (it only grows through its own test) or was played under another protocol; None when neither can grow."""
+    """Report orientation for more a-b games: a-vs-b, else b-vs-a, skipping a report that holds an SPRT record or a
+    posterior verdict (it only grows through its own decision) or was played under another protocol; None when
+    neither can grow."""
     for x, y in ((a, b), (b, a)):
         path = report_path(run, x, y)
         report = json.loads(path.read_text()) if path.exists() else None
-        if report is None or (same_protocol(report, settings) and 'sprt' not in report['metrics']):
+        if report is None or (same_protocol(report, settings) and not {'sprt', 'posterior'} & report['metrics'].keys()):
             return x, y
     return None
 
@@ -1177,6 +1178,10 @@ def loop(args):
     if args.once:
         settings = replace(settings, idle_fill=False)  # fill work never runs out
     evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share), args.processes)
+    legacy = 'decision' not in json.loads((run/'config.json').read_text())['evaluation']
+    log_event(run, 'evaluator', 'info', f'promotion rule: {settings.decision}'
+              + (' (default; config.json predates the setting)' if legacy and args.eval_decision is None else ''),
+              decision=settings.decision)
     try:
         while True:
             if evaluator.step():

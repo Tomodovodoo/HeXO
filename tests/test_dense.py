@@ -2,6 +2,7 @@
 learner's validation and the actor/evaluator engine."""
 import argparse
 import copy
+import dataclasses
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -2352,6 +2353,19 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         decision = next(e for e in events if e['kind'] == 'decision')
         self.assertIn('main/000020 vs main/000010: promote after', decision['message'])
+        self.assertEqual(dense_eval.rematch_pair(self.run, 'main/000020', 'main/000010', evaluator.settings),
+                         ('main/000010', 'main/000020'))                        # the decided report never grows
+
+    def test_loop_logs_the_promotion_rule_of_a_legacy_config(self):
+        self.start()
+        config = json.loads((self.run/'config.json').read_text())
+        del config['evaluation']['decision']
+        (self.run/'config.json').write_text(json.dumps(config))
+        flags = {f'eval_{f.name}': None for f in dataclasses.fields(dense_config.EvaluationSettings)}
+        dense_eval.loop(argparse.Namespace(run=str(self.run), once=True, poll=0., processes=1, **flags))
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([e['message'] for e in events if e['kind'] == 'info'],
+                         ['promotion rule: posterior (default; config.json predates the setting)'])
 
     def test_posterior_direct_games_stop_at_sprt_max_games(self):
         evaluator = self.start(decision='posterior', sprt_max_games=10, round_games=8)
