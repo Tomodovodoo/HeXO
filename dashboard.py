@@ -462,8 +462,10 @@ def dense_run(run, config, fresh=30):
     for rows in per_variant.values(): checkpoints += rows[-50:]  # Newest 50 per variant.
     champion = status(run/'champion.json')
     champion['age'] = beat(champion)
-    return dict(name=run.name, config=config, actor=actor, actors=actors, learners=learners, league=status(run/'league.json'),
-                champion=champion, checkpoints=checkpoints, data=data, now=now)
+    evaluator = status(run/'evaluator-status.json')
+    evaluator['heartbeat'] = beat(evaluator)
+    return dict(name=run.name, config=config, actor=actor, actors=actors, learners=learners, evaluator=evaluator,
+                league=status(run/'league.json'), champion=champion, checkpoints=checkpoints, data=data, now=now)
 
 
 _jsonl = {}

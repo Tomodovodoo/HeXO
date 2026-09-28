@@ -6,7 +6,10 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
   checkpoints/<variant>/<step:06d>/    model.pt, ema.pt, optimizer.pt, manifest.json (dense_learn); complete once
                                        manifest.json exists; the checkpoint id is '<variant>/<step:06d>'
   champion.json                        {checkpoint, ema_sha256, updated_at}: the checkpoint actors play (dense_eval)
-  league.json                          ratings, champion and Elo differences of variant heads (dense_eval)
+  league.json                          ratings, champion and Elo differences of variant heads; checkpoints the
+                                       evaluator passed over have skipped true and elo null (dense_eval)
+  evaluator-status.json                evaluator heartbeat and progress (dense_eval.Evaluator), rewritten about
+                                       every 2 s while it plays
   evaluations/<a>-vs-<b>/report.json   paired match records, ids with '/' written as '-' (dense_eval)
   actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s
   learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s
@@ -95,20 +98,22 @@ class LearnerSettings:
 
 @dataclass(frozen=True)
 class EvaluationSettings:
-    games: int = 64               # per internal comparison, colour-swapped opening pairs
+    games: int = 64               # games per round of every comparison, colour-swapped opening pairs
+    previous_games: int = 0       # vs the previous rated checkpoint of the variant, only while idle; 0 = never
     sims: int = 64
     root_samples: int = 16
     max_plies: int = 256
     tactics: bool = True
     anchor_every: int = 5         # rate against external anchors every N checkpoints
-    anchor_games: int = 100
+    anchor_games: int = 100       # vs Seal, only while idle; 0 = never
     seal_ms: int = 100
     sprt_elo0: float = 0.         # promotion SPRT bounds on candidate minus champion
     sprt_elo1: float = 50.
     sprt_alpha: float = .05
     sprt_beta: float = .05
-    sprt_max_games: int = 400
+    sprt_max_games: int = 200     # 'max-games' does not promote
     opening_suite: str = 'standard-v1'
+    eval_share: float = .12       # ceiling on the evaluator's playing share of wall time (dense_eval.Pacer)
 
 
 @dataclass(frozen=True)

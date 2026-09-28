@@ -302,8 +302,9 @@ def dashboard_kind(run):
 
 
 def e2e_stage(report, run):
-    """Actor (8 games, 2 shards), learner (20 steps, exports at 10 and 20), one evaluator pass and the dashboard
-    on the E2E configuration in `run`, each checked against the files it must leave behind."""
+    """Actor (8 games, 2 shards), learner to step 10 and an evaluator pass, learner resumed to step 20 and a
+    second evaluator pass with two worker processes (it rates only a variant's newest unrated checkpoint), then
+    the dashboard, on the E2E configuration in `run`, each checked against the files it must leave behind."""
     if not torch.cuda.is_available():
         print('  CUDA unavailable: end-to-end stage skipped')
         report.add('e2e', 'end-to-end run', 'CUDA unavailable, skipped', '', 'skip')
@@ -322,7 +323,11 @@ def e2e_stage(report, run):
     if rows < needed:
         report.add('e2e', 'learner', f'{rows} rows cannot pace 20 steps (needs {needed:.0f})', '', 'FAIL')
         return
-    seconds = run_step(run, 'learner', ['dense_learn.py', '--run', str(run), '--steps', '20', '--workers', '1'], remaining())
+    seconds = 0.
+    for steps in (10, 20):
+        seconds += run_step(run, f'learner-{steps}', ['dense_learn.py', '--run', str(run), '--steps', str(steps), '--workers', '1'], remaining())
+        evaluated = run_step(run, f'evaluator-{steps}', ['dense_eval.py', 'loop', '--run', str(run), '--once',
+                                                         '--processes', str(steps//10)], remaining())
     saved = dense_learn.checkpoints(run, 'main')
     good = [p.name for p in saved] == ['000010', '000020']
     for path in saved:
@@ -332,12 +337,11 @@ def e2e_stage(report, run):
         good &= manifest['ema_sha256'] == hexnet.model_digest(hexnet.load_model(path/'ema.pt'))
     report.add('e2e', 'learner: 20 steps, checkpoint manifests', f'{", ".join(p.name for p in saved)} in {seconds:.0f}s',
                'main/000010, main/000020', 'PASS' if good else 'FAIL')
-    seconds = run_step(run, 'evaluator', ['dense_eval.py', 'loop', '--run', str(run), '--once'], remaining())
     league = json.loads((run/'league.json').read_text(encoding='utf-8'))
     champion = json.loads((run/'champion.json').read_text(encoding='utf-8'))
     rated = [c['id'] for c in league['checkpoints'] if c['elo'] is not None]
     good = len(rated) == 2 and 'differences' in league and champion['checkpoint'] in rated
-    report.add('e2e', 'evaluator: league, champion', f'{len(rated)} rated, champion {champion["checkpoint"]} in {seconds:.0f}s',
+    report.add('e2e', 'evaluator: league, champion', f'{len(rated)} rated, champion {champion["checkpoint"]}; second pass {evaluated:.0f}s',
                '2 rated', 'PASS' if good else 'FAIL')
     events = [json.loads(line) for line in (run/'events.jsonl').read_text(encoding='utf-8').splitlines()]
     kinds = {e['kind'] for e in events}
