@@ -580,6 +580,27 @@ def pointwise_model(config):
 
 
 class DenseConfigTests(unittest.TestCase):
+    def test_pages_serve_from_step_control(self):
+        """The project page and a dense run page carry the "from step" header control."""
+        import dashboard
+        from http.server import ThreadingHTTPServer
+        import threading
+        import urllib.request
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp)/'r').mkdir()
+            (Path(tmp)/'r'/'config.json').write_text('{}')
+            handler = type('Handler', (dashboard.Handler,), dict(runs=Path(tmp)))
+            server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                for query in ('', '?run=r'):
+                    with urllib.request.urlopen(f'http://127.0.0.1:{server.server_port}/{query}') as response:
+                        page = response.read().decode()
+                    self.assertIn('from step <input id="from-step" type="number"', page)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_metrics_log_series(self):
         """Partial last lines are skipped until completed, resumed steps replace the rewound ones and
         downsampling keeps the first, last and extreme points."""
