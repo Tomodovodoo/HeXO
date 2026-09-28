@@ -102,7 +102,7 @@ for(const s of series){const st=style(s.index,s.dash),pts=s.points;if(!pts.lengt
 if(s.raw!==pts){ctx.globalAlpha=.25;ctx.strokeStyle=st.color;ctx.lineWidth=1;ctx.beginPath();trace(s.raw,sx,sy,ctx);ctx.stroke();ctx.globalAlpha=1}
 if(p.band&&pts[0].length>3){ctx.globalAlpha=.16;ctx.fillStyle=st.color;ctx.beginPath();pts.forEach((q,i)=>ctx[i?'lineTo':'moveTo'](sx(q[0]),sy(q[3])));[...pts].reverse().forEach(q=>ctx.lineTo(sx(q[0]),sy(q[2])));ctx.fill();ctx.globalAlpha=1}
 ctx.strokeStyle=st.color;ctx.setLineDash(st.dash);ctx.lineWidth=1.75;ctx.lineJoin='round';ctx.beginPath();trace(pts,sx,sy,ctx);ctx.stroke();ctx.setLineDash([]);
-if(p.band||pts.length<40){ctx.fillStyle=st.color;for(const q of pts){if(q[1]==null)continue;ctx.beginPath();ctx.arc(sx(q[0]),sy(q[1]),p.band?3:2,0,7);ctx.fill()}}}
+const dots=pts.filter(q=>q[1]!=null);if(p.band||dots.length<40){ctx.fillStyle=st.color;for(const q of dots){ctx.beginPath();ctx.arc(sx(q[0]),sy(q[1]),p.band?3:2,0,7);ctx.fill()}}}
 ctx.restore();if(!hover||hover[0]<L||hover[0]>w-R)return;
 const at=x0+(hover[0]-L)/(w-L-R)*(x1-x0),tol=(x1-x0)*.02,hits=[];
 for(const s of series){const pts=s.points.filter(q=>q[1]!=null);if(!pts.length||at<pts[0][0]-tol||at>pts.at(-1)[0]+tol)continue;let lo=0,hi=pts.length-1;while(hi-lo>1){const m=(lo+hi)>>1;pts[m][0]<at?lo=m:hi=m}hits.push({s,q:Math.abs(pts[lo][0]-at)<=Math.abs(pts[hi][0]-at)?pts[lo]:pts[hi]})}
