@@ -1772,6 +1772,71 @@ class YieldTests(unittest.TestCase):
         self.assertEqual(dense_config.from_dict(data).actor.yield_below, dense_config.ActorSettings.yield_below)
 
 
+class ActorModelTests(unittest.TestCase):
+    """dense_selfplay.resolve per model_source and the worker's switch between games."""
+
+    def setUp(self):
+        self.threads = torch.get_num_threads()
+        torch.set_num_threads(2)
+        self.addCleanup(torch.set_num_threads, self.threads)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.run = Path(tmp.name)
+
+    def export(self, cid, created_at):
+        path = self.run/'checkpoints'/cid
+        path.mkdir(parents=True)
+        hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
+        (path/'manifest.json').write_text(json.dumps(dict(created_at=created_at)))
+
+    def pick(self, source):
+        return dense_selfplay.resolve(self.run, None, source, 'main')[0]
+
+    def test_sources(self):
+        self.assertEqual(dense_config.ActorSettings().model_source, 'newest_veto')
+        data = asdict(dense_config.RunConfig())
+        del data['actor']['model_source'], data['evaluation']['veto_margin']
+        loaded = dense_config.from_dict(data)
+        self.assertEqual((loaded.actor.model_source, loaded.evaluation.veto_margin), ('newest_veto', -30.))
+        self.export('main/000010', 1.)
+        self.export('main/000020', 2.)
+        self.export('wide/000030', 3.)
+        self.assertEqual([self.pick(s) for s in ('champion', 'newest', 'newest_veto')], ['wide/000030', 'main/000020', 'wide/000030'])
+        (self.run/'champion.json').write_text(json.dumps(dict(checkpoint='main/000010')))
+        self.assertEqual([self.pick(s) for s in ('champion', 'newest', 'newest_veto')], ['main/000010', 'main/000020', 'main/000010'])
+        (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000020', reason='newest', vetoed=[])))
+        self.assertEqual([self.pick(s) for s in ('champion', 'newest', 'newest_veto')], ['main/000010', 'main/000020', 'main/000020'])
+        with self.assertRaises(ValueError):
+            self.pick('latest')
+
+    def test_worker_switches_between_games(self):
+        """The pointer moves as the first shard is written: the game started before it keeps the first model, the
+        next game plays the second, and the switch is an 'actor_model' event."""
+        self.export('main/000010', 1.)
+        self.export('main/000020', 2.)
+        config = dense_config.RunConfig(
+            device='cpu', model=dense_config.ModelSettings(**{k: getattr(TINY, k) for k in (
+                'blocks', 'channels', 'pool_every', 'line_length', 'value_hidden', 'head_channels')}),
+            actor=dense_config.ActorSettings(games_in_flight=1, leaf_batch=64, full_sims=2, cheap_sims=2, root_samples=2,
+                                             max_plies=6, cache_positions=256, shard_games=1, opening_random_plies=0.))
+        dense_config.save(self.run, config)
+        pointer = lambda cid: (self.run/'actor.json').write_text(json.dumps(dict(checkpoint=cid, reason='newest', vetoed=[])))
+        pointer('main/000010')
+        write_shard = dense_data.write_shard
+
+        def publish(path, identity, *args):
+            pointer('main/000020')
+            return write_shard(path, identity, *args)
+        with unittest.mock.patch.object(dense_data, 'write_shard', publish):
+            dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
+        shards = [dense_data.manifest(path)['identity'] for path in dense_data.shard_dirs(self.run)]
+        self.assertEqual([s['checkpoint'] for s in shards], ['main/000010', 'main/000020'])
+        self.assertEqual(json.loads((self.run/'actor-status.json').read_text())['checkpoint'], 'main/000020')
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([(e['previous'], e['checkpoint']) for e in events if e['kind'] == 'actor_model'],
+                         [('main/000010', 'main/000020')])
+
+
 class PacerTests(unittest.TestCase):
     def test_share_ceiling_with_a_fake_clock(self):
         now, slept, ticks = [0.], [], []
@@ -2355,6 +2420,54 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator.use('main/000030', 'main/000010')                 # main/000020 is least recently used
         self.assertEqual(set(evaluator.models), {'main/000010', 'main/000030'})
         self.assertIs(evaluator.models['main/000010'], first)
+
+    def pointer(self):
+        return json.loads((self.run/'actor.json').read_text())
+
+    def test_pointer_follows_newest_exports(self):
+        evaluator = self.start()
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        evaluator.publish(True)
+        self.assertEqual((self.pointer()['checkpoint'], self.pointer()['reason']), ('main/000010', 'newest'))
+        self.export(20)
+        evaluator.publish(True)                                    # before main/000020 plays a game
+        self.assertEqual(self.pointer()['checkpoint'], 'main/000020')
+        self.assertTrue(evaluator.step())
+        self.assertEqual((self.pointer()['checkpoint'], self.pointer()['vetoed']), ('main/000020', []))
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([(e['previous'], e['checkpoint']) for e in events if e['kind'] == 'actor_model'],
+                         [(None, 'main/000010'), ('main/000010', 'main/000020')])
+
+    def test_veto_falls_back_to_the_best_rated_until_the_next_export(self):
+        self.export(10, 20, 30)
+        evaluator = self.start()
+        evaluator.league = dict(champion='main/000010', checkpoints=[
+            dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
+            dict(id='main/000020', variant='main', step=20, elo=50., matches=[], panel=dict(incumbent='main/000010')),
+            dict(id='main/000030', variant='main', step=30, elo=-300., matches=[], panel=dict(incumbent='main/000010'))])
+        evaluator.publish(True)
+        self.assertEqual(self.pointer()['checkpoint'], 'main/000030')
+        path = dense_eval.report_path(self.run, 'main/000030', 'main/000010')
+        path.parent.mkdir(parents=True)
+        games = [dict(seed=k//2, challenger_color=k % 2, winner=1-k % 2) for k in range(128)]
+        path.write_text(json.dumps(dict(candidate='main/000030', opponent='main/000010', settings=asdict(evaluator.settings), games=games)))
+        evaluator.publish(True)
+        pointer = self.pointer()
+        self.assertEqual((pointer['checkpoint'], pointer['vetoed']), ('main/000020', ['main/000030']))
+        self.assertIn('main/000030 vetoed: Elo', pointer['reason'])
+        self.export(40)
+        evaluator.publish(True)
+        self.assertEqual((self.pointer()['checkpoint'], self.pointer()['vetoed']), ('main/000040', ['main/000030']))
+        evaluator.league['checkpoints'].append(dict(id='main/000040', variant='main', step=40, elo=80., matches=[], demoted=True,
+                                                    panel=dict(incumbent='main/000010')))
+        evaluator.publish(True)
+        pointer = self.pointer()
+        self.assertEqual((pointer['checkpoint'], pointer['vetoed']), ('main/000020', ['main/000030', 'main/000040']))
+        self.assertIn('demoted', pointer['reason'])
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([e['checkpoint'] for e in events if e['kind'] == 'actor_model'],
+                         ['main/000030', 'main/000020', 'main/000040', 'main/000020'])
 
     def test_evaluation_defaults(self):
         s = dense_config.EvaluationSettings()

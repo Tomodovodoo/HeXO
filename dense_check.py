@@ -364,7 +364,8 @@ def e2e_stage(report, run):
     fresh = [path for path in dense_data.shard_dirs(run) if path not in shards]
     episodes = [e for path in fresh for e in dense_data.read_shard(path, policies=False)[0]]
     mixed = [e for e in episodes if e['opponent']]
-    opponents = {c['id']: c['ema_sha256'] for c in league['checkpoints'] if c['id'] != champion['checkpoint']}
+    played = json.loads((run/'actor-status.json').read_text(encoding='utf-8'))['checkpoint']
+    opponents = {c['id']: c['ema_sha256'] for c in league['checkpoints'] if c['id'] != played}
     good = len(mixed) == 4 and sum(dense_bootstrap.check(path) for path in fresh) > 0 and all(
         e['opponent'] in opponents and sorted(e['actors'].values()) == sorted([e['actor'], opponents[e['opponent']]])
         and e['actor'] != opponents[e['opponent']] for e in mixed)
