@@ -492,8 +492,9 @@ class Book:
         taken by an earlier start; of the lines whose opening is plausible (policy probability at least
         book_min_prob) the shallowest wins, among equals the one whose value-head P1 expected score is nearest 1/2.
         It records probability and visit_share (the product of the visit shares of the placements the search sampled
-        after the start; null in policy mode). A challenger (third field set) competes with that opening. Returns how
-        many were added."""
+        after the start; null in policy mode). A challenger (third field set) competes with that opening: it is taken
+        at exactly `depth` placements (a line whose position there is used is discarded, never extended), so the two
+        share no games. Returns how many were added."""
         s = self.settings
         if not starts:
             return 0
@@ -501,9 +502,9 @@ class Book:
         lines, shares = continuations(model, starting, s, rng, leaf_batch)
         prefixes = []  # per line: [(key, moves, visit share)] of the unused prefixes deep enough, shortest first
         for i, line in enumerate(lines):
-            start, depth, _ = starts[i//ALTERNATIVES]
+            start, depth, challenged = starts[i//ALTERNATIVES]
             prefixes.append([])
-            for d in range(max(depth, len(start)+1), len(line)+1):
+            for d in [depth] if challenged else range(max(depth, len(start)+1), len(line)+1):
                 key, moves = canonical(line[:d])
                 if (self.nodes.get(key) or {}).get('status') is None:
                     gained = shares[i][:d-len(start)]

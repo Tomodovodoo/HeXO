@@ -262,6 +262,13 @@ class RefreshTests(unittest.TestCase):
             self.assertEqual((result['openings'], result['challengers'], len(challengers)), (4, 2, 2))
             self.assertEqual({n['challenges'] for n in challengers}, {first['key'], second['key']})
             self.assertTrue(all(n['depth'] == 3 for n in challengers))
+            # A revisit never extends a used position: with only three two-neighbour positions (all taken) a challenge
+            # at depth three finds nothing, where a fresh opening would extend to depth four.
+            tight = self.book(tempfile.mkdtemp(dir=run), book_size=3, book_revisit_fraction=1.)
+            tight.refresh(Uniform(radius=1), CHAMPION, np.random.default_rng(0), now=0.)
+            self.assertEqual([n['depth'] for n in tight.openings()], [3, 3, 3])
+            again = tight.refresh(Uniform(radius=1), 'main/000020', np.random.default_rng(1), now=1.)
+            self.assertEqual((again['challengers'], again['added']), (0, 0))
             rival = next(n for n in challengers if n['challenges'] == first['key'])
             for points in (1.5, 1.5, 1, 1):
                 book.tally(pair(first['moves'], points))                       # the incumbent leans toward P1
