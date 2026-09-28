@@ -14,6 +14,8 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
                                        true and elo null (dense_eval)
   evaluator-status.json                evaluator heartbeat and progress (dense_eval.Evaluator), rewritten about
                                        every 2 s while it plays
+  openings.json                        the live opening book (dense_openings); openings-<suite>.json the statistics
+                                       of a frozen suite's book
   evaluations/<a>-vs-<b>/report.json   paired match records of a (candidate) against b, ids with '/' written as '-';
                                        idle rematches append pairs to an existing report (dense_eval)
   actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s;
@@ -162,7 +164,27 @@ class EvaluationSettings:
     sprt_alpha: float = .05
     sprt_beta: float = .05
     sprt_max_games: int = 200     # 'max-games' does not promote
-    opening_suite: str = 'standard-v1'
+    opening_suite: str = 'standard-v1'  # 'book' (the live book) or a frozen openings/<suite>.json (dense_openings)
+    # Live opening book (dense_openings.Book.refresh), refreshed at every champion change and every
+    # book_refresh_hours: book_size settled openings of book_min_plies..book_plies placements, each the shortest
+    # plausible, unused prefix of a line sampled at book_temperature from the visit counts of book_sims-simulation
+    # searches (0: from the policy). An opening retires once book_min_games colour-swapped pairs put its first-player
+    # skew interval wholly beyond +-book_max_skew Elo (and is replaced by a child below book_plies), or when the
+    # champion's policy probability of it is below book_min_prob; each refresh the champion challenges a random
+    # book_revisit_fraction of the settled openings with an alternative at the same depth. book_weighting 'uniform'
+    # or 'least_played' (weight 1 / (1 + pairs)) chooses how matches draw openings.
+    book_plies: int = 5
+    book_min_plies: int = 3
+    book_temperature: float = 1.5
+    book_sims: int = 16
+    book_size: int = 512
+    book_revisit_fraction: float = .25
+    book_refresh_hours: float = 6.
+    book_max_skew: float = 50.
+    book_min_games: int = 16
+    book_min_prob: float = 1e-4
+    book_weighting: str = 'uniform'
+    opening_book: str = ''        # Book.digest of the live book the games are played under; stamped by the evaluator
     eval_share: float = .12       # ceiling on the evaluator's playing share of wall time (dense_eval.Pacer)
     extra_opponents: int = 2      # panel opponents drawn per rated checkpoint with probability ~ p(1-p), idle only
     idle_rematch: bool = True     # replay decision-relevant comparisons while no checkpoint awaits rating
