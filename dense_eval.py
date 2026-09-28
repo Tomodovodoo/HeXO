@@ -865,8 +865,9 @@ class Evaluator:
     before any),
     settings (the effective EvaluationSettings), eval_share (the Pacer's share: 1 with --once), backlog (unrated
     checkpoint ids at the last step), eval_share_used (Pacer.used), vram (hexnet.vram()), error, solver (the solver
-    settings in use, dense_solver.Budgets, with the session's query statistics, Pool.solver, as `queries`; None
-    while every budget is 0)}. Match events,
+    settings' dense_solver.Budgets, `sides` {player: Budgets} of the session's players with their own budgets
+    (variants), and the session's query statistics, Pool.solver, as `queries`; None while every budget in use is
+    0)}. Match events,
     one per lane at the end of a session, carry the lane's games and placements, the session's seconds and
     worker_seconds (seconds times the lane's share of the session's placements)."""
 
@@ -884,10 +885,17 @@ class Evaluator:
                            placements_per_second=None, settings=asdict(settings), eval_share=pacer.share, backlog=[],
                            eval_share_used=0., error=None, solver=self.solver_status(None))
 
-    def solver_status(self, pool):
-        """The status `solver` field for `pool` (None: no session)."""
+    def solver_status(self, pool, names=()):
+        """The status `solver` field for `pool` (None: no session) playing the players `names`: the evaluation
+        settings' Budgets, `sides` {name: Budgets} of the players whose own budgets (`side`) differ from them, and
+        `queries`; None while every budget in use is 0."""
         budgets = Budgets.of(self.settings)
-        return dict(asdict(budgets), queries=pool.solver() if pool else None) if budgets.active else None
+        sides = {name: Budgets.of(self.side(name)) for name in dict.fromkeys(names) if name != SEAL}
+        sides = {name: b for name, b in sides.items() if b != budgets}
+        if not budgets.active and not any(b.active for b in sides.values()):
+            return None
+        return dict(asdict(budgets), sides={name: asdict(b) for name, b in sides.items()},
+                    queries=pool.solver() if pool else None)
 
     def publish(self, force=False, **fields):
         """Update the status; rewrite the file when forced or STATUS_SECONDS after the last write."""
@@ -1040,7 +1048,8 @@ class Evaluator:
                                for x, y, k in shown], started_at=wall, games_played=len(done), games_planned=planned,
                          tally=tally(done, self.test if kind in ('champion', 'sprt') else None), placements_played=live,
                          mean_placements=added[main][1]/added[main][0] if main in added else None,
-                         placements_per_second=live/max(self.pacer.clock()-start, 1e-9), solver=self.solver_status(pool))
+                         placements_per_second=live/max(self.pacer.clock()-start, 1e-9),
+                         solver=self.solver_status(pool, [name for lane in shown for name in lane[:2]]))
         while True:
             for a, b, _ in lanes:
                 self.open(a, b)

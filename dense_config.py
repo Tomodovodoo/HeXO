@@ -147,6 +147,8 @@ class LearnerSettings:
     def __post_init__(self):
         if self.value_target not in VALUE_TARGETS:
             raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
+        if '@' in self.variant or '/' in self.variant:
+            raise ValueError(f"variant {self.variant!r}: '@' marks a search-settings variant (dense_eval) and '/' a step")
 
 
 @dataclass(frozen=True)

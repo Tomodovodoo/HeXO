@@ -2928,6 +2928,12 @@ class EvaluatorLoopTests(unittest.TestCase):
             self.assertEqual((game.solvers[mine].root_nodes, game.solvers[1-mine].active), (16, False))
             self.assertEqual(game.budget, game.budgets[game.game.player])
             game.finish()
+        solver = evaluator.solver_status(None, [a, b])                       # the baseline's budgets are all 0
+        self.assertEqual((solver['root_nodes'], solver['sides'][a]['root_nodes'], list(solver['sides'])), (0, 16, [a]))
+        self.assertIsNone(evaluator.solver_status(None, [b, 'seal']))
+        for name in ('ab@test', 'ab/1'):
+            with self.assertRaises(ValueError):
+                dense_config.LearnerSettings(variant=name)
 
     def test_variant_decisions_stop_on_p_and_never_promote(self):
         """A variant is decided against its checkpoint by P(better) alone, well before sprt_max_games; it is rated
