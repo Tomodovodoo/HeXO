@@ -956,7 +956,7 @@ class Evaluator:
                 break
             a, b, kind = self.pairing(verdict, cid, champion)
             self.publish(True, decision=dict({k: v for k, v in verdict.items() if k != 'posterior'}, next=[a, b]))
-            report = self.extend(a, b, kind, s.round_games)
+            report = self.extend(a, b, kind, s.sprt_max_games-verdict['direct']['games'] if a == cid and b == champion else s.round_games)
             if report is not None and a != cid:
                 self.record(a, b, report)
         if not verdict['direct']['games']:

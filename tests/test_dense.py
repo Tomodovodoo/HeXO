@@ -2353,6 +2353,18 @@ class EvaluatorLoopTests(unittest.TestCase):
         decision = next(e for e in events if e['kind'] == 'decision')
         self.assertIn('main/000020 vs main/000010: promote after', decision['message'])
 
+    def test_posterior_direct_games_stop_at_sprt_max_games(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=10, round_games=8)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        def drawn(config, settings, candidate, opponent, first_pair, games, seal=None, heartbeat=lambda *_: None):
+            return [dict(r, winner=-1) for r in self.winning([])(config, settings, candidate, opponent, first_pair, games, seal)]
+        with unittest.mock.patch.object(dense_eval, 'play_pairs', drawn):
+            self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        self.assertEqual((len(report['games']), report['metrics']['posterior']['decision']), (10, 'max-games'))
+
     def test_posterior_decision_rejects_a_clear_loser(self):
         evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9, uncertainty_parity=1.5)
         self.export(10)
