@@ -1744,6 +1744,7 @@ class Evaluator:
         if not self.reviewed:
             self.reviewed = True
             self.review()
+            self.refresh_openings()  # a champion crowned on review refreshes the book before any game
         if unrated:
             self.filling(None)
             variant = lambda e: e[0].split('/')[0]

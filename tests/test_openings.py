@@ -634,6 +634,21 @@ class EvaluatorBookTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['checkpoint'] for e in events if e['kind'] == 'book'], [CHAMPION, 'main/000020'])
 
+    def test_a_champion_crowned_on_review_refreshes_the_book_before_any_game(self):
+        self.export(10)
+        evaluator = self.start()
+        evaluator.step()                                                    # the first champion, unopposed
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            evaluator.step()                                                # refresh by 10, 20 rated, not promoted
+        self.assertEqual((self.saved()['refreshed_by'], json.loads((self.run/'league.json').read_text())['champion']),
+                         (CHAMPION, CHAMPION))
+        restarted = self.start()
+        with unittest.mock.patch.object(restarted, 'review', lambda: restarted.promote('main/000020', CHAMPION)):
+            self.assertFalse(restarted.step())                              # nothing else to play
+        self.assertEqual(self.saved()['refreshed_by'], 'main/000020')
+        self.assertEqual(restarted.settings.opening_book, dense_openings.Book(self.run, restarted.settings).digest())
+
     def test_a_timed_refresh_waits_for_a_resumed_candidate(self):
         self.export(10)
         evaluator = self.start(sprt_max_games=4)
