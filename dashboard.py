@@ -560,7 +560,9 @@ def project(root, fresh=30):
 
 
 HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')
-LEARNER_METRICS = HEADS+('lr', 'samples_per_second', 'window_rows')+tuple('validation_'+h for h in HEADS)
+SOURCES = ('converted', 'fresh', 'newest')  # dense_data.SOURCES
+SOURCE_METRICS = tuple(f'{s}_{k}{h}' for s in SOURCES for k in ('', 'train_', 'gap_') for h in ('policy_ce', 'value_bce'))
+LEARNER_METRICS = HEADS+('lr', 'samples_per_second', 'window_rows')+tuple('validation_'+h for h in HEADS+SOURCE_METRICS)
 ACTOR_SUMMED = ('placements_per_second', 'evals_per_second', 'games_per_hour')
 ACTOR_METRICS = ACTOR_SUMMED+('terminal_fraction', 'mean_plies')
 GPU_METRICS = ('utilization', 'used_mib', 'watts', 'temperature')

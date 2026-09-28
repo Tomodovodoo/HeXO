@@ -7,7 +7,8 @@ millisecond time plus pid) holding
   rows.json      [{game, ply, player, remaining, target, weight, legal_sha256}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
-  manifest.json  schema, created_at, identity, actor, files (sha256), counts (opponent_rows may be absent: 0)
+  manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows may be absent: 0)
+`origin` is 'converted' (dense_bootstrap) or 'actor' (dense_selfplay); `origin()` infers it for older manifests.
 `row.game` indexes the shard's episode list. `episode.winner` is 0/1 for finished games ('six-in-a-row') and -1
 for capped games ('cap' at the ply limit, 'span' when a searched position does not fit the largest crop);
 `episode.root_values` is null or one entry per ply (searched root value in [-1, 1] for the side to
@@ -16,12 +17,13 @@ move at that ply, or null). The learner derives every target from the episode (`
 `episode.actor` is the sha256 of the evaluator being trained. Actor shards also record `actors` {"0": sha, "1": sha}
 per colour, `opponent` (null for self-play, else the checkpoint id of a frozen historical opponent) and
 `trained_side` (null for self-play, else the colour the trained evaluator played). Every ply keeps a row so ply
-indexing stays contiguous, but a ply of the opponent's colour (`trained` False) has no policy, a null root value and full_search False; it never enters the replay window and
-does not count toward `total_rows`.
+indexing stays contiguous, but a ply of the opponent's colour (`trained` False) has no policy, a null root
+value and full_search False; it never enters the replay window and does not count toward `total_rows`.
 """
-from collections import namedtuple
+from collections import Counter, namedtuple
 import hashlib
 import json
+import zlib
 import multiprocessing
 from pathlib import Path
 import queue
@@ -42,6 +44,8 @@ FILES = ('episodes.json', 'rows.json', 'targets.npz')
 Ref = namedtuple('Ref', 'shard index row episode')
 Shard = namedtuple('Shard', 'episodes rows full held following')
 FUTURE = (6, 20)
+ORIGINS = ('converted', 'actor')
+SOURCES = ('converted', 'fresh', 'newest')
 
 
 def legal_digest(actions):
@@ -100,10 +104,12 @@ def value_targets(players, root_values, winner, lam=.9, full=None):
     return [(1 + (g if p == 0 else -g))/2 for p, g in zip(players, G)], [1.]*T
 
 
-def write_shard(path, identity, episodes, rows):
-    """Atomically publish a shard. `identity` must carry `actor_sha256`; each row carries `policy`
-    (float array over the legal moves, or None/empty for no policy target) besides the stored fields;
-    `target`/`weight` default to null/0."""
+def write_shard(path, identity, episodes, rows, origin='actor'):
+    """Atomically publish a shard of `origin` (one of ORIGINS). `identity` must carry `actor_sha256`; each row
+    carries `policy` (float array over the legal moves, or None/empty for no policy target) besides the stored
+    fields; `target`/`weight` default to null/0."""
+    if origin not in ORIGINS:
+        raise ValueError(f'Unknown shard origin {origin!r}')
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -125,7 +131,7 @@ def write_shard(path, identity, episodes, rows):
         write_json(stage/'rows.json', [{**dict(target=None, weight=0.), **{k: r[k] for k in keys if k in r}} for r in rows])
         np.savez_compressed(stage/'targets.npz', offsets=np.cumsum([0]+[len(p) for p in policies]).astype(np.int64),
                             probabilities=np.concatenate(policies+[np.zeros(0, np.float32)]))
-        manifest = dict(schema=SCHEMA, created_at=time.time(), identity=identity, actor=identity['actor_sha256'],
+        manifest = dict(schema=SCHEMA, created_at=time.time(), origin=origin, identity=identity, actor=identity['actor_sha256'],
                         files={name: digest(stage/name) for name in FILES}, counts=counts)
         write_json(stage/'manifest.json', manifest)
         stage.rename(path)
@@ -137,6 +143,12 @@ def manifest(path):
     if data['schema'] != SCHEMA:
         raise ValueError(f'Expected a dense shard: {path}')
     return data
+
+
+def origin(manifest):
+    """The shard's origin: its manifest `origin`, else (manifests written before the field existed) 'converted'
+    when the identity names a `source` corpus (only dense_bootstrap writes one), else 'actor'."""
+    return manifest.get('origin') or ('converted' if 'source' in manifest['identity'] else 'actor')
 
 
 def verify(path):
@@ -282,6 +294,123 @@ class ReplayWindow:
             self.values[key] = value_targets([player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'],
                                              lam, e['full_search'] if full_only else None)
         return self.values[key]
+
+
+class ValidationSets:
+    """Fixed per-source row subsets for validation, independent of the replay window.
+
+    Sources (SOURCES): 'converted' draws from converted shards, 'fresh' from actor shards and 'newest' from the
+    actor-shard episodes played by the newest actor: among the episode actors with full-search rows in any actor
+    shard, the one whose first shard as manifest `actor` comes latest in name order (never-published actors rank
+    oldest; ties go to the most rows). It only moves to a higher-ranked actor, so a lagging worker's shard of an
+    older model cannot move it back, and a shard written right after a checkpoint switch that holds only the
+    previous model's games does not leave the subset empty. `newest_checkpoint` is the identity `checkpoint`
+    of the first shard published by the newest actor (None when it never published one). Each source has a 'held'
+    subset of full-search rows of games selected by holdout(episode, fraction) and a 'train' subset of full-search
+    rows of the other games. A subset walks
+    its source's shards in name order and takes from each at most `quota` rows, in the order of a permutation
+    seeded by (seed, crc32(shard name)), until it holds `limit` rows. Shards are immutable and named in
+    creation order, so a subset only grows, by rows of newer shards, until it is full, and a restart rebuilds
+    it exactly; the 'newest' subsets start over when the newest actor changes. refresh() updates them.
+    `subsets[source, split]` lists Refs; policy, value_targets and following serve examples() like
+    ReplayWindow. Retained between refreshes: the chosen rows with their next-ply rows and episodes, the names
+    of the shards each subset has consumed, and per scanned shard its full-search row count per episode actor
+    (`actors`); a shard's row candidates live for one refresh, so a new newest actor rescans the shards it
+    played.
+    """
+
+    def __init__(self, run_dir, fraction, seed, limit=1024, quota=64):
+        self.run_dir, self.fraction, self.seed, self.limit, self.quota = Path(run_dir), fraction, seed, limit, quota
+        self.manifests = {}; self.actors = {}; self.entries = {}; self.following_index = {}
+        self.subsets = {(source, split): [] for source in SOURCES for split in ('held', 'train')}
+        self.picks = {key: [] for key in self.subsets}; self.walked = {key: set() for key in self.subsets}
+        self.newest = self.newest_checkpoint = None
+
+    def scan(self, name, scanned):
+        """A shard's full-search rows as permuted (index, held, actor) candidates, kept in `scanned` (one
+        refresh); records the shard's full-search rows per episode actor in `actors`."""
+        if name not in scanned:
+            episodes, rows = read_shard(self.run_dir/'shards'/name)
+            full = [i for i, r in enumerate(rows) if len(r['policy'])]
+            held = [holdout(e, self.fraction) for e in episodes]
+            order = np.random.default_rng([self.seed, zlib.crc32(name.encode())]).permutation(len(full))
+            scanned[name] = [(i, held[rows[i]['game']], episodes[rows[i]['game']]['actor']) for i in (full[k] for k in order)]
+            self.actors[name] = Counter(a for _, _, a in scanned[name])
+        return scanned[name]
+
+    def refresh(self):
+        """Rescan shard manifests and extend (for a new newest actor, rebuild) every subset."""
+        for path in shard_dirs(self.run_dir):
+            if path.name not in self.manifests:
+                self.manifests[path.name] = manifest(path)
+        names = sorted(self.manifests)
+        actors = [n for n in names if origin(self.manifests[n]) == 'actor']
+        published = {}
+        for n in actors:
+            published.setdefault(self.manifests[n]['actor'], (len(published), self.manifests[n]['identity'].get('checkpoint')))
+        scanned, previous = {}, self.newest
+        rows = Counter()
+        for name in actors:
+            if name not in self.actors:
+                self.scan(name, scanned)
+            rows += self.actors[name]
+        rank = lambda a: (published.get(a, (-1,))[0], rows[a])
+        if rows and (self.newest is None or rank(max(rows, key=rank))[0] > rank(self.newest)[0]):
+            self.newest = max(rows, key=rank)
+            self.newest_checkpoint = published.get(self.newest, (None, None))[1]
+        if self.newest != previous:
+            for split in ('held', 'train'):
+                self.picks['newest', split], self.walked['newest', split] = [], set()
+        played = lambda n: self.actors[n][self.newest] > 0 if n in self.actors else \
+            self.newest in self.manifests[n]['identity'].get('actors', [self.manifests[n]['actor']])
+        shards = dict(converted=[n for n in names if origin(self.manifests[n]) == 'converted'], fresh=actors,
+                      newest=[n for n in actors if played(n)])
+        for (source, split), chosen in self.picks.items():
+            walked = self.walked[source, split]
+            for name in shards[source]:
+                if len(chosen) >= self.limit:
+                    break
+                if name in walked:
+                    continue
+                rows = [i for i, h, a in self.scan(name, scanned) if h == (split == 'held') and (source != 'newest' or a == self.newest)]
+                chosen += [(name, i) for i in rows[:min(self.quota, self.limit-len(chosen))]]
+                walked.add(name)
+        entries, following, missing = {}, {}, {}
+        for name, i in {key for chosen in self.picks.values() for key in chosen}:
+            if (name, i) in self.following_index:    # cached as a chosen row, not only as a successor
+                following[name, i] = j = self.following_index[name, i]
+                entries.update({(name, k): self.entries[name, k] for k in (i, j) if k is not None})
+            else:
+                missing.setdefault(name, []).append(i)
+        for name, indices in missing.items():
+            episodes, rows = read_shard(self.run_dir/'shards'/name)
+            where = {(r['game'], r['ply']): k for k, r in enumerate(rows)}
+            for i in indices:
+                j = where.get((rows[i]['game'], rows[i]['ply']+1))
+                following[name, i] = j if j is not None and len(rows[j]['policy']) else None
+                for k in (i, following[name, i]):
+                    if k is not None:    # copies, so the shard's policy array can be freed
+                        row = {key: v for key, v in rows[k].items() if key != 'policy'}
+                        entries[name, k] = (row, episodes[row['game']], rows[k]['policy'].copy())
+        self.entries, self.following_index = entries, following
+        self.subsets = {key: [self.ref(*k) for k in chosen] for key, chosen in self.picks.items()}
+
+    def ref(self, name, i):
+        row, episode, _ = self.entries[name, i]
+        return Ref(name, i, row, episode)
+
+    def policy(self, ref):
+        return self.entries[ref.shard, ref.index][2]
+
+    def following(self, ref):
+        """Ref of the same game's next-ply row when it has a policy, else None."""
+        j = self.following_index[ref.shard, ref.index]
+        return None if j is None else self.ref(ref.shard, j)
+
+    def value_targets(self, ref, lam, full_only):
+        e = ref.episode
+        return value_targets([player_at(t) for t in range(len(e['moves']))], e['root_values'], e['winner'],
+                             lam, e['full_search'] if full_only else None)
 
 
 def crop_index(s, points):

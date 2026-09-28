@@ -12,14 +12,23 @@ starts a tree's next search as soon as its previous one finishes, so full (`full
 is re-read after each shard: games in progress finish with the evaluator they started with, new games use
 the new one; a shard may therefore mix actors (identity `actors`; `actor_sha256` is the newest).
 
+GPU sharing (Yield): CUDA contexts of separate processes time-slice the GPU, so every busy actor worker takes
+a share from the learner. Workers therefore pause between engine steps while a learner falls behind its
+pacing: they re-read the learner heartbeats every `yield_check_seconds`, pause once the lowest ratio of
+samples_per_row to that learner's own samples_per_row_target (config learner.samples_per_row when a heartbeat
+lacks it) among the learners that are training drops below `yield_below` and resume once it reaches
+`yield_resume` (hysteresis, so the learner does not reach its own waiting point while the
+actors sleep). A missing, stale or non-training heartbeat never pauses. Paused workers keep their trees and
+in-flight batch and heartbeat with stage 'paused'. Actor settings can be overridden per process with
+--<setting> flags (the supervisor forwards them; shards record the effective values).
+
 Historical opponents (ActorSettings.historical_*): up to round(historical_fraction * min(games_in_flight, --games))
 games in flight pit the champion, alternating colours over historical games, against a frozen rated checkpoint
-(`Historical`); only the champion's plies become training rows (dense_data.trained). Settings flags given to the actor override config.json
-for its processes and are recorded in each shard's identity.
+(`Historical`); only the champion's plies become training rows (dense_data.trained).
 """
 import argparse
 from collections import deque
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 import json
 import math
 import os
@@ -51,7 +60,8 @@ METRICS_SECONDS = 30.
 PRIOR_GAMES = 16.  # weight, in games, of the Elo prediction when PFSP blends in a recorded score
 BLOCKS = 2          # historical opponents in flight at once, about: blocks of target/BLOCKS games per opponent
 METRICS = ('positions', 'games_completed', 'placements_per_second', 'evals_per_second', 'mean_batch',
-           'terminal_fraction', 'mean_plies', 'checkpoint')
+           'terminal_fraction', 'mean_plies', 'checkpoint', 'paused_seconds')
+STALE_SECONDS = 120.  # learner heartbeats older than this are ignored by Yield
 
 
 def checkpoints(run):
@@ -450,6 +460,57 @@ class Historical:
         return self.models[self.plan.popleft()], (self.started-1) % 2
 
 
+def metrics_due(stage, logged_stage, elapsed):
+    """Whether a worker appends a metrics line: on every stage change, else every METRICS_SECONDS."""
+    return stage != logged_stage or elapsed >= METRICS_SECONDS
+
+
+class Yield:
+    """Cooperative pause of the actor workers while a learner is behind its pacing (module contract).
+    paused() re-reads <run>/learner-status*.json at most every `check_seconds` and returns the current state;
+    `reason` describes the last decision."""
+
+    def __init__(self, run, target, below, resume, check_seconds, clock=time.monotonic, now=time.time):
+        if below and not 0 < below <= resume:
+            raise ValueError('yield_below must be 0 (off) or in (0, yield_resume]')
+        self.run, self.target, self.below, self.resume, self.check_seconds = Path(run), target, below, resume, check_seconds
+        self.clock, self.now, self.checked, self.state, self.reason = clock, now, None, False, 'not checked'
+
+    def lowest(self):
+        """(samples_per_row / its target, samples_per_row, target, variant) of the furthest-behind training learner
+        with a fresh heartbeat, or None. The target is the heartbeat's samples_per_row_target, else `target`."""
+        found = []
+        for path in sorted(self.run.glob('learner-status*.json')):
+            try:
+                status = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                continue
+            fresh = self.now()-float(status.get('updated_at') or 0) <= STALE_SECONDS
+            if fresh and status.get('stage') in ('training', 'exporting') and status.get('samples_per_row') is not None:
+                rate, target = float(status['samples_per_row']), float(status.get('samples_per_row_target') or self.target)
+                found.append((rate/target, rate, target, status.get('variant', path.stem)))
+        return min(found) if found else None
+
+    def paused(self):
+        if not self.below:
+            return False
+        if self.checked is not None and self.clock()-self.checked < self.check_seconds:
+            return self.state
+        self.checked = self.clock()
+        lowest = self.lowest()
+        if lowest is None:
+            self.state, self.reason = False, 'no training learner heartbeat'
+            return False
+        ratio, rate, target, variant = lowest
+        if self.state and ratio >= self.resume:
+            self.state = False
+        elif not self.state and ratio < self.below:
+            self.state = True
+        self.reason = (f'learner {variant} at {rate:.2f} samples/row; pause below {self.below*target:.2f}, '
+                       f'resume at {self.resume*target:.2f}')
+        return self.state
+
+
 def shard_name():
     return f'{time.time_ns()//1_000_000:013d}{os.getpid() % 1000:03d}'
 
@@ -457,8 +518,8 @@ def shard_name():
 def worker(args):
     run = Path(args.run)
     config = dense_config.load(run)
-    config = replace(config, actor=dense_config.override(config.actor, args))
-    settings = config.actor
+    settings = dense_config.override(config.actor, args)
+    config = replace(config, actor=settings)
     torch.backends.cudnn.benchmark = False
     status_path = run/('actor-status.json' if args.worker == 0 else f'actor-status-{args.worker}.json')
     entropy = np.random.SeedSequence([config.seed, args.worker, time.time_ns() % 2**63]).entropy
@@ -477,11 +538,14 @@ def worker(args):
     window = deque([(time.perf_counter(), state['positions'], 0)])
     since = dict(time=time.perf_counter(), positions=state['positions'], evals=0)
 
-    logged = time.perf_counter()
+    logged, stage_logged = time.perf_counter(), 'playing'
+    gate = Yield(run, config.learner.samples_per_row, settings.yield_below, settings.yield_resume, settings.yield_check_seconds)
+    paused_since, paused_total = None, 0.
 
     def status(stage):
-        """Rewrite the heartbeat; append a metrics line every METRICS_SECONDS and whenever the stage is not 'playing'."""
-        nonlocal logged
+        """Rewrite the heartbeat; append a metrics line whenever the stage changes and otherwise every
+        METRICS_SECONDS."""
+        nonlocal logged, stage_logged
         now = time.perf_counter()
         window.append((now, state['positions'], engine.evals))
         while len(window) > 2 and now-window[1][0] > 60:
@@ -493,10 +557,12 @@ def worker(args):
             games_completed=g, games_total=target, positions=state['positions'], active_games=len(engine.slots),
             placements_per_second=(state['positions']-p)/max(1e-9, now-t), evals_per_second=(engine.evals-e)/max(1e-9, now-t),
             mean_batch=engine.evals/max(1, engine.calls), terminal_fraction=state['terminal']/g if g else None,
-            mean_plies=state['plies']/g if g else None, shards_written=state['shards_written'], error=state['error'])
+            mean_plies=state['plies']/g if g else None, shards_written=state['shards_written'],
+            paused_seconds=paused_total+(time.perf_counter()-paused_since if paused_since is not None else 0.),
+            error=state['error'])
         write_json(status_path, fields)
-        if stage != 'playing' or now-logged >= METRICS_SECONDS:
-            logged = now
+        if metrics_due(stage, stage_logged, now-logged):
+            logged, stage_logged = now, stage
             dense_config.append_metrics(run, f'actor-{args.worker}', **{k: fields[k] for k in METRICS})
 
     def publish():
@@ -512,7 +578,7 @@ def worker(args):
                         process=args.worker,
                         pid=os.getpid(), seed_entropy=str(entropy), model=asdict(model.config),
                         actor=asdict(settings), value_targets='not stored; derive from episode root_values and winner')
-        dense_data.write_shard(run/'shards'/name, identity, episodes, rows)
+        dense_data.write_shard(run/'shards'/name, identity, episodes, rows, 'actor')
         state['shards_written'] += 1
         games = len(episodes); terminal = sum(e['winner'] >= 0 for e in episodes)
         elapsed = now-since['time']
@@ -545,6 +611,19 @@ def worker(args):
                 started += 1
             if not engine.slots:
                 break
+            if gate.paused():
+                if paused_since is None:
+                    paused_since = time.perf_counter()
+                    log_event(run, 'actor', 'info', f'worker {args.worker} paused: {gate.reason}', process=args.worker)
+                    status('paused'); last = time.perf_counter()
+                time.sleep(1.)
+                if time.perf_counter()-last >= 2:
+                    status('paused'); last = time.perf_counter()
+                continue
+            if paused_since is not None:
+                paused_total += time.perf_counter()-paused_since; paused_since = None
+                log_event(run, 'actor', 'info', f'worker {args.worker} resumed: {gate.reason}', process=args.worker)
+                status('playing'); last = time.perf_counter()
             before = engine.searches
             for slot in engine.step():
                 episode, items = slot.episode()
@@ -581,6 +660,17 @@ def published(run, worker, since=0.):
     return totals
 
 
+def actor_flags(args):
+    """The --<actor setting> flags given in `args`, for forwarding to worker processes."""
+    flags = []
+    for item in fields(dense_config.ActorSettings):
+        value, flag = getattr(args, item.name, None), '--'+item.name.replace('_', '-')
+        if value is None:
+            continue
+        flags += [flag if value else '--no-'+flag[2:]] if isinstance(value, bool) else [flag, str(value)]
+    return flags
+
+
 def supervise(args):
     """Run --processes workers as subprocesses of this script; restart a crashed worker with the games it has
     not published yet."""
@@ -588,7 +678,7 @@ def supervise(args):
     dense_config.load(run)
     command = [sys.executable, str(Path(__file__).resolve()), '--run', str(run)]
     command += ['--initial-model', str(args.initial_model)] if args.initial_model else []
-    command += dense_config.flags(dense_config.ActorSettings, args)
+    command += actor_flags(args)
     remaining = dict.fromkeys(range(args.processes), args.games)
 
     def spawn(k):
@@ -628,7 +718,8 @@ def main():
     parser.add_argument('--games', type=int, default=None, help='games per process (default: endless)')
     parser.add_argument('--initial-model', help='hexnet checkpoint used while the run has no checkpoint')
     parser.add_argument('--worker', type=int, default=None, help=argparse.SUPPRESS)
-    dense_config.add_arguments(parser.add_argument_group('actor settings (override config.json)'), dense_config.ActorSettings)
+    dense_config.add_arguments(parser.add_argument_group('actor settings (override config.json for this process)'),
+                               dense_config.ActorSettings)
     args = parser.parse_args()
     if args.worker is None:
         supervise(args)

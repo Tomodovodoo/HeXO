@@ -5,7 +5,8 @@ manifest.json {variant, step, samples_seen, created_at, model_sha256, ema_sha256
 learner (effective LearnerSettings), model (ModelSettings), copied_from}. Events have source 'learner' and kind
 export, info, error or replace. league.json is read for population replacement, never written. metrics/learner-
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
-falls on every tenth step) and one with the EMA validation losses per export.
+falls on every tenth step) and one per export with validation_fields(metrics) of the manifest (Learner.export): EMA
+losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets).
 
 Every target is derived here from episodes (dense_data.examples), so td_lambda, bootstrap_weight and
 short_value_horizon are learner settings; batches are rendered by dense_data.Renderers worker processes
@@ -13,7 +14,8 @@ short_value_horizon are learner settings; batches are rendered by dense_data.Ren
 over every row of the batch that has that target, summed with the head coefficients; each crop bucket is
 a separate forward pass whose gradients accumulate (buckets padded to QUANTUM rows with inert rows).
 Pacing: at most samples_per_row * (trained rows in all shards, cheap rows included; a historical opponent's
-plies are not trained, see dense_data.trained) samples are presented; beyond that the learner waits. The window is sized in full-search rows (dense_data.ReplayWindow).
+plies are not trained, see dense_data.trained) samples are presented; beyond that the learner waits. The window
+is sized in full-search rows (dense_data.ReplayWindow).
 """
 import argparse
 import copy
@@ -44,6 +46,13 @@ KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'valid
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce')))  # metrics log names
 # (low, high) for replacement perturbations; td_lambda and ema are perturbed through 1 - x.
 BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995), ema=(.99, .9999))
+
+
+def validation_fields(metrics):
+    """The metrics-log fields of an export's manifest metrics: metrics.validation under LOGGED names plus
+    metrics.validation_sources; None when both are null."""
+    fields = {LOGGED[h]: v for h, v in (metrics['validation'] or {}).items()} | (metrics.get('validation_sources') or {})
+    return fields or None
 
 
 def status_path(run, variant):
@@ -232,14 +241,46 @@ class Learner:
                 total += batch_losses(self.ema, batch, None, self.device, self.memory_format, False); n += 1
         return dict(zip(HEADS, (total/n).tolist()))
 
-    def export(self, window):
-        """Write checkpoints/<variant>/<step:06d>/ atomically (staged in a hidden sibling, then renamed)."""
+    def subset_losses(self, sets, refs):
+        """EMA (policy_ce, value_bce) over `refs` of `sets`, each the weighted mean over every row with that
+        target, under symmetries drawn from a fixed seed (a row keeps its symmetry while rows are appended);
+        None for a head without target weight."""
+        s = self.settings
+        rng = np.random.default_rng(self.config.seed)
+        total = torch.zeros(len(HEADS), device=self.device); mass = torch.zeros(len(HEADS), device=self.device)
+        with torch.no_grad():
+            for k in range(0, len(refs), s.batch):
+                batch = dense_data.collate(*dense_data.examples(sets, refs[k:k+s.batch], rng, **dense_data.target_options(s)))
+                weights = torch.stack([sum(b[w].sum() for b in batch.values()) for w in WEIGHTS]).to(self.device)
+                total += batch_losses(self.ema, batch, None, self.device, self.memory_format, False)*weights; mass += weights
+        return tuple(float(total[h]/mass[h]) if mass[h] > 0 else None for h in (0, 1))
+
+    def validate_sources(self, sets):
+        """Refresh `sets` (dense_data.ValidationSets) and return, per source, <source>_policy_ce and
+        <source>_value_bce on its held subset, <source>_train_* on its train subset, <source>_gap_* = held minus
+        train (None when either is), <source>_rows (held rows), plus newest_checkpoint."""
+        sets.refresh()
+        self.ema.eval()
+        out = dict(newest_checkpoint=sets.newest_checkpoint)
+        for source in dense_data.SOURCES:
+            held, train = (self.subset_losses(sets, sets.subsets[source, split]) for split in ('held', 'train'))
+            for name, v, w in zip(('policy_ce', 'value_bce'), held, train):
+                out.update({f'{source}_{name}': v, f'{source}_train_{name}': w,
+                            f'{source}_gap_{name}': None if v is None or w is None else v-w})
+            out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
+        return out
+
+    def export(self, window, sets=None):
+        """Write checkpoints/<variant>/<step:06d>/ atomically (staged in a hidden sibling, then renamed).
+        metrics.validation is validate(window) (the HEADS; null without held-out rows in the window) and
+        metrics.validation_sources is validate_sources(sets) (null without `sets`)."""
         s = self.settings
         root = self.run/'checkpoints'/s.variant
         root.mkdir(parents=True, exist_ok=True)
         final, stage = root/f'{self.step:06d}', root/f'.pending-{self.step:06d}'
         if final.exists():
             raise FileExistsError(f'{final} already exists')
+        validation, sources = self.validate(window), None if sets is None else self.validate_sources(sets)
         shutil.rmtree(stage, ignore_errors=True); stage.mkdir()
         hexnet.save_model(stage/'model.pt', self.model)
         hexnet.save_model(stage/'ema.pt', self.ema)
@@ -247,7 +288,7 @@ class Learner:
                         ema_updates=self.ema_updates), stage/'optimizer.pt')
         manifest = dict(variant=s.variant, step=self.step, samples_seen=self.samples_seen, created_at=time.time(),
                         model_sha256=hexnet.model_digest(self.model), ema_sha256=hexnet.model_digest(self.ema),
-                        metrics=dict(self.metrics or {h: None for h in HEADS}, validation=self.validate(window)),
+                        metrics=dict(self.metrics or {h: None for h in HEADS}, validation=validation, validation_sources=sources),
                         learner=asdict(s), model=asdict(self.config.model), copied_from=self.copied_from)
         write_json(stage/'manifest.json', manifest)
         stage.rename(final)
@@ -325,7 +366,8 @@ def main():
         status.update(fields, updated_at=time.time(), step=learner.step, samples_seen=learner.samples_seen,
                       rows_available=window.total_rows, window_rows=window.rows, full_rows_available=window.total_full_rows,
                       window_full_rows=window.full_rows,
-                      samples_per_row=learner.samples_seen/max(1, window.total_rows), lr=learner.lr(),
+                      samples_per_row=learner.samples_seen/max(1, window.total_rows),
+                      samples_per_row_target=learner.settings.samples_per_row, lr=learner.lr(),
                       last_export_step=learner.last_export, policy_ce=(learner.metrics or {}).get('policy_ce'),
                       value_bce=(learner.metrics or {}).get('value_bce'))
         write_json(status_path(args.run, s.variant), status)
@@ -336,10 +378,10 @@ def main():
 
     def export():
         write_status(stage='exporting')
-        validation = learner.export(window)['metrics']['validation']
-        if validation:
+        fields = validation_fields(learner.export(window, sets)['metrics'])
+        if fields:
             dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
-                                        validation=True, **{LOGGED[h]: v for h, v in validation.items()})
+                                        validation=True, **fields)
 
     rate = []
     try:
@@ -350,6 +392,7 @@ def main():
             return dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
                                            s.window_taper, s.validation_fraction)
         window = replay()
+        sets = dense_data.ValidationSets(args.run, s.validation_fraction, config.seed)
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers)
         stream = renderers()
         factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])
