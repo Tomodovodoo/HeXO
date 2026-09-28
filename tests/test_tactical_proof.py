@@ -95,6 +95,19 @@ class NativeStrategy(unittest.TestCase):
         self.assertFalse(rejected['native_verified'])
         with self.assertRaises(ValueError): independent_verify(bad, history)
 
+    def test_native_search_stops_at_its_deadline(self):
+        from tests.reference import interleave
+        ours = [(q,r) for r in (0,3,6,9) for q in range(3)] + [(12,0)]
+        theirs = [(-1,0)] + [(6+(i%3)*3,2+3*(i//3)) for i in range(13)]
+        history = [list(p) for p in interleave([ours,theirs])]
+        # The complete candidate proof takes seconds; a 300 ms query must stop the native worker too.
+        result = self.engine.history(history, ms=300, idtt_ms=0, nodes=1000000, root_moves=[[3,0],[5,0]])
+        self.assertEqual(result['status'], 'UNKNOWN')
+        time.sleep(0.2)
+        after = self.engine.history([[0,0]], ms=1000, idtt_ms=0)
+        self.assertNotIn('busy', after['reason'])
+        self.assertLess(after['last_worker_completion']['last_after_deadline']['elapsed_ms'], 450)
+
     def test_deadline_and_unknown_are_not_loss(self):
         start = time.perf_counter()
         result = self.engine.history([[0,0]], ms=1, idtt_ms=0, nodes=1)

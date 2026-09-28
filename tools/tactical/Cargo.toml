@@ -8,7 +8,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-hexo-solver = { git = "https://github.com/SootyOwl/hexo-strix", rev = "5a771e572553a8bd8e010112b2ce65f16e5afa1b" }
-hexo-engine = { git = "https://github.com/SootyOwl/hexo-strix", rev = "5a771e572553a8bd8e010112b2ce65f16e5afa1b" }
+hexo-solver = { path = "vendor/hexo-strix/hexo-rs/hexo-solver" }
+hexo-engine = { path = "vendor/hexo-strix/hexo-rs/hexo-engine" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
