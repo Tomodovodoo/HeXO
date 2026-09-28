@@ -851,7 +851,7 @@ always score finished games against their hard outcome.
   conditions hold (`decision sprt` settles the same way). On every start the evaluator re-applies the rule to
   the reports on disk, and a rated checkpoint that already passes it is crowned at once.
 - **Streaming.** `evaluator-status.json` carries the pool composition, the running tally of the current
-  comparison (updated per finished game) and the pending verdict. The dashboard shows all three, including a
+  comparison (every recorded game of the pair, in either role and across restarts, updated per finished game) and the pending verdict. The dashboard shows all three, including a
   provisional league row for the candidate.
 - **Idle work.** After the decision, the evaluator plays the champion's Seal anchor, the adaptive panel (the
   rated checkpoints closest to the champion) and other optional comparisons. It then plays fill games until the
