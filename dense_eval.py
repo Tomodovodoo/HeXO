@@ -27,13 +27,14 @@ checkpoint becomes champion unopposed.
 
 Panels: a checkpoint rated while a champion exists gets `panel_members` (at most 2 * extra_opponents + 1:
 p(1-p)-drawn and retained weaknesses) as entry `panel` {members, incumbent}; the incumbent is the champion it
-met. Its panel games and the champion's top-ups against the members are optional rounds. An SPRT H1 with a panel
-waits for it (entry `pending` true; a later pending candidate replaces an earlier one) and promotes unless the
-panel vetoes (`panel_result`) or the champion changed meanwhile. A complete panel records candidate_score,
-incumbent_score, z and veto in the entry and a 'panel' event.
+met. Its panel games and the incumbent's top-ups against the members are optional rounds, the current
+champion's first. SPRT H1 promotes at once; the panel is a post-hoc regression check: a complete panel records
+candidate_score, incumbent_score, z and veto in the entry and a 'panel' event, and when the vetoed checkpoint is
+the champion it promoted over its incumbent, that incumbent is restored as champion ('regression' event, entry
+`demoted` true), and a demoted checkpoint is never promoted again.
 
 league.json: {champion, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
-superseded?, panel?, pending?}], differences, anchors, matrix, rating_note, updated_at}. `matrix` (`payoff`) holds
+superseded?, panel?, demoted?}], differences, anchors, matrix, rating_note, updated_at}. `matrix` (`payoff`) holds
 only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
 written before `matrix` and `panel` existed lack those keys; the Evaluator adds `matrix` on start.
 """
@@ -672,24 +673,6 @@ class Evaluator:
         log_event(self.run, 'evaluator', 'promotion', f'{cid} promoted to champion' + (f' over {previous}' if previous else ''),
                   checkpoint=cid, previous_champion=previous, panel=panel)
 
-    def accept(self, entry):
-        """An SPRT H1 of `entry` against the champion: promote now without panel members or with a judged panel
-        that did not veto, else wait for the panel (pending; an earlier pending candidate is dropped)."""
-        panel = entry.get('panel', {})
-        if not panel.get('members') or 'veto' in panel:
-            if panel.get('veto'):
-                log_event(self.run, 'evaluator', 'panel', f'{entry["id"]} not promoted: panel veto', candidate=entry['id'])
-            else:
-                self.promote(entry['id'], self.league['champion'], panel or None)
-            return
-        for c in self.league['checkpoints']:
-            if c.pop('pending', None):
-                log_event(self.run, 'evaluator', 'panel', f'{c["id"]} no longer awaits promotion: {entry["id"]} replaces it',
-                          candidate=c['id'])
-        entry['pending'] = True
-        log_event(self.run, 'evaluator', 'panel', f'{entry["id"]} passed its SPRT; promotion waits for its panel',
-                  candidate=entry['id'], members=entry['panel']['members'])
-
     def needs(self, entry):
         """The panel comparisons `entry` still lacks: [(a, b, kind, games)], its own games against each member
         first, then the incumbent's top-ups to `games` protocol-matching games against the member."""
@@ -704,8 +687,8 @@ class Evaluator:
         return out
 
     def settle(self):
-        """Judge every panel that became complete and is not judged yet; a pending candidate is promoted unless
-        vetoed or the champion changed since its SPRT."""
+        """Judge every panel that became complete and is not judged yet; a vetoed champion is demoted: its panel
+        incumbent (the champion it replaced) is restored."""
         for entry in self.league['checkpoints']:
             panel = entry.get('panel')
             if not panel or 'veto' in panel or self.needs(entry):
@@ -715,12 +698,14 @@ class Evaluator:
             log_event(self.run, 'evaluator', 'panel', f'{entry["id"]} vs panel of {len(panel["members"])}: decisive score '
                       f'{score(panel["candidate_score"])}, incumbent {panel["incumbent"]} {score(panel["incumbent_score"])}'
                       + (' - veto' if panel['veto'] else ''), candidate=entry['id'], **panel)
-            if entry.pop('pending', None):
-                if panel['veto'] or self.league['champion'] != panel['incumbent']:
-                    log_event(self.run, 'evaluator', 'panel', f'{entry["id"]} not promoted: ' + (
-                        'panel veto' if panel['veto'] else f'the champion is now {self.league["champion"]}'), candidate=entry['id'])
-                else:
-                    self.promote(entry['id'], panel['incumbent'], panel)
+            if panel['veto'] and self.league['champion'] == entry['id']:
+                entry['demoted'] = True
+                self.league['champion'] = panel['incumbent']
+                write_json(self.run/'champion.json', dict(checkpoint=panel['incumbent'], updated_at=time.time(),
+                                                          ema_sha256=digest(self.run/'checkpoints'/panel['incumbent']/'ema.pt')))
+                log_event(self.run, 'evaluator', 'regression', f'{entry["id"]} demoted: its panel score is significantly '
+                          f'below {panel["incumbent"]}\'s, which is champion again', checkpoint=entry['id'],
+                          restored=panel['incumbent'], panel=panel)
             write_league(self.run, self.league, self.config)
 
     def rematches(self):
@@ -787,7 +772,7 @@ class Evaluator:
         if champion is None:
             self.promote(cid, None)
         elif decision == 'H1':
-            self.accept(entry)
+            self.promote(cid, champion)
         promoted = self.league['champion'] == cid
         write_league(self.run, self.league, self.config)
         print(f'{cid}: ' + ', '.join(f'vs {o} +{r["summary"]["wins"]} -{r["summary"]["losses"]} ={r["summary"]["capped"]}'
@@ -795,12 +780,12 @@ class Evaluator:
 
     def optional(self):
         """(league entry of the candidate side, opponent, kind, games) of the first optional comparison, else None:
-        the panel of a pending candidate ('panel', 'incumbent'), idle rematches (`rematches`, with idle_rematch),
+        the current champion's panel ('panel', 'incumbent'), idle rematches (`rematches`, with idle_rematch),
         the panels of the variant heads, newest first, then the newest rated checkpoint missing its
         previous-checkpoint comparison (when previous_games > 0) or its due Seal anchor (when anchor_games > 0)."""
         s = self.settings
-        pending = [c for c in self.league['checkpoints'] if c.get('pending')]
-        for a, b, kind, games in [n for c in pending for n in self.needs(c)] + (self.rematches() if s.idle_rematch else []) \
+        champion = [c for c in self.league['checkpoints'] if c['id'] == self.league['champion']]
+        for a, b, kind, games in [n for c in champion for n in self.needs(c)] + (self.rematches() if s.idle_rematch else []) \
                 + [n for c in self.heads() for n in self.needs(c)]:
             return self.entry(a), b, kind, games
         rated = [c for c in self.league['checkpoints'] if not c.get('skipped')]
@@ -845,8 +830,9 @@ class Evaluator:
             report = self.report(entry['id'], opponent, kind, games, lambda records: len(records) >= games)
         if report is not None:
             self.record(entry['id'], opponent, report)
-            if kind == 'sprt' and report['metrics']['sprt']['decision'] == 'H1' and self.league['champion'] == opponent:
-                self.accept(entry)
+            if kind == 'sprt' and report['metrics']['sprt']['decision'] == 'H1' and self.league['champion'] == opponent \
+                    and not entry.get('demoted'):
+                self.promote(entry['id'], opponent)
                 write_league(self.run, self.league, self.config)
             self.settle()
         return True

@@ -1298,30 +1298,45 @@ class EvaluatorLoopTests(unittest.TestCase):
         kinds = [e.get('comparison') for e in map(json.loads, (self.run/'events.jsonl').read_text().splitlines()) if e['kind'] == 'match']
         self.assertEqual(kinds[-2:], ['sprt', 'panel'])
 
-    def test_pending_promotion_waits_for_the_panel_and_respects_its_veto(self):
+    def test_h1_promotes_before_any_panel_game(self):
+        evaluator = self.start(extra_opponents=1)
+        for step in (10, 20, 30):
+            self.export(step)
+            self.assertTrue(evaluator.step())
+        self.assertEqual(self.league()['champion'], 'main/000010')
+        test = evaluator.test
+        evaluator.test = lambda records: dict(test(records), decision='H1')
+        self.export(40)
+        self.assertTrue(evaluator.step())
+        league = self.league()
+        self.assertEqual(league['champion'], 'main/000040')
+        self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000040')
+        self.assertEqual(league['checkpoints'][-1]['panel'], dict(members=['main/000020'], incumbent='main/000010'))
+        self.assertFalse(dense_eval.report_path(self.run, 'main/000040', 'main/000020').exists())
+        self.assertEqual(evaluator.optional()[1:], ('main/000020', 'panel', 2))   # the champion's panel comes first
+
+    def test_panel_regression_demotes_the_champion(self):
         self.export(10, 20, 30, 40)
         evaluator = self.start(extra_opponents=1)
         cell = lambda a, b, w, l: dict(candidate=a, opponent=b, settings=asdict(evaluator.settings),
                                        summary=dict(wins=w, losses=l, capped=0, games=w+l), metrics={}, games=[])
-        for veto in (True, False):
-            evaluator.league = dict(champion='main/000010', checkpoints=[
+        for regressed in (True, False):
+            evaluator.league = dict(champion='main/000040', checkpoints=[
                 dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20, 30)])
             evaluator.league['checkpoints'].append(dict(id='main/000040', variant='main', step=40, elo=0., matches=[],
                                                         panel=dict(members=['main/000020'], incumbent='main/000010')))
-            with unittest.mock.patch.object(dense_eval, 'write_league'), unittest.mock.patch.object(dense_eval, 'write_json'):
-                evaluator.accept(evaluator.league['checkpoints'][-1])
-                self.assertTrue(evaluator.league['checkpoints'][-1]['pending'])
-                self.assertEqual(evaluator.optional()[1:], ('main/000020', 'panel', 2))
-                reports = [cell('main/000040', 'main/000020', 2 if not veto else 0, 0 if not veto else 20),
-                           cell('main/000010', 'main/000020', 15, 5)]
-                with unittest.mock.patch.object(dense_eval, 'load_reports', lambda *args: reports), \
-                        unittest.mock.patch.object(dense_eval, 'report_path', lambda run, a, b: self.run):
-                    evaluator.settle()
+            reports = [cell('main/000040', 'main/000020', 0 if regressed else 2, 20 if regressed else 0),
+                       cell('main/000010', 'main/000020', 15, 5)]
+            with unittest.mock.patch.object(dense_eval, 'write_league'), \
+                    unittest.mock.patch.object(dense_eval, 'load_reports', lambda *args: reports), \
+                    unittest.mock.patch.object(dense_eval, 'report_path', lambda run, a, b: self.run):
+                evaluator.settle()
             entry = evaluator.league['checkpoints'][-1]
-            self.assertNotIn('pending', entry)
-            self.assertEqual(entry['panel']['veto'], veto)
-            self.assertEqual(evaluator.league['champion'], 'main/000010' if veto else 'main/000040')
-
+            self.assertEqual((entry['panel']['veto'], entry.get('demoted', False)), (regressed, regressed))
+            self.assertEqual(evaluator.league['champion'], 'main/000010' if regressed else 'main/000040')
+        self.assertEqual(json.loads((self.run/'champion.json').read_text())['checkpoint'], 'main/000010')
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([(e['checkpoint'], e['restored']) for e in events if e['kind'] == 'regression'], [('main/000040', 'main/000010')])
 
 if __name__ == '__main__':
     unittest.main()
