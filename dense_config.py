@@ -84,6 +84,9 @@ class ActorSettings:
     yield_check_seconds: float = 30.
 
 
+VALUE_TARGETS = ('outcome', 'td', 'calibrated')
+
+
 @dataclass(frozen=True)
 class LearnerSettings:
     variant: str = 'main'
@@ -104,12 +107,22 @@ class LearnerSettings:
     bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only
     cheap_value_weight: float = .25    # value weight of cheap-search rows (KataGo: 0)
     td_lambda: float = .9
+    # Value target of finished games (dense_data.value_targets): 'outcome' = the hard outcome; 'td' = TD(outcome_lambda)
+    # from the outcome through the root values, KataGo-style; 'calibrated' = P(win | root value, plies remaining)
+    # refitted from the newest calibration_games finished games at every export (dense_learn.Learner.calibrate).
+    # 'td' and 'calibrated' honour bootstrap_full_only like the capped-game chain.
+    value_target: str = 'outcome'
+    outcome_lambda: float = .98
+    calibration_games: int = 4000
+    outcome_weight: float = 0.    # coefficient of an extra value-logit BCE against the hard outcome (finished games)
     short_value_horizon: int = 16
     value_weight: float = 1.5
     short_value_weight: float = .5
     opponent_policy_weight: float = .15
     future_weight: float = .5
     validation_fraction: float = .03
+    validation_rows: int = 8192   # rows per per-source validation subset (dense_data.ValidationSets limit)
+    validation_quota: int = 128   # rows each shard may contribute to a subset (ValidationSets quota)
     export_every: int = 500
     log_every: int = 20           # steps per metrics/learner-<variant>.jsonl line
     protect_steps: int = 3000     # no replacement for this many steps after start or copy
@@ -119,6 +132,10 @@ class LearnerSettings:
     # Cap in MB on the learner's CUDA caching allocator (dense_learn.Learner.cap_vram); 0 = unlimited. Reaching it
     # raises out-of-memory instead of spilling into shared system memory (the intended failure on Windows).
     vram_reserved_mb: int = 0
+
+    def __post_init__(self):
+        if self.value_target not in VALUE_TARGETS:
+            raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
 
 
 @dataclass(frozen=True)

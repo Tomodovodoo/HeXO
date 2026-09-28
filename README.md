@@ -781,6 +781,39 @@ It verifies and binds the old manifests in `history.json`, preserves model and
 optimizer files, and records the new source identity. Normal later resumes omit
 `--upgrade-run`. Never change the source checkout of an active trainer.
 
+## Dense learner value targets
+
+`dense_learn.py` derives the value target of every row from its episode
+(`dense_data.value_targets`). Capped games always use TD(`td_lambda`) over the
+searched root values. For finished games, `--value-target` chooses the target:
+
+- `outcome` (the default): the hard result, 1 for the side that won and 0 for
+  the side that lost.
+- `td`: TD(`outcome_lambda`, default 0.98). The recursion is the capped-game one,
+  started from the outcome at the last ply.
+- `calibrated`: P(side to move wins | v, h), where v is the searched root value
+  at the ply and h is the plies remaining. A null value carries the previous one
+  forward along the game. Before the first search value, the target is the base
+  rate.
+
+The `calibrated` map is a ridge-regularised logistic regression that is shrunk
+toward the base rate. Its inputs are the product of degree-1 B-splines in
+log2(h) (knots 1, 2, 4, ..., 256) with [1, logit((1+v)/2)]. The learner fits it
+from the newest `calibration_games` (4000) finished training games in the
+replay window, at startup and again at every export, in about 2 s of CPU. Each
+export trains the render workers on its new map until the next one. Where
+search values carry no information, the map returns the base rate. Near the
+end of a game it returns about the outcome. With fewer than 200 finished games,
+`calibrated` falls back to `outcome`. Each checkpoint records its map as
+`metrics.calibration`: the coefficients, plus a table over v in -1..1 in steps
+of 0.25 and h in 0..160 in steps of 8.
+
+With `--bootstrap-full-only`, all three chains (the capped TD chain, `td` and
+`calibrated`) use only full-search root values. `--outcome-weight w` adds a
+KataGo-style value-logit BCE against the hard outcome, with weight w. That head,
+`outcome_bce`, is always logged. The validation curves by plies remaining
+always score finished games against their hard outcome.
+
 ## Dense evaluator
 
 `dense_eval.py loop` rates each new dense checkpoint against the champion and keeps the league in
