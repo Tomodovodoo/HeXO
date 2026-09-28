@@ -1457,5 +1457,18 @@ class EvaluatorLoopTests(unittest.TestCase):
             dense_eval.write_league(self.run, league, dense_config.load(self.run))
         self.assertEqual([(d['a'], d['b']) for d in league['differences']], [('main/000010', 'side/000010')])
 
+    def test_panel_of_the_head_below_a_demoted_checkpoint_is_scheduled(self):
+        evaluator = self.start(extra_opponents=1)
+        evaluator.league = dict(champion='main/000010', checkpoints=[
+            dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
+            dict(id='main/000020', variant='main', step=20, elo=0., matches=[]),
+            dict(id='main/000030', variant='main', step=30, elo=0., matches=[],
+                 panel=dict(members=['main/000020'], incumbent='main/000010')),
+            dict(id='main/000040', variant='main', step=40, elo=0., matches=[], demoted=True,
+                 panel=dict(members=['main/000020'], incumbent='main/000030', veto=True))])
+        self.assertEqual([c['id'] for c in evaluator.heads()], ['main/000030'])
+        entry, opponent, kind, games = evaluator.optional()
+        self.assertEqual((entry['id'], opponent, kind, games), ('main/000030', 'main/000020', 'panel', 2))
+
 if __name__ == '__main__':
     unittest.main()

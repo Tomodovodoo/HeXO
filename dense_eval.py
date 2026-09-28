@@ -402,6 +402,16 @@ def rematch_pair(run, a, b, settings):
     return None
 
 
+def variant_heads(entries, rated=lambda c: True):
+    """{variant: entry}: each variant's newest (highest step) entry that is `rated`, not skipped and not demoted;
+    the heads of league differences, panels and rematches."""
+    heads = {}
+    for c in entries:
+        if rated(c) and not c.get('skipped') and not c.get('demoted') and c['step'] >= heads.get(c['variant'], c)['step']:
+            heads[c['variant']] = c
+    return heads
+
+
 def write_league(run, league, config):
     """Recompute ratings and the payoff matrix from every report among rated (not skipped) ids and Seal, then
     publish league.json; skipped entries keep elo and elo_interval null."""
@@ -413,12 +423,8 @@ def write_league(run, league, config):
     point, intervals, draws = rate(names, ids[0], reports, seed=config.seed) if ids else ({}, {}, {})
     for c in league['checkpoints']:
         c['elo'], c['elo_interval'] = point.get(c['id']), intervals.get(c['id'])
-    # Latest rated, not demoted checkpoint of each variant; a-b intervals come from the same joint draws.
-    latest = {}
-    for c in league['checkpoints']:
-        if point.get(c['id']) is not None and not c.get('demoted') and c['step'] >= latest.get(c['variant'], c)['step']:
-            latest[c['variant']] = c
-    heads = [c['id'] for _, c in sorted(latest.items())]
+    # a-b intervals of the variant heads come from the same joint draws.
+    heads = [c['id'] for _, c in sorted(variant_heads(league['checkpoints'], lambda c: point.get(c['id']) is not None).items())]
     league['differences'] = [
         dict(a=a, b=b, elo_delta=point[a]-point[b],
              interval=np.quantile(np.subtract(draws[a], draws[b]), [.025, .975]).tolist() if draws[a] else [0., 0.])
@@ -747,12 +753,9 @@ class Evaluator:
         return []
 
     def heads(self):
-        """The newest rated entry of each variant, newest first."""
-        heads = {}
-        for c in self.league['checkpoints']:
-            if not c.get('skipped') and c['step'] >= heads.get(c['variant'], c)['step']:
-                heads[c['variant']] = c
-        return sorted(heads.values(), key=lambda c: -self.league['checkpoints'].index(c))
+        """`variant_heads` of the league, newest first."""
+        heads = variant_heads(self.league['checkpoints']).values()
+        return sorted(heads, key=lambda c: -self.league['checkpoints'].index(c))
 
     def test(self, records):
         s = self.settings
