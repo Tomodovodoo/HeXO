@@ -3,11 +3,11 @@
 Run layout: dense_config. Subcommands
   loop       rate the newest unrated checkpoint of a variant (dense_selfplay.checkpoints order) against the
              champion; that variant's older unrated checkpoints enter league.json with skipped true and elo null
-             and are never played (KataGo's gatekeeper: only the newest candidate meets the champion). Only when
-             no checkpoint waits does it play the optional comparisons (`Evaluator.optional`), one round of `games`
-             at a time: panels and idle rematches, then, newest rated checkpoint first, `previous_games` vs the
-             previous rated checkpoint of the variant and, for every `anchor_every`-th rated checkpoint,
-             `anchor_games` vs Seal. A champion SPRT that sees a newer
+             and are never played (KataGo's gatekeeper: only the newest candidate meets the champion). When
+             no checkpoint waits it first plays the current champion's scheduled Seal anchor (`Evaluator.anchor`),
+             then the optional comparisons (`Evaluator.optional`), one round of `games` at a time: panels and idle
+             rematches, then, newest rated checkpoint first, `previous_games` vs the previous rated checkpoint of
+             the variant. A champion SPRT that sees a newer
              checkpoint of its variant after an undecided round stops there (decision 'superseded', entry
              superseded true, no promotion); a bound crossed in that round still decides. All play is paced by `eval_share` (Pacer); --processes splits each round
              over worker subprocesses (each about 0.7 GB of VRAM: on an 8 GB card two workers leave room for
@@ -33,8 +33,12 @@ candidate_score, incumbent_score, z and veto in the entry and a 'panel' event. A
 `demoted` ('regression' event) and never promoted or restored again; a vetoed champion is replaced by its most
 recent non-demoted, non-skipped predecessor along panel incumbents (`Evaluator.settle`).
 
-league.json: {champion, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
-superseded?, panel?, demoted?}], differences, anchors, matrix, rating_note, updated_at}. `matrix` (`payoff`) holds
+league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
+superseded?, panel?, demoted?}], differences, anchors, matrix, rating_note, updated_at}. anchors.seal is {elo,
+elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
+latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, latest_delta the newest one's. reign_from
+is the number of checkpoint entries and reign_games the champion's Seal games when it was promoted or restored
+(absent: its own position + 1 and 0). `matrix` (`payoff`) holds
 only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
 written before `matrix` and `panel` existed lack those keys; the Evaluator adds `matrix` on start.
 """
@@ -429,7 +433,11 @@ def write_league(run, league, config):
         dict(a=a, b=b, elo_delta=point[a]-point[b],
              interval=np.quantile(np.subtract(draws[a], draws[b]), [.025, .975]).tolist() if draws[a] else [0., 0.])
         for i, a in enumerate(heads) for b in heads[i+1:]]
-    league['anchors'] = {SEAL: dict(elo=point.get(SEAL), elo_interval=intervals.get(SEAL), games=seal_games)}
+    anchored = sorted((r for r in reports if r['opponent'] == SEAL), key=lambda r: ids.index(r['candidate']))
+    matches = [dict(checkpoint=r['candidate'], **{k: r['summary'][k] for k in ('wins', 'losses', 'capped', 'games', 'elo_delta')})
+               for r in anchored]
+    league['anchors'] = {SEAL: dict(elo=point.get(SEAL), elo_interval=intervals.get(SEAL), games=seal_games, matches=matches,
+                                    latest_delta=matches[-1]['elo_delta'] if matches else None)}
     league['matrix'] = payoff(reports, point)
     league['rating_note'] = RATING_NOTE
     league['updated_at'] = time.time()
@@ -677,7 +685,7 @@ class Evaluator:
         write_league(self.run, self.league, self.config)
 
     def promote(self, cid, previous, panel=None):
-        self.league['champion'] = cid
+        self.crown(cid)
         write_json(self.run/'champion.json', dict(checkpoint=cid, ema_sha256=digest(self.run/'checkpoints'/cid/'ema.pt'),
                                                   updated_at=time.time()))
         log_event(self.run, 'evaluator', 'promotion', f'{cid} promoted to champion' + (f' over {previous}' if previous else ''),
@@ -720,7 +728,7 @@ class Evaluator:
                     restored = entries[restored].get('panel', {}).get('incumbent')
                 restored = restored if restored in entries and restored not in seen else None
                 if self.league['champion'] == entry['id'] and restored:
-                    self.league['champion'] = restored
+                    self.crown(restored)
                     write_json(self.run/'champion.json', dict(checkpoint=restored, updated_at=time.time(),
                                                               ema_sha256=digest(self.run/'checkpoints'/restored/'ema.pt')))
                 champion = self.league['champion'] == restored
@@ -799,11 +807,39 @@ class Evaluator:
         print(f'{cid}: ' + ', '.join(f'vs {o} +{r["summary"]["wins"]} -{r["summary"]["losses"]} ={r["summary"]["capped"]}'
                                       for o, r in reports.items()) + (' -> champion' if promoted else f' ({decision})' if decision else ''), flush=True)
 
+    def sealed(self, cid):
+        """The champion-vs-Seal report of cid, or None."""
+        path = report_path(self.run, cid, SEAL)
+        return json.loads(path.read_text()) if path.is_file() else None
+
+    def crown(self, cid):
+        """Make cid champion and start its reign: reign_from and reign_games (league contract)."""
+        report = self.sealed(cid)
+        self.league.update(champion=cid, reign_from=len(self.league['checkpoints']), reign_games=len(report['games']) if report else 0)
+
+    def anchor(self):
+        """(champion entry, SEAL, 'anchor', games left) while the current champion owes Seal games, else None. In
+        its current reign it owes anchor_games once (anchor_on_promotion) and anchor_games more per `anchor_every`
+        checkpoints rated during the reign (entries from `reign_from` on), counted against the games its
+        champion-vs-Seal report gained since reign_games; a report under another protocol is left alone. A newer
+        champion supersedes the old one's unfinished anchor."""
+        s, champion = self.settings, self.entry(self.league['champion'])
+        if not s.anchor_games or champion is None:
+            return None
+        entries = self.league['checkpoints']
+        later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])
+        report = self.sealed(champion['id'])
+        if report and not same_protocol(report, s):
+            return None
+        played = len(report['games'])-self.league.get('reign_games', 0) if report else 0
+        left = s.anchor_games*(s.anchor_on_promotion+later//s.anchor_every)-played
+        return (champion, SEAL, 'anchor', left) if left > 0 else None
+
     def optional(self):
         """(league entry of the candidate side, opponent, kind, games) of the first optional comparison, else None:
         the current champion's panel ('panel', 'incumbent'), idle rematches (`rematches`, with idle_rematch),
         the panels of the variant heads, newest first, then the newest rated checkpoint missing its
-        previous-checkpoint comparison (when previous_games > 0) or its due Seal anchor (when anchor_games > 0)."""
+        previous-checkpoint comparison (when previous_games > 0)."""
         s = self.settings
         champion = [c for c in self.league['checkpoints'] if c['id'] == self.league['champion']]
         for a, b, kind, games in [n for c in champion for n in self.needs(c)] + (self.rematches() if s.idle_rematch else []) \
@@ -813,19 +849,16 @@ class Evaluator:
         for index in reversed(range(len(rated))):
             c = rated[index]
             earlier = [p for p in rated[:index] if p['variant'] == c['variant'] and p['step'] < c['step']]
-            wanted = [(max(earlier, key=lambda p: p['step'])['id'], 'previous', s.previous_games)] if earlier and s.previous_games else []
-            wanted += [(SEAL, 'anchor', s.anchor_games)] if s.anchor_games and index % s.anchor_every == 0 else []
-            played = {m['opponent'] for m in c['matches']}
-            for opponent, kind, games in wanted:
-                if opponent not in played:
-                    return c, opponent, kind, games
+            if earlier and s.previous_games and (previous := max(earlier, key=lambda p: p['step'])['id'])                     not in {m['opponent'] for m in c['matches']}:
+                return c, previous, 'previous', s.previous_games
         return None
 
     def step(self):
         """One unit of work; False when there is none. First judges every panel already complete on disk
         (`settle`, e.g. after a restart), so no candidate meets a regressed champion; then rates the newest
         unrated checkpoint of the variant whose newest unrated checkpoint is oldest, skipping that variant's older
-        unrated checkpoints, or else plays one round of an optional comparison."""
+        unrated checkpoints, or else plays one round of the champion's Seal anchor (`anchor`) or else of an
+        optional comparison."""
         self.settle()
         known = {c['id'] for c in self.league['checkpoints']}
         unrated = [e for e in checkpoints(self.run) if e[0] not in known]
@@ -843,11 +876,11 @@ class Evaluator:
                           checkpoints=skipped, candidate=head[0])
             self.rate(head)
             return True
-        task = self.optional()
+        task = self.anchor() or self.optional()
         if task is None:
             return False
         entry, opponent, kind, games = task
-        if kind in ('sprt', 'replacement', 'panel', 'incumbent'):
+        if kind in ('sprt', 'replacement', 'panel', 'incumbent', 'anchor'):
             report = self.extend(entry['id'], opponent, kind, games)
         else:
             report = self.report(entry['id'], opponent, kind, games, lambda records: len(records) >= games)

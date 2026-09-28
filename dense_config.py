@@ -116,8 +116,9 @@ class EvaluationSettings:
     root_samples: int = 16
     max_plies: int = 256
     tactics: bool = True
-    anchor_every: int = 5         # rate against external anchors every N checkpoints
-    anchor_games: int = 100       # vs Seal, only while idle; 0 = never
+    anchor_every: int = 5         # the champion owes anchor_games more vs Seal per N checkpoints rated during its reign
+    anchor_games: int = 100       # champion vs Seal, played before optional work; 0 = never
+    anchor_on_promotion: bool = True  # every new champion owes anchor_games vs Seal
     seal_ms: int = 100
     sprt_elo0: float = 0.         # promotion SPRT bounds on candidate minus champion
     sprt_elo1: float = 50.

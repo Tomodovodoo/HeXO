@@ -613,7 +613,8 @@ def actor_points(run):
 
 
 def series(run, config, variant, metric, x='step', max_points=1000):
-    """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval) sorted by x and
+    """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval; seal_delta: the direct-match
+    Elo minus Seal of each anchored checkpoint, league anchors.seal.matches) sorted by x and
     downsampled; x is the learner step or hours since the run's created_at. Actor and GPU metrics have hours
     only. Raises ValueError for an unknown metric or x."""
     created = config.get('created_at') or 0.
@@ -631,6 +632,13 @@ def series(run, config, variant, metric, x='step', max_points=1000):
         points = sorted((c['step'] if x == 'step' else hours(c['created_at']), c['elo'],
                          *(c['elo_interval'] if isinstance(c.get('elo_interval'), list) else (c['elo'], c['elo'])))
                         for c in rated(run) if c.get('variant') == variant and (x == 'step' or finite(c['created_at'])))
+    elif metric == 'seal_delta':
+        made = {c['id']: c['created_at'] for c in rated(run)}
+        league = read_json(run/'league.json', {})
+        matches = ((league.get('anchors') or {}).get('seal') or {}).get('matches') or [] if isinstance(league, dict) else []
+        points = sorted((int(m['checkpoint'].split('/')[1]) if x == 'step' else hours(made[m['checkpoint']]), m['elo_delta'])
+                        for m in matches if m['checkpoint'].split('/')[0] == variant and finite(m.get('elo_delta'))
+                        and (x == 'step' or finite(made.get(m['checkpoint']))))
     elif x != 'hours':
         raise ValueError(f'{metric} has hours only')
     elif metric in ACTOR_METRICS:

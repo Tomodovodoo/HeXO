@@ -1558,20 +1558,118 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(league['checkpoints'][-1]['matches'][-1]['games'], 4)
         self.assertIsNone(evaluator.optional())  # main/000030's previous is its champion comparison
 
-    def test_league_without_skipped_rates_and_anchors(self):
+    def test_league_without_skipped_rates_before_anchoring(self):
         self.export(10, 30)
         (self.run/'league.json').write_text(json.dumps(dict(champion='main/000010', checkpoints=[
             dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
             dict(id='main/000020', variant='main', step=20, skipped=True, elo=None, matches=[])])))
-        evaluator = self.start(anchor_every=1, anchor_games=2)
-        entry, opponent, kind, games = evaluator.optional()
-        self.assertEqual((entry['id'], opponent, kind, games), ('main/000010', 'seal', 'anchor', 2))
+        evaluator = self.start(anchor_every=1, anchor_games=2, seal_ms=5)
+        self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
         self.assertTrue(evaluator.step())
         league = self.league()
         self.assertEqual([(c['id'], c['elo'] is None) for c in league['checkpoints']],
                          [('main/000010', False), ('main/000020', True), ('main/000030', False)])
         self.assertEqual(league['checkpoints'][0]['elo'], 0.)
-        self.assertEqual(evaluator.optional()[0]['id'], 'main/000030')
+        self.assertEqual(league['anchors']['seal'], dict(elo=None, elo_interval=None, games=0, matches=[], latest_delta=None))
+        # main/000030 was not promoted: no anchor of its own; the champion owes 2 more per rated checkpoint.
+        entry, opponent, kind, games = evaluator.anchor()
+        self.assertEqual((entry['id'], opponent, kind, games), ('main/000010', 'seal', 'anchor', 4))
+        evaluator = self.start(anchor_every=1, anchor_games=2, anchor_on_promotion=False)
+        self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
+
+    def anchored(self):
+        """An evaluator (anchor_games 4, idle rematches) that rated main/000010 (champion) before main/000020 was
+        exported."""
+        evaluator = self.start(anchor_games=4, seal_ms=5, idle_rematch=True)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 4))
+        self.export(20)
+        return evaluator
+
+    def test_promotion_anchors_after_the_next_sprt_and_before_optional_work(self):
+        import dashboard
+        evaluator = self.anchored()
+        self.assertTrue(evaluator.step())                                   # the waiting candidate's SPRT first
+        self.assertEqual(self.league()['checkpoints'][-1]['matches'][0]['opponent'], 'main/000010')
+        path = dense_eval.report_path(self.run, 'main/000010', 'seal')
+        self.assertFalse(path.exists())
+        self.assertEqual(evaluator.optional()[1:], ('main/000010', 'sprt', 2))
+        for played in (2, 4):
+            self.assertTrue(evaluator.step())
+            self.assertEqual(len(json.loads(path.read_text())['games']), played)
+            status = json.loads((self.run/'evaluator-status.json').read_text())
+            self.assertEqual(status['comparison'], dict(candidate='main/000010', opponent='seal', kind='anchor'))
+        self.assertIsNone(evaluator.anchor())
+        league = self.league()
+        seal, report = league['anchors']['seal'], json.loads(path.read_text())['summary']
+        self.assertEqual(seal['matches'], [dict(checkpoint='main/000010', **{k: report[k] for k in
+                                                ('wins', 'losses', 'capped', 'games', 'elo_delta')})])
+        self.assertEqual((seal['games'], seal['latest_delta']), (4, report['elo_delta']))
+        self.assertIsNotNone(seal['elo'])
+        self.assertEqual(league['checkpoints'][0]['matches'][-1]['opponent'], 'seal')
+        self.assertTrue(evaluator.step())                                   # then the optional rematch
+        self.assertEqual(len(json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())['games']), 4)
+        for x, at in (('step', 10), ('hours', 10/3600)):
+            self.assertEqual(dashboard.series(self.run, dict(created_at=0.), 'main', 'seal_delta', x)['points'],
+                             [[at, report['elo_delta']]])
+        self.assertEqual(dashboard.series(self.run, dict(created_at=0.), 'side', 'seal_delta')['points'], [])
+
+    def test_late_promotion_and_restoration_owe_anchors_from_their_reign(self):
+        self.vetoed_on_disk()
+        with unittest.mock.patch.object(dense_eval, 'write_league'):
+            evaluator = self.start(anchor_every=1, anchor_games=2)
+            evaluator.settle()
+        self.assertEqual((evaluator.league['champion'], evaluator.league['reign_from']), ('main/000010', 3))
+        self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
+        # Restored with 200 Seal games from an earlier reign: a fresh anchor per anchor_every rated checkpoints.
+        report = dense_eval.report_path(self.run, 'main/000010', 'seal')
+        report.parent.mkdir(parents=True)
+        report.write_text(json.dumps(dict(candidate='main/000010', opponent='seal', settings=asdict(evaluator.settings),
+                                          games=[{}]*200)))
+        evaluator.crown('main/000010')
+        self.assertEqual((evaluator.league['reign_games'], evaluator.anchor()[3]), (200, 2))
+        evaluator.league['checkpoints'].append(dict(id='main/000050', variant='main', step=50, elo=0., matches=[]))
+        self.assertEqual(evaluator.anchor()[3], 4)
+        report.write_text(json.dumps(dict(json.loads(report.read_text()), games=[{}]*204)))
+        self.assertIsNone(evaluator.anchor())
+        report.unlink()
+        self.export(30)
+        evaluator.league = dict(champion='main/000010', checkpoints=[
+            dict(id=f'main/{k:06d}', variant='main', step=k, elo=0., matches=[]) for k in (10, 20, 30, 40)])
+        self.assertEqual(evaluator.anchor()[3], 8)                  # legacy league: from the champion's entry on
+        evaluator.promote('main/000020', 'main/000010')             # e.g. an idle SPRT rematch reaching H1
+        self.assertEqual((evaluator.league['reign_from'], evaluator.anchor()[3]), (4, 2))
+        evaluator.league['checkpoints'].append(dict(id='main/000050', variant='main', step=50, elo=0., matches=[]))
+        self.assertEqual(evaluator.anchor()[3], 4)
+
+    def test_anchor_rounds_resume_across_restarts(self):
+        evaluator = self.anchored()
+        evaluator.step()
+        evaluator.step()
+        evaluator = self.start(anchor_games=4, seal_ms=5, idle_rematch=True)
+        self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
+        self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())
+        self.assertEqual([g['pair'] for g in report['games']], [0, 0, 1, 1])
+        self.assertIsNone(evaluator.anchor())
+
+    def test_newer_champion_supersedes_an_unfinished_anchor(self):
+        evaluator = self.anchored()
+        evaluator.step()
+        evaluator.step()                                                    # 2 of main/000010's 4 anchor games
+        test = evaluator.test
+        evaluator.test = lambda records: dict(test(records), decision='H1')
+        self.export(30)
+        self.assertTrue(evaluator.step())
+        self.assertEqual(self.league()['champion'], 'main/000030')
+        entry, opponent, kind, games = evaluator.anchor()
+        self.assertEqual((entry['id'], opponent, kind, games), ('main/000030', 'seal', 'anchor', 4))
+        self.assertTrue(evaluator.step())
+        seal = self.league()['anchors']['seal']
+        self.assertEqual([(m['checkpoint'], m['games']) for m in seal['matches']], [('main/000010', 2), ('main/000030', 2)])
+        self.assertEqual(seal['latest_delta'], seal['matches'][-1]['elo_delta'])
+        self.assertEqual(len(json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())['games']), 2)
 
     def test_newer_checkpoint_before_the_first_round_skips_the_candidate(self):
         evaluator = self.start(sprt_max_games=8)
