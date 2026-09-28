@@ -140,6 +140,7 @@ class EvaluationSettings:
     idle_fill: bool = True        # after all other work, play fill rounds until a checkpoint awaits rating
     anchor_target_halfwidth: float = 25.  # fill Seal games until the champion-Seal Elo interval is this narrow; 0 = never
     fill_top: int = 3             # then fill the widest Elo-difference interval among this many top-rated checkpoints
+    max_expected_score: float = .85  # panel, optional and fill pairings only while either side's expected score is at most this
 
 
 @dataclass(frozen=True)

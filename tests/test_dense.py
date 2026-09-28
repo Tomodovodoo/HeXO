@@ -1800,6 +1800,15 @@ class OpponentSchedulerTests(unittest.TestCase):
         _, drawn = dense_eval.panel_members(league, 'main/000006', set(), 10, rng)
         self.assertEqual(sorted(drawn), sorted(elos))
 
+    def test_panel_skips_uninformative_members(self):
+        """The champion (Elo 0) is the reference: expected .95 against main/000002 is skipped, .7 against
+        main/000003 is played."""
+        elos = {'main/000001': 0., 'main/000002': -400*math.log10(19), 'main/000003': -400*math.log10(7/3)}
+        league = league_of(elos, 'main/000001')
+        weak, drawn = dense_eval.panel_members(league, 'side/000001', {'main/000001'}, 5, np.random.default_rng(0), .85)
+        self.assertEqual((weak, drawn), ([], ['main/000003']))
+        self.assertEqual(len(dense_eval.panel_members(league, 'side/000001', {'main/000001'}, 5, np.random.default_rng(0))[1]), 2)
+
     def test_weakness_retention(self):
         elos = {f'main/{k:06d}': float(10*k) for k in range(1, 9)} | {'side/000001': 0., 'side/000002': 5.}
         matrix = {}
@@ -2297,6 +2306,18 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['target'] for e in events if e['kind'] == 'fill'],
                          ['seal', f'{entry["id"]} vs {opponent}', None])
+
+    def test_existing_panels_skip_uninformative_members(self):
+        """A panel chosen earlier plays only the members within max_expected_score of each side."""
+        entry = lambda step, elo, **extra: dict(id=f'main/{step:06d}', variant='main', step=step, elo=elo, matches=[], **extra)
+        (self.run/'league.json').write_text(json.dumps(dict(champion='main/000001', matrix={}, ladder=[], checkpoints=[
+            entry(1, 0.), entry(2, -400*math.log10(19)), entry(3, -400*math.log10(7/3)),
+            entry(4, 0., panel=dict(members=['main/000002', 'main/000003'], incumbent='main/000001'))])))
+        evaluator = self.start()
+        self.assertEqual(evaluator.needs(evaluator.entry('main/000004')),
+                         [('main/000004', 'main/000003', 'panel', 2), ('main/000001', 'main/000003', 'incumbent', 2)])
+        evaluator.settings = replace(evaluator.settings, max_expected_score=1.)
+        self.assertEqual(len(evaluator.needs(evaluator.entry('main/000004'))), 4)
 
     def test_fill_is_off_without_idle_fill(self):
         evaluator = self.start(anchor_target_halfwidth=25.)
