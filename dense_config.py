@@ -22,9 +22,9 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
                                        future_bce, samples_per_second, window_rows} every log_every steps, plus
                                        {time, step, samples_seen, <the five losses>, validation: true} per export
   metrics/actor-<k>.jsonl              {time, positions, games_completed, placements_per_second, evals_per_second,
-                                       mean_batch, terminal_fraction, mean_plies, checkpoint, paused_seconds} about
-                                       every 30 s and at every pause or resume; counters restart with the worker
-                                       process (dense_selfplay)
+                                       mean_batch, terminal_fraction, adjudicated_fraction, mean_plies, checkpoint,
+                                       paused_seconds} about every 30 s and at every pause or resume; counters
+                                       restart with the worker process (dense_selfplay)
   metrics/gpu.jsonl                    {time, utilization, used_mib, watts, temperature} about every 10 s while a
                                        dashboard watches the run (dashboard.py)
 Metrics logs are append-only, one JSON line per write (append_metrics); readers skip a partial last line.
@@ -62,6 +62,12 @@ class ActorSettings:
     full_fraction: float = .25   # KataGo playout-cap randomization share
     root_samples: int = 16       # Gumbel m
     max_plies: int = 256
+    # Adjudication (dense_selfplay.SelfPlayGame): once at least adjudicate_after plies are played, a game whose last
+    # adjudicate_window root values all satisfy |v| <= adjudicate_margin ends like a capped game (reason
+    # 'adjudicated'); 0 disables.
+    adjudicate_after: int = 160
+    adjudicate_window: int = 40
+    adjudicate_margin: float = .12
     tactics: bool = True         # exact win/must-block classification inside the tree
     cache_positions: int = 4096
     shard_games: int = 32

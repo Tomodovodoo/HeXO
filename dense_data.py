@@ -7,10 +7,12 @@ millisecond time plus pid) holding
   rows.json      [{game, ply, player, remaining, target, weight, legal_sha256}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
-  manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows may be absent: 0)
+  manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows and
+                 adjudicated_games may be absent: 0)
 `origin` is 'converted' (dense_bootstrap) or 'actor' (dense_selfplay); `origin()` infers it for older manifests.
 `row.game` indexes the shard's episode list. `episode.winner` is 0/1 for finished games ('six-in-a-row') and -1
-for capped games ('cap' at the ply limit, 'span' when a searched position does not fit the largest crop);
+for capped games ('cap' at the ply limit, 'span' when a searched position does not fit the largest crop,
+'adjudicated' when the actor ended a balanced game early; all three get the same TD(lambda) value targets);
 `episode.root_values` is null or one entry per ply (searched root value in [-1, 1] for the side to
 move at that ply, or null). The learner derives every target from the episode (`examples`); the stored
 `row.target`/`row.weight` (p(win) or null, weight) are informational and optional.
@@ -124,7 +126,8 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
     keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256')
     counts = dict(games=len(episodes), rows=len(rows), policy_rows=sum(len(p) > 0 for p in policies),
                   opponent_rows=sum(not trained(episodes[r['game']], r['ply']) for r in rows),
-                  terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes))
+                  terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes),
+                  adjudicated_games=sum(e.get('reason') == 'adjudicated' for e in episodes))
     with tempfile.TemporaryDirectory(dir=path.parent, prefix='pending-') as temporary:
         stage = Path(temporary)/'shard'
         stage.mkdir()

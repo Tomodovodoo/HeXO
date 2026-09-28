@@ -4,7 +4,8 @@ Run layout: dense_config. The actor plays the ema.pt of champion.json's checkpoi
 checkpoint, else --initial-model, else a fresh HexNet(config.model) seeded with config.seed. Shards are named
 <ms:013d><pid%1000:03d>; their rows carry no value targets (target null, weight 0): the learner derives them
 from episode root_values and winner. A game with a searched position wider than the largest crop ends capped with
-reason 'span' and an error event.
+reason 'span' and an error event. A game adjudicated as drawn (SelfPlayGame) ends like a capped game with reason
+'adjudicated', so the learner bootstraps its value targets from the root values exactly as for 'cap'.
 
 Scheduling: every game owns one persistent NeuralSearch tree. Engine keeps all trees searching at once and
 starts a tree's next search as soon as its previous one finishes, so full (`full_sims`) and cheap
@@ -60,7 +61,7 @@ METRICS_SECONDS = 30.
 PRIOR_GAMES = 16.  # weight, in games, of the Elo prediction when PFSP blends in a recorded score
 BLOCKS = 2          # historical opponents in flight at once, about: blocks of target/BLOCKS games per opponent
 METRICS = ('positions', 'games_completed', 'placements_per_second', 'evals_per_second', 'mean_batch',
-           'terminal_fraction', 'mean_plies', 'checkpoint', 'paused_seconds')
+           'terminal_fraction', 'adjudicated_fraction', 'mean_plies', 'checkpoint', 'paused_seconds')
 STALE_SECONDS = 120.  # learner heartbeats older than this are ignored by Yield
 
 
@@ -259,6 +260,12 @@ def position_key(history):
     return n, history[order].tobytes(), turn.tobytes(), previous.tobytes()
 
 
+def tactical(result):
+    """Whether a finished search saw an exact outcome at its root: a proven root, or a root move the tactics
+    classifier marked as winning or as losing to an unblocked threat (hxg_stats reports such moves at exactly +-1)."""
+    return result['exact_winner'] >= 0 or bool(np.any(np.abs(result['values']) >= 1))
+
+
 def root_value(result, player):
     """Side-to-move value of a finished search: exact +-1, else the visit-weighted mean child value."""
     if result['exact_winner'] >= 0:
@@ -366,7 +373,11 @@ class SelfPlayGame:
     playing that colour: the trained model twice for self-play, else the trained model as sides[learner] and a
     frozen checkpoint `opponent` (its id) as the other, whose plies keep rows without a policy, with a null root
     value and full_search False (dense_data.trained). Each distinct model owns one tree, advanced on every
-    placement; both sides use the same playout-cap randomization and opening sampling."""
+    placement; both sides use the same playout-cap randomization and opening sampling.
+    Adjudication: after a placement that leaves the game undecided below max_plies, the game ends with winner -1
+    and reason 'adjudicated' when adjudicate_after > 0, at least adjudicate_after plies were played and each of
+    the last adjudicate_window searches (either side, opponent plies included) had a side-to-move root value
+    within adjudicate_margin and no tactical() root."""
 
     def __init__(self, sides, settings, seed, learner=0, opponent=None):
         self.sides, self.settings, self.seed, self.reason = sides, settings, seed, None
@@ -374,7 +385,7 @@ class SelfPlayGame:
         self.rng = np.random.default_rng(seed)
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) if settings.opening_random_plies > 0 else 0
         self.trees = {model: model.tree((), seed+k, settings.tactics) for k, model in enumerate(dict.fromkeys(sides))}
-        self.game, self.moves, self.rows, self.values, self.full = Game(), [], [], [], []
+        self.game, self.moves, self.rows, self.values, self.full, self.calm = Game(), [], [], [], [], 0
         self.plan()
 
     @property
@@ -403,7 +414,9 @@ class SelfPlayGame:
                 raise ValueError('Search policy is not a distribution')
             row['policy'] = policy.astype(np.float32)
         self.rows.append(row)
-        self.values.append(root_value(result, player) if trained else None)
+        value = root_value(result, player)
+        self.values.append(value if trained else None)
+        self.calm = self.calm+1 if abs(value) <= self.settings.adjudicate_margin and not tactical(result) else 0
         self.full.append(self.is_full and trained)
         if ply < self.random_plies:
             action = actions[self.rng.choice(len(policy), p=policy/policy.sum())].tolist()
@@ -415,6 +428,10 @@ class SelfPlayGame:
             tree.advance((q, r))
         self.moves.append([q, r])
         if game.winner >= 0 or len(self.moves) >= self.settings.max_plies:
+            return False
+        s = self.settings
+        if 0 < s.adjudicate_after <= len(self.moves) and self.calm >= s.adjudicate_window:
+            self.reason = 'adjudicated'
             return False
         self.plan()
         return True
@@ -565,6 +582,7 @@ def worker(args):
             games_completed=g, games_total=target, positions=state['positions'], active_games=len(engine.slots),
             placements_per_second=(state['positions']-p)/max(1e-9, now-t), evals_per_second=(engine.evals-e)/max(1e-9, now-t),
             mean_batch=engine.evals/max(1, engine.calls), terminal_fraction=state['terminal']/g if g else None,
+            adjudicated_fraction=state['adjudicated']/g if g else None,
             mean_plies=state['plies']/g if g else None, shards_written=state['shards_written'],
             paused_seconds=paused_total+(time.perf_counter()-paused_since if paused_since is not None else 0.),
             vram=hexnet.vram(), error=state['error'])
@@ -589,8 +607,10 @@ def worker(args):
         dense_data.write_shard(run/'shards'/name, identity, episodes, rows, 'actor')
         state['shards_written'] += 1
         games = len(episodes); terminal = sum(e['winner'] >= 0 for e in episodes)
+        adjudicated = sum(e['reason'] == 'adjudicated' for e in episodes)
         elapsed = now-since['time']
         fields = dict(shard=name, games=games, rows=len(rows), terminal_fraction=terminal/games,
+                      adjudicated_fraction=adjudicated/games,
                       mean_plies=sum(len(e['moves']) for e in episodes)/games,
                       placements_per_second=(state['positions']-since['positions'])/elapsed,
                       evals_per_second=(engine.evals-since['evals'])/elapsed, process=args.worker, opponents=opponents)
@@ -640,7 +660,8 @@ def worker(args):
                               f'a searched position spans more than the largest crop', process=args.worker)
                 episodes.append(episode)
                 rows.extend(dict(r, game=len(episodes)-1) for r in items)
-                state['games_completed'] += 1; state['terminal'] += episode['winner'] >= 0; state['plies'] += len(episode['moves'])
+                state['games_completed'] += 1; state['terminal'] += episode['winner'] >= 0
+                state['adjudicated'] += episode['reason'] == 'adjudicated'; state['plies'] += len(episode['moves'])
                 if len(episodes) >= settings.shard_games:
                     publish()
             state['positions'] += engine.searches-before
@@ -659,12 +680,13 @@ def worker(args):
 def published(run, worker, since=0.):
     """Cumulative counts from shards written by actor worker `worker` at or after `since`; every ply has a row,
     so rows count both positions and plies."""
-    totals = dict(games_completed=0, positions=0, shards_written=0, terminal=0, plies=0)
+    totals = dict(games_completed=0, positions=0, shards_written=0, terminal=0, adjudicated=0, plies=0)
     for m in (dense_data.manifest(path) for path in dense_data.shard_dirs(run)):
         if m['identity'].get('process') == worker and m['created_at'] >= since:
             c = m['counts']
             totals['games_completed'] += c['games']; totals['positions'] += c['rows']; totals['plies'] += c['rows']
-            totals['terminal'] += c['terminal_games']; totals['shards_written'] += 1
+            totals['terminal'] += c['terminal_games']; totals['adjudicated'] += c.get('adjudicated_games', 0)
+            totals['shards_written'] += 1
     return totals
 
 

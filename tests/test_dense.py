@@ -1003,7 +1003,8 @@ class DenseBootstrapTests(unittest.TestCase):
             written = dense_data.write_shard(target, identity, new_episodes, new_rows, 'converted')
             self.assertEqual((written['actor'], written['origin']), ('b'*64, 'converted'))
             self.assertEqual(dense_data.origin(dict(written, origin=None)), 'converted')    # inferred from the identity
-            self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, opponent_rows=0, terminal_games=1, capped_games=1))
+            self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, opponent_rows=0, terminal_games=1, capped_games=1,
+                                                    adjudicated_games=0))
             self.assertEqual(dense_bootstrap.check(target), 21)
             _, stored = dense_data.read_shard(target)
             self.assertEqual({r['game'] for r in stored}, {0, 1})
@@ -1362,6 +1363,65 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(dense_selfplay.published(tmp, 1, since)['games_completed'], 1)
             self.assertEqual(dense_selfplay.published(tmp, 0, since)['games_completed'], 2)
             self.assertEqual(dense_selfplay.published(tmp, 1, time.time()+1)['games_completed'], 0)
+
+
+class AdjudicationTests(unittest.TestCase):
+    """SelfPlayGame fed synthetic search results: stones 8 apart on a line never win, so only the cap or
+    adjudication ends the game."""
+
+    def setUp(self):
+        self.model = dense_selfplay.Model(hexnet.HexNet(TINY), 't'*64, 'test', 'cpu', 64, 256)
+
+    def play(self, values, exact=(), **settings):
+        """Episode after feeding one root value per ply (plies in `exact` report a proven losing root move)."""
+        settings = dense_config.ActorSettings(opening_random_plies=0., max_plies=len(values), **settings)
+        game = dense_selfplay.SelfPlayGame([self.model, self.model], settings, 1)
+        for ply, v in enumerate(values):
+            action = np.array([[8*ply, 0]], np.int64)
+            result = dict(actions=action, visits=np.array([1]), policy=np.array([1.]), exact_winner=-1, action=[8*ply, 0],
+                          values=np.array([v, -1.]) if ply in exact else np.array([v]))
+            if ply in exact:
+                result.update(actions=np.array([[8*ply, 0], [8*ply, 1]]), visits=np.array([1, 0]), policy=np.array([1., 0.]))
+            if not game.searched(result):
+                break
+        episode, rows = game.episode()
+        return episode, rows
+
+    def test_balanced_game_is_adjudicated_after_the_window(self):
+        episode, rows = self.play([.3]*10+[(-.1) ** k for k in range(1, 91)], adjudicate_after=20, adjudicate_window=30,
+                                  adjudicate_margin=.12)
+        self.assertEqual((episode['winner'], episode['reason'], len(episode['moves'])), (-1, 'adjudicated', 40))
+        self.assertEqual((len(episode['root_values']), len(episode['full_search']), len(rows)), (40, 40, 40))
+        targets, weights = dense_data.value_targets([dense_data.player_at(t) for t in range(40)], episode['root_values'], -1)
+        self.assertTrue(all(w == 1 and t is not None for t, w in zip(targets, weights)))
+        self.assertEqual(len(self.play([0.]*100, adjudicate_after=60, adjudicate_window=30)[0]['moves']), 60)
+
+    def test_out_of_margin_value_or_tactic_resets_the_window(self):
+        values = [0.]*25+[.2]+[0.]*74
+        episode, _ = self.play(values, adjudicate_after=20, adjudicate_window=30)
+        self.assertEqual((episode['reason'], len(episode['moves'])), ('adjudicated', 56))
+        episode, _ = self.play([0.]*100, exact={25}, adjudicate_after=20, adjudicate_window=30)
+        self.assertEqual((episode['reason'], len(episode['moves'])), ('adjudicated', 56))
+
+    def test_disabled_plays_to_the_cap(self):
+        episode, _ = self.play([0.]*70, adjudicate_after=0, adjudicate_window=10)
+        self.assertEqual((episode['winner'], episode['reason'], len(episode['moves'])), (-1, 'cap', 70))
+
+    def test_manifest_and_published_counts(self):
+        adjudicated, _ = self.play([0.]*30, adjudicate_after=10, adjudicate_window=10)
+        capped, _ = self.play([.5]*30, adjudicate_after=10, adjudicate_window=10)
+        with tempfile.TemporaryDirectory() as tmp:
+            episodes, rows = [], []
+            for moves, winner, reason, values in ((adjudicated['moves'], -1, 'adjudicated', adjudicated['root_values']),
+                                                  (capped['moves'], -1, 'cap', capped['root_values']),
+                                                  (winning_game(), 0, None, None)):
+                e, r = episode_rows(moves, winner, values, np.random.default_rng(0))
+                episodes.append(dict(e, reason=reason or e['reason']))
+                rows += [dict(x, game=len(episodes)-1) for x in r]
+            manifest = dense_data.write_shard(Path(tmp)/'shards'/'000001', dict(actor_sha256='a'*64, process=0), episodes, rows)
+            self.assertEqual({k: manifest['counts'][k] for k in ('games', 'terminal_games', 'capped_games', 'adjudicated_games')},
+                             dict(games=3, terminal_games=1, capped_games=2, adjudicated_games=1))
+            self.assertEqual(dense_selfplay.published(tmp, 0)['adjudicated'], 1)
 
 
 class YieldTests(unittest.TestCase):
