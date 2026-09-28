@@ -1391,10 +1391,20 @@ class ValidationSourceTests(unittest.TestCase):
                     self.assertEqual(len(v[f'{source}_{key}']), len(dense_learn.PLY_GRID))
                 for key in ('value_horizon', 'policy_ce_early', 'policy_ce_late'):
                     self.assertIn(f'{source}_{key}', v)
+            for source in dense_learn.CURVE_SOURCES:
+                for key, field in (('value_surface', 'value'), ('value_excess_surface', 'excess'), ('policy_surface', 'policy')):
+                    grid = v[f'{source}_{key}']
+                    self.assertEqual(set(grid), {'ply_bins', 'remaining_bins', 'counts', field})
+                    self.assertEqual(len(grid[field]), len(grid['ply_bins']))
+            fg, (bce,) = dense_learn.surfaces(r['ply'][f], r['remaining'][f], (r['value_bce'][f],))
+            self.assertEqual(v['fresh_value_surface'], fg | dict(value=[dense_learn.compact(x) for x in bce]))
+            self.assertEqual(sum(map(sum, v['fresh_policy_surface']['counts'])), int(p.sum()))
+            self.assertTrue(any(y is not None for row in v['fresh_value_surface']['value'] for y in row))
             self.assertNotIn('converted_value_curve', v)
+            self.assertNotIn('converted_value_surface', v)
             self.assertNotIn('converted_policy_ce_curve', v)
             fields = dense_learn.validation_fields(metrics)
-            self.assertFalse([k for k, x in fields.items() if isinstance(x, list)])
+            self.assertFalse([k for k, x in fields.items() if isinstance(x, (list, dict))])
             self.assertEqual(fields['fresh_value_bce_last20'], v['fresh_value_bce_last20'])
             self.assertEqual(fields['fresh_policy_ce_early'], v['fresh_policy_ce_early'])
             dense_config.append_metrics(run, 'learner-main', step=7, validation=True, **fields)
@@ -1422,6 +1432,66 @@ class ValidationSourceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     dashboard.series(run, config, 'main', f'fresh_{key}', 'remaining')
             json.dumps(curve, allow_nan=False)
+
+    def test_surfaces_bin_rows_into_cells(self):
+        """Rows land in the (ply // 16, remaining // 16) cell; cells under min_cells rows are nan but keep their
+        count; rows beyond the limit are dropped; the excess subtracts the entropy of the cell's outcome rate."""
+        ply = [0]*8+[20]*8+[40]*3+[400]
+        remaining = [15]*8+[33]*8+[5]*3+[0]
+        loss = [.5]*8+[1., 2.]*4+[9.]*3+[9.]
+        target = [1.]*8+[1., 0.]*4+[0.]*4
+        grid, (mean, rate) = dense_learn.surfaces(ply, remaining, (loss, target))
+        self.assertEqual(grid['ply_bins'], list(range(0, 384, 16)))
+        self.assertEqual(grid['remaining_bins'], grid['ply_bins'])
+        counts = np.array(grid['counts'])
+        self.assertEqual(counts.shape, (24, 24))
+        self.assertEqual((counts[0, 0], counts[1, 2], counts[2, 0], counts.sum()), (8, 8, 3, 19))
+        self.assertEqual((mean[0, 0], mean[1, 2]), (.5, 1.5))
+        self.assertTrue(np.isnan(mean[2, 0]) and np.isnan(mean[5, 5]))
+        excess = mean-dense_learn.binary_entropy(rate)
+        self.assertAlmostEqual(excess[0, 0], .5)
+        self.assertAlmostEqual(excess[1, 2], 1.5-math.log(2))
+        self.assertTrue(np.isnan(excess[2, 0]))
+        few = dense_learn.surfaces(ply, remaining, (loss,), min_cells=3)[1][0]
+        self.assertEqual(few[2, 0], 9.)
+
+    def test_surface_endpoint_returns_the_newest_grid(self):
+        import dashboard
+        from http.server import HTTPServer
+        from urllib.error import HTTPError
+        from urllib.request import urlopen
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root/'r'
+            run.mkdir()
+            (run/'config.json').write_text(json.dumps(dict(schema=dense_config.SCHEMA, created_at=0.)))
+            bins = [0, 16]
+            for step, value in ((5, .9), (10, .4)):
+                path = run/'checkpoints'/'main'/f'{step:06d}'
+                path.mkdir(parents=True)
+                grid = dict(ply_bins=bins, remaining_bins=bins, counts=[[9, 2], [0, 12]], value=[[value, None], [None, .7]])
+                (path/'manifest.json').write_text(json.dumps(dict(step=step, metrics=dict(validation_sources=dict(newest_value_surface=grid)))))
+            out = dashboard.surface(run, 'main', 'newest_value_surface')
+            self.assertEqual(out['checkpoint'], 'main/000010')
+            self.assertEqual((out['ply_bins'], out['remaining_bins'], out['counts']), (bins, bins, [[9, 2], [0, 12]]))
+            self.assertEqual(out['values'], [[.4, None], [None, .7]])
+            empty = dashboard.surface(run, 'main', 'fresh_policy_surface')
+            self.assertEqual((empty['checkpoint'], empty['values'], empty['counts']), (None, [], []))
+            with self.assertRaises(ValueError):
+                dashboard.surface(run, 'main', 'fresh_value_curve')
+            server = HTTPServer(('127.0.0.1', 0), type('Handler', (dashboard.Handler,), dict(runs=root)))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                url = f'http://127.0.0.1:{server.server_port}/api/surface?run=r&variant=main&metric='
+                with urlopen(url+'newest_value_surface', timeout=5) as response:
+                    self.assertEqual(json.loads(response.read()), out)
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(url+'nope', timeout=5)
+                self.assertEqual(error.exception.code, 400)
+                error.exception.close()
+            finally:
+                server.shutdown(); server.server_close()
 
     def test_value_curve_series_keeps_unsupported_gaps(self):
         """A curve supported on two separate ranges keeps null points between them in the response, so the chart

@@ -7,8 +7,8 @@ export, info, error or replace. league.json is read for population replacement, 
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
 falls on every tenth step) and one per export with validation_fields(metrics) of the manifest (Learner.export): EMA
 losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets), plus the value
-loss of finished held-out games against plies remaining (remaining_curve) and the policy and value losses against
-the ply from the start (ply_curve, ply_split). The EMA
+loss of finished held-out games against plies remaining (remaining_curve), the policy and value losses against
+the ply from the start (ply_curve, ply_split) and both over (ply from the start, plies remaining) cells (surfaces). The EMA
 averages parameters only; each export first recomputes its norm statistics (Learner.recalibrate), since the
 raw model's running statistics do not describe the EMA weights.
 
@@ -62,13 +62,14 @@ PLY_SIGMA = 4.
 EARLY_PLY, LATE_PLY = 20, 60  # ply_split: early rows have ply < EARLY_PLY, late rows ply >= LATE_PLY
 HORIZON_BCE = math.log(2)/2  # midpoint between a perfect and a chance value head
 CURVE_SOURCES = ('fresh', 'newest')
+SURFACE_WIDTH, SURFACE_LIMIT, SURFACE_MIN = 16, 384, 8  # surfaces: cell width, axis limit, rows per reported cell
 BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995), ema=(.99, .9999))
 
 
 def validation_fields(metrics):
     """The metrics-log fields of an export's manifest metrics: metrics.validation under LOGGED names plus the
-    non-list entries of metrics.validation_sources (curves stay in the manifest); None when both are null."""
-    sources = {k: v for k, v in (metrics.get('validation_sources') or {}).items() if not isinstance(v, list)}
+    scalar entries of metrics.validation_sources (curves and surfaces stay in the manifest); None when both are null."""
+    sources = {k: v for k, v in (metrics.get('validation_sources') or {}).items() if not isinstance(v, (list, dict))}
     fields = {LOGGED[h]: v for h, v in (metrics['validation'] or {}).items()} | sources
     return fields or None
 
@@ -85,6 +86,29 @@ def smoothed(x, ys, grid, sigma):
 def compact(curve):
     """A curve as a JSON list: values rounded to 4 decimals, None where not finite."""
     return [round(float(v), 4) if np.isfinite(v) else None for v in curve]
+
+
+def binary_entropy(rate):
+    """Elementwise binary entropy in nats of an outcome rate (0 at rates 0 and 1, nan stays nan)."""
+    rate = np.asarray(rate, np.float64)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where((rate <= 0) | (rate >= 1), 0., -rate*np.log(rate)-(1-rate)*np.log(1-rate))
+
+
+def surfaces(ply, remaining, columns, width=SURFACE_WIDTH, limit=SURFACE_LIMIT, min_cells=SURFACE_MIN):
+    """Per-cell means over `width`-ply cells in (ply from the start, plies remaining), each axis covering
+    [0, limit) (rows outside are dropped): (grid, means). grid is {ply_bins, remaining_bins (lower cell edges),
+    counts ([ply bin][remaining bin] row counts)}; means holds per column a float array [ply bin][remaining bin],
+    nan in cells with fewer than `min_cells` rows."""
+    n = -(-limit//width)
+    p, r = (np.asarray(x, np.float64)//width for x in (ply, remaining))
+    keep = (p >= 0) & (p < n) & (r >= 0) & (r < n)
+    index = (p[keep]*n+r[keep]).astype(np.int64)
+    counts = np.bincount(index, minlength=n*n).reshape(n, n)
+    means = [np.where(counts >= min_cells, np.bincount(index, np.asarray(y, np.float64)[keep], n*n).reshape(n, n)
+                      / np.maximum(counts, 1), np.nan) for y in columns]
+    bins = list(range(0, n*width, width))
+    return dict(ply_bins=bins, remaining_bins=bins, counts=counts.tolist()), means
 
 
 def ply_curve(ply, loss, grid=PLY_GRID, sigma=PLY_SIGMA):
@@ -110,9 +134,7 @@ def remaining_curve(remaining, bce, target, grid=REMAINING_GRID, sigma=REMAINING
     r, b, t = (np.asarray(x, np.float64) for x in (remaining, bce, target))
     g = np.asarray(grid, np.float64)
     curve, rate = smoothed(r, (b, t), g, sigma)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        entropy = -np.nan_to_num(rate*np.log(rate))-np.nan_to_num((1-rate)*np.log(1-rate))
-    excess = np.where(np.isfinite(curve), curve-entropy, np.nan)
+    excess = curve-binary_entropy(rate)
     horizon = None
     for i in range(len(g)):
         if curve[i] > HORIZON_BCE:
@@ -409,7 +431,10 @@ class Learner:
         row_losses of the held subset: the remaining_curve of the rows of finished games as <source>_<key> (grid:
         remaining_grid); <source>_value_bce_by_ply, the ply_curve of the same rows' value BCE, and
         <source>_policy_ce_curve, the ply_curve of the policy CE of rows with a policy target (grid: ply_grid);
-        <source>_policy_ce_early and <source>_policy_ce_late, the ply_split of that policy CE."""
+        <source>_policy_ce_early and <source>_policy_ce_late, the ply_split of that policy CE. Surfaces (surfaces
+        grid dicts, cells compact rows): <source>_value_surface adds `value`, the mean value BCE of the rows of
+        finished games, and <source>_value_excess_surface adds `excess`, that minus the binary entropy of the cell's
+        mean value target; <source>_policy_surface adds `policy`, the mean policy CE of rows with a policy target."""
         sets.refresh()
         self.ema.eval()
         out = dict(newest_checkpoint=sets.newest_checkpoint)
@@ -428,6 +453,11 @@ class Learner:
             out.update({f'{source}_value_bce_by_ply': ply_curve(r['ply'][f], r['value_bce'][f]),
                         f'{source}_policy_ce_curve': ply_curve(r['ply'][p], r['policy_ce'][p]),
                         f'{source}_policy_ce_early': early, f'{source}_policy_ce_late': late})
+            grid, (bce, rate) = surfaces(r['ply'][f], r['remaining'][f], (r['value_bce'][f], r['value'][f]))
+            out[f'{source}_value_surface'] = grid | dict(value=[compact(x) for x in bce])
+            out[f'{source}_value_excess_surface'] = grid | dict(excess=[compact(x) for x in bce-binary_entropy(rate)])
+            grid, (ce,) = surfaces(r['ply'][p], r['remaining'][p], (r['policy_ce'][p],))
+            out[f'{source}_policy_surface'] = grid | dict(policy=[compact(x) for x in ce])
         return out
 
     def export(self, window, sets=None):

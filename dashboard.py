@@ -699,6 +699,8 @@ CURVE_SCALARS = tuple(f'{s}_{k}' for s in CURVE_SOURCES
                       for k in ('value_bce_last20', 'value_horizon', 'policy_ce_early', 'policy_ce_late'))
 CURVE_AXES = dict(value_curve='remaining', value_excess_curve='remaining', policy_ce_curve='ply', value_bce_by_ply='ply')
 CURVE_METRICS = {f'{s}_{k}': x for s in CURVE_SOURCES for k, x in CURVE_AXES.items()}  # metric: its only x (grid <x>_grid)
+SURFACE_METRICS = {f'{s}_{k}': field for s in CURVE_SOURCES for k, field in
+                   (('value_surface', 'value'), ('value_excess_surface', 'excess'), ('policy_surface', 'policy'))}  # metric: cell field
 LEARNER_METRICS = HEADS+('lr', 'samples_per_second', 'window_rows')+tuple('validation_'+h for h in HEADS+SOURCE_METRICS+CURVE_SCALARS)
 ACTOR_SUMMED = ('placements_per_second', 'evals_per_second', 'games_per_hour')
 ACTOR_METRICS = ACTOR_SUMMED+('terminal_fraction', 'mean_plies')
@@ -800,6 +802,21 @@ def series(run, config, variant, metric, x='step', max_points=1000):
                 points=[list(p) for p in downsample(points, max_points)])
 
 
+def surface(run, variant, metric):
+    """/api/surface: {run, variant, metric, checkpoint, ply_bins, remaining_bins, values, counts} from SURFACE_METRICS
+    `metric` of the newest checkpoint manifest of `variant` holding it (metrics.validation_sources; dense_learn.surfaces):
+    values[i][j] is the cell's loss (null under the learner's row minimum) for ply bin i and remaining bin j; empty
+    grids and checkpoint None without one. Raises ValueError for an unknown metric."""
+    if metric not in SURFACE_METRICS: raise ValueError(f'unknown surface {metric!r}')
+    found = [(path, v[metric]) for path, m in dense_manifests(run/'checkpoints'/variant)
+             if isinstance(v := (m.get('metrics') or {}).get('validation_sources'), dict) and isinstance(v.get(metric), dict)]
+    path, grid = found[-1] if found else (None, {})
+    values = [[y if finite(y) else None for y in row] for row in grid.get(SURFACE_METRICS[metric]) or []]
+    return dict(run=run.name, variant=variant, metric=metric, checkpoint=path and f'{variant}/{path.parent.name}',
+                ply_bins=grid.get('ply_bins') or [], remaining_bins=grid.get('remaining_bins') or [], values=values,
+                counts=grid.get('counts') or [])
+
+
 def sample_gpu(watched, period=10.):
     """Refresh Handler.gpu_status every 2 s; about every `period` s append a metrics/gpu.jsonl line to each
     run of watched()."""
@@ -864,15 +881,16 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/openings.js":
             payload = (Path(__file__).parent / "web/openings.js").read_bytes()
             content_type = "text/javascript; charset=utf-8"
-        elif url.path in ("/api/project", "/api/series") and self.runs:
+        elif url.path in ("/api/project", "/api/series", "/api/surface") and self.runs:
             try:
                 if url.path == "/api/project":
                     data = project(self.runs)
                 else:
                     config = dense_config_of(run) if run else None
                     if config is None: raise ValueError('series need a dense run')
-                    data = series(run, config, query.get('variant', 'main'), query.get('metric', ''), query.get('x', 'step'),
-                                  max(10, min(20000, int(query.get('max_points', 1000)))))
+                    variant, metric = query.get('variant', 'main'), query.get('metric', '')
+                    data = surface(run, variant, metric) if url.path == "/api/surface" else series(
+                        run, config, variant, metric, query.get('x', 'step'), max(10, min(20000, int(query.get('max_points', 1000)))))
             except ValueError as error:
                 self.send_error(400, str(error))
                 return
