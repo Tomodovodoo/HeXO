@@ -14,9 +14,10 @@ the new one; a shard may therefore mix actors (identity `actors`; `actor_sha256`
 
 GPU sharing (Yield): CUDA contexts of separate processes time-slice the GPU, so every busy actor worker takes
 a share from the learner. Workers therefore pause between engine steps while a learner falls behind its
-pacing: they re-read the learner heartbeats every `yield_check_seconds`, pause once the lowest samples_per_row
-of the learners that are training drops below `yield_below` times learner.samples_per_row and resume once it
-reaches `yield_resume` times it (hysteresis, so the learner does not reach its own waiting point while the
+pacing: they re-read the learner heartbeats every `yield_check_seconds`, pause once the lowest ratio of
+samples_per_row to that learner's own samples_per_row_target (config learner.samples_per_row when a heartbeat
+lacks it) among the learners that are training drops below `yield_below` and resume once it reaches
+`yield_resume` (hysteresis, so the learner does not reach its own waiting point while the
 actors sleep). A missing, stale or non-training heartbeat never pauses. Paused workers keep their trees and
 in-flight batch and heartbeat with stage 'paused'. Actor settings can be overridden per process with
 --<setting> flags (the supervisor forwards them; shards record the effective values).
@@ -355,6 +356,11 @@ class SelfPlayGame:
                     root_values=self.values, full_search=self.full), self.rows
 
 
+def metrics_due(stage, logged_stage, elapsed):
+    """Whether a worker appends a metrics line: on every stage change, else every METRICS_SECONDS."""
+    return stage != logged_stage or elapsed >= METRICS_SECONDS
+
+
 class Yield:
     """Cooperative pause of the actor workers while a learner is behind its pacing (module contract).
     paused() re-reads <run>/learner-status*.json at most every `check_seconds` and returns the current state;
@@ -367,7 +373,8 @@ class Yield:
         self.clock, self.now, self.checked, self.state, self.reason = clock, now, None, False, 'not checked'
 
     def lowest(self):
-        """(samples_per_row, variant) of the furthest-behind training learner with a fresh heartbeat, or None."""
+        """(samples_per_row / its target, samples_per_row, target, variant) of the furthest-behind training learner
+        with a fresh heartbeat, or None. The target is the heartbeat's samples_per_row_target, else `target`."""
         found = []
         for path in sorted(self.run.glob('learner-status*.json')):
             try:
@@ -376,7 +383,8 @@ class Yield:
                 continue
             fresh = self.now()-float(status.get('updated_at') or 0) <= STALE_SECONDS
             if fresh and status.get('stage') in ('training', 'exporting') and status.get('samples_per_row') is not None:
-                found.append((float(status['samples_per_row']), status.get('variant', path.stem)))
+                rate, target = float(status['samples_per_row']), float(status.get('samples_per_row_target') or self.target)
+                found.append((rate/target, rate, target, status.get('variant', path.stem)))
         return min(found) if found else None
 
     def paused(self):
@@ -389,13 +397,13 @@ class Yield:
         if lowest is None:
             self.state, self.reason = False, 'no training learner heartbeat'
             return False
-        rate, variant = lowest
-        if self.state and rate >= self.resume*self.target:
+        ratio, rate, target, variant = lowest
+        if self.state and ratio >= self.resume:
             self.state = False
-        elif not self.state and rate < self.below*self.target:
+        elif not self.state and ratio < self.below:
             self.state = True
-        self.reason = (f'learner {variant} at {rate:.2f} samples/row; pause below {self.below*self.target:.2f}, '
-                       f'resume at {self.resume*self.target:.2f}')
+        self.reason = (f'learner {variant} at {rate:.2f} samples/row; pause below {self.below*target:.2f}, '
+                       f'resume at {self.resume*target:.2f}')
         return self.state
 
 
@@ -428,8 +436,8 @@ def worker(args):
     paused_since, paused_total = None, 0.
 
     def status(stage):
-        """Rewrite the heartbeat; append a metrics line every METRICS_SECONDS and whenever the stage changes to one
-        other than 'playing'."""
+        """Rewrite the heartbeat; append a metrics line whenever the stage changes and otherwise every
+        METRICS_SECONDS."""
         nonlocal logged, stage_logged
         now = time.perf_counter()
         window.append((now, state['positions'], engine.evals))
@@ -446,7 +454,7 @@ def worker(args):
             paused_seconds=paused_total+(time.perf_counter()-paused_since if paused_since is not None else 0.),
             error=state['error'])
         write_json(status_path, fields)
-        if stage not in ('playing', stage_logged) or now-logged >= METRICS_SECONDS:
+        if metrics_due(stage, stage_logged, now-logged):
             logged, stage_logged = now, stage
             dense_config.append_metrics(run, f'actor-{args.worker}', **{k: fields[k] for k in METRICS})
 
