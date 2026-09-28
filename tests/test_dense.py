@@ -3046,6 +3046,24 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual((entry['id'], entry['checkpoint'], entry['matches'][0]['opponent']),
                          ('main/000020@solver', 'main/000020', 'main/000020'))
 
+    def test_a_champion_variant_never_collides_with_a_registered_id(self):
+        evaluator = self.start(decision='posterior')
+        self.export(10, 20, 30)
+        evaluator.step()                                                    # main/000030 champion
+        dense_eval.register(self.run, 'main/000030', 'solver', dict(sims=1))
+        with self.assertRaises(ValueError):
+            dense_eval.register(self.run, 'champion', 'solver', dict(sims=1))
+        dense_eval.register(self.run, 'champion', 'fast', dict(sims=1))
+        dense_eval.register(self.run, 'main/000030', 'y', dict(sims=2))
+        dense_eval.adopt(evaluator.league, self.run)
+        evaluator.variants()[0]['bound_at'] = 0.                            # main/000030@solver has started
+        evaluator.variants()[2].update(id='main/000020@fast', checkpoint='main/000020', name='fast', bound_at=0.)
+        self.crown(evaluator, 20)                                           # champion@fast would collide: dropped
+        self.assertTrue(evaluator.bind())
+        self.assertEqual([v['id'] for v in evaluator.variants()], ['main/000030@solver', 'main/000020@fast'])
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertIn('champion@fast dropped', events[-1]['message'])
+
     def test_a_pending_variant_of_the_champion_rebases_on_promotion(self):
         evaluator = self.start(decision='posterior')
         self.export(10, 20)

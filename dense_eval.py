@@ -324,7 +324,8 @@ def register(run, checkpoint, name, settings):
     <run>/variant-requests/<id>.json, never to league.json: the evaluator, league.json's only writer, adopts it
     (`adopt`) on its next step. The name is letters, digits, '.', '_' or '-'. Registering an id again (in the
     league, by its current id or registered_as, or waiting) with the same settings returns the existing entry, with
-    other settings raises ValueError."""
+    other settings raises ValueError; a new champion variant whose `<champion>@<name>` is already registered raises
+    ValueError too."""
     run = Path(run)
     if not name or not all(ch.isalnum() or ch in '._-' for ch in name):
         raise ValueError(f'{name!r}: a variant name is letters, digits, ".", "_" or "-"')
@@ -347,6 +348,10 @@ def register(run, checkpoint, name, settings):
         if existing['settings'] != settings:
             raise ValueError(f'{cid} is registered with settings {existing["settings"]}; register another name')
         return existing
+    taken = f'{league.get("champion")}@{name}'
+    if checkpoint == CHAMPION and (any(taken in (v['id'], v.get('registered_as')) for v in league.get('variants', []))
+                                   or taken in waiting):
+        raise ValueError(f'{taken} is already registered; register the champion variant under another name')
     entry = dict(id=cid, checkpoint=None if checkpoint == CHAMPION else checkpoint, name=name, settings=settings,
                  base=checkpoint, registered_as=cid, on_champion=checkpoint in (CHAMPION, league.get('champion')),
                  registered_at=time.time(), elo=None, elo_interval=None, matches=[])
@@ -1418,12 +1423,20 @@ class Evaluator:
         """Point every variant whose comparison has not started (no bound_at) at the current champion when it
         follows the champion: base CHAMPION always, and with rebase_on_promotion a variant registered against the
         then champion (on_champion) whose checkpoint is no longer champion. Its id becomes `<champion>@<name>`
-        (unless another entry holds that id) with a 'variant' event. Returns whether any entry changed."""
+        with a 'variant' event. When another entry holds that id, a bound entry keeps its checkpoint and an unbound
+        one (base CHAMPION, never bound) is dropped with an 'error' event, as it could never run. Returns whether
+        any entry changed."""
         champion, changed = self.league['champion'], False
-        for entry in self.variants():
+        for entry in list(self.variants()):
             follows = entry.get('base') == CHAMPION or (self.settings.rebase_on_promotion and entry.get('on_champion'))
-            if 'bound_at' in entry or not follows or champion is None or entry['checkpoint'] == champion \
-                    or self.entry(f'{champion}@{entry["name"]}'):
+            if 'bound_at' in entry or not follows or champion is None or entry['checkpoint'] == champion:
+                continue
+            if self.entry(f'{champion}@{entry["name"]}'):
+                if entry['checkpoint'] is None:
+                    self.variants().remove(entry)
+                    log_event(self.run, 'evaluator', 'error', f'{entry["id"]} dropped: {champion}@{entry["name"]} is already '
+                              'registered; register it under another name', candidate=entry['id'])
+                    changed = True
                 continue
             before = entry['id']
             entry.update(id=f'{champion}@{entry["name"]}', checkpoint=champion)
