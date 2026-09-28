@@ -335,7 +335,7 @@ impl SolverBoard {
         }
         self.stones.clear();
         self.hash = 0;
-        self.windows.states.clear();
+        self.windows.clear();
         if self.reach_radius >= 0 {
             self.reach.fill(0);
         }
@@ -351,7 +351,7 @@ impl SolverBoard {
     /// Enable or disable incremental length-`wl` window maintenance while
     /// retaining the map allocation across independent leaf probes.
     pub(crate) fn configure_windows(&mut self, wl: u8, enabled: bool) {
-        self.windows.states.clear();
+        self.windows.clear();
         self.windows.wl = wl;
         self.windows.enabled = enabled;
     }
@@ -552,14 +552,45 @@ impl WindowState {
     }
 }
 
+/// Own-stone count from which a window is kept in `WindowIndex::live`: every
+/// scan except the builder-score one wants at least this many.
+const LIVE_MIN_STONES: u32 = 2;
+
 #[derive(Clone, Default)]
 struct WindowIndex {
     wl: u8,
     enabled: bool,
     states: FxHashMap<(Coord, u8), WindowState>,
+    /// Per player (P1, P2): windows holding at least `LIVE_MIN_STONES` of that
+    /// player's stones and none of the opponent's.
+    live: [FxHashSet<(Coord, u8)>; 2],
 }
 
 impl WindowIndex {
+    fn clear(&mut self) {
+        self.states.clear();
+        self.live[0].clear();
+        self.live[1].clear();
+    }
+
+    /// Keep `live` in step with one window's state change.
+    #[inline]
+    fn track(&mut self, key: (Coord, u8), before: WindowState, after: WindowState) {
+        let live = |mine: u16, enemy: u16| enemy == 0 && mine.count_ones() >= LIVE_MIN_STONES;
+        for (side, was, now) in [
+            (0, live(before.p1, before.p2), live(after.p1, after.p2)),
+            (1, live(before.p2, before.p1), live(after.p2, after.p1)),
+        ] {
+            if was != now {
+                if now {
+                    self.live[side].insert(key);
+                } else {
+                    self.live[side].remove(&key);
+                }
+            }
+        }
+    }
+
     /// Apply one stone delta to the 3*wl windows containing `coord`.
     #[inline]
     fn update(&mut self, coord: Coord, player: Player, placed: bool) {
@@ -575,24 +606,32 @@ impl WindowIndex {
                 );
                 let key = (start, axis as u8);
                 let bit = 1u16 << offset;
-                if placed {
+                let (before, after) = if placed {
                     let state = self.states.entry(key).or_default();
+                    let before = *state;
                     match player {
                         Player::P1 => state.p1 |= bit,
                         Player::P2 => state.p2 |= bit,
                     }
+                    (before, *state)
                 } else if let std::collections::hash_map::Entry::Occupied(mut occupied) =
                     self.states.entry(key)
                 {
                     let state = occupied.get_mut();
+                    let before = *state;
                     match player {
                         Player::P1 => state.p1 &= !bit,
                         Player::P2 => state.p2 &= !bit,
                     }
-                    if state.p1 == 0 && state.p2 == 0 {
+                    let after = *state;
+                    if after.p1 == 0 && after.p2 == 0 {
                         occupied.remove();
                     }
-                }
+                    (before, after)
+                } else {
+                    continue;
+                };
+                self.track(key, before, after);
             }
         }
     }
@@ -641,7 +680,15 @@ fn scan_windows_incremental(
     let enforce = radius < l - 1;
     let full = if wl == 16 { u16::MAX } else { (1u16 << wl) - 1 };
     let mut empties = [(0i32, 0i32); MAX_WL];
-    for (&(start, axis), &state) in &board.windows.states {
+    let index = &board.windows;
+    // Scans needing two or more stones read the player's live set, a small
+    // fraction of all windows touching a stone.
+    let live = pc_lo >= LIVE_MIN_STONES as i32;
+    let side = usize::from(player == Player::P2);
+    let mut all = index.states.iter().take(if live { 0 } else { usize::MAX });
+    let mut live_only =
+        index.live[side].iter().take(if live { usize::MAX } else { 0 }).map(|key| (key, &index.states[key]));
+    for (&(start, axis), &state) in std::iter::from_fn(|| all.next().or_else(|| live_only.next())) {
         let (mine, enemy) = state.masks(player);
         if mine == 0 || enemy != 0 {
             continue;
