@@ -409,6 +409,17 @@ class Solver:
             gate_score_mean=float(np.mean(s['gate_scores'])) if s['gate_scores'] else None,
             **{k: s[k] for k in ('deferred', 'late', 'dropped', 'skipped', 'followed', 'labelled')})
 
+    def drain(self, timeout=DEEP_SAFETY_MS/1000):
+        """Wait up to `timeout` seconds for the orphaned queries and account them (the end of a run)."""
+        end = time.perf_counter()+timeout
+        for query in list(self.orphans):
+            try:
+                query.future.result(max(0., end-time.perf_counter()))
+            except TimeoutError:
+                continue
+            self.orphans.remove(query)
+            query.result()
+
     def close(self):
         for pool in (self.pool, self.background):
             if pool:

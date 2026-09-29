@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from dataclasses import asdict, replace
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 
@@ -426,6 +427,12 @@ class Scheduler(unittest.TestCase):
         orphan.future.set_result(dict(status='UNKNOWN', reason='no verified strategy', nodes_used=100, budget=100))
         solver.tick(100., 50.)
         self.assertEqual((solver.orphans, solver.stats['points']['root']['queries']), ([], 2))
+        # At the end of a run the orphans are drained.
+        solver.orphans.append(last := dense_solver.Query(solver, 'deep', ((0, 0),), 100, Future()))
+        threading.Timer(.05, last.future.set_result, [dict(status='UNKNOWN', reason='no verified strategy',
+                                                            nodes_used=100, budget=100)]).start()
+        solver.drain(5.)
+        self.assertEqual((solver.orphans, solver.stats['points']['deep']['queries']), ([], 1))
 
     def test_adaptive_selfplay_plays_proofs_within_the_caps(self):
         try:

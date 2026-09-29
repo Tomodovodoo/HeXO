@@ -331,6 +331,11 @@ class Engine:
         self.begin(slot)
         self.slots.append(slot)
 
+    def drain(self):
+        """Account the solver queries of finished games that are still running (dense_solver.Solver.drain)."""
+        if self.solver:
+            self.solver.drain()
+
     def close(self):
         if self.solver:
             self.solver.close()
@@ -771,6 +776,7 @@ def worker(args):
                 status('playing'); last = time.perf_counter()
         if episodes:
             publish()
+        engine.drain()
         status('finished')
     except BaseException as error:
         state['error'] = f'{type(error).__name__}: {error}'
