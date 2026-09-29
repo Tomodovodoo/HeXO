@@ -419,6 +419,13 @@ class Scheduler(unittest.TestCase):
         threat.future.set_result(dict(status='UNKNOWN', reason='no verified strategy', nodes_used=135, budget=135))
         plan.poll(((0, 0),))
         self.assertEqual((plan.late, solver.stats['points']['threat']['queries']), ([], 1))
+        # A game ending with a query still running hands it to the Solver, which accounts it once it completes.
+        plan.late.append(orphan := dense_solver.Query(solver, 'root', ((0, 0),), 100, Future()))
+        plan.close(slot, ((0, 0),))
+        self.assertEqual(solver.orphans, [orphan])
+        orphan.future.set_result(dict(status='UNKNOWN', reason='no verified strategy', nodes_used=100, budget=100))
+        solver.tick(100., 50.)
+        self.assertEqual((solver.orphans, solver.stats['points']['root']['queries']), ([], 2))
 
     def test_adaptive_selfplay_plays_proofs_within_the_caps(self):
         try:

@@ -264,7 +264,7 @@ class Solver:
             raise ValueError('Adaptive solver budgets need the asynchronous backend (solver_async)')
         self.schedule, self.asynchronous, self.build_hash = schedule, asynchronous, build_hash()
         self.step_ms = self.collect_ms = None
-        self.allowance, self.lead = 0., {}
+        self.allowance, self.lead, self.orphans = 0., {}, []
         self.leads = {p: deque(maxlen=WINDOW) for p in POINTS}
         self.pool = Pool(schedule.workers, 'below_normal') if asynchronous else None
         self.background = Pool(1, 'idle') if asynchronous and schedule.deep_nodes and not schedule.fixed_budgets else None
@@ -284,7 +284,10 @@ class Solver:
     def tick(self, step_ms, collect_ms):
         """End of an Engine step of `step_ms`, `collect_ms` of it collecting the previous batch (GPU wait plus
         decoding): refresh the estimates (step and collect times, per-point leads) and the next step's overrun
-        allowance."""
+        allowance, and account the orphaned queries (of finished games) that have completed."""
+        for query in [q for q in self.orphans if q.future.done()]:
+            self.orphans.remove(query)
+            query.result()
         s = self.stats
         s['steps'] += 1
         s['step_ms'] += step_ms
@@ -655,9 +658,12 @@ class Plan:
     def close(self, slot, moves):
         """The game of `slot` ended with `moves`: with follow, label the rows every kept proof decides through
         slot.label(ply, proven, proof_turns) (adaptive budgets first take the deep and late verdicts already in;
-        fixed budgets drop the ones never consumed)."""
+        fixed budgets drop the ones never consumed). Queries still running pass to the Solver, which accounts
+        them when they complete."""
         if not self.schedule.fixed_budgets:
             self.poll(moves)
+        pending = [self.threat, self.root, *(q for _, q in self.finalists or ()), *self.deep.values(), *self.late]
+        self.solver.orphans += [q for q in pending if q is not None and q.outcome is None]
         if not self.schedule.follow:
             return
         for proof in self.found:
