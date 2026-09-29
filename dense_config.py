@@ -163,6 +163,7 @@ class LearnerSettings:
     window_taper: float = .65
     window_capacity: int = 2000000
     recency: float = 0.
+    regret_fraction: float = 0.  # share of training batches drawn from the proof restart buffer
     bootstrap_weight: float = 1.  # weight of TD(lambda) value rows from capped games; 0 = mask
     bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only
     cheap_value_weight: float = .25    # value weight of cheap-search rows (KataGo: 0)
@@ -217,6 +218,8 @@ class LearnerSettings:
             raise ValueError(f'phase_rows must be 0 (off) or positive, not {self.phase_rows}')
         if not 0 <= self.proof_policy_weight < float('inf'):
             raise ValueError('proof_policy_weight must be finite and nonnegative')
+        if not 0 <= self.regret_fraction <= 1:
+            raise ValueError('regret_fraction must lie in [0, 1]')
 
 
 @dataclass(frozen=True)

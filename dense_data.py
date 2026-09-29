@@ -463,7 +463,8 @@ class ReplayWindow:
     Cheap rows: an ordinary cheap row (no policy, no exact label) is retained with probability
     `cheap_row_fraction`, decided per row by `retention` keyed by the run `seed`, so every process and restart
     agrees; full-search and exact rows are always retained (`retained`). The training index holds retained rows
-    only, the validation index every held-out row. At fraction 1 every row is retained and nothing is filtered.
+    only (regret priority draws included), the validation index every held-out row. At fraction 1 every row is
+    retained and nothing is filtered.
     Counts: `total_rows` is the pacing count, the retained trained rows (see `trained`) of all shards, held-out
     rows included; `rows` the window's trained rows (retained or not); `retained_rows` the training index and
     `retained_fraction` its share of the window's trained rows outside the validation split (1 without any);
@@ -497,7 +498,9 @@ class ReplayWindow:
         self.policy_dir = self.run_dir/'cache'/'policies' if policy_dir is None else Path(policy_dir)
         self.manifests = {}; self.shards = {}; self.values = OrderedDict()
         self.unlabelled = set(); self.deblunders = {}
+        self.regret_mtime = None; self.regret_entries = {}
         self.refresh()
+        self.refresh_regret()
 
     def load(self, name):
         path = self.run_dir/'shards'/name
@@ -578,6 +581,15 @@ class ReplayWindow:
         self.index, self.validation = (Rows(names, flat(ids), flat(rows)) for ids, rows in parts)
         self.rows = candidates+len(self.validation)
         self.retained_rows = len(self.index); self.retained_fraction = self.retained_rows/candidates if candidates else 1.
+        self.regret_positions = np.array([k for k, (name, i) in enumerate(self.index)
+                                          if (name, int(self.shards[name].game[i]), int(self.shards[name].ply[i]))
+                                          in self.regret_entries], np.int32) if self.regret_entries else np.zeros(0, np.int32)
+        self.regret_weights = np.array([self.regret_entries[(name, int(self.shards[name].game[i]),
+                                                             int(self.shards[name].ply[i]))]
+                                        for name, i in (self.index[k] for k in self.regret_positions)], np.float64)
+        self.regret_rows = len(self.regret_positions)
+        self.regret_probability_cache = {}
+        self.regret_distribution_cache = {}
         return self.rows
 
     @property
@@ -602,6 +614,107 @@ class ReplayWindow:
         full = np.diff(load_offsets(path, len(rows))) > 0
         keep = trained_rows(side, game, ply) & retained(self.seed, name, full, proven, self.cheap_row_fraction)
         return int(keep.sum()), labels is not None
+
+    def refresh_regret(self):
+        """Read the proof buffer only when its mtime changes, then match its entries to training rows."""
+        path = self.run_dir/'restarts.json'
+        try:
+            mtime = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            mtime = None
+        except OSError:
+            return
+        if mtime != self.regret_mtime:
+            entries = {}
+            try:
+                if mtime is not None:
+                    for entry in json.loads(path.read_text(encoding='utf-8'))['entries']:
+                        key = (str(entry['shard']), int(entry['game']), int(entry['ply']))
+                        regret = float(entry['regret'])
+                        if not math.isfinite(regret):
+                            raise ValueError('Nonfinite regret')
+                        if regret > 0:
+                            entries[key] = max(entries.get(key, 0.), regret)
+            except (OSError, ValueError, OverflowError, KeyError, TypeError):
+                return
+            self.regret_mtime = mtime
+            self.set_regret(entries)
+
+    def set_regret(self, entries):
+        """Use one captured buffer snapshot for this window's priority rows."""
+        if entries != self.regret_entries:
+            self.regret_entries = entries
+            self.refresh()
+
+    def regret_distribution(self, recency):
+        """The existing recency distribution, capped at fourfold uniform when priority sampling is enabled."""
+        if recency not in self.regret_distribution_cache:
+            W = len(self.index)
+            if recency:
+                weights = (np.arange(1, W+1)/W)**recency
+                base = weights/weights.sum()
+            else:
+                base = np.full(W, 1/W)
+            cap = 4/W
+            if base.max() > cap:
+                if np.count_nonzero(base)*cap <= 1:
+                    order = np.arange(W-1, -1, -1) if recency > 0 else np.arange(W)
+                    full = int(1/cap)
+                    base = np.zeros(W)
+                    base[order[:full]] = cap
+                    base[order[full]] = 1-full*cap
+                else:
+                    low, high = 0., 1.
+                    while np.minimum(base*high, cap).sum() < 1:
+                        high *= 2
+                    for _ in range(50):
+                        mid = (low+high)/2
+                        if np.minimum(base*mid, cap).sum() < 1:
+                            low = mid
+                        else:
+                            high = mid
+                    base = np.minimum(base*high, cap)
+                    base /= base.sum()
+            self.regret_distribution_cache[recency] = base
+        return self.regret_distribution_cache[recency]
+
+    def regret_baseline(self, recency):
+        return self.regret_distribution(recency)[self.regret_positions]
+
+    def regret_count(self, batch_size, fraction, recency=0.):
+        """Number of priority draws allowed by the fourfold per-row probability cap."""
+        if not fraction or not self.regret_rows:
+            return 0
+        W, K = len(self.index), self.regret_rows
+        baseline = self.regret_baseline(recency).sum()
+        limit = 1. if K == W or baseline == 1 else max(0., min(1., (4*K/W-baseline)/(1-baseline)))
+        return min(batch_size, int(batch_size*min(fraction, limit)+1e-12))
+
+    def regret_share(self, batch_size, fraction, recency=0.):
+        return self.regret_count(batch_size, fraction, recency)/batch_size
+
+    def regret_probabilities(self, share, recency=0.):
+        """Regret weights normalized with the cap on total uniform-plus-priority probability."""
+        key = (share, recency)
+        if key in self.regret_probability_cache:
+            return self.regret_probability_cache[key]
+        cap = (4/len(self.index)-(1-share)*self.regret_baseline(recency))/share
+        weights = self.regret_weights
+        if cap.sum() <= 1:
+            self.regret_probability_cache[key] = cap/cap.sum()
+            return self.regret_probability_cache[key]
+        low, high = 0., 1./min(weights)
+        while np.minimum(weights*high, cap).sum() < 1:
+            high *= 2
+        for _ in range(50):
+            mid = (low+high)/2
+            if np.minimum(weights*mid, cap).sum() < 1:
+                low = mid
+            else:
+                high = mid
+        probabilities = np.minimum(weights*high, cap)
+        self.regret_probability_cache[key] = probabilities/probabilities.sum()
+        return self.regret_probability_cache[key]
 
     def ref(self, name, i, episode=None):
         """Ref of row i of admitted shard `name`; `episode`, when given, must be the episode dict of the row's game."""
@@ -632,7 +745,7 @@ class ReplayWindow:
                 out.append((s.roots[a:b], s.searched[a:b] if s.has_search[g] else None, int(s.winner[g])))
         return out
 
-    def sample(self, rng, n, recency=0., validation=False):
+    def sample(self, rng, n, recency=0., validation=False, regret_fraction=0.):
         """n Refs drawn with replacement from the training (or validation) index; the k-th oldest of
         W rows has weight ((k+1)/W)^recency."""
         index = self.validation if validation else self.index
@@ -641,9 +754,14 @@ class ReplayWindow:
             raise ValueError('Replay window is empty')
         if recency:
             w = (np.arange(1, W+1)/W)**recency
-            picks = rng.choice(W, n, p=w/w.sum())
+            p = self.regret_distribution(recency) if regret_fraction and self.regret_rows and not validation else w/w.sum()
+            picks = rng.choice(W, n, p=p)
         else:
             picks = rng.integers(W, size=n)
+        priority = 0 if validation else self.regret_count(n, regret_fraction, recency)
+        if priority:
+            share = priority/n
+            picks[:priority] = rng.choice(self.regret_positions, priority, p=self.regret_probabilities(share, recency))
         return [self.ref(*index[k]) for k in picks]
 
     def following(self, ref):
@@ -1045,7 +1163,7 @@ def batches(window, rng, batch_size, settings, validation=False, calibration=lam
     (recency and target_options)."""
     while True:
         s = settings()
-        refs = window.sample(rng, batch_size, s.recency, validation)
+        refs = window.sample(rng, batch_size, s.recency, validation, s.regret_fraction)
         yield collate_arrays(*examples(window, refs, rng, **target_options(s, calibration())))
 
 
@@ -1061,18 +1179,28 @@ def start_hidden(processes):
         sys.modules['__main__'] = main
 
 
-def _render_worker(run, settings, seed, output, calibration, policy_dir, run_seed):
+def _render_worker(run, settings, seed, output, calibration, policy_dir, regret_updates, initial_regret, run_seed):
     """Worker process body: put `batches` from a private ReplayWindow on `policy_dir` (refreshed every 30 s; cheap rows
     retained per settings.cheap_row_fraction keyed by `run_seed`), with the Calibration packed in the shared array
     `calibration`."""
     try:
         window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
                               settings.window_taper, settings.validation_fraction, policy_dir, settings.cheap_row_fraction, run_seed)
+        if initial_regret is not None:
+            window.set_regret(initial_regret)
         rng = np.random.default_rng(seed); refreshed = time.time()
         while not window.index:
             time.sleep(5); window.refresh(); refreshed = time.time()
         for batch in batches(window, rng, settings.batch, lambda: settings, calibration=lambda: unpack_calibration(calibration[:])):
             output.put(batch)
+            latest_regret = None
+            try:
+                while True:
+                    latest_regret = regret_updates.get_nowait()
+            except queue.Empty:
+                pass
+            if latest_regret is not None:
+                window.set_regret(latest_regret)
             if time.time()-refreshed > 30:
                 window.refresh(); refreshed = time.time()
     except BaseException:
@@ -1087,18 +1215,25 @@ class Renderers:
     fixed per pool: close() it and start another to change them; set_calibration() replaces the Calibration of batches rendered from then on. Iterate to consume {S: batch of
     torch tensors}; a worker's exception or death is raised in the consumer."""
 
-    def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None, policy_dir=None, run_seed=0):
+    def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None, policy_dir=None, regret_entries=None,
+                 run_seed=0):
         context = multiprocessing.get_context('spawn')
         self.queue = context.Queue(depth*workers)
         self.calibration = context.Array('d', CALIBRATION_FEATURES+1)
+        self.regret_updates = [context.Queue() for _ in range(workers)]
         self.set_calibration(calibration)
         self.processes = [context.Process(target=_render_worker, daemon=True,
-                                          args=(str(run), settings, [*seed, i], self.queue, self.calibration, policy_dir, run_seed))
+                                          args=(str(run), settings, [*seed, i], self.queue, self.calibration, policy_dir,
+                                                self.regret_updates[i], regret_entries, run_seed))
                           for i in range(workers)]
         start_hidden(self.processes)
 
     def set_calibration(self, calibration):
         self.calibration[:] = pack_calibration(calibration)
+
+    def refresh_regret(self, entries):
+        for updates in self.regret_updates:
+            updates.put(entries)
 
     def __iter__(self):
         return self
@@ -1121,3 +1256,5 @@ class Renderers:
         for process in self.processes:
             process.join()
         self.queue.cancel_join_thread()
+        for updates in self.regret_updates:
+            updates.cancel_join_thread()
