@@ -440,7 +440,7 @@ class Engine:
                 continue
             self.closing.remove(entry)
             if plan:
-                plan.close(slot, slot.tree.history)
+                plan.close(slot, tuple(map(tuple, slot.moves)))
             done.append(slot)
         if self.closing and not self.slots and not done:
             self.solver.idle()

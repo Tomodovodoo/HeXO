@@ -32,7 +32,8 @@ Run layout: dense_config. Subcommands
              the realised results.
   match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal; per-side
              solver budgets (--a-solver-*, --b-solver-*, default the evaluation settings') allow one checkpoint
-             against itself with different solver settings, e.g. champion+solver vs champion.
+             against itself with different solver settings, e.g. champion+solver vs champion. Saves completed games
+             in matches/<timestamp>-<id>.json as they finish, including an unfinished colour pair on failure.
   variant    register a variant (`register`): a rated checkpoint, or the champion (--checkpoint champion), with
              overridden search settings, decided by the loop against that checkpoint.
 
@@ -232,6 +233,10 @@ class MatchGame:
             self.error = f'{type(error).__name__}: {error}'
         return not self.over()
 
+    def label(self, ply, proven, turns, proof_action=None):
+        """Match games have no training rows to label when a followed proof arrives."""
+        return 0
+
     def finish(self):
         winner = self.game.winner
         self.game.close()
@@ -241,17 +246,19 @@ class MatchGame:
                     plies=len(self.moves), moves=self.moves, **(dict(error=self.error) if self.error else {}))
 
 
-def play(games, leaf_batch, heartbeat=lambda finished: None):
+def play(games, leaf_batch, heartbeat=lambda finished: None, schedule=None):
     """Run MatchGames to completion in one engine; returns their records in input order. heartbeat(records of
     the finished games, in finishing order) is called after every engine step."""
-    engine, records = Engine(leaf_batch), {}
+    engine, records = Engine(leaf_batch, schedule=schedule), {}
     try:
         for game in games:
             if game.over():
                 records[id(game)] = game.finish()
             else:
                 engine.add(game)
-        while engine.slots:
+        if records:
+            heartbeat(list(records.values()))
+        while engine.slots or engine.closing:
             for game in engine.step():
                 records[id(game)] = game.finish()
             heartbeat(list(records.values()))
@@ -2072,13 +2079,26 @@ def match(args):
     book = dense_openings.Book(run, settings)
     settings = replace(settings, opening_book=book.digest())
     started = time.perf_counter()
+    target = run/'matches'/f'{time.strftime("%Y%m%d-%H%M%S")}-{uuid.uuid4().hex[:8]}.json'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    report = dict(id=uuid.uuid4().hex, candidate=args.a, opponent=args.b, created_at=time.time(),
+                  candidate_sha256=models['a'].sha,
+                  opponent_sha256=SEAL if args.b == SEAL else models['b'].sha,
+                  settings=asdict(settings), solver={side: asdict(b) for side, b in budgets.items()}, games=[])
+
+    def record(finished):
+        if len(finished) == len(report['games']):
+            return
+        report.update(games=finished, summary=tally(finished), metrics=paired_metrics(finished, args.games))
+        write_json(target, report)
+
     records = play(paired_games(models['a'], SEAL if args.b == SEAL else models['b'], args.games,
                                 f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None, book,
                                 sides=(sides['a'], sides['b']), candidate=args.a, opponent=args.b),
-                   config.actor.leaf_batch)
-    report = make_report(args.a, args.b, records, {m.checkpoint: m.sha for m in models.values()}, settings)
+                   config.actor.leaf_batch, heartbeat=record)
+    record(records)
     print(json.dumps(dict(summary=report['summary'], metrics=report['metrics'], seconds=time.perf_counter()-started,
-                          solver={side: asdict(b) for side, b in budgets.items()}), indent=2))
+                          solver=report['solver'], report=str(target)), indent=2))
 
 
 def variant(args):
