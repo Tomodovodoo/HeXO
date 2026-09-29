@@ -315,6 +315,9 @@ class Engine:
     bounded to leaf_nodes and 10 ms. NativeTactics verifies the returned certificate against that leaf;
     hxg_prove backs up an exact result and keeps its first turn in the tree. UNKNOWN leaves use the network.
     A proof at the current root also reaches the usual proof-following, adjudication and exact-row path.
+    Immediate child proofs exclude losing root moves. A winning first stone extends the certificate to
+    the root's two-stone turn. Deeper leaf proofs remain
+    numeric backups because one continuation does not prove the intervening choices.
     This is opt-in because its CPU cost competes with producing GPU batches.
     """
 
@@ -429,13 +432,33 @@ class Engine:
                         checked(native.hxg_prove(ptr, request, history, size, dense_data.player_at(size),
                                                 2 if size % 2 else 1, moves, len(moves)))
                         self.leaf_proofs += 1
-                        if size == len(slot.tree.history):
+                        root_size = len(slot.tree.history)
+                        if size <= root_size+1:
                             witness = dense_solver.Proof(tuple(map(tuple, history.tolist())), proof['certificate'],
                                                          first_turn_only=not self.schedule.follow)
+                            if size == root_size+1:
+                                winner = dense_data.player_at(size)
+                                plan.found.append(witness)
+                                if winner != dense_data.player_at(root_size):
+                                    checked(native.hxg_mark_exact(ptr, int(history[-1, 0]), int(history[-1, 1]), winner))
+                                    plan.pruned.append(history[-1].tolist())
+                                    plan.turns = max(plan.turns, proof['proof_turns'])
+                                    plan.spent(proof)
+                                    progress = True
+                                    continue
+                                # This is the same mover's second stone. Include its first stone in the
+                                # certificate's first turn to prove the preceding root as well. Finish the
+                                # current schedule: marking a win mid-round would strand its other samples.
+                                certificate = proof['certificate']
+                                nodes = list(certificate['nodes'])
+                                i = certificate['root']
+                                nodes[i] = dict(nodes[i], action=[history[-1].tolist(), *nodes[i]['action']])
+                                witness = dense_solver.Proof(tuple(map(tuple, slot.tree.history)),
+                                    dict(certificate, nodes=nodes), first_turn_only=not self.schedule.follow)
                             self.leaf_roots[id(slot)] = witness, proof
                             if plan is not None:
                                 plan.found.append(witness)
-                                plan.proofs[dense_data.player_at(size)] = witness
+                                plan.proofs[dense_data.player_at(root_size)] = witness
                         progress = True
                         continue
                 model = slot.model

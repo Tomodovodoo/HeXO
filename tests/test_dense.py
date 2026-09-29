@@ -3122,6 +3122,72 @@ class EngineTests(unittest.TestCase):
                 tree.close()
             slot.game.close()
 
+    def test_immediate_child_proof_marks_the_root_move_and_lifts_a_winning_turn(self):
+        from dense_solver import Plan, Proof, Schedule
+        base = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        for winning in (True, False):
+            with self.subTest(winning=winning):
+                history = base if winning else base+[[-1,3]]
+                action = [4,0] if winning else [7,6]
+                model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+                settings = dense_config.ActorSettings(full_fraction=0., tactics=False, solver_follow=True,
+                    max_plies=len(history)+(2 if winning else 1), adjudicate_proven=winning, proven_line_rows=True)
+                slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+                try:
+                    try:
+                        engine = dense_selfplay.Engine(8, schedule=Schedule.of(settings), leaf_nodes=32)
+                    except FileNotFoundError:
+                        self.skipTest('Prebuilt tactical library required')
+                    self.addCleanup(engine.close)
+                    leaf_history = history+[action]
+                    verdict = engine.leaf_solver.history(leaf_history, nodes=32, ms=1000)
+                    self.assertTrue(verdict['native_verified'])
+                    actions = np.asarray(slot.game.legal_moves(), np.int64)
+                    logits = np.full(len(actions), -1000.)
+                    for i, cell in enumerate(actions):
+                        if cell.tolist() == action:
+                            logits[i] = 100.
+                        elif cell.tolist() == [5,3]:
+                            logits[i] = 99.
+                    model.cache.put(dense_selfplay.position_key(np.asarray(history)),
+                                    (actions, logits, np.zeros(len(actions))))
+                    # The root query misses. Only its immediate child reveals the verified win.
+                    with unittest.mock.patch.object(engine.leaf_solver, 'history', side_effect=lambda h, **k:
+                            verdict if h == leaf_history else dict(status='UNKNOWN', native_verified=False)), \
+                         unittest.mock.patch.object(slot, 'searched', wraps=slot.searched) as searched:
+                        engine.add(slot)
+                        while engine.slots or engine.closing:
+                            engine.step()
+                    result = searched.call_args_list[0].args[0]
+                    self.assertEqual(result['solver_budget'], 32)
+                    if winning:
+                        self.assertEqual(result['action'], action)
+                        self.assertEqual((result['proven'], slot.rows[0]['proven'], slot.values[len(history)]),
+                                         (1, 1, 1.))
+                        self.assertEqual(slot.reason, 'proven')
+                        self.assertEqual(slot.game.winner, dense_data.player_at(len(history)))
+                        witness = result['proof']
+                        lifted = dict(verdict['certificate'], nodes=witness.nodes, root=witness.root)
+                        self.assertTrue(engine.leaf_solver.history(history, certificate=lifted, nodes=32,
+                                                                  ms=1000)['native_verified'])
+                    else:
+                        self.assertEqual(result['action'], [5,3])
+                        self.assertIn(action, result['pruned'])
+                        self.assertEqual(result['exact_winner'], -1)
+                        self.assertFalse(slot.rows[0].get('proven'))
+                        # If this losing move is played later, the opponent can follow its retained proof.
+                        from types import SimpleNamespace
+                        plan = Plan(None, Schedule.of(settings), leaf_nodes=32)
+                        plan.found.append(Proof(tuple(map(tuple, leaf_history)), verdict['certificate']))
+                        plan.begin(SimpleNamespace(tree=SimpleNamespace(history=leaf_history), solver=slot.solver))
+                        self.assertTrue(plan.following)
+                        self.assertEqual(plan.move(dense_data.player_at(len(leaf_history)), leaf_history)[0],
+                                         list(map(tuple, verdict['moves'])))
+                finally:
+                    for tree in slot.trees.values():
+                        tree.close()
+                    slot.game.close()
+
     def test_leaf_root_certificate_reaches_active_solver_plan(self):
         from dense_solver import Schedule
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
