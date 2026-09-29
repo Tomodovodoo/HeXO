@@ -821,10 +821,11 @@ class DenseConfigTests(unittest.TestCase):
         dense_config.add_arguments(prefixed, dense_config.ActorSettings)
         dense_config.add_arguments(prefixed, dense_config.EvaluationSettings, 'eval_')
         args = prefixed.parse_args(['--root-samples', '8', '--eval-root-samples', '4', '--no-eval-tactics',
-                                    '--eval-solver-workers', '3'])
+                                    '--eval-solver-workers', '3', '--eval-solver-gate-cap-nodes', '32768'])
         self.assertEqual(dense_config.override(base, args).root_samples, 8)
         evaluation = dense_config.override(dense_config.EvaluationSettings(), args, 'eval_')
-        self.assertEqual((evaluation.root_samples, evaluation.tactics, evaluation.solver_workers), (4, False, 3))
+        self.assertEqual((evaluation.root_samples, evaluation.tactics, evaluation.solver_workers,
+                          evaluation.solver_gate_cap_nodes), (4, False, 3, 32768))
 
     def test_learner_target_and_validation_flags(self):
         parser = argparse.ArgumentParser()

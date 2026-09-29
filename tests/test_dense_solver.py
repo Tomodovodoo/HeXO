@@ -25,7 +25,7 @@ from dense_solver import Budgets, Proof, Schedule
 import hexnet
 from hexo import Game
 from neural_search import HOLD, NeuralSearch, checked, native
-from tactical_proof import NativeTactics
+from tactical_proof import NativeTactics, gated_nodes
 from tests.test_dense import episode_rows, winning_game
 from tests.test_tactical_proof import FIXTURE, TWO_TURN
 
@@ -520,7 +520,25 @@ class Scheduler(unittest.TestCase):
         fixed = dense_solver.Solver(Schedule(gate_weight=3.), asynchronous=False)
         fixed.leads['root'].extend([5000.]*8)
         self.assertEqual(fixed.allocate('root', NODES)[:2],
-                         (NODES, dict(weight=3., floor=NODES, cap_low=dense_solver.MAX_NODES, cap_high=dense_solver.MAX_NODES)))
+                         (NODES, dict(weight=3., floor=NODES, cap_low=NODES, cap_high=8192)))
+        self.assertEqual(fixed.allocate('threat', NODES)[1], fixed.allocate('root', NODES)[1])
+
+    def test_evaluation_gate_budget_is_position_deterministic(self):
+        base = dense_config.EvaluationSettings(solver_root_nodes=2048, solver_threat_nodes=2048)
+        self.assertEqual(Schedule.of(base).gate_weight, 0.)
+        self.assertEqual(dense_solver.Solver(Schedule.of(base), asynchronous=False).allocate('root', 2048)[1], None)
+        scaled = replace(base, solver_gate_cap_nodes=32768)
+        solver = dense_solver.Solver(Schedule.of(scaled), asynchronous=False)
+        gate = solver.allocate('root', 2048)[1]
+        self.assertEqual(gate, solver.allocate('threat', 2048)[1])
+        self.assertEqual(gated_nodes([[0, 0]], 'mover', 2048, gate), (2048, 0.))
+        history = FIXTURE['positions'][PROOF]
+        self.assertEqual(gated_nodes(history, 'mover', 2048, gate), (8192, 19.5))
+        solver.leads['root'].extend([5000.]*8)
+        solver.tick(100., 50.)
+        self.assertEqual(solver.allocate('root', 2048)[1], gate)
+        with self.assertRaises(ValueError):
+            Schedule.of(replace(base, solver_gate_cap_nodes=1024))
 
     def test_late_proofs_are_played_only_as_their_own_root_turn_without_follow(self):
         try:
@@ -784,6 +802,8 @@ class Protocol(unittest.TestCase):
         self.assertTrue(dense_eval.same_protocol(on, replace(settings, solver_root_nodes=NODES)))
         self.assertTrue(dense_eval.same_protocol(on, replace(settings, solver_root_nodes=NODES, solver_workers=3)))
         self.assertFalse(dense_eval.same_protocol(on, settings))
+        self.assertFalse(dense_eval.same_protocol(on, replace(settings, solver_root_nodes=NODES,
+                                                                solver_gate_cap_nodes=32768)))
 
     def test_budgets_validate(self):
         with self.assertRaises(ValueError):
