@@ -3867,10 +3867,21 @@ class EvaluatorLoopTests(unittest.TestCase):
         report = json.loads(path.read_text())
         report['metrics']['posterior'] = dict(decision='reject')
         path.write_text(json.dumps(report))
+        dense_eval._reports.clear()                                                   # rewritten within one mtime tick
         evaluator.review()
         self.assertEqual(evaluator.league['champion'], 'main/019500')                 # settled under another model
         report['metrics']['posterior']['model'] = dense_posterior.MODEL
         path.write_text(json.dumps(report))
+        dense_eval._reports.clear()
+        self.report('main/019500', 'main/025000', [1, 0])
+        reverse = dense_eval.report_path(self.run, 'main/019500', 'main/025000')
+        stored = json.loads(reverse.read_text())
+        stored['metrics']['posterior'] = dict(decision='promote')
+        reverse.write_text(json.dumps(stored))
+        dense_eval._reports.clear()
+        evaluator.review()
+        self.assertEqual(evaluator.league['champion'], 'main/019500')                 # in either orientation
+        shutil.rmtree(reverse.parent)
         evaluator.review()
         self.assertEqual((self.league()['champion'], json.loads((self.run/'champion.json').read_text())['checkpoint']),
                          ('main/025000', 'main/025000'))

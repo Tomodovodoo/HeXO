@@ -1565,13 +1565,14 @@ class Evaluator:
     def review(self):
         """Posterior mode, once per evaluator (so after every restart or settings change): re-apply the promotion
         rule to the existing reports. Of the rated checkpoints, neither skipped nor demoted, with at least
-        sprt_min_games direct games against the champion (`direct`), those whose direct report's decision
-        (metrics.posterior), if any, was taken under the current likelihood (model dense_posterior.MODEL: a settled
-        decision is never re-judged under another) and whose `verdict` is `ready` with P(delta > sprt_elo0) >= promote_confidence are eligible; the one of highest posterior
-        rating among them is promoted when it also out-rates the champion and every other checkpoint with those
-        direct games ('decision' event 'promote on review', then the 'promotion' event; its Seal anchor is scheduled
-        as for any promotion), and its entry keeps that verdict with its `snapshot`. A higher-rated checkpoint
-        without those direct games does not block it: it has not met the champion."""
+        sprt_min_games direct games against the champion (`direct`), those whose direct reports' decisions
+        (metrics.posterior of either orientation under the current protocol), if any, were taken under the current
+        likelihood (model dense_posterior.MODEL: a settled decision is never re-judged under another) and whose
+        `verdict` is `ready` with P(delta > sprt_elo0) >= promote_confidence are eligible; the one of highest
+        posterior rating among them is promoted when it also out-rates the champion and every other checkpoint with
+        those direct games ('decision' event 'promote on review', then the 'promotion' event; its Seal anchor is
+        scheduled as for any promotion), and its entry keeps that verdict with its `snapshot`. A higher-rated
+        checkpoint without those direct games does not block it: it has not met the champion."""
         s, champion = self.settings, self.league['champion']
         if s.decision != 'posterior' or champion is None:
             return
@@ -1581,9 +1582,8 @@ class Evaluator:
                     or len(self.direct(c['id'], champion)) < s.sprt_min_games:
                 continue
             met.append(c['id'])
-            path = report_path(self.run, c['id'], champion)
-            settled = json.loads(path.read_text())['metrics'].get('posterior') if path.exists() else None
-            if settled and settled.get('model') != MODEL:
+            if any(r['metrics']['posterior'].get('model') != MODEL for r in load_reports(self.run, s)
+                   if {r['candidate'], r['opponent']} == {c['id'], champion} and 'posterior' in r['metrics']):
                 continue
             verdict = self.verdict(c['id'], champion)
             if ready(s, verdict['direct']['games'], verdict['disagree']) \
