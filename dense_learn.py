@@ -71,7 +71,7 @@ REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
         'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'deblunder_weight',
-        'optimizer', 'proof_policy_weight', 'future_target')
+        'optimizer', 'proof_policy_weight', 'future_target', 'regret_fraction')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
@@ -649,7 +649,7 @@ class Learner:
         rng, s = np.random.default_rng([self.config.seed, 1]), self.settings
         with torch.no_grad():
             for _ in range(math.ceil(RECALIBRATION_ROWS/s.batch)):
-                refs = window.sample(rng, s.batch, s.recency)
+                refs = window.sample(rng, s.batch, s.recency, regret_fraction=s.regret_fraction)
                 batch = dense_data.collate(*dense_data.examples(window, refs, rng, **self.targets()))
                 batch_losses(self.ema, batch, None, self.device, self.memory_format, False)
         for m, momentum in zip(norms, momenta):
@@ -911,6 +911,8 @@ def main():
         status.update(fields, updated_at=time.time(), step=learner.step, samples_seen=learner.samples_seen,
                       rows_available=window.total_rows, window_rows=window.rows, full_rows_available=window.total_full_rows,
                       window_full_rows=window.full_rows,
+                      regret_rows=window.regret_rows, regret_effective_share=window.regret_share(
+                          learner.settings.batch, learner.settings.regret_fraction, learner.settings.recency),
                       samples_per_row=(learner.samples_seen-base['samples'])/max(1, window.total_rows-base['rows']),
                       samples_per_row_target=learner.settings.samples_per_row, phase_rows=learner.settings.phase_rows,
                       backlog_rows=backlog(learner.samples_seen, window.total_rows, learner.settings.samples_per_row, base),
@@ -928,6 +930,8 @@ def main():
     def export():
         write_status(stage='exporting')
         fields = validation_fields(learner.export(window, sets)['metrics'])
+        window.refresh_regret()
+        stream.refresh_regret(window.regret_entries)
         stream.set_calibration(learner.calibration)
         if fields:
             dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
@@ -945,7 +949,8 @@ def main():
         sets = validation_sets(args.run, s, config.seed)
         learner.calibrate(window)
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers,
-                                                 calibration=learner.calibration, policy_dir=policy_dir(args.run, s.variant))
+                                                 calibration=learner.calibration, policy_dir=policy_dir(args.run, s.variant),
+                                                 regret_entries=window.regret_entries)
         stream = renderers()
         factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])
         dense_config.log_event(args.run, 'learner', 'info', f'{s.variant} learner started at step {learner.step}', variant=s.variant, step=learner.step,
