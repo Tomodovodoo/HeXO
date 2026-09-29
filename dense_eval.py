@@ -260,7 +260,15 @@ def play(games, leaf_batch, heartbeat=lambda finished: None, schedule=None):
         if records:
             heartbeat(list(records.values()))
         while engine.slots or engine.closing:
-            for game in engine.step():
+            try:
+                finished = engine.step()
+            except Exception:
+                for game in engine.completed:
+                    if id(game) not in records:
+                        records[id(game)] = game.finish()
+                heartbeat(list(records.values()))
+                raise
+            for game in finished:
                 records[id(game)] = game.finish()
             heartbeat(list(records.values()))
     finally:

@@ -338,6 +338,7 @@ class Engine:
 
     def step(self):
         pending, count, done, progress, deferred = {}, 0, [], False, False
+        self.completed = done
         started = time.perf_counter()
         slots = self.slots
         for _ in range(len(slots)):
