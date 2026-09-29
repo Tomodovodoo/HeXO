@@ -30,7 +30,7 @@ const columns = [
   ['median_plies','Median','Median total placements in matching report games, including capped games',number],
   ['mean_plies','Mean','Mean total placements in matching report games, including capped games',number],
   ['depth','Depth','Opening placements, including the first origin stone',number],
-  ['champion_probability','P %','Probability of reaching this canonical position under the champion',percent],
+  ['champion_probability','P %','Probability of reaching this canonical position under the champion',v=>v==null?'·':(100*v).toPrecision(3)],
   ['status','S','Green: opening; amber: retired; grey: prefix',v=>'●'],
   ['created_at','Created','Book creation or adoption time, UTC',timestamp],
   ['retired_at','Retired','Retirement time, UTC',timestamp],
@@ -74,18 +74,22 @@ class OpeningBook {
   control(label,key,e){const wrap=element('label',label);wrap.append(e);this.controls.append(wrap);this.filters.push([key,e,wrap]);e.onchange=()=>{if(!e.checkValidity()){e.reportValidity();return}this.change({[key]:e.type==='checkbox'?(e.checked?'1':'0'):e.value,page:1})}}
   state(){const q=new URLSearchParams(location.hash.slice(1)),get=(k,d)=>q.get('book_'+k)??d;return {view:get('view','charts'),run:get('run',this.runs[0]||''),sort:get('sort','games'),direction:get('direction','desc'),page:get('page','1'),page_size:get('page_size','50'),status:get('status',''),reason:get('reason',''),min_games:get('min_games','0'),depth:get('depth',''),colour_decides:get('colour_decides','0'),min_decisive:get('min_decisive','10')}}
   change(values){const q=new URLSearchParams(location.hash.slice(1));for(const [k,v] of Object.entries({...this.state(),...values}))q.set('book_'+k,v);const hash=q.toString();if(location.hash.slice(1)===hash)this.render();else location.hash=hash}
-  setRuns(names){const changed=names.join('\n')!==this.runs.join('\n');if(!changed)return;this.runs=names;this.runSelect.replaceChildren(...names.map(n=>element('option',n,{value:n})));this.render()}
+  setRuns(names){const changed=names.join('\n')!==this.runs.join('\n');if(changed){this.runs=names;this.runSelect.replaceChildren(...names.map(n=>element('option',n,{value:n})));this.render()}else if(['book','retired'].includes(this.state().view))this.render(true)}
   query(state){const q=new URLSearchParams(state);q.delete('view');if(this.single){q.delete('run');const run=new URLSearchParams(location.search).get('run');if(run)q.set('run',run)}return q}
   async fetch(path,q,signal){const res=await fetch(path+'?'+q,{signal});if(!res.ok)throw Error(`Book: HTTP ${res.status}`);return res.json()}
-  async render(){
+  async render(refresh=false){
+    if(refresh&&this.loading)return;
     const s=this.state(),id=++this.request;this.abort?.abort();this.abort=new AbortController();const signal=this.abort.signal;
     const isChart=s.view==='charts',isDag=s.view==='dag';this.overview.hidden=!isChart;this.panel.hidden=isChart;
     for(const b of this.tabs.children)b.setAttribute('aria-pressed',b.dataset.view===s.view);
     if(isChart){window.dispatchEvent(new Event('resize'));return}
-    this.runSelect.hidden=this.single;this.runSelect.value=s.run;
-    for(const [key,e,wrap] of this.filters){if(e.type==='checkbox')e.checked=s[key]==='1';else e.value=s[key];wrap.hidden=isDag||(s.view==='retired'&&key==='status')}
-    this.content.replaceChildren();this.pages.replaceChildren();this.error.textContent='';
+    if(!refresh){
+      this.runSelect.hidden=this.single;this.runSelect.value=s.run;
+      for(const [key,e,wrap] of this.filters){if(e.type==='checkbox')e.checked=s[key]==='1';else e.value=s[key];wrap.hidden=isDag||(s.view==='retired'&&key==='status')}
+      this.content.replaceChildren();this.pages.replaceChildren();this.error.textContent='';
+    }
     if(!this.runs.length)return;
+    this.loading=true;
     try{
       if(isDag){
         const q=this.query({run:s.run}),key=q.toString();let data=this.dags.get(key);
@@ -94,12 +98,17 @@ class OpeningBook {
       }
       if(s.view==='retired')s.status='retired';
       const data=await this.fetch('/api/book',this.query(s),signal);if(id!==this.request)return;
-      this.content.append(this.table(data.rows,s));
+      this.error.textContent='';const signature=JSON.stringify(data);
+      if(refresh&&signature===this.pageSignature)return;
+      this.pageSignature=signature;
+      const old=this.content.querySelector('.book-scroll'),scroll=[old?.scrollLeft||0,old?.scrollTop||0],table=this.table(data.rows,s);
+      this.content.replaceChildren(table);table.scrollLeft=scroll[0];table.scrollTop=scroll[1];this.pages.replaceChildren();
       const count=Math.max(1,Math.ceil(data.total/data.page_size));
       if(data.page>count){this.change({page:count});return}
       for(const [label,page,disabled] of [['‹',data.page-1,data.page===1],['›',data.page+1,data.page>=count]]){const b=element('button',label,{'aria-label':label==='‹'?'Previous page':'Next page'});b.disabled=disabled;b.onclick=()=>this.change({page});this.pages.append(b)}
       this.pages.append(element('span',`${data.page} / ${count} · ${data.total}`,{title:'Page / pages · matching positions'}));
     }catch(e){if(e.name!=='AbortError'&&id===this.request)this.error.textContent=e.message}
+    finally{if(id===this.request)this.loading=false}
   }
   table(rows,s){
     const wrap=element('div',null,{class:'book-scroll'}),table=element('table'),head=element('thead'),tr=element('tr');tr.append(element('th',''));
