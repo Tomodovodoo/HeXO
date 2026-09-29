@@ -36,6 +36,7 @@ Run layout: dense_config. Subcommands
              in matches/<timestamp>-<id>.json as they finish, including an unfinished colour pair on failure.
   variant    register a variant (`register`): a rated checkpoint, or the champion (--checkpoint champion), with
              overridden search settings, decided by the loop against that checkpoint.
+  settle     ask the running loop to settle a checkpoint trial on its completed games.
 
 Scoring: a capped game (at the ply limit, or reason 'span' when a searched position does not fit the largest crop) is
 half a point for each side. Pair score = candidate points / 2 over its two games; decisions use completed pairs.
@@ -51,12 +52,12 @@ probability is at most 1 - promote_confidence (`Evaluator.verdict`), re-judged a
 until then direct games keep playing. On start the rule is re-applied to the existing reports (`Evaluator.review`). Direct games fill
 the pool until sprt_min_games are complete; after that at most evidence_share of the pool may go to the evidence
 pairing that most reduces Var(delta) (value of information: the candidate or champion vs the previous champion or
-Seal, `Evaluator.evidence`), up to sprt_max_games direct games. Supersession settles once the games in flight have
+Seal, `Evaluator.evidence`), up to sprt_max_games direct games. Supersession or a settle request ends a trial once the games in flight have
 finished: the candidate is promoted when P(delta > sprt_elo0) >= promote_confidence, however the readiness
 conditions stand, else 'superseded'. Evidence games are ordinary reports, kind 'evidence'.
 With 'sprt', the comparison with the champion is a sequential test (see `sprt`) until it accepts H0 or H1, reaches
 `sprt_max_games` (decision 'max-games') or is superseded by a newer checkpoint of its variant. H1 promotes; a
-superseded comparison is settled on the same posterior: it promotes when P(delta > sprt_elo0) >= promote_confidence,
+superseded or requested comparison is settled on the same posterior: it promotes when P(delta > sprt_elo0) >= promote_confidence,
 recorded as metrics.sprt.settled {pair_score, p_better, promote} with a 'settle' event. The first rated checkpoint becomes champion unopposed.
 
 Variants: an A/B test of search settings played by the evaluator's own machinery. A variant is a league entry with id
@@ -394,6 +395,18 @@ def register(run, checkpoint, name, settings):
     log_event(run, 'evaluator', 'variant', f'{cid} registered: ' + ', '.join(f'{k}={v}' for k, v in settings.items()),
               candidate=cid, checkpoint=checkpoint, settings=settings)
     return entry
+
+
+def settle_path(run, checkpoint):
+    return Path(run)/'settle-requests'/f'{hashlib.sha256(checkpoint.encode()).hexdigest()}.json'
+
+
+def request_settle(run, checkpoint):
+    request = dict(checkpoint=checkpoint, requested_at=time.time())
+    path = settle_path(run, checkpoint)
+    path.parent.mkdir(exist_ok=True)
+    write_json(path, request)
+    return request
 
 
 def pair_scores(records):
@@ -1241,6 +1254,17 @@ class Evaluator:
         known = {c['id'] for c in self.league['checkpoints']}
         return any(e[0] != cid and e[0].split('/')[0] == cid.split('/')[0] and e[0] not in known for e in checkpoints(self.run))
 
+    def requested(self, cid):
+        return settle_path(self.run, cid).exists()
+
+    def dismiss_settle_requests(self, resumed):
+        for path in sorted((self.run/'settle-requests').glob('*.json')):
+            cid = json.loads(path.read_text())['checkpoint']
+            if cid in resumed:
+                continue
+            log_event(self.run, 'evaluator', 'info', f'{cid}: settle request ignored; no running trial', candidate=cid)
+            path.unlink()
+
     def variants(self):
         """The league's variant entries (league contract), in registration order."""
         return self.league.setdefault('variants', [])
@@ -1467,7 +1491,8 @@ class Evaluator:
         def want():
             verdict = self.verdict(cid, champion)
             self.refresh(cid, champion, verdict)
-            if verdict['decision'] or verdict['direct']['games'] >= s.sprt_max_games or self.newer(cid):
+            if verdict['decision'] or verdict['direct']['games'] >= s.sprt_max_games or self.newer(cid) \
+                    or self.requested(cid) and verdict['direct']['games']:
                 return {}
             lanes = self.lanes(verdict, cid, champion)
             self.publish(decision=dict(public(verdict), candidate=cid, opponent=champion, next=[list(l[:2]) for l in lanes]))
@@ -1478,15 +1503,16 @@ class Evaluator:
                 if a != cid and games:
                     self.record(a, b, json.loads(report_path(self.run, a, b).read_text()))
             verdict = self.verdict(cid, champion)
-            if verdict['decision'] or not added or verdict['direct']['games'] >= s.sprt_max_games or self.newer(cid):
+            if verdict['decision'] or not added or verdict['direct']['games'] >= s.sprt_max_games or self.newer(cid) \
+                    or self.requested(cid) and verdict['direct']['games']:
                 break
         if not self.games(cid, champion):
             return {}, None
-        superseded = self.newer(cid)
+        requested, superseded = self.requested(cid), self.newer(cid)
         verdict = dict(public(verdict), candidate=cid, **self.snapshot(cid, champion))
-        if not verdict['decision'] and superseded and verdict['p_better'] >= s.promote_confidence:
+        if not verdict['decision'] and (superseded or requested) and verdict['p_better'] >= s.promote_confidence:
             verdict.update(decision='promote', settled=True)
-        verdict['decision'] = verdict['decision'] or ('superseded' if superseded else 'max-games')
+        verdict['decision'] = verdict['decision'] or ('superseded' if superseded or requested else 'max-games')
         path = report_path(self.run, cid, champion)
         report = json.loads(path.read_text())
         report['metrics']['posterior'] = verdict
@@ -1494,10 +1520,13 @@ class Evaluator:
         self.publish(True, decision=verdict, pending=[p for p in self.status['pending'] if p['candidate'] != cid])
         direct, g = verdict['direct'], lambda v: f'{v:+.0f}' if v is not None else '-'
         log_event(self.run, 'evaluator', 'decision', f'{cid} vs {champion}: {verdict["decision"]}'
-                  + (' (settled on supersession)' if superseded else '') + f' after {direct["games"]} direct games: '
+                  + (f' (settled on {"request" if requested else "supersession"})' if requested or superseded else '')
+                  + f' after {direct["games"]} direct games: '
                   f'P(delta > {s.sprt_elo0:g}) {verdict["p_better"]:.3f}, delta {g(verdict["delta"])} +- {verdict["delta_sd"]:.0f}, '
                   f'direct {g(direct["elo"])}, pooled [{verdict["pooled"][0]:+.0f}, {verdict["pooled"][1]:+.0f}]',
                   **verdict)
+        if requested:
+            settle_path(self.run, cid).unlink(missing_ok=True)
         found = {r['opponent']: r for r in load_reports(self.run, s) if r['candidate'] == cid}
         return {champion: found[champion], **found}, verdict
 
@@ -1664,7 +1693,7 @@ class Evaluator:
             games = self.games(cid, champion)
             if games and (decision := self.test(games)['decision']):
                 decided.append(decision)
-            if decided or len(games) >= s.sprt_max_games or self.newer(cid):
+            if decided or len(games) >= s.sprt_max_games or self.newer(cid) or self.requested(cid) and games:
                 return {}
             self.publish(decision=dict(shown(), next=[[cid, champion]]))
             return {(cid, champion, 'champion'): even(min(s.pool_games, s.sprt_max_games-len(games)))}
@@ -1674,7 +1703,8 @@ class Evaluator:
             return {}, None
         report = json.loads(path.read_text())
         result, n = self.test(report['games']), len(report['games'])
-        decision = decided[0] if decided else 'superseded' if n < s.sprt_max_games and self.newer(cid) else 'max-games'
+        requested = self.requested(cid)
+        decision = decided[0] if decided else 'superseded' if n < s.sprt_max_games and (self.newer(cid) or requested) else 'max-games'
         test = report['metrics']['sprt'] = dict(result, decision=decision)
         final = shown(decision)
         self.publish(True, decision=final, pending=[p for p in self.status['pending'] if p['candidate'] != cid])
@@ -1683,13 +1713,15 @@ class Evaluator:
             p_better = final['p_better']
             settled = test['settled'] = dict(pair_score=summary_['pair_score'], p_better=p_better,
                                              promote=p_better >= s.promote_confidence)
-            log_event(self.run, 'evaluator', 'settle', f'{cid} vs {champion} settled on supersession after {n} games: '
+            log_event(self.run, 'evaluator', 'settle', f'{cid} vs {champion} settled on {"request" if requested else "supersession"} after {n} games: '
                       f'+{summary_["wins"]} -{summary_["losses"]} ={summary_["capped"]}, pair score {summary_["pair_score"]:.3f}, '
                       f'P(delta > {s.sprt_elo0:g}) {p_better:.3f}, LLR {test["llr"]:.2f}: '
                       + ('promoted' if settled['promote'] else 'not promoted'),
                       candidate=cid, opponent=champion, games=n, llr=test['llr'], rule=final['rule'],
                       threshold=final['threshold'], **settled)
         write_json(path, report)
+        if requested:
+            settle_path(self.run, cid).unlink(missing_ok=True)
         return {champion: report}, test
 
     def rate(self, entry):
@@ -1888,6 +1920,7 @@ class Evaluator:
         self.status['backlog'] = [e[0] for e in unrated]
         self.queue(self.status['backlog'])
         resumed = [e for e in unrated if champion and self.games(e[0], champion)]
+        self.dismiss_settle_requests({e[0] for e in resumed})
         # A refresh that changes the book would restart the games of a candidate or variant trial waiting to resume.
         trials = [v for v in self.variants() if 'verdict' not in v and v['checkpoint'] and self.games(v['id'], v['checkpoint'])]
         if not resumed and not trials:
@@ -2107,6 +2140,10 @@ def variant(args):
     print(json.dumps(register(args.run, args.checkpoint, args.name, parse_settings(args.set)), indent=2))
 
 
+def settle(args):
+    print(json.dumps(request_settle(args.run, args.checkpoint), indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest='command', required=True)
@@ -2126,8 +2163,9 @@ def main():
     p = sub.add_parser('variant'); p.add_argument('--run', required=True); p.add_argument('--checkpoint', required=True)
     p.add_argument('--name', required=True)
     p.add_argument('--set', action='append', default=[], metavar='KEY=VALUE', help=f'one of {", ".join(SIDE)}; repeatable')
+    p = sub.add_parser('settle'); p.add_argument('--run', required=True); p.add_argument('--checkpoint', required=True)
     args = parser.parse_args()
-    dict(loop=loop, calibrate=calibrate, match=match, variant=variant)[args.command](args)
+    dict(loop=loop, calibrate=calibrate, match=match, variant=variant, settle=settle)[args.command](args)
 
 
 if __name__ == '__main__':
