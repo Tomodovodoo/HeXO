@@ -225,14 +225,19 @@ def skewed(node, settings):
     return node['skew']['pairs'] >= settings.book_min_games and (low > settings.book_max_skew or high < -settings.book_max_skew)
 
 
+def short_skewed(node, settings, short_limit):
+    """Decisive first-player skew on a line shorter than the played openings' mean-length quantile."""
+    decisive = node.get('p1_wins', 0)+node.get('p2_wins', 0)
+    return short_limit is not None and decisive >= settings.book_short_min_games and node.get('mean_plies') is not None \
+            and node['mean_plies'] < short_limit \
+            and abs(node['p1_wins']-decisive/2)/math.sqrt(decisive/4) >= settings.book_short_skew_z
+
+
 def judge(node, settings, short_limit=None):
     """Why an opening must retire, else None. `short_limit` is the played openings' mean-length quantile."""
     if skewed(node, settings):
         return 'skew'
-    decisive = node.get('p1_wins', 0)+node.get('p2_wins', 0)
-    if short_limit is not None and decisive >= settings.book_short_min_games and node.get('mean_plies') is not None \
-            and node['mean_plies'] < short_limit \
-            and abs(node['p1_wins']-decisive/2)/math.sqrt(decisive/4) >= settings.book_short_skew_z:
+    if short_skewed(node, settings, short_limit):
         return 'short_skew'
     p = node['champion_probability']
     return 'probability' if p is not None and p < settings.book_min_prob else None
@@ -416,6 +421,11 @@ class Book:
         always; a live book counts the reports of other suites too the first time (`imported`), adding the positions of
         their openings (status null: a refresh may make them openings). Returns the pairs counted."""
         if self._missing_plies:
+            for key in self._missing_plies:
+                node = self.nodes[key]
+                node.setdefault('plies_sum', 0)
+                node.setdefault('plies_games', 0)
+                node.setdefault('mean_plies', None)
             for report in reports:
                 for pair in pairs_of(report)[:self._legacy_counted.get(report_id(report), 0)]:
                     for k in range(1, len(pair[0]['opening'])+1):
@@ -457,7 +467,7 @@ class Book:
            depth, sampled from its parent position (`generate`);
         4. while fewer than book_size openings are settled, add settled replacements: first the imported positions
            with pairs that no opening passes through (most pairs first; at least book_min_plies deep, plausible and
-           not `skewed`), then one child of every opening retired for skew in step 1 below book_plies, then fresh
+           free of either skew), then one child of every opening retired for skew in step 1 below book_plies, then fresh
            openings from the origin (`generate`, up to GROW_ROUNDS rounds).
         Writes the file; returns {digest, openings, challengers, retired {reason: count} of this refresh, added}."""
         if self.frozen:
@@ -492,7 +502,7 @@ class Book:
         added = self.generate(model, checkpoint, [(settled[k]['moves'][:-1], settled[k]['depth'], settled[k]['key'])
                                                   for k in sorted(chosen)], rng, now, leaf_batch)
         missing = lambda: s.book_size-sum(n['challenges'] is None for n in self.openings())
-        added += self.adopt(model, checkpoint, missing(), now)
+        added += self.adopt(model, checkpoint, missing(), now, short_limit)
         if missing() > 0:
             added += self.generate(model, checkpoint, [(n['moves'], n['depth']+1, None) for n in extend][:missing()],
                                    rng, now, leaf_batch)
@@ -505,15 +515,16 @@ class Book:
         return dict(digest=self.digest(), openings=len(self.openings()),
                     challengers=sum(n['challenges'] is not None for n in self.openings()), retired=retired, added=added)
 
-    def adopt(self, model, checkpoint, count, now):
+    def adopt(self, model, checkpoint, count, now, short_limit=None):
         """Make up to `count` imported positions openings (step 4 of `refresh`), none of them a prefix of an opening,
-        a retired opening or an earlier adoption; returns how many."""
+        a retired opening or an earlier adoption, and neither skew rule rejects them; returns how many."""
         s = self.settings
         if count <= 0:
             return 0
         used = {canonical(n['moves'][:d])[0] for n in self.nodes.values() if n['status'] for d in range(1, n['depth']+1)}
         pool = sorted((n for n in self.nodes.values() if n['status'] is None and n['key'] not in used and n['skew']['pairs']
-                       and s.book_min_plies <= n['depth'] <= s.book_plies and not skewed(n, s)),
+                       and s.book_min_plies <= n['depth'] <= s.book_plies and not skewed(n, s)
+                       and not short_skewed(n, s, short_limit)),
                       key=lambda n: (-n['skew']['pairs'], n['key']))
         self.score(model, checkpoint, pool)
         taken = 0

@@ -177,6 +177,7 @@ class SkewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as run:
             book = dense_openings.Book(run, settings())
             node = opening(book, [(0, 0), (1, 0), (-1, 0)])
+            idle = opening(book, [(0, 0), (2, 0), (3, 0)])
             games = [dict(g, seed=1) for g in pair(node['moves'], 2)]
             games[0]['plies'], games[1]['plies'] = 80, 100
             book.record(games, 'r')
@@ -189,6 +190,9 @@ class SkewTests(unittest.TestCase):
             report = dict(id='r', settings=dict(opening_suite='book'), games=games)
             self.assertEqual(reopened.reconcile([report]), 0)
             self.assertEqual(reopened.nodes[node['key']]['mean_plies'], 90)
+            self.assertEqual(reopened.nodes[idle['key']]['plies_games'], 0)
+            saved_nodes = {n['key']: n for n in json.loads(reopened.path.read_text())['nodes']}
+            self.assertEqual(saved_nodes[idle['key']]['plies_games'], 0)
 
 
 class FilterTests(unittest.TestCase):
@@ -364,6 +368,18 @@ class RefreshTests(unittest.TestCase):
             book.refresh(Uniform(radius=2), CHAMPION, np.random.default_rng(0), now=1.)
             self.assertEqual([n['key'] for n in book.openings()], [node['key']])
             self.assertEqual((node['status'], node['checkpoint']), ('opening', CHAMPION))
+
+    def test_adoption_skips_an_imported_short_skew(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run)
+            node = book.add([(0, 0), (1, 0), (-1, 0)], 0.)
+            for _ in range(7):
+                games = pair(node['moves'], 2)
+                for game_record in games:
+                    game_record['plies'] = 70
+                book.tally(games)
+            self.assertEqual(book.adopt(Uniform(radius=2), CHAMPION, 1, 1., short_limit=99), 0)
+            self.assertIsNone(node['status'])
 
     def test_draws_follow_the_weighting(self):
         with tempfile.TemporaryDirectory() as run:
