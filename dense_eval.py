@@ -1011,14 +1011,14 @@ class Evaluator:
     def open(self, a, b):
         """Load report a-vs-b for appending and number its next opening pair after the highest one it holds, so a
         restart resumes the pairing; the report keeps its id (dense_openings.report_id). A report played under another
-        protocol is kept as report-<created_at>.json beside it (still pooled by load_reports) with an 'info' event, and
-        a new one starts with a new id."""
+        protocol is kept as report-<created_at>-<id>.json beside it (unique per report; still pooled by load_reports)
+        with an 'info' event, and a new one starts with a new id."""
         if (a, b) in self.book:
             return
         path = report_path(self.run, a, b)
         old = json.loads(path.read_text()) if path.exists() else None
         if old and not same_protocol(old, self.settings):
-            kept = path.with_name(f'report-{int(old["created_at"])}.json')
+            kept = path.with_name(f'report-{int(old["created_at"])}-{dense_openings.report_id(old)}.json')
             path.replace(kept)
             log_event(self.run, 'evaluator', 'info', f'{a} vs {b}: the report played under another protocol is kept as '
                       f'{kept.name}; a new one starts', candidate=a, opponent=b)

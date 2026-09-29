@@ -3437,13 +3437,14 @@ class EvaluatorLoopTests(unittest.TestCase):
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=crash)), self.assertRaises(Crash):
             evaluator.step()
         path = dense_eval.report_path(self.run, 'main/000020', 'main/000010')
-        created = json.loads(path.read_text())['created_at']
+        first = json.loads(path.read_text())
         evaluator = self.start(sprt_max_games=6, sims=3)                        # e.g. restarted with --eval-sims 3
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
             self.assertTrue(evaluator.step())
         report = json.loads(path.read_text())
         self.assertEqual((report['settings']['sims'], len(report['games'])), (3, 6))
-        self.assertEqual(len(json.loads(path.with_name(f'report-{int(created)}.json').read_text())['games']), 2)
+        kept = path.with_name(f"report-{int(first['created_at'])}-{first['id']}.json")
+        self.assertEqual(len(json.loads(kept.read_text())['games']), 2)
 
     def test_an_old_protocol_report_never_rates_a_candidate_without_games(self):
         evaluator = self.start(sprt_max_games=6)

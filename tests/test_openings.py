@@ -750,6 +750,18 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual(len(list(path.parent.glob('report-*.json'))), 1)
         self.assertEqual(json.loads((self.run/'league.json').read_text())['anchors']['seal']['games'], 4)
 
+    def test_archives_of_one_pairing_never_overwrite_each_other(self):
+        self.export(10)
+        evaluator = self.start(opening_suite='standard-v1')
+        path = dense_eval.report_path(self.run, CHAMPION, 'seal')
+        path.parent.mkdir(parents=True)
+        for sims in (97, 98):                                               # two archives created in the same second
+            report = dense_eval.make_report(CHAMPION, 'seal', [dict(g, seed=5, pair=0) for g in pair(dense_openings.Book(
+                self.run, evaluator.settings).openings()[0]['moves'], 2)], {CHAMPION: 'c'*64}, replace(evaluator.settings, sims=sims))
+            path.write_text(json.dumps(dict(report, created_at=1000.)))
+            evaluator.open(CHAMPION, 'seal')
+            evaluator.book.clear()
+        self.assertEqual(len(list(path.parent.glob('report-1000-*.json'))), 2)
     def test_the_standard_suite_is_a_frozen_book_with_its_statistics_in_the_run(self):
         self.export(10)
         played = dense_openings.Book(self.run, dense_config.EvaluationSettings()).openings()[0]['moves']
