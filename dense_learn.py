@@ -9,7 +9,8 @@ falls on every tenth step) and one per export with validation_fields(metrics) of
 losses on held-out rows of the window and on fixed per-source subsets (dense_data.ValidationSets), plus the value
 loss of finished held-out games against their hard outcome by plies remaining (remaining_curve), the policy and
 value losses against the ply from the start (ply_curve, ply_split), both over (ply from the start, plies remaining)
-cells (surfaces) and the value regret against what the search knew (calibration_reference, value_regret). The EMA
+cells (surfaces), the value regret against what the search knew (calibration_reference, value_regret) and on rows
+with a proof (value_regret_proven), and the replay window's count of rows with a proof (proven_rows). The EMA
 averages parameters only; each export first recomputes its norm statistics (Learner.recalibrate), since the
 raw model's running statistics do not describe the EMA weights.
 
@@ -518,7 +519,7 @@ class Learner:
         ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
         finished (1. when winner >= 0, else 0.), value_bce, value (its target), outcome_bce, outcome (the hard
         outcome; .5 for capped games), policy_ce (against the improved policy; nan on rows without a policy
-        target) and searched (searched_value at the row)."""
+        target), searched (searched_value at the row) and proven (the row's `proven`)."""
         s = self.settings
         rng = np.random.default_rng(self.config.seed)
         rows = []
@@ -539,8 +540,9 @@ class Learner:
                 for i, loss in zip(order, losses):
                     ref = chunk[i]
                     e, t = ref.episode, ref.row['ply']
-                    rows.append((t, len(e['moves'])-t, float(e['winner'] >= 0), *loss, searched_value(e, t)))
-        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce', 'searched')
+                    rows.append((t, len(e['moves'])-t, float(e['winner'] >= 0), *loss, searched_value(e, t),
+                                 float(ref.row.get('proven', 0))))
+        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce', 'searched', 'proven')
         return dict(zip(keys, np.array(rows, np.float64).reshape(-1, len(keys)).T))
 
     def validate_sources(self, sets):
@@ -556,7 +558,9 @@ class Learner:
         the cell's outcome rate; <source>_policy_surface adds `policy`, the mean policy CE of rows with a policy
         target. <source>_value_regret(_early, _late) is the value_regret of the outcome BCE of the held rows of
         finished games against the calibration_reference fitted on the source's train rows of finished games
-        (searched value, plies remaining, outcome for the side to move)."""
+        (searched value, plies remaining, outcome for the side to move). <source>_value_regret_proven is the mean of
+        1 - p over its held rows with a proof, p the EMA's probability of the proven result (the value target), and
+        <source>_proven_rows their count; None without such rows."""
         sets.refresh()
         self.ema.eval()
         out = dict(newest_checkpoint=sets.newest_checkpoint)
@@ -585,6 +589,9 @@ class Learner:
             fit = np.array(fit, np.float64).reshape(-1, 3).T
             reference = calibration_reference(*fit, r['searched'][f], r['remaining'][f])
             out.update({f'{source}_{k}': v for k, v in value_regret(r['outcome_bce'][f], r['outcome'][f], reference, r['remaining'][f]).items()})
+            proven = r['proven'] != 0
+            out[f'{source}_proven_rows'] = int(proven.sum())
+            out[f'{source}_value_regret_proven'] = float(np.mean(1-np.exp(-r['value_bce'][proven]))) if proven.any() else None
         return out
 
     def export(self, window, sets=None):
@@ -707,7 +714,7 @@ def main():
         stream.set_calibration(learner.calibration)
         if fields:
             dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
-                                        validation=True, vram=learner.vram(), **fields)
+                                        validation=True, vram=learner.vram(), proven_rows=window.proven_rows, **fields)
 
     rate = []
     try:

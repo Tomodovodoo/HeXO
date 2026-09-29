@@ -3,12 +3,15 @@
 A shard is an immutable directory `<run>/shards/<name>/` (all digits; converted corpora use six, actors use
 millisecond time plus pid) holding
   episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search, actors?, opponent?,
-                  trained_side?}]
+                  trained_side?, origin?, restart?}]
   rows.json      [{game, ply, player, remaining, target, weight, legal_sha256, proven?, proof_turns?, solver_nodes?,
                   solver_budget?}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
-  manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows may be absent: 0)
+  manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows,
+                 restart_games and forced_plies may be absent: 0)
+  proofs.jsonl   optional sidecar written later by the proof pass (dense_solve; not in `files`): one line per proven
+                 window {game, mover, plies, ...}; rows of the listed plies are proven wins for their side to move
 `origin` is 'converted' (dense_bootstrap) or 'actor' (dense_selfplay); `origin()` infers it for older manifests.
 `row.game` indexes the shard's episode list. `episode.winner` is 0/1 for finished games ('six-in-a-row') and -1
 for capped games ('cap' at the ply limit, 'span' when a searched position does not fit the largest crop);
@@ -17,15 +20,23 @@ move at that ply, or null). The learner derives every target from the episode (`
 `row.target`/`row.weight` (p(win) or null, weight) are informational and optional. Rows of games played with the
 solver (episode `solver`, dense_solver.record) carry `proven` (+1 / -1: the side to move wins / loses by a verified
 proof, 0: unproven), `proof_turns` (attacker turns of that proof, 0 when unproven), `solver_nodes` (solver work
-spent on the ply's search) and `solver_budget` (the node budgets granted to its queries); absent means 0. A game
-ended at a proof (actor adjudicate_proven) has reason 'proven', its winner and `adjudicated` {ply, winner,
-line_plies: placements of the certificate's forced line from there}; rows of that line played without search carry
-`line` True and no policy. The manifest counts `proven_games`, `line_rows` and `adjudicated_plies`. The manifest counts the proven rows as `proven_rows`.
+spent on the ply's search) and `solver_budget` (the node budgets granted to its queries); absent means 0. The
+manifest counts the proven rows as `proven_rows`. Readers (ReplayWindow, ValidationSets) also set proven = +1 on the
+rows a sidecar lists (proof_labels) once it appears. A game ended at a proof (actor adjudicate_proven) has reason
+'proven', its winner and `adjudicated` {ply, winner, line_plies: placements of the certificate's forced line from
+there}; rows of that line played without search carry `line` True and no policy. The manifest counts
+`proven_games`, `line_rows` and `adjudicated_plies`.
+Actor episodes record `origin` ('selfplay' or 'restart'; absent: 'selfplay'). A restart game (dense_selfplay.Restarts)
+starts from a buffer position: its first `restart.ply` moves are the source game's, replayed without search, so it
+has rows only from that ply on (null root values and full_search False before it); `restart` names the source
+{shard, game, ply, kind, regret, plies_to_proof}. The manifest counts them as `restart_games` and their
+replayed plies without rows as `forced_plies`.
 `episode.actor` is the sha256 of the evaluator being trained. Actor shards also record `actors` {"0": sha, "1": sha}
 per colour, `opponent` (null for self-play, else the checkpoint id of a frozen historical opponent) and
-`trained_side` (null for self-play, else the colour the trained evaluator played). Every ply keeps a row so ply
-indexing stays contiguous, but a ply of the opponent's colour (`trained` False) has no policy, a null root
-value and full_search False; it never enters the replay window and does not count toward `total_rows`.
+`trained_side` (null for self-play, else the colour the trained evaluator played). Every ply (from the restart ply
+of a restart game) keeps a row so ply indexing stays contiguous, but a ply of the opponent's colour (`trained`
+False) has no policy, a null root value and full_search False; it never enters the replay window and does not count
+toward `total_rows`.
 """
 from collections import Counter, OrderedDict, namedtuple
 import hashlib
@@ -49,6 +60,7 @@ from train import write_json
 
 SCHEMA = 'hexo-dense-shard-v1'
 FILES = ('episodes.json', 'rows.json', 'targets.npz')
+SIDECAR = 'proofs.jsonl'
 Ref = namedtuple('Ref', 'shard index row episode')
 Shard = namedtuple('Shard', 'game ply player remaining proven legal full following start moves roots searched has_roots '
                              'has_search winner side held')
@@ -244,7 +256,9 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
                   terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes),
                   proven_rows=sum(bool(r.get('proven')) for r in rows),
                   proven_games=sum(e.get('reason') == 'proven' for e in episodes), line_rows=sum(bool(r.get('line')) for r in rows),
-                  adjudicated_plies=sum(e['adjudicated']['line_plies'] for e in episodes if e.get('adjudicated')))
+                  adjudicated_plies=sum(e['adjudicated']['line_plies'] for e in episodes if e.get('adjudicated')),
+                  restart_games=sum(e.get('origin') == 'restart' for e in episodes),
+                  forced_plies=sum(e['restart']['ply'] for e in episodes if e.get('origin') == 'restart'))
     with tempfile.TemporaryDirectory(dir=path.parent, prefix='pending-') as temporary:
         stage = Path(temporary)/'shard'
         stage.mkdir()
@@ -303,6 +317,30 @@ def read_shard(path, policies=True):
     return episodes, rows
 
 
+def proof_windows(path):
+    """The window records of the shard's proof sidecar (dense_solve), or None while it has none."""
+    try:
+        text = (Path(path)/SIDECAR).read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return None
+    return [json.loads(line) for line in text.splitlines() if line]
+
+
+def proof_labels(path):
+    """{(game, ply)} of the rows the shard's sidecar proves won for the side to move, or None while it has none."""
+    windows = proof_windows(path)
+    return None if windows is None else {(w['game'], t) for w in windows for t in w['plies']}
+
+
+def label(shard, labels):
+    """Set proven = +1 on the rows of `shard` (a Shard) at the (game, ply) in `labels` that record no proof."""
+    if labels:
+        where = {key: i for i, key in enumerate(zip(shard.game.tolist(), shard.ply.tolist()))}
+        for i in (where[key] for key in labels if key in where):
+            if not shard.proven[i]:
+                shard.proven[i] = 1
+
+
 def shard_dirs(run_dir):
     root = Path(run_dir)/'shards'
     return sorted(p for p in root.iterdir() if p.is_dir() and p.name.isdigit()) if root.exists() else []
@@ -337,12 +375,14 @@ class ReplayWindow:
     Only full-search rows (rows with a policy) count toward N_full and the window size; cheap-search rows ride
     along with their shard. Shards are ordered by directory name; the oldest admitted shard contributes its rows
     from its take-th last full-search row onward. `total_rows`/`rows` count every trained row (all shards /
-    window; see `trained`), `total_full_rows`/`full_rows` only full-search rows. Rows of games selected by
+    window; see `trained`), `total_full_rows`/`full_rows` only full-search rows, `proven_rows` the window's rows
+    with a nonzero `proven` (sidecar labels included). Rows of games selected by
     `holdout(episode, validation_fraction)` form the validation index and are never drawn for training.
     `index`/`validation` are Rows, oldest first.
 
     Memory: each admitted shard is held as numpy arrays (Shard): per row its game, ply, player, remaining, proven,
-    raw legal digest, next-ply row and full-search flag; per game its ply offset, winner, trained side and
+    raw legal digest, next-ply row and full-search flag (proven includes the shard's proof_labels, applied at
+    load or at the first refresh after its sidecar appears); per game its ply offset, winner, trained side and
     held-out flag; per ply its move, root value (NaN for null) and full_search flag. A Ref's row dict and its
     episode dict {moves, winner, root_values, full_search, trained_side} are rebuilt on demand. Policy vectors
     load per shard on first use into an LRU bounded by `policy_cache_mb` (the shard in use is always kept);
@@ -357,6 +397,7 @@ class ReplayWindow:
         self.shape = dict(min_rows=min_rows, expand_per_row=expand_per_row, taper_exponent=taper_exponent)
         self.policy_budget = policy_cache_mb*2**20
         self.manifests = {}; self.shards = {}; self.policies = OrderedDict(); self.values = OrderedDict()
+        self.unlabelled = set()
         self.refresh()
 
     def load(self, name):
@@ -364,10 +405,13 @@ class ReplayWindow:
         episodes, rows = read_shard(path, policies=False)
         with np.load(path/'targets.npz', allow_pickle=False) as data:
             full = np.diff(data['offsets']) > 0
+        labels = proof_labels(path)
+        if labels is None:
+            self.unlabelled.add(name)
         game = np.array([r['game'] for r in rows], np.int32); ply = np.array([r['ply'] for r in rows], np.int32)
         where = {(g, t): i for i, (g, t) in enumerate(zip(game.tolist(), ply.tolist()))}
         per_ply = lambda key: [v for e in episodes for v in (e.get(key) or [None]*len(e['moves']))]
-        return Shard(
+        shard = Shard(
             game=game, ply=ply.astype(np.int16), player=np.array([r['player'] for r in rows], np.int8),
             remaining=np.array([r['remaining'] for r in rows], np.int8),
             proven=np.array([r.get('proven', 0) for r in rows], np.int8),
@@ -382,6 +426,8 @@ class ReplayWindow:
             winner=np.array([e['winner'] for e in episodes], np.int8),
             side=np.array([-1 if e.get('trained_side') is None else e['trained_side'] for e in episodes], np.int8),
             held=np.array([holdout(e, self.validation_fraction) for e in episodes], bool))
+        label(shard, labels)
+        return shard
 
     def refresh(self):
         """Rescan manifests, recompute the window and load newly admitted shards; returns window rows."""
@@ -399,13 +445,15 @@ class ReplayWindow:
             take = min(self.manifests[name]['counts']['policy_rows'], want-have)
             admitted.append((name, take)); have += take
         for name in set(self.shards) - {n for n, _ in admitted}:
-            del self.shards[name]; self.policies.pop(name, None)
+            del self.shards[name]; self.policies.pop(name, None); self.unlabelled.discard(name)
             for key in [k for k in self.values if k[0] == name]:
                 del self.values[key]
         for name, _ in admitted:
             if name not in self.shards:
                 self.shards[name] = self.load(name)
-        self.admitted = admitted[::-1]; self.full_rows = have
+            elif name in self.unlabelled and (labels := proof_labels(self.run_dir/'shards'/name)) is not None:
+                label(self.shards[name], labels); self.unlabelled.discard(name)
+        self.admitted = admitted[::-1]; self.full_rows = have; self.proven_rows = 0
         parts = ([], []), ([], [])    # (shard ids, rows) of the training and validation index
         self.starts = {}
         for k, (name, take) in enumerate(self.admitted):
@@ -414,6 +462,7 @@ class ReplayWindow:
             i = np.arange(start, len(s.game), dtype=np.int32)
             side = s.side[s.game[i]]
             i = i[(side < 0) | ((s.ply[i].astype(np.int32)+1)//2 % 2 == side)]
+            self.proven_rows += int(np.count_nonzero(s.proven[i]))
             held = s.held[s.game[i]]
             for split, (ids, rows) in enumerate(parts):
                 ids.append(np.full(int((held == split).sum()), k, np.int32)); rows.append(i[held == split])
@@ -516,12 +565,13 @@ class ValidationSets:
     ReplayWindow. Retained between refreshes: the chosen rows with their next-ply rows and episodes, the names
     of the shards each subset has consumed, and per scanned shard its full-search row count per episode actor
     (`actors`); a shard's row candidates live for one refresh, so a new newest actor rescans the shards it
-    played.
+    played. Each refresh sets proven = +1 on chosen rows (and successors) that their shard's proof sidecar lists
+    (proof_labels), keeping the labels of the shards the chosen rows come from.
     """
 
     def __init__(self, run_dir, fraction, seed, limit, quota):
         self.run_dir, self.fraction, self.seed, self.limit, self.quota = Path(run_dir), fraction, seed, limit, quota
-        self.manifests = {}; self.actors = {}; self.entries = {}; self.following_index = {}
+        self.manifests = {}; self.actors = {}; self.entries = {}; self.following_index = {}; self.labels = {}
         self.subsets = {(source, split): [] for source in SOURCES for split in ('held', 'train')}
         self.picks = {key: [] for key in self.subsets}; self.walked = {key: set() for key in self.subsets}
         self.newest = self.newest_checkpoint = None
@@ -593,6 +643,11 @@ class ValidationSets:
                         row = {key: v for key, v in rows[k].items() if key != 'policy'}
                         entries[name, k] = (row, episodes[row['game']], rows[k]['policy'].copy())
         self.entries, self.following_index = entries, following
+        known = lambda n: self.labels[n] if self.labels.get(n) is not None else proof_labels(self.run_dir/'shards'/n)
+        self.labels = {n: known(n) for n in {n for n, _ in entries}}
+        for (name, _), (row, _, _) in entries.items():
+            if (row['game'], row['ply']) in (self.labels[name] or ()) and not row.get('proven'):
+                row['proven'] = 1
         self.subsets = {key: [self.ref(*k) for k in chosen] for key, chosen in self.picks.items()}
 
     def ref(self, name, i):
