@@ -2087,6 +2087,7 @@ def match(args):
                   settings=asdict(settings), solver={side: asdict(b) for side, b in budgets.items()}, games=[])
 
     def record(finished):
+        finished = [g for g in finished if 'error' not in g]
         if len(finished) == len(report['games']):
             return
         report.update(games=finished, summary=tally(finished), metrics=paired_metrics(finished, args.games))

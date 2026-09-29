@@ -2630,6 +2630,7 @@ class EvaluatorSearchTests(unittest.TestCase):
             model = SimpleNamespace(checkpoint='main/000010', sha='a'*64)
             games = [dict(seed=seed, challenger_color=colour, winner=-1)
                      for seed, colour in ((1, 0), (1, 1), (2, 0))]
+            games.append(dict(seed=2, challenger_color=1, winner=-1, error='Seal unavailable'))
             def fail(games_to_play, leaf_batch, heartbeat):
                 heartbeat(games)
                 raise RuntimeError('mid-run failure')
