@@ -3883,6 +3883,32 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertIn('settled on request', next(e for e in events if e['kind'] == 'settle')['message'])
 
+    def test_settle_request_waits_for_a_usable_pair(self):
+        evaluator = self.start(sprt_max_games=10)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        candidate = 'main/000020'
+
+        def request(pool, steps):
+            if steps == 1:
+                dense_eval.request_settle(self.run, candidate)
+
+        class FailedFirst(scripted(hook=request)):
+            def step(self):
+                results = super().step()
+                for _, record in results:
+                    if record['pair'] == 0:
+                        record['error'] = 'scripted failure'
+                return results
+
+        with unittest.mock.patch.object(dense_eval, 'Pool', FailedFirst):
+            self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, candidate, 'main/000010').read_text())
+        self.assertEqual((len(report['games']), {g['pair'] for g in report['games']}), (2, {1}))
+        self.assertEqual(report['metrics']['sprt']['decision'], 'superseded')
+        self.assertFalse(dense_eval.settle_path(self.run, candidate).exists())
+
     def test_newer_champion_supersedes_an_unfinished_anchor(self):
         evaluator = self.anchored()
         evaluator.step()
@@ -4481,6 +4507,24 @@ class EvaluatorLoopTests(unittest.TestCase):
             self.assertTrue(evaluator.step())
         report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
         self.assertEqual((len(report['games']), report['metrics']['sprt']['decision']), (4, 'H1'))   # the pair in flight drains
+        self.assertEqual(self.league()['champion'], 'main/000020')
+
+    def test_sprt_bound_crossed_during_request_drain_stays_the_decision(self):
+        evaluator = self.start(sprt_max_games=12, pool_games=6)
+        self.export(10)
+        evaluator.step()
+        test = evaluator.test
+        evaluator.test = lambda records: dict(test(records), decision='H1' if len(records) == 4 else None)
+        self.export(20)
+
+        def request(pool, steps):
+            if steps == 3:
+                dense_eval.request_settle(self.run, 'main/000020')
+
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=request)):
+            self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
+        self.assertEqual((len(report['games']), report['metrics']['sprt']['decision']), (8, 'H1'))
         self.assertEqual(self.league()['champion'], 'main/000020')
 
     def test_an_idle_sprt_rematch_keeps_the_bound_it_crossed(self):

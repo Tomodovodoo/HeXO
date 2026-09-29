@@ -1132,7 +1132,7 @@ class Evaluator:
                 log_event(self.run, 'evaluator', 'error', f'{a} vs {b} pair {record["pair"]}: game counted as capped at ply '
                           f'{record["plies"]}, a searched position spans more than the largest crop', candidate=a, opponent=b)
 
-    def session(self, want, planned, candidate=None):
+    def session(self, want, planned, trial=None):
         """Play the pool until want() asks for nothing and the games in flight have finished; returns {lane:
         games finished}. want() -> {(a, b, kind): games in flight wanted, even}, asked at the start and after every
         completed colour pair; a finished game's slot is refilled before the next engine step, and a lane want()
@@ -1202,7 +1202,7 @@ class Evaluator:
             self.pacer.played(tick, self.pacer.clock())
             paired = False
             for lane, record in results:
-                if candidate and not stopping and (self.newer(candidate) or self.requested(candidate)):
+                if trial and not stopping and (self.newer(trial[0]) or self.requested(trial[0]) and self.games(*trial)):
                     stopping = True
                     lanes = {}
                 moves = record['plies']-len(record['opening'])
@@ -1226,8 +1226,9 @@ class Evaluator:
                         count[0] += 2
                         count[1] += sum(game['plies']-len(game['opening']) for game in group)
                     paired = True
-            if paired and not stopping:
-                lanes = want()
+            if paired:
+                wanted = want()
+                lanes = {} if stopping else wanted
         show('playing', True)
         pool.close()
         seconds = self.pacer.clock()-start
@@ -1499,7 +1500,7 @@ class Evaluator:
             self.publish(decision=dict(public(verdict), candidate=cid, opponent=champion, next=[list(l[:2]) for l in lanes]))
             return lanes
         while True:  # the games in flight can undo a verdict that stopped the session: then play on
-            added = self.session(want, s.sprt_max_games, cid)
+            added = self.session(want, s.sprt_max_games, (cid, champion))
             for (a, b, _), games in added.items():
                 if a != cid and games:
                     self.record(a, b, json.loads(report_path(self.run, a, b).read_text()))
@@ -1698,7 +1699,7 @@ class Evaluator:
                 return {}
             self.publish(decision=dict(shown(), next=[[cid, champion]]))
             return {(cid, champion, 'champion'): even(min(s.pool_games, s.sprt_max_games-len(games)))}
-        self.session(want, s.sprt_max_games, cid)
+        self.session(want, s.sprt_max_games, (cid, champion))
         path = report_path(self.run, cid, champion)
         if not self.games(cid, champion):  # no game under the active protocol
             return {}, None
