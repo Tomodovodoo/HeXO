@@ -541,6 +541,7 @@ class ReplayWindow:
                                         for name, i in (self.index[k] for k in self.regret_positions)], np.float64)
         self.regret_rows = len(self.regret_positions)
         self.regret_probability_cache = {}
+        self.regret_baseline_cache = {}
         return self.rows
 
     def refresh_regret(self):
@@ -560,22 +561,35 @@ class ReplayWindow:
                         self.regret_entries[key] = max(self.regret_entries.get(key, 0.), float(entry['regret']))
             self.refresh()
 
-    def regret_count(self, batch_size, fraction):
+    def regret_baseline(self, recency):
+        if recency not in self.regret_baseline_cache:
+            W = len(self.index)
+            if recency:
+                weights = (np.arange(1, W+1)/W)**recency
+                base = weights[self.regret_positions]/weights.sum()
+            else:
+                base = np.full(self.regret_rows, 1/W)
+            self.regret_baseline_cache[recency] = base
+        return self.regret_baseline_cache[recency]
+
+    def regret_count(self, batch_size, fraction, recency=0.):
         """Number of priority draws allowed by the fourfold per-row probability cap."""
         if not fraction or not self.regret_rows:
             return 0
         W, K = len(self.index), self.regret_rows
-        limit = 1. if K == W else min(1., 3*K/(W-K))
+        baseline = self.regret_baseline(recency).sum()
+        limit = 1. if K == W else min(1., (4*K/W-baseline)/(1-baseline))
         return min(batch_size, int(batch_size*min(fraction, limit)+1e-12))
 
-    def regret_share(self, batch_size, fraction):
-        return self.regret_count(batch_size, fraction)/batch_size
+    def regret_share(self, batch_size, fraction, recency=0.):
+        return self.regret_count(batch_size, fraction, recency)/batch_size
 
-    def regret_probabilities(self, share):
+    def regret_probabilities(self, share, recency=0.):
         """Regret weights normalized with the cap on total uniform-plus-priority probability."""
-        if share in self.regret_probability_cache:
-            return self.regret_probability_cache[share]
-        cap = (3+share)/(share*len(self.index))
+        key = (share, recency)
+        if key in self.regret_probability_cache:
+            return self.regret_probability_cache[key]
+        cap = (4/len(self.index)-(1-share)*self.regret_baseline(recency))/share
         weights = self.regret_weights
         low, high = 0., 1./min(weights)
         while np.minimum(weights*high, cap).sum() < 1:
@@ -587,8 +601,8 @@ class ReplayWindow:
             else:
                 high = mid
         probabilities = np.minimum(weights*high, cap)
-        self.regret_probability_cache[share] = probabilities/probabilities.sum()
-        return self.regret_probability_cache[share]
+        self.regret_probability_cache[key] = probabilities/probabilities.sum()
+        return self.regret_probability_cache[key]
 
     def ref(self, name, i, episode=None):
         """Ref of row i of admitted shard `name`; `episode`, when given, must be the episode dict of the row's game."""
@@ -631,10 +645,10 @@ class ReplayWindow:
             picks = rng.choice(W, n, p=w/w.sum())
         else:
             picks = rng.integers(W, size=n)
-        priority = 0 if validation else self.regret_count(n, regret_fraction)
+        priority = 0 if validation else self.regret_count(n, regret_fraction, recency)
         if priority:
             share = priority/n
-            picks[:priority] = rng.choice(self.regret_positions, priority, p=self.regret_probabilities(share))
+            picks[:priority] = rng.choice(self.regret_positions, priority, p=self.regret_probabilities(share, recency))
         return [self.ref(*index[k]) for k in picks]
 
     def following(self, ref):

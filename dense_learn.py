@@ -649,7 +649,7 @@ class Learner:
         rng, s = np.random.default_rng([self.config.seed, 1]), self.settings
         with torch.no_grad():
             for _ in range(math.ceil(RECALIBRATION_ROWS/s.batch)):
-                refs = window.sample(rng, s.batch, s.recency)
+                refs = window.sample(rng, s.batch, s.recency, regret_fraction=s.regret_fraction)
                 batch = dense_data.collate(*dense_data.examples(window, refs, rng, **self.targets()))
                 batch_losses(self.ema, batch, None, self.device, self.memory_format, False)
         for m, momentum in zip(norms, momenta):
@@ -911,8 +911,8 @@ def main():
         status.update(fields, updated_at=time.time(), step=learner.step, samples_seen=learner.samples_seen,
                       rows_available=window.total_rows, window_rows=window.rows, full_rows_available=window.total_full_rows,
                       window_full_rows=window.full_rows,
-                      regret_rows=window.regret_rows, regret_effective_share=window.regret_share(learner.settings.batch,
-                                                                                               learner.settings.regret_fraction),
+                      regret_rows=window.regret_rows, regret_effective_share=window.regret_share(
+                          learner.settings.batch, learner.settings.regret_fraction, learner.settings.recency),
                       samples_per_row=(learner.samples_seen-base['samples'])/max(1, window.total_rows-base['rows']),
                       samples_per_row_target=learner.settings.samples_per_row, phase_rows=learner.settings.phase_rows,
                       backlog_rows=backlog(learner.samples_seen, window.total_rows, learner.settings.samples_per_row, base),
