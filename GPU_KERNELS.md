@@ -68,25 +68,62 @@ kernel. Cumulative recalibration retains the existing implementation.
 These changes use the existing `--net-kernels fused` flag. They add no learner
 graph flag, checkpointing flag, dependency or checkpoint format change.
 
-Production-path validation uses `Learner.train_step`, model/optimizer/EMA state
-from export 85000, and successive 256-row batches sampled through the real
-replay window with the learner's sampling and target settings. The source run
-is read-only. The owner authorized stopping the learner after export 85000
-completed so these measurements could use its 3328 MiB memory allowance.
-Actors and the evaluator continue running. Every GPU child still has a
-55-second limit and a 60-second cooldown.
+Production-path validation used `Learner.train_step` with model, optimizer and
+EMA state from export 85000. Three successive 256-row batches came from a
+saved real replay-window sample rendered at step 82500; both modes consumed the
+same CPU batch tensors. The source run was read-only. The owner authorized
+stopping the learner after export 85000 so measurements could use its 3328 MiB
+memory allowance. GPU children had a 55-second limit and 60-second cooldown.
 
-The early LineConv-only comparison measured 146.9 samples/s versus 70.3 for
-reference. A later comparison measured 145.3 versus 126.7 for the already
-deployed fused implementation. These short windows expose warmup and shared
-GPU load, so they do not establish the final twofold target. The final warmed
-comparison and profiler table are pending.
+After warming all ten padded `(canvas, batch)` shapes, the reference/fused/
+reference comparison measured the following synchronized `train_step` rates.
+Each rate omits its first timed step; the reference baseline pools both phases
+by total rows divided by total time. Data rendering, collation and queue wait
+are outside these rates, while padding, transfers, losses, backward, clipping,
+optimizer and EMA are inside.
 
-Learner graphs were tested on these changing crop shapes and removed from
-this PR. Five private graphs with block recomputation reached 131.9 samples/s
-versus 146.9 for the eager kernel. A single 40x40 graph reached 140.7 versus
-145.3 and reserved 3324 MiB. The eager kernel is the better measured choice
-for this learner workload. Actor graphs remain available as described below.
+| Mode | Steady samples/s | Peak allocated MiB |
+|---|---:|---:|
+| Reference, first / last | 89.27 / 92.07 | 1955.54 |
+| Reference, pooled | 90.65 | 1955.54 |
+| Current fused | 149.10 | 1416.01 |
+
+That is **1.64x** reference throughput and 539.53 MiB less peak allocated
+memory. The general 2x learner target remains unmet. The separately profiled
+steps measured 11,174 versus 6,225 kernels, 372.16 versus 285.29 ms summed
+kernel time, and 113.23 versus 55.26 ms of CPU kernel-launch calls. These
+profiles are separate runs, so their durations are diagnostic rather than
+components of the paired wall-time comparison. cuDNN convolutions remain near
+their reference cost; the fused line tap-gradient partials are the largest new
+kernel group at 36.61 ms. Both traces transferred about 10.5 MB host-to-device
+in 0.921 versus 0.630 ms of copy-engine time; those values do not measure DRAM
+bandwidth or total transfer wall time.
+
+| Leading profiled kernel | Reference ms | Fused ms |
+|---|---:|---:|
+| BF16 elementwise multiply | 38.45 | — |
+| Line tap-gradient partials | — | 36.61 |
+| Dominant cuDNN weight gradient | 29.59 | 30.57 |
+| Dominant cuDNN forward | 28.23 | 28.59 |
+| Dominant cuDNN input gradient | 29.29 | 28.28 |
+
+The trace annotations plus estimated convolution backward work give about
+3.14 versus 2.95 TFLOPs per profiled step, or 8.43 versus 10.35 TF/s when
+divided by summed kernel time: 19.4% and 23.8% of the 43.5 TF/s dense bf16
+peak. These are bounded arithmetic estimates, not hardware counters. Achieved
+DRAM bandwidth remains unmeasured. The older CPU-profiled collation and padding measurements
+below remain a separate snapshot and are not included in the rates above.
+
+The CUDA LineConv gradient and expanded masked-normalization checks passed.
+The real first-step losses, gradients, model and EMA met tolerance, and model
+and EMA state still met tolerance after three updates. One later batch exceeded
+the strict reference-gradient tolerance in the already-deployed fused baseline;
+the new candidate matched that baseline.
+
+Learner graphs were removed after real-workload trials: five private graphs
+with block recomputation reached 131.9 samples/s versus 146.9 eager, and one
+40x40 graph reached 140.7 versus 145.3 while reserving 3324 MiB. Actor graphs
+remain available as described below.
 
 ## Actor CUDA graphs
 
