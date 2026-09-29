@@ -541,7 +541,7 @@ class ReplayWindow:
                                         for name, i in (self.index[k] for k in self.regret_positions)], np.float64)
         self.regret_rows = len(self.regret_positions)
         self.regret_probability_cache = {}
-        self.regret_baseline_cache = {}
+        self.regret_distribution_cache = {}
         return self.rows
 
     def refresh_regret(self):
@@ -561,16 +561,33 @@ class ReplayWindow:
                         self.regret_entries[key] = max(self.regret_entries.get(key, 0.), float(entry['regret']))
             self.refresh()
 
-    def regret_baseline(self, recency):
-        if recency not in self.regret_baseline_cache:
+    def regret_distribution(self, recency):
+        """The existing recency distribution, capped at fourfold uniform when priority sampling is enabled."""
+        if recency not in self.regret_distribution_cache:
             W = len(self.index)
             if recency:
                 weights = (np.arange(1, W+1)/W)**recency
-                base = weights[self.regret_positions]/weights.sum()
+                base = weights/weights.sum()
             else:
-                base = np.full(self.regret_rows, 1/W)
-            self.regret_baseline_cache[recency] = base
-        return self.regret_baseline_cache[recency]
+                base = np.full(W, 1/W)
+            cap = 4/W
+            if base.max() > cap:
+                low, high = 0., 1.
+                while np.minimum(base*high, cap).sum() < 1:
+                    high *= 2
+                for _ in range(50):
+                    mid = (low+high)/2
+                    if np.minimum(base*mid, cap).sum() < 1:
+                        low = mid
+                    else:
+                        high = mid
+                base = np.minimum(base*high, cap)
+                base /= base.sum()
+            self.regret_distribution_cache[recency] = base
+        return self.regret_distribution_cache[recency]
+
+    def regret_baseline(self, recency):
+        return self.regret_distribution(recency)[self.regret_positions]
 
     def regret_count(self, batch_size, fraction, recency=0.):
         """Number of priority draws allowed by the fourfold per-row probability cap."""
@@ -578,7 +595,7 @@ class ReplayWindow:
             return 0
         W, K = len(self.index), self.regret_rows
         baseline = self.regret_baseline(recency).sum()
-        limit = 1. if K == W else min(1., (4*K/W-baseline)/(1-baseline))
+        limit = 1. if K == W else max(0., min(1., (4*K/W-baseline)/(1-baseline)))
         return min(batch_size, int(batch_size*min(fraction, limit)+1e-12))
 
     def regret_share(self, batch_size, fraction, recency=0.):
@@ -642,7 +659,8 @@ class ReplayWindow:
             raise ValueError('Replay window is empty')
         if recency:
             w = (np.arange(1, W+1)/W)**recency
-            picks = rng.choice(W, n, p=w/w.sum())
+            p = self.regret_distribution(recency) if regret_fraction and self.regret_rows and not validation else w/w.sum()
+            picks = rng.choice(W, n, p=p)
         else:
             picks = rng.integers(W, size=n)
         priority = 0 if validation else self.regret_count(n, regret_fraction, recency)
