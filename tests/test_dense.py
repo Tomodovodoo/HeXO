@@ -647,6 +647,18 @@ class DenseConfigTests(unittest.TestCase):
         page = (ROOT/'web'/'training.html').read_text(encoding='utf-8')
         self.assertIn("['Samples / second',n(l.samples_per_second,1),false,Number.isFinite(l.data_wait_fraction)?", page)
 
+    def test_actor_batch_status_aggregates_by_gpu_calls(self):
+        import dashboard
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for worker, calls, mean, full in ((0, 1, 256., 1.), (1, 3, 128., 0.)):
+                name = 'actor-status.json' if worker == 0 else f'actor-status-{worker}.json'
+                (run/name).write_text(json.dumps(dict(updated_at=time.time(), stage='playing', batch_calls=calls,
+                                                      evals_per_second=calls,
+                                                      mean_batch=mean, full_batch_fraction=full)))
+            actor = dashboard.dense_run(run, dict(created_at=time.time()))['actor']
+            self.assertEqual((actor['mean_batch'], actor['full_batch_fraction']), (160., .25))
+
     def test_metrics_log_series(self):
         """Partial last lines are skipped until completed, resumed steps replace the rewound ones and
         downsampling keeps the first, last and extreme points."""
@@ -2173,6 +2185,26 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(torch.set_num_threads, self.threads)
         torch.manual_seed(5)
 
+    def test_full_batch_counts_submitted_positions(self):
+        from neural_search import EvaluationCache
+
+        class Evaluator:
+            def submit(self, histories, legal):
+                return [(actions, np.zeros(len(actions)), np.zeros(len(actions))) for actions in legal]
+
+        model = type('Model', (), dict(cache=EvaluationCache(), evaluator=Evaluator()))()
+        trees = [NeuralSearch(None, 'test', history=history) for history in ((), ((0, 0),))]
+        try:
+            engine = dense_selfplay.Engine(2)
+            for tree in trees:
+                slot = SimpleNamespace(tree=tree, model=model, budget=2, samples=2, solver=None)
+                engine.add(slot)
+            engine.step()
+            self.assertEqual((engine.calls, engine.evals, engine.full_calls), (1, 2, 1))
+        finally:
+            for tree in trees:
+                tree.close()
+
     def test_position_wider_than_the_largest_crop_ends_the_game(self):
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 64, 256)
         openings = (line_history(33), POSITIONS[12])
@@ -2350,12 +2382,20 @@ class YieldTests(unittest.TestCase):
     def test_actor_flags_round_trip_through_the_worker_parser(self):
         parser = argparse.ArgumentParser()
         dense_config.add_arguments(parser, dense_config.ActorSettings)
-        args = parser.parse_args(['--games-in-flight', '256', '--no-tactics', '--yield-below', '0.8'])
+        args = parser.parse_args(['--games-in-flight', '256', '--leaf-batch', '512', '--no-tactics', '--yield-below', '0.8'])
         flags = dense_selfplay.actor_flags(args)
-        self.assertEqual(flags, ['--games-in-flight', '256', '--no-tactics', '--yield-below', '0.8'])
+        self.assertEqual(flags, ['--games-in-flight', '256', '--leaf-batch', '512', '--no-tactics', '--yield-below', '0.8'])
         settings = dense_config.override(dense_config.ActorSettings(), parser.parse_args(flags))
         self.assertEqual((settings.games_in_flight, settings.tactics, settings.yield_below, settings.leaf_batch),
-                         (256, False, .8, dense_config.ActorSettings.leaf_batch))
+                         (256, False, .8, 512))
+
+    def test_actor_cli_accepts_games_and_batch_flags(self):
+        argv = ['dense_selfplay.py', '--run', 'unused', '--games', '100', '--games-in-flight', '256', '--leaf-batch', '512']
+        with unittest.mock.patch.object(sys, 'argv', argv), unittest.mock.patch.object(dense_selfplay, 'supervise') as supervise:
+            dense_selfplay.main()
+        args = supervise.call_args.args[0]
+        self.assertEqual(args.games, 100)
+        self.assertEqual(dense_selfplay.actor_flags(args), ['--games-in-flight', '256', '--leaf-batch', '512'])
 
     def test_configs_written_before_the_yield_settings_load_with_the_defaults(self):
         data = asdict(dense_config.RunConfig())
@@ -2584,7 +2624,13 @@ class ActorModelTests(unittest.TestCase):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
         shards = [dense_data.manifest(path)['identity'] for path in dense_data.shard_dirs(self.run)]
         self.assertEqual([s['checkpoint'] for s in shards], ['main/000010', 'main/000020'])
-        self.assertEqual(json.loads((self.run/'actor-status.json').read_text())['checkpoint'], 'main/000020')
+        status = json.loads((self.run/'actor-status.json').read_text())
+        self.assertEqual(status['checkpoint'], 'main/000020')
+        self.assertGreater(status['mean_batch'], 0)
+        self.assertEqual(status['full_batch_fraction'], 0.)
+        metrics = [json.loads(line) for line in (self.run/'metrics'/'actor-0.jsonl').read_text().splitlines()]
+        self.assertEqual((metrics[-1]['mean_batch'], metrics[-1]['full_batch_fraction']),
+                         (status['mean_batch'], status['full_batch_fraction']))
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([(e['previous'], e['checkpoint']) for e in events if e['kind'] == 'actor_model'],
                          [('main/000010', 'main/000020')])
