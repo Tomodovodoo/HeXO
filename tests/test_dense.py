@@ -3693,7 +3693,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(league['checkpoints'][-1]['matches'][-1]['games'], 4)
         self.assertIsNone(evaluator.optional())  # main/000030's previous is its champion comparison
 
-    def test_league_without_skipped_rates_before_anchoring(self):
+    def test_league_without_skipped_anchors_before_rating(self):
         self.export(10, 30)
         (self.run/'league.json').write_text(json.dumps(dict(champion='main/000010', checkpoints=[
             dict(id='main/000010', variant='main', step=10, elo=0., matches=[]),
@@ -3701,16 +3701,18 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator = self.start(anchor_every=1, anchor_games=2, seal_ms=5)
         self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
         self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        self.assertTrue(evaluator.step())
         league = self.league()
         self.assertEqual([(c['id'], c['elo'] is None) for c in league['checkpoints']],
                          [('main/000010', False), ('main/000020', True), ('main/000030', False)])
         self.assertEqual(league['checkpoints'][0]['elo'], 0.)
-        self.assertEqual(league['anchors']['seal'], dict(elo=None, elo_interval=None, games=0, matches=[], latest_delta=None))
+        self.assertEqual(league['anchors']['seal']['games'], 2)
         # main/000030 was not promoted: no anchor of its own; the champion owes 2 more per rated checkpoint.
         entry, opponent, kind, games = evaluator.anchor()
-        self.assertEqual((entry['id'], opponent, kind, games), ('main/000010', 'seal', 'anchor', 4))
+        self.assertEqual((entry['id'], opponent, kind, games), ('main/000010', 'seal', 'anchor', 2))
         evaluator = self.start(anchor_every=1, anchor_games=2, anchor_on_promotion=False)
-        self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
+        self.assertIsNone(evaluator.anchor())
 
     def anchored(self):
         """An evaluator (anchor_games 4, idle rematches) that rated main/000010 (champion) before main/000020 was
@@ -3721,6 +3723,104 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 4))
         self.export(20)
         return evaluator
+
+    def test_anchor_sessions_alternate_with_pending_candidates(self):
+        evaluator = self.start(anchor_games=6, anchor_session_games=2, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
+            self.assertTrue(evaluator.step())
+            self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+            self.assertFalse(evaluator.games('main/000020', 'main/000010'))
+            self.assertTrue(evaluator.step())
+            self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
+            self.export(30)
+            self.assertTrue(evaluator.step())
+            self.assertEqual(len(evaluator.games('main/000010', 'seal')), 4)
+            self.assertFalse(evaluator.games('main/000030', 'main/000010'))
+            self.assertTrue(evaluator.step())
+            self.assertEqual(len(evaluator.games('main/000030', 'main/000010')), 2)
+            self.assertTrue(evaluator.step())
+            self.export(40)
+            self.assertTrue(evaluator.step())
+            self.assertEqual(len(evaluator.games('main/000040', 'main/000010')), 2)
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 6)
+        self.assertIsNone(evaluator.anchor())
+
+    def test_owed_anchor_precedes_a_resumed_candidate(self):
+        evaluator = self.start(anchor_games=4, anchor_session_games=2, sprt_max_games=6, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.export(20)
+        def crash(pool, steps):
+            if steps == 3:
+                raise Crash
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=crash, winner=lambda r: -1)), \
+                self.assertRaises(Crash):
+            evaluator.sequential('main/000020', 'main/000010')
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
+        evaluator = self.start(anchor_games=4, anchor_session_games=2, sprt_max_games=6, seal_ms=5)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
+
+    def test_candidate_arriving_during_anchor_gets_the_next_turn(self):
+        evaluator = self.start(anchor_games=4, anchor_session_games=4, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        def export(pool, steps):
+            if steps == 2 and not (self.run/'checkpoints'/'main'/'000020').exists():
+                self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=export)):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        self.assertTrue(evaluator.step())
+        self.assertIsNone(evaluator.anchor())
+
+    def test_variant_registered_during_anchor_gets_the_next_turn(self):
+        evaluator = self.start(anchor_games=4, anchor_session_games=4, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        def register(pool, steps):
+            if steps == 2 and not (self.run/'variant-requests'/'main-000010@x.json').exists():
+                dense_eval.register(self.run, 'main/000010', 'x', dict(sims=1))
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=register)):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000010@x', 'main/000010')), 2)
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+
+    def test_anchor_yield_survives_a_restart(self):
+        evaluator = self.start(anchor_games=4, anchor_session_games=2, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.export(20)
+        self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        evaluator = self.start(anchor_games=4, anchor_session_games=2, seal_ms=5)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+
+    def test_candidate_between_anchor_sessions_gets_the_next_turn(self):
+        evaluator = self.start(anchor_games=4, anchor_session_games=2, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.assertTrue(evaluator.step())                                # no trial waits; 2 anchor games
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
 
     def test_seal_anchor_discards_failed_pair_and_continues(self):
         evaluator = self.start(anchor_games=2, seal_ms=5)
@@ -3779,18 +3879,15 @@ class EvaluatorLoopTests(unittest.TestCase):
             evaluator.failed_seal.add((name, 'seal', 'evidence', evaluator.settings.opening_book))
         self.assertIsNone(evaluator.evidence(verdict, candidate, champion, 2))
 
-    def test_promotion_anchors_after_the_next_sprt_and_before_optional_work(self):
+    def test_anchor_before_the_next_sprt_and_optional_work(self):
         import dashboard
         evaluator = self.anchored()
-        self.assertTrue(evaluator.step())                                   # the waiting candidate's SPRT first
-        self.assertEqual(self.league()['checkpoints'][-1]['matches'][0]['opponent'], 'main/000010')
+        self.assertTrue(evaluator.step())                                   # anchor before the waiting candidate
         path = dense_eval.report_path(self.run, 'main/000010', 'seal')
-        self.assertFalse(path.exists())
-        self.assertEqual(evaluator.optional()[1:], ('main/000010', 'sprt', 2))
-        self.assertTrue(evaluator.step())                                   # all 4 anchor games in one session
         self.assertEqual(len(json.loads(path.read_text())['games']), 4)
-        status = json.loads((self.run/'evaluator-status.json').read_text())
-        self.assertEqual(status['comparison'], dict(candidate='main/000010', opponent='seal', kind='anchor'))
+        self.assertTrue(evaluator.step())                                   # then the candidate's SPRT
+        self.assertEqual(self.league()['checkpoints'][-1]['matches'][0]['opponent'], 'main/000010')
+        self.assertEqual(evaluator.optional()[1:], ('main/000010', 'sprt', 2))
         self.assertIsNone(evaluator.anchor())
         league = self.league()
         seal, report = league['anchors']['seal'], json.loads(path.read_text())['summary']
@@ -3837,17 +3934,21 @@ class EvaluatorLoopTests(unittest.TestCase):
     def test_a_restart_loses_only_the_games_in_flight(self):
         """Every completed colour pair is on disk at once: an evaluator killed mid-session resumes the pairing."""
         evaluator = self.anchored()
-        self.assertTrue(evaluator.step())                                   # main/000020's SPRT
-        def crash(pool, steps):
-            if steps == 3:                                                  # pair 0 is persisted, pair 1 is in flight
-                raise Crash
-        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=crash)), self.assertRaises(Crash):
+        persist = evaluator.persist
+        def crash(*args):
+            persist(*args)
+            raise Crash                                                    # pair 0 is on disk, before the next want()
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()), \
+                unittest.mock.patch.object(evaluator, 'persist', side_effect=crash), self.assertRaises(Crash):
             evaluator.step()
         report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())
         self.assertEqual([g['pair'] for g in report['games']], [0, 0])
         evaluator = self.start(anchor_games=4, seal_ms=5, idle_rematch=True)
         self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
-        self.assertTrue(evaluator.step())
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
+            self.assertTrue(evaluator.step())                               # the waiting candidate goes next
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        self.assertTrue(evaluator.step())                                   # then the anchor resumes
         report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())
         self.assertEqual([g['pair'] for g in report['games']], [0, 0, 1, 1])
         self.assertIsNone(evaluator.anchor())
@@ -3967,7 +4068,6 @@ class EvaluatorLoopTests(unittest.TestCase):
 
     def test_newer_champion_supersedes_an_unfinished_anchor(self):
         evaluator = self.anchored()
-        evaluator.step()
         def export(pool, steps):
             if steps == 2 and not (self.run/'checkpoints'/'main'/'000030').exists():
                 self.export(30)                                             # stops the anchor after its first pair

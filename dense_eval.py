@@ -3,8 +3,8 @@
 Run layout: dense_config. Subcommands
   loop       rate the newest unrated checkpoint of a variant (dense_selfplay.checkpoints order) against the
              champion; that variant's older unrated checkpoints enter league.json with skipped true and elo null
-             and are never played (KataGo's gatekeeper: only the newest candidate meets the champion). When
-             no checkpoint waits it plays the current champion's scheduled Seal anchor (`Evaluator.anchor`), then
+             and are never played (KataGo's gatekeeper: only the newest candidate meets the champion). While the
+             champion owes Seal games, capped anchor sessions (`Evaluator.anchor`) alternate with pending trials. Then
              the optional comparisons (`Evaluator.optional`): panels and idle rematches, then, newest rated
              checkpoint first, `previous_games` vs the previous rated checkpoint of the variant; then, with
              idle_fill (off with --once), fill work until a checkpoint waits (`Evaluator.fill`): the champion vs
@@ -65,7 +65,7 @@ Variants: an A/B test of search settings played by the evaluator's own machinery
 of the per-side PROTOCOL fields (SIDE; `side_settings`). Every pool game gives each side its own settings; reports
 with a variant side record its overrides as `overrides` {id: settings}. A variant with no verdict is a pending
 decision 'variant vs base' (comparison kind 'variant', `Evaluator.trial`), played once no checkpoint awaits rating
-and before anchor, optional and fill work; direct games fill the pool, evidence pairings follow the posterior rule's
+and between owed anchor sessions, before optional and fill work; direct games fill the pool, evidence pairings follow the posterior rule's
 value of information, and the decision is the posterior rule without the leader condition: 'better' when P(r_variant
 - r_base + deviation > sprt_elo0) >= promote_confidence, 'worse' when it is at most 1 - promote_confidence (after
 sprt_min_games direct games with agreeing direct and pooled intervals, as for checkpoints), 'max-games' at
@@ -997,12 +997,23 @@ class Evaluator:
                                            or self.league.get('ladder_top') != settings.fill_top):
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         self.models, self.seal, self.written, self.fill_target, self.deciding, self.reviewed = {}, None, 0., None, None, False
+        previous_status = self.run/'evaluator-status.json'
+        previous = json.loads(previous_status.read_text()) if previous_status.exists() else {}
+        self.anchor_turn = previous.get('anchor_turn', True) if previous.get('anchor_champion') == self.league['champion'] else True
         self.book, self.next, self.ids, self.shas = {}, {}, {}, {}
         self.failed_seal = set()
         self.status = dict(stage='idle', updated_at=None, comparison=None, pool=[], started_at=None, games_played=0,
                            games_planned=0, tally=None, decision=None, pending=[], placements_played=0, mean_placements=None,
                            placements_per_second=None, settings=asdict(settings), eval_share=pacer.share, backlog=[],
-                           eval_share_used=0., error=None, solver=self.solver_status(None))
+                           eval_share_used=0., error=None, solver=self.solver_status(None),
+                           anchor_turn=self.anchor_turn, anchor_champion=self.league['champion'])
+
+    def set_anchor_turn(self, turn):
+        """Persist which task gets the next turn, including across evaluator restarts."""
+        champion = self.league['champion']
+        if (self.anchor_turn, self.status['anchor_champion']) != (turn, champion):
+            self.anchor_turn = turn
+            self.publish(True, anchor_turn=turn, anchor_champion=champion)
 
     def solver_status(self, pool, names=()):
         """The status `solver` field for `pool` (None: no session) playing the players `names`: the evaluation
@@ -1918,10 +1929,13 @@ class Evaluator:
         rule is re-applied to the existing reports (`review`). Then it rates the newest unrated checkpoint of the
         variant whose newest unrated checkpoint is oldest, skipping that variant's older unrated checkpoints (none
         of them has games against the champion), or else decides the first pending variant (`trial`, in
-        registration order; waiting registrations are adopted into league.json first), or else plays a session of the champion's Seal anchor
-        (`anchor`), else of an optional comparison, else of fill work (`fill`), each until its games are complete
+        registration order; waiting registrations are adopted into league.json first). While the champion owes
+        Seal games, it plays at most anchor_session_games before a pending trial, then gives the trial a turn.
+        Without a trial it plays the anchor, then optional and fill work, each until its games are complete
         or a checkpoint waits (the games in flight then finish and count)."""
         self.settle()
+        if self.status['anchor_champion'] != self.league['champion']:
+            self.set_anchor_turn(True)
         champion = self.league['champion']
         revived = [c for c in self.league['checkpoints'] if c.get('skipped') and champion and self.games(c['id'], champion)]
         for c in revived:
@@ -1942,16 +1956,21 @@ class Evaluator:
         trials = [v for v in self.variants() if 'verdict' not in v and v['checkpoint'] and self.games(v['id'], v['checkpoint'])]
         if not resumed and not trials:
             self.refresh_openings()
-        if resumed:
+        anchor_task = self.anchor() if self.anchor_turn else None
+        if resumed and not anchor_task:
             self.filling(None)
             self.rate(resumed[0])
+            self.set_anchor_turn(True)
             return True
         if not self.reviewed:
             self.reviewed = True
             self.review()
+            if self.status['anchor_champion'] != self.league['champion']:
+                self.set_anchor_turn(True)
             if not trials:
                 self.refresh_openings()  # a champion crowned on review refreshes the book before any game
-        if unrated:
+        anchor_task = self.anchor() if self.anchor_turn else None
+        if unrated and not anchor_task:
             self.filling(None)
             variant = lambda e: e[0].split('/')[0]
             heads = {variant(e): e for e in unrated}
@@ -1964,26 +1983,39 @@ class Evaluator:
                 log_event(self.run, 'evaluator', 'skip', f'skipped {", ".join(skipped)} for {head[0]}',
                           checkpoints=skipped, candidate=head[0])
             self.rate(head)
+            self.set_anchor_turn(True)
             return True
-        for entry in self.variants():
-            if 'verdict' not in entry and entry['checkpoint']:
-                self.filling(None)
-                self.trial(entry)
-                return True
-        task = self.anchor() or self.optional() or self.fill()
+        if not anchor_task:
+            for entry in self.variants():
+                if 'verdict' not in entry and entry['checkpoint']:
+                    self.filling(None)
+                    self.trial(entry)
+                    self.set_anchor_turn(True)
+                    return True
+        task = anchor_task or self.anchor() or self.optional() or self.fill()
         self.filling(None if task is None or task[2] not in ('fill', 'generalization') else 'seal' if task[1] == SEAL
                      else f'{"generalization " if task[2] == "generalization" else ""}{task[0]["id"]} vs {task[1]}')
         if task is None:
             return False
         entry, opponent, kind, games = task
         a, s = entry['id'], self.settings
-        target, decided = games if kind == 'previous' else len(self.games(a, opponent))+games, []
+        initial_games = len(self.games(a, opponent))
+        if kind == 'anchor':
+            games = min(games, s.anchor_session_games)
+            self.set_anchor_turn(False)  # commit the handoff before any anchor pair is written
+        target, decided = games if kind == 'previous' else initial_games+games, []
+        waiting = {e[0] for e in unrated}
+
+        def arrived():
+            return (any(e[0] not in waiting and self.entry(e[0]) is None for e in checkpoints(self.run))
+                    or any((self.run/'variant-requests').glob('*.json')))
 
         def want():
             done = self.games(a, opponent)
             if kind == 'sprt' and done and (decision := self.test(done)['decision']):
                 decided.append(decision)  # an idle SPRT rematch keeps the first bound it crosses
-            if self.backlog() or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
+            new_trial = arrived() if kind == 'anchor' else self.backlog()
+            if new_trial or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
         self.session(want, target)
@@ -2006,7 +2038,7 @@ def loop(args):
     run = Path(args.run)
     config = dense_config.load(run)
     settings = dense_config.override(config.evaluation, args, 'eval_')
-    if any(getattr(settings, name) % 2 for name in ('games', 'previous_games', 'anchor_games', 'sprt_max_games', 'pool_games', 'sprt_min_games')):
+    if any(getattr(settings, name) % 2 for name in ('games', 'previous_games', 'anchor_games', 'anchor_session_games', 'sprt_max_games', 'pool_games', 'sprt_min_games')):
         raise ValueError('Evaluation game counts must be even: every opening is played with both colours')
     if min(settings.games, settings.sprt_max_games, settings.pool_games) < 2 or any(0 < getattr(settings, name) < 2 or getattr(settings, name) < 0
                                                                 for name in ('previous_games', 'anchor_games')):
@@ -2019,6 +2051,8 @@ def loop(args):
                          'and sprt_min_games at least one opening pair')
     if settings.anchor_games and settings.anchor_every < 1:
         raise ValueError('anchor_every must be at least 1 while anchor games are enabled')
+    if settings.anchor_session_games < 2:
+        raise ValueError('anchor_session_games must be at least one opening pair')
     if settings.anchor_target_halfwidth < 0 or settings.fill_top < 0 or not .5 <= settings.max_expected_score <= 1:
         raise ValueError('anchor_target_halfwidth and fill_top must be at least 0, max_expected_score in [0.5, 1]')
     dense_openings.check(settings)
