@@ -613,10 +613,10 @@ def book_page(run, query):
     page, size = int(query.get('page', 1)), int(query.get('page_size', 50))
     sort, direction = query.get('sort', 'games'), query.get('direction', 'desc')
     status, reason = query.get('status', ''), query.get('reason', '')
-    minimum = int(query.get('min_games', 0))
+    minimum = int(query.get('min_games') or 0)
     depth = int(query['depth']) if query.get('depth', '') else None
     colour = query.get('colour_decides', '0')
-    decisive = int(query.get('min_decisive', 10))
+    decisive = int(query.get('min_decisive') or 10)
     if page < 1 or not 1 <= size <= 200 or sort not in BOOK_SORTS or direction not in ('asc', 'desc') or \
             status not in ('', 'opening', 'retired', 'prefix') or reason not in ('', *dense_openings.REASONS) or \
             minimum < 0 or (depth is not None and depth < 0) or colour not in ('0', '1') or decisive < 1:

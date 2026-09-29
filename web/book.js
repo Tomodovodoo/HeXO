@@ -70,15 +70,16 @@ class OpeningBook {
     this.render();
   }
   select(label,key,options){const e=element('select',null,{'aria-label':label});for(const [v,t] of options)e.append(element('option',t,{value:v}));this.control(label,key,e);return e}
-  input(label,key,value,min,type='number'){const e=element('input',null,{type,min,step:1,'aria-label':label});e.value=value;this.control(label,key,e);return e}
-  control(label,key,e){const wrap=element('label',label);wrap.append(e);this.controls.append(wrap);this.filters.push([key,e,wrap]);e.onchange=()=>{if(!e.checkValidity()){e.reportValidity();return}this.change({[key]:e.type==='checkbox'?(e.checked?'1':'0'):e.value,page:1})}}
+  input(label,key,value,min,type='number'){const e=element('input',null,{type,min,step:1,'aria-label':label});e.defaultValue=value;this.control(label,key,e);return e}
+  control(label,key,e){const wrap=element('label',label);wrap.append(e);this.controls.append(wrap);this.filters.push([key,e,wrap]);e.onchange=()=>{if(e.type==='number'&&!e.value)e.value=e.defaultValue;if(!e.checkValidity()){e.reportValidity();return}this.change({[key]:e.type==='checkbox'?(e.checked?'1':'0'):e.value,page:1})}}
   state(){const q=new URLSearchParams(location.hash.slice(1)),get=(k,d)=>q.get('book_'+k)??d;return {view:get('view','charts'),run:get('run',this.runs[0]||''),sort:get('sort','games'),direction:get('direction','desc'),page:get('page','1'),page_size:get('page_size','50'),status:get('status',''),reason:get('reason',''),min_games:get('min_games','0'),depth:get('depth',''),colour_decides:get('colour_decides','0'),min_decisive:get('min_decisive','10')}}
   change(values){const q=new URLSearchParams(location.hash.slice(1));for(const [k,v] of Object.entries({...this.state(),...values}))q.set('book_'+k,v);const hash=q.toString();if(location.hash.slice(1)===hash)this.render();else location.hash=hash}
   setRuns(names){
     const changed=names.join('\n')!==this.runs.join('\n');
     if(changed){this.runs=names;this.runSelect.replaceChildren(...names.map(n=>element('option',n,{value:n})))}
     if(names.length&&!names.includes(this.state().run)){this.change({run:names[0],page:1});return}
-    if(changed)this.render();else if(['book','retired'].includes(this.state().view))this.render(true);
+    const s=this.state(),needsDag=s.view==='dag'&&!this.dags.has(this.query({run:s.run}).toString());
+    if(changed)this.render();else if(['book','retired'].includes(s.view)||needsDag)this.render(true);
   }
   query(state){const q=new URLSearchParams(state);q.delete('view');if(this.single){q.delete('run');const run=new URLSearchParams(location.search).get('run');if(run)q.set('run',run)}return q}
   async fetch(path,q,signal){const res=await fetch(path+'?'+q,{signal});if(!res.ok)throw Error(`Book: HTTP ${res.status}`);return res.json()}
@@ -99,7 +100,7 @@ class OpeningBook {
       if(isDag){
         const q=this.query({run:s.run}),key=q.toString();let data=this.dags.get(key);
         if(!data){data=await this.fetch('/api/book/dag',q,signal);this.dags.set(key,data)}
-        if(id===this.request)this.drawDag(data,s);return;
+        if(id===this.request){this.error.textContent='';this.drawDag(data,s)}return;
       }
       if(s.view==='retired')s.status='retired';
       const data=await this.fetch('/api/book',this.query(s),signal);if(id!==this.request)return;

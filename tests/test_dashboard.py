@@ -126,6 +126,7 @@ class OpeningBookPages(unittest.TestCase):
         self.assertEqual([r['games'] for r in self.get(page=2, page_size=2)['rows']], [4, 2])
         self.assertEqual(self.get(page=9)['rows'], [])
         self.assertEqual(self.get()['page_size'], 50)
+        self.assertEqual(self.get(min_games='', min_decisive='')['total'], 5)
         self.assertEqual([r['games'] for r in self.get(sort='games', direction='asc')['rows']], [0, 2, 4, 6, 12])
         retired = self.get(status='retired', min_games=1, depth=3)['rows']
         self.assertEqual([r['key'] for r in retired], [self.nodes[1]['key']])
