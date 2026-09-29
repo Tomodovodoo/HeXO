@@ -109,7 +109,7 @@ class ActorSettings:
     # solver_deep_cap_nodes, on one extra idle-priority worker.
     solver_fixed_budgets: bool = True
     solver_workers: int = 1
-    solver_slack_fraction: float = .8
+    solver_slack_fraction: float = .95
     solver_overrun_fraction: float = .05
     solver_min_nodes: int = 32
     solver_cap_nodes: int = 512
@@ -118,6 +118,11 @@ class ActorSettings:
     solver_deep_nodes: int = 0
     solver_deep_cap_nodes: int = 65536
     solver_follow: bool = False
+    solver_table_mb: int = 32   # adaptive budgets: resident solver table per worker and attacker colour (tactical_proof)
+    # End a game at a verified proof (dense_selfplay.SelfPlayGame.adjudicate, reason 'proven'); proven_line_rows also
+    # appends the certificate's forced line as search-free rows with exact values.
+    adjudicate_proven: bool = False
+    proven_line_rows: bool = False
 
 
 VALUE_TARGETS = ('outcome', 'td', 'calibrated')

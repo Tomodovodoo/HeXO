@@ -34,6 +34,8 @@ struct Request {
     #[serde(default)] attacker:Attacker,
     #[serde(default)] certificate:Option<ProofCertificate>,
     #[serde(default)] root_moves:Option<Vec<(i32,i32)>>,
+    /// Resident search state of this worker thread in megabytes (dfpn::set_resident); 0 = none.
+    #[serde(default)] table_mb:u64,
 }
 fn position(board:&check::Board,side:u8,remaining:u8)->Position {
     Position{stones:board.iter().map(|(&p,&s)|(p,if s==0{Player::P1}else{Player::P2})).collect(),
@@ -74,12 +76,15 @@ fn complete_candidate(board:&check::Board,start:usize,moves:&[(i32,i32)],req:&Re
     cert.nodes[1]=ProofNode::DefenderReplies{responses};Ok(cert)
 }
 /// One query. `nodes` bounds the total search work (IDTT nodes plus PDS-PN level-1
-/// nodes and level-2 expansions), so the verdict and certificate are a function of
-/// (position, attacker, nodes, idtt_nodes, build); `ms` is only a safety cap, and a
-/// query that reaches it returns UNKNOWN.
+/// nodes and level-2 expansions), so with `table_mb` 0 the verdict and certificate are a
+/// function of (position, attacker, nodes, idtt_nodes, build); a resident table
+/// (`table_mb` > 0) carries search state across queries, so they then also depend on the
+/// earlier queries of the worker. `ms` is only a safety cap, and a query that reaches it
+/// returns UNKNOWN.
 fn run(req:Request, start:Instant) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.nodes==0 || req.nodes>10_000_000
-        || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 {return Err("invalid tactical limits".into());}
+        || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>1024 {return Err("invalid tactical limits".into());}
+    prover::dfpn::set_resident(req.table_mb as usize);
     let deadline=start+Duration::from_millis(req.ms as u64);
     let board=check::replay(&req.history)?;
     let ply=if req.attacker==Attacker::Opponent {check::flip(req.history.len())} else {req.history.len()};
@@ -268,6 +273,21 @@ mod tests {
         assert_eq!(plain["certificate"],probed["certificate"]);
         let extra=probed["nodes_used"].as_u64().unwrap()-plain["nodes_used"].as_u64().unwrap();
         assert!(extra<=3,"IDTT spent {extra} units of a 3-unit share");
+    }
+    #[test]
+    fn resident_state_proves_again_with_less_work() {
+        let query=|table_mb:usize| {
+            let (pos,cfg,ctl,meter)=setup(1_000_000);
+            prover::dfpn::set_resident(table_mb);
+            let solved=prover::pdspn::solve(&pos,&cfg,&ctl);
+            (solved.certificate.is_some(),meter.spent())
+        };
+        let (fresh,cold)=query(0);
+        let (first,_)=query(4);
+        let (again,warm)=query(4);
+        assert!(fresh && first && again,"every search proves the win");
+        assert!(warm<cold,"the resident table saves work: {warm} of {cold}");
+        prover::dfpn::set_resident(0);
     }
     #[test]
     fn exhausted_meter_stops_the_search() {

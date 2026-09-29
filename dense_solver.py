@@ -27,8 +27,8 @@ budget (deep: deep_nodes, awaited at the mover's next turn-start search end; a d
 there is dropped) and every verdict is awaited where it is needed, so a verdict is a function of (position,
 attacker, budget, build) and a seeded run repeats exactly on either backend. Otherwise (actors) budgets follow the
 measured slack and verdicts are polled:
-  budget     a query's allowance is slack_fraction * (lead - GUARD_MS) minus its pool's reserved work per worker,
-             in nodes at the pool's measured rate (the RATE_QUANTILE of recent queries, at most RATE), clamped
+  budget     a query's allowance is slack_fraction * (lead - GUARD_MS, plus the step's overrun allowance for root
+             and finalist queries, which may be waited for) minus its pool's reserved work per worker, in nodes at the pool's measured rate (the RATE_QUANTILE of recent queries, at most RATE), clamped
              to [min_nodes, cap_nodes]; `lead` is the LEAD_QUANTILE of the measured times from submission to the
              first consumption attempt of that point, refreshed every step (before any was measured: the Engine's
              step time, DEEP_LEAD_MS for deep queries). Threat queries keep their fixed budget. Deep queries run
@@ -109,7 +109,7 @@ class Schedule:
     add one."""
     fixed_budgets: bool = True
     workers: int = 1
-    slack_fraction: float = .8
+    slack_fraction: float = .95
     overrun_fraction: float = .05
     min_nodes: int = 32
     cap_nodes: int = 512
@@ -118,9 +118,11 @@ class Schedule:
     deep_nodes: int = 0
     deep_cap_nodes: int = 65536
     follow: bool = False
+    table_mb: int = 32
 
     def __post_init__(self):
         if (self.workers < 1 or self.slack_fraction < 0 or self.overrun_fraction < 0 or not 0 <= self.gate_weight <= 100
+                or not 0 <= self.table_mb <= 1024
                 or not 1 <= self.min_nodes <= self.cap_nodes <= self.gate_cap_nodes <= MAX_NODES
                 or not 0 <= self.deep_nodes <= self.deep_cap_nodes <= MAX_NODES):
             raise ValueError('Invalid solver schedule')
@@ -200,7 +202,7 @@ class Pool:
     def __init__(self, workers, priority):
         self.engines = [IsolatedTactics(priority=priority) for _ in range(workers)]
         self.heap, self.sequence, self.reserved, self.stopped = [], 0, 0., False
-        self.rates, self.rate = deque(maxlen=256), RATE
+        self.rates, self.rate, self.busy_ms = deque(maxlen=256), RATE, 0.
         self.condition = threading.Condition()
         self.threads = [threading.Thread(target=self.serve, args=(e,), daemon=True) for e in self.engines]
         for thread in self.threads:
@@ -223,6 +225,7 @@ class Pool:
                 if self.stopped:
                     return
                 _, _, reserved, history, request, future = heapq.heappop(self.heap)
+            start = time.perf_counter()
             try:
                 result = decode(engine.history(history, **request))
             except Exception as error:
@@ -233,6 +236,7 @@ class Pool:
             used, elapsed = int(result.get('nodes_used') or 0), float(result.get('elapsed_ms') or 0.)
             with self.condition:
                 self.reserved -= reserved
+                self.busy_ms += (time.perf_counter()-start)*1000
                 if used >= RATE_NODES and elapsed > OVERHEAD_MS:
                     self.rates.append(used/(elapsed-OVERHEAD_MS))
                     self.rate = min(RATE, quantile(self.rates, RATE_QUANTILE))
@@ -272,8 +276,8 @@ class Solver:
         self.stats = dict(points={p: dict(queries=0, hits=0, nodes=0, budget=0, solver_ms=0.) for p in POINTS},
                           bands=[[0, 0] for _ in range(len(BANDS)+1)], budgets=deque(maxlen=WINDOW),
                           gate_scores=deque(maxlen=WINDOW), steps=0, step_ms=0., waits=0, wait_ms=0., wait_steps=0,
-                          step_waits=0, deferred=0, late=0, dropped=0, skipped=0, followed=0, labelled=0, failures=0,
-                          last_failure=None)
+                          step_waits=0, slack_ms=0., deferred=0, late=0, dropped=0, skipped=0, followed=0, labelled=0,
+                          failures=0, last_failure=None)
 
     def waited(self, seconds):
         self.stats['waits'] += 1
@@ -291,6 +295,7 @@ class Solver:
         s = self.stats
         s['steps'] += 1
         s['step_ms'] += step_ms
+        s['slack_ms'] += collect_ms+self.schedule.overrun_fraction*step_ms
         s['wait_steps'] += s['step_waits'] > 0
         s['step_waits'] = 0
         ema = lambda old, new: new if old is None else .95*old+.05*new
@@ -314,7 +319,8 @@ class Solver:
                 rate, queued = pool.rate, pool.reserved/len(pool.engines)
         else:
             rate, queued = RATE, 0.
-        nodes_free = rate*(sc.slack_fraction*(lead-GUARD_MS)-queued-OVERHEAD_MS)
+        overrun = sc.overrun_fraction*(self.step_ms or 0.) if point in ('root', 'finalist') else 0.
+        nodes_free = rate*(sc.slack_fraction*(lead-GUARD_MS+overrun)-queued-OVERHEAD_MS)
         cap, high = (sc.deep_cap_nodes, sc.deep_cap_nodes) if deep else (sc.cap_nodes, sc.gate_cap_nodes)
         if deep and nodes_free < nodes:
             return None, None, pool
@@ -332,7 +338,8 @@ class Solver:
             return None
         most = budget if gate is None else max(budget, gate['floor'], min(gate['cap_high'], round(budget*(1+gate['weight']))))
         request = dict(nodes=budget, ms=DEEP_SAFETY_MS if point == 'deep' else min(DEEP_SAFETY_MS, SAFETY_MS+most//4),
-                       attacker=attacker, gate=gate, root_moves=root_moves)
+                       attacker=attacker, gate=gate, root_moves=root_moves,
+                       table_mb=0 if self.schedule.fixed_budgets else self.schedule.table_mb)
         base = None if attacker == 'opponent' else tuple(map(tuple, history))
         history = [list(p) for p in history]
         if pool:
@@ -383,8 +390,10 @@ class Solver:
         """Status fields: query rate; per point hit rate, mean backend ms, mean granted budget and query count;
         granted budget mean and p95; hit rate by budget band; verdict waits (wait_step_fraction: share of steps
         with one, wait_ms_per_waiting_step, overrun_fraction: wait time over step time); the measured nodes per ms,
-        step, collect and per-point lead times; worker utilisation (backend time over worker wall time); deferred,
-        late, dropped, skipped, followed and labelled counts; failures."""
+        step, collect and per-point lead times; worker utilisation (backend time over worker wall time),
+        idle_fraction per pool (share of its workers' wall time without a query) and slack_utilisation (foreground
+        busy time over its workers' share of the collect time plus overrun allowance of every step: the capacity
+        the scheduler targets); deferred, late, dropped, skipped, followed and labelled counts; failures."""
         s, points = self.stats, self.stats['points']
         queries = sum(p['queries'] for p in points.values())
         rate = lambda a, b: a/b if b else None
@@ -407,6 +416,9 @@ class Solver:
             nodes_per_ms=[p.rate for p in pools], step_ms=self.step_ms, collect_ms=self.collect_ms,
             lead_ms={p: quantile(v, LEAD_QUANTILE) for p, v in self.leads.items()},
             utilisation=rate(sum(p['solver_ms'] for p in points.values()), workers*seconds*1000),
+            idle_fraction={name: 1-pool.busy_ms/(len(pool.engines)*seconds*1000) if seconds else None
+                           for name, pool in (('foreground', self.pool), ('background', self.background)) if pool},
+            slack_utilisation=rate(self.pool.busy_ms, len(self.pool.engines)*s['slack_ms']) if self.pool else None,
             gate_score_mean=float(np.mean(s['gate_scores'])) if s['gate_scores'] else None,
             **{k: s[k] for k in ('deferred', 'late', 'dropped', 'skipped', 'followed', 'labelled')})
 
@@ -456,9 +468,26 @@ class Proof:
         return self.depth[index]
 
     def path(self, history):
+        return self.walk(history)[:2]
+
+    def reply(self, history):
+        """The defender stones still to play in the first certificate reply that extends the defender's turn in
+        progress at the end of `history`, or None (not at a covered defender turn on the certificate)."""
+        _, move, node, played = self.walk(history)
+        if move is None or move[0] or node['kind'] != 'defender_replies':
+            return None
+        for response in node['responses']:
+            action = [tuple(a) for a in response['action']]
+            if set(played) <= set(action):
+                return [a for a in action if a not in played]
+        return None
+
+    def walk(self, history):
+        """(labels, move, node, played) of `path`, plus the certificate node the walk ended at and the stones of the
+        turn in progress there (None, () when it left the certificate)."""
         history, i = tuple(map(tuple, history)), len(self.base)
         if history[:i] != self.base:
-            return [], None
+            return [], None, None, ()
         labels, index, first = [], self.root, True
         while True:
             node, turns = self.nodes[index], self.turns(index)
@@ -466,17 +495,17 @@ class Proof:
                 labels += [(p, -1, turns) for p in range(i, min(i+2, len(history)))]
                 reply = history[i:i+2]
                 if len(reply) < 2:
-                    return labels, ([], turns)
+                    return labels, ([], turns), node, reply
                 i += 2
                 if node['kind'] == 'unstoppable':
                     threat = next((t for t in node['threats'] if not set(map(tuple, t)) & set(reply)), None)
                     if threat is None:
-                        return labels, None
+                        return labels, None, None, ()
                     node, turns = dict(kind='immediate_win', action=threat), 1
                 else:
                     index = self.replies[index].get(tuple(sorted(reply)))
                     if index is None:
-                        return labels, None
+                        return labels, None, None, ()
                     continue
             action = [tuple(a) for a in node['action']]
             played = history[i:i+len(action)]
@@ -485,9 +514,11 @@ class Proof:
             if played[:1] and played[0] in action and len(action) > 1 and i+1 < len(history):
                 labels.append((i+1, 1, turns))
             if len(played) < len(action):
-                return labels, ([a for a in action if a not in played], turns) if set(played) <= set(action) else None
+                if not set(played) <= set(action):
+                    return labels, None, None, ()
+                return labels, ([a for a in action if a not in played], turns), node, played
             if set(played) != set(action) or node['kind'] == 'immediate_win' or (first and self.first_turn_only):
-                return labels, None
+                return labels, None, None, ()
             index, i, first = node['child'], i+len(action), False
 
 
@@ -643,8 +674,8 @@ class Plan:
         """Before the move is played: consume the root verdict (and, with fixed budgets, the mover's pending deep
         verdict at a turn start), play the kept proof's stone, and set result proven (+1 proof, -1 a root the
         finalist marks left exact-lost, else 0), proof_turns, solver_nodes (nodes spent on this search's queries),
-        solver_budget (their granted budgets) and pruned (the finalists marked lost). False defers the slot to its
-        next visit."""
+        solver_budget (their granted budgets), pruned (the finalists marked lost) and, with proven +1, proof (the
+        Proof played from). False defers the slot to its next visit."""
         history = tuple(map(tuple, slot.tree.history))
         player = mover(history)
         if self.root is not None:
@@ -660,7 +691,7 @@ class Plan:
         result.update(proven=0, proof_turns=0)
         move = self.move(player, history) if active(slot.solver, self.schedule) else None
         if move is not None:
-            result.update(action=list(move[0][0]), proven=1, proof_turns=move[1])
+            result.update(action=list(move[0][0]), proven=1, proof_turns=move[1], proof=self.proofs[player])
             self.solver.stats['followed'] += self.following
         elif self.pruned and native.hxg_exact(slot.tree.ptr) == 1-mover(history):
             result.update(proven=-1, proof_turns=self.turns)

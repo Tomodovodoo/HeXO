@@ -17,7 +17,10 @@ move at that ply, or null). The learner derives every target from the episode (`
 `row.target`/`row.weight` (p(win) or null, weight) are informational and optional. Rows of games played with the
 solver (episode `solver`, dense_solver.record) carry `proven` (+1 / -1: the side to move wins / loses by a verified
 proof, 0: unproven), `proof_turns` (attacker turns of that proof, 0 when unproven), `solver_nodes` (solver work
-spent on the ply's search) and `solver_budget` (the node budgets granted to its queries); absent means 0. The manifest counts the proven rows as `proven_rows`.
+spent on the ply's search) and `solver_budget` (the node budgets granted to its queries); absent means 0. A game
+ended at a proof (actor adjudicate_proven) has reason 'proven', its winner and `adjudicated` {ply, winner,
+line_plies: placements of the certificate's forced line from there}; rows of that line played without search carry
+`line` True and no policy. The manifest counts `proven_games`, `line_rows` and `adjudicated_plies`. The manifest counts the proven rows as `proven_rows`.
 `episode.actor` is the sha256 of the evaluator being trained. Actor shards also record `actors` {"0": sha, "1": sha}
 per colour, `opponent` (null for self-play, else the checkpoint id of a frozen historical opponent) and
 `trained_side` (null for self-play, else the colour the trained evaluator played). Every ply keeps a row so ply
@@ -235,11 +238,13 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
         if len(p) and (not np.isfinite(p).all() or np.any(p < 0) or not np.isclose(p.sum(), 1, atol=1e-4)):
             raise ValueError('Invalid policy target')
     keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256', 'proven', 'proof_turns', 'solver_nodes',
-            'solver_budget')
+            'solver_budget', 'line')
     counts = dict(games=len(episodes), rows=len(rows), policy_rows=sum(len(p) > 0 for p in policies),
                   opponent_rows=sum(not trained(episodes[r['game']], r['ply']) for r in rows),
                   terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes),
-                  proven_rows=sum(bool(r.get('proven')) for r in rows))
+                  proven_rows=sum(bool(r.get('proven')) for r in rows),
+                  proven_games=sum(e.get('reason') == 'proven' for e in episodes), line_rows=sum(bool(r.get('line')) for r in rows),
+                  adjudicated_plies=sum(e['adjudicated']['line_plies'] for e in episodes if e.get('adjudicated')))
     with tempfile.TemporaryDirectory(dir=path.parent, prefix='pending-') as temporary:
         stage = Path(temporary)/'shard'
         stage.mkdir()

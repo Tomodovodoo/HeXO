@@ -30,7 +30,9 @@ use super::pn::{
 use super::{Ctl, DriverResult, ProverConfig};
 use crate::forcing::{CellSet2, WinDepthHints};
 use hexo_engine::types::Coord;
+use hexo_engine::types::Player;
 use rustc_hash::FxHashSet;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -46,6 +48,50 @@ const MOVE_RANK_BIAS: u32 = 0;
 /// wins are shallow (corpus depth ≤ 6; the deepest composition is ~18 turns ≈ 40
 /// plies), so this only fires on pathological non-terminating forcing.
 const MAX_PLY: u32 = 1024;
+
+/// Resident search state of one attacker: the transposition table and the proven-node set.
+type Resident = (ProofTt, FxHashSet<u64>);
+/// Proven-node keys kept per resident megabyte; past that the set is cleared (the table is kept).
+const PROVEN_PER_MB: usize = 32768;
+
+thread_local! {
+    static RESIDENT_MB: Cell<usize> = const { Cell::new(0) };
+    static RESIDENT: RefCell<Vec<(bool, Resident)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Keep each attacker's transposition table (`mb` megabytes) and proven-node set alive across this thread's
+/// df-pn / PDS-PN searches; 0 turns it off and frees them, a new size drops the kept state. Sound: table
+/// entries are exact facts or proof-number estimates of the positions their keys name, so they only steer later
+/// searches, and a kept proven node still has to be re-walked into a certificate that is verified. A search is
+/// then no longer a function of its position and budget alone.
+pub fn set_resident(mb: usize) {
+    if RESIDENT_MB.with(|c| c.replace(mb)) != mb {
+        RESIDENT.with(|r| r.borrow_mut().clear());
+    }
+}
+
+fn take_resident(attacker: Player) -> Option<Resident> {
+    let mb = RESIDENT_MB.with(|c| c.get());
+    if mb == 0 {
+        return None;
+    }
+    let side = attacker == Player::P1;
+    RESIDENT.with(|r| {
+        let mut r = r.borrow_mut();
+        Some(match r.iter().position(|e| e.0 == side) {
+            Some(i) => r.swap_remove(i).1,
+            None => (ProofTt::new(mb), FxHashSet::default()),
+        })
+    })
+}
+
+fn keep_resident(attacker: Player, mut state: Resident) {
+    let mb = RESIDENT_MB.with(|c| c.get());
+    if state.1.len() > mb * PROVEN_PER_MB {
+        state.1.clear();
+    }
+    RESIDENT.with(|r| r.borrow_mut().push((attacker == Player::P1, state)));
+}
 
 pub struct Dfpn<'a> {
     k: KernelCtx,
@@ -88,15 +134,17 @@ impl<'a> Dfpn<'a> {
         ctl: &'a Ctl,
         pds_mode: bool,
         hints: Option<Rc<WinDepthHints>>,
+        resident: Option<Resident>,
     ) -> Dfpn<'a> {
+        let (tt, proven) = resident.unwrap_or_else(|| (ProofTt::new(cfg.tt_mb), FxHashSet::default()));
         Dfpn {
             k,
-            tt: ProofTt::new(cfg.tt_mb),
+            tt,
             ctl,
             nodes: 0,
             budget: cfg.node_budget,
             exceeded: false,
-            proven: FxHashSet::default(),
+            proven,
             kids: Vec::new(),
             max_depth: 0,
             pds_mode,
@@ -623,7 +671,7 @@ pub(crate) fn screen_root_attacks(
     ) else {
         return empty();
     };
-    let mut d = Dfpn::new(ctx, cfg, ctl, true, None);
+    let mut d = Dfpn::new(ctx, cfg, ctl, true, None, None);
     let moves = match d.k.or_eval(pos.placements_remaining) {
         OrEval::Moves(moves) => moves,
         OrEval::WinNow | OrEval::Loss => return empty(),
@@ -746,7 +794,9 @@ pub(crate) fn solve_mode_at_guided(
         Some(c) => c,
         None => return DriverResult::new(Verdict::BudgetExceeded),
     };
-    let mut d = Dfpn::new(ctx, cfg, ctl, pds_mode, hints);
+    let resident = take_resident(pos.attacker);
+    let keep = resident.is_some();
+    let mut d = Dfpn::new(ctx, cfg, ctl, pds_mode, hints, resident);
     let root = Node::Or { placements: pos.placements_remaining };
     // `Instant::now()` traps at runtime on wasm32-unknown-unknown (no monotonic
     // clock in std for that target). The elapsed value is only used for the
@@ -847,6 +897,9 @@ pub(crate) fn solve_mode_at_guided(
         }
     }
     res.stats = d.stats(elapsed);
+    if keep {
+        keep_resident(pos.attacker, (d.tt, d.proven));
+    }
     res
 }
 

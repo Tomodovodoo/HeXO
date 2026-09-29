@@ -330,6 +330,61 @@ class Proofs(unittest.TestCase):
         self.assertEqual(summary['followed'], len([r for r in rows if r['player'] == winner])-1)  # adopted at its first search end
 
 
+class Adjudication(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            engine = NativeTactics()
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        cls.opening = [tuple(m) for m in FIXTURE['positions'][PROOF]]
+        cls.proof = engine.history(cls.opening, nodes=NODES)
+
+    def play(self, **changes):
+        model = tiny_model()
+        s = settings(full_fraction=1., solver_root_nodes=NODES, adjudicate_proven=True, **changes)
+        game = from_position(dense_selfplay.SelfPlayGame([model, model], replace(s, max_plies=len(self.opening)+40), 5),
+                             self.opening)
+        run([game], schedule=Schedule.of(s))
+        return game.episode()
+
+    def test_a_root_proof_ends_the_game(self):
+        episode, rows = self.play()
+        winner = dense_solver.mover(self.opening)
+        self.assertEqual((episode['reason'], episode['winner']), ('proven', winner))
+        self.assertEqual(episode['moves'][len(self.opening):], [self.proof['moves'][0]])
+        self.assertEqual([r['proven'] for r in rows], [1])
+        self.assertEqual(episode['adjudicated']['ply'], len(self.opening)+1)
+        self.assertGreater(episode['adjudicated']['line_plies'], 1)
+        with tempfile.TemporaryDirectory() as root:
+            manifest = dense_data.write_shard(Path(root)/'shards'/'000001', dict(actor_sha256='a'*64), [episode],
+                                              [dict(r, game=0) for r in rows])
+        self.assertEqual((manifest['counts']['proven_games'], manifest['counts']['line_rows']), (1, 0))
+        self.assertEqual(manifest['counts']['adjudicated_plies'], episode['adjudicated']['line_plies'])
+
+    def test_line_rows_play_the_certificate_to_six_without_search(self):
+        episode, rows = self.play(proven_line_rows=True)
+        winner = dense_solver.mover(self.opening)
+        game = Game([tuple(m) for m in episode['moves']])
+        self.assertEqual((game.winner, episode['winner'], episode['reason']), (winner, winner, 'proven'))
+        game.close()
+        line = rows[1:]
+        self.assertEqual(len(line), episode['adjudicated']['line_plies'])
+        self.assertTrue(all(r['line'] and r['policy'] is None for r in line))
+        self.assertEqual([r['proven'] for r in rows], [1 if r['player'] == winner else -1 for r in rows])
+        self.assertEqual(episode['root_values'][1:], [1. if r['player'] == winner else -1. for r in line])
+        self.assertFalse(any(episode['full_search'][1:]))
+        with tempfile.TemporaryDirectory() as root:
+            manifest = dense_data.write_shard(Path(root)/'shards'/'000001', dict(actor_sha256='a'*64), [episode],
+                                              [dict(r, game=0) for r in rows])
+            window = dense_data.ReplayWindow(root, capacity_rows=1000)
+            refs = [window.ref('000001', i) for i in range(len(window.index))]
+            options = dense_data.target_options(dense_config.LearnerSettings())
+            targets = dense_data.examples(window, refs, np.random.default_rng(0), **options)[1]   # rows replay
+        self.assertEqual(manifest['counts']['line_rows'], len(line))
+        self.assertEqual([t['value'] for t in targets], [float(r['proven'] > 0) for r in rows])
+
+
 class Scheduler(unittest.TestCase):
     def test_schedule_defaults_and_validation(self):
         self.assertEqual(Schedule.of(dense_config.ActorSettings()), Schedule())
@@ -352,7 +407,8 @@ class Scheduler(unittest.TestCase):
         solver.leads['root'].extend([70.]*8)
         solver.tick(10., 5.)
         budget, gate, _ = solver.allocate('root', NODES)
-        self.assertEqual(budget, int(dense_solver.RATE*(.8*(70-dense_solver.GUARD_MS)-dense_solver.OVERHEAD_MS)))
+        overrun = .05*10.   # root verdicts may be waited for: the step's overrun allowance counts as slack
+        self.assertEqual(budget, int(dense_solver.RATE*(.95*(70-dense_solver.GUARD_MS+overrun)-dense_solver.OVERHEAD_MS)))
         self.assertEqual(gate, dict(weight=3., floor=32, cap_low=512, cap_high=8192))
         solver.leads['finalist'].extend([5000.]*8)
         solver.tick(10., 5.)
@@ -487,6 +543,8 @@ class Scheduler(unittest.TestCase):
         self.assertLessEqual(summary['budget_p95'], 8192)
         self.assertGreaterEqual(min(solver_budgets(summary)), NODES)
         self.assertEqual(summary['failures'], 0)
+        self.assertEqual(set(summary['idle_fraction']), {'foreground', 'background'})
+        self.assertTrue(0 <= summary['slack_utilisation'])
         for key in ('wait_step_fraction', 'overrun_fraction', 'band_hit_rate', 'utilisation', 'lead_ms', 'nodes_per_ms'):
             self.assertIn(key, summary)
 

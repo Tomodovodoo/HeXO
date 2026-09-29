@@ -239,6 +239,13 @@ class Gate(unittest.TestCase):
         flipped = self.engine.history(TWO_TURN, nodes=135, attacker='opponent', gate=self.GATE)
         self.assertGreater(flipped['gate_score'], self.engine.history(TWO_TURN, nodes=135, gate=self.GATE)['gate_score'])
 
+    def test_resident_table_keeps_proofs_and_is_bounded(self):
+        strong = FIXTURE['positions']['1790600149713752:2:253']
+        for table in (4, 4, 0):
+            self.assertEqual(self.engine.history(strong, nodes=135, table_mb=table)['status'], 'PROVEN_WIN')
+        with self.assertRaises(ValueError):
+            self.engine.history(strong, nodes=135, table_mb=2000)
+
     def test_invalid_gates_are_rejected(self):
         for gate in (dict(self.GATE, cap_low=9000), dict(self.GATE, floor=0), dict(self.GATE, weight=-1),
                      dict(weight=1., floor=1)):

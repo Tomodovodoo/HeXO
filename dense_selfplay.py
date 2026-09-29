@@ -465,10 +465,12 @@ class SelfPlayGame:
     placement; both sides use the same playout-cap randomization, opening sampling and solver budgets (`solver`,
     from the settings' solver_* fields). With the solver active every row records `proven`, `proof_turns`,
     `solver_nodes` and `solver_budget` (Engine), a proof's move is played even on an opening ply, the episode
-    records `solver` (dense_solver.record) and `label` marks rows a proof decided after they were searched."""
+    records `solver` (dense_solver.record) and `label` marks rows a proof decided after they were searched.
+    With adjudicate_proven a proven search (+1: the side to move wins, -1: every candidate it kept loses) plays its
+    move and ends the game there (`adjudicate`)."""
 
     def __init__(self, sides, settings, seed, learner=0, opponent=None):
-        self.sides, self.settings, self.seed, self.reason = sides, settings, seed, None
+        self.sides, self.settings, self.seed, self.reason, self.adjudicated = sides, settings, seed, None, None
         self.solver, self.schedule = dense_solver.Budgets.of(settings), dense_solver.Schedule.of(settings)
         self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
@@ -519,8 +521,60 @@ class SelfPlayGame:
         self.moves.append([q, r])
         if game.winner >= 0 or len(self.moves) >= self.settings.max_plies:
             return False
+        if self.settings.adjudicate_proven and result.get('proven'):
+            self.adjudicate(player if result['proven'] > 0 else 1-player, result.get('proof'))
+            return False
         self.plan()
         return True
+
+    def adjudicate(self, winner, proof):
+        """End the game as a proven win of `winner` (reason 'proven'). With proven_line_rows and the winner's
+        `proof`, first play the certificate's forced line to six in a row (forced_line), each placement with a row
+        and no search: no policy, the exact value, `line` True. The episode records `adjudicated` {ply, winner,
+        line_plies: the placements of that line, played or not}."""
+        full = proof and dense_solver.Proof(proof.base, dict(nodes=proof.nodes, root=proof.root))  # past its first turn
+        line = self.forced_line(full) if full else []
+        ply = len(self.moves)
+        if self.settings.proven_line_rows:
+            trained = lambda p: self.opponent is None or p == self.learner
+            for (q, r), turns in line:
+                if len(self.moves) >= self.settings.max_plies:
+                    break
+                game = self.game
+                player = game.player
+                legal = hexcrop.legal_array(game, np.asarray(self.moves, np.int64).reshape(-1, 2))
+                proven = 1 if player == winner else -1
+                self.rows.append(dict(ply=len(self.moves), player=player, remaining=game.remaining,
+                                      legal_sha256=dense_data.legal_digest(legal), policy=None, proven=proven,
+                                      proof_turns=turns, solver_nodes=0, solver_budget=0, line=True))
+                self.values.append(float(proven) if trained(player) else None)
+                self.full.append(False)
+                game.play(q, r)
+                self.moves.append([q, r])
+        self.reason, self.adjudicated = 'proven', dict(ply=ply, winner=winner, line_plies=len(line))
+
+    def forced_line(self, proof):
+        """[((q, r), proof_turns)] from the current position to the winner's six in a row along `proof`: the
+        attacker's certificate stones, the defender's first covered reply, and after an unstoppable node any legal
+        stones off the attacker's threats; the line stops early (never expected) where the certificate gives no
+        move."""
+        history, line = [tuple(m) for m in self.moves], []
+        game = Game(history)
+        try:
+            while game.winner < 0:
+                _, move, node, _ = proof.walk(history)
+                if move is None:
+                    break
+                stones = move[0] or proof.reply(history)
+                if stones is None:
+                    threats = {tuple(c) for t in node.get('threats', ()) for c in t}
+                    stones = [next(tuple(m) for m in game.legal_moves() if tuple(m) not in threats)]
+                line.append((stones[0], move[1]))
+                game.play(*stones[0])
+                history.append(stones[0])
+        finally:
+            game.close()
+        return line
 
     def label(self, ply, proven, turns):
         """Record a proof's verdict (+1 / -1: the side to move wins / loses) on the row of `ply` unless it has one;
@@ -534,7 +588,7 @@ class SelfPlayGame:
 
     def episode(self):
         """(episode, rows without `game`) after closing the native objects."""
-        winner = self.game.winner
+        winner = self.adjudicated['winner'] if self.adjudicated else self.game.winner
         self.game.close()
         for tree in self.trees.values():
             tree.close()
@@ -545,6 +599,8 @@ class SelfPlayGame:
                        root_values=self.values, full_search=self.full)
         if dense_solver.active(self.solver, self.schedule):
             episode['solver'] = dense_solver.record(self.solver, self.schedule)
+        if self.adjudicated:
+            episode['adjudicated'] = self.adjudicated
         return episode, self.rows
 
 

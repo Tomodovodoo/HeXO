@@ -18,6 +18,10 @@ The score is computed where the query runs (in the worker process for IsolatedTa
 so the verdict stays a function of (position, attacker, nodes, gate, build). Results
 carry the granted `budget` and `gate_score` (None without a gate).
 
+`table_mb` > 0 keeps the worker thread's transposition table and proven-node set (that
+many megabytes per attacker colour) across queries; a verdict then also depends on the
+earlier queries of the same worker, never on anything unverified.
+
 `attacker='mover'` asks whether the side to move has a forced win.
 `attacker='opponent'` asks whether its opponent, moving now with a fresh
 two-placement turn on the current stones, has one; `threat_cells` of that
@@ -48,11 +52,12 @@ RESPONSE_LIMIT = 16*1024*1024
 PRIORITIES = {None: None, 'below_normal': (0x4000, 5), 'idle': (0x40, 19)}
 
 
-def check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate=None):
+def check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate=None, table_mb=0):
     counts = [nodes] if gate is None else [nodes, gate.get('floor'), gate.get('cap_low'), gate.get('cap_high')]
     if (type(ms) is not int or not 1 <= ms <= 60000 or any(type(n) is not int or not 1 <= n <= MAX_NODES for n in counts)
             or type(idtt_nodes) is not int or not 0 <= idtt_nodes < min(counts)
             or type(depth) is not int or not 1 <= depth <= 64 or attacker not in ('mover', 'opponent')
+            or type(table_mb) is not int or not 0 <= table_mb <= 1024
             or (gate is not None and (set(gate) != {'weight', 'floor', 'cap_low', 'cap_high'}
                                       or not 0 <= gate['weight'] <= 100 or gate['cap_low'] > gate['cap_high']))):
         raise ValueError('Invalid tactical budgets')
@@ -123,8 +128,8 @@ class NativeTactics:
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None, gate=None):
-        check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate)
+                certificate=None, root_moves=None, gate=None, table_mb=0):
+        check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         start = time.perf_counter()
         nodes, score = gated_nodes(history, attacker, nodes, gate)
         unknown = lambda reason: dict(unknown_result(reason, start, attacker, self.metadata['binary_sha256']),
@@ -136,7 +141,7 @@ class NativeTactics:
             if remaining < 1:
                 return unknown('deadline')
             request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
-                           attacker=attacker)
+                           attacker=attacker, table_mb=table_mb)
             if certificate is not None:
                 request['certificate'] = certificate
             if root_moves is not None:
@@ -172,7 +177,7 @@ class IsolatedTactics:
     `package`. `priority` ('below_normal', 'idle' or None: inherited) is the child's CPU
     scheduling class, set by the child before it loads the engine.
 
-    `history` takes the same budgets, `attacker` and `gate` as `NativeTactics.history`, and its
+    `history` takes the same budgets, `attacker`, `gate` and `table_mb` as `NativeTactics.history`, and its
     results carry the same `nodes_used`, `budget`, `gate_score`, `proof_turns`, `attacker` and
     `build_hash` (None when no worker answered; `budget` and `gate_score` None too). A verdict depends on the node budget only; a kill at the hard deadline is a
     failure to investigate, not a verdict.
@@ -237,8 +242,8 @@ class IsolatedTactics:
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None, gate=None):
-        check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate)
+                certificate=None, root_moves=None, gate=None, table_mb=0):
+        check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         start = time.perf_counter()
         hard = start+(ms+self.grace_ms)/1000
         unknown = lambda reason, build_hash=None: dict(unknown_result(reason, start, attacker, build_hash), budget=None,
@@ -268,7 +273,8 @@ class IsolatedTactics:
             if remaining < 1:
                 return unknown('deadline')
             request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
-                           attacker=attacker, certificate=certificate, root_moves=root_moves, gate=gate)
+                           attacker=attacker, certificate=certificate, root_moves=root_moves, gate=gate,
+                           table_mb=table_mb)
             payload = json.dumps(request, separators=(',', ':'))
             if len(payload) > REQUEST_LIMIT:
                 return unknown('request size limit')
