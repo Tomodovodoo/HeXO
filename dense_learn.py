@@ -931,7 +931,7 @@ def main():
         write_status(stage='exporting')
         fields = validation_fields(learner.export(window, sets)['metrics'])
         window.refresh_regret()
-        stream.refresh_regret()
+        stream.refresh_regret(window.regret_entries)
         stream.set_calibration(learner.calibration)
         if fields:
             dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
@@ -949,7 +949,8 @@ def main():
         sets = validation_sets(args.run, s, config.seed)
         learner.calibrate(window)
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers,
-                                                 calibration=learner.calibration, policy_dir=policy_dir(args.run, s.variant))
+                                                 calibration=learner.calibration, policy_dir=policy_dir(args.run, s.variant),
+                                                 regret_entries=window.regret_entries)
         stream = renderers()
         factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])
         dense_config.log_event(args.run, 'learner', 'info', f'{s.variant} learner started at step {learner.step}', variant=s.variant, step=learner.step,

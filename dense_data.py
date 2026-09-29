@@ -561,7 +561,13 @@ class ReplayWindow:
                             entries[key] = max(entries.get(key, 0.), float(entry['regret']))
             except (OSError, ValueError, KeyError, TypeError):
                 return
-            self.regret_mtime, self.regret_entries = mtime, entries
+            self.regret_mtime = mtime
+            self.set_regret(entries)
+
+    def set_regret(self, entries):
+        """Use one captured buffer snapshot for this window's priority rows."""
+        if entries != self.regret_entries:
+            self.regret_entries = entries
             self.refresh()
 
     def regret_distribution(self, recency):
@@ -1090,20 +1096,27 @@ def start_hidden(processes):
         sys.modules['__main__'] = main
 
 
-def _render_worker(run, settings, seed, output, calibration, policy_dir, regret_epoch):
+def _render_worker(run, settings, seed, output, calibration, policy_dir, regret_updates, initial_regret):
     """Worker process body: put `batches` from a private ReplayWindow on `policy_dir` (refreshed every 30 s), with
     the Calibration packed in the shared array `calibration`."""
     try:
         window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
                               settings.window_taper, settings.validation_fraction, policy_dir)
+        if initial_regret is not None:
+            window.set_regret(initial_regret)
         rng = np.random.default_rng(seed); refreshed = time.time()
-        seen_regret_epoch = regret_epoch.value
         while not window.index:
             time.sleep(5); window.refresh(); refreshed = time.time()
         for batch in batches(window, rng, settings.batch, lambda: settings, calibration=lambda: unpack_calibration(calibration[:])):
             output.put(batch)
-            if regret_epoch.value != seen_regret_epoch:
-                window.refresh_regret(); seen_regret_epoch = regret_epoch.value
+            latest_regret = None
+            try:
+                while True:
+                    latest_regret = regret_updates.get_nowait()
+            except queue.Empty:
+                pass
+            if latest_regret is not None:
+                window.set_regret(latest_regret)
             if time.time()-refreshed > 30:
                 window.refresh(); refreshed = time.time()
     except BaseException:
@@ -1118,24 +1131,24 @@ class Renderers:
     set_calibration() replaces the Calibration of batches rendered from then on. Iterate to consume {S: batch of
     torch tensors}; a worker's exception or death is raised in the consumer."""
 
-    def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None, policy_dir=None):
+    def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None, policy_dir=None, regret_entries=None):
         context = multiprocessing.get_context('spawn')
         self.queue = context.Queue(depth*workers)
         self.calibration = context.Array('d', CALIBRATION_FEATURES+1)
-        self.regret_epoch = context.Value('i', 0)
+        self.regret_updates = [context.Queue() for _ in range(workers)]
         self.set_calibration(calibration)
         self.processes = [context.Process(target=_render_worker, daemon=True,
                                           args=(str(run), settings, [*seed, i], self.queue, self.calibration, policy_dir,
-                                                self.regret_epoch))
+                                                self.regret_updates[i], regret_entries))
                           for i in range(workers)]
         start_hidden(self.processes)
 
     def set_calibration(self, calibration):
         self.calibration[:] = pack_calibration(calibration)
 
-    def refresh_regret(self):
-        with self.regret_epoch.get_lock():
-            self.regret_epoch.value += 1
+    def refresh_regret(self, entries):
+        for updates in self.regret_updates:
+            updates.put(entries)
 
     def __iter__(self):
         return self
@@ -1158,3 +1171,5 @@ class Renderers:
         for process in self.processes:
             process.join()
         self.queue.cancel_join_thread()
+        for updates in self.regret_updates:
+            updates.cancel_join_thread()
