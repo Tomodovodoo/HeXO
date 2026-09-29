@@ -140,9 +140,10 @@ STATUS_SECONDS = 2.
 # Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
 PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'opening_book', 'seal_ms',
             'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes',
-            'solver_defence', 'solver_defence_candidates')
+            'solver_defence', 'solver_defence_candidates', 'solver_gate_cap_nodes')
 PROTOCOL_DEFAULTS = dict(opening_book='', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
-                         solver_threat_nodes=0, solver_defence=False, solver_defence_candidates=8)
+                         solver_threat_nodes=0, solver_defence=False, solver_defence_candidates=8,
+                         solver_gate_cap_nodes=0)
 CHAMPION = 'champion'  # the symbolic base of a variant, bound to the champion when its comparison starts
 # The PROTOCOL fields of one side's search, which a variant may override; max_plies, opening_suite, seal_ms
 # and opening_book belong to the game.
@@ -318,7 +319,9 @@ def side_settings(settings, overrides):
     """One side's EvaluationSettings: `settings` with `overrides` (SIDE fields); root_samples, unless overridden,
     is at most the side's sims."""
     out = replace(settings, **overrides)
-    return out if 'root_samples' in overrides else replace(out, root_samples=min(out.root_samples, out.sims))
+    out = out if 'root_samples' in overrides else replace(out, root_samples=min(out.root_samples, out.sims))
+    Schedule.of(out)
+    return out
 
 
 def parse_settings(assignments):
@@ -2154,6 +2157,8 @@ def match(args):
     sides = {side: replace(settings, **{'solver_'+f: getattr(args, f'{side}_solver_{f}') for f in asdict(Budgets())
                                         if getattr(args, f'{side}_solver_{f}') is not None}) for side in 'ab'}
     budgets = {side: Budgets.of(s) for side, s in sides.items()}
+    for side in sides.values():
+        Schedule.of(side)
     if args.a == SEAL:
         raise ValueError('Seal plays as --b; pass the checkpoint as --a')
     if args.a == args.b and budgets['a'] == budgets['b']:
@@ -2183,7 +2188,7 @@ def match(args):
     records = play(paired_games(models['a'], SEAL if args.b == SEAL else models['b'], args.games,
                                 f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None, book,
                                 sides=(sides['a'], sides['b']), candidate=args.a, opponent=args.b),
-                   config.actor.leaf_batch, heartbeat=record)
+                   config.actor.leaf_batch, heartbeat=record, schedule=Schedule.of(settings))
     record(records)
     print(json.dumps(dict(summary=report['summary'], metrics=report['metrics'], seconds=time.perf_counter()-started,
                           solver=report['solver'], report=str(target)), indent=2))

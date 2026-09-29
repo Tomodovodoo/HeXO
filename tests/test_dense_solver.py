@@ -25,7 +25,7 @@ from dense_solver import Budgets, Proof, Schedule
 import hexnet
 from hexo import Game
 from neural_search import HOLD, NeuralSearch, checked, native
-from tactical_proof import NativeTactics
+from tactical_proof import NativeTactics, gated_nodes
 from tests.test_dense import episode_rows, winning_game
 from tests.test_tactical_proof import FIXTURE, ONE_TURN, TWO_TURN
 
@@ -177,8 +177,8 @@ class NativeEntries(unittest.TestCase):
 
 
 class DefenceSearch(unittest.TestCase):
-    def search(self, history=ONE_TURN, enabled=True, candidates=8):
-        solver = dense_solver.Solver(asynchronous=False)
+    def search(self, history=ONE_TURN, enabled=True, candidates=8, schedule=None):
+        solver = dense_solver.Solver(schedule or Schedule(), asynchronous=False)
         self.addCleanup(solver.close)
         tree = NeuralSearch(object(), 'test', history, seed=5)
         self.addCleanup(tree.close)
@@ -220,6 +220,12 @@ class DefenceSearch(unittest.TestCase):
         self.assertEqual(pa.budget, 5*27000)
         for x, y in zip(stats(a.tree), stats(b.tree)):
             np.testing.assert_array_equal(x, y)
+
+    def test_gated_threat_keeps_defence_at_its_point_budget(self):
+        schedule = Schedule.of(dense_config.EvaluationSettings(solver_threat_nodes=27000,
+                                                                  solver_gate_cap_nodes=32768))
+        _, plan, _ = self.search(schedule=schedule)
+        self.assertEqual(plan.budget, 32768+6*27000)
 
     def test_enabled_selfplay_shards_repeat(self):
         with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
@@ -613,7 +619,33 @@ class Scheduler(unittest.TestCase):
         fixed = dense_solver.Solver(Schedule(gate_weight=3.), asynchronous=False)
         fixed.leads['root'].extend([5000.]*8)
         self.assertEqual(fixed.allocate('root', NODES)[:2],
-                         (NODES, dict(weight=3., floor=NODES, cap_low=dense_solver.MAX_NODES, cap_high=dense_solver.MAX_NODES)))
+                         (NODES, dict(weight=3., floor=NODES, cap_low=dense_solver.MAX_NODES,
+                                      cap_high=dense_solver.MAX_NODES)))
+        self.assertEqual(gated_nodes(FIXTURE['positions'][PROOF], 'mover', 27000,
+                                     fixed.allocate('root', 27000)[1])[0], 108000)
+        self.assertIsNone(fixed.allocate('threat', NODES)[1])
+        self.assertIsNone(fixed.allocate('defence', NODES)[1])
+
+    def test_evaluation_gate_budget_is_position_deterministic(self):
+        base = dense_config.EvaluationSettings(solver_root_nodes=2048, solver_threat_nodes=2048)
+        self.assertEqual(Schedule.of(base).gate_weight, 0.)
+        self.assertEqual(dense_solver.Solver(Schedule.of(base), asynchronous=False).allocate('root', 2048)[1], None)
+        scaled = replace(base, solver_gate_cap_nodes=32768)
+        solver = dense_solver.Solver(Schedule.of(scaled), asynchronous=False)
+        gate = solver.allocate('root', 2048)[1]
+        self.assertEqual(gate, solver.allocate('threat', 2048)[1])
+        self.assertEqual(gated_nodes([[0, 0]], 'mover', 2048, gate), (2048, 0.))
+        history = FIXTURE['positions'][PROOF]
+        self.assertEqual(gated_nodes(history, 'mover', 2048, gate), (8192, 19.5))
+        solver.leads['root'].extend([5000.]*8)
+        solver.tick(100., 50.)
+        self.assertEqual(solver.allocate('root', 2048)[1], gate)
+        small = replace(base, solver_root_nodes=135, solver_threat_nodes=0, solver_gate_cap_nodes=256)
+        self.assertEqual(Schedule.of(small).cap_nodes, 256)
+        small_gate = dense_solver.Solver(Schedule.of(small), asynchronous=False).allocate('root', 135)[1]
+        self.assertEqual(gated_nodes(history, 'mover', 135, small_gate)[0], 256)
+        with self.assertRaises(ValueError):
+            Schedule.of(replace(base, solver_gate_cap_nodes=1024))
 
     def test_late_proofs_are_played_only_as_their_own_root_turn_without_follow(self):
         try:
@@ -869,6 +901,11 @@ class ProvenTargets(unittest.TestCase):
 
 
 class Protocol(unittest.TestCase):
+    def test_variant_budget_must_fit_evaluation_gate_cap(self):
+        settings = dense_config.EvaluationSettings(solver_gate_cap_nodes=256)
+        with self.assertRaisesRegex(ValueError, 'must cover'):
+            dense_eval.side_settings(settings, dict(solver_root_nodes=512))
+
     def test_reports_before_the_solver_settings_count_as_solver_off(self):
         settings = dense_config.EvaluationSettings()
         old = dict(settings={k: v for k, v in asdict(settings).items() if not k.startswith('solver_')})
@@ -878,6 +915,8 @@ class Protocol(unittest.TestCase):
         self.assertTrue(dense_eval.same_protocol(on, replace(settings, solver_root_nodes=NODES)))
         self.assertTrue(dense_eval.same_protocol(on, replace(settings, solver_root_nodes=NODES, solver_workers=3)))
         self.assertFalse(dense_eval.same_protocol(on, settings))
+        self.assertFalse(dense_eval.same_protocol(on, replace(settings, solver_root_nodes=NODES,
+                                                                solver_gate_cap_nodes=32768)))
 
     def test_budgets_validate(self):
         with self.assertRaises(ValueError):

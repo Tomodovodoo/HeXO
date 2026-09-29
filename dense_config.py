@@ -294,6 +294,7 @@ class EvaluationSettings:
     solver_defence: bool = False
     solver_defence_candidates: int = 8
     solver_workers: int = 1      # foreground tactical processes; fixed budgets remain unchanged
+    solver_gate_cap_nodes: int = 0  # 0 keeps fixed budgets flat; otherwise gate scales toward this cap at weight 3
 
 
 @dataclass(frozen=True)

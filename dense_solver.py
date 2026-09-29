@@ -39,8 +39,8 @@ measured slack and verdicts are polled:
              deep_nodes, and are capped at deep_cap_nodes.
   gate       with gate_weight > 0 the worker scores the attacker's forcing material (tactical_proof gate): below
              forcing_material.LOW the query gets min_nodes (deep queries: deep_nodes), else its allowance times
-             (1 + gate_weight * g), capped by cap_nodes rising linearly to gate_cap_nodes at g = 1 (fixed mode:
-             floor and caps are the point budget and unbounded, so only the multiplier applies).
+             (1 + gate_weight * g), capped by cap_nodes rising linearly to gate_cap_nodes at g = 1 (fixed evaluator
+             gate: floor and lower cap are the point budget, upper cap is gate_cap_nodes).
   consume    a root or finalist verdict not ready when needed may be waited for up to the step's overrun allowance,
              overrun_fraction of the measured step time; past it the slot is deferred to its next visit while the
              other games build the batch. After DEFER_VISITS deferrals the search goes on without it (finalist hold
@@ -61,6 +61,7 @@ import time
 
 import numpy as np
 
+from dense_config import EvaluationSettings
 from neural_search import checked, native
 from hexo import Game
 from tactical_proof import MAX_NODES, MAX_TABLE_MB, PROVEN_WIN, IsolatedTactics, NativeTactics, build_hash
@@ -122,6 +123,7 @@ class Schedule:
     cap_nodes: int = 512
     gate_cap_nodes: int = 8192
     gate_weight: float = 0.
+    fixed_gate_cap: bool = False
     deep_nodes: int = 0
     deep_cap_nodes: int = 65536
     follow: bool = False
@@ -139,7 +141,17 @@ class Schedule:
     @classmethod
     def of(cls, settings):
         """The schedule of settings' solver_* fields; absent fields use the defaults."""
-        return cls(**{f.name: getattr(settings, 'solver_'+f.name, f.default) for f in fields(cls)})
+        values = {f.name: getattr(settings, 'solver_'+f.name, f.default) for f in fields(cls)}
+        if isinstance(settings, EvaluationSettings):
+            if settings.solver_gate_cap_nodes and settings.solver_gate_cap_nodes < max(
+                    settings.solver_root_nodes, settings.solver_finalist_nodes, settings.solver_threat_nodes):
+                raise ValueError('solver_gate_cap_nodes must cover every enabled evaluation query budget')
+            values['gate_weight'] = 3. if settings.solver_gate_cap_nodes else 0.
+            values['fixed_gate_cap'] = bool(settings.solver_gate_cap_nodes)
+            values['gate_cap_nodes'] = settings.solver_gate_cap_nodes or cls.gate_cap_nodes
+            values['cap_nodes'] = min(values['cap_nodes'], values['gate_cap_nodes'])
+            values['min_nodes'] = min(values['min_nodes'], values['cap_nodes'])
+        return cls(**values)
 
 
 def active(budgets, schedule):
@@ -317,8 +329,10 @@ class Solver:
         contract)."""
         sc = self.schedule
         if sc.fixed_budgets or point in ('threat', 'defence'):
-            gate = None if not sc.gate_weight or point in ('threat', 'defence') else \
-                dict(weight=sc.gate_weight, floor=nodes, cap_low=MAX_NODES, cap_high=MAX_NODES)
+            cap = max(nodes, sc.gate_cap_nodes) if sc.fixed_gate_cap else MAX_NODES
+            gate = None if not sc.gate_weight or point == 'defence' or (point == 'threat' and not sc.fixed_gate_cap) else \
+                dict(weight=sc.gate_weight, floor=nodes, cap_low=nodes if sc.fixed_gate_cap else MAX_NODES,
+                     cap_high=cap)
             return nodes, gate, self.pool
         deep = point == 'deep'
         pool = self.background if deep else self.pool
@@ -735,7 +749,7 @@ class Plan:
                         turns = defence_turns(history, result['certificate'], min(self.defence_limit, slot.budget))
                         # After our complete turn the original threat attacker is the actual mover.
                         self.defence_queries = [(turn, self.solver.submit('defence', history+turn, 'mover',
-                                                                          result['budget'])) for turn in turns]
+                                                                          self.threat.budget)) for turn in turns]
                     else:
                         cells = np.ascontiguousarray(result['moves'], np.int64).reshape(-1, 2)
                         checked(native.hxg_priority(ptr, cells, len(cells)))

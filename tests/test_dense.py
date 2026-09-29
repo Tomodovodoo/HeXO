@@ -959,10 +959,11 @@ class DenseConfigTests(unittest.TestCase):
         dense_config.add_arguments(prefixed, dense_config.ActorSettings)
         dense_config.add_arguments(prefixed, dense_config.EvaluationSettings, 'eval_')
         args = prefixed.parse_args(['--root-samples', '8', '--eval-root-samples', '4', '--no-eval-tactics',
-                                    '--eval-solver-workers', '3'])
+                                    '--eval-solver-workers', '3', '--eval-solver-gate-cap-nodes', '32768'])
         self.assertEqual(dense_config.override(base, args).root_samples, 8)
         evaluation = dense_config.override(dense_config.EvaluationSettings(), args, 'eval_')
-        self.assertEqual((evaluation.root_samples, evaluation.tactics, evaluation.solver_workers), (4, False, 3))
+        self.assertEqual((evaluation.root_samples, evaluation.tactics, evaluation.solver_workers,
+                          evaluation.solver_gate_cap_nodes), (4, False, 3, 32768))
 
     def test_learner_target_and_validation_flags(self):
         parser = argparse.ArgumentParser()
@@ -2765,12 +2766,15 @@ class EvaluatorSearchTests(unittest.TestCase):
     def test_match_saves_completed_games_before_play_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
-            dense_config.save(run, dense_config.RunConfig(device='cpu'))
+            config = dense_config.RunConfig(device='cpu', evaluation=dense_config.EvaluationSettings(
+                solver_root_nodes=2048, solver_gate_cap_nodes=32768))
+            dense_config.save(run, config)
             model = SimpleNamespace(checkpoint='main/000010', sha='a'*64)
             games = [dict(seed=seed, challenger_color=colour, winner=-1)
                      for seed, colour in ((1, 0), (1, 1), (2, 0))]
             games.append(dict(seed=2, challenger_color=1, winner=-1, error='Seal unavailable'))
-            def fail(games_to_play, leaf_batch, heartbeat):
+            def fail(games_to_play, leaf_batch, heartbeat, schedule):
+                self.assertEqual(schedule, dense_eval.Schedule.of(config.evaluation))
                 heartbeat(games)
                 raise RuntimeError('mid-run failure')
             args = SimpleNamespace(run=run, a=model.checkpoint, b='seal', games=4, sims=None,
@@ -2788,6 +2792,17 @@ class EvaluatorSearchTests(unittest.TestCase):
             report = json.loads(paths[0].read_text())
             self.assertEqual((len(report['games']), report['summary']['games'], report['summary']['pairs'],
                               report['metrics']['pending']), (3, 3, 1, 1))
+
+    def test_match_side_budget_must_fit_evaluation_gate_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            dense_config.save(run, dense_config.RunConfig(device='cpu', evaluation=dense_config.EvaluationSettings(
+                solver_gate_cap_nodes=256)))
+            overrides = {f'{side}_solver_{name}': None for side in 'ab' for name in asdict(dense_eval.Budgets())}
+            args = SimpleNamespace(run=run, a='main/000010', b='seal', games=2, sims=None,
+                                   **(overrides | dict(a_solver_root_nodes=512)))
+            with self.assertRaisesRegex(ValueError, 'must cover'):
+                dense_eval.match(args)
 
     def test_play_reports_a_completed_slot_before_a_later_slot_fails(self):
         model = dense_selfplay.Model(self.model, 'tiny', 'test', 'cpu', 64, 256)
