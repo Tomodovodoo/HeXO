@@ -766,6 +766,24 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual([r['settings']['sims'] for r in dense_eval.load_reports(self.run, replace(evaluator.settings, sims=97))], [])
         self.assertEqual(sorted(r['settings']['sims'] for r in dense_eval.load_reports(self.run)), [97, 98])
 
+    def test_calibration_keeps_an_archive_that_matches_the_protocol_again(self):
+        """A verdict decided on a report later archived (its protocol changed and was restored) still counts: the
+        archive is matched by its prefix digest, and the pairing's new report.json is a later comparison."""
+        s = dense_config.EvaluationSettings()
+        games = lambda wins, offset=0: [dict(pair=offset+k, seed=offset+k, challenger_color=c, winner=c if w else 1-c, plies=9,
+                                             opening=[[0, 0]]) for k, w in enumerate(wins) for c in (0, 1)]
+        shas = {f'main/{k:06d}': 'c'*64 for k in (10, 20, 30, 40)}
+        archive = dense_eval.make_report('main/000020', 'main/000010', games([1, 1, 0, 1]*2), shas, s)
+        current = dense_eval.make_report('main/000020', 'main/000010', games([0, 1], 50), shas, s)
+        later = [dense_eval.make_report('main/000030', 'main/000020', games([1, 0]*2), shas, s),
+                 dense_eval.make_report('main/000020', 'main/000040', games([1, 0]*2), shas, s)]
+        entry = lambda step: dict(id=f'main/{step:06d}', variant='main', step=step, elo=0.)
+        snapshot = dict(opponent='main/000010', protocol={k: getattr(s, k) for k in dense_eval.PROTOCOL}, matchup_prior=30.,
+                        reports={'main-000020-vs-main-000010': dict(games=16, digest=dense_eval.games_digest(archive['games']))})
+        league = dict(checkpoints=[entry(10), dict(entry(20), verdict=dict(snapshot, delta=10., delta_sd=40.)), entry(30), entry(40)])
+        self.assertEqual(dense_eval.calibration(league, [archive, current]+later)['count'], 1)
+        self.assertEqual(dense_eval.calibration(league, [current]+later)['count'], 0)       # the decided games are gone
+
     def test_the_standard_suite_is_a_frozen_book_with_its_statistics_in_the_run(self):
         self.export(10)
         played = dense_openings.Book(self.run, dense_config.EvaluationSettings()).openings()[0]['moves']

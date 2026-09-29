@@ -667,7 +667,8 @@ def calibration(league, reports):
     verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports), whose snapshotted reports
     (every input of the verdict's posterior, the direct one among them) all still begin with the games it was decided
     on (`games_digest` of that prefix: extended at most, not replaced) and which has at least CALIBRATION_LATER later
-    comparisons (reports with it under that protocol that are new or have grown since the verdict), shift = delta
+    comparisons (reports with it under that protocol that are new or have grown since the verdict; a pairing's archive
+    that matches the protocol again is a report of its own), shift = delta
     now - delta at the verdict, both r_cid - r_opponent + their matchup deviation over the reports of that protocol
     with the verdict's matchup prior. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
     resolved). Returns {count, predicted_sd (mean delta_sd at the verdicts), expected_rms (root mean sd_then^2 -
@@ -683,14 +684,18 @@ def calibration(league, reports):
             continue
         key = protocol(verdict['protocol'])
         group = [r for r in reports if protocol(r['settings']) == key]
-        named = {report_name(r): r for r in group}
+        named = {}  # report name -> its reports of the protocol: the current one and archives it matches again
+        for r in group:
+            named.setdefault(report_name(r), []).append(r)
         direct = report_path('', cid, verdict['opponent']).parent.name
-        intact = lambda name, snap: name in named and len(named[name]['games']) >= snap['games'] \
-            and games_digest(named[name]['games'][:snap['games']]) == snap['digest']
-        if direct not in verdict['reports'] or not all(intact(*item) for item in verdict['reports'].items()):
+        intact = lambda name, snap: next((r for r in named.get(name, []) if len(r['games']) >= snap['games']
+                                          and games_digest(r['games'][:snap['games']]) == snap['digest']), None)
+        decided = {name: intact(name, snap) for name, snap in verdict['reports'].items()}
+        if direct not in decided or None in decided.values():
             continue
-        later = sum(cid in (r['candidate'], r['opponent']) and len(r['games']) > verdict['reports'].get(name, {}).get('games', 0)
-                    for name, r in named.items())
+        later = sum(cid in (r['candidate'], r['opponent'])
+                    and len(r['games']) > (verdict['reports'][name]['games'] if r is decided.get(name) else 0)
+                    for name, rs in named.items() for r in rs)
         if later < CALIBRATION_LATER:
             continue
         model = key, verdict['matchup_prior']
