@@ -376,8 +376,11 @@ class MuonAdamW:
         groups = [dict(params=[p for p in remaining if p.ndim > 1], weight_decay=s.weight_decay),
                   dict(params=[p for p in remaining if p.ndim <= 1], weight_decay=0.)]
         self.adamw = torch.optim.AdamW(groups, lr=s.lr, betas=(.9, .98), fused=next(model.parameters()).is_cuda)
-        self.param_groups = self.muon.param_groups+self.adamw.param_groups
         self.optimizers = (self.muon, self.adamw)
+
+    @property
+    def param_groups(self):
+        return self.muon.param_groups+self.adamw.param_groups
 
     def zero_grad(self, set_to_none=True):
         self.muon.zero_grad(set_to_none=set_to_none)
