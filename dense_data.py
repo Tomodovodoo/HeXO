@@ -755,7 +755,9 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         `cheap_value_weight` for cheap-search rows; a row with a nonzero `proven` instead gets the proven value
         (1. for +1, 0. for -1) with weight `proven_weight`;
       outcome, outcome_weight: 1. when the side to move won a finished game, else 0.; weight value_weight for
-        finished games, 0 for capped games (outcome .5);
+        finished games, 0 for capped games (outcome .5) and for rows with an exact label (a nonzero `proven`,
+        forced-line rows included), whose value target is the proven result;
+      exact: 1. for a row with an exact label, else 0.;
       short_value, short_weight: p(win) of the side to move from the root value `horizon` plies later
         (negated when that ply's mover is the opponent); the outcome when a finished game ends within the
         horizon; weight 0 when that root value is null or a capped game ends first;
@@ -806,7 +808,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
                         value=float(proven > 0) if proven else .5 if values[t] is None else values[t],
                         value_weight=proven_weight if proven else value_weight,
                         outcome=float(me == e['winner']) if e['winner'] >= 0 else .5,
-                        outcome_weight=value_weight if e['winner'] >= 0 else 0.,
+                        outcome_weight=value_weight if e['winner'] >= 0 and not proven else 0., exact=float(proven != 0),
                         short_value=short[0], short_weight=short[1], future=future, future_weight=known,
                         next_cells=following[0], next_policy=following[1], next_weight=following[2]))
     return samples, out
@@ -820,7 +822,7 @@ def collate_arrays(samples, targets):
         (zeros where policy_weight is 0; far cells keep their target mass); offsets int64 [B+1];
       future uint8 [B,2,S,S]; next_cells int64 [B,M] (-1 off the crop and on padding),
         next_counts int64 [B], next_policy float32 [B,M] (zero beyond counts);
-      policy_weight, value, value_weight, outcome, outcome_weight, short_value, short_weight, next_weight;
+      policy_weight, value, value_weight, outcome, outcome_weight, exact, short_value, short_weight, next_weight;
       future_weight [B,2] per horizon
       (0 where a capped game ends before the horizon)
         float32 [B]; player, remaining int64 [B].
@@ -852,8 +854,8 @@ def collate_arrays(samples, targets):
             policy=np.concatenate(policy).astype(np.float32),
             future=np.stack([t['future'] for _, t in items]),
             next_cells=next_cells, next_counts=next_counts, next_policy=next_policy,
-            **{k: column(k) for k in ('policy_weight', 'value', 'value_weight', 'outcome', 'outcome_weight', 'short_value',
-                                      'short_weight', 'next_weight')},
+            **{k: column(k) for k in ('policy_weight', 'value', 'value_weight', 'outcome', 'outcome_weight', 'exact',
+                                      'short_value', 'short_weight', 'next_weight')},
             future_weight=np.stack([t['future_weight'] for _, t in items]),
             player=np.array([int(s.player) for s, _ in items], np.int64),
             remaining=np.array([int(s.remaining) for s, _ in items], np.int64))

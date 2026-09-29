@@ -20,8 +20,10 @@ recalibration and validation raise the peak above what training needs. vram_rese
 
 Every target is derived here from episodes (dense_data.examples), so value_target, td_lambda, outcome_lambda,
 bootstrap_weight and short_value_horizon are learner settings; outcome_weight weighs a second value-logit loss, the
-BCE against the hard outcome of finished games (head outcome_bce, always logged), KataGo-style. The value target
-calibration map (Learner.calibrate) is fitted at startup and refitted at every export, recorded in the manifest as
+BCE against the hard outcome of finished games (head outcome_bce, always logged), KataGo-style. Rows with an exact
+label (a nonzero `proven`) are left out of it, since their value target is the proven result; validation reports
+the outcome BCE of held-out rows of finished games split into rows with and without one (outcome_split). The value
+target calibration map (Learner.calibrate) is fitted at startup and refitted at every export, recorded in the manifest as
 metrics.calibration (calibration_report) and handed to the render workers; value_target 'calibrated' trains on the
 newest map (hard outcomes while none is fitted). Batches are rendered by dense_data.Renderers worker processes
 (--workers) with random hex symmetries; the window of this process and its workers share the variant's policy file
@@ -85,10 +87,11 @@ COMPLEMENTED = ('td_lambda', 'outcome_lambda', 'ema')
 
 
 def validation_fields(metrics):
-    """The metrics-log fields of an export's manifest metrics: metrics.validation under LOGGED names plus the
-    scalar entries of metrics.validation_sources (curves and surfaces stay in the manifest); None when both are null."""
+    """The metrics-log fields of an export's manifest metrics: metrics.validation (HEADS under LOGGED names, other
+    keys as they are) plus the scalar entries of metrics.validation_sources (curves and surfaces stay in the
+    manifest); None when both are null."""
     sources = {k: v for k, v in (metrics.get('validation_sources') or {}).items() if not isinstance(v, (list, dict))}
-    fields = {LOGGED[h]: v for h, v in (metrics['validation'] or {}).items()} | sources
+    fields = {LOGGED.get(h, h): v for h, v in (metrics['validation'] or {}).items()} | sources
     return fields or None
 
 
@@ -163,6 +166,17 @@ def value_regret(bce, outcome, reference, remaining):
     regret = np.asarray(bce, np.float64)+y*np.log(r)+(1-y)*np.log(1-r)
     return {k: float(regret[m].mean()) if m.any() else None
             for k, m in zip(keys, (np.ones(len(h), bool), h < NEAR_END, h >= FAR_END))}
+
+
+def outcome_split(bce, finished, exact):
+    """{outcome_bce_exact, outcome_bce_exact_rows, outcome_bce_unproven, outcome_bce_unproven_rows}: the mean of
+    `bce` (the value logit's BCE against the hard outcome) over rows of finished games with an exact label and over
+    those without one, and the row counts; a mean is None without rows."""
+    bce, finished, exact = np.asarray(bce, np.float64), np.asarray(finished, bool), np.asarray(exact, bool)
+    out = {}
+    for name, m in (('exact', finished & exact), ('unproven', finished & ~exact)):
+        out |= {f'outcome_bce_{name}': float(bce[m].mean()) if m.any() else None, f'outcome_bce_{name}_rows': int(m.sum())}
+    return out
 
 
 def ply_curve(ply, loss, grid=PLY_GRID, sigma=PLY_SIGMA):
@@ -542,14 +556,20 @@ class Learner:
 
     def validate(self, window):
         """EMA weighted_means (eval mode) over VALIDATION_ROWS held-out rows drawn with a fixed sampling seed, by
-        head; None without held-out rows."""
+        head, plus the outcome_split of the same rows; None without held-out rows."""
         if not window.validation:
             return None
         self.ema.eval()
         rng, s = np.random.default_rng(self.config.seed), self.settings
-        batches = (dense_data.collate(*dense_data.examples(window, window.sample(rng, s.batch, validation=True), rng, **self.targets()))
-                   for _ in range(math.ceil(VALIDATION_ROWS/s.batch)))
-        return dict(zip(HEADS, self.weighted_means(batches)))
+        batches = [dense_data.collate(*dense_data.examples(window, window.sample(rng, s.batch, validation=True), rng, **self.targets()))
+                   for _ in range(math.ceil(VALIDATION_ROWS/s.batch))]
+        rows = []
+        with torch.no_grad():
+            for b in (b for batch in batches for b in batch.values()):
+                logit = forward(self.ema, b['planes'], self.device, self.memory_format)[0]['value_logit'].float().cpu()
+                bce = torch.nn.functional.binary_cross_entropy_with_logits(logit, b['outcome'], reduction='none')
+                rows.append(np.stack([bce.numpy(), b['outcome'].numpy() != .5, b['exact'].numpy() > 0]))
+        return dict(zip(HEADS, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1))
 
     def subset_losses(self, sets, refs):
         """EMA weighted_means (policy_ce, value_bce) over `refs` of `sets` under symmetries drawn from a fixed seed
@@ -594,7 +614,9 @@ class Learner:
     def validate_sources(self, sets):
         """Refresh `sets` (dense_data.ValidationSets) and return, per source, <source>_policy_ce and
         <source>_value_bce on its held subset, <source>_train_* on its train subset, <source>_gap_* = held minus
-        train (None when either is), <source>_rows (held rows), plus newest_checkpoint. For CURVE_SOURCES, over the
+        train (None when either is), <source>_rows (held rows), <source>_outcome_bce_exact(_rows) and
+        <source>_outcome_bce_unproven(_rows), the outcome_split of the row_losses of the held subset, plus
+        newest_checkpoint. For CURVE_SOURCES, over the
         row_losses of the held subset: the remaining_curve of the outcome BCE of the rows of finished games as
         <source>_<key> (grid: remaining_grid); <source>_value_bce_by_ply, the ply_curve of the same rows' outcome
         BCE, and <source>_policy_ce_curve, the ply_curve of the policy CE of rows with a policy target (grid:
@@ -616,9 +638,10 @@ class Learner:
                 out.update({f'{source}_{name}': v, f'{source}_train_{name}': w,
                             f'{source}_gap_{name}': None if v is None or w is None else v-w})
             out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
-        out.update(remaining_grid=list(REMAINING_GRID), ply_grid=list(PLY_GRID))
-        for source in CURVE_SOURCES:
             r = self.row_losses(sets, sets.subsets[source, 'held'])
+            out.update({f'{source}_{k}': v for k, v in outcome_split(r['outcome_bce'], r['finished'] > 0, r['proven'] != 0).items()})
+            if source not in CURVE_SOURCES:
+                continue
             f, p = r['finished'] > 0, np.isfinite(r['policy_ce'])
             out.update({f'{source}_{k}': v for k, v in remaining_curve(r['remaining'][f], r['outcome_bce'][f], r['outcome'][f]).items()})
             early, late = ply_split(r['ply'][p], r['policy_ce'][p])
@@ -638,12 +661,12 @@ class Learner:
             proven = r['proven'] != 0
             out[f'{source}_proven_rows'] = int(proven.sum())
             out[f'{source}_value_regret_proven'] = float(np.mean(1-np.exp(-r['value_bce'][proven]))) if proven.any() else None
-        return out
+        return out | dict(remaining_grid=list(REMAINING_GRID), ply_grid=list(PLY_GRID))
 
     def export(self, window, sets=None):
         """Write checkpoints/<variant>/<step:06d>/ atomically (staged in a hidden sibling, then renamed).
         The value target map is refitted first (calibrate; metrics.calibration), then the EMA is recalibrated;
-        metrics.validation is validate(window) (the HEADS; null without held-out rows in the window) and
+        metrics.validation is validate(window) (the HEADS and the outcome_split; null without held-out rows in the window) and
         metrics.validation_sources is validate_sources(sets) (null without `sets`). The cache is released after
         these passes. rows is window.total_rows and pacing the pacing base (rebase)."""
         s = self.settings

@@ -171,7 +171,7 @@ class LearnerSettings:
     value_target: str = 'outcome'
     outcome_lambda: float = .98
     calibration_games: int = 4000
-    outcome_weight: float = 0.    # coefficient of an extra value-logit BCE against the hard outcome (finished games)
+    outcome_weight: float = 0.    # coefficient of an extra value-logit BCE against the hard outcome (finished games, rows without a proof)
     short_value_horizon: int = 16
     value_weight: float = 1.5
     short_value_weight: float = .5
