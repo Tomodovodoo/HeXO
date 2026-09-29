@@ -6,7 +6,7 @@ per example of each stage (window.sample, dense_data.examples, dense_data.collat
 dense_data.Renderers pool of W processes and reports examples/s, the consumer's share of time spent waiting for a
 batch, its time per batch in dense_learn.pad and the CPU cores it used (torch on --threads threads). Timing covers
 --batches batches after one warm-up batch; the learner settings are the run's config.json with --batch as the
-batch size.
+batch size, and cheap rows are retained as the learner retains them (cheap_row_fraction keyed by the run seed).
 """
 import argparse
 from dataclasses import replace
@@ -37,10 +37,12 @@ def copy_shards(run, count, target):
     return names
 
 
-def in_process(run, settings, count, policy_dir, seed=0):
-    """{examples_per_second, <stage>_ms per example} of rendering `count` batches after a warm-up batch here."""
+def in_process(run, settings, count, policy_dir, seed=0, run_seed=0):
+    """{examples_per_second, <stage>_ms per example} of rendering `count` batches after a warm-up batch here, from a
+    window retaining cheap rows as the learner's (settings.cheap_row_fraction keyed by `run_seed`)."""
     window = dense_data.ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
-                                     settings.window_taper, settings.validation_fraction, policy_dir)
+                                     settings.window_taper, settings.validation_fraction, policy_dir,
+                                     settings.cheap_row_fraction, run_seed)
     rng, options = np.random.default_rng(seed), dense_data.target_options(settings)
     stages = dict(sample=0., examples=0., collate=0.)
     for k in range(count+1):
@@ -58,10 +60,11 @@ def in_process(run, settings, count, policy_dir, seed=0):
     return dict(examples_per_second=total/sum(stages.values()), **{f'{k}_ms': 1000*v/total for k, v in stages.items()})
 
 
-def pooled(run, settings, count, workers, policy_dir, seed=0):
+def pooled(run, settings, count, workers, policy_dir, seed=0, run_seed=0):
     """{examples_per_second, wait_fraction, pad_ms per batch, consumer_cores} of consuming `count` batches of a
-    Renderers pool after a warm-up batch, padding each bucket as the learner does."""
-    stream = dense_data.Renderers(run, settings, [seed], workers, policy_dir=policy_dir)
+    Renderers pool (cheap rows retained as the learner's, keyed by `run_seed`) after a warm-up batch, padding each
+    bucket as the learner does."""
+    stream = dense_data.Renderers(run, settings, [seed], workers, policy_dir=policy_dir, run_seed=run_seed)
     try:
         next(stream)
         wait = pad = 0.; examples = 0
@@ -92,7 +95,8 @@ def main():
     args = parser.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
-    settings = replace(dense_config.load(args.run).learner, batch=args.batch)
+    config = dense_config.load(args.run)
+    settings = replace(config.learner, batch=args.batch)
     with tempfile.TemporaryDirectory(prefix='bench-dense-', ignore_cleanup_errors=True) as temporary:
         run = args.run
         if args.shards:
@@ -100,9 +104,9 @@ def main():
             copy_shards(args.run, args.shards, run)
         policy_dir = Path(temporary)/'policies'
         if args.workers:
-            result = pooled(run, settings, args.batches, args.workers, policy_dir)
+            result = pooled(run, settings, args.batches, args.workers, policy_dir, run_seed=config.seed)
         else:
-            result = in_process(run, settings, args.batches, policy_dir)
+            result = in_process(run, settings, args.batches, policy_dir, run_seed=config.seed)
     print(f'shards {args.shards or "all"}, {args.batches} batches of {args.batch}, workers {args.workers}: '
           + ', '.join(f'{k} {v:.3f}' for k, v in result.items()))
 

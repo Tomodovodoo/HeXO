@@ -1595,6 +1595,21 @@ class CheapRowTests(unittest.TestCase):
                 stream.close()
             self.assertEqual(batch_bytes({size: {k: v.numpy() for k, v in b.items()} for size, b in got.items()}), expected)
 
+    def test_pipeline_benchmark_retains_like_the_learner(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('bench_dense_data', ROOT/'tools'/'bench_dense_data.py')
+        bench = importlib.util.module_from_spec(spec); spec.loader.exec_module(bench)
+        with tempfile.TemporaryDirectory() as tmp:
+            source_shard(Path(tmp)/'shards'/'000001', 1, 'a', games=4, policy_every=3)
+            settings = dense_config.LearnerSettings(batch=8, window_min_rows=10**6, validation_fraction=0., cheap_row_fraction=.3)
+            with unittest.mock.patch.object(dense_data, 'ReplayWindow', wraps=dense_data.ReplayWindow) as made:
+                bench.in_process(tmp, settings, 1, Path(tmp)/'policies', run_seed=6)
+            self.assertEqual(made.call_args.args[-2:], (.3, 6))
+            with unittest.mock.patch.object(dense_data, 'Renderers', side_effect=RuntimeError) as pool:
+                with self.assertRaises(RuntimeError):
+                    bench.pooled(tmp, settings, 1, 1, Path(tmp)/'policies', run_seed=6)
+            self.assertEqual(pool.call_args.kwargs['run_seed'], 6)
+
     def test_fraction_is_bounded_and_kept_across_replacement(self):
         for bad in (-.1, 1.5):
             with self.assertRaises(ValueError):
