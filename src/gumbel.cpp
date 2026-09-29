@@ -17,6 +17,8 @@ struct Tree {
  std::mt19937_64 rng;int budget=0,started=0,completed=0,next_id=1,samples=0,last=0;bool tactics=false,hold=false;std::vector<int> sequence;
  // Root actions sampled first in the opening phase of the current search; ordering only (set_priority).
  std::vector<Cell> priority;
+ std::map<Cell,double> defence;
+ double bonus(const Edge& e)const {auto i=defence.find(e.action);return i==defence.end()?0:i->second;}
  explicit Tree(uint64_t seed):rng(seed){}
  std::vector<double> transformed(Node& node) {
   double weighted=0,mass=0;int total=0,maximum=0;
@@ -30,7 +32,7 @@ struct Tree {
  // `last` is the simulation index where the final candidate count begins (the last halving boundary), or the
  // budget when the schedule never halves.
  void schedule(int count) {
-  sequence.clear();last=budget;int m=std::min({samples,budget,count});if(!m)return;
+  sequence.clear();last=budget;int m=std::min({std::max(samples,int(defence.size())),budget,count});if(!m)return;
   std::vector<int> v(m);int considered=m,previous=-1,halving=0,rounds=std::max(1,int(std::ceil(std::log2(m))));
   while(int(sequence.size())<budget){if(considered!=previous){halving=int(sequence.size());previous=considered;}int extra=std::max(1,budget/(rounds*considered));for(int k=0;k<extra && int(sequence.size())<budget;++k)for(int i=0;i<considered;++i){sequence.push_back(v[i]++);if(int(sequence.size())==budget)break;}considered=m==1?1:std::max(2,considered/2);}
   if(halving)last=halving;
@@ -83,7 +85,7 @@ struct Tree {
  }
  void begin(int simulations,int sample) {
   if(!requests.empty()||simulations<1||sample<1)throw std::runtime_error("Invalid search budget or pending requests");
-  budget=simulations;samples=sample;started=completed=0;hold=false;priority.clear();
+  budget=simulations;samples=sample;started=completed=0;hold=false;priority.clear();defence.clear();
   schedule(root->expanded?int(std::count_if(root->edges.begin(),root->edges.end(),[](auto& e){return e.eligible;})):int(board.legal_moves().size()));
   for(auto& e:root->edges){e.epoch=0;double u=std::generate_canonical<double,53>(rng);e.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));}
  }
@@ -108,10 +110,11 @@ struct Tree {
     // Finish each visit layer before its values decide the next halving round.
     if(started && considered!=sequence[started-1] && !requests.empty())return 0;
     auto first=[&](const Edge& e){return considered==0 && std::find(priority.begin(),priority.end(),e.action)!=priority.end();};
-    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch!=considered)continue;double score=e.gumbel+e.logit+(considered?q[i]:0)+(first(e)?1e6:0);if(score>best){best=score;chosen=i;}}
+    bool forced=false;
+    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch!=considered)continue;bool admit=considered==0 && defence.contains(e.action);double score=e.gumbel+e.logit+(considered?q[i]:0)+(first(e)?1e6:0)+bonus(e);if((admit && !forced) || (admit==forced && score>best)){forced=admit;best=score;chosen=i;}}
     // Marked-lost candidates can leave a round short of candidates; the best of the latest-eliminated ones step in.
     int reached=-1;
-    if(chosen<0)for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch>considered)continue;double score=e.gumbel+e.logit+q[i];if(e.epoch>reached || (e.epoch==reached && score>best)){reached=e.epoch;best=score;chosen=i;}}
+    if(chosen<0)for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch>considered)continue;double score=e.gumbel+e.logit+q[i]+bonus(e);if(e.epoch>reached || (e.epoch==reached && score>best)){reached=e.epoch;best=score;chosen=i;}}
    } else {
     double maxlog=-1e300,total=0;int visits=0;for(int i=0;i<int(q.size());++i){q[i]=node->edges[i].eligible?q[i]+node->edges[i].logit:-std::numeric_limits<double>::infinity();maxlog=std::max(maxlog,q[i]);visits+=node->edges[i].visits+node->edges[i].pending;}
     for(auto& x:q){x=std::exp(x-maxlog);total+=x;}
@@ -164,7 +167,7 @@ struct Tree {
   }
  }
  void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].pending;if(!path.edges.empty()){--root->edges[path.edges.front().second].epoch;--started;}}requests.clear();}
- void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::unique_ptr<Node> next;priority.clear();hold=false;
+ void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::unique_ptr<Node> next;priority.clear();defence.clear();hold=false;
   for(auto& e:root->edges)if(e.action==action){next=std::move(e.child);break;}
   board.make(action);root=next?std::move(next):std::make_unique<Node>();root->player=board.player;budget=started=completed=0;
  }
@@ -188,14 +191,22 @@ HX_API int hxg_fulfill(void* p,int id,const int64_t* a,const double* logits,cons
 HX_API int hxg_prove(void* p,int id,const int64_t* h,int n,int player,int remaining,const int64_t* moves,int count){try{static_cast<gumbel::Tree*>(p)->prove(id,h,n,player,remaining,moves,count);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API void hxg_cancel(void* p){static_cast<gumbel::Tree*>(p)->cancel();}
 HX_API int hxg_advance(void* p,int64_t q,int64_t r){try{static_cast<gumbel::Tree*>(p)->advance({q,r});return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double* scores){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto q=t.transformed(n);int max_epoch=0;for(auto& e:n.edges)if(e.eligible)max_epoch=std::max(max_epoch,e.epoch);for(int i=0;i<int(n.edges.size());++i){auto& e=n.edges[i];if(actions){actions[2*i]=e.action.q;actions[2*i+1]=e.action.r;visits[i]=e.visits;values[i]=e.exact_winner>=0?(e.exact_winner==n.player?1:-1):e.visits?e.sum/e.visits:n.value;scores[i]=e.eligible && max_epoch && e.epoch==max_epoch?e.gumbel+e.logit+q[i]:-std::numeric_limits<double>::infinity();}}return int(n.edges.size());}
-HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto q=t.transformed(n);double maximum=-1e300,total=0;for(int i=0;i<int(q.size());++i){q[i]=n.edges[i].eligible?q[i]+n.edges[i].logit:-std::numeric_limits<double>::infinity();maximum=std::max(maximum,q[i]);}for(auto& v:q){v=std::exp(v-maximum);total+=v;}if(out)for(int i=0;i<int(q.size());++i)out[i]=q[i]/total;return int(q.size());}
+HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double* scores){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto q=t.transformed(n);int max_epoch=0;for(auto& e:n.edges)if(e.eligible)max_epoch=std::max(max_epoch,e.epoch);for(int i=0;i<int(n.edges.size());++i){auto& e=n.edges[i];if(actions){actions[2*i]=e.action.q;actions[2*i+1]=e.action.r;visits[i]=e.visits;values[i]=e.exact_winner>=0?(e.exact_winner==n.player?1:-1):e.visits?e.sum/e.visits:n.value;scores[i]=e.eligible && max_epoch && e.epoch==max_epoch?e.gumbel+e.logit+q[i]+t.bonus(e):-std::numeric_limits<double>::infinity();}}return int(n.edges.size());}
+HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto q=t.transformed(n);double maximum=-1e300,total=0;for(int i=0;i<int(q.size());++i){q[i]=n.edges[i].eligible?q[i]+n.edges[i].logit+t.bonus(n.edges[i]):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,q[i]);}for(auto& v:q){v=std::exp(v-maximum);total+=v;}if(out)for(int i=0;i<int(q.size());++i)out[i]=q[i]/total;return int(q.size());}
 HX_API int hxg_completed(void* p){return static_cast<gumbel::Tree*>(p)->completed;}
 // Arms (enabled != 0) or clears the hold of the current search: hxg_next returns -3 once the search reaches its last
 // halving boundary (the end of the search when it never halves) with no request pending, until the hold is cleared.
 HX_API int hxg_hold(void* p,int enabled){static_cast<gumbel::Tree*>(p)->hold=enabled!=0;return 1;}
 // Root actions (n cells, int64 q/r pairs) the opening phase of the current search samples before any other.
 HX_API int hxg_priority(void* p,const int64_t* cells,int n){auto& t=*static_cast<gumbel::Tree*>(p);t.priority.clear();for(int i=0;i<n;++i)t.priority.push_back({cells[2*i],cells[2*i+1]});return 1;}
+// Verified threat-breaking candidates. Search-local bonuses never change stored network logits or exact winners.
+HX_API int hxg_defence(void* p,const int64_t* cells,const double* bonuses,int n){try{
+ auto& t=*static_cast<gumbel::Tree*>(p);
+ if(t.started || !t.requests.empty() || n<0 || n>t.budget)throw std::runtime_error("Defence needs an unstarted search and at most budget candidates");
+ for(int i=0;i<n;++i)if(!t.board.legal({cells[2*i],cells[2*i+1]}) || !std::isfinite(bonuses[i]) || bonuses[i]<0)throw std::runtime_error("Invalid defence candidate");
+ t.defence.clear();for(int i=0;i<n;++i)t.defence[{cells[2*i],cells[2*i+1]}]=bonuses[i];
+ t.schedule(t.root->expanded?int(std::count_if(t.root->edges.begin(),t.root->edges.end(),[](auto& e){return e.eligible;})):int(t.board.legal_moves().size()));return 1;
+ }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Caller must hold a verified proof that `winner` wins after root edge (q, r); see Tree::mark.
 HX_API int hxg_mark_exact(void* p,int64_t q,int64_t r,int winner){try{static_cast<gumbel::Tree*>(p)->mark({q,r},winner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 }

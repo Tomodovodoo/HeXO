@@ -105,6 +105,8 @@ class ActorSettings:
     solver_finalists: int = 0
     solver_finalist_nodes: int = 0
     solver_threat_nodes: int = 0
+    solver_defence: bool = False  # verify certificate-derived turns, admit survivors and bonus them at the root
+    solver_defence_candidates: int = 8
     solver_async: bool = True
     # Scheduling of those queries (dense_solver.Schedule). solver_fixed_budgets: every query spends its point's fixed
     # budget and every verdict is awaited (reproducible; evaluation always runs this way). Off: budgets follow the
@@ -286,6 +288,8 @@ class EvaluationSettings:
     solver_finalists: int = 0
     solver_finalist_nodes: int = 0
     solver_threat_nodes: int = 0
+    solver_defence: bool = False
+    solver_defence_candidates: int = 8
 
 
 @dataclass(frozen=True)
