@@ -3720,6 +3720,23 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
         self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
 
+    def test_candidate_arriving_during_anchor_gets_the_next_turn(self):
+        evaluator = self.start(anchor_games=4, anchor_session_games=4, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        def export(pool, steps):
+            if steps == 2 and not (self.run/'checkpoints'/'main'/'000020').exists():
+                self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=export)):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        self.assertTrue(evaluator.step())
+        self.assertIsNone(evaluator.anchor())
+
     def test_seal_anchor_discards_failed_pair_and_continues(self):
         evaluator = self.start(anchor_games=2, seal_ms=5)
         self.export(10)

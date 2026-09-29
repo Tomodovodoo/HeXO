@@ -1940,6 +1940,8 @@ class Evaluator:
                 decided.append(decision)  # an idle SPRT rematch keeps the first bound it crosses
             new_checkpoint = any(e[0] not in waiting and self.entry(e[0]) is None for e in checkpoints(self.run)) \
                 if kind == 'anchor' else self.backlog()
+            if kind == 'anchor' and new_checkpoint:
+                self.anchor_turn = False
             if new_checkpoint or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
