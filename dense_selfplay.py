@@ -530,7 +530,7 @@ class Restarts:
 
     def __init__(self, run, temperature, max_plies):
         self.run, self.temperature, self.max_plies = Path(run), temperature, max_plies
-        self.entries, self.games = [], OrderedDict()
+        self.entries, self.games, self.p = [], OrderedDict(), None
         self.load()
 
     def load(self):

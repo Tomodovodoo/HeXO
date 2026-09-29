@@ -267,6 +267,8 @@ class RestartActorTests(unittest.TestCase):
         self.assertIsNone(dense_selfplay.Restarts(self.run, 1., 4).draw(np.random.default_rng(0)))
         (self.run/'restarts.json').write_text(json.dumps(dict(entries=[dict(self.buffer[0], shard='gone')])))
         self.assertIsNone(dense_selfplay.Restarts(self.run, 1., 10).draw(np.random.default_rng(0)))
+        (self.run/'restarts.json').write_text('{"entries": [')
+        self.assertIsNone(dense_selfplay.Restarts(self.run, 1., 10).draw(np.random.default_rng(0)))
         (self.run/'restarts.json').unlink()
         self.assertIsNone(dense_selfplay.Restarts(self.run, 1., 10).draw(np.random.default_rng(0)))
 
