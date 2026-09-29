@@ -55,6 +55,35 @@ Run `python tools/profile_evaluator.py live --kernels reference`, then `fused`,
 then `reference`. The shared guard enforces headroom, cooldown and a 55-second
 GPU deadline, and closes the measurement's own solver processes on timeout.
 
+## Learner CUDA graphs, under development
+
+The learner's `--net-kernels fused --cuda-graphs` captures model forward and
+backward at five crop capacities. The existing loss, gradient clipping,
+optimizer and EMA code still runs for every step. Capacities are 64 rows at
+24x24, 112 at 32x32, 96 at 40x40, 48 at 48x48 and 16 at 64x64. Additional rows
+have zero crop masks and do not enter normalization statistics or losses.
+The existing learner padding remains part of the input, with its original
+normalization contribution. Larger whole buckets run eagerly.
+
+`--block-checkpoint` separately trades recomputation for lower training memory.
+It recomputes each residual block during backward while updating normalization
+running statistics only once. Both flags default off and are absent from saved
+model configuration and checkpoint tensors.
+
+This draft has no production throughput claim yet. An earlier exact-shape
+diagnostic reached 129.1 samples/s against 67.6 samples/s for reference,
+1.91x, with whole-block checkpointing enabled in both paths to fit the 12%
+development memory cap. That changed execution path does not establish the
+requested gain over the normal learner. The original unmodified batch-256
+baseline could not fit that cap.
+
+The next comparison uses the actual `Learner.train_step`, saved optimizer and
+EMA state, and successive batches sampled with the live replay settings.
+It will report variable crop sizes, graph reuse, capture cost, eager fallback,
+memory and end-to-end samples/s. The owner authorized stopping the learner
+after export 85000 completes so this test can use its normal memory allowance.
+Until those results pass review, these learner flags remain experimental.
+
 ## Actor CUDA graphs
 
 `--net-kernels fused --cuda-graphs` adds a second opt-in acceleration for actors.

@@ -8,6 +8,8 @@ masks exactly those two taps: kernel[0, 0] and kernel[2, 2]. Line axes are the
 index directions (dx, dy) = (1, 0), (0, 1) and (1, -1).
 """
 from dataclasses import dataclass, asdict
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import copy
 import hashlib
 import json
@@ -26,6 +28,23 @@ SCHEMA = 'hexo-dense-policy-value-v1'
 AXES = ((1, 0), (0, 1), (1, -1))    # index directions (dx, dy)
 WINDOW = 6
 FEATURES = len(hexcrop.PLANES)+2*len(AXES)+4
+
+_block_replaying = ContextVar('hexnet_block_replaying', default=False)
+
+
+@contextmanager
+def _block_replay_context():
+    token = _block_replaying.set(True)
+    try:
+        yield
+    finally:
+        _block_replaying.reset(token)
+
+
+def _block_checkpoint_contexts():
+    return nullcontext(), _block_replay_context()
+
+
 # Inference line convolutions run in batch chunks of at most this many crop cells: their matmul temporaries
 # (about four chunk-sized activations, ~45 MB at 96 channels) then stay below the 3x3 convolutions' layout
 # copies at dense_selfplay.MAX_CELLS; smaller chunks save no peak memory and add launches.
@@ -252,6 +271,8 @@ class MaskedNorm(nn.BatchNorm2d):
             y, mean, var = MaskedBatchNorm.apply(x, mask, self.weight, self.bias, cells, self.eps, ceiling is not None)
         else:
             y, mean, var = _MaskedBatchNorm.apply(x, mask, self.weight, self.bias, cells, self.eps)
+        if _block_replaying.get():
+            return y if ceiling is None or fused else act(y, ceiling)
         with torch.no_grad():
             self.num_batches_tracked += 1
             if self.momentum is None:
@@ -285,8 +306,15 @@ class Block(nn.Module):
         self.line = LineConv(c, config.line_length) if config.line_length else None
         self.norm2, self.conv2 = MaskedNorm(c), HexConv(c, c)
         self.pool = nn.Linear(2*c, c) if pooled else None
+        self.full_checkpoint = False
 
     def forward(self, x, mask, ceiling, count, cells):
+        if self.full_checkpoint and self.training and torch.is_grad_enabled():
+            return checkpoint(self._body, x, mask, ceiling, count, cells,
+                              use_reentrant=False, context_fn=_block_checkpoint_contexts)
+        return self._body(x, mask, ceiling, count, cells)
+
+    def _body(self, x, mask, ceiling, count, cells):
         """x may hold junk on padding cells; every convolution input is zero there."""
         y = self.conv1(self.norm1(x, mask, cells, ceiling))
         if self.pool is not None:
@@ -294,7 +322,10 @@ class Block(nn.Module):
         if self.line is not None:
             y = y*mask
             # Recomputing the line matmuls in backward keeps training memory near the plain ResNet's.
-            y = y+checkpoint(self.line, y, use_reentrant=False) if torch.is_grad_enabled() else self.line.add_to(y)
+            if self.full_checkpoint and self.training and torch.is_grad_enabled():
+                y = y+self.line(y)
+            else:
+                y = y+checkpoint(self.line, y, use_reentrant=False) if torch.is_grad_enabled() else self.line.add_to(y)
         return x+self.conv2(self.norm2(y, mask, cells, ceiling))
 
 
@@ -335,6 +366,12 @@ class HexNet(nn.Module):
                 self.future_masked = nn.Conv2d(c.head_channels, 3, 1)  # empty, own, opponent at 20 placements
         self.set_kernels(net_kernels)
 
+    def set_block_checkpoint(self, enabled):
+        """Select whole-block activation checkpointing for training only."""
+        for block in self.blocks:
+            block.full_checkpoint = bool(enabled)
+        return self
+
     def set_kernels(self, mode):
         """Select execution only; parameter names, config, digest and checkpoints stay the same."""
         if mode not in ('reference', 'fused'):
@@ -345,9 +382,11 @@ class HexNet(nn.Module):
                 module.net_kernels = mode
         return self
 
-    def forward(self, planes, mask, aux=True):
+    def forward(self, planes, mask, aux=True, *, allow_empty=False):
         count = mask.sum((2, 3), dtype=torch.float32)    # a bf16 sum rounds counts above 256
         cells = count.sum()
+        if allow_empty:
+            count = count.clamp_min(1)
         x = self.stem(torch.cat((planes, self.lines(planes[:, :1], planes[:, 1:2], mask)), 1)*mask)
         if self.net_kernels == 'fused':
             mask = mask.to(x.dtype)
