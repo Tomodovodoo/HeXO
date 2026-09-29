@@ -1,6 +1,8 @@
 """CPU checks for the dense hex ResNet stack: hexcrop, hexnet, dense_config, dense_data, dense_bootstrap, the
 learner's validation and the actor/evaluator engine."""
 import argparse
+import concurrent.futures
+import contextlib
 import copy
 import dataclasses
 from dataclasses import asdict, replace
@@ -818,6 +820,59 @@ class FusedCudaTests(unittest.TestCase):
 
 
 class DenseConfigTests(unittest.TestCase):
+    def test_fused_actor_cache_warms_before_workers_and_isolates_compiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            args = SimpleNamespace(run=run, processes=2, games=None, initial_model=None, net_kernels='fused')
+            config = SimpleNamespace(actor=dense_config.ActorSettings(), device='cuda')
+            caches = []
+
+            def compile_in_worker(cache):
+                (cache/'kernel'/'new.json').open('x').close()
+
+            def compile_once(command, *, env, check):
+                self.assertIn('--warm-cache', command)
+                self.assertTrue(check)
+                path = Path(env['TRITON_CACHE_DIR'])/'kernel'
+                path.mkdir()
+                (path/'_eval.json').write_text('compiled')
+
+            def spawn(command, *, env):
+                self.assertIn('--worker', command)
+                cache = Path(env['TRITON_CACHE_DIR'])
+                self.assertEqual((cache/'kernel'/'_eval.json').read_text(), 'compiled')
+                caches.append(cache)
+                if len(caches) == 2:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                        list(pool.map(compile_in_worker, caches))
+                return SimpleNamespace(poll=lambda: 0)
+
+            with unittest.mock.patch.object(dense_selfplay.dense_config, 'load', return_value=config), \
+                 unittest.mock.patch.object(dense_selfplay.subprocess, 'run', side_effect=compile_once) as warm, \
+                 unittest.mock.patch.object(dense_selfplay.subprocess, 'Popen', side_effect=spawn), \
+                 unittest.mock.patch.object(dense_selfplay, 'log_event'), \
+                 unittest.mock.patch.object(dense_selfplay.time, 'sleep'):
+                dense_selfplay.supervise(args)
+            self.assertEqual(warm.call_count, 1)
+            self.assertEqual(len(caches), 2)
+            self.assertNotEqual(*caches)
+            self.assertTrue(all(not cache.exists() for cache in caches))
+
+    def test_fused_actor_warmup_covers_crop_shapes_without_gpu(self):
+        shapes = []
+        model = lambda x, mask, aux: shapes.append(tuple(x.shape))
+        config = SimpleNamespace(actor=dense_config.ActorSettings(leaf_batch=48), device='cuda')
+        zeros = torch.zeros
+        with unittest.mock.patch.object(dense_selfplay, 'load', return_value=SimpleNamespace(
+                evaluator=SimpleNamespace(model=model))), \
+             unittest.mock.patch.object(dense_selfplay.torch, 'zeros', side_effect=lambda shape, **kwargs: zeros(shape, dtype=kwargs['dtype'])), \
+             unittest.mock.patch.object(dense_selfplay.torch, 'autocast', return_value=contextlib.nullcontext()), \
+             unittest.mock.patch.object(dense_selfplay.torch.cuda, 'synchronize'):
+            dense_selfplay.warm_fused('unused', config, None)
+        self.assertEqual([shape[-1] for shape in shapes], list(hexcrop.BUCKETS))
+        self.assertEqual([shape[0] for shape in shapes],
+                         [max(1, min(48, dense_selfplay.MAX_CELLS//(size*size))) for size in hexcrop.BUCKETS])
+
     def test_net_kernels_are_opt_in_and_reach_actor_workers(self):
         self.assertEqual(dense_config.ActorSettings().net_kernels, 'reference')
         parser = argparse.ArgumentParser()
