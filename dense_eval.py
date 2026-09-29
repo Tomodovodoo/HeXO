@@ -22,7 +22,12 @@ Run layout: dense_config. Subcommands
              finish and count. All play is paced by `eval_share` (Pacer: no new game while its credit is
              negative); --eval-* flags override evaluation settings for this process (reports record the
              effective settings). Writes evaluations/<a>-vs-<b>/report.json, league.json, champion.json on
-             promotion, evaluator-status.json (Evaluator.publish) and events.
+             promotion, evaluator-status.json (Evaluator.publish) and events. Every pairing, Seal anchors included,
+             draws its openings from the opening book of opening_suite (dense_openings: the live book 'book' or a
+             frozen suite such as 'standard-v1'); each completed pair is recorded on the book's nodes, a live book is
+             refreshed between steps (`Evaluator.refresh_openings`), and reports are reused only under the book state
+             they were played in (`same_protocol`). On start every report gets an `id` if it lacks one
+             (dense_openings.stamp) and the book counts the pairs its file misses (dense_openings.Book.reconcile).
   calibrate  continue capped self-play games with the champion and score TD(lambda) value targets against
              the realised results.
   match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal; per-side
@@ -82,19 +87,23 @@ league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, ste
 superseded?, panel?, demoted?, verdict? (the posterior verdict that rated or promoted it on review, with its
 `Evaluator.snapshot`: opponent, protocol, matchup_prior and reports)}], variants: [{id, checkpoint, name, settings,
 base, registered_as, on_champion, registered_at, bound_at?, elo, elo_interval, matches, verdict? (its final verdict)}], differences, ladder, ladder_top, anchors,
-matrix, calibration, rating_note, updated_at}. calibration (`calibration`) compares the delta sd the posterior
+matrix, calibration, openings (dense_openings.summary: P1/P2 results overall and per player, and the
+state of each opening book), rating_note, updated_at}. calibration (`calibration`) compares the delta sd the posterior
 stated at each verdict with how far delta moved once later games of that checkpoint came in. The evaluator is
 league.json's only writer: `register` leaves a request in variant-requests/, which the evaluator adopts into
 `variants` (`adopt`).
 differences and ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the ladder_top
 (fill_top) best rated, not demoted checkpoints, a above b, intervals from the joint rating draws. anchors.seal is {elo,
-elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
+elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order, one per checkpoint summed
+over its Seal reports (archives included; elo_delta the continuity-corrected Elo of the summed points, as `summary`),
 latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, latest_delta the newest one's. reign_from
 is the number of checkpoint entries and reign_games the champion's Seal games when it was promoted or restored
-(absent: its own position + 1 and 0). `matrix` (`payoff`) holds
+(absent: its own position + 1 and 0), counted over its archived Seal reports too (reign_pooled; `Evaluator.pool_reign`
+migrates a reign begun before). `matrix` (`payoff`) holds
 only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
-written before `matrix`, `ladder`, `panel` and `calibration` existed lack those keys; the Evaluator adds `matrix`
-and `calibration` on start and rebuilds the ladder when its ladder_top differs from the effective fill_top.
+written before `matrix`, `ladder`, `panel`, `calibration` and `openings` existed lack those keys; the Evaluator
+adds `matrix` and `calibration` on start, and rebuilds the league when its ladder_top differs from the effective
+fill_top or its book counted pairs it had missed.
 """
 import argparse
 from dataclasses import asdict, replace
@@ -103,6 +112,7 @@ import json
 import math
 from pathlib import Path
 import time
+import uuid
 
 import numpy as np
 import torch
@@ -110,6 +120,7 @@ import torch
 import dense_config
 from dense_config import log_event
 import dense_data
+import dense_openings
 from dense_posterior import Posterior, parents
 from dense_solver import Budgets
 import hexnet
@@ -117,18 +128,18 @@ from arena import Seal
 from dense_selfplay import Engine, checkpoints, expected, load, resolve
 from hexo import Game
 from klent import digest
-from train import paired_metrics, task_opening, write_json
+from train import paired_metrics, write_json
 
 SEAL = 'seal'
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
 # Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
-PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'seal_ms', 'solver_root_nodes',
-            'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes')
-PROTOCOL_DEFAULTS = dict(solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0, solver_threat_nodes=0)
+PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'opening_book', 'seal_ms',
+            'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes')
+PROTOCOL_DEFAULTS = dict(opening_book='', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0, solver_threat_nodes=0)
 CHAMPION = 'champion'  # the symbolic base of a variant, bound to the champion when its comparison starts
-# The PROTOCOL fields of one side's search, which a variant may override; max_plies, opening_suite and seal_ms
-# belong to the game.
+# The PROTOCOL fields of one side's search, which a variant may override; max_plies, opening_suite, seal_ms
+# and opening_book belong to the game.
 SIDE = ('sims', 'root_samples', 'tactics', 'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes',
         'solver_threat_nodes')
 REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
@@ -241,18 +252,18 @@ def pair_seed(run_seed, label, pair):
     return int.from_bytes(hashlib.sha256(f'{run_seed}/{label}/{pair}'.encode()).digest()[:4], 'little')
 
 
-def paired_games(challenger, rival, games, label, config, settings, seal, first_pair=0, sides=None, **record):
-    """`games` MatchGames: games/2 openings (train.task_opening from run seed, `label` and pair index, pairs
-    numbered from `first_pair`), each played once with the candidate as colour 0 and once as colour 1. `sides` is
-    (challenger's, rival's) EvaluationSettings of their search (sims, root_samples, tactics and solver budgets),
-    by default both `settings`; openings, max_plies and seal_ms come from `settings`."""
+def paired_games(challenger, rival, games, label, config, settings, seal, book, first_pair=0, sides=None, **record):
+    """`games` MatchGames: games/2 openings drawn from `book` (dense_openings.Book.draw) by the seed of run seed,
+    `label` and pair index (pairs numbered from `first_pair`), each played once with the candidate as colour 0 and
+    once as colour 1. `sides` is (challenger's, rival's) EvaluationSettings of their search (sims, root_samples,
+    tactics and solver budgets), by default both `settings`; max_plies and seal_ms come from `settings`."""
     sides = sides or (settings, settings)
     if games < 2 or games % 2:
         raise ValueError('Paired matches need an even game count of at least two')
     out = []
     for pair in range(first_pair, first_pair+games//2):
         seed = pair_seed(config.seed, label, pair)
-        opening = task_opening(seed, True, settings.max_plies, settings.opening_suite)['opening']
+        opening = book.draw(seed)
         for colour in (0, 1):
             players, search = [rival, rival], [sides[1], sides[1]]
             players[colour], search[colour] = challenger, sides[0]
@@ -486,10 +497,11 @@ def report_name(report):
     return report_path('', report['candidate'], report['opponent']).parent.name
 
 
-def make_report(candidate, opponent, records, shas, settings, overrides=None):
+def make_report(candidate, opponent, records, shas, settings, overrides=None, report_id=None):
     """Report of a finished comparison; `shas` maps checkpoint ids to their ema.pt digests; `overrides` ({id:
-    settings} of its variant sides) is stored when not empty."""
-    return dict(candidate=candidate, opponent=opponent, created_at=time.time(),
+    settings} of its variant sides) is stored when not empty; `report_id` is the report's `id` (a new one when
+    None), kept while pairs are appended."""
+    return dict(id=report_id or uuid.uuid4().hex, candidate=candidate, opponent=opponent, created_at=time.time(),
                 candidate_sha256=shas[candidate], opponent_sha256=SEAL if opponent == SEAL else shas[opponent],
                 settings=asdict(settings), **({'overrides': overrides} if overrides else {}),
                 metrics=paired_metrics(records), summary=summary(records), games=records)
@@ -561,10 +573,12 @@ _reports = {}
 
 
 def load_reports(run, settings=None):
-    """Every evaluations/*/report.json (cached per path and modification time); with `settings`, only the reports
-    played under its PROTOCOL."""
+    """Every evaluations/*/report*.json: each pairing's report.json and the reports `Evaluator.open` archived beside it
+    (cached per path and modification time), which pool into the league ratings. With `settings`, only the current
+    report.json files played under its PROTOCOL: decisions read a pairing's games from its current report alone
+    (`Evaluator.games`), so an archive whose protocol matches again (a setting changed and restored) stays out of them."""
     reports = []
-    for path in sorted((Path(run)/'evaluations').glob('*/report.json')):
+    for path in sorted((Path(run)/'evaluations').glob('*/report.json' if settings else '*/report*.json')):
         stamp = path.stat().st_mtime_ns
         if _reports.get(path, (None,))[0] != stamp:
             _reports[path] = stamp, json.loads(path.read_text())
@@ -573,6 +587,10 @@ def load_reports(run, settings=None):
 
 
 def same_protocol(report, settings):
+    """Whether `report` was played under the PROTOCOL of `settings`. Under the live book that includes opening_book
+    (dense_openings.Book.digest of its openings), which changes only at a book refresh: a report is reused while the
+    book keeps its openings, and a refresh that changes them starts every comparison afresh. A frozen suite's name
+    fixes its openings (opening_book ''); a report without a PROTOCOL_DEFAULTS field was played at its default."""
     return all(report['settings'].get(k, PROTOCOL_DEFAULTS.get(k)) == getattr(settings, k) for k in PROTOCOL)
 
 
@@ -667,9 +685,11 @@ def calibration(league, reports):
     verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports), whose snapshotted reports
     (every input of the verdict's posterior, the direct one among them) all still begin with the games it was decided
     on (`games_digest` of that prefix: extended at most, not replaced) and which has at least CALIBRATION_LATER later
-    comparisons (reports with it under that protocol that are new or have grown since the verdict), shift = delta
-    now - delta at the verdict, both r_cid - r_opponent + their matchup deviation over the reports of that protocol
-    with the verdict's matchup prior. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
+    comparisons (reports with it under that protocol that are new or have grown since the verdict; a pairing's archive
+    that matches the protocol again is a report of its own), shift = delta now - delta at the verdict, both r_cid -
+    r_opponent + their matchup deviation over the reports of that protocol with the verdict's matchup prior. Reports
+    the snapshot lists as `earlier` (present at the verdict but not among its inputs, such as older archives) are
+    neither later comparisons nor part of the posterior now. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
     resolved). Returns {count, predicted_sd (mean delta_sd at the verdicts), expected_rms (root mean sd_then^2 -
     sd_now^2), realised_rms (root mean shift^2)}, the three None without a counted verdict: realised_rms well below
     expected_rms means the posterior overstates its variance."""
@@ -682,18 +702,23 @@ def calibration(league, reports):
                 or cid not in rated or verdict['opponent'] not in rated:
             continue
         key = protocol(verdict['protocol'])
-        group = [r for r in reports if protocol(r['settings']) == key]
-        named = {report_name(r): r for r in group}
+        earlier = frozenset(verdict.get('earlier', ()))
+        group = [r for r in reports if protocol(r['settings']) == key and r.get('id') not in earlier]
+        named = {}  # report name -> its reports of the protocol: the current one and archives it matches again
+        for r in group:
+            named.setdefault(report_name(r), []).append(r)
         direct = report_path('', cid, verdict['opponent']).parent.name
-        intact = lambda name, snap: name in named and len(named[name]['games']) >= snap['games'] \
-            and games_digest(named[name]['games'][:snap['games']]) == snap['digest']
-        if direct not in verdict['reports'] or not all(intact(*item) for item in verdict['reports'].items()):
+        intact = lambda name, snap: next((r for r in named.get(name, []) if len(r['games']) >= snap['games']
+                                          and games_digest(r['games'][:snap['games']]) == snap['digest']), None)
+        decided = {name: intact(name, snap) for name, snap in verdict['reports'].items()}
+        if direct not in decided or None in decided.values():
             continue
-        later = sum(cid in (r['candidate'], r['opponent']) and len(r['games']) > verdict['reports'].get(name, {}).get('games', 0)
-                    for name, r in named.items())
+        later = sum(cid in (r['candidate'], r['opponent'])
+                    and len(r['games']) > (verdict['reports'][name]['games'] if r is decided.get(name) else 0)
+                    for name, rs in named.items() for r in rs)
         if later < CALIBRATION_LATER:
             continue
-        model = key, verdict['matchup_prior']
+        model = key, verdict['matchup_prior'], earlier
         if model not in posteriors:
             ids = rated+([SEAL] if any(SEAL in (r['candidate'], r['opponent']) for r in group) else [])
             posteriors[model] = Posterior(ids, ids[0], [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
@@ -709,7 +734,9 @@ def write_league(run, league, config, top=None):
     """Adopt waiting variant registrations (`adopt`; their request files are removed after the write), recompute ratings, the payoff matrix and the ladder (`top`
     checkpoints, default config.evaluation.fill_top) from every report among rated (not skipped) ids, the variants
     of those ids and Seal, then publish league.json; skipped entries keep elo and elo_interval null. The ladder and
-    differences hold checkpoints only."""
+    differences hold checkpoints only. The ratings pool the reports of every protocol, opening-book states included,
+    so a refresh never empties the ladder; the promotion posterior, panels and rematches use protocol-matching
+    reports only (`same_protocol`)."""
     run = Path(run)
     adopt(league, run)
     ids = [c['id'] for c in league['checkpoints'] if not c.get('skipped')]
@@ -730,13 +757,19 @@ def write_league(run, league, config, top=None):
     best = sorted((c['id'] for c in league['checkpoints'] if point.get(c['id']) is not None and not c.get('demoted')),
                   key=lambda k: -point[k])[:league['ladder_top']]
     league['ladder'] = [difference(a, b) for i, a in enumerate(best) for b in best[i+1:]]
-    anchored = sorted((r for r in reports if r['opponent'] == SEAL and r['candidate'] in ids), key=lambda r: ids.index(r['candidate']))
-    matches = [dict(checkpoint=r['candidate'], **{k: r['summary'][k] for k in ('wins', 'losses', 'capped', 'games', 'elo_delta')})
-               for r in anchored]
+    anchored = {}  # checkpoint -> its Seal results summed over its reports (archives included), in league order
+    for r in sorted((r for r in reports if r['opponent'] == SEAL and r['candidate'] in ids), key=lambda r: ids.index(r['candidate'])):
+        total = anchored.setdefault(r['candidate'], dict(wins=0, losses=0, capped=0, games=0))
+        for k in total:
+            total[k] += r['summary'][k]
+    points = lambda t: t['wins']+t['capped']/2
+    matches = [dict(checkpoint=cid, **t, elo_delta=400*math.log10((points(t)+.5)/(t['games']-points(t)+.5)))
+               for cid, t in anchored.items()]
     league['anchors'] = {SEAL: dict(elo=point.get(SEAL), elo_interval=intervals.get(SEAL), games=seal_games, matches=matches,
                                     latest_delta=matches[-1]['elo_delta'] if matches else None)}
     league['matrix'] = payoff(reports, point)
     league['calibration'] = calibration(league, reports)
+    league['openings'] = dense_openings.summary(run, reports)
     league['rating_note'] = RATING_NOTE
     league['updated_at'] = time.time()
     write_json(run/'league.json', league)
@@ -897,14 +930,18 @@ class Evaluator:
     worker_seconds (seconds times the lane's share of the session's placements)."""
 
     def __init__(self, run, config, settings, pacer):
+        self.openings = dense_openings.Book(run, settings)
+        missed = self.openings.reconcile(dense_openings.stamp(run))
+        settings = replace(settings, opening_book=self.openings.digest())
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
-        if self.league['checkpoints'] and ('matrix' not in self.league or 'calibration' not in self.league
+        self.pool_reign()
+        if self.league['checkpoints'] and (missed or 'matrix' not in self.league or 'calibration' not in self.league
                                            or self.league.get('ladder_top') != settings.fill_top):
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         self.models, self.seal, self.written, self.fill_target, self.deciding, self.reviewed = {}, None, 0., None, None, False
-        self.book, self.next, self.shas = {}, {}, {}
+        self.book, self.next, self.ids, self.shas = {}, {}, {}, {}
         self.status = dict(stage='idle', updated_at=None, comparison=None, pool=[], started_at=None, games_played=0,
                            games_planned=0, tally=None, decision=None, pending=[], placements_played=0, mean_placements=None,
                            placements_per_second=None, settings=asdict(settings), eval_share=pacer.share, backlog=[],
@@ -1006,20 +1043,22 @@ class Evaluator:
 
     def open(self, a, b):
         """Load report a-vs-b for appending and number its next opening pair after the highest one it holds, so a
-        restart resumes the pairing. A report played under another protocol is kept as report-<created_at>.json
-        beside it (outside load_reports) with an 'info' event, and a new one starts."""
+        restart resumes the pairing; the report keeps its id (dense_openings.report_id). A report played under another
+        protocol is kept as report-<created_at>-<id>.json beside it (unique per report; still pooled by load_reports)
+        with an 'info' event, and a new one starts with a new id."""
         if (a, b) in self.book:
             return
         path = report_path(self.run, a, b)
         old = json.loads(path.read_text()) if path.exists() else None
         if old and not same_protocol(old, self.settings):
-            kept = path.with_name(f'report-{int(old["created_at"])}.json')
+            kept = path.with_name(f'report-{int(old["created_at"])}-{dense_openings.report_id(old)}.json')
             path.replace(kept)
             log_event(self.run, 'evaluator', 'info', f'{a} vs {b}: the report played under another protocol is kept as '
                       f'{kept.name}; a new one starts', candidate=a, opponent=b)
             old = None
         self.book[a, b] = list(old['games']) if old else []
         self.next[a, b] = max((g['pair'] for g in self.book[a, b]), default=-1)+1
+        self.ids[a, b] = dense_openings.report_id(old) if old else uuid.uuid4().hex
 
     def start(self, pool, lane):
         """Start the next opening pair of lane (a, b, kind) in `pool`: both colours at once (`paired_games`), each
@@ -1027,23 +1066,25 @@ class Evaluator:
         a, b, _ = lane
         pair, self.next[a, b] = self.next[a, b], self.next[a, b]+1
         pool.add(lane, paired_games(self.models[a], SEAL if b == SEAL else self.models[b], 2, a, self.config, self.settings,
-                                    self.seal, pair, (self.side(a), self.side(b)), candidate=a, opponent=b))
+                                    self.seal, self.openings, pair, (self.side(a), self.side(b)), candidate=a, opponent=b))
 
     def persist(self, a, b, kind, pair):
         """Append a completed colour pair to report a-vs-b and rewrite it (kind 'sprt' recomputes metrics.sprt,
-        decision or 'max-games'), so a restart loses only the games in flight; a game stopped by 'span' is logged."""
+        decision or 'max-games'), so a restart loses only the games in flight, then record it in the opening book; a
+        game stopped by 'span' is logged."""
         records = self.book[a, b] = self.book[a, b]+pair
         for name in (a, b):
             if name != SEAL and name not in self.shas:
                 self.shas[name] = digest(self.weights(name))
         report = make_report(a, b, records, self.shas, self.settings,
-                             {name: self.overrides(name) for name in (a, b) if self.overrides(name)})
+                             {name: self.overrides(name) for name in (a, b) if self.overrides(name)}, self.ids[a, b])
         if kind == 'sprt':
             result = self.test(records)
             report['metrics']['sprt'] = dict(result, decision=result['decision'] or 'max-games')
         path = report_path(self.run, a, b)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json(path, report)
+        self.openings.record(pair, self.ids[a, b])
         for record in pair:
             if record['reason'] == 'span':
                 log_event(self.run, 'evaluator', 'error', f'{a} vs {b} pair {record["pair"]}: game counted as capped at ply '
@@ -1315,11 +1356,13 @@ class Evaluator:
     def snapshot(self, cid, champion):
         """What a decided verdict records for `calibration`: {opponent (the champion), protocol ({PROTOCOL setting:
         value}), matchup_prior (the effective matchup_prior_elo), reports ({report name: {games, digest
-        (`games_digest`)}} of every report the verdict's posterior uses, `inputs`)}."""
-        s = self.settings
+        (`games_digest`)}} of every report the verdict's posterior uses, `inputs`), earlier (the ids of every other
+        report present, archives included)}."""
+        s, inputs = self.settings, self.inputs(cid, champion)[1]
+        used = {r.get('id') for r in inputs}
         return dict(opponent=champion, protocol={k: getattr(s, k) for k in PROTOCOL}, matchup_prior=s.matchup_prior_elo,
-                    reports={report_name(r): dict(games=len(r['games']), digest=games_digest(r['games']))
-                             for r in self.inputs(cid, champion)[1]})
+                    reports={report_name(r): dict(games=len(r['games']), digest=games_digest(r['games'])) for r in inputs},
+                    earlier=sorted(r['id'] for r in load_reports(self.run) if r.get('id') and r['id'] not in used))
 
     def evidence(self, verdict, cid, champion, games):
         """(a, b) of the evidence pairing for a pending posterior decision, or None: of cid and the champion each
@@ -1635,26 +1678,42 @@ class Evaluator:
         path = report_path(self.run, cid, SEAL)
         return json.loads(path.read_text()) if path.is_file() else None
 
+    def seal_reports(self, cid):
+        """cid's reports against Seal under every protocol: its report.json and those archived beside it."""
+        return [r for r in load_reports(self.run) if r['candidate'] == cid and r['opponent'] == SEAL]
+
     def crown(self, cid):
-        """Make cid champion and start its reign: reign_from and reign_games (league contract)."""
-        report = self.sealed(cid)
-        self.league.update(champion=cid, reign_from=len(self.league['checkpoints']), reign_games=len(report['games']) if report else 0)
+        """Make cid champion and start its reign: reign_from, reign_games and reign_pooled (league contract)."""
+        self.league.update(champion=cid, reign_from=len(self.league['checkpoints']), reign_pooled=True,
+                           reign_games=sum(len(r['games']) for r in self.seal_reports(cid)))
+
+    def pool_reign(self):
+        """Once, for a reign begun before archived reports were pooled (no reign_pooled): add the champion's archived
+        Seal games to reign_games, so they count as played before the reign, capped at all its Seal games (the
+        report reign_games was counted on may itself be archived by now, its prefix then counted once). Games played
+        during the reign in an archive are then owed again; no game is ever taken as played twice and the anchor
+        never goes negative. The two fields are written to league.json at once, so the migration happens once."""
+        champion = self.league.get('champion')
+        if champion is None or self.league.get('reign_pooled'):
+            return
+        current = self.sealed(champion)
+        total = sum(len(r['games']) for r in self.seal_reports(champion))
+        archived = total-(len(current['games']) if current else 0)
+        self.league.update(reign_games=min(self.league.get('reign_games', 0)+archived, total), reign_pooled=True)
+        write_json(self.run/'league.json', self.league)
 
     def anchor(self):
         """(champion entry, SEAL, 'anchor', games left) while the current champion owes Seal games, else None. In
         its current reign it owes anchor_games once (anchor_on_promotion) and anchor_games more per `anchor_every`
-        checkpoints rated during the reign (entries from `reign_from` on), counted against the games its
-        champion-vs-Seal report gained since reign_games; a report under another protocol is left alone. A newer
-        champion supersedes the old one's unfinished anchor."""
+        checkpoints rated during the reign (entries from `reign_from` on), counted against the games its Seal reports
+        (`seal_reports`, every protocol) gained since reign_games, so an anchor owed when the protocol changes (a book
+        refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor."""
         s, champion = self.settings, self.entry(self.league['champion'])
         if not s.anchor_games or champion is None:
             return None
         entries = self.league['checkpoints']
         later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])
-        report = self.sealed(champion['id'])
-        if report and not same_protocol(report, s):
-            return None
-        played = len(report['games'])-self.league.get('reign_games', 0) if report else 0
+        played = sum(len(r['games']) for r in self.seal_reports(champion['id']))-self.league.get('reign_games', 0)
         left = s.anchor_games*(s.anchor_on_promotion+later//s.anchor_every)-played
         return (champion, SEAL, 'anchor', left) if left > 0 else None
 
@@ -1686,17 +1745,17 @@ class Evaluator:
     def fill(self):
         """(league entry, opponent, kind, games) of the next fill work with idle_fill, else None; only `close`
         pairings, `games` each. (1) The champion vs Seal ('fill') while anchor_target_halfwidth > 0 and the
-        half-width of the 95% interval of their Elo difference (`rate` over the champion's Seal report alone)
-        exceeds it (no report yet counts as wide; a report under another protocol is left alone). (2) Once, the
+        half-width of the 95% interval of their Elo difference (`rate` over the champion's Seal reports alone,
+        `seal_reports`) exceeds it (no report yet counts as wide). (2) Once, the
         newest rated, not demoted checkpoint vs the previous champion ('generalization'): the champion that the
         champion it met had met (`met` twice), when the two have no games yet. (3) The league ladder pair with
         the widest interval whose report can grow (`rematch_pair`, 'fill')."""
         s, champion = self.settings, self.entry(self.league['champion'])
         if not s.idle_fill or champion is None:
             return None
-        report = self.sealed(champion['id'])
-        if s.anchor_target_halfwidth > 0 and (report is None or same_protocol(report, s)) and self.close(champion['id'], SEAL):
-            low, high = rate([champion['id'], SEAL], champion['id'], [report], seed=self.config.seed)[1][SEAL] if report \
+        reports = self.seal_reports(champion['id'])
+        if s.anchor_target_halfwidth > 0 and self.close(champion['id'], SEAL):
+            low, high = rate([champion['id'], SEAL], champion['id'], reports, seed=self.config.seed)[1][SEAL] if reports \
                 else (-math.inf, math.inf)
             if (high-low)/2 > s.anchor_target_halfwidth:
                 return champion, SEAL, 'fill', s.games
@@ -1719,12 +1778,36 @@ class Evaluator:
                       target=target)
             self.fill_target = target
 
+    def refresh_openings(self):
+        """Refresh a live book with the champion's model when it is due (dense_openings.Book.due: the champion
+        changed or book_refresh_hours passed), stamp settings.opening_book with its new digest, log a 'book' event
+        and republish the league. A new digest drops the open pairings' cached games, so each reopens (`open`) under
+        the new state."""
+        champion, now = self.league['champion'], time.time()
+        if champion is None or not self.openings.due(champion, now):
+            return
+        self.use(champion)
+        rng = np.random.default_rng(pair_seed(self.config.seed, f'book/{champion}', int(now)))
+        result = self.openings.refresh(self.models[champion], champion, rng, now, self.config.actor.leaf_batch)
+        if result['digest'] != self.settings.opening_book:
+            for cache in (self.book, self.next, self.ids):
+                cache.clear()
+        self.settings = replace(self.settings, opening_book=result['digest'])
+        self.status['settings'] = asdict(self.settings)
+        log_event(self.run, 'evaluator', 'book', f'opening book refreshed by {champion}: {result["added"]} added, retired '
+                  + ', '.join(f'{n} {r}' for r, n in result['retired'].items()) + f'; {result["openings"]} openings, '
+                  f'{result["challengers"]} of them challengers', checkpoint=champion, **result)
+        write_league(self.run, self.league, self.config, self.settings.fill_top)
+
     def step(self):
         """One unit of work; False when there is none. First judges every panel already complete on disk
         (`settle`, e.g. after a restart), so no candidate meets a regressed champion. A checkpoint with games
         against the champion is never left skipped: a skipped league entry with such games is removed again
         ('info' event), and an unrated checkpoint with such games is rated first (an evaluation cut short by a
-        restart resumes there, or settles on its games when superseded). Then, on the first step, the promotion
+        restart resumes there, or settles on its games when superseded). Otherwise a due refresh of the live opening
+        book runs (`refresh_openings`; never while such a candidate or a variant trial with games waits, as it would
+        restart its games). Then, on
+        the first step, the promotion
         rule is re-applied to the existing reports (`review`). Then it rates the newest unrated checkpoint of the
         variant whose newest unrated checkpoint is oldest, skipping that variant's older unrated checkpoints (none
         of them has games against the champion), or else decides the first pending variant (`trial`, in
@@ -1747,6 +1830,10 @@ class Evaluator:
         self.status['backlog'] = [e[0] for e in unrated]
         self.queue(self.status['backlog'])
         resumed = [e for e in unrated if champion and self.games(e[0], champion)]
+        # A refresh that changes the book would restart the games of a candidate or variant trial waiting to resume.
+        trials = [v for v in self.variants() if 'verdict' not in v and v['checkpoint'] and self.games(v['id'], v['checkpoint'])]
+        if not resumed and not trials:
+            self.refresh_openings()
         if resumed:
             self.filling(None)
             self.rate(resumed[0])
@@ -1754,6 +1841,8 @@ class Evaluator:
         if not self.reviewed:
             self.reviewed = True
             self.review()
+            if not trials:
+                self.refresh_openings()  # a champion crowned on review refreshes the book before any game
         if unrated:
             self.filling(None)
             variant = lambda e: e[0].split('/')[0]
@@ -1824,8 +1913,7 @@ def loop(args):
         raise ValueError('anchor_every must be at least 1 while anchor games are enabled')
     if settings.anchor_target_halfwidth < 0 or settings.fill_top < 0 or not .5 <= settings.max_expected_score <= 1:
         raise ValueError('anchor_target_halfwidth and fill_top must be at least 0, max_expected_score in [0.5, 1]')
-    if settings.opening_suite not in ('standard-v1', 'mixed-v1'):
-        raise ValueError("the evaluator draws openings with train.task_opening: opening_suite 'standard-v1' or 'mixed-v1'")
+    dense_openings.check(settings)
     Budgets.of(settings)
     if args.once:
         settings = replace(settings, idle_fill=False)  # fill work never runs out
@@ -1930,9 +2018,11 @@ def match(args):
         if name != SEAL:
             path = Path(name) if Path(name).is_file() else run/'checkpoints'/name/'ema.pt'
             models[side] = load(run, config, source=(name, path))
+    book = dense_openings.Book(run, settings)
+    settings = replace(settings, opening_book=book.digest())
     started = time.perf_counter()
     records = play(paired_games(models['a'], SEAL if args.b == SEAL else models['b'], args.games,
-                                f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None,
+                                f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None, book,
                                 sides=(sides['a'], sides['b']), candidate=args.a, opponent=args.b),
                    config.actor.leaf_batch)
     report = make_report(args.a, args.b, records, {m.checkpoint: m.sha for m in models.values()}, settings)
