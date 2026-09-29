@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import time
 import unittest
+from unittest.mock import patch
 
 from tactical_proof import IsolatedTactics
 
@@ -86,13 +87,17 @@ class Isolation(unittest.TestCase):
             greedy.close()
 
     def test_oversized_request_is_not_sent(self):
-        result = self.tactics.history([[0, 0]], ms=1000, certificate=dict(padding='x'*(9*2**20)))
+        with patch('tactical_proof.REQUEST_LIMIT', 8*2**20):
+            result = self.tactics.history([[0, 0]], ms=1000, certificate=dict(padding='x'*(9*2**20)))
         self.assertEqual(result['reason'], 'request size limit')
         self.assertEqual(self.tactics.history([[0, 0]], ms=1000)['reason'], 'scripted')
 
     def test_oversized_response_is_discarded(self):
-        pid = self.tactics.history([[0, 0]], ms=10000)['pid']
-        self.assertEqual(self.tactics.history([[4, 4]], ms=10000)['reason'], 'response size limit')
+        self.tactics.close()
+        with patch('tactical_proof.RESPONSE_LIMIT', 16*2**20):
+            self.tactics = IsolatedTactics(engine=ENGINE, grace_ms=100, memory_mb=256)
+            pid = self.tactics.history([[0, 0]], ms=10000)['pid']
+            self.assertEqual(self.tactics.history([[4, 4]], ms=10000)['reason'], 'response size limit')
         self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
 
     def test_certificate_arrives_undecoded(self):

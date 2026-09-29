@@ -59,6 +59,16 @@ class NativeStrategy(unittest.TestCase):
         with self.assertRaises(VerificationTimeout):
             independent_verify(result['certificate'], OPEN_THREE, deadline_seconds=0)
 
+    def test_certificate_cap_tracks_granted_budget(self):
+        cert = dict(version=1, width='wide', root=0,
+                    nodes=[dict(kind='immediate_win', action=[[5, 0]])]*50001)
+        small = self.engine.history(IMMEDIATE, nodes=6250, ms=10000, certificate=cert)
+        self.assertEqual((small['status'], small['reason']), ('UNKNOWN', 'certificate format/size'))
+        large = self.engine.history(IMMEDIATE, nodes=8192, ms=10000, certificate=cert)
+        self.assertEqual(large['status'], 'PROVEN_WIN', large['reason'])
+        self.assertEqual(large['scope']['budget']['check_nodes'], 65536)
+        self.assertEqual(independent_verify(large['certificate'], IMMEDIATE), 'PROVEN_WIN')
+
     def test_partial_phase_and_first_placement_terminal(self):
         cert = dict(version=1, width='wide', root=0, nodes=[dict(kind='immediate_win', action=[[5,0]])])
         for history in [IMMEDIATE, IMMEDIATE+[[8,0]]]:
