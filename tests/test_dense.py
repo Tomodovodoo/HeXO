@@ -997,8 +997,36 @@ class DenseDataTests(unittest.TestCase):
                     continue
                 won = float(dense_data.player_at(ply) == 0)
                 self.assertEqual((h['value'], h['outcome'], t['outcome'], t['outcome_weight']), (won, won, won, t['value_weight']))
+                self.assertEqual(t['exact'], 0.)
                 self.assertEqual(t['value'], dense_data.episode_value_targets(e, .9, False, .9)[0][ply])
                 self.assertEqual(t['value'] == won, ply == len(moves)-1)
+
+    def test_shards_without_proofs_load(self):
+        """Rows without `proven` and a manifest without the proof counts: no exact label, outcome weight kept."""
+        moves = winning_game()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'shards'/'000001'
+            write_games(path, [(moves, 0, None)])
+            manifest = json.loads((path/'manifest.json').read_text())
+            for k in ('proven_rows', 'proven_games', 'line_rows', 'adjudicated_plies'):
+                del manifest['counts'][k]
+            (path/'manifest.json').write_text(json.dumps(manifest))
+            self.assertNotIn('proven', json.loads((path/'rows.json').read_text())[0])
+            window = dense_data.ReplayWindow(tmp, capacity_rows=1000)
+            refs = [window.ref('000001', i) for i in range(len(window.index))]
+            batch = dense_data.collate_arrays(*dense_data.examples(window, refs, np.random.default_rng(0)))
+        self.assertEqual((window.proven_rows, len(refs)), (0, len(moves)))
+        for b in batch.values():
+            np.testing.assert_array_equal(b['exact'], 0.)
+            np.testing.assert_array_equal(b['outcome_weight'], b['value_weight'])
+
+    def test_outcome_split(self):
+        bce = [.1, .2, .3, .4, .5]
+        out = dense_learn.outcome_split(bce, [1, 1, 1, 0, 1], [1, 0, 0, 1, 1])
+        self.assertEqual(out, dict(outcome_bce_exact=.3, outcome_bce_exact_rows=2,
+                                   outcome_bce_unproven=.25, outcome_bce_unproven_rows=2))
+        self.assertEqual(dense_learn.outcome_split(bce, [0]*5, [1]*5),
+                         dict(outcome_bce_exact=None, outcome_bce_exact_rows=0, outcome_bce_unproven=None, outcome_bce_unproven_rows=0))
 
     def test_outcome_weight_adds_a_value_term(self):
         torch.manual_seed(0)

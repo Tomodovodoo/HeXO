@@ -654,9 +654,10 @@ class ProvenTargets(unittest.TestCase):
             ply = ref.row['ply']
             if ply in proven:
                 self.assertEqual((target['value'], target['value_weight']), (float(proven[ply] > 0), 2.5))
-                self.assertEqual(target['outcome_weight'], 1.)
+                self.assertEqual((target['outcome'], target['outcome_weight'], target['exact']), (float(dense_data.player_at(ply) == 0), 0., 1.))
             else:
                 self.assertEqual((target['value'], target['value_weight']), (base['value'], base['value_weight']))
+                self.assertEqual((target['outcome_weight'], target['exact']), (target['value_weight'], 0.))
                 if ply < len(moves)-1:
                     self.assertNotIn(target['value'], (0., 1.))
             np.testing.assert_array_equal(target['policy'], base['policy'])

@@ -558,6 +558,36 @@ class ProvenLabelTests(unittest.TestCase):
         self.assertAlmostEqual(out['newest_value_regret_proven'], float(np.mean(1-np.exp(-rows['value_bce'][proven]))))
         self.assertTrue(0 < out['newest_value_regret_proven'] < 1)
 
+    def test_validation_splits_the_outcome_loss_by_exact_label(self):
+        torch.set_num_threads(2)
+        torch.manual_seed(0)
+        run = self.run/'split'
+        source_shard(run/'shards'/'1000000000001', 2, 'x', checkpoint='main/000010', winner=0)
+        dense_solve.write_sidecar(run/'shards'/'1000000000001', [dict(game=g, plies=[3, 4, 5]) for g in range(6)])
+        config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                        learner=dense_config.LearnerSettings(batch=8, validation_fraction=.5))
+        learner = dense_learn.Learner(run, config.learner, config)
+        sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=12)
+        out = learner.validate_sources(sets)
+        for source in ('fresh', 'newest'):
+            r = learner.row_losses(sets, sets.subsets[source, 'held'])
+            exact = r['proven'] != 0
+            self.assertTrue(exact.any() and (~exact).any())
+            self.assertEqual((out[f'{source}_outcome_bce_exact_rows'], out[f'{source}_outcome_bce_unproven_rows']),
+                             (int(exact.sum()), int((~exact).sum())))
+            self.assertAlmostEqual(out[f'{source}_outcome_bce_exact'], float(r['outcome_bce'][exact].mean()))
+            self.assertAlmostEqual(out[f'{source}_outcome_bce_unproven'], float(r['outcome_bce'][~exact].mean()))
+        self.assertEqual((out['converted_outcome_bce_exact'], out['converted_outcome_bce_exact_rows']), (None, 0))
+        window = dense_data.ReplayWindow(run, 1000, 10, validation_fraction=.5)
+        self.assertTrue(window.validation)
+        v = learner.validate(window)
+        self.assertEqual(v['outcome_bce_exact_rows']+v['outcome_bce_unproven_rows'], dense_learn.VALIDATION_ROWS)
+        self.assertTrue(v['outcome_bce_exact_rows'] > 0 and v['outcome_bce_unproven_rows'] > 0)
+        self.assertTrue(0 < v['outcome_bce_exact'] and 0 < v['outcome_bce_unproven'])
+        fields = dense_learn.validation_fields(dict(validation=v, validation_sources=out))
+        self.assertEqual((fields['outcome_bce_exact'], fields['newest_outcome_bce_unproven_rows'], fields['next_ce']),
+                         (v['outcome_bce_exact'], out['newest_outcome_bce_unproven_rows'], v['opponent_ce']))
+
 
 class DashboardTests(unittest.TestCase):
     def test_actor_tile_fields(self):
