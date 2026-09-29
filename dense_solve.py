@@ -6,9 +6,9 @@ A coordinator process at BelowNormal priority runs shard workers: each is this s
 shard with its own tactical worker (tactical_proof.IsolatedTactics, one query at a time) and handing the result back
 in out/.solve/<name>.json; the coordinator alone writes the buffer and the sidecars. Shards are read and never
 changed; everything is written under `--out` (default: the run): the sidecar shards/<name>/proofs.jsonl,
-restarts.json, solver-status.json, events and .solve/ (worker results and logs). A shard is done once its sidecar exists, so a restarted pass resumes where it stopped. Pending shards
-are taken newest first: the pass starts at the newest shards, keeps up with new ones and back-fills older ones
-while it has nothing newer.
+restarts.json, solver-status.json, events and .solve/ (worker results and logs). A shard is done once its sidecar
+exists, so a restarted pass resumes where it stopped. Pending shards are taken newest first: the pass starts at the
+newest shards, keeps up with new ones and back-fills older ones while it has nothing newer.
 
 Workers (Pass.workers). While the main learner's fresh heartbeat (learner-status.json, at most STALE_SECONDS old)
 shows a phased learner (phase_rows > 0) in its training phase (stage 'training' or 'exporting'), the actors are
@@ -49,7 +49,9 @@ a 'defence' entry at each lookback ply d with regret (1 + v)/2 and the saving_tu
 root value of the side to move at that ply (no entry where it is null); plies_to_proof is first_ply minus the
 entry's ply. Restart games add no entries at or before their restart ply; instead their recorded root value at the
 restart ply is stored in the source entry's `observed` {checkpoint: {value, shard}} when the game was played by the
-shard's checkpoint, one observation per checkpoint, the one from the newest shard. Entries with regret below
+shard's checkpoint, one observation per checkpoint, the one from the newest shard; an observation of an entry not
+kept yet waits in `waiting` (saved with the buffer) until the entry is added, and is dropped at a refresh once the
+source shard has a sidecar without it. Entries with regret below
 min_regret are never kept; beyond buffer_size the lowest regrets go. Every refresh_minutes the buffer takes regret
 from the observation of the newest complete checkpoint of the learner variant where it has one (checkpoint becomes
 it), forgets the observations of other checkpoints, and drops entries added more than buffer_max_exports exports of
@@ -179,12 +181,14 @@ def merge(total, part):
 
 
 class RestartBuffer:
-    """restarts.json (module contract), held as {key: entry} with key (shard, game, ply, kind)."""
+    """restarts.json {updated_at, entries, waiting} (module contract), held as {key: entry} with key (shard, game,
+    ply, kind) and waiting observations {key: {checkpoint: {value, shard}}}."""
 
     def __init__(self, path, size, max_exports, min_regret):
         self.path, self.size, self.max_exports, self.min_regret = Path(path), size, max_exports, min_regret
         data = json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else dict(entries=[])
         self.entries = {self.key(e): e for e in data['entries']}
+        self.waiting = {tuple(key): observed for key, observed in data.get('waiting', [])}
 
     @staticmethod
     def key(entry):
@@ -193,8 +197,11 @@ class RestartBuffer:
     def add(self, entry):
         """Keep `entry` unless its regret is below min_regret or its key is already kept (the kept entry, with its
         observations, stays)."""
-        if entry['regret'] >= self.min_regret and self.key(entry) not in self.entries:
-            self.entries[self.key(entry)] = entry
+        key = self.key(entry)
+        if entry['regret'] >= self.min_regret and key not in self.entries:
+            self.entries[key] = entry
+            for checkpoint, seen in self.waiting.pop(key, {}).items():
+                self.observe(key, checkpoint, seen['value'], seen['shard'])
             self.trim()
 
     def trim(self):
@@ -203,14 +210,17 @@ class RestartBuffer:
             self.entries = {self.key(e): e for e in kept}
 
     def observe(self, key, checkpoint, value, shard):
-        """Record a restart game's value at entry `key` for `checkpoint`, unless one from a newer shard is kept."""
-        if key in self.entries:
-            observed = self.entries[key].setdefault('observed', {})
-            if checkpoint not in observed or observed[checkpoint]['shard'] <= shard:
-                observed[checkpoint] = dict(value=value, shard=shard)
+        """Record a restart game's value at entry `key` for `checkpoint`, unless one from a newer shard is kept; for
+        an entry not kept yet, in `waiting`."""
+        entry = self.entries.get(key)
+        observed = entry.setdefault('observed', {}) if entry else self.waiting.setdefault(key, {})
+        if checkpoint not in observed or observed[checkpoint]['shard'] <= shard:
+            observed[checkpoint] = dict(value=value, shard=shard)
 
-    def refresh(self, created, newest):
-        """Apply observations of checkpoint `newest` and drop entries by age (`created`: export times) and regret."""
+    def refresh(self, created, newest, solved=lambda shard: False):
+        """Apply observations of checkpoint `newest`, drop entries by age (`created`: export times) and regret, and
+        drop waiting observations whose source shard is `solved`."""
+        self.waiting = {key: observed for key, observed in self.waiting.items() if not solved(key[0])}
         for key, e in list(self.entries.items()):
             seen = e.get('observed', {}).get(newest)
             if seen:
@@ -222,7 +232,8 @@ class RestartBuffer:
 
     def save(self):
         entries = sorted(self.entries.values(), key=lambda e: (-e['regret'], self.key(e)))
-        write_json(self.path, dict(updated_at=time.time(), entries=entries))
+        write_json(self.path, dict(updated_at=time.time(), entries=entries,
+                                   waiting=[[list(key), observed] for key, observed in sorted(self.waiting.items())]))
 
     def summary(self):
         values = [e['regret'] for e in self.entries.values()]
@@ -384,7 +395,7 @@ class Pass:
     def refresh(self):
         """RestartBuffer.refresh against the variant's exports, then save the buffer."""
         created, newest = exports(self.run, self.variant)
-        self.buffer.refresh(created, newest)
+        self.buffer.refresh(created, newest, lambda shard: (self.out/'shards'/shard/dense_data.SIDECAR).exists())
         self.buffer.save()
         self.refreshed = self.clock()
 
@@ -464,8 +475,8 @@ class Pass:
 
     def loop(self, limit=None, once=False, sleep=time.sleep):
         """Refresh the buffer, then run step() every second while there is work and every poll_seconds otherwise,
-        refreshing every refresh_minutes; return once nothing is pending or running with `once`. Workers still
-        running when it ends are stopped."""
+        refreshing every refresh_minutes; with `once`, refresh again and return once nothing is pending or running.
+        Workers still running when it ends are stopped."""
         self.refresh()
         try:
             while True:
@@ -474,6 +485,7 @@ class Pass:
                 if self.step(limit):
                     sleep(1.)
                 elif once:
+                    self.refresh()
                     return
                 else:
                     sleep(self.s.poll_seconds)

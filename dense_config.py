@@ -4,7 +4,7 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
   config.json                          RunConfig, written once; the single source of settings for every process
   shards/<name>/                       immutable self-play shards (format in dense_data); names sort oldest first;
                                        shards/<name>/proofs.jsonl is the proof pass's sidecar (dense_solve)
-  restarts.json                        {updated_at, entries}: the restart buffer of the proof pass (dense_solve),
+  restarts.json                        {updated_at, entries, waiting}: the restart buffer of the proof pass (dense_solve),
                                        highest regret first; actors draw restart positions from it
   solver-status.json                   proof pass heartbeat and counters (dense_solve), rewritten after every shard
   checkpoints/<variant>/<step:06d>/    model.pt, ema.pt, optimizer.pt, manifest.json (dense_learn); complete once

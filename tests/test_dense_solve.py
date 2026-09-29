@@ -318,6 +318,27 @@ class RestartBufferTests(unittest.TestCase):
             buffer.refresh([5., 15., 25., 35., 45.], 'main/000040')
             self.assertEqual(buffer.entries, {})
 
+    def test_observations_wait_for_their_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            buffer = dense_solve.RestartBuffer(Path(tmp)/'restarts.json', 10, 2, .1)
+            buffer.observe(('s', 0, 1, 'attack'), 'main/000030', .6, '0003')
+            buffer.observe(('t', 0, 1, 'attack'), 'main/000030', .6, '0003')
+            buffer.save()
+            buffer = dense_solve.RestartBuffer(Path(tmp)/'restarts.json', 10, 2, .1)
+            buffer.add(self.entry(1, -.5))
+            self.assertEqual(buffer.entries['s', 0, 1, 'attack']['observed'], {'main/000030': dict(value=.6, shard='0003')})
+            self.assertEqual(list(buffer.waiting), [('t', 0, 1, 'attack')])
+            buffer.refresh([], 'main/000030', solved=lambda shard: shard == 't')
+            self.assertEqual((buffer.waiting, round(buffer.entries['s', 0, 1, 'attack']['regret'], 9)), ({}, .2))
+
+    def test_one_shot_pass_refreshes_after_its_last_shard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = new_run(Path(tmp)/'run')
+            coordinator = dense_solve.Pass(run, run, SMALL)
+            with unittest.mock.patch.object(coordinator, 'refresh') as refresh:
+                coordinator.loop(once=True)
+            self.assertEqual(refresh.call_count, 2)
+
     def test_exports_count_the_learner_variant(self):
         with tempfile.TemporaryDirectory() as tmp:
             for cid, created in (('main/000010', 1.), ('main/000020', 2.), ('wide/000030', 3.)):
