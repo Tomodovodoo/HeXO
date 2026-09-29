@@ -1177,13 +1177,14 @@ class Evaluator:
         pair is persisted at once. For a checkpoint trial, a newer export or settle request stops new games after
         the next finished game; games already in flight drain normally."""
         pool, waiting, added, failed = Pool(self.config.actor.leaf_batch, Schedule.of(self.settings)), {}, {}, {}
-        placed = 0
+        placed, completed, shown_completed = 0, 0, 0
         start, wall = self.pacer.clock(), time.time()
         lanes = want()
         stopping = False
         shown = dict(lanes)
 
         def show(stage, force=False):
+            nonlocal shown_completed
             if not force and time.monotonic()-self.written < STATUS_SECONDS:
                 return  # the tally is computed only for a write
             main = next(iter(shown), None)
@@ -1194,11 +1195,13 @@ class Evaluator:
             live = placed+pool.moves()
             score = tally(done, self.test if kind in ('champion', 'sprt') else None)
             decision = self.status['decision']
-            if decision and (decision['candidate'], decision['opponent']) == (a, b) and decision['direct']['games'] != score['games']:
+            if decision and (decision['candidate'], decision['opponent']) == (a, b) and \
+                    (decision['direct']['games'] != score['games'] or completed != shown_completed):
                 current = public(self.verdict(a, b))
                 direct = dict(current['direct'], games=score['games'], wins=score['wins'], losses=score['losses'],
                               capped=score['capped'], elo=score['elo_delta'], interval=score['elo_interval'])
                 decision = decision | current | dict(decision=decision['decision'], direct=direct)
+                shown_completed = completed
             self.publish(True, stage=stage, comparison=dict(candidate=a, opponent=b, kind=kind) if a else None,
                          pool=[dict(candidate=x, opponent=y, kind=k, running=pool.running((x, y, k)), share=lanes.get((x, y, k), 0))
                                for x, y, k in shown], started_at=wall, games_played=played, games_planned=planned,
@@ -1255,6 +1258,7 @@ class Evaluator:
                                       f'{failed[lane]} failed pairs', candidate=lane[0], opponent=SEAL)
                     else:
                         self.persist(*lane, sorted(group, key=lambda r: r['challenger_color']))
+                        completed += 1
                         count = added.setdefault(lane, [0, 0])
                         count[0] += 2
                         count[1] += sum(game['plies']-len(game['opening']) for game in group)
