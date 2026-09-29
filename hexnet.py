@@ -529,7 +529,7 @@ class DenseEvaluator:
     in native legal order, 'logits' float32 [N], 'q' float32 [N] (V(s) broadcast),
     'player', 'remaining' and 'model_version'.
     """
-    def __init__(self, model, device='cuda', model_version=None, max_batch=512):
+    def __init__(self, model, device='cuda', model_version=None, max_batch=512, cuda_graphs=False):
         model = copy.deepcopy(model).requires_grad_(False)
         self.model_version = model_version or model_digest(model)
         self.device = torch.device(device)
@@ -538,6 +538,14 @@ class DenseEvaluator:
         self.model = model.to(self.device, memory_format=self.memory_format).eval()
         self.max_batch = max_batch
         self.staging = {}
+        self.graph = None
+        if cuda_graphs and self.cuda:
+            from hexnet_graphs import ActorGraph
+            self.graph = ActorGraph(self.model)
+
+    def predict(self, planes):
+        with torch.autocast(self.device.type, torch.bfloat16, enabled=self.cuda):
+            return self.graph(planes) if self.graph is not None else self.model(planes, planes[:, 3:4], aux=False)
 
     @torch.inference_mode()
     def evaluate(self, histories):
@@ -550,8 +558,7 @@ class DenseEvaluator:
                 np.stack([samples[i].planes for i in chunk], out=host.numpy())
                 x = host.to(self.device, non_blocking=True)
                 x = x.to(memory_format=self.memory_format, dtype=torch.bfloat16 if self.cuda else torch.float32)
-                with torch.autocast(self.device.type, torch.bfloat16, enabled=self.cuda):
-                    out = self.model(x, x[:, 3:4], aux=False)
+                out = self.predict(x)
                 packed = torch.cat((out['policy'], out['far'][:, None], out['value_logit'][:, None]), 1).cpu().numpy()
                 if not np.isfinite(packed).all():
                     raise FloatingPointError('Nonfinite dense model predictions')

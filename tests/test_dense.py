@@ -711,6 +711,33 @@ class FusedCudaTests(unittest.TestCase):
         self.assertLessEqual(float((a-b).abs().max()), tolerance*float(a.abs().max())+1e-4)
 
     @torch.inference_mode()
+    def test_actor_graph_outputs_survive_other_replays(self):
+        from hexnet_graphs import ActorGraph
+        torch.manual_seed(3070)
+        model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
+        runner = ActorGraph(model)
+        inputs, outputs, saved = [], [], []
+        for rows, side in ((19, 24), (7, 32)):
+            x = torch.randint(0, 2, (rows, 8, side, side), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
+            x[:, 3] = 1
+            with torch.autocast('cuda', torch.bfloat16):
+                expected = model(x, x[:, 3:4], aux=False)
+            out = runner(x)
+            for name in expected:
+                self.assert_bf16_close(expected[name], out[name])
+            inputs.append(x)
+            outputs.append(out)
+            saved.append({name: value.clone() for name, value in out.items()})
+        for i in reversed(range(len(inputs))):
+            out = runner(inputs[i])
+            for name in out:
+                torch.testing.assert_close(out[name], saved[i][name], rtol=0, atol=0)
+        for out, snapshot in zip(outputs, saved):
+            for name in out:
+                torch.testing.assert_close(out[name], snapshot[name], rtol=0, atol=0)
+        runner.close()
+
+    @torch.inference_mode()
     def test_actor_shapes_reuse_compiled_kernels(self):
         import hexnet_kernels as kernels
         torch.manual_seed(3070)
@@ -875,15 +902,20 @@ class DenseConfigTests(unittest.TestCase):
 
     def test_net_kernels_are_opt_in_and_reach_actor_workers(self):
         self.assertEqual(dense_config.ActorSettings().net_kernels, 'reference')
+        self.assertFalse(dense_config.ActorSettings().cuda_graphs)
         parser = argparse.ArgumentParser()
         dense_config.add_arguments(parser, dense_config.ActorSettings)
-        args = parser.parse_args(['--net-kernels', 'fused'])
+        args = parser.parse_args(['--net-kernels', 'fused', '--cuda-graphs'])
         actor = dense_config.override(dense_config.ActorSettings(), args)
         self.assertEqual(actor.net_kernels, 'fused')
         self.assertIn('--net-kernels', dense_selfplay.actor_flags(args))
         self.assertIn('fused', dense_selfplay.actor_flags(args))
+        self.assertTrue(actor.cuda_graphs)
+        self.assertIn('--cuda-graphs', dense_selfplay.actor_flags(args))
         with self.assertRaises(ValueError):
             replace(actor, net_kernels='unknown')
+        with self.assertRaises(ValueError):
+            replace(actor, net_kernels='reference')
 
     def test_pages_serve_from_step_control(self):
         """The project page and a dense run page carry the "from step" header control."""
@@ -2950,6 +2982,21 @@ class EvaluatorSearchTests(unittest.TestCase):
         self.assertEqual(len(evaluator.free), 2)
         self.assertEqual({k: v.data_ptr() for k, v in staging.items()}, pointers)
 
+    def test_graph_fallback_keeps_large_canvas_transfers_bounded(self):
+        from hexnet_graphs import ActorGraph
+        evaluator = dense_selfplay.Evaluator(self.model, 'cpu', 'tiny', 256)
+        shapes = []
+        def predict(planes):
+            shapes.append(tuple(planes.shape))
+            b, _, h, w = planes.shape
+            return dict(policy=torch.zeros(b, h*w), far=torch.zeros(b), value_logit=torch.zeros(b))
+        evaluator.graph = unittest.mock.Mock(CANVASES=ActorGraph.CANVASES, side_effect=predict)
+        sample = SimpleNamespace(size=256, planes=np.zeros((8, 256, 256), np.uint8))
+        histories = [np.empty((0, 2), np.int64)]*3
+        with unittest.mock.patch.object(hexcrop, 'encode_game', return_value=sample):
+            evaluator.submit(histories)
+        self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
+
     def test_native_search_returns_legal_actions_in_native_order(self):
         for history in (POSITIONS[12], [(0, 0)], line_history(31)):
             search = NeuralSearch(self.evaluator, self.evaluator.model_version, history=history, seed=1)
@@ -3424,6 +3471,17 @@ class ActorModelTests(unittest.TestCase):
 
     def pick(self, source):
         return dense_selfplay.resolve(self.run, None, source, 'main')[0]
+
+    def test_historical_models_do_not_capture_graphs(self):
+        self.export('main/000010', 1.)
+        path = self.run/'checkpoints/main/000010/ema.pt'
+        config = replace(dense_config.RunConfig(), device='cpu',
+                         actor=dense_config.ActorSettings(net_kernels='fused', cuda_graphs=True))
+        with unittest.mock.patch.object(dense_selfplay, 'Model') as construct:
+            dense_selfplay.load(self.run, config)
+            self.assertTrue(construct.call_args.kwargs['cuda_graphs'])
+            dense_selfplay.load(self.run, config, source=('main/000010', path))
+            self.assertFalse(construct.call_args.kwargs['cuda_graphs'])
 
     def test_sources(self):
         self.assertEqual(dense_config.ActorSettings().model_source, 'newest_veto')

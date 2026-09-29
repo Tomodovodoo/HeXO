@@ -95,7 +95,7 @@ def trace_summary(path):
     events = json.loads(path.read_text())['traceEvents']
     kernels = [e for e in events if e.get('cat') == 'kernel']
     runtime = [e for e in events if e.get('cat') in ('cuda_runtime', 'cuda_driver')]
-    launch = [e for e in runtime if 'LaunchKernel' in e['name']]
+    launch = [e for e in runtime if 'LaunchKernel' in e['name'] or 'GraphLaunch' in e['name']]
     grouped = defaultdict(lambda: [0, 0.])
     for e in kernels:
         grouped[e['name']][0] += 1
@@ -120,6 +120,7 @@ def trace_summary(path):
     copies = [e for e in events if e.get('cat') == 'gpu_memcpy' and 'HtoD' in e['name']]
     return dict(kernel_count=len(kernels), kernel_ms=sum(e['dur'] for e in kernels)/1000,
                 launch_calls=len(launch), launch_cpu_ms=sum(e['dur'] for e in launch)/1000,
+                graph_launch_calls=sum('GraphLaunch' in e['name'] for e in launch),
                 sync_cpu_ms=sum(e['dur'] for e in runtime if 'Synchronize' in e['name'])/1000,
                 conv_gemm_flops=flops, h2d_bytes=sum(e['args']['bytes'] for e in copies),
                 h2d_ms=sum(e['dur'] for e in copies)/1000,
@@ -140,10 +141,19 @@ def measure(args):
     report = dict(mode=args.mode, rows=args.batch, torch=torch.__version__,
                   gpu=torch.cuda.get_device_name(), fraction=torch.cuda.get_per_process_memory_fraction(),
                   shapes={s:list(b['planes'].shape) for s,b in batch.items()})
-    models = {mode:hexnet.load_model(args.output/'model.pt', device=device, net_kernels=mode) for mode in args.kernels}
-    formats = {mode:torch.channels_last if args.mode == 'eval' and mode == 'fused' else fmt for mode in models}
+    if 'graphs' in args.kernels and args.mode != 'eval':
+        raise ValueError('graphs is an inference-only comparison mode')
+    models = {mode:hexnet.load_model(args.output/'model.pt', device=device,
+                                   net_kernels='fused' if mode == 'graphs' else mode) for mode in args.kernels}
+    formats = {mode:torch.channels_last if args.mode == 'eval' and mode != 'reference' else fmt for mode in models}
     for mode, model in models.items():
         model.to(memory_format=formats[mode])
+        if args.mode == 'eval':
+            model.eval().requires_grad_(False)
+    graphs = {}
+    if 'graphs' in models:
+        from hexnet_graphs import ActorGraph
+        graphs['graphs'] = ActorGraph(models['graphs'])
     optim = {m:torch.optim.AdamW(model.parameters(), lr=.0003, fused=True) for m,model in models.items()} if args.mode == 'train' else {}
     ema = {m:copy.deepcopy(model) for m,model in models.items()} if args.mode == 'train' else {}
     coeff = torch.tensor([1.,1.5,.5,.15,.5,0.], device=device)
@@ -171,8 +181,11 @@ def measure(args):
             model.eval()
             with torch.inference_mode(), torch.autocast('cuda', torch.bfloat16):
                 for x in inputs[mode]:
-                    for part in x.split(max(1,110592//x.shape[-1]**2)):
-                        model(part, part[:,3:4], aux=False)
+                    if mode in graphs:
+                        graphs[mode](x)
+                    else:
+                        for part in x.split(max(1,110592//x.shape[-1]**2)):
+                            model(part, part[:,3:4], aux=False)
 
     try:
         for mode in models:
@@ -187,7 +200,7 @@ def measure(args):
         medians = {m:statistics.median(v) for m,v in times.items()}
         report.update(seconds=times, median_seconds=medians, rows_per_second={m:args.batch/v for m,v in medians.items()})
         if len(medians) == 2:
-            report['speedup'] = medians['reference']/medians['fused']
+            report['speedup'] = medians[args.kernels[0]]/medians[args.kernels[1]]
         (args.output/f'comparison-{args.mode}-{args.batch}.json').write_text(json.dumps(report,indent=2))
         if args.profile:
             report['profiles'] = {}
@@ -203,6 +216,9 @@ def measure(args):
         report['oom'] = str(error)
     report.update(peak_allocated_mib=torch.cuda.max_memory_allocated()/2**20,
                   peak_reserved_mib=torch.cuda.max_memory_reserved()/2**20)
+    for mode, graph in graphs.items():
+        report[mode+'_reserved_mib'] = graph.incremental_reserved_bytes/2**20
+        graph.close()
     return report
 
 
@@ -258,7 +274,7 @@ def main():
     parser.add_argument('--shards',nargs='+')
     parser.add_argument('--seed',type=int,default=3070)
     parser.add_argument('--batch',type=int,choices=[16,32,64,128,256],default=256)
-    parser.add_argument('--kernels',choices=['reference','fused'],nargs='+',default=['reference','fused'])
+    parser.add_argument('--kernels',choices=['reference','fused','graphs'],nargs='+',default=['reference','fused'])
     parser.add_argument('--profile',action='store_true')
     parser.add_argument('--repeats',type=int,choices=[1,2,3],default=3)
     parser.add_argument('--worker',action='store_true',help=argparse.SUPPRESS)
