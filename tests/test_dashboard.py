@@ -47,7 +47,7 @@ class OpeningBookPages(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.run = Path(self.tmp.name)/'synthetic'
         self.run.mkdir()
-        self.write(self.run/'config.json', dict(schema=dense_config.SCHEMA))
+        self.write(self.run/'config.json', dict(schema=dense_config.SCHEMA, evaluation=dict(opening_suite='book')))
         self.a = [[0, 0], [1, 0], [0, 2]]
         self.b = [[0, 0], [2, 0], [0, 3]]
         specs = [([[0, 0]], None, 12, 3, 5, None, None),
@@ -152,8 +152,10 @@ class OpeningBookPages(unittest.TestCase):
 
     def test_cache_invalidates_on_report_book_and_directory_changes(self):
         first = dashboard.book_rows(self.run)
-        with patch.object(dashboard, 'read_json', side_effect=AssertionError('cache reread')):
+        with patch.object(dashboard, 'read_json', wraps=dashboard.read_json) as reader:
             self.assertIs(dashboard.book_rows(self.run), first)
+            self.assertFalse(any(call.args[0] == self.run/'openings.json' or call.args[0] in
+                                 (self.run/'evaluations').glob('*/report*.json') for call in reader.call_args_list))
         folder = self.run/'evaluations'
         folder_stat = folder.stat()
         data = json.loads(self.report.read_text())
@@ -172,6 +174,26 @@ class OpeningBookPages(unittest.TestCase):
         self.assertEqual(self.get(key=self.nodes[1]['key'])['rows'][0]['report_games'], 7)
         self.report.unlink()
         self.assertEqual(self.get(key=self.nodes[1]['key'])['rows'][0]['report_games'], 3)
+
+    def test_default_frozen_suite_and_effective_evaluator_override(self):
+        self.write(self.run/'config.json', dict(schema=dense_config.SCHEMA))
+        self.write(self.run/'openings-standard-v1.json', dict(nodes=[self.nodes[1]]))
+        rows = self.get()['rows']
+        self.assertEqual([row['key'] for row in rows], [self.nodes[1]['key']])
+        self.assertEqual(rows[0]['report_games'], 6)
+        self.assertEqual(len(self.get('/api/book/dag')['nodes']), 1)
+        self.write(self.run/'evaluator-status.json', dict(settings=dict(opening_suite='book')))
+        self.assertEqual(self.get()['total'], 5)
+        self.assertEqual(len(self.get('/api/book/dag')['nodes']), 5)
+        (self.run/'evaluator-status.json').unlink()
+        self.write(self.run/'config.json', dict(schema=dense_config.SCHEMA, evaluation=dict(opening_suite='custom')))
+        self.write(self.run/'openings-custom.json', dict(nodes=[self.nodes[2]]))
+        self.write(self.run/'evaluations/custom/report.json', dict(settings=dict(opening_suite='custom'),
+                   games=[dict(opening=self.b, plies=9, winner=1, pair=0, reason='win')]))
+        rows = self.get()['rows']
+        self.assertEqual([row['key'] for row in rows], [self.nodes[2]['key']])
+        self.assertEqual(rows[0]['report_games'], 1)
+        self.assertEqual(rows[0]['median_plies'], 9)
 
     def test_dag_payload_and_request_validation(self):
         nodes = self.get('/api/book/dag')['nodes']

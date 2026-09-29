@@ -555,11 +555,15 @@ def book_rows(run):
     Archives belong here because book counters retain games across protocol refreshes.
     """
     run = Path(run)
-    book = run/'openings.json'
+    config = read_json(run/'config.json', {})
+    evaluator = read_json(run/'evaluator-status.json', {})
+    suite = evaluator.get('settings', {}).get('opening_suite') or config.get('evaluation', {}).get(
+        'opening_suite', dense_config.EvaluationSettings.opening_suite)
+    book = dense_openings.book_path(run, suite)
     folder = run/'evaluations'
     paths = sorted(folder.glob('*/report*.json'))
     stamp = lambda path: (path.stat().st_mtime_ns, path.stat().st_size) if path.exists() else None
-    revision = (stamp(book), stamp(folder), tuple((str(p), stamp(p)) for p in paths))
+    revision = (str(book), stamp(book), stamp(folder), tuple((str(p), stamp(p)) for p in paths))
     cached = _book_cache.get(run)
     if cached and cached[0] == revision:
         return cached[1]
@@ -567,7 +571,11 @@ def book_rows(run):
     lengths = {node['key']: [] for node in nodes}
     matched = {}
     for path in paths:
-        for game in read_json(path, {}).get('games', []):
+        report = read_json(path, {})
+        if suite != dense_openings.LIVE and report.get('settings', {}).get(
+                'opening_suite', dense_config.EvaluationSettings.opening_suite) != suite:
+            continue
+        for game in report.get('games', []):
             moves = tuple(map(tuple, game['opening']))
             if moves not in matched:
                 matched[moves] = [key for depth in range(1, len(moves)+1)
