@@ -374,8 +374,9 @@ def deblunder_row(row, winner, ranges):
 
 
 def proof_labels(path):
-    """{(game, ply): proof_action or None} for sidecar wins; None while the shard has no sidecar."""
-    return proof_annotations(path)[0]
+    """{(game, ply)} of sidecar wins; None while the shard has no sidecar."""
+    labels = proof_annotations(path)[0]
+    return None if labels is None else set(labels)
 
 
 def label(shard, labels):
