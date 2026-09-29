@@ -17,7 +17,10 @@ class DensePlayer:
         self.evaluator = self.prover = None
         self.checkpoint = None
         self.options = dict(search=True, simulations=128, solver=True, solver_nodes=32768)
-        self.select('main/065000')
+        available = self.models()
+        if not available:
+            raise ValueError('No playable dense exports found')
+        self.select(available[0]['id'])
 
     def models(self):
         labels = {'main/065000': '65k · champion', 'main/075000': '75k',

@@ -5669,6 +5669,15 @@ class DenseBrowser(unittest.TestCase):
         finally:
             game.close()
 
+    def test_startup_selects_an_available_export(self):
+        from play import DensePlayer
+        (self.run/'checkpoints/main/065000/ema.pt').unlink()
+        player = DensePlayer(self.run, 'cpu')
+        try:
+            self.assertEqual(player.checkpoint, 'main/075000')
+        finally:
+            player.close()
+
     def test_verified_line_replays_to_a_win_without_playing_the_game(self):
         history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (2, 5), (3, 5), (3, 0),
                    (-1, 3), (5, 5), (6, 5)]
