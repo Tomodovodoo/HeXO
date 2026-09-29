@@ -2,7 +2,7 @@
 
 A checkpoint holds model.pt (raw weights) and ema.pt (what actors play), both hexnet.save_model, optimizer.pt and
 manifest.json {variant, step, samples_seen, created_at, model_sha256, ema_sha256 (hexnet.model_digest), metrics,
-learner (effective LearnerSettings), model (ModelSettings), copied_from, pacing}. Events have source 'learner' and kind
+learner (effective LearnerSettings), model (ModelSettings), copied_from, rows, pacing}. Events have source 'learner' and kind
 export, info, error or replace. league.json is read for population replacement, never written. metrics/learner-
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
 falls on every tenth step) and one per export with validation_fields(metrics) of the manifest (Learner.export): EMA
@@ -376,7 +376,7 @@ class Learner:
         self.model = self.place(hexnet.HexNet(hexnet.HexNetConfig(**asdict(config.model))))
         self.step = self.samples_seen = self.optimizer_started = self.ema_updates = 0
         self.copied_from = None
-        self.pacing, self.pacing_per_row = dict(NO_BASE), self.settings.samples_per_row
+        self.pacing, self.pacing_per_row, self.resumed_rows = dict(NO_BASE), self.settings.samples_per_row, None
         if saved:
             self.resume(saved[-1], manifest)
         else:
@@ -435,17 +435,22 @@ class Learner:
         self.optimizer_started, self.ema_updates = state['optimizer_started'], state['ema_updates']
         self.copied_from = manifest.get('copied_from')
         self.pacing, self.pacing_per_row = dict(manifest.get('pacing', NO_BASE)), manifest['learner']['samples_per_row']
+        self.resumed_rows = manifest.get('rows')
         dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} resumed from step {self.step}', variant=self.settings.variant, step=self.step)
 
     def rebase(self, total_rows):
-        """Keep the pacing base {rows, samples} (self.pacing) tied to settings.samples_per_row: when the setting
-        differs from the one the base was set under (the resumed checkpoint's, or a replacement copy's), the base
-        becomes (total_rows, samples_seen) and an info event records both with the old and new setting."""
+        """Keep the pacing base {rows, samples} (self.pacing) tied to settings.samples_per_row; called before every
+        pacing check. When the setting differs from the one the base was set under (the resumed checkpoint's, or
+        a replacement copy's), the base becomes (rows, samples_seen) and an info event records both with the old
+        and new setting. rows is the resumed checkpoint's manifest rows on the first call after a resume (so
+        restarts from the same checkpoint agree on the base), else total_rows."""
         old, new = self.pacing_per_row, self.settings.samples_per_row
+        rows = total_rows if self.resumed_rows is None else self.resumed_rows
+        self.resumed_rows = None
         if old == new:
             return
-        self.pacing, self.pacing_per_row = dict(rows=total_rows, samples=self.samples_seen), new
-        dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} pacing base moved to {total_rows} rows, '
+        self.pacing, self.pacing_per_row = dict(rows=rows, samples=self.samples_seen), new
+        dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} pacing base moved to {rows} rows, '
               f'{self.samples_seen} samples: samples_per_row {old} -> {new}', variant=self.settings.variant, step=self.step,
               pacing=self.pacing, old_samples_per_row=old, new_samples_per_row=new)
 
@@ -624,7 +629,7 @@ class Learner:
         The value target map is refitted first (calibrate; metrics.calibration), then the EMA is recalibrated;
         metrics.validation is validate(window) (the HEADS; null without held-out rows in the window) and
         metrics.validation_sources is validate_sources(sets) (null without `sets`). The cache is released after
-        these passes."""
+        these passes. rows is window.total_rows and pacing the pacing base (rebase)."""
         s = self.settings
         root = self.run/'checkpoints'/s.variant
         root.mkdir(parents=True, exist_ok=True)
@@ -645,7 +650,7 @@ class Learner:
                         metrics=dict(self.metrics or {h: None for h in HEADS}, validation=validation, validation_sources=sources,
                                      calibration=self.calibration_report),
                         learner=asdict(s), model=asdict(self.config.model), copied_from=self.copied_from,
-                        pacing=self.pacing)
+                        rows=window.total_rows, pacing=self.pacing)
         write_json(stage/'manifest.json', manifest)
         stage.rename(final)
         self.last_export = self.step

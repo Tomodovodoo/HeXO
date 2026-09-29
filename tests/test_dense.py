@@ -1493,7 +1493,7 @@ class ValidationSourceTests(unittest.TestCase):
             sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=6)
             manifest = learner.export(window, sets)
             self.assertEqual(set(manifest), {'variant', 'step', 'samples_seen', 'created_at', 'model_sha256', 'ema_sha256',
-                                             'metrics', 'learner', 'model', 'copied_from', 'pacing'})
+                                             'metrics', 'learner', 'model', 'copied_from', 'rows', 'pacing'})
             aggregate, v = manifest['metrics']['validation'], manifest['metrics']['validation_sources']
             self.assertEqual(v['newest_checkpoint'], 'main/000010')
             for h in ('policy_ce', 'value_bce', 'opponent_ce', 'future_bce'):
@@ -2203,29 +2203,37 @@ class PhaseTests(unittest.TestCase):
             window = dense_data.ReplayWindow(run, 1000, 10)
             first = dense_learn.Learner(run, config.learner, config)
             first.samples_seen = 5000
-            self.assertEqual(first.export(window)['pacing'], dict(rows=0, samples=0))
+            manifest = first.export(window)
+            rows = window.total_rows
+            self.assertEqual((manifest['rows'], manifest['pacing']), (rows, dict(rows=0, samples=0)))
             same = dense_learn.Learner(run, config.learner, config)
-            same.rebase(1000)
+            same.rebase(rows+100)
             self.assertEqual(same.pacing, dict(rows=0, samples=0))
             events = lambda: [e for e in map(json.loads, (run/'events.jsonl').read_text().splitlines()) if 'pacing' in e]
             self.assertEqual(events(), [])
-            lower = dense_learn.Learner(run, config.learner, config, overrides=dict(samples_per_row=3.))
-            lower.rebase(1000)
-            self.assertEqual(lower.pacing, dict(rows=1000, samples=5000))
-            self.assertLess(dense_learn.backlog(5000, 1000, 4.), 0)
-            self.assertEqual(dense_learn.backlog(5000, 1000, 3., lower.pacing), 0)
-            self.assertEqual(dense_learn.backlog(5000, 1010, 3., lower.pacing), 10)
-            [event] = events()
+            # The base is the checkpoint's rows, whatever arrived before each restart that did not export.
+            for arrived in (100, 300):
+                lower = dense_learn.Learner(run, config.learner, config, overrides=dict(samples_per_row=3.))
+                lower.rebase(rows+arrived)
+                self.assertEqual(lower.pacing, dict(rows=rows, samples=5000))
+                self.assertLess(dense_learn.backlog(5000, rows+arrived, 4.), 0)
+                self.assertEqual(dense_learn.backlog(5000, rows+arrived, 3., lower.pacing), arrived)
+            event = events()[-1]
             self.assertEqual((event['pacing'], event['old_samples_per_row'], event['new_samples_per_row']),
-                             (dict(rows=1000, samples=5000), 4., 3.))
-            lower.rebase(1200)
-            self.assertEqual(lower.pacing, dict(rows=1000, samples=5000))
+                             (dict(rows=rows, samples=5000), 4., 3.))
+            lower.rebase(rows+500)
+            self.assertEqual(lower.pacing, dict(rows=rows, samples=5000))
+            lower.settings = replace(lower.settings, samples_per_row=2.)  # a replacement copy's setting
+            lower.rebase(rows+500)
+            self.assertEqual(lower.pacing, dict(rows=rows+500, samples=5000))
+            lower.settings = replace(lower.settings, samples_per_row=3.)
+            lower.rebase(rows+500)
             lower.step = 1
-            self.assertEqual(lower.export(window)['pacing'], dict(rows=1000, samples=5000))
+            self.assertEqual(lower.export(window)['pacing'], dict(rows=rows+500, samples=5000))
             kept = dense_learn.Learner(run, config.learner, config, overrides=dict(samples_per_row=3.))
-            kept.rebase(1500)
-            self.assertEqual(kept.pacing, dict(rows=1000, samples=5000))
-            self.assertEqual(len(events()), 1)
+            kept.rebase(rows+900)
+            self.assertEqual(kept.pacing, dict(rows=rows+500, samples=5000))
+            self.assertEqual(len(events()), 4)
 
     def test_manifests_without_a_pacing_base_pace_from_zero(self):
         torch.set_num_threads(2)
@@ -2239,12 +2247,15 @@ class PhaseTests(unittest.TestCase):
             learner.export(dense_data.ReplayWindow(run, 1000, 10))
             path = run/'checkpoints'/'main'/'000000'/'manifest.json'
             manifest = json.loads(path.read_text())
-            del manifest['pacing']
+            del manifest['pacing'], manifest['rows']
             path.write_text(json.dumps(manifest))
             resumed = dense_learn.Learner(run, config.learner, config)
             resumed.rebase(1000)
             self.assertEqual(resumed.pacing, dense_learn.NO_BASE)
             self.assertEqual(dense_learn.backlog(5000, 1000, 4., resumed.pacing), dense_learn.backlog(5000, 1000, 4.))
+            lower = dense_learn.Learner(run, config.learner, config, overrides=dict(samples_per_row=3.))
+            lower.rebase(1000)  # no manifest rows: the rows at the rebase
+            self.assertEqual(lower.pacing, dict(rows=1000, samples=5000))
 
     def simulate(self, phase_rows, ticks, arrivals=90, batch=256, per_row=4., rows=0, seen=0):
         """One tick: the learner takes one batch if Phase says so and the pacing allows it, otherwise actors
