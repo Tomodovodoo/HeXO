@@ -355,6 +355,9 @@ class Scheduler(unittest.TestCase):
         solver.tick(10., 5.)
         self.assertEqual(solver.allocate('finalist', NODES)[0], 512)
         self.assertEqual(solver.allocate('threat', NODES)[:2], (NODES, None))
+        solver.leads['deep'].extend([5000.]*8)
+        solver.tick(10., 5.)
+        self.assertEqual(solver.allocate('deep', 2000)[1]['floor'], 2000)   # below the gate a deep query keeps its minimum
         fixed = dense_solver.Solver(Schedule(gate_weight=3.), asynchronous=False)
         fixed.leads['root'].extend([5000.]*8)
         self.assertEqual(fixed.allocate('root', NODES)[:2],

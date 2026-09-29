@@ -31,13 +31,13 @@ measured slack and verdicts are polled:
              in nodes at the pool's measured rate (the RATE_QUANTILE of recent queries, at most RATE), clamped
              to [min_nodes, cap_nodes]; `lead` is the LEAD_QUANTILE of the measured times from submission to the
              first consumption attempt of that point, refreshed every step (before any was measured: the Engine's
-             step time, DEEP_LEAD_MS for deep queries). Threat
-             queries keep their fixed budget. Deep queries run on their own idle-priority worker with its own ledger,
-             are skipped while their allowance is below deep_nodes, and are capped at deep_cap_nodes.
+             step time, DEEP_LEAD_MS for deep queries). Threat queries keep their fixed budget. Deep queries run
+             on their own idle-priority worker with its own ledger, are skipped while their allowance is below
+             deep_nodes, and are capped at deep_cap_nodes.
   gate       with gate_weight > 0 the worker scores the attacker's forcing material (tactical_proof gate): below
-             forcing_material.LOW the query gets min_nodes, else its allowance times (1 + gate_weight * g), capped by
-             cap_nodes rising linearly to gate_cap_nodes at g = 1 (fixed mode: floor and caps are the point budget
-             and unbounded, so only the multiplier applies).
+             forcing_material.LOW the query gets min_nodes (deep queries: deep_nodes), else its allowance times
+             (1 + gate_weight * g), capped by cap_nodes rising linearly to gate_cap_nodes at g = 1 (fixed mode:
+             floor and caps are the point budget and unbounded, so only the multiplier applies).
   consume    a root or finalist verdict not ready when needed may be waited for up to the step's overrun allowance,
              overrun_fraction of the measured step time; past it the slot is deferred to its next visit while the
              other games build the batch. After DEFER_VISITS deferrals the search goes on without it (finalist hold
@@ -319,7 +319,8 @@ class Solver:
         if deep and nodes_free < nodes:
             return None, None, pool
         budget = int(min(cap, max(sc.min_nodes, nodes_free)))
-        gate = dict(weight=sc.gate_weight, floor=sc.min_nodes, cap_low=cap, cap_high=high) if sc.gate_weight else None
+        floor = nodes if deep else sc.min_nodes
+        gate = dict(weight=sc.gate_weight, floor=floor, cap_low=cap, cap_high=high) if sc.gate_weight else None
         return budget, gate, pool
 
     def submit(self, point, history, attacker, nodes, root_moves=None):
