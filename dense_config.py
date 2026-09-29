@@ -102,6 +102,26 @@ class ActorSettings:
     solver_finalist_nodes: int = 0
     solver_threat_nodes: int = 0
     solver_async: bool = True
+    # Scheduling of those queries (dense_solver.Schedule). solver_fixed_budgets: every query spends its point's fixed
+    # budget and every verdict is awaited (reproducible; evaluation always runs this way). Off: budgets follow the
+    # measured slack (solver_slack_fraction of each point's lead time less GUARD_MS, net of queued work), clamped to
+    # [solver_min_nodes, solver_cap_nodes]; with solver_gate_weight > 0 forcing material scales them by
+    # 1 + weight * g up to solver_gate_cap_nodes; a verdict may cost the loop solver_overrun_fraction of the step
+    # time in waits before its game is deferred. solver_workers: foreground worker processes. solver_follow: a side
+    # with a proof plays its certificate and every proof labels the rows it decides; solver_deep_nodes (needs
+    # solver_follow): background proof of each committed turn, its fixed budget and adaptive minimum, adaptive cap
+    # solver_deep_cap_nodes, on one extra idle-priority worker.
+    solver_fixed_budgets: bool = True
+    solver_workers: int = 1
+    solver_slack_fraction: float = .8
+    solver_overrun_fraction: float = .05
+    solver_min_nodes: int = 32
+    solver_cap_nodes: int = 512
+    solver_gate_cap_nodes: int = 8192
+    solver_gate_weight: float = 0.
+    solver_deep_nodes: int = 0
+    solver_deep_cap_nodes: int = 65536
+    solver_follow: bool = False
     # Restarts (dense_selfplay.Restarts): a self-play game starts with probability restart_fraction from a position
     # of restarts.json, drawn with probability proportional to regret^(1/restart_temperature); 0 = never.
     restart_fraction: float = 0.

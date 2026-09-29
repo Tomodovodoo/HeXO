@@ -215,6 +215,47 @@ class FlippedTurnThreats(unittest.TestCase):
             tactics.close()
 
 
+class Gate(unittest.TestCase):
+    GATE = dict(weight=3., floor=32, cap_low=512, cap_high=8192)
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.engine = NativeTactics()
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+
+    def test_budget_follows_the_attackers_forcing_material(self):
+        strong = FIXTURE['positions']['1790600149713752:2:253']   # forcing material 19.5: gate level 1
+        result = self.engine.history(strong, nodes=135, gate=self.GATE)
+        self.assertEqual((result['status'], result['budget'], result['gate_score']), ('PROVEN_WIN', 540, 19.5))
+        self.assertLessEqual(result['nodes_used'], 540)
+        self.assertEqual(self.engine.history(strong, nodes=5000, gate=self.GATE)['budget'], 8192)
+        quiet = self.engine.history(NO_THREAT, nodes=135, gate=self.GATE)
+        self.assertEqual((quiet['budget'], quiet['gate_score']), (32, 0.))
+        plain = self.engine.history(strong, nodes=135)
+        self.assertEqual((plain['budget'], plain['gate_score']), (135, None))
+        # The opponent's material decides a flipped-turn query.
+        flipped = self.engine.history(TWO_TURN, nodes=135, attacker='opponent', gate=self.GATE)
+        self.assertGreater(flipped['gate_score'], self.engine.history(TWO_TURN, nodes=135, gate=self.GATE)['gate_score'])
+
+    def test_invalid_gates_are_rejected(self):
+        for gate in (dict(self.GATE, cap_low=9000), dict(self.GATE, floor=0), dict(self.GATE, weight=-1),
+                     dict(weight=1., floor=1)):
+            with self.assertRaises(ValueError):
+                self.engine.history(NO_THREAT, nodes=135, gate=gate)
+        with self.assertRaises(ValueError):
+            IsolatedTactics(priority='realtime')
+
+    def test_isolated_worker_gates_and_runs_at_its_priority(self):
+        tactics = IsolatedTactics(priority='idle')
+        try:
+            result = tactics.history(FIXTURE['positions']['1790600149713752:2:253'], nodes=135, gate=self.GATE)
+            self.assertEqual((result['status'], result['budget'], result['gate_score']), ('PROVEN_WIN', 540, 19.5))
+        finally:
+            tactics.close()
+
+
 class IndependentCheckerBounds(unittest.TestCase):
     def test_negative_index_and_shared_dag_expansion_rejected(self):
         with self.assertRaises(ValueError):

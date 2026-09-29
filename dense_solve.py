@@ -21,8 +21,8 @@ Positions and queries. A game's positions are plies start..T-1 (the position bef
 restart ply of a restart game, else 0). attack(t, nodes) asks whether the side to move at t has a forced win,
 threat(t, nodes) whether its opponent would have one moving now with a fresh turn (attacker 'opponent'). Budgets are
 node counts; SAFETY_MS is only a wall-clock cap. Only a native-verified PROVEN_WIN is a proof. A PROVEN_WIN without
-native verification, or an UNKNOWN whose reason is not the search's own, counts as a failure (status `failures`)
-and as no proof. A deterministic `verify_fraction` of proofs (by shard, game, ply, attacker and budget) is checked
+native verification, or an UNKNOWN whose reason is not a search verdict (dense_solver.VERDICTS), counts as a
+failure (status `failures`) and as no proof. A deterministic `verify_fraction` of proofs (by shard, game, ply, attacker and budget) is checked
 again by tactical_proof.independent_verify; a rejection logs an error event and ends the pass.
 
 Per game:
@@ -37,7 +37,7 @@ Per game:
   lookback      for each window of the game's winner, the loser's `lookback_turns` turn starts before the window's
                 first ply (latest first, at or after start) get threat(d, scan_nodes). When it is proven,
                 `saving_turns` lists the candidate turns of the loser at d after which attack(., saving_nodes) for
-                the winner is the search's own UNKNOWN (a failed query does not count): the unordered pairs of cells
+                the winner is a search verdict UNKNOWN (a failed query does not count): the unordered pairs of cells
                 empty at d among the threat's first turn and the first turn of the window's opening proof.
 Sidecar: one JSON line per window {game, first_ply, last_ply, mover, plies, proof_turns,
 budget (nodes of the first ply's proof), certificate_hash (sha256 of its certificate JSON),
@@ -79,7 +79,7 @@ import time
 import dense_config
 import dense_data
 from dense_data import player_at
-from dense_solver import SEARCHED
+from dense_solver import VERDICTS
 from forcing_material import worth_solving
 from hexo import Game
 from tactical_proof import PROVEN_WIN, IsolatedTactics, independent_verify
@@ -87,7 +87,7 @@ from train import write_json
 
 SAFETY_MS = 60000
 KINDS = ('solve', 'scan', 'threat', 'saving')
-FAILED = ()  # query result of a failure: no proof, and not the search's own UNKNOWN (None)
+FAILED = ()  # query result of a failure: no proof, and not a search verdict UNKNOWN (None)
 STALE_SECONDS = 120.  # older learner heartbeats are ignored by Pass.workers
 SWITCHES = 20
 STATUS_SECONDS = 5.
@@ -250,14 +250,14 @@ class Solver:
         self.stats = new_stats()
 
     def query(self, where, history, attacker, nodes, kind):
-        """(moves, proof_turns, certificate hash) of a native-verified proof, None for the search's own UNKNOWN, else
+        """(moves, proof_turns, certificate hash) of a native-verified proof, None for a search verdict UNKNOWN, else
         FAILED (module contract)."""
         result = self.tactics.history([list(p) for p in history], nodes=nodes, ms=SAFETY_MS, attacker=attacker)
         stats = self.stats['queries'][kind]
         stats['queries'] += 1
         stats['ms'] += float(result.get('elapsed_ms') or 0.)
         if result['status'] != PROVEN_WIN or not result.get('native_verified'):
-            if result['status'] == PROVEN_WIN or result.get('reason') != SEARCHED:
+            if result['status'] == PROVEN_WIN or result.get('reason') not in VERDICTS:
                 self.stats['failures'] += 1
                 self.stats['last_failure'] = result.get('reason')
                 return FAILED
