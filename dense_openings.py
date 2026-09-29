@@ -10,8 +10,9 @@ aggregate the games of its subtree along the paths played.
 Two kinds share one format and one code path (`Book`):
   live    opening_suite 'book', <run>/openings.json. `Book.refresh` (at every champion change and every
           book_refresh_hours) re-scores every opening under the champion, retires the implausible and the skewed
-          ones, settles contests, lets the champion challenge a random book_revisit_fraction of the settled openings
-          with an alternative at the same depth, and replaces retired openings until book_size are settled.
+          ones and nested children, settles contests, lets the champion challenge a random book_revisit_fraction of
+          the settled openings with an alternative at the same depth, and replaces retired openings until book_size
+          are settled.
   frozen  any other suite: the repo's openings/<suite>.json, drawn in proportion to each opening's `weight` and never
           refreshed; its statistics are kept in <run>/openings-<suite>.json. openings/standard-v1.json is
           train.opening_for's evaluation suite.
@@ -22,8 +23,8 @@ ordered by depth then key; counted maps `report_id` to the pairs of that report 
 node {key, moves, depth, weight (frozen openings), status, reason, challenges, probability, visit_share, checkpoint,
       created_at, retired_at, champion_probability, champion_value, scored_by, games, p1_wins, p2_wins, capped,
       plies_sum, plies_games, mean_plies, pairs, skew}:
-  status        'opening' (drawn), 'retired' (was an opening; `reason` 'probability', 'skew', 'short_skew' or 'replaced') or null (a
-                prefix, or a position imported from reports that never was an opening).
+  status        'opening' (drawn), 'retired' (was an opening; `reason` 'probability', 'skew', 'short_skew', 'nested' or
+                'replaced') or null (a prefix, or a position imported from reports that never was an opening).
   challenges    the key of the opening an open challenger competes with (null when settled).
   probability   `reach` policy probability of the node's class under `checkpoint`, the champion that made it an
                 opening, and visit_share the product of the search visit shares its generator sampled (`generate`);
@@ -62,7 +63,7 @@ GROW_ROUNDS = 8     # generation rounds per refresh while settled openings are m
 SCORE_BATCH = 512   # positions per policy call
 SKEW_EDGES = list(range(-200, 201, 25))  # histogram bins of `Book.stats`, the outer bins open-ended
 MAX_PLIES = 10      # longest book line: P2's sixth stone is the 11th placement, so no book position is terminal
-REASONS = ('probability', 'skew', 'short_skew', 'replaced')
+REASONS = ('probability', 'skew', 'short_skew', 'nested', 'replaced')
 
 
 def turns(moves):
@@ -459,7 +460,7 @@ class Book:
 
     def refresh(self, model, checkpoint, rng, now=None, leaf_batch=256):
         """Refresh a live book with the champion `model` (checkpoint id `checkpoint`), in order:
-        1. score every opening (`reach`) and retire each one `judge` rejects;
+        1. score every opening (`reach`), retire nested children, then retire each remaining one `judge` rejects;
         2. settle contests: once a challenger and the opening it challenges both have book_min_games pairs, the one
            of larger `worst` |skew| retires ('replaced'; the challenger on a tie) and the other is settled; a challenger
            whose opponent retired is settled;
@@ -468,7 +469,7 @@ class Book:
         4. while fewer than book_size openings are settled, add settled replacements: first the imported positions
            with pairs that no opening passes through (most pairs first; at least book_min_plies deep, plausible and
            free of either skew), then one child of every opening retired for skew in step 1 below book_plies, then fresh
-           openings from the origin (`generate`, up to GROW_ROUNDS rounds).
+           openings from the origin (`generate`, up to GROW_ROUNDS rounds, stopping when a round finds none).
         Writes the file; returns {digest, openings, challengers, retired {reason: count} of this refresh, added}."""
         if self.frozen:
             raise ValueError(f'The frozen suite {self.suite!r} is never refreshed')
@@ -478,9 +479,11 @@ class Book:
         self.score(model, checkpoint, openings)
         lengths = [n['mean_plies'] for n in openings if n.get('mean_plies') is not None]
         short_limit = float(np.quantile(lengths, s.book_short_quantile)) if lengths else None
+        active = {n['key'] for n in openings}
         extend = []
         for node in openings:
-            if reason := judge(node, s, short_limit):
+            nested = any(canonical(node['moves'][:d])[0] in active for d in range(1, node['depth']))
+            if reason := ('nested' if nested else judge(node, s, short_limit)):
                 self.retire(node, reason, now)
                 retired[reason] += 1
                 if reason in ('skew', 'short_skew') and node['depth'] < s.book_plies:
@@ -509,7 +512,10 @@ class Book:
         for _ in range(GROW_ROUNDS):
             if missing() <= 0:
                 break
-            added += self.generate(model, checkpoint, [([ORIGIN], s.book_min_plies, None)]*missing(), rng, now, leaf_batch)
+            grown = self.generate(model, checkpoint, [([ORIGIN], s.book_min_plies, None)]*missing(), rng, now, leaf_batch)
+            added += grown
+            if not grown:
+                break
         self.data.update(refreshed_by=checkpoint, refreshed_at=now)
         self.save()
         return dict(digest=self.digest(), openings=len(self.openings()),
@@ -540,7 +546,8 @@ class Book:
         the start's moves to book_plies (`continuations`); on each line the opening is the shortest prefix of at least
         `depth` placements (and longer than the start) whose position is not, and never was, an opening, was not
         taken by an earlier start and is plausible (policy probability at least book_min_prob); of the lines with
-        one, the shallowest wins, among equals the one whose value-head P1 expected score is nearest 1/2.
+        one, the shallowest wins, among equals the one whose value-head P1 expected score is nearest 1/2. A line
+        stops at an active opening, and candidates cannot be ancestors of one; a retired start can have a child.
         It records probability and visit_share (the product of the visit shares of the placements the search sampled
         after the start; null in policy mode). A challenger (third field set) competes with that opening: it is taken
         at exactly `depth` placements (a line whose position there is used is discarded, never extended), so the two
@@ -550,29 +557,39 @@ class Book:
             return 0
         starting = [m for m, _, _ in starts for _ in range(ALTERNATIVES)]
         lines, shares = continuations(model, starting, s, rng, leaf_batch)
+        active = self.openings()
+        occupied = {n['key'] for n in active}
+        covered = {canonical(n['moves'][:d])[0] for n in active for d in range(1, n['depth'])}
         prefixes = []  # per line: [(key, moves, visit share)] of the unused prefixes deep enough, shortest first
         for i, line in enumerate(lines):
             start, depth, challenged = starts[i//ALTERNATIVES]
             prefixes.append([])
+            keys = [canonical(line[:d])[0] for d in range(1, len(line)+1)]
+            blocked = next((d for d, key in enumerate(keys, 1) if key in occupied), len(line)+1)
             for d in [depth] if challenged else range(max(depth, len(start)+1), len(line)+1):
-                key, moves = canonical(line[:d])
-                if (self.nodes.get(key) or {}).get('status') is None:
+                if d >= blocked:
+                    break
+                key = keys[d-1]
+                if key not in covered and (self.nodes.get(key) or {}).get('status') is None:
+                    _, moves = canonical(line[:d])
                     gained = shares[i][:d-len(start)]
-                    prefixes[-1].append((key, moves, None if None in gained else math.prod(gained)))
-        flat = list({key: moves for options in prefixes for key, moves, _ in options}.items())
-        scores = dict(zip((key for key, _ in flat), reach(model, [moves for _, moves in flat])))
+                    prefixes[-1].append((key, moves, None if None in gained else math.prod(gained), keys[:d]))
+        flat = list({key: moves for options in prefixes for key, moves, _, _ in options}.items())
+        scores = dict(zip((key for key, _ in flat), reach(model, [moves for _, moves in flat]))) if flat else {}
         added, taken = 0, set()
         for k, (_, _, challenged) in enumerate(starts):
             fit = []
             for options in prefixes[k*ALTERNATIVES:(k+1)*ALTERNATIVES]:
-                key, moves, share = next((o for o in options if o[0] not in taken and scores[o[0]][0] >= s.book_min_prob),
-                                         (None, None, None))
+                key, moves, share, path = next((o for o in options if o[0] not in covered and
+                                                not any(p in taken for p in o[3]) and
+                                                scores[o[0]][0] >= s.book_min_prob), (None, None, None, None))
                 if key is not None:
-                    fit.append((len(moves), abs(scores[key][1]-.5), key, moves, share))
+                    fit.append((len(moves), abs(scores[key][1]-.5), key, moves, share, path))
             if not fit:
                 continue
-            *_, key, moves, share = min(fit, key=lambda f: f[:3])
+            *_, key, moves, share, path = min(fit, key=lambda f: f[:3])
             taken.add(key)
+            covered.update(path[:-1])
             node = self.add(moves, now)
             node.update(status='opening', challenges=challenged, probability=scores[key][0], visit_share=share,
                         checkpoint=checkpoint, created_at=now, champion_probability=scores[key][0],
