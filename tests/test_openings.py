@@ -748,8 +748,10 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertIsNone(evaluator.anchor())
         self.assertEqual(len(json.loads(path.read_text())['games']), 2)     # a new report under the current protocol
         self.assertEqual(len(list(path.parent.glob('report-*.json'))), 1)
-        self.assertEqual(json.loads((self.run/'league.json').read_text())['anchors']['seal']['games'], 4)
-
+        seal = json.loads((self.run/'league.json').read_text())['anchors']['seal']
+        self.assertEqual((seal['games'], [m['checkpoint'] for m in seal['matches']]), (4, [CHAMPION]))   # one entry, summed
+        self.assertEqual((seal['matches'][0]['games'], seal['matches'][0]['wins']), (4, 4))
+        self.assertAlmostEqual(seal['latest_delta'], 400*math.log10(4.5/.5))
     def test_a_reign_begun_before_pooling_moves_its_archives_into_the_baseline_once(self):
         self.export(10)
         evaluator = self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.)

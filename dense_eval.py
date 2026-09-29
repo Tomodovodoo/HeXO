@@ -92,7 +92,8 @@ league.json's only writer: `register` leaves a request in variant-requests/, whi
 `variants` (`adopt`).
 differences and ladder are [{a, b, elo_delta, interval}] over pairs of the variant heads and of the ladder_top
 (fill_top) best rated, not demoted checkpoints, a above b, intervals from the joint rating draws. anchors.seal is {elo,
-elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
+elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order, one per checkpoint summed
+over its Seal reports (archives included; elo_delta the continuity-corrected Elo of the summed points, as `summary`),
 latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, latest_delta the newest one's. reign_from
 is the number of checkpoint entries and reign_games the champion's Seal games when it was promoted or restored
 (absent: its own position + 1 and 0), counted over its archived Seal reports too (reign_pooled; `Evaluator.pool_reign`
@@ -740,9 +741,14 @@ def write_league(run, league, config, top=None):
     best = sorted((c['id'] for c in league['checkpoints'] if point.get(c['id']) is not None and not c.get('demoted')),
                   key=lambda k: -point[k])[:league['ladder_top']]
     league['ladder'] = [difference(a, b) for i, a in enumerate(best) for b in best[i+1:]]
-    anchored = sorted((r for r in reports if r['opponent'] == SEAL and r['candidate'] in ids), key=lambda r: ids.index(r['candidate']))
-    matches = [dict(checkpoint=r['candidate'], **{k: r['summary'][k] for k in ('wins', 'losses', 'capped', 'games', 'elo_delta')})
-               for r in anchored]
+    anchored = {}  # checkpoint -> its Seal results summed over its reports (archives included), in league order
+    for r in sorted((r for r in reports if r['opponent'] == SEAL and r['candidate'] in ids), key=lambda r: ids.index(r['candidate'])):
+        total = anchored.setdefault(r['candidate'], dict(wins=0, losses=0, capped=0, games=0))
+        for k in total:
+            total[k] += r['summary'][k]
+    points = lambda t: t['wins']+t['capped']/2
+    matches = [dict(checkpoint=cid, **t, elo_delta=400*math.log10((points(t)+.5)/(t['games']-points(t)+.5)))
+               for cid, t in anchored.items()]
     league['anchors'] = {SEAL: dict(elo=point.get(SEAL), elo_interval=intervals.get(SEAL), games=seal_games, matches=matches,
                                     latest_delta=matches[-1]['elo_delta'] if matches else None)}
     league['matrix'] = payoff(reports, point)
