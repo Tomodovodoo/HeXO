@@ -2184,7 +2184,7 @@ def match(args):
     records = play(paired_games(models['a'], SEAL if args.b == SEAL else models['b'], args.games,
                                 f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None, book,
                                 sides=(sides['a'], sides['b']), candidate=args.a, opponent=args.b),
-                   config.actor.leaf_batch, heartbeat=record)
+                   config.actor.leaf_batch, heartbeat=record, schedule=Schedule.of(settings))
     record(records)
     print(json.dumps(dict(summary=report['summary'], metrics=report['metrics'], seconds=time.perf_counter()-started,
                           solver=report['solver'], report=str(target)), indent=2))

@@ -2766,12 +2766,15 @@ class EvaluatorSearchTests(unittest.TestCase):
     def test_match_saves_completed_games_before_play_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
-            dense_config.save(run, dense_config.RunConfig(device='cpu'))
+            config = dense_config.RunConfig(device='cpu', evaluation=dense_config.EvaluationSettings(
+                solver_root_nodes=2048, solver_gate_cap_nodes=32768))
+            dense_config.save(run, config)
             model = SimpleNamespace(checkpoint='main/000010', sha='a'*64)
             games = [dict(seed=seed, challenger_color=colour, winner=-1)
                      for seed, colour in ((1, 0), (1, 1), (2, 0))]
             games.append(dict(seed=2, challenger_color=1, winner=-1, error='Seal unavailable'))
-            def fail(games_to_play, leaf_batch, heartbeat):
+            def fail(games_to_play, leaf_batch, heartbeat, schedule):
+                self.assertEqual(schedule, dense_eval.Schedule.of(config.evaluation))
                 heartbeat(games)
                 raise RuntimeError('mid-run failure')
             args = SimpleNamespace(run=run, a=model.checkpoint, b='seal', games=4, sims=None,
