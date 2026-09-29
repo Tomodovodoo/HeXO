@@ -852,6 +852,21 @@ validation source reports the active metric on held and training panels, plus
 their gap, under separate names such as `newest_future_masked_ce` and
 `newest_future_bce`. These are different objectives, not comparable loss values.
 
+## Dense actor batches
+
+`dense_selfplay.py` accepts `--games-in-flight` and `--leaf-batch` per worker, alongside `--games` per process. The
+actor heartbeat and metrics log report `mean_batch` and `full_batch_fraction`, the share of model submissions with
+exactly `leaf_batch` distinct positions. More games can supply more leaves to each call; increasing `leaf_batch`
+alone only raises the limit. These are engine submission counts; the evaluator splits each submission into model
+forwards by crop size and `MAX_CELLS`.
+
+Each game owns a native CPU tree, with no fixed per-game GPU allocation. On this Windows host, 128 trees at a
+20-ply position used about 30 KiB of private memory each before search and 3.39 MiB each after a 64-simulation
+search with tactics enabled, measured without a model or GPU. An additional inference row makes an 8-plane bf16
+GPU input of `8 * size * size * 2` bytes, or 36 KiB at a 48x48 crop. One 96-channel bf16 activation at that size
+is 432 KiB per row; the network also needs other activations and temporary buffers. Crop size changes the cost
+quadratically, so these tensor sizes are not a measured peak VRAM increase.
+
 ## Dense evaluator
 
 `dense_eval.py loop` rates each new dense checkpoint against the champion and keeps the league in

@@ -71,7 +71,7 @@ COLOR = ((np.arange(1 << 16)+1)//2) % 2
 METRICS_SECONDS = 30.
 PRIOR_GAMES = 16.  # weight, in games, of the Elo prediction when PFSP blends in a recorded score
 BLOCKS = 2          # historical opponents in flight at once, about: blocks of target/BLOCKS games per opponent
-METRICS = ('positions', 'games_completed', 'placements_per_second', 'evals_per_second', 'mean_batch',
+METRICS = ('positions', 'games_completed', 'placements_per_second', 'evals_per_second', 'mean_batch', 'full_batch_fraction',
            'terminal_fraction', 'mean_plies', 'checkpoint', 'paused_seconds')
 STALE_SECONDS = 120.  # learner heartbeats older than this are ignored by Yield
 RESTART_SOURCE = ('shard', 'game', 'ply', 'kind', 'regret', 'plies_to_proof')  # buffer entry fields a restart records
@@ -309,7 +309,7 @@ class Engine:
 
     def __init__(self, leaf_batch, solver_async=True, schedule=None):
         self.leaf_batch, self.slots, self.cursor, self.inflight = leaf_batch, [], 0, []
-        self.evals = self.calls = self.hits = self.searches = 0
+        self.evals = self.calls = self.full_calls = self.hits = self.searches = 0
         self.solver_async, self.schedule = solver_async, schedule or dense_solver.Schedule()
         self.solver, self.plans, self.closing = None, {}, []
 
@@ -404,6 +404,7 @@ class Engine:
             launched.append((model, positions, keys, model.evaluator.submit(histories, legal)))
             self.calls += 1
             self.evals += len(keys)
+            self.full_calls += len(keys) == self.leaf_batch
         stopped, collecting = set(), time.perf_counter()
         for model, positions, keys, handle in self.inflight:
             for key, prediction in zip(keys, model.evaluator.collect(handle)):
@@ -819,8 +820,11 @@ def worker(args):
         fields = dict(
             stage=stage, updated_at=time.time(), checkpoint=model.checkpoint, actor_sha256=model.sha,
             games_completed=g, games_total=target, positions=state['positions'], active_games=len(engine.slots),
+            batch_calls=engine.calls,
             placements_per_second=(state['positions']-p)/max(1e-9, now-t), evals_per_second=(engine.evals-e)/max(1e-9, now-t),
-            mean_batch=engine.evals/max(1, engine.calls), terminal_fraction=state['terminal']/g if g else None,
+            mean_batch=engine.evals/max(1, engine.calls),
+            full_batch_fraction=engine.full_calls/max(1, engine.calls),
+            terminal_fraction=state['terminal']/g if g else None,
             mean_plies=state['plies']/g if g else None, shards_written=state['shards_written'],
             paused_seconds=paused_total+(time.perf_counter()-paused_since if paused_since is not None else 0.),
             vram=hexnet.vram(), error=state['error'],
