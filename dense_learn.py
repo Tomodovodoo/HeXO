@@ -71,7 +71,7 @@ REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
         'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'deblunder_weight',
-        'optimizer', 'proof_policy_weight', 'future_target')
+        'optimizer', 'proof_policy_weight', 'future_target', 'regret_fraction')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
@@ -911,6 +911,8 @@ def main():
         status.update(fields, updated_at=time.time(), step=learner.step, samples_seen=learner.samples_seen,
                       rows_available=window.total_rows, window_rows=window.rows, full_rows_available=window.total_full_rows,
                       window_full_rows=window.full_rows,
+                      regret_rows=window.regret_rows, regret_effective_share=window.regret_share(learner.settings.batch,
+                                                                                               learner.settings.regret_fraction),
                       samples_per_row=(learner.samples_seen-base['samples'])/max(1, window.total_rows-base['rows']),
                       samples_per_row_target=learner.settings.samples_per_row, phase_rows=learner.settings.phase_rows,
                       backlog_rows=backlog(learner.samples_seen, window.total_rows, learner.settings.samples_per_row, base),
@@ -928,6 +930,8 @@ def main():
     def export():
         write_status(stage='exporting')
         fields = validation_fields(learner.export(window, sets)['metrics'])
+        window.refresh_regret()
+        stream.refresh_regret()
         stream.set_calibration(learner.calibration)
         if fields:
             dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,

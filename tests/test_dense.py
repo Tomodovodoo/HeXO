@@ -1216,6 +1216,46 @@ class DenseDataTests(unittest.TestCase):
             self.assertNotIn('000001', window.shards)
             self.assertEqual(window.index[-1], ('000004', 9))
 
+    def test_regret_sampling_is_bounded_and_refreshes_at_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            moves, _ = random_game(np.random.default_rng(4), 20)
+            write_games(run/'shards'/'000001', [(moves, -1, None)])
+            window = dense_data.ReplayWindow(run, capacity_rows=1000)
+            seed = 19
+            original = window.sample(np.random.default_rng(seed), 256)
+            disabled = window.sample(np.random.default_rng(seed), 256, regret_fraction=0.)
+            self.assertEqual([(r.shard, r.index) for r in original], [(r.shard, r.index) for r in disabled])
+            self.assertEqual(window.regret_rows, 0)
+            missing = window.sample(np.random.default_rng(seed), 256, regret_fraction=.25)
+            self.assertEqual([(r.shard, r.index) for r in original], [(r.shard, r.index) for r in missing])
+
+            path = run/'restarts.json'
+            listed = {0, 1, 2, 3, 4}
+            path.write_text(json.dumps(dict(entries=[dict(shard='000001', game=0, ply=i, regret=1000 if i == 4 else i+1)
+                                                     for i in listed])), encoding='utf-8')
+            window.refresh_regret()
+            self.assertEqual(window.regret_rows, 5)
+            with_buffer = window.sample(np.random.default_rng(seed), 256, regret_fraction=0.)
+            self.assertEqual([(r.shard, r.index) for r in original], [(r.shard, r.index) for r in with_buffer])
+            self.assertEqual(window.regret_share(256, .25), .25)
+            refs = window.sample(np.random.default_rng(8), 25600, regret_fraction=.25)
+            listed_share = sum(r.index in listed for r in refs)/len(refs)
+            self.assertAlmostEqual(listed_share, .25+.75*5/20, delta=.015)
+            probabilities = window.regret_probabilities(.25)
+            self.assertLessEqual(max((.75/20+.25*p) for p in probabilities), 4/20+1e-12)
+
+            path.write_text(json.dumps(dict(entries=[dict(shard='000001', game=0, ply=0, regret=1.)])), encoding='utf-8')
+            os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns+1_000_000_000))
+            window.refresh_regret()
+            self.assertEqual(window.regret_rows, 1)
+            share = window.regret_share(256, 1.)
+            self.assertLess(share, 1.)
+            self.assertLessEqual((1-share)/20+share, 4/20+1e-12)
+            path.unlink()
+            window.refresh_regret()
+            self.assertEqual(window.regret_rows, 0)
+
     def test_collate_is_collate_arrays_as_tensors(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_games(Path(tmp)/'shards'/'000001', [(random_game(np.random.default_rng(3), 12)[0], -1, None), (winning_game(), 0, None)])
