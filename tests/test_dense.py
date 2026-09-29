@@ -1406,9 +1406,10 @@ class DenseDataTests(unittest.TestCase):
                     self.assertAlmostEqual(float(t['next_policy'].sum()), 1, places=5)
 
 
-def synthetic_run(run, shards, games, plies, seed=0):
+def synthetic_run(run, shards, games, plies, seed=0, proven=False):
     """Shards of fake games (positions are never replayed): random moves, digests, root values (some null),
-    trained sides and winners; every other ply has a short policy; rows are stored in shuffled order."""
+    trained sides and winners; every other ply has a short policy; rows are stored in shuffled order. With
+    `proven`, the cheap rows at plies 1 and 7 (mod 12) record proven +1 and -1."""
     rng = np.random.default_rng(seed)
     for k in range(shards):
         episodes, rows = [], []
@@ -1421,7 +1422,8 @@ def synthetic_run(run, shards, games, plies, seed=0):
             for t in range(T):
                 p = rng.random(int(rng.integers(1, 4))) if t % 2 == 0 else None
                 rows.append(dict(game=g, ply=t, player=dense_data.player_at(t), remaining=1 if t == 0 else 2-(t+1) % 2,
-                                 legal_sha256=rng.bytes(32).hex(), policy=None if p is None else p/p.sum()))
+                                 legal_sha256=rng.bytes(32).hex(), policy=None if p is None else p/p.sum(),
+                                 proven={1: 1, 7: -1}.get(t % 12, 0) if proven else 0))
         rows = [rows[i] for i in rng.permutation(len(rows))]
         dense_data.write_shard(Path(run)/'shards'/f'{k+1:06d}', dict(actor_sha256='a'*64), episodes, rows)
 
@@ -1642,6 +1644,191 @@ def old_corpus(path):
                     metrics=None, files=files)
     (path/'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
     return games
+
+
+def batch_bytes(batch):
+    return {size: {k: (v.dtype.str, v.shape, v.tobytes()) for k, v in b.items()} for size, b in batch.items()}
+
+
+class CheapRowTests(unittest.TestCase):
+    """cheap_row_fraction: which rows the training index and the pacing count retain."""
+
+    @staticmethod
+    def kinds(tmp):
+        """{(shard, row): 'full' | 'exact' | 'cheap'} over every row of the run, sidecar labels included."""
+        out = {}
+        for path in dense_data.shard_dirs(tmp):
+            _, rows = dense_data.read_shard(path)
+            labels = dense_data.proof_labels(path) or set()
+            for i, r in enumerate(rows):
+                exact = r.get('proven') or (r['game'], r['ply']) in labels
+                out[path.name, i] = 'full' if len(r['policy']) else 'exact' if exact else 'cheap'
+        return out
+
+    @staticmethod
+    def label(tmp, name, plies):
+        """A proof sidecar on shard `name` proving `plies` of game 0."""
+        (Path(tmp)/'shards'/name/dense_data.SIDECAR).write_text(json.dumps(dict(game=0, mover=0, plies=plies))+'\n')
+
+    def test_full_fraction_reproduces_the_unfiltered_batches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for k in range(3):
+                source_shard(Path(tmp)/'shards'/f'{k+1:06d}', k, 'a', games=4, policy_every=3)
+            plain = dense_data.ReplayWindow(tmp, 10**6, 20, validation_fraction=.3, policy_dir=Path(tmp)/'a')
+            flagged = dense_data.ReplayWindow(tmp, 10**6, 20, validation_fraction=.3, policy_dir=Path(tmp)/'b',
+                                              cheap_row_fraction=1., seed=11)
+            index, held, _ = reference_window(Path(tmp), 10**6, 20, .3)
+            self.assertEqual((list(flagged.index), list(flagged.validation)), (index, held))
+            self.assertEqual((flagged.total_rows, flagged.rows, flagged.retained_rows, flagged.retained_fraction),
+                             (plain.total_rows, plain.rows, len(index), 1.))
+            settings = dense_config.LearnerSettings(batch=16, recency=1.)
+            for validation in (False, True):
+                a, b = (dense_data.batches(w, np.random.default_rng(3), 16, lambda: settings, validation) for w in (plain, flagged))
+                for _ in range(3):
+                    self.assertEqual(batch_bytes(next(a)), batch_bytes(next(b)))
+
+    def test_half_fraction_drops_only_ordinary_cheap_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 4, 20, 40, proven=True)
+            self.label(tmp, '000002', [3, 5, 9, 11])
+            kinds = self.kinds(tmp)
+            full = dense_data.ReplayWindow(tmp, 10**6, 10**6, validation_fraction=.2)
+            half = dense_data.ReplayWindow(tmp, 10**6, 10**6, validation_fraction=.2, cheap_row_fraction=.5, seed=4)
+            kept, before = set(half.index), list(full.index)
+            self.assertTrue(kept <= set(before))
+            self.assertEqual([key for key in before if kinds[key] != 'cheap'], [key for key in half.index if kinds[key] != 'cheap'])
+            cheap = [key for key in before if kinds[key] == 'cheap']
+            self.assertGreater(len(cheap), 300)
+            self.assertAlmostEqual(sum(key in kept for key in cheap)/len(cheap), .5, delta=.08)
+            self.assertIn('exact', {kinds[key] for key in half.index})
+            self.assertEqual(list(half.validation), list(full.validation))
+            self.assertEqual(half.rows, full.rows)
+            self.assertEqual(half.retained_rows, len(half.index))
+            self.assertAlmostEqual(half.retained_fraction, len(half.index)/len(before))
+            none = dense_data.ReplayWindow(tmp, 10**6, 10**6, validation_fraction=.2, cheap_row_fraction=0.)
+            self.assertEqual(list(none.index), [key for key in before if kinds[key] != 'cheap'])
+
+    def test_pacing_counts_retained_rows_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 3, 10, 30, proven=True)
+            full = dense_data.ReplayWindow(tmp, 10**6, 10**6)
+            half = dense_data.ReplayWindow(tmp, 10**6, 10**6, cheap_row_fraction=.5, seed=4)
+            self.assertEqual(half.total_rows, len(half.index))    # every row is in the window and none is held out
+            self.assertEqual(full.total_rows, len(full.index))
+            self.assertLess(half.total_rows, full.total_rows)
+            self.assertEqual(dense_learn.backlog(400, half.total_rows, 4.), half.total_rows-100)
+            self.assertTrue(dense_learn.paced(4*half.total_rows-7, half.total_rows, 4., 8))
+            self.assertFalse(dense_learn.paced(4*half.total_rows-8, half.total_rows, 4., 8))
+            # A sidecar makes dropped cheap rows of game 0 exact: they enter the index and the pacing count.
+            kept = set(half.index)
+            _, rows = dense_data.read_shard(Path(tmp)/'shards'/'000001', policies=False)
+            plies = sorted(rows[i]['ply'] for n, i in full.index if n == '000001' and (n, i) not in kept and rows[i]['game'] == 0)
+            self.assertTrue(plies)
+            before = half.total_rows
+            self.label(tmp, '000001', plies)
+            half.refresh()
+            self.assertEqual(half.total_rows, before+len(plies))
+            self.assertEqual(half.total_rows, len(half.index))
+            # Held-out rows count toward pacing when retained, though validation keeps all of them.
+            held = dense_data.ReplayWindow(tmp, 10**6, 10**6, validation_fraction=.3, cheap_row_fraction=.5, seed=4)
+            self.assertEqual(held.total_rows, half.total_rows)
+            self.assertGreater(len(held.validation), 0)
+            kept = set(half.index)
+            self.assertEqual(held.total_rows, len(held.index)+sum(key in kept for key in held.validation))
+
+    def test_retention_is_stable_across_rebuilds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 3, 8, 30)
+            first = dense_data.ReplayWindow(tmp, 10**6, 10**6, cheap_row_fraction=.5, seed=9)
+            second = dense_data.ReplayWindow(tmp, 10**6, 10**6, cheap_row_fraction=.5, seed=9)
+            self.assertEqual(list(first.index), list(second.index))
+            self.assertEqual(first.total_rows, second.total_rows)
+            synthetic_run(Path(tmp)/'more', 4, 8, 30, seed=1)
+            shutil.move(Path(tmp)/'more'/'shards'/'000004', Path(tmp)/'shards'/'000004')
+            first.refresh()
+            self.assertEqual([key for key in first.index if key[0] != '000004'], list(second.index))
+            other = dense_data.ReplayWindow(tmp, 10**6, 10**6, cheap_row_fraction=.5, seed=10)
+            self.assertNotEqual([key for key in other.index if key[0] != '000004'], list(second.index))
+            np.testing.assert_array_equal(dense_data.retention(9, '000001', 50, .5), dense_data.retention(9, '000001', 80, .5)[:50])
+
+    def test_regret_priority_draws_only_retained_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 2, 10, 30)
+            kinds = self.kinds(tmp)
+            half = dense_data.ReplayWindow(tmp, 10**6, 10**6, cheap_row_fraction=.5, seed=4)
+            full = dense_data.ReplayWindow(tmp, 10**6, 10**6)
+            kept = set(half.index)
+            dropped = [key for key in full.index if key not in kept][:5]
+            chosen = dropped+[key for key in half.index if kinds[key] == 'cheap'][:5]
+            self.assertEqual((len(dropped), len(chosen)), (5, 10))
+            entries = {(n, int(half.shards[n].game[i]), int(half.shards[n].ply[i])): 1. for n, i in chosen}
+            half.set_regret(entries)
+            self.assertEqual(half.regret_rows, 5)
+            self.assertEqual(half.retained_rows, len(kept))
+            refs = half.sample(np.random.default_rng(1), 64, regret_fraction=.5)
+            self.assertTrue({(r.shard, r.index) for r in refs} <= kept)
+
+    def test_render_workers_retain_like_the_learner_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_shard(Path(tmp)/'shards'/'000001', 1, 'a', games=4, policy_every=3)
+            settings = dense_config.LearnerSettings(batch=8, window_min_rows=10**6, validation_fraction=0., cheap_row_fraction=.3)
+            window = dense_data.ReplayWindow(tmp, settings.window_capacity, 10**6, policy_dir=Path(tmp)/'expected',
+                                             cheap_row_fraction=.3, seed=6)
+            self.assertLess(window.retained_fraction, 1.)
+            expected = batch_bytes(next(dense_data.batches(window, np.random.default_rng([4, 0]), 8, lambda: settings)))
+            stream = dense_data.Renderers(tmp, settings, [4], workers=1, depth=1, run_seed=6)
+            try:
+                got = next(stream)
+            finally:
+                stream.close()
+            self.assertEqual(batch_bytes({size: {k: v.numpy() for k, v in b.items()} for size, b in got.items()}), expected)
+
+    def test_pipeline_benchmark_retains_like_the_learner(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('bench_dense_data', ROOT/'tools'/'bench_dense_data.py')
+        bench = importlib.util.module_from_spec(spec); spec.loader.exec_module(bench)
+        with tempfile.TemporaryDirectory() as tmp:
+            source_shard(Path(tmp)/'shards'/'000001', 1, 'a', games=4, policy_every=3)
+            settings = dense_config.LearnerSettings(batch=8, window_min_rows=10**6, validation_fraction=0., cheap_row_fraction=.3)
+            with unittest.mock.patch.object(dense_data, 'ReplayWindow', wraps=dense_data.ReplayWindow) as made:
+                bench.in_process(tmp, settings, 1, Path(tmp)/'policies', run_seed=6)
+            self.assertEqual(made.call_args.args[-2:], (.3, 6))
+            with unittest.mock.patch.object(dense_data, 'Renderers', side_effect=RuntimeError) as pool:
+                with self.assertRaises(RuntimeError):
+                    bench.pooled(tmp, settings, 1, 1, Path(tmp)/'policies', run_seed=6)
+            self.assertEqual(pool.call_args.kwargs['run_seed'], 6)
+
+    def test_fraction_is_bounded_and_kept_across_replacement(self):
+        for bad in (-.1, 1.5):
+            with self.assertRaises(ValueError):
+                dense_config.LearnerSettings(cheap_row_fraction=bad)
+        self.assertIn('cheap_row_fraction', dense_learn.KEEP)
+
+    def test_changing_the_fraction_moves_the_pacing_base_to_the_new_count(self):
+        torch.set_num_threads(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x', policy_every=3)
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=0.))
+            window = dense_data.ReplayWindow(run, 1000, 10)
+            first = dense_learn.Learner(run, config.learner, config)
+            first.samples_seen = 5000
+            rows = first.export(window)['rows']
+            half = dense_data.ReplayWindow(run, 1000, 10, cheap_row_fraction=.5, seed=config.seed)
+            self.assertLess(half.total_rows, rows)
+            resumed = dense_learn.Learner(run, config.learner, config, overrides=dict(cheap_row_fraction=.5))
+            resumed.rebase(half.total_rows)
+            self.assertEqual(resumed.pacing, dict(rows=half.total_rows, samples=5000))
+            self.assertEqual(dense_learn.backlog(5000, half.total_rows, 4., resumed.pacing), 0)
+            event = [e for e in map(json.loads, (run/'events.jsonl').read_text().splitlines()) if 'pacing' in e][-1]
+            self.assertEqual((event['old_cheap_row_fraction'], event['new_cheap_row_fraction']), (1., .5))
+            resumed.step = 1
+            self.assertEqual(resumed.export(half)['rows'], half.total_rows)
+            again = dense_learn.Learner(run, config.learner, config)
+            self.assertEqual(again.settings.cheap_row_fraction, .5)
+            again.rebase(half.total_rows+40)
+            self.assertEqual(again.pacing, dict(rows=half.total_rows, samples=5000))
 
 
 class DenseBootstrapTests(unittest.TestCase):

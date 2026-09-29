@@ -35,9 +35,12 @@ data_wait_fraction, the share of the recent step time spent waiting for a render
 of one optimizer step is, per head, the weighted mean over every row of the batch that has that target, summed with
 the head coefficients; each crop bucket is a separate forward pass whose gradients accumulate (buckets padded to
 QUANTUM rows with inert rows).
-Pacing: at most samples_per_row * (trained rows in all shards, cheap rows included; a historical opponent's
-plies are not trained, see dense_data.trained) samples are presented since the pacing base (manifest
-pacing, Learner.rebase); beyond that the learner waits. The window
+Pacing: at most samples_per_row * (retained trained rows in all shards; a historical opponent's plies are not
+trained, see dense_data.trained) samples are presented since the pacing base (manifest pacing, Learner.rebase);
+beyond that the learner waits. With cheap_row_fraction < 1 only that share of the ordinary cheap rows is retained
+(full-search and exact rows always are, dense_data.retained), both for sampling and for this count, so
+samples_per_row stays per retained row; held-out rows are validated whether retained or not. learner-status.json
+reports retained_rows and retained_fraction of the window. The window
 is sized in full-search rows (dense_data.ReplayWindow). With phase_rows > 0 the learner alternates phases (Phase):
 it idles until the untrained backlog (backlog) reaches phase_rows, then trains until the pacing limit, so actors
 following the phase (ActorSettings.phase_follow) have the GPU to themselves while it idles; exports still fall on
@@ -71,7 +74,7 @@ REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
         'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'deblunder_weight',
-        'optimizer', 'proof_policy_weight', 'future_target', 'regret_fraction')
+        'optimizer', 'proof_policy_weight', 'future_target', 'regret_fraction', 'cheap_row_fraction')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
@@ -489,6 +492,7 @@ class Learner:
         self.step = self.samples_seen = self.optimizer_started = self.ema_updates = 0
         self.copied_from = None
         self.pacing, self.pacing_per_row, self.resumed_rows = dict(NO_BASE), self.settings.samples_per_row, None
+        self.pacing_fraction = self.settings.cheap_row_fraction
         if saved:
             self.resume(saved[-1], manifest)
         else:
@@ -563,6 +567,7 @@ class Learner:
                                    f'future target switched to {self.settings.future_target}; optimizer and EMA update count reset')
         self.copied_from = manifest.get('copied_from')
         self.pacing, self.pacing_per_row = dict(manifest.get('pacing', NO_BASE)), manifest['learner']['samples_per_row']
+        self.pacing_fraction = manifest['learner'].get('cheap_row_fraction', 1.)
         self.resumed_rows = manifest.get('rows')
         if saved_kind != self.settings.optimizer:
             dense_config.log_event(self.run, 'learner', 'optimizer_reset',
@@ -571,20 +576,23 @@ class Learner:
         dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} resumed from step {self.step}', variant=self.settings.variant, step=self.step)
 
     def rebase(self, total_rows):
-        """Keep the pacing base {rows, samples} (self.pacing) tied to settings.samples_per_row; called before every
-        pacing check. When the setting differs from the one the base was set under (the resumed checkpoint's, or
-        a replacement copy's), the base becomes (rows, samples_seen) and an info event records both with the old
-        and new setting. rows is the resumed checkpoint's manifest rows on the first call after a resume (so
-        restarts from the same checkpoint agree on the base), else total_rows."""
-        old, new = self.pacing_per_row, self.settings.samples_per_row
-        rows = total_rows if self.resumed_rows is None else self.resumed_rows
+        """Keep the pacing base {rows, samples} (self.pacing) tied to settings.samples_per_row and
+        settings.cheap_row_fraction; called before every pacing check with the window's pacing count. When either
+        differs from the one the base was set under (the resumed checkpoint's, or a replacement copy's), the base
+        becomes (rows, samples_seen) and an info event records it with the old and new settings. rows is the
+        resumed checkpoint's manifest rows on the first call after a resume when cheap_row_fraction is unchanged (so
+        restarts from the same checkpoint agree on the base), else total_rows (a changed fraction changes how rows
+        are counted)."""
+        old, new = (self.pacing_per_row, self.pacing_fraction), (self.settings.samples_per_row, self.settings.cheap_row_fraction)
+        rows = total_rows if self.resumed_rows is None or old[1] != new[1] else self.resumed_rows
         self.resumed_rows = None
         if old == new:
             return
-        self.pacing, self.pacing_per_row = dict(rows=rows, samples=self.samples_seen), new
+        self.pacing, (self.pacing_per_row, self.pacing_fraction) = dict(rows=rows, samples=self.samples_seen), new
         dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} pacing base moved to {rows} rows, '
-              f'{self.samples_seen} samples: samples_per_row {old} -> {new}', variant=self.settings.variant, step=self.step,
-              pacing=self.pacing, old_samples_per_row=old, new_samples_per_row=new)
+              f'{self.samples_seen} samples: samples_per_row {old[0]} -> {new[0]}, cheap_row_fraction {old[1]} -> {new[1]}',
+              variant=self.settings.variant, step=self.step, pacing=self.pacing, old_samples_per_row=old[0],
+              new_samples_per_row=new[0], old_cheap_row_fraction=old[1], new_cheap_row_fraction=new[1])
 
     def lr(self):
         """Linear warmup over warmup_steps from the optimizer's start, then constant."""
@@ -808,7 +816,7 @@ class Learner:
         The value target map is refitted first (calibrate; metrics.calibration), then the EMA is recalibrated;
         metrics.validation is validate(window) (the HEADS and the outcome_split; null without held-out rows in the window) and
         metrics.validation_sources is validate_sources(sets) (null without `sets`). The cache is released after
-        these passes. rows is window.total_rows and pacing the pacing base (rebase)."""
+        these passes. rows is window.total_rows (the pacing count) and pacing the pacing base (rebase)."""
         s = self.settings
         root = self.run/'checkpoints'/s.variant
         root.mkdir(parents=True, exist_ok=True)
@@ -910,7 +918,7 @@ def main():
         base = learner.pacing
         status.update(fields, updated_at=time.time(), step=learner.step, samples_seen=learner.samples_seen,
                       rows_available=window.total_rows, window_rows=window.rows, full_rows_available=window.total_full_rows,
-                      window_full_rows=window.full_rows,
+                      window_full_rows=window.full_rows, retained_rows=window.retained_rows, retained_fraction=window.retained_fraction,
                       regret_rows=window.regret_rows, regret_effective_share=window.regret_share(
                           learner.settings.batch, learner.settings.regret_fraction, learner.settings.recency),
                       samples_per_row=(learner.samples_seen-base['samples'])/max(1, window.total_rows-base['rows']),
@@ -944,13 +952,14 @@ def main():
         def replay():
             s = learner.settings
             return dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
-                                           s.window_taper, s.validation_fraction, policy_dir(args.run, s.variant))
+                                           s.window_taper, s.validation_fraction, policy_dir(args.run, s.variant),
+                                           s.cheap_row_fraction, config.seed)
         window = replay()
         sets = validation_sets(args.run, s, config.seed)
         learner.calibrate(window)
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers,
                                                  calibration=learner.calibration, policy_dir=policy_dir(args.run, s.variant),
-                                                 regret_entries=window.regret_entries)
+                                                 regret_entries=window.regret_entries, run_seed=config.seed)
         stream = renderers()
         factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])
         dense_config.log_event(args.run, 'learner', 'info', f'{s.variant} learner started at step {learner.step}', variant=s.variant, step=learner.step,
