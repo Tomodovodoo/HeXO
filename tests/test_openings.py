@@ -762,6 +762,10 @@ class EvaluatorBookTests(unittest.TestCase):
             evaluator.open(CHAMPION, 'seal')
             evaluator.book.clear()
         self.assertEqual(len(list(path.parent.glob('report-1000-*.json'))), 2)
+        # An archive whose protocol matches again stays out of the decision inputs but pools into the league.
+        self.assertEqual([r['settings']['sims'] for r in dense_eval.load_reports(self.run, replace(evaluator.settings, sims=97))], [])
+        self.assertEqual(sorted(r['settings']['sims'] for r in dense_eval.load_reports(self.run)), [97, 98])
+
     def test_the_standard_suite_is_a_frozen_book_with_its_statistics_in_the_run(self):
         self.export(10)
         played = dense_openings.Book(self.run, dense_config.EvaluationSettings()).openings()[0]['moves']

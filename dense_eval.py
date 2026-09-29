@@ -556,9 +556,11 @@ _reports = {}
 
 def load_reports(run, settings=None):
     """Every evaluations/*/report*.json: each pairing's report.json and the reports `Evaluator.open` archived beside it
-    (cached per path and modification time); with `settings`, only the reports played under its PROTOCOL."""
+    (cached per path and modification time), which pool into the league ratings. With `settings`, only the current
+    report.json files played under its PROTOCOL: decisions read a pairing's games from its current report alone
+    (`Evaluator.games`), so an archive whose protocol matches again (a setting changed and restored) stays out of them."""
     reports = []
-    for path in sorted((Path(run)/'evaluations').glob('*/report*.json')):
+    for path in sorted((Path(run)/'evaluations').glob('*/report.json' if settings else '*/report*.json')):
         stamp = path.stat().st_mtime_ns
         if _reports.get(path, (None,))[0] != stamp:
             _reports[path] = stamp, json.loads(path.read_text())
