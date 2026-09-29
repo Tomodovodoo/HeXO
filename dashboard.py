@@ -560,6 +560,8 @@ def book_rows(run):
     suite = evaluator.get('settings', {}).get('opening_suite') or config.get('evaluation', {}).get(
         'opening_suite', dense_config.EvaluationSettings.opening_suite)
     book = dense_openings.book_path(run, suite)
+    if suite != dense_openings.LIVE and not book.exists():
+        book = dense_openings.FROZEN/f'{suite}.json'
     folder = run/'evaluations'
     paths = sorted(folder.glob('*/report*.json'))
     stamp = lambda path: (path.stat().st_mtime_ns, path.stat().st_size) if path.exists() else None
@@ -567,7 +569,8 @@ def book_rows(run):
     cached = _book_cache.get(run)
     if cached and cached[0] == revision:
         return cached[1]
-    nodes = read_json(book, {}).get('nodes', [])
+    data = read_json(book, {})
+    nodes, counted = data.get('nodes', []), data.get('counted')
     lengths = {node['key']: [] for node in nodes}
     matched = {}
     for path in paths:
@@ -575,7 +578,13 @@ def book_rows(run):
         if suite != dense_openings.LIVE and report.get('settings', {}).get(
                 'opening_suite', dense_config.EvaluationSettings.opening_suite) != suite:
             continue
-        for game in report.get('games', []):
+        games = report.get('games', [])
+        if counted is not None:
+            limit = counted.get(report.get('id'), 0)
+            if not limit:
+                continue
+            games = [game for pair in dense_openings.pairs_of(report)[:limit] for game in pair]
+        for game in games:
             moves = tuple(map(tuple, game['opening']))
             if moves not in matched:
                 matched[moves] = [key for depth in range(1, len(moves)+1)

@@ -212,6 +212,47 @@ class OpeningBookPages(unittest.TestCase):
                 pass
         self.assertEqual(error.exception.code, 404)
 
+    def test_unsaved_frozen_book_uses_repository_suite_without_writing(self):
+        self.write(self.run/'config.json', dict(schema=dense_config.SCHEMA))
+        frozen = Path(self.tmp.name)/'frozen'
+        node = dict(self.nodes[3], status='opening')
+        self.write(frozen/'standard-v1.json', dict(nodes=[node], counted={}))
+        with patch.object(dense_openings, 'FROZEN', frozen):
+            rows = self.get()['rows']
+            self.assertEqual([row['key'] for row in rows], [node['key']])
+            self.assertEqual(rows[0]['report_games'], 0)
+            self.assertEqual(len(self.get('/api/book/dag')['nodes']), 1)
+        self.assertFalse((self.run/'openings-standard-v1.json').exists())
+
+    def test_lengths_use_recorded_report_pairs_including_imported_archives(self):
+        for path, identity in [(self.report, 'current'), (self.report.with_name('report-old.json'), 'imported')]:
+            report = json.loads(path.read_text())
+            report['id'] = identity
+            report['settings'] = dict(opening_suite='book' if identity=='current' else 'standard-v1')
+            for game in report['games']:
+                game['seed'] = game['pair']
+            if identity == 'current':
+                report['games'].append(dict(opening=self.a, winner=0, plies=100, pair=2, seed=2))
+            self.write(path, report)
+        self.write(self.run/'evaluations/later-foreign/report.json', dict(id='uncounted',
+                   settings=dict(opening_suite='standard-v1'), games=[
+                       dict(opening=self.a, winner=0, plies=200, pair=0, seed=0),
+                       dict(opening=self.a, winner=0, plies=300, pair=0, seed=0)]))
+        node = dict(self.nodes[1], games=4, p1_wins=3, p2_wins=0, capped=1)
+        book = dict(nodes=[node], counted=dict(current=1, imported=1))
+        self.write(self.run/'openings.json', book)
+        row = self.get()['rows'][0]
+        self.assertEqual(row['report_games'], row['games'])
+        self.assertEqual(row['median_plies'], 15)
+        self.assertEqual(row['mean_plies'], 15)
+        book['counted']['current'] = 2
+        node.update(games=6, p2_wins=1, capped=2)
+        self.write(self.run/'openings.json', book)
+        row = self.get()['rows'][0]
+        self.assertEqual(row['report_games'], row['games'])
+        self.assertEqual(row['median_plies'], 19)
+        self.assertAlmostEqual(row['mean_plies'], 130/6)
+
 
 if __name__ == '__main__':
     unittest.main()
