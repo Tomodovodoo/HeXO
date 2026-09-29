@@ -276,13 +276,14 @@ def position_key(history):
 
 def root_value(result, player):
     """Side-to-move value of a finished search: the solver's exact value when it proved one (result `proven`), else
-    exact +-1 when the tree root is exact, else the visit-weighted mean child value."""
+    exact +-1 when the tree root is exact, else child values under the improved policy. Unvisited child values
+    are the root network estimate from hxg_stats. Visits include exploration of rejected moves and must not
+    weight the value teacher."""
     if result.get('proven'):
         return float(result['proven'])
     if result['exact_winner'] >= 0:
         return 1. if result['exact_winner'] == player else -1.
-    visits = result['visits']
-    return float(visits @ result['values'])/int(visits.sum())
+    return float(result['policy'] @ result['values'])
 
 
 class Engine:

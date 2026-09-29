@@ -3026,6 +3026,18 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(torch.set_num_threads, self.threads)
         torch.manual_seed(5)
 
+    def test_value_teacher_uses_policy_instead_of_exploration_visits(self):
+        result = dict(exact_winner=-1, policy=np.array([.98, .02]), values=np.array([.9, -1.]),
+                      visits=np.array([16, 48]))
+        self.assertAlmostEqual(dense_selfplay.root_value(result, 0), .862)
+        result['visits'] = np.array([48, 16])
+        self.assertAlmostEqual(dense_selfplay.root_value(result, 0), .862)
+        result['exact_winner'] = 1
+        self.assertEqual(dense_selfplay.root_value(result, 0), -1.)
+        self.assertEqual(dense_selfplay.root_value(result, 1), 1.)
+        result['proven'] = 1
+        self.assertEqual(dense_selfplay.root_value(result, 0), 1.)
+
     def test_full_batch_counts_submitted_positions(self):
         from neural_search import EvaluationCache
 

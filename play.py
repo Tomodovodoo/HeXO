@@ -89,6 +89,7 @@ class DensePlayer:
     def turn(self, game, milliseconds=None, analyze=False):
         import numpy as np
         from neural_search import NeuralSearch
+        from dense_selfplay import root_value
         if game.winner >= 0:
             raise ValueError('This game has finished')
         history = [cell[:2] for cell in game.cells]
@@ -116,8 +117,7 @@ class DensePlayer:
                     finally:
                         tree.close()
                     action, policy, actions = result['action'], result['policy'], result['actions']
-                    visits = result['visits']
-                    value = float(visits @ result['values']/max(1, visits.sum()))
+                    value = root_value(result, local.player)
                 else:
                     result = self.evaluator.evaluate([current])[0]
                     actions = result['actions']
