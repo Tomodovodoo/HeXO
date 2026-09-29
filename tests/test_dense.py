@@ -1346,6 +1346,31 @@ class WindowMemoryTests(unittest.TestCase):
             with unittest.mock.patch.object(dense_data, 'open', side_effect=PermissionError('held'), create=True),                     unittest.mock.patch.object(dense_data.time, 'sleep'), self.assertRaises(PermissionError):
                 window.policy(ref)
 
+    def test_failed_policy_write_leaves_no_staging_file_and_stale_ones_are_pruned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 1, 6, 20)
+            _, _, data = reference_window(Path(tmp), 10**6, 10**6, 0.)
+            (name, (_, rows)), = data.items()
+            directory = Path(tmp)/'cache'/'policies'
+            window = dense_data.ReplayWindow(tmp, 10**6, 10**6)
+            ref = window.ref(name, next(i for i, r in enumerate(rows) if len(r['policy'])))
+
+            class Full:    # probabilities whose write fills the disk halfway
+                astype = lambda self, dtype: self
+
+                def tofile(self, path):
+                    Path(path).write_bytes(b'partial')
+                    raise OSError(28, 'No space left on device')
+            with unittest.mock.patch.object(dense_data, 'load_policies', return_value=(None, Full())), self.assertRaises(OSError):
+                window.policy(ref)
+            self.assertEqual(list(directory.iterdir()), [])
+            old, fresh = directory/'.000009.1.tmp', directory/'.000009.2.tmp'
+            for path in (old, fresh):
+                path.write_bytes(b'partial')
+            os.utime(old, (time.time()-dense_data.STALE_STAGING_SECONDS-1,)*2)
+            window.refresh()
+            self.assertEqual([p.name for p in directory.iterdir()], [fresh.name])
+
     def test_policy_file_disagreeing_with_its_shard_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             synthetic_run(tmp, 1, 6, 20)

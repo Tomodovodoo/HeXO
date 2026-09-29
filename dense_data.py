@@ -76,6 +76,7 @@ CALIBRATION_MIN_GAMES = 200
 CALIBRATION_RIDGE = 1.
 CALIBRATION_ITERATIONS = 25
 POLICY_ATTEMPTS = 20
+STALE_STAGING_SECONDS = 600.  # a policy staging file this old belongs to a writer that died
 
 
 def legal_digest(actions):
@@ -566,22 +567,26 @@ class ReplayWindow:
         _, probabilities = load_policies(self.run_dir/'shards'/name, len(self.shards[name].game))
         self.policy_dir.mkdir(parents=True, exist_ok=True)
         staged = self.policy_dir/f'.{name}.{os.getpid()}.tmp'
-        probabilities.astype(np.float32).tofile(staged)
         try:
+            probabilities.astype(np.float32).tofile(staged)
             os.link(staged, path)
         except FileExistsError:
             pass
         finally:
-            staged.unlink()
+            staged.unlink(missing_ok=True)
 
     def prune(self, keep):
-        """Delete the policy_dir files of shards not in `keep`, skipping files that cannot be deleted now."""
-        for path in self.policy_dir.glob('*.f32') if self.policy_dir.exists() else ():
-            if path.stem not in keep:
-                try:
+        """Delete the policy_dir files of shards not in `keep` and staging files older than STALE_STAGING_SECONDS,
+        skipping files that cannot be deleted now."""
+        if not self.policy_dir.exists():
+            return
+        stale = time.time()-STALE_STAGING_SECONDS
+        for path in self.policy_dir.iterdir():
+            try:
+                if path.suffix == '.f32' and path.stem not in keep or path.suffix == '.tmp' and path.stat().st_mtime < stale:
                     path.unlink()
-                except OSError:
-                    pass
+            except OSError:
+                pass
 
     def value_targets(self, ref, lam, full_only, outcome_lam=1., calibration=None):
         """episode_value_targets of the ref's episode, cached."""
