@@ -8,8 +8,10 @@ may finish in the background. Late results are not exposed as exact values.
 Budgets: `nodes` bounds the total native search work (IDTT nodes plus PDS-PN
 level-1 nodes and level-2 expansions; `idtt_nodes` of it go to the optional IDTT
 probe), so a verdict and its certificate depend only on (position, attacker,
-nodes, idtt_nodes, build). `ms` is a safety cap: a query that reaches it returns
-UNKNOWN with reason 'deadline'.
+nodes, idtt_nodes, build). The native checker permits at most
+min(200000, max(50000, 8*nodes)) certificate nodes and visits. This limit is
+derived from the granted node budget, including any gate adjustment. `ms` is a
+safety cap: a query that reaches it returns UNKNOWN with reason 'deadline'.
 
 `gate` = dict(weight, floor, cap_low, cap_high) sizes the budget by the attacker's
 forcing material (forcing_material.gate_level g of the queried position): `floor`
@@ -46,9 +48,9 @@ PACKAGE = Path(__file__).resolve().parent/'tools/tactical'
 MAX_NODES = 10000000
 MAX_TABLE_MB = 256  # resident table per attacker colour; two of them stay well inside a worker's 1536 MB cap
 DEFAULT_NODES, DEFAULT_MS = 2500, 1000
-REQUEST_LIMIT = 8*1024*1024
-# Worker responses above this are discarded unparsed; the verifier's 50,000-node certificate cap stays well below it.
-RESPONSE_LIMIT = 16*1024*1024
+REQUEST_LIMIT = 64*1024*1024
+# Room for a certificate at the 200,000-node native cap.
+RESPONSE_LIMIT = 64*1024*1024
 # IsolatedTactics worker priorities: (Windows priority class, POSIX nice increment); None inherits.
 PRIORITIES = {None: None, 'below_normal': (0x4000, 5), 'idle': (0x40, 19)}
 
@@ -107,7 +109,8 @@ class NativeTactics:
     `nodes_used` (search work charged against the budget), `budget` and `gate_score`
     (module contract), `proof_turns` (most attacker turns on any certificate path, the
     completing turn included; None unless PROVEN_WIN), `attacker` and `build_hash`
-    (SHA-256 of the loaded library).
+    (SHA-256 of the loaded library). Verification accepts at most
+    min(200000, max(50000, 8*budget)) certificate nodes and visits.
     """
 
     def __init__(self, package=PACKAGE):
@@ -183,8 +186,7 @@ class IsolatedTactics:
     `build_hash` (None when no worker answered; `budget` and `gate_score` None too). A verdict depends on the node budget only; a kill at the hard deadline is a
     failure to investigate, not a verdict.
     Results carry `certificate=None` and the strategy as undecoded JSON text in
-    `certificate_json` (up to ~6 MiB for a 45,000-node strategy); decoding it is left to the
-    caller, outside the deadline.
+    `certificate_json`; decoding it is left to the caller, outside the deadline.
     """
 
     def __init__(self, package=PACKAGE, *, grace_ms=100, memory_mb=1536, startup_ms=10000,
@@ -437,7 +439,8 @@ def independent_verify(certificate, history, attacker='mover', deadline_seconds=
     `attacker` is the query's attacker: 'opponent' checks the certificate on the
     flipped-turn position. Returns PROVEN_WIN, raises ValueError for an invalid
     certificate and proof.VerificationTimeout when the check takes longer than
-    `deadline_seconds`.
+    `deadline_seconds`. This checker allows up to 200,000 visits, the native
+    ceiling; native acceptance also depends on the query's node budget.
     """
     from proof import verify
     work = 0
@@ -445,7 +448,7 @@ def independent_verify(certificate, history, attacker='mover', deadline_seconds=
         nonlocal work
         work += 1
         if (type(index) is not int or not 0 <= index < len(certificate['nodes']) or
-                index in stack or len(stack) >= 128 or work > 50000):
+                index in stack or len(stack) >= 128 or work > 200000):
             raise ValueError('Invalid certificate edge, cycle, depth or work limit')
         node = certificate['nodes'][index]
         stack = stack | {index}
