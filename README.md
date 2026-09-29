@@ -870,3 +870,14 @@ always score finished games against their hard outcome.
   once P(variant - checkpoint > `sprt_elo0`) reaches `promote_confidence`, 'worse' once it falls to 1 -
   `promote_confidence`, 'max-games' at `sprt_max_games`. Variants are rated in the league and shown in the
   checkpoint history, but they never become champion and never reach the actors. `--checkpoint champion` registers against whichever checkpoint is champion when the comparison starts; with `rebase_on_promotion` (default on) a variant registered against the champion also follows a new champion until it starts.
+
+## Dense actor solver scheduling
+
+`dense_solver.Schedule` decides how the solver queries of the dense searches run (settings `solver_*` in `ActorSettings`; the evaluator always uses the defaults).
+
+- **Fixed budgets** (`solver_fixed_budgets`, default on): every query spends its point's node budget and every verdict is awaited where it is needed. Seeded self-play repeats exactly on both backends. Evaluation, engine verification and the determinism test run this way.
+- **Adaptive budgets** (`--no-solver-fixed-budgets`, actors): a query's budget is `solver_slack_fraction` of its point's measured lead time (20th percentile, minus 50 ms), net of the work already queued, at the measured worker rate, clamped to `[solver_min_nodes, solver_cap_nodes]`. With `solver_gate_weight` the worker scales it by the attacker's forcing material up to `solver_gate_cap_nodes`; positions below the gate's lower level get the floor. Verdicts are polled. A root or finalist verdict may cost at most `solver_overrun_fraction` of the step time in waits; past that its game is skipped for one step while the others build the batch, and then goes on without it. Threat verdicts that miss the next visit are dropped.
+- **Following** (`solver_follow`): a side with a proof plays the certificate's turns while the game stays on it and asks no further queries; every proof labels the rows it decides (`proven` +1 for the winner, -1 for the loser), including proofs that arrived too late to decide a move.
+- **Deep proofs** (`solver_deep_nodes`, needs following): at each turn start, a `root_moves` query asks whether the side that just moved wins against every defence of its turn. Adaptive deep queries run on one extra idle-priority worker, up to `solver_deep_cap_nodes`.
+
+Foreground workers (`solver_workers`) run at below-normal priority. Actor status `solver` reports queries per second, budget mean and p95, hit rates by point and by budget band, the share of steps with a verdict wait and its mean, the overrun (wait time over step time), lead times, worker rate and utilisation, and deferred, late, dropped, followed and labelled counts.

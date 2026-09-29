@@ -1,9 +1,12 @@
 """Solver points inside the dense searches (dense_solver): the native hold, mark and priority entries, each
-injection point on positions with known forced wins, learner targets of proven rows and reproducibility of
-seeded self-play with the solver on, across runs and backends. CPU only, tiny models."""
+injection point on positions with known forced wins, proofs followed and labelled, the adaptive scheduler, learner
+targets of proven rows and reproducibility of seeded self-play with fixed budgets, across runs and backends. CPU
+only, tiny models."""
+from concurrent.futures import Future
 from dataclasses import asdict, replace
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 import numpy as np
@@ -13,7 +16,8 @@ import dense_config
 import dense_data
 import dense_eval
 import dense_selfplay
-from dense_solver import Budgets
+import dense_solver
+from dense_solver import Budgets, Proof, Schedule
 import hexnet
 from hexo import Game
 from neural_search import HOLD, NeuralSearch, checked, native
@@ -37,14 +41,15 @@ def settings(**changes):
     return replace(dense_config.ActorSettings(), **{**base, **changes})
 
 
-def run(slots, asynchronous=True):
-    """Play `slots` to the end on one Engine."""
-    engine = dense_selfplay.Engine(64, asynchronous)
+def run(slots, asynchronous=True, schedule=None):
+    """Play `slots` to the end on one Engine; returns the Solver's summary (None when no slot used it)."""
+    engine = dense_selfplay.Engine(64, asynchronous, schedule)
     try:
         for slot in slots:
             engine.add(slot)
         while engine.slots:
             engine.step()
+        return engine.solver.summary(1.) if engine.solver else None
     finally:
         engine.close()
 
@@ -197,6 +202,7 @@ class InjectionPoints(unittest.TestCase):
         self.assertEqual(rows[0]['solver_nodes'], proof['nodes_used'])
         self.assertEqual(episode['root_values'], [1., 1.])
         self.assertEqual(episode['solver'], dict(root_nodes=NODES, finalists=0, finalist_nodes=0, threat_nodes=0,
+                                                 schedule=asdict(Schedule()),
                                                  build_hash=self.engine.metadata['binary_sha256']))
         policy = rows[0]['policy']
         self.assertGreater(int((policy > 0).sum()), 1)
@@ -251,18 +257,167 @@ class InjectionPoints(unittest.TestCase):
             game.finish()
 
 
+def line(certificate):
+    """The certificate's first attacker turn, the first defender reply it covers and the attacker's next turn."""
+    nodes = certificate['nodes']
+    first = nodes[certificate['root']]
+    reply = nodes[first['child']]['responses'][0]
+    return first['action'], reply['action'], nodes[reply['child']]['action']
+
+
+class Proofs(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            engine = NativeTactics()
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        cls.opening = [tuple(m) for m in FIXTURE['positions'][PROOF]]
+        cls.result = engine.history(cls.opening, nodes=NODES)
+
+    def test_path_walks_the_game_labels_both_sides_and_names_the_next_stones(self):
+        certificate, base = self.result['certificate'], self.opening
+        first, reply, second = ([tuple(c) for c in turn] for turn in line(certificate))
+        proof = Proof(base, certificate)
+        turns = self.result['proof_turns']
+        self.assertEqual(proof.path(base), ([], (first, turns)))
+        self.assertEqual(proof.path(base+first[:1]), ([(len(base), 1, turns)], (first[1:], turns)))
+        self.assertEqual(proof.path(base+first)[1], ([], turns-1))
+        labels, move = proof.path(base+first+reply)
+        self.assertEqual(labels, [(len(base), 1, turns), (len(base)+1, 1, turns), (len(base)+2, -1, turns-1),
+                                  (len(base)+3, -1, turns-1)])
+        self.assertEqual(move, (second, turns-1))
+        self.assertIsNone(Proof(base, certificate, first_turn_only=True).path(base+first+reply)[1])
+        self.assertEqual(proof.path(base[:-1]), ([], None))
+        other = next(m for m in Game(list(base)).legal_moves() if tuple(m) not in first)
+        self.assertEqual(proof.path(base+[tuple(other)]), ([(len(base), 1, turns)], None))  # a stone off the turn
+
+    def test_followed_proof_plays_the_certificate_to_the_win_and_labels_the_loser(self):
+        model = tiny_model()
+        s = settings(full_fraction=1., solver_root_nodes=NODES, solver_follow=True)
+        game = from_position(dense_selfplay.SelfPlayGame([model, model], replace(s, max_plies=len(self.opening)+16), 5),
+                             self.opening)
+        summary = run([game], schedule=Schedule.of(s))
+        episode, rows = game.episode()
+        winner = dense_solver.mover(self.opening)
+        self.assertEqual(episode['winner'], winner)
+        labels, move = Proof(self.opening, self.result['certificate']).path([tuple(m) for m in episode['moves']])
+        self.assertEqual([p for p, _, _ in labels], [r['ply'] for r in rows])   # the game never left the certificate
+        self.assertEqual([r['proven'] for r in rows], [1 if r['player'] == winner else -1 for r in rows])
+        # One root query for the winner; the loser asks at each of its turn starts.
+        self.assertEqual(summary['root_queries'], 1+len([r for r in rows if r['player'] != winner and r['remaining'] == 2]))
+        self.assertEqual(summary['followed'], len([r for r in rows if r['player'] == winner])-1)  # all but the root's
+
+    def test_deep_proof_of_a_committed_turn_is_followed(self):
+        first = [tuple(c) for c in self.result['moves']]
+        model = tiny_model()
+        s = settings(full_fraction=1., solver_threat_nodes=NODES, solver_deep_nodes=2000, solver_follow=True)
+        opening = self.opening+first
+        game = from_position(dense_selfplay.SelfPlayGame([model, model], replace(s, max_plies=len(opening)+24), 5),
+                             opening)
+        summary = run([game], schedule=Schedule.of(s))
+        episode, rows = game.episode()
+        winner = dense_solver.mover(self.opening)
+        self.assertEqual(episode['winner'], winner)
+        self.assertEqual(summary['root_queries'], 0)
+        self.assertGreater(summary['deep_hit_rate'], 0)
+        # The defender's turn after the committed one is labelled lost; the winner follows the proof from then on.
+        self.assertEqual([r['proven'] for r in rows], [1 if r['player'] == winner else -1 for r in rows])
+        self.assertEqual(summary['followed'], len([r for r in rows if r['player'] == winner])-1)  # adopted at its first search end
+
+
+class Scheduler(unittest.TestCase):
+    def test_schedule_defaults_and_validation(self):
+        self.assertEqual(Schedule.of(dense_config.ActorSettings()), Schedule())
+        self.assertEqual(Schedule.of(dense_config.EvaluationSettings()), Schedule())
+        self.assertTrue(Schedule().fixed_budgets)
+        for bad in (dict(deep_nodes=100), dict(workers=0), dict(min_nodes=600), dict(cap_nodes=9000),
+                    dict(overrun_fraction=-.1), dict(deep_nodes=70000, follow=True)):
+            with self.assertRaises(ValueError):
+                Schedule(**bad)
+
+    def test_allocation_follows_the_measured_lead(self):
+        try:
+            solver = dense_solver.Solver(Schedule(fixed_budgets=False, gate_weight=3.), asynchronous=False)
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        self.assertEqual(solver.allocate('root', NODES)[0], 32)          # nothing measured yet: the floor
+        solver.leads['root'].extend([70.]*8)
+        solver.tick(10., 5.)
+        budget, gate, _ = solver.allocate('root', NODES)
+        self.assertEqual(budget, int(dense_solver.RATE*(.8*(70-dense_solver.GUARD_MS)-dense_solver.OVERHEAD_MS)))
+        self.assertEqual(gate, dict(weight=3., floor=32, cap_low=512, cap_high=8192))
+        solver.leads['finalist'].extend([5000.]*8)
+        solver.tick(10., 5.)
+        self.assertEqual(solver.allocate('finalist', NODES)[0], 512)
+        self.assertEqual(solver.allocate('threat', NODES)[:2], (NODES, None))
+        fixed = dense_solver.Solver(Schedule(gate_weight=3.), asynchronous=False)
+        fixed.leads['root'].extend([5000.]*8)
+        self.assertEqual(fixed.allocate('root', NODES)[:2],
+                         (NODES, dict(weight=3., floor=NODES, cap_low=dense_solver.MAX_NODES, cap_high=dense_solver.MAX_NODES)))
+
+    def test_a_late_verdict_defers_its_game_once_then_finishes_in_the_background(self):
+        try:
+            solver = dense_solver.Solver(Schedule(fixed_budgets=False), asynchronous=False)
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        plan, future = dense_solver.Plan(solver), Future()
+        query = dense_solver.Query(solver, 'root', ((0, 0),), 100, future)
+        solver.tick(100., 50.)                                          # allowance: 5 ms
+        start = time.perf_counter()
+        self.assertFalse(plan.defer([query]))
+        self.assertGreaterEqual(time.perf_counter()-start, .004)       # waited out the overrun allowance
+        self.assertLessEqual(solver.allowance, 0)
+        self.assertTrue(plan.defer([query]))
+        self.assertEqual((plan.late, solver.stats['deferred'], solver.stats['late']), ([query], 1, 1))
+        future.set_result(dict(status='UNKNOWN', reason='no verified strategy', nodes_used=100, budget=100))
+        plan.poll(((0, 0),))
+        self.assertEqual((plan.late, solver.stats['points']['root']['queries']), ([], 1))
+        solver.tick(100., 50.)
+        self.assertEqual(solver.summary(1.)['wait_step_fraction'], .5)
+
+    def test_adaptive_selfplay_plays_proofs_within_the_caps(self):
+        try:
+            NativeTactics()
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        model = tiny_model()
+        s = settings(solver_root_nodes=NODES, solver_finalists=2, solver_finalist_nodes=NODES, solver_threat_nodes=NODES,
+                     solver_fixed_budgets=False, solver_workers=2, solver_min_nodes=NODES, solver_gate_weight=3.,
+                     solver_deep_nodes=NODES, solver_follow=True, solver_overrun_fraction=.5)
+        games = [dense_selfplay.SelfPlayGame([model, model], s, seed) for seed in (1, 2)]
+        for seed, key in ((3, PROOF), (4, '1790600287230040:25:213')):
+            opening = FIXTURE['positions'][key]
+            games.append(from_position(dense_selfplay.SelfPlayGame([model, model], replace(s, max_plies=len(opening)+12),
+                                                                   seed), opening))
+        summary = run(games, schedule=Schedule.of(s))
+        rows = [r for g in games for r in g.episode()[1]]
+        self.assertGreater(sum(r['proven'] == 1 for r in rows), 0)
+        self.assertTrue(all(r['solver_budget'] >= 0 for r in rows))
+        self.assertLessEqual(summary['budget_p95'], 8192)
+        self.assertGreaterEqual(min(solver_budgets(summary)), NODES)
+        self.assertEqual(summary['failures'], 0)
+        for key in ('wait_step_fraction', 'overrun_fraction', 'band_hit_rate', 'utilisation', 'lead_ms', 'nodes_per_ms'):
+            self.assertIn(key, summary)
+
+
+def solver_budgets(summary):
+    return [summary[f'{p}_budget'] for p in dense_solver.POINTS if summary[f'{p}_queries']]
+
+
 def shards(asynchronous, root):
-    """Seeded self-play with every solver point on, including two games from positions with forced wins, published
-    as a shard under `root`; returns the digests of its data files."""
+    """Seeded self-play with every solver point, gate, deep proofs and following on under fixed budgets, including two
+    games from positions with forced wins, published as a shard under `root`; returns the digests of its data
+    files."""
     model = tiny_model()
     s = settings(solver_root_nodes=NODES, solver_finalists=2, solver_finalist_nodes=NODES, solver_threat_nodes=NODES,
-                 solver_async=asynchronous)
+                 solver_async=asynchronous, solver_gate_weight=3., solver_deep_nodes=NODES, solver_follow=True)
     games = [dense_selfplay.SelfPlayGame([model, model], s, seed) for seed in (1, 2)]
     for seed, key in ((3, PROOF), (4, '1790600287230040:25:213')):
         opening = FIXTURE['positions'][key]
         games.append(from_position(dense_selfplay.SelfPlayGame([model, model], replace(s, max_plies=len(opening)+12),
                                                                seed), opening))
-    run(games, asynchronous)
+    run(games, asynchronous, Schedule.of(s))
     episodes, rows = [], []
     for game in games:
         episode, items = game.episode()

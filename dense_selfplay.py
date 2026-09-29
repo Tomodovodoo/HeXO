@@ -302,23 +302,28 @@ class Engine:
     position could not be encoded (`reason` set to 'span'; none of their requests is fulfilled afterwards).
 
     Solver (dense_solver): a slot with active budgets gets a dense_solver.Plan on the Engine's Solver (created on
-    first use; `solver_async` picks its backend). A search that submits queries leaves its slot until the next
-    visit, which awaits the verdicts before the search goes on; the root verdict is awaited before `searched`,
-    whose result then carries `proven`, `proof_turns`, `solver_nodes` and `pruned` (and the proof's action)
-    (dense_solver.Plan.finish). close() stops the Solver.
+    first use with `schedule`, default fixed budgets; `solver_async` picks its backend). A search that submits
+    queries leaves its slot until the next visit, which consumes the verdicts before the search goes on; the root
+    verdict is consumed before `searched`, whose result then carries `proven`, `proof_turns`, `solver_nodes`,
+    `solver_budget` and `pruned` (and the proof's action) (dense_solver.Plan.finish). Under adaptive budgets a
+    slot whose verdict is not in is skipped for the step (the other slots build the batch), and a step in which
+    every slot waits and no batch is in flight sleeps briefly instead of raising the stall error. Each step
+    reports its wall time and its collect time to the Solver; a finished slot's Plan closes with the game's
+    history (dense_solver.Plan.close; with solver_follow it calls slot.label). close() stops the Solver.
     """
 
-    def __init__(self, leaf_batch, solver_async=True):
+    def __init__(self, leaf_batch, solver_async=True, schedule=None):
         self.leaf_batch, self.slots, self.cursor, self.inflight = leaf_batch, [], 0, []
         self.evals = self.calls = self.hits = self.searches = 0
-        self.solver_async, self.solver, self.plans = solver_async, None, {}
+        self.solver_async, self.schedule = solver_async, schedule or dense_solver.Schedule()
+        self.solver, self.plans = None, {}
 
     def begin(self, slot):
         """Start the slot's next search; True when it must wait for solver verdicts until the next visit."""
         checked(native.hxg_begin(slot.tree.ptr, slot.budget, slot.samples))
         plan = self.plans.get(id(slot))
         if plan is None and slot.solver is not None and slot.solver.active:
-            self.solver = self.solver or dense_solver.Solver(self.solver_async)
+            self.solver = self.solver or dense_solver.Solver(self.schedule, self.solver_async)
             plan = self.plans[id(slot)] = dense_solver.Plan(self.solver)
         return plan is not None and plan.begin(slot)
 
@@ -332,7 +337,8 @@ class Engine:
             self.solver = None
 
     def step(self):
-        pending, count, done, progress = {}, 0, [], False
+        pending, count, done, progress, deferred = {}, 0, [], False, False
+        started = time.perf_counter()
         slots = self.slots
         for _ in range(len(slots)):
             if count >= self.leaf_batch:
@@ -340,8 +346,9 @@ class Engine:
             slot = slots[self.cursor % len(slots)]
             self.cursor += 1
             plan = self.plans.get(id(slot))
-            if plan:
-                plan.ready(slot)
+            if plan and not plan.ready(slot):
+                deferred = True
+                continue
             ptr = slot.tree.ptr
             while True:
                 request = native.hxg_next(ptr)
@@ -354,10 +361,11 @@ class Engine:
                     if native.hxg_completed(ptr) < slot.budget:
                         break
                     progress = True
-                    self.searches += 1
                     result = slot.tree.result(0, 0, 0, 0)
-                    if plan:
-                        plan.finish(slot, result)
+                    if plan and not plan.finish(slot, result):
+                        deferred = True
+                        break
+                    self.searches += 1
                     if not slot.searched(result):
                         done.append(slot)
                         break
@@ -396,7 +404,7 @@ class Engine:
             launched.append((model, positions, keys, model.evaluator.submit(histories, legal)))
             self.calls += 1
             self.evals += len(keys)
-        stopped = set()
+        stopped, collecting = set(), time.perf_counter()
         for model, positions, keys, handle in self.inflight:
             for key, prediction in zip(keys, model.evaluator.collect(handle)):
                 if prediction is None:
@@ -414,14 +422,21 @@ class Engine:
                 slot.reason = 'span'
                 if slot in self.slots and slot not in done:
                     done.append(slot)
+        collected = time.perf_counter()
         if not launched and not self.inflight and not progress and self.slots:
-            raise RuntimeError('Native scheduler stalled without pending evaluations')
+            if not deferred:
+                raise RuntimeError('Native scheduler stalled without pending evaluations')
+            self.solver.idle()
         self.inflight = launched
         if done:
             finished = set(map(id, done))
             self.slots = [s for s in self.slots if id(s) not in finished]
-            for key in finished:
-                self.plans.pop(key, None)
+            for slot in done:
+                plan = self.plans.pop(id(slot), None)
+                if plan:
+                    plan.close(slot, slot.tree.history)
+        if self.solver:
+            self.solver.tick((time.perf_counter()-started)*1000, (collected-collecting)*1000)
         return done
 
 
@@ -431,13 +446,13 @@ class SelfPlayGame:
     frozen checkpoint `opponent` (its id) as the other, whose plies keep rows without a policy, with a null root
     value and full_search False (dense_data.trained). Each distinct model owns one tree, advanced on every
     placement; both sides use the same playout-cap randomization, opening sampling and solver budgets (`solver`,
-    from the settings' solver_* fields). With the solver active every row records `proven`, `proof_turns` and
-    `solver_nodes` (Engine), a proof's move is played even on an opening ply, and the episode records `solver`
-    (dense_solver.record)."""
+    from the settings' solver_* fields). With the solver active every row records `proven`, `proof_turns`,
+    `solver_nodes` and `solver_budget` (Engine), a proof's move is played even on an opening ply, the episode
+    records `solver` (dense_solver.record) and `label` marks rows a proof decided after they were searched."""
 
     def __init__(self, sides, settings, seed, learner=0, opponent=None):
         self.sides, self.settings, self.seed, self.reason = sides, settings, seed, None
-        self.solver = dense_solver.Budgets.of(settings)
+        self.solver, self.schedule = dense_solver.Budgets.of(settings), dense_solver.Schedule.of(settings)
         self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) if settings.opening_random_plies > 0 else 0
@@ -471,7 +486,8 @@ class SelfPlayGame:
                 raise ValueError('Search policy is not a distribution')
             row['policy'] = policy.astype(np.float32)
         if self.solver.active:
-            row.update(proven=result['proven'], proof_turns=result['proof_turns'], solver_nodes=result['solver_nodes'])
+            row.update(proven=result['proven'], proof_turns=result['proof_turns'], solver_nodes=result['solver_nodes'],
+                       solver_budget=result['solver_budget'])
         self.rows.append(row)
         self.values.append(root_value(result, player) if trained else None)
         self.full.append(self.is_full and trained)
@@ -489,6 +505,16 @@ class SelfPlayGame:
         self.plan()
         return True
 
+    def label(self, ply, proven, turns):
+        """Record a proof's verdict (+1 / -1: the side to move wins / loses) on the row of `ply` unless it has one;
+        1 when set."""
+        index = ply-(len(self.moves)-len(self.rows))
+        row = self.rows[index] if 0 <= index < len(self.rows) else None
+        if row is None or row.get('proven'):
+            return 0
+        row.update(proven=proven, proof_turns=turns)
+        return 1
+
     def episode(self):
         """(episode, rows without `game`) after closing the native objects."""
         winner = self.game.winner
@@ -501,7 +527,7 @@ class SelfPlayGame:
                        trained_side=None if self.opponent is None else self.learner,
                        root_values=self.values, full_search=self.full)
         if self.solver.active:
-            episode['solver'] = dense_solver.record(self.solver)
+            episode['solver'] = dense_solver.record(self.solver, self.schedule)
         return episode, self.rows
 
 
@@ -628,7 +654,7 @@ def worker(args):
     historical = Historical(run, config, np.random.default_rng(seeds.spawn(1)[0]), args.games) if settings.historical_fraction > 0 else None
     if historical:
         historical.redraw(model.checkpoint, model.sha)
-    engine = Engine(settings.leaf_batch, settings.solver_async)
+    engine = Engine(settings.leaf_batch, settings.solver_async, dense_solver.Schedule.of(settings))
     began, solver_failures = time.perf_counter(), 0
     state = dict(published(run, args.worker), error=None)
     target = None if args.games is None else args.games+state['games_completed']

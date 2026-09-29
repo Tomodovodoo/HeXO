@@ -12,6 +12,9 @@ win in the dense-v1 capped and scanned positions had one.
 _DIGITS = [[(index//3**k) % 3 for k in range(6)] for index in range(729)]
 _STONES = [(digits.count(1), digits.count(2)) for digits in _DIGITS]
 WEIGHTS = {2: 0.25, 3: 2.0, 4: 4.0, 5: 4.0}
+# Gate levels of forcing_material on 916 labelled dense-v1 turn starts: no proven win scored below LOW (41% of all
+# turn starts do); 38% of the wins and 5% of all turn starts score HIGH or more.
+LOW, HIGH = 4.0, 16.0
 
 
 def live_windows(game, player=None):
@@ -35,3 +38,8 @@ def forcing_material(game, player=None):
 def worth_solving(game, player=None):
     """True when `player` (default: side to move) holds a live window with three or more stones."""
     return sum(live_windows(game, player)[3:]) > 0
+
+
+def gate_level(score):
+    """None below LOW (no forced win seen there), else the score's position in [LOW, HIGH] clipped to [0, 1]."""
+    return None if score < LOW else min(1.0, (score-LOW)/(HIGH-LOW))

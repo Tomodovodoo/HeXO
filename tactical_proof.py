@@ -11,6 +11,13 @@ probe), so a verdict and its certificate depend only on (position, attacker,
 nodes, idtt_nodes, build). `ms` is a safety cap: a query that reaches it returns
 UNKNOWN with reason 'deadline'.
 
+`gate` = dict(weight, floor, cap_low, cap_high) sizes the budget by the attacker's
+forcing material (forcing_material.gate_level g of the queried position): `floor`
+nodes when g is None, else min(cap_low + (cap_high-cap_low)*g, round(nodes*(1+weight*g))).
+The score is computed where the query runs (in the worker process for IsolatedTactics),
+so the verdict stays a function of (position, attacker, nodes, gate, build). Results
+carry the granted `budget` and `gate_score` (None without a gate).
+
 `attacker='mover'` asks whether the side to move has a forced win.
 `attacker='opponent'` asks whether its opponent, moving now with a fresh
 two-placement turn on the current stones, has one; `threat_cells` of that
@@ -22,6 +29,7 @@ import hashlib
 import importlib
 import json
 import math
+import os
 from pathlib import Path
 import queue
 import subprocess
@@ -36,13 +44,35 @@ DEFAULT_NODES, DEFAULT_MS = 2500, 1000
 REQUEST_LIMIT = 8*1024*1024
 # Worker responses above this are discarded unparsed; the verifier's 50,000-node certificate cap stays well below it.
 RESPONSE_LIMIT = 16*1024*1024
+# IsolatedTactics worker priorities: (Windows priority class, POSIX nice increment); None inherits.
+PRIORITIES = {None: None, 'below_normal': (0x4000, 5), 'idle': (0x40, 19)}
 
 
-def check_budgets(ms, nodes, idtt_nodes, depth, attacker):
-    if (type(ms) is not int or not 1 <= ms <= 60000 or type(nodes) is not int or not 1 <= nodes <= MAX_NODES
-            or type(idtt_nodes) is not int or not 0 <= idtt_nodes < nodes
-            or type(depth) is not int or not 1 <= depth <= 64 or attacker not in ('mover', 'opponent')):
+def check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate=None):
+    counts = [nodes] if gate is None else [nodes, gate.get('floor'), gate.get('cap_low'), gate.get('cap_high')]
+    if (type(ms) is not int or not 1 <= ms <= 60000 or any(type(n) is not int or not 1 <= n <= MAX_NODES for n in counts)
+            or type(idtt_nodes) is not int or not 0 <= idtt_nodes < min(counts)
+            or type(depth) is not int or not 1 <= depth <= 64 or attacker not in ('mover', 'opponent')
+            or (gate is not None and (set(gate) != {'weight', 'floor', 'cap_low', 'cap_high'}
+                                      or not 0 <= gate['weight'] <= 100 or gate['cap_low'] > gate['cap_high']))):
         raise ValueError('Invalid tactical budgets')
+
+
+def gated_nodes(history, attacker, nodes, gate):
+    """(node budget, forcing-material score) of a query under `gate` (module contract)."""
+    if gate is None:
+        return nodes, None
+    from forcing_material import forcing_material, gate_level
+    from hexo import Game
+    game = Game([tuple(p) for p in history])
+    try:
+        score = forcing_material(game, game.player if attacker == 'mover' else 1-game.player)
+    finally:
+        game.close()
+    g = gate_level(score)
+    if g is None:
+        return gate['floor'], score
+    return min(round(gate['cap_low']+(gate['cap_high']-gate['cap_low'])*g), round(nodes*(1+gate['weight']*g))), score
 
 
 def unknown_result(reason, start, attacker, build_hash=None):
@@ -68,9 +98,10 @@ class NativeTactics:
     """In-process native solver; one query at a time.
 
     Every result carries `status`, `moves` (the verified first turn), `certificate`,
-    `nodes_used` (search work charged against `nodes`), `proof_turns` (most attacker
-    turns on any certificate path, the completing turn included; None unless
-    PROVEN_WIN), `attacker` and `build_hash` (SHA-256 of the loaded library).
+    `nodes_used` (search work charged against the budget), `budget` and `gate_score`
+    (module contract), `proof_turns` (most attacker turns on any certificate path, the
+    completing turn included; None unless PROVEN_WIN), `attacker` and `build_hash`
+    (SHA-256 of the loaded library).
     """
 
     def __init__(self, package=PACKAGE):
@@ -92,10 +123,12 @@ class NativeTactics:
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None):
-        check_budgets(ms, nodes, idtt_nodes, depth, attacker)
+                certificate=None, root_moves=None, gate=None):
+        check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate)
         start = time.perf_counter()
-        unknown = lambda reason: unknown_result(reason, start, attacker, self.metadata['binary_sha256'])
+        nodes, score = gated_nodes(history, attacker, nodes, gate)
+        unknown = lambda reason: dict(unknown_result(reason, start, attacker, self.metadata['binary_sha256']),
+                                      budget=nodes, gate_score=score)
         if not self.lock.acquire(timeout=ms/1000):
             return unknown('lock deadline')
         try:
@@ -120,7 +153,7 @@ class NativeTactics:
                 self.lib.hexo_tactical_free(output)
             if time.perf_counter()-start >= ms/1000:
                 result.update(unknown('deadline'), nodes_used=result['nodes_used'])
-            result['elapsed_ms'] = (time.perf_counter()-start)*1000
+            result.update(elapsed_ms=(time.perf_counter()-start)*1000, budget=nodes, gate_score=score)
             return result
         finally:
             self.lock.release()
@@ -136,11 +169,12 @@ class IsolatedTactics:
     child's private memory is capped at `memory_mb` before it loads the engine; exceeding it
     ends the child and the query returns UNKNOWN. A child not ready `startup_ms` after it
     was started is replaced. `engine` names the `module:Class` constructed in the child with
-    `package`.
+    `package`. `priority` ('below_normal', 'idle' or None: inherited) is the child's CPU
+    scheduling class, set by the child before it loads the engine.
 
-    `history` takes the same budgets and `attacker` as `NativeTactics.history`, and its results
-    carry the same `nodes_used`, `proof_turns`, `attacker` and `build_hash` (None when no worker
-    answered). A verdict depends on the node budget only; a kill at the hard deadline is a
+    `history` takes the same budgets, `attacker` and `gate` as `NativeTactics.history`, and its
+    results carry the same `nodes_used`, `budget`, `gate_score`, `proof_turns`, `attacker` and
+    `build_hash` (None when no worker answered; `budget` and `gate_score` None too). A verdict depends on the node budget only; a kill at the hard deadline is a
     failure to investigate, not a verdict.
     Results carry `certificate=None` and the strategy as undecoded JSON text in
     `certificate_json` (up to ~6 MiB for a 45,000-node strategy); decoding it is left to the
@@ -148,9 +182,11 @@ class IsolatedTactics:
     """
 
     def __init__(self, package=PACKAGE, *, grace_ms=100, memory_mb=1536, startup_ms=10000,
-                 engine='tactical_proof:NativeTactics'):
+                 engine='tactical_proof:NativeTactics', priority=None):
+        if priority not in PRIORITIES:
+            raise ValueError(f'Unknown worker priority {priority!r}')
         self.command = [sys.executable, str(Path(__file__).resolve()), 'serve', engine, str(Path(package).resolve()),
-                        str(memory_mb)]
+                        str(memory_mb), str(priority)]
         self.grace_ms, self.startup_ms = grace_ms, startup_ms
         self.stats = dict(queries=0, spawns=0, kills=0, exits=0)
         self.lock = threading.Lock()
@@ -201,11 +237,12 @@ class IsolatedTactics:
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None):
-        check_budgets(ms, nodes, idtt_nodes, depth, attacker)
+                certificate=None, root_moves=None, gate=None):
+        check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate)
         start = time.perf_counter()
         hard = start+(ms+self.grace_ms)/1000
-        unknown = lambda reason, build_hash=None: unknown_result(reason, start, attacker, build_hash)
+        unknown = lambda reason, build_hash=None: dict(unknown_result(reason, start, attacker, build_hash), budget=None,
+                                                       gate_score=None)
         if not self.lock.acquire(timeout=ms/1000):
             return unknown('lock deadline')
         try:
@@ -231,7 +268,7 @@ class IsolatedTactics:
             if remaining < 1:
                 return unknown('deadline')
             request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
-                           attacker=attacker, certificate=certificate, root_moves=root_moves)
+                           attacker=attacker, certificate=certificate, root_moves=root_moves, gate=gate)
             payload = json.dumps(request, separators=(',', ':'))
             if len(payload) > REQUEST_LIMIT:
                 return unknown('request size limit')
@@ -250,7 +287,8 @@ class IsolatedTactics:
             if result.get('background_worker_busy'):
                 self._retire(killed=True)
             if time.perf_counter()-start >= ms/1000:
-                result.update(unknown('deadline', result.get('build_hash')), nodes_used=result.get('nodes_used', 0))
+                result.update(unknown('deadline', result.get('build_hash')), nodes_used=result.get('nodes_used', 0),
+                              budget=result.get('budget'), gate_score=result.get('gate_score'))
             result['elapsed_ms'] = (time.perf_counter()-start)*1000
             return result
         except OSError:
@@ -340,17 +378,23 @@ def _pump(stream, lines):
     lines.put(line)
 
 
-def _serve(engine, package, memory_mb):
+def _serve(engine, package, memory_mb, priority='None'):
     """Child side of IsolatedTactics: one JSON request per stdin line, one JSON result per stdout line.
 
-    On POSIX the child caps its own address space before loading the engine; the
-    parent never runs code between fork and exec.
+    On POSIX the child caps its own address space and lowers its priority before loading
+    the engine; the parent never runs code between fork and exec.
     """
     sys.stdin.readline()  # the parent has applied the job-object cap (Windows)
-    if sys.platform != 'win32':
+    level = PRIORITIES[None if priority == 'None' else priority]
+    if sys.platform == 'win32':
+        if level:
+            C.windll.kernel32.SetPriorityClass(C.c_void_p(-1), level[0])
+    else:
         import resource
         cap = int(memory_mb)*2**20
         resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+        if level:
+            os.nice(level[1])
     module, name = engine.split(':')
     try:
         tactics = getattr(importlib.import_module(module), name)(package)
@@ -419,4 +463,4 @@ def independent_verify(certificate, history, attacker='mover'):
 
 
 if __name__ == '__main__' and sys.argv[1:2] == ['serve']:
-    _serve(*sys.argv[2:5])
+    _serve(*sys.argv[2:6])
