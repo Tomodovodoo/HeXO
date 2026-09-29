@@ -708,6 +708,29 @@ class FusedCudaTests(unittest.TestCase):
         self.assertLessEqual(float((a-b).norm()), tolerance*float(a.norm())+1e-5)
         self.assertLessEqual(float((a-b).abs().max()), tolerance*float(a.abs().max())+1e-4)
 
+    @torch.inference_mode()
+    def test_actor_shapes_reuse_compiled_kernels(self):
+        import hexnet_kernels as kernels
+        torch.manual_seed(3070)
+        reference = hexnet.HexNet(TINY).cuda().eval()
+        fused = copy.deepcopy(reference).set_kernels('fused').to(memory_format=torch.channels_last)
+        functions = (kernels._windows, kernels._features, kernels._eval, kernels._line_add_nhwc)
+        compiled = None
+        # Change batch, canvas, row strides and tile tails after the first launch.
+        for b, h, w in ((2, 24, 24), (1, 24, 24), (3, 32, 32), (5, 40, 40), (1, 48, 48), (1, 64, 64)):
+            x = torch.randint(0, 2, (b, 8, h, w), device='cuda').bfloat16()
+            x[:, 3] = 1
+            with torch.autocast('cuda', torch.bfloat16):
+                a = reference(x, x[:, 3:4], aux=False)
+                y = x.contiguous(memory_format=torch.channels_last)
+                z = fused(y, y[:, 3:4], aux=False)
+            for key in a:
+                self.assert_bf16_close(a[key], z[key])
+            counts = [len(fn.device_caches[torch.cuda.current_device()][0]) for fn in functions]
+            if compiled is None:
+                compiled = counts
+            self.assertEqual(counts, compiled, 'a new actor shape must reuse the compiled kernels')
+
     def test_masked_norm_activation_and_gradients(self):
         torch.manual_seed(3070)
         for fmt in (torch.contiguous_format, torch.channels_last):

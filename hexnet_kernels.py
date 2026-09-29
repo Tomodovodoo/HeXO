@@ -2,15 +2,24 @@
 
 Keep the reference bf16 rounding points, including the centred variance and
 the products used for the affine gradients. Reductions accumulate in fp32.
+Batch, canvas and strides are runtime values, with scalar specialization disabled.
+Only model constants, layout and tile sizes specialize the actor kernels.
 """
+import os
+from pathlib import Path
+
+# One persistent per-user cache, independent of actor PID and working directory.
+# Respect an explicit shared cache supplied by the launcher.
+os.environ.setdefault("TRITON_CACHE_DIR", str(Path.home()/".triton"/"cache"))
+
 import torch
 import triton as tr
 import triton.language as tl
 
 
-@tr.jit
-def _windows(Own,Opp,Mask,Counts,N:tl.constexpr,H:tl.constexpr,W:tl.constexpr,
-             OS:tl.constexpr,PS:tl.constexpr,MS:tl.constexpr,K:tl.constexpr):
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'OS', 'PS', 'MS'])
+def _windows(Own,Opp,Mask,Counts,N,H,W,
+             OS,PS,MS,K:tl.constexpr):
     i=tl.program_id(0)*K+tl.arange(0,K)
     axis=tl.program_id(1)
     b,y,x=i//(H*W),i//W % H,i % W
@@ -33,9 +42,9 @@ def _windows(Own,Opp,Mask,Counts,N:tl.constexpr,H:tl.constexpr,W:tl.constexpr,
     tl.store(Counts+at+3*H*W,tl.where((mask>5.5)&(own<.5),opp,0.),i<N)
 
 
-@tr.jit
-def _features(Own,Opp,Mask,Counts,Out,N:tl.constexpr,H:tl.constexpr,W:tl.constexpr,
-              OS:tl.constexpr,PS:tl.constexpr,MS:tl.constexpr,K:tl.constexpr,NHWC:tl.constexpr):
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'OS', 'PS', 'MS'])
+def _features(Own,Opp,Mask,Counts,Out,N,H,W,
+              OS,PS,MS,K:tl.constexpr,NHWC:tl.constexpr):
     i=tl.program_id(0)*K+tl.arange(0,K)
     b,y,x=i//(H*W),i//W % H,i % W
     mine=tl.full((K,),0.,tl.float32)
@@ -82,11 +91,11 @@ def line_features(own,opp,mask):
     return out
 
 
-@tr.jit
-def _line_add(X,Weight,Y,B:tl.constexpr,C:tl.constexpr,H:tl.constexpr,W:tl.constexpr,
-              S:tl.constexpr,L:tl.constexpr,K:tl.constexpr):
+@tr.jit(do_not_specialize=['B', 'H', 'W', 'S'])
+def _line_add(X,Weight,Y,B,C:tl.constexpr,H,W,
+              S,L:tl.constexpr,K:tl.constexpr,NHWC:tl.constexpr):
     i=tl.program_id(0)*K+tl.arange(0,K)
-    if S[1]==1:
+    if NHWC:
         c,x,y,b=i % C,i//C % W,i//(C*W) % H,i//(C*H*W)
     else:
         x,y=i % W,i//W % H
@@ -114,8 +123,8 @@ def _line_add(X,Weight,Y,B:tl.constexpr,C:tl.constexpr,H:tl.constexpr,W:tl.const
     tl.store(Y+i,value,valid)
 
 
-@tr.jit
-def _line_add_nhwc(X,Weight,Y,N:tl.constexpr,C:tl.constexpr,H:tl.constexpr,W:tl.constexpr,
+@tr.jit(do_not_specialize=['N', 'H', 'W'])
+def _line_add_nhwc(X,Weight,Y,N,C:tl.constexpr,H,W,
                    L:tl.constexpr,P:tl.constexpr,CH:tl.constexpr):
     p=tl.program_id(0)*P+tl.arange(0,P)
     c=tl.program_id(1)*CH+tl.arange(0,CH)
@@ -148,19 +157,19 @@ def line_add(x,weight):
     if x.is_contiguous(memory_format=torch.channels_last):
         _line_add_nhwc[(tr.cdiv(b*h*w,16),tr.cdiv(c,32))](x,weight,out,b*h*w,c,h,w,weight.shape[-1],16,32)
     else:
-        _line_add[(tr.cdiv(x.numel(),256),)](x,weight,out,*x.shape,x.stride(),weight.shape[-1],256)
+        _line_add[(tr.cdiv(x.numel(),256),)](x,weight,out,*x.shape,x.stride(),weight.shape[-1],256,False)
     return out
 
 
-@tr.jit
-def _offset(i, c, H: tl.constexpr, W: tl.constexpr, S: tl.constexpr):
+@tr.jit(do_not_specialize=['H', 'W', 'S'])
+def _offset(i, c, H, W, S):
     return i//(H*W)*S[0]+c*S[1]+(i//W % H)*S[2]+(i % W)*S[3]
 
 
-@tr.jit
-def _eval(X,M,Y,Mean,Var,Weight,Bias,N:tl.constexpr,H:tl.constexpr,W:tl.constexpr,
-          XS:tl.constexpr,MS:tl.constexpr,YS:tl.constexpr,EPS:tl.constexpr,K:tl.constexpr,C:tl.constexpr):
-    if XS[1]==1:
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'YS'])
+def _eval(X,M,Y,Mean,Var,Weight,Bias,N,H,W,
+          XS,MS,YS,EPS:tl.constexpr,K:tl.constexpr,C:tl.constexpr,NHWC:tl.constexpr):
+    if NHWC:
         at=tl.program_id(0)*K+tl.arange(0,K)
         c,i=at % C,at//C
     else:
@@ -179,13 +188,13 @@ def norm_eval(norm,x,mask):
     ms=mask.stride() if mask.shape[1]==c else (mask.stride(0),0,*mask.stride()[2:])
     grid=(tr.cdiv(x.numel(),1024),) if x.stride(1)==1 else (c,tr.cdiv(b*h*w,1024))
     _eval[grid](x,mask,out,norm.running_mean,norm.running_var,norm.weight,norm.bias,
-                b*h*w,h,w,x.stride(),ms,out.stride(),norm.eps,1024,c,enable_fp_fusion=False)
+                b*h*w,h,w,x.stride(),ms,out.stride(),norm.eps,1024,c,x.stride(1)==1,enable_fp_fusion=False)
     return out
 
 
-@tr.jit
-def _reduce(X, M, Mean, Partial, N: tl.constexpr, H: tl.constexpr, W: tl.constexpr,
-            XS: tl.constexpr, MS: tl.constexpr, T: tl.constexpr, VAR: tl.constexpr,
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'T'])
+def _reduce(X, M, Mean, Partial, N, H, W,
+            XS, MS, T, VAR: tl.constexpr,
             K: tl.constexpr):
     c, t = tl.program_id(0), tl.program_id(1)
     i = t*K+tl.arange(0, K)
@@ -200,8 +209,8 @@ def _reduce(X, M, Mean, Partial, N: tl.constexpr, H: tl.constexpr, W: tl.constex
     tl.store(Partial+c*T+t, tl.sum(tl.where(i<N,v,0),0))
 
 
-@tr.jit
-def _finish(Partial, Mean, Var, Inv, Cells, X, T: tl.constexpr,
+@tr.jit(do_not_specialize=['T'])
+def _finish(Partial, Mean, Var, Inv, Cells, X, T,
             EPS: tl.constexpr, VAR: tl.constexpr, K: tl.constexpr):
     c = tl.program_id(0)
     i = tl.arange(0,K)
@@ -225,9 +234,9 @@ def _normalized(x,mean,inv,weight,bias,D:tl.constexpr):
     return tl.fma(centred,scale.to(D).to(tl.float32),offset).to(D).to(tl.float32)
 
 
-@tr.jit
-def _apply(X,M,Y,Mean,Inv,Weight,Bias,N:tl.constexpr,H:tl.constexpr,W:tl.constexpr,
-           XS:tl.constexpr,MS:tl.constexpr,YS:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr):
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'YS'])
+def _apply(X,M,Y,Mean,Inv,Weight,Bias,N,H,W,
+           XS,MS,YS,ACT:tl.constexpr,K:tl.constexpr):
     c=tl.program_id(0)
     i=tl.program_id(1)*K+tl.arange(0,K)
     x=tl.load(X+_offset(i,c,H,W,XS),i<N,0).to(tl.float32)
@@ -246,9 +255,9 @@ def _xhat(x,mean,inv,D:tl.constexpr):
     return tl.fma(centred,inv.to(D).to(tl.float32),bias).to(D).to(tl.float32)
 
 
-@tr.jit
-def _grad_reduce(X,M,G,Mean,Inv,Weight,Bias,Partial,N:tl.constexpr,H:tl.constexpr,W:tl.constexpr,
-                 XS:tl.constexpr,MS:tl.constexpr,GS:tl.constexpr,C:tl.constexpr,T:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr):
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'GS', 'T'])
+def _grad_reduce(X,M,G,Mean,Inv,Weight,Bias,Partial,N,H,W,
+                 XS,MS,GS,C:tl.constexpr,T,ACT:tl.constexpr,K:tl.constexpr):
     c,t=tl.program_id(0),tl.program_id(1)
     i=t*K+tl.arange(0,K)
     x=tl.load(X+_offset(i,c,H,W,XS),i<N,0).to(tl.float32)
@@ -263,17 +272,17 @@ def _grad_reduce(X,M,G,Mean,Inv,Weight,Bias,Partial,N:tl.constexpr,H:tl.constexp
     tl.store(Partial+(C+c)*T+t,tl.sum(tl.where(i<N,dw,0),0))
 
 
-@tr.jit
-def _grad_finish(Partial,Db,Dw,C:tl.constexpr,T:tl.constexpr,K:tl.constexpr):
+@tr.jit(do_not_specialize=['T'])
+def _grad_finish(Partial,Db,Dw,C:tl.constexpr,T,K:tl.constexpr):
     c=tl.program_id(0)
     i=tl.arange(0,K)
     tl.store(Db+c,tl.sum(tl.load(Partial+c*T+i,i<T,0),0))
     tl.store(Dw+c,tl.sum(tl.load(Partial+(C+c)*T+i,i<T,0),0))
 
 
-@tr.jit
-def _grad_apply(X,M,G,Dx,Mean,Inv,Weight,Bias,Db,Dw,Cells,N:tl.constexpr,H:tl.constexpr,W:tl.constexpr,
-                XS:tl.constexpr,MS:tl.constexpr,GS:tl.constexpr,DS:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr):
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'GS', 'DS'])
+def _grad_apply(X,M,G,Dx,Mean,Inv,Weight,Bias,Db,Dw,Cells,N,H,W,
+                XS,MS,GS,DS,ACT:tl.constexpr,K:tl.constexpr):
     c=tl.program_id(0)
     i=tl.program_id(1)*K+tl.arange(0,K)
     x=tl.load(X+_offset(i,c,H,W,XS),i<N,0).to(tl.float32)
