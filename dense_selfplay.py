@@ -442,6 +442,7 @@ class Engine:
             self.closing.remove(entry)
             if plan:
                 plan.close(slot, tuple(map(tuple, slot.moves)))
+            self.completed.append(slot)
             done.append(slot)
         if self.closing and not self.slots and not done:
             self.solver.idle()

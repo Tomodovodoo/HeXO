@@ -435,6 +435,18 @@ class Adjudication(unittest.TestCase):
 
 
 class Scheduler(unittest.TestCase):
+    def test_closing_tracks_games_before_a_later_plan_fails(self):
+        engine = dense_selfplay.Engine(64)
+        first, second = mock.Mock(moves=[]), mock.Mock(moves=[])
+        good, bad = mock.Mock(), mock.Mock()
+        good.pending.return_value = bad.pending.return_value = False
+        bad.close.side_effect = RuntimeError('later plan failed')
+        engine.closing = [(first, good, time.perf_counter()), (second, bad, time.perf_counter())]
+        with self.assertRaisesRegex(RuntimeError, 'later plan failed'):
+            engine.step()
+        self.assertIn(first, engine.completed)
+        self.assertNotIn(second, engine.completed)
+
     def test_seal_match_closes_adaptive_plan_after_seal_turn(self):
         model = tiny_model()
         calls = []
