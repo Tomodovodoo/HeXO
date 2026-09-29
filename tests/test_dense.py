@@ -4390,6 +4390,63 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(all(s[0] >= 5 for s in seen[:13]))                 # kept full until the budget runs out
         self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 20)
 
+    def test_status_refreshes_posterior_while_games_drain(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=20, pool_games=6)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+
+        def supersede(pool, steps):
+            if steps == 1:
+                self.export(30)
+            if steps == 5:
+                raise Crash
+
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=supersede)), \
+                unittest.mock.patch.object(dense_eval, 'STATUS_SECONDS', 0.), self.assertRaises(Crash):
+            evaluator.step()
+        status = json.loads((self.run/'evaluator-status.json').read_text())
+        candidate, champion = 'main/000020', 'main/000010'
+        current = evaluator.verdict(candidate, champion)
+        self.assertEqual(status['decision']['direct']['games'], status['tally']['games'])
+        self.assertEqual(status['decision']['direct']['games'], 4)
+        self.assertAlmostEqual(status['decision']['p_better'], current['p_better'])
+        self.assertAlmostEqual(status['decision']['delta'], current['delta'])
+        self.assertAlmostEqual(status['decision']['delta_sd'], current['delta_sd'])
+        self.assertAlmostEqual(status['decision']['direct']['effective_pairs'], current['direct']['effective_pairs'])
+
+    def test_status_refreshes_when_only_evidence_finishes(self):
+        evaluator = self.start(decision='posterior', opening_suite='standard-v1', pool_games=4, sprt_max_games=20)
+        self.export(10, 20, 30)
+        candidate, champion, evidence = 'main/000030', 'main/000010', 'main/000020'
+        entry = lambda step: dict(id=f'main/{step:06d}', variant='main', step=step, elo=0., matches=[])
+        evaluator.league.update(champion=champion, checkpoints=[entry(10), entry(20)], variants=[])
+        self.report(evidence, champion, [0, 0]*5)
+        self.report(candidate, champion, [1, 0])
+        initial = evaluator.verdict(candidate, champion)
+        evaluator.status['decision'] = dict(dense_eval.public(initial), candidate=candidate, opponent=champion)
+        calls = 0
+
+        def want():
+            nonlocal calls
+            calls += 1
+            return {(candidate, champion, 'champion'): 2, (candidate, evidence, 'evidence'): 2} if calls == 1 else {}
+
+        def stop(pool, steps):
+            if steps == 3:
+                raise Crash
+
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=stop,
+                order=lambda r: 0 if r['opponent'] == evidence else 1)), \
+                unittest.mock.patch.object(dense_eval, 'STATUS_SECONDS', 0.), self.assertRaises(Crash):
+            evaluator.session(want, 20)
+        status = json.loads((self.run/'evaluator-status.json').read_text())
+        current = evaluator.verdict(candidate, champion)
+        self.assertEqual(status['tally']['games'], 2)
+        self.assertEqual(status['decision']['direct']['games'], 2)
+        self.assertNotAlmostEqual(initial['p_better'], current['p_better'])
+        self.assertAlmostEqual(status['decision']['p_better'], current['p_better'])
+
     def test_superseded_sprt_settles_on_its_games(self):
         """A newer checkpoint stops the SPRT; the settlement promotes because the paired 95% lower bound of its pair
         score exceeds 1/2."""
