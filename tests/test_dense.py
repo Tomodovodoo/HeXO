@@ -1726,14 +1726,17 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertTrue(math.isnan(losses[2]) and math.isnan(losses[5]) and torch.isfinite(losses[:2]).all())
 
     def test_policy_validation_rows_on_synthetic_panel(self):
-        out = dict(policy=torch.tensor([[3., 1.], [3., 0.], [0., 1.]]), far=torch.tensor([0., 0., 4.]))
-        batch = dict(cells=torch.tensor([[0, 1, -1], [0, 1, -1], [1, -1, -1]]), counts=torch.tensor([3, 3, 2]),
-                     mask=torch.tensor([[True, True, True], [True, True, True], [True, True, False]]),
-                     policy=torch.tensor([.8, .2, 0., .1, .8, .1, .2, .8]))
+        out = dict(policy=torch.tensor([[3., 1.], [3., 0.], [0., 1.], [0., 1.]]),
+                   far=torch.tensor([0., 0., 4., 4.]))
+        batch = dict(cells=torch.tensor([[0, 1, -1], [0, 1, -1], [1, -1, -1], [0, -1, -1]]),
+                     counts=torch.tensor([3, 3, 2, 3]),
+                     mask=torch.tensor([[True, True, True], [True, True, True], [True, True, False],
+                                        [True, True, True]]),
+                     policy=torch.tensor([.8, .2, 0., .1, .8, .1, .2, .8, .1, .1, .8]))
         ce, entropy, kl, top1 = dense_learn.policy_validation_rows(out, batch)
         np.testing.assert_allclose(ce.numpy(), entropy.numpy()+kl.numpy(), rtol=0, atol=1e-7)
-        self.assertEqual(top1.tolist(), [1., 0., 1.])
-        self.assertAlmostEqual(float(top1.mean()), 2/3)
+        self.assertEqual(top1.tolist(), [1., 0., 1., 1.])
+        self.assertAlmostEqual(float(top1.mean()), 3/4)
 
     def test_remaining_curve_on_outcomes_decided_in_the_last_ten_plies(self):
         """Games whose outcome is fixed only in their last 10 plies: a predictor that knows it there and says 0.5
