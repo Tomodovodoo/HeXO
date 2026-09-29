@@ -251,7 +251,8 @@ class Pool:
 class Solver:
     """The tactical backend of one process under a Schedule (module contract): asynchronous (a Pool of
     schedule.workers below-normal IsolatedTactics children, plus a one-child idle-priority Pool for adaptive deep
-    proofs) or synchronous (NativeTactics, each query answered inside submit).
+    proofs) or synchronous (NativeTactics, each query answered inside submit; fixed budgets only, since adaptive
+    verdicts are polled and deep proofs need their own worker).
 
     stats: per point {queries, hits, nodes, budget, solver_ms}, hit counts by budget band, recent budgets and gate
     scores, verdict waits (count, ms, steps with a wait), deferred slots, late verdicts, dropped threat verdicts,
@@ -259,6 +260,8 @@ class Solver:
     """
 
     def __init__(self, schedule=Schedule(), asynchronous=True):
+        if not asynchronous and not schedule.fixed_budgets:
+            raise ValueError('Adaptive solver budgets need the asynchronous backend (solver_async)')
         self.schedule, self.asynchronous, self.build_hash = schedule, asynchronous, build_hash()
         self.step_ms = self.collect_ms = None
         self.allowance, self.lead = 0., {}

@@ -338,9 +338,12 @@ class Scheduler(unittest.TestCase):
 
     def test_allocation_follows_the_measured_lead(self):
         try:
-            solver = dense_solver.Solver(Schedule(fixed_budgets=False, gate_weight=3.), asynchronous=False)
+            solver = dense_solver.Solver(Schedule(fixed_budgets=False, gate_weight=3.))
         except FileNotFoundError:
             raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        self.addCleanup(solver.close)
+        with self.assertRaises(ValueError):
+            dense_solver.Solver(Schedule(fixed_budgets=False), asynchronous=False)
         self.assertEqual(solver.allocate('root', NODES)[0], 32)          # nothing measured yet: the floor
         solver.leads['root'].extend([70.]*8)
         solver.tick(10., 5.)
@@ -371,9 +374,10 @@ class Scheduler(unittest.TestCase):
 
     def test_a_late_verdict_defers_its_game_once_then_finishes_in_the_background(self):
         try:
-            solver = dense_solver.Solver(Schedule(fixed_budgets=False), asynchronous=False)
+            solver = dense_solver.Solver(Schedule(fixed_budgets=False))
         except FileNotFoundError:
             raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        self.addCleanup(solver.close)
         plan, future = dense_solver.Plan(solver), Future()
         query = dense_solver.Query(solver, 'root', ((0, 0),), 100, future)
         solver.tick(100., 50.)                                          # allowance: 5 ms
