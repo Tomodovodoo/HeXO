@@ -869,7 +869,7 @@ always score finished games against their hard outcome.
   The running evaluator picks it up once no checkpoint waits and decides it against its checkpoint: 'better'
   once P(variant - checkpoint > `sprt_elo0`) reaches `promote_confidence`, 'worse' once it falls to 1 -
   `promote_confidence`, 'max-games' at `sprt_max_games`. Variants are rated in the league and shown in the
-  checkpoint history, but they never become champion and never reach the actors.
+  checkpoint history, but they never become champion and never reach the actors. `--checkpoint champion` registers against whichever checkpoint is champion when the comparison starts; with `rebase_on_promotion` (default on) a variant registered against the champion also follows a new champion until it starts.
 - **Opening books** (`dense_openings.py`). Every pairing, Seal anchors included, draws its colour-swapped openings from
   the book of `opening_suite`. Each completed pair is recorded on every node its opening passed through, so the
   statistics of a node cover its whole subtree. A book is a DAG of symmetry-reduced positions, and a frozen suite
