@@ -22,7 +22,10 @@ solver (episode `solver`, dense_solver.record) carry `proven` (+1 / -1: the side
 proof, 0: unproven), `proof_turns` (attacker turns of that proof, 0 when unproven), `solver_nodes` (solver work
 spent on the ply's search) and `solver_budget` (the node budgets granted to its queries); absent means 0. The
 manifest counts the proven rows as `proven_rows`. Readers (ReplayWindow, ValidationSets) also set proven = +1 on the
-rows a sidecar lists (proof_labels) once it appears.
+rows a sidecar lists (proof_labels) once it appears. A game ended at a proof (actor adjudicate_proven) has reason
+'proven', its winner and `adjudicated` {ply, winner, line_plies: placements of the certificate's forced line from
+there}; rows of that line played without search carry `line` True and no policy. The manifest counts
+`proven_games`, `line_rows` and `adjudicated_plies`.
 Actor episodes record `origin` ('selfplay' or 'restart'; absent: 'selfplay'). A restart game (dense_selfplay.Restarts)
 starts from a buffer position: its first `restart.ply` moves are the source game's, replayed without search, so it
 has rows only from that ply on (null root values and full_search False before it); `restart` names the source
@@ -247,11 +250,13 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
         if len(p) and (not np.isfinite(p).all() or np.any(p < 0) or not np.isclose(p.sum(), 1, atol=1e-4)):
             raise ValueError('Invalid policy target')
     keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256', 'proven', 'proof_turns', 'solver_nodes',
-            'solver_budget')
+            'solver_budget', 'line')
     counts = dict(games=len(episodes), rows=len(rows), policy_rows=sum(len(p) > 0 for p in policies),
                   opponent_rows=sum(not trained(episodes[r['game']], r['ply']) for r in rows),
                   terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes),
                   proven_rows=sum(bool(r.get('proven')) for r in rows),
+                  proven_games=sum(e.get('reason') == 'proven' for e in episodes), line_rows=sum(bool(r.get('line')) for r in rows),
+                  adjudicated_plies=sum(e['adjudicated']['line_plies'] for e in episodes if e.get('adjudicated')),
                   restart_games=sum(e.get('origin') == 'restart' for e in episodes),
                   forced_plies=sum(e['restart']['ply'] for e in episodes if e.get('origin') == 'restart'))
     with tempfile.TemporaryDirectory(dir=path.parent, prefix='pending-') as temporary:

@@ -17,9 +17,10 @@ const REVISION:&str="5a771e572553a8bd8e010112b2ce65f16e5afa1b";
 const NODES_PER_TT_MB:u64=2048;
 // Exact state keys, never Zobrist hashes. Rules/scope are fixed by this library version.
 // The budgets (and the IDTT depth when IDTT runs) are part of the key: a search is a
-// function of position and budgets. A hit replays the search's certificate, work and
+// function of position and budgets. Searches with resident state are keyed apart, so a
+// cold (table_mb 0) query never replays a result that depended on earlier queries. A hit replays the search's certificate, work and
 // IDTT verdict, so it is indistinguishable from a fresh search except for `cache_hit`.
-type Key=(Vec<((i32,i32),u8)>,u8,u8,u64,u64,u8);
+type Key=(Vec<((i32,i32),u8)>,u8,u8,u64,u64,u8,bool);
 type Solved=(ProofCertificate,u64,Option<String>);
 static CACHE:OnceLock<Mutex<BTreeMap<Key,Solved>>>=OnceLock::new();
 /// Whose forced win is asked: the side to move, or its opponent given a fresh
@@ -34,6 +35,8 @@ struct Request {
     #[serde(default)] attacker:Attacker,
     #[serde(default)] certificate:Option<ProofCertificate>,
     #[serde(default)] root_moves:Option<Vec<(i32,i32)>>,
+    /// Resident search state of this worker thread in megabytes (dfpn::set_resident); 0 = none.
+    #[serde(default)] table_mb:u64,
 }
 fn position(board:&check::Board,side:u8,remaining:u8)->Position {
     Position{stones:board.iter().map(|(&p,&s)|(p,if s==0{Player::P1}else{Player::P2})).collect(),
@@ -74,18 +77,21 @@ fn complete_candidate(board:&check::Board,start:usize,moves:&[(i32,i32)],req:&Re
     cert.nodes[1]=ProofNode::DefenderReplies{responses};Ok(cert)
 }
 /// One query. `nodes` bounds the total search work (IDTT nodes plus PDS-PN level-1
-/// nodes and level-2 expansions), so the verdict and certificate are a function of
-/// (position, attacker, nodes, idtt_nodes, build); `ms` is only a safety cap, and a
-/// query that reaches it returns UNKNOWN.
+/// nodes and level-2 expansions), so with `table_mb` 0 the verdict and certificate are a
+/// function of (position, attacker, nodes, idtt_nodes, build); a resident table
+/// (`table_mb` > 0) carries search state across queries, so they then also depend on the
+/// earlier queries of the worker. `ms` is only a safety cap, and a query that reaches it
+/// returns UNKNOWN.
 fn run(req:Request, start:Instant) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.nodes==0 || req.nodes>10_000_000
-        || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 {return Err("invalid tactical limits".into());}
+        || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256 {return Err("invalid tactical limits".into());}
+    prover::dfpn::set_resident(req.table_mb as usize);
     let deadline=start+Duration::from_millis(req.ms as u64);
     let board=check::replay(&req.history)?;
     let ply=if req.attacker==Attacker::Opponent {check::flip(req.history.len())} else {req.history.len()};
     let (side,remaining)=check::phase(ply);
     let key=(board.iter().map(|(&p,&s)|(p,s)).collect(),side,remaining,req.nodes,req.idtt_nodes,
-        if req.idtt_nodes>0 {req.depth} else {0});
+        if req.idtt_nodes>0 {req.depth} else {0},req.table_mb>0);
     let scope=json!({"rules":{"win_length":6,"placement_radius":8,"match_move_cap":null},
         "defenses":"all legal two-stone covers including complete free-second frontier; quiet defender nodes unsupported",
         "attacks":"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN","checker_version":3,
@@ -268,6 +274,33 @@ mod tests {
         assert_eq!(plain["certificate"],probed["certificate"]);
         let extra=probed["nodes_used"].as_u64().unwrap()-plain["nodes_used"].as_u64().unwrap();
         assert!(extra<=3,"IDTT spent {extra} units of a 3-unit share");
+    }
+    #[test]
+    fn resident_state_proves_again_with_less_work() {
+        let query=|table_mb:usize| {
+            let (pos,cfg,ctl,meter)=setup(1_000_000);
+            prover::dfpn::set_resident(table_mb);
+            let solved=prover::pdspn::solve(&pos,&cfg,&ctl);
+            (solved.certificate.is_some(),meter.spent())
+        };
+        let (fresh,cold)=query(0);
+        let (first,_)=query(4);
+        let (again,warm)=query(4);
+        assert!(fresh && first && again,"every search proves the win");
+        assert!(warm<cold,"the resident table saves work: {warm} of {cold}");
+        prover::dfpn::set_resident(0);
+    }
+    #[test]
+    fn resident_results_never_serve_cold_queries() {
+        let query=|table_mb:u64| {
+            let req=serde_json::from_value(json!({"history":OPEN_THREE,"ms":60000,"nodes":777_777,
+                "idtt_nodes":0,"depth":8,"table_mb":table_mb})).unwrap();
+            run(req,Instant::now()).unwrap()["cache_hit"].as_bool().unwrap()
+        };
+        assert!(!query(4),"first resident search");
+        assert!(!query(0),"a cold query does not reuse the resident result");
+        assert!(query(0),"cold results are cached for cold queries");
+        prover::dfpn::set_resident(0);
     }
     #[test]
     fn exhausted_meter_stops_the_search() {
