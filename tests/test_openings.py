@@ -750,7 +750,7 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual(len(list(path.parent.glob('report-*.json'))), 1)
         self.assertEqual(json.loads((self.run/'league.json').read_text())['anchors']['seal']['games'], 4)
 
-    def test_a_reign_begun_before_pooling_counts_its_current_seal_report(self):
+    def test_a_reign_begun_before_pooling_moves_its_archives_into_the_baseline_once(self):
         self.export(10)
         evaluator = self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.)
         evaluator.step()                                                    # the first champion, unopposed
@@ -762,13 +762,16 @@ class EvaluatorBookTests(unittest.TestCase):
                                                         replace(evaluator.settings, sims=sims))
         (folder/'report-1-old.json').write_text(json.dumps(report(10, 99)))  # archived before this reign
         (folder/'report.json').write_text(json.dumps(report(1, evaluator.settings.sims)))
-        evaluator.league.update(reign_games=2)                               # counted on the current report alone
-        evaluator.league.pop('reign_pooled')
-        self.assertEqual(evaluator.anchor()[3], 4)                           # the archive's 20 games do not count
-        evaluator.crown(CHAMPION)                                            # a new reign counts everything pooled
-        self.assertEqual((evaluator.league['reign_games'], evaluator.league['reign_pooled']), (22, True))
-        self.assertEqual(evaluator.anchor()[3], 4)
-
+        league = json.loads((self.run/'league.json').read_text())
+        league.pop('reign_pooled')
+        (self.run/'league.json').write_text(json.dumps(dict(league, reign_games=2)))   # counted on report.json alone
+        restarted = self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.)
+        self.assertEqual((restarted.league['reign_games'], restarted.league['reign_pooled']), (22, True))
+        self.assertEqual(json.loads((self.run/'league.json').read_text())['reign_games'], 22)
+        self.assertEqual(restarted.anchor()[3], 4)                          # the archive's 20 games do not count
+        (folder/'report-2-new.json').write_text(json.dumps(report(2, 98)))  # archived during the reign
+        (folder/'report.json').unlink()                                     # a book change moved report.json aside
+        self.assertEqual(self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.).anchor()[3], 2)
     def test_archives_of_one_pairing_never_overwrite_each_other(self):
         self.export(10)
         evaluator = self.start(opening_suite='standard-v1')
@@ -802,7 +805,9 @@ class EvaluatorBookTests(unittest.TestCase):
         league = dict(checkpoints=[entry(10), dict(entry(20), verdict=dict(snapshot, delta=10., delta_sd=40.)), entry(30), entry(40)])
         self.assertEqual(dense_eval.calibration(league, [archive, current]+later)['count'], 1)
         self.assertEqual(dense_eval.calibration(league, [current]+later)['count'], 0)       # the decided games are gone
-
+        # Archives present at the verdict (listed as earlier) are neither later comparisons nor evidence now.
+        league['checkpoints'][1]['verdict']['earlier'] = [later[0]['id'], later[1]['id']]
+        self.assertEqual(dense_eval.calibration(league, [archive, current]+later)['count'], 0)
     def test_the_standard_suite_is_a_frozen_book_with_its_statistics_in_the_run(self):
         self.export(10)
         played = dense_openings.Book(self.run, dense_config.EvaluationSettings()).openings()[0]['moves']

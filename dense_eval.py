@@ -95,8 +95,8 @@ differences and ladder are [{a, b, elo_delta, interval}] over pairs of the varia
 elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
 latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, latest_delta the newest one's. reign_from
 is the number of checkpoint entries and reign_games the champion's Seal games when it was promoted or restored
-(absent: its own position + 1 and 0), counted over its archived Seal reports too when reign_pooled is true (a reign
-begun before that counts its current report alone). `matrix` (`payoff`) holds
+(absent: its own position + 1 and 0), counted over its archived Seal reports too (reign_pooled; `Evaluator.pool_reign`
+migrates a reign begun before). `matrix` (`payoff`) holds
 only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
 written before `matrix`, `ladder`, `panel`, `calibration` and `openings` existed lack those keys; the Evaluator
 adds `matrix` and `calibration` on start, and rebuilds the league when its ladder_top differs from the effective
@@ -669,9 +669,10 @@ def calibration(league, reports):
     (every input of the verdict's posterior, the direct one among them) all still begin with the games it was decided
     on (`games_digest` of that prefix: extended at most, not replaced) and which has at least CALIBRATION_LATER later
     comparisons (reports with it under that protocol that are new or have grown since the verdict; a pairing's archive
-    that matches the protocol again is a report of its own), shift = delta
-    now - delta at the verdict, both r_cid - r_opponent + their matchup deviation over the reports of that protocol
-    with the verdict's matchup prior. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
+    that matches the protocol again is a report of its own), shift = delta now - delta at the verdict, both r_cid -
+    r_opponent + their matchup deviation over the reports of that protocol with the verdict's matchup prior. Reports
+    the snapshot lists as `earlier` (present at the verdict but not among its inputs, such as older archives) are
+    neither later comparisons nor part of the posterior now. A calibrated Gaussian posterior expects E[shift^2] = sd_then^2 - sd_now^2 (the variance the later games
     resolved). Returns {count, predicted_sd (mean delta_sd at the verdicts), expected_rms (root mean sd_then^2 -
     sd_now^2), realised_rms (root mean shift^2)}, the three None without a counted verdict: realised_rms well below
     expected_rms means the posterior overstates its variance."""
@@ -684,7 +685,8 @@ def calibration(league, reports):
                 or cid not in rated or verdict['opponent'] not in rated:
             continue
         key = protocol(verdict['protocol'])
-        group = [r for r in reports if protocol(r['settings']) == key]
+        earlier = frozenset(verdict.get('earlier', ()))
+        group = [r for r in reports if protocol(r['settings']) == key and r.get('id') not in earlier]
         named = {}  # report name -> its reports of the protocol: the current one and archives it matches again
         for r in group:
             named.setdefault(report_name(r), []).append(r)
@@ -699,7 +701,7 @@ def calibration(league, reports):
                     for name, rs in named.items() for r in rs)
         if later < CALIBRATION_LATER:
             continue
-        model = key, verdict['matchup_prior']
+        model = key, verdict['matchup_prior'], earlier
         if model not in posteriors:
             ids = rated+([SEAL] if any(SEAL in (r['candidate'], r['opponent']) for r in group) else [])
             posteriors[model] = Posterior(ids, ids[0], [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
@@ -912,6 +914,7 @@ class Evaluator:
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
+        self.pool_reign()
         if self.league['checkpoints'] and (missed or 'matrix' not in self.league or 'calibration' not in self.league
                                            or self.league.get('ladder_top') != settings.fill_top):
             write_league(self.run, self.league, self.config, self.settings.fill_top)
@@ -1331,11 +1334,13 @@ class Evaluator:
     def snapshot(self, cid, champion):
         """What a decided verdict records for `calibration`: {opponent (the champion), protocol ({PROTOCOL setting:
         value}), matchup_prior (the effective matchup_prior_elo), reports ({report name: {games, digest
-        (`games_digest`)}} of every report the verdict's posterior uses, `inputs`)}."""
-        s = self.settings
+        (`games_digest`)}} of every report the verdict's posterior uses, `inputs`), earlier (the ids of every other
+        report present, archives included)}."""
+        s, inputs = self.settings, self.inputs(cid, champion)[1]
+        used = {r.get('id') for r in inputs}
         return dict(opponent=champion, protocol={k: getattr(s, k) for k in PROTOCOL}, matchup_prior=s.matchup_prior_elo,
-                    reports={report_name(r): dict(games=len(r['games']), digest=games_digest(r['games']))
-                             for r in self.inputs(cid, champion)[1]})
+                    reports={report_name(r): dict(games=len(r['games']), digest=games_digest(r['games'])) for r in inputs},
+                    earlier=sorted(r['id'] for r in load_reports(self.run) if r.get('id') and r['id'] not in used))
 
     def evidence(self, verdict, cid, champion, games):
         """(a, b) of the evidence pairing for a pending posterior decision, or None: of cid and the champion each
@@ -1616,13 +1621,18 @@ class Evaluator:
         self.league.update(champion=cid, reign_from=len(self.league['checkpoints']), reign_pooled=True,
                            reign_games=sum(len(r['games']) for r in self.seal_reports(cid)))
 
-    def reign_seal_games(self, cid):
-        """cid's Seal games on the basis reign_games was counted on: its `seal_reports` pooled (reign_pooled), else, for a
-        reign begun before archives were pooled, its current report alone."""
-        if self.league.get('reign_pooled'):
-            return sum(len(r['games']) for r in self.seal_reports(cid))
-        report = self.sealed(cid)
-        return len(report['games']) if report else 0
+    def pool_reign(self):
+        """Once, for a reign begun before archived reports were pooled (no reign_pooled): add the champion's archived
+        Seal games to reign_games, so they count as played before the reign. Games an archive gained during the
+        reign are then owed again (at most one more anchor round); none is ever taken as played twice. The two fields
+        are written to league.json at once, so the migration happens once."""
+        champion = self.league.get('champion')
+        if champion is None or self.league.get('reign_pooled'):
+            return
+        current = self.sealed(champion)
+        archived = sum(len(r['games']) for r in self.seal_reports(champion))-(len(current['games']) if current else 0)
+        self.league.update(reign_games=self.league.get('reign_games', 0)+archived, reign_pooled=True)
+        write_json(self.run/'league.json', self.league)
 
     def anchor(self):
         """(champion entry, SEAL, 'anchor', games left) while the current champion owes Seal games, else None. In
@@ -1635,7 +1645,7 @@ class Evaluator:
             return None
         entries = self.league['checkpoints']
         later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])
-        played = self.reign_seal_games(champion['id'])-self.league.get('reign_games', 0)
+        played = sum(len(r['games']) for r in self.seal_reports(champion['id']))-self.league.get('reign_games', 0)
         left = s.anchor_games*(s.anchor_on_promotion+later//s.anchor_every)-played
         return (champion, SEAL, 'anchor', left) if left > 0 else None
 
