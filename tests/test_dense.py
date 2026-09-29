@@ -3836,6 +3836,20 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertIn('settled on request', next(e for e in events if e['kind'] == 'decision')['message'])
 
+    def test_settle_request_is_kept_for_a_resumed_trial(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=10, sprt_min_games=10)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        candidate = 'main/000020'
+        self.report(candidate, 'main/000010', [.5, .5])
+        dense_eval.request_settle(self.run, candidate)
+        self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, candidate, 'main/000010').read_text())
+        self.assertEqual((evaluator.entry(candidate)['verdict']['decision'], len(report['games'])), ('superseded', 2))
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertIn('settled on request', next(e for e in events if e['kind'] == 'decision')['message'])
+
     def test_settle_request_without_a_running_trial_is_ignored(self):
         evaluator = self.start()
         self.export(10)

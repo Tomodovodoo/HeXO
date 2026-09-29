@@ -1250,9 +1250,11 @@ class Evaluator:
     def requested(self, cid):
         return settle_path(self.run, cid).exists()
 
-    def dismiss_settle_requests(self):
+    def dismiss_settle_requests(self, resumed):
         for path in sorted((self.run/'settle-requests').glob('*.json')):
             cid = json.loads(path.read_text())['checkpoint']
+            if cid in resumed:
+                continue
             log_event(self.run, 'evaluator', 'info', f'{cid}: settle request ignored; no running trial', candidate=cid)
             path.unlink()
 
@@ -1895,7 +1897,6 @@ class Evaluator:
         registration order; waiting registrations are adopted into league.json first), or else plays a session of the champion's Seal anchor
         (`anchor`), else of an optional comparison, else of fill work (`fill`), each until its games are complete
         or a checkpoint waits (the games in flight then finish and count)."""
-        self.dismiss_settle_requests()
         self.settle()
         champion = self.league['champion']
         revived = [c for c in self.league['checkpoints'] if c.get('skipped') and champion and self.games(c['id'], champion)]
@@ -1912,6 +1913,7 @@ class Evaluator:
         self.status['backlog'] = [e[0] for e in unrated]
         self.queue(self.status['backlog'])
         resumed = [e for e in unrated if champion and self.games(e[0], champion)]
+        self.dismiss_settle_requests({e[0] for e in resumed})
         # A refresh that changes the book would restart the games of a candidate or variant trial waiting to resume.
         trials = [v for v in self.variants() if 'verdict' not in v and v['checkpoint'] and self.games(v['id'], v['checkpoint'])]
         if not resumed and not trials:
