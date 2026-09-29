@@ -26,7 +26,8 @@
 <p id="error" role="alert"></p><p>Click a cell to place. Drag to pan; scroll to zoom. Place two stones each turn after the opening. Each stone must be within eight steps of an occupied cell.</p><div id="stats">Ready for the opening.</div></aside></main>
 <script>
 const $=id=>document.getElementById(id),canvas=$('board'),ctx=canvas.getContext('2d');
-let state={cells:[],player:0,remaining:1,winner:-1},busy=false,size=24,pan={x:0,y:0},hover=null,drag=null,hints=null;
+let state={cells:[],player:0,remaining:1,winner:-1},busy=false,size=24,pan={x:0,y:0},hover=null,drag=null;
+let hints=null;
 const key=(q,r)=>`${q},${r}`,color=['#226b95','#c35539'];
 function screen(q,r){return [canvas.clientWidth/2+pan.x+size*Math.sqrt(3)*(q+r/2),canvas.clientHeight/2+pan.y+size*1.5*r]}
 function axial(x,y){x-=canvas.clientWidth/2+pan.x;y-=canvas.clientHeight/2+pan.y;let q=(Math.sqrt(3)/3*x-y/3)/size,r=2*y/3/size,s=-q-r,a=Math.round(q),b=Math.round(r),c=Math.round(s);let da=Math.abs(a-q),db=Math.abs(b-r),dc=Math.abs(c-s);if(da>db&&da>dc)a=-b-c;else if(db>dc)b=-a-c;return [a,b]}
