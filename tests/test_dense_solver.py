@@ -631,6 +631,10 @@ class Scheduler(unittest.TestCase):
         solver.leads['root'].extend([5000.]*8)
         solver.tick(100., 50.)
         self.assertEqual(solver.allocate('root', 2048)[1], gate)
+        small = replace(base, solver_root_nodes=135, solver_threat_nodes=0, solver_gate_cap_nodes=256)
+        self.assertEqual(Schedule.of(small).cap_nodes, 256)
+        small_gate = dense_solver.Solver(Schedule.of(small), asynchronous=False).allocate('root', 135)[1]
+        self.assertEqual(gated_nodes(history, 'mover', 135, small_gate)[0], 256)
         with self.assertRaises(ValueError):
             Schedule.of(replace(base, solver_gate_cap_nodes=1024))
 

@@ -147,6 +147,8 @@ class Schedule:
                 raise ValueError('solver_gate_cap_nodes must cover every enabled evaluation query budget')
             values['gate_weight'] = 3. if settings.solver_gate_cap_nodes else 0.
             values['gate_cap_nodes'] = settings.solver_gate_cap_nodes or cls.gate_cap_nodes
+            values['cap_nodes'] = min(values['cap_nodes'], values['gate_cap_nodes'])
+            values['min_nodes'] = min(values['min_nodes'], values['cap_nodes'])
         return cls(**values)
 
 
