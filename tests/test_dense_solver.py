@@ -472,12 +472,28 @@ class Scheduler(unittest.TestCase):
     def test_schedule_defaults_and_validation(self):
         self.assertEqual(Schedule.of(dense_config.ActorSettings()), Schedule())
         self.assertEqual(Schedule.of(dense_config.EvaluationSettings()), Schedule())
+        self.assertEqual(Schedule.of(dense_config.EvaluationSettings(solver_workers=3)).workers, 3)
         self.assertTrue(Schedule().fixed_budgets)
         for bad in (dict(deep_nodes=100), dict(workers=0), dict(min_nodes=600), dict(cap_nodes=9000),
                     dict(overrun_fraction=-.1), dict(deep_nodes=70000, follow=True), dict(gate_weight=101),
                     dict(table_mb=257)):
             with self.assertRaises(ValueError):
                 Schedule(**bad)
+
+    def test_evaluation_pool_uses_configured_solver_workers(self):
+        settings = dense_config.EvaluationSettings(solver_workers=3)
+        schedule = Schedule.of(settings)
+        with mock.patch.object(dense_solver, 'build_hash', return_value='test'), \
+                mock.patch.object(dense_solver, 'IsolatedTactics') as tactics:
+            pool = dense_eval.Pool(64, schedule)
+            try:
+                self.assertEqual(pool.engine.schedule, schedule)
+                solver = dense_solver.Solver(pool.engine.schedule)
+                pool.engine.solver = solver
+                self.assertEqual(len(solver.pool.engines), 3)
+                self.assertEqual(tactics.call_args_list, [mock.call(priority='below_normal')]*3)
+            finally:
+                pool.close()
 
     def test_allocation_follows_the_measured_lead(self):
         try:
@@ -766,6 +782,7 @@ class Protocol(unittest.TestCase):
         self.assertFalse(dense_eval.same_protocol(old, replace(settings, solver_root_nodes=NODES)))
         on = dict(settings=asdict(replace(settings, solver_root_nodes=NODES)))
         self.assertTrue(dense_eval.same_protocol(on, replace(settings, solver_root_nodes=NODES)))
+        self.assertTrue(dense_eval.same_protocol(on, replace(settings, solver_root_nodes=NODES, solver_workers=3)))
         self.assertFalse(dense_eval.same_protocol(on, settings))
 
     def test_budgets_validate(self):
