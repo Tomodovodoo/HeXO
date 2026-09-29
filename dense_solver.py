@@ -120,7 +120,7 @@ class Schedule:
     follow: bool = False
 
     def __post_init__(self):
-        if (self.workers < 1 or self.slack_fraction < 0 or self.overrun_fraction < 0 or self.gate_weight < 0
+        if (self.workers < 1 or self.slack_fraction < 0 or self.overrun_fraction < 0 or not 0 <= self.gate_weight <= 100
                 or not 1 <= self.min_nodes <= self.cap_nodes <= self.gate_cap_nodes <= MAX_NODES
                 or not 0 <= self.deep_nodes <= self.deep_cap_nodes <= MAX_NODES):
             raise ValueError('Invalid solver schedule')
@@ -132,6 +132,12 @@ class Schedule:
         """The schedule of an ActorSettings (its solver_* fields); settings without them (EvaluationSettings) get
         the defaults."""
         return cls(**{f.name: getattr(settings, 'solver_'+f.name, f.default) for f in fields(cls)})
+
+
+def active(budgets, schedule):
+    """Whether a side with `budgets` (None: no solver) asks anything under `schedule`: a point budget, or deep
+    proofs."""
+    return budgets is not None and (budgets.active or bool(schedule.deep_nodes))
 
 
 def record(budgets, schedule=Schedule()):
@@ -217,7 +223,13 @@ class Pool:
                 if self.stopped:
                     return
                 _, _, reserved, history, request, future = heapq.heappop(self.heap)
-            result = decode(engine.history(history, **request))
+            try:
+                result = decode(engine.history(history, **request))
+            except Exception as error:
+                with self.condition:
+                    self.reserved -= reserved
+                future.set_exception(error)
+                continue
             used, elapsed = int(result.get('nodes_used') or 0), float(result.get('elapsed_ms') or 0.)
             with self.condition:
                 self.reserved -= reserved
@@ -318,7 +330,7 @@ class Solver:
         history = [list(p) for p in history]
         if pool:
             deadline = time.perf_counter()*1000+(self.lead.get(point) or 0.)
-            future = pool.submit(deadline, OVERHEAD_MS+budget/pool.rate, history, request)
+            future = pool.submit(deadline, OVERHEAD_MS+most/pool.rate, history, request)
         else:
             future = Future()
             future.set_result(self.engine.history(history, **request))
@@ -517,7 +529,7 @@ class Plan:
         history = tuple(map(tuple, tree.history))
         self.threat = self.root = self.finalists = None
         self.nodes, self.budget, self.turns, self.pruned, self.following, self.deferrals = 0, 0, 0, [], False, 0
-        if budgets is None or not budgets.active or not history:
+        if not active(budgets, schedule) or not history:
             return False
         player, other = mover(history), 1-mover(history)
         if not schedule.fixed_budgets:
@@ -623,7 +635,7 @@ class Plan:
             self.spent(self.deep[player].result()[1])
             self.proven(self.deep.pop(player), history)
         result.update(proven=0, proof_turns=0)
-        move = self.move(player, history) if slot.solver is not None and slot.solver.active else None
+        move = self.move(player, history) if active(slot.solver, self.schedule) else None
         if move is not None:
             result.update(action=list(move[0][0]), proven=1, proof_turns=move[1])
             self.solver.stats['followed'] += self.following

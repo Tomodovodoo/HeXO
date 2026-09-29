@@ -301,7 +301,7 @@ class Engine:
     produce the next. It returns the slots whose games finished, including slots stopped because a searched
     position could not be encoded (`reason` set to 'span'; none of their requests is fulfilled afterwards).
 
-    Solver (dense_solver): a slot with active budgets gets a dense_solver.Plan on the Engine's Solver (created on
+    Solver (dense_solver): a slot whose budgets are active under `schedule` (dense_solver.active) gets a dense_solver.Plan on the Engine's Solver (created on
     first use with `schedule`, default fixed budgets; `solver_async` picks its backend). A search that submits
     queries leaves its slot until the next visit, which consumes the verdicts before the search goes on; the root
     verdict is consumed before `searched`, whose result then carries `proven`, `proof_turns`, `solver_nodes`,
@@ -322,7 +322,7 @@ class Engine:
         """Start the slot's next search; True when it must wait for solver verdicts until the next visit."""
         checked(native.hxg_begin(slot.tree.ptr, slot.budget, slot.samples))
         plan = self.plans.get(id(slot))
-        if plan is None and slot.solver is not None and slot.solver.active:
+        if plan is None and dense_solver.active(slot.solver, self.schedule):
             self.solver = self.solver or dense_solver.Solver(self.schedule, self.solver_async)
             plan = self.plans[id(slot)] = dense_solver.Plan(self.solver)
         return plan is not None and plan.begin(slot)
@@ -485,7 +485,7 @@ class SelfPlayGame:
             if not np.isclose(policy.sum(), 1, atol=1e-6) or np.any(policy < 0):
                 raise ValueError('Search policy is not a distribution')
             row['policy'] = policy.astype(np.float32)
-        if self.solver.active:
+        if dense_solver.active(self.solver, self.schedule):
             row.update(proven=result['proven'], proof_turns=result['proof_turns'], solver_nodes=result['solver_nodes'],
                        solver_budget=result['solver_budget'])
         self.rows.append(row)
@@ -526,7 +526,7 @@ class SelfPlayGame:
                        actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
                        trained_side=None if self.opponent is None else self.learner,
                        root_values=self.values, full_search=self.full)
-        if self.solver.active:
+        if dense_solver.active(self.solver, self.schedule):
             episode['solver'] = dense_solver.record(self.solver, self.schedule)
         return episode, self.rows
 

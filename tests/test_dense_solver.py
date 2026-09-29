@@ -311,7 +311,7 @@ class Proofs(unittest.TestCase):
     def test_deep_proof_of_a_committed_turn_is_followed(self):
         first = [tuple(c) for c in self.result['moves']]
         model = tiny_model()
-        s = settings(full_fraction=1., solver_threat_nodes=NODES, solver_deep_nodes=2000, solver_follow=True)
+        s = settings(full_fraction=1., solver_deep_nodes=2000, solver_follow=True)   # deep proofs alone
         opening = self.opening+first
         game = from_position(dense_selfplay.SelfPlayGame([model, model], replace(s, max_plies=len(opening)+24), 5),
                              opening)
@@ -332,7 +332,7 @@ class Scheduler(unittest.TestCase):
         self.assertEqual(Schedule.of(dense_config.EvaluationSettings()), Schedule())
         self.assertTrue(Schedule().fixed_budgets)
         for bad in (dict(deep_nodes=100), dict(workers=0), dict(min_nodes=600), dict(cap_nodes=9000),
-                    dict(overrun_fraction=-.1), dict(deep_nodes=70000, follow=True)):
+                    dict(overrun_fraction=-.1), dict(deep_nodes=70000, follow=True), dict(gate_weight=101)):
             with self.assertRaises(ValueError):
                 Schedule(**bad)
 
@@ -355,6 +355,19 @@ class Scheduler(unittest.TestCase):
         fixed.leads['root'].extend([5000.]*8)
         self.assertEqual(fixed.allocate('root', NODES)[:2],
                          (NODES, dict(weight=3., floor=NODES, cap_low=dense_solver.MAX_NODES, cap_high=dense_solver.MAX_NODES)))
+
+    def test_a_failing_query_fails_its_future_and_releases_its_reservation(self):
+        try:
+            pool = dense_solver.Pool(1, None)
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        try:
+            future = pool.submit(0., 5., [[0, 0]], dict(nodes=0, ms=100))
+            with self.assertRaises(ValueError):
+                future.result(10)
+            self.assertEqual(pool.reserved, 0.)
+        finally:
+            pool.close()
 
     def test_a_late_verdict_defers_its_game_once_then_finishes_in_the_background(self):
         try:
