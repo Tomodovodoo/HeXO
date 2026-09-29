@@ -774,6 +774,14 @@ class EvaluatorBookTests(unittest.TestCase):
         (folder/'report-2-new.json').write_text(json.dumps(report(2, 98)))  # archived during the reign
         (folder/'report.json').unlink()                                     # a book change moved report.json aside
         self.assertEqual(self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.).anchor()[3], 2)
+        # A legacy baseline counted on a report archived during the reign: its prefix is not counted twice.
+        league = json.loads((self.run/'league.json').read_text())
+        league.pop('reign_pooled')
+        (self.run/'league.json').write_text(json.dumps(dict(league, reign_games=20)))
+        restarted = self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.)
+        self.assertEqual(restarted.league['reign_games'], 24)                # capped at all 24 Seal games
+        self.assertEqual(restarted.anchor()[3], 4)
+
     def test_archives_of_one_pairing_never_overwrite_each_other(self):
         self.export(10)
         evaluator = self.start(opening_suite='standard-v1')

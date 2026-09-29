@@ -1629,15 +1629,17 @@ class Evaluator:
 
     def pool_reign(self):
         """Once, for a reign begun before archived reports were pooled (no reign_pooled): add the champion's archived
-        Seal games to reign_games, so they count as played before the reign. Games an archive gained during the
-        reign are then owed again (at most one more anchor round); none is ever taken as played twice. The two fields
-        are written to league.json at once, so the migration happens once."""
+        Seal games to reign_games, so they count as played before the reign, capped at all its Seal games (the
+        report reign_games was counted on may itself be archived by now, its prefix then counted once). Games played
+        during the reign in an archive are then owed again; no game is ever taken as played twice and the anchor
+        never goes negative. The two fields are written to league.json at once, so the migration happens once."""
         champion = self.league.get('champion')
         if champion is None or self.league.get('reign_pooled'):
             return
         current = self.sealed(champion)
-        archived = sum(len(r['games']) for r in self.seal_reports(champion))-(len(current['games']) if current else 0)
-        self.league.update(reign_games=self.league.get('reign_games', 0)+archived, reign_pooled=True)
+        total = sum(len(r['games']) for r in self.seal_reports(champion))
+        archived = total-(len(current['games']) if current else 0)
+        self.league.update(reign_games=min(self.league.get('reign_games', 0)+archived, total), reign_pooled=True)
         write_json(self.run/'league.json', self.league)
 
     def anchor(self):
