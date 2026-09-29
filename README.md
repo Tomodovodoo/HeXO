@@ -818,6 +818,18 @@ KataGo-style value-logit BCE against the hard outcome, with weight w. That head,
 `outcome_bce`, is always logged. The validation curves by plies remaining
 always score finished games against their hard outcome.
 
+`--deblunder-weight w`, default 0, uses transient wins found by `dense_solve.py`
+to soften a losing owner's earlier value targets. The proof pass writes
+`deblunder` records automatically on newly solved shards. For that owner's
+rows before the window, after the previous proof window or from game start,
+the learner uses `w * 1 + (1 - w) * original_outcome` as the win probability
+for both value losses. This replaces the calibrated or TD target on those
+rows. Exact labels take precedence, and these soft rows remain unproven.
+The original outcome stays available for diagnostics. Validation reports
+`value_bce_deblundered` and `deblundered_rows`, also per source.
+Restart the proof pass with its existing flags and the learner with, for
+example, `--deblunder-weight 0.25`. Existing sidecars are not rewritten.
+
 ## Dense evaluator
 
 `dense_eval.py loop` rates each new dense checkpoint against the champion and keeps the league in
