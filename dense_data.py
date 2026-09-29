@@ -551,15 +551,20 @@ class ReplayWindow:
             mtime = path.stat().st_mtime_ns
         except FileNotFoundError:
             mtime = None
+        except OSError:
+            return
         if mtime != self.regret_mtime:
             entries = {}
             try:
                 if mtime is not None:
                     for entry in json.loads(path.read_text(encoding='utf-8'))['entries']:
                         key = (str(entry['shard']), int(entry['game']), int(entry['ply']))
-                        if float(entry['regret']) > 0:
-                            entries[key] = max(entries.get(key, 0.), float(entry['regret']))
-            except (OSError, ValueError, KeyError, TypeError):
+                        regret = float(entry['regret'])
+                        if not math.isfinite(regret):
+                            raise ValueError('Nonfinite regret')
+                        if regret > 0:
+                            entries[key] = max(entries.get(key, 0.), regret)
+            except (OSError, ValueError, OverflowError, KeyError, TypeError):
                 return
             self.regret_mtime = mtime
             self.set_regret(entries)
@@ -611,7 +616,7 @@ class ReplayWindow:
             return 0
         W, K = len(self.index), self.regret_rows
         baseline = self.regret_baseline(recency).sum()
-        limit = 1. if K == W else max(0., min(1., (4*K/W-baseline)/(1-baseline)))
+        limit = 1. if K == W or baseline == 1 else max(0., min(1., (4*K/W-baseline)/(1-baseline)))
         return min(batch_size, int(batch_size*min(fraction, limit)+1e-12))
 
     def regret_share(self, batch_size, fraction, recency=0.):
