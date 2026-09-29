@@ -51,7 +51,8 @@ const MAX_PLY: u32 = 1024;
 
 /// Resident search state of one attacker: the transposition table and the proven-node set.
 type Resident = (ProofTt, FxHashSet<u64>);
-/// Proven-node keys kept per resident megabyte; past that the set is cleared (the table is kept).
+/// Proven-node keys kept per resident megabyte; past that the whole state is dropped, since the table's
+/// resolved entries need their proven witnesses for certificate reconstruction.
 const PROVEN_PER_MB: usize = 32768;
 
 thread_local! {
@@ -85,12 +86,34 @@ fn take_resident(attacker: Player) -> Option<Resident> {
     })
 }
 
-fn keep_resident(attacker: Player, mut state: Resident) {
+fn keep_resident(attacker: Player, state: Resident) {
     let mb = RESIDENT_MB.with(|c| c.get());
-    if state.1.len() > mb * PROVEN_PER_MB {
-        state.1.clear();
+    if state.1.len() <= mb * PROVEN_PER_MB {
+        RESIDENT.with(|r| r.borrow_mut().push((attacker == Player::P1, state)));
     }
-    RESIDENT.with(|r| r.borrow_mut().push((attacker == Player::P1, state)));
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+
+    #[test]
+    fn an_oversized_proven_set_drops_the_whole_state() {
+        set_resident(1);
+        let mut state = take_resident(Player::P1).unwrap();
+        state.1.insert(1);
+        keep_resident(Player::P1, state);
+        assert_eq!(take_resident(Player::P1).unwrap().1.len(), 1, "a small state is kept");
+        let mut state = take_resident(Player::P1).unwrap();
+        state.1.extend(0..(PROVEN_PER_MB as u64 + 1));
+        state.0.store(7, 0, INF, 1);
+        keep_resident(Player::P1, state);
+        let fresh = take_resident(Player::P1).unwrap();
+        assert!(fresh.1.is_empty(), "the proven set starts empty");
+        let mut table = fresh.0;
+        assert_eq!(table.probe(7), None, "and so does the table");
+        set_resident(0);
+    }
 }
 
 pub struct Dfpn<'a> {
