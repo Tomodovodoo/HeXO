@@ -3059,6 +3059,20 @@ class EvaluatorLoopTests(unittest.TestCase):
             evaluator.trial(evaluator.variants()[-1])
         self.assertEqual({p['candidate'] for p in seen[0]}, {'main/000010@fast'})     # rebuilt after the rebinding
 
+    def test_a_trial_without_games_leaves_the_binding_open(self):
+        evaluator = self.start(decision='posterior')
+        self.export(10, 20)
+        evaluator.step()                                                    # main/000020 champion
+        dense_eval.register(self.run, 'champion', 'solver', dict(sims=1))
+        dense_eval.adopt(evaluator.league, self.run)
+        evaluator.bind()
+        self.export(30)                                                     # a checkpoint waits: no game starts
+        evaluator.trial(evaluator.variants()[0])
+        self.assertNotIn('bound_at', evaluator.variants()[0])
+        self.crown(evaluator, 30)
+        self.assertTrue(evaluator.bind())
+        self.assertEqual(evaluator.variants()[0]['id'], 'main/000030@solver')
+
     def test_a_champion_variant_never_collides_with_a_registered_id(self):
         evaluator = self.start(decision='posterior')
         self.export(10, 20, 30)

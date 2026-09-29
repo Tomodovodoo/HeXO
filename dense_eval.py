@@ -1420,15 +1420,17 @@ class Evaluator:
                                   for cid, opponent, kind in pairs]
 
     def bind(self):
-        """Point every variant whose comparison has not started (no bound_at) at the current champion when it
-        follows the champion: base CHAMPION always, and with rebase_on_promotion a variant registered against the
+        """Record bound_at for a variant whose direct report exists (its comparison has started), then point every
+        variant whose comparison has not started (no bound_at) at the current champion when it follows the champion: base CHAMPION always, and with rebase_on_promotion a variant registered against the
         then champion (on_champion) whose checkpoint is no longer champion. Its id becomes `<champion>@<name>`
         with a 'variant' event. When another entry holds that id, an entry of base CHAMPION is dropped with an
         'error' event (it may compare against the champion only), and a rebased one keeps its checkpoint. Returns
         whether any entry changed."""
         champion, changed = self.league['champion'], False
         for entry in list(self.variants()):
-            follows = entry.get('base') == CHAMPION or (self.settings.rebase_on_promotion and entry.get('on_champion'))
+            if 'bound_at' not in entry and entry['checkpoint'] and report_path(self.run, entry['id'], entry['checkpoint']).exists():
+                entry['bound_at'], changed = time.time(), True
+            follows =entry.get('base') == CHAMPION or (self.settings.rebase_on_promotion and entry.get('on_champion'))
             if 'bound_at' in entry or not follows or champion is None or entry['checkpoint'] == champion:
                 continue
             if self.entry(f'{champion}@{entry["name"]}'):
@@ -1456,16 +1458,14 @@ class Evaluator:
         as a 'decision' event with P(better), delta, delta_sd and its 95% interval. Every report played is
         recorded in the league (`record`). The first trial of an entry binds it to the champion of that moment
         (`bind`, after any promotion earlier in the step; status `pending` is rebuilt when that moves an entry, and
-        an entry `bind` drops ends the trial) and fixes the binding: bound_at (epoch seconds) is recorded and `bind`
-        leaves it alone from then on."""
-        if 'bound_at' not in entry:
-            if self.bind():
-                self.queue(self.status['backlog'])
-            if entry not in self.variants():
-                write_league(self.run, self.league, self.config, self.settings.fill_top)
-                return
-            entry['bound_at'] = time.time()
+        an entry `bind` drops ends the trial). Its first persisted game fixes the binding: bound_at (epoch
+        seconds) is recorded (`bind` also records it for an entry whose direct report exists) and `bind` leaves it
+        alone from then on."""
+        if 'bound_at' not in entry and self.bind():
+            self.queue(self.status['backlog'])
             write_league(self.run, self.league, self.config, self.settings.fill_top)
+            if entry not in self.variants():
+                return
         s, cid, base = self.settings, entry['id'], entry['checkpoint']
 
         def want():
@@ -1478,6 +1478,9 @@ class Evaluator:
             return lanes
         while True:
             added = self.session(want, s.sprt_max_games)
+            if 'bound_at' not in entry and report_path(self.run, cid, base).exists():
+                entry['bound_at'] = time.time()
+                write_league(self.run, self.league, self.config, self.settings.fill_top)
             for (a, b, _), games in added.items():
                 if games:
                     self.record(a, b, json.loads(report_path(self.run, a, b).read_text()))
