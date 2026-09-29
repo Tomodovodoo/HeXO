@@ -715,6 +715,12 @@ class Yield:
         return self.state
 
 
+def unsearched(rows):
+    """Placements among a game's `rows` played without a search (forced-line rows); the actor adds them to the
+    Engine's search count so its positions match the rows it publishes."""
+    return sum(bool(r.get('line')) for r in rows)
+
+
 def shard_name():
     return f'{time.time_ns()//1_000_000:013d}{os.getpid() % 1000:03d}'
 
@@ -844,6 +850,7 @@ def worker(args):
                               f'a searched position spans more than the largest crop', process=args.worker)
                 episodes.append(episode)
                 rows.extend(dict(r, game=len(episodes)-1) for r in items)
+                state['positions'] += unsearched(items)
                 state['games_completed'] += 1; state['terminal'] += episode['winner'] >= 0; state['plies'] += len(episode['moves'])
                 if len(episodes) >= settings.shard_games:
                     publish()

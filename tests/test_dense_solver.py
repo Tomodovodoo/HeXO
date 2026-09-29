@@ -400,6 +400,7 @@ class Adjudication(unittest.TestCase):
             options = dense_data.target_options(dense_config.LearnerSettings())
             targets = dense_data.examples(window, refs, np.random.default_rng(0), **options)[1]   # rows replay
         self.assertEqual(manifest['counts']['line_rows'], len(line))
+        self.assertEqual(dense_selfplay.unsearched(rows), len(line))   # counted into the actor's positions
         self.assertEqual([t['value'] for t in targets], [float(r['proven'] > 0) for r in rows])
 
 
