@@ -20,6 +20,7 @@ import argparse
 from dataclasses import asdict
 import gc
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,31 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.profile_hexnet import guard, trace_summary
 PROCESS_START = time.perf_counter()
+DEPLOYED_KERNEL_REV = 'edb9f868dfc4c6bb38aec2032222a424e1404505'
+DEPLOYED_KERNEL_BLOB = '65845d6a820617e6da92a6c4ff63f29502559a57'
+ALLOCATOR_COUNTS = ('num_alloc_retries', 'num_ooms', 'num_device_alloc', 'num_device_free')
+
+
+def deployed_kernels(output):
+    """Load the merged #179 kernels for a reproducible `shipped` comparison."""
+    blob = subprocess.check_output(
+        ['git', 'rev-parse', f'{DEPLOYED_KERNEL_REV}:hexnet_kernels.py'], cwd=ROOT,
+        text=True).strip()
+    if blob != DEPLOYED_KERNEL_BLOB:
+        raise ValueError(f'Deployed kernel blob changed: {blob}')
+    source = subprocess.check_output(['git', 'cat-file', 'blob', blob], cwd=ROOT)
+    path = output/f'deployed-hexnet-kernels-{blob}.py'
+    if path.exists():
+        if path.read_bytes() != source:
+            raise ValueError(f'Deployed kernel artifact changed: {path}')
+    else:
+        path.write_bytes(source)
+    name = f'_deployed_hexnet_kernels_{blob}'
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def file_sha256(path):
@@ -199,6 +225,8 @@ def measure(args):
     if len(set(rows)) != 1 or rows[0] != settings.batch:
         raise ValueError('Snapshot batch size differs from checkpoint learner settings')
     original_update = hexnet_kernels.norm_update
+    original_norm = hexnet_kernels.MaskedBatchNorm
+    deployed = deployed_kernels(args.output) if 'shipped' in args.modes else None
     device = torch.device('cuda')
     gpu_bytes = torch.cuda.get_device_properties(0).total_memory
     fraction = torch.cuda.get_per_process_memory_fraction()
@@ -222,6 +250,9 @@ def measure(args):
                   allocator_fraction=fraction, allocator_cap_mib=fraction*gpu_bytes/2**20,
                   gpu=torch.cuda.get_device_name(),
                   phases=[], stage='setup')
+    if deployed is not None:
+        report['shipped_kernel_revision'] = DEPLOYED_KERNEL_REV
+        report['shipped_kernel_blob'] = DEPLOYED_KERNEL_BLOB
     path = args.output/'learner-profile.json'
 
     def save(stage):
@@ -238,6 +269,7 @@ def measure(args):
 
     def create(mode):
         hexnet_kernels.norm_update = shipped_update if mode == 'shipped' else original_update
+        hexnet_kernels.MaskedBatchNorm = deployed.MaskedBatchNorm if mode == 'shipped' else original_norm
         learner = dense_learn.Learner.__new__(dense_learn.Learner)
         learner.settings = settings
         learner.device = device
@@ -300,6 +332,7 @@ def measure(args):
                 phase['warmup_seconds'] = time.perf_counter()-warm_started
                 warmed_modes[mode] = phase['warmed_shapes']
             torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_accumulated_memory_stats()
             for step, batch in enumerate(batches):
                 if time.perf_counter()-started > 48:
                     raise TimeoutError('Benchmark budget expired before all requested steps')
@@ -314,6 +347,8 @@ def measure(args):
             phase['short_window_samples_per_second'] = sum(rows[1:])/sum(steady)
             phase['peak_allocated_mib'] = torch.cuda.max_memory_allocated()/2**20
             phase['peak_reserved_mib'] = torch.cuda.max_memory_reserved()/2**20
+            memory = torch.cuda.memory_stats()
+            phase['allocator_counts_since_warmup'] = {key: memory[key] for key in ALLOCATOR_COUNTS}
             if args.profile:
                 with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                         torch.profiler.ProfilerActivity.CUDA], record_shapes=True, with_flops=True) as prof:
@@ -342,6 +377,7 @@ def measure(args):
         raise
     finally:
         hexnet_kernels.norm_update = original_update
+        hexnet_kernels.MaskedBatchNorm = original_norm
     print(json.dumps(report, indent=2), flush=True)
 
 
@@ -362,6 +398,8 @@ def live(args):
     config = dense_config.load(frozen_run)
     mode = args.modes[0]
     original_update = hexnet_kernels.norm_update
+    original_norm = hexnet_kernels.MaskedBatchNorm
+    deployed = deployed_kernels(args.output) if mode == 'shipped' else None
     GPU_START = None
 
     @torch.no_grad()
@@ -381,6 +419,9 @@ def live(args):
                   workers=args.workers, seed=[config.seed, zlib.crc32(settings.variant.encode()), manifest['step']],
                   minimum_steps=args.steps, minimum_active_seconds=args.min_seconds,
                   steps=[], stage='setup')
+    if deployed is not None:
+        report['shipped_kernel_revision'] = DEPLOYED_KERNEL_REV
+        report['shipped_kernel_blob'] = DEPLOYED_KERNEL_BLOB
     # Keep interleaved reference/fused/reference runs as separate observations.
     path = args.output/f'learner-live-{mode}-{time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())}.json'
     marker = args.output/f'gpu-start-{os.getpid()}.txt'
@@ -491,6 +532,7 @@ def live(args):
         report['allocator_cap_mib'] = report['allocator_fraction']*torch.cuda.get_device_properties(0).total_memory/2**20
 
         hexnet_kernels.norm_update = shipped_update if mode == 'shipped' else original_update
+        hexnet_kernels.MaskedBatchNorm = deployed.MaskedBatchNorm if mode == 'shipped' else original_norm
         learner = dense_learn.Learner.__new__(dense_learn.Learner)
         learner.settings, learner.device = settings, device
         learner.net_kernels = 'reference' if mode == 'reference' else 'fused'
@@ -531,6 +573,7 @@ def live(args):
         if time.perf_counter()-GPU_START + args.min_seconds > 49:
             raise TimeoutError('Insufficient 55-second child budget after renderer startup')
         save('measuring')
+        torch.cuda.reset_accumulated_memory_stats()
         active_start = time.perf_counter()
         while len(report['steps']) < args.steps or time.perf_counter()-active_start < args.min_seconds:
             if time.perf_counter()-GPU_START > 49:
@@ -557,6 +600,8 @@ def live(args):
         report['last_losses'] = losses.detach().cpu().tolist()
         report['peak_allocated_mib'] = torch.cuda.max_memory_allocated()/2**20
         report['peak_reserved_mib'] = torch.cuda.max_memory_reserved()/2**20
+        memory = torch.cuda.memory_stats()
+        report['allocator_counts_since_warmup'] = {key: memory[key] for key in ALLOCATOR_COUNTS}
         save('complete')
         print(json.dumps(dict(report=str(path), rows_per_second=report['rows_per_second'],
                               steps=len(report['steps']), active_seconds=report['active_seconds'])), flush=True)
@@ -568,6 +613,7 @@ def live(args):
         if stream is not None:
             stream.close()
         hexnet_kernels.norm_update = original_update
+        hexnet_kernels.MaskedBatchNorm = original_norm
 
 
 def main():

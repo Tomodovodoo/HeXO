@@ -59,12 +59,17 @@ GPU deadline, and closes the measurement's own solver processes on timeout.
 
 The learner's fused mode packs planar and skewed line inputs in Triton,
 uses the existing cuBLAS products, and gathers the result with the residual
-addition. It retains those packed inputs for backward. One stencil computes
-the input gradient; three cuBLAS products and an FP32 diagonal reduction compute
-tap gradients. This removes activation recomputation and the slower direct
-tap-gradient reduction while retaining the reference's bf16 addition order.
+addition. It retains those packed inputs for backward. Three cuBLAS products
+compute the input gradient; three more products and an FP32 diagonal reduction
+compute tap gradients. A fused gather adds the residual gradient in the
+reference's bf16 order. This removes activation recomputation and the slower
+direct tap-gradient reduction.
 Normalization updates its running mean, variance and batch counter in one
-kernel. Cumulative recalibration retains the existing implementation.
+kernel. Its mean and backward sums use PyTorch's reduction order: sub-ULP
+differences in these sums can change the bf16 correction coefficients and
+amplify downstream. Triton still combines the elementwise activation,
+gradient products and input-gradient calculation. Cumulative recalibration
+retains the existing implementation.
 
 These changes use the existing `--net-kernels fused` flag. They add no learner
 graph flag, checkpointing flag, dependency or checkpoint format change.
@@ -73,6 +78,46 @@ Validation used `Learner.train_step` with model, optimizer and EMA state from
 export 85000. The source run stayed read-only. The owner authorized stopping
 the learner after that export and using its 3328 MiB allocator allowance.
 GPU work has a 55-second watchdog and at least 60 seconds of cooldown.
+
+The corrected revision passed the affected random/real full-model and
+masked-normalization CUDA checks at export 85000, plus the full-batch
+gradient/model/EMA comparison described below. Four fresh production-loop
+windows then used the same frozen corpus and settings with a 2560 MiB cap.
+Another thread's encoder experiment shared the card throughout. These windows
+include rendering, queue waits, padding, transfers, training and metric
+flushes, and exclude renderer startup and one full warmup step.
+
+| UTC report start, September 29 | Mode | Timed steps | Active seconds | Rows/s |
+|---|---|---:|---:|---:|
+| 22:57:08 | Reference | 23 | 20.82 | 282.77 |
+| 22:58:58 | Deployed fused | 25 | 20.58 | 310.91 |
+| 23:00:47 | Corrected fused | 31 | 20.05 | 395.78 |
+| 23:02:34 | Reference | 21 | 20.54 | 261.67 |
+
+The pooled reference rate is 272.29 rows/s. Corrected fused is **1.45x
+reference** and **1.27x deployed fused**. The learner's 2x target remains
+unmet. The corrected window reached 1818/2558 MiB allocated/reserved; its
+mean renderer wait was 9.47 ms per batch. All windows used the same allocator
+cap. Their renderer queue order differs, so the batches are representative
+of the same corpus rather than byte-identical between processes.
+
+The corrected saved-batch profile records 4585 launches, 270.64 ms in kernels,
+36.19 ms in CPU launch calls and 10,501,104 H2D bytes in 0.563 ms. Leading
+groups are cuDNN weight gradient 31.85 ms, input gradient 30.24 ms, forward
+29.01 ms, NCHW-to-NHWC conversion 16.93 ms, line skew packing 14.10 ms,
+PyTorch channel reductions 10.33 ms and norm gradient products 9.96 ms.
+Convolution/GEMM arithmetic including convolution backward totals about
+3.046 TFLOPs, or 11.25 TF/s over summed kernel time, 25.9% of the dense bf16
+peak. This remains an arithmetic estimate; DRAM counters were unavailable.
+The device interval contains 271.92 ms of activity and 233.64 ms of gaps
+while the encoder experiment shares the GPU. Those gaps are not measured
+launch overhead. The three warmed saved-batch steps recorded no allocator
+retries or OOMs. The live windows did not yet record allocator retry counts.
+
+The older measurements below predate the input-gradient and normalization
+corrections and used different shared-card load and memory limits. Their
+rates must not be multiplied by the current comparison or attributed to
+the corrected revision.
 
 The initial PR comparison warmed ten padded shapes and ran reference/fused/
 reference on three successive real 256-row batches saved at step 82500.
@@ -124,17 +169,27 @@ estimates excluding custom-kernel arithmetic, not hardware counters. Achieved
 DRAM bandwidth remains unmeasured. CPU collation and padding measurements from
 the earlier snapshot are reported below.
 
-The CUDA LineConv gradient and masked-normalization checks passed, as did CPU
-checkpoint compatibility. The new matrix path passed first-step gradients,
-model and EMA against the initial fused path on real 256-row batches.
-A fresh reference/fused comparison in one process, using export 85000 and
-the first batch of the step-82500 snapshot, still fails the peak-error check
-for two gradients. `blocks.5.pool.weight` has relative L2 error 0.956% and
-peak-scaled error 2.614%; `norm.bias` has 1.258% and 3.415%. Their L2 errors
-pass the 1.5625% bound, but their peak errors do not. Model and EMA comparisons
-pass. The same two gradient failures appeared in the initial PR candidate;
-that comparison did not establish their presence in the deployed fused path.
-Full-batch reference gradient equivalence therefore remains unresolved.
+The earlier matrix path passed first-step gradients, model and EMA against
+the initial fused path, but failed the full-batch reference peak-error check
+for `blocks.5.pool.weight` and `norm.bias`. Preserving the reference mean
+reduction fixed that comparison: every gradient, model tensor and EMA tensor
+passed, with worst scaled gradient error 0.971% against the unchanged 1.5625%
+bound. The newer checkpoint also exposed a small-batch `blocks.2.pool.bias`
+failure. Isolating normalization and LineConv showed contributions from both;
+preserving normalization's backward reductions and cuBLAS input-gradient
+products fixed the affected random/real model tests. The final combined
+revision also passed every first-step gradient, model and EMA comparison
+against reference on the saved real 256-row batch, with worst scaled gradient
+error 0.218%, model error 0.000617% and EMA error 0.00000571%. This check used
+a 2560 MiB cap; peak allocated/reserved memory was 1956/2184 MiB for reference
+and 1818/2104 MiB for fused. The two timed steps after the first step measured
+260.54 versus 545.55 rows/s, 2.09x, while another GPU experiment was active.
+That short comparison does not establish the production-loop target.
+
+The benchmark's `shipped` mode now loads the normalization implementation from
+merged PR 179, commit `edb9f868dfc4c6bb38aec2032222a424e1404505`, and records its
+kernel blob. It therefore remains a comparison against the deployed code
+after the current normalization implementation changes.
 
 `tools/profile_learner.py live` measures the production `Renderers.next` and
 `Learner.train_step` loop, including regret sampling, queue waits, padding,

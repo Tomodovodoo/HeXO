@@ -285,29 +285,22 @@ def _xhat(x,mean,inv,D:tl.constexpr):
     return tl.fma(centred,inv.to(D).to(tl.float32),bias).to(D).to(tl.float32)
 
 
-@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'GS', 'T'])
-def _grad_reduce(X,M,G,Mean,Inv,Weight,Bias,Partial,N,H,W,
-                 XS,MS,GS,C:tl.constexpr,T,ACT:tl.constexpr,K:tl.constexpr):
-    c,t=tl.program_id(0),tl.program_id(1)
-    i=t*K+tl.arange(0,K)
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'GS', 'OS', 'PS'])
+def _grad_products(X,M,G,Gated,Product,Mean,Inv,Weight,Bias,N,H,W,
+                   XS,MS,GS,OS,PS,ACT:tl.constexpr,K:tl.constexpr):
+    c=tl.program_id(0)
+    i=tl.program_id(1)*K+tl.arange(0,K)
     x=tl.load(X+_offset(i,c,H,W,XS),i<N,0).to(tl.float32)
     g=tl.load(G+_offset(i,c,H,W,GS),i<N,0).to(tl.float32)
+    inv=tl.load(Inv+c)
     if ACT:
         m=tl.load(M+_offset(i,c,H,W,MS),i<N,0)
-        y=_normalized(x,tl.load(Mean+c),tl.load(Inv+c),tl.load(Weight+c),tl.load(Bias+c),X.dtype.element_ty)
+        y=_normalized(x,tl.load(Mean+c),inv,tl.load(Weight+c),tl.load(Bias+c),X.dtype.element_ty)
         g=tl.where((y>=0)&((m>0)|(y<=0)),g,0.)
-    h=_xhat(x,tl.load(Mean+c),tl.load(Inv+c),X.dtype.element_ty)
-    dw=(g*h).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(Partial+c*T+t,tl.sum(g,0))
-    tl.store(Partial+(C+c)*T+t,tl.sum(tl.where(i<N,dw,0),0))
-
-
-@tr.jit(do_not_specialize=['T'])
-def _grad_finish(Partial,Db,Dw,C:tl.constexpr,T,K:tl.constexpr):
-    c=tl.program_id(0)
-    i=tl.arange(0,K)
-    tl.store(Db+c,tl.sum(tl.load(Partial+c*T+i,i<T,0),0))
-    tl.store(Dw+c,tl.sum(tl.load(Partial+(C+c)*T+i,i<T,0),0))
+    g=g.to(Gated.dtype.element_ty).to(tl.float32)
+    h=_xhat(x,tl.load(Mean+c),inv,X.dtype.element_ty)
+    tl.store(Gated+_offset(i,c,H,W,OS),g,i<N)
+    tl.store(Product+_offset(i,c,H,W,PS),(g*h).to(Product.dtype.element_ty),i<N)
 
 
 @tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'GS', 'DS'])
@@ -339,15 +332,15 @@ class MaskedBatchNorm(torch.autograd.Function):
         n,k=b*h*w,1024
         t=tr.cdiv(n,k)
         partial=torch.empty((c,t),device=x.device,dtype=torch.float32)
-        mean=torch.empty_like(weight)
+        # Match ATen's reduction order. Sub-ULP mean differences can change
+        # BF16 activations enough to exceed the full-model gradient tolerance.
+        mean=(x*mask).sum((0,2,3),dtype=torch.float32)/cells
         var=torch.empty_like(weight)
         inv=torch.empty_like(weight)
         y=torch.empty_like(x)
         ms=mask.stride() if mask.shape[1]==c else (mask.stride(0),0,*mask.stride()[2:])
         grid=(c,t)
         common=dict(N=n,H=h,W=w,XS=x.stride(),MS=ms,T=t,K=k,enable_fp_fusion=False)
-        _reduce[grid](x,mask,mean,partial,VAR=False,**common)
-        _finish[(c,)](partial,mean,var,inv,cells,x,t,eps,False,tr.next_power_of_2(t),enable_fp_fusion=False)
         _reduce[grid](x,mask,mean,partial,VAR=True,**common)
         _finish[(c,)](partial,mean,var,inv,cells,x,t,eps,True,tr.next_power_of_2(t),enable_fp_fusion=False)
         _apply[grid](x,mask,y,mean,inv,weight,bias,n,h,w,x.stride(),ms,y.stride(),activate,k,enable_fp_fusion=False)
@@ -361,15 +354,20 @@ class MaskedBatchNorm(torch.autograd.Function):
         b,c,h,w=x.shape
         n,k=b*h*w,1024
         t=tr.cdiv(n,k)
-        partial=torch.empty((2,c,t),device=x.device,dtype=torch.float32)
-        db,dw=torch.empty_like(weight),torch.empty_like(weight)
+        gated=torch.empty_like(grad)
+        product=torch.empty_like(grad,dtype=torch.promote_types(grad.dtype,x.dtype))
         dx=torch.empty_like(x)
         ms=mask.stride() if mask.shape[1]==c else (mask.stride(0),0,*mask.stride()[2:])
-        _grad_reduce[(c,t)](x,mask,grad,mean,inv,weight,bias,partial,n,h,w,x.stride(),ms,grad.stride(),c,t,ctx.activate,k,enable_fp_fusion=False)
-        _grad_finish[(c,)](partial,db,dw,c,t,tr.next_power_of_2(t),enable_fp_fusion=False)
-        _grad_apply[(c,t)](x,mask,grad,dx,mean,inv,weight,bias,db,dw,cells,n,h,w,
-                            x.stride(),ms,grad.stride(),dx.stride(),ctx.activate,k,enable_fp_fusion=False)
-        return (dx,None,dw,db,None,None,None)[:len(ctx.needs_input_grad)]
+        _grad_products[(c,t)](x,mask,grad,gated,product,mean,inv,weight,bias,n,h,w,
+                               x.stride(),ms,grad.stride(),gated.stride(),product.stride(),
+                               ctx.activate,k,enable_fp_fusion=False)
+        # Preserve the reference reduction order before rounding the correction
+        # coefficients to bf16. A different tree can change those coefficients.
+        db=gated.sum((0,2,3),dtype=mean.dtype)
+        dw=product.sum((0,2,3),dtype=mean.dtype)
+        _grad_apply[(c,t)](x,mask,gated,dx,mean,inv,weight,bias,db,dw,cells,n,h,w,
+                            x.stride(),ms,gated.stride(),dx.stride(),False,k,enable_fp_fusion=False)
+        return (dx,None,dw.to(weight.dtype),db.to(weight.dtype),None,None,None)[:len(ctx.needs_input_grad)]
 
 
 # Training LineConv keeps the reference Toeplitz bmm operations and BF16
@@ -411,28 +409,17 @@ def _train_line_gather(HV,Diagonal,X,Y,B,H,W,C:tl.constexpr,K:tl.constexpr):
 
 
 @tr.jit(do_not_specialize=['B', 'H', 'W'])
-def _train_line_direct_dx(G,Weight,DX,B,H,W,C:tl.constexpr,L:tl.constexpr,K:tl.constexpr):
+def _train_line_gather_dx(DH,DV,DD,G,DX,B,H,W,C:tl.constexpr,K:tl.constexpr):
     i=tl.program_id(0)*K+tl.arange(0,K)
     x,y=i%W,i//W%H
     c,b=i//(H*W)%C,i//(C*H*W)
     valid=i<B*C*H*W
-    ah=tl.full((K,),0.,tl.float32)
-    av=tl.full((K,),0.,tl.float32)
-    ad=tl.full((K,),0.,tl.float32)
-    for tap in tl.static_range(L):
-        d,dd=tap-L//2,tap-(L-1-L//2)
-        wh=tl.load(Weight+(c*3)*L+tap,valid,0).to(tl.float32)
-        wv=tl.load(Weight+(c*3+1)*L+tap,valid,0).to(tl.float32)
-        wd=tl.load(Weight+(c*3+2)*L+tap,valid,0).to(tl.float32)
-        h=tl.load(G+i-d,valid&(x-d>=0)&(x-d<W),0).to(tl.float32)
-        v=tl.load(G+i-d*W,valid&(y-d>=0)&(y-d<H),0).to(tl.float32)
-        a=tl.load(G+i+dd*(W-1),valid&(x-dd>=0)&(x-dd<W)&(y+dd>=0)&(y+dd<H),0).to(tl.float32)
-        ah=tl.fma(h,wh,ah)
-        av=tl.fma(v,wv,av)
-        ad=tl.fma(a,wd,ad)
-    h=ah.to(G.dtype.element_ty).to(tl.float32)
-    v=av.to(G.dtype.element_ty).to(tl.float32)
-    d=ad.to(G.dtype.element_ty).to(tl.float32)
+    wide=H+W-1
+    planar=((c*H+y)*B+b)*W+x
+    skew=((c*H+y)*B+b)*wide+x+y
+    h=tl.load(DH+planar,valid,0).to(tl.float32)
+    v=tl.load(DV+planar,valid,0).to(tl.float32)
+    d=tl.load(DD+skew,valid,0).to(tl.float32)
     hv=(h+v).to(G.dtype.element_ty).to(tl.float32)
     residual=(hv+tl.load(G+i,valid,0).to(tl.float32)).to(G.dtype.element_ty).to(tl.float32)
     tl.store(DX+i,residual+d,valid)
@@ -507,19 +494,14 @@ class _TrainLineAdd(torch.autograd.Function):
         b,c,h,w=ctx.shape
         line_grad=grad.to(weight.dtype).contiguous()
         dx=dw=None
-        if ctx.needs_input_grad[0]:
-            dx=torch.empty((b,c,h,w),device=grad.device,dtype=line_grad.dtype)
-            _train_line_direct_dx[(tr.cdiv(dx.numel(),256),)](
-                line_grad,weight,dx,b,h,w,c,weight.shape[-1],256)
+        wide=h+w-1
+        planar_g=torch.empty_like(planar_x)
+        _train_line_planar[(tr.cdiv(planar_g.numel(),256),)](
+            line_grad,planar_g,b,h,w,c,256)
+        skew_g=torch.empty_like(skew_x)
+        _train_line_skew[(tr.cdiv(skew_g.numel(),256),)](
+            line_grad,skew_g,b,h,w,c,256)
         if ctx.needs_input_grad[1]:
-            wide=h+w-1
-            planar_g=torch.empty_like(planar_x)
-            _train_line_planar[(tr.cdiv(planar_g.numel(),256),)](
-                line_grad,planar_g,b,h,w,c,256)
-            skew_g=torch.empty_like(skew_x)
-            _train_line_skew[(tr.cdiv(skew_g.numel(),256),)](
-                line_grad,skew_g,b,h,w,c,256)
-
             dh=torch.bmm(planar_x.view(c,h*b,w).transpose(1,2),
                          planar_g.view(c,h*b,w))
             dv=torch.bmm(planar_g.view(c,h,b*w),
@@ -530,6 +512,15 @@ class _TrainLineAdd(torch.autograd.Function):
             dw=torch.empty((c,3,l),dtype=torch.float32,device=grad.device)
             _train_line_tap_diagonals[(c,3)](
                 dh,dv,dd,dw,h,l,tr.next_power_of_2(h),tr.next_power_of_2(l))
+            del dh,dv,dd
+        if ctx.needs_input_grad[0]:
+            horizontal,vertical,diagonal=_train_line_matrices(weight,h)
+            dh=torch.bmm(planar_g.view(c,h*b,w),horizontal.transpose(1,2)).view(c,h,b,w)
+            dv=torch.bmm(vertical.transpose(1,2),planar_g.view(c,h,b*w)).view(c,h,b,w)
+            dd=torch.bmm(diagonal.transpose(1,2),skew_g.view(c,h,b*wide)).view(c,h,b,wide)
+            dx=torch.empty((b,c,h,w),device=grad.device,dtype=line_grad.dtype)
+            _train_line_gather_dx[(tr.cdiv(dx.numel(),256),)](
+                dh,dv,dd,line_grad,dx,b,h,w,c,256)
         return dx,dw
 
 
