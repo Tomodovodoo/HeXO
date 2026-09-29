@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import threading
 import time
+import statistics
 from collections import deque
 from functools import lru_cache
 import urllib.parse
@@ -542,6 +543,102 @@ def openings(run):
     return {suite: book.graph() for suite, book in dense_openings.books(run).items()}
 
 
+_book_cache = {}
+BOOK_SORTS = {'games', 'p1_win_rate', 'skew_z', 'decisive_share', 'median_plies', 'mean_plies',
+              'depth', 'champion_probability', 'status', 'created_at', 'retired_at', 'reason'}
+
+
+def book_rows(run):
+    """Book counters plus report lengths along canonical prefixes, cached per run revision.
+
+    Report file mtimes matter too: rewriting a report need not change its directory's mtime.
+    Archives belong here because book counters retain games across protocol refreshes.
+    """
+    run = Path(run)
+    config = read_json(run/'config.json', {})
+    evaluator = read_json(run/'evaluator-status.json', {})
+    suite = evaluator.get('settings', {}).get('opening_suite') or config.get('evaluation', {}).get(
+        'opening_suite', dense_config.EvaluationSettings.opening_suite)
+    book = dense_openings.book_path(run, suite)
+    if suite != dense_openings.LIVE and not book.exists():
+        book = dense_openings.FROZEN/f'{suite}.json'
+    folder = run/'evaluations'
+    paths = sorted(folder.glob('*/report*.json'))
+    stamp = lambda path: (path.stat().st_mtime_ns, path.stat().st_size) if path.exists() else None
+    revision = (str(book), stamp(book), stamp(folder), tuple((str(p), stamp(p)) for p in paths))
+    cached = _book_cache.get(run)
+    if cached and cached[0] == revision:
+        return cached[1]
+    data = read_json(book, {})
+    nodes, counted = data.get('nodes', []), data.get('counted')
+    lengths = {node['key']: [] for node in nodes}
+    matched = {}
+    for path in paths:
+        report = read_json(path, {})
+        if suite != dense_openings.LIVE and report.get('settings', {}).get(
+                'opening_suite', dense_config.EvaluationSettings.opening_suite) != suite:
+            continue
+        games = report.get('games', [])
+        if counted is not None:
+            limit = counted.get(report.get('id'), 0)
+            if not limit:
+                continue
+            games = [game for pair in dense_openings.pairs_of(report)[:limit] for game in pair]
+        for game in games:
+            moves = tuple(map(tuple, game['opening']))
+            if moves not in matched:
+                matched[moves] = [key for depth in range(1, len(moves)+1)
+                                  if (key := dense_openings.canonical(moves[:depth])[0]) in lengths]
+            for key in matched[moves]:
+                lengths[key].append(game['plies'])
+    rows = []
+    for node in nodes:
+        row = {key: node.get(key) for key in ('key', 'moves', 'depth', 'status', 'reason', 'created_at',
+               'retired_at', 'champion_probability', 'games', 'p1_wins', 'p2_wins', 'capped', 'pairs', 'skew')}
+        decisive = row['p1_wins'] + row['p2_wins']
+        plies = lengths[row['key']]
+        row.update(decisive=decisive, p1_win_rate=row['p1_wins']/decisive if decisive else None,
+                   skew_z=(row['p1_wins']-row['p2_wins'])/math.sqrt(decisive) if decisive else None,
+                   decisive_share=decisive/row['games'] if row['games'] else None,
+                   report_games=len(plies), median_plies=statistics.median(plies) if plies else None,
+                   mean_plies=statistics.fmean(plies) if plies else None,
+                   parents=node.get('parents', dense_openings.parents(node['moves'])))
+        rows.append(row)
+    _book_cache[run] = revision, rows
+    return rows
+
+
+def book_page(run, query):
+    """Global filter/sort before slicing; missing statistics sort last in either direction."""
+    page, size = int(query.get('page', 1)), int(query.get('page_size', 50))
+    sort, direction = query.get('sort', 'games'), query.get('direction', 'desc')
+    status, reason = query.get('status', ''), query.get('reason', '')
+    minimum = int(query.get('min_games') or 0)
+    depth = int(query['depth']) if query.get('depth', '') else None
+    colour = query.get('colour_decides', '0')
+    decisive = int(query.get('min_decisive') or 10)
+    if page < 1 or not 1 <= size <= 200 or sort not in BOOK_SORTS or direction not in ('asc', 'desc') or \
+            status not in ('', 'opening', 'retired', 'prefix') or reason not in ('', *dense_openings.REASONS) or \
+            minimum < 0 or (depth is not None and depth < 0) or colour not in ('0', '1') or decisive < 1:
+        raise ValueError('Invalid book page, sort or filter')
+    rows = [row for row in book_rows(run)
+            if (not status or (row['status'] or 'prefix') == status)
+            and (not reason or row['reason'] == reason)
+            and row['games'] >= minimum and (depth is None or row['depth'] == depth)
+            and (colour == '0' or (row['decisive'] >= decisive and min(row['p1_wins'], row['p2_wins']) == 0))
+            and (not query.get('key') or row['key'] == query['key'])]
+    rows.sort(key=lambda row: row['key'])  # Stable tie order across pages.
+    known = [row for row in rows if row[sort] is not None]
+    known.sort(key=lambda row: row[sort], reverse=direction == 'desc')
+    rows = known + [row for row in rows if row[sort] is None]
+    return dict(page=page, page_size=size, total=len(rows), rows=rows[(page-1)*size:page*size])
+
+
+def book_dag(run):
+    return dict(nodes=[{key: row[key] for key in ('key', 'parents', 'depth', 'status', 'games', 'moves')}
+                       for row in book_rows(run)])
+
+
 def heartbeats(run, now):
     """({variant: learner status}, [actor status]) with 'age' seconds since each process's last heartbeat."""
     def load(path):
@@ -791,9 +888,19 @@ class Handler(BaseHTTPRequestHandler):
             page = "project.html" if self.runs and run is None else "training.html"
             payload = (Path(__file__).parent / "web" / page).read_bytes()
             content_type = "text/html; charset=utf-8"
-        elif url.path == "/openings.js":
-            payload = (Path(__file__).parent / "web/openings.js").read_bytes()
+        elif url.path in ("/openings.js", "/book.js"):
+            payload = (Path(__file__).parent / 'web' / url.path[1:]).read_bytes()
             content_type = "text/javascript; charset=utf-8"
+        elif url.path in ('/api/book', '/api/book/dag') and run:
+            try:
+                if dense_config_of(run) is None:
+                    raise ValueError('opening books belong to dense runs')
+                data = book_dag(run) if url.path.endswith('/dag') else book_page(run, query)
+            except ValueError as error:
+                self.send_error(400, str(error))
+                return
+            payload = json.dumps(data, allow_nan=False).encode()
+            content_type = 'application/json'
         elif url.path in ("/api/project", "/api/series", "/api/surface") and self.runs:
             try:
                 if url.path == "/api/project":
