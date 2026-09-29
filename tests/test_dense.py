@@ -2007,14 +2007,17 @@ class YieldTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.run, self.clock, self.wall = Path(tmp.name), [0.], [1000.]
 
-    def heartbeat(self, rate, variant='main', stage='training', age=0., target=None):
+    def heartbeat(self, rate, variant='main', stage='training', age=0., target=None, phase_rows=None):
         name = 'learner-status.json' if variant == 'main' else f'learner-status-{variant}.json'
         extra = {} if target is None else dict(samples_per_row_target=target)
+        if phase_rows is not None:
+            extra['phase_rows'] = phase_rows
         (self.run/name).write_text(json.dumps(dict(stage=stage, variant=variant, samples_per_row=rate,
                                                    updated_at=self.wall[0]-age, **extra)))
 
-    def gate(self, below=.9, resume=.975, check=30.):
-        return dense_selfplay.Yield(self.run, 4., below, resume, check, clock=lambda: self.clock[0], now=lambda: self.wall[0])
+    def gate(self, below=.9, resume=.975, check=30., follow=False):
+        return dense_selfplay.Yield(self.run, 4., below, resume, check, follow, clock=lambda: self.clock[0],
+                                    now=lambda: self.wall[0])
 
     def advance(self, seconds):
         self.clock[0] += seconds; self.wall[0] += seconds
@@ -2079,6 +2082,40 @@ class YieldTests(unittest.TestCase):
         self.heartbeat(3.5)  # no samples_per_row_target: the config target applies
         self.assertTrue(gate.paused())
 
+    def test_the_pacing_rule_alone_does_not_follow_the_phases(self):
+        gate = self.gate(check=0.)
+        self.heartbeat(3.88, stage='training', phase_rows=12000)  # the live ratio: a training phase, no pause
+        self.assertFalse(gate.paused())
+        self.heartbeat(3.0, stage='phase-idle', phase_rows=12000)  # far behind, but idling: no pause
+        self.assertFalse(gate.paused())
+
+    def test_phase_follow_pauses_exactly_during_the_training_phase(self):
+        gate = self.gate(below=0., check=0., follow=True)
+        states = []
+        for stage in ('phase-idle', 'training', 'exporting', 'training', 'phase-idle', 'waiting-for-data', 'training'):
+            self.heartbeat(3.99, stage=stage, phase_rows=12000)
+            states.append(gate.paused())
+        self.assertEqual(states, [False, True, True, True, False, False, True])
+        self.assertIn('main in its training phase', gate.reason)
+        self.heartbeat(3.99, stage='training', phase_rows=12000, age=dense_selfplay.STALE_SECONDS+1)
+        self.assertFalse(gate.paused())
+        self.heartbeat(3.99, stage='training', phase_rows=0)  # an unphased learner is not followed
+        self.assertFalse(gate.paused())
+        self.heartbeat(3.99, stage='training')  # nor one whose heartbeat predates phase_rows
+        self.assertFalse(gate.paused())
+
+    def test_phase_follow_and_the_pacing_rule_combine(self):
+        gate = self.gate(check=0., follow=True)
+        self.heartbeat(3.99, stage='training', phase_rows=12000)
+        self.heartbeat(3.0, variant='wide')
+        self.assertTrue(gate.paused())
+        self.heartbeat(3.99, stage='phase-idle', phase_rows=12000)
+        self.assertTrue(gate.paused())  # wide is still behind its pacing
+        self.assertIn('wide', gate.reason)
+        self.heartbeat(3.95, variant='wide')
+        self.assertFalse(gate.paused())
+        self.assertFalse(self.gate(below=0., check=0.).paused())  # neither rule enabled
+
     def test_metrics_lines_on_every_stage_change_and_periodically(self):
         due = dense_selfplay.metrics_due
         self.assertTrue(due('paused', 'playing', 0.))
@@ -2101,6 +2138,8 @@ class YieldTests(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             status = json.loads((run/'learner-status.json').read_text())
             self.assertEqual(status['samples_per_row_target'], 7.5)
+            self.assertEqual(status['phase_rows'], 0)
+            self.assertAlmostEqual(status['backlog_rows'], status['rows_available']-status['samples_seen']/7.5)
             zeros = dict(allocated_mb=0, reserved_mb=0)
             self.assertEqual(status['vram'], zeros)
             lines = [json.loads(line) for line in (run/'metrics'/'learner-main.jsonl').read_text().splitlines()]
@@ -2129,6 +2168,78 @@ class YieldTests(unittest.TestCase):
         for name in ('yield_below', 'yield_resume', 'yield_check_seconds'):
             del data['actor'][name]
         self.assertEqual(dense_config.from_dict(data).actor.yield_below, dense_config.ActorSettings.yield_below)
+
+
+class PhaseTests(unittest.TestCase):
+    """dense_learn.backlog and dense_learn.Phase: the phased schedule against synthetic row arrivals."""
+
+    def test_backlog_is_the_unspent_pacing_budget_in_rows(self):
+        self.assertEqual(dense_learn.backlog(0, 100, 4.), 100)
+        self.assertEqual(dense_learn.backlog(400, 100, 4.), 0)
+        self.assertEqual(dense_learn.backlog(200, 100, 4.), 50)
+        self.assertEqual(dense_learn.backlog(10496000, 2705320, 4.), 81320)  # the live heartbeat at step 41000
+
+    def simulate(self, phase_rows, ticks, arrivals=90, batch=256, per_row=4., rows=0, seen=0):
+        """One tick: the learner takes one batch if Phase says so and the pacing allows it, otherwise actors
+        publish `arrivals` rows (they pause while the learner trains). Returns (stage, backlog) per tick."""
+        phase, trace = dense_learn.Phase(), []
+        for _ in range(ticks):
+            paced = seen+batch > per_row*rows
+            if not phase.due(phase_rows, dense_learn.backlog(seen, rows, per_row), paced):
+                trace.append(('phase-idle', dense_learn.backlog(seen, rows, per_row)))
+                rows += arrivals
+            elif paced:
+                trace.append(('waiting-for-data', dense_learn.backlog(seen, rows, per_row)))
+                rows += arrivals
+            else:
+                trace.append(('training', dense_learn.backlog(seen, rows, per_row)))
+                seen += batch
+                if not phase_rows:
+                    rows += arrivals
+        return trace
+
+    def test_phases_alternate_on_the_backlog(self):
+        trace = self.simulate(1000, 200)
+        stages = [s for s, _ in trace]
+        runs = [stages[0]]
+        for s in stages[1:]:
+            if s != runs[-1]:
+                runs.append(s)
+        self.assertEqual(runs[:5], ['phase-idle', 'training', 'phase-idle', 'training', 'phase-idle'])
+        self.assertNotIn('waiting-for-data', stages)
+        for (stage, backlog), (after, _) in zip(trace, trace[1:]):
+            if stage == 'phase-idle' and after == 'training':
+                self.assertGreaterEqual(backlog+90, 1000)  # a phase starts once the backlog reaches phase_rows
+            if stage == 'phase-idle':
+                self.assertLess(backlog, 1000)
+            if stage == 'training' and after == 'phase-idle':
+                self.assertLess(backlog-256/4., 256/4.)  # and ends only when the next batch is out of budget
+        first = stages.index('training')
+        self.assertEqual(stages[first:first+16], ['training']*16)  # ~1000 rows * 4 / 256 batches, uninterrupted
+
+    def test_a_backlog_above_phase_rows_trains_at_once(self):
+        trace = self.simulate(1000, 3, rows=5000)
+        self.assertEqual([s for s, _ in trace], ['training']*3)
+
+    def test_phase_rows_zero_trains_whenever_the_pacing_allows(self):
+        stages = [s for s, _ in self.simulate(0, 40)]
+        self.assertEqual(stages[0], 'waiting-for-data')
+        self.assertNotIn('phase-idle', stages)
+        self.assertIn('training', stages)
+        phase = dense_learn.Phase()
+        self.assertTrue(phase.due(0, 0., True))
+        self.assertTrue(phase.due(0, 1e9, False))
+
+    def test_defaults_keep_the_unphased_schedule(self):
+        self.assertEqual(dense_config.LearnerSettings().phase_rows, 0)
+        self.assertIs(dense_config.ActorSettings().phase_follow, False)
+        data = asdict(dense_config.RunConfig())
+        del data['learner']['phase_rows'], data['actor']['phase_follow']
+        config = dense_config.from_dict(data)
+        self.assertEqual((config.learner.phase_rows, config.actor.phase_follow), (0, False))
+        self.assertIn('phase_rows', dense_learn.KEEP)
+        with self.assertRaises(ValueError):
+            dense_config.LearnerSettings(phase_rows=-1)
 
 
 class ActorModelTests(unittest.TestCase):

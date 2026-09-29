@@ -21,8 +21,9 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
   actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s;
                                        vram is hexnet.vram() of that process
   learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s;
-                                       samples_per_row_target is its effective learner.samples_per_row; vram
-                                       is dense_learn.Learner.vram()
+                                       samples_per_row_target is its effective learner.samples_per_row;
+                                       phase_rows its effective learner.phase_rows and backlog_rows its
+                                       dense_learn.backlog; vram is dense_learn.Learner.vram()
   events.jsonl                         one line per event: {time, source, kind, message, ...} (log_event)
   metrics/learner-<variant>.jsonl      {time, step, samples_seen, lr, policy_ce, value_bce, short_value_bce, next_ce,
                                        future_bce, samples_per_second, window_rows, vram} every log_every steps,
@@ -84,6 +85,9 @@ class ActorSettings:
     yield_below: float = .9       # 0 disables
     yield_resume: float = .975
     yield_check_seconds: float = 30.
+    # True: also pause while a learner with phase_rows > 0 is in its training phase (heartbeat stage 'training' or
+    # 'exporting'), so actors and learner alternate (dense_selfplay.Yield).
+    phase_follow: bool = False
     # Solver points inside the search (dense_solver), node budgets; 0 = off. root: forced-win check at each turn
     # start, a proof decides the turn played; finalists: defence check of the k best mid-turn candidates at the last
     # halving boundary, a proven opponent win eliminates the candidate; threat: the opponent's forced win on a
@@ -109,6 +113,9 @@ class LearnerSettings:
     grad_clip: float = 1.
     ema: float = .999
     samples_per_row: float = 4.   # training presentations per generated row (KataGo ~4)
+    # Phased schedule (dense_learn.Phase); 0 = train whenever the pacing allows. > 0: idle (stage 'phase-idle')
+    # until the untrained backlog (dense_learn.backlog) reaches phase_rows rows, then train until the pacing limit.
+    phase_rows: int = 0
     window_min_rows: int = 100000  # counts full-search rows only
     window_expand_per_row: float = .4
     window_taper: float = .65
@@ -151,6 +158,8 @@ class LearnerSettings:
             raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
         if '@' in self.variant or '/' in self.variant:
             raise ValueError(f"variant {self.variant!r}: '@' marks a search-settings variant (dense_eval) and '/' a step")
+        if self.phase_rows < 0:
+            raise ValueError(f'phase_rows must be 0 (off) or positive, not {self.phase_rows}')
 
 
 @dataclass(frozen=True)
