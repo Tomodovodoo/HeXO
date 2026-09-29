@@ -7,6 +7,7 @@ from dataclasses import asdict, replace
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import subprocess
@@ -1314,21 +1315,35 @@ class DenseDataTests(unittest.TestCase):
             for i in range(2):
                 batch = next(dense_data.batches(window, np.random.default_rng([4, i]), 8, lambda: settings))
                 expected.append({size: {k: v.tolist() for k, v in b.items()} for size, b in batch.items()})
+            context = multiprocessing.get_context('spawn')
+            calibration = context.Array('d', dense_data.CALIBRATION_FEATURES+1)
+            calibration[:] = dense_data.pack_calibration(None)
+            outputs = [context.Queue(1) for _ in range(2)]
+            updates = [context.Queue() for _ in range(2)]
+            processes = [context.Process(target=dense_data._render_worker, daemon=True,
+                                         args=(tmp, settings, [4, i], outputs[i], calibration, None, updates[i], None, 0))
+                         for i in range(2)]
+            dense_data.start_hidden(processes)
+            try:
+                got = [output.get(timeout=30) for output in outputs]
+            finally:
+                for process in processes:
+                    process.terminate()
+                for process in processes:
+                    process.join()
+                for output in outputs+updates:
+                    output.close()
+            for batch, first in zip(got, expected):
+                if isinstance(batch, BaseException):
+                    raise batch
+                self.assertEqual(sum(len(b['counts']) for b in batch.values()), 8)
+                self.assertEqual({size: {k: v.tolist() for k, v in b.items()} for size, b in batch.items()}, first)
             stream = dense_data.Renderers(tmp, settings, [4], workers=2, depth=1)
             try:
-                remaining = expected.copy()
-                for _ in range(64):
-                    batch = next(stream)
-                    self.assertEqual(sum(len(b['counts']) for b in batch.values()), 8)
-                    self.assertIsInstance(batch[min(batch)]['planes'], torch.Tensor)
-                    rendered = {size: {k: v.tolist() for k, v in b.items()} for size, b in batch.items()}
-                    if rendered in remaining:
-                        remaining.remove(rendered)
-                    if not remaining:
-                        break
+                batch = next(stream)
+                self.assertIsInstance(batch[min(batch)]['planes'], torch.Tensor)
             finally:
                 stream.close()
-            self.assertEqual(remaining, [])
             self.assertTrue(any((Path(tmp)/'cache'/'policies').glob('*.f32')))
 
     def test_pipeline_benchmark_copies_newest_shards_and_times_stages(self):
@@ -3295,15 +3310,18 @@ class PosteriorTests(unittest.TestCase):
 
 
 class OpponentSchedulerTests(unittest.TestCase):
-    def test_load_reports_not_stale_after_same_size_same_mtime_rewrite(self):
+    def test_load_reports_not_stale_after_same_size_same_mtime_replacement(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'evaluations'/'pair'/'report.json'
             path.parent.mkdir(parents=True)
             path.write_text('{"games":[1]}')
             self.assertEqual(dense_eval.load_reports(tmp)[0]['games'], [1])
             stamp = path.stat()
-            path.write_text('{"games":[2]}')
-            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            replacement = path.with_suffix('.tmp')
+            replacement.write_text('{"games":[2]}')
+            os.utime(replacement, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            os.replace(replacement, path)
+            self.assertEqual((path.stat().st_size, path.stat().st_mtime_ns), (stamp.st_size, stamp.st_mtime_ns))
             self.assertEqual(dense_eval.load_reports(tmp)[0]['games'], [2])
 
     def test_payoff_matrix_from_reports(self):
@@ -3662,13 +3680,13 @@ class EvaluatorLoopTests(unittest.TestCase):
         # Restored with 200 Seal games from an earlier reign: a fresh anchor per anchor_every rated checkpoints.
         report = dense_eval.report_path(self.run, 'main/000010', 'seal')
         report.parent.mkdir(parents=True)
-        report.write_text(json.dumps(dict(candidate='main/000010', opponent='seal', settings=asdict(evaluator.settings),
-                                          games=[{}]*200)))
+        dense_eval.write_json(report, dict(candidate='main/000010', opponent='seal', settings=asdict(evaluator.settings),
+                                          games=[{}]*200))
         evaluator.crown('main/000010')
         self.assertEqual((evaluator.league['reign_games'], evaluator.anchor()[3]), (200, 2))
         evaluator.league['checkpoints'].append(dict(id='main/000050', variant='main', step=50, elo=0., matches=[]))
         self.assertEqual(evaluator.anchor()[3], 4)
-        report.write_text(json.dumps(dict(json.loads(report.read_text()), games=[{}]*204)))
+        dense_eval.write_json(report, dict(json.loads(report.read_text()), games=[{}]*204))
         self.assertIsNone(evaluator.anchor())
         report.unlink()
         self.export(30)
