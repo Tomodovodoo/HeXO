@@ -2,7 +2,11 @@
 
 Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval (evaluator) and dashboard.py:
   config.json                          RunConfig, written once; the single source of settings for every process
-  shards/<name>/                       immutable self-play shards (format in dense_data); names sort oldest first
+  shards/<name>/                       immutable self-play shards (format in dense_data); names sort oldest first;
+                                       shards/<name>/proofs.jsonl is the proof pass's sidecar (dense_solve)
+  restarts.json                        {updated_at, entries}: the restart buffer of the proof pass (dense_solve),
+                                       highest regret first; actors draw restart positions from it
+  solver-status.json                   proof pass heartbeat and counters (dense_solve), rewritten after every shard
   checkpoints/<variant>/<step:06d>/    model.pt, ema.pt, optimizer.pt, manifest.json (dense_learn); complete once
                                        manifest.json exists; the checkpoint id is '<variant>/<step:06d>'
   champion.json                        {checkpoint, ema_sha256, updated_at}: the promoted checkpoint (dense_eval);
@@ -27,8 +31,8 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
   events.jsonl                         one line per event: {time, source, kind, message, ...} (log_event)
   metrics/learner-<variant>.jsonl      {time, step, samples_seen, lr, policy_ce, value_bce, short_value_bce, next_ce,
                                        future_bce, samples_per_second, window_rows, vram} every log_every steps,
-                                       plus {time, step, samples_seen, vram, validation: true, <validation fields>}
-                                       per export
+                                       plus {time, step, samples_seen, vram, validation: true, proven_rows,
+                                       <validation fields>} per export
   metrics/actor-<k>.jsonl              {time, positions, games_completed, placements_per_second, evals_per_second,
                                        mean_batch, terminal_fraction, mean_plies, checkpoint, paused_seconds} about
                                        every 30 s and at every pause or resume; counters restart with the worker
@@ -98,6 +102,14 @@ class ActorSettings:
     solver_finalist_nodes: int = 0
     solver_threat_nodes: int = 0
     solver_async: bool = True
+    # Restarts (dense_selfplay.Restarts): a self-play game starts with probability restart_fraction from a position
+    # of restarts.json, drawn with probability proportional to regret^(1/restart_temperature); 0 = never.
+    restart_fraction: float = 0.
+    restart_temperature: float = 1.
+
+    def __post_init__(self):
+        if not 0 <= self.restart_fraction <= 1 or not self.restart_temperature > 0:
+            raise ValueError('restart_fraction must lie in [0, 1] and restart_temperature must be positive')
 
 
 VALUE_TARGETS = ('outcome', 'td', 'calibrated')

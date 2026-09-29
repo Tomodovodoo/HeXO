@@ -456,7 +456,8 @@ def dense_run(run, config, fresh=30):
                  vram_reserved_mb=[a['vram'].get('reserved_mb') for a in live if isinstance(a.get('vram'), dict)],
                  checkpoint=actors[0].get('checkpoint') if actors else None, actor_sha256=actors[0].get('actor_sha256') if actors else None,
                  error='; '.join(f"{a['process']}: {a['error']}" for a in actors if a.get('error')) or None,
-                 heartbeat=max((a['heartbeat'] for a in actors if a['heartbeat'] is not None), default=None))
+                 heartbeat=max((a['heartbeat'] for a in actors if a['heartbeat'] is not None), default=None),
+                 restart_buffer=status(run/'solver-status.json').get('buffer_size'))
     learners = {}
     for path in sorted(run.glob('learner-status*.json')):
         learner = status(path)
@@ -467,17 +468,20 @@ def dense_run(run, config, fresh=30):
     data = dict.fromkeys(keys, 0)
     shards = [manifest for _, manifest in dense_manifests(run/'shards')]
     recent = {3600: 0, 21600: 0}
+    restarts = 0
     for shard in shards:
         counts = shard.get('counts') or {}
         for key in keys: data[key] += counts.get(key) or 0
         for window in recent:
             if now-(shard.get('created_at') or 0) <= window: recent[window] += counts.get('games') or 0
+        if now-(shard.get('created_at') or 0) <= 21600: restarts += counts.get('restart_games') or 0
     # A young run is averaged over its lifetime, not the full window.
     age = now-config['created_at'] if isinstance(config.get('created_at'), (int, float)) else None
     for window, games in recent.items():
         span = max(60, min(window, age)) if age is not None else window
         data[f'games_per_hour_{window//3600}h'] = games*3600/span
-    data.update(shards=len(shards), latest_shard_at=max((s.get('created_at') or 0 for s in shards), default=None))
+    data.update(shards=len(shards), latest_shard_at=max((s.get('created_at') or 0 for s in shards), default=None),
+                restart_share_6h=restarts/recent[21600] if recent[21600] else None)
     checkpoints, per_variant = [], {}
     for path, manifest in dense_manifests(run/'checkpoints', '*/*/manifest.json'):
         variant, step = path.parent.parent.name, int(path.parent.name)

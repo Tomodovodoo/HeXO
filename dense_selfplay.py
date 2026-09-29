@@ -32,9 +32,13 @@ be overridden per process with --<setting> flags (the supervisor forwards them; 
 Historical opponents (ActorSettings.historical_*): up to round(historical_fraction * min(games_in_flight, --games))
 games in flight pit the played model (called the champion below), alternating colours over historical games,
 against a frozen rated checkpoint (`Historical`); only its plies become training rows (dense_data.trained).
+
+Restarts (ActorSettings.restart_*): with restart_fraction > 0 each new self-play game starts with that probability
+from a position of the run's restart buffer (`Restarts`, written by dense_solve); its source moves are replayed as
+forced opening plies without search or rows, and the episode records origin 'restart' and its source.
 """
 import argparse
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import asdict, fields, replace
 import json
 import math
@@ -70,6 +74,8 @@ BLOCKS = 2          # historical opponents in flight at once, about: blocks of t
 METRICS = ('positions', 'games_completed', 'placements_per_second', 'evals_per_second', 'mean_batch',
            'terminal_fraction', 'mean_plies', 'checkpoint', 'paused_seconds')
 STALE_SECONDS = 120.  # learner heartbeats older than this are ignored by Yield
+RESTART_SOURCE = ('shard', 'game', 'ply', 'kind', 'regret', 'plies_to_proof')  # buffer entry fields a restart records
+RESTART_SHARDS = 16   # source shards whose moves Restarts keeps
 
 
 def checkpoints(run):
@@ -433,16 +439,23 @@ class SelfPlayGame:
     placement; both sides use the same playout-cap randomization, opening sampling and solver budgets (`solver`,
     from the settings' solver_* fields). With the solver active every row records `proven`, `proof_turns` and
     `solver_nodes` (Engine), a proof's move is played even on an opening ply, and the episode records `solver`
-    (dense_solver.record)."""
+    (dense_solver.record). `restart` (entry, moves) starts the game after `moves`, the forced opening of a restart
+    buffer `entry`: those plies get no row, a null root value and full_search False, no opening ply is sampled
+    after them, and the episode records origin 'restart' and `restart` (the entry's RESTART_SOURCE fields); other
+    games record origin 'selfplay'."""
 
-    def __init__(self, sides, settings, seed, learner=0, opponent=None):
+    def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None):
         self.sides, self.settings, self.seed, self.reason = sides, settings, seed, None
         self.solver = dense_solver.Budgets.of(settings)
         self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
-        self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) if settings.opening_random_plies > 0 else 0
-        self.trees = {model: model.tree((), seed+k, settings.tactics) for k, model in enumerate(dict.fromkeys(sides))}
-        self.game, self.moves, self.rows, self.values, self.full = Game(), [], [], [], []
+        self.restart, forced = (None, []) if restart is None else (restart[0], [[int(q), int(r)] for q, r in restart[1]])
+        self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) \
+            if settings.opening_random_plies > 0 and restart is None else 0
+        self.trees = {model: model.tree([tuple(m) for m in forced], seed+k, settings.tactics)
+                      for k, model in enumerate(dict.fromkeys(sides))}
+        self.game, self.moves, self.rows = Game(forced), forced, []
+        self.values, self.full = [None]*len(forced), [False]*len(forced)
         self.plan()
 
     @property
@@ -495,14 +508,55 @@ class SelfPlayGame:
         self.game.close()
         for tree in self.trees.values():
             tree.close()
+        forced = self.restart['ply'] if self.restart else 0
         episode = dict(moves=self.moves, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
-                       opening_plies=min(self.random_plies, len(self.moves)), actor=self.sides[self.learner].sha,
+                       opening_plies=min(forced+self.random_plies, len(self.moves)), actor=self.sides[self.learner].sha,
                        actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
                        trained_side=None if self.opponent is None else self.learner,
-                       root_values=self.values, full_search=self.full)
+                       root_values=self.values, full_search=self.full, origin='restart' if self.restart else 'selfplay')
+        if self.restart:
+            episode['restart'] = {k: self.restart[k] for k in RESTART_SOURCE}
         if self.solver.active:
             episode['solver'] = dense_solver.record(self.solver)
         return episode, self.rows
+
+
+class Restarts:
+    """The run's restart buffer (restarts.json, dense_solve) as an actor worker uses it. load() re-reads it (missing:
+    empty; unreadable: the previous entries are kept). draw(rng) returns (entry, moves) for an entry drawn with probability proportional to
+    regret^(1/temperature), `moves` the first entry['ply'] moves of its source game, or None when the buffer is
+    empty or the source shard is gone. The moves of the RESTART_SHARDS most recently used source shards are kept."""
+
+    def __init__(self, run, temperature):
+        self.run, self.temperature, self.entries, self.games = Path(run), temperature, [], OrderedDict()
+        self.load()
+
+    def load(self):
+        path = self.run/'restarts.json'
+        try:
+            self.entries = json.loads(path.read_text(encoding='utf-8'))['entries'] if path.exists() else []
+        except (OSError, ValueError):
+            return
+        weights = np.array([max(e['regret'], 0.) for e in self.entries])**(1/self.temperature)
+        self.p = weights/weights.sum() if len(weights) and weights.sum() > 0 else None
+
+    def moves(self, shard):
+        if shard not in self.games:
+            path = self.run/'shards'/shard/'episodes.json'
+            if not path.exists():
+                return None
+            self.games[shard] = [e['moves'] for e in json.loads(path.read_text(encoding='utf-8'))]
+            while len(self.games) > RESTART_SHARDS:
+                self.games.popitem(last=False)
+        self.games.move_to_end(shard)
+        return self.games[shard]
+
+    def draw(self, rng):
+        if self.p is None:
+            return None
+        entry = self.entries[rng.choice(len(self.entries), p=self.p)]
+        games = self.moves(entry['shard'])
+        return None if games is None else (entry, games[entry['game']][:entry['ply']])
 
 
 class Historical:
@@ -628,6 +682,8 @@ def worker(args):
     historical = Historical(run, config, np.random.default_rng(seeds.spawn(1)[0]), args.games) if settings.historical_fraction > 0 else None
     if historical:
         historical.redraw(model.checkpoint, model.sha)
+    restarts = Restarts(run, settings.restart_temperature) if settings.restart_fraction > 0 else None
+    restart_rng = np.random.default_rng(seeds.spawn(1)[0]) if restarts else None
     engine = Engine(settings.leaf_batch, settings.solver_async)
     began, solver_failures = time.perf_counter(), 0
     state = dict(published(run, args.worker), error=None)
@@ -701,6 +757,8 @@ def worker(args):
                       process=args.worker, checkpoint=model.checkpoint, previous=previous, reason=settings.model_source)
         if historical:
             historical.redraw(model.checkpoint, model.sha)
+        if restarts:
+            restarts.load()
 
     try:
         last = 0.
@@ -712,7 +770,8 @@ def worker(args):
                     sides = [model, opponent] if learner == 0 else [opponent, model]
                     engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint))
                 else:
-                    engine.add(SelfPlayGame([model, model], settings, seed))
+                    restart = restarts.draw(restart_rng) if restarts and restart_rng.random() < settings.restart_fraction else None
+                    engine.add(SelfPlayGame([model, model], settings, seed, restart=restart))
                 started += 1
             if not engine.slots:
                 break
