@@ -1316,13 +1316,19 @@ class DenseDataTests(unittest.TestCase):
                 expected.append({size: {k: v.tolist() for k, v in b.items()} for size, b in batch.items()})
             stream = dense_data.Renderers(tmp, settings, [4], workers=2, depth=1)
             try:
-                got = [next(stream) for _ in range(2)]
+                remaining = expected.copy()
+                for _ in range(64):
+                    batch = next(stream)
+                    self.assertEqual(sum(len(b['counts']) for b in batch.values()), 8)
+                    self.assertIsInstance(batch[min(batch)]['planes'], torch.Tensor)
+                    rendered = {size: {k: v.tolist() for k, v in b.items()} for size, b in batch.items()}
+                    if rendered in remaining:
+                        remaining.remove(rendered)
+                    if not remaining:
+                        break
             finally:
                 stream.close()
-            for batch in got:
-                self.assertEqual(sum(len(b['counts']) for b in batch.values()), 8)
-                self.assertIsInstance(batch[min(batch)]['planes'], torch.Tensor)
-                self.assertIn({size: {k: v.tolist() for k, v in b.items()} for size, b in batch.items()}, expected)
+            self.assertEqual(remaining, [])
             self.assertTrue(any((Path(tmp)/'cache'/'policies').glob('*.f32')))
 
     def test_pipeline_benchmark_copies_newest_shards_and_times_stages(self):
@@ -3289,6 +3295,17 @@ class PosteriorTests(unittest.TestCase):
 
 
 class OpponentSchedulerTests(unittest.TestCase):
+    def test_load_reports_not_stale_after_same_size_same_mtime_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'evaluations'/'pair'/'report.json'
+            path.parent.mkdir(parents=True)
+            path.write_text('{"games":[1]}')
+            self.assertEqual(dense_eval.load_reports(tmp)[0]['games'], [1])
+            stamp = path.stat()
+            path.write_text('{"games":[2]}')
+            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            self.assertEqual(dense_eval.load_reports(tmp)[0]['games'], [2])
+
     def test_payoff_matrix_from_reports(self):
         reports = [fake_report('main/000002', 'main/000001', 5, 2, 1), fake_report('main/000001', 'main/000002', 3, 3, 2),
                    fake_report('main/000002', 'seal', 1, 6, 1)]
