@@ -1188,7 +1188,7 @@ class Evaluator:
                     if any('error' in game for game in group):
                         failed[lane] = failed.get(lane, 0)+1
                         if lane[1] == SEAL and failed[lane] == 2:
-                            self.failed_seal.add((lane[0], lane[2], self.settings.opening_book))
+                            self.failed_seal.add((*lane, self.settings.opening_book))
                             log_event(self.run, 'evaluator', 'error', f'{lane[0]} vs Seal ({lane[2]}): paused after '
                                       f'{failed[lane]} failed pairs', candidate=lane[0], opponent=SEAL)
                     else:
@@ -1407,7 +1407,7 @@ class Evaluator:
         s, post, previous = self.settings, verdict['posterior'], self.met(champion)
         options = []
         for a, b in ((cid, previous), (champion, previous), (cid, SEAL), (champion, SEAL)):
-            if not b or b == a or not self.close(a, b):
+            if not b or b == a or (a, b, 'evidence', s.opening_book) in self.failed_seal or not self.close(a, b):
                 continue
             if b == SEAL:
                 path = report_path(self.run, a, SEAL)
@@ -1749,7 +1749,7 @@ class Evaluator:
         (`seal_reports`, every protocol) gained since reign_games, so an anchor owed when the protocol changes (a book
         refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor."""
         s, champion = self.settings, self.entry(self.league['champion'])
-        if not s.anchor_games or champion is None or (champion['id'], 'anchor', s.opening_book) in self.failed_seal:
+        if not s.anchor_games or champion is None or (champion['id'], SEAL, 'anchor', s.opening_book) in self.failed_seal:
             return None
         entries = self.league['checkpoints']
         later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])
@@ -1794,7 +1794,7 @@ class Evaluator:
         if not s.idle_fill or champion is None:
             return None
         reports = self.seal_reports(champion['id'])
-        if s.anchor_target_halfwidth > 0 and (champion['id'], 'fill', s.opening_book) not in self.failed_seal \
+        if s.anchor_target_halfwidth > 0 and (champion['id'], SEAL, 'fill', s.opening_book) not in self.failed_seal \
                 and self.close(champion['id'], SEAL):
             low, high = rate([champion['id'], SEAL], champion['id'], reports, seed=self.config.seed)[1][SEAL] if reports \
                 else (-math.inf, math.inf)
@@ -1916,7 +1916,7 @@ class Evaluator:
             done = self.games(a, opponent)
             if kind == 'sprt' and done and (decision := self.test(done)['decision']):
                 decided.append(decision)  # an idle SPRT rematch keeps the first bound it crosses
-            if self.backlog() or len(done) >= target or decided or (a, kind, s.opening_book) in self.failed_seal:
+            if self.backlog() or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
         self.session(want, target)

@@ -3656,6 +3656,19 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(any(event['kind'] == 'error' and 'paused after 2 failed pairs' in event['message']
                             for event in events))
 
+    def test_paused_seal_evidence_is_not_selected(self):
+        evaluator = self.start()
+        candidate, champion = 'main/000020', 'main/000010'
+        evaluator.met = lambda name: None
+        evaluator.close = lambda a, b: True
+        post = SimpleNamespace(index={candidate, champion, 'seal'}, anchor=champion,
+                               after=lambda comparison, pair, games=None: 0 if pair[1] == 'seal' else 1)
+        verdict = dict(posterior=post)
+        self.assertEqual(evaluator.evidence(verdict, candidate, champion, 2), (candidate, 'seal'))
+        for name in (candidate, champion):
+            evaluator.failed_seal.add((name, 'seal', 'evidence', evaluator.settings.opening_book))
+        self.assertIsNone(evaluator.evidence(verdict, candidate, champion, 2))
+
     def test_promotion_anchors_after_the_next_sprt_and_before_optional_work(self):
         import dashboard
         evaluator = self.anchored()
@@ -4239,6 +4252,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertNotEqual(opponent, 'seal')
         growable = [d for d in self.league()['ladder'] if dense_eval.rematch_pair(self.run, d['a'], d['b'], evaluator.settings)]
         self.assertEqual({entry['id'], opponent}, {max(growable, key=lambda d: d['interval'][1]-d['interval'][0])[k] for k in 'ab'})
+        evaluator.failed_seal.add((entry['id'], 'seal', kind, evaluator.settings.opening_book))
         self.assertTrue(evaluator.step())
         self.assertTrue(dense_eval.report_path(self.run, entry['id'], opponent).exists())
         targets = [f'{entry["id"]} vs {opponent}']
