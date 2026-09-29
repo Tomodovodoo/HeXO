@@ -6,6 +6,67 @@ Keep cuDNN for HexConv. This checkout already implements each hex convolution as
 
 Checkpoint parameter names, config, digest and serialized tensors do not include the execution mode. Loading a checkpoint defaults to `reference`, including a checkpoint saved while training with `fused`. The learner flag is process-local. CPU execution uses the existing operations.
 
+## Actor CUDA graphs
+
+`--net-kernels fused --cuda-graphs` adds a second opt-in acceleration for actors.
+It keeps each crop's canvas and replays batches of 8, 16 or 32 rows, with at most
+seven inert rows added per crop group. The 64x64 canvas uses at most 16 rows.
+Fourteen possible captures share one memory pool and one stream. Inputs and
+packed outputs live outside that pool; every returned output owns its storage.
+Captures disable autocast's weight cache so graph pointers remain valid after
+the capture context exits.
+
+Only the current champion owns graphs. Historical opponents use eager fused
+inference. A champion switch releases the old graphs before loading the new
+champion; games using the old model continue with eager inference. New captures
+stop when the measured reservation increase reaches the 384 MiB budget, or an
+allocation fails, and uncaptured shapes use eager inference. The allocator cap
+still applies to all development measurements.
+
+The following paired comparison uses the same frozen real inputs and weights as
+the earlier measurements. It compares the current fused implementation with
+graphs, using four alternating observations per mode after capture and warmup.
+These are resident-input model rates under the live run's shared GPU load.
+
+| Batch | Fused positions/s | Fused + graphs positions/s | Additional speed-up |
+|---|---:|---:|---:|
+| 64 | 488.4 | 676.8 | 1.39x |
+| 128 | 671.3 | 1051.0 | 1.57x |
+| 256 | 845.3 | 1135.3 | 1.34x |
+
+All fourteen shapes were captured, adding 292 MiB of reserved memory. Peak
+allocated/reserved memory for the whole comparison was 274/686 MiB. Outputs
+matched eager inference to the existing bf16 tolerance. Holding outputs across
+later replays and reversing the canvas order preserved them exactly. Rates
+exclude first-use capture; captures belong to each process and model.
+
+At batch 256, eager execution submitted 831 individual kernel launches. Graph
+execution submitted 12 graph launches and 4 individual kernel launches. Measured
+CPU time in those launch calls fell from 9.01 to 4.03 ms. The graph contained
+1,780 kernels versus 831 in eager execution: smaller batches and padding raised
+the sum of kernel durations from 48.29 to 56.32 ms. Removing host submission work
+still improved wall throughput. GPU gaps include contention from the live run
+and are not counted as measured launch overhead.
+
+| Top kernel group at batch 256 | Fused ms | Fused + graphs ms |
+|---|---:|---:|
+| Dominant cuDNN bf16 convolution | 25.20 | 22.53 |
+| Direct LineConv | 10.10 | 10.82 |
+| Norm plus activation | 3.69 | 3.95 |
+| Elementwise residual add | 2.67 | 2.56 |
+
+Graph replay lacks eager operator FLOP annotations; zero in that profiler field
+does not mean zero arithmetic. The CUDA trace still records kernel durations.
+These gains are measured against fused in the same window, and are not multiplied
+by earlier reference comparisons made under different shared-card load.
+
+Enable actors with `python dense_selfplay.py --run runs/dense-v1 --processes 4
+--net-kernels fused --cuda-graphs`. No additional dependency beyond the existing
+Triton installation is needed. The learner continues to use `--net-kernels fused`.
+To reproduce each graph comparison, run `python tools/profile_hexnet.py eval
+--kernels fused graphs --batch 256 --repeats 2 --profile`, replacing 256 with 64
+or 128. The tool enforces the same bounded GPU sessions and cooldowns.
+
 ## Variable actor shapes
 
 The original fixed-shape measurements below missed a live regression. On September 29,

@@ -196,13 +196,12 @@ class Evaluator(hexnet.DenseEvaluator):
                 else:
                     view[j] = 0
                     view[j, :, :planes.shape[-1], :planes.shape[-1]] = planes
-            step = max(1, min(self.max_batch, MAX_CELLS//(size*size)))
+            step = self.max_batch if self.graph is not None else max(1, min(self.max_batch, MAX_CELLS//(size*size)))
             for start in range(0, len(indices), step):
                 chunk = indices[start:start+step]
                 x = host[start:start+len(chunk)].to(self.device, non_blocking=True)
                 x = x.to(memory_format=self.memory_format, dtype=torch.bfloat16 if self.cuda else torch.float32)
-                with torch.autocast(self.device.type, torch.bfloat16, enabled=self.cuda):
-                    out = self.model(x, x[:, 3:4], aux=False)
+                out = self.predict(x)
                 packed = torch.cat((out['policy'], out['far'][:, None], out['value_logit'][:, None]), 1)
                 chunks.append((size, chunk, result[start:start+len(chunk)].copy_(packed, non_blocking=True)))
         # A blocking-sync event parks collect() in the driver instead of spinning a core while the GPU works.
@@ -237,9 +236,9 @@ class Evaluator(hexnet.DenseEvaluator):
 class Model:
     """A frozen evaluator, its identity and its position cache; trees of one Model share GPU batches."""
 
-    def __init__(self, net, sha, checkpoint, device, max_batch, cache_positions):
+    def __init__(self, net, sha, checkpoint, device, max_batch, cache_positions, cuda_graphs=False):
         self.sha, self.checkpoint, self.config = sha, checkpoint, net.config
-        self.evaluator = Evaluator(net, device, sha, max_batch)
+        self.evaluator = Evaluator(net, device, sha, max_batch, cuda_graphs=cuda_graphs)
         self.cache = EvaluationCache(cache_positions)
 
     def tree(self, history, seed, tactics):
@@ -256,7 +255,8 @@ def load(run, config, initial=None, source=None):
     else:
         net, sha = hexnet.load_model(path), digest(path)
     net.set_kernels(config.actor.net_kernels)
-    return Model(net, sha, checkpoint, config.device, config.actor.leaf_batch, config.actor.cache_positions)
+    return Model(net, sha, checkpoint, config.device, config.actor.leaf_batch, config.actor.cache_positions,
+                 cuda_graphs=config.actor.cuda_graphs and source is None)
 
 
 def position_key(history):
@@ -877,6 +877,11 @@ def worker(args):
         since.update(time=now, positions=state['positions'], evals=engine.evals)
         episodes.clear(); rows.clear()
         if resolve(run, args.initial_model, settings.model_source, config.learner.variant)[0] != model.checkpoint:
+            graph = model.evaluator.graph
+            if graph is not None:
+                graph.close()
+                model.evaluator.graph = None
+                del graph
             previous, model = model.checkpoint, load(run, config, args.initial_model)
             log_event(run, 'actor', 'actor_model', f'worker {args.worker} switched from {previous} to {model.checkpoint} '
                       f'({model.sha[:12]}, {settings.model_source}); games in progress finish with the previous model',

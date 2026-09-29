@@ -138,10 +138,13 @@ class ActorSettings:
     restart_fraction: float = 0.
     restart_temperature: float = 1.
     net_kernels: str = 'reference'  # opt-in Triton features, normalization and inference LineConv
+    cuda_graphs: bool = False  # reuse bounded CUDA graphs for frozen fused actor models
 
     def __post_init__(self):
         if self.net_kernels not in ('reference', 'fused'):
             raise ValueError('net_kernels must be reference or fused')
+        if self.cuda_graphs and self.net_kernels != 'fused':
+            raise ValueError('cuda_graphs requires net_kernels=fused')
         if not 0 <= self.restart_fraction <= 1 or not self.restart_temperature > 0:
             raise ValueError('restart_fraction must lie in [0, 1] and restart_temperature must be positive')
 
