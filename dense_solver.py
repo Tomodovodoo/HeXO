@@ -503,15 +503,19 @@ class Plan:
         move = self.proofs[player].path(history)[1] if self.alive(player, history) else None
         return move if move and move[0] else None
 
-    def proven(self, query, history, first_turn_only=False):
+    def proven(self, query, history):
         """Keep `query`'s proof for the labels at the end (with follow), and as the proof its side plays from when
-        `history` lies on it and that side has no live one (a replaced root proof of its own first turn only)."""
+        `history` lies on it and that side has no live one. Without follow only a root proof is played, and only
+        for its own first turn, even when it arrives late."""
         proven, result = query.result()
         if not proven or query.base is None:
             return
+        first_turn_only = not self.schedule.follow
         proof = Proof(query.base, result['certificate'], first_turn_only)
         self.found.append(proof)
         player = mover(query.base)
+        if first_turn_only and query.point != 'root':
+            return
         if not self.alive(player, history) and proof.path(history)[1] is not None:
             self.proofs[player] = proof
 
@@ -633,7 +637,7 @@ class Plan:
                 return False
             if self.root not in self.late:
                 self.spent(self.root.result()[1])
-                self.proven(self.root, history, not self.schedule.follow)
+                self.proven(self.root, history)
             self.root = None
         if self.schedule.fixed_budgets and len(history) % 2 and player in self.deep:
             self.spent(self.deep[player].result()[1])

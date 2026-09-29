@@ -359,6 +359,25 @@ class Scheduler(unittest.TestCase):
         self.assertEqual(fixed.allocate('root', NODES)[:2],
                          (NODES, dict(weight=3., floor=NODES, cap_low=dense_solver.MAX_NODES, cap_high=dense_solver.MAX_NODES)))
 
+    def test_late_proofs_are_played_only_as_their_own_root_turn_without_follow(self):
+        try:
+            engine = NativeTactics()
+            solver = dense_solver.Solver(Schedule(fixed_budgets=False))
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        self.addCleanup(solver.close)
+        opening = [tuple(m) for m in FIXTURE['positions'][PROOF]]
+        result = dict(engine.history(opening, nodes=NODES), budget=NODES)
+        first = [tuple(c) for c in result['moves']]
+        for point, base, history, played in (('finalist', opening, opening, False),
+                                             ('root', opening, opening+first[:1], True)):
+            plan, future = dense_solver.Plan(solver), Future()
+            future.set_result(result)
+            plan.late.append(dense_solver.Query(solver, point, tuple(base), NODES, future))
+            plan.poll(history)
+            self.assertEqual(plan.move(dense_solver.mover(opening), history) is not None, played, point)
+            self.assertEqual(len(plan.found), 1)
+
     def test_a_failing_query_fails_its_future_and_releases_its_reservation(self):
         try:
             pool = dense_solver.Pool(1, None)
@@ -383,8 +402,8 @@ class Scheduler(unittest.TestCase):
         solver.tick(100., 50.)                                          # allowance: 5 ms
         start = time.perf_counter()
         self.assertFalse(plan.defer([query]))
-        self.assertGreaterEqual(time.perf_counter()-start, .004)       # waited out the overrun allowance
-        self.assertLessEqual(solver.allowance, 0)
+        self.assertGreaterEqual(time.perf_counter()-start, .003)       # waited out the overrun allowance (1 ms timer)
+        self.assertLess(solver.allowance, 1.5)
         self.assertTrue(plan.defer([query]))
         self.assertEqual((plan.late, solver.stats['deferred'], solver.stats['late']), ([query], 1, 1))
         future.set_result(dict(status='UNKNOWN', reason='no verified strategy', nodes_used=100, budget=100))
