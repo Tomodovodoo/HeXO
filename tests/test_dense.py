@@ -2602,6 +2602,18 @@ class EvaluatorSearchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Match game failed: RuntimeError: Seal unavailable'):
             dense_eval.play([game], 64)
 
+    def test_model_move_error_in_seal_match_escapes(self):
+        def fail(move):
+            raise RuntimeError('tree advance failed')
+        model = SimpleNamespace(tree=lambda opening, seed, tactics: SimpleNamespace(advance=fail, close=lambda: None))
+        game = dense_eval.MatchGame([model, dense_eval.SEAL], [(0, 0), (1, 0), (-1, 0)], 1,
+                                    2, 2, False, 8, {}, lambda board, ms: board.legal_moves()[:2], 5)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'tree advance failed'):
+                game.searched(dict(action=game.game.legal_moves()[0]))
+        finally:
+            game.game.close()
+
     def test_evaluator_matches_model_including_far_cells(self):
         histories = [POSITIONS[10], [], line_history(31), line_history(6)]
         results = self.evaluator.evaluate(histories)

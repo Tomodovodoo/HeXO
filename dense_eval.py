@@ -223,8 +223,8 @@ class MatchGame:
                 raise ValueError('Seal did not complete its turn')
 
     def searched(self, result):
+        self.play(*map(int, result['action']))
         try:
-            self.play(*map(int, result['action']))
             self.seal_turns()
         except Exception as error:
             if SEAL not in self.sides:
