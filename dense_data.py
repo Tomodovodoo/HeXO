@@ -44,25 +44,25 @@ import json
 import math
 import zlib
 import multiprocessing
+import os
 from pathlib import Path
 import queue
+import sys
 import tempfile
 import time
 import traceback
+import types
 
 import numpy as np
-import torch
 
 import hexcrop
-from hexo import Game
-from klent import digest
-from train import write_json
+from train import digest, write_json
 
 SCHEMA = 'hexo-dense-shard-v1'
 FILES = ('episodes.json', 'rows.json', 'targets.npz')
 SIDECAR = 'proofs.jsonl'
 Ref = namedtuple('Ref', 'shard index row episode')
-Shard = namedtuple('Shard', 'game ply player remaining proven legal full following start moves roots searched has_roots '
+Shard = namedtuple('Shard', 'game ply player remaining proven legal offsets following start moves roots searched has_roots '
                              'has_search winner side held')
 FUTURE = (6, 20)
 ORIGINS = ('converted', 'actor')
@@ -75,6 +75,8 @@ CALIBRATION_FEATURES = 2*len(H_KNOTS)
 CALIBRATION_MIN_GAMES = 200
 CALIBRATION_RIDGE = 1.
 CALIBRATION_ITERATIONS = 25
+POLICY_ATTEMPTS = 20
+STALE_STAGING_SECONDS = 600.  # a policy staging file this old belongs to a writer that died
 
 
 def legal_digest(actions):
@@ -295,11 +297,21 @@ def verify(path):
     return data
 
 
+def load_offsets(path, rows):
+    """The shard's policy offsets after checking they are rows+1 nondecreasing values from 0."""
+    with np.load(Path(path)/'targets.npz', allow_pickle=False) as data:
+        offsets = data['offsets']
+    if len(offsets) != rows+1 or offsets[0] != 0 or np.any(np.diff(offsets) < 0):
+        raise ValueError(f'Malformed policy offsets: {path}')
+    return offsets
+
+
 def load_policies(path, rows):
     """Return (offsets, probabilities) after checking they partition the flat vector one slice per row."""
+    offsets = load_offsets(path, rows)
     with np.load(Path(path)/'targets.npz', allow_pickle=False) as data:
-        offsets = data['offsets']; probabilities = data['probabilities']
-    if len(offsets) != rows+1 or offsets[0] != 0 or offsets[-1] != len(probabilities) or np.any(np.diff(offsets) < 0):
+        probabilities = data['probabilities']
+    if offsets[-1] != len(probabilities):
         raise ValueError(f'Malformed policy offsets: {path}')
     return offsets, probabilities
 
@@ -381,30 +393,36 @@ class ReplayWindow:
     `index`/`validation` are Rows, oldest first.
 
     Memory: each admitted shard is held as numpy arrays (Shard): per row its game, ply, player, remaining, proven,
-    raw legal digest, next-ply row and full-search flag (proven includes the shard's proof_labels, applied at
+    raw legal digest, next-ply row and policy offset (proven includes the shard's proof_labels, applied at
     load or at the first refresh after its sidecar appears); per game its ply offset, winner, trained side and
     held-out flag; per ply its move, root value (NaN for null) and full_search flag. A Ref's row dict and its
-    episode dict {moves, winner, root_values, full_search, trained_side} are rebuilt on demand. Policy vectors
-    load per shard on first use into an LRU bounded by `policy_cache_mb` (the shard in use is always kept);
-    value targets are cached for the VALUE_CACHE most recently used (episode, target options) keys.
+    episode dict {moves, winner, root_values, full_search, trained_side} are rebuilt on demand. Value targets are
+    cached for the VALUE_CACHE most recently used (episode, target options) keys.
+
+    Policies: on first use a shard's policy vector is written uncompressed as raw float32 to
+    `policy_dir`/<shard>.f32 (default <run>/cache/policies; written under a temporary name and hard-linked into
+    place, never over an existing file, so a present file is complete), and each row's slice is read from it, so
+    windows of several processes on one directory share one copy in the OS page cache and hold no file open between
+    reads. Every refresh deletes the directory's files of shards outside this window (a file another process is
+    reading stays until a later refresh; a deleted file is rewritten on its next use), so windows sharing a directory
+    must admit the same shards: one directory per learner (dense_learn.policy_dir).
     """
 
     VALUE_CACHE = 4096
 
     def __init__(self, run_dir, capacity_rows, min_rows=100000, expand_per_row=.4, taper_exponent=.65, validation_fraction=0.,
-                 policy_cache_mb=512.):
+                 policy_dir=None):
         self.run_dir = Path(run_dir); self.capacity_rows = capacity_rows; self.validation_fraction = validation_fraction
         self.shape = dict(min_rows=min_rows, expand_per_row=expand_per_row, taper_exponent=taper_exponent)
-        self.policy_budget = policy_cache_mb*2**20
-        self.manifests = {}; self.shards = {}; self.policies = OrderedDict(); self.values = OrderedDict()
+        self.policy_dir = self.run_dir/'cache'/'policies' if policy_dir is None else Path(policy_dir)
+        self.manifests = {}; self.shards = {}; self.values = OrderedDict()
         self.unlabelled = set()
         self.refresh()
 
     def load(self, name):
         path = self.run_dir/'shards'/name
         episodes, rows = read_shard(path, policies=False)
-        with np.load(path/'targets.npz', allow_pickle=False) as data:
-            full = np.diff(data['offsets']) > 0
+        offsets = load_offsets(path, len(rows))
         labels = proof_labels(path)
         if labels is None:
             self.unlabelled.add(name)
@@ -416,7 +434,7 @@ class ReplayWindow:
             remaining=np.array([r['remaining'] for r in rows], np.int8),
             proven=np.array([r.get('proven', 0) for r in rows], np.int8),
             legal=np.frombuffer(bytes.fromhex(''.join(r['legal_sha256'] for r in rows)), np.uint8).reshape(-1, 32),
-            full=full, following=np.array([where.get((g, t+1), -1) for g, t in zip(game.tolist(), ply.tolist())], np.int32),
+            offsets=offsets, following=np.array([where.get((g, t+1), -1) for g, t in zip(game.tolist(), ply.tolist())], np.int32),
             start=np.cumsum([0]+[len(e['moves']) for e in episodes]).astype(np.int32),
             moves=np.array([m for e in episodes for m in e['moves']], np.int32).reshape(-1, 2),
             roots=np.array([np.nan if v is None else v for v in per_ply('root_values')], np.float64),
@@ -445,9 +463,10 @@ class ReplayWindow:
             take = min(self.manifests[name]['counts']['policy_rows'], want-have)
             admitted.append((name, take)); have += take
         for name in set(self.shards) - {n for n, _ in admitted}:
-            del self.shards[name]; self.policies.pop(name, None); self.unlabelled.discard(name)
+            del self.shards[name]; self.unlabelled.discard(name)
             for key in [k for k in self.values if k[0] == name]:
                 del self.values[key]
+        self.prune({n for n, _ in admitted})
         for name, _ in admitted:
             if name not in self.shards:
                 self.shards[name] = self.load(name)
@@ -457,7 +476,7 @@ class ReplayWindow:
         parts = ([], []), ([], [])    # (shard ids, rows) of the training and validation index
         self.starts = {}
         for k, (name, take) in enumerate(self.admitted):
-            s = self.shards[name]; positions = np.flatnonzero(s.full)
+            s = self.shards[name]; positions = np.flatnonzero(np.diff(s.offsets) > 0)
             start = self.starts[name] = 0 if take >= len(positions) else int(positions[-take]) if take else len(s.game)
             i = np.arange(start, len(s.game), dtype=np.int32)
             side = s.side[s.game[i]]
@@ -472,12 +491,12 @@ class ReplayWindow:
         self.rows = len(self.index)+len(self.validation)
         return self.rows
 
-    def ref(self, name, i):
-        """Ref of row i of admitted shard `name`."""
+    def ref(self, name, i, episode=None):
+        """Ref of row i of admitted shard `name`; `episode`, when given, must be the episode dict of the row's game."""
         s = self.shards[name]; g = int(s.game[i]); a, b = int(s.start[g]), int(s.start[g+1])
         row = dict(game=g, ply=int(s.ply[i]), player=int(s.player[i]), remaining=int(s.remaining[i]),
                    proven=int(s.proven[i]), legal_sha256=s.legal[i].tobytes().hex())
-        episode = dict(moves=s.moves[a:b].tolist(), winner=int(s.winner[g]), trained_side=None if s.side[g] < 0 else int(s.side[g]),
+        episode = episode or dict(moves=s.moves[a:b].tolist(), winner=int(s.winner[g]), trained_side=None if s.side[g] < 0 else int(s.side[g]),
                        root_values=[None if v != v else v for v in s.roots[a:b].tolist()] if s.has_roots[g] else None,
                        full_search=s.searched[a:b].tolist() if s.has_search[g] else None)
         return Ref(name, i, row, episode)
@@ -514,24 +533,60 @@ class ReplayWindow:
     def following(self, ref):
         """Ref of the same game's row at ply+1 in the same shard, or None."""
         i = int(self.shards[ref.shard].following[ref.index])
-        return None if i < 0 else self.ref(ref.shard, i)
+        return None if i < 0 else self.ref(ref.shard, i, ref.episode)
 
     def policy(self, ref):
-        """A copy of the row's policy vector (empty float32 when the ply had no full search); never a view, so
-        an evicted shard's arrays are freed while rendered batches still hold their rows' policies."""
-        if ref.shard in self.policies:
-            self.policies.move_to_end(ref.shard)
-        else:
-            self.policies[ref.shard] = load_policies(self.run_dir/'shards'/ref.shard, len(self.shards[ref.shard].game))
-            while len(self.policies) > 1 and self.policy_bytes() > self.policy_budget:
-                self.policies.popitem(last=False)
-        offsets, probabilities = self.policies[ref.shard]
-        a, b = offsets[ref.index], offsets[ref.index+1]
-        return probabilities[a:b].copy() if b > a else np.zeros(0, np.float32)
+        """The row's policy vector read from its shard's policy file (empty float32 when the ply had no full
+        search), publishing the file first when it is missing; a file another process is deleting is retried for
+        up to POLICY_ATTEMPTS reads 50 ms apart. Raises ValueError when the file's size disagrees with the shard."""
+        s = self.shards[ref.shard]
+        a, b = int(s.offsets[ref.index]), int(s.offsets[ref.index+1])
+        if b == a:
+            return np.zeros(0, np.float32)
+        path = self.policy_dir/f'{ref.shard}.f32'
+        for attempt in range(POLICY_ATTEMPTS):
+            try:
+                with open(path, 'rb') as stream:
+                    if os.fstat(stream.fileno()).st_size != 4*int(s.offsets[-1]):
+                        raise ValueError(f'Policy file disagrees with its shard: {path}')
+                    stream.seek(4*a)
+                    out = np.empty(b-a, np.float32)
+                    stream.readinto(out)
+                    return out
+            except FileNotFoundError:
+                self.publish(ref.shard, path)
+            except PermissionError:    # Windows: another process is deleting the file
+                if attempt == POLICY_ATTEMPTS-1:
+                    raise
+                time.sleep(.05)
+        raise FileNotFoundError(f'Policy file keeps disappearing: {path}')
 
-    def policy_bytes(self):
-        """Bytes held by the policy cache."""
-        return sum(o.nbytes+p.nbytes for o, p in self.policies.values())
+    def publish(self, name, path):
+        """Write the shard's policy probabilities as raw float32 under a temporary name and link it to `path`
+        unless another process has published it first; an existing file is never replaced."""
+        _, probabilities = load_policies(self.run_dir/'shards'/name, len(self.shards[name].game))
+        self.policy_dir.mkdir(parents=True, exist_ok=True)
+        staged = self.policy_dir/f'.{name}.{os.getpid()}.tmp'
+        try:
+            probabilities.astype(np.float32).tofile(staged)
+            os.link(staged, path)
+        except FileExistsError:
+            pass
+        finally:
+            staged.unlink(missing_ok=True)
+
+    def prune(self, keep):
+        """Delete the policy_dir files of shards not in `keep` and staging files older than STALE_STAGING_SECONDS,
+        skipping files that cannot be deleted now."""
+        if not self.policy_dir.exists():
+            return
+        stale = time.time()-STALE_STAGING_SECONDS
+        for path in self.policy_dir.iterdir():
+            try:
+                if path.suffix == '.f32' and path.stem not in keep or path.suffix == '.tmp' and path.stat().st_mtime < stale:
+                    path.unlink()
+            except OSError:
+                pass
 
     def value_targets(self, ref, lam, full_only, outcome_lam=1., calibration=None):
         """episode_value_targets of the ref's episode, cached."""
@@ -691,7 +746,8 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
              outcome_lam=1., calibration=None, proven_weight=2.):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
-    The replayed side to move and legal list must match each row. Returns (samples, targets); each target is a
+    Positions are encoded from the move prefix without replaying it (hexcrop.Position); the side to move and the
+    legal list must match each row. Returns (samples, targets); each target is a
     dict of
       policy, policy_weight: the row's improved policy (weight 0 when empty, i.e. a cheap-search row);
       value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam, calibration) at the ply;
@@ -715,8 +771,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
     for ref in refs:
         e, t = ref.episode, ref.row['ply']
         moves = np.asarray(e['moves'], np.int64).reshape(-1, 2); T = len(moves); me = player_at(t)
-        game = Game(e['moves'][:t])
-        s = hexcrop.encode_game(game, moves[:t], rng=rng)
+        s = hexcrop.encode_game(hexcrop.Position(moves[:t]), moves[:t], rng=rng)
         if (s.player, s.remaining) != (ref.row['player'], ref.row['remaining']) or legal_digest(s.actions) != ref.row['legal_sha256']:
             raise ValueError(f'Replayed position disagrees with row: {ref.shard}/{ref.index}')
         policy = window.policy(ref)
@@ -740,14 +795,12 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
             known[k] = e['winner'] >= 0 or t+h <= T
         nref = window.following(ref); following = (np.zeros(0, np.int64), np.zeros(0, np.float32), 0.)
         if nref is not None and len(p := window.policy(nref)):
-            game.play(*e['moves'][t])
-            actions = hexcrop.legal_array(game, moves[:t+1])
+            actions = hexcrop.legal_array(hexcrop.Position(moves[:t+1]), moves[:t+1])
             if len(actions) != len(p) or legal_digest(actions) != nref.row['legal_sha256']:
                 raise ValueError(f'Next-ply legal list disagrees with row: {nref.shard}/{nref.index}')
             cells = crop_index(s, actions); p = np.where(cells >= 0, p, 0).astype(np.float32)
             if p.sum() > 0:
                 following = (cells, p/p.sum(), 1.)
-        game.close()
         samples.append(s)
         out.append(dict(policy=policy, policy_weight=float(len(policy) > 0),
                         value=float(proven > 0) if proven else .5 if values[t] is None else values[t],
@@ -759,8 +812,8 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
     return samples, out
 
 
-def collate(samples, targets):
-    """Group by crop size into {S: batch} of torch tensors:
+def collate_arrays(samples, targets):
+    """Group by crop size into {S: batch} of numpy arrays:
       planes uint8 [B,8,S,S]; cells int64 [B,N] (flat crop index, -1 for far cells and padding);
       mask bool [B,N] (True for the first counts[b] entries, far cells included); counts int64 [B];
       policy float32 [sum counts] in the order of cells[mask], row b at policy[offsets[b]:offsets[b+1]]
@@ -791,44 +844,67 @@ def collate(samples, targets):
         for b, (_, t) in enumerate(items):
             next_cells[b, :next_counts[b]] = t['next_cells']
             next_policy[b, :next_counts[b]] = t['next_policy']
-        column = lambda key: torch.tensor([t[key] for _, t in items], dtype=torch.float32)
+        column = lambda key: np.array([t[key] for _, t in items], np.float32)
         out[size] = dict(
-            planes=torch.from_numpy(np.stack([s.planes for s, _ in items])),
-            cells=torch.from_numpy(cells), mask=torch.from_numpy(np.arange(cells.shape[1]) < counts[:, None]),
-            counts=torch.from_numpy(counts), offsets=torch.from_numpy(np.concatenate([[0], np.cumsum(counts)])),
-            policy=torch.from_numpy(np.concatenate(policy).astype(np.float32)),
-            future=torch.from_numpy(np.stack([t['future'] for _, t in items])),
-            next_cells=torch.from_numpy(next_cells), next_counts=torch.from_numpy(next_counts),
-            next_policy=torch.from_numpy(next_policy),
+            planes=np.stack([s.planes for s, _ in items]),
+            cells=cells, mask=np.arange(cells.shape[1]) < counts[:, None],
+            counts=counts, offsets=np.concatenate([[0], np.cumsum(counts)]).astype(np.int64),
+            policy=np.concatenate(policy).astype(np.float32),
+            future=np.stack([t['future'] for _, t in items]),
+            next_cells=next_cells, next_counts=next_counts, next_policy=next_policy,
             **{k: column(k) for k in ('policy_weight', 'value', 'value_weight', 'outcome', 'outcome_weight', 'short_value',
                                       'short_weight', 'next_weight')},
-            future_weight=torch.from_numpy(np.stack([t['future_weight'] for _, t in items])),
-            player=torch.tensor([int(s.player) for s, _ in items]), remaining=torch.tensor([int(s.remaining) for s, _ in items]))
+            future_weight=np.stack([t['future_weight'] for _, t in items]),
+            player=np.array([int(s.player) for s, _ in items], np.int64),
+            remaining=np.array([int(s.remaining) for s, _ in items], np.int64))
     return out
 
 
+def tensors(batch):
+    """A collate_arrays batch as torch tensors sharing its memory. Torch is imported here only, so render workers
+    (which import this module) never load it."""
+    import torch
+    return {size: {k: torch.from_numpy(v) for k, v in b.items()} for size, b in batch.items()}
+
+
+def collate(samples, targets):
+    """collate_arrays as torch tensors."""
+    return tensors(collate_arrays(samples, targets))
+
+
 def batches(window, rng, batch_size, settings, validation=False, calibration=lambda: None):
-    """Endless generator of collated {S: batch} dicts covering `batch_size` positions in total.
+    """Endless generator of collate_arrays {S: batch} dicts covering `batch_size` positions in total.
     `settings()` and `calibration()` return the current LearnerSettings and Calibration, read per batch
     (recency and target_options)."""
     while True:
         s = settings()
         refs = window.sample(rng, batch_size, s.recency, validation)
-        yield collate(*examples(window, refs, rng, **target_options(s, calibration())))
+        yield collate_arrays(*examples(window, refs, rng, **target_options(s, calibration())))
 
 
+def start_hidden(processes):
+    """Start spawn-context `processes` with the parent's __main__ hidden, so each child imports only the modules
+    its target and arguments need instead of re-importing the parent's main script (and torch with it)."""
+    main = sys.modules['__main__']
+    sys.modules['__main__'] = types.ModuleType('__main__')
+    try:
+        for process in processes:
+            process.start()
+    finally:
+        sys.modules['__main__'] = main
 
-def _render_worker(run, settings, seed, output, calibration):
-    """Worker process body: put numpy-packed `batches` from a private ReplayWindow (refreshed every 30 s), with
+
+def _render_worker(run, settings, seed, output, calibration, policy_dir):
+    """Worker process body: put `batches` from a private ReplayWindow on `policy_dir` (refreshed every 30 s), with
     the Calibration packed in the shared array `calibration`."""
     try:
         window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
-                              settings.window_taper, settings.validation_fraction, settings.policy_cache_mb)
+                              settings.window_taper, settings.validation_fraction, policy_dir)
         rng = np.random.default_rng(seed); refreshed = time.time()
         while not window.index:
             time.sleep(5); window.refresh(); refreshed = time.time()
         for batch in batches(window, rng, settings.batch, lambda: settings, calibration=lambda: unpack_calibration(calibration[:])):
-            output.put({size: {k: v.numpy() for k, v in b.items()} for size, b in batch.items()})
+            output.put(batch)
             if time.time()-refreshed > 30:
                 window.refresh(); refreshed = time.time()
     except BaseException:
@@ -836,21 +912,22 @@ def _render_worker(run, settings, seed, output, calibration):
 
 
 class Renderers:
-    """`batches` of the run rendered by `workers` spawned processes, each with its own ReplayWindow, so
-    rendering never holds the trainer's GIL. Settings (a LearnerSettings) are fixed per pool: close() it and
-    start another to change them; set_calibration() replaces the Calibration of batches rendered from then on. Iterate to consume {S: batch of torch tensors}; a worker's exception or
-    death is raised in the consumer."""
+    """`batches` of the run rendered by `workers` spawned processes (started by start_hidden, so they never load
+    torch), each with its own ReplayWindow on `policy_dir` (None: the run's default), so rendering never holds the
+    trainer's GIL; at most depth * workers rendered batches wait in the queue. Worker i draws from its own generator
+    seeded [*seed, i]. Settings (a LearnerSettings) are fixed per pool: close() it and start another to change them;
+    set_calibration() replaces the Calibration of batches rendered from then on. Iterate to consume {S: batch of
+    torch tensors}; a worker's exception or death is raised in the consumer."""
 
-    def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None):
+    def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None, policy_dir=None):
         context = multiprocessing.get_context('spawn')
         self.queue = context.Queue(depth*workers)
         self.calibration = context.Array('d', CALIBRATION_FEATURES+1)
         self.set_calibration(calibration)
-        self.processes = [context.Process(target=_render_worker, args=(str(run), settings, [*seed, i], self.queue, self.calibration),
-                                          daemon=True)
+        self.processes = [context.Process(target=_render_worker, daemon=True,
+                                          args=(str(run), settings, [*seed, i], self.queue, self.calibration, policy_dir))
                           for i in range(workers)]
-        for process in self.processes:
-            process.start()
+        start_hidden(self.processes)
 
     def set_calibration(self, calibration):
         self.calibration[:] = pack_calibration(calibration)
@@ -868,7 +945,7 @@ class Renderers:
                 continue
             if isinstance(item, BaseException):
                 raise item
-            return {size: {k: torch.from_numpy(v) for k, v in b.items()} for size, b in item.items()}
+            return tensors(item)
 
     def close(self):
         for process in self.processes:

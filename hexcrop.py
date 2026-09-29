@@ -68,6 +68,22 @@ def native_legal(game):
     return np.stack((buffer['q'][:n], buffer['r'][:n]), 1)
 
 
+class Position:
+    """encode_game's and legal_array's view of a non-terminal native history int64 [n, 2] without replaying it:
+    side to move and placements left follow from n. A Game is replayed only if legal_array needs the engine
+    fallback (`ptr`)."""
+    winner = -1
+
+    def __init__(self, history):
+        n = len(history)
+        self.history, self.player, self.remaining = history, ((n+1)//2) % 2, 2 if n % 2 else 1
+
+    @property
+    def ptr(self):
+        self.game = Game(self.history.tolist())
+        return self.game.ptr
+
+
 def _shift_or(grid, dq, dr):
     """grid[x] |= grid[x-(dq, dr)] in place."""
     h, w = grid.shape

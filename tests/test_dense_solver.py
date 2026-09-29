@@ -367,7 +367,7 @@ class Adjudication(unittest.TestCase):
     def test_line_rows_stop_before_a_position_wider_than_the_largest_crop(self):
         encode = hexcrop.encode_game
 
-        def narrow(game, history, **kwargs):   # searched positions (dense_selfplay.Position) still encode
+        def narrow(game, history, **kwargs):   # searched positions (hexcrop.Position) still encode
             if isinstance(game, Game):
                 raise hexcrop.SpanError('wide')
             return encode(game, history, **kwargs)
