@@ -18,6 +18,7 @@ import dense_data
 import dense_learn
 import dense_selfplay
 import dense_solve
+import hexcrop
 from dense_data import player_at
 from forcing_material import worth_solving
 from hexo import Game
@@ -115,6 +116,9 @@ class PassTests(unittest.TestCase):
         for t in window['plies']:
             result = self.engine.history(self.moves[:t], nodes=SMALL.scan_nodes, ms=60000)
             self.assertEqual(result['status'], 'PROVEN_WIN', t)
+            self.assertTrue(window['proof_action'][str(t)])
+            legal = hexcrop.legal_array(hexcrop.Position(self.moves[:t]), np.asarray(self.moves[:t]))
+            self.assertTrue(all(tuple(a) in set(map(tuple, legal)) for a in window['proof_action'][str(t)]))
         if first-4 >= 1:
             result = self.engine.history(self.moves[:first-4], nodes=SMALL.scan_nodes, ms=60000)
             self.assertEqual(result['status'], 'UNKNOWN')
@@ -570,14 +574,20 @@ class ProvenLabelTests(unittest.TestCase):
         sets = dense_data.ValidationSets(self.run, 1., 0, 100, 100)
         sets.refresh()
         dense_solve.write_sidecar(self.run/'shards'/'000001', [
-            dict(game=0, first_ply=3, last_ply=4, mover=0, plies=[3, 4]),
+            dict(game=0, first_ply=3, last_ply=4, mover=0, plies=[3, 4],
+                 proof_action={'3': [list(m) for m in winning_game()[3:5]], '4': [list(winning_game()[4])]}),
             dict(game=0, first_ply=9, last_ply=10, mover=1, plies=[9, 10]),
             dict(kind='deblunder', game=0, first_ply=9, owner=1)])
         window.refresh(); sets.refresh()
         for source, refs in ((window, [window.ref('000001', i) for i in range(12)]),
                              (sets, sets.subsets['fresh', 'held'])):
-            _, targets = dense_data.examples(source, refs, np.random.default_rng(0), deblunder_weight=.5)
+            _, targets = dense_data.examples(source, refs, np.random.default_rng(0), deblunder_weight=.5, proof_policy_weight=.5)
             self.assertEqual(sorted(r.row['ply'] for r, t in zip(refs, targets) if t['deblundered']), [5, 6])
+            for ref, target in zip(refs, targets):
+                if ref.row['ply'] in (3, 4):
+                    self.assertTrue(ref.row['proof_action'])
+                    self.assertFalse(np.array_equal(target['policy'], source.policy(ref)))
+                    self.assertEqual((target['value'], target['deblundered']), (1., 0.))
 
     def test_deblunder_loss_and_validation(self):
         torch.set_num_threads(2)
@@ -638,20 +648,37 @@ class ProvenLabelTests(unittest.TestCase):
         sets.refresh()
         self.assertEqual(sorted(r.row['ply'] for r in sets.subsets['fresh', 'held'] if r.row.get('proven')), [7, 8])
 
+    def test_sidecar_actions_reach_replay_and_fixed_panels(self):
+        window = dense_data.ReplayWindow(self.run, 1000, 100)
+        sets = dense_data.ValidationSets(self.run, 1., 0, 100, 100)
+        sets.refresh()
+        actions = {'7': [list(m) for m in winning_game()[7:9]], '8': [list(winning_game()[8])]}
+        dense_solve.write_sidecar(self.run/'shards'/'000001', [dict(game=0, plies=[7, 8], proof_action=actions)])
+        window.refresh()
+        sets.refresh()
+        for reader, refs in ((window, [window.ref('000001', i) for i in (7, 8)]),
+                             (sets, [r for r in sets.subsets['fresh', 'held'] if r.row['ply'] in (7, 8)])):
+            for ref in refs:
+                self.assertEqual(ref.row['proof_action'], actions[str(ref.row['ply'])])
+                self.assertEqual(ref.row['proven'], 1)
+            self.assertTrue(all(t['policy_weight'] > 0 for t in dense_data.examples(
+                reader, refs, np.random.default_rng(0), proof_policy_weight=1.)[1]))
+
     def test_validation_reports_value_regret_on_proven_rows(self):
         torch.set_num_threads(2)
         torch.manual_seed(0)
         run = self.run/'sources'
         source_shard(run/'shards'/'1000000000001', 2, 'x', checkpoint='main/000010', winner=0)
         config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
-                                        learner=dense_config.LearnerSettings(batch=8, validation_fraction=.5))
+                                        learner=dense_config.LearnerSettings(batch=8, validation_fraction=.5, proof_policy_weight=.5))
         learner = dense_learn.Learner(run, config.learner, config)
         sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=12)
         sets.refresh()
         held = sets.subsets['newest', 'held']
         self.assertTrue(held)
         chosen = held[:3]
-        windows = [dict(game=r.row['game'], plies=[r.row['ply']]) for r in chosen]
+        windows = [dict(game=r.row['game'], plies=[r.row['ply']],
+                        proof_action={str(r.row['ply']): [r.episode['moves'][r.row['ply']]]}) for r in chosen]
         dense_solve.write_sidecar(run/'shards'/'1000000000001', windows)
         out = learner.validate_sources(sets)
         rows = learner.row_losses(sets, sets.subsets['newest', 'held'])
@@ -659,6 +686,11 @@ class ProvenLabelTests(unittest.TestCase):
         self.assertEqual(out['newest_proven_rows'], len({(r.row['game'], r.row['ply']) for r in chosen}))
         self.assertAlmostEqual(out['newest_value_regret_proven'], float(np.mean(1-np.exp(-rows['value_bce'][proven]))))
         self.assertTrue(0 < out['newest_value_regret_proven'] < 1)
+        self.assertEqual(out['newest_policy_ce_proof_rows'], int(proven.sum()))
+        self.assertAlmostEqual(out['newest_policy_ce_proof'], float(rows['policy_ce'][proven].mean()))
+        self.assertIsNone(out['converted_policy_ce_proof'])
+        fields = dense_learn.validation_fields(dict(validation=None, validation_sources=out))
+        self.assertEqual(fields['newest_policy_ce_proof'], out['newest_policy_ce_proof'])
 
     def test_validation_splits_the_outcome_loss_by_exact_label(self):
         torch.set_num_threads(2)

@@ -827,6 +827,12 @@ class DenseConfigTests(unittest.TestCase):
         parser = argparse.ArgumentParser()
         dense_config.add_arguments(parser, dense_config.LearnerSettings)
         base = dense_config.LearnerSettings()
+        self.assertEqual(base.proof_policy_weight, 0.)
+        self.assertIn('proof_policy_weight', dense_learn.KEEP)
+        self.assertEqual(dense_config.override(base, parser.parse_args(['--proof-policy-weight', '.5'])).proof_policy_weight, .5)
+        for weight in (-1., float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                replace(base, proof_policy_weight=weight)
         self.assertEqual((base.value_target, base.outcome_lambda, base.outcome_weight, base.calibration_games, base.validation_rows,
                           base.validation_quota), ('outcome', .98, 0., 4000, 8192, 128))
         self.assertEqual(base.future_target, 'legacy')
