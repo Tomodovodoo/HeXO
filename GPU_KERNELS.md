@@ -6,7 +6,129 @@ Keep cuDNN for HexConv. This checkout already implements each hex convolution as
 
 Checkpoint parameter names, config, digest and serialized tensors do not include the execution mode. Loading a checkpoint defaults to `reference`, including a checkpoint saved while training with `fused`. The learner flag is process-local. CPU execution uses the existing operations.
 
-## Measurements
+## Variable actor shapes
+
+The original fixed-shape measurements below missed a live regression. On September 29,
+four actors using `fused` spent much of their time compiling new shapes. CPU inspection
+of `%USERPROFILE%\.triton\cache` found 1,191 directories, 377,623,192 bytes and 1,184
+compiled HeXO kernels: 297 `_windows`, 296 `_features`, 296 `_eval` and 295
+`_line_add_nhwc`. Reading the constants from `_windows.ttir` recovered 297 distinct
+`(batch, canvas)` pairs: 143 for 24x24, 44 for 32x32, 64 for 40x40 and 46 for 48x48.
+These are distinct compiled variants, not a frequency histogram of forwards.
+
+`dense_selfplay.Evaluator.submit` merges small crop groups into the next canvas when
+the added area is below `MERGE_CELLS`, then splits at `MAX_CELLS = 110592`. For those
+four canvases, the maximum forward batches are 192, 108, 69 and 48. The last chunk
+can have any smaller positive batch. Warming one fixed batch per canvas does not
+cover this workload.
+
+Batch, height, width and strides now enter the Triton kernels as runtime arguments.
+The [JIT `do_not_specialize` option](https://triton-lang.org/main/python-api/generated/triton.jit.html)
+also prevents scalar value/alignment specialization. Launch grids use the actual
+sizes and the existing masks cover partial tiles. Model constants, layout and tile
+sizes remain compile-time choices; no canvas or batch padding was added. Training
+uses runtime dimensions too, with bounded power-of-two tiles for the final reductions.
+Triton 3.6 retains alignment specialization inside stride tuples; all supported
+actor canvases share those alignments. The CUDA reuse check covers the actual actor
+buckets and varying batch tails, while the existing checks cover both layouts.
+
+The default cache is explicitly `%USERPROFILE%\.triton\cache` (or `~/.triton/cache`
+on Linux). All actor processes and subsequent launches use the same persistent
+directory. An explicit `TRITON_CACHE_DIR` takes precedence; set it once in the
+supervisor's environment if a different shared location is wanted. No cache is
+created in a run, and existing cache entries need not be deleted. Kernel source
+changes produce new cache keys.
+
+`tools/profile_actor.py cache` reproduces the CPU cache audit. For an actor run,
+first prepare the frozen inputs with `tools/profile_hexnet.py prepare` as below,
+then run `tools/profile_actor.py prepare --run <run>`. Preparation reads the
+effective actor settings from the first shard's manifest; CLI overrides are also
+accepted. Preparation only reads the run. The actor benchmark uses `Engine`,
+`SelfPlayGame` and `Evaluator.submit` directly, with 128 games started from real
+shard positions and the frozen checkpoint; it records actual forward shapes.
+It does not publish shards or update run status. Each completed game is replaced
+from the same frozen position pool. This measures an isolated actor under shared
+GPU load, including search, crop encoding and transfers.
+
+Use `python tools/profile_actor.py actor --kernels fused --cache
+artifacts/gpu-kernels/actor-cold-cache --label cold --windows 10` with a new cache
+directory for a cold run. Each window targets 30 seconds and finishes its current
+engine step. The worker retains its games, CUDA context and loaded kernels through
+the required 60-second idle breaks. Rates exclude the breaks; the first window
+includes model construction and JIT compilation, after Python/CUDA initialization.
+The parent stops a window at 55 seconds and waits above 7400 MiB card usage.
+Subsequent processes should reuse that cache with a new `--label`; use
+`--kernels reference` for the paired baseline. Every GPU worker uses BelowNormal
+priority, `OMP_NUM_THREADS=2` and the 12% allocator cap before other GPU work.
+
+The cold run used the same four shards and `main/065000/ema.pt` as PR 174. Search
+used 64/12 simulations, 128 games, leaf batch 256, 135-node root/threat/finalist
+base budgets, two finalists, two adaptive solver workers, node caps 2048/32768,
+gate weight 3, proof following, adjudication and proven-line rows. All ten windows
+stayed below 30.41 seconds; the table labels their nominal active-time intervals.
+They totalled 302.02 active seconds plus the mandatory idle breaks.
+
+| Active seconds | Placements/s | Evaluated positions/s |
+|---|---:|---:|
+| 0-30 | 65.8 | 1312 |
+| 30-60 | 87.0 | 1780 |
+| 60-90 | 85.1 | 1744 |
+| 90-120 | 52.5 | 1102 |
+| 120-150 | 57.3 | 1089 |
+| 150-180 | 54.2 | 1139 |
+| 180-210 | 53.0 | 1119 |
+| 210-240 | 79.7 | 1630 |
+| 240-270 | 50.1 | 1013 |
+| 270-300 | 47.5 | 976 |
+
+The actor made 9,198 forwards with 251 distinct `(batch, canvas)` pairs. Canvas
+frequencies were 9 at 24x24, 1,048 at 32x32, 3,637 at 40x40, 2,447 at 48x48 and
+2,057 at 64x64. Mean request batches ranged from 225 to 239. The isolated cold
+cache contained exactly four compiled kernels after the first window and after
+every subsequent window: nine directories, 1,441,782 bytes. Peak allocated/reserved
+PyTorch memory was 117/254 MiB. The last five windows had medians of 53.0 placements/s
+and 1,119 evaluated positions/s. Shared-card load varied during the run; those rates
+are not a four-actor deployment result.
+
+The actor comparison then ran reference/fused/fused/reference, each in a fresh
+process using the same position pool, seed, settings and checkpoint. Fused reused
+the disk cache. Each 30-second window includes actor setup; the median of the two
+windows per mode gives the following result. Reference windows were 24.2 and 28.3
+placements/s; fused windows were 85.1 and 59.9. This variability is why the order
+is paired and the individual results are retained.
+
+| Actor work | Reference /s | Fused /s | Speed-up |
+|---|---:|---:|---:|
+| Placements | 26.3 | 72.5 | 2.76x |
+| Evaluated positions | 473 | 1428 | 3.02x |
+
+The cold worker and three subsequent fused worker processes shared the same four
+kernel files without changing their write times. The fourth process measured
+79.3 placements/s. Processes ran sequentially to obey the one-GPU-process limit;
+this verifies persistent reuse without launching four benchmark actors together.
+Twenty-seven focused CPU tests and all four CUDA tests passed, including changing
+actor batches/canvases without adding compiled variants, both layouts, full-model
+forward/backward agreement and checkpoint compatibility.
+
+The PR 174 resident-input inference benchmark was repeated after warmup with its
+unchanged frozen batch and reference/fused/fused/reference order, three repetitions.
+These are steady-state model submissions, excluding actor search and transfers.
+
+| Batch | Reference positions/s | Fused positions/s | Speed-up |
+|---|---:|---:|---:|
+| 64 | 254.0 | 752.8 | 2.96x |
+| 128 | 383.6 | 911.2 | 2.38x |
+| 256 | 500.2 | 1185.6 | 2.37x |
+
+At batch 256 the profiler counted 2,184 versus 828 kernel launches and 72.90 versus
+45.83 ms in kernels. Launch-call CPU time was 17.77 versus 7.72 ms. The runtime
+dimensions retained the original kernel-time improvement while bounding compilation.
+The batch-64 training comparison (two paired repetitions) measured 51.3 reference
+versus 74.6 fused samples/s, a 1.45x gain, with peak allocated/reserved memory of
+762/982 MiB. The original batch-256 training OOM limit remains; it was not rerun or
+extrapolated from batch 64.
+
+## Original fixed-shape measurements (PR 174)
 
 Measured on 2026-09-29 with RTX 3070 Ti, driver 560.94, Python 3.14, torch 2.11.0+cu126 and triton-windows 3.6.0.post26. All GPU children ran at BelowNormal priority with two OpenMP threads and `torch.cuda.set_per_process_memory_fraction(0.12)` before GPU work. A parent stopped children at 55 seconds and enforced at least 60 seconds between them. It waited whenever the preflight `nvidia-smi` reading exceeded 7400 MiB. The live run kept running throughout.
 
