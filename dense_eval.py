@@ -1423,16 +1423,16 @@ class Evaluator:
         """Point every variant whose comparison has not started (no bound_at) at the current champion when it
         follows the champion: base CHAMPION always, and with rebase_on_promotion a variant registered against the
         then champion (on_champion) whose checkpoint is no longer champion. Its id becomes `<champion>@<name>`
-        with a 'variant' event. When another entry holds that id, a bound entry keeps its checkpoint and an unbound
-        one (base CHAMPION, never bound) is dropped with an 'error' event, as it could never run. Returns whether
-        any entry changed."""
+        with a 'variant' event. When another entry holds that id, an entry of base CHAMPION is dropped with an
+        'error' event (it may compare against the champion only), and a rebased one keeps its checkpoint. Returns
+        whether any entry changed."""
         champion, changed = self.league['champion'], False
         for entry in list(self.variants()):
             follows = entry.get('base') == CHAMPION or (self.settings.rebase_on_promotion and entry.get('on_champion'))
             if 'bound_at' in entry or not follows or champion is None or entry['checkpoint'] == champion:
                 continue
             if self.entry(f'{champion}@{entry["name"]}'):
-                if entry['checkpoint'] is None:
+                if entry.get('base') == CHAMPION:
                     self.variants().remove(entry)
                     log_event(self.run, 'evaluator', 'error', f'{entry["id"]} dropped: {champion}@{entry["name"]} is already '
                               'registered; register it under another name', candidate=entry['id'])
@@ -1455,10 +1455,15 @@ class Evaluator:
         the entry's verdict and the direct report's metrics.posterior, published as status decision and logged
         as a 'decision' event with P(better), delta, delta_sd and its 95% interval. Every report played is
         recorded in the league (`record`). The first trial of an entry binds it to the champion of that moment
-        (`bind`, after any promotion earlier in the step) and fixes the binding: bound_at (epoch seconds) is
-        recorded and `bind` leaves it alone from then on."""
+        (`bind`, after any promotion earlier in the step; status `pending` is rebuilt when that moves an entry, and
+        an entry `bind` drops ends the trial) and fixes the binding: bound_at (epoch seconds) is recorded and `bind`
+        leaves it alone from then on."""
         if 'bound_at' not in entry:
-            self.bind()
+            if self.bind():
+                self.queue(self.status['backlog'])
+            if entry not in self.variants():
+                write_league(self.run, self.league, self.config, self.settings.fill_top)
+                return
             entry['bound_at'] = time.time()
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         s, cid, base = self.settings, entry['id'], entry['checkpoint']
