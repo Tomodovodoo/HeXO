@@ -1,10 +1,59 @@
 # Opt-in dense GPU kernels
 
-`--net-kernels fused` selects Triton kernels for fixed line features, masked normalization with activation and its backward pass, and inference LineConv. Actors also use channels-last with this mode. The learner keeps the current NCHW layout and the reference differentiable LineConv. `reference` remains the default for both commands.
+`--net-kernels fused` selects Triton kernels for fixed line features, masked normalization with activation and its backward pass, and inference LineConv. Actors also use channels-last with this mode. The learner keeps the current NCHW layout and the reference differentiable LineConv. `reference` remains the default.
 
 Keep cuDNN for HexConv. This checkout already implements each hex convolution as one masked 3x3 convolution. Its tensor-core kernels are the largest single cost, but the avoidable work is around them: small synchronous index transfers, layout copies, full-activation normalization intermediates, and the matrices and skewed copies used by inference LineConv. The direct LineConv kernel tiles pixels and channels together, which makes channels-last usable without those matrices. Normalization preserves the reference's bf16 rounding points and centred variance computation.
 
 Checkpoint parameter names, config, digest and serialized tensors do not include the execution mode. Loading a checkpoint defaults to `reference`, including a checkpoint saved while training with `fused`. The learner flag is process-local. CPU execution uses the existing operations.
+
+## Evaluator inference
+
+Actor command-line overrides do not select kernels for the evaluator. Add
+`--net-kernels fused` to `dense_eval.py loop`, `match` or `calibrate` to use the
+same fused inference in that process. `dense_openings.py refresh` accepts the
+flag too. Without an override, each command keeps the saved actor kernel setting,
+which defaults to `reference`. The override never writes `config.json`.
+Historical checkpoint models continue to use eager inference without CUDA graphs.
+
+On September 29, 2026, the running evaluator still inherited `reference` from its
+saved configuration. Its previously reported roughly 12 placements/s therefore
+did not include the fused kernels. The following comparison uses the real
+`dense_eval.Pool`, `MatchGame` and solver path on the shared RTX 3070 Ti:
+
+| Mode, in measurement order | Placements/s | Neural positions/s | Mean neural batch |
+|---|---:|---:|---:|
+| Reference, first window | 33.48 | 444.83 | 41.14 |
+| Fused | 60.25 | 791.75 | 42.06 |
+| Reference, closing window | 36.17 | 469.42 | 40.18 |
+
+Pooling the reference windows gives 34.83 placements/s, so fused improves
+placement throughput by **1.73x**. Neural throughput also improves by 1.73x.
+The fixed inputs are 32 saved replay prefixes, played with both colours in 64
+concurrent slots, using the `085000` and `075000` EMA checkpoints. Finished slots
+refill from those prefixes. Both modes use 64 simulations, 16 root samples,
+the live evaluator's 2048-node root/finalist/threat budgets, two finalists,
+three solver workers and a 32768-node gate cap. Each fresh process warms for
+eight seconds and measures twenty seconds. The same frozen input file has
+SHA-256 `b5596b5892e1f39ec12f122c571c00e83fc3f6cdf4ce0318188b354fdfa6a141`.
+
+This measures actual search, inference and solver work on those midgame
+positions. It excludes league bookkeeping and opening-book refresh, and its
+absolute rate is not a forecast for the live evaluator's changing game mix.
+Solver wait time was 1.69 and 2.43 seconds in the reference windows and 7.04
+seconds with fused inference. Faster inference exposes more solver waiting.
+Peak allocated/reserved GPU memory was 142/232 MiB for reference and 119/220 MiB
+for fused. GPU occupancy lasted 29.4 to 30.2 seconds per child, with at least
+60 seconds idle between children, BelowNormal priority and two CPU threads.
+The allocator cap stayed at 12%; the live evaluator and run files were untouched.
+
+Enable with `python dense_eval.py loop --run runs/dense-v1 --net-kernels fused`,
+retaining the evaluator's other flags. Existing Triton installation suffices.
+To reproduce the table, prepare replay references with
+`python tools/profile_hexnet.py prepare --run runs/dense-v1`, then freeze the
+evaluator inputs with `python tools/profile_evaluator.py prepare --run runs/dense-v1`.
+Run `python tools/profile_evaluator.py live --kernels reference`, then `fused`,
+then `reference`. The shared guard enforces headroom, cooldown and a 55-second
+GPU deadline, and closes the measurement's own solver processes on timeout.
 
 ## Actor CUDA graphs
 

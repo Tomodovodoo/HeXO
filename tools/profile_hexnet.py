@@ -13,6 +13,7 @@ from collections import defaultdict
 import hashlib
 import json
 import os
+import signal
 from pathlib import Path
 import statistics
 import subprocess
@@ -222,7 +223,7 @@ def measure(args):
     return report
 
 
-def guard(args):
+def guard(args, entry=None):
     state = ROOT/'artifacts/gpu-kernels'
     state.mkdir(parents=True, exist_ok=True)
     stamp, lock = state/'last_gpu_end.txt', state/'gpu.lock'
@@ -231,35 +232,77 @@ def guard(args):
     try:
         while True:
             idle = 60-(time.time()-float(stamp.read_text())) if stamp.exists() else 0
-            used = int(subprocess.check_output(['nvidia-smi','--query-gpu=memory.used','--format=csv,noheader,nounits'],text=True).strip())
-            if idle <= 0 and used <= 7400:
+            used, free, total = map(int, subprocess.check_output(
+                ['nvidia-smi','--query-gpu=memory.used,memory.free,memory.total','--format=csv,noheader,nounits'],
+                text=True).strip().split(','))
+            memory_mib = getattr(args, 'memory_mib', None)
+            requested_mib = memory_mib if memory_mib is not None else int(.12*total+.999)
+            ready = used <= 7400 and free >= requested_mib+384
+            if idle <= 0 and ready:
                 break
-            print(json.dumps(dict(cooldown_seconds=max(0,round(idle)), gpu_used_mib=used)), flush=True)
-            time.sleep(min(10,max(1,idle)))
+            print(json.dumps(dict(cooldown_seconds=max(0,round(idle)), gpu_used_mib=used,
+                                  gpu_free_mib=free, requested_memory_mib=requested_mib)), flush=True)
+            time.sleep(10 if idle <= 0 else min(10, max(1, idle)))
         tmp = args.output/'tmp'
         tmp.mkdir(exist_ok=True)
         env = dict(os.environ, OMP_NUM_THREADS='2', MKL_NUM_THREADS='2', PYTHONDONTWRITEBYTECODE='1',
                    TEMP=str(tmp), TMP=str(tmp), TRITON_CACHE_DIR=str(args.output/'triton-cache'),
                    TORCHINDUCTOR_CACHE_DIR=str(args.output/'inductor-cache'), CUDA_CACHE_PATH=str(args.output/'cuda-cache'))
-        if args.mode == 'check':
+        if getattr(args, 'mode', None) == 'check':
             env.update(HEXO_TEST_CUDA='1', HEXO_TEST_BATCH=str(args.output/'batch.pt'), HEXO_TEST_MODEL=str(args.output/'model.pt'))
             command = [sys.executable,'-B','-m','unittest','tests.test_dense.FusedCudaTests']
         else:
-            command = [sys.executable,'-B',str(Path(__file__).resolve()),*sys.argv[1:],'--output',str(args.output),'--worker']
+            command = [sys.executable,'-B',str(entry or Path(__file__).resolve()),*sys.argv[1:],
+                       '--output',str(args.output),'--worker']
         started = time.time()
         child = subprocess.Popen(command,cwd=ROOT,env=env,
+                                 start_new_session=os.name != 'nt',
                                  creationflags=subprocess.BELOW_NORMAL_PRIORITY_CLASS if os.name=='nt' else 0)
+        deferred_gpu = getattr(args, 'action', None) == 'live'
+        gpu_started = None if deferred_gpu else started
+        marker = args.output/f'gpu-start-{child.pid}.txt'
         try:
-            code = child.wait(timeout=55)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait()
-            code = 124
+            while True:
+                if deferred_gpu and gpu_started is None:
+                    try:
+                        timestamp = float(marker.read_text())
+                        if timestamp >= started:
+                            gpu_started = timestamp
+                    except (FileNotFoundError, ValueError):
+                        pass
+                # A live worker may prepare CPU inputs before its first CUDA call.
+                deadline = gpu_started+55 if gpu_started is not None else started+180
+                remaining = deadline-time.time()
+                if remaining <= 0:
+                    if os.name != 'nt':
+                        try:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    elif deferred_gpu and child.poll() is None:
+                        # Solver processes belong to this child, so stop its whole tree.
+                        subprocess.run(['taskkill', '/PID', str(child.pid), '/T', '/F'],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        child.kill()
+                    child.wait()
+                    code = 124
+                    break
+                try:
+                    code = child.wait(timeout=min(.1, remaining) if gpu_started is None else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         finally:
             ended = time.time()
             stamp.write_text(str(ended))
             with (state/'sessions.jsonl').open('a') as f:
-                f.write(json.dumps(dict(start=started,end=ended,elapsed=ended-started,code=code,gpu_used_mib=used,command=command))+'\n')
+                f.write(json.dumps(dict(start=started,end=ended,elapsed=ended-started,
+                                        gpu_start=gpu_started,
+                                        gpu_seconds=None if gpu_started is None else ended-gpu_started,
+                                        code=code,gpu_used_mib=used,command=command))+'\n')
+            if deferred_gpu and marker.exists():
+                marker.unlink()
         return code
     finally:
         lock.unlink()

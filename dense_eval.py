@@ -2057,7 +2057,7 @@ class Evaluator:
 
 def loop(args):
     run = Path(args.run)
-    config = dense_config.load(run)
+    config = kernel_config(dense_config.load(run), getattr(args, 'net_kernels', None))
     settings = dense_config.override(config.evaluation, args, 'eval_')
     if any(getattr(settings, name) % 2 for name in ('games', 'previous_games', 'anchor_games', 'anchor_session_games', 'sprt_max_games', 'pool_games', 'sprt_min_games')):
         raise ValueError('Evaluation game counts must be even: every opening is played with both colours')
@@ -2106,7 +2106,7 @@ def calibrate(args):
     --extra plies, then score each original ply's TD(lambda) target (dense_data.value_targets), the raw root
     value and the masked baseline (p = 1/2) against the realised result, overall and per continuation length."""
     run = Path(args.run)
-    config = dense_config.load(run)
+    config = kernel_config(dense_config.load(run), getattr(args, 'net_kernels', None))
     model = load(run, config, source=resolve(run))
     chosen = []
     for path in reversed(dense_data.shard_dirs(run)):
@@ -2166,7 +2166,7 @@ def calibrate(args):
 def match(args):
     """Paired match of --a against --b; each side has its own model instance, trees and solver budgets."""
     run = Path(args.run)
-    config = dense_config.load(run)
+    config = kernel_config(dense_config.load(run), getattr(args, 'net_kernels', None))
     settings = config.evaluation
     if args.sims:
         settings = replace(settings, sims=args.sims, root_samples=min(settings.root_samples, args.sims))
@@ -2219,17 +2219,26 @@ def settle(args):
     print(json.dumps(request_settle(args.run, args.checkpoint), indent=2))
 
 
+def kernel_config(config, mode):
+    """Override evaluator model kernels in this process, leaving the run config untouched."""
+    return (config if mode is None else replace(
+        config, actor=replace(config.actor, net_kernels=mode, cuda_graphs=False)))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('loop'); p.add_argument('--run', required=True); p.add_argument('--once', action='store_true')
     p.add_argument('--poll', type=float, default=30.)
+    p.add_argument('--net-kernels', choices=('reference', 'fused'), help='model kernels for this evaluator process')
     dense_config.add_arguments(p.add_argument_group('evaluation overrides for this process'), dense_config.EvaluationSettings, 'eval_')
     p = sub.add_parser('calibrate'); p.add_argument('--run', required=True)
+    p.add_argument('--net-kernels', choices=('reference', 'fused'), help='model kernels for this process')
     p.add_argument('--lambdas', type=float, nargs='+', default=[.5, .7, .9, 1.])
     p.add_argument('--games', type=int, default=100); p.add_argument('--sims', type=int, default=64)
     p.add_argument('--extra', type=int, default=256)
     p = sub.add_parser('match'); p.add_argument('--run', required=True); p.add_argument('--a', required=True)
+    p.add_argument('--net-kernels', choices=('reference', 'fused'), help='model kernels for this process')
     p.add_argument('--b', required=True); p.add_argument('--games', type=int, default=32); p.add_argument('--sims', type=int)
     for side in 'ab':
         for name, default in asdict(Budgets()).items():

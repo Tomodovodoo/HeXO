@@ -687,6 +687,7 @@ def main():
         dense_config.add_arguments(p.add_argument_group('evaluation overrides'), dense_config.EvaluationSettings, 'eval_')
         if name == 'refresh':
             p.add_argument('--device', default='cpu')
+            p.add_argument('--net-kernels', choices=('reference', 'fused'), help='model kernels for this process')
         if name == 'stats':
             p.add_argument('--nodes', action='store_true', help='also print the DAG (nodes and edges)')
     args = parser.parse_args()
@@ -697,7 +698,9 @@ def main():
     if args.command == 'refresh':
         champion = json.loads((Path(args.run)/'champion.json').read_text())['checkpoint']
         from dense_selfplay import load
-        model = load(args.run, replace(config, device=args.device),
+        actor = config.actor if args.net_kernels is None else replace(
+            config.actor, net_kernels=args.net_kernels, cuda_graphs=False)
+        model = load(args.run, replace(config, device=args.device, actor=actor),
                                     source=(champion, Path(args.run)/'checkpoints'/champion/'ema.pt'))
         book.reconcile(stamp(args.run))
         now = time.time()
