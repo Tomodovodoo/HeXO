@@ -5,7 +5,7 @@ millisecond time plus pid) holding
   episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search, actors?, opponent?,
                   trained_side?, origin?, restart?}]
   rows.json      [{game, ply, player, remaining, target, weight, legal_sha256, proven?, proof_turns?, solver_nodes?,
-                  solver_budget?}]
+                  solver_budget?, proof_action?}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
   manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows,
@@ -28,6 +28,10 @@ rows a sidecar lists (proof_labels) once it appears. A game ended at a proof (ac
 'proven', its winner and `adjudicated` {ply, winner, line_plies: placements of the certificate's forced line from
 there}; rows of that line played without search carry `line` True and no policy. The manifest counts
 `proven_games`, `line_rows` and `adjudicated_plies`.
+Winning rows may carry `proof_action`, the certificate's remaining placements [[q,r], ...] at that row.
+Sidecars carry the same field as a mapping from ply strings to placements, applied by both readers. Missing
+actions preserve legacy training. `proof_policy_weight` mixes these witnesses into the search policy at learning
+time; the stored search distribution is unchanged.
 Actor episodes record `origin` ('selfplay' or 'restart'; absent: 'selfplay'). A restart game (dense_selfplay.Restarts)
 starts from a buffer position: its first `restart.ply` moves are the source game's, replayed without search, so it
 has rows only from that ply on (null root values and full_search False before it); `restart` names the source
@@ -64,7 +68,7 @@ SCHEMA = 'hexo-dense-shard-v1'
 FILES = ('episodes.json', 'rows.json', 'targets.npz')
 SIDECAR = 'proofs.jsonl'
 Ref = namedtuple('Ref', 'shard index row episode')
-Shard = namedtuple('Shard', 'game ply player remaining proven legal offsets following start moves roots searched has_roots '
+Shard = namedtuple('Shard', 'game ply player remaining proven proof_action legal offsets following start moves roots searched has_roots '
                              'has_search winner side held')
 FUTURE = (6, 20)
 ORIGINS = ('converted', 'actor')
@@ -254,7 +258,7 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
         if len(p) and (not np.isfinite(p).all() or np.any(p < 0) or not np.isclose(p.sum(), 1, atol=1e-4)):
             raise ValueError('Invalid policy target')
     keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256', 'proven', 'proof_turns', 'solver_nodes',
-            'solver_budget', 'line')
+            'solver_budget', 'line', 'proof_action')
     counts = dict(games=len(episodes), rows=len(rows), policy_rows=sum(len(p) > 0 for p in policies),
                   opponent_rows=sum(not trained(episodes[r['game']], r['ply']) for r in rows),
                   terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes),
@@ -352,7 +356,7 @@ def proof_annotations(path):
     if records is None:
         return None, {}
     windows = [r for r in records if r.get('kind') != 'deblunder']
-    labels = {(w['game'], t) for w in windows for t in w['plies']}
+    labels = {(w['game'], t): w.get('proof_action', {}).get(str(t)) for w in windows for t in w['plies']}
     ranges = {}
     for r in records:
         if r.get('kind') == 'deblunder':
@@ -370,18 +374,21 @@ def deblunder_row(row, winner, ranges):
 
 
 def proof_labels(path):
-    """{(game, ply)} of the rows the shard's sidecar proves won for the side to move, or None while it has none."""
-    windows = proof_windows(path)
-    return None if windows is None else {(w['game'], t) for w in windows for t in w['plies']}
+    """{(game, ply)} of sidecar wins; None while the shard has no sidecar."""
+    labels = proof_annotations(path)[0]
+    return None if labels is None else set(labels)
 
 
 def label(shard, labels):
     """Set proven = +1 on the rows of `shard` (a Shard) at the (game, ply) in `labels` that record no proof."""
     if labels:
         where = {key: i for i, key in enumerate(zip(shard.game.tolist(), shard.ply.tolist()))}
-        for i in (where[key] for key in labels if key in where):
+        for key in labels.keys() & where.keys():
+            i = where[key]
             if not shard.proven[i]:
                 shard.proven[i] = 1
+            if shard.proven[i] > 0 and labels[key]:
+                shard.proof_action.setdefault(i, labels[key])
 
 
 def _splitmix(x):
@@ -506,6 +513,7 @@ class ReplayWindow:
             game=game, ply=ply.astype(np.int16), player=np.array([r['player'] for r in rows], np.int8),
             remaining=np.array([r['remaining'] for r in rows], np.int8),
             proven=np.array([r.get('proven', 0) for r in rows], np.int8),
+            proof_action={i: r['proof_action'] for i, r in enumerate(rows) if r.get('proof_action')},
             legal=np.frombuffer(bytes.fromhex(''.join(r['legal_sha256'] for r in rows)), np.uint8).reshape(-1, 32),
             offsets=offsets, following=np.array([where.get((g, t+1), -1) for g, t in zip(game.tolist(), ply.tolist())], np.int32),
             start=np.cumsum([0]+[len(e['moves']) for e in episodes]).astype(np.int32),
@@ -600,6 +608,8 @@ class ReplayWindow:
         s = self.shards[name]; g = int(s.game[i]); a, b = int(s.start[g]), int(s.start[g+1])
         row = dict(game=g, ply=int(s.ply[i]), player=int(s.player[i]), remaining=int(s.remaining[i]),
                    proven=int(s.proven[i]), legal_sha256=s.legal[i].tobytes().hex())
+        if i in s.proof_action:
+            row['proof_action'] = s.proof_action[i]
         if deblunder_row(row, int(s.winner[g]), self.deblunders[name]):
             row['deblunder'] = True
         episode = episode or dict(moves=s.moves[a:b].tolist(), winner=int(s.winner[g]), trained_side=None if s.side[g] < 0 else int(s.side[g]),
@@ -812,8 +822,13 @@ class ValidationSets:
         self.labels = {n: self.labels[n] for n in names}
         self.deblunders = {n: self.deblunders[n] for n in names}
         for (name, _), (row, episode, _) in entries.items():
-            if (row['game'], row['ply']) in (self.labels[name] or ()) and not row.get('proven'):
-                row['proven'] = 1
+            labels = self.labels[name] or {}
+            key = row['game'], row['ply']
+            if key in labels:
+                if not row.get('proven'):
+                    row['proven'] = 1
+                if row['proven'] > 0 and labels[key]:
+                    row.setdefault('proof_action', labels[key])
             if deblunder_row(row, episode['winner'], self.deblunders[name]):
                 row['deblunder'] = True
         self.subsets = {key: [self.ref(*k) for k in chosen] for key, chosen in self.picks.items()}
@@ -852,17 +867,21 @@ def target_options(settings, calibration=None):
                 cheap_value_weight=settings.cheap_value_weight, full_only=settings.bootstrap_full_only,
                 outcome_lam=settings.outcome_lambda if settings.value_target == 'td' else 1.,
                 calibration=calibration if settings.value_target == 'calibrated' else None,
-                proven_weight=settings.proven_value_weight, deblunder_weight=settings.deblunder_weight)
+                proven_weight=settings.proven_value_weight, proof_policy_weight=settings.proof_policy_weight,
+                deblunder_weight=settings.deblunder_weight, future_target=settings.future_target)
 
 
 def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False,
-             outcome_lam=1., calibration=None, proven_weight=2., deblunder_weight=0.):
+             outcome_lam=1., calibration=None, proven_weight=2., deblunder_weight=0., proof_policy_weight=0., future_target='legacy'):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
     Positions are encoded from the move prefix without replaying it (hexcrop.Position); the side to move and the
     legal list must match each row. Returns (samples, targets); each target is a
     dict of
-      policy, policy_weight: the row's improved policy (weight 0 when empty, i.e. a cheap-search row);
+      policy, policy_weight: the row's improved policy (weight 0 when empty). With proof_policy_weight > 0,
+        a proven win carrying proof_action mixes (search + weight * proof)/(1 + weight), where proof is uniform
+        over the certificate's remaining placements. Without search, use proof with loss weight equal to
+        proof_policy_weight. Losing rows and rows without a witness keep their original policy;
       value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam, calibration) at the ply;
         weight 1 for finished games, `bootstrap_weight` for capped games with root values, 0 otherwise, times
         `cheap_value_weight` for cheap-search rows; a row with a nonzero `proven` instead gets the proven value
@@ -878,7 +897,9 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         (negated when that ply's mover is the opponent); the outcome when a finished game ends within the
         horizon; weight 0 when that root value is null or a capped game ends first;
       future uint8 [2, S, S]: crop-plane cells occupied after the next 6 / 20 placements (stones already on
-        the board included; truncated at the game end);
+        the board included; truncated at the game end). With future_target='masked', uint8 [S,S] classes
+        0 empty, 1 own, 2 opponent after 20 placements, relative to this row's mover. Only future placements
+        are rendered; the loss excludes cells occupied now. A capped game needs the full horizon;
       next_cells int64 [M], next_policy float32 [M], next_weight: the next ply's policy (the ply+1 row's
         improved policy over the ply+1 native legal list: the opponent's reply after the second stone of a
         turn, the same player's second stone after the first), each cell mapped into this crop (-1 off the
@@ -896,6 +917,18 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         values, weights = window.value_targets(ref, lam, full_only, outcome_lam, calibration)
         value_weight = weights[t]*(1. if e['winner'] >= 0 else bootstrap_weight)*(1. if len(policy) else cheap_value_weight)
         proven = ref.row.get('proven', 0)
+        policy_weight = float(len(policy) > 0)
+        if proof_policy_weight > 0 and proven > 0 and ref.row.get('proof_action'):
+            action = np.asarray(ref.row['proof_action'], np.int64).reshape(-1, 2)
+            matches = (s.actions[:, None, :] == action[None, :, :]).all(2)
+            if not matches.any(0).all():
+                raise ValueError(f'Proof action is not legal: {ref.shard}/{ref.index}')
+            proof_policy = matches.any(1).astype(np.float32)
+            proof_policy /= proof_policy.sum()
+            if len(policy):
+                policy = (policy + proof_policy_weight*proof_policy)/(1+proof_policy_weight)
+            else:
+                policy, policy_weight = proof_policy, proof_policy_weight
         u = t+horizon; roots = e['root_values']
         if u >= T:
             short = (float(me == e['winner']), 1.) if e['winner'] >= 0 else (.5, 0.)
@@ -911,6 +944,13 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
             cells = occupied[:min(T, t+h)]
             future[k].reshape(-1)[cells[cells >= 0]] = 1
             known[k] = e['winner'] >= 0 or t+h <= T
+        if future_target == 'masked':
+            future = np.zeros((s.size, s.size), np.uint8)
+            for u in range(t, min(T, t+20)):
+                cell = occupied[u]
+                if cell >= 0:
+                    future.reshape(-1)[cell] = 1 if player_at(u) == me else 2
+            known = known[1:]
         nref = window.following(ref); following = (np.zeros(0, np.int64), np.zeros(0, np.float32), 0.)
         if nref is not None and len(p := window.policy(nref)):
             actions = hexcrop.legal_array(hexcrop.Position(moves[:t+1]), moves[:t+1])
@@ -920,7 +960,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
             if p.sum() > 0:
                 following = (cells, p/p.sum(), 1.)
         samples.append(s)
-        out.append(dict(policy=policy, policy_weight=float(len(policy) > 0),
+        out.append(dict(policy=policy, policy_weight=policy_weight,
                         value=float(proven > 0) if proven else .5 if values[t] is None else values[t],
                         value_weight=proven_weight if proven else value_weight,
                         outcome=float(me == e['winner']) if e['winner'] >= 0 else .5,
@@ -943,10 +983,10 @@ def collate_arrays(samples, targets):
       mask bool [B,N] (True for the first counts[b] entries, far cells included); counts int64 [B];
       policy float32 [sum counts] in the order of cells[mask], row b at policy[offsets[b]:offsets[b+1]]
         (zeros where policy_weight is 0; far cells keep their target mass); offsets int64 [B+1];
-      future uint8 [B,2,S,S]; next_cells int64 [B,M] (-1 off the crop and on padding),
+      future uint8 [B,2,S,S] (legacy) or [B,S,S] (masked); next_cells int64 [B,M] (-1 off the crop and on padding),
         next_counts int64 [B], next_policy float32 [B,M] (zero beyond counts);
       policy_weight, value, value_weight, outcome, outcome_weight, exact, short_value, short_weight, next_weight;
-      future_weight [B,2] per horizon
+      future_weight [B,2] per horizon (legacy) or [B,1] (masked)
       (0 where a capped game ends before the horizon)
         float32 [B]; player, remaining int64 [B].
     """

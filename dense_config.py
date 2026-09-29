@@ -184,7 +184,9 @@ class LearnerSettings:
     short_value_weight: float = .5
     opponent_policy_weight: float = .15
     future_weight: float = .5
+    future_target: str = 'legacy'  # legacy: occupancy BCE at 6/20; masked: empty/own/opponent CE at 20 on empty cells
     proven_value_weight: float = 2.  # value weight of rows the solver proved; their target is the proven value
+    proof_policy_weight: float = 0.  # mix (search + weight * proof)/(1 + weight); proof-only rows have this loss weight
     validation_fraction: float = .03
     validation_rows: int = 8192   # rows per per-source validation subset (dense_data.ValidationSets limit)
     validation_quota: int = 128   # rows each shard may contribute to a subset (ValidationSets quota)
@@ -203,6 +205,8 @@ class LearnerSettings:
             raise ValueError(f'optimizer must be adamw or muon, not {self.optimizer!r}')
         if self.value_target not in VALUE_TARGETS:
             raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
+        if self.future_target not in ('legacy', 'masked'):
+            raise ValueError(f'future_target must be legacy or masked, not {self.future_target!r}')
         if not 0. <= self.deblunder_weight <= 1.:
             raise ValueError('deblunder_weight must be between 0 and 1')
         if '@' in self.variant or '/' in self.variant:
@@ -211,6 +215,8 @@ class LearnerSettings:
             raise ValueError(f'cheap_row_fraction must lie in [0, 1], not {self.cheap_row_fraction}')
         if self.phase_rows < 0:
             raise ValueError(f'phase_rows must be 0 (off) or positive, not {self.phase_rows}')
+        if not 0 <= self.proof_policy_weight < float('inf'):
+            raise ValueError('proof_policy_weight must be finite and nonnegative')
 
 
 @dataclass(frozen=True)

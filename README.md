@@ -849,6 +849,28 @@ does. Held-out validation rows are all scored whatever f is.
 window) and `retained_fraction` (their share of the window's training rows).
 At f < 1 the learner reads every shard's rows once at startup to count them.
 
+## Dense learner future occupancy
+
+`--future-target legacy` is the default. It keeps the occupancy BCE at 6 and
+20 placements, including stones already on the board. `--future-target masked`
+uses a fresh three-class head at 20 placements: empty, own, or opponent from
+the current mover's view. Cross-entropy is averaged over currently empty cells
+inside each crop, then over rows with a known target. Finished games use their
+final board when they end before 20 placements; capped games need all 20.
+`--future-weight` keeps its default coefficient of 0.5.
+
+Restart the learner with its existing arguments plus `--future-target masked`.
+The first mode switch preserves shared and legacy head weights and training
+counters, adds the new head, and resets the optimizer and EMA update count.
+Later resumes restore the saved mode, head, and optimizer. To switch back,
+pass `--future-target legacy`. Actors and evaluators read either checkpoint
+format without extra flags.
+
+The new loss is `future_masked_ce`; legacy remains `future_bce`. Each fixed
+validation source reports the active metric on held and training panels, plus
+their gap, under separate names such as `newest_future_masked_ce` and
+`newest_future_bce`. These are different objectives, not comparable loss values.
+
 ## Dense actor batches
 
 `dense_selfplay.py` accepts `--games-in-flight` and `--leaf-batch` per worker, alongside `--games` per process. The
@@ -873,12 +895,23 @@ quadratically, so these tensor sizes are not a measured peak VRAM increase.
 - **Promotion** (`decision`, default `posterior`). One Bradley-Terry posterior covers every rated checkpoint, the
   candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
   and against panel members. Each pair also gets a matchup deviation (prior sd `matchup_prior_elo`, default 30),
-  so a pair's own games outweigh the transitive picture when the two disagree. The candidate needs at least
+  so a pair's own games outweigh the transitive picture when the two disagree. Each colour-swapped opening pair
+  is one observation with five outcomes (0, 1/2, 1, 3/2 or 2 points; a capped game is half a point), because the
+  two games of a pair share their opening. The likelihood of each pair of players is divided by its dispersion:
+  the observed variance of the pair points over what two independent games at the same score would give, shrunk
+  toward 1 by four pseudo-pairs. Pairs that sweep (2-0 or 0-2) more often than chance widen the interval; pairs
+  that split 1-1 more often than chance narrow it, since the opening then decides the colour rather than the
+  player. The dispersion scales the weight of a pair's games, so it moves the point estimate only where priors or
+  other pairings compete with them. `evaluator-status.json` reports the effective pair count (pairs over
+  dispersion) of the direct games. The candidate needs at least
   `sprt_min_games` direct games. No separate bound applies to its rating sd: P(better) already accounts for it.
   It is promoted when it has the highest posterior rating and P(candidate - champion > `sprt_elo0`) is at least
   `promote_confidence`. It is rejected when that probability is at most 1 - `promote_confidence`. Neither
   happens while the direct-only and pooled estimates disagree beyond their intervals. `decision sprt` keeps the
-  sequential test (`sprt_elo0` 0, `sprt_elo1` 25).
+  sequential test (`sprt_elo0` 0, `sprt_elo1` 25), the generalized SPRT over the same five pair outcomes, so its
+  log-likelihood ratio carries the pair-level variance too. Each verdict records its likelihood as `model`
+  (`pentanomial`). A decision recorded under another model stays settled: the start-up review does not re-judge it
+  and the calibration diagnostic leaves it out.
 - **Calibration diagnostic.** Each posterior verdict records the sd of delta it stated. Once the checkpoint has
   three later comparisons, `league.json` `calibration` compares the realised RMS shift of delta with what a
   calibrated posterior expects (root mean of sd then squared minus sd now squared). A realised RMS well below the
@@ -948,3 +981,15 @@ quadratically, so these tensor sizes are not a measured peak VRAM increase.
 - **Resident tables** (`solver_table_mb`, adaptive budgets only): each worker keeps its solver transposition table and proven-node set per attacker colour across queries.
 
 Foreground workers (`solver_workers`) run at below-normal priority. Actor status `solver` reports queries per second, budget mean and p95, hit rates by point and by budget band, the share of steps with a verdict wait and its mean, the overrun (wait time over step time), lead times, worker rate and utilisation, idle fraction per pool, slack utilisation (busy time over the collect time plus overrun allowance the scheduler targets), and deferred, late, dropped, followed and labelled counts.
+
+Winning certificates also record `proof_action` on actor rows, including late proof labels and forced-line rows.
+The proof pass writes an action for each proven ply in its sidecar. Readers accept older rows and sidecars without
+actions. Restart actors with their existing solver flags to collect these targets; no new actor flag is needed.
+
+The learner's `--proof-policy-weight` defaults to `0.0`, preserving existing training. A positive weight `w` uses
+`(search + w * proof) / (1 + w)` on winning rows with a witness. The proof distribution splits mass equally across
+the certificate's two placements at turn start and uses the remaining stone at mid-turn. Other searched moves
+keep their mass. Without a search policy, the proof supplies the target with policy loss weight `w`. Proven
+losing rows keep their existing policy. For a first trial, restart the learner with `--proof-policy-weight 0.5`.
+Fixed validation panels report `<source>_policy_ce_proof` and `<source>_policy_ce_proof_rows` for winning witness
+rows with a policy target, using the configured mix.

@@ -287,10 +287,14 @@ class HexNet(nn.Module):
     win logit of the searched root value 16 plies ahead); future [B, 2, S, S]
     logits that a cell is occupied after the next 6 / 20 placements;
     opponent_policy [B, S*S] logits of the improved policy recorded at the next ply.
+    With future_target='masked', also future_masked [B,3,S,S] logits for empty/own/opponent at 20 placements.
     Aux heads share the policy's 1x1 hidden layer and the value's hidden layer.
     """
-    def __init__(self, config=None):
+    def __init__(self, config=None, future_target='legacy'):
         super().__init__()
+        if future_target not in ('legacy', 'masked'):
+            raise ValueError(f'Unknown future target: {future_target!r}')
+        self.future_target = future_target
         self.config = c = config or HexNetConfig()
         self.lines = LineFeatures()
         self.stem = HexConv(FEATURES, c.channels)
@@ -304,6 +308,8 @@ class HexNet(nn.Module):
         if c.aux_heads:
             self.aux_spatial = nn.Conv2d(c.head_channels, 3, 1)    # opponent policy, future 6, future 20
             self.short_value = nn.Linear(c.value_hidden, 1)
+            if future_target == 'masked':
+                self.future_masked = nn.Conv2d(c.head_channels, 3, 1)  # empty, own, opponent at 20 placements
 
     def forward(self, planes, mask, aux=True):
         count = mask.sum((2, 3), dtype=torch.float32)    # a bf16 sum rounds counts above 256
@@ -327,6 +333,8 @@ class HexNet(nn.Module):
             spatial = self.aux_spatial(hidden).float()
             out.update(short_value_logit=self.short_value(value)[:, 0].float(), future=spatial[:, 1:],
                        opponent_policy=spatial[:, 0].flatten(1))
+            if self.future_target == 'masked':
+                out['future_masked'] = self.future_masked(hidden).float()
         return out
 
 
@@ -399,6 +407,15 @@ def future_loss(future, target, mask, weight=None):
     return _weighted_mean(per.reshape(-1), None if weight is None else weight.reshape(-1))
 
 
+def masked_future_loss(future, target, planes, weight=None):
+    """Three-class CE at 20 placements, averaged per row over currently empty in-crop cells.
+    Classes are empty/own/opponent relative to the current mover; weight [B,1] excludes unknown horizons."""
+    mask = (planes[:, 3] > 0) & (planes[:, 0] == 0) & (planes[:, 1] == 0)
+    loss = F.cross_entropy(future, target.long(), reduction='none')
+    per = (loss*mask).sum((1, 2))/mask.sum((1, 2)).clamp_min(1)
+    return _weighted_mean(per, None if weight is None else weight.reshape(-1))
+
+
 def memory_format(config):
     """The line convolutions are matmuls that prefer NCHW; the plain trunk is faster channels_last."""
     return torch.contiguous_format if config.line_length else torch.channels_last
@@ -406,6 +423,8 @@ def memory_format(config):
 
 def model_digest(model):
     digest = hashlib.sha256(json.dumps(asdict(model.config), sort_keys=True).encode())
+    if model.future_target != 'legacy':
+        digest.update(model.future_target.encode())
     for name, tensor in model.state_dict().items():
         digest.update(name.encode()+str(tensor.dtype).encode()+str(tuple(tensor.shape)).encode())
         digest.update(tensor.detach().cpu().reshape(-1).view(torch.uint8).numpy().tobytes())
@@ -416,7 +435,8 @@ def save_model(path, model):
     """Write via a sibling temporary file and os.replace so readers never see a partial checkpoint."""
     path = Path(path)
     pending = path.with_name(path.name+'.tmp')
-    torch.save(dict(schema=SCHEMA, config=asdict(model.config), state=model.state_dict()), pending)
+    torch.save(dict(schema=SCHEMA, config=asdict(model.config), future_target=model.future_target,
+                    state=model.state_dict()), pending)
     for attempt in range(8):
         try:
             os.replace(pending, path)
@@ -427,12 +447,19 @@ def save_model(path, model):
             time.sleep(.05*(attempt+1))
 
 
-def load_model(path, device='cpu'):
+def load_model(path, device='cpu', future_target=None):
+    """Load the saved mode by default; an explicit mode switch keeps shared/legacy weights and adds a fresh head."""
     data = torch.load(path, map_location=device, weights_only=True)
     if data.get('schema') != SCHEMA:
         raise ValueError(f'{path} is not a {SCHEMA} checkpoint')
-    model = HexNet(HexNetConfig(**data['config']))
-    missing, unexpected = model.load_state_dict(data['state'], strict=False)
+    saved_target = data.get('future_target', 'legacy')
+    model = HexNet(HexNetConfig(**data['config']), future_target or saved_target)
+    state = data['state']
+    if saved_target == 'masked' and model.future_target == 'legacy':
+        state = {k: v for k, v in state.items() if not k.startswith('future_masked.')}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if saved_target == 'legacy' and model.future_target == 'masked':
+        missing = [k for k in missing if not k.startswith('future_masked.')]
     missing = [k for k in missing if not k.startswith(AUX_PREFIXES)]
     if missing or unexpected:
         raise ValueError(f'{path} does not match its config: missing {missing}, unexpected {unexpected}')

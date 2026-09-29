@@ -470,6 +470,11 @@ class Proof:
     def path(self, history):
         return self.walk(history)[:2]
 
+    def action(self, history):
+        """Winning placements still to play at this prefix, or None outside an attacker turn."""
+        move = self.path(history)[1]
+        return [list(a) for a in move[0]] if move and move[0] else None
+
     def reply(self, history):
         """The defender stones still to play in the first certificate reply that extends the defender's turn in
         progress at the end of `history`, or None (not at a covered defender turn on the certificate)."""
@@ -674,7 +679,8 @@ class Plan:
         """Before the move is played: consume the root verdict (and, with fixed budgets, the mover's pending deep
         verdict at a turn start), play the kept proof's stone, and set result proven (+1 proof, -1 a root the
         finalist marks left exact-lost, else 0), proof_turns, solver_nodes (nodes spent on this search's queries),
-        solver_budget (their granted budgets), pruned (the finalists marked lost) and proof: with proven +1 the
+        solver_budget (their granted budgets), pruned (the finalists marked lost), proof_action (the remaining
+        winning placements for proven +1) and proof: with proven +1 the
         Proof played from, with proven -1 the opponent's Proof after the chosen action when a finalist query proved
         it (else None). False defers the slot to its next visit."""
         history = tuple(map(tuple, slot.tree.history))
@@ -692,7 +698,8 @@ class Plan:
         result.update(proven=0, proof_turns=0)
         move = self.move(player, history) if active(slot.solver, self.schedule) else None
         if move is not None:
-            result.update(action=list(move[0][0]), proven=1, proof_turns=move[1], proof=self.proofs[player])
+            result.update(action=list(move[0][0]), proven=1, proof_turns=move[1], proof=self.proofs[player],
+                          proof_action=[list(a) for a in move[0]])
             self.solver.stats['followed'] += self.following
         elif self.pruned and native.hxg_exact(slot.tree.ptr) == 1-mover(history):
             played = history+(tuple(map(int, result['action'])),)
@@ -710,7 +717,7 @@ class Plan:
 
     def close(self, slot, moves):
         """The game of `slot` ended with `moves`: with follow, label the rows every kept proof decides through
-        slot.label(ply, proven, proof_turns) (adaptive budgets first take the deep and late verdicts already in;
+        slot.label(ply, proven, proof_turns, proof_action) (adaptive budgets first take the deep and late verdicts already in;
         fixed budgets drop the ones never consumed). Queries still running pass to the Solver, which accounts
         them when they complete."""
         if not self.schedule.fixed_budgets:
@@ -721,4 +728,5 @@ class Plan:
             return
         for proof in self.found:
             for ply, proven, turns in proof.path(moves)[0]:
-                self.solver.stats['labelled'] += slot.label(ply, proven, turns)
+                self.solver.stats['labelled'] += slot.label(ply, proven, turns,
+                                                          proof.action(moves[:ply]) if proven > 0 else None)

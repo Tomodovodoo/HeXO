@@ -31,6 +31,7 @@ import dense_data
 import dense_bootstrap
 import dense_eval
 import dense_learn
+import dense_posterior
 import dense_selfplay
 from neural_search import NeuralSearch
 
@@ -288,6 +289,51 @@ def planes_batch(histories):
 
 
 class HexNetTests(unittest.TestCase):
+    def test_masked_future_loss_scores_only_empty_crop_cells(self):
+        planes = torch.zeros(2, 8, 2, 3)
+        planes[:, 3, :, :2] = 1
+        planes[0, 0, 0, 0] = planes[0, 1, 1, 0] = 1
+        logits = torch.randn(2, 3, 2, 3, requires_grad=True)
+        target = torch.tensor([[[0, 1, 2], [1, 2, 0]], [[2, 1, 0], [0, 1, 2]]])
+        weight = torch.tensor([[1.], [0.]])
+        got = hexnet.masked_future_loss(logits, target, planes, weight)
+        expected = F.cross_entropy(logits[0, :, :, 1].T, target[0, :, 1])
+        self.assertAlmostEqual(got.item(), expected.item(), places=6)
+        got.backward()
+        self.assertTrue(torch.all(logits.grad[0, :, :, 0] == 0))  # both colours already present
+        self.assertTrue(torch.all(logits.grad[:, :, :, 2] == 0))  # crop padding
+        self.assertTrue(torch.all(logits.grad[1] == 0))           # incomplete capped horizon
+        self.assertGreater(logits.grad[0, :, :, 1].abs().sum().item(), 0)
+        self.assertEqual(hexnet.masked_future_loss(logits, target, planes, weight*0).item(), 0)
+
+    def test_future_checkpoint_modes(self):
+        legacy = hexnet.HexNet(TINY).eval()
+        _, _, planes = planes_batch(same_bucket(2))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'model.pt'
+            hexnet.save_model(path, legacy)
+            data = torch.load(path, weights_only=True)
+            del data['future_target']  # checkpoint written before this flag existed
+            torch.save(data, path)
+            self.assertEqual(hexnet.load_model(path).future_target, 'legacy')
+            torch.manual_seed(71)
+            expected = hexnet.HexNet(TINY, 'masked')
+            torch.manual_seed(71)
+            masked = hexnet.load_model(path, future_target='masked').eval()
+            self.assertTrue(torch.equal(masked.future_masked.weight, expected.future_masked.weight))
+            for key, value in legacy.state_dict().items():
+                self.assertTrue(torch.equal(masked.state_dict()[key], value), key)
+            a, b = legacy(planes, planes[:, 3:4]), masked(planes, planes[:, 3:4])
+            for key in a:
+                self.assertTrue(torch.equal(a[key], b[key]), key)
+            self.assertEqual(b['future_masked'].shape, (2, 3, *planes.shape[-2:]))
+            hexnet.save_model(path, masked)
+            loaded = hexnet.load_model(path).eval()
+            self.assertEqual(hexnet.model_digest(masked), hexnet.model_digest(loaded))
+            self.assertTrue(torch.equal(b['future_masked'], loaded(planes, planes[:, 3:4])['future_masked']))
+            restored = hexnet.load_model(path, future_target='legacy')
+            self.assertEqual(hexnet.model_digest(legacy), hexnet.model_digest(restored))
+
     def setUp(self):
         self.threads = torch.get_num_threads()
         torch.set_num_threads(2)
@@ -782,8 +828,19 @@ class DenseConfigTests(unittest.TestCase):
         parser = argparse.ArgumentParser()
         dense_config.add_arguments(parser, dense_config.LearnerSettings)
         base = dense_config.LearnerSettings()
+        self.assertEqual(base.proof_policy_weight, 0.)
+        self.assertIn('proof_policy_weight', dense_learn.KEEP)
+        self.assertEqual(dense_config.override(base, parser.parse_args(['--proof-policy-weight', '.5'])).proof_policy_weight, .5)
+        for weight in (-1., float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                replace(base, proof_policy_weight=weight)
         self.assertEqual((base.value_target, base.outcome_lambda, base.outcome_weight, base.calibration_games, base.validation_rows,
                           base.validation_quota), ('outcome', .98, 0., 4000, 8192, 128))
+        self.assertEqual(base.future_target, 'legacy')
+        masked = dense_config.override(base, parser.parse_args(['--future-target', 'masked']))
+        self.assertEqual(dense_data.target_options(masked)['future_target'], 'masked')
+        with self.assertRaises(ValueError):
+            dense_config.override(base, parser.parse_args(['--future-target', 'unknown']))
         fit = dense_data.Calibration((0.,)*dense_data.CALIBRATION_FEATURES, .5)
         pick = lambda s, c=fit: {k: v for k, v in dense_data.target_options(s, c).items() if k in ('outcome_lam', 'calibration', 'full_only')}
         self.assertEqual(pick(base), dict(outcome_lam=1., calibration=None, full_only=False))
@@ -800,7 +857,7 @@ class DenseConfigTests(unittest.TestCase):
             dense_config.override(base, parser.parse_args(['--value-target', 'soft']))
         # Manifests written before these settings load with the defaults.
         old = {k: v for k, v in asdict(base).items() if k not in ('value_target', 'outcome_lambda', 'outcome_weight', 'calibration_games',
-                                                                   'validation_rows', 'validation_quota')}
+                                                                   'validation_rows', 'validation_quota', 'future_target')}
         self.assertEqual(dense_config.LearnerSettings(**old), base)
         rng = np.random.default_rng(0)
         self.assertEqual(dense_learn.perturb(replace(base, outcome_lambda=1.), rng, .2).outcome_lambda, 1.)
@@ -861,6 +918,38 @@ def write_games(path, games, identity=None):
 
 
 class DenseDataTests(unittest.TestCase):
+    def test_masked_future_rendering(self):
+        moves, _ = random_game(np.random.default_rng(41), 32)
+        self.assertEqual(len(moves), 32)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_games(Path(tmp)/'shards'/'000001', [(moves, -1, None), (winning_game(), 0, None)])
+            window = dense_data.ReplayWindow(tmp, capacity_rows=1000)
+            refs = [window.ref('000001', i) for i in range(len(window.index))]
+            encode = hexcrop.encode_game
+            for symmetry in range(12):
+                with unittest.mock.patch.object(hexcrop, 'encode_game', side_effect=lambda g, h, **kw: encode(g, h, symmetry=symmetry)):
+                    samples, targets = dense_data.examples(window, refs, np.random.default_rng(0), future_target='masked')
+                for ref, sample, target in zip(refs, samples, targets):
+                    e, t = ref.episode, ref.row['ply']
+                    game = Game(e['moves'][:min(len(e['moves']), t+20)])
+                    try:
+                        # Render the future board independently in the current crop and mover's view.
+                        expected = np.zeros((sample.size, sample.size), np.uint8)
+                        qmin, rmin, ox, oy = sample.offset
+                        for q, r, colour in game.cells:
+                            x, y = np.array([q, r]) @ hexcrop.SYMMETRIES[symmetry] + (ox-qmin, oy-rmin)
+                            if 0 <= x < sample.size and 0 <= y < sample.size and sample.planes[3, y, x]:
+                                expected[y, x] = 1 if colour == sample.player else 2
+                        empty = (sample.planes[0]+sample.planes[1]) == 0
+                        expected[~empty] = 0
+                        np.testing.assert_array_equal(target['future'], expected)
+                        self.assertEqual(target['future_weight'].tolist(), [float(e['winner'] >= 0 or t+20 <= len(e['moves']))])
+                    finally:
+                        game.close()
+                for size, b in dense_data.collate(samples, targets).items():
+                    self.assertEqual(b['future'].shape, (len(b['counts']), size, size))
+                    self.assertEqual(b['future_weight'].shape, (len(b['counts']), 1))
+
     def test_value_targets(self):
         players = [dense_data.player_at(t) for t in range(7)]
         self.assertEqual(players, [0, 1, 1, 0, 0, 1, 1])
@@ -1705,6 +1794,88 @@ def source_shard(path, seed, actor, origin='actor', checkpoint=None, games=6, po
     identity = dict(source='gumbel-policy-value-v1', actor_sha256=publisher) if origin == 'converted' else \
         dict(actor_sha256=publisher, actors=sorted(set(actors)), checkpoint=checkpoint)
     return dense_data.write_shard(path, identity, episodes, rows, origin)
+
+
+class MaskedFutureLearnerTests(unittest.TestCase):
+    def test_resume_switch_and_fixed_panel_metrics(self):
+        self.check_resume('adamw')
+
+    def test_resume_switch_with_muon(self):
+        self.check_resume('muon')
+
+    def check_resume(self, optimizer):
+        import dashboard
+        parts = lambda opt: opt.optimizers if optimizer == 'muon' else (opt,)
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(dense_learn, 'VALIDATION_ROWS', 16), \
+                unittest.mock.patch.object(dense_learn, 'RECALIBRATION_ROWS', 16):
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x', checkpoint='main/000010', winner=0)
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=.5,
+                                                                                 lr=.01, warmup_steps=0, weight_decay=.1,
+                                                                                 optimizer=optimizer))
+            window = dense_data.ReplayWindow(run, 1000, 10, validation_fraction=.5)
+            sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=6)
+            learner = dense_learn.Learner(run, config.learner, config)
+            for mode in ('legacy', 'masked', 'legacy'):
+                if mode != learner.settings.future_target:
+                    previous = learner
+                    learner = dense_learn.Learner(run, config.learner, config, overrides=dict(future_target=mode))
+                    self.assertEqual((learner.step, learner.samples_seen, learner.pacing),
+                                     (previous.step, previous.samples_seen, previous.pacing))
+                    for part in parts(learner.optimizer):
+                        self.assertEqual(part.state, {})
+                    self.assertEqual(learner.optimizer_started, learner.step)
+                    for key, value in previous.model.state_dict().items():
+                        if not key.startswith('future_masked.'):
+                            self.assertTrue(torch.equal(value, learner.model.state_dict()[key]), key)
+                    if mode == 'masked':
+                        self.assertTrue(torch.equal(learner.model.future_masked.weight, learner.ema.future_masked.weight))
+                refs = window.sample(np.random.default_rng(0), 8)
+                batch = dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0), **learner.targets()))
+                before = [p.detach().clone() for net in (learner.model, learner.ema)
+                          for p in (net.aux_spatial.weight, net.aux_spatial.bias)]
+                losses = learner.train_step(batch)
+                self.assertTrue(torch.isfinite(losses).all())
+                if mode == 'masked':
+                    self.assertGreater(learner.model.future_masked.weight.grad.abs().sum().item(), 0)
+                    after = [p for net in (learner.model, learner.ema)
+                             for p in (net.aux_spatial.weight, net.aux_spatial.bias)]
+                    for old, new in zip(before, after):
+                        self.assertTrue(torch.equal(old[1:], new[1:]))  # raw and EMA legacy channels stay frozen
+                    self.assertFalse(torch.equal(before[0][:1], after[0][:1]))  # opponent policy still learns
+                    with torch.no_grad():
+                        learner.ema.future_masked.weight.zero_()
+                        learner.ema.future_masked.bias.zero_()
+                learner.metrics = dict(zip(learner.heads, losses.tolist()))
+                manifest = learner.export(window, sets)
+                name = 'future_masked_ce' if mode == 'masked' else 'future_bce'
+                other = 'future_bce' if mode == 'masked' else 'future_masked_ce'
+                self.assertIn(name, manifest['metrics'])
+                self.assertNotIn(other, manifest['metrics'])
+                self.assertIn(name, manifest['metrics']['validation'])
+                self.assertNotIn(other, manifest['metrics']['validation'])
+                panels = manifest['metrics']['validation_sources']
+                for source in ('fresh', 'newest'):
+                    self.assertIn(f'{source}_{name}', panels)
+                    self.assertNotIn(f'{source}_{other}', panels)
+                    if mode == 'masked':
+                        self.assertAlmostEqual(panels[f'{source}_{name}'], math.log(3), places=5)
+                        self.assertAlmostEqual(panels[f'{source}_train_{name}'], math.log(3), places=5)
+                        self.assertAlmostEqual(panels[f'{source}_gap_{name}'], 0, places=5)
+                fields = dense_learn.validation_fields(manifest['metrics'])
+                dense_config.append_metrics(run, 'learner-main', step=learner.step, validation=True, **fields)
+                points = dashboard.series(run, dict(created_at=0.), 'main', f'validation_newest_{name}')['points']
+                self.assertEqual(points[-1], [learner.step, panels[f'newest_{name}']])
+                resumed = dense_learn.Learner(run, config.learner, config)
+                self.assertEqual(resumed.settings.future_target, mode)
+                self.assertEqual(hexnet.model_digest(resumed.model), hexnet.model_digest(learner.model))
+                self.assertEqual(hexnet.model_digest(resumed.ema), hexnet.model_digest(learner.ema))
+                for old, new in zip(parts(learner.optimizer), parts(resumed.optimizer)):
+                    self.assertEqual(new.state_dict()['param_groups'], old.state_dict()['param_groups'])
+                    for key, state in old.state_dict()['state'].items():
+                        for field, value in state.items():
+                            self.assertTrue(torch.equal(value, new.state_dict()['state'][key][field]))
 
 
 class ValidationSourceTests(unittest.TestCase):
@@ -2935,12 +3106,21 @@ def league_of(elos, champion=None, matrix=None):
     return league
 
 
+def independent(results):
+    """Posterior results from (a, b, points of a, games): the pentanomial that independent games at a's score expect."""
+    out = []
+    for a, b, w, n in results:
+        p, pairs = w/n, n/2
+        out.append((a, b, [pairs*(1-p)**2, 0., 2*pairs*p*(1-p), 0., pairs*p*p]))
+    return out
+
+
 class PosteriorTests(unittest.TestCase):
-    """dense_posterior.Posterior on synthetic results (a, b, points of a, games)."""
+    """dense_posterior.Posterior on synthetic results, most of them the pentanomial of independent games."""
 
     def test_pooled_and_direct_estimates(self):
         from dense_posterior import Posterior
-        results = [('a', 'b', 12, 20), ('a', 'c', 30, 40), ('b', 'c', 20, 40)]
+        results = independent([('a', 'b', 12, 20), ('a', 'c', 30, 40), ('b', 'c', 20, 40)])
         direct = Posterior(['a', 'b', 'c'], 'c', results, 1e4)          # a free deviation: a-b from its own games
         pooled = Posterior(['a', 'b', 'c'], 'c', results, 0.)           # transitive Bradley-Terry
         mean, sd = direct.difference('a', 'b')
@@ -2952,7 +3132,7 @@ class PosteriorTests(unittest.TestCase):
 
     def test_direct_games_dominate_a_non_transitive_triangle(self):
         from dense_posterior import Posterior
-        results = [('a', 'b', 900, 1000), ('b', 'c', 900, 1000), ('c', 'a', 900, 1000)]
+        results = independent([('a', 'b', 900, 1000), ('b', 'c', 900, 1000), ('c', 'a', 900, 1000)])
         post = Posterior(['a', 'b', 'c'], 'c', results, 30.)
         direct = 400*math.log10(9)
         self.assertAlmostEqual(post.difference('a', 'b', False)[0], 0., delta=1)  # the transitive picture: a tie
@@ -2965,8 +3145,8 @@ class PosteriorTests(unittest.TestCase):
         self.assertEqual(parents(ids), {'main/000020': 'main/000010', 'main/000030': 'main/000020', 'main/000040': 'main/000030',
                                         'main/000030@solver': 'main/000030'})
         # The champion main/000030 sits far above the anchor; the candidate splits 20-20 with it.
-        results = [('main/000020', 'main/000010', 380, 400), ('main/000030', 'main/000020', 380, 400),
-                   ('main/000040', 'main/000030', 20, 40)]
+        results = independent([('main/000020', 'main/000010', 380, 400), ('main/000030', 'main/000020', 380, 400),
+                               ('main/000040', 'main/000030', 20, 40)])
         ids = ['main/000010', 'main/000020', 'main/000030', 'main/000040']
         centred = Posterior(ids, ids[0], results, 30., parents(ids)).difference('main/000040', 'main/000030', False)[0]
         self.assertLess(abs(centred), 3.)
@@ -2977,13 +3157,48 @@ class PosteriorTests(unittest.TestCase):
         best = lambda post: min((('cand', 'champ'), ('cand', 'prev'), ('champ', 'prev')),
                                 key=lambda pair: post.after(('cand', 'champ', True), pair, 8))
         # No indirect evidence about the candidate: only direct games inform delta.
-        post = Posterior(['champ', 'prev', 'cand'], 'champ', [('champ', 'prev', 5, 10)], 30.)
+        post = Posterior(['champ', 'prev', 'cand'], 'champ', independent([('champ', 'prev', 5, 10)]), 30.)
         self.assertEqual(best(post), ('cand', 'champ'))
         # The candidate is lopsided against the champion (p ~ .95) but even with the well-measured previous
         # champion: a round against it resolves delta faster than another lopsided direct round.
-        results = [('prev', 'champ', 950, 1000), ('cand', 'champ', 38, 40)]
+        results = independent([('prev', 'champ', 950, 1000), ('cand', 'champ', 38, 40)])
         post = Posterior(['champ', 'prev', 'cand'], 'champ', results, 1.)
         self.assertEqual(best(post), ('cand', 'prev'))
+
+    def test_opening_pairs_that_sweep_widen_the_interval(self):
+        from dense_posterior import Posterior
+        # 50 pairs at an even score: the opening decides the winner of both games (25 sweeps each way).
+        swept = Posterior(['a', 'b'], 'b', [('a', 'b', [25, 0, 0, 0, 25])], 0.)
+        loose = Posterior(['a', 'b'], 'b', independent([('a', 'b', 50, 100)]), 0.)
+        self.assertAlmostEqual(swept.difference('a', 'b')[0], 0., delta=1e-6)
+        self.assertGreater(swept.difference('a', 'b')[1], 1.3*loose.difference('a', 'b')[1])
+        self.assertLess(swept.effective_pairs('a', 'b'), 30)
+        self.assertAlmostEqual(loose.effective_pairs('b', 'a'), 50.)
+
+    def test_opening_pairs_that_split_narrow_the_interval(self):
+        from dense_posterior import Posterior
+        # Every pair splits 1-1: the opening decides the colour that wins, and the pair scores exactly even.
+        split = Posterior(['a', 'b'], 'b', [('a', 'b', [0, 0, 50, 0, 0])], 0.)
+        loose = Posterior(['a', 'b'], 'b', independent([('a', 'b', 50, 100)]), 0.)
+        self.assertLess(split.difference('a', 'b')[1], .5*loose.difference('a', 'b')[1])
+        self.assertGreater(split.effective_pairs('a', 'b'), 500)
+
+    def test_balanced_decisive_pairs_keep_the_point_estimate(self):
+        from dense_posterior import Posterior, dispersion
+        # 2-0, 1-1 and 0-2 pairs in the binomial proportions of a .75 score: the pentanomial of independent games.
+        counts = [2, 0, 12, 0, 18]
+        self.assertAlmostEqual(dispersion(counts), 1.)
+        ids, games = ['a', 'b', 'c'], [('b', 'c', 20, 40)]
+        paired = Posterior(ids, 'c', [('a', 'b', counts)]+independent(games), 30.)
+        loose = Posterior(ids, 'c', independent([('a', 'b', 48, 64)]+games), 30.)
+        for x, y in zip(paired.difference('a', 'b'), loose.difference('a', 'b')):
+            self.assertAlmostEqual(x, y, places=6)
+        # Sweeps and splits in balance move the interval, not the estimate.
+        mixed = Posterior(['a', 'b'], 'b', [('a', 'b', [4, 0, 8, 0, 20])], 0.)
+        plain = Posterior(['a', 'b'], 'b', independent([('a', 'b', 48, 64)]), 0.)
+        self.assertAlmostEqual(mixed.difference('a', 'b')[0], plain.difference('a', 'b')[0], delta=1.)
+        self.assertEqual(dispersion([0, 0, 0, 0, 5]), 1.)
+        self.assertEqual(dispersion([0, 0, 0, 0, 0]), 1.)
 
 
 class OpponentSchedulerTests(unittest.TestCase):
@@ -4079,6 +4294,11 @@ class EvaluatorLoopTests(unittest.TestCase):
         pairs = [(1, 1)]*12+[(0, 0)]*5+[(1, 0)]*3
         score = sum(map(sum, pairs))/len(pairs)/2
         self.assertAlmostEqual(resumed['tally']['pair_score'], score)
+        effective = 20/dense_posterior.dispersion([5, 0, 3, 0, 12])                  # 2-0 sweeps outnumber splits
+        self.assertLess(effective, 20)
+        self.assertAlmostEqual(resumed['decision']['direct']['effective_pairs'], effective)
+        self.assertEqual([p['direct']['effective_pairs'] for p in resumed['pending']], [resumed['decision']['direct']['effective_pairs']])
+        self.assertEqual(resumed['decision']['model'], 'pentanomial')
         s = self.start(**settings).settings
         games = [dict(seed=k, challenger_color=c, winner=c if r else 1-c) for k, pair in enumerate(pairs) for c, r in enumerate(pair)]
         self.assertAlmostEqual(resumed['tally']['llr'], dense_eval.sprt(games, s.sprt_elo0, s.sprt_elo1, s.sprt_alpha, s.sprt_beta)['llr'])
@@ -4109,6 +4329,25 @@ class EvaluatorLoopTests(unittest.TestCase):
                 verdict(cid, champion), posterior=SimpleNamespace(rating=ratings.get))):
             evaluator.review()
         self.assertEqual(evaluator.league['champion'], 'main/019500')                 # P(better) alone, not out-rating it
+        path = dense_eval.report_path(self.run, 'main/025000', 'main/019500')
+        report = json.loads(path.read_text())
+        report['metrics']['posterior'] = dict(decision='reject')
+        path.write_text(json.dumps(report))
+        dense_eval._reports.clear()                                                   # rewritten within one mtime tick
+        evaluator.review()
+        self.assertEqual(evaluator.league['champion'], 'main/019500')                 # settled under another model
+        report['metrics']['posterior']['model'] = dense_posterior.MODEL
+        path.write_text(json.dumps(report))
+        dense_eval._reports.clear()
+        self.report('main/019500', 'main/025000', [1, 0])
+        reverse = dense_eval.report_path(self.run, 'main/019500', 'main/025000')
+        stored = json.loads(reverse.read_text())
+        stored['metrics']['posterior'] = dict(decision='promote')
+        reverse.write_text(json.dumps(stored))
+        dense_eval._reports.clear()
+        evaluator.review()
+        self.assertEqual(evaluator.league['champion'], 'main/019500')                 # in either orientation
+        shutil.rmtree(reverse.parent)
         evaluator.review()
         self.assertEqual((self.league()['champion'], json.loads((self.run/'champion.json').read_text())['checkpoint']),
                          ('main/025000', 'main/025000'))
@@ -4513,11 +4752,11 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(league['calibration']['count'], 0)                            # two later comparisons
         league['checkpoints'].append(entry(50))
         self.report('main/000020', 'main/000050', [1, 0]*4)
+        self.report('main/000030', 'main/000010', [1, 0, 0, 0]*2)                     # moves delta through main/000030
         dense_eval.write_league(self.run, league, config)
         reports = dense_eval.load_reports(self.run)
         post = dense_eval.Posterior([f'main/{s:06d}' for s in (10, 20, 30, 40, 50)], 'main/000010',
-                                    [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
-                                      r['summary']['games']) for r in reports], 20.,
+                                    dense_eval.observations(reports), 20.,
                                     dense_eval.parents([f'main/{s:06d}' for s in (10, 20, 30, 40, 50)]))
         mean, sd = post.difference('main/000020', 'main/000010')
         calibration = league['calibration']
@@ -4539,6 +4778,10 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.report('main/000020', 'main/000010', [1, 1, 0, 1]*4+[1, 0])              # extended: still counted
         dense_eval.write_league(self.run, league, config)
         self.assertEqual(league['calibration']['count'], 1)
+        league['checkpoints'][1]['verdict']['model'] = 'other'                        # stated under another likelihood
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration']['count'], 0)
+        league['checkpoints'][1]['verdict']['model'] = dense_posterior.MODEL
         league['checkpoints'][1]['verdict']['protocol']['sims'] += 1                  # decided under another protocol
         dense_eval.write_league(self.run, league, config)
         self.assertEqual(league['calibration']['count'], 0)
