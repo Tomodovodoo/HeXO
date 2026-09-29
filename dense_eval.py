@@ -1423,8 +1423,9 @@ class Evaluator:
         """Record bound_at for a variant whose direct report exists (its comparison has started), then point every
         variant whose comparison has not started (no bound_at) at the current champion when it follows the champion: base CHAMPION always, and with rebase_on_promotion a variant registered against the
         then champion (on_champion) whose checkpoint is no longer champion. Its id becomes `<champion>@<name>`
-        with a 'variant' event. When another entry holds that id, an entry of base CHAMPION is dropped with an
-        'error' event (it may compare against the champion only), and a rebased one keeps its checkpoint. Returns
+        with a 'variant' event. When another entry holds that id, an entry of base CHAMPION is dropped, with its
+        request file if still waiting, and an 'error' event (it may compare against the champion only), and a
+        rebased one keeps its checkpoint. Returns
         whether any entry changed."""
         champion, changed = self.league['champion'], False
         for entry in list(self.variants()):
@@ -1436,6 +1437,9 @@ class Evaluator:
             if self.entry(f'{champion}@{entry["name"]}'):
                 if entry.get('base') == CHAMPION:
                     self.variants().remove(entry)
+                    request = requests(self.run).get(entry.get('registered_as', entry['id']))
+                    if request:
+                        request.unlink()
                     log_event(self.run, 'evaluator', 'error', f'{entry["id"]} dropped: {champion}@{entry["name"]} is already '
                               'registered; register it under another name', candidate=entry['id'])
                     changed = True

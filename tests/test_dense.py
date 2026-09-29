@@ -3091,6 +3091,9 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual([v['id'] for v in evaluator.variants()], ['main/000030@solver', 'main/000020@fast'])
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertIn('main/000030@fast dropped', events[-1]['message'])
+        self.assertNotIn('champion@fast', dense_eval.requests(self.run))    # the drop is never re-adopted
+        dense_eval.write_league(self.run, evaluator.league, evaluator.config)
+        self.assertEqual([v['id'] for v in self.league()['variants']], ['main/000030@solver', 'main/000020@fast'])
 
     def test_a_pending_variant_of_the_champion_rebases_on_promotion(self):
         evaluator = self.start(decision='posterior')
