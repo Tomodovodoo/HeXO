@@ -163,6 +163,9 @@ class LearnerSettings:
     bootstrap_weight: float = 1.  # weight of TD(lambda) value rows from capped games; 0 = mask
     bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only
     cheap_value_weight: float = .25    # value weight of cheap-search rows (KataGo: 0)
+    # Probability that an ordinary cheap row (no full search, no exact label) enters the training index and the
+    # pacing count; decided per row from the run seed (dense_data.ReplayWindow). 1 = every row (KataGo: 0).
+    cheap_row_fraction: float = 1.
     td_lambda: float = .9
     # Value target of finished games (dense_data.value_targets): 'outcome' = the hard outcome; 'td' = TD(outcome_lambda)
     # from the outcome through the root values, KataGo-style; 'calibrated' = P(win | root value, plies remaining)
@@ -196,6 +199,8 @@ class LearnerSettings:
             raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
         if '@' in self.variant or '/' in self.variant:
             raise ValueError(f"variant {self.variant!r}: '@' marks a search-settings variant (dense_eval) and '/' a step")
+        if not 0 <= self.cheap_row_fraction <= 1:
+            raise ValueError(f'cheap_row_fraction must lie in [0, 1], not {self.cheap_row_fraction}')
         if self.phase_rows < 0:
             raise ValueError(f'phase_rows must be 0 (off) or positive, not {self.phase_rows}')
 

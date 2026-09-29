@@ -818,6 +818,25 @@ KataGo-style value-logit BCE against the hard outcome, with weight w. That head,
 `outcome_bce`, is always logged. The validation curves by plies remaining
 always score finished games against their hard outcome.
 
+### Cheap rows
+
+Most self-play rows come from cheap searches: they have no policy target and
+their value weight is `cheap_value_weight` (0.25). `--cheap-row-fraction f`
+(default 1) keeps only a share f of these ordinary cheap rows in training.
+Full-search rows and rows with an exact label (a proof, including forced-line
+rows) are always kept. Each row is kept or dropped by a hash of the run seed,
+the shard name and the row index, so the learner, its render workers and every
+restart agree. f = 0 matches KataGo, which does not train on cheap rows.
+
+Pacing counts kept rows only, so `samples_per_row` stays the number of
+presentations per kept row: at f = 0.5 a shard adds fewer rows to the pacing
+budget, and each kept row is seen as often as before. Changing f on a restart
+moves the pacing base to the current count, as a change of `samples_per_row`
+does. Held-out validation rows are all scored whatever f is.
+`learner-status.json` reports `retained_rows` (the kept training rows of the
+window) and `retained_fraction` (their share of the window's training rows).
+At f < 1 the learner reads every shard's rows once at startup to count them.
+
 ## Dense evaluator
 
 `dense_eval.py loop` rates each new dense checkpoint against the champion and keeps the league in

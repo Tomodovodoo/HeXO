@@ -353,6 +353,39 @@ def label(shard, labels):
                 shard.proven[i] = 1
 
 
+def _splitmix(x):
+    """SplitMix64 finaliser of a uint64 array (wrapping arithmetic)."""
+    x = x+np.uint64(0x9E3779B97F4A7C15)
+    x = (x ^ (x >> np.uint64(30)))*np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> np.uint64(27)))*np.uint64(0x94D049BB133111EB)
+    return x ^ (x >> np.uint64(31))
+
+
+def retention(seed, name, rows, fraction):
+    """Bool [rows]: row i of shard `name` passes when SplitMix64 of (seed, crc32(name), i) maps below `fraction` of
+    the 64-bit range, so the draw depends only on those three and agrees across processes and restarts; every row
+    passes at fraction >= 1."""
+    if fraction >= 1:
+        return np.ones(rows, bool)
+    key = _splitmix(_splitmix(np.array([seed % 2**64], np.uint64)) ^ np.uint64(zlib.crc32(name.encode())))
+    h = _splitmix(key+np.arange(1, rows+1, dtype=np.uint64)*np.uint64(0xD1B54A32D192ED03))
+    return (h >> np.uint64(11)).astype(np.float64) < fraction*2.**53
+
+
+def retained(seed, name, full, proven, fraction):
+    """Bool mask over the rows of shard `name` from per-row full-search flags `full` and `proven` labels: every
+    full-search row, every row with an exact label (nonzero proven, forced-line rows included) and the ordinary
+    cheap rows `retention(seed, name, rows, fraction)` passes."""
+    return np.asarray(full, bool) | (np.asarray(proven) != 0) | retention(seed, name, len(full), fraction)
+
+
+def trained_rows(side, game, ply):
+    """Bool mask over rows (arrays `game`, `ply`; `side` per game, -1 for self-play) played by the evaluator being
+    trained, as `trained`."""
+    side = side[game]
+    return (side < 0) | ((ply.astype(np.int32)+1)//2 % 2 == side)
+
+
 def shard_dirs(run_dir):
     root = Path(run_dir)/'shards'
     return sorted(p for p in root.iterdir() if p.is_dir() and p.name.isdigit()) if root.exists() else []
@@ -386,11 +419,19 @@ class ReplayWindow:
 
     Only full-search rows (rows with a policy) count toward N_full and the window size; cheap-search rows ride
     along with their shard. Shards are ordered by directory name; the oldest admitted shard contributes its rows
-    from its take-th last full-search row onward. `total_rows`/`rows` count every trained row (all shards /
-    window; see `trained`), `total_full_rows`/`full_rows` only full-search rows, `proven_rows` the window's rows
-    with a nonzero `proven` (sidecar labels included). Rows of games selected by
-    `holdout(episode, validation_fraction)` form the validation index and are never drawn for training.
-    `index`/`validation` are Rows, oldest first.
+    from its take-th last full-search row onward. Rows of games selected by `holdout(episode, validation_fraction)`
+    form the validation index and are never drawn for training. `index`/`validation` are Rows, oldest first.
+
+    Cheap rows: an ordinary cheap row (no policy, no exact label) is retained with probability
+    `cheap_row_fraction`, decided per row by `retention` keyed by the run `seed`, so every process and restart
+    agrees; full-search and exact rows are always retained (`retained`). The training index holds retained rows
+    only, the validation index every held-out row. At fraction 1 every row is retained and nothing is filtered.
+    Counts: `total_rows` is the pacing count, the retained trained rows (see `trained`) of all shards, held-out
+    rows included; `rows` the window's trained rows (retained or not); `retained_rows` the training index and
+    `retained_fraction` its share of the window's trained rows outside the validation split (1 without any);
+    `total_full_rows`/`full_rows` full-search rows (all shards / window); `proven_rows` the window's rows with a
+    nonzero `proven` (sidecar labels included). Below fraction 1, total_rows reads each shard's rows once on first
+    use (`count`) and keeps its count until a refresh finds that the shard's proof sidecar appeared since.
 
     Memory: each admitted shard is held as numpy arrays (Shard): per row its game, ply, player, remaining, proven,
     raw legal digest, next-ply row and policy offset (proven includes the shard's proof_labels, applied at
@@ -411,8 +452,9 @@ class ReplayWindow:
     VALUE_CACHE = 4096
 
     def __init__(self, run_dir, capacity_rows, min_rows=100000, expand_per_row=.4, taper_exponent=.65, validation_fraction=0.,
-                 policy_dir=None):
+                 policy_dir=None, cheap_row_fraction=1., seed=0):
         self.run_dir = Path(run_dir); self.capacity_rows = capacity_rows; self.validation_fraction = validation_fraction
+        self.cheap_row_fraction, self.seed, self.counts = cheap_row_fraction, seed, {}
         self.shape = dict(min_rows=min_rows, expand_per_row=expand_per_row, taper_exponent=taper_exponent)
         self.policy_dir = self.run_dir/'cache'/'policies' if policy_dir is None else Path(policy_dir)
         self.manifests = {}; self.shards = {}; self.values = OrderedDict()
@@ -452,8 +494,10 @@ class ReplayWindow:
         for path in shard_dirs(self.run_dir):
             if path.name not in self.manifests:
                 self.manifests[path.name] = manifest(path)
-        names = sorted(self.manifests)
-        self.total_rows = sum(self.manifests[n]['counts']['rows']-self.manifests[n]['counts'].get('opponent_rows', 0) for n in names)
+        names = self.names = sorted(self.manifests)
+        for name in [n for n, (_, labelled) in self.counts.items() if not labelled]:
+            if (self.run_dir/'shards'/name/SIDECAR).exists():
+                del self.counts[name]
         self.total_full_rows = sum(self.manifests[n]['counts']['policy_rows'] for n in names)
         want = min(self.capacity_rows, window_size(self.total_full_rows, **self.shape))
         admitted = []; have = 0
@@ -474,22 +518,48 @@ class ReplayWindow:
                 label(self.shards[name], labels); self.unlabelled.discard(name)
         self.admitted = admitted[::-1]; self.full_rows = have; self.proven_rows = 0
         parts = ([], []), ([], [])    # (shard ids, rows) of the training and validation index
-        self.starts = {}
+        self.starts = {}; candidates = 0
         for k, (name, take) in enumerate(self.admitted):
-            s = self.shards[name]; positions = np.flatnonzero(np.diff(s.offsets) > 0)
+            s = self.shards[name]; full = np.diff(s.offsets) > 0; positions = np.flatnonzero(full)
             start = self.starts[name] = 0 if take >= len(positions) else int(positions[-take]) if take else len(s.game)
             i = np.arange(start, len(s.game), dtype=np.int32)
-            side = s.side[s.game[i]]
-            i = i[(side < 0) | ((s.ply[i].astype(np.int32)+1)//2 % 2 == side)]
+            i = i[trained_rows(s.side, s.game[i], s.ply[i])]
             self.proven_rows += int(np.count_nonzero(s.proven[i]))
             held = s.held[s.game[i]]
-            for split, (ids, rows) in enumerate(parts):
-                ids.append(np.full(int((held == split).sum()), k, np.int32)); rows.append(i[held == split])
+            train = i[~held]; candidates += len(train)
+            if self.cheap_row_fraction < 1:
+                train = train[retained(self.seed, name, full, s.proven, self.cheap_row_fraction)[train]]
+            for (ids, rows), chosen in zip(parts, (train, i[held])):
+                ids.append(np.full(len(chosen), k, np.int32)); rows.append(chosen)
         names = [name for name, _ in self.admitted]
         flat = lambda arrays: np.concatenate(arrays) if arrays else np.zeros(0, np.int32)
         self.index, self.validation = (Rows(names, flat(ids), flat(rows)) for ids, rows in parts)
-        self.rows = len(self.index)+len(self.validation)
+        self.rows = candidates+len(self.validation)
+        self.retained_rows = len(self.index); self.retained_fraction = self.retained_rows/candidates if candidates else 1.
         return self.rows
+
+    @property
+    def total_rows(self):
+        """Retained trained rows of the shards seen by the last refresh, held-out rows included: the pacing count."""
+        if self.cheap_row_fraction >= 1:
+            return sum(self.manifests[n]['counts']['rows']-self.manifests[n]['counts'].get('opponent_rows', 0) for n in self.names)
+        for name in self.names:
+            if name not in self.counts:
+                self.counts[name] = self.count(name)
+        return sum(self.counts[n][0] for n in self.names)
+
+    def count(self, name):
+        """(retained trained rows, whether its proof sidecar was read) of shard `name`, read from its files; rows the
+        sidecar lists count as exact."""
+        path = self.run_dir/'shards'/name
+        episodes = json.loads((path/'episodes.json').read_text()); rows = json.loads((path/'rows.json').read_text())
+        labels = proof_labels(path)
+        game = np.array([r['game'] for r in rows], np.int32); ply = np.array([r['ply'] for r in rows], np.int32)
+        proven = np.array([r.get('proven') or (r['game'], r['ply']) in (labels or ()) for r in rows], np.int8)
+        side = np.array([-1 if e.get('trained_side') is None else e['trained_side'] for e in episodes], np.int8)
+        full = np.diff(load_offsets(path, len(rows))) > 0
+        keep = trained_rows(side, game, ply) & retained(self.seed, name, full, proven, self.cheap_row_fraction)
+        return int(keep.sum()), labels is not None
 
     def ref(self, name, i, episode=None):
         """Ref of row i of admitted shard `name`; `episode`, when given, must be the episode dict of the row's game."""
@@ -896,12 +966,13 @@ def start_hidden(processes):
         sys.modules['__main__'] = main
 
 
-def _render_worker(run, settings, seed, output, calibration, policy_dir):
-    """Worker process body: put `batches` from a private ReplayWindow on `policy_dir` (refreshed every 30 s), with
-    the Calibration packed in the shared array `calibration`."""
+def _render_worker(run, settings, seed, output, calibration, policy_dir, run_seed):
+    """Worker process body: put `batches` from a private ReplayWindow on `policy_dir` (refreshed every 30 s; cheap rows
+    retained per settings.cheap_row_fraction keyed by `run_seed`), with the Calibration packed in the shared array
+    `calibration`."""
     try:
         window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
-                              settings.window_taper, settings.validation_fraction, policy_dir)
+                              settings.window_taper, settings.validation_fraction, policy_dir, settings.cheap_row_fraction, run_seed)
         rng = np.random.default_rng(seed); refreshed = time.time()
         while not window.index:
             time.sleep(5); window.refresh(); refreshed = time.time()
@@ -917,17 +988,17 @@ class Renderers:
     """`batches` of the run rendered by `workers` spawned processes (started by start_hidden, so they never load
     torch), each with its own ReplayWindow on `policy_dir` (None: the run's default), so rendering never holds the
     trainer's GIL; at most depth * workers rendered batches wait in the queue. Worker i draws from its own generator
-    seeded [*seed, i]. Settings (a LearnerSettings) are fixed per pool: close() it and start another to change them;
-    set_calibration() replaces the Calibration of batches rendered from then on. Iterate to consume {S: batch of
+    seeded [*seed, i]; `run_seed` keys cheap-row retention (ReplayWindow seed). Settings (a LearnerSettings) are
+    fixed per pool: close() it and start another to change them; set_calibration() replaces the Calibration of batches rendered from then on. Iterate to consume {S: batch of
     torch tensors}; a worker's exception or death is raised in the consumer."""
 
-    def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None, policy_dir=None):
+    def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None, policy_dir=None, run_seed=0):
         context = multiprocessing.get_context('spawn')
         self.queue = context.Queue(depth*workers)
         self.calibration = context.Array('d', CALIBRATION_FEATURES+1)
         self.set_calibration(calibration)
         self.processes = [context.Process(target=_render_worker, daemon=True,
-                                          args=(str(run), settings, [*seed, i], self.queue, self.calibration, policy_dir))
+                                          args=(str(run), settings, [*seed, i], self.queue, self.calibration, policy_dir, run_seed))
                           for i in range(workers)]
         start_hidden(self.processes)
 
