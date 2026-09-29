@@ -257,6 +257,9 @@ def play(games, leaf_batch, heartbeat=lambda finished: None):
             heartbeat(list(records.values()))
     finally:
         engine.close()
+    for record in records.values():
+        if 'error' in record:
+            raise ValueError(f'Match game failed: {record["error"]}')
     return [records[id(g)] for g in games]
 
 

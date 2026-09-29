@@ -2595,6 +2595,13 @@ class EvaluatorSearchTests(unittest.TestCase):
                          +[list(move) for move in calls[1][1]])
         self.assertNotIn('error', record)
 
+    def test_standalone_match_rejects_failed_seal_game(self):
+        def seal(game, ms):
+            raise RuntimeError('Seal unavailable')
+        game = dense_eval.MatchGame([dense_eval.SEAL, dense_eval.SEAL], [], 1, 2, 2, False, 6, {}, seal, 5)
+        with self.assertRaisesRegex(ValueError, 'Match game failed: RuntimeError: Seal unavailable'):
+            dense_eval.play([game], 64)
+
     def test_evaluator_matches_model_including_far_cells(self):
         histories = [POSITIONS[10], [], line_history(31), line_history(6)]
         results = self.evaluator.evaluate(histories)
