@@ -20,12 +20,12 @@ import dense_selfplay
 import dense_solve
 from dense_data import player_at
 from forcing_material import worth_solving
-import hexnet
 from hexo import Game
 from tactical_proof import NativeTactics
 from tests.test_dense import source_shard, winning_game, write_games
 from tests.test_dense_solver import TINY, tiny_model
 from tests.test_tactical_proof import FIXTURE
+from train import write_json
 
 PROOF = '1790600149713752:2:253'  # the side to move wins in 4 turns; proven within 135 nodes
 SMALL = dense_solve.PassSettings(solve_nodes=135, scan_nodes=1500, saving_nodes=300, verify_fraction=1.)
@@ -92,10 +92,14 @@ class PassTests(unittest.TestCase):
         self.run = new_run(Path(tmp.name)/'run')
         shard_of(self.run, '1000000000001', [episode(self.moves, self.mover)])
 
-    def solve(self, out=None, settings=SMALL):
-        tactics = Recorder(self.engine)
-        solver = dense_solve.Pass(self.run, out or self.run, settings, tactics, clock=lambda: 1000.)
-        return solver, tactics, solver.shard('1000000000001')
+    def solve(self, out=None, settings=SMALL, name='1000000000001', tactics=None, prepare=lambda coordinator: None):
+        """Solve shard `name` in process and record it through JSON as the coordinator does a worker's result."""
+        tactics = tactics or Recorder(self.engine)
+        result = dense_solve.Solver(self.run, out or self.run, settings, tactics, clock=lambda: 1000.).solve(name)
+        coordinator = dense_solve.Pass(self.run, out or self.run, settings, clock=lambda: 1000.)
+        prepare(coordinator)
+        coordinator.record(name, json.loads(json.dumps(result)))
+        return coordinator, tactics, result['windows']
 
     def test_known_win_opens_a_window_with_lookback_and_buffer_entries(self):
         solver, tactics, windows = self.solve()
@@ -155,20 +159,41 @@ class PassTests(unittest.TestCase):
         self.assertEqual(outputs[0], outputs[1])
         self.assertFalse((self.run/'shards'/'1000000000001'/'proofs.jsonl').exists())
 
-    def test_loop_is_restart_safe_and_writes_status(self):
+    def test_worker_processes_match_the_in_process_solver_and_resume(self):
         out = self.run.parent/'out'
-        tactics = Recorder(self.engine)
-        solver = dense_solve.Pass(self.run, out, SMALL, tactics)
-        solver.loop(once=True)
-        calls = len(tactics.calls)
-        dense_solve.Pass(self.run, out, SMALL, tactics).loop(once=True)
-        self.assertEqual(len(tactics.calls), calls)
+        coordinator = dense_solve.Pass(self.run, out, SMALL)
+        coordinator.loop(once=True)
+        self.solve(self.run.parent/'reference')
+        for name in ('shards/1000000000001/proofs.jsonl', 'restarts.json'):
+            read = lambda root: json.loads((root/name).read_text()) if name.endswith('.json') else (root/name).read_text()
+            expected, got = read(self.run.parent/'reference'), read(out)
+            if name == 'restarts.json':
+                expected, got = ([dict(e, added_at=None) for e in x['entries']] for x in (expected, got))
+            self.assertEqual(got, expected)
+        resumed = dense_solve.Pass(self.run, out, SMALL)
+        self.assertFalse(resumed.step(spawn=lambda name: self.fail(f'{name} solved twice')))
         status = json.loads((out/'solver-status.json').read_text())
-        self.assertEqual((status['stage'], status['shards_pending'], status['buffer_size']),
-                         ('idle', 0, len(solver.buffer.entries)))
+        self.assertEqual((status['stage'], status['shards_pending'], status['buffer_size'], status['workers']),
+                         ('idle', 0, len(coordinator.buffer.entries), 1))
         for key in ('positions_per_hour', 'hits_per_hour', 'gate_pass_rate', 'transient', 'persistent', 'window_plies',
-                    'buffer_mean_regret', 'busy_fraction'):
+                    'buffer_mean_regret', 'busy_cores', 'worker_switches'):
             self.assertIn(key, status)
+        self.assertEqual(list((out/'.solve').glob('*.json')), [])
+
+    def test_failed_queries_are_no_saving_turns(self):
+        engine = self.engine
+
+        class Failing(Recorder):
+            def history(self, history, **query):
+                if query['nodes'] == SMALL.saving_nodes:
+                    return dict(status='UNKNOWN', reason='deadline', elapsed_ms=1.)
+                return engine.history(history, **query)
+        solver, _, windows = self.solve(self.run.parent/'failing', tactics=Failing(engine))
+        threats = [d for w in windows for d in w['defence'] if d['threat']]
+        self.assertTrue(threats)
+        self.assertTrue(all(d['saving_turns'] == [] for d in threats))
+        self.assertEqual((solver.stats['failures'], solver.stats['last_failure']),
+                         (solver.stats['queries']['saving']['queries'], 'deadline'))
 
     def test_rejected_independent_check_aborts_with_an_event(self):
         with unittest.mock.patch.object(dense_solve, 'independent_verify', side_effect=ValueError('bad')):
@@ -183,13 +208,68 @@ class PassTests(unittest.TestCase):
         moves = [list(m) for m in winning_game()]
         restart = dict(episode(moves, 0, origin='restart', restart=source), root_values=[None]*5+[.4]*(len(moves)-5))
         shard_of(self.run, '1000000000002', [restart])
-        solver = dense_solve.Pass(self.run, self.run, SMALL, Recorder(self.engine), clock=lambda: 1000.)
-        solver.buffer.entries[('1000000000001', 0, 5, 'attack')] = dict(source, side_to_move=0, added_at=0., checkpoint=None)
-        windows = solver.shard('1000000000002')
+        known = lambda c: c.buffer.entries.update({('1000000000001', 0, 5, 'attack'): dict(
+            source, side_to_move=0, added_at=0., checkpoint=None)})
+        solver, _, windows = self.solve(name='1000000000002', prepare=known)
         self.assertTrue(windows and all(w['first_ply'] >= 5 for w in windows))
         self.assertTrue(all(e['ply'] > 5 for e in solver.buffer.entries.values() if e['shard'] == '1000000000002'))
         self.assertEqual(solver.buffer.entries[('1000000000001', 0, 5, 'attack')]['observed'],
                          {'main/000010': dict(value=.4, shard='1000000000002')})
+
+
+class Process:
+    """A shard worker stand-in that never finishes until killed."""
+
+    def __init__(self):
+        self.killed = False
+
+    def poll(self):
+        return None
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self):
+        return -9
+
+
+class WorkerCountTests(unittest.TestCase):
+    def test_workers_follow_the_phased_learner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = new_run(Path(tmp)/'run')
+            for k in range(5):
+                shard_of(run, f'100000000000{k}', [episode(PREFIX, -1)])
+            now = [1000.]
+            coordinator = dense_solve.Pass(run, run, replace(SMALL, solve_workers_max=3), clock=lambda: now[0])
+            heartbeat = lambda **status: write_json(run/'learner-status.json', dict(updated_at=now[0], **status))
+            started = []
+
+            def spawn(name):
+                started.append((name, Process()))
+                return started[-1][1]
+            self.assertEqual(coordinator.workers()[0], 1)
+            heartbeat(stage='training', phase_rows=0)
+            self.assertTrue(coordinator.step(spawn=spawn))
+            self.assertEqual([n for n, _ in started], ['1000000000004'])
+            heartbeat(stage='training', phase_rows=1000)
+            coordinator.step(spawn=spawn)
+            self.assertEqual([n for n, _ in started], [f'100000000000{k}' for k in (4, 3, 2)])
+            heartbeat(stage='phase-idle', phase_rows=1000)
+            coordinator.step(spawn=spawn)
+            self.assertEqual(([p.killed for _, p in started], sorted(coordinator.running)), ([False, True, True], ['1000000000004']))
+            now[0] += dense_solve.STALE_SECONDS+1
+            heartbeat(stage='exporting', phase_rows=1000)
+            now[0] += dense_solve.STALE_SECONDS+1
+            self.assertEqual(coordinator.workers()[0], 1)
+            status = json.loads((run/'solver-status.json').read_text())
+            self.assertEqual([s['workers'] for s in status['worker_switches']], [1, 3, 1])
+            self.assertEqual(status['workers_reason'], 'learner phase-idle')
+            events = [json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
+            self.assertEqual([e['workers'] for e in events], [1, 3, 1])
+            self.assertEqual(dense_solve.Pass(run, run, SMALL).workers()[0], 1)
+            heartbeat(stage='training', phase_rows=1000)
+            self.assertEqual(dense_solve.Pass(run, run, SMALL, clock=lambda: now[0]).workers()[0],
+                             max(1, dense_solve.physical_cores()-2))
 
 
 class RestartBufferTests(unittest.TestCase):
@@ -208,6 +288,10 @@ class RestartBufferTests(unittest.TestCase):
             buffer.save()
             again = dense_solve.RestartBuffer(Path(tmp)/'restarts.json', 3, 2, .1)
             self.assertEqual(again.entries, buffer.entries)
+            again.observe(('s', 0, 3, 'attack'), 'main/000010', .2, '0001')
+            again.add(self.entry(3, -1., added_at=99.))
+            self.assertEqual((again.entries['s', 0, 3, 'attack']['added_at'], again.entries['s', 0, 3, 'attack']['observed']),
+                             (10., {'main/000010': dict(value=.2, shard='0001')}))
             self.assertEqual([e['ply'] for e in json.loads((Path(tmp)/'restarts.json').read_text())['entries']], [3, 9, 2])
 
     def test_refresh_reads_newest_observations_and_ages_by_exports(self):

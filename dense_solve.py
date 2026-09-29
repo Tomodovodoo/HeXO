@@ -2,11 +2,20 @@
 
   python dense_solve.py --run runs/dense-v1 [--out DIR] [--limit N] [--once] [--<setting> ...]
 
-One process at BelowNormal priority with one tactical worker (tactical_proof.IsolatedTactics), one query at a time.
-Shards are read and never changed; everything is written under `--out` (default: the run): the sidecar
-shards/<name>/proofs.jsonl, restarts.json, solver-status.json and events. A shard is done once its sidecar exists,
-so a restarted pass resumes where it stopped. The pass always takes the newest shard without a sidecar: it starts
-at the newest shards, keeps up with new ones and back-fills older ones while it has nothing newer.
+A coordinator process at BelowNormal priority runs shard workers: each is this script with --shard, solving one
+shard with its own tactical worker (tactical_proof.IsolatedTactics, one query at a time) and handing the result back
+in out/.solve/<name>.json; the coordinator alone writes the buffer and the sidecars. Shards are read and never
+changed; everything is written under `--out` (default: the run): the sidecar shards/<name>/proofs.jsonl,
+restarts.json, solver-status.json, events and .solve/ (worker results and logs). A shard is done once its sidecar exists, so a restarted pass resumes where it stopped. Pending shards
+are taken newest first: the pass starts at the newest shards, keeps up with new ones and back-fills older ones
+while it has nothing newer.
+
+Workers (Pass.workers). While the main learner's fresh heartbeat (learner-status.json, at most STALE_SECONDS old)
+shows a phased learner (phase_rows > 0) in its training phase (stage 'training' or 'exporting'), the actors are
+paused and the pass runs solve_workers_max shard workers (0: physical cores minus 2); otherwise it runs
+solve_workers_min, so the actors keep the CPU. Workers beyond a lowered target are stopped at once; their shards
+stay pending. Every change of the target is recorded in solver-status.json (workers, workers_reason,
+worker_switches) and as an event.
 
 Positions and queries. A game's positions are plies start..T-1 (the position before placement t; start is the
 restart ply of a restart game, else 0). attack(t, nodes) asks whether the side to move at t has a forced win,
@@ -14,7 +23,7 @@ threat(t, nodes) whether its opponent would have one moving now with a fresh tur
 node counts; SAFETY_MS is only a wall-clock cap. Only a native-verified PROVEN_WIN is a proof. A PROVEN_WIN without
 native verification, or an UNKNOWN whose reason is not the search's own, counts as a failure (status `failures`)
 and as no proof. A deterministic `verify_fraction` of proofs (by shard, game, ply, attacker and budget) is checked
-again by tactical_proof.independent_verify; a rejection logs an error event and ends the process.
+again by tactical_proof.independent_verify; a rejection logs an error event and ends the pass.
 
 Per game:
   gate + solve  each turn start (odd t) whose mover passes forcing_material.worth_solving gets attack(t, solve_nodes);
@@ -28,8 +37,8 @@ Per game:
   lookback      for each window of the game's winner, the loser's `lookback_turns` turn starts before the window's
                 first ply (latest first, at or after start) get threat(d, scan_nodes). When it is proven,
                 `saving_turns` lists the candidate turns of the loser at d after which attack(., saving_nodes) for
-                the winner is UNKNOWN: the unordered pairs of cells empty at d among the threat's first turn and the
-                first turn of the window's opening proof.
+                the winner is the search's own UNKNOWN (a failed query does not count): the unordered pairs of cells
+                empty at d among the threat's first turn and the first turn of the window's opening proof.
 Sidecar: one JSON line per window {game, first_ply, last_ply, mover, plies, proof_turns,
 budget (nodes of the first ply's proof), certificate_hash (sha256 of its certificate JSON),
 search_value_at_first_ply (recorded root value or null), persistent, defence: [{ply, threat, saving_turns}]}.
@@ -48,18 +57,20 @@ that variant ago or whose regret fell below min_regret. No net is evaluated.
 
 solver-status.json: pass counters (positions: turn starts scanned; gated: those passing the gate; hits: forward
 proofs; windows, persistent, transient, window_plies histogram of last_ply - first_ply + 1; per query kind
-queries, proofs and ms; verified, failures, last_failure), their per-hour rates over the process lifetime, gate_pass_rate,
-busy_fraction (time spent on shards over elapsed time), shards_done, shards_pending, buffer_size and
+queries, proofs and ms; verified, failures, last_failure), their per-hour rates over the coordinator's lifetime,
+gate_pass_rate, busy_cores (shard-worker seconds over elapsed seconds), shards_done, shards_pending, shards_running,
+workers, workers_reason, worker_switches (the last SWITCHES {time, workers, reason}), buffer_size and
 buffer_mean_regret.
 """
 import argparse
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 import hashlib
 import itertools
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -74,6 +85,10 @@ from train import write_json
 
 SAFETY_MS = 60000
 KINDS = ('solve', 'scan', 'threat', 'saving')
+FAILED = ()  # query result of a failure: no proof, and not the search's own UNKNOWN (None)
+STALE_SECONDS = 120.  # older learner heartbeats are ignored by Pass.workers
+SWITCHES = 20
+STATUS_SECONDS = 5.
 
 
 @dataclass(frozen=True)
@@ -88,10 +103,12 @@ class PassSettings:
     min_regret: float = .1
     refresh_minutes: float = 30.
     poll_seconds: float = 30.
+    solve_workers_min: int = 1     # shard workers while the actors play
+    solve_workers_max: int = 0     # shard workers during a phased learner's training phase; 0: physical cores - 2
 
 
 def below_normal():
-    """Lower this process (and the workers it starts later) to BelowNormal priority."""
+    """Lower this process (and the processes it starts later) to BelowNormal priority."""
     if sys.platform == 'win32':
         import ctypes
         kernel32 = ctypes.windll.kernel32
@@ -100,6 +117,23 @@ def below_normal():
         kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x4000)
     else:
         os.nice(5)
+
+
+def physical_cores():
+    """Physical processor cores (Windows: GetLogicalProcessorInformation core records; elsewhere os.cpu_count())."""
+    if sys.platform != 'win32':
+        return os.cpu_count() or 1
+    import ctypes
+    size = ctypes.c_uint32(0)
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetLogicalProcessorInformation(None, ctypes.byref(size))
+    buffer = ctypes.create_string_buffer(size.value)
+    if not kernel32.GetLogicalProcessorInformation(buffer, ctypes.byref(size)):
+        return os.cpu_count() or 1
+    record = 32 if ctypes.sizeof(ctypes.c_void_p) == 8 else 24  # SYSTEM_LOGICAL_PROCESSOR_INFORMATION
+    offset = ctypes.sizeof(ctypes.c_void_p)                     # Relationship follows ProcessorMask
+    cores = sum(int.from_bytes(buffer.raw[k+offset:k+offset+4], 'little') == 0 for k in range(0, size.value, record))
+    return cores or os.cpu_count() or 1
 
 
 def regret(kind, value):
@@ -124,6 +158,26 @@ def exports(run, variant):
     return [t for t, _ in found], found[-1][1] if found else None
 
 
+def new_stats():
+    return dict(positions=0, gated=0, hits=0, windows=0, persistent=0, transient=0, verified=0, failures=0,
+                last_failure=None, window_plies=Counter(), queries={k: dict(queries=0, proofs=0, ms=0.) for k in KINDS})
+
+
+def merge(total, part):
+    """Add the counters of `part` (new_stats layout; window_plies keys may be strings after JSON) into `total`."""
+    for key, value in part.items():
+        if key == 'window_plies':
+            total[key].update({int(k): v for k, v in value.items()})
+        elif key == 'queries':
+            for kind, counts in value.items():
+                for name, v in counts.items():
+                    total[key][kind][name] += v
+        elif key == 'last_failure':
+            total[key] = value or total[key]
+        else:
+            total[key] += value
+
+
 class RestartBuffer:
     """restarts.json (module contract), held as {key: entry} with key (shard, game, ply, kind)."""
 
@@ -137,7 +191,9 @@ class RestartBuffer:
         return entry['shard'], entry['game'], entry['ply'], entry['kind']
 
     def add(self, entry):
-        if entry['regret'] >= self.min_regret:
+        """Keep `entry` unless its regret is below min_regret or its key is already kept (the kept entry, with its
+        observations, stays)."""
+        if entry['regret'] >= self.min_regret and self.key(entry) not in self.entries:
             self.entries[self.key(entry)] = entry
             self.trim()
 
@@ -173,24 +229,17 @@ class RestartBuffer:
         return dict(buffer_size=len(values), buffer_mean_regret=sum(values)/len(values) if values else None)
 
 
-class Pass:
-    """The proof pass over the shards of `run`, writing under `out` (module contract). `tactics` answers
-    history(history, nodes=, ms=, attacker=) like tactical_proof.NativeTactics or IsolatedTactics."""
+class Solver:
+    """Solves one shard of `run` (module contract, per game): `tactics` answers history(history, nodes=, ms=,
+    attacker=) like tactical_proof.NativeTactics or IsolatedTactics; `out` receives independent-check events."""
 
     def __init__(self, run, out, settings, tactics, clock=time.time):
         self.run, self.out, self.s, self.tactics, self.clock = Path(run), Path(out), settings, tactics, clock
-        self.out.mkdir(parents=True, exist_ok=True)
-        self.variant = dense_config.load(self.run).learner.variant
-        self.buffer = RestartBuffer(self.out/'restarts.json', settings.buffer_size, settings.buffer_max_exports,
-                                    settings.min_regret)
-        self.started = self.refreshed = clock()
-        self.busy = 0.
-        self.stats = dict(shards_done=0, positions=0, gated=0, hits=0, windows=0, persistent=0, transient=0, verified=0,
-                          failures=0, last_failure=None, window_plies=Counter(),
-                          queries={k: dict(queries=0, proofs=0, ms=0.) for k in KINDS})
+        self.stats = new_stats()
 
     def query(self, where, history, attacker, nodes, kind):
-        """(moves, proof_turns, certificate hash) of a native-verified proof, else None (module contract)."""
+        """(moves, proof_turns, certificate hash) of a native-verified proof, None for the search's own UNKNOWN, else
+        FAILED (module contract)."""
         result = self.tactics.history([list(p) for p in history], nodes=nodes, ms=SAFETY_MS, attacker=attacker)
         stats = self.stats['queries'][kind]
         stats['queries'] += 1
@@ -199,6 +248,7 @@ class Pass:
             if result['status'] == PROVEN_WIN or result.get('reason') != SEARCHED:
                 self.stats['failures'] += 1
                 self.stats['last_failure'] = result.get('reason')
+                return FAILED
             return None
         stats['proofs'] += 1
         text = result.get('certificate_json') or json.dumps(result['certificate'], separators=(',', ':'))
@@ -283,29 +333,53 @@ class Pass:
                 occupied = {tuple(m) for m in history}
                 cells = [c for c in dict.fromkeys(threat[0]+opening) if c not in occupied]
                 saving = [[list(a), list(b)] for a, b in itertools.combinations(cells, 2)
-                          if not self.query((shard, g, d, a, b), history+[a, b], 'mover', self.s.saving_nodes, 'saving')]
+                          if self.query((shard, g, d, a, b), history+[a, b], 'mover', self.s.saving_nodes, 'saving') is None]
             found.append(dict(ply=d, threat=bool(threat), saving_turns=saving))
         return found
 
-    def shard(self, name):
-        """Solve shard `name`: add its buffer entries and observations, then write its sidecar; returns its windows."""
+    def solve(self, name):
+        """The result of shard `name`: {windows, entries (checkpoint: the shard's), observations [(key, checkpoint,
+        value)] of its restart games, stats (this shard's counters)}."""
+        self.stats = new_stats()
         path = self.run/'shards'/name
         manifest = dense_data.verify(path)
         episodes = json.loads((path/'episodes.json').read_text(encoding='utf-8'))
         identity = manifest['identity']
-        windows = []
+        windows, entries, observations = [], [], []
         for g, e in enumerate(episodes):
-            found, entries = self.game(name, g, e)
+            found, new = self.game(name, g, e)
             windows += found
-            for entry in entries:
-                self.buffer.add(dict(entry, checkpoint=identity.get('checkpoint')))
+            entries += [dict(entry, checkpoint=identity.get('checkpoint')) for entry in new]
             source = e.get('restart') if e.get('origin') == 'restart' else None
             if source and e['actor'] == identity.get('actor_sha256') and e['root_values'][source['ply']] is not None:
-                key = (source['shard'], source['game'], source['ply'], source['kind'])
-                self.buffer.observe(key, identity.get('checkpoint'), e['root_values'][source['ply']], name)
+                key = [source['shard'], source['game'], source['ply'], source['kind']]
+                observations.append((key, identity.get('checkpoint'), e['root_values'][source['ply']]))
+        return dict(windows=windows, entries=entries, observations=observations, stats=self.stats)
+
+
+class Pass:
+    """The coordinator of the proof pass over the shards of `run`, writing under `out` (module contract)."""
+
+    def __init__(self, run, out, settings, clock=time.time):
+        self.run, self.out, self.s, self.clock = Path(run), Path(out), settings, clock
+        self.out.mkdir(parents=True, exist_ok=True)
+        self.variant = dense_config.load(self.run).learner.variant
+        self.buffer = RestartBuffer(self.out/'restarts.json', settings.buffer_size, settings.buffer_max_exports,
+                                    settings.min_regret)
+        self.started = self.refreshed = self.reported = clock()
+        self.busy, self.running, self.target, self.switches = 0., {}, None, []
+        self.stats = dict(new_stats(), shards_done=0)
+
+    def record(self, name, result):
+        """Add a shard's result to the buffer and the counters, then save the buffer and write the sidecar."""
+        for entry in result['entries']:
+            self.buffer.add(entry)
+        for key, checkpoint, value in result['observations']:
+            self.buffer.observe(tuple(key), checkpoint, value, name)
+        merge(self.stats, result['stats'])
+        self.stats['shards_done'] += 1
         self.buffer.save()
-        write_sidecar(self.out/'shards'/name, windows)
-        return windows
+        write_sidecar(self.out/'shards'/name, result['windows'])
 
     def refresh(self):
         """RestartBuffer.refresh against the variant's exports, then save the buffer."""
@@ -319,35 +393,94 @@ class Pass:
         names = [p.name for p in dense_data.shard_dirs(self.run)][::-1][:limit]
         return [n for n in names if not (self.out/'shards'/n/dense_data.SIDECAR).exists()]
 
+    def workers(self):
+        """(shard workers, reason) from the main learner's heartbeat (module contract)."""
+        try:
+            status = json.loads((self.run/'learner-status.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            status = {}
+        fresh = self.clock()-float(status.get('updated_at') or 0) <= STALE_SECONDS
+        if fresh and (status.get('phase_rows') or 0) > 0 and status.get('stage') in ('training', 'exporting'):
+            return self.s.solve_workers_max or max(1, physical_cores()-2), 'learner training phase: actors paused'
+        return self.s.solve_workers_min, f"learner {status.get('stage') if fresh else 'heartbeat absent or stale'}"
+
+    def spawn(self, name):
+        """Start a shard worker process for `name`; its result goes to out/.solve/<name>.json."""
+        (self.out/'.solve').mkdir(exist_ok=True)
+        flags = [x for f in fields(self.s) for x in ('--'+f.name.replace('_', '-'), str(getattr(self.s, f.name)))]
+        log = (self.out/'.solve'/f'{name}.log').open('w')
+        try:
+            return subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--run', str(self.run), '--out',
+                                     str(self.out), '--shard', name, *flags], stdout=log, stderr=subprocess.STDOUT)
+        finally:
+            log.close()
+
     def status(self, stage, pending):
-        hours = max(1e-9, self.clock()-self.started)/3600
+        seconds = max(1e-9, self.clock()-self.started)
         q = self.stats
         write_json(self.out/'solver-status.json', dict(
             stage=stage, updated_at=self.clock(), started_at=self.started, shards_pending=pending,
+            shards_running=sorted(self.running), workers=self.target[0] if self.target else None,
+            workers_reason=self.target[1] if self.target else None, worker_switches=self.switches,
             **{k: v for k, v in q.items() if k != 'window_plies'}, window_plies=dict(sorted(q['window_plies'].items())),
-            positions_per_hour=q['positions']/hours, hits_per_hour=q['hits']/hours,
+            positions_per_hour=q['positions']*3600/seconds, hits_per_hour=q['hits']*3600/seconds,
             gate_pass_rate=q['gated']/q['positions'] if q['positions'] else None,
-            busy_fraction=self.busy/(hours*3600), **self.buffer.summary(), settings=asdict(self.s)))
+            busy_cores=self.busy/seconds, **self.buffer.summary(), settings=asdict(self.s)))
+        self.reported = self.clock()
+
+    def step(self, limit=None, spawn=None):
+        """One coordinator round: collect finished workers, adjust the worker count, start workers on pending shards
+        newest first and report; returns True while work is pending or running."""
+        spawn = spawn or self.spawn
+        for name, (process, began) in list(self.running.items()):
+            code = process.poll()
+            if code is None:
+                continue
+            del self.running[name]
+            if code:
+                raise RuntimeError(f'shard worker for {name} exited with code {code}; see {self.out/".solve"/name}.log')
+            path = self.out/'.solve'/f'{name}.json'
+            self.record(name, json.loads(path.read_text(encoding='utf-8')))
+            path.unlink()
+            self.busy += self.clock()-began
+        target = self.workers()
+        switched = self.target is None or target[0] != self.target[0]
+        if switched:
+            self.switches = (self.switches+[dict(time=self.clock(), workers=target[0], reason=target[1])])[-SWITCHES:]
+            dense_config.log_event(self.out, 'solve', 'info', f'{target[0]} shard workers: {target[1]}', workers=target[0])
+        self.target = target
+        for name in sorted(self.running, key=lambda n: self.running[n][1])[target[0]:]:
+            process, began = self.running.pop(name)
+            process.kill()
+            process.wait()
+            self.busy += self.clock()-began
+        pending = [n for n in self.pending(limit) if n not in self.running]
+        while pending and len(self.running) < target[0]:
+            name = pending.pop(0)
+            self.running[name] = (spawn(name), self.clock())
+        if switched or self.clock()-self.reported >= STATUS_SECONDS or not self.running:
+            self.status('solving' if self.running else 'idle', len(pending))
+        return bool(self.running or pending)
 
     def loop(self, limit=None, once=False, sleep=time.sleep):
-        """Refresh the buffer, then solve pending shards newest first, refreshing every refresh_minutes; poll for new
-        shards every poll_seconds, or return once none is pending with `once`."""
+        """Refresh the buffer, then run step() every second while there is work and every poll_seconds otherwise,
+        refreshing every refresh_minutes; return once nothing is pending or running with `once`. Workers still
+        running when it ends are stopped."""
         self.refresh()
-        while True:
-            if self.clock()-self.refreshed >= self.s.refresh_minutes*60:
-                self.refresh()
-            pending = self.pending(limit)
-            if not pending:
-                self.status('idle', 0)
-                if once:
+        try:
+            while True:
+                if self.clock()-self.refreshed >= self.s.refresh_minutes*60:
+                    self.refresh()
+                if self.step(limit):
+                    sleep(1.)
+                elif once:
                     return
-                sleep(self.s.poll_seconds)
-                continue
-            began = time.perf_counter()
-            self.shard(pending[0])
-            self.busy += time.perf_counter()-began
-            self.stats['shards_done'] += 1
-            self.status('solving', len(pending)-1)
+                else:
+                    sleep(self.s.poll_seconds)
+        finally:
+            for process, _ in self.running.values():
+                process.kill()
+                process.wait()
 
 
 def main():
@@ -356,21 +489,27 @@ def main():
     parser.add_argument('--out', help='directory for sidecars, buffer, status and events (default: the run)')
     parser.add_argument('--limit', type=int, help='consider only the newest N shards')
     parser.add_argument('--once', action='store_true', help='exit when no shard is pending')
+    parser.add_argument('--shard', help=argparse.SUPPRESS)
     dense_config.add_arguments(parser, PassSettings)
     args = parser.parse_args()
     settings = dense_config.override(PassSettings(), args)
     below_normal()
     out = Path(args.out or args.run)
-    tactics = IsolatedTactics()
+    if args.shard:
+        tactics = IsolatedTactics()
+        try:
+            result = Solver(args.run, out, settings, tactics).solve(args.shard)
+        finally:
+            tactics.close()
+        write_json(out/'.solve'/f'{args.shard}.json', result)
+        return
     try:
-        solver = Pass(args.run, out, settings, tactics)
+        solver = Pass(args.run, out, settings)
         dense_config.log_event(out, 'solve', 'info', 'proof pass started', settings=asdict(settings))
         solver.loop(args.limit, args.once)
     except Exception as error:
         dense_config.log_event(out, 'solve', 'error', f'proof pass stopped: {error!r}')
         raise
-    finally:
-        tactics.close()
 
 
 if __name__ == '__main__':
