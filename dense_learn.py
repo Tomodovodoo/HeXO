@@ -105,7 +105,8 @@ def policy_validation_rows(out, batch):
     ce = hexnet.policy_row_losses(policy, far, batch['cells'], batch['counts'], target)
     entropy = -torch.xlogy(target, target).sum(1)
     logits, _ = hexnet.action_logits(policy, far, batch['cells'], batch['counts'])
-    top1 = (logits.gather(1, target.argmax(1, keepdim=True)).squeeze(1) == logits.max(1).values).float()
+    top1 = ((logits == logits.max(1, keepdim=True).values) &
+            (target == target.max(1, keepdim=True).values)).any(1).float()
     return ce, entropy, ce-entropy, top1
 
 
