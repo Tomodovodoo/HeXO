@@ -818,13 +818,14 @@ def worker(args):
 
 
 def published(run, worker, since=0.):
-    """Cumulative counts from shards written by actor worker `worker` at or after `since`; every ply has a row,
-    so rows count both positions and plies."""
+    """Cumulative counts from shards written by actor worker `worker` at or after `since`: positions are rows
+    (searched plies), plies are rows plus the forced plies of restart games."""
     totals = dict(games_completed=0, positions=0, shards_written=0, terminal=0, plies=0)
     for m in (dense_data.manifest(path) for path in dense_data.shard_dirs(run)):
         if m['identity'].get('process') == worker and m['created_at'] >= since:
             c = m['counts']
-            totals['games_completed'] += c['games']; totals['positions'] += c['rows']; totals['plies'] += c['rows']
+            totals['games_completed'] += c['games']; totals['positions'] += c['rows']
+            totals['plies'] += c['rows']+c.get('forced_plies', 0)
             totals['terminal'] += c['terminal_games']; totals['shards_written'] += 1
     return totals
 

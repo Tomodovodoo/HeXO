@@ -7,8 +7,8 @@ millisecond time plus pid) holding
   rows.json      [{game, ply, player, remaining, target, weight, legal_sha256, proven?, proof_turns?, solver_nodes?}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
-  manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows and
-                 restart_games may be absent: 0)
+  manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows,
+                 restart_games and forced_plies may be absent: 0)
   proofs.jsonl   optional sidecar written later by the proof pass (dense_solve; not in `files`): one line per proven
                  window {game, mover, plies, ...}; rows of the listed plies are proven wins for their side to move
 `origin` is 'converted' (dense_bootstrap) or 'actor' (dense_selfplay); `origin()` infers it for older manifests.
@@ -24,7 +24,8 @@ spent on the ply's search); absent means 0. The manifest counts the proven rows 
 Actor episodes record `origin` ('selfplay' or 'restart'; absent: 'selfplay'). A restart game (dense_selfplay.Restarts)
 starts from a buffer position: its first `restart.ply` moves are the source game's, replayed without search, so it
 has rows only from that ply on (null root values and full_search False before it); `restart` names the source
-{shard, game, ply, kind, regret, plies_to_proof}. The manifest counts them as `restart_games`.
+{shard, game, ply, kind, regret, plies_to_proof}. The manifest counts them as `restart_games` and their
+replayed plies without rows as `forced_plies`.
 `episode.actor` is the sha256 of the evaluator being trained. Actor shards also record `actors` {"0": sha, "1": sha}
 per colour, `opponent` (null for self-play, else the checkpoint id of a frozen historical opponent) and
 `trained_side` (null for self-play, else the colour the trained evaluator played). Every ply (from the restart ply
@@ -248,7 +249,8 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
                   opponent_rows=sum(not trained(episodes[r['game']], r['ply']) for r in rows),
                   terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes),
                   proven_rows=sum(bool(r.get('proven')) for r in rows),
-                  restart_games=sum(e.get('origin') == 'restart' for e in episodes))
+                  restart_games=sum(e.get('origin') == 'restart' for e in episodes),
+                  forced_plies=sum(e['restart']['ply'] for e in episodes if e.get('origin') == 'restart'))
     with tempfile.TemporaryDirectory(dir=path.parent, prefix='pending-') as temporary:
         stage = Path(temporary)/'shard'
         stage.mkdir()

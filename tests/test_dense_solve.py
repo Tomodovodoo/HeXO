@@ -298,7 +298,11 @@ class RestartActorTests(unittest.TestCase):
         self.assertEqual([r['ply'] for r in rows], list(range(6, len(restart['moves']))))
         manifest = dense_data.write_shard(self.run/'shards'/'1000000000002', dict(actor_sha256='a'*64),
                                           [restart, plain], [dict(r, game=0) for r in rows])
-        self.assertEqual(manifest['counts']['restart_games'], 1)
+        self.assertEqual((manifest['counts']['restart_games'], manifest['counts']['forced_plies']), (1, 6))
+        (self.run/'shards'/'1000000000002'/'manifest.json').write_text(json.dumps(dict(
+            manifest, identity=dict(manifest['identity'], process=0))))
+        totals = dense_selfplay.published(self.run, 0)
+        self.assertEqual((totals['positions'], totals['plies']), (len(rows), len(restart['moves'])))
         dense_bootstrap.check(self.run/'shards'/'1000000000002')
         window = dense_data.ReplayWindow(self.run, 10**6, 1)
         trained = [window.ref(*k) for k in window.index] + [window.ref(*k) for k in window.validation]
