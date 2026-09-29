@@ -2602,6 +2602,39 @@ class EvaluatorSearchTests(unittest.TestCase):
         self.model = hexnet.HexNet(TINY).eval()
         self.evaluator = hexnet.DenseEvaluator(self.model, device='cpu')
 
+    def test_seal_finishes_mid_turn_opening_with_first_reply_move(self):
+        opening = [(0, 0), (1, 0), (-1, 0), (0, 1)]
+        calls = []
+        def seal(game, ms):
+            moves = game.legal_moves()[:2]
+            calls.append((game.remaining, moves))
+            return moves
+        game = dense_eval.MatchGame([dense_eval.SEAL, dense_eval.SEAL], opening, 1, 2, 2, False, 7, {}, seal, 5)
+        record = game.finish()
+        self.assertEqual([remaining for remaining, _ in calls], [1, 2])
+        self.assertEqual(record['moves'], [list(move) for move in opening]+[list(calls[0][1][0])]
+                         +[list(move) for move in calls[1][1]])
+        self.assertNotIn('error', record)
+
+    def test_standalone_match_rejects_failed_seal_game(self):
+        def seal(game, ms):
+            raise RuntimeError('Seal unavailable')
+        game = dense_eval.MatchGame([dense_eval.SEAL, dense_eval.SEAL], [], 1, 2, 2, False, 6, {}, seal, 5)
+        with self.assertRaisesRegex(ValueError, 'Match game failed: RuntimeError: Seal unavailable'):
+            dense_eval.play([game], 64)
+
+    def test_model_move_error_in_seal_match_escapes(self):
+        def fail(move):
+            raise RuntimeError('tree advance failed')
+        model = SimpleNamespace(tree=lambda opening, seed, tactics: SimpleNamespace(advance=fail, close=lambda: None))
+        game = dense_eval.MatchGame([model, dense_eval.SEAL], [(0, 0), (1, 0), (-1, 0)], 1,
+                                    2, 2, False, 8, {}, lambda board, ms: board.legal_moves()[:2], 5)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'tree advance failed'):
+                game.searched(dict(action=game.game.legal_moves()[0]))
+        finally:
+            game.game.close()
+
     def test_evaluator_matches_model_including_far_cells(self):
         histories = [POSITIONS[10], [], line_history(31), line_history(6)]
         results = self.evaluator.evaluate(histories)
@@ -3643,6 +3676,53 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.export(20)
         return evaluator
 
+    def test_seal_anchor_discards_failed_pair_and_continues(self):
+        evaluator = self.start(anchor_games=2, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        calls = [0]
+        def seal(game, ms):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise RuntimeError('one bad Seal game')
+            return game.legal_moves()[:game.remaining]
+        evaluator.seal = seal
+        self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())
+        self.assertEqual(len(report['games']), 2)
+        self.assertEqual({game['pair'] for game in report['games']}, {1})
+        self.assertIsNone(evaluator.anchor())
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertTrue(any(event['kind'] == 'error' and 'one bad Seal game' in event['message'] for event in events))
+
+    def test_seal_anchor_pauses_after_repeated_game_errors(self):
+        evaluator = self.start(anchor_games=2, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        def seal(game, ms):
+            raise RuntimeError('Seal unavailable')
+        evaluator.seal = seal
+        self.assertTrue(evaluator.step())
+        self.assertIsNone(evaluator.anchor())
+        self.assertFalse(evaluator.step())
+        self.assertFalse(dense_eval.report_path(self.run, 'main/000010', 'seal').exists())
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertTrue(any(event['kind'] == 'error' and 'paused after 2 failed pairs' in event['message']
+                            for event in events))
+
+    def test_paused_seal_evidence_is_not_selected(self):
+        evaluator = self.start()
+        candidate, champion = 'main/000020', 'main/000010'
+        evaluator.met = lambda name: None
+        evaluator.close = lambda a, b: True
+        post = SimpleNamespace(index={candidate, champion, 'seal'}, anchor=champion,
+                               after=lambda comparison, pair, games=None: 0 if pair[1] == 'seal' else 1)
+        verdict = dict(posterior=post)
+        self.assertEqual(evaluator.evidence(verdict, candidate, champion, 2), (candidate, 'seal'))
+        for name in (candidate, champion):
+            evaluator.failed_seal.add((name, 'seal', 'evidence', evaluator.settings.opening_book))
+        self.assertIsNone(evaluator.evidence(verdict, candidate, champion, 2))
+
     def test_promotion_anchors_after_the_next_sprt_and_before_optional_work(self):
         import dashboard
         evaluator = self.anchored()
@@ -4226,6 +4306,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertNotEqual(opponent, 'seal')
         growable = [d for d in self.league()['ladder'] if dense_eval.rematch_pair(self.run, d['a'], d['b'], evaluator.settings)]
         self.assertEqual({entry['id'], opponent}, {max(growable, key=lambda d: d['interval'][1]-d['interval'][0])[k] for k in 'ab'})
+        evaluator.failed_seal.add((entry['id'], 'seal', kind, evaluator.settings.opening_book))
         self.assertTrue(evaluator.step())
         self.assertTrue(dense_eval.report_path(self.run, entry['id'], opponent).exists())
         targets = [f'{entry["id"]} vs {opponent}']

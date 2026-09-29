@@ -164,7 +164,7 @@ class MatchGame:
                  solvers=(None, None)):
         self.sides, self.max_plies, self.seal, self.seal_ms, self.record = sides, max_plies, seal, seal_ms, record
         self.solvers = solvers
-        self.reason = None
+        self.reason, self.error = None, None
         per = lambda value: tuple(value) if isinstance(value, (tuple, list)) else (value, value)
         self.budgets, self.sample_counts, tactics = per(sims), per(samples), per(tactics)
         self.game, self.moves = Game([tuple(m) for m in opening]), [list(m) for m in opening]
@@ -172,7 +172,12 @@ class MatchGame:
         for colour, side in enumerate(sides):
             if side != SEAL and id(side) not in self.trees:
                 self.trees[id(side)] = side.tree([tuple(m) for m in opening], seed*2+colour, tactics[colour])
-        self.seal_turns()
+        try:
+            self.seal_turns()
+        except Exception as error:
+            if SEAL not in sides:
+                raise
+            self.error = f'{type(error).__name__}: {error}'
 
     @property
     def budget(self):
@@ -195,7 +200,7 @@ class MatchGame:
         return self.solvers[self.game.player]
 
     def over(self):
-        return self.game.winner >= 0 or len(self.moves) >= self.max_plies
+        return self.error is not None or self.game.winner >= 0 or len(self.moves) >= self.max_plies
 
     def play(self, q, r):
         self.game.play(q, r)
@@ -206,9 +211,9 @@ class MatchGame:
     def seal_turns(self):
         while not self.over() and self.sides[self.game.player] == SEAL:
             side, turn = self.game.player, self.seal(self.game, self.seal_ms)
-            if not 1 <= len(turn) <= self.game.remaining:
+            if not 1 <= len(turn) <= 2:
                 raise ValueError(f'Seal returned {len(turn)} moves for {self.game.remaining} placements')
-            for q, r in turn:
+            for q, r in turn[:self.game.remaining]:
                 if not self.game.legal(q, r):
                     raise ValueError(f'Seal played an illegal placement {q}, {r}')
                 self.play(int(q), int(r))
@@ -219,7 +224,12 @@ class MatchGame:
 
     def searched(self, result):
         self.play(*map(int, result['action']))
-        self.seal_turns()
+        try:
+            self.seal_turns()
+        except Exception as error:
+            if SEAL not in self.sides:
+                raise
+            self.error = f'{type(error).__name__}: {error}'
         return not self.over()
 
     def finish(self):
@@ -228,7 +238,7 @@ class MatchGame:
         for tree in self.trees.values():
             tree.close()
         return dict(self.record, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
-                    plies=len(self.moves), moves=self.moves)
+                    plies=len(self.moves), moves=self.moves, **(dict(error=self.error) if self.error else {}))
 
 
 def play(games, leaf_batch, heartbeat=lambda finished: None):
@@ -247,6 +257,9 @@ def play(games, leaf_batch, heartbeat=lambda finished: None):
             heartbeat(list(records.values()))
     finally:
         engine.close()
+    for record in records.values():
+        if 'error' in record:
+            raise ValueError(f'Match game failed: {record["error"]}')
     return [records[id(g)] for g in games]
 
 
@@ -955,6 +968,7 @@ class Evaluator:
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         self.models, self.seal, self.written, self.fill_target, self.deciding, self.reviewed = {}, None, 0., None, None, False
         self.book, self.next, self.ids, self.shas = {}, {}, {}, {}
+        self.failed_seal = set()
         self.status = dict(stage='idle', updated_at=None, comparison=None, pool=[], started_at=None, games_played=0,
                            games_planned=0, tally=None, decision=None, pending=[], placements_played=0, mean_placements=None,
                            placements_per_second=None, settings=asdict(settings), eval_share=pacer.share, backlog=[],
@@ -1114,7 +1128,7 @@ class Evaluator:
         engine steps and for starting games (Seal plays its first turns then); no game starts while its credit
         is negative, and with nothing running the session then waits and asks want() again. Every completed
         pair is persisted at once."""
-        pool, waiting, added = Pool(self.config.actor.leaf_batch), {}, {}
+        pool, waiting, added, failed = Pool(self.config.actor.leaf_batch), {}, {}, {}
         placed = 0
         start, wall = self.pacer.clock(), time.time()
         lanes = want()
@@ -1125,7 +1139,7 @@ class Evaluator:
                 return  # the tally is computed only for a write
             main = next(iter(shown), None)
             a, b, kind = main or (None, None, None)
-            halves = [r for group in waiting.get(main, {}).values() for r in group]
+            halves = [r for group in waiting.get(main, {}).values() for r in group if 'error' not in r]
             played = len(self.games(a, b))+len(halves) if a else 0
             done = self.direct(a, b)+oriented(halves, a, a) if a else []
             live = placed+pool.moves()
@@ -1167,13 +1181,24 @@ class Evaluator:
             for lane, record in results:
                 moves = record['plies']-len(record['opening'])
                 placed += moves
-                count = added.setdefault(lane, [0, 0])
-                count[0] += 1; count[1] += moves
                 group = waiting.setdefault(lane, {}).setdefault(record['pair'], [])
                 group.append(record)
+                if 'error' in record:
+                    log_event(self.run, 'evaluator', 'error', f'{lane[0]} vs {lane[1]} pair {record["pair"]}: '
+                              f'game discarded after {record["error"]}', candidate=lane[0], opponent=lane[1])
                 if len(group) == 2:
                     del waiting[lane][record['pair']]
-                    self.persist(*lane, sorted(group, key=lambda r: r['challenger_color']))
+                    if any('error' in game for game in group):
+                        failed[lane] = failed.get(lane, 0)+1
+                        if lane[1] == SEAL and failed[lane] == 2:
+                            self.failed_seal.add((*lane, self.settings.opening_book))
+                            log_event(self.run, 'evaluator', 'error', f'{lane[0]} vs Seal ({lane[2]}): paused after '
+                                      f'{failed[lane]} failed pairs', candidate=lane[0], opponent=SEAL)
+                    else:
+                        self.persist(*lane, sorted(group, key=lambda r: r['challenger_color']))
+                        count = added.setdefault(lane, [0, 0])
+                        count[0] += 2
+                        count[1] += sum(game['plies']-len(game['opening']) for game in group)
                     paired = True
             if paired:
                 lanes = want()
@@ -1385,7 +1410,7 @@ class Evaluator:
         s, post, previous = self.settings, verdict['posterior'], self.met(champion)
         options = []
         for a, b in ((cid, previous), (champion, previous), (cid, SEAL), (champion, SEAL)):
-            if not b or b == a or not self.close(a, b):
+            if not b or b == a or (a, b, 'evidence', s.opening_book) in self.failed_seal or not self.close(a, b):
                 continue
             if b == SEAL:
                 path = report_path(self.run, a, SEAL)
@@ -1727,7 +1752,7 @@ class Evaluator:
         (`seal_reports`, every protocol) gained since reign_games, so an anchor owed when the protocol changes (a book
         refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor."""
         s, champion = self.settings, self.entry(self.league['champion'])
-        if not s.anchor_games or champion is None:
+        if not s.anchor_games or champion is None or (champion['id'], SEAL, 'anchor', s.opening_book) in self.failed_seal:
             return None
         entries = self.league['checkpoints']
         later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])
@@ -1772,7 +1797,8 @@ class Evaluator:
         if not s.idle_fill or champion is None:
             return None
         reports = self.seal_reports(champion['id'])
-        if s.anchor_target_halfwidth > 0 and self.close(champion['id'], SEAL):
+        if s.anchor_target_halfwidth > 0 and (champion['id'], SEAL, 'fill', s.opening_book) not in self.failed_seal \
+                and self.close(champion['id'], SEAL):
             low, high = rate([champion['id'], SEAL], champion['id'], reports, seed=self.config.seed)[1][SEAL] if reports \
                 else (-math.inf, math.inf)
             if (high-low)/2 > s.anchor_target_halfwidth:
@@ -1893,7 +1919,7 @@ class Evaluator:
             done = self.games(a, opponent)
             if kind == 'sprt' and done and (decision := self.test(done)['decision']):
                 decided.append(decision)  # an idle SPRT rematch keeps the first bound it crosses
-            if self.backlog() or len(done) >= target or decided:
+            if self.backlog() or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
         self.session(want, target)
