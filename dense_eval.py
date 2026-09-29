@@ -1805,7 +1805,8 @@ class Evaluator:
         against the champion is never left skipped: a skipped league entry with such games is removed again
         ('info' event), and an unrated checkpoint with such games is rated first (an evaluation cut short by a
         restart resumes there, or settles on its games when superseded). Otherwise a due refresh of the live opening
-        book runs (`refresh_openings`; never while such a candidate waits, as it would restart its games). Then, on
+        book runs (`refresh_openings`; never while such a candidate or a variant trial with games waits, as it would
+        restart its games). Then, on
         the first step, the promotion
         rule is re-applied to the existing reports (`review`). Then it rates the newest unrated checkpoint of the
         variant whose newest unrated checkpoint is oldest, skipping that variant's older unrated checkpoints (none
@@ -1829,7 +1830,9 @@ class Evaluator:
         self.status['backlog'] = [e[0] for e in unrated]
         self.queue(self.status['backlog'])
         resumed = [e for e in unrated if champion and self.games(e[0], champion)]
-        if not resumed:
+        # A refresh that changes the book would restart the games of a candidate or variant trial waiting to resume.
+        trials = [v for v in self.variants() if 'verdict' not in v and v['checkpoint'] and self.games(v['id'], v['checkpoint'])]
+        if not resumed and not trials:
             self.refresh_openings()
         if resumed:
             self.filling(None)
@@ -1838,7 +1841,8 @@ class Evaluator:
         if not self.reviewed:
             self.reviewed = True
             self.review()
-            self.refresh_openings()  # a champion crowned on review refreshes the book before any game
+            if not trials:
+                self.refresh_openings()  # a champion crowned on review refreshes the book before any game
         if unrated:
             self.filling(None)
             variant = lambda e: e[0].split('/')[0]

@@ -668,6 +668,34 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual(self.saved()['refreshed_by'], 'main/000020')
         self.assertEqual(restarted.settings.opening_book, dense_openings.Book(self.run, restarted.settings).digest())
 
+    def test_a_timed_refresh_waits_for_a_resumed_variant_trial(self):
+        settings = dict(decision='posterior', sprt_max_games=8, sprt_min_games=4, promote_confidence=.999999)
+        self.export(10)
+        evaluator = self.start(**settings)
+        evaluator.step()                                                    # the first champion, unopposed
+        variant = f'{CHAMPION}@x'
+        dense_eval.register(self.run, CHAMPION, 'x', dict(sims=1))
+
+        def crash(pool, steps):
+            if steps == 3:
+                raise Crash()
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=crash)), self.assertRaises(Crash):
+            evaluator.step()                                                # refresh by 10, then a partial trial
+        played = len(evaluator.games(variant, CHAMPION))
+        self.assertGreater(played, 0)
+        state = self.saved()
+        state['refreshed_at'] -= 7*3600                                     # past book_refresh_hours
+        (self.run/'openings.json').write_text(json.dumps(state))
+        restarted = self.start(**settings)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(restarted.step())                               # the trial resumes under the same book
+        self.assertEqual(self.saved()['refreshed_at'], state['refreshed_at'])
+        report = json.loads(dense_eval.report_path(self.run, variant, CHAMPION).read_text())
+        self.assertEqual(len(report['games']), 8)
+        self.assertEqual(list(dense_eval.report_path(self.run, variant, CHAMPION).parent.glob('report-*.json')), [])
+        restarted.step()
+        self.assertGreater(self.saved()['refreshed_at'], state['refreshed_at'])
+
     def test_a_timed_refresh_waits_for_a_resumed_candidate(self):
         self.export(10)
         evaluator = self.start(sprt_max_games=4)
