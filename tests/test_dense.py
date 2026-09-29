@@ -1178,6 +1178,46 @@ def write_games(path, games, identity=None):
 
 
 class DenseDataTests(unittest.TestCase):
+    def test_average_auxiliary_preserves_the_main_outcome_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            moves = winning_game()
+            roots = [.2]*len(moves)
+            write_games(run/'shards'/'000001', [(moves, 0, roots)])
+            window = dense_data.ReplayWindow(run, capacity_rows=1000)
+            refs = [window.ref('000001', i) for i in range(len(moves))]
+            settings = dense_config.LearnerSettings(short_value_target='average', short_value_horizon=2)
+            samples, targets = dense_data.examples(window, refs, np.random.default_rng(1),
+                                                  **dense_data.target_options(settings))
+            expected, weights = dense_data.short_value_targets(refs[0].episode, 2, False)
+            self.assertEqual([t['short_value'] for t in targets], expected)
+            self.assertEqual([t['short_weight'] for t in targets], weights)
+            self.assertEqual([t['value'] for t in targets], [float(dense_data.player_at(i) == 0) for i in range(len(moves))])
+            self.assertEqual(sum(len(b['value']) for b in dense_data.collate(samples, targets).values()), len(moves))
+
+    def test_short_search_average_tracks_placements_and_player_frame(self):
+        episode = dict(moves=[[i, 0] for i in range(4)], winner=0,
+                       root_values=[.2, -.4, .6, .8], full_search=[True]*4)
+        targets, weights = dense_data.short_value_targets(episode, 2, True)
+        self.assertEqual(weights, [1.]*4)
+        for t in range(4):
+            me = dense_data.player_at(t)
+            expected = sum(.5**(k-t+1)*(v if dense_data.player_at(k) == me else -v)
+                           for k, v in enumerate(episode['root_values']) if k >= t)
+            expected += .5**(4-t)*(1 if me == 0 else -1)
+            self.assertAlmostEqual(targets[t], (1+expected)/2)
+        episode.update(root_values=[.2, None, -.6, .8], full_search=[True, False, True, False])
+        targets, weights = dense_data.short_value_targets(episode, 2, True)
+        # The missing ply and the cheap root still occupy time in the exponential decay.
+        self.assertAlmostEqual(targets[0], (1+(.5*.2+.125*.6+.0625)/(.5+.125+.0625))/2)
+        self.assertEqual(targets[3], 1.)
+        episode.update(winner=-1, root_values=[.2, None, None, None])
+        targets, weights = dense_data.short_value_targets(episode, 2, True)
+        self.assertEqual(weights, [1., 0., 0., 0.])
+        self.assertEqual(targets, [.6, None, None, None])
+        episode['full_search'] = None
+        self.assertEqual(dense_data.short_value_targets(episode, 2, True), (targets, weights))
+
     def test_masked_future_rendering(self):
         moves, _ = random_game(np.random.default_rng(41), 32)
         self.assertEqual(len(moves), 32)
@@ -3020,6 +3060,63 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_cheap_search_can_descend_with_fewer_root_samples(self):
+        slot = SimpleNamespace(settings=dense_config.ActorSettings(full_fraction=0.), rng=np.random.default_rng(1))
+        dense_selfplay.SelfPlayGame.plan(slot)
+        self.assertEqual((slot.budget, slot.samples), (12, 4))
+        slot.settings = replace(slot.settings, full_fraction=1.)
+        dense_selfplay.SelfPlayGame.plan(slot)
+        self.assertEqual((slot.budget, slot.samples), (64, 16))
+
+    def test_leaf_proof_skips_inference_and_records_exact_value(self):
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        settings = dense_config.ActorSettings(full_fraction=0., tactics=False, max_plies=len(history)+2)
+        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+        try:
+            try:
+                engine = dense_selfplay.Engine(8, leaf_nodes=32)
+            except FileNotFoundError:
+                self.skipTest('Prebuilt tactical library required')
+            self.addCleanup(engine.close)
+            # Cached guesses must not hide a verified win at the requested leaf.
+            actions = np.asarray(slot.game.legal_moves(), np.int64)
+            model.cache.put(dense_selfplay.position_key(np.asarray(history)),
+                            (actions, np.zeros(len(actions)), np.zeros(len(actions))))
+            engine.add(slot)
+            while engine.slots:
+                engine.step()
+            self.assertGreater(engine.leaf_proofs, 0)
+            self.assertEqual(engine.evals, 0)
+            self.assertEqual(slot.rows[0]['proven'], 1)
+            self.assertEqual(slot.values[-1], 1.)
+            self.assertEqual(slot.game.winner, 0)
+        finally:
+            for tree in slot.trees.values():
+                tree.close()
+            slot.game.close()
+
+    def test_unknown_leaf_proof_uses_normal_inference(self):
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        settings = dense_config.ActorSettings(full_fraction=0., max_plies=1)
+        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1)
+        try:
+            try:
+                engine = dense_selfplay.Engine(8, leaf_nodes=32)
+            except FileNotFoundError:
+                self.skipTest('Prebuilt tactical library required')
+            self.addCleanup(engine.close)
+            engine.add(slot)
+            while engine.slots:
+                engine.step()
+            self.assertGreater(engine.evals, 0)
+            self.assertEqual(engine.leaf_proofs, 0)
+            self.assertFalse(slot.rows[0].get('proven'))
+        finally:
+            for tree in slot.trees.values():
+                tree.close()
+            slot.game.close()
+
     def setUp(self):
         self.threads = torch.get_num_threads()
         torch.set_num_threads(2)

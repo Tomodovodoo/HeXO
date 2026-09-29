@@ -241,6 +241,32 @@ def episode_value_targets(e, lam, full_only, outcome_lam=1., calibration=None):
                          lam, e['full_search'] if full_only else None, outcome_lam, calibration)
 
 
+def short_value_targets(e, horizon, full_only):
+    """Exponential future-search averages in each ply's mover frame, including its own root value.
+
+    With lambda = 1 - 1/horizon, a known root k placements ahead has mass (1-lambda)*lambda**k;
+    the terminal outcome has mass lambda**(T-t). Missing roots, including cheap roots with full_only,
+    contribute no mass. Normalize the known mass, so gaps decay by placement distance. Capped games
+    use only known roots and a row without any future mass is unweighted. This is an auxiliary target;
+    the main outcome target and exact labels are unchanged.
+    """
+    lam = 1 - 1/horizon
+    full = e['full_search'] if full_only else None
+    numerator = 0. if e['winner'] < 0 else 1. if e['winner'] == 0 else -1.
+    mass = float(e['winner'] >= 0)
+    targets, weights = [None]*len(e['moves']), [0.]*len(e['moves'])
+    for t in range(len(targets)-1, -1, -1):
+        numerator *= lam; mass *= lam
+        value = None if e['root_values'] is None else e['root_values'][t]
+        if value is not None and (full is None or full[t]):
+            numerator += (1-lam)*(value if player_at(t) == 0 else -value)
+            mass += 1-lam
+        if mass > 0:
+            targets[t] = (1 + (numerator if player_at(t) == 0 else -numerator)/mass)/2
+            weights[t] = 1.
+    return targets, weights
+
+
 def write_shard(path, identity, episodes, rows, origin='actor'):
     """Atomically publish a shard of `origin` (one of ORIGINS). `identity` must carry `actor_sha256`; each row
     carries `policy` (float array over the legal moves, or None/empty for no policy target) besides the stored
@@ -986,11 +1012,13 @@ def target_options(settings, calibration=None):
                 outcome_lam=settings.outcome_lambda if settings.value_target == 'td' else 1.,
                 calibration=calibration if settings.value_target == 'calibrated' else None,
                 proven_weight=settings.proven_value_weight, proof_policy_weight=settings.proof_policy_weight,
-                deblunder_weight=settings.deblunder_weight, future_target=settings.future_target)
+                deblunder_weight=settings.deblunder_weight, future_target=settings.future_target,
+                short_value_target=settings.short_value_target)
 
 
 def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False,
-             outcome_lam=1., calibration=None, proven_weight=2., deblunder_weight=0., proof_policy_weight=0., future_target='legacy'):
+             outcome_lam=1., calibration=None, proven_weight=2., deblunder_weight=0., proof_policy_weight=0., future_target='legacy',
+             short_value_target='future'):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
     Positions are encoded from the move prefix without replaying it (hexcrop.Position); the side to move and the
@@ -1014,6 +1042,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
       short_value, short_weight: p(win) of the side to move from the root value `horizon` plies later
         (negated when that ply's mover is the opponent); the outcome when a finished game ends within the
         horizon; weight 0 when that root value is null or a capped game ends first;
+        with short_value_target='average', short_value_targets(..., horizon, full_only) instead;
       future uint8 [2, S, S]: crop-plane cells occupied after the next 6 / 20 placements (stones already on
         the board included; truncated at the game end). With future_target='masked', uint8 [S,S] classes
         0 empty, 1 own, 2 opponent after 20 placements, relative to this row's mover. Only future placements
@@ -1024,7 +1053,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         crop plane, mass dropped, the rest renormalised); weight 0 when ply+1 has no row with a policy or no
         mass lands in the crop. The network's opponent_policy head is trained on it.
     """
-    samples, out = [], []
+    samples, out, short_cache = [], [], {}
     for ref in refs:
         e, t = ref.episode, ref.row['ply']
         moves = np.asarray(e['moves'], np.int64).reshape(-1, 2); T = len(moves); me = player_at(t)
@@ -1048,7 +1077,13 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
             else:
                 policy, policy_weight = proof_policy, proof_policy_weight
         u = t+horizon; roots = e['root_values']
-        if u >= T:
+        if short_value_target == 'average':
+            key = (ref.shard, ref.row['game'])
+            if key not in short_cache:
+                short_cache[key] = short_value_targets(e, horizon, full_only)
+            short_targets, short_weights = short_cache[key]
+            short = (.5 if short_targets[t] is None else short_targets[t], short_weights[t])
+        elif u >= T:
             short = (float(me == e['winner']), 1.) if e['winner'] >= 0 else (.5, 0.)
         elif roots is not None and roots[u] is not None:
             v = roots[u] if player_at(u) == me else -roots[u]
