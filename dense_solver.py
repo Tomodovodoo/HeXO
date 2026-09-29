@@ -39,8 +39,8 @@ measured slack and verdicts are polled:
              deep_nodes, and are capped at deep_cap_nodes.
   gate       with gate_weight > 0 the worker scores the attacker's forcing material (tactical_proof gate): below
              forcing_material.LOW the query gets min_nodes (deep queries: deep_nodes), else its allowance times
-             (1 + gate_weight * g), capped by cap_nodes rising linearly to gate_cap_nodes at g = 1 (fixed mode:
-             floor and lower cap are the point budget, upper cap is gate_cap_nodes).
+             (1 + gate_weight * g), capped by cap_nodes rising linearly to gate_cap_nodes at g = 1 (fixed evaluator
+             gate: floor and lower cap are the point budget, upper cap is gate_cap_nodes).
   consume    a root or finalist verdict not ready when needed may be waited for up to the step's overrun allowance,
              overrun_fraction of the measured step time; past it the slot is deferred to its next visit while the
              other games build the batch. After DEFER_VISITS deferrals the search goes on without it (finalist hold
@@ -123,7 +123,7 @@ class Schedule:
     cap_nodes: int = 512
     gate_cap_nodes: int = 8192
     gate_weight: float = 0.
-    gate_threat: bool = False
+    fixed_gate_cap: bool = False
     deep_nodes: int = 0
     deep_cap_nodes: int = 65536
     follow: bool = False
@@ -147,7 +147,7 @@ class Schedule:
                     settings.solver_root_nodes, settings.solver_finalist_nodes, settings.solver_threat_nodes):
                 raise ValueError('solver_gate_cap_nodes must cover every enabled evaluation query budget')
             values['gate_weight'] = 3. if settings.solver_gate_cap_nodes else 0.
-            values['gate_threat'] = bool(settings.solver_gate_cap_nodes)
+            values['fixed_gate_cap'] = bool(settings.solver_gate_cap_nodes)
             values['gate_cap_nodes'] = settings.solver_gate_cap_nodes or cls.gate_cap_nodes
             values['cap_nodes'] = min(values['cap_nodes'], values['gate_cap_nodes'])
             values['min_nodes'] = min(values['min_nodes'], values['cap_nodes'])
@@ -329,8 +329,10 @@ class Solver:
         contract)."""
         sc = self.schedule
         if sc.fixed_budgets or point in ('threat', 'defence'):
-            gate = None if not sc.gate_weight or point == 'defence' or (point == 'threat' and not sc.gate_threat) else \
-                dict(weight=sc.gate_weight, floor=nodes, cap_low=nodes, cap_high=max(nodes, sc.gate_cap_nodes))
+            cap = max(nodes, sc.gate_cap_nodes) if sc.fixed_gate_cap else MAX_NODES
+            gate = None if not sc.gate_weight or point == 'defence' or (point == 'threat' and not sc.fixed_gate_cap) else \
+                dict(weight=sc.gate_weight, floor=nodes, cap_low=nodes if sc.fixed_gate_cap else MAX_NODES,
+                     cap_high=cap)
             return nodes, gate, self.pool
         deep = point == 'deep'
         pool = self.background if deep else self.pool

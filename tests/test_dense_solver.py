@@ -619,7 +619,10 @@ class Scheduler(unittest.TestCase):
         fixed = dense_solver.Solver(Schedule(gate_weight=3.), asynchronous=False)
         fixed.leads['root'].extend([5000.]*8)
         self.assertEqual(fixed.allocate('root', NODES)[:2],
-                         (NODES, dict(weight=3., floor=NODES, cap_low=NODES, cap_high=8192)))
+                         (NODES, dict(weight=3., floor=NODES, cap_low=dense_solver.MAX_NODES,
+                                      cap_high=dense_solver.MAX_NODES)))
+        self.assertEqual(gated_nodes(FIXTURE['positions'][PROOF], 'mover', 27000,
+                                     fixed.allocate('root', 27000)[1])[0], 108000)
         self.assertIsNone(fixed.allocate('threat', NODES)[1])
         self.assertIsNone(fixed.allocate('defence', NODES)[1])
 
