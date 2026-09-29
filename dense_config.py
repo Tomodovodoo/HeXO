@@ -290,6 +290,7 @@ class EvaluationSettings:
     solver_threat_nodes: int = 0
     solver_defence: bool = False
     solver_defence_candidates: int = 8
+    solver_workers: int = 1      # foreground tactical processes; fixed budgets remain unchanged
 
 
 @dataclass(frozen=True)

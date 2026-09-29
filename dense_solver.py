@@ -138,8 +138,7 @@ class Schedule:
 
     @classmethod
     def of(cls, settings):
-        """The schedule of an ActorSettings (its solver_* fields); settings without them (EvaluationSettings) get
-        the defaults."""
+        """The schedule of settings' solver_* fields; absent fields use the defaults."""
         return cls(**{f.name: getattr(settings, 'solver_'+f.name, f.default) for f in fields(cls)})
 
 
