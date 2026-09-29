@@ -28,8 +28,8 @@ Run layout: dense_config. Subcommands
   match      ad hoc paired match between two checkpoints (run ids or paths) or a checkpoint and Seal; per-side
              solver budgets (--a-solver-*, --b-solver-*, default the evaluation settings') allow one checkpoint
              against itself with different solver settings, e.g. champion+solver vs champion.
-  variant    register a variant (`register`): a rated checkpoint with overridden search settings, decided by the
-             loop against that checkpoint.
+  variant    register a variant (`register`): a rated checkpoint, or the champion (--checkpoint champion), with
+             overridden search settings, decided by the loop against that checkpoint.
 
 Scoring: a capped game (at the ply limit, or reason 'span' when a searched position does not fit the largest crop) is
 half a point for each side. Pair score = candidate points / 2 over its two games; decisions use completed pairs.
@@ -61,7 +61,9 @@ value of information, and the decision is the posterior rule without the leader 
 - r_base + deviation > sprt_elo0) >= promote_confidence, 'worse' when it is at most 1 - promote_confidence (after
 sprt_min_games direct games with agreeing direct and pooled intervals, as for checkpoints), 'max-games' at
 sprt_max_games. Variants are rated jointly with the checkpoints but never become champion, never lead a posterior
-verdict, and never enter panels, the ladder, differences, the actor pointer or its veto.
+verdict, and never enter panels, the ladder, differences, the actor pointer or its veto. Until its comparison starts a
+variant can follow the champion (`Evaluator.bind`): one registered against the symbolic base 'champion' always, one
+registered against the then champion with rebase_on_promotion; its first trial fixes the binding (bound_at).
 
 Panels: a checkpoint rated while a champion exists (with extra_opponents > 0) gets entry `panel` {incumbent}, the
 champion it met. Its members are re-derived from the current ladder whenever the panel is scheduled or judged:
@@ -79,7 +81,7 @@ checkpoint until the next export.
 league.json: {champion, reign_from, reign_games, checkpoints: [{id, variant, step, ema_sha256, elo, elo_interval, matches, skipped?,
 superseded?, panel?, demoted?, verdict? (the posterior verdict that rated or promoted it on review, with its
 `Evaluator.snapshot`: opponent, protocol, matchup_prior and reports)}], variants: [{id, checkpoint, name, settings,
-registered_at, elo, elo_interval, matches, verdict? (its final verdict)}], differences, ladder, ladder_top, anchors,
+base, registered_as, on_champion, registered_at, bound_at?, elo, elo_interval, matches, verdict? (its final verdict)}], differences, ladder, ladder_top, anchors,
 matrix, calibration, rating_note, updated_at}. calibration (`calibration`) compares the delta sd the posterior
 stated at each verdict with how far delta moved once later games of that checkpoint came in. The evaluator is
 league.json's only writer: `register` leaves a request in variant-requests/, which the evaluator adopts into
@@ -124,6 +126,7 @@ STATUS_SECONDS = 2.
 PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'seal_ms', 'solver_root_nodes',
             'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes')
 PROTOCOL_DEFAULTS = dict(solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0, solver_threat_nodes=0)
+CHAMPION = 'champion'  # the symbolic base of a variant, bound to the champion when its comparison starts
 # The PROTOCOL fields of one side's search, which a variant may override; max_plies, opening_suite and seal_ms
 # belong to the game.
 SIDE = ('sims', 'root_samples', 'tactics', 'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes',
@@ -306,7 +309,7 @@ def adopt(league, run):
     """Append to league['variants'] the registrations waiting in <run>/variant-requests (`requests`) whose id it
     lacks, in registration order; the entries already in `league` stay as they are. Returns how many were added.
     `write_league` removes the request files once league.json holds them."""
-    known = {v['id'] for v in league.setdefault('variants', [])}
+    known = {v.get('registered_as', v['id']) for v in league.setdefault('variants', [])}
     new = [json.loads(path.read_text()) for cid, path in requests(run).items() if cid not in known]
     league['variants'] += sorted(new, key=lambda v: v['registered_at'])
     return len(new)
@@ -314,31 +317,44 @@ def adopt(league, run):
 
 def register(run, checkpoint, name, settings):
     """Register variant `<checkpoint>@<name>` of a rated league checkpoint with overrides `settings`
-    (`parse_settings`) and log a 'variant' event; returns its entry. The registration is written as
+    (`parse_settings`) and log a 'variant' event; returns its entry. `checkpoint` CHAMPION registers against the
+    symbolic champion: id `champion@<name>` with checkpoint None until the evaluator binds it (`Evaluator.bind`).
+    The entry records base (`checkpoint` as given), registered_as (its id at registration) and on_champion
+    (whether `checkpoint` was the champion then). The registration is written as
     <run>/variant-requests/<id>.json, never to league.json: the evaluator, league.json's only writer, adopts it
-    (`adopt`) on its next step. The name is letters, digits, '.', '_' or '-'. An id is immutable: registering it
-    again (in the league or waiting) with the same settings returns the existing entry, with other settings raises
-    ValueError."""
+    (`adopt`) on its next step. The name is letters, digits, '.', '_' or '-'. Registering an id again (in the
+    league, by its current id or registered_as, or waiting) with the same settings returns the existing entry, with
+    other settings raises ValueError; a new champion variant whose `<champion>@<name>` is already registered raises
+    ValueError too."""
     run = Path(run)
     if not name or not all(ch.isalnum() or ch in '._-' for ch in name):
         raise ValueError(f'{name!r}: a variant name is letters, digits, ".", "_" or "-"')
     path = run/'league.json'
     league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
-    base = next((c for c in league['checkpoints'] if c['id'] == checkpoint), None)
-    if base is None or base.get('skipped') or base.get('elo') is None:
-        raise ValueError(f'{checkpoint} is not a rated league checkpoint')
+    if checkpoint == CHAMPION:
+        if league.get('champion') is None:
+            raise ValueError('The league has no champion yet')
+    else:
+        base = next((c for c in league['checkpoints'] if c['id'] == checkpoint), None)
+        if base is None or base.get('skipped') or base.get('elo') is None:
+            raise ValueError(f'{checkpoint} is not a rated league checkpoint')
     config = dense_config.load(run)
     Budgets.of(side_settings(config.evaluation, settings))
     cid = f'{checkpoint}@{name}'
     waiting = requests(run)
-    existing = next((v for v in league.get('variants', []) if v['id'] == cid), None) \
+    existing = next((v for v in league.get('variants', []) if cid in (v['id'], v.get('registered_as'))), None) \
         or (json.loads(waiting[cid].read_text()) if cid in waiting else None)
     if existing is not None:
         if existing['settings'] != settings:
             raise ValueError(f'{cid} is registered with settings {existing["settings"]}; register another name')
         return existing
-    entry = dict(id=cid, checkpoint=checkpoint, name=name, settings=settings, registered_at=time.time(), elo=None,
-                 elo_interval=None, matches=[])
+    taken = f'{league.get("champion")}@{name}'
+    if checkpoint == CHAMPION and (any(taken in (v['id'], v.get('registered_as')) for v in league.get('variants', []))
+                                   or taken in waiting):
+        raise ValueError(f'{taken} is already registered; register the champion variant under another name')
+    entry = dict(id=cid, checkpoint=None if checkpoint == CHAMPION else checkpoint, name=name, settings=settings,
+                 base=checkpoint, registered_as=cid, on_champion=checkpoint in (CHAMPION, league.get('champion')),
+                 registered_at=time.time(), elo=None, elo_interval=None, matches=[])
     target = run/'variant-requests'/f'{cid.replace("/", "-")}.json'
     target.parent.mkdir(exist_ok=True)
     write_json(target, entry)
@@ -724,7 +740,7 @@ def write_league(run, league, config, top=None):
     league['rating_note'] = RATING_NOTE
     league['updated_at'] = time.time()
     write_json(run/'league.json', league)
-    adopted = {v['id'] for v in league['variants']}
+    adopted = {v.get('registered_as', v['id']) for v in league['variants']}
     for cid, path in requests(run).items():
         if cid in adopted:
             path.unlink()
@@ -1399,9 +1415,41 @@ class Evaluator:
         only for a pairing with direct games."""
         champion = self.league['champion']
         pairs = [(cid, champion, 'champion') for cid in unrated] + \
-            [(v['id'], v['checkpoint'], 'variant') for v in self.variants() if 'verdict' not in v]
+            [(v['id'], v['checkpoint'], 'variant') for v in self.variants() if 'verdict' not in v and v['checkpoint']]
         self.status['pending'] = [brief(cid, opponent, kind, self.verdict(cid, opponent) if opponent and self.direct(cid, opponent) else None)
                                   for cid, opponent, kind in pairs]
+
+    def bind(self):
+        """Record bound_at for a variant whose direct report exists (its comparison has started), then point every
+        variant whose comparison has not started (no bound_at) at the current champion when it follows the champion: base CHAMPION always, and with rebase_on_promotion a variant registered against the
+        then champion (on_champion) whose checkpoint is no longer champion. Its id becomes `<champion>@<name>`
+        with a 'variant' event. When another entry holds that id, an entry of base CHAMPION is dropped, with its
+        request file if still waiting, and an 'error' event (it may compare against the champion only), and a
+        rebased one keeps its checkpoint. Returns
+        whether any entry changed."""
+        champion, changed = self.league['champion'], False
+        for entry in list(self.variants()):
+            if 'bound_at' not in entry and entry['checkpoint'] and report_path(self.run, entry['id'], entry['checkpoint']).exists():
+                entry['bound_at'], changed = time.time(), True
+            follows =entry.get('base') == CHAMPION or (self.settings.rebase_on_promotion and entry.get('on_champion'))
+            if 'bound_at' in entry or not follows or champion is None or entry['checkpoint'] == champion:
+                continue
+            if self.entry(f'{champion}@{entry["name"]}'):
+                if entry.get('base') == CHAMPION:
+                    self.variants().remove(entry)
+                    request = requests(self.run).get(entry.get('registered_as', entry['id']))
+                    if request:
+                        request.unlink()
+                    log_event(self.run, 'evaluator', 'error', f'{entry["id"]} dropped: {champion}@{entry["name"]} is already '
+                              'registered; register it under another name', candidate=entry['id'])
+                    changed = True
+                continue
+            before = entry['id']
+            entry.update(id=f'{champion}@{entry["name"]}', checkpoint=champion)
+            log_event(self.run, 'evaluator', 'variant', f'{before} now plays as {entry["id"]}: {champion} is champion',
+                      candidate=entry['id'], previous=before, checkpoint=champion)
+            changed = True
+        return changed
 
     def trial(self, entry):
         """Decide the pending variant `entry` against its checkpoint (module contract): a session like `decide`'s
@@ -1412,7 +1460,16 @@ class Evaluator:
         verdict (`public`, decision 'better', 'worse' or 'max-games', with candidate and opponent) is stored as
         the entry's verdict and the direct report's metrics.posterior, published as status decision and logged
         as a 'decision' event with P(better), delta, delta_sd and its 95% interval. Every report played is
-        recorded in the league (`record`)."""
+        recorded in the league (`record`). The first trial of an entry binds it to the champion of that moment
+        (`bind`, after any promotion earlier in the step; status `pending` is rebuilt when that moves an entry, and
+        an entry `bind` drops ends the trial). Its first persisted game fixes the binding: bound_at (epoch
+        seconds) is recorded (`bind` also records it for an entry whose direct report exists) and `bind` leaves it
+        alone from then on."""
+        if 'bound_at' not in entry and self.bind():
+            self.queue(self.status['backlog'])
+            write_league(self.run, self.league, self.config, self.settings.fill_top)
+            if entry not in self.variants():
+                return
         s, cid, base = self.settings, entry['id'], entry['checkpoint']
 
         def want():
@@ -1425,6 +1482,9 @@ class Evaluator:
             return lanes
         while True:
             added = self.session(want, s.sprt_max_games)
+            if 'bound_at' not in entry and report_path(self.run, cid, base).exists():
+                entry['bound_at'] = time.time()
+                write_league(self.run, self.league, self.config, self.settings.fill_top)
             for (a, b, _), games in added.items():
                 if games:
                     self.record(a, b, json.loads(report_path(self.run, a, b).read_text()))
@@ -1680,7 +1740,7 @@ class Evaluator:
                       f'against {champion}; it is rated on them', candidate=c['id'])
         if revived:
             write_league(self.run, self.league, self.config, self.settings.fill_top)
-        if adopt(self.league, self.run):
+        if adopt(self.league, self.run) + self.bind():
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         known = {c['id'] for c in self.league['checkpoints']}
         unrated = [e for e in checkpoints(self.run) if e[0] not in known]
@@ -1709,7 +1769,7 @@ class Evaluator:
             self.rate(head)
             return True
         for entry in self.variants():
-            if 'verdict' not in entry:
+            if 'verdict' not in entry and entry['checkpoint']:
                 self.filling(None)
                 self.trial(entry)
                 return True
