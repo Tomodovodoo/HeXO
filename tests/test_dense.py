@@ -4807,6 +4807,19 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual([e['message'] for e in events if e['kind'] == 'info'],
                          ['promotion rule: posterior (default; config.json predates the setting)'])
 
+    def test_evaluator_kernel_flag_only_changes_process_config(self):
+        self.start()
+        saved = (self.run/'config.json').read_bytes()
+        for flag, expected in (([], 'reference'), (['--net-kernels', 'fused'], 'fused')):
+            argv = ['dense_eval.py', 'loop', '--run', str(self.run), '--once', *flag]
+            with unittest.mock.patch.object(sys, 'argv', argv), unittest.mock.patch.object(dense_eval, 'Evaluator') as evaluator:
+                evaluator.return_value.step.return_value = False
+                dense_eval.main()
+                effective = evaluator.call_args.args[1]
+            self.assertEqual(effective.actor.net_kernels, expected)
+            self.assertFalse(effective.actor.cuda_graphs)
+            self.assertEqual((self.run/'config.json').read_bytes(), saved)
+
     def test_posterior_direct_games_stop_at_sprt_max_games(self):
         evaluator = self.start(decision='posterior', sprt_max_games=10, pool_games=8)
         self.export(10)
