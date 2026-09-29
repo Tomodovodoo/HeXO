@@ -11,19 +11,22 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
 import numpy as np
 import torch
 
+import dashboard
 import dense_config
+import dense_eval
 import dense_openings
 import dense_selfplay
 import hexcrop
 import hexnet
 import train
-from tests.test_dense import TINY
+from tests.test_dense import TINY, scripted
 
 CHAMPION = 'main/000010'
 
@@ -549,6 +552,329 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual([r['id'] for r in dense_openings.stamp(run)], [r['id'] for r in first])
             book = dense_openings.Book(run, settings())
             self.assertEqual(book.reconcile(first), 2)
+
+class Crash(Exception):
+    """Stops a scripted pool mid-session, as a killed process would."""
+
+
+class EvaluatorBookTests(unittest.TestCase):
+    """dense_eval.Evaluator with opening books on a CPU run of TINY checkpoints and scripted games."""
+
+    def setUp(self):
+        threads = torch.get_num_threads()
+        torch.set_num_threads(2)
+        self.addCleanup(torch.set_num_threads, threads)
+        torch.manual_seed(11)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.run = Path(tmp.name)
+
+    def start(self, **evaluation):
+        values = dict(games=2, pool_games=2, sims=2, root_samples=2, max_plies=12, anchor_games=0, sprt_max_games=8,
+                      sprt_elo1=400., extra_opponents=0, decision='sprt', sprt_min_games=2, idle_rematch=False,
+                      idle_fill=False, opening_suite='book', book_size=4, book_sims=0, book_min_prob=0.)
+        config = dense_config.RunConfig(
+            device='cpu', model=dense_config.ModelSettings(**{k: getattr(TINY, k) for k in (
+                'blocks', 'channels', 'pool_every', 'line_length', 'value_hidden', 'head_channels')}),
+            actor=dense_config.ActorSettings(leaf_batch=64, cache_positions=256),
+            evaluation=dense_config.EvaluationSettings(**{**values, **evaluation}))
+        if not (self.run/'config.json').exists():
+            dense_config.save(self.run, config)
+        return dense_eval.Evaluator(self.run, config, config.evaluation, dense_eval.Pacer(1.))
+
+    def export(self, *steps):
+        for step in steps:
+            path = self.run/'checkpoints'/'main'/f'{step:06d}'
+            path.mkdir(parents=True)
+            hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
+            (path/'manifest.json').write_text(json.dumps(dict(variant='main', step=step, created_at=float(step))))
+
+    def saved(self, name='openings.json'):
+        return json.loads((self.run/name).read_text())
+
+    def test_games_draw_openings_and_write_their_results_to_every_node_passed(self):
+        book = dense_openings.Book(self.run, settings())
+        drawn = [opening(book, [(0, 0), (1, 0), (-1, 0)]), opening(book, [(0, 0), (1, 0), (1, -1), (2, 0)])]
+        book.retire(opening(book, [(0, 0), (3, 0), (2, 1)]), 'skew', 0.)
+        book.data.update(refreshed_by=CHAMPION, refreshed_at=time.time(), imported=True)
+        book.save()
+        self.export(10)
+        evaluator = self.start()
+        digest = evaluator.settings.opening_book
+        self.assertEqual(digest, book.digest())
+        self.assertTrue(evaluator.step())                                   # the first champion, unopposed
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 0)):   # P1 always wins
+            self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', CHAMPION).read_text())
+        self.assertEqual(report['settings']['opening_book'], digest)       # not due: same champion, fresh refresh
+        games = report['games']
+        self.assertGreaterEqual(len(games), 2)
+        self.assertLessEqual({dense_openings.canonical(g['opening'])[0] for g in games}, {n['key'] for n in drawn})
+        nodes = {n['key']: n for n in self.saved()['nodes']}
+        self.assertEqual(sum(nodes[n['key']]['games'] for n in drawn), len(games))
+        self.assertEqual(nodes[dense_openings.canonical([(0, 0)])[0]]['p1_wins'], len(games))
+        self.assertEqual(nodes[dense_openings.canonical([(0, 0), (1, 0)])[0]]['pairs'][4], len(games)//2)
+        self.assertEqual(nodes[dense_openings.canonical([(0, 0), (3, 0), (2, 1)])[0]]['games'], 0)
+        league = json.loads((self.run/'league.json').read_text())['openings']
+        self.assertEqual((league['games'], league['p1_wins'], league['p2_wins']), (len(games), len(games), 0))
+        self.assertEqual((league['books']['book']['openings'], league['books']['book']['retired']['skew']), (2, 1))
+        seat = league['players']['main/000020']
+        self.assertEqual((seat['p1_games']+seat['p2_games'], seat['p1_wins']), (len(games), seat['p1_games']))
+        other = self.start(book_weighting='least_played')                 # another draw rule than config.json's
+        self.assertNotEqual(other.settings.opening_book, digest)
+        dense_eval.write_league(self.run, other.league, other.config)
+        published = json.loads((self.run/'league.json').read_text())['openings']['books']['book']['digest']
+        self.assertEqual(published, other.settings.opening_book)
+    def test_a_promotion_refreshes_the_book_before_the_next_candidate(self):
+        self.export(10)
+        evaluator = self.start(sprt_max_games=40)
+        self.assertEqual(evaluator.settings.opening_book, dense_openings.Book(self.run, settings()).digest())
+        self.assertTrue(evaluator.step())                                   # the first champion, unopposed
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):   # the candidate wins every game
+            self.assertTrue(evaluator.step())                               # refresh by 10, then rate 20
+        first = self.saved()
+        self.assertEqual((first['refreshed_by'], sum(n['status'] == 'opening' for n in first['nodes'])), (CHAMPION, 4))
+        report = dense_eval.report_path(self.run, 'main/000020', CHAMPION)
+        state = json.loads(report.read_text())['settings']['opening_book']
+        self.assertEqual(state, dense_openings.Book(self.run, settings()).digest())
+        self.assertEqual(json.loads((self.run/'league.json').read_text())['champion'], 'main/000020')
+        self.export(30)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())                               # refresh by 20, then rate 30
+        second = dense_openings.Book(self.run, settings())
+        self.assertEqual(second.data['refreshed_by'], 'main/000020')
+        self.assertEqual(sum(n['challenges'] is not None for n in second.openings()), 1)   # a quarter of four challenged
+        later = json.loads(dense_eval.report_path(self.run, 'main/000030', 'main/000020').read_text())
+        self.assertEqual(later['settings']['opening_book'], second.digest())
+        self.assertNotEqual(second.digest(), state)
+        self.assertEqual(evaluator.games('main/000020', CHAMPION), [])      # played under the earlier state
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([e['checkpoint'] for e in events if e['kind'] == 'book'], [CHAMPION, 'main/000020'])
+
+    def test_a_champion_crowned_on_review_refreshes_the_book_before_any_game(self):
+        self.export(10)
+        evaluator = self.start()
+        evaluator.step()                                                    # the first champion, unopposed
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            evaluator.step()                                                # refresh by 10, 20 rated, not promoted
+        self.assertEqual((self.saved()['refreshed_by'], json.loads((self.run/'league.json').read_text())['champion']),
+                         (CHAMPION, CHAMPION))
+        restarted = self.start()
+        with unittest.mock.patch.object(restarted, 'review', lambda: restarted.promote('main/000020', CHAMPION)):
+            self.assertFalse(restarted.step())                              # nothing else to play
+        self.assertEqual(self.saved()['refreshed_by'], 'main/000020')
+        self.assertEqual(restarted.settings.opening_book, dense_openings.Book(self.run, restarted.settings).digest())
+
+    def test_a_timed_refresh_waits_for_a_resumed_variant_trial(self):
+        settings = dict(decision='posterior', sprt_max_games=8, sprt_min_games=4, promote_confidence=.999999)
+        self.export(10)
+        evaluator = self.start(**settings)
+        evaluator.step()                                                    # the first champion, unopposed
+        variant = f'{CHAMPION}@x'
+        dense_eval.register(self.run, CHAMPION, 'x', dict(sims=1))
+
+        def crash(pool, steps):
+            if steps == 3:
+                raise Crash()
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=crash)), self.assertRaises(Crash):
+            evaluator.step()                                                # refresh by 10, then a partial trial
+        played = len(evaluator.games(variant, CHAMPION))
+        self.assertGreater(played, 0)
+        state = self.saved()
+        state['refreshed_at'] -= 7*3600                                     # past book_refresh_hours
+        (self.run/'openings.json').write_text(json.dumps(state))
+        restarted = self.start(**settings)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(restarted.step())                               # the trial resumes under the same book
+        self.assertEqual(self.saved()['refreshed_at'], state['refreshed_at'])
+        report = json.loads(dense_eval.report_path(self.run, variant, CHAMPION).read_text())
+        self.assertEqual(len(report['games']), 8)
+        self.assertEqual(list(dense_eval.report_path(self.run, variant, CHAMPION).parent.glob('report-*.json')), [])
+        restarted.step()
+        self.assertGreater(self.saved()['refreshed_at'], state['refreshed_at'])
+
+    def test_a_timed_refresh_waits_for_a_resumed_candidate(self):
+        self.export(10)
+        evaluator = self.start(sprt_max_games=4)
+        evaluator.step()
+        self.export(20)
+
+        def crash(pool, steps):
+            if steps == 3:
+                raise Crash()
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=crash)), self.assertRaises(Crash):
+            evaluator.step()
+        state = self.saved()
+        state['refreshed_at'] -= 7*3600                                     # past book_refresh_hours
+        (self.run/'openings.json').write_text(json.dumps(state))
+        evaluator = self.start(sprt_max_games=4)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
+            self.assertTrue(evaluator.step())                               # resumes 20 under the same book
+        self.assertEqual(len(json.loads(dense_eval.report_path(self.run, 'main/000020', CHAMPION).read_text())['games']), 4)
+        self.assertEqual(self.saved()['refreshed_at'], state['refreshed_at'])
+        evaluator.step()
+        self.assertGreater(self.saved()['refreshed_at'], state['refreshed_at'])
+
+    def test_a_pair_the_book_missed_before_a_stop_is_counted_on_restart(self):
+        self.export(10)
+        evaluator = self.start(sprt_max_games=4)
+        evaluator.step()
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 0)), \
+                unittest.mock.patch.object(dense_openings.Book, 'record', side_effect=Crash):
+            with self.assertRaises(Crash):                                  # stopped after the report write
+                evaluator.step()
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', CHAMPION).read_text())
+        self.assertEqual((len(report['games']), self.saved()['counted'].get(report['id'], 0)), (2, 0))
+        published = json.loads((self.run/'league.json').read_text())['updated_at']
+        restarted = self.start(sprt_max_games=4)
+        root = lambda: restarted.openings.nodes[dense_openings.canonical([(0, 0)])[0]]
+        self.assertEqual((root()['games'], root()['pairs'][4]), (2, 1))
+        self.assertGreater(json.loads((self.run/'league.json').read_text())['updated_at'], published)    # republished
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 0)):
+            restarted.step()                                                # resumes the report and keeps its id
+        report = json.loads(dense_eval.report_path(self.run, 'main/000020', CHAMPION).read_text())
+        self.assertEqual((len(report['games']), self.saved()['counted'][report['id']], root()['games']), (4, 2, 4))
+
+    def test_reports_archived_on_a_protocol_change_stay_in_the_pooled_league(self):
+        self.export(10)
+        evaluator = self.start(opening_suite='standard-v1')
+        evaluator.step()
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            evaluator.step()
+        path = dense_eval.report_path(self.run, 'main/000020', CHAMPION)
+        report = json.loads(path.read_text())
+        report['settings']['sims'] = 99                                     # played under another protocol
+        path.write_text(json.dumps(report))
+        evaluator.open('main/000020', CHAMPION)
+        self.assertEqual(len(list(path.parent.glob('report-*.json'))), 1)
+        dense_eval.write_league(self.run, evaluator.league, evaluator.config)
+        league = json.loads((self.run/'league.json').read_text())
+        self.assertEqual(league['matrix']['main/000020'][CHAMPION]['games'], len(report['games']))
+        self.assertIsNotNone(next(c for c in league['checkpoints'] if c['id'] == 'main/000020')['elo'])
+
+    def test_a_seal_anchor_owed_across_a_protocol_change_is_played_under_the_new_one(self):
+        """The champion's Seal games count toward its anchor under every protocol; an anchor still owed after a
+        change (such as a book refresh) archives the old report and continues under the new protocol."""
+        self.export(10)
+        evaluator = self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            evaluator.step()                                                # the first champion, unopposed
+            self.assertEqual(evaluator.anchor()[3], 4)
+            evaluator.session(lambda: {} if len(evaluator.games(CHAMPION, 'seal')) >= 2 else {(CHAMPION, 'seal', 'anchor'): 2}, 2)
+        path = dense_eval.report_path(self.run, CHAMPION, 'seal')
+        report = json.loads(path.read_text())
+        report['settings']['sims'] = 99                                     # now another protocol's report
+        path.write_text(json.dumps(report))
+        self.assertEqual(evaluator.anchor()[3], 2)                          # its games still count
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        self.assertIsNone(evaluator.anchor())
+        self.assertEqual(len(json.loads(path.read_text())['games']), 2)     # a new report under the current protocol
+        self.assertEqual(len(list(path.parent.glob('report-*.json'))), 1)
+        seal = json.loads((self.run/'league.json').read_text())['anchors']['seal']
+        self.assertEqual((seal['games'], [m['checkpoint'] for m in seal['matches']]), (4, [CHAMPION]))   # one entry, summed
+        self.assertEqual((seal['matches'][0]['games'], seal['matches'][0]['wins']), (4, 4))
+        self.assertAlmostEqual(seal['latest_delta'], 400*math.log10(4.5/.5))
+    def test_a_reign_begun_before_pooling_moves_its_archives_into_the_baseline_once(self):
+        self.export(10)
+        evaluator = self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.)
+        evaluator.step()                                                    # the first champion, unopposed
+        folder = dense_eval.report_path(self.run, CHAMPION, 'seal').parent
+        folder.mkdir(parents=True)
+        played = dense_openings.Book(self.run, evaluator.settings).openings()[0]['moves']
+        report = lambda n, sims: dense_eval.make_report(CHAMPION, 'seal', [dict(g, seed=k, pair=k) for k in range(n)
+                                                                           for g in pair(played, 2)], {CHAMPION: 'c'*64},
+                                                        replace(evaluator.settings, sims=sims))
+        (folder/'report-1-old.json').write_text(json.dumps(report(10, 99)))  # archived before this reign
+        (folder/'report.json').write_text(json.dumps(report(1, evaluator.settings.sims)))
+        league = json.loads((self.run/'league.json').read_text())
+        league.pop('reign_pooled')
+        (self.run/'league.json').write_text(json.dumps(dict(league, reign_games=2)))   # counted on report.json alone
+        restarted = self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.)
+        self.assertEqual((restarted.league['reign_games'], restarted.league['reign_pooled']), (22, True))
+        self.assertEqual(json.loads((self.run/'league.json').read_text())['reign_games'], 22)
+        self.assertEqual(restarted.anchor()[3], 4)                          # the archive's 20 games do not count
+        (folder/'report-2-new.json').write_text(json.dumps(report(2, 98)))  # archived during the reign
+        (folder/'report.json').unlink()                                     # a book change moved report.json aside
+        self.assertEqual(self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.).anchor()[3], 2)
+        # A legacy baseline counted on a report archived during the reign: its prefix is not counted twice.
+        league = json.loads((self.run/'league.json').read_text())
+        league.pop('reign_pooled')
+        (self.run/'league.json').write_text(json.dumps(dict(league, reign_games=20)))
+        restarted = self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.)
+        self.assertEqual(restarted.league['reign_games'], 24)                # capped at all 24 Seal games
+        self.assertEqual(restarted.anchor()[3], 4)
+
+    def test_archives_of_one_pairing_never_overwrite_each_other(self):
+        self.export(10)
+        evaluator = self.start(opening_suite='standard-v1')
+        path = dense_eval.report_path(self.run, CHAMPION, 'seal')
+        path.parent.mkdir(parents=True)
+        for sims in (97, 98):                                               # two archives created in the same second
+            report = dense_eval.make_report(CHAMPION, 'seal', [dict(g, seed=5, pair=0) for g in pair(dense_openings.Book(
+                self.run, evaluator.settings).openings()[0]['moves'], 2)], {CHAMPION: 'c'*64}, replace(evaluator.settings, sims=sims))
+            path.write_text(json.dumps(dict(report, created_at=1000.)))
+            evaluator.open(CHAMPION, 'seal')
+            evaluator.book.clear()
+        self.assertEqual(len(list(path.parent.glob('report-1000-*.json'))), 2)
+        # An archive whose protocol matches again stays out of the decision inputs but pools into the league.
+        self.assertEqual([r['settings']['sims'] for r in dense_eval.load_reports(self.run, replace(evaluator.settings, sims=97))], [])
+        self.assertEqual(sorted(r['settings']['sims'] for r in dense_eval.load_reports(self.run)), [97, 98])
+
+    def test_calibration_keeps_an_archive_that_matches_the_protocol_again(self):
+        """A verdict decided on a report later archived (its protocol changed and was restored) still counts: the
+        archive is matched by its prefix digest, and the pairing's new report.json is a later comparison."""
+        s = dense_config.EvaluationSettings()
+        games = lambda wins, offset=0: [dict(pair=offset+k, seed=offset+k, challenger_color=c, winner=c if w else 1-c, plies=9,
+                                             opening=[[0, 0]]) for k, w in enumerate(wins) for c in (0, 1)]
+        shas = {f'main/{k:06d}': 'c'*64 for k in (10, 20, 30, 40)}
+        archive = dense_eval.make_report('main/000020', 'main/000010', games([1, 1, 0, 1]*2), shas, s)
+        current = dense_eval.make_report('main/000020', 'main/000010', games([0, 1], 50), shas, s)
+        later = [dense_eval.make_report('main/000030', 'main/000020', games([1, 0]*2), shas, s),
+                 dense_eval.make_report('main/000020', 'main/000040', games([1, 0]*2), shas, s)]
+        entry = lambda step: dict(id=f'main/{step:06d}', variant='main', step=step, elo=0.)
+        snapshot = dict(opponent='main/000010', protocol={k: getattr(s, k) for k in dense_eval.PROTOCOL}, matchup_prior=30.,
+                        reports={'main-000020-vs-main-000010': dict(games=16, digest=dense_eval.games_digest(archive['games']))})
+        league = dict(checkpoints=[entry(10), dict(entry(20), verdict=dict(snapshot, delta=10., delta_sd=40.)), entry(30), entry(40)])
+        self.assertEqual(dense_eval.calibration(league, [archive, current]+later)['count'], 1)
+        self.assertEqual(dense_eval.calibration(league, [current]+later)['count'], 0)       # the decided games are gone
+        # Archives present at the verdict (listed as earlier) are neither later comparisons nor evidence now.
+        league['checkpoints'][1]['verdict']['earlier'] = [later[0]['id'], later[1]['id']]
+        self.assertEqual(dense_eval.calibration(league, [archive, current]+later)['count'], 0)
+    def test_the_standard_suite_is_a_frozen_book_with_its_statistics_in_the_run(self):
+        self.export(10)
+        played = dense_openings.Book(self.run, dense_config.EvaluationSettings()).openings()[0]['moves']
+        old = dense_eval.make_report(CHAMPION, 'seal', [dict(g, seed=5, pair=0) for g in pair(played, 2)], {CHAMPION: 'c'*64},
+                                     dense_config.EvaluationSettings(max_plies=12, sims=2, root_samples=2))
+        old['settings'].pop('opening_book')
+        dense_eval.report_path(self.run, CHAMPION, 'seal').parent.mkdir(parents=True)
+        dense_eval.report_path(self.run, CHAMPION, 'seal').write_text(json.dumps(old))
+        evaluator = self.start(opening_suite='standard-v1')
+        self.assertEqual(evaluator.settings.opening_book, '')
+        self.assertTrue(dense_eval.same_protocol(old, evaluator.settings))   # written before opening_book existed
+        counted = self.saved('openings-standard-v1.json')
+        self.assertEqual(counted['counted'], {dense_openings.report_id(old): 1})
+        self.assertEqual(next(n for n in counted['nodes'] if n['depth'] == 1)['pairs'], [0, 0, 0, 0, 1])
+        self.assertTrue(evaluator.step())
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        games = json.loads(dense_eval.report_path(self.run, 'main/000020', CHAMPION).read_text())['games']
+        keys = {n['key'] for n in dense_openings.Book(self.run, dense_config.EvaluationSettings()).openings()}
+        self.assertLessEqual({dense_openings.canonical(g['opening'])[0] for g in games}, keys)
+        self.assertEqual(next(n for n in self.saved('openings-standard-v1.json')['nodes'] if n['depth'] == 1)['games'],
+                         2+len(games))
+        self.assertFalse((self.run/'openings.json').exists())
+        graph = dashboard.openings(self.run)
+        self.assertEqual(set(graph), {'standard-v1'})
+        self.assertEqual(graph['standard-v1']['stats']['openings'], 47)
+        self.assertIn([dense_openings.canonical([(0, 0)])[0], dense_openings.canonical(played[:2])[0]], graph['standard-v1']['edges'])
+
 
 if __name__ == '__main__':
     unittest.main()
