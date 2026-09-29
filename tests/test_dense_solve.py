@@ -21,6 +21,7 @@ import dense_solve
 from dense_data import player_at
 from forcing_material import worth_solving
 from hexo import Game
+from proof import VerificationTimeout
 from tactical_proof import NativeTactics
 from tests.test_dense import source_shard, winning_game, write_games
 from tests.test_dense_solver import TINY, tiny_model
@@ -197,11 +198,26 @@ class PassTests(unittest.TestCase):
 
     def test_rejected_independent_check_aborts_with_an_event(self):
         with unittest.mock.patch.object(dense_solve, 'independent_verify', side_effect=ValueError('bad')):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(dense_solve.Rejected):
                 self.solve()
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['kind'] for e in events], ['error'])
         self.assertIsNone(dense_data.proof_windows(self.run/'shards'/'1000000000001'))
+
+    def test_timed_out_independent_check_keeps_the_proof_unverified(self):
+        settings = replace(SMALL, verify_seconds=7.)
+        _, _, reference = self.solve(self.run.parent/'reference')
+        with unittest.mock.patch.object(dense_solve, 'independent_verify', side_effect=VerificationTimeout('late')) as check:
+            coordinator, _, windows = self.solve(self.run.parent/'late', settings=settings)
+        self.assertEqual(windows, reference)
+        proofs = sum(q['proofs'] for q in coordinator.stats['queries'].values())
+        self.assertEqual((coordinator.stats['verify_timeouts'], coordinator.stats['verified']), (proofs, 0))
+        self.assertTrue(all(call.args[3] == 7. for call in check.call_args_list))
+        self.assertFalse((self.run.parent/'late'/'events.jsonl').exists())
+        coordinator.status('idle', 0)
+        status = json.loads((self.run.parent/'late'/'solver-status.json').read_text())
+        self.assertEqual((status['verify_timeouts'], status['verified'], status['settings']['verify_seconds']),
+                         (proofs, 0, 7.))
 
     def test_restart_games_record_observations_instead_of_early_entries(self):
         source = dict(shard='1000000000001', game=0, ply=5, kind='attack', regret=.5, plies_to_proof=0)
@@ -433,6 +449,35 @@ class RestartActorTests(unittest.TestCase):
         for e in episodes:
             self.assertEqual(e['moves'][:e['restart']['ply']], PREFIX[:e['restart']['ply']])
 
+    def test_failed_workers_are_retried_once_and_rejections_stop_the_pass(self):
+        for name in ('1000000000002', '1000000000003'):
+            shard_of(self.run, name, [episode(PREFIX, -1)])
+        codes = {'1000000000003': [1, 1], '1000000000002': [0]}
+        started = []
+
+        def spawn(name):
+            started.append(name)
+            code = codes[name].pop(0)
+            if code == 0:
+                write_json(out/'.solve'/f'{name}.json', dict(windows=[], entries=[], observations=[],
+                                                             stats=dense_solve.new_stats()))
+            return SimpleNamespace(poll=lambda: code)
+        out = self.run.parent/'out'
+        (out/'.solve').mkdir(parents=True)
+        coordinator = dense_solve.Pass(self.run, out, replace(SMALL, solve_workers_min=1))
+        while coordinator.step(limit=2, spawn=spawn):
+            pass
+        self.assertEqual(started, ['1000000000003', '1000000000002', '1000000000003'])
+        self.assertTrue((out/'shards'/'1000000000002'/dense_data.SIDECAR).exists())
+        status = json.loads((out/'solver-status.json').read_text())
+        self.assertEqual((status['shards_failed'], status['shards_done'], status['shards_pending']),
+                         ({'1000000000003': 2}, 1, 0))
+        events = [json.loads(line) for line in (out/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([e['attempts'] for e in events if e['kind'] == 'error'], [1, 2])
+        coordinator.running['1000000000001'] = (SimpleNamespace(poll=lambda: dense_solve.REJECTED), 0.)
+        with self.assertRaises(RuntimeError):
+            coordinator.step(spawn=spawn)
+
     def test_settings_bounds(self):
         with self.assertRaises(ValueError):
             dense_config.ActorSettings(restart_fraction=1.5)
@@ -501,9 +546,11 @@ class DashboardTests(unittest.TestCase):
             episodes = [episode(PREFIX, -1), episode(PREFIX, -1, origin='restart', restart=dict(ply=2)),
                         episode(PREFIX, -1, origin='selfplay'), episode(PREFIX, -1)]
             shard_of(run, '1000000000001', episodes)
-            (run/'solver-status.json').write_text(json.dumps(dict(buffer_size=17)))
+            (run/'solver-status.json').write_text(json.dumps(dict(buffer_size=17, verified=5, verify_timeouts=2)))
             state = dashboard.dense_run(run, dict(created_at=0.))
             self.assertEqual((state['actor']['restart_buffer'], state['data']['restart_share_6h']), (17, .25))
+            self.assertEqual((state['actor']['proofs_verified'], state['actor']['verify_timeouts']), (5, 2))
+            self.assertIn('verify_timeouts', (Path(dashboard.__file__).parent/'web'/'training.html').read_text(encoding='utf-8'))
             self.assertIn('restart_share_6h', (Path(dashboard.__file__).parent/'web'/'training.html').read_text(encoding='utf-8'))
 
 

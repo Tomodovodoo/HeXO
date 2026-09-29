@@ -439,6 +439,7 @@ def dense_run(run, config, fresh=30):
     actors = [dict(status(path), process=path.stem.removeprefix('actor-status').lstrip('-') or '0')
               for path in sorted(run.glob('actor-status*.json'), key=lambda path: (len(path.stem), path.stem))]
     for actor in actors: actor['heartbeat'] = beat(actor)
+    solver = status(run/'solver-status.json')
     # Rates only count live processes; cumulative counters count every process.
     live = [a for a in actors if a['heartbeat'] is not None and a['heartbeat'] <= fresh and a.get('stage') != 'failed']
     total = lambda rows, key: sum(a.get(key) or 0 for a in rows)
@@ -458,7 +459,8 @@ def dense_run(run, config, fresh=30):
                  checkpoint=actors[0].get('checkpoint') if actors else None, actor_sha256=actors[0].get('actor_sha256') if actors else None,
                  error='; '.join(f"{a['process']}: {a['error']}" for a in actors if a.get('error')) or None,
                  heartbeat=max((a['heartbeat'] for a in actors if a['heartbeat'] is not None), default=None),
-                 restart_buffer=status(run/'solver-status.json').get('buffer_size'))
+                 **{key: solver.get(name) for key, name in (('restart_buffer', 'buffer_size'), ('proofs_verified', 'verified'),
+                                                            ('verify_timeouts', 'verify_timeouts'))})
     learners = {}
     for path in sorted(run.glob('learner-status*.json')):
         learner = status(path)

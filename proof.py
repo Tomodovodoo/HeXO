@@ -3,7 +3,8 @@
 solve(game, deadline=perf_counter()+0.1) cooperatively checks an absolute deadline.
 Game.turns is a synchronous native proposal call and cannot be interrupted here;
 an overrun returns UNKNOWN. Certificates contain no trusted hashes or evaluations.
-verify(certificate, history) independently checks the proof against trusted history.
+verify(certificate, history) independently checks the proof against trusted history; it raises ValueError for an
+invalid certificate and VerificationTimeout, which says nothing about validity, when its deadline passes.
 """
 from itertools import combinations
 from math import isfinite
@@ -16,6 +17,10 @@ LIMIT = 10**12
 
 class _Budget(Exception):
     pass
+
+
+class VerificationTimeout(TimeoutError):
+    """verify() reached its deadline before finishing; the certificate is neither accepted nor rejected."""
 
 
 def _phase(n):
@@ -185,7 +190,8 @@ def solve(game, *, deadline, node_limit=10000, attack_turns=3, width=8):
 
 
 def verify(certificate, history, *, deadline=None):
-    """Independent raw-board checker; return certified root status or raise ValueError.
+    """Independent raw-board checker; return certified root status, raise ValueError for an invalid certificate or
+    VerificationTimeout once perf_counter() reaches `deadline`.
 
     history is supplied by the caller, not accepted solely from the certificate.
     With "flipped": true the root is a flipped-turn position: the history's stones
@@ -196,7 +202,7 @@ def verify(certificate, history, *, deadline=None):
     """
     def require(condition):
         if deadline is not None and perf_counter() >= deadline:
-            raise ValueError("Certificate verification deadline")
+            raise VerificationTimeout("Certificate verification deadline")
         if not condition:
             raise ValueError("Invalid forcing certificate")
 
