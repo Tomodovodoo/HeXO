@@ -1751,6 +1751,23 @@ class CheapRowTests(unittest.TestCase):
             self.assertNotEqual([key for key in other.index if key[0] != '000004'], list(second.index))
             np.testing.assert_array_equal(dense_data.retention(9, '000001', 50, .5), dense_data.retention(9, '000001', 80, .5)[:50])
 
+    def test_regret_priority_draws_only_retained_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 2, 10, 30)
+            kinds = self.kinds(tmp)
+            half = dense_data.ReplayWindow(tmp, 10**6, 10**6, cheap_row_fraction=.5, seed=4)
+            full = dense_data.ReplayWindow(tmp, 10**6, 10**6)
+            kept = set(half.index)
+            dropped = [key for key in full.index if key not in kept][:5]
+            chosen = dropped+[key for key in half.index if kinds[key] == 'cheap'][:5]
+            self.assertEqual((len(dropped), len(chosen)), (5, 10))
+            entries = {(n, int(half.shards[n].game[i]), int(half.shards[n].ply[i])): 1. for n, i in chosen}
+            half.set_regret(entries)
+            self.assertEqual(half.regret_rows, 5)
+            self.assertEqual(half.retained_rows, len(kept))
+            refs = half.sample(np.random.default_rng(1), 64, regret_fraction=.5)
+            self.assertTrue({(r.shard, r.index) for r in refs} <= kept)
+
     def test_render_workers_retain_like_the_learner_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_shard(Path(tmp)/'shards'/'000001', 1, 'a', games=4, policy_every=3)
