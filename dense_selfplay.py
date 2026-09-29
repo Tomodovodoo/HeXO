@@ -338,6 +338,7 @@ class Engine:
 
     def step(self):
         pending, count, done, progress, deferred = {}, 0, [], False, False
+        self.completed = done
         started = time.perf_counter()
         slots = self.slots
         for _ in range(len(slots)):
@@ -440,7 +441,8 @@ class Engine:
                 continue
             self.closing.remove(entry)
             if plan:
-                plan.close(slot, slot.tree.history)
+                plan.close(slot, tuple(map(tuple, slot.moves)))
+            self.completed.append(slot)
             done.append(slot)
         if self.closing and not self.slots and not done:
             self.solver.idle()
