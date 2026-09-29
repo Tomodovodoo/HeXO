@@ -3641,6 +3641,21 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertTrue(any(event['kind'] == 'error' and 'one bad Seal game' in event['message'] for event in events))
 
+    def test_seal_anchor_pauses_after_repeated_game_errors(self):
+        evaluator = self.start(anchor_games=2, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        def seal(game, ms):
+            raise RuntimeError('Seal unavailable')
+        evaluator.seal = seal
+        self.assertTrue(evaluator.step())
+        self.assertIsNone(evaluator.anchor())
+        self.assertFalse(evaluator.step())
+        self.assertFalse(dense_eval.report_path(self.run, 'main/000010', 'seal').exists())
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertTrue(any(event['kind'] == 'error' and 'paused after 2 failed pairs' in event['message']
+                            for event in events))
+
     def test_promotion_anchors_after_the_next_sprt_and_before_optional_work(self):
         import dashboard
         evaluator = self.anchored()

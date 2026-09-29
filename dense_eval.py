@@ -596,12 +596,13 @@ _reports = {}
 
 def load_reports(run, settings=None):
     """Every evaluations/*/report*.json: each pairing's report.json and the reports `Evaluator.open` archived beside it
-    (cached per path and modification time), which pool into the league ratings. With `settings`, only the current
+    (cached per path, modification time and size), which pool into the league ratings. With `settings`, only the current
     report.json files played under its PROTOCOL: decisions read a pairing's games from its current report alone
     (`Evaluator.games`), so an archive whose protocol matches again (a setting changed and restored) stays out of them."""
     reports = []
     for path in sorted((Path(run)/'evaluations').glob('*/report.json' if settings else '*/report*.json')):
-        stamp = path.stat().st_mtime_ns
+        stat = path.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
         if _reports.get(path, (None,))[0] != stamp:
             _reports[path] = stamp, json.loads(path.read_text())
         reports.append(_reports[path][1])
@@ -964,6 +965,7 @@ class Evaluator:
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         self.models, self.seal, self.written, self.fill_target, self.deciding, self.reviewed = {}, None, 0., None, None, False
         self.book, self.next, self.ids, self.shas = {}, {}, {}, {}
+        self.failed_seal = set()
         self.status = dict(stage='idle', updated_at=None, comparison=None, pool=[], started_at=None, games_played=0,
                            games_planned=0, tally=None, decision=None, pending=[], placements_played=0, mean_placements=None,
                            placements_per_second=None, settings=asdict(settings), eval_share=pacer.share, backlog=[],
@@ -1123,7 +1125,7 @@ class Evaluator:
         engine steps and for starting games (Seal plays its first turns then); no game starts while its credit
         is negative, and with nothing running the session then waits and asks want() again. Every completed
         pair is persisted at once."""
-        pool, waiting, added = Pool(self.config.actor.leaf_batch), {}, {}
+        pool, waiting, added, failed = Pool(self.config.actor.leaf_batch), {}, {}, {}
         placed = 0
         start, wall = self.pacer.clock(), time.time()
         lanes = want()
@@ -1183,7 +1185,13 @@ class Evaluator:
                               f'game discarded after {record["error"]}', candidate=lane[0], opponent=lane[1])
                 if len(group) == 2:
                     del waiting[lane][record['pair']]
-                    if not any('error' in game for game in group):
+                    if any('error' in game for game in group):
+                        failed[lane] = failed.get(lane, 0)+1
+                        if lane[1] == SEAL and failed[lane] == 2:
+                            self.failed_seal.add((lane[0], lane[2], self.settings.opening_book))
+                            log_event(self.run, 'evaluator', 'error', f'{lane[0]} vs Seal ({lane[2]}): paused after '
+                                      f'{failed[lane]} failed pairs', candidate=lane[0], opponent=SEAL)
+                    else:
                         self.persist(*lane, sorted(group, key=lambda r: r['challenger_color']))
                         count = added.setdefault(lane, [0, 0])
                         count[0] += 2
@@ -1741,7 +1749,7 @@ class Evaluator:
         (`seal_reports`, every protocol) gained since reign_games, so an anchor owed when the protocol changes (a book
         refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor."""
         s, champion = self.settings, self.entry(self.league['champion'])
-        if not s.anchor_games or champion is None:
+        if not s.anchor_games or champion is None or (champion['id'], 'anchor', s.opening_book) in self.failed_seal:
             return None
         entries = self.league['checkpoints']
         later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])
@@ -1786,7 +1794,8 @@ class Evaluator:
         if not s.idle_fill or champion is None:
             return None
         reports = self.seal_reports(champion['id'])
-        if s.anchor_target_halfwidth > 0 and self.close(champion['id'], SEAL):
+        if s.anchor_target_halfwidth > 0 and (champion['id'], 'fill', s.opening_book) not in self.failed_seal \
+                and self.close(champion['id'], SEAL):
             low, high = rate([champion['id'], SEAL], champion['id'], reports, seed=self.config.seed)[1][SEAL] if reports \
                 else (-math.inf, math.inf)
             if (high-low)/2 > s.anchor_target_halfwidth:
@@ -1907,7 +1916,7 @@ class Evaluator:
             done = self.games(a, opponent)
             if kind == 'sprt' and done and (decision := self.test(done)['decision']):
                 decided.append(decision)  # an idle SPRT rematch keeps the first bound it crosses
-            if self.backlog() or len(done) >= target or decided:
+            if self.backlog() or len(done) >= target or decided or (a, kind, s.opening_book) in self.failed_seal:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
         self.session(want, target)
