@@ -181,6 +181,7 @@ class LearnerSettings:
     short_value_weight: float = .5
     opponent_policy_weight: float = .15
     future_weight: float = .5
+    future_target: str = 'legacy'  # legacy: occupancy BCE at 6/20; masked: empty/own/opponent CE at 20 on empty cells
     proven_value_weight: float = 2.  # value weight of rows the solver proved; their target is the proven value
     proof_policy_weight: float = 0.  # mix (search + weight * proof)/(1 + weight); proof-only rows have this loss weight
     validation_fraction: float = .03
@@ -201,6 +202,8 @@ class LearnerSettings:
             raise ValueError(f'optimizer must be adamw or muon, not {self.optimizer!r}')
         if self.value_target not in VALUE_TARGETS:
             raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
+        if self.future_target not in ('legacy', 'masked'):
+            raise ValueError(f'future_target must be legacy or masked, not {self.future_target!r}')
         if not 0. <= self.deblunder_weight <= 1.:
             raise ValueError('deblunder_weight must be between 0 and 1')
         if '@' in self.variant or '/' in self.variant:

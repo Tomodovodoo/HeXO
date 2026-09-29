@@ -830,6 +830,28 @@ The original outcome stays available for diagnostics. Validation reports
 Restart the proof pass with its existing flags and the learner with, for
 example, `--deblunder-weight 0.25`. Existing sidecars are not rewritten.
 
+## Dense learner future occupancy
+
+`--future-target legacy` is the default. It keeps the occupancy BCE at 6 and
+20 placements, including stones already on the board. `--future-target masked`
+uses a fresh three-class head at 20 placements: empty, own, or opponent from
+the current mover's view. Cross-entropy is averaged over currently empty cells
+inside each crop, then over rows with a known target. Finished games use their
+final board when they end before 20 placements; capped games need all 20.
+`--future-weight` keeps its default coefficient of 0.5.
+
+Restart the learner with its existing arguments plus `--future-target masked`.
+The first mode switch preserves shared and legacy head weights and training
+counters, adds the new head, and resets the optimizer and EMA update count.
+Later resumes restore the saved mode, head, and optimizer. To switch back,
+pass `--future-target legacy`. Actors and evaluators read either checkpoint
+format without extra flags.
+
+The new loss is `future_masked_ce`; legacy remains `future_bce`. Each fixed
+validation source reports the active metric on held and training panels, plus
+their gap, under separate names such as `newest_future_masked_ce` and
+`newest_future_bce`. These are different objectives, not comparable loss values.
+
 ## Dense actor batches
 
 `dense_selfplay.py` accepts `--games-in-flight` and `--leaf-batch` per worker, alongside `--games` per process. The
