@@ -255,17 +255,20 @@ class RestartActorTests(unittest.TestCase):
 
     def test_draws_follow_regret_and_temperature(self):
         for temperature, share in ((1., .8), (.5, .64/.68)):
-            restarts = dense_selfplay.Restarts(self.run, temperature)
+            restarts = dense_selfplay.Restarts(self.run, temperature, 10)
             rng = np.random.default_rng(0)
             draws = [restarts.draw(rng) for _ in range(4000)]
             first = sum(d[0]['ply'] == 6 for d in draws)/len(draws)
             self.assertAlmostEqual(first, share, delta=.02)
             self.assertEqual({len(d[1]) for d in draws}, {4, 6})
             self.assertTrue(all(d[1] == PREFIX[:d[0]['ply']] for d in draws))
+        capped = dense_selfplay.Restarts(self.run, 1., 5)
+        self.assertEqual({capped.draw(np.random.default_rng(k))[0]['ply'] for k in range(20)}, {4})
+        self.assertIsNone(dense_selfplay.Restarts(self.run, 1., 4).draw(np.random.default_rng(0)))
         (self.run/'restarts.json').write_text(json.dumps(dict(entries=[dict(self.buffer[0], shard='gone')])))
-        self.assertIsNone(dense_selfplay.Restarts(self.run, 1.).draw(np.random.default_rng(0)))
+        self.assertIsNone(dense_selfplay.Restarts(self.run, 1., 10).draw(np.random.default_rng(0)))
         (self.run/'restarts.json').unlink()
-        self.assertIsNone(dense_selfplay.Restarts(self.run, 1.).draw(np.random.default_rng(0)))
+        self.assertIsNone(dense_selfplay.Restarts(self.run, 1., 10).draw(np.random.default_rng(0)))
 
     def test_restart_game_replays_the_prefix_without_rows(self):
         settings = replace(dense_config.ActorSettings(), full_sims=4, cheap_sims=2, root_samples=2, max_plies=12,

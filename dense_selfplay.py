@@ -523,20 +523,23 @@ class SelfPlayGame:
 
 class Restarts:
     """The run's restart buffer (restarts.json, dense_solve) as an actor worker uses it. load() re-reads it (missing:
-    empty; unreadable: the previous entries are kept). draw(rng) returns (entry, moves) for an entry drawn with probability proportional to
-    regret^(1/temperature), `moves` the first entry['ply'] moves of its source game, or None when the buffer is
-    empty or the source shard is gone. The moves of the RESTART_SHARDS most recently used source shards are kept."""
+    empty; unreadable: the previous entries are kept) and keeps the entries whose ply is below `max_plies`, so every
+    restart game searches at least one ply. draw(rng) returns (entry, moves) for an entry drawn with probability
+    proportional to regret^(1/temperature), `moves` the first entry['ply'] moves of its source game, or None when
+    no entry is kept or the source shard is gone. The moves of the RESTART_SHARDS most recently used source shards are kept."""
 
-    def __init__(self, run, temperature):
-        self.run, self.temperature, self.entries, self.games = Path(run), temperature, [], OrderedDict()
+    def __init__(self, run, temperature, max_plies):
+        self.run, self.temperature, self.max_plies = Path(run), temperature, max_plies
+        self.entries, self.games = [], OrderedDict()
         self.load()
 
     def load(self):
         path = self.run/'restarts.json'
         try:
-            self.entries = json.loads(path.read_text(encoding='utf-8'))['entries'] if path.exists() else []
+            entries = json.loads(path.read_text(encoding='utf-8'))['entries'] if path.exists() else []
         except (OSError, ValueError):
             return
+        self.entries = [e for e in entries if e['ply'] < self.max_plies]
         weights = np.array([max(e['regret'], 0.) for e in self.entries])**(1/self.temperature)
         self.p = weights/weights.sum() if len(weights) and weights.sum() > 0 else None
 
@@ -682,7 +685,7 @@ def worker(args):
     historical = Historical(run, config, np.random.default_rng(seeds.spawn(1)[0]), args.games) if settings.historical_fraction > 0 else None
     if historical:
         historical.redraw(model.checkpoint, model.sha)
-    restarts = Restarts(run, settings.restart_temperature) if settings.restart_fraction > 0 else None
+    restarts = Restarts(run, settings.restart_temperature, settings.max_plies) if settings.restart_fraction > 0 else None
     restart_rng = np.random.default_rng(seeds.spawn(1)[0]) if restarts else None
     engine = Engine(settings.leaf_batch, settings.solver_async)
     began, solver_failures = time.perf_counter(), 0
