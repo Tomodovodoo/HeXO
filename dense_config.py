@@ -234,6 +234,7 @@ class EvaluationSettings:
     tactics: bool = True
     anchor_every: int = 5         # the champion owes anchor_games more vs Seal per N checkpoints rated during its reign
     anchor_games: int = 100       # champion vs Seal, played before optional work; 0 = never
+    anchor_session_games: int = 20  # most Seal anchor games before a pending trial gets its turn
     anchor_on_promotion: bool = True  # every new champion owes anchor_games vs Seal
     seal_ms: int = 100
     decision: str = 'posterior'   # promotion rule: 'posterior' (dense_eval.Evaluator.verdict) or 'sprt'
