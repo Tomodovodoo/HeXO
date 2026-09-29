@@ -152,8 +152,9 @@ SIDE = ('sims', 'root_samples', 'tactics', 'solver_root_nodes', 'solver_finalist
 REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
 CALIBRATION_LATER = 3     # later comparisons of a decided checkpoint before `calibration` counts its verdict
 RATING_NOTE = ('Bradley-Terry over paired comparisons (caps count half a point to each side); each opening pair is one '
-               'observation with a Jeffreys Dirichlet prior over the five pair scores 0..2 in half points; 95% '
-               'credible intervals from posterior draws; the first evaluated checkpoint is fixed at 0. Seal is one '
+               'observation, with counts pooled across reports and uncertainty adjusted for pair correlation; weak '
+               '1000 Elo Gaussian priors on rating differences between adjacent checkpoints; 95% Laplace credible '
+               'intervals from joint posterior draws; the first evaluated checkpoint is fixed at 0. Seal is one '
                'more node rated jointly from its anchor games, so its Elo is estimated, not assumed.')
 
 
@@ -607,23 +608,32 @@ def solve(ids, anchor, edges):
 
 
 def rate(ids, anchor, reports, samples=2048, seed=1740):
-    """(point ratings, 95% intervals, posterior draws per rated id), the model of checkpoint_league.rate_league
-    over string ids with caps as half points: per comparison a Dirichlet(counts + 1/2) posterior over the pair
-    scores 0, 1/2, 1, 3/2, 2, each draw solved jointly so draws of different ids are paired."""
-    comparisons = []
-    for report in reports:
-        counts = np.zeros(5)
-        for score in pair_scores(report['games']).values():
-            counts[round(4*score)] += 1
-        comparisons.append((report['candidate'], report['opponent'], counts+.5, len(report['games'])))
-    edge = lambda a, b, p, n: (a, b, n*(p@np.arange(5))/4, n)
-    point = solve(ids, anchor, [edge(a, b, alpha/alpha.sum(), n) for a, b, alpha, n in comparisons])
-    rng = np.random.default_rng(seed)
-    draws = {name: [] for name in ids if point[name] is not None}
-    for _ in range(samples if comparisons else 0):
-        ratings = solve(ids, anchor, [edge(a, b, rng.dirichlet(alpha), n) for a, b, alpha, n in comparisons])
-        for name in draws:
-            draws[name].append(ratings[name])
+    """(point ratings, 95% intervals, joint posterior draws per rated id) from actual paired scores.
+
+    The existing pentanomial Posterior pools counts across reports, adjusts for pair correlation and uses weak
+    rating priors to keep perfect sweeps finite. No prior pseudo-games enter the observed score. Matchup deviations
+    are disabled for the global Bradley-Terry table; decision posteriors are fitted separately. The anchor is 0
+    and ids outside its connected component remain unrated. Draws use the joint Laplace approximation.
+    """
+    results = [(a, b, c) for a, b, c in observations(reports) if sum(c)]
+    connected = {anchor}
+    while True:
+        before = len(connected)
+        for a, b, _ in results:
+            if a in connected or b in connected:
+                connected.update((a, b))
+        if len(connected) == before:
+            break
+    rated = [name for name in ids if name in connected]
+    point = {name: 0. if name == anchor else None for name in ids}
+    draws = {name: [] for name in rated}
+    if len(rated) > 1:
+        fit = Posterior(rated, anchor, [(a, b, c) for a, b, c in results if a in connected],
+                        matchup_prior=0., parents=parents(rated))
+        point.update({name: fit.rating(name) for name in rated})
+        rng = np.random.default_rng(seed)
+        joint = rng.multivariate_normal(fit.mode, fit.cov, size=samples, method='cholesky')
+        draws = {name: [0.]*samples if name == anchor else joint[:, fit.index[name]].tolist() for name in rated}
     return point, {name: np.quantile(v, [.025, .975]).tolist() if v else [0., 0.] for name, v in draws.items()}, draws
 
 

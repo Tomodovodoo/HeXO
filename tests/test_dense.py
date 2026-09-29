@@ -3616,6 +3616,40 @@ def independent(results):
 class PosteriorTests(unittest.TestCase):
     """dense_posterior.Posterior on synthetic results, most of them the pentanomial of independent games."""
 
+    def test_league_perfect_seal_sweep_does_not_deflate_the_models(self):
+        ids = ['main/000500', 'main/065000', 'main/082500', 'seal']
+        def report(a, b, pairs):
+            return dict(candidate=a, opponent=b, games=[dict(seed=k, challenger_color=c,
+                        winner=c if won else 1-c) for k, pair in enumerate(pairs) for c, won in enumerate(pair)])
+        reports = [report(ids[0], 'seal', [(1, 1)]*7+[(0, 0)]*43),
+                   report(ids[1], ids[0], [(1, 1)]*48+[(0, 0)]*2),
+                   report(ids[1], 'seal', [(1, 1)]*48+[(1, 0)]+[(0, 0)]),
+                   report(ids[2], ids[1], [(1, 1)]*5+[(0, 0)]*5+[(1, 0)]*10)]
+        before = dense_eval.rate(ids, ids[0], reports, samples=128)
+        after = dense_eval.rate(ids, ids[0], reports+[report(ids[2], 'seal', [(1, 1)]*10)], samples=128)
+        for name in ids[1:3]:
+            self.assertGreater(after[0][name], before[0][name])
+        self.assertLess(after[0]['seal'], before[0]['seal'])
+        self.assertEqual(after[0][ids[0]], 0.)
+        self.assertEqual(after[2][ids[0]], [0.]*128)
+        self.assertTrue(all(np.isfinite(v).all() for v in after[2].values()))
+        self.assertTrue(all(low < after[0][name] < high for name, (low, high) in after[1].items() if name != ids[0]))
+
+    def test_league_archive_partition_and_orientation_do_not_change_ratings(self):
+        games = [dict(seed=k, challenger_color=c, winner=-1 if result == .5 else c if result else 1-c)
+                 for k, pair in enumerate([(1, 1)]*10+[(1, 0)]*4+[(.5, 0)]*2+[(0, 0)]*4)
+                 for c, result in enumerate(pair)]
+        ids = ['main/000500', 'main/065000', 'seal']
+        whole = dense_eval.rate(ids, ids[0], [dict(candidate=ids[0], opponent='seal', games=games)], samples=128)
+        reverse = [dict(g, challenger_color=1-g['challenger_color']) for g in games[20:]]
+        split = dense_eval.rate(ids, ids[0], [dict(candidate=ids[0], opponent='seal', games=games[:20]),
+                                            dict(candidate='seal', opponent=ids[0], games=reverse)], samples=128)
+        self.assertIsNone(whole[0][ids[1]])
+        self.assertNotIn(ids[1], whole[2])
+        self.assertEqual(whole, split)
+        self.assertEqual(dense_eval.rate(ids, ids[0], []),
+                         ({ids[0]: 0., ids[1]: None, 'seal': None}, {ids[0]: [0., 0.]}, {ids[0]: []}))
+
     def test_pooled_and_direct_estimates(self):
         from dense_posterior import Posterior
         results = independent([('a', 'b', 12, 20), ('a', 'c', 30, 40), ('b', 'c', 20, 40)])
