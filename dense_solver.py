@@ -674,8 +674,9 @@ class Plan:
         """Before the move is played: consume the root verdict (and, with fixed budgets, the mover's pending deep
         verdict at a turn start), play the kept proof's stone, and set result proven (+1 proof, -1 a root the
         finalist marks left exact-lost, else 0), proof_turns, solver_nodes (nodes spent on this search's queries),
-        solver_budget (their granted budgets), pruned (the finalists marked lost) and, with proven +1, proof (the
-        Proof played from). False defers the slot to its next visit."""
+        solver_budget (their granted budgets), pruned (the finalists marked lost) and proof: with proven +1 the
+        Proof played from, with proven -1 the opponent's Proof after the chosen action when a finalist query proved
+        it (else None). False defers the slot to its next visit."""
         history = tuple(map(tuple, slot.tree.history))
         player = mover(history)
         if self.root is not None:
@@ -694,7 +695,8 @@ class Plan:
             result.update(action=list(move[0][0]), proven=1, proof_turns=move[1], proof=self.proofs[player])
             self.solver.stats['followed'] += self.following
         elif self.pruned and native.hxg_exact(slot.tree.ptr) == 1-mover(history):
-            result.update(proven=-1, proof_turns=self.turns)
+            played = history+(tuple(map(int, result['action'])),)
+            result.update(proven=-1, proof_turns=self.turns, proof=next((p for p in self.found if p.base == played), None))
         result.update(solver_nodes=self.nodes, solver_budget=self.budget, pruned=self.pruned)
         return True
 

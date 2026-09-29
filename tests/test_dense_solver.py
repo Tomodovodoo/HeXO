@@ -376,6 +376,23 @@ class Adjudication(unittest.TestCase):
         self.assertEqual((episode['reason'], len(rows)), ('proven', 1))
         self.assertGreater(episode['adjudicated']['line_plies'], 1)
 
+    def test_a_lost_root_passes_the_opponents_proof_after_the_chosen_action(self):
+        try:
+            solver = dense_solver.Solver(Schedule(), asynchronous=False)
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        history, action = tuple(self.opening[:-1]), self.opening[-1]
+        plan = dense_solver.Plan(solver)
+        plan.pruned = [list(action)]
+        plan.found = [Proof(self.opening[:-2], self.proof['certificate']),
+                      mine := Proof(self.opening, self.proof['certificate'])]
+        slot = type('Slot', (), dict(tree=type('Tree', (), dict(history=history, ptr=None))(),
+                                     solver=Budgets(finalists=2, finalist_nodes=NODES)))()
+        result = dict(action=list(action))
+        with mock.patch.object(dense_solver, 'native', mock.Mock(hxg_exact=lambda ptr: 1-dense_solver.mover(history))):
+            self.assertTrue(plan.finish(slot, result))
+        self.assertEqual((result['proven'], result['proof']), (-1, mine))
+
     def test_a_proof_on_the_capped_ply_still_adjudicates(self):
         episode, rows = self.play(plies=1)
         self.assertEqual((episode['reason'], episode['winner'], len(rows)), ('proven', dense_solver.mover(self.opening), 1))
