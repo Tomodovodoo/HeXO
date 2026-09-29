@@ -12,7 +12,7 @@ css.textContent = `
 .book-panel th,.book-panel td{padding:3px 10px;border-bottom:1px solid var(--grid,#e6ebef);white-space:nowrap;text-align:right}
 .book-panel th{position:sticky;top:0;background:var(--surface,#fff);z-index:1}.book-panel th button{border:0;background:none;padding:6px 0}.book-panel th:first-child,.book-panel td:first-child{text-align:left;width:64px}
 .book-panel td svg{display:block}.book-pages{margin:12px 0 0;font-size:12px;font-variant-numeric:tabular-nums}.book-error{color:#d95926;font-size:12px}
-.book-mini .move-order{visibility:hidden;pointer-events:none}.book-mini:hover .move-order,.book-mini:focus .move-order{visibility:visible}
+.book-mini .move-order{visibility:hidden;pointer-events:none}.book-mini:hover .move-order{visibility:visible}
 .book-dag{overflow:auto;max-height:65vh}.book-dag svg{display:block}.book-node{cursor:pointer}.book-node:focus{outline:none}.book-node:focus .node-border{stroke-width:3}
 `;
 document.head.append(css);
