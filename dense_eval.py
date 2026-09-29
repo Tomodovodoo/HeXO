@@ -982,13 +982,23 @@ class Evaluator:
                                            or self.league.get('ladder_top') != settings.fill_top):
             write_league(self.run, self.league, self.config, self.settings.fill_top)
         self.models, self.seal, self.written, self.fill_target, self.deciding, self.reviewed = {}, None, 0., None, None, False
-        self.anchor_turn = True
+        previous_status = self.run/'evaluator-status.json'
+        previous = json.loads(previous_status.read_text()) if previous_status.exists() else {}
+        self.anchor_turn = previous.get('anchor_turn', True) if previous.get('anchor_champion') == self.league['champion'] else True
         self.book, self.next, self.ids, self.shas = {}, {}, {}, {}
         self.failed_seal = set()
         self.status = dict(stage='idle', updated_at=None, comparison=None, pool=[], started_at=None, games_played=0,
                            games_planned=0, tally=None, decision=None, pending=[], placements_played=0, mean_placements=None,
                            placements_per_second=None, settings=asdict(settings), eval_share=pacer.share, backlog=[],
-                           eval_share_used=0., error=None, solver=self.solver_status(None))
+                           eval_share_used=0., error=None, solver=self.solver_status(None),
+                           anchor_turn=self.anchor_turn, anchor_champion=self.league['champion'])
+
+    def set_anchor_turn(self, turn):
+        """Persist which task gets the next turn, including across evaluator restarts."""
+        champion = self.league['champion']
+        if (self.anchor_turn, self.status['anchor_champion']) != (turn, champion):
+            self.anchor_turn = turn
+            self.publish(True, anchor_turn=turn, anchor_champion=champion)
 
     def solver_status(self, pool, names=()):
         """The status `solver` field for `pool` (None: no session) playing the players `names`: the evaluation
@@ -1900,6 +1910,8 @@ class Evaluator:
         Without a trial it plays the anchor, then optional and fill work, each until its games are complete
         or a checkpoint waits (the games in flight then finish and count)."""
         self.settle()
+        if self.status['anchor_champion'] != self.league['champion']:
+            self.set_anchor_turn(True)
         champion = self.league['champion']
         revived = [c for c in self.league['checkpoints'] if c.get('skipped') and champion and self.games(c['id'], champion)]
         for c in revived:
@@ -1924,11 +1936,13 @@ class Evaluator:
         if resumed and not anchor_task:
             self.filling(None)
             self.rate(resumed[0])
-            self.anchor_turn = True
+            self.set_anchor_turn(True)
             return True
         if not self.reviewed:
             self.reviewed = True
             self.review()
+            if self.status['anchor_champion'] != self.league['champion']:
+                self.set_anchor_turn(True)
             if not trials:
                 self.refresh_openings()  # a champion crowned on review refreshes the book before any game
         anchor_task = self.anchor() if self.anchor_turn else None
@@ -1945,14 +1959,14 @@ class Evaluator:
                 log_event(self.run, 'evaluator', 'skip', f'skipped {", ".join(skipped)} for {head[0]}',
                           checkpoints=skipped, candidate=head[0])
             self.rate(head)
-            self.anchor_turn = True
+            self.set_anchor_turn(True)
             return True
         if not anchor_task:
             for entry in self.variants():
                 if 'verdict' not in entry and entry['checkpoint']:
                     self.filling(None)
                     self.trial(entry)
-                    self.anchor_turn = True
+                    self.set_anchor_turn(True)
                     return True
         task = anchor_task or self.anchor() or self.optional() or self.fill()
         self.filling(None if task is None or task[2] not in ('fill', 'generalization') else 'seal' if task[1] == SEAL
@@ -1961,24 +1975,29 @@ class Evaluator:
             return False
         entry, opponent, kind, games = task
         a, s = entry['id'], self.settings
+        initial_games = len(self.games(a, opponent))
+        yield_to_trial = resumed or unrated or any('verdict' not in v and v['checkpoint'] for v in self.variants())
         if kind == 'anchor':
             games = min(games, s.anchor_session_games)
-            self.anchor_turn = not (resumed or unrated or any('verdict' not in v and v['checkpoint'] for v in self.variants()))
-        target, decided = games if kind == 'previous' else len(self.games(a, opponent))+games, []
+        target, decided = games if kind == 'previous' else initial_games+games, []
         waiting = {e[0] for e in unrated}
 
         def want():
             done = self.games(a, opponent)
+            if kind == 'anchor' and yield_to_trial and len(done) > initial_games:
+                self.set_anchor_turn(False)
             if kind == 'sprt' and done and (decision := self.test(done)['decision']):
                 decided.append(decision)  # an idle SPRT rematch keeps the first bound it crosses
             new_trial = (any(e[0] not in waiting and self.entry(e[0]) is None for e in checkpoints(self.run))
                          or any((self.run/'variant-requests').glob('*.json'))) if kind == 'anchor' else self.backlog()
             if kind == 'anchor' and new_trial:
-                self.anchor_turn = False
+                self.set_anchor_turn(False)
             if new_trial or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
         self.session(want, target)
+        if kind == 'anchor' and yield_to_trial:
+            self.set_anchor_turn(False)
         path = report_path(self.run, a, opponent)
         if path.exists():
             report = json.loads(path.read_text())

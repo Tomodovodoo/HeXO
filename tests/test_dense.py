@@ -3752,6 +3752,19 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(len(evaluator.games('main/000010@x', 'main/000010')), 2)
         self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
 
+    def test_anchor_yield_survives_a_restart(self):
+        evaluator = self.start(anchor_games=4, anchor_session_games=2, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        self.export(20)
+        self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        evaluator = self.start(anchor_games=4, anchor_session_games=2, seal_ms=5)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+
     def test_seal_anchor_discards_failed_pair_and_continues(self):
         evaluator = self.start(anchor_games=2, seal_ms=5)
         self.export(10)
@@ -3863,7 +3876,10 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual([g['pair'] for g in report['games']], [0, 0])
         evaluator = self.start(anchor_games=4, seal_ms=5, idle_rematch=True)
         self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
-        self.assertTrue(evaluator.step())
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
+            self.assertTrue(evaluator.step())                               # the waiting candidate goes next
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        self.assertTrue(evaluator.step())                                   # then the anchor resumes
         report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())
         self.assertEqual([g['pair'] for g in report['games']], [0, 0, 1, 1])
         self.assertIsNone(evaluator.anchor())
