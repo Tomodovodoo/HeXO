@@ -3888,12 +3888,21 @@ class EvaluatorLoopTests(unittest.TestCase):
         def watch(pool, steps):
             if steps > 1:
                 status = json.loads((self.run/'evaluator-status.json').read_text())
-                seen.append((pool.running(), status['games_played'], status['tally']['wins'], status['pool'][0]['running']))
+                direct, score = status['decision']['direct'], status['tally']
+                self.assertEqual(tuple(direct[k] for k in ('games', 'wins', 'losses', 'capped')),
+                                 tuple(score[k] for k in ('games', 'wins', 'losses', 'capped')))
+                seen.append((pool.running(), status['games_played'], score['wins'], status['pool'][0]['running'],
+                             status['decision']['p_better'], direct['effective_pairs']))
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=watch)), \
                 unittest.mock.patch.object(dense_eval, 'STATUS_SECONDS', 0.):
             self.assertTrue(evaluator.step())
         self.assertEqual([s[1] for s in seen], list(range(1, 20)))            # one more finished game per step
         self.assertEqual([s[2] for s in seen], list(range(1, 20)))
+        self.assertIsNone(seen[0][4])                                     # one game is not a complete pair
+        self.assertEqual(seen[0][5], 0)
+        self.assertIsNotNone(seen[1][4])
+        self.assertGreater(seen[1][5], 0)
+        self.assertEqual(seen[2][4:], seen[1][4:])                         # the next game is still unpaired
         self.assertTrue(all(s[0] >= 5 for s in seen[:13]))                 # kept full until the budget runs out
         self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 20)
 
