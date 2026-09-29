@@ -27,7 +27,9 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
   learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s;
                                        samples_per_row_target is its effective learner.samples_per_row;
                                        phase_rows its effective learner.phase_rows and backlog_rows its
-                                       dense_learn.backlog; vram is dense_learn.Learner.vram()
+                                       dense_learn.backlog; samples_per_row and backlog_rows count from the
+                                       pacing base (pacing_rows, pacing_samples; dense_learn.Learner.rebase);
+                                       vram is dense_learn.Learner.vram()
   events.jsonl                         one line per event: {time, source, kind, message, ...} (log_event)
   metrics/learner-<variant>.jsonl      {time, step, samples_seen, lr, policy_ce, value_bce, short_value_bce, next_ce,
                                        future_bce, samples_per_second, window_rows, vram} every log_every steps,
