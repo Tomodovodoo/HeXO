@@ -250,7 +250,9 @@ class EvaluationSettings:
     # book_refresh_hours: book_size settled openings of book_min_plies..book_plies placements, each the shortest
     # plausible, unused prefix of a line sampled at book_temperature from the visit counts of book_sims-simulation
     # searches (0: from the policy). An opening retires once book_min_games colour-swapped pairs put its first-player
-    # skew interval wholly beyond +-book_max_skew Elo (and is replaced by a child below book_plies), or when the
+    # skew interval wholly beyond +-book_max_skew Elo, or after book_short_min_games decisive games when its P1 win
+    # z-score reaches book_short_skew_z and its mean length falls below the book_short_quantile of played openings.
+    # Skewed openings are replaced by a child below book_plies. An opening also retires when the
     # champion's policy probability of it is below book_min_prob; each refresh the champion challenges a random
     # book_revisit_fraction of the settled openings with an alternative at the same depth. book_weighting 'uniform'
     # or 'least_played' (weight 1 / (1 + pairs)) chooses how matches draw openings.
@@ -263,6 +265,9 @@ class EvaluationSettings:
     book_refresh_hours: float = 6.
     book_max_skew: float = 50.
     book_min_games: int = 16
+    book_short_min_games: int = 6
+    book_short_skew_z: float = 2.5
+    book_short_quantile: float = .25
     book_min_prob: float = 1e-4
     book_weighting: str = 'uniform'
     opening_book: str = ''        # Book.digest of the live book the games are played under; stamped by the evaluator

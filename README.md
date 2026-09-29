@@ -958,7 +958,9 @@ quadratically, so these tensor sizes are not a measured peak VRAM increase.
   `book_temperature` from the visit counts of `book_sims` (16) searches. At every champion change and every
   `book_refresh_hours` (6) the champion re-scores the openings. It retires the implausible ones (policy
   probability below `book_min_prob`) and the skewed ones (first-player skew interval beyond ±`book_max_skew`
-  Elo after `book_min_games` pairs); a skewed opening makes way for a child. The champion also challenges
+  Elo after `book_min_games` pairs); a skewed opening makes way for a child. It also retires an opening with at least
+  `book_short_min_games` (6) decisive games when its first-player win z-score reaches `book_short_skew_z` (2.5) and its
+  mean game length is below the `book_short_quantile` (0.25) of played openings' mean lengths. The champion also challenges
   `book_revisit_fraction` of the settled openings with alternatives at the same depth, and the more balanced one
   stays. Retired openings are replaced until the target is met again. On start a book counts every report pair it
   has not counted yet (the first time, a live book imports the other suites' reports too), and a refresh adopts

@@ -52,8 +52,8 @@ def settings(**values):
     return dense_config.EvaluationSettings(**{**dict(opening_suite='book', book_sims=0, book_size=4), **values})
 
 
-def game(opening, winner, colour):
-    return dict(opening=[list(m) for m in opening], winner=winner, challenger_color=colour)
+def game(opening, winner, colour, plies=120):
+    return dict(opening=[list(m) for m in opening], winner=winner, challenger_color=colour, plies=plies)
 
 
 def pair(opening, points):
@@ -159,18 +159,36 @@ class SkewTests(unittest.TestCase):
             leaf = opening(book, deep)
             image = [[int(v) for v in np.array(p) @ hexcrop.SYMMETRIES[5]] for p in deep]
             book.record(pair(image, 2), 'r')                               # P1 won both
-            book.record([game(image, 0, 0), game(image, -1, 1)], 'r')      # 1.5
+            book.record([game(image, 0, 0, 80), game(image, -1, 1, 100)], 'r')  # 1.5
             book.record(pair([(0, 0), (1, 0), (2, 0), (3, 0)], 1), 'r')    # shares the first three placements
             book.record(pair([(0, 0), (5, 0), (6, 0)], 0), 'r')             # not in the book
             saved = {n['key']: n for n in json.loads(book.path.read_text())['nodes']}
             node = lambda k: saved[dense_openings.canonical(deep[:k])[0]]
             self.assertEqual((node(5)['games'], node(5)['p1_wins'], node(5)['p2_wins'], node(5)['capped']), (4, 3, 0, 1))
+            self.assertEqual((node(5)['plies_sum'], node(5)['plies_games'], node(5)['mean_plies']), (420, 4, 105))
             self.assertEqual(node(5)['pairs'], [0, 0, 0, 1, 1])
             self.assertEqual(node(5)['skew'], dense_openings.skew([0, 0, 0, 1, 1]))
             self.assertEqual(node(4)['pairs'], [0, 0, 0, 1, 1])
             self.assertEqual(node(3)['pairs'], [0, 0, 1, 1, 1])           # its subtree, along the paths played
             self.assertEqual(node(1)['games'], 8)                         # every game starts at the origin
             self.assertEqual(leaf['status'], 'opening')                    # statuses wait for a refresh
+
+    def test_reconcile_fills_lengths_in_an_existing_book(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = dense_openings.Book(run, settings())
+            node = opening(book, [(0, 0), (1, 0), (-1, 0)])
+            games = [dict(g, seed=1) for g in pair(node['moves'], 2)]
+            games[0]['plies'], games[1]['plies'] = 80, 100
+            book.record(games, 'r')
+            saved = json.loads(book.path.read_text())
+            for n in saved['nodes']:
+                for field in ('plies_sum', 'plies_games', 'mean_plies'):
+                    n.pop(field)
+            book.path.write_text(json.dumps(saved))
+            reopened = dense_openings.Book(run, settings())
+            report = dict(id='r', settings=dict(opening_suite='book'), games=games)
+            self.assertEqual(reopened.reconcile([report]), 0)
+            self.assertEqual(reopened.nodes[node['key']]['mean_plies'], 90)
 
 
 class FilterTests(unittest.TestCase):
@@ -188,6 +206,15 @@ class FilterTests(unittest.TestCase):
         self.assertIsNone(dense_openings.judge(lean, replace(s, book_max_skew=low+1)))
         self.assertEqual(dense_openings.judge(node((2, 4, 8, 4, 2), 5e-5), s), 'probability')
         self.assertIsNone(dense_openings.judge(node((2, 4, 8, 4, 2), None), s))                  # not scored yet
+
+    def test_short_skew_needs_decisive_games_z_and_below_quantile_length(self):
+        s = settings()
+        node = lambda wins, losses, plies: dict(skew=dense_openings.skew([0]*5), champion_probability=1.,
+                                                p1_wins=wins, p2_wins=losses, mean_plies=plies)
+        self.assertEqual(dense_openings.judge(node(7, 0, 94), s, 99), 'short_skew')
+        self.assertIsNone(dense_openings.judge(node(7, 0, 100), s, 99))
+        self.assertIsNone(dense_openings.judge(node(4, 3, 94), s, 99))
+        self.assertIsNone(dense_openings.judge(node(6, 0, 94), s, 99))
 
 
 class RefreshTests(unittest.TestCase):
@@ -244,6 +271,27 @@ class RefreshTests(unittest.TestCase):
             deep.refresh(Uniform(radius=2), CHAMPION, np.random.default_rng(3), now=1.)
             [fresh] = deep.openings()
             self.assertEqual((last['reason'], fresh['depth']), ('skew', 3))
+
+    def test_short_skew_retires_and_is_replaced(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run, book_size=6, book_revisit_fraction=0.)
+            lines = [[(0, 0), (1, 0), p] for p in ((1, -1), (-1, 0), (2, 0), (0, -1), (2, -1), (0, 2))]
+            nodes = [opening(book, line) for line in lines]
+            lengths = (70, 60, 130, 120, 125, 135)
+            for i, node in enumerate(nodes):
+                for j in range(7):
+                    points = 2 if i in (0, 2) else 1 if i == 1 else 1.5 if j % 2 else .5
+                    games = pair(node['moves'], points)
+                    for g in games:
+                        g['plies'] = lengths[i]
+                    book.tally(games)
+            result = book.refresh(Uniform(radius=2), CHAMPION, np.random.default_rng(2), now=1.)
+            self.assertEqual((nodes[0]['status'], nodes[0]['reason']), ('retired', 'short_skew'))
+            self.assertEqual((nodes[1]['status'], nodes[2]['status']), ('opening', 'opening'))
+            self.assertEqual(result['retired']['short_skew'], 1)
+            self.assertEqual(result['openings'], 6)
+            self.assertTrue(any(n['depth'] == 4 and dense_openings.canonical(n['moves'][:3])[0] == nodes[0]['key']
+                                for n in book.openings()))
 
     def test_implausible_openings_retire(self):
         with tempfile.TemporaryDirectory() as run:
@@ -346,7 +394,7 @@ class RefreshTests(unittest.TestCase):
                 book.retire(node, reason, 1.)
             stats = book.stats()
             self.assertEqual((stats['openings'], stats['retired'], stats['depths']),
-                             (1, dict(probability=1, skew=1, replaced=0), {'4': 1}))
+                             (1, dict(probability=1, skew=1, short_skew=0, replaced=0), {'4': 1}))
             self.assertAlmostEqual(stats['mean_abs_skew'], abs(kept['skew']['elo']))
             self.assertEqual(sum(stats['histogram']['counts']), 1)
             graph = book.graph()
@@ -487,23 +535,29 @@ class SettingsTests(unittest.TestCase):
         args = parser.parse_args(['--eval-opening-suite', 'book', '--eval-book-plies', '7', '--eval-book-min-plies', '4',
                                   '--eval-book-temperature', '2', '--eval-book-sims', '8', '--eval-book-size', '256',
                                   '--eval-book-revisit-fraction', '.5', '--eval-book-refresh-hours', '2.5',
-                                  '--eval-book-max-skew', '40', '--eval-book-min-games', '8', '--eval-book-min-prob', '1e-5',
+                                  '--eval-book-max-skew', '40', '--eval-book-min-games', '8',
+                                  '--eval-book-short-min-games', '9', '--eval-book-short-skew-z', '3',
+                                  '--eval-book-short-quantile', '.2', '--eval-book-min-prob', '1e-5',
                                   '--eval-book-weighting', 'least_played'])
         s = dense_config.override(dense_config.EvaluationSettings(), args, 'eval_')
         self.assertEqual((s.opening_suite, s.book_plies, s.book_min_plies, s.book_temperature, s.book_sims, s.book_size,
                           s.book_revisit_fraction, s.book_refresh_hours, s.book_max_skew, s.book_min_games, s.book_min_prob,
                           s.book_weighting), ('book', 7, 4, 2., 8, 256, .5, 2.5, 40., 8, 1e-5, 'least_played'))
+        self.assertEqual((s.book_short_min_games, s.book_short_skew_z, s.book_short_quantile), (9, 3., .2))
         dense_openings.check(s)
         d = dense_config.EvaluationSettings()
         self.assertEqual((d.opening_suite, d.book_plies, d.book_min_plies, d.book_temperature, d.book_sims, d.book_size,
                           d.book_revisit_fraction, d.book_refresh_hours, d.book_max_skew, d.book_min_games, d.book_min_prob,
                           d.book_weighting, d.opening_book),
                          ('standard-v1', 5, 3, 1.5, 16, 512, .25, 6., 50., 16, 1e-4, 'uniform', ''))
+        self.assertEqual((d.book_short_min_games, d.book_short_skew_z, d.book_short_quantile), (6, 2.5, .25))
         dense_openings.check(d)
         self.assertEqual(dense_openings.suites(), ('book', 'standard-v1'))
         for bad in (dict(opening_suite='mixed-v1'), dict(opening_book='abc'), dict(book_plies=0), dict(book_plies=256),
                     dict(book_min_plies=6), dict(book_min_plies=1), dict(book_plies=11), dict(book_temperature=0.), dict(book_sims=-1),
-                    dict(book_size=0), dict(book_min_games=0), dict(book_revisit_fraction=1.5), dict(book_refresh_hours=0.),
+                    dict(book_size=0), dict(book_min_games=0), dict(book_short_min_games=0),
+                    dict(book_short_skew_z=-1.), dict(book_short_quantile=1.5),
+                    dict(book_revisit_fraction=1.5), dict(book_refresh_hours=0.),
                     dict(book_min_prob=1.), dict(book_max_skew=-1.), dict(book_weighting='other')):
             with self.assertRaises(ValueError, msg=bad):
                 dense_openings.check(replace(d, **bad))

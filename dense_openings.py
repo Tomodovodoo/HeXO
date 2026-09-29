@@ -20,9 +20,9 @@ File {schema, suite, frozen, refreshed_by, refreshed_at, counted, imported, weig
 ordered by depth then key; counted maps `report_id` to the pairs of that report the book has counted
 (`Book.reconcile`) and weighting is the live book's draw rule (EvaluationSettings.book_weighting).
 node {key, moves, depth, weight (frozen openings), status, reason, challenges, probability, visit_share, checkpoint,
-      created_at, retired_at, champion_probability, champion_value, scored_by, games, p1_wins, p2_wins, capped, pairs,
-      skew}:
-  status        'opening' (drawn), 'retired' (was an opening; `reason` 'probability', 'skew' or 'replaced') or null (a
+      created_at, retired_at, champion_probability, champion_value, scored_by, games, p1_wins, p2_wins, capped,
+      plies_sum, plies_games, mean_plies, pairs, skew}:
+  status        'opening' (drawn), 'retired' (was an opening; `reason` 'probability', 'skew', 'short_skew' or 'replaced') or null (a
                 prefix, or a position imported from reports that never was an opening).
   challenges    the key of the opening an open challenger competes with (null when settled).
   probability   `reach` policy probability of the node's class under `checkpoint`, the champion that made it an
@@ -30,6 +30,7 @@ node {key, moves, depth, weight (frozen openings), status, reason, challenges, p
                 champion_probability and champion_value (the value head's P1 expected score) under `scored_by`, the
                 champion of the newest refresh; null until scored.
   games, p1_wins, p2_wins, capped  games through the node; P1 is player 0, who places the origin stone.
+  mean_plies    mean final game length through the node, from plies_sum / plies_games.
   pairs         colour-swapped pairs through the node by P1's points: counts of 0, 1/2, 1, 3/2 and 2.
   skew          `skew` of pairs: P1's advantage in Elo with its 95% interval.
 The openings change only at a refresh; `Book.digest` names that state for the match protocol.
@@ -61,7 +62,7 @@ GROW_ROUNDS = 8     # generation rounds per refresh while settled openings are m
 SCORE_BATCH = 512   # positions per policy call
 SKEW_EDGES = list(range(-200, 201, 25))  # histogram bins of `Book.stats`, the outer bins open-ended
 MAX_PLIES = 10      # longest book line: P2's sixth stone is the 11th placement, so no book position is terminal
-REASONS = ('probability', 'skew', 'replaced')
+REASONS = ('probability', 'skew', 'short_skew', 'replaced')
 
 
 def turns(moves):
@@ -224,11 +225,15 @@ def skewed(node, settings):
     return node['skew']['pairs'] >= settings.book_min_games and (low > settings.book_max_skew or high < -settings.book_max_skew)
 
 
-def judge(node, settings):
-    """Why an opening must retire, else None: 'skew' when `skewed`, else 'probability' when its champion_probability
-    is below book_min_prob."""
+def judge(node, settings, short_limit=None):
+    """Why an opening must retire, else None. `short_limit` is the played openings' mean-length quantile."""
     if skewed(node, settings):
         return 'skew'
+    decisive = node.get('p1_wins', 0)+node.get('p2_wins', 0)
+    if short_limit is not None and decisive >= settings.book_short_min_games and node.get('mean_plies') is not None \
+            and node['mean_plies'] < short_limit \
+            and abs(node['p1_wins']-decisive/2)/math.sqrt(decisive/4) >= settings.book_short_skew_z:
+        return 'short_skew'
     p = node['champion_probability']
     return 'probability' if p is not None and p < settings.book_min_prob else None
 
@@ -242,7 +247,8 @@ def new_node(moves, now=0.):
     key, moves = canonical(moves)
     return dict(key=key, moves=moves, depth=len(moves), status=None, reason=None, challenges=None, probability=None,
                 visit_share=None, checkpoint=None, created_at=now, retired_at=None, champion_probability=None, champion_value=None,
-                scored_by=None, games=0, p1_wins=0, p2_wins=0, capped=0, pairs=[0]*5, skew=skew([0]*5))
+                scored_by=None, games=0, p1_wins=0, p2_wins=0, capped=0, plies_sum=0, plies_games=0,
+                mean_plies=None, pairs=[0]*5, skew=skew([0]*5))
 
 
 def suites():
@@ -258,7 +264,8 @@ def check(settings):
     """Raise ValueError unless the opening settings are usable: opening_suite one of `suites`, opening_book empty
     outside 'book' (the evaluator stamps it), 2 <= book_min_plies <= book_plies <= MAX_PLIES and book_plies <
     max_plies (a one-placement opening is the empty start), book_temperature > 0,
-    book_sims and book_max_skew >= 0, book_size and book_min_games >= 1, book_revisit_fraction in [0, 1],
+    book_sims and book_max_skew >= 0, book_size, book_min_games and book_short_min_games >= 1,
+    book_short_skew_z >= 0, book_short_quantile in [0, 1], book_revisit_fraction in [0, 1],
     book_refresh_hours > 0, book_min_prob in [0, 1) and book_weighting 'uniform' or 'least_played'."""
     s = settings
     if s.opening_suite not in suites():
@@ -266,12 +273,14 @@ def check(settings):
     if s.opening_suite != LIVE and s.opening_book:
         raise ValueError("opening_book names a book state; it stays empty outside opening_suite 'book'")
     if not 2 <= s.book_min_plies <= s.book_plies <= MAX_PLIES or s.book_plies >= s.max_plies or s.book_temperature <= 0 \
-            or min(s.book_sims, s.book_max_skew) < 0 \
-            or min(s.book_size, s.book_min_games) < 1 or not 0 <= s.book_revisit_fraction <= 1 or s.book_refresh_hours <= 0 \
+            or min(s.book_sims, s.book_max_skew, s.book_short_skew_z) < 0 \
+            or min(s.book_size, s.book_min_games, s.book_short_min_games) < 1 \
+            or not 0 <= s.book_short_quantile <= 1 or not 0 <= s.book_revisit_fraction <= 1 or s.book_refresh_hours <= 0 \
             or not 0 <= s.book_min_prob < 1 or s.book_weighting not in ('uniform', 'least_played'):
         raise ValueError(f'need 2 <= book_min_plies <= book_plies <= {MAX_PLIES}, book_plies < max_plies, '
                          'book_temperature > 0, book_sims and '
-                         'book_max_skew >= 0, book_size and book_min_games >= 1, book_revisit_fraction in [0, 1], '
+                         'book_max_skew and book_short_skew_z >= 0, book_size, book_min_games and '
+                         'book_short_min_games >= 1, book_short_quantile and book_revisit_fraction in [0, 1], '
                          "book_refresh_hours > 0, book_min_prob in [0, 1) and book_weighting 'uniform' or 'least_played'")
 
 
@@ -327,6 +336,8 @@ class Book:
         if settings and not self.frozen:
             self.data['weighting'] = settings.book_weighting
         self.nodes = {n['key']: n for n in self.data['nodes']}
+        self._missing_plies = {n['key'] for n in self.nodes.values() if 'plies_games' not in n}
+        self._legacy_counted = dict(self.data['counted'])
 
     def openings(self):
         """The openings (status 'opening'), by key."""
@@ -380,8 +391,15 @@ class Book:
             node['p1_wins'] += sum(g['winner'] == 0 for g in pair)
             node['p2_wins'] += sum(g['winner'] == 1 for g in pair)
             node['capped'] += sum(g['winner'] < 0 for g in pair)
+            self._count_plies(node, pair)
             node['pairs'][round(2*points)] += 1
             node['skew'] = skew(node['pairs'])
+
+    @staticmethod
+    def _count_plies(node, pair):
+        node['plies_sum'] = node.get('plies_sum', 0)+sum(g['plies'] for g in pair)
+        node['plies_games'] = node.get('plies_games', 0)+len(pair)
+        node['mean_plies'] = node['plies_sum']/node['plies_games']
 
     def record(self, pair, report):
         """`tally` a completed colour pair (two game records of one opening, as dense_eval writes them) that was just
@@ -397,6 +415,14 @@ class Book:
         stopped between the two writes, is counted once on the next start). Reports of the book's own suite count
         always; a live book counts the reports of other suites too the first time (`imported`), adding the positions of
         their openings (status null: a refresh may make them openings). Returns the pairs counted."""
+        if self._missing_plies:
+            for report in reports:
+                for pair in pairs_of(report)[:self._legacy_counted.get(report_id(report), 0)]:
+                    for k in range(1, len(pair[0]['opening'])+1):
+                        key = canonical(pair[0]['opening'][:k])[0]
+                        if key in self._missing_plies:
+                            self._count_plies(self.nodes[key], pair)
+            self._missing_plies.clear()
         added = 0
         for report in reports:
             if report['settings'].get('opening_suite') != self.suite and (self.frozen or self.data['imported']):
@@ -431,7 +457,7 @@ class Book:
            depth, sampled from its parent position (`generate`);
         4. while fewer than book_size openings are settled, add settled replacements: first the imported positions
            with pairs that no opening passes through (most pairs first; at least book_min_plies deep, plausible and
-           not `skewed`), then one child of every opening retired as skewed in step 1 below book_plies, then fresh
+           not `skewed`), then one child of every opening retired for skew in step 1 below book_plies, then fresh
            openings from the origin (`generate`, up to GROW_ROUNDS rounds).
         Writes the file; returns {digest, openings, challengers, retired {reason: count} of this refresh, added}."""
         if self.frozen:
@@ -440,12 +466,14 @@ class Book:
         retired = dict.fromkeys(REASONS, 0)
         openings = self.openings()
         self.score(model, checkpoint, openings)
+        lengths = [n['mean_plies'] for n in openings if n.get('mean_plies') is not None]
+        short_limit = float(np.quantile(lengths, s.book_short_quantile)) if lengths else None
         extend = []
         for node in openings:
-            if reason := judge(node, s):
+            if reason := judge(node, s, short_limit):
                 self.retire(node, reason, now)
                 retired[reason] += 1
-                if reason == 'skew' and node['depth'] < s.book_plies:
+                if reason in ('skew', 'short_skew') and node['depth'] < s.book_plies:
                     extend.append(node)
         for node in self.openings():
             rival = self.nodes.get(node['challenges'])
