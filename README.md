@@ -955,7 +955,8 @@ quadratically, so these tensor sizes are not a measured peak VRAM increase.
   is a book file too: `openings/standard-v1.json` is the old evaluation suite with its original distribution.
   With `--eval-opening-suite book`, the live book `openings.json` holds `book_size` (512) settled openings of 3 to
   `book_plies` (5) placements. Each is the shortest plausible, unused prefix of a line sampled at
-  `book_temperature` from the visit counts of `book_sims` (16) searches. At every champion change and every
+  `book_temperature` from the visit counts of `book_sims` (16) searches. Generation skips prefixes of active openings;
+  when a child extends an opening, the parent retires as `nested` at refresh. At every champion change and every
   `book_refresh_hours` (6) the champion re-scores the openings. It retires the implausible ones (policy
   probability below `book_min_prob`) and the skewed ones (first-player skew interval beyond ±`book_max_skew`
   Elo after `book_min_games` pairs); a skewed opening makes way for a child. It also retires an opening with at least

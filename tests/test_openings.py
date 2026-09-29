@@ -256,7 +256,35 @@ class RefreshTests(unittest.TestCase):
             self.assertEqual((len(openings), len({n['key'] for n in openings})), (8, 8))
             self.assertLessEqual(depths[3], 3)
             self.assertGreater(depths[4]+depths[5], 0)
+            self.assertFalse(any(dense_openings.canonical(n['moves'][:d])[0] in {o['key'] for o in openings}
+                                 for n in openings for d in range(1, n['depth'])))
             self.assertEqual(book.stats()['depths'], {str(d): c for d, c in sorted(depths.items())})
+
+    def test_refresh_retires_a_nested_parent_and_keeps_its_child(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run, book_size=1, book_revisit_fraction=0.)
+            line = [(0, 0), (1, 0), (-1, 0), (0, 1)]
+            parent = opening(book, line[:3])
+            child = opening(book, line)
+            result = book.refresh(Uniform(radius=2), CHAMPION, np.random.default_rng(0), now=1.)
+            self.assertEqual((parent['status'], parent['reason'], parent['retired_at']), ('retired', 'nested', 1.))
+            self.assertEqual(child['status'], 'opening')
+            self.assertEqual((result['retired']['nested'], result['added'], result['openings']), (1, 0, 1))
+
+    def test_refresh_retires_a_parent_extended_during_generation(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run, book_size=2, book_plies=4, book_revisit_fraction=0.)
+            line = [(0, 0), (1, 0), (-1, 0), (0, 1)]
+            parent = opening(book, line[:3])
+            with unittest.mock.patch.object(dense_openings, 'continuations',
+                                            lambda model, starts, s, rng, leaf_batch: ([list(line)]*len(starts), [[None]*3]*len(starts))), \
+                    unittest.mock.patch.object(dense_openings, 'reach',
+                                               lambda model, positions: [(1., .5)]*len(positions)):
+                result = book.refresh(None, CHAMPION, np.random.default_rng(0), now=1.)
+            self.assertEqual((parent['status'], parent['reason']), ('retired', 'nested'))
+            self.assertEqual(book.nodes[dense_openings.canonical(line[:4])[0]]['status'], 'opening')
+            self.assertEqual((result['retired']['nested'], result['added']), (1, 1))
+
     def test_skewed_openings_retire_and_a_child_replaces_them(self):
         with tempfile.TemporaryDirectory() as run:
             book = self.book(run, book_size=2, book_revisit_fraction=0.)
@@ -353,6 +381,20 @@ class RefreshTests(unittest.TestCase):
                 self.assertEqual(book.generate(None, CHAMPION, [([(0, 0)], 3, None)], np.random.default_rng(0), 0.), 1)
             self.assertEqual(sorted(n['depth'] for n in book.openings()), [3, 5])
 
+    def test_generation_skips_a_prefix_of_an_active_opening(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run)
+            line = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+            child = opening(book, line[:4])
+            with unittest.mock.patch.object(dense_openings, 'continuations',
+                                            lambda model, starts, s, rng, leaf_batch: ([list(line)]*len(starts), [[None]*4]*len(starts))), \
+                    unittest.mock.patch.object(dense_openings, 'reach',
+                                               lambda model, positions: [(1., .5)]*len(positions)):
+                self.assertEqual(book.generate(None, CHAMPION, [([(0, 0)], 3, None)], np.random.default_rng(0), 0.), 1)
+            self.assertEqual(child['status'], 'opening')
+            self.assertEqual(sorted(n['depth'] for n in book.openings()), [4, 5])
+            self.assertIsNone(book.nodes[dense_openings.canonical(line[:3])[0]]['status'])
+
     def test_reports_of_another_suite_are_imported_once_and_refresh_adopts_them(self):
         with tempfile.TemporaryDirectory() as run:
             played = [(0, 0), (1, 0), (-1, 0)]
@@ -410,7 +452,7 @@ class RefreshTests(unittest.TestCase):
                 book.retire(node, reason, 1.)
             stats = book.stats()
             self.assertEqual((stats['openings'], stats['retired'], stats['depths']),
-                             (1, dict(probability=1, skew=1, short_skew=0, replaced=0), {'4': 1}))
+                             (1, dict(probability=1, skew=1, short_skew=0, nested=0, replaced=0), {'4': 1}))
             self.assertAlmostEqual(stats['mean_abs_skew'], abs(kept['skew']['elo']))
             self.assertEqual(sum(stats['histogram']['counts']), 1)
             graph = book.graph()
@@ -661,6 +703,21 @@ class EvaluatorBookTests(unittest.TestCase):
 
     def saved(self, name='openings.json'):
         return json.loads((self.run/name).read_text())
+
+    def test_book_event_reports_nested_retirements(self):
+        book = dense_openings.Book(self.run, settings(book_size=1, book_revisit_fraction=0.))
+        line = [(0, 0), (1, 0), (-1, 0), (0, 1)]
+        opening(book, line[:3])
+        opening(book, line)
+        book.save()
+        self.export(10)
+        evaluator = self.start(book_size=1, book_revisit_fraction=0.)
+        evaluator.step()
+        evaluator.refresh_openings()
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        [event] = [e for e in events if e['kind'] == 'book']
+        self.assertEqual(event['retired']['nested'], 1)
+        self.assertIn('1 nested', event['message'])
 
     def test_games_draw_openings_and_write_their_results_to_every_node_passed(self):
         book = dense_openings.Book(self.run, settings())
