@@ -164,7 +164,7 @@ class MatchGame:
                  solvers=(None, None)):
         self.sides, self.max_plies, self.seal, self.seal_ms, self.record = sides, max_plies, seal, seal_ms, record
         self.solvers = solvers
-        self.reason = None
+        self.reason, self.error = None, None
         per = lambda value: tuple(value) if isinstance(value, (tuple, list)) else (value, value)
         self.budgets, self.sample_counts, tactics = per(sims), per(samples), per(tactics)
         self.game, self.moves = Game([tuple(m) for m in opening]), [list(m) for m in opening]
@@ -172,7 +172,12 @@ class MatchGame:
         for colour, side in enumerate(sides):
             if side != SEAL and id(side) not in self.trees:
                 self.trees[id(side)] = side.tree([tuple(m) for m in opening], seed*2+colour, tactics[colour])
-        self.seal_turns()
+        try:
+            self.seal_turns()
+        except Exception as error:
+            if SEAL not in sides:
+                raise
+            self.error = f'{type(error).__name__}: {error}'
 
     @property
     def budget(self):
@@ -195,7 +200,7 @@ class MatchGame:
         return self.solvers[self.game.player]
 
     def over(self):
-        return self.game.winner >= 0 or len(self.moves) >= self.max_plies
+        return self.error is not None or self.game.winner >= 0 or len(self.moves) >= self.max_plies
 
     def play(self, q, r):
         self.game.play(q, r)
@@ -206,9 +211,9 @@ class MatchGame:
     def seal_turns(self):
         while not self.over() and self.sides[self.game.player] == SEAL:
             side, turn = self.game.player, self.seal(self.game, self.seal_ms)
-            if not 1 <= len(turn) <= self.game.remaining:
+            if not 1 <= len(turn) <= 2:
                 raise ValueError(f'Seal returned {len(turn)} moves for {self.game.remaining} placements')
-            for q, r in turn:
+            for q, r in turn[:self.game.remaining]:
                 if not self.game.legal(q, r):
                     raise ValueError(f'Seal played an illegal placement {q}, {r}')
                 self.play(int(q), int(r))
@@ -218,8 +223,13 @@ class MatchGame:
                 raise ValueError('Seal did not complete its turn')
 
     def searched(self, result):
-        self.play(*map(int, result['action']))
-        self.seal_turns()
+        try:
+            self.play(*map(int, result['action']))
+            self.seal_turns()
+        except Exception as error:
+            if SEAL not in self.sides:
+                raise
+            self.error = f'{type(error).__name__}: {error}'
         return not self.over()
 
     def finish(self):
@@ -228,7 +238,7 @@ class MatchGame:
         for tree in self.trees.values():
             tree.close()
         return dict(self.record, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
-                    plies=len(self.moves), moves=self.moves)
+                    plies=len(self.moves), moves=self.moves, **(dict(error=self.error) if self.error else {}))
 
 
 def play(games, leaf_batch, heartbeat=lambda finished: None):
@@ -1124,7 +1134,7 @@ class Evaluator:
                 return  # the tally is computed only for a write
             main = next(iter(shown), None)
             a, b, kind = main or (None, None, None)
-            halves = [r for group in waiting.get(main, {}).values() for r in group]
+            halves = [r for group in waiting.get(main, {}).values() for r in group if 'error' not in r]
             played = len(self.games(a, b))+len(halves) if a else 0
             done = self.direct(a, b)+oriented(halves, a, a) if a else []
             live = placed+pool.moves()
@@ -1166,13 +1176,18 @@ class Evaluator:
             for lane, record in results:
                 moves = record['plies']-len(record['opening'])
                 placed += moves
-                count = added.setdefault(lane, [0, 0])
-                count[0] += 1; count[1] += moves
                 group = waiting.setdefault(lane, {}).setdefault(record['pair'], [])
                 group.append(record)
+                if 'error' in record:
+                    log_event(self.run, 'evaluator', 'error', f'{lane[0]} vs {lane[1]} pair {record["pair"]}: '
+                              f'game discarded after {record["error"]}', candidate=lane[0], opponent=lane[1])
                 if len(group) == 2:
                     del waiting[lane][record['pair']]
-                    self.persist(*lane, sorted(group, key=lambda r: r['challenger_color']))
+                    if not any('error' in game for game in group):
+                        self.persist(*lane, sorted(group, key=lambda r: r['challenger_color']))
+                        count = added.setdefault(lane, [0, 0])
+                        count[0] += 2
+                        count[1] += sum(game['plies']-len(game['opening']) for game in group)
                     paired = True
             if paired:
                 lanes = want()

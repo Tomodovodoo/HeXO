@@ -2581,6 +2581,20 @@ class EvaluatorSearchTests(unittest.TestCase):
         self.model = hexnet.HexNet(TINY).eval()
         self.evaluator = hexnet.DenseEvaluator(self.model, device='cpu')
 
+    def test_seal_finishes_mid_turn_opening_with_first_reply_move(self):
+        opening = [(0, 0), (1, 0), (-1, 0), (0, 1)]
+        calls = []
+        def seal(game, ms):
+            moves = game.legal_moves()[:2]
+            calls.append((game.remaining, moves))
+            return moves
+        game = dense_eval.MatchGame([dense_eval.SEAL, dense_eval.SEAL], opening, 1, 2, 2, False, 7, {}, seal, 5)
+        record = game.finish()
+        self.assertEqual([remaining for remaining, _ in calls], [1, 2])
+        self.assertEqual(record['moves'], [list(move) for move in opening]+[list(calls[0][1][0])]
+                         +[list(move) for move in calls[1][1]])
+        self.assertNotIn('error', record)
+
     def test_evaluator_matches_model_including_far_cells(self):
         histories = [POSITIONS[10], [], line_history(31), line_history(6)]
         results = self.evaluator.evaluate(histories)
@@ -3607,6 +3621,25 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 4))
         self.export(20)
         return evaluator
+
+    def test_seal_anchor_discards_failed_pair_and_continues(self):
+        evaluator = self.start(anchor_games=2, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        calls = [0]
+        def seal(game, ms):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise RuntimeError('one bad Seal game')
+            return game.legal_moves()[:game.remaining]
+        evaluator.seal = seal
+        self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())
+        self.assertEqual(len(report['games']), 2)
+        self.assertEqual({game['pair'] for game in report['games']}, {1})
+        self.assertIsNone(evaluator.anchor())
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertTrue(any(event['kind'] == 'error' and 'one bad Seal game' in event['message'] for event in events))
 
     def test_promotion_anchors_after_the_next_sprt_and_before_optional_work(self):
         import dashboard
