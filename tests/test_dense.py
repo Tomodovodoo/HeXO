@@ -1493,7 +1493,7 @@ class ValidationSourceTests(unittest.TestCase):
             sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=6)
             manifest = learner.export(window, sets)
             self.assertEqual(set(manifest), {'variant', 'step', 'samples_seen', 'created_at', 'model_sha256', 'ema_sha256',
-                                             'metrics', 'learner', 'model', 'copied_from'})
+                                             'metrics', 'learner', 'model', 'copied_from', 'pacing'})
             aggregate, v = manifest['metrics']['validation'], manifest['metrics']['validation_sources']
             self.assertEqual(v['newest_checkpoint'], 'main/000010')
             for h in ('policy_ce', 'value_bce', 'opponent_ce', 'future_bce'):
@@ -2141,6 +2141,7 @@ class YieldTests(unittest.TestCase):
             self.assertEqual(status['samples_per_row_target'], 7.5)
             self.assertEqual(status['phase_rows'], 0)
             self.assertAlmostEqual(status['backlog_rows'], status['rows_available']-status['samples_seen']/7.5)
+            self.assertEqual((status['pacing_rows'], status['pacing_samples']), (0, 0))
             zeros = dict(allocated_mb=0, reserved_mb=0)
             self.assertEqual(status['vram'], zeros)
             lines = [json.loads(line) for line in (run/'metrics'/'learner-main.jsonl').read_text().splitlines()]
@@ -2179,6 +2180,71 @@ class PhaseTests(unittest.TestCase):
         self.assertEqual(dense_learn.backlog(400, 100, 4.), 0)
         self.assertEqual(dense_learn.backlog(200, 100, 4.), 50)
         self.assertEqual(dense_learn.backlog(10496000, 2705320, 4.), 81320)  # the live heartbeat at step 41000
+
+    def test_backlog_and_pacing_count_from_the_base(self):
+        base = dict(rows=3_800_000, samples=14_800_000)
+        self.assertEqual(dense_learn.backlog(14_800_000, 3_800_000, 3., base), 0)
+        self.assertEqual(dense_learn.backlog(14_800_300, 3_800_400, 3., base), 300)
+        self.assertLess(dense_learn.backlog(14_800_000, 3_800_000, 3.), -1e6)  # without the base: a deficit
+        self.assertTrue(dense_learn.paced(14_800_000, 3_800_000, 3., 1, base))
+        self.assertFalse(dense_learn.paced(14_800_000, 3_800_100, 3., 300, base))
+        self.assertTrue(dense_learn.paced(14_800_000, 3_800_100, 3., 301, base))
+        for seen, rows in ((0, 0), (400, 100), (401, 100), (100, 30)):
+            self.assertEqual(dense_learn.paced(seen, rows, 4., 8), seen+8 > 4.*rows)
+            self.assertEqual(dense_learn.backlog(seen, rows, 4.), rows-seen/4.)
+
+    def test_resume_moves_the_pacing_base_only_when_samples_per_row_changes(self):
+        torch.set_num_threads(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x')
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=0.))
+            window = dense_data.ReplayWindow(run, 1000, 10)
+            first = dense_learn.Learner(run, config.learner, config)
+            first.samples_seen = 5000
+            self.assertEqual(first.export(window)['pacing'], dict(rows=0, samples=0))
+            same = dense_learn.Learner(run, config.learner, config)
+            same.rebase(1000)
+            self.assertEqual(same.pacing, dict(rows=0, samples=0))
+            events = lambda: [e for e in map(json.loads, (run/'events.jsonl').read_text().splitlines()) if 'pacing' in e]
+            self.assertEqual(events(), [])
+            lower = dense_learn.Learner(run, config.learner, config, overrides=dict(samples_per_row=3.))
+            lower.rebase(1000)
+            self.assertEqual(lower.pacing, dict(rows=1000, samples=5000))
+            self.assertLess(dense_learn.backlog(5000, 1000, 4.), 0)
+            self.assertEqual(dense_learn.backlog(5000, 1000, 3., lower.pacing), 0)
+            self.assertEqual(dense_learn.backlog(5000, 1010, 3., lower.pacing), 10)
+            [event] = events()
+            self.assertEqual((event['pacing'], event['old_samples_per_row'], event['new_samples_per_row']),
+                             (dict(rows=1000, samples=5000), 4., 3.))
+            lower.rebase(1200)
+            self.assertEqual(lower.pacing, dict(rows=1000, samples=5000))
+            lower.step = 1
+            self.assertEqual(lower.export(window)['pacing'], dict(rows=1000, samples=5000))
+            kept = dense_learn.Learner(run, config.learner, config, overrides=dict(samples_per_row=3.))
+            kept.rebase(1500)
+            self.assertEqual(kept.pacing, dict(rows=1000, samples=5000))
+            self.assertEqual(len(events()), 1)
+
+    def test_manifests_without_a_pacing_base_pace_from_zero(self):
+        torch.set_num_threads(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x')
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=0.))
+            learner = dense_learn.Learner(run, config.learner, config)
+            learner.samples_seen = 5000
+            learner.export(dense_data.ReplayWindow(run, 1000, 10))
+            path = run/'checkpoints'/'main'/'000000'/'manifest.json'
+            manifest = json.loads(path.read_text())
+            del manifest['pacing']
+            path.write_text(json.dumps(manifest))
+            resumed = dense_learn.Learner(run, config.learner, config)
+            resumed.rebase(1000)
+            self.assertEqual(resumed.pacing, dense_learn.NO_BASE)
+            self.assertEqual(dense_learn.backlog(5000, 1000, 4., resumed.pacing), dense_learn.backlog(5000, 1000, 4.))
 
     def simulate(self, phase_rows, ticks, arrivals=90, batch=256, per_row=4., rows=0, seen=0):
         """One tick: the learner takes one batch if Phase says so and the pacing allows it, otherwise actors
