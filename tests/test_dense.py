@@ -3867,10 +3867,12 @@ class EvaluatorLoopTests(unittest.TestCase):
     def test_a_restart_loses_only_the_games_in_flight(self):
         """Every completed colour pair is on disk at once: an evaluator killed mid-session resumes the pairing."""
         evaluator = self.anchored()
-        def crash(pool, steps):
-            if steps == 3:                                                  # pair 0 is persisted, pair 1 is in flight
-                raise Crash
-        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=crash)), self.assertRaises(Crash):
+        persist = evaluator.persist
+        def crash(*args):
+            persist(*args)
+            raise Crash                                                    # pair 0 is on disk, before the next want()
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()), \
+                unittest.mock.patch.object(evaluator, 'persist', side_effect=crash), self.assertRaises(Crash):
             evaluator.step()
         report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())
         self.assertEqual([g['pair'] for g in report['games']], [0, 0])

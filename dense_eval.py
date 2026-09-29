@@ -1979,25 +1979,25 @@ class Evaluator:
         yield_to_trial = resumed or unrated or any('verdict' not in v and v['checkpoint'] for v in self.variants())
         if kind == 'anchor':
             games = min(games, s.anchor_session_games)
+            self.set_anchor_turn(False)  # commit the handoff before any anchor pair is written
         target, decided = games if kind == 'previous' else initial_games+games, []
         waiting = {e[0] for e in unrated}
 
+        def arrived():
+            return (any(e[0] not in waiting and self.entry(e[0]) is None for e in checkpoints(self.run))
+                    or any((self.run/'variant-requests').glob('*.json')))
+
         def want():
             done = self.games(a, opponent)
-            if kind == 'anchor' and yield_to_trial and len(done) > initial_games:
-                self.set_anchor_turn(False)
             if kind == 'sprt' and done and (decision := self.test(done)['decision']):
                 decided.append(decision)  # an idle SPRT rematch keeps the first bound it crosses
-            new_trial = (any(e[0] not in waiting and self.entry(e[0]) is None for e in checkpoints(self.run))
-                         or any((self.run/'variant-requests').glob('*.json'))) if kind == 'anchor' else self.backlog()
-            if kind == 'anchor' and new_trial:
-                self.set_anchor_turn(False)
+            new_trial = arrived() if kind == 'anchor' else self.backlog()
             if new_trial or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
         self.session(want, target)
-        if kind == 'anchor' and yield_to_trial:
-            self.set_anchor_turn(False)
+        if kind == 'anchor' and not yield_to_trial and not arrived():
+            self.set_anchor_turn(True)
         path = report_path(self.run, a, opponent)
         if path.exists():
             report = json.loads(path.read_text())
