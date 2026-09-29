@@ -9,8 +9,9 @@ changed; everything is written under `--out` (default: the run): the sidecar sha
 restarts.json, solver-status.json, events and .solve/ (worker results and logs). A shard is done once its sidecar
 exists, so a restarted pass resumes where it stopped. Pending shards are taken newest first: the pass starts at the
 newest shards, keeps up with new ones and back-fills older ones while it has nothing newer. A worker that exits with
-REJECTED stops the pass; one that fails in any other way logs an error event and its shard is retried once after the
-other pending shards (status shards_failed: {name: failed attempts}); after a second failure the coordinator skips it.
+REJECTED stops the pass; one that fails in any other way logs an error event and its shard is retried once, when no
+shard on its first attempt is pending or running (status shards_failed: {name: failed attempts}); after a second
+failure the coordinator skips it.
 
 Workers (Pass.workers). While the main learner's fresh heartbeat (learner-status.json, at most STALE_SECONDS old)
 shows a phased learner (phase_rows > 0) in its training phase (stage 'training' or 'exporting'), the actors are
@@ -496,8 +497,11 @@ class Pass:
             process.wait()
             self.busy += self.clock()-began
         pending = [n for n in self.pending(limit) if n not in self.running]
-        while pending and len(self.running) < target[0]:
-            name = pending.pop(0)
+        first = any(not self.failed[n] for n in [*pending, *self.running])
+        startable = [n for n in pending if not (first and self.failed[n])]
+        while startable and len(self.running) < target[0]:
+            name = startable.pop(0)
+            pending.remove(name)
             self.running[name] = (spawn(name), self.clock())
         if switched or self.clock()-self.reported >= STATUS_SECONDS or not self.running:
             self.status('solving' if self.running else 'idle', len(pending))

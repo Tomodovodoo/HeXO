@@ -478,6 +478,26 @@ class RestartActorTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             coordinator.step(spawn=spawn)
 
+    def test_a_failed_shard_waits_for_first_attempts_still_running(self):
+        for name in ('1000000000002', '1000000000003'):
+            shard_of(self.run, name, [episode(PREFIX, -1)])
+        out = self.run.parent/'out'
+        (out/'.solve').mkdir(parents=True)
+        codes = {'1000000000003': 1, '1000000000002': None}
+        started = []
+
+        def spawn(name):
+            started.append(name)
+            return SimpleNamespace(poll=lambda: codes[name])
+        coordinator = dense_solve.Pass(self.run, out, replace(SMALL, solve_workers_min=2))
+        coordinator.step(limit=2, spawn=spawn)
+        self.assertTrue(coordinator.step(limit=2, spawn=spawn))
+        codes['1000000000003'] = None
+        self.assertEqual((started, list(coordinator.running)), (['1000000000003', '1000000000002'], ['1000000000002']))
+        codes['1000000000002'] = 1
+        coordinator.step(limit=2, spawn=spawn)
+        self.assertEqual(sorted(coordinator.running), ['1000000000002', '1000000000003'])
+
     def test_settings_bounds(self):
         with self.assertRaises(ValueError):
             dense_config.ActorSettings(restart_fraction=1.5)
