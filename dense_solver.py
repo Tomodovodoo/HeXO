@@ -42,8 +42,8 @@ measured slack and verdicts are polled:
              overrun_fraction of the measured step time; past it the slot is deferred to its next visit while the
              other games build the batch. After DEFER_VISITS deferrals the search goes on without it (finalist hold
              released, move from the search) and the query finishes in the background as a late proof. A threat
-             verdict not in at the next visit is dropped (the search starts unordered). Deep verdicts are polled at
-             every search start of the game.
+             verdict not in at the next visit is dropped (the search starts unordered; the query is still accounted
+             when it completes). Deep and late verdicts are polled at every search start of the game.
 SAFETY_MS (deep: DEEP_SAFETY_MS) is only the wall-clock cap: a query that reaches it, or any other UNKNOWN whose
 reason is not a search verdict (VERDICTS), is a failure (Solver.stats), not a verdict.
 """
@@ -582,6 +582,7 @@ class Plan:
                     checked(native.hxg_priority(ptr, cells, len(cells)))
             else:
                 self.solver.stats['dropped'] += 1
+                self.late.append(self.threat)   # accounted once it completes; its verdict no longer acts
             self.threat = None
         if self.finalists is not None:
             if not self.defer([query for _, query in self.finalists]):

@@ -392,6 +392,14 @@ class Scheduler(unittest.TestCase):
         self.assertEqual((plan.late, solver.stats['points']['root']['queries']), ([], 1))
         solver.tick(100., 50.)
         self.assertEqual(solver.summary(1.)['wait_step_fraction'], .5)
+        # A threat verdict missing its visit is dropped but still accounted when it completes.
+        slot = type('Slot', (), dict(tree=type('Tree', (), dict(ptr=None))))()
+        plan.threat = threat = dense_solver.Query(solver, 'threat', None, 135, Future())
+        self.assertTrue(plan.ready(slot))
+        self.assertEqual((plan.threat, plan.late, solver.stats['dropped']), (None, [threat], 1))
+        threat.future.set_result(dict(status='UNKNOWN', reason='no verified strategy', nodes_used=135, budget=135))
+        plan.poll(((0, 0),))
+        self.assertEqual((plan.late, solver.stats['points']['threat']['queries']), ([], 1))
 
     def test_adaptive_selfplay_plays_proofs_within_the_caps(self):
         try:
