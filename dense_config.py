@@ -175,6 +175,7 @@ class LearnerSettings:
     outcome_lambda: float = .98
     calibration_games: int = 4000
     outcome_weight: float = 0.    # coefficient of an extra value-logit BCE against the hard outcome (finished games, rows without a proof)
+    deblunder_weight: float = 0.  # blend earlier losing-owner rows toward a transient proof's win; 0 disables
     short_value_horizon: int = 16
     value_weight: float = 1.5
     short_value_weight: float = .5
@@ -197,6 +198,8 @@ class LearnerSettings:
     def __post_init__(self):
         if self.value_target not in VALUE_TARGETS:
             raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
+        if not 0. <= self.deblunder_weight <= 1.:
+            raise ValueError('deblunder_weight must be between 0 and 1')
         if '@' in self.variant or '/' in self.variant:
             raise ValueError(f"variant {self.variant!r}: '@' marks a search-settings variant (dense_eval) and '/' a step")
         if not 0 <= self.cheap_row_fraction <= 1:

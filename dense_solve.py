@@ -47,6 +47,8 @@ Per game:
 Sidecar: one JSON line per window {game, first_ply, last_ply, mover, plies, proof_turns,
 budget (nodes of the first ply's proof), certificate_hash (sha256 of its certificate JSON),
 search_value_at_first_ply (recorded root value or null), persistent, defence: [{ply, threat, saving_turns}]}.
+Each transient window whose owner lost also adds {kind: 'deblunder', game, first_ply, owner}. The learner
+uses these only with a positive --deblunder-weight; existing sidecars stay unchanged on restart.
 
 Restart buffer (RestartBuffer). Entries {shard, game, ply, side_to_move, regret, kind, added_at, checkpoint,
 plies_to_proof, saving_turns?, observed?}: an 'attack' entry at each window's first ply with regret (1 - v)/2, and
@@ -382,7 +384,9 @@ class Solver:
             if source and e['actor'] == identity.get('actor_sha256') and e['root_values'][source['ply']] is not None:
                 key = [source['shard'], source['game'], source['ply'], source['kind']]
                 observations.append((key, identity.get('checkpoint'), e['root_values'][source['ply']]))
-        return dict(windows=windows, entries=entries, observations=observations, stats=self.stats)
+        deblunders = [dict(kind='deblunder', game=w['game'], first_ply=w['first_ply'], owner=w['mover'])
+                      for w in windows if not w['persistent'] and episodes[w['game']]['winner'] == 1-w['mover']]
+        return dict(windows=windows, deblunders=deblunders, entries=entries, observations=observations, stats=self.stats)
 
 
 class Pass:
@@ -407,7 +411,7 @@ class Pass:
         merge(self.stats, result['stats'])
         self.stats['shards_done'] += 1
         self.buffer.save()
-        write_sidecar(self.out/'shards'/name, result['windows'])
+        write_sidecar(self.out/'shards'/name, result['windows']+result.get('deblunders', []))
 
     def refresh(self):
         """RestartBuffer.refresh against the variant's exports, then save the buffer."""

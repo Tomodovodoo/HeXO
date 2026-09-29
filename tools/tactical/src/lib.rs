@@ -15,6 +15,8 @@ use serde_json::{json,Value};
 const REVISION:&str="5a771e572553a8bd8e010112b2ce65f16e5afa1b";
 /// PDS-PN table size: one MiB per this many budgeted nodes, clamped to 1..=16 MiB.
 const NODES_PER_TT_MB:u64=2048;
+/// Certificate size and checker visits scale with search work, up to 200,000.
+fn check_nodes(nodes:u64)->usize {(nodes.saturating_mul(8)).clamp(50_000,200_000) as usize}
 // Exact state keys, never Zobrist hashes. Rules/scope are fixed by this library version.
 // The budgets (and the IDTT depth when IDTT runs) are part of the key: a search is a
 // function of position and budgets. Searches with resident state are keyed apart, so a
@@ -60,7 +62,7 @@ fn complete_candidate(board:&check::Board,start:usize,moves:&[(i32,i32)],req:&Re
         let cfg=ProverConfig{driver:DriverKind::Pdspn,wide:true,node_budget:req.nodes,tt_mb:1,pn2_nodes:1000,..Default::default()};
         let child=prover::pdspn::solve(&position(&next,side,check::phase(n).1),&cfg,ctl);
         let mut child=child.certificate.ok_or("candidate has unproved defender continuation")?;
-        if cert.nodes.len()+child.nodes.len()>50000 {return Err("candidate certificate size limit".into());}
+        if cert.nodes.len()+child.nodes.len()>check_nodes(req.nodes) {return Err("candidate certificate size limit".into());}
         let offset=cert.nodes.len() as u32;
         responses.push(ProofResponse{action,child:offset+child.root});
         for node in &mut child.nodes {
@@ -80,8 +82,9 @@ fn complete_candidate(board:&check::Board,start:usize,moves:&[(i32,i32)],req:&Re
 /// nodes and level-2 expansions), so with `table_mb` 0 the verdict and certificate are a
 /// function of (position, attacker, nodes, idtt_nodes, build); a resident table
 /// (`table_mb` > 0) carries search state across queries, so they then also depend on the
-/// earlier queries of the worker. `ms` is only a safety cap, and a query that reaches it
-/// returns UNKNOWN.
+/// earlier queries of the worker. The checker accepts at most
+/// clamp(8 * nodes, 50,000, 200,000) certificate nodes and visits. `ms` is only a
+/// safety cap, and a query that reaches it returns UNKNOWN.
 fn run(req:Request, start:Instant) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.nodes==0 || req.nodes>10_000_000
         || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256 {return Err("invalid tactical limits".into());}
@@ -96,7 +99,8 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
         "defenses":"all legal two-stone covers including complete free-second frontier; quiet defender nodes unsupported",
         "attacks":"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN","checker_version":3,
         "budget":{"nodes":req.nodes,"idtt_nodes":req.idtt_nodes,"idtt_depth_cap":req.depth,"safety_ms":req.ms,
-            "work":"one shared meter over IDTT nodes, PDS-PN level-1 nodes and level-2 expansions; verifier path limit 128"}});
+            "work":"one shared meter over IDTT nodes, PDS-PN level-1 nodes and level-2 expansions; verifier path limit 128",
+            "check_nodes":check_nodes(req.nodes)}});
     let meter=Meter::new(req.nodes);
     let ctl=Ctl{deadline:Some(deadline),cancel:Arc::new(AtomicBool::new(false)),meter:Some(meter.clone())};
     let cache=CACHE.get_or_init(||Mutex::new(BTreeMap::new()));
@@ -130,7 +134,7 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
         "attacker":if req.attacker==Attacker::Opponent {"opponent"} else {"mover"},
         "reason":"no verified strategy","nodes_used":cached_nodes.unwrap_or(meter.spent().min(req.nodes)),"proof_turns":null,"elapsed_ms":0.0});
     if let Some(cert)=cert {
-        match check::verify(&req.history,ply,&cert,deadline,50000) {
+        match check::verify(&req.history,ply,&cert,deadline,check_nodes(req.nodes)) {
             Ok((moves,turns))=>{
                 if !cache_hit && req.certificate.is_none() && req.root_moves.is_none() {
                     let mut guard=cache.lock().map_err(|_|"cache lock")?;
@@ -222,7 +226,7 @@ pub unsafe extern "C" fn hexo_tactical_query(input:*const c_char)->*mut c_char {
     let result=std::panic::catch_unwind(|| {
         if input.is_null(){return Err("null request".to_string());}
         let bytes=unsafe{CStr::from_ptr(input)}.to_bytes();
-        if bytes.len()>8*1024*1024{return Err("request size limit".into());}
+        if bytes.len()>64*1024*1024{return Err("request size limit".into());}
         serde_json::from_slice(bytes).map_err(|e|e.to_string()).and_then(|req|dispatch(req,start))
     });
     let mut value=match result {
@@ -245,6 +249,20 @@ pub unsafe extern "C" fn hexo_tactical_free(value:*mut c_char) {
 mod tests {
     use super::*;
     const OPEN_THREE:[(i32,i32);7]=[(0,0),(0,8),(2,8),(1,0),(2,0),(4,8),(6,8)];
+    const IMMEDIATE:[(i32,i32);11]=[(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(4,0),(4,3),(5,4)];
+    #[test]
+    fn certificate_limit_follows_node_budget() {
+        assert_eq!((check_nodes(1),check_nodes(8192),check_nodes(27000)),(50000,65536,200000));
+        let cert=ProofCertificate{version:1,width:"wide".into(),root:0,
+            nodes:vec![ProofNode::ImmediateWin{action:vec![(5,0)]};50001]};
+        let query=|nodes| {
+            let req=serde_json::from_value(json!({"history":IMMEDIATE,"ms":60000,"nodes":nodes,
+                "idtt_nodes":0,"depth":8,"certificate":cert})).unwrap();
+            run(req,Instant::now()).unwrap()
+        };
+        assert_eq!(query(6250)["reason"],"certificate format/size");
+        assert_eq!(query(8192)["status"],"PROVEN_WIN");
+    }
     fn setup(limit:u64)->(Position,ProverConfig,Ctl,Meter) {
         let board=check::replay(&OPEN_THREE).unwrap();
         let (side,remaining)=check::phase(OPEN_THREE.len());
