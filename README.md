@@ -976,6 +976,16 @@ quadratically, so these tensor sizes are not a measured peak VRAM increase.
 
 `dense_solver.Schedule` decides how the solver queries of the dense searches run (settings `solver_*` in `ActorSettings`; the evaluator always uses the defaults).
 
+Defence search defaults off. Actors enable it with `--solver-defence --solver-threat-nodes 27000`.
+Evaluator loops use
+`--eval-solver-defence --eval-solver-threat-nodes 27000`; a match can enable just one side with
+`--a-solver-defence --a-solver-threat-nodes 27000`. `solver_defence_candidates` defaults to 8.
+Each proven threat supplies candidate complete turns from its placements, replies and line completions.
+The solver checks each turn at the threat budget. A completed UNKNOWN keeps the turn as a search candidate,
+without claiming safety. Surviving placements enter the root sample set and receive a bonus proportional to
+their surviving turns. Matching second stones receive that support on the next placement. Status reports
+`defence_queries`, `defence_hits` and `defence_nodes`. See [the measured Seal positions](docs/defence-search.md).
+
 - **Fixed budgets** (`solver_fixed_budgets`, default on): every query spends its point's node budget and every verdict is awaited where it is needed. Seeded self-play repeats exactly on both backends. Evaluation, engine verification and the determinism test run this way.
 - **Adaptive budgets** (`--no-solver-fixed-budgets`, actors): a query's budget is `solver_slack_fraction` of its point's measured lead time (20th percentile, minus 50 ms), net of the work already queued, at the measured worker rate, clamped to `[solver_min_nodes, solver_cap_nodes]`. With `solver_gate_weight` the worker scales it by the attacker's forcing material up to `solver_gate_cap_nodes`; positions below the gate's lower level get the floor. Verdicts are polled. A root or finalist verdict may cost at most `solver_overrun_fraction` of the step time in waits; past that its game is skipped for one step while the others build the batch, and then goes on without it. Threat verdicts that miss the next visit are dropped.
 - **Following** (`solver_follow`): a side with a proof plays the certificate's turns while the game stays on it and asks no further queries; every proof labels the rows it decides (`proven` +1 for the winner, -1 for the loser), including proofs that arrived too late to decide a move.
