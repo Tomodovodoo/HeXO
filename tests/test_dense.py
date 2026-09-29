@@ -1684,7 +1684,7 @@ class ValidationSourceTests(unittest.TestCase):
             window = dense_data.ReplayWindow(run, 1000, 10, validation_fraction=.5)
             sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=6)
             manifest = learner.export(window, sets)
-            self.assertEqual(set(manifest), {'variant', 'step', 'samples_seen', 'created_at', 'model_sha256', 'ema_sha256',
+            self.assertEqual(set(manifest), {'variant', 'step', 'samples_seen', 'created_at', 'optimizer_kind', 'model_sha256', 'ema_sha256',
                                              'metrics', 'learner', 'model', 'copied_from', 'rows', 'pacing'})
             aggregate, v = manifest['metrics']['validation'], manifest['metrics']['validation_sources']
             self.assertEqual(v['newest_checkpoint'], 'main/000010')
@@ -2336,6 +2336,7 @@ class YieldTests(unittest.TestCase):
             self.assertEqual((status['pacing_rows'], status['pacing_samples']), (0, 0))
             zeros = dict(allocated_mb=0, reserved_mb=0)
             self.assertEqual(status['vram'], zeros)
+            self.assertEqual(status['optimizer_state_mb'], 0.)
             lines = [json.loads(line) for line in (run/'metrics'/'learner-main.jsonl').read_text().splitlines()]
             self.assertEqual([(r.get('validation', False), r['vram']) for r in lines], [(False, zeros), (True, zeros)])
             manifest = json.loads((run/'checkpoints'/'main'/'000001'/'manifest.json').read_text())
@@ -2365,6 +2366,57 @@ class YieldTests(unittest.TestCase):
 
 
 class LearnerPipelineTests(unittest.TestCase):
+    def test_muon_partition_covers_every_parameter_once(self):
+        for aux in (False, True):
+            model = hexnet.HexNet(replace(TINY, aux_heads=aux))
+            muon, adamw = dense_learn.muon_parameters(model)
+            self.assertEqual(len(muon)+len(adamw), len(list(model.parameters())))
+            self.assertEqual(len({id(p) for p in muon+adamw}), len(list(model.parameters())))
+            expected = {n for n, _ in model.named_parameters() if n in ('policy_hidden.weight', 'value_hidden.weight') or
+                        n.startswith('blocks.') and n.endswith(('.conv1.weight', '.conv2.weight', '.pool.weight'))}
+            self.assertEqual({n for n, p in model.named_parameters() if any(p is q for q in muon)}, expected)
+
+    def test_adamw_and_muon_train_on_cpu_and_reset_on_kind_change(self):
+        torch.set_num_threads(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x')
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(replace(TINY, line_length=0))),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=0.))
+            window = dense_data.ReplayWindow(run, 1000, 10)
+            refs = window.sample(np.random.default_rng(0), 8)
+            batch = dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0)))
+            adamw = dense_learn.Learner(run, config.learner, config)
+            before = adamw.model.blocks[0].conv1.weight.detach().clone()
+            for _ in range(3):
+                self.assertTrue(torch.isfinite(adamw.train_step(batch)[:2]).all())
+            self.assertFalse(torch.equal(before, adamw.model.blocks[0].conv1.weight))
+            self.assertTrue(adamw.optimizer.state)
+            self.assertEqual(adamw.optimizer_state_mb(), 0.)
+            self.assertEqual(adamw.export(window)['optimizer_kind'], 'adamw')
+
+            muon = dense_learn.Learner(run, config.learner, config, overrides=dict(optimizer='muon'))
+            self.assertEqual((muon.step, muon.optimizer_started, muon.settings.optimizer), (3, 3, 'muon'))
+            torch.testing.assert_close(muon.model.blocks[0].conv1.weight, adamw.model.blocks[0].conv1.weight)
+            self.assertFalse(muon.optimizer.muon.state)
+            self.assertFalse(muon.optimizer.adamw.state)
+            before = muon.model.blocks[0].conv1.weight.detach().clone()
+            for _ in range(3):
+                self.assertTrue(torch.isfinite(muon.train_step(batch)[:2]).all())
+            self.assertFalse(torch.equal(before, muon.model.blocks[0].conv1.weight))
+            self.assertTrue(muon.optimizer.muon.state)
+            self.assertTrue(muon.optimizer.adamw.state)
+            self.assertEqual(muon.optimizer_state_mb(), 0.)
+            self.assertEqual(muon.export(window)['optimizer_kind'], 'muon')
+            same = dense_learn.Learner(run, config.learner, config, overrides=dict(optimizer='muon'))
+            self.assertTrue(same.optimizer.muon.state)
+            back = dense_learn.Learner(run, config.learner, config, overrides=dict(optimizer='adamw'))
+            self.assertEqual((back.step, back.optimizer_started), (6, 6))
+            self.assertFalse(back.optimizer.state)
+            events = [json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
+            self.assertEqual([(e['old_optimizer'], e['new_optimizer']) for e in events if e['kind'] == 'optimizer_reset'],
+                             [('adamw', 'muon'), ('muon', 'adamw')])
+
     def test_each_variant_has_its_own_policy_directory(self):
         run = Path('run')
         self.assertNotEqual(dense_learn.policy_dir(run, 'main'), dense_learn.policy_dir(run, 'b'))

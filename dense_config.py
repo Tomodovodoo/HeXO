@@ -146,6 +146,7 @@ VALUE_TARGETS = ('outcome', 'td', 'calibrated')
 class LearnerSettings:
     variant: str = 'main'
     batch: int = 256
+    optimizer: str = 'adamw'
     lr: float = 3e-4
     warmup_steps: int = 300
     weight_decay: float = 1e-2    # decoupled (AdamW), conv and linear weights only
@@ -192,6 +193,8 @@ class LearnerSettings:
     vram_reserved_mb: int = 0
 
     def __post_init__(self):
+        if self.optimizer not in ('adamw', 'muon'):
+            raise ValueError(f'optimizer must be adamw or muon, not {self.optimizer!r}')
         if self.value_target not in VALUE_TARGETS:
             raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
         if '@' in self.variant or '/' in self.variant:

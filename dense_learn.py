@@ -67,7 +67,7 @@ STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
-        'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows')
+        'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'optimizer')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
@@ -353,8 +353,59 @@ def batch_losses(model, batch, coefficients, device, memory_format, train):
     return logged
 
 
+def muon_parameters(model):
+    """Split trunk hidden weights from the parameters retained by AdamW."""
+    muon, adamw = [], []
+    for name, param in model.named_parameters():
+        parts = name.split('.')
+        selected = (name in ('value_hidden.weight', 'policy_hidden.weight') or
+                    len(parts) == 4 and parts[0] == 'blocks' and parts[1].isdigit() and
+                    parts[2] in ('conv1', 'conv2', 'pool') and parts[3] == 'weight')
+        (muon if selected else adamw).append(param)
+    return muon, adamw
+
+
+class MuonAdamW:
+    """Muon on 2D weight copies, with AdamW on the remaining model parameters."""
+    def __init__(self, model, s):
+        self.weights, remaining = muon_parameters(model)
+        # Reshape copies channels-last conv filters; 2D weights can share their storage.
+        self.matrices = [p.detach().reshape(p.shape[0], -1).requires_grad_() for p in self.weights]
+        self.muon = torch.optim.Muon(self.matrices, lr=s.lr, weight_decay=.1, momentum=.95,
+                                     nesterov=True, adjust_lr_fn='match_rms_adamw')
+        groups = [dict(params=[p for p in remaining if p.ndim > 1], weight_decay=s.weight_decay),
+                  dict(params=[p for p in remaining if p.ndim <= 1], weight_decay=0.)]
+        self.adamw = torch.optim.AdamW(groups, lr=s.lr, betas=(.9, .98), fused=next(model.parameters()).is_cuda)
+        self.param_groups = self.muon.param_groups+self.adamw.param_groups
+        self.optimizers = (self.muon, self.adamw)
+
+    def zero_grad(self, set_to_none=True):
+        self.muon.zero_grad(set_to_none=set_to_none)
+        self.adamw.zero_grad(set_to_none=set_to_none)
+        for p in self.weights:
+            p.grad = None
+
+    @torch.no_grad()
+    def step(self):
+        for p, matrix in zip(self.weights, self.matrices):
+            matrix.grad = None if p.grad is None else p.grad.detach().reshape_as(matrix)
+        self.muon.step()
+        for p, matrix in zip(self.weights, self.matrices):
+            if p.data_ptr() != matrix.data_ptr():
+                p.copy_(matrix.reshape_as(p))
+        self.adamw.step()
+
+    def state_dict(self):
+        return dict(muon=self.muon.state_dict(), adamw=self.adamw.state_dict())
+
+    def load_state_dict(self, state):
+        self.muon.load_state_dict(state['muon'])
+        self.adamw.load_state_dict(state['adamw'])
+
+
 def make_optimizer(model, s):
-    """AdamW with weight decay on conv/linear weights only (no decay on norm scales and biases)."""
+    if s.optimizer == 'muon':
+        return MuonAdamW(model, s)
     groups = [dict(params=[p for p in model.parameters() if p.ndim > 1], weight_decay=s.weight_decay),
               dict(params=[p for p in model.parameters() if p.ndim <= 1], weight_decay=0.)]
     return torch.optim.AdamW(groups, lr=s.lr, betas=(.9, .98), fused=next(model.parameters()).is_cuda)
@@ -441,6 +492,12 @@ class Learner:
         """{allocated_mb, reserved_mb} of this process's caching allocator (hexnet.vram), zeros off CUDA."""
         return hexnet.vram() if self.device.type == 'cuda' else dict(allocated_mb=0, reserved_mb=0)
 
+    def optimizer_state_mb(self):
+        """CUDA storage held by optimizer state tensors, in MiB."""
+        optimizers = self.optimizer.optimizers if self.settings.optimizer == 'muon' else (self.optimizer,)
+        return sum(value.numel()*value.element_size() for optimizer in optimizers for state in optimizer.state.values()
+                   for value in state.values() if torch.is_tensor(value) and value.is_cuda)/2**20
+
     def place(self, model):
         return model.to(self.device, memory_format=self.memory_format)
 
@@ -451,21 +508,29 @@ class Learner:
         self.model.load_state_dict(source.state_dict())
 
     def resume(self, path, manifest):
-        """Load the weights, optimizer and counters of checkpoint `path` (whose manifest settings are already applied)."""
+        """Load checkpoint weights and counters; reuse optimizer state only for the same kind."""
         self.model = self.place(hexnet.load_model(path/'model.pt'))
         self.ema = self.place(hexnet.load_model(path/'ema.pt'))
         if self.model.config != hexnet.HexNetConfig(**asdict(self.config.model)):
             raise ValueError(f'{path} does not match the run model settings')
         state = torch.load(path/'optimizer.pt', map_location=self.device, weights_only=True)
         self.optimizer = make_optimizer(self.model, self.settings)
-        self.optimizer.load_state_dict(state['optimizer'])
-        for group, decay in zip(self.optimizer.param_groups, (self.settings.weight_decay, 0.)):
+        saved_kind = manifest.get('optimizer_kind', manifest['learner'].get('optimizer', 'adamw'))
+        if saved_kind == self.settings.optimizer:
+            self.optimizer.load_state_dict(state['optimizer'])
+        adamw = self.optimizer.adamw if self.settings.optimizer == 'muon' else self.optimizer
+        for group, decay in zip(adamw.param_groups, (self.settings.weight_decay, 0.)):
             group['weight_decay'] = decay
         self.step, self.samples_seen = manifest['step'], manifest['samples_seen']
-        self.optimizer_started, self.ema_updates = state['optimizer_started'], state['ema_updates']
+        self.optimizer_started = state['optimizer_started'] if saved_kind == self.settings.optimizer else self.step
+        self.ema_updates = state['ema_updates']
         self.copied_from = manifest.get('copied_from')
         self.pacing, self.pacing_per_row = dict(manifest.get('pacing', NO_BASE)), manifest['learner']['samples_per_row']
         self.resumed_rows = manifest.get('rows')
+        if saved_kind != self.settings.optimizer:
+            dense_config.log_event(self.run, 'learner', 'optimizer_reset',
+                  f'{self.settings.variant} optimizer changed from {saved_kind} to {self.settings.optimizer} at step {self.step}',
+                  variant=self.settings.variant, step=self.step, old_optimizer=saved_kind, new_optimizer=self.settings.optimizer)
         dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} resumed from step {self.step}', variant=self.settings.variant, step=self.step)
 
     def rebase(self, total_rows):
@@ -682,9 +747,10 @@ class Learner:
         shutil.rmtree(stage, ignore_errors=True); stage.mkdir()
         hexnet.save_model(stage/'model.pt', self.model)
         hexnet.save_model(stage/'ema.pt', self.ema)
-        torch.save(dict(optimizer=self.optimizer.state_dict(), optimizer_started=self.optimizer_started,
+        torch.save(dict(kind=s.optimizer, optimizer=self.optimizer.state_dict(), optimizer_started=self.optimizer_started,
                         ema_updates=self.ema_updates), stage/'optimizer.pt')
         manifest = dict(variant=s.variant, step=self.step, samples_seen=self.samples_seen, created_at=time.time(),
+                        optimizer_kind=s.optimizer,
                         model_sha256=hexnet.model_digest(self.model), ema_sha256=hexnet.model_digest(self.ema),
                         metrics=dict(self.metrics or {h: None for h in HEADS}, validation=validation, validation_sources=sources,
                                      calibration=self.calibration_report),
@@ -776,7 +842,8 @@ def main():
                       pacing_rows=base['rows'], pacing_samples=base['samples'],
                       lr=learner.lr(), data_wait_fraction=wait_fraction(rate),
                       last_export_step=learner.last_export, policy_ce=(learner.metrics or {}).get('policy_ce'),
-                      value_bce=(learner.metrics or {}).get('value_bce'), vram=learner.vram())
+                      value_bce=(learner.metrics or {}).get('value_bce'), vram=learner.vram(),
+                      optimizer_state_mb=learner.optimizer_state_mb())
         write_json(status_path(args.run, s.variant), status)
 
     def speed():
