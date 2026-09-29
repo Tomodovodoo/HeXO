@@ -647,6 +647,18 @@ class DenseConfigTests(unittest.TestCase):
         page = (ROOT/'web'/'training.html').read_text(encoding='utf-8')
         self.assertIn("['Samples / second',n(l.samples_per_second,1),false,Number.isFinite(l.data_wait_fraction)?", page)
 
+    def test_actor_batch_status_aggregates_by_gpu_calls(self):
+        import dashboard
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for worker, calls, mean, full in ((0, 1, 256., 1.), (1, 3, 128., 0.)):
+                name = 'actor-status.json' if worker == 0 else f'actor-status-{worker}.json'
+                (run/name).write_text(json.dumps(dict(updated_at=time.time(), stage='playing', batch_calls=calls,
+                                                      evals_per_second=calls,
+                                                      mean_batch=mean, full_batch_fraction=full)))
+            actor = dashboard.dense_run(run, dict(created_at=time.time()))['actor']
+            self.assertEqual((actor['mean_batch'], actor['full_batch_fraction']), (160., .25))
+
     def test_metrics_log_series(self):
         """Partial last lines are skipped until completed, resumed steps replace the rewound ones and
         downsampling keeps the first, last and extreme points."""
@@ -1854,17 +1866,22 @@ class ValidationSourceTests(unittest.TestCase):
             window = dense_data.ReplayWindow(run, 1000, 10, validation_fraction=.5)
             sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=6)
             manifest = learner.export(window, sets)
-            self.assertEqual(set(manifest), {'variant', 'step', 'samples_seen', 'created_at', 'model_sha256', 'ema_sha256',
+            self.assertEqual(set(manifest), {'variant', 'step', 'samples_seen', 'created_at', 'optimizer_kind', 'model_sha256', 'ema_sha256',
                                              'metrics', 'learner', 'model', 'copied_from', 'rows', 'pacing'})
             aggregate, v = manifest['metrics']['validation'], manifest['metrics']['validation_sources']
             self.assertEqual(v['newest_checkpoint'], 'main/000010')
             for h in ('policy_ce', 'value_bce', 'opponent_ce', 'future_bce'):
                 self.assertTrue(math.isfinite(aggregate[h]))
+            self.assertAlmostEqual(aggregate['policy_ce'], aggregate['policy_target_entropy']+aggregate['policy_kl'], delta=1e-5)
+            self.assertGreaterEqual(aggregate['policy_top1'], 0.)
+            self.assertLessEqual(aggregate['policy_top1'], 1.)
             # Capped 8-ply games: no short-value row (the game ends within the horizon) and no outcome row.
             self.assertEqual((aggregate['short_value_bce'], aggregate['outcome_bce']), (None, None))
             self.assertEqual(manifest['metrics']['calibration'], dict(games=0, fitted=False))
             for source in dense_data.SOURCES:
                 self.assertEqual(v[f'{source}_rows'], len(sets.subsets[source, 'held']))
+                self.assertAlmostEqual(v[f'{source}_policy_ce'],
+                                       v[f'{source}_policy_target_entropy']+v[f'{source}_policy_kl'], delta=1e-5)
                 for name in ('policy_ce', 'value_bce'):
                     self.assertAlmostEqual(v[f'{source}_gap_{name}'], v[f'{source}_{name}']-v[f'{source}_train_{name}'])
             self.assertEqual((aggregate, v), (learner.validate(window), learner.validate_sources(sets)))
@@ -1873,15 +1890,35 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual(dense_learn.Learner(run, config.learner, config).step, 0)
             fields = dense_learn.validation_fields(manifest['metrics'])
             self.assertEqual(fields['next_ce'], aggregate['opponent_ce'])
+            for key in ('policy_kl', 'policy_target_entropy', 'policy_top1'):
+                self.assertEqual(fields[key], aggregate[key])
+                self.assertEqual(fields[f'fresh_{key}'], v[f'fresh_{key}'])
             dense_config.append_metrics(run, 'learner-main', step=10, validation=True, **fields)
             points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_newest_gap_policy_ce')['points']
             self.assertEqual(points, [[10, v['newest_gap_policy_ce']]])
+            self.assertEqual(dashboard.series(run, dict(created_at=0.), 'main', 'validation_policy_kl')['points'],
+                             [[10, aggregate['policy_kl']]])
+            self.assertEqual(dashboard.series(run, dict(created_at=0.), 'main', 'validation_converted_policy_top1')['points'],
+                             [[10, v['converted_policy_top1']]])
             dense_config.append_metrics(run, 'learner-main', step=20, outcome_bce=.5)
             self.assertEqual(dashboard.series(run, dict(created_at=0.), 'main', 'outcome_bce')['points'], [[20, .5]])
             self.assertIn('validation_outcome_bce', dashboard.LEARNER_METRICS)
             refs = window.sample(np.random.default_rng(0), 8)
             losses = learner.train_step(dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0))))
             self.assertTrue(math.isnan(losses[2]) and math.isnan(losses[5]) and torch.isfinite(losses[:2]).all())
+
+    def test_policy_validation_rows_on_synthetic_panel(self):
+        out = dict(policy=torch.tensor([[3., 1.], [3., 0.], [0., 1.], [0., 1.], [0., 3.]]),
+                   far=torch.tensor([0., 0., 4., 4., 0.]))
+        batch = dict(cells=torch.tensor([[0, 1, -1], [0, 1, -1], [1, -1, -1], [0, -1, -1], [0, 1, -1]]),
+                     counts=torch.tensor([3, 3, 2, 3, 2]),
+                     mask=torch.tensor([[True, True, True], [True, True, True], [True, True, False],
+                                        [True, True, True], [True, True, False]]),
+                     policy=torch.tensor([.8, .2, 0., .1, .8, .1, .2, .8, .1, .1, .8, .5, .5]))
+        ce, entropy, kl, top1 = dense_learn.policy_validation_rows(out, batch)
+        np.testing.assert_allclose(ce.numpy(), entropy.numpy()+kl.numpy(), rtol=0, atol=1e-7)
+        self.assertEqual(top1.tolist(), [1., 0., 1., 1., 1.])
+        self.assertAlmostEqual(float(top1.mean()), 4/5)
 
     def test_remaining_curve_on_outcomes_decided_in_the_last_ten_plies(self):
         """Games whose outcome is fixed only in their last 10 plies: a predictor that knows it there and says 0.5
@@ -2343,6 +2380,26 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(torch.set_num_threads, self.threads)
         torch.manual_seed(5)
 
+    def test_full_batch_counts_submitted_positions(self):
+        from neural_search import EvaluationCache
+
+        class Evaluator:
+            def submit(self, histories, legal):
+                return [(actions, np.zeros(len(actions)), np.zeros(len(actions))) for actions in legal]
+
+        model = type('Model', (), dict(cache=EvaluationCache(), evaluator=Evaluator()))()
+        trees = [NeuralSearch(None, 'test', history=history) for history in ((), ((0, 0),))]
+        try:
+            engine = dense_selfplay.Engine(2)
+            for tree in trees:
+                slot = SimpleNamespace(tree=tree, model=model, budget=2, samples=2, solver=None)
+                engine.add(slot)
+            engine.step()
+            self.assertEqual((engine.calls, engine.evals, engine.full_calls), (1, 2, 1))
+        finally:
+            for tree in trees:
+                tree.close()
+
     def test_position_wider_than_the_largest_crop_ends_the_game(self):
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 64, 256)
         openings = (line_history(33), POSITIONS[12])
@@ -2506,6 +2563,7 @@ class YieldTests(unittest.TestCase):
             self.assertEqual((status['pacing_rows'], status['pacing_samples']), (0, 0))
             zeros = dict(allocated_mb=0, reserved_mb=0)
             self.assertEqual(status['vram'], zeros)
+            self.assertEqual(status['optimizer_state_mb'], 0.)
             lines = [json.loads(line) for line in (run/'metrics'/'learner-main.jsonl').read_text().splitlines()]
             self.assertEqual([(r.get('validation', False), r['vram']) for r in lines], [(False, zeros), (True, zeros)])
             manifest = json.loads((run/'checkpoints'/'main'/'000001'/'manifest.json').read_text())
@@ -2520,12 +2578,20 @@ class YieldTests(unittest.TestCase):
     def test_actor_flags_round_trip_through_the_worker_parser(self):
         parser = argparse.ArgumentParser()
         dense_config.add_arguments(parser, dense_config.ActorSettings)
-        args = parser.parse_args(['--games-in-flight', '256', '--no-tactics', '--yield-below', '0.8'])
+        args = parser.parse_args(['--games-in-flight', '256', '--leaf-batch', '512', '--no-tactics', '--yield-below', '0.8'])
         flags = dense_selfplay.actor_flags(args)
-        self.assertEqual(flags, ['--games-in-flight', '256', '--no-tactics', '--yield-below', '0.8'])
+        self.assertEqual(flags, ['--games-in-flight', '256', '--leaf-batch', '512', '--no-tactics', '--yield-below', '0.8'])
         settings = dense_config.override(dense_config.ActorSettings(), parser.parse_args(flags))
         self.assertEqual((settings.games_in_flight, settings.tactics, settings.yield_below, settings.leaf_batch),
-                         (256, False, .8, dense_config.ActorSettings.leaf_batch))
+                         (256, False, .8, 512))
+
+    def test_actor_cli_accepts_games_and_batch_flags(self):
+        argv = ['dense_selfplay.py', '--run', 'unused', '--games', '100', '--games-in-flight', '256', '--leaf-batch', '512']
+        with unittest.mock.patch.object(sys, 'argv', argv), unittest.mock.patch.object(dense_selfplay, 'supervise') as supervise:
+            dense_selfplay.main()
+        args = supervise.call_args.args[0]
+        self.assertEqual(args.games, 100)
+        self.assertEqual(dense_selfplay.actor_flags(args), ['--games-in-flight', '256', '--leaf-batch', '512'])
 
     def test_configs_written_before_the_yield_settings_load_with_the_defaults(self):
         data = asdict(dense_config.RunConfig())
@@ -2535,6 +2601,60 @@ class YieldTests(unittest.TestCase):
 
 
 class LearnerPipelineTests(unittest.TestCase):
+    def test_muon_partition_covers_every_parameter_once(self):
+        for aux in (False, True):
+            model = hexnet.HexNet(replace(TINY, aux_heads=aux))
+            muon, adamw = dense_learn.muon_parameters(model)
+            self.assertEqual(len(muon)+len(adamw), len(list(model.parameters())))
+            self.assertEqual(len({id(p) for p in muon+adamw}), len(list(model.parameters())))
+            expected = {n for n, _ in model.named_parameters() if n in ('policy_hidden.weight', 'value_hidden.weight') or
+                        n.startswith('blocks.') and n.endswith(('.conv1.weight', '.conv2.weight', '.pool.weight'))}
+            self.assertEqual({n for n, p in model.named_parameters() if any(p is q for q in muon)}, expected)
+
+    def test_adamw_and_muon_train_on_cpu_and_reset_on_kind_change(self):
+        torch.set_num_threads(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x')
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(replace(TINY, line_length=0))),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=0.))
+            window = dense_data.ReplayWindow(run, 1000, 10)
+            refs = window.sample(np.random.default_rng(0), 8)
+            batch = dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0)))
+            adamw = dense_learn.Learner(run, config.learner, config)
+            before = adamw.model.blocks[0].conv1.weight.detach().clone()
+            for _ in range(3):
+                self.assertTrue(torch.isfinite(adamw.train_step(batch)[:2]).all())
+            self.assertFalse(torch.equal(before, adamw.model.blocks[0].conv1.weight))
+            self.assertTrue(adamw.optimizer.state)
+            self.assertEqual(adamw.optimizer_state_mb(), 0.)
+            self.assertEqual(adamw.export(window)['optimizer_kind'], 'adamw')
+
+            muon = dense_learn.Learner(run, config.learner, config, overrides=dict(optimizer='muon'))
+            self.assertEqual((muon.step, muon.optimizer_started, muon.settings.optimizer), (3, 3, 'muon'))
+            torch.testing.assert_close(muon.model.blocks[0].conv1.weight, adamw.model.blocks[0].conv1.weight)
+            self.assertFalse(muon.optimizer.muon.state)
+            self.assertFalse(muon.optimizer.adamw.state)
+            before = muon.model.blocks[0].conv1.weight.detach().clone()
+            for _ in range(3):
+                self.assertTrue(torch.isfinite(muon.train_step(batch)[:2]).all())
+            self.assertFalse(torch.equal(before, muon.model.blocks[0].conv1.weight))
+            self.assertTrue(muon.optimizer.muon.state)
+            self.assertTrue(muon.optimizer.adamw.state)
+            self.assertEqual(muon.optimizer_state_mb(), 0.)
+            self.assertEqual(muon.export(window)['optimizer_kind'], 'muon')
+            same = dense_learn.Learner(run, config.learner, config, overrides=dict(optimizer='muon', lr=.001))
+            self.assertTrue(same.optimizer.muon.state)
+            expected_lr = same.lr()
+            same.train_step(batch)
+            self.assertEqual([group['lr'] for group in same.optimizer.param_groups], [expected_lr]*3)
+            back = dense_learn.Learner(run, config.learner, config, overrides=dict(optimizer='adamw'))
+            self.assertEqual((back.step, back.optimizer_started), (6, 6))
+            self.assertFalse(back.optimizer.state)
+            events = [json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
+            self.assertEqual([(e['old_optimizer'], e['new_optimizer']) for e in events if e['kind'] == 'optimizer_reset'],
+                             [('adamw', 'muon'), ('muon', 'adamw')])
+
     def test_each_variant_has_its_own_policy_directory(self):
         run = Path('run')
         self.assertNotEqual(dense_learn.policy_dir(run, 'main'), dense_learn.policy_dir(run, 'b'))
@@ -2754,7 +2874,13 @@ class ActorModelTests(unittest.TestCase):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
         shards = [dense_data.manifest(path)['identity'] for path in dense_data.shard_dirs(self.run)]
         self.assertEqual([s['checkpoint'] for s in shards], ['main/000010', 'main/000020'])
-        self.assertEqual(json.loads((self.run/'actor-status.json').read_text())['checkpoint'], 'main/000020')
+        status = json.loads((self.run/'actor-status.json').read_text())
+        self.assertEqual(status['checkpoint'], 'main/000020')
+        self.assertGreater(status['mean_batch'], 0)
+        self.assertEqual(status['full_batch_fraction'], 0.)
+        metrics = [json.loads(line) for line in (self.run/'metrics'/'actor-0.jsonl').read_text().splitlines()]
+        self.assertEqual((metrics[-1]['mean_batch'], metrics[-1]['full_batch_fraction']),
+                         (status['mean_batch'], status['full_batch_fraction']))
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([(e['previous'], e['checkpoint']) for e in events if e['kind'] == 'actor_model'],
                          [('main/000010', 'main/000020')])

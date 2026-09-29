@@ -23,6 +23,7 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
   evaluations/<a>-vs-<b>/report.json   paired match records of a (candidate) against b, ids with '/' written as '-';
                                        idle rematches append pairs to an existing report (dense_eval)
   actor-status[-<k>].json              heartbeat of actor worker k (none for k = 0), rewritten about every 2 s;
+                                       batch_calls counts engine submissions before crop-size splitting;
                                        vram is hexnet.vram() of that process
   learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s;
                                        samples_per_row_target is its effective learner.samples_per_row;
@@ -36,7 +37,8 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
                                        plus {time, step, samples_seen, vram, validation: true, proven_rows,
                                        <validation fields>} per export
   metrics/actor-<k>.jsonl              {time, positions, games_completed, placements_per_second, evals_per_second,
-                                       mean_batch, terminal_fraction, mean_plies, checkpoint, paused_seconds} about
+                                       mean_batch, full_batch_fraction, terminal_fraction, mean_plies, checkpoint,
+                                       paused_seconds} about
                                        every 30 s and at every pause or resume; counters restart with the worker
                                        process (dense_selfplay)
   metrics/gpu.jsonl                    {time, utilization, used_mib, watts, temperature} about every 10 s while a
@@ -146,6 +148,7 @@ VALUE_TARGETS = ('outcome', 'td', 'calibrated')
 class LearnerSettings:
     variant: str = 'main'
     batch: int = 256
+    optimizer: str = 'adamw'
     lr: float = 3e-4
     warmup_steps: int = 300
     weight_decay: float = 1e-2    # decoupled (AdamW), conv and linear weights only
@@ -196,6 +199,8 @@ class LearnerSettings:
     vram_reserved_mb: int = 0
 
     def __post_init__(self):
+        if self.optimizer not in ('adamw', 'muon'):
+            raise ValueError(f'optimizer must be adamw or muon, not {self.optimizer!r}')
         if self.value_target not in VALUE_TARGETS:
             raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
         if not 0. <= self.deblunder_weight <= 1.:

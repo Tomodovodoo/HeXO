@@ -453,7 +453,9 @@ def dense_run(run, config, fresh=30):
                  active_games=total(live, 'active_games'), positions=total(actors, 'positions'),
                  games_completed=total(actors, 'games_completed'), shards_written=total(actors, 'shards_written'),
                  games_total=total(actors, 'games_total') if actors and all(a.get('games_total') is not None for a in actors) else None,
-                 mean_batch=weighted('mean_batch', 'evals_per_second'), terminal_fraction=weighted('terminal_fraction', 'games_completed'),
+                 mean_batch=weighted('mean_batch', 'evals_per_second'),
+                 full_batch_fraction=weighted('full_batch_fraction', 'batch_calls'),
+                 terminal_fraction=weighted('terminal_fraction', 'games_completed'),
                  mean_plies=weighted('mean_plies', 'games_completed'),
                  vram_reserved_mb=[a['vram'].get('reserved_mb') for a in live if isinstance(a.get('vram'), dict)],
                  checkpoint=actors[0].get('checkpoint') if actors else None, actor_sha256=actors[0].get('actor_sha256') if actors else None,
@@ -600,6 +602,8 @@ def project(root, fresh=30):
 HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')  # dense_learn.LOGGED
 SOURCES = ('converted', 'fresh', 'newest')  # dense_data.SOURCES
 SOURCE_METRICS = tuple(f'{s}_{k}{h}' for s in SOURCES for k in ('', 'train_', 'gap_') for h in ('policy_ce', 'value_bce'))
+POLICY_METRICS = ('policy_kl', 'policy_target_entropy', 'policy_top1')
+POLICY_VALIDATION_METRICS = POLICY_METRICS+tuple(f'{s}_{h}' for s in SOURCES for h in POLICY_METRICS)
 CURVE_SOURCES = ('fresh', 'newest')  # dense_learn.CURVE_SOURCES
 CURVE_SCALARS = tuple(f'{s}_{k}' for s in CURVE_SOURCES
                       for k in ('value_bce_last20', 'value_horizon', 'policy_ce_early', 'policy_ce_late',
@@ -608,7 +612,7 @@ CURVE_AXES = dict(value_curve='remaining', value_excess_curve='remaining', polic
 CURVE_METRICS = {f'{s}_{k}': x for s in CURVE_SOURCES for k, x in CURVE_AXES.items()}  # metric: its only x (grid <x>_grid)
 SURFACE_METRICS = {f'{s}_{k}': field for s in CURVE_SOURCES for k, field in
                    (('value_surface', 'value'), ('value_excess_surface', 'excess'), ('policy_surface', 'policy'))}  # metric: cell field
-LEARNER_METRICS = HEADS+('lr', 'samples_per_second', 'window_rows')+tuple('validation_'+h for h in HEADS+SOURCE_METRICS+CURVE_SCALARS)
+LEARNER_METRICS = HEADS+('lr', 'samples_per_second', 'window_rows')+tuple('validation_'+h for h in HEADS+SOURCE_METRICS+POLICY_VALIDATION_METRICS+CURVE_SCALARS)
 ACTOR_SUMMED = ('placements_per_second', 'evals_per_second', 'games_per_hour')
 ACTOR_METRICS = ACTOR_SUMMED+('terminal_fraction', 'mean_plies')
 GPU_METRICS = ('utilization', 'used_mib', 'watts', 'temperature')
