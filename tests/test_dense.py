@@ -3816,6 +3816,56 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual((entry.get('skipped'), entry.get('superseded'), len(report['games'])), (None, True, 2))
         self.assertEqual(report['metrics']['sprt']['decision'], 'superseded')
 
+    def test_settle_request_ends_a_running_posterior_trial(self):
+        evaluator = self.start(decision='posterior', sprt_max_games=10, sprt_min_games=10)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        candidate = 'main/000020'
+
+        def request(pool, steps):
+            if steps == 1:
+                dense_eval.request_settle(self.run, candidate)
+
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=request)):
+            self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, candidate, 'main/000010').read_text())
+        verdict = evaluator.entry(candidate)['verdict']
+        self.assertEqual((verdict['decision'], len(report['games'])), ('superseded', 2))
+        self.assertFalse(dense_eval.settle_path(self.run, candidate).exists())
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertIn('settled on request', next(e for e in events if e['kind'] == 'decision')['message'])
+
+    def test_settle_request_without_a_running_trial_is_ignored(self):
+        evaluator = self.start()
+        self.export(10)
+        evaluator.step()
+        for candidate in ('main/999999', 'main/000010'):
+            dense_eval.request_settle(self.run, candidate)
+        self.assertFalse(evaluator.step())
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual({e['candidate'] for e in events if e['kind'] == 'info' and 'settle request ignored' in e['message']},
+                         {'main/999999', 'main/000010'})
+        self.assertFalse(any((self.run/'settle-requests').glob('*.json')))
+
+    def test_settle_request_keeps_the_sprt_settle_event(self):
+        evaluator = self.start(sprt_max_games=10, sprt_alpha=1e-9, sprt_beta=1e-9)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        candidate = 'main/000020'
+
+        def request(pool, steps):
+            if steps == 1:
+                dense_eval.request_settle(self.run, candidate)
+
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=request)):
+            self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, candidate, 'main/000010').read_text())
+        self.assertEqual((report['metrics']['sprt']['decision'], len(report['games'])), ('superseded', 2))
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertIn('settled on request', next(e for e in events if e['kind'] == 'settle')['message'])
+
     def test_newer_champion_supersedes_an_unfinished_anchor(self):
         evaluator = self.anchored()
         evaluator.step()
