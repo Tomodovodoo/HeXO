@@ -1231,6 +1231,10 @@ class DenseDataTests(unittest.TestCase):
             self.assertEqual([(r.shard, r.index) for r in original], [(r.shard, r.index) for r in missing])
 
             path = run/'restarts.json'
+            path.write_text('{"entries": [', encoding='utf-8')
+            self.assertEqual(dense_data.ReplayWindow(run, capacity_rows=1000).regret_rows, 0)
+            window.refresh_regret()
+            self.assertEqual(window.regret_rows, 0)
             listed = {0, 1, 2, 3, 4}
             path.write_text(json.dumps(dict(entries=[dict(shard='000001', game=0, ply=i, regret=1000 if i == 4 else i+1)
                                                      for i in listed])), encoding='utf-8')

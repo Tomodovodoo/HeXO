@@ -552,13 +552,16 @@ class ReplayWindow:
         except FileNotFoundError:
             mtime = None
         if mtime != self.regret_mtime:
-            self.regret_mtime = mtime
-            self.regret_entries = {}
-            if mtime is not None:
-                for entry in json.loads(path.read_text(encoding='utf-8'))['entries']:
-                    key = (str(entry['shard']), int(entry['game']), int(entry['ply']))
-                    if float(entry['regret']) > 0:
-                        self.regret_entries[key] = max(self.regret_entries.get(key, 0.), float(entry['regret']))
+            entries = {}
+            try:
+                if mtime is not None:
+                    for entry in json.loads(path.read_text(encoding='utf-8'))['entries']:
+                        key = (str(entry['shard']), int(entry['game']), int(entry['ply']))
+                        if float(entry['regret']) > 0:
+                            entries[key] = max(entries.get(key, 0.), float(entry['regret']))
+            except (OSError, ValueError, KeyError, TypeError):
+                return
+            self.regret_mtime, self.regret_entries = mtime, entries
             self.refresh()
 
     def regret_distribution(self, recency):
