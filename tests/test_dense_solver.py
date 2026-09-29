@@ -7,6 +7,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 import tempfile
 import threading
+from unittest import mock
 import time
 import unittest
 
@@ -19,6 +20,7 @@ import dense_eval
 import dense_openings
 import dense_selfplay
 import dense_solver
+import hexcrop
 from dense_solver import Budgets, Proof, Schedule
 import hexnet
 from hexo import Game
@@ -362,6 +364,18 @@ class Adjudication(unittest.TestCase):
         self.assertEqual((manifest['counts']['proven_games'], manifest['counts']['line_rows']), (1, 0))
         self.assertEqual(manifest['counts']['adjudicated_plies'], episode['adjudicated']['line_plies'])
 
+    def test_line_rows_stop_before_a_position_wider_than_the_largest_crop(self):
+        encode = hexcrop.encode_game
+
+        def narrow(game, history, **kwargs):   # searched positions (dense_selfplay.Position) still encode
+            if isinstance(game, Game):
+                raise hexcrop.SpanError('wide')
+            return encode(game, history, **kwargs)
+        with mock.patch.object(hexcrop, 'encode_game', side_effect=narrow):
+            episode, rows = self.play(proven_line_rows=True)
+        self.assertEqual((episode['reason'], len(rows)), ('proven', 1))
+        self.assertGreater(episode['adjudicated']['line_plies'], 1)
+
     def test_a_proof_on_the_capped_ply_still_adjudicates(self):
         episode, rows = self.play(plies=1)
         self.assertEqual((episode['reason'], episode['winner'], len(rows)), ('proven', dense_solver.mover(self.opening), 1))
@@ -395,7 +409,8 @@ class Scheduler(unittest.TestCase):
         self.assertEqual(Schedule.of(dense_config.EvaluationSettings()), Schedule())
         self.assertTrue(Schedule().fixed_budgets)
         for bad in (dict(deep_nodes=100), dict(workers=0), dict(min_nodes=600), dict(cap_nodes=9000),
-                    dict(overrun_fraction=-.1), dict(deep_nodes=70000, follow=True), dict(gate_weight=101)):
+                    dict(overrun_fraction=-.1), dict(deep_nodes=70000, follow=True), dict(gate_weight=101),
+                    dict(table_mb=257)):
             with self.assertRaises(ValueError):
                 Schedule(**bad)
 

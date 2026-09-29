@@ -83,7 +83,7 @@ fn complete_candidate(board:&check::Board,start:usize,moves:&[(i32,i32)],req:&Re
 /// returns UNKNOWN.
 fn run(req:Request, start:Instant) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.nodes==0 || req.nodes>10_000_000
-        || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>1024 {return Err("invalid tactical limits".into());}
+        || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256 {return Err("invalid tactical limits".into());}
     prover::dfpn::set_resident(req.table_mb as usize);
     let deadline=start+Duration::from_millis(req.ms as u64);
     let board=check::replay(&req.history)?;

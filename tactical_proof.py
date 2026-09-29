@@ -44,6 +44,7 @@ import time
 PROVEN_WIN, UNKNOWN = 'PROVEN_WIN', 'UNKNOWN'
 PACKAGE = Path(__file__).resolve().parent/'tools/tactical'
 MAX_NODES = 10000000
+MAX_TABLE_MB = 256  # resident table per attacker colour; two of them stay well inside a worker's 1536 MB cap
 DEFAULT_NODES, DEFAULT_MS = 2500, 1000
 REQUEST_LIMIT = 8*1024*1024
 # Worker responses above this are discarded unparsed; the verifier's 50,000-node certificate cap stays well below it.
@@ -57,7 +58,7 @@ def check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate=None, table_mb=0)
     if (type(ms) is not int or not 1 <= ms <= 60000 or any(type(n) is not int or not 1 <= n <= MAX_NODES for n in counts)
             or type(idtt_nodes) is not int or not 0 <= idtt_nodes < min(counts)
             or type(depth) is not int or not 1 <= depth <= 64 or attacker not in ('mover', 'opponent')
-            or type(table_mb) is not int or not 0 <= table_mb <= 1024
+            or type(table_mb) is not int or not 0 <= table_mb <= MAX_TABLE_MB
             or (gate is not None and (set(gate) != {'weight', 'floor', 'cap_low', 'cap_high'}
                                       or not 0 <= gate['weight'] <= 100 or gate['cap_low'] > gate['cap_high']))):
         raise ValueError('Invalid tactical budgets')

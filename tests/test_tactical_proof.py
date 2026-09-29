@@ -244,7 +244,7 @@ class Gate(unittest.TestCase):
         for table in (4, 4, 0):
             self.assertEqual(self.engine.history(strong, nodes=135, table_mb=table)['status'], 'PROVEN_WIN')
         with self.assertRaises(ValueError):
-            self.engine.history(strong, nodes=135, table_mb=2000)
+            self.engine.history(strong, nodes=135, table_mb=257)
 
     def test_invalid_gates_are_rejected(self):
         for gate in (dict(self.GATE, cap_low=9000), dict(self.GATE, floor=0), dict(self.GATE, weight=-1),

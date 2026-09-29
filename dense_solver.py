@@ -58,7 +58,7 @@ import time
 import numpy as np
 
 from neural_search import checked, native
-from tactical_proof import MAX_NODES, PROVEN_WIN, IsolatedTactics, NativeTactics, build_hash
+from tactical_proof import MAX_NODES, MAX_TABLE_MB, PROVEN_WIN, IsolatedTactics, NativeTactics, build_hash
 
 SAFETY_MS, DEEP_SAFETY_MS = 5000, 60000
 POINTS = ('root', 'threat', 'finalist', 'deep')
@@ -122,7 +122,7 @@ class Schedule:
 
     def __post_init__(self):
         if (self.workers < 1 or self.slack_fraction < 0 or self.overrun_fraction < 0 or not 0 <= self.gate_weight <= 100
-                or not 0 <= self.table_mb <= 1024
+                or not 0 <= self.table_mb <= MAX_TABLE_MB
                 or not 1 <= self.min_nodes <= self.cap_nodes <= self.gate_cap_nodes <= MAX_NODES
                 or not 0 <= self.deep_nodes <= self.deep_cap_nodes <= MAX_NODES):
             raise ValueError('Invalid solver schedule')

@@ -532,7 +532,8 @@ class SelfPlayGame:
     def adjudicate(self, winner, proof):
         """End the game as a proven win of `winner` (reason 'proven'). With proven_line_rows and the winner's
         `proof`, first play the certificate's forced line to six in a row (forced_line), each placement with a row
-        and no search: no policy, the exact value, `line` True. The episode records `adjudicated` {ply, winner,
+        and no search: no policy, the exact value, `line` True; the line stops at the ply cap or at a position
+        wider than the largest crop. The episode records `adjudicated` {ply, winner,
         line_plies: the placements of that line, played or not}."""
         full = proof and dense_solver.Proof(proof.base, dict(nodes=proof.nodes, root=proof.root))  # past its first turn
         line = self.forced_line(full) if full else []
@@ -544,7 +545,12 @@ class SelfPlayGame:
                     break
                 game = self.game
                 player = game.player
-                legal = hexcrop.legal_array(game, np.asarray(self.moves, np.int64).reshape(-1, 2))
+                history = np.asarray(self.moves, np.int64).reshape(-1, 2)
+                try:
+                    hexcrop.encode_game(game, history)
+                except hexcrop.SpanError:
+                    break   # wider than the largest crop: the learner could not encode the row
+                legal = hexcrop.legal_array(game, history)
                 proven = 1 if player == winner else -1
                 self.rows.append(dict(ply=len(self.moves), player=player, remaining=game.remaining,
                                       legal_sha256=dense_data.legal_digest(legal), policy=None, proven=proven,
