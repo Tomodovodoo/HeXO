@@ -77,6 +77,7 @@ class ActorSettings:
     cheap_sims: int = 12         # value-only positions; no policy row
     full_fraction: float = .25   # KataGo playout-cap randomization share
     root_samples: int = 16       # Gumbel m
+    cheap_root_samples: int = 4  # leave cheap searches enough visits to descend beyond the root
     max_plies: int = 256
     tactics: bool = True         # exact win/must-block classification inside the tree
     cache_positions: int = 4096
@@ -105,6 +106,7 @@ class ActorSettings:
     solver_finalists: int = 0
     solver_finalist_nodes: int = 0
     solver_threat_nodes: int = 0
+    solver_leaf_nodes: int = 0  # opt-in verified forced-win check before evaluating a new leaf; 10 ms per query
     solver_defence: bool = False  # verify certificate-derived turns, admit survivors and bonus them at the root
     solver_defence_candidates: int = 8
     solver_async: bool = True
@@ -141,6 +143,8 @@ class ActorSettings:
     cuda_graphs: bool = False  # reuse bounded CUDA graphs for frozen fused actor models
 
     def __post_init__(self):
+        if self.cheap_root_samples < 1 or self.solver_leaf_nodes < 0:
+            raise ValueError('cheap_root_samples must be positive and solver_leaf_nodes nonnegative')
         if self.net_kernels not in ('reference', 'fused'):
             raise ValueError('net_kernels must be reference or fused')
         if self.cuda_graphs and self.net_kernels != 'fused':
@@ -189,6 +193,7 @@ class LearnerSettings:
     outcome_weight: float = 0.    # coefficient of an extra value-logit BCE against the hard outcome (finished games, rows without a proof)
     deblunder_weight: float = 0.  # blend earlier losing-owner rows toward a transient proof's win; 0 disables
     short_value_horizon: int = 16
+    short_value_target: str = 'future'  # future: one root at horizon; average: exponential future roots and outcome
     value_weight: float = 1.5
     short_value_weight: float = .5
     opponent_policy_weight: float = .15
@@ -216,6 +221,8 @@ class LearnerSettings:
             raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
         if self.future_target not in ('legacy', 'masked'):
             raise ValueError(f'future_target must be legacy or masked, not {self.future_target!r}')
+        if self.short_value_target not in ('future', 'average') or (self.short_value_target == 'average' and self.short_value_horizon < 1):
+            raise ValueError('short_value_target must be future or average, with a positive averaging horizon')
         if not 0. <= self.deblunder_weight <= 1.:
             raise ValueError('deblunder_weight must be between 0 and 1')
         if '@' in self.variant or '/' in self.variant:

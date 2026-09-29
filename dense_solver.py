@@ -635,10 +635,13 @@ class Proof:
 class Plan:
     """The solver work of one Engine slot across its searches (module contract). `budgets` is re-read from the
     slot at every search start, so each colour of a match uses its own; the proof a side plays from and the pending
-    deep queries are kept per side."""
+    deep queries are kept per side. With leaf_nodes, the Plan also keeps root certificates from in-process leaf
+    checks. The solver can be None when no external queries are enabled, so following these proofs needs no
+    worker processes."""
 
-    def __init__(self, solver):
-        self.solver, self.schedule = solver, solver.schedule
+    def __init__(self, solver, schedule=None, leaf_nodes=0):
+        self.solver, self.schedule = solver, solver.schedule if solver is not None else schedule or Schedule()
+        self.leaf_nodes = leaf_nodes
         self.proofs, self.deep, self.late, self.found = {}, {}, [], []
         self.threat = self.root = self.finalists = None
         self.defence_queries, self.defences, self.defence_base = [], [], ()
@@ -694,13 +697,13 @@ class Plan:
         history = tuple(map(tuple, tree.history))
         self.threat = self.root = self.finalists = None
         self.nodes, self.budget, self.turns, self.pruned, self.following, self.deferrals = 0, 0, 0, [], False, 0
-        if not active(budgets, schedule) or not history:
+        if not history:
             return False
         player, other = mover(history), 1-mover(history)
         if not schedule.fixed_budgets:
             self.poll(history)
-        self.following = schedule.follow and self.move(player, history) is not None
-        if self.following:
+        self.following = schedule.follow and (active(budgets, schedule) or self.leaf_nodes) and self.move(player, history) is not None
+        if self.following or not active(budgets, schedule):
             return False
         if len(history) % 2 == 0:
             if budgets.defence and history[:-1] == self.defence_base:
@@ -839,11 +842,12 @@ class Plan:
             self.spent(self.deep[player].result()[1])
             self.proven(self.deep.pop(player), history)
         result.update(proven=0, proof_turns=0)
-        move = self.move(player, history) if active(slot.solver, self.schedule) else None
+        move = self.move(player, history) if active(slot.solver, self.schedule) or self.leaf_nodes else None
         if move is not None:
             result.update(action=list(move[0][0]), proven=1, proof_turns=move[1], proof=self.proofs[player],
                           proof_action=[list(a) for a in move[0]])
-            self.solver.stats['followed'] += self.following
+            if self.solver is not None:
+                self.solver.stats['followed'] += self.following
         elif self.pruned and native.hxg_exact(slot.tree.ptr) == 1-mover(history):
             played = history+(tuple(map(int, result['action'])),)
             result.update(proven=-1, proof_turns=self.turns, proof=next((p for p in self.found if p.base == played), None))
@@ -867,10 +871,12 @@ class Plan:
             self.poll(moves)
         pending = [self.threat, self.root, *(q for _, q in self.finalists or ()),
                    *(q for _, q in self.defence_queries), *self.deep.values(), *self.late]
-        self.solver.orphans += [q for q in pending if q is not None and q.outcome is None]
+        if self.solver is not None:
+            self.solver.orphans += [q for q in pending if q is not None and q.outcome is None]
         if not self.schedule.follow:
             return
         for proof in self.found:
             for ply, proven, turns in proof.path(moves)[0]:
-                self.solver.stats['labelled'] += slot.label(ply, proven, turns,
-                                                          proof.action(moves[:ply]) if proven > 0 else None)
+                labelled = slot.label(ply, proven, turns, proof.action(moves[:ply]) if proven > 0 else None)
+                if self.solver is not None:
+                    self.solver.stats['labelled'] += labelled
