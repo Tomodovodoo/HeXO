@@ -891,6 +891,7 @@ quadratically, so these tensor sizes are not a measured peak VRAM increase.
 `dense_eval.py loop` rates each new dense checkpoint against the champion and keeps the league in
 `league.json`; its module docstring is the full contract, and every setting is an `EvaluationSettings` field in
 `dense_config.py` (override per process with `--eval-*`).
+`python dense_eval.py settle --run runs/dense-v1 --checkpoint main/032500` asks the running evaluator to settle that checkpoint on its completed games at its next step.
 
 - **Promotion** (`decision`, default `posterior`). One Bradley-Terry posterior covers every rated checkpoint, the
   candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
