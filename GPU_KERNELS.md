@@ -84,8 +84,8 @@ The matrix-gradient revision then measured 629.58 versus 710.82 samples/s,
 **1.13x** over that initial fused path, with identical inputs and saved states.
 Allocated/reserved memory rose from 1416/2102 to 1803/2720 MiB. This second
 short comparison ran under a different shared-card load; its gain must not be
-multiplied by the earlier 1.64x result. The general 2x learner target remains
-unproven pending longer renderer-inclusive comparisons.
+multiplied by the earlier 1.64x result. The renderer-inclusive results below
+measure the final path directly and remain below the general 2x learner target.
 
 Separate CPU+CUDA profiles of a full 256-row step, with input shapes, show:
 
@@ -110,7 +110,12 @@ These profiles ran in separate windows. Launch-call CPU time is measured
 submission cost, not a claim that every GPU gap is launch overhead. H2D
 copy-engine timing excludes pageable-host staging and waiting. The final trace
 spent 107.7 ms inside host `cudaMemcpyAsync` calls, mostly in three pageable
-copies; pinned staging is a separate candidate under measurement.
+copies. Those three calls overlapped 101.5 ms of active GPU work out of
+104.8 ms total, so their host duration is not removable wall time. The device
+timeline spans 350.8 ms, including 273.6 ms of kernels, copies and memsets and
+77.2 ms of fragmented idle time. Pinning each padded bucket measured 726.15 samples/s versus 726.44
+for the surrounding unpinned phases, with identical first-step losses. It
+provided no measurable throughput gain and is not included.
 
 Convolution/GEMM shapes plus convolution backward give about 3.14 versus 2.95
 TFLOPs per step. Dividing by summed kernel time gives 8.43 versus 10.85 TF/s,
@@ -136,6 +141,34 @@ seconds. CPU renderer startup occurs before the GPU watchdog begins. Run
 writes, pacing sleeps, validation and checkpoint exports are outside the
 measurement.
 
+Five fresh-process windows on September 29 used export 85000's model,
+optimizer, EMA and learner settings, the same frozen replay corpus (1,647
+committed shards), two renderers and a 3328 MiB allocator cap. `shipped` means
+the previously deployed fused normalization with reference training LineConv;
+`fused` means the new matrix-gradient training path. Each process consumed one
+rendered batch for a full warmup `train_step`, then timed successive real
+batches. The rate includes queue waiting and a final GPU synchronization, but
+excludes the roughly 18 to 19 seconds of CPU renderer startup and the warmup step.
+
+| UTC start | Mode | Timed steps | Active seconds | Rows/s |
+|---|---|---:|---:|---:|
+| 21:04:26 | Original reference | 28 | 20.54 | 349.02 |
+| 21:06:14 | Deployed fused (`shipped`) | 27 | 20.41 | 338.58 |
+| 21:08:31 | New fused | 44 | 20.20 | 557.67 |
+| 21:10:27 | Deployed fused (`shipped`) | 35 | 20.46 | 437.85 |
+| 21:13:27 | Original reference | 27 | 20.23 | 341.73 |
+
+Pooling each repeated mode as total timed rows divided by total active time
+gives **345.40 rows/s reference** and **388.27 rows/s deployed fused**. The
+single new-fused window is **557.67 rows/s**, or **1.61x reference** and
+**1.44x deployed fused** by those pooled rates. The two deployed-fused windows
+span 338.58 to 437.85 rows/s under changing shared-card load; the new path has
+only one live observation. Render workers have independent seeded streams and
+their queue arrival order varies, so these are comparable workload windows,
+not identical batch sequences. The **2x reference target was not met** in
+this test. These live rates supersede the separate short-window ratios for
+assessing learner-loop throughput; neither short-window gain is compounded.
+
 ```text
 python tools/profile_learner.py prepare --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches
 python tools/profile_learner.py live --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches --modes reference --memory-mib 3328
@@ -145,11 +178,19 @@ python tools/profile_learner.py live --run /path/to/runs/dense-v1 --checkpoint /
 Repeat reference after fused. The larger allocator cap requires a validation
 window with that memory free. Saved-batch `measure` reports are explicitly
 labelled short-window results and record SHA256 hashes of their batch payloads.
+The five live reports and their per-step bucket counts are under
+`artifacts/gpu-kernels/learner-live-*.json`.
 
 Learner graphs were removed after real-workload trials: five private graphs
 with block recomputation reached 131.9 samples/s versus 146.9 eager, and one
 40x40 graph reached 140.7 versus 145.3 while reserving 3324 MiB. Actor graphs
 remain available as described below.
+
+A bounded `torch.compile` trial on the real 40x40 training bucket failed in
+PyTorch 2.11 Inductor while lowering the custom Triton kernels' runtime stride
+tuples. The error was `TypeError: '<=' not supported between instances of
+'tuple' and 'int'`. It exited after 38.4 seconds without a compiled performance
+result. No compiler or toolkit was installed, and compile mode is not shipped.
 
 ## Actor CUDA graphs
 
