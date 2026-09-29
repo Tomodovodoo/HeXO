@@ -2000,7 +2000,6 @@ class Evaluator:
         entry, opponent, kind, games = task
         a, s = entry['id'], self.settings
         initial_games = len(self.games(a, opponent))
-        yield_to_trial = resumed or unrated or any('verdict' not in v and v['checkpoint'] for v in self.variants())
         if kind == 'anchor':
             games = min(games, s.anchor_session_games)
             self.set_anchor_turn(False)  # commit the handoff before any anchor pair is written
@@ -2020,8 +2019,6 @@ class Evaluator:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
         self.session(want, target)
-        if kind == 'anchor' and not yield_to_trial and not arrived():
-            self.set_anchor_turn(True)
         path = report_path(self.run, a, opponent)
         if path.exists():
             report = json.loads(path.read_text())
