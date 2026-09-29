@@ -827,6 +827,9 @@ class DenseConfigTests(unittest.TestCase):
             config = SimpleNamespace(actor=dense_config.ActorSettings(), device='cuda')
             caches = []
 
+            def compile_in_worker(cache):
+                (cache/'kernel'/'new.json').open('x').close()
+
             def compile_once(command, *, env, check):
                 self.assertIn('--warm-cache', command)
                 self.assertTrue(check)
@@ -839,6 +842,9 @@ class DenseConfigTests(unittest.TestCase):
                 cache = Path(env['TRITON_CACHE_DIR'])
                 self.assertEqual((cache/'kernel'/'_eval.json').read_text(), 'compiled')
                 caches.append(cache)
+                if len(caches) == 2:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                        list(pool.map(compile_in_worker, caches))
                 return SimpleNamespace(poll=lambda: 0)
 
             with unittest.mock.patch.object(dense_selfplay.dense_config, 'load', return_value=config), \
@@ -850,12 +856,7 @@ class DenseConfigTests(unittest.TestCase):
             self.assertEqual(warm.call_count, 1)
             self.assertEqual(len(caches), 2)
             self.assertNotEqual(*caches)
-
-            def compile_in_worker(cache):
-                (cache/'kernel'/'new.json').open('x').close()
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                list(pool.map(compile_in_worker, caches))
+            self.assertTrue(all(not cache.exists() for cache in caches))
 
     def test_fused_actor_warmup_covers_crop_shapes_without_gpu(self):
         shapes = []

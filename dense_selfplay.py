@@ -994,28 +994,33 @@ def supervise(args):
     if settings.net_kernels == 'fused' and torch.device(config.device).type == 'cuda':
         cache = run/'cache'/'triton'/uuid.uuid4().hex
         shared = cache/'shared'
-        shared.mkdir(parents=True)
-        subprocess.run(command+['--warm-cache'], env=dict(os.environ, TRITON_CACHE_DIR=str(shared.resolve())), check=True)
 
     def spawn(k):
         games = [] if remaining[k] is None else ['--games', str(remaining[k])]
-        env = None
+        env, worker_cache = None, None
         if cache is not None:
             worker_cache = cache/f'worker-{k}-{uuid.uuid4().hex}'
             shutil.copytree(shared, worker_cache)
             env = dict(os.environ, TRITON_CACHE_DIR=str(worker_cache.resolve()))
-        return subprocess.Popen(command+games+['--worker', str(k)], env=env), time.time()
+        return subprocess.Popen(command+games+['--worker', str(k)], env=env), time.time(), worker_cache
 
-    workers = {k: spawn(k) for k in range(args.processes)}
-    log_event(run, 'actor', 'info', f'supervisor started {args.processes} workers')
+    workers = {}
     try:
+        if cache is not None:
+            shared.mkdir(parents=True)
+            subprocess.run(command+['--warm-cache'], env=dict(os.environ, TRITON_CACHE_DIR=str(shared.resolve())), check=True)
+        for k in range(args.processes):
+            workers[k] = spawn(k)
+        log_event(run, 'actor', 'info', f'supervisor started {args.processes} workers')
         while workers:
             time.sleep(1)
-            for k, (process, started) in list(workers.items()):
+            for k, (process, started, worker_cache) in list(workers.items()):
                 code = process.poll()
                 if code is None:
                     continue
                 del workers[k]
+                if worker_cache is not None:
+                    shutil.rmtree(worker_cache)
                 if code == 0:
                     continue
                 if remaining[k] is not None:
@@ -1028,8 +1033,12 @@ def supervise(args):
                     time.sleep(10)
                     workers[k] = spawn(k)
     finally:
-        for process, _ in workers.values():
+        for process, _, _ in workers.values():
             process.terminate()
+        for process, _, _ in workers.values():
+            process.wait()
+        if cache is not None:
+            shutil.rmtree(cache)
 
 
 def main():
