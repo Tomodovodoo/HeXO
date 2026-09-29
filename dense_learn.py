@@ -2,7 +2,7 @@
 
 A checkpoint holds model.pt (raw weights) and ema.pt (what actors play), both hexnet.save_model, optimizer.pt and
 manifest.json {variant, step, samples_seen, created_at, model_sha256, ema_sha256 (hexnet.model_digest), metrics,
-learner (effective LearnerSettings), model (ModelSettings), copied_from}. Events have source 'learner' and kind
+learner (effective LearnerSettings), model (ModelSettings), copied_from, rows, pacing}. Events have source 'learner' and kind
 export, info, error or replace. league.json is read for population replacement, never written. metrics/learner-
 <variant>.jsonl gets a line every log_every steps (losses averaged since the previous averaging point, which also
 falls on every tenth step) and one per export with validation_fields(metrics) of the manifest (Learner.export): EMA
@@ -28,7 +28,8 @@ dense_data.Renderers worker processes (--workers) with random hex symmetries. Th
 over every row of the batch that has that target, summed with the head coefficients; each crop bucket is
 a separate forward pass whose gradients accumulate (buckets padded to QUANTUM rows with inert rows).
 Pacing: at most samples_per_row * (trained rows in all shards, cheap rows included; a historical opponent's
-plies are not trained, see dense_data.trained) samples are presented; beyond that the learner waits. The window
+plies are not trained, see dense_data.trained) samples are presented since the pacing base (manifest
+pacing, Learner.rebase); beyond that the learner waits. The window
 is sized in full-search rows (dense_data.ReplayWindow). With phase_rows > 0 the learner alternates phases (Phase):
 it idles until the untrained backlog (backlog) reaches phase_rows, then trains until the pacing limit, so actors
 following the phase (ActorSettings.phase_follow) have the GPU to themselves while it idles; exports still fall on
@@ -221,12 +222,22 @@ def status_path(run, variant):
     return run/('learner-status.json' if variant == 'main' else f'learner-status-{variant}.json')
 
 
-def backlog(samples_seen, total_rows, samples_per_row):
-    """Untrained backlog in rows: the part of the pacing budget samples_per_row * total_rows not yet presented,
-    divided by samples_per_row, i.e. total_rows - samples_seen / samples_per_row: the rows still below the target if
+NO_BASE = dict(rows=0, samples=0)
+
+
+def backlog(samples_seen, total_rows, samples_per_row, base=NO_BASE):
+    """Untrained backlog in rows since the pacing base {rows, samples}: the part of the pacing budget
+    samples_per_row * rows not yet presented, divided by samples_per_row, i.e. rows - samples / samples_per_row with
+    rows = total_rows - base rows and samples = samples_seen - base samples: the rows still below the target if
     every samples_per_row presented samples had brought one whole row up to it. The learner cannot take another
-    batch once it falls below batch / samples_per_row."""
-    return total_rows-samples_seen/samples_per_row
+    batch once it falls below batch / samples_per_row (paced)."""
+    return total_rows-base['rows']-(samples_seen-base['samples'])/samples_per_row
+
+
+def paced(samples_seen, total_rows, samples_per_row, batch, base=NO_BASE):
+    """True when the next batch would exceed the pacing budget samples_per_row * (total_rows - base rows) for the
+    samples presented since the base."""
+    return samples_seen-base['samples']+batch > samples_per_row*(total_rows-base['rows'])
 
 
 class Phase:
@@ -365,6 +376,7 @@ class Learner:
         self.model = self.place(hexnet.HexNet(hexnet.HexNetConfig(**asdict(config.model))))
         self.step = self.samples_seen = self.optimizer_started = self.ema_updates = 0
         self.copied_from = None
+        self.pacing, self.pacing_per_row, self.resumed_rows = dict(NO_BASE), self.settings.samples_per_row, None
         if saved:
             self.resume(saved[-1], manifest)
         else:
@@ -422,7 +434,25 @@ class Learner:
         self.step, self.samples_seen = manifest['step'], manifest['samples_seen']
         self.optimizer_started, self.ema_updates = state['optimizer_started'], state['ema_updates']
         self.copied_from = manifest.get('copied_from')
+        self.pacing, self.pacing_per_row = dict(manifest.get('pacing', NO_BASE)), manifest['learner']['samples_per_row']
+        self.resumed_rows = manifest.get('rows')
         dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} resumed from step {self.step}', variant=self.settings.variant, step=self.step)
+
+    def rebase(self, total_rows):
+        """Keep the pacing base {rows, samples} (self.pacing) tied to settings.samples_per_row; called before every
+        pacing check. When the setting differs from the one the base was set under (the resumed checkpoint's, or
+        a replacement copy's), the base becomes (rows, samples_seen) and an info event records both with the old
+        and new setting. rows is the resumed checkpoint's manifest rows on the first call after a resume (so
+        restarts from the same checkpoint agree on the base), else total_rows."""
+        old, new = self.pacing_per_row, self.settings.samples_per_row
+        rows = total_rows if self.resumed_rows is None else self.resumed_rows
+        self.resumed_rows = None
+        if old == new:
+            return
+        self.pacing, self.pacing_per_row = dict(rows=rows, samples=self.samples_seen), new
+        dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} pacing base moved to {rows} rows, '
+              f'{self.samples_seen} samples: samples_per_row {old} -> {new}', variant=self.settings.variant, step=self.step,
+              pacing=self.pacing, old_samples_per_row=old, new_samples_per_row=new)
 
     def lr(self):
         """Linear warmup over warmup_steps from the optimizer's start, then constant."""
@@ -599,7 +629,7 @@ class Learner:
         The value target map is refitted first (calibrate; metrics.calibration), then the EMA is recalibrated;
         metrics.validation is validate(window) (the HEADS; null without held-out rows in the window) and
         metrics.validation_sources is validate_sources(sets) (null without `sets`). The cache is released after
-        these passes."""
+        these passes. rows is window.total_rows and pacing the pacing base (rebase)."""
         s = self.settings
         root = self.run/'checkpoints'/s.variant
         root.mkdir(parents=True, exist_ok=True)
@@ -619,7 +649,8 @@ class Learner:
                         model_sha256=hexnet.model_digest(self.model), ema_sha256=hexnet.model_digest(self.ema),
                         metrics=dict(self.metrics or {h: None for h in HEADS}, validation=validation, validation_sources=sources,
                                      calibration=self.calibration_report),
-                        learner=asdict(s), model=asdict(self.config.model), copied_from=self.copied_from)
+                        learner=asdict(s), model=asdict(self.config.model), copied_from=self.copied_from,
+                        rows=window.total_rows, pacing=self.pacing)
         write_json(stage/'manifest.json', manifest)
         stage.rename(final)
         self.last_export = self.step
@@ -693,12 +724,14 @@ def main():
     status = dict(stage='training', variant=s.variant, error=None, samples_per_second=0.)
 
     def write_status(**fields):
+        base = learner.pacing
         status.update(fields, updated_at=time.time(), step=learner.step, samples_seen=learner.samples_seen,
                       rows_available=window.total_rows, window_rows=window.rows, full_rows_available=window.total_full_rows,
                       window_full_rows=window.full_rows,
-                      samples_per_row=learner.samples_seen/max(1, window.total_rows),
+                      samples_per_row=(learner.samples_seen-base['samples'])/max(1, window.total_rows-base['rows']),
                       samples_per_row_target=learner.settings.samples_per_row, phase_rows=learner.settings.phase_rows,
-                      backlog_rows=backlog(learner.samples_seen, window.total_rows, learner.settings.samples_per_row),
+                      backlog_rows=backlog(learner.samples_seen, window.total_rows, learner.settings.samples_per_row, base),
+                      pacing_rows=base['rows'], pacing_samples=base['samples'],
                       lr=learner.lr(),
                       last_export_step=learner.last_export, policy_ce=(learner.metrics or {}).get('policy_ce'),
                       value_bce=(learner.metrics or {}).get('value_bce'), vram=learner.vram())
@@ -743,12 +776,13 @@ def main():
             s = learner.settings
             if time.time()-last_refresh > REFRESH_SECONDS:
                 window.refresh(); last_refresh = time.time()
-            paced = learner.samples_seen+s.batch > s.samples_per_row*window.total_rows
-            if window.index and not phase.due(s.phase_rows, backlog(learner.samples_seen, window.total_rows, s.samples_per_row), paced):
+            learner.rebase(window.total_rows)
+            limited = paced(learner.samples_seen, window.total_rows, s.samples_per_row, s.batch, learner.pacing)
+            if window.index and not phase.due(s.phase_rows, backlog(learner.samples_seen, window.total_rows, s.samples_per_row, learner.pacing), limited):
                 write_status(stage='phase-idle', samples_per_second=0.)
                 rate = []; time.sleep(5.); window.refresh(); last_refresh = time.time()
                 continue
-            if not window.index or paced:
+            if not window.index or limited:
                 write_status(stage='waiting-for-data', samples_per_second=0.)
                 rate = []; time.sleep(5.); window.refresh(); last_refresh = time.time()
                 continue
