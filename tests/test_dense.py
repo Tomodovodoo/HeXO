@@ -1264,6 +1264,19 @@ class DenseDataTests(unittest.TestCase):
             window.refresh_regret()
             self.assertEqual(window.regret_rows, 0)
 
+    def test_regret_cap_at_feasibility_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            moves, _ = random_game(np.random.default_rng(6), 45)
+            write_games(run/'shards'/'000001', [(moves, -1, None)])
+            (run/'restarts.json').write_text(json.dumps(dict(entries=[
+                dict(shard='000001', game=0, ply=i, regret=i+1) for i in range(5)])), encoding='utf-8')
+            window = dense_data.ReplayWindow(run, capacity_rows=1000)
+            self.assertEqual(window.regret_share(256, 1.), .375)
+            weights = window.regret_probabilities(.375)
+            self.assertAlmostEqual(weights.sum(), 1.)
+            self.assertLessEqual(weights.max(), .2+1e-12)
+
     def test_collate_is_collate_arrays_as_tensors(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_games(Path(tmp)/'shards'/'000001', [(random_game(np.random.default_rng(3), 12)[0], -1, None), (winning_game(), 0, None)])

@@ -608,6 +608,9 @@ class ReplayWindow:
             return self.regret_probability_cache[key]
         cap = (4/len(self.index)-(1-share)*self.regret_baseline(recency))/share
         weights = self.regret_weights
+        if cap.sum() <= 1:
+            self.regret_probability_cache[key] = cap/cap.sum()
+            return self.regret_probability_cache[key]
         low, high = 0., 1./min(weights)
         while np.minimum(weights*high, cap).sum() < 1:
             high *= 2
