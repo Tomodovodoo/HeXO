@@ -1,6 +1,6 @@
 # Opt-in dense GPU kernels
 
-`--net-kernels fused` selects Triton kernels for fixed line features, masked normalization with activation and its backward pass, and inference LineConv. Actors also use channels-last with this mode. The learner keeps the current NCHW layout and the reference differentiable LineConv. `reference` remains the default.
+`--net-kernels fused` selects Triton kernels for fixed line features, masked normalization with activation and its backward pass, and LineConv. Actors also use channels-last with this mode. Training keeps NCHW and the reference cuBLAS line products, with fused staging, residual additions and tap-gradient reductions. `reference` remains the default.
 
 Keep cuDNN for HexConv. This checkout already implements each hex convolution as one masked 3x3 convolution. Its tensor-core kernels are the largest single cost, but the avoidable work is around them: small synchronous index transfers, layout copies, full-activation normalization intermediates, and the matrices and skewed copies used by inference LineConv. The direct LineConv kernel tiles pixels and channels together, which makes channels-last usable without those matrices. Normalization preserves the reference's bf16 rounding points and centred variance computation.
 
@@ -55,34 +55,38 @@ Run `python tools/profile_evaluator.py live --kernels reference`, then `fused`,
 then `reference`. The shared guard enforces headroom, cooldown and a 55-second
 GPU deadline, and closes the measurement's own solver processes on timeout.
 
-## Learner CUDA graphs, under development
+## Training LineConv and running statistics
 
-The learner's `--net-kernels fused --cuda-graphs` captures model forward and
-backward at five crop capacities. The existing loss, gradient clipping,
-optimizer and EMA code still runs for every step. Capacities are 64 rows at
-24x24, 112 at 32x32, 96 at 40x40, 48 at 48x48 and 16 at 64x64. Additional rows
-have zero crop masks and do not enter normalization statistics or losses.
-The existing learner padding remains part of the input, with its original
-normalization contribution. Larger whole buckets run eagerly.
+The learner's fused mode now packs planar and skewed line inputs in Triton,
+uses the existing cuBLAS products, and gathers the result with the residual
+addition. Backward retains the reference order of bf16 additions and reduces
+tap gradients directly. The custom backward saves the input and taps, so it
+avoids recomputing the line forward through an inner activation checkpoint.
+Normalization updates its running mean, variance and batch counter in one
+kernel. Cumulative recalibration retains the existing implementation.
 
-`--block-checkpoint` separately trades recomputation for lower training memory.
-It recomputes each residual block during backward while updating normalization
-running statistics only once. Both flags default off and are absent from saved
-model configuration and checkpoint tensors.
+These changes use the existing `--net-kernels fused` flag. They add no learner
+graph flag, checkpointing flag, dependency or checkpoint format change.
 
-This draft has no production throughput claim yet. An earlier exact-shape
-diagnostic reached 129.1 samples/s against 67.6 samples/s for reference,
-1.91x, with whole-block checkpointing enabled in both paths to fit the 12%
-development memory cap. That changed execution path does not establish the
-requested gain over the normal learner. The original unmodified batch-256
-baseline could not fit that cap.
+Production-path validation uses `Learner.train_step`, model/optimizer/EMA state
+from export 85000, and successive 256-row batches sampled through the real
+replay window with the learner's sampling and target settings. The source run
+is read-only. The owner authorized stopping the learner after export 85000
+completed so these measurements could use its 3328 MiB memory allowance.
+Actors and the evaluator continue running. Every GPU child still has a
+55-second limit and a 60-second cooldown.
 
-The next comparison uses the actual `Learner.train_step`, saved optimizer and
-EMA state, and successive batches sampled with the live replay settings.
-It will report variable crop sizes, graph reuse, capture cost, eager fallback,
-memory and end-to-end samples/s. The owner authorized stopping the learner
-after export 85000 completes so this test can use its normal memory allowance.
-Until those results pass review, these learner flags remain experimental.
+The early LineConv-only comparison measured 146.9 samples/s versus 70.3 for
+reference. A later comparison measured 145.3 versus 126.7 for the already
+deployed fused implementation. These short windows expose warmup and shared
+GPU load, so they do not establish the final twofold target. The final warmed
+comparison and profiler table are pending.
+
+Learner graphs were tested on these changing crop shapes and removed from
+this PR. Five private graphs with block recomputation reached 131.9 samples/s
+versus 146.9 for the eager kernel. A single 40x40 graph reached 140.7 versus
+145.3 and reserved 3324 MiB. The eager kernel is the better measured choice
+for this learner workload. Actor graphs remain available as described below.
 
 ## Actor CUDA graphs
 

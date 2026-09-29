@@ -475,18 +475,13 @@ def checkpoints(run, variant):
 
 
 class Learner:
-    def __init__(self, run, settings, config, initial=None, overrides=None, net_kernels='reference',
-                 cuda_graphs=False, block_checkpoint=False):
+    def __init__(self, run, settings, config, initial=None, overrides=None, net_kernels='reference'):
         """Resume from the newest checkpoint of settings.variant if any (its saved settings under the explicit
         `overrides`), else start from `initial` or random weights. The VRAM cap of the effective settings is
         installed before any CUDA allocation."""
         self.run, self.settings, self.config, self.overrides = run, settings, config, overrides or {}
         self.net_kernels = net_kernels
-        self.cuda_graphs, self.block_checkpoint = cuda_graphs, block_checkpoint
-        self.train_graph = None
         self.device = torch.device(config.device)
-        if cuda_graphs and (self.device.type != 'cuda' or net_kernels != 'fused'):
-            raise ValueError('learner CUDA graphs require CUDA and --net-kernels fused')
         self.memory_format = hexnet.memory_format(config.model)
         saved = checkpoints(run, settings.variant)
         manifest = json.loads((saved[-1]/'manifest.json').read_text(encoding='utf-8')) if saved else None
@@ -540,8 +535,7 @@ class Learner:
                    for value in state.values() if torch.is_tensor(value) and value.is_cuda)/2**20
 
     def place(self, model):
-        return model.set_kernels(self.net_kernels).set_block_checkpoint(self.block_checkpoint).to(
-            self.device, memory_format=self.memory_format)
+        return model.set_kernels(self.net_kernels).to(self.device, memory_format=self.memory_format)
 
     def load_weights(self, path):
         source = hexnet.load_model(path, future_target=self.settings.future_target)
@@ -551,9 +545,6 @@ class Learner:
 
     def resume(self, path, manifest):
         """Load checkpoint weights and counters; reuse optimizer state only for the same kind and future target."""
-        if self.train_graph is not None:
-            self.train_graph.close()
-            self.train_graph = None
         changed = manifest['learner'].get('future_target', 'legacy') != self.settings.future_target
         self.model = self.place(hexnet.load_model(path/'model.pt', future_target=self.settings.future_target))
         self.ema = self.place(hexnet.load_model(path/'ema.pt', future_target=self.settings.future_target))
@@ -638,15 +629,7 @@ class Learner:
         for group in self.optimizer.param_groups:
             group['lr'] = lr
         self.optimizer.zero_grad(set_to_none=True)
-        model = self.model
-        if self.cuda_graphs:
-            if self.train_graph is None:
-                from hexnet_train_graphs import LearnerGraph
-                self.train_graph = LearnerGraph(self.model, self.memory_format)
-                self.train_graph.prepare(batch)
-            self.train_graph.begin_step()
-            model = self.train_graph
-        losses = batch_losses(model, batch, self.coefficients(), self.device, self.memory_format, True)
+        losses = batch_losses(self.model, batch, self.coefficients(), self.device, self.memory_format, True)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.settings.grad_clip, error_if_nonfinite=True)
         # AdamW decays a whole parameter, including the two inactive channels sharing the opponent head.
         legacy = self.model.aux_spatial.weight[1:] if self.model.future_target == 'masked' and self.model.config.aux_heads else None
@@ -922,18 +905,13 @@ def main():
     parser.add_argument('--threads', type=int, default=1, help='torch CPU threads of this process when training on CUDA')
     parser.add_argument('--net-kernels', choices=['reference', 'fused'], default='reference',
                         help='opt-in CUDA masked norm fusion; fused training requires Triton')
-    parser.add_argument('--cuda-graphs', action='store_true',
-                        help='capture learner forward/backward crop buckets; requires --net-kernels fused')
-    parser.add_argument('--block-checkpoint', action='store_true',
-                        help='recompute residual blocks in backward to reduce training memory')
     dense_config.add_arguments(parser, dense_config.LearnerSettings)
     args = parser.parse_args()
     config = dense_config.load(args.run)
     settings = dense_config.override(config.learner, args)
     overrides = {k: v for k, v in asdict(settings).items() if getattr(args, k, None) is not None}
     torch.manual_seed(config.seed)
-    learner = Learner(args.run, settings, config, args.initial, overrides, net_kernels=args.net_kernels,
-                      cuda_graphs=args.cuda_graphs, block_checkpoint=args.block_checkpoint)
+    learner = Learner(args.run, settings, config, args.initial, overrides, net_kernels=args.net_kernels)
     if learner.device.type == 'cuda':
         torch.set_num_threads(args.threads)
     s = learner.settings
