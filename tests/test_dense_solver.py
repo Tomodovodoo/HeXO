@@ -435,6 +435,40 @@ class Adjudication(unittest.TestCase):
 
 
 class Scheduler(unittest.TestCase):
+    def test_closing_tracks_games_before_a_later_plan_fails(self):
+        engine = dense_selfplay.Engine(64)
+        first, second = mock.Mock(moves=[]), mock.Mock(moves=[])
+        good, bad = mock.Mock(), mock.Mock()
+        good.pending.return_value = bad.pending.return_value = False
+        bad.close.side_effect = RuntimeError('later plan failed')
+        engine.closing = [(first, good, time.perf_counter()), (second, bad, time.perf_counter())]
+        with self.assertRaisesRegex(RuntimeError, 'later plan failed'):
+            engine.step()
+        self.assertIn(first, engine.completed)
+        self.assertNotIn(second, engine.completed)
+
+    def test_seal_match_closes_adaptive_plan_after_seal_turn(self):
+        model = tiny_model()
+        calls = []
+        def seal(board, ms):
+            calls.append(board.player)
+            return board.legal_moves()[:board.remaining]
+        game = dense_eval.MatchGame([model, dense_eval.SEAL], [(0, 0), (1, 0), (-1, 0)], 3,
+                                    4, 4, False, 9, dict(pair=0, seed=3, challenger_color=0), seal, 5,
+                                    solvers=(Budgets(root_nodes=NODES), Budgets()))
+        closed, close = [], dense_solver.Plan.close
+        def observe(plan, slot, moves):
+            closed.append((moves, slot.model))
+            return close(plan, slot, moves)
+        with mock.patch.object(dense_solver.Plan, 'close', observe):
+            records = dense_eval.play([game], 64, schedule=Schedule(fixed_budgets=False, follow=True))
+        self.assertEqual(len(records), 1)
+        self.assertGreater(len(calls), 0)
+        self.assertEqual(records[0]['plies'], 9)
+        self.assertEqual(records[0]['moves'], game.moves)
+        self.assertEqual(closed, [(tuple(map(tuple, game.moves)), dense_eval.SEAL)])
+        self.assertNotIn('error', records[0])
+
     def test_schedule_defaults_and_validation(self):
         self.assertEqual(Schedule.of(dense_config.ActorSettings()), Schedule())
         self.assertEqual(Schedule.of(dense_config.EvaluationSettings()), Schedule())
@@ -505,7 +539,7 @@ class Scheduler(unittest.TestCase):
         plan, future = dense_solver.Plan(engine.solver), Future()
         plan.late.append(dense_solver.Query(engine.solver, 'root', tuple(opening), NODES, future))
         rows = []
-        slot = type('Slot', (), dict(tree=type('Tree', (), dict(history=opening+first))(),
+        slot = type('Slot', (), dict(moves=opening+first,
                                      label=lambda self, ply, proven, turns, action: rows.append((ply, proven, action)) or 1))()
         engine.closing.append((slot, plan, time.perf_counter()+10))
         self.assertEqual(engine.step(), [])

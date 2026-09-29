@@ -2623,6 +2623,52 @@ class EvaluatorSearchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Match game failed: RuntimeError: Seal unavailable'):
             dense_eval.play([game], 64)
 
+    def test_match_saves_completed_games_before_play_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            dense_config.save(run, dense_config.RunConfig(device='cpu'))
+            model = SimpleNamespace(checkpoint='main/000010', sha='a'*64)
+            games = [dict(seed=seed, challenger_color=colour, winner=-1)
+                     for seed, colour in ((1, 0), (1, 1), (2, 0))]
+            games.append(dict(seed=2, challenger_color=1, winner=-1, error='Seal unavailable'))
+            def fail(games_to_play, leaf_batch, heartbeat):
+                heartbeat(games)
+                raise RuntimeError('mid-run failure')
+            args = SimpleNamespace(run=run, a=model.checkpoint, b='seal', games=4, sims=None,
+                                   **{f'{side}_solver_{name}': None for side in 'ab'
+                                      for name in asdict(dense_eval.Budgets())})
+            with unittest.mock.patch.object(dense_eval, 'load', return_value=model), \
+                    unittest.mock.patch.object(dense_eval.dense_openings, 'Book',
+                                               return_value=SimpleNamespace(digest=lambda: 'book')), \
+                    unittest.mock.patch.object(dense_eval, 'paired_games', return_value=[]), \
+                    unittest.mock.patch.object(dense_eval, 'play', side_effect=fail):
+                with self.assertRaisesRegex(RuntimeError, 'mid-run failure'):
+                    dense_eval.match(args)
+            paths = list((run/'matches').glob('*.json'))
+            self.assertEqual(len(paths), 1)
+            report = json.loads(paths[0].read_text())
+            self.assertEqual((len(report['games']), report['summary']['games'], report['summary']['pairs'],
+                              report['metrics']['pending']), (3, 3, 1, 1))
+
+    def test_play_reports_a_completed_slot_before_a_later_slot_fails(self):
+        model = dense_selfplay.Model(self.model, 'tiny', 'test', 'cpu', 64, 256)
+        opening = [(0, 0), (1, 0), (-1, 0)]
+        for error in (RuntimeError('later slot failed'), KeyboardInterrupt()):
+            class Failing(dense_eval.MatchGame):
+                def searched(self, result):
+                    raise error
+            first = dense_eval.MatchGame([model, model], opening, 1, 2, 2, False, 4, dict(index=1))
+            second = Failing([model, model], opening, 2, 2, 2, False, 4, dict(index=2))
+            saved = []
+            try:
+                with self.assertRaises(type(error)):
+                    dense_eval.play([first, second], 64, heartbeat=lambda records: saved.extend(records))
+                self.assertEqual([g['index'] for g in saved], [1])
+            finally:
+                second.game.close()
+                for tree in second.trees.values():
+                    tree.close()
+
     def test_model_move_error_in_seal_match_escapes(self):
         def fail(move):
             raise RuntimeError('tree advance failed')
@@ -3694,6 +3740,16 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertIsNone(evaluator.anchor())
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertTrue(any(event['kind'] == 'error' and 'one bad Seal game' in event['message'] for event in events))
+
+    def test_seal_anchor_with_solver_records_both_colours(self):
+        evaluator = self.start(anchor_games=2, seal_ms=5, solver_root_nodes=135)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        evaluator.seal = lambda board, ms: board.legal_moves()[:board.remaining]
+        self.assertTrue(evaluator.step())
+        report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())
+        self.assertEqual(len(report['games']), 2)
+        self.assertEqual({g['challenger_color'] for g in report['games']}, {0, 1})
 
     def test_seal_anchor_pauses_after_repeated_game_errors(self):
         evaluator = self.start(anchor_games=2, seal_ms=5)
