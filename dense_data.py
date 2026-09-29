@@ -11,7 +11,9 @@ millisecond time plus pid) holding
   manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows,
                  restart_games and forced_plies may be absent: 0)
   proofs.jsonl   optional sidecar written later by the proof pass (dense_solve; not in `files`): one line per proven
-                 window {game, mover, plies, ...}; rows of the listed plies are proven wins for their side to move
+                 window {game, mover, plies, ...}; rows of the listed plies are proven wins for their side to move.
+                 {kind: 'deblunder', game, first_ply, owner} records soften earlier losing-owner targets only
+                 with --deblunder-weight > 0; they never add exact labels.
 `origin` is 'converted' (dense_bootstrap) or 'actor' (dense_selfplay); `origin()` infers it for older manifests.
 `row.game` indexes the shard's episode list. `episode.winner` is 0/1 for finished games ('six-in-a-row') and -1
 for capped games ('cap' at the ply limit, 'span' when a searched position does not fit the largest crop);
@@ -333,8 +335,8 @@ def read_shard(path, policies=True):
     return episodes, rows
 
 
-def proof_windows(path):
-    """The window records of the shard's proof sidecar (dense_solve), or None while it has none."""
+def proof_records(path):
+    """The records of the shard's proof sidecar, or None while it has none."""
     try:
         text = (Path(path)/SIDECAR).read_text(encoding='utf-8')
     except FileNotFoundError:
@@ -342,11 +344,38 @@ def proof_windows(path):
     return [json.loads(line) for line in text.splitlines() if line]
 
 
+def proof_windows(path):
+    """Window records only, keeping readers of older sidecars compatible."""
+    records = proof_records(path)
+    return None if records is None else [r for r in records if r.get('kind') != 'deblunder']
+
+
+def proof_annotations(path):
+    """Exact labels and deblunder intervals by game. Each interval starts after the previous proof window."""
+    records = proof_records(path)
+    if records is None:
+        return None, {}
+    windows = [r for r in records if r.get('kind') != 'deblunder']
+    labels = {(w['game'], t): w.get('proof_action', {}).get(str(t)) for w in windows for t in w['plies']}
+    ranges = {}
+    for r in records:
+        if r.get('kind') == 'deblunder':
+            first = r['first_ply']
+            start = max((max(w['plies'])+1 for w in windows
+                         if w['game'] == r['game'] and min(w['plies']) < first), default=0)
+            ranges.setdefault(r['game'], []).append((start, first, r['owner']))
+    return labels, ranges
+
+
+def deblunder_row(row, winner, ranges):
+    """Only the losing owner's rows strictly before its window are eligible."""
+    return any(start <= row['ply'] < stop and row['player'] == owner and winner == 1-owner
+               for start, stop, owner in ranges.get(row['game'], ()))
+
+
 def proof_labels(path):
     """{(game, ply): proof_action or None} for sidecar wins; None while the shard has no sidecar."""
-    windows = proof_windows(path)
-    return None if windows is None else {(w['game'], t): w.get('proof_action', {}).get(str(t))
-                                        for w in windows for t in w['plies']}
+    return proof_annotations(path)[0]
 
 
 def label(shard, labels):
@@ -424,14 +453,14 @@ class ReplayWindow:
         self.shape = dict(min_rows=min_rows, expand_per_row=expand_per_row, taper_exponent=taper_exponent)
         self.policy_dir = self.run_dir/'cache'/'policies' if policy_dir is None else Path(policy_dir)
         self.manifests = {}; self.shards = {}; self.values = OrderedDict()
-        self.unlabelled = set()
+        self.unlabelled = set(); self.deblunders = {}
         self.refresh()
 
     def load(self, name):
         path = self.run_dir/'shards'/name
         episodes, rows = read_shard(path, policies=False)
         offsets = load_offsets(path, len(rows))
-        labels = proof_labels(path)
+        labels, self.deblunders[name] = proof_annotations(path)
         if labels is None:
             self.unlabelled.add(name)
         game = np.array([r['game'] for r in rows], np.int32); ply = np.array([r['ply'] for r in rows], np.int32)
@@ -473,14 +502,17 @@ class ReplayWindow:
             admitted.append((name, take)); have += take
         for name in set(self.shards) - {n for n, _ in admitted}:
             del self.shards[name]; self.unlabelled.discard(name)
+            del self.deblunders[name]
             for key in [k for k in self.values if k[0] == name]:
                 del self.values[key]
         self.prune({n for n, _ in admitted})
         for name, _ in admitted:
             if name not in self.shards:
                 self.shards[name] = self.load(name)
-            elif name in self.unlabelled and (labels := proof_labels(self.run_dir/'shards'/name)) is not None:
-                label(self.shards[name], labels); self.unlabelled.discard(name)
+            elif name in self.unlabelled:
+                labels, self.deblunders[name] = proof_annotations(self.run_dir/'shards'/name)
+                if labels is not None:
+                    label(self.shards[name], labels); self.unlabelled.discard(name)
         self.admitted = admitted[::-1]; self.full_rows = have; self.proven_rows = 0
         parts = ([], []), ([], [])    # (shard ids, rows) of the training and validation index
         self.starts = {}
@@ -507,6 +539,8 @@ class ReplayWindow:
                    proven=int(s.proven[i]), legal_sha256=s.legal[i].tobytes().hex())
         if i in s.proof_action:
             row['proof_action'] = s.proof_action[i]
+        if deblunder_row(row, int(s.winner[g]), self.deblunders[name]):
+            row['deblunder'] = True
         episode = episode or dict(moves=s.moves[a:b].tolist(), winner=int(s.winner[g]), trained_side=None if s.side[g] < 0 else int(s.side[g]),
                        root_values=[None if v != v else v for v in s.roots[a:b].tolist()] if s.has_roots[g] else None,
                        full_search=s.searched[a:b].tolist() if s.has_search[g] else None)
@@ -638,6 +672,7 @@ class ValidationSets:
     def __init__(self, run_dir, fraction, seed, limit, quota):
         self.run_dir, self.fraction, self.seed, self.limit, self.quota = Path(run_dir), fraction, seed, limit, quota
         self.manifests = {}; self.actors = {}; self.entries = {}; self.following_index = {}; self.labels = {}
+        self.deblunders = {}
         self.subsets = {(source, split): [] for source in SOURCES for split in ('held', 'train')}
         self.picks = {key: [] for key in self.subsets}; self.walked = {key: set() for key in self.subsets}
         self.newest = self.newest_checkpoint = None
@@ -709,9 +744,13 @@ class ValidationSets:
                         row = {key: v for key, v in rows[k].items() if key != 'policy'}
                         entries[name, k] = (row, episodes[row['game']], rows[k]['policy'].copy())
         self.entries, self.following_index = entries, following
-        known = lambda n: self.labels[n] if self.labels.get(n) is not None else proof_labels(self.run_dir/'shards'/n)
-        self.labels = {n: known(n) for n in {n for n, _ in entries}}
-        for (name, _), (row, _, _) in entries.items():
+        names = {n for n, _ in entries}
+        for name in names:
+            if self.labels.get(name) is None:
+                self.labels[name], self.deblunders[name] = proof_annotations(self.run_dir/'shards'/name)
+        self.labels = {n: self.labels[n] for n in names}
+        self.deblunders = {n: self.deblunders[n] for n in names}
+        for (name, _), (row, episode, _) in entries.items():
             labels = self.labels[name] or {}
             key = row['game'], row['ply']
             if key in labels:
@@ -719,6 +758,8 @@ class ValidationSets:
                     row['proven'] = 1
                 if row['proven'] > 0 and labels[key]:
                     row.setdefault('proof_action', labels[key])
+            if deblunder_row(row, episode['winner'], self.deblunders[name]):
+                row['deblunder'] = True
         self.subsets = {key: [self.ref(*k) for k in chosen] for key, chosen in self.picks.items()}
 
     def ref(self, name, i):
@@ -755,11 +796,12 @@ def target_options(settings, calibration=None):
                 cheap_value_weight=settings.cheap_value_weight, full_only=settings.bootstrap_full_only,
                 outcome_lam=settings.outcome_lambda if settings.value_target == 'td' else 1.,
                 calibration=calibration if settings.value_target == 'calibrated' else None,
-                proven_weight=settings.proven_value_weight, proof_policy_weight=settings.proof_policy_weight)
+                proven_weight=settings.proven_value_weight, proof_policy_weight=settings.proof_policy_weight,
+                deblunder_weight=settings.deblunder_weight)
 
 
 def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False,
-             outcome_lam=1., calibration=None, proven_weight=2., proof_policy_weight=0.):
+             outcome_lam=1., calibration=None, proven_weight=2., deblunder_weight=0., proof_policy_weight=0.):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
     Positions are encoded from the move prefix without replaying it (hexcrop.Position); the side to move and the
@@ -777,6 +819,9 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         finished games, 0 for capped games (outcome .5) and for rows with an exact label (a nonzero `proven`,
         forced-line rows included), whose value target is the proven result;
       exact: 1. for a row with an exact label, else 0.;
+      With deblunder_weight > 0, eligible losing-owner rows use w*1 + (1-w)*outcome for value and the
+        extra outcome loss, overriding calibration/TD at those rows. Exact labels always take precedence.
+        outcome stays original; outcome_target and deblundered are added only when enabled.
       short_value, short_weight: p(win) of the side to move from the root value `horizon` plies later
         (negated when that ply's mover is the opponent); the outcome when a finished game ends within the
         horizon; weight 0 when that root value is null or a capped game ends first;
@@ -842,6 +887,13 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
                         outcome_weight=value_weight if e['winner'] >= 0 and not proven else 0., exact=float(proven != 0),
                         short_value=short[0], short_weight=short[1], future=future, future_weight=known,
                         next_cells=following[0], next_policy=following[1], next_weight=following[2]))
+        if deblunder_weight:
+            target = out[-1]
+            changed = bool(ref.row.get('deblunder') and not proven)
+            target['deblundered'] = float(changed)
+            target['outcome_target'] = target['outcome']
+            if changed:
+                target['value'] = target['outcome_target'] = deblunder_weight + (1-deblunder_weight)*target['outcome']
     return samples, out
 
 
@@ -890,6 +942,8 @@ def collate_arrays(samples, targets):
             future_weight=np.stack([t['future_weight'] for _, t in items]),
             player=np.array([int(s.player) for s, _ in items], np.int64),
             remaining=np.array([int(s.remaining) for s, _ in items], np.int64))
+        if 'outcome_target' in items[0][1]:
+            out[size].update({k: column(k) for k in ('outcome_target', 'deblundered')})
     return out
 
 
