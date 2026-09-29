@@ -123,6 +123,7 @@ class Schedule:
     cap_nodes: int = 512
     gate_cap_nodes: int = 8192
     gate_weight: float = 0.
+    gate_threat: bool = False
     deep_nodes: int = 0
     deep_cap_nodes: int = 65536
     follow: bool = False
@@ -146,6 +147,7 @@ class Schedule:
                     settings.solver_root_nodes, settings.solver_finalist_nodes, settings.solver_threat_nodes):
                 raise ValueError('solver_gate_cap_nodes must cover every enabled evaluation query budget')
             values['gate_weight'] = 3. if settings.solver_gate_cap_nodes else 0.
+            values['gate_threat'] = bool(settings.solver_gate_cap_nodes)
             values['gate_cap_nodes'] = settings.solver_gate_cap_nodes or cls.gate_cap_nodes
             values['cap_nodes'] = min(values['cap_nodes'], values['gate_cap_nodes'])
             values['min_nodes'] = min(values['min_nodes'], values['cap_nodes'])
@@ -327,7 +329,7 @@ class Solver:
         contract)."""
         sc = self.schedule
         if sc.fixed_budgets or point in ('threat', 'defence'):
-            gate = None if not sc.gate_weight or point == 'defence' or (point == 'threat' and not sc.fixed_budgets) else \
+            gate = None if not sc.gate_weight or point == 'defence' or (point == 'threat' and not sc.gate_threat) else \
                 dict(weight=sc.gate_weight, floor=nodes, cap_low=nodes, cap_high=max(nodes, sc.gate_cap_nodes))
             return nodes, gate, self.pool
         deep = point == 'deep'

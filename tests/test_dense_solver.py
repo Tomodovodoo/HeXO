@@ -620,7 +620,7 @@ class Scheduler(unittest.TestCase):
         fixed.leads['root'].extend([5000.]*8)
         self.assertEqual(fixed.allocate('root', NODES)[:2],
                          (NODES, dict(weight=3., floor=NODES, cap_low=NODES, cap_high=8192)))
-        self.assertEqual(fixed.allocate('threat', NODES)[1], fixed.allocate('root', NODES)[1])
+        self.assertIsNone(fixed.allocate('threat', NODES)[1])
         self.assertIsNone(fixed.allocate('defence', NODES)[1])
 
     def test_evaluation_gate_budget_is_position_deterministic(self):
