@@ -287,6 +287,9 @@ class Proofs(unittest.TestCase):
         proof = Proof(base, certificate)
         turns = self.result['proof_turns']
         self.assertEqual(proof.path(base), ([], (first, turns)))
+        self.assertEqual(proof.action(base), [list(a) for a in first])
+        self.assertEqual(proof.action(base+first[:1]), [list(a) for a in first[1:]])
+        self.assertIsNone(proof.action(base+first))
         self.assertEqual(proof.path(base+first[:1]), ([(len(base), 1, turns)], (first[1:], turns)))
         self.assertEqual(proof.path(base+first)[1], ([], turns-1))
         labels, move = proof.path(base+first+reply)
@@ -356,6 +359,7 @@ class Adjudication(unittest.TestCase):
         self.assertEqual((episode['reason'], episode['winner']), ('proven', winner))
         self.assertEqual(episode['moves'][len(self.opening):], [self.proof['moves'][0]])
         self.assertEqual([r['proven'] for r in rows], [1])
+        self.assertEqual(rows[0]['proof_action'], self.proof['moves'])
         self.assertEqual(episode['adjudicated']['ply'], len(self.opening)+1)
         self.assertGreater(episode['adjudicated']['line_plies'], 1)
         with tempfile.TemporaryDirectory() as root:
@@ -392,6 +396,7 @@ class Adjudication(unittest.TestCase):
         with mock.patch.object(dense_solver, 'native', mock.Mock(hxg_exact=lambda ptr: 1-dense_solver.mover(history))):
             self.assertTrue(plan.finish(slot, result))
         self.assertEqual((result['proven'], result['proof']), (-1, mine))
+        self.assertNotIn('proof_action', result)
 
     def test_a_proof_on_the_capped_ply_still_adjudicates(self):
         episode, rows = self.play(plies=1)
@@ -409,6 +414,9 @@ class Adjudication(unittest.TestCase):
         self.assertEqual([r['proven'] for r in rows], [1 if r['player'] == winner else -1 for r in rows])
         self.assertEqual(episode['root_values'][1:], [1. if r['player'] == winner else -1. for r in line])
         self.assertFalse(any(episode['full_search'][1:]))
+        proof = Proof(self.opening, self.proof['certificate'])
+        for row in rows:
+            self.assertEqual(row.get('proof_action'), proof.action(episode['moves'][:row['ply']]))
         with tempfile.TemporaryDirectory() as root:
             manifest = dense_data.write_shard(Path(root)/'shards'/'000001', dict(actor_sha256='a'*64), [episode],
                                               [dict(r, game=0) for r in rows])
@@ -416,6 +424,11 @@ class Adjudication(unittest.TestCase):
             refs = [window.ref('000001', i) for i in range(len(window.index))]
             options = dense_data.target_options(dense_config.LearnerSettings())
             targets = dense_data.examples(window, refs, np.random.default_rng(0), **options)[1]   # rows replay
+            mixed = dense_data.examples(window, refs, np.random.default_rng(0), proof_policy_weight=.5)[1]
+            for ref, row, target in zip(refs, rows, mixed):
+                self.assertEqual(ref.row.get('proof_action'), row.get('proof_action'))
+                if row.get('line'):
+                    self.assertEqual(target['policy_weight'], .5 if row['proven'] > 0 else 0.)
         self.assertEqual(manifest['counts']['line_rows'], len(line))
         self.assertEqual(dense_selfplay.unsearched(rows), len(line))   # counted into the actor's positions
         self.assertEqual([t['value'] for t in targets], [float(r['proven'] > 0) for r in rows])
@@ -493,12 +506,12 @@ class Scheduler(unittest.TestCase):
         plan.late.append(dense_solver.Query(engine.solver, 'root', tuple(opening), NODES, future))
         rows = []
         slot = type('Slot', (), dict(tree=type('Tree', (), dict(history=opening+first))(),
-                                     label=lambda self, ply, proven, turns: rows.append((ply, proven)) or 1))()
+                                     label=lambda self, ply, proven, turns, action: rows.append((ply, proven, action)) or 1))()
         engine.closing.append((slot, plan, time.perf_counter()+10))
         self.assertEqual(engine.step(), [])
         future.set_result(proof)
         self.assertEqual(engine.step(), [slot])
-        self.assertEqual(rows, [(len(opening), 1), (len(opening)+1, 1)])
+        self.assertEqual(rows, [(len(opening), 1, proof['moves']), (len(opening)+1, 1, proof['moves'][1:])])
 
     def test_a_failing_query_fails_its_future_and_releases_its_reservation(self):
         try:
@@ -634,6 +647,54 @@ class Determinism(unittest.TestCase):
 
 
 class ProvenTargets(unittest.TestCase):
+    def test_policy_mix_and_legacy_rows(self):
+        moves = winning_game()
+        episode, rows = episode_rows(moves, 0, [0.]*len(moves))
+        action = [list(m) for m in moves[7:9]]
+        rows[7].update(proven=1, proof_action=action)
+        rows[8].update(proven=1, proof_action=action[1:], policy=None)
+        rows[9].update(proven=-1, proof_action=[list(moves[9])])
+        rows[10].update(proven=1)  # old proof row with no action
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'shards'/'000001'
+            dense_data.write_shard(path, dict(actor_sha256='a'*64), [episode], rows)
+            stored = dense_data.read_shard(path)[1]
+            self.assertEqual(stored[7]['proof_action'], action)
+            window = dense_data.ReplayWindow(tmp, capacity_rows=1000)
+            refs = [window.ref('000001', i) for i in (7, 8, 9, 10)]
+            self.assertEqual(refs[0].row['proof_action'], action)
+            self.assertNotIn('proof_action', refs[-1].row)
+            plain = dense_data.examples(window, refs, np.random.default_rng(0))[1]
+            options = dense_data.target_options(replace(dense_config.LearnerSettings(), proof_policy_weight=.5))
+            samples, mixed = dense_data.examples(window, refs, np.random.default_rng(0), **options)
+            expected = np.isin(np.arange(len(samples[0].actions)),
+                               [np.flatnonzero((samples[0].actions == a).all(1))[0] for a in action]).astype(np.float32)/2
+            np.testing.assert_allclose(mixed[0]['policy'], (plain[0]['policy']+.5*expected)/1.5)
+            self.assertTrue((mixed[0]['policy'][expected == 0] > 0).all())
+            self.assertEqual((plain[1]['policy_weight'], mixed[1]['policy_weight']), (0., .5))
+            self.assertEqual(mixed[1]['policy'].sum(), 1.)
+            self.assertEqual(samples[1].actions[mixed[1]['policy'].argmax()].tolist(), action[1])
+            for i in (2, 3):
+                np.testing.assert_array_equal(mixed[i]['policy'], plain[i]['policy'])
+            np.testing.assert_array_equal(plain[0]['policy'], rows[7]['policy'])
+            sets = dense_data.ValidationSets(tmp, 1., 0, 100, 100)
+            sets.refresh()
+            self.assertEqual(next(r.row['proof_action'] for r in sets.subsets['fresh', 'held'] if r.row['ply'] == 7), action)
+
+    def test_late_proof_labels_its_witness_even_after_an_off_witness_move(self):
+        slot = object.__new__(dense_selfplay.SelfPlayGame)
+        slot.moves = [[0, 0], [0, 1], [1, 1]]
+        slot.rows = [dict(ply=i) for i in range(3)]
+        certificate = dict(root=0, nodes=[dict(kind='immediate_win', action=[[1, 0], [2, 0]])])
+        proof = Proof([(0, 0)], certificate)
+        solver = mock.Mock(stats=dict(labelled=0), orphans=[])
+        plan = dense_solver.Plan(solver)
+        plan.schedule = Schedule(follow=True)
+        plan.found = [proof]
+        plan.close(slot, slot.moves)
+        self.assertEqual(slot.rows[1]['proof_action'], [[1, 0], [2, 0]])
+        self.assertNotIn('proof_action', slot.rows[2])
+
     def test_proven_rows_get_the_exact_value_with_their_weight(self):
         moves = winning_game()
         roots = [float(v) for v in np.random.default_rng(3).uniform(-1, 1, len(moves))]

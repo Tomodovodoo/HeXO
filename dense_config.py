@@ -182,6 +182,7 @@ class LearnerSettings:
     opponent_policy_weight: float = .15
     future_weight: float = .5
     proven_value_weight: float = 2.  # value weight of rows the solver proved; their target is the proven value
+    proof_policy_weight: float = 0.  # mix (search + weight * proof)/(1 + weight); proof-only rows have this loss weight
     validation_fraction: float = .03
     validation_rows: int = 8192   # rows per per-source validation subset (dense_data.ValidationSets limit)
     validation_quota: int = 128   # rows each shard may contribute to a subset (ValidationSets quota)
@@ -206,6 +207,8 @@ class LearnerSettings:
             raise ValueError(f"variant {self.variant!r}: '@' marks a search-settings variant (dense_eval) and '/' a step")
         if self.phase_rows < 0:
             raise ValueError(f'phase_rows must be 0 (off) or positive, not {self.phase_rows}')
+        if not 0 <= self.proof_policy_weight < float('inf'):
+            raise ValueError('proof_policy_weight must be finite and nonnegative')
 
 
 @dataclass(frozen=True)

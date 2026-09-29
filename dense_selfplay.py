@@ -507,6 +507,8 @@ class SelfPlayGame:
         if dense_solver.active(self.solver, self.schedule):
             row.update(proven=result['proven'], proof_turns=result['proof_turns'], solver_nodes=result['solver_nodes'],
                        solver_budget=result['solver_budget'])
+            if result.get('proof_action'):
+                row['proof_action'] = result['proof_action']
         self.rows.append(row)
         self.values.append(root_value(result, player) if trained else None)
         self.full.append(self.is_full and trained)
@@ -555,6 +557,8 @@ class SelfPlayGame:
                 self.rows.append(dict(ply=len(self.moves), player=player, remaining=game.remaining,
                                       legal_sha256=dense_data.legal_digest(legal), policy=None, proven=proven,
                                       proof_turns=turns, solver_nodes=0, solver_budget=0, line=True))
+                if proven > 0:
+                    self.rows[-1]['proof_action'] = full.action(self.moves)
                 self.values.append(float(proven) if trained(player) else None)
                 self.full.append(False)
                 game.play(q, r)
@@ -584,12 +588,16 @@ class SelfPlayGame:
             game.close()
         return line
 
-    def label(self, ply, proven, turns):
+    def label(self, ply, proven, turns, proof_action=None):
         """Record a proof's verdict (+1 / -1: the side to move wins / loses) on the row of `ply` unless it has one;
         1 when set."""
         index = ply-(len(self.moves)-len(self.rows))
         row = self.rows[index] if 0 <= index < len(self.rows) else None
-        if row is None or row.get('proven'):
+        if row is None:
+            return 0
+        if proof_action and proven > 0 and row.get('proven', 0) >= 0:
+            row.setdefault('proof_action', proof_action)
+        if row.get('proven'):
             return 0
         row.update(proven=proven, proof_turns=turns)
         return 1

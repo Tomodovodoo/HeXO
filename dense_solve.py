@@ -46,6 +46,7 @@ Per game:
                 empty at d among the threat's first turn and the first turn of the window's opening proof.
 Sidecar: one JSON line per window {game, first_ply, last_ply, mover, plies, proof_turns,
 budget (nodes of the first ply's proof), certificate_hash (sha256 of its certificate JSON),
+proof_action (mapping from each proven ply string to that proof's first-turn placements),
 search_value_at_first_ply (recorded root value or null), persistent, defence: [{ply, threat, saving_turns}]}.
 Each transient window whose owner lost also adds {kind: 'deblunder', game, first_ply, owner}. The learner
 uses these only with a positive --deblunder-weight; existing sidecars stay unchanged on restart.
@@ -332,11 +333,12 @@ class Solver:
             plies = sorted(turns+[t+1 for t in turns if t+1 < T and attack(t+1, s.solve_nodes)])
             budget = s.solve_nodes if memo.get((plies[0], s.solve_nodes)) else s.scan_nodes
             opening = memo[plies[0], budget]
+            actions = {str(t): [list(a) for a in (memo.get((t, s.solve_nodes)) or memo[t, s.scan_nodes])[0]] for t in plies}
             persistent = e['winner'] == m and turns[-1] == starts[-1]
             defence = self.lookback(shard, g, moves, plies[0], m, opening[0], start) if e['winner'] == m else []
             windows.append(dict(game=g, first_ply=plies[0], last_ply=plies[-1], mover=m, plies=plies, proof_turns=opening[1],
                                 budget=budget, certificate_hash=opening[2], search_value_at_first_ply=roots[plies[0]],
-                                persistent=persistent, defence=defence))
+                                persistent=persistent, defence=defence, proof_action=actions))
             self.stats['windows'] += 1
             self.stats['persistent' if persistent else 'transient'] += 1
             self.stats['window_plies'][plies[-1]-plies[0]+1] += 1
