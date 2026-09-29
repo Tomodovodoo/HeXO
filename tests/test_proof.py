@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from hexo import Game
-from proof import PROVEN_LOSS, PROVEN_WIN, UNKNOWN, solve, verify
+from proof import PROVEN_LOSS, PROVEN_WIN, UNKNOWN, VerificationTimeout, solve, verify
 from tests.reference import AXES, interleave
 
 
@@ -93,6 +93,11 @@ class ForcingProof(unittest.TestCase):
                 bad['history'][0] = [1, 0]
             with self.assertRaises(ValueError, msg=mutation):
                 verify(bad, history)
+        # Running out of time is not a rejection: a valid and an invalid certificate time out alike.
+        for certificate in (cert, bad):
+            with self.assertRaises(VerificationTimeout) as caught:
+                verify(certificate, history, deadline=time.perf_counter())
+            self.assertNotIsInstance(caught.exception, ValueError)
 
     def test_free_filler_quiet_and_depth_exhaustion_are_unknown(self):
         self.assertEqual(self.run_proof(self.game(), attack_turns=0)['status'], UNKNOWN)

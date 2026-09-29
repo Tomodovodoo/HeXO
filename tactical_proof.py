@@ -431,11 +431,13 @@ def threat_cells(certificate):
     return [tuple(cell) for cell in node['action']]
 
 
-def independent_verify(certificate, history, attacker='mover'):
+def independent_verify(certificate, history, attacker='mover', deadline_seconds=10.):
     """Second checker via proof.py, independent of both native search and verifier.
 
     `attacker` is the query's attacker: 'opponent' checks the certificate on the
-    flipped-turn position. Returns PROVEN_WIN or raises ValueError.
+    flipped-turn position. Returns PROVEN_WIN, raises ValueError for an invalid
+    certificate and proof.VerificationTimeout when the check takes longer than
+    `deadline_seconds`.
     """
     from proof import verify
     work = 0
@@ -466,7 +468,7 @@ def independent_verify(certificate, history, attacker='mover'):
     start = n+1+n % 2 if flipped else n
     converted = dict(version=1, history=[list(p) for p in history], attacker=((start+1)//2) % 2 if start else 0,
                      flipped=flipped, tree=expand(certificate['root'], set()))
-    return verify(converted, history, deadline=time.perf_counter()+10)
+    return verify(converted, history, deadline=time.perf_counter()+deadline_seconds)
 
 
 if __name__ == '__main__' and sys.argv[1:2] == ['serve']:

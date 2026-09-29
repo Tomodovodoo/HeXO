@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import unittest
+from proof import VerificationTimeout
 from tactical_proof import IsolatedTactics, NativeTactics, independent_verify, threat_cells
 
 
@@ -55,6 +56,8 @@ class NativeStrategy(unittest.TestCase):
             self.assertEqual(rejected['status'], 'UNKNOWN', mutation)
             self.assertFalse(rejected['native_verified'])
             with self.assertRaises(ValueError): independent_verify(cert, OPEN_THREE)
+        with self.assertRaises(VerificationTimeout):
+            independent_verify(result['certificate'], OPEN_THREE, deadline_seconds=0)
 
     def test_partial_phase_and_first_placement_terminal(self):
         cert = dict(version=1, width='wide', root=0, nodes=[dict(kind='immediate_win', action=[[5,0]])])

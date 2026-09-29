@@ -8,7 +8,10 @@ in out/.solve/<name>.json; the coordinator alone writes the buffer and the sidec
 changed; everything is written under `--out` (default: the run): the sidecar shards/<name>/proofs.jsonl,
 restarts.json, solver-status.json, events and .solve/ (worker results and logs). A shard is done once its sidecar
 exists, so a restarted pass resumes where it stopped. Pending shards are taken newest first: the pass starts at the
-newest shards, keeps up with new ones and back-fills older ones while it has nothing newer.
+newest shards, keeps up with new ones and back-fills older ones while it has nothing newer. A worker that exits with
+REJECTED stops the pass; one that fails in any other way logs an error event and its shard is retried once, when no
+shard on its first attempt is pending or running (status shards_failed: {name: failed attempts}); after a second
+failure the coordinator skips it.
 
 Workers (Pass.workers). While the main learner's fresh heartbeat (learner-status.json, at most STALE_SECONDS old)
 shows a phased learner (phase_rows > 0) in its training phase (stage 'training' or 'exporting'), the actors are
@@ -22,8 +25,10 @@ restart ply of a restart game, else 0). attack(t, nodes) asks whether the side t
 threat(t, nodes) whether its opponent would have one moving now with a fresh turn (attacker 'opponent'). Budgets are
 node counts; SAFETY_MS is only a wall-clock cap. Only a native-verified PROVEN_WIN is a proof. A PROVEN_WIN without
 native verification, or an UNKNOWN whose reason is not a search verdict (dense_solver.VERDICTS), counts as a
-failure (status `failures`) and as no proof. A deterministic `verify_fraction` of proofs (by shard, game, ply, attacker and budget) is checked
-again by tactical_proof.independent_verify; a rejection logs an error event and ends the pass.
+failure (status `failures`) and as no proof. A deterministic `verify_fraction` of proofs (by shard, game, ply,
+attacker and budget) is checked again by tactical_proof.independent_verify within `verify_seconds`: a rejection logs
+an error event and ends the pass (the worker exits with REJECTED); a check that runs out of time counts in
+`verify_timeouts` and the proof, already accepted by the native verifier, is kept.
 
 Per game:
   gate + solve  each turn start (odd t) whose mover passes forcing_material.worth_solving gets attack(t, solve_nodes);
@@ -59,9 +64,9 @@ that variant ago or whose regret fell below min_regret. No net is evaluated.
 
 solver-status.json: pass counters (positions: turn starts scanned; gated: those passing the gate; hits: forward
 proofs; windows, persistent, transient, window_plies histogram of last_ply - first_ply + 1; per query kind
-queries, proofs and ms; verified, failures, last_failure), their per-hour rates over the coordinator's lifetime,
+queries, proofs and ms; verified, verify_timeouts, failures, last_failure), their per-hour rates over the coordinator's lifetime,
 gate_pass_rate, busy_cores (shard-worker seconds over elapsed seconds), shards_done, shards_pending, shards_running,
-workers, workers_reason, worker_switches (the last SWITCHES {time, workers, reason}), buffer_size and
+shards_failed, workers, workers_reason, worker_switches (the last SWITCHES {time, workers, reason}), buffer_size and
 buffer_mean_regret.
 """
 import argparse
@@ -75,6 +80,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import traceback
 
 import dense_config
 import dense_data
@@ -82,6 +88,7 @@ from dense_data import player_at
 from dense_solver import VERDICTS
 from forcing_material import worth_solving
 from hexo import Game
+from proof import VerificationTimeout
 from tactical_proof import PROVEN_WIN, IsolatedTactics, independent_verify
 from train import write_json
 
@@ -91,6 +98,12 @@ FAILED = ()  # query result of a failure: no proof, and not a search verdict UNK
 STALE_SECONDS = 120.  # older learner heartbeats are ignored by Pass.workers
 SWITCHES = 20
 STATUS_SECONDS = 5.
+REJECTED = 17  # exit code of a shard worker whose proof the independent check rejected
+ATTEMPTS = 2   # worker runs per shard before the coordinator skips it
+
+
+class Rejected(RuntimeError):
+    """The independent check rejected a native-verified proof."""
 
 
 @dataclass(frozen=True)
@@ -100,6 +113,7 @@ class PassSettings:
     saving_nodes: int = 2700       # attack query after each candidate saving turn
     lookback_turns: int = 2        # the loser's turn starts before a window that get defence entries
     verify_fraction: float = .1    # proofs checked again by independent_verify
+    verify_seconds: float = 120.   # time limit of one independent check
     buffer_size: int = 20000
     buffer_max_exports: int = 2
     min_regret: float = .1
@@ -161,7 +175,7 @@ def exports(run, variant):
 
 
 def new_stats():
-    return dict(positions=0, gated=0, hits=0, windows=0, persistent=0, transient=0, verified=0, failures=0,
+    return dict(positions=0, gated=0, hits=0, windows=0, persistent=0, transient=0, verified=0, verify_timeouts=0, failures=0,
                 last_failure=None, window_plies=Counter(), queries={k: dict(queries=0, proofs=0, ms=0.) for k in KINDS})
 
 
@@ -267,12 +281,14 @@ class Solver:
         tag = json.dumps([*where, attacker, nodes]).encode()
         if int.from_bytes(hashlib.sha256(tag).digest()[:8], 'little') < self.s.verify_fraction*2**64:
             try:
-                independent_verify(json.loads(text), history, attacker)
+                independent_verify(json.loads(text), history, attacker, self.s.verify_seconds)
+                self.stats['verified'] += 1
+            except VerificationTimeout:
+                self.stats['verify_timeouts'] += 1
             except ValueError as error:
                 dense_config.log_event(self.out, 'solve', 'error', f'independent check rejected a proof at {where} '
                                        f'({attacker}, {nodes} nodes): {error}', where=list(where), attacker=attacker)
-                raise RuntimeError(f'Independent check rejected a native proof at {where}') from error
-            self.stats['verified'] += 1
+                raise Rejected(f'Independent check rejected a native proof at {where}') from error
         return [tuple(m) for m in result['moves']], result['proof_turns'], hashlib.sha256(text.encode()).hexdigest()
 
     def game(self, shard, g, e):
@@ -379,7 +395,7 @@ class Pass:
         self.buffer = RestartBuffer(self.out/'restarts.json', settings.buffer_size, settings.buffer_max_exports,
                                     settings.min_regret)
         self.started = self.refreshed = self.reported = clock()
-        self.busy, self.running, self.target, self.switches = 0., {}, None, []
+        self.busy, self.running, self.target, self.switches, self.failed = 0., {}, None, [], Counter()
         self.stats = dict(new_stats(), shards_done=0)
 
     def record(self, name, result):
@@ -401,9 +417,11 @@ class Pass:
         self.refreshed = self.clock()
 
     def pending(self, limit=None):
-        """Shard names without a sidecar under `out`, newest first, among the newest `limit` shards."""
+        """Shard names without a sidecar under `out` among the newest `limit` shards, newest first, shards whose
+        worker failed after the others and without those that failed ATTEMPTS times."""
         names = [p.name for p in dense_data.shard_dirs(self.run)][::-1][:limit]
-        return [n for n in names if not (self.out/'shards'/n/dense_data.SIDECAR).exists()]
+        names = [n for n in names if self.failed[n] < ATTEMPTS and not (self.out/'shards'/n/dense_data.SIDECAR).exists()]
+        return sorted(names, key=lambda n: self.failed[n])
 
     def workers(self):
         """(shard workers, reason) from the main learner's heartbeat (module contract)."""
@@ -432,7 +450,7 @@ class Pass:
         q = self.stats
         write_json(self.out/'solver-status.json', dict(
             stage=stage, updated_at=self.clock(), started_at=self.started, shards_pending=pending,
-            shards_running=sorted(self.running), workers=self.target[0] if self.target else None,
+            shards_running=sorted(self.running), shards_failed=dict(sorted(self.failed.items())), workers=self.target[0] if self.target else None,
             workers_reason=self.target[1] if self.target else None, worker_switches=self.switches,
             **{k: v for k, v in q.items() if k != 'window_plies'}, window_plies=dict(sorted(q['window_plies'].items())),
             positions_per_hour=q['positions']*3600/seconds, hits_per_hour=q['hits']*3600/seconds,
@@ -442,19 +460,31 @@ class Pass:
 
     def step(self, limit=None, spawn=None):
         """One coordinator round: collect finished workers, adjust the worker count, start workers on pending shards
-        newest first and report; returns True while work is pending or running."""
+        newest first and report; returns True while work is pending or running. Raises RuntimeError when a worker
+        exited with REJECTED; any other failure of a worker is logged and counted in `failed`."""
         spawn = spawn or self.spawn
         for name, (process, began) in list(self.running.items()):
             code = process.poll()
             if code is None:
                 continue
             del self.running[name]
-            if code:
-                raise RuntimeError(f'shard worker for {name} exited with code {code}; see {self.out/".solve"/name}.log')
-            path = self.out/'.solve'/f'{name}.json'
-            self.record(name, json.loads(path.read_text(encoding='utf-8')))
-            path.unlink()
             self.busy += self.clock()-began
+            log = self.out/'.solve'/f'{name}.log'
+            if code == REJECTED:
+                raise RuntimeError(f'independent check rejected a proof in shard {name}; see {log}')
+            path = self.out/'.solve'/f'{name}.json'
+            try:
+                if code:
+                    raise RuntimeError(f'exited with code {code}')
+                result = json.loads(path.read_text(encoding='utf-8'))
+            except (RuntimeError, OSError, ValueError) as error:
+                self.failed[name] += 1
+                retry = 'retried later' if self.failed[name] < ATTEMPTS else 'skipped'
+                dense_config.log_event(self.out, 'solve', 'error', f'shard worker for {name} failed ({error}); '
+                                       f'{retry}; see {log}', shard=name, attempts=self.failed[name])
+                continue
+            self.record(name, result)
+            path.unlink()
         target = self.workers()
         switched = self.target is None or target[0] != self.target[0]
         if switched:
@@ -467,8 +497,11 @@ class Pass:
             process.wait()
             self.busy += self.clock()-began
         pending = [n for n in self.pending(limit) if n not in self.running]
-        while pending and len(self.running) < target[0]:
-            name = pending.pop(0)
+        first = any(not self.failed[n] for n in [*pending, *self.running])
+        startable = [n for n in pending if not (first and self.failed[n])]
+        while startable and len(self.running) < target[0]:
+            name = startable.pop(0)
+            pending.remove(name)
             self.running[name] = (spawn(name), self.clock())
         if switched or self.clock()-self.reported >= STATUS_SECONDS or not self.running:
             self.status('solving' if self.running else 'idle', len(pending))
@@ -512,6 +545,9 @@ def main():
         tactics = IsolatedTactics()
         try:
             result = Solver(args.run, out, settings, tactics).solve(args.shard)
+        except Rejected:
+            traceback.print_exc()
+            sys.exit(REJECTED)
         finally:
             tactics.close()
         write_json(out/'.solve'/f'{args.shard}.json', result)
