@@ -262,7 +262,7 @@ def play(games, leaf_batch, heartbeat=lambda finished: None, schedule=None):
         while engine.slots or engine.closing:
             try:
                 finished = engine.step()
-            except Exception:
+            except BaseException:
                 for game in engine.completed:
                     if id(game) not in records:
                         records[id(game)] = game.finish()

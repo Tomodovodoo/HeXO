@@ -2652,21 +2652,22 @@ class EvaluatorSearchTests(unittest.TestCase):
 
     def test_play_reports_a_completed_slot_before_a_later_slot_fails(self):
         model = dense_selfplay.Model(self.model, 'tiny', 'test', 'cpu', 64, 256)
-        class Failing(dense_eval.MatchGame):
-            def searched(self, result):
-                raise RuntimeError('later slot failed')
         opening = [(0, 0), (1, 0), (-1, 0)]
-        first = dense_eval.MatchGame([model, model], opening, 1, 2, 2, False, 4, dict(index=1))
-        second = Failing([model, model], opening, 2, 2, 2, False, 4, dict(index=2))
-        saved = []
-        try:
-            with self.assertRaisesRegex(RuntimeError, 'later slot failed'):
-                dense_eval.play([first, second], 64, heartbeat=lambda records: saved.extend(records))
-            self.assertEqual([g['index'] for g in saved], [1])
-        finally:
-            second.game.close()
-            for tree in second.trees.values():
-                tree.close()
+        for error in (RuntimeError('later slot failed'), KeyboardInterrupt()):
+            class Failing(dense_eval.MatchGame):
+                def searched(self, result):
+                    raise error
+            first = dense_eval.MatchGame([model, model], opening, 1, 2, 2, False, 4, dict(index=1))
+            second = Failing([model, model], opening, 2, 2, 2, False, 4, dict(index=2))
+            saved = []
+            try:
+                with self.assertRaises(type(error)):
+                    dense_eval.play([first, second], 64, heartbeat=lambda records: saved.extend(records))
+                self.assertEqual([g['index'] for g in saved], [1])
+            finally:
+                second.game.close()
+                for tree in second.trees.values():
+                    tree.close()
 
     def test_model_move_error_in_seal_match_escapes(self):
         def fail(move):
