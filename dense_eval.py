@@ -95,7 +95,8 @@ differences and ladder are [{a, b, elo_delta, interval}] over pairs of the varia
 elo_interval, games, matches: [{checkpoint, wins, losses, capped, games, elo_delta}] in league order,
 latest_delta}: elo_delta is each checkpoint's direct-match Elo minus Seal, latest_delta the newest one's. reign_from
 is the number of checkpoint entries and reign_games the champion's Seal games when it was promoted or restored
-(absent: its own position + 1 and 0). `matrix` (`payoff`) holds
+(absent: its own position + 1 and 0), counted over its archived Seal reports too when reign_pooled is true (a reign
+begun before that counts its current report alone). `matrix` (`payoff`) holds
 only pairs that met; readers compute p for other rated pairs from the ratings (dense_selfplay.expected). Leagues
 written before `matrix`, `ladder`, `panel`, `calibration` and `openings` existed lack those keys; the Evaluator
 adds `matrix` and `calibration` on start, and rebuilds the league when its ladder_top differs from the effective
@@ -1611,9 +1612,17 @@ class Evaluator:
         return [r for r in load_reports(self.run) if r['candidate'] == cid and r['opponent'] == SEAL]
 
     def crown(self, cid):
-        """Make cid champion and start its reign: reign_from and reign_games (league contract)."""
-        self.league.update(champion=cid, reign_from=len(self.league['checkpoints']),
+        """Make cid champion and start its reign: reign_from, reign_games and reign_pooled (league contract)."""
+        self.league.update(champion=cid, reign_from=len(self.league['checkpoints']), reign_pooled=True,
                            reign_games=sum(len(r['games']) for r in self.seal_reports(cid)))
+
+    def reign_seal_games(self, cid):
+        """cid's Seal games on the basis reign_games was counted on: its `seal_reports` pooled (reign_pooled), else, for a
+        reign begun before archives were pooled, its current report alone."""
+        if self.league.get('reign_pooled'):
+            return sum(len(r['games']) for r in self.seal_reports(cid))
+        report = self.sealed(cid)
+        return len(report['games']) if report else 0
 
     def anchor(self):
         """(champion entry, SEAL, 'anchor', games left) while the current champion owes Seal games, else None. In
@@ -1626,7 +1635,7 @@ class Evaluator:
             return None
         entries = self.league['checkpoints']
         later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])
-        played = sum(len(r['games']) for r in self.seal_reports(champion['id']))-self.league.get('reign_games', 0)
+        played = self.reign_seal_games(champion['id'])-self.league.get('reign_games', 0)
         left = s.anchor_games*(s.anchor_on_promotion+later//s.anchor_every)-played
         return (champion, SEAL, 'anchor', left) if left > 0 else None
 

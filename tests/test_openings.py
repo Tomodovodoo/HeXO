@@ -750,6 +750,25 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual(len(list(path.parent.glob('report-*.json'))), 1)
         self.assertEqual(json.loads((self.run/'league.json').read_text())['anchors']['seal']['games'], 4)
 
+    def test_a_reign_begun_before_pooling_counts_its_current_seal_report(self):
+        self.export(10)
+        evaluator = self.start(opening_suite='standard-v1', anchor_games=4, anchor_target_halfwidth=0.)
+        evaluator.step()                                                    # the first champion, unopposed
+        folder = dense_eval.report_path(self.run, CHAMPION, 'seal').parent
+        folder.mkdir(parents=True)
+        played = dense_openings.Book(self.run, evaluator.settings).openings()[0]['moves']
+        report = lambda n, sims: dense_eval.make_report(CHAMPION, 'seal', [dict(g, seed=k, pair=k) for k in range(n)
+                                                                           for g in pair(played, 2)], {CHAMPION: 'c'*64},
+                                                        replace(evaluator.settings, sims=sims))
+        (folder/'report-1-old.json').write_text(json.dumps(report(10, 99)))  # archived before this reign
+        (folder/'report.json').write_text(json.dumps(report(1, evaluator.settings.sims)))
+        evaluator.league.update(reign_games=2)                               # counted on the current report alone
+        evaluator.league.pop('reign_pooled')
+        self.assertEqual(evaluator.anchor()[3], 4)                           # the archive's 20 games do not count
+        evaluator.crown(CHAMPION)                                            # a new reign counts everything pooled
+        self.assertEqual((evaluator.league['reign_games'], evaluator.league['reign_pooled']), (22, True))
+        self.assertEqual(evaluator.anchor()[3], 4)
+
     def test_archives_of_one_pairing_never_overwrite_each_other(self):
         self.export(10)
         evaluator = self.start(opening_suite='standard-v1')
