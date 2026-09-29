@@ -516,6 +516,108 @@ class ProvenLabelTests(unittest.TestCase):
         dense_solve.write_sidecar(self.run/'shards'/'000001', [dict(game=0, first_ply=plies[0], last_ply=plies[-1],
                                                                     mover=0, plies=plies)])
 
+    def test_proof_pass_emits_losing_owner_deblunder_record(self):
+        new_run(self.run)
+        solver = dense_solve.Solver(self.run, self.run, SMALL, None)
+        def query(where, history, *args):
+            return ([(20, 20), (21, 20)], 1, 'verified') if len(history) in (5, 6) else None
+        with unittest.mock.patch.object(solver, 'query', side_effect=query), \
+                unittest.mock.patch.object(dense_solve, 'worth_solving', return_value=True):
+            result = solver.solve('000001')
+        self.assertEqual(result['deblunders'], [dict(kind='deblunder', game=0, first_ply=5, owner=1)])
+        dense_solve.Pass(self.run, self.run, SMALL).record('000001', result)
+        path = self.run/'shards'/'000001'
+        self.assertEqual(dense_data.proof_windows(path), result['windows'])
+        self.assertEqual(dense_data.proof_records(path)[-1], result['deblunders'][0])
+        self.assertEqual(dense_data.proof_labels(path), {(0, 5), (0, 6)})
+
+    def test_deblunder_blend_signs_default_bytes_and_exact_precedence(self):
+        write_games(self.run/'shards'/'000002', [(winning_game(), 1, [.2]*12)])
+        window = dense_data.ReplayWindow(self.run, 1000, 100)
+        refs = [window.ref(name, i) for name in ('000001', '000002') for i in range(12)]
+        before = dense_data.collate_arrays(*dense_data.examples(window, refs, np.random.default_rng(4)))
+        for name, owner, first in (('000001', 1, 5), ('000002', 0, 7)):
+            dense_solve.write_sidecar(self.run/'shards'/name, [dict(kind='deblunder', game=0, first_ply=first, owner=owner)])
+        window.refresh()
+        refs = [window.ref(name, i) for name in ('000001', '000002') for i in range(12)]
+        after = dense_data.collate_arrays(*dense_data.examples(window, refs, np.random.default_rng(4), deblunder_weight=0.))
+        self.assertEqual(before.keys(), after.keys())
+        for size in before:
+            self.assertEqual(before[size].keys(), after[size].keys())
+            for key in before[size]:
+                self.assertEqual(before[size][key].tobytes(), after[size][key].tobytes(), key)
+        refs[1].row['proven'] = -1
+        refs[12].row['proven'] = 1
+        for options in ({}, dict(outcome_lam=.8), dict(calibration=dense_data.Calibration((0.,)*dense_data.CALIBRATION_FEATURES, .3))):
+            # The outcome blend is the same under each learner target mode.
+            _, targets = dense_data.examples(window, refs, np.random.default_rng(4), deblunder_weight=.25, **options)
+            for ref, target in zip(refs, targets):
+                owner, first = (1, 5) if ref.shard == '000001' else (0, 7)
+                changed = ref.row['player'] == owner and ref.row['ply'] < first and not ref.row['proven']
+                self.assertEqual(target['deblundered'], float(changed))
+                self.assertEqual(target['outcome'], float(ref.row['player'] == ref.episode['winner']))
+                if changed:
+                    self.assertEqual((target['value'], target['outcome_target'], target['exact']), (.25, .25, 0.))
+                    self.assertEqual(ref.row['proven'], 0)
+                elif ref.row['proven']:
+                    self.assertEqual((target['value'], target['exact'], target['outcome_weight']),
+                                     (float(ref.row['proven'] > 0), 1., 0.))
+                else:
+                    self.assertEqual(target['outcome_target'], target['outcome'])
+
+    def test_deblunder_stops_after_previous_window_and_refreshes_validation(self):
+        window = dense_data.ReplayWindow(self.run, 1000, 100)
+        sets = dense_data.ValidationSets(self.run, 1., 0, 100, 100)
+        sets.refresh()
+        dense_solve.write_sidecar(self.run/'shards'/'000001', [
+            dict(game=0, first_ply=3, last_ply=4, mover=0, plies=[3, 4]),
+            dict(game=0, first_ply=9, last_ply=10, mover=1, plies=[9, 10]),
+            dict(kind='deblunder', game=0, first_ply=9, owner=1)])
+        window.refresh(); sets.refresh()
+        for source, refs in ((window, [window.ref('000001', i) for i in range(12)]),
+                             (sets, sets.subsets['fresh', 'held'])):
+            _, targets = dense_data.examples(source, refs, np.random.default_rng(0), deblunder_weight=.5)
+            self.assertEqual(sorted(r.row['ply'] for r, t in zip(refs, targets) if t['deblundered']), [5, 6])
+
+    def test_deblunder_loss_and_validation(self):
+        torch.set_num_threads(2)
+        dense_solve.write_sidecar(self.run/'shards'/'000001', [dict(kind='deblunder', game=0, first_ply=9, owner=1)])
+        config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                        learner=dense_config.LearnerSettings(batch=8, deblunder_weight=.25, validation_fraction=1.))
+        learner = dense_learn.Learner(self.run, config.learner, config)
+        sets = dense_data.ValidationSets(self.run, 1., 0, 100, 100)
+        metrics = learner.validate_sources(sets)
+        rows = learner.row_losses(sets, sets.subsets['fresh', 'held'])
+        changed = rows['deblundered'] > 0
+        self.assertEqual(metrics['fresh_deblundered_rows'], 4)
+        self.assertAlmostEqual(metrics['fresh_value_bce_deblundered'], float(rows['value_bce'][changed].mean()))
+        self.assertTrue(np.all(rows['outcome'][changed] == 0))
+        batch = dense_data.collate(*dense_data.examples(sets, sets.subsets['fresh', 'held'], np.random.default_rng(0),
+                                                        **learner.targets()))
+        for b in batch.values():
+            with torch.no_grad():
+                losses, _ = dense_learn.head_losses(learner.ema, b, learner.device, learner.memory_format)
+                logit = dense_learn.forward(learner.ema, b['planes'], learner.device, learner.memory_format)[0]['value_logit']
+                expected = dense_learn.hexnet.value_loss(logit, b['outcome_target'], b['outcome_weight'])
+                torch.testing.assert_close(losses[-1], expected)
+        window = dense_data.ReplayWindow(self.run, 1000, 100, validation_fraction=1.)
+        with unittest.mock.patch.object(dense_learn, 'VALIDATION_ROWS', 16):
+            aggregate = learner.validate(window)
+        self.assertGreater(aggregate['deblundered_rows'], 0)
+        self.assertGreater(aggregate['value_bce_deblundered'], 0)
+
+    def test_deblunder_flag(self):
+        import argparse
+        parser = argparse.ArgumentParser()
+        dense_config.add_arguments(parser, dense_config.LearnerSettings)
+        settings = dense_config.LearnerSettings()
+        self.assertEqual(settings.deblunder_weight, 0.)
+        self.assertEqual(dense_config.override(settings, parser.parse_args(['--deblunder-weight', '.25'])).deblunder_weight, .25)
+        self.assertIn('deblunder_weight', dense_learn.KEEP)
+        for weight in (-.1, 1.1, float('nan')):
+            with self.assertRaises(ValueError):
+                replace(settings, deblunder_weight=weight)
+
     def test_window_applies_labels_when_the_sidecar_appears(self):
         window = dense_data.ReplayWindow(self.run, 1000, 100)
         self.assertEqual(window.proven_rows, 0)

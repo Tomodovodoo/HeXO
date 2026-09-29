@@ -22,7 +22,10 @@ Every target is derived here from episodes (dense_data.examples), so value_targe
 bootstrap_weight and short_value_horizon are learner settings; outcome_weight weighs a second value-logit loss, the
 BCE against the hard outcome of finished games (head outcome_bce, always logged), KataGo-style. Rows with an exact
 label (a nonzero `proven`) are left out of it, since their value target is the proven result; validation reports
-the outcome BCE of held-out rows of finished games split into rows with and without one (outcome_split). The value
+the outcome BCE of held-out rows of finished games split into rows with and without one (outcome_split).
+With --deblunder-weight > 0, eligible earlier losing-owner rows use the soft outcome for both value losses;
+validation also reports value_bce_deblundered and deblundered_rows, while outcome splits and curves keep the
+original game outcome. The value
 target calibration map (Learner.calibrate) is fitted at startup and refitted at every export, recorded in the manifest as
 metrics.calibration (calibration_report) and handed to the render workers; value_target 'calibrated' trains on the
 newest map (hard outcomes while none is fitted). Batches are rendered by dense_data.Renderers worker processes
@@ -67,7 +70,7 @@ STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
-        'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'optimizer')
+        'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'deblunder_weight', 'optimizer')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
@@ -318,9 +321,16 @@ def forward(model, planes, device, memory_format):
         return model(planes, mask), mask
 
 
+def deblunder_split(bce, changed):
+    """Value BCE and row count on the soft targets introduced by deblundering."""
+    bce, changed = np.asarray(bce), np.asarray(changed, bool)
+    return dict(value_bce_deblundered=float(bce[changed].mean()) if changed.any() else None,
+                deblundered_rows=int(changed.sum()))
+
+
 def head_losses(model, batch, device, memory_format):
     """Per-head weighted means over one bucket and the bucket's weight sums, both [len(HEADS)] on device.
-    outcome_bce is the value logit's BCE against the hard outcome of finished games."""
+    outcome_bce uses the soft outcome_target when deblundering is enabled, otherwise the hard outcome."""
     b = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
     out, mask = forward(model, b['planes'], device, memory_format)
     future = b['future'].float()
@@ -334,7 +344,7 @@ def head_losses(model, batch, device, memory_format):
                    hexnet.future_loss(out['future'], future, mask, b['future_weight'])]
     else:
         losses += [torch.zeros((), device=device)]*3
-    losses.append(hexnet.value_loss(out['value_logit'], b['outcome'], b['outcome_weight']))
+    losses.append(hexnet.value_loss(out['value_logit'], b.get('outcome_target', b['outcome']), b['outcome_weight']))
     return torch.stack(losses), torch.stack([b[k].sum() for k in WEIGHTS])
 
 
@@ -631,13 +641,19 @@ class Learner:
         rng, s = np.random.default_rng(self.config.seed), self.settings
         batches = [dense_data.collate(*dense_data.examples(window, window.sample(rng, s.batch, validation=True), rng, **self.targets()))
                    for _ in range(math.ceil(VALIDATION_ROWS/s.batch))]
-        rows = []
+        rows, deblundered = [], []
         with torch.no_grad():
             for b in (b for batch in batches for b in batch.values()):
                 logit = forward(self.ema, b['planes'], self.device, self.memory_format)[0]['value_logit'].float().cpu()
                 bce = torch.nn.functional.binary_cross_entropy_with_logits(logit, b['outcome'], reduction='none')
                 rows.append(np.stack([bce.numpy(), b['outcome'].numpy() != .5, b['exact'].numpy() > 0]))
-        return dict(zip(HEADS, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1))
+                if s.deblunder_weight:
+                    value_bce = torch.nn.functional.binary_cross_entropy_with_logits(logit, b['value'], reduction='none')
+                    deblundered.append(np.stack([value_bce.numpy(), b['deblundered'].numpy()]))
+        result = dict(zip(HEADS, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1))
+        if s.deblunder_weight:
+            result.update(deblunder_split(*np.concatenate(deblundered, 1)))
+        return result
 
     def subset_losses(self, sets, refs):
         """EMA weighted_means (policy_ce, value_bce) over `refs` of `sets` under symmetries drawn from a fixed seed
@@ -653,7 +669,7 @@ class Learner:
         ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
         finished (1. when winner >= 0, else 0.), value_bce, value (its target), outcome_bce, outcome (the hard
         outcome; .5 for capped games), policy_ce (against the improved policy; nan on rows without a policy
-        target), searched (searched_value at the row) and proven (the row's `proven`)."""
+        target), searched (searched_value at the row), proven (the row's `proven`) and deblundered (0/1)."""
         s = self.settings
         rng = np.random.default_rng(self.config.seed)
         rows = []
@@ -675,8 +691,8 @@ class Learner:
                     ref = chunk[i]
                     e, t = ref.episode, ref.row['ply']
                     rows.append((t, len(e['moves'])-t, float(e['winner'] >= 0), *loss, searched_value(e, t),
-                                 float(ref.row.get('proven', 0))))
-        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce', 'searched', 'proven')
+                                 float(ref.row.get('proven', 0)), targets[i].get('deblundered', 0.)))
+        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce', 'searched', 'proven', 'deblundered')
         return dict(zip(keys, np.array(rows, np.float64).reshape(-1, len(keys)).T))
 
     def validate_sources(self, sets):
@@ -708,6 +724,8 @@ class Learner:
             out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
             r = self.row_losses(sets, sets.subsets[source, 'held'])
             out.update({f'{source}_{k}': v for k, v in outcome_split(r['outcome_bce'], r['finished'] > 0, r['proven'] != 0).items()})
+            if self.settings.deblunder_weight:
+                out.update({f'{source}_{k}': v for k, v in deblunder_split(r['value_bce'], r['deblundered']).items()})
             if source not in CURVE_SOURCES:
                 continue
             f, p = r['finished'] > 0, np.isfinite(r['policy_ce'])
