@@ -74,7 +74,12 @@ class OpeningBook {
   control(label,key,e){const wrap=element('label',label);wrap.append(e);this.controls.append(wrap);this.filters.push([key,e,wrap]);e.onchange=()=>{if(!e.checkValidity()){e.reportValidity();return}this.change({[key]:e.type==='checkbox'?(e.checked?'1':'0'):e.value,page:1})}}
   state(){const q=new URLSearchParams(location.hash.slice(1)),get=(k,d)=>q.get('book_'+k)??d;return {view:get('view','charts'),run:get('run',this.runs[0]||''),sort:get('sort','games'),direction:get('direction','desc'),page:get('page','1'),page_size:get('page_size','50'),status:get('status',''),reason:get('reason',''),min_games:get('min_games','0'),depth:get('depth',''),colour_decides:get('colour_decides','0'),min_decisive:get('min_decisive','10')}}
   change(values){const q=new URLSearchParams(location.hash.slice(1));for(const [k,v] of Object.entries({...this.state(),...values}))q.set('book_'+k,v);const hash=q.toString();if(location.hash.slice(1)===hash)this.render();else location.hash=hash}
-  setRuns(names){const changed=names.join('\n')!==this.runs.join('\n');if(changed){this.runs=names;this.runSelect.replaceChildren(...names.map(n=>element('option',n,{value:n})));this.render()}else if(['book','retired'].includes(this.state().view))this.render(true)}
+  setRuns(names){
+    const changed=names.join('\n')!==this.runs.join('\n');
+    if(changed){this.runs=names;this.runSelect.replaceChildren(...names.map(n=>element('option',n,{value:n})))}
+    if(names.length&&!names.includes(this.state().run)){this.change({run:names[0],page:1});return}
+    if(changed)this.render();else if(['book','retired'].includes(this.state().view))this.render(true);
+  }
   query(state){const q=new URLSearchParams(state);q.delete('view');if(this.single){q.delete('run');const run=new URLSearchParams(location.search).get('run');if(run)q.set('run',run)}return q}
   async fetch(path,q,signal){const res=await fetch(path+'?'+q,{signal});if(!res.ok)throw Error(`Book: HTTP ${res.status}`);return res.json()}
   async render(refresh=false){
@@ -86,7 +91,7 @@ class OpeningBook {
     if(!refresh){
       this.runSelect.hidden=this.single;this.runSelect.value=s.run;
       for(const [key,e,wrap] of this.filters){if(e.type==='checkbox')e.checked=s[key]==='1';else e.value=s[key];wrap.hidden=isDag||(s.view==='retired'&&key==='status')}
-      this.content.replaceChildren();this.pages.replaceChildren();this.error.textContent='';
+      this.content.replaceChildren();this.pages.replaceChildren();this.error.textContent='';this.pageSignature=null;
     }
     if(!this.runs.length)return;
     this.loading=true;
