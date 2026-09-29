@@ -702,6 +702,11 @@ class Plan:
         player, other = mover(history), 1-mover(history)
         if not schedule.fixed_budgets:
             self.poll(history)
+        if self.leaf_nodes and schedule.follow and not self.alive(player, history):
+            # An immediate child proof was found before this position became the played root.
+            proof = next((p for p in reversed(self.found) if p.base == history), None)
+            if proof is not None:
+                self.proofs[player] = proof
         self.following = schedule.follow and (active(budgets, schedule) or self.leaf_nodes) and self.move(player, history) is not None
         if self.following or not active(budgets, schedule):
             return False
