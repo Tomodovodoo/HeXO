@@ -1010,6 +1010,34 @@ class DenseConfigTests(unittest.TestCase):
             self.assertEqual((kept[0], kept[-1]), (points[0], points[-1]))
             self.assertIn((777, 100.), kept)
 
+    def test_seal_series_uses_published_rating_on_the_league_scale(self):
+        import dashboard
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            league = dict(checkpoints=[dict(id='main/000010', variant='main', step=10, elo=100.),
+                                       dict(id='side/000020', variant='side', step=20, elo=600.)],
+                          anchors=dict(seal=dict(elo=-300., elo_interval=[-350., -250.],
+                                                matches=[dict(checkpoint='main/000010', elo_delta=55.)])))
+            for cid, created in (('main/000010', 3600.), ('side/000020', 7200.)):
+                path = run/'checkpoints'/cid/'manifest.json'
+                path.parent.mkdir(parents=True)
+                dense_eval.write_json(path, dict(created_at=created))
+            dense_eval.write_json(run/'league.json', league)
+            config = dict(created_at=0.)
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_elo')['points'],
+                             [[10, -300., -350., -250.], [20, -300., -350., -250.]])
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_elo', 'hours')['points'],
+                             [[1., -300., -350., -250.], [2., -300., -350., -250.]])
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_elo', from_step=20)['points'],
+                             [[20, -300., -350., -250.]])
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_delta')['points'], [[10, 55.]])
+            league['anchors']['seal'].update(elo=450., elo_interval=[400., 500.])
+            dense_eval.write_json(run/'league.json', league)
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_elo')['points'][-1], [20, 450., 400., 500.])
+            league['anchors'] = {}
+            dense_eval.write_json(run/'league.json', league)
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_elo')['points'], [])
+
     def test_provisional_league_row(self):
         """The league row of an unrated candidate under evaluation comes from the status tally, offset by the
         opponent's league Elo (Seal: its anchor Elo); rated candidates and idle evaluators have none."""

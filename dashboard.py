@@ -761,7 +761,8 @@ def actor_points(run):
 
 
 def series(run, config, variant, metric, x='step', max_points=1000, from_step=0):
-    """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval; seal_delta: the direct-match
+    """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval; seal_elo: the published
+    Seal rating and interval across the run's rated checkpoint coordinates; seal_delta: the direct-match
     Elo minus Seal of each anchored checkpoint, league anchors.seal.matches) sorted by x and
     downsampled after dropping steps below from_step when x is 'step'; x is the learner step or hours since
     the run's created_at. Actor and GPU metrics have hours only. CURVE_METRICS have their own x only ('remaining' or 'ply'): [[grid point, y or null where unsupported], ...]
@@ -791,6 +792,13 @@ def series(run, config, variant, metric, x='step', max_points=1000, from_step=0)
         points = sorted((c['step'] if x == 'step' else hours(c['created_at']), c['elo'],
                          *(c['elo_interval'] if isinstance(c.get('elo_interval'), list) else (c['elo'], c['elo'])))
                         for c in rated(run) if c.get('variant') == variant and (x == 'step' or finite(c['created_at'])))
+    elif metric == 'seal_elo':
+        league = read_json(run/'league.json', {})
+        seal = ((league.get('anchors') or {}).get('seal') or {}) if isinstance(league, dict) else {}
+        elo, interval = seal.get('elo'), seal.get('elo_interval')
+        points = sorted((c['step'] if x == 'step' else hours(c['created_at']), elo,
+                         *(interval if isinstance(interval, list) else (elo, elo)))
+                        for c in rated(run) if finite(elo) and (x == 'step' or finite(c['created_at'])))
     elif metric == 'seal_delta':
         made = {c['id']: c['created_at'] for c in rated(run)}
         league = read_json(run/'league.json', {})
