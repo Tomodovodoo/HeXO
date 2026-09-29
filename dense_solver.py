@@ -8,14 +8,17 @@ Schedule.deep_nodes; 0 = off):
              (`proven`).
   threat     at a turn start: would the opponent have a forced win if it moved now with a fresh turn? Root actions on
              the certificate's threat cells are sampled first in the search's opening phase (hxg_priority). Ordering
-             only: nothing is pruned.
+             only by default. With Budgets.defence, verify up to defence_candidates complete turns at the same
+             node budget. An UNKNOWN search verdict, including a defender counterwin, breaks the threat within
+             this budget. Surviving first stones enter the Gumbel root set with 5/defence_candidates bonus per turn;
+             compatible second stones get the same treatment next search. No proof labels or pruning follow.
   finalists  in a mid-turn search, at its last halving boundary (its end when it never halves): for each of the
              `finalists` best candidates b (hxg_stats scores), does the opponent have a forced win after our turn
              ends with b? A proof marks b exact-lost (hxg_mark_exact: Q -1, ineligible), so the remaining rounds and
              the final selection discard it and the improved policy gives it no mass.
   deep       background proof of a committed turn: at each turn start, does the side that just moved win against
              every defence of the turn it played (a root_moves query on the position before that turn)?
-Only native-verified PROVEN_WIN results act; UNKNOWN is never a loss. Proofs of positions on the game (root, deep,
+Only native-verified PROVEN_WIN results act as proofs; UNKNOWN is never a loss. Proofs of positions on the game (root, deep,
 finalist) are Proofs. Without Schedule.follow a root proof decides its own turn only. With follow, the side a proof
 favours plays the certificate's turns for as long as the game stays on it (each defender reply covered, each
 attacker turn the certificate's), asking no further root, threat, deep or finalist queries, and when the game ends
@@ -47,10 +50,11 @@ measured slack and verdicts are polled:
 SAFETY_MS (deep: DEEP_SAFETY_MS) is only the wall-clock cap: a query that reaches it, or any other UNKNOWN whose
 reason is not a search verdict (VERDICTS), is a failure (Solver.stats), not a verdict.
 """
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future
 from dataclasses import asdict, dataclass, fields
 import heapq
+from itertools import combinations
 import json
 import threading
 import time
@@ -59,10 +63,11 @@ import numpy as np
 
 from dense_config import EvaluationSettings
 from neural_search import checked, native
+from hexo import Game
 from tactical_proof import MAX_NODES, MAX_TABLE_MB, PROVEN_WIN, IsolatedTactics, NativeTactics, build_hash
 
 SAFETY_MS, DEEP_SAFETY_MS = 5000, 60000
-POINTS = ('root', 'threat', 'finalist', 'deep')
+POINTS = ('root', 'threat', 'finalist', 'deep', 'defence')
 # UNKNOWN reasons that are search verdicts, not failures: the searcher's own, and a root_moves query whose turn leaves
 # no forcing continuation within its budget.
 VERDICTS = {'no verified strategy', 'quiet defender unsupported', 'defender counterwin',
@@ -86,9 +91,11 @@ class Budgets:
     finalists: int = 0
     finalist_nodes: int = 0
     threat_nodes: int = 0
+    defence: bool = False
+    defence_candidates: int = 8
 
     def __post_init__(self):
-        if min(self.root_nodes, self.finalists, self.finalist_nodes, self.threat_nodes) < 0 \
+        if self.defence_candidates < 1 or min(self.root_nodes, self.finalists, self.finalist_nodes, self.threat_nodes) < 0 \
                 or (self.finalists > 0) != (self.finalist_nodes > 0):
             raise ValueError('Solver budgets are non-negative; solver_finalists and solver_finalist_nodes are both 0 or '
                              'both positive')
@@ -100,7 +107,7 @@ class Budgets:
 
     @property
     def active(self):
-        return any(getattr(self, f.name) for f in fields(self))
+        return any((self.root_nodes, self.finalists, self.finalist_nodes, self.threat_nodes))
 
 
 @dataclass(frozen=True)
@@ -152,7 +159,10 @@ def active(budgets, schedule):
 def record(budgets, schedule=Schedule()):
     """The episode-level `solver` record of a game played with `budgets` under `schedule`: the budgets, the schedule
     and the tactical build hash (the backend is left out: both give the same games)."""
-    return dict(**asdict(budgets), schedule=asdict(schedule), build_hash=build_hash())
+    values = asdict(budgets)
+    if not budgets.defence:
+        del values['defence'], values['defence_candidates']
+    return dict(**values, schedule=asdict(schedule), build_hash=build_hash())
 
 
 def quantile(values, q):
@@ -314,8 +324,8 @@ class Solver:
         """(node budget or None to skip, gate, pool) of a new `point` query whose fixed budget is `nodes` (module
         contract)."""
         sc = self.schedule
-        if sc.fixed_budgets or point == 'threat':
-            gate = None if not sc.gate_weight or (point == 'threat' and not sc.fixed_budgets) else \
+        if sc.fixed_budgets or point in ('threat', 'defence'):
+            gate = None if not sc.gate_weight or point == 'defence' or (point == 'threat' and not sc.fixed_budgets) else \
                 dict(weight=sc.gate_weight, floor=nodes, cap_low=nodes, cap_high=max(nodes, sc.gate_cap_nodes))
             return nodes, gate, self.pool
         deep = point == 'deep'
@@ -347,7 +357,7 @@ class Solver:
         request = dict(nodes=budget, ms=DEEP_SAFETY_MS if point == 'deep' else min(DEEP_SAFETY_MS, SAFETY_MS+most//4),
                        attacker=attacker, gate=gate, root_moves=root_moves,
                        table_mb=0 if self.schedule.fixed_budgets else self.schedule.table_mb)
-        base = None if attacker == 'opponent' else tuple(map(tuple, history))
+        base = None if attacker == 'opponent' or point == 'defence' else tuple(map(tuple, history))
         history = [list(p) for p in history]
         if pool:
             deadline = time.perf_counter()*1000+(self.lead.get(point) or 0.)
@@ -379,7 +389,7 @@ class Solver:
             raise ValueError('Tactical build changed while the solver was running; rebuild and restart')
         budget = int(result.get('budget') or 0)
         stats['queries'] += 1
-        stats['hits'] += proven
+        stats['hits'] += defence_hit(result) if point == 'defence' else proven
         stats['nodes'] += int(result.get('nodes_used') or 0)
         stats['budget'] += budget
         stats['solver_ms'] += float(result.get('elapsed_ms') or 0.)
@@ -415,6 +425,7 @@ class Solver:
             **{f'{k}_ms': rate(p['solver_ms'], p['queries']) for k, p in points.items()},
             **{f'{k}_budget': rate(p['budget'], p['queries']) for k, p in points.items()},
             **{f'{k}_queries': p['queries'] for k, p in points.items()},
+            defence_hits=points['defence']['hits'], defence_nodes=points['defence']['nodes'],
             budget_mean=float(np.mean(budgets)) if budgets else None, budget_p95=quantile(budgets, .95),
             band_queries=dict(zip(labels, (b[0] for b in s['bands']))),
             band_hit_rate=dict(zip(labels, (rate(b[1], b[0]) for b in s['bands']))),
@@ -449,6 +460,87 @@ class Solver:
 def mover(history):
     """The side to move after `history` placements (one opening placement, then turns of two)."""
     return ((len(history)+1)//2) % 2
+
+
+def defence_hit(result):
+    """A completed search failed to re-prove the attack. Operational failures are not evidence."""
+    return result['status'] == 'UNKNOWN' and result.get('reason') in VERDICTS
+
+
+def defence_turns(history, certificate, limit):
+    """Rank complete turns from certificate actions, covered replies and winning completions.
+
+    Deduplicate groups so a large reply expansion cannot multiply their weight. Keep the first attack turn,
+    then pairs hitting the most distinct groups. Cross the 2*limit most frequent cells as well as the certificate's
+    own pairs; this keeps pair construction bounded even for certificates covering thousands of free replies.
+    Coordinate order breaks ties. Every returned turn is legal on the actual board.
+    """
+    occupied = set(map(tuple, history))
+    groups = set()
+    attacker = {tuple(c) for i, c in enumerate(history) if ((i+1)//2) % 2 != mover(history)}
+    defender = occupied-attacker
+    # The certificate may name only one way to finish a line. Include its other open completions too.
+    segments = {tuple((q+(k-offset)*dq, r+(k-offset)*dr) for k in range(6))
+                for q, r in attacker for dq, dr in ((1, 0), (0, 1), (1, -1)) for offset in range(6)}
+    for segment in segments:
+        gaps = set(segment)-attacker
+        if 0 < len(gaps) <= 2 and not gaps & defender:
+            groups.add(tuple(sorted(gaps)))
+    for node in certificate['nodes']:
+        actions = [node['action']] if 'action' in node else []
+        actions += [r['action'] for r in node.get('responses', ())]
+        actions += [r['action'] for r in node.get('alternatives', ())]
+        actions += node.get('threats', [])
+        for action in actions:
+            group = tuple(sorted(set(map(tuple, action))-occupied))
+            if group:
+                groups.add(group)
+    counts = Counter(c for group in groups for c in group)
+    cells = sorted(counts, key=lambda c: (-counts[c], c))[:2*limit]
+    if len(cells) == 1:
+        # A single forced block still needs a second placement to make a queryable complete turn.
+        game = Game(history)
+        try:
+            q, r = cells[0]
+            filler = min((c for c in game.legal_moves() if c != cells[0]),
+                         key=lambda c: (max(abs(c[0]-q), abs(c[1]-r), abs(sum(c)-q-r)), c))
+            cells.append(filler)
+            counts[filler] = 0
+        finally:
+            game.close()
+    pairs = {g for g in groups if len(g) == 2} | {tuple(sorted(p)) for p in combinations(cells, 2)}
+    masks = {c: 0 for c in counts}
+    for i, group in enumerate(sorted(groups)):
+        for c in group:
+            masks[c] |= 1 << i
+    first = tuple(sorted(map(tuple, certificate['nodes'][certificate['root']].get('action', ()))))
+    rank = lambda p: (p != first, -(masks[p[0]] | masks[p[1]]).bit_count(), -sum(counts[c] for c in p), p)
+    game, turns = Game(history), []
+    try:
+        for pair in sorted(pairs, key=rank):
+            # Prefer the more frequent cell first; reverse if only the other order is legal.
+            pair = tuple(sorted(pair, key=lambda c: (-counts[c], c)))
+            if not game.legal(*pair[0]):
+                pair = pair[::-1]
+            if not game.legal(*pair[0]):
+                continue
+            game.play(*pair[0])
+            if game.winner >= 0:
+                game.undo()
+                continue  # Own terminal wins belong to the exact tactical search.
+            legal = game.legal(*pair[1])
+            if legal:
+                game.play(*pair[1])
+                legal = game.winner < 0
+                game.undo()
+            game.undo()
+            if legal:
+                turns.append(pair)
+                if len(turns) == limit:
+                    break
+    finally:
+        game.close()
+    return turns
 
 
 class Proof:
@@ -543,6 +635,8 @@ class Plan:
         self.solver, self.schedule = solver, solver.schedule
         self.proofs, self.deep, self.late, self.found = {}, {}, [], []
         self.threat = self.root = self.finalists = None
+        self.defence_queries, self.defences, self.defence_base = [], [], ()
+        self.defence_limit = 8
         self.nodes, self.budget, self.turns, self.pruned, self.following, self.deferrals = 0, 0, 0, [], False, 0
 
     def spent(self, result):
@@ -603,9 +697,13 @@ class Plan:
         if self.following:
             return False
         if len(history) % 2 == 0:
+            if budgets.defence and history[:-1] == self.defence_base:
+                self.apply_defences(slot, history[-1])
             if budgets.finalists and self.move(player, history) is None:
                 checked(native.hxg_hold(tree.ptr, 1))
             return False
+        self.defences, self.defence_base = [], history
+        self.defence_limit = budgets.defence_candidates
         if schedule.deep_nodes and len(history) >= 3 and other not in self.deep and not self.alive(other, history):
             query = self.solver.submit('deep', history[:-2], 'mover', schedule.deep_nodes,
                                        root_moves=[list(m) for m in history[-2:]])
@@ -632,7 +730,7 @@ class Plan:
         return True
 
     def ready(self, slot):
-        """Apply the verdicts consumed before the search continues: threat ordering, finalist marks. False defers
+        """Apply threat ordering or verified defence candidates, and finalist marks. False defers
         the slot to its next visit."""
         ptr = slot.tree.ptr
         if self.threat is not None:
@@ -640,12 +738,31 @@ class Plan:
                 proven, result = self.threat.result()
                 self.spent(result)
                 if proven:
-                    cells = np.ascontiguousarray(result['moves'], np.int64).reshape(-1, 2)
-                    checked(native.hxg_priority(ptr, cells, len(cells)))
+                    if slot.solver.defence:
+                        history = tuple(map(tuple, slot.tree.history))
+                        turns = defence_turns(history, result['certificate'], min(self.defence_limit, slot.budget))
+                        # After our complete turn the original threat attacker is the actual mover.
+                        self.defence_queries = [(turn, self.solver.submit('defence', history+turn, 'mover',
+                                                                          result['budget'])) for turn in turns]
+                    else:
+                        cells = np.ascontiguousarray(result['moves'], np.int64).reshape(-1, 2)
+                        checked(native.hxg_priority(ptr, cells, len(cells)))
             else:
                 self.solver.stats['dropped'] += 1
                 self.late.append(self.threat)   # accounted once it completes; its verdict no longer acts
             self.threat = None
+        if self.defence_queries:
+            if not self.defer([query for _, query in self.defence_queries]):
+                return False
+            for turn, query in self.defence_queries:
+                if query in self.late:
+                    continue
+                result = query.result()[1]
+                self.spent(result)
+                if defence_hit(result):
+                    self.defences.append(turn)
+            self.defence_queries = []
+            self.apply_defences(slot)
         if self.finalists is not None:
             if not self.defer([query for _, query in self.finalists]):
                 return False
@@ -663,6 +780,19 @@ class Plan:
             self.finalists = None
             checked(native.hxg_hold(ptr, 0))
         return True
+
+    def apply_defences(self, slot, first=None):
+        """Admit surviving first stones, or their compatible second stones, with 5/k per surviving turn.
+
+        The bonus is at most one initial transformed-Q range. Search still chooses the move; no exact labels
+        or pruning follow from an UNKNOWN. A very small search admits at most its simulation budget in cells.
+        """
+        counts = Counter(turn[0] if first is None else next(c for c in turn if c != first)
+                         for turn in self.defences if first is None or first in turn)
+        cells = sorted(counts, key=lambda c: (-counts[c], c))[:slot.budget]
+        if cells:
+            checked(native.hxg_defence(slot.tree.ptr, np.ascontiguousarray(cells, np.int64),
+                                       np.asarray([5.*counts[c]/self.defence_limit for c in cells]), len(cells)))
 
     def hold(self, slot):
         """At the armed hold: submit the finalist queries and return True (leave the slot until the next visit), or
@@ -719,7 +849,7 @@ class Plan:
         rows is running."""
         if self.schedule.fixed_budgets or not self.schedule.follow:
             return False
-        queries = [*self.deep.values(), *(q for q in self.late if q.point != 'threat')]
+        queries = [*self.deep.values(), *(q for q in self.late if q.point not in ('threat', 'defence'))]
         return any(not q.future.done() for q in queries)
 
     def close(self, slot, moves):
@@ -729,7 +859,8 @@ class Plan:
         them when they complete."""
         if not self.schedule.fixed_budgets:
             self.poll(moves)
-        pending = [self.threat, self.root, *(q for _, q in self.finalists or ()), *self.deep.values(), *self.late]
+        pending = [self.threat, self.root, *(q for _, q in self.finalists or ()),
+                   *(q for _, q in self.defence_queries), *self.deep.values(), *self.late]
         self.solver.orphans += [q for q in pending if q is not None and q.outcome is None]
         if not self.schedule.follow:
             return

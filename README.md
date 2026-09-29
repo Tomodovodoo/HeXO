@@ -873,6 +873,11 @@ their gap, under separate names such as `newest_future_masked_ce` and
 
 ## Dense actor batches
 
+Both the learner and actors accept `--net-kernels fused` for optional Triton GPU kernels. The default is
+`reference`; checkpoints load in either mode. See [GPU kernels](GPU_KERNELS.md) for installation, the paired
+benchmarks, profiling commands, and the batch-256 training validation that remains blocked by the shared-card
+memory cap.
+
 `dense_selfplay.py` accepts `--games-in-flight` and `--leaf-batch` per worker, alongside `--games` per process. The
 actor heartbeat and metrics log report `mean_batch` and `full_batch_fraction`, the share of model submissions with
 exactly `leaf_batch` distinct positions. More games can supply more leaves to each call; increasing `leaf_batch`
@@ -975,6 +980,16 @@ quadratically, so these tensor sizes are not a measured peak VRAM increase.
 ## Dense actor solver scheduling
 
 `dense_solver.Schedule` decides how the solver queries of the dense searches run (settings `solver_*` in `ActorSettings` and `EvaluationSettings`).
+
+Defence search defaults off. Actors enable it with `--solver-defence --solver-threat-nodes 27000`.
+Evaluator loops use
+`--eval-solver-defence --eval-solver-threat-nodes 27000`; a match can enable just one side with
+`--a-solver-defence --a-solver-threat-nodes 27000`. `solver_defence_candidates` defaults to 8.
+Each proven threat supplies candidate complete turns from its placements, replies and line completions.
+The solver checks each turn at the threat budget. A completed UNKNOWN keeps the turn as a search candidate,
+without claiming safety. Surviving placements enter the root sample set and receive a bonus proportional to
+their surviving turns. Matching second stones receive that support on the next placement. Status reports
+`defence_queries`, `defence_hits` and `defence_nodes`. See [the measured Seal positions](docs/defence-search.md).
 
 - **Fixed budgets** (`solver_fixed_budgets`, default on): every verdict is awaited where it is needed. Seeded self-play repeats exactly on both backends. Evaluation, engine verification and the determinism test run this way. Evaluation spends each point's flat node budget by default; `--eval-solver-gate-cap-nodes` enables position-only gate scaling with weight 3 and the point budget as its floor.
 - **Adaptive budgets** (`--no-solver-fixed-budgets`, actors): a query's budget is `solver_slack_fraction` of its point's measured lead time (20th percentile, minus 50 ms), net of the work already queued, at the measured worker rate, clamped to `[solver_min_nodes, solver_cap_nodes]`. With `solver_gate_weight` the worker scales it by the attacker's forcing material up to `solver_gate_cap_nodes`; positions below the gate's lower level get the floor. Verdicts are polled. A root or finalist verdict may cost at most `solver_overrun_fraction` of the step time in waits; past that its game is skipped for one step while the others build the batch, and then goes on without it. Threat verdicts that miss the next visit are dropped.

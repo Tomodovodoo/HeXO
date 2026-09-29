@@ -27,7 +27,7 @@ from hexo import Game
 from neural_search import HOLD, NeuralSearch, checked, native
 from tactical_proof import NativeTactics, gated_nodes
 from tests.test_dense import episode_rows, winning_game
-from tests.test_tactical_proof import FIXTURE, TWO_TURN
+from tests.test_tactical_proof import FIXTURE, ONE_TURN, TWO_TURN
 
 TINY = hexnet.HexNetConfig(blocks=2, channels=16, pool_every=2, line_length=5, value_hidden=16, head_channels=8)
 PROOF = '1790600149713752:2:253'  # the side to move wins in 4 turns; proven within 135 nodes
@@ -174,6 +174,99 @@ class NativeEntries(unittest.TestCase):
         actions, visits, _, _, policy = stats(first)
         self.assertTrue(all(visits[actions.index(a)] > 0 for a in unsampled))
         self.assertTrue(np.all(policy > 0))
+
+
+class DefenceSearch(unittest.TestCase):
+    def search(self, history=ONE_TURN, enabled=True, candidates=8):
+        solver = dense_solver.Solver(asynchronous=False)
+        self.addCleanup(solver.close)
+        tree = NeuralSearch(object(), 'test', history, seed=5)
+        self.addCleanup(tree.close)
+        slot = type('Slot', (), dict(tree=tree, budget=16, samples=1,
+                                    solver=Budgets(threat_nodes=27000, defence=enabled,
+                                                   defence_candidates=candidates)))()
+        plan = dense_solver.Plan(solver)
+        checked(native.hxg_begin(tree.ptr, slot.budget, slot.samples))
+        self.assertTrue(plan.begin(slot))
+        self.assertTrue(plan.ready(slot))
+        drive(tree, slot.budget)
+        return slot, plan, solver
+
+    def test_known_breaking_turn_is_admitted_at_both_placements(self):
+        slot, plan, solver = self.search()
+        turn = ((0, 2), (5, 2))
+        self.assertIn(turn, plan.defences)
+        actions, visits, _, _, policy = stats(slot.tree)
+        self.assertTrue(all(visits[actions.index(list(t[0]))] > 0 for t in plan.defences))
+        self.assertTrue(np.all(policy > 0))
+        self.assertEqual(solver.summary(1.)['defence_hits'], len(plan.defences))
+        self.assertEqual(solver.summary(1.)['defence_queries'], 6)
+        self.assertEqual(plan.budget, 7*27000)
+        self.assertEqual(native.hxg_exact(slot.tree.ptr), -1)
+        slot.tree.advance(turn[0])
+        checked(native.hxg_begin(slot.tree.ptr, slot.budget, slot.samples))
+        self.assertFalse(plan.begin(slot))
+        drive(slot.tree, slot.budget)
+        actions, visits, *_ = stats(slot.tree)
+        self.assertGreater(visits[actions.index(list(turn[1]))], 0)
+        self.assertEqual(solver.summary(1.)['defence_queries'], 6)
+
+    def test_fixed_budgets_repeat_and_cap_queries(self):
+        a, pa, sa = self.search(TWO_TURN, candidates=4)
+        b, pb, sb = self.search(TWO_TURN, candidates=4)
+        self.assertEqual(pa.defences, pb.defences)
+        self.assertEqual((pa.nodes, pa.budget), (pb.nodes, pb.budget))
+        self.assertEqual(sa.summary(1.)['defence_queries'], 4)
+        self.assertEqual(pa.budget, 5*27000)
+        for x, y in zip(stats(a.tree), stats(b.tree)):
+            np.testing.assert_array_equal(x, y)
+
+    def test_enabled_selfplay_shards_repeat(self):
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            self.assertEqual(shards(False, a, defence=True), shards(False, b, defence=True))
+
+    def test_off_has_no_queries_or_changes_to_search_bytes(self):
+        a, pa, sa = self.search(enabled=False)
+        b, pb, sb = self.search(enabled=False, candidates=1)
+        self.assertEqual(sa.summary(1.)['defence_queries'], 0)
+        self.assertEqual(dense_solver.record(a.solver), dense_solver.record(b.solver))
+        for x, y in zip(stats(a.tree)[1:], stats(b.tree)[1:]):
+            self.assertEqual(x.tobytes(), y.tobytes())
+
+    def test_bonus_survives_halving_and_is_cleared_for_reuse(self):
+        a, _, _ = self.search(enabled=False)
+        b, _, _ = self.search(enabled=False)
+        cells = np.asarray([[0, 2], [5, 2]], np.int64)
+        for slot in (a, b):
+            checked(native.hxg_begin(slot.tree.ptr, 16, 1))
+        checked(native.hxg_defence(b.tree.ptr, cells, np.asarray([1., 2.]), 2))
+        before, after = stats(a.tree)[4], stats(b.tree)[4]
+        actions = stats(a.tree)[0]
+        i, j = (actions.index(c.tolist()) for c in cells)
+        self.assertAlmostEqual((after[j]/after[i])/(before[j]/before[i]), np.exp(1.))
+        drive(b.tree, 16)
+        self.assertTrue(all(stats(b.tree)[1][actions.index(c.tolist())] > 0 for c in cells))
+        checked(native.hxg_begin(b.tree.ptr, 16, 1))
+        plain = stats(b.tree)[4].copy()
+        checked(native.hxg_defence(b.tree.ptr, cells, np.asarray([1., 2.]), 2))
+        checked(native.hxg_begin(b.tree.ptr, 16, 1))
+        np.testing.assert_array_equal(stats(b.tree)[4], plain)
+
+    def test_only_search_verdicts_count_as_survivors(self):
+        self.assertTrue(dense_solver.defence_hit(dict(status='UNKNOWN', reason='defender counterwin')))
+        self.assertFalse(dense_solver.defence_hit(dict(status='UNKNOWN', reason='deadline')))
+        self.assertFalse(dense_solver.defence_hit(dict(status='PROVEN_WIN', native_verified=True)))
+
+    def test_one_certificate_cell_gets_a_legal_complete_turn(self):
+        certificate = dict(root=0, nodes=[dict(kind='immediate_win', action=[[1, 0]])])
+        turns = dense_solver.defence_turns([(0, 0)], certificate, 8)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0][0], (1, 0))
+        game = Game([(0, 0)])
+        self.addCleanup(game.close)
+        for cell in turns[0]:
+            game.play(*cell)
+        self.assertEqual(game.remaining, 2)
 
 
 class InjectionPoints(unittest.TestCase):
@@ -522,6 +615,7 @@ class Scheduler(unittest.TestCase):
         self.assertEqual(fixed.allocate('root', NODES)[:2],
                          (NODES, dict(weight=3., floor=NODES, cap_low=NODES, cap_high=8192)))
         self.assertEqual(fixed.allocate('threat', NODES)[1], fixed.allocate('root', NODES)[1])
+        self.assertIsNone(fixed.allocate('defence', NODES)[1])
 
     def test_evaluation_gate_budget_is_position_deterministic(self):
         base = dense_config.EvaluationSettings(solver_root_nodes=2048, solver_threat_nodes=2048)
@@ -671,13 +765,14 @@ def solver_budgets(summary):
     return [summary[f'{p}_budget'] for p in dense_solver.POINTS if summary[f'{p}_queries']]
 
 
-def shards(asynchronous, root):
+def shards(asynchronous, root, defence=False):
     """Seeded self-play with every solver point, gate, deep proofs and following on under fixed budgets, including two
     games from positions with forced wins, published as a shard under `root`; returns the digests of its data
     files."""
     model = tiny_model()
     s = settings(solver_root_nodes=NODES, solver_finalists=2, solver_finalist_nodes=NODES, solver_threat_nodes=NODES,
-                 solver_async=asynchronous, solver_gate_weight=3., solver_deep_nodes=NODES, solver_follow=True)
+                 solver_async=asynchronous, solver_gate_weight=3., solver_deep_nodes=NODES, solver_follow=True,
+                 solver_defence=defence)
     games = [dense_selfplay.SelfPlayGame([model, model], s, seed) for seed in (1, 2)]
     for seed, key in ((3, PROOF), (4, '1790600287230040:25:213')):
         opening = FIXTURE['positions'][key]

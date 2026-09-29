@@ -105,6 +105,8 @@ class ActorSettings:
     solver_finalists: int = 0
     solver_finalist_nodes: int = 0
     solver_threat_nodes: int = 0
+    solver_defence: bool = False  # verify certificate-derived turns, admit survivors and bonus them at the root
+    solver_defence_candidates: int = 8
     solver_async: bool = True
     # Scheduling of those queries (dense_solver.Schedule). solver_fixed_budgets: every query spends its point's fixed
     # budget and every verdict is awaited (reproducible; evaluation always runs this way). Off: budgets follow the
@@ -135,8 +137,11 @@ class ActorSettings:
     # of restarts.json, drawn with probability proportional to regret^(1/restart_temperature); 0 = never.
     restart_fraction: float = 0.
     restart_temperature: float = 1.
+    net_kernels: str = 'reference'  # opt-in Triton features, normalization and inference LineConv
 
     def __post_init__(self):
+        if self.net_kernels not in ('reference', 'fused'):
+            raise ValueError('net_kernels must be reference or fused')
         if not 0 <= self.restart_fraction <= 1 or not self.restart_temperature > 0:
             raise ValueError('restart_fraction must lie in [0, 1] and restart_temperature must be positive')
 
@@ -286,6 +291,8 @@ class EvaluationSettings:
     solver_finalists: int = 0
     solver_finalist_nodes: int = 0
     solver_threat_nodes: int = 0
+    solver_defence: bool = False
+    solver_defence_candidates: int = 8
     solver_workers: int = 1      # foreground tactical processes; fixed budgets remain unchanged
     solver_gate_cap_nodes: int = 0  # 0 keeps fixed budgets flat; otherwise gate scales toward this cap at weight 3
 

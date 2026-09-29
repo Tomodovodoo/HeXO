@@ -140,14 +140,15 @@ STATUS_SECONDS = 2.
 # Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
 PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'opening_book', 'seal_ms',
             'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes',
-            'solver_gate_cap_nodes')
+            'solver_defence', 'solver_defence_candidates', 'solver_gate_cap_nodes')
 PROTOCOL_DEFAULTS = dict(opening_book='', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
-                         solver_threat_nodes=0, solver_gate_cap_nodes=0)
+                         solver_threat_nodes=0, solver_defence=False, solver_defence_candidates=8,
+                         solver_gate_cap_nodes=0)
 CHAMPION = 'champion'  # the symbolic base of a variant, bound to the champion when its comparison starts
 # The PROTOCOL fields of one side's search, which a variant may override; max_plies, opening_suite, seal_ms
 # and opening_book belong to the game.
 SIDE = ('sims', 'root_samples', 'tactics', 'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes',
-        'solver_threat_nodes')
+        'solver_threat_nodes', 'solver_defence', 'solver_defence_candidates')
 REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
 CALIBRATION_LATER = 3     # later comparisons of a decided checkpoint before `calibration` counts its verdict
 RATING_NOTE = ('Bradley-Terry over paired comparisons (caps count half a point to each side); each opening pair is one '
@@ -2211,8 +2212,9 @@ def main():
     p = sub.add_parser('match'); p.add_argument('--run', required=True); p.add_argument('--a', required=True)
     p.add_argument('--b', required=True); p.add_argument('--games', type=int, default=32); p.add_argument('--sims', type=int)
     for side in 'ab':
-        for name in asdict(Budgets()):
-            p.add_argument(f'--{side}-solver-{name.replace("_", "-")}', dest=f'{side}_solver_{name}', type=int,
+        for name, default in asdict(Budgets()).items():
+            kind = dict(action=argparse.BooleanOptionalAction) if isinstance(default, bool) else dict(type=int)
+            p.add_argument(f'--{side}-solver-{name.replace("_", "-")}', dest=f'{side}_solver_{name}', **kind,
                            help=f'solver_{name} of --{side} (default: the evaluation setting)')
     p = sub.add_parser('variant'); p.add_argument('--run', required=True); p.add_argument('--checkpoint', required=True)
     p.add_argument('--name', required=True)

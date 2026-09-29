@@ -290,6 +290,33 @@ def planes_batch(histories):
 
 
 class HexNetTests(unittest.TestCase):
+    def test_fused_mode_preserves_cpu_forward_backward_and_checkpoint(self):
+        torch.manual_seed(3070)
+        reference = hexnet.HexNet(TINY)
+        fused = copy.deepcopy(reference).set_kernels('fused')
+        _, _, planes = planes_batch(same_bucket(3))
+        mask = planes[:, 3:4]
+        for training in (True, False):
+            a, b = reference.train(training)(planes, mask), fused.train(training)(planes, mask)
+            for key in a:
+                torch.testing.assert_close(a[key], b[key], atol=1e-6, rtol=1e-6)
+            if training:
+                for model, outputs in ((reference, a), (fused, b)):
+                    sum(v.square().mean() for v in outputs.values()).backward()
+                for (name, x), (_, y) in zip(reference.named_parameters(), fused.named_parameters()):
+                    torch.testing.assert_close(x.grad, y.grad, atol=1e-6, rtol=1e-5, msg=name)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'model.pt'
+            for source in (reference, fused):
+                hexnet.save_model(path, source)
+                for mode in ('reference', 'fused'):
+                    loaded = hexnet.load_model(path, net_kernels=mode)
+                    self.assertEqual(loaded.net_kernels, mode)
+                    self.assertEqual(hexnet.model_digest(source), hexnet.model_digest(loaded))
+                self.assertEqual(hexnet.load_model(path).net_kernels, 'reference')
+        with self.assertRaises(ValueError):
+            fused.set_kernels('unknown')
+
     def test_masked_future_loss_scores_only_empty_crop_cells(self):
         planes = torch.zeros(2, 8, 2, 3)
         planes[:, 3, :, :2] = 1
@@ -668,7 +695,118 @@ def pointwise_model(config):
     return model
 
 
+@unittest.skipUnless(os.environ.get('HEXO_TEST_CUDA') == '1', 'explicit, bounded GPU run only')
+class FusedCudaTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        torch.cuda.set_per_process_memory_fraction(.12)
+        torch.set_num_threads(2)
+
+    def assert_bf16_close(self, a, b):
+        a, b = a.detach().float(), b.detach().float()
+        tolerance = 2*torch.finfo(torch.bfloat16).eps
+        self.assertLessEqual(float((a-b).norm()), tolerance*float(a.norm())+1e-5)
+        self.assertLessEqual(float((a-b).abs().max()), tolerance*float(a.abs().max())+1e-4)
+
+    def test_masked_norm_activation_and_gradients(self):
+        torch.manual_seed(3070)
+        for fmt in (torch.contiguous_format, torch.channels_last):
+            x = (torch.randn(3, 16, 24, 24, device='cuda')+20).bfloat16().contiguous(memory_format=fmt)
+            x.requires_grad_()
+            mask = (torch.rand(3, 1, 24, 24, device='cuda') > .3).bfloat16()
+            ceiling = torch.where(mask > 0, math.inf, 0).to(x.dtype)
+            cells = mask.sum(dtype=torch.float32)
+            reference = hexnet.MaskedNorm(16).cuda()
+            with torch.no_grad():
+                reference.weight.normal_()
+                reference.bias.normal_()
+                reference.weight[0] = reference.bias[0] = 0
+            fused = copy.deepcopy(reference)
+            fused.net_kernels = 'fused'
+            grad = torch.randn_like(x)
+            outputs, gradients = [], []
+            for norm in (reference, fused):
+                y = norm(x, mask, cells, ceiling)
+                outputs.append(y)
+                gradients.append(torch.autograd.grad(y, (x, norm.weight, norm.bias), grad))
+            self.assert_bf16_close(*outputs)
+            for a, b in zip(*gradients):
+                self.assert_bf16_close(a, b)
+            torch.testing.assert_close(reference.running_mean, fused.running_mean)
+            torch.testing.assert_close(reference.running_var, fused.running_var)
+
+    @torch.inference_mode()
+    def test_line_kernels_match_reference(self):
+        torch.manual_seed(3070)
+        features = hexnet.LineFeatures().cuda()
+        fast = copy.deepcopy(features)
+        fast.net_kernels = 'fused'
+        planes = torch.randint(0, 2, (2, 8, 24, 24), device='cuda').float()
+        planes[:, :2, 5, 3:9] = 0
+        planes[:, 0, 5, 3:9] = 1
+        planes[:, 3, 3:15, 3:15] = 1
+        for fmt in (torch.contiguous_format, torch.channels_last):
+            p = planes.contiguous(memory_format=fmt)
+            with torch.autocast('cuda', torch.bfloat16):
+                torch.testing.assert_close(features(p[:, :1], p[:, 1:2], p[:, 3:4]),
+                                           fast(p[:, :1], p[:, 1:2], p[:, 3:4]), atol=0, rtol=0)
+            for length in (5, 6, 11):
+                line = hexnet.LineConv(8, length).cuda()
+                line.weight.normal_(0, .2)
+                fused = copy.deepcopy(line)
+                fused.net_kernels = 'fused'
+                for dtype in (torch.float32, torch.bfloat16):
+                    x = torch.randn(2, 8, 24, 24, device='cuda').to(dtype=dtype, memory_format=fmt)
+                    a, b = x.clone(), x.clone()
+                    line.add_to(a)
+                    fused.add_to(b)
+                    tol = .02 if dtype == torch.bfloat16 else 2e-5
+                    torch.testing.assert_close(a, b, atol=tol, rtol=tol)
+
+    def test_model_random_and_real_forward_backward(self):
+        torch.manual_seed(3070)
+        cases = [torch.randint(0, 2, (4, 8, 32, 32)).float()]
+        cases[0][:, 3] = 1
+        snapshot = os.environ.get('HEXO_TEST_BATCH')
+        if snapshot:
+            batches = torch.load(snapshot, weights_only=True)
+            cases.append(batches[32]['planes'][:4].float())
+        checkpoint = os.environ.get('HEXO_TEST_MODEL')
+        base = hexnet.load_model(checkpoint) if checkpoint else hexnet.HexNet(TINY)
+        for planes in cases:
+            x = planes.cuda()
+            for training in (True, False):
+                results = []
+                for mode in ('reference', 'fused'):
+                    fmt = torch.channels_last if mode == 'fused' and not training else torch.contiguous_format
+                    model = copy.deepcopy(base).set_kernels(mode).cuda().to(memory_format=fmt).train(training)
+                    inputs = x.contiguous(memory_format=fmt)
+                    with torch.set_grad_enabled(training), torch.autocast('cuda', torch.bfloat16):
+                        outputs = model(inputs, inputs[:, 3:4])
+                        if training:
+                            sum(v.square().mean() for v in outputs.values()).backward()
+                    results.append(({k:v.detach().cpu() for k,v in outputs.items()},
+                                    {k:p.grad.cpu() for k,p in model.named_parameters()} if training else {}))
+                    del model, outputs
+                for category in (0, 1):
+                    for key, a in results[0][category].items():
+                        with self.subTest(training=training, tensor=key):
+                            self.assert_bf16_close(a, results[1][category][key])
+
+
 class DenseConfigTests(unittest.TestCase):
+    def test_net_kernels_are_opt_in_and_reach_actor_workers(self):
+        self.assertEqual(dense_config.ActorSettings().net_kernels, 'reference')
+        parser = argparse.ArgumentParser()
+        dense_config.add_arguments(parser, dense_config.ActorSettings)
+        args = parser.parse_args(['--net-kernels', 'fused'])
+        actor = dense_config.override(dense_config.ActorSettings(), args)
+        self.assertEqual(actor.net_kernels, 'fused')
+        self.assertIn('--net-kernels', dense_selfplay.actor_flags(args))
+        self.assertIn('fused', dense_selfplay.actor_flags(args))
+        with self.assertRaises(ValueError):
+            replace(actor, net_kernels='unknown')
+
     def test_pages_serve_from_step_control(self):
         """The project page and a dense run page carry the "from step" header control."""
         import dashboard
