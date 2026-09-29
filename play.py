@@ -1,9 +1,141 @@
 """Local browser game. Run python play.py, then open http://127.0.0.1:8765."""
 import argparse
 import json
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from hexo import Game
+
+
+class DensePlayer:
+    """Play exported dense checkpoints; analysis searches a copy of the browser game."""
+    mode = 'dense'
+
+    def __init__(self, run, device, tactical_package=None):
+        self.run, self.device = run, device
+        self.tactical_package = tactical_package
+        self.evaluator = self.prover = None
+        self.checkpoint = None
+        self.options = dict(search=True, simulations=128, solver=True, solver_nodes=32768)
+        available = self.models()
+        if not available:
+            raise ValueError('No playable dense exports found')
+        self.select(available[0]['id'])
+
+    def models(self):
+        labels = {'main/065000': '65k · champion', 'main/075000': '75k',
+                  'main/082500': '82.5k', 'main/085000': '85k · newest'}
+        return [dict(id=k, label=v) for k, v in labels.items()
+                if (self.run/'checkpoints'/k/'ema.pt').is_file()]
+
+    def select(self, checkpoint):
+        if checkpoint not in {m['id'] for m in self.models()}:
+            raise ValueError('Choose one of the available checkpoints')
+        if checkpoint == self.checkpoint:
+            return
+        import hexnet
+        from train import digest
+        path = self.run/'checkpoints'/checkpoint/'ema.pt'
+        model = hexnet.load_model(path)
+        self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path), max_batch=16)
+        self.checkpoint, self.model_sha256 = checkpoint, digest(path)
+        self.set_history()
+
+    def configure(self, options):
+        updated = self.options | options
+        if any(type(updated[k]) is not bool for k in ('search', 'solver')):
+            raise ValueError('Search and solver must be on or off')
+        for key, maximum in (('simulations', 4096), ('solver_nodes', 1000000)):
+            if type(updated[key]) is not int or not 1 <= updated[key] <= maximum:
+                raise ValueError(f'{key} must be 1..{maximum}')
+        self.options = updated
+
+    def set_history(self, history=()):
+        from neural_search import EvaluationCache
+        self.cache = EvaluationCache(4096)
+
+    def close(self):
+        self.evaluator = None
+
+    def solve(self, history, attacker='mover'):
+        from tactical_proof import NativeTactics
+        if self.prover is None:
+            self.prover = NativeTactics(**({'package': self.tactical_package} if self.tactical_package else {}))
+        return self.prover.history(history, attacker=attacker, nodes=self.options['solver_nodes'], ms=10000)
+
+    @staticmethod
+    def winning_line(history, result):
+        """One legal continuation of a verified strategy, choosing its first covered defender reply."""
+        from dense_solver import Proof
+        certificate = result.get('certificate') or json.loads(result['certificate_json'])
+        proof = Proof(list(map(tuple, history)), certificate)
+        local, line = Game(history), []
+        try:
+            while local.winner < 0:
+                current = [cell[:2] for cell in local.cells]
+                move = proof.path(current)[1]
+                if move is None:
+                    break
+                actions = move[0] or proof.reply(current) or local.legal_moves()[:local.remaining]
+                for action in actions:
+                    line.append([*action, local.player])
+                    local.play(*action)
+                    if local.winner >= 0:
+                        break
+            return line
+        finally:
+            local.close()
+
+    def turn(self, game, milliseconds=None, analyze=False):
+        import numpy as np
+        from neural_search import NeuralSearch
+        if game.winner >= 0:
+            raise ValueError('This game has finished')
+        history = [cell[:2] for cell in game.cells]
+        local, moves, suggestions = Game(history), [], []
+        player, start, proof, line, threat = local.player, time.perf_counter(), None, [], None
+        win_probability = None
+        try:
+            if self.options['solver']:
+                proof = self.solve(history)
+                if proof['status'] == 'PROVEN_WIN' and proof.get('native_verified'):
+                    moves = proof['moves']
+                    line = self.winning_line(history, proof)
+                if analyze:
+                    danger = self.solve(history, 'opponent')
+                    if danger['status'] == 'PROVEN_WIN' and danger.get('native_verified'):
+                        threat = dict(moves=danger['moves'], turns=danger['proof_turns'])
+            proven = bool(proof and proof['status'] == 'PROVEN_WIN' and proof.get('native_verified'))
+            while not proven and local.player == player and local.winner < 0:
+                current = [cell[:2] for cell in local.cells]
+                if self.options['search']:
+                    tree = NeuralSearch(self.evaluator, self.model_sha256, current, seed=1740,
+                                        cache=self.cache, tactics=True)
+                    try:
+                        result = tree.search(self.options['simulations'], root_samples=16, batch_size=16)
+                    finally:
+                        tree.close()
+                    action, policy, actions = result['action'], result['policy'], result['actions']
+                    visits = result['visits']
+                    value = float(visits @ result['values']/max(1, visits.sum()))
+                else:
+                    result = self.evaluator.evaluate([current])[0]
+                    actions = result['actions']
+                    policy = np.exp(result['logits']-result['logits'].max()); policy /= policy.sum()
+                    action, value = actions[policy.argmax()].tolist(), float(result['q'][0])
+                if not suggestions:
+                    suggestions = [dict(move=actions[i].tolist(), probability=float(policy[i]))
+                                   for i in np.argsort(-policy)[:5]]
+                    win_probability = (value+1)/2
+                moves.append(action)
+                local.play(*action)
+            return dict(moves=moves, backend='dense', checkpoint=self.checkpoint,
+                        elapsed_ms=(time.perf_counter()-start)*1000, suggestions=suggestions,
+                        player=player, win_probability=1. if proven else win_probability,
+                        proof_status='PROVEN_WIN' if proven else 'UNKNOWN', winning_line=line, threat=threat,
+                        solver_status=proof['status'] if proof else 'off', settings=dict(self.options))
+        finally:
+            local.close()
 
 
 def promoted_checkpoint(run):
@@ -56,11 +188,15 @@ class Handler(BaseHTTPRequestHandler):
             backend = "nnue-pvs"
         elif promoted:
             backend = "table-pvs"
-        return {**self.game.state(), "opponent": self.label,
+        dense = isinstance(self.neural, DensePlayer)
+        return {**self.game.state(), "opponent": f'Dense {self.neural.checkpoint}' if dense else self.label,
                 "backend": backend,
-                "checkpoint": self.search_checkpoint if self.search_run else promoted["id"] if promoted else None,
+                "checkpoint": self.neural.checkpoint if dense else self.search_checkpoint if self.search_run else promoted["id"] if promoted else None,
                 "default_budget_ms": 10000 if self.neural else 1000,
-                "model_sha256": self.neural.model_sha256 if self.neural else None}
+                "model_sha256": self.neural.model_sha256 if self.neural else None,
+                "models": self.neural.models() if dense else [],
+                "dense_settings": self.neural.options if dense else None,
+                "dense_checkpoint": self.neural.checkpoint if dense else None}
 
     def respond(self, status, data, content_type="application/json"):
         payload = data.encode() if isinstance(data, str) else json.dumps(data).encode()
@@ -100,11 +236,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.game.undo()
                 if self.neural:
                     self.neural.set_history([cell[:2] for cell in self.game.cells])
+            elif self.path == '/settings' and isinstance(self.neural, DensePlayer):
+                if 'checkpoint' in args:
+                    self.neural.select(args.pop('checkpoint'))
+                self.neural.configure(args)
+            elif self.path == '/analyze' and isinstance(self.neural, DensePlayer):
+                analysis = self.neural.turn(self.game, analyze=True)
             elif self.path == "/bot":
                 ms = args.get("ms", 1000)
                 if type(ms) is not int or not 1 <= ms <= 30000:
                     raise ValueError("Think time must be 1..30000 ms")
-                checkpoint = self.search_checkpoint if self.search_run else None
+                checkpoint = self.neural.checkpoint if isinstance(self.neural, DensePlayer) else self.search_checkpoint if self.search_run else None
                 if self.neural is not None:
                     analysis = self.neural.turn(self.game, milliseconds=ms)
                 elif self.model is not None:
@@ -139,11 +281,17 @@ if __name__ == "__main__":
     opponent.add_argument("--model", type=Path, help="Play against a specific NNUE export, without claiming promotion")
     opponent.add_argument("--relational", type=Path, help="Play the actual relational policy/Q checkpoint")
     opponent.add_argument("--search-run", type=Path, help="Use the internal search champion; refresh on New game")
+    opponent.add_argument('--dense-run', type=Path, help='Play dense exports with model, search and solver controls')
+    parser.add_argument('--tactical-package', type=Path, help='Directory containing the verified prebuilt tactical library')
     parser.add_argument("--neural-mode", choices=("pi", "mu", "gumbel", "gumbel-proof"), default="gumbel")
     parser.add_argument("--simulations", type=int, default=16, help="Maximum neural search simulations per placement")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--label", help="Visible opponent name")
     args = parser.parse_args()
+    if args.dense_run:
+        import torch
+        torch.set_num_threads(2)
+        Handler.neural = DensePlayer(args.dense_run.resolve(), args.device, args.tactical_package)
     Handler.run = args.run.resolve() if args.run else None
     if Handler.run:
         promoted_checkpoint(Handler.run)

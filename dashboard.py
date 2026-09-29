@@ -654,7 +654,7 @@ def heartbeats(run, now):
 
 def live(run, fresh=30):
     learners, actors = heartbeats(run, time.time())
-    return any(s['age'] is not None and s['age'] <= fresh and s.get('stage') not in ('failed', 'idle', 'finished')
+    return any(s['age'] is not None and s['age'] <= fresh and s.get('stage') not in ('failed', 'idle', 'finished', 'paused')
                for s in [*learners.values(), *actors])
 
 

@@ -942,6 +942,15 @@ class DenseConfigTests(unittest.TestCase):
         page = (ROOT/'web'/'training.html').read_text(encoding='utf-8')
         self.assertIn("['Samples / second',n(l.samples_per_second,1),false,Number.isFinite(l.data_wait_fraction)?", page)
 
+    def test_paused_learner_does_not_make_a_run_live(self):
+        import dashboard
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            (run/'learner-status.json').write_text(json.dumps(dict(stage='paused', updated_at=time.time())))
+            self.assertFalse(dashboard.live(run))
+            (run/'actor-status.json').write_text(json.dumps(dict(stage='playing', updated_at=time.time())))
+            self.assertTrue(dashboard.live(run))
+
     def test_actor_batch_status_aggregates_by_gpu_calls(self):
         import dashboard
         with tempfile.TemporaryDirectory() as tmp:
@@ -5621,6 +5630,73 @@ class EvaluatorLoopTests(unittest.TestCase):
         (self.run/'league.json').write_text(json.dumps(league))
         self.start()
         self.assertIn('calibration', self.league())                                    # added on start
+
+class DenseBrowser(unittest.TestCase):
+    def setUp(self):
+        from play import DensePlayer
+        self.temp = tempfile.TemporaryDirectory()
+        self.run = Path(self.temp.name)
+        for checkpoint in ('065000', '075000', '082500', '085000'):
+            path = self.run/'checkpoints/main'/checkpoint
+            path.mkdir(parents=True)
+            hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
+        self.player = DensePlayer(self.run, 'cpu')
+
+    def tearDown(self):
+        self.player.close()
+        self.temp.cleanup()
+
+    def test_picker_raw_policy_and_search_preserve_the_board(self):
+        game = Game([(0, 0)])
+        try:
+            before = game.cells
+            self.player.configure(dict(search=False, solver=False))
+            raw = self.player.turn(game, analyze=True)
+            self.assertEqual(len(raw['moves']), 2)
+            self.assertEqual(game.cells, before)
+            self.assertEqual(len(self.player.models()), 4)
+            self.player.select('main/085000')
+            self.player.configure(dict(search=True, simulations=4))
+            searched = self.player.turn(game)
+            self.assertEqual(searched['checkpoint'], 'main/085000')
+            replay = Game([c[:2] for c in before])
+            try:
+                for move in searched['moves']:
+                    replay.play(*move)
+            finally:
+                replay.close()
+            self.assertEqual(game.cells, before)
+        finally:
+            game.close()
+
+    def test_startup_selects_an_available_export(self):
+        from play import DensePlayer
+        (self.run/'checkpoints/main/065000/ema.pt').unlink()
+        player = DensePlayer(self.run, 'cpu')
+        try:
+            self.assertEqual(player.checkpoint, 'main/075000')
+        finally:
+            player.close()
+
+    def test_verified_line_replays_to_a_win_without_playing_the_game(self):
+        history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (2, 5), (3, 5), (3, 0),
+                   (-1, 3), (5, 5), (6, 5)]
+        game = Game(history)
+        result = dict(status='PROVEN_WIN', native_verified=True, moves=[[4, 0], [5, 0]],
+                      certificate=dict(root=0, nodes=[dict(kind='immediate_win', action=[[4, 0], [5, 0]])]))
+        try:
+            with unittest.mock.patch.object(self.player, 'solve', side_effect=[result, dict(status='UNKNOWN')]):
+                analysis = self.player.turn(game, analyze=True)
+            self.assertEqual(analysis['proof_status'], 'PROVEN_WIN')
+            self.assertEqual(analysis['win_probability'], 1.)
+            self.assertEqual([c[:2] for c in game.cells], [list(p) for p in history])
+            for q, r, player in analysis['winning_line']:
+                self.assertEqual(player, game.player)
+                game.play(q, r)
+            self.assertEqual(game.winner, 0)
+        finally:
+            game.close()
+
 
 if __name__ == '__main__':
     unittest.main()
