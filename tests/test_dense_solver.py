@@ -48,7 +48,7 @@ def run(slots, asynchronous=True, schedule=None):
     try:
         for slot in slots:
             engine.add(slot)
-        while engine.slots:
+        while engine.slots or engine.closing:
             engine.step()
         return engine.solver.summary(1.) if engine.solver else None
     finally:
@@ -382,6 +382,28 @@ class Scheduler(unittest.TestCase):
             self.assertEqual(plan.move(dense_solver.mover(opening), history) is not None, played, point)
             self.assertEqual(len(plan.found), 1)
 
+    def test_a_finished_game_waits_for_a_proof_that_labels_its_rows(self):
+        try:
+            engine = NativeTactics()
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        opening = [tuple(m) for m in FIXTURE['positions'][PROOF]]
+        proof = dict(engine.history(opening, nodes=NODES), budget=NODES)
+        first = [tuple(c) for c in proof['moves']]
+        engine = dense_selfplay.Engine(64, schedule=Schedule(fixed_budgets=False, follow=True))
+        engine.solver = dense_solver.Solver(engine.schedule)
+        self.addCleanup(engine.close)
+        plan, future = dense_solver.Plan(engine.solver), Future()
+        plan.late.append(dense_solver.Query(engine.solver, 'root', tuple(opening), NODES, future))
+        rows = []
+        slot = type('Slot', (), dict(tree=type('Tree', (), dict(history=opening+first))(),
+                                     label=lambda self, ply, proven, turns: rows.append((ply, proven)) or 1))()
+        engine.closing.append((slot, plan, time.perf_counter()+10))
+        self.assertEqual(engine.step(), [])
+        future.set_result(proof)
+        self.assertEqual(engine.step(), [slot])
+        self.assertEqual(rows, [(len(opening), 1), (len(opening)+1, 1)])
+
     def test_a_failing_query_fails_its_future_and_releases_its_reservation(self):
         try:
             pool = dense_solver.Pool(1, None)
@@ -423,6 +445,10 @@ class Scheduler(unittest.TestCase):
         threat.future.set_result(dict(status='UNKNOWN', reason='no verified strategy', nodes_used=135, budget=135))
         plan.poll(((0, 0),))
         self.assertEqual((plan.late, solver.stats['points']['threat']['queries']), ([], 1))
+        # Without follow no running query holds a finished game back.
+        plan.late.append(dense_solver.Query(solver, 'root', ((0, 0),), 100, Future()))
+        self.assertFalse(plan.pending())
+        plan.late.clear()
         # A game ending with a query still running hands it to the Solver, which accounts it once it completes.
         plan.late.append(orphan := dense_solver.Query(solver, 'root', ((0, 0),), 100, Future()))
         plan.close(slot, ((0, 0),))

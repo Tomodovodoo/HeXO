@@ -70,6 +70,7 @@ BLOCKS = 2          # historical opponents in flight at once, about: blocks of t
 METRICS = ('positions', 'games_completed', 'placements_per_second', 'evals_per_second', 'mean_batch',
            'terminal_fraction', 'mean_plies', 'checkpoint', 'paused_seconds')
 STALE_SECONDS = 120.  # learner heartbeats older than this are ignored by Yield
+CLOSE_SECONDS = 10.   # longest a finished game waits for proofs that may label its rows
 
 
 def checkpoints(run):
@@ -309,14 +310,17 @@ class Engine:
     slot whose verdict is not in is skipped for the step (the other slots build the batch), and a step in which
     every slot waits and no batch is in flight sleeps briefly instead of raising the stall error. Each step
     reports its wall time and its collect time to the Solver; a finished slot's Plan closes with the game's
-    history (dense_solver.Plan.close; with solver_follow it calls slot.label). close() stops the Solver.
+    history (dense_solver.Plan.close; with solver_follow it calls slot.label). A finished game whose Plan still
+    waits for proofs that may label its rows (Plan.pending) stays in `closing` until they are in, at most
+    CLOSE_SECONDS, and is returned by the step that closes it; run until both `slots` and `closing` are empty.
+    close() stops the Solver.
     """
 
     def __init__(self, leaf_batch, solver_async=True, schedule=None):
         self.leaf_batch, self.slots, self.cursor, self.inflight = leaf_batch, [], 0, []
         self.evals = self.calls = self.hits = self.searches = 0
         self.solver_async, self.schedule = solver_async, schedule or dense_solver.Schedule()
-        self.solver, self.plans = None, {}
+        self.solver, self.plans, self.closing = None, {}, []
 
     def begin(self, slot):
         """Start the slot's next search; True when it must wait for solver verdicts until the next visit."""
@@ -436,10 +440,18 @@ class Engine:
         if done:
             finished = set(map(id, done))
             self.slots = [s for s in self.slots if id(s) not in finished]
-            for slot in done:
-                plan = self.plans.pop(id(slot), None)
-                if plan:
-                    plan.close(slot, slot.tree.history)
+            self.closing += [(slot, self.plans.pop(id(slot), None), time.perf_counter()+CLOSE_SECONDS) for slot in done]
+        done = []
+        for entry in list(self.closing):
+            slot, plan, deadline = entry
+            if plan and plan.pending() and time.perf_counter() < deadline:
+                continue
+            self.closing.remove(entry)
+            if plan:
+                plan.close(slot, slot.tree.history)
+            done.append(slot)
+        if self.closing and not self.slots and not done:
+            self.solver.idle()
         if self.solver:
             self.solver.tick((time.perf_counter()-started)*1000, (collected-collecting)*1000)
         return done
@@ -745,7 +757,7 @@ def worker(args):
                 else:
                     engine.add(SelfPlayGame([model, model], settings, seed))
                 started += 1
-            if not engine.slots:
+            if not engine.slots and not engine.closing:
                 break
             if gate.paused():
                 if paused_since is None:

@@ -667,6 +667,14 @@ class Plan:
         result.update(solver_nodes=self.nodes, solver_budget=self.budget, pruned=self.pruned)
         return True
 
+    def pending(self):
+        """Adaptive budgets with follow: whether a root, finalist or deep query that may still label this game's
+        rows is running."""
+        if self.schedule.fixed_budgets or not self.schedule.follow:
+            return False
+        queries = [*self.deep.values(), *(q for q in self.late if q.point != 'threat')]
+        return any(not q.future.done() for q in queries)
+
     def close(self, slot, moves):
         """The game of `slot` ended with `moves`: with follow, label the rows every kept proof decides through
         slot.label(ply, proven, proof_turns) (adaptive budgets first take the deep and late verdicts already in;
