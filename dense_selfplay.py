@@ -540,8 +540,15 @@ class Restarts:
         except (OSError, ValueError):
             return
         self.entries = [e for e in entries if e['ply'] < self.max_plies]
-        weights = np.array([max(e['regret'], 0.) for e in self.entries])**(1/self.temperature)
-        self.p = weights/weights.sum() if len(weights) and weights.sum() > 0 else None
+        regrets = np.array([e['regret'] for e in self.entries], np.float64)
+        positive = regrets > 0
+        if not positive.any():
+            self.p = None
+            return
+        logs = np.log(regrets[positive])/self.temperature
+        weights = np.zeros(len(regrets))
+        weights[positive] = np.exp(logs-logs.max())
+        self.p = weights/weights.sum()
 
     def moves(self, shard):
         if shard not in self.games:

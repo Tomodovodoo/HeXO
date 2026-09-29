@@ -189,6 +189,7 @@ class RestartBuffer:
         data = json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else dict(entries=[])
         self.entries = {self.key(e): e for e in data['entries']}
         self.waiting = {tuple(key): observed for key, observed in data.get('waiting', [])}
+        self.trim()
 
     @staticmethod
     def key(entry):

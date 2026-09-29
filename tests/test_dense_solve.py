@@ -293,6 +293,8 @@ class RestartBufferTests(unittest.TestCase):
             self.assertEqual((again.entries['s', 0, 3, 'attack']['added_at'], again.entries['s', 0, 3, 'attack']['observed']),
                              (10., {'main/000010': dict(value=.2, shard='0001')}))
             self.assertEqual([e['ply'] for e in json.loads((Path(tmp)/'restarts.json').read_text())['entries']], [3, 9, 2])
+            smaller = dense_solve.RestartBuffer(Path(tmp)/'restarts.json', 2, 2, .1)
+            self.assertEqual(sorted(e['ply'] for e in smaller.entries.values()), [3, 9])
 
     def test_refresh_reads_newest_observations_and_ages_by_exports(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,13 +365,13 @@ class RestartActorTests(unittest.TestCase):
         (self.run/'restarts.json').write_text(json.dumps(dict(entries=self.buffer)))
 
     def test_draws_follow_regret_and_temperature(self):
-        for temperature, share in ((1., .8), (.5, .64/.68)):
+        for temperature, share in ((1., .8), (.5, .64/.68), (1e-3, 1.)):
             restarts = dense_selfplay.Restarts(self.run, temperature, 10)
             rng = np.random.default_rng(0)
             draws = [restarts.draw(rng) for _ in range(4000)]
             first = sum(d[0]['ply'] == 6 for d in draws)/len(draws)
             self.assertAlmostEqual(first, share, delta=.02)
-            self.assertEqual({len(d[1]) for d in draws}, {4, 6})
+            self.assertLessEqual({len(d[1]) for d in draws}, {4, 6})
             self.assertTrue(all(d[1] == PREFIX[:d[0]['ply']] for d in draws))
         capped = dense_selfplay.Restarts(self.run, 1., 5)
         self.assertEqual({capped.draw(np.random.default_rng(k))[0]['ply'] for k in range(20)}, {4})
