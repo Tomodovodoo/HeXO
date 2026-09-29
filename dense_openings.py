@@ -468,7 +468,8 @@ class Book:
         4. while fewer than book_size openings are settled, add settled replacements: first the imported positions
            with pairs that no opening passes through (most pairs first; at least book_min_plies deep, plausible and
            free of either skew), then one child of every opening retired for skew in step 1 below book_plies, then fresh
-           openings from the origin (`generate`, up to GROW_ROUNDS rounds); retire parents extended during generation.
+           openings from the origin (`generate`, up to GROW_ROUNDS rounds); retire parents extended during adoption or
+           generation.
         Writes the file; returns {digest, openings, challengers, retired {reason: count} of this refresh, added}."""
         if self.frozen:
             raise ValueError(f'The frozen suite {self.suite!r} is never refreshed')
@@ -481,10 +482,15 @@ class Book:
 
         def retire_nested():
             covered = {canonical(n['moves'][:d])[0] for n in self.openings() for d in range(1, n['depth'])}
+            retired_keys = set()
             for node in self.openings():
                 if node['key'] in covered:
                     self.retire(node, 'nested', now)
+                    retired_keys.add(node['key'])
                     retired['nested'] += 1
+            for node in self.openings():
+                if node['challenges'] in retired_keys:
+                    node['challenges'] = None
 
         retire_nested()
         extend = []
@@ -514,6 +520,7 @@ class Book:
                                                   for k in sorted(chosen)], rng, now, leaf_batch)
         missing = lambda: s.book_size-sum(n['challenges'] is None for n in self.openings())
         added += self.adopt(model, checkpoint, missing(), now, short_limit)
+        retire_nested()
         if missing() > 0:
             added += self.generate(model, checkpoint, [(n['moves'], n['depth']+1, None) for n in extend][:missing()],
                                    rng, now, leaf_batch)

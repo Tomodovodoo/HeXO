@@ -285,6 +285,34 @@ class RefreshTests(unittest.TestCase):
             self.assertEqual(book.nodes[dense_openings.canonical(line[:4])[0]]['status'], 'opening')
             self.assertEqual((result['retired']['nested'], result['added']), (1, 1))
 
+    def test_refresh_retires_a_parent_of_an_adopted_opening(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run, book_size=2, book_plies=4, book_revisit_fraction=0.)
+            line = [(0, 0), (1, 0), (-1, 0), (0, 1)]
+            parent = opening(book, line[:3])
+            child = book.add(line, 0.)
+            book.tally(pair(line, 1))
+            result = book.refresh(Uniform(radius=2), CHAMPION, np.random.default_rng(0), now=1.)
+            self.assertEqual((parent['status'], parent['reason']), ('retired', 'nested'))
+            self.assertEqual(child['status'], 'opening')
+            self.assertEqual(result['retired']['nested'], 1)
+
+    def test_nested_retirement_settles_a_challenger_of_the_parent(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run, book_size=2, book_plies=4, book_revisit_fraction=0.)
+            line = [(0, 0), (1, 0), (-1, 0), (0, 1)]
+            parent = opening(book, line[:3])
+            challenger = opening(book, [(0, 0), (1, 0), (1, -1)])
+            challenger['challenges'] = parent['key']
+            with unittest.mock.patch.object(dense_openings, 'continuations',
+                                            lambda model, starts, s, rng, leaf_batch: ([list(line)]*len(starts), [[None]*3]*len(starts))), \
+                    unittest.mock.patch.object(dense_openings, 'reach',
+                                               lambda model, positions: [(1., .5)]*len(positions)):
+                result = book.refresh(None, CHAMPION, np.random.default_rng(0), now=1.)
+            self.assertEqual((parent['status'], parent['reason']), ('retired', 'nested'))
+            self.assertIsNone(challenger['challenges'])
+            self.assertEqual(result['retired']['nested'], 1)
+
     def test_skewed_openings_retire_and_a_child_replaces_them(self):
         with tempfile.TemporaryDirectory() as run:
             book = self.book(run, book_size=2, book_revisit_fraction=0.)
