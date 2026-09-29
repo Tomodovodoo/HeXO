@@ -253,6 +253,7 @@ def load(run, config, initial=None, source=None):
         sha = hexnet.model_digest(net)
     else:
         net, sha = hexnet.load_model(path), digest(path)
+    net.set_kernels(config.actor.net_kernels)
     return Model(net, sha, checkpoint, config.device, config.actor.leaf_batch, config.actor.cache_positions)
 
 

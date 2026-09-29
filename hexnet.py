@@ -62,10 +62,15 @@ class LineFeatures(nn.Module):
     """
     def __init__(self):
         super().__init__()
+        self.net_kernels = 'reference'
         window = _line_kernel(2*WINDOW-1, range(WINDOW))[:, None]   # window starting at the cell
         self.register_buffer('kernel', window.repeat(3, 1, 1, 1), persistent=False)
 
     def forward(self, own, opp, mask):
+        if (self.net_kernels == 'fused' and own.is_cuda and own.dtype in (torch.float32, torch.bfloat16)
+                and not any(v.requires_grad for v in (own, opp, mask))):
+            from hexnet_kernels import line_features
+            return line_features(own, opp, mask)
         size, pad = own.shape[-1], WINDOW-1
         counts = F.conv2d(torch.cat((own, opp, mask), 1), self.kernel.to(own.dtype), padding=pad, groups=3)
         o, p, m = counts.split(len(AXES), 1)
@@ -75,9 +80,11 @@ class LineFeatures(nn.Module):
         best = []
         for a, (dx, dy) in enumerate(AXES):
             # Windows containing the cell start at cell - i*(dx, dy), i = 0..5.
-            best.append(torch.stack([open_counts[:, (a, a+3), pad-i*dy:pad-i*dy+size, pad-i*dx:pad-i*dx+size]
+            channels = slice(a, a+4, 3) if self.net_kernels == 'fused' else (a, a+3)
+            best.append(torch.stack([open_counts[:, channels, pad-i*dy:pad-i*dy+size, pad-i*dx:pad-i*dx+size]
                                      for i in range(WINDOW)]).amax(0))
-        best = torch.cat(best, 1)[:, (0, 2, 4, 1, 3, 5)]
+        best = torch.cat(best, 1)
+        best = torch.cat((best[:, ::2], best[:, 1::2]), 1) if self.net_kernels == 'fused' else best[:, (0, 2, 4, 1, 3, 5)]
         mine, theirs = best[:, :3].amax(1, keepdim=True), best[:, 3:].amax(1, keepdim=True)
         empty = mask*(1-own-opp)
         threats = torch.cat((mine > 3.5, theirs > 3.5, mine > 4.5, theirs > 4.5), 1).to(own.dtype)*empty
@@ -161,6 +168,12 @@ class LineConv(nn.Module):
 
     def add_to(self, x):
         """x += self(x) in place without autograd, in batch chunks of at most LINE_CHUNK_CELLS crop cells."""
+        if (getattr(self, 'net_kernels', 'reference') == 'fused' and x.is_cuda
+                and x.dtype in (torch.float32, torch.bfloat16)
+                and (x.is_contiguous() or x.is_contiguous(memory_format=torch.channels_last))
+                and (not torch.is_autocast_enabled('cuda') or x.dtype == torch.get_autocast_dtype('cuda'))):
+            from hexnet_kernels import line_add
+            return x.copy_(line_add(x, self.weight))
         matrices = self.matrices(x.shape[-2], x.dtype)
         for part in x.split(max(1, LINE_CHUNK_CELLS//(x.shape[-2]*x.shape[-1]))):
             part += self.lines(part, matrices)
@@ -225,10 +238,20 @@ class MaskedNorm(nn.BatchNorm2d):
         super().reset_running_stats()
         self.cells_seen = 0.
 
-    def forward(self, x, mask, cells):
+    def forward(self, x, mask, cells, ceiling=None):
+        fused = (getattr(self, 'net_kernels', 'reference') == 'fused' and x.is_cuda
+                 and x.dtype in (torch.float32, torch.bfloat16) and self.weight.dtype == torch.float32)
         if not self.training:
-            return super().forward(x)
-        y, mean, var = _MaskedBatchNorm.apply(x, mask, self.weight, self.bias, cells, self.eps)
+            if fused and ceiling is not None and not torch.is_grad_enabled():
+                from hexnet_kernels import norm_eval
+                return norm_eval(self, x, mask)
+            y = super().forward(x)
+            return y if ceiling is None else act(y, ceiling)
+        if fused:
+            from hexnet_kernels import MaskedBatchNorm
+            y, mean, var = MaskedBatchNorm.apply(x, mask, self.weight, self.bias, cells, self.eps, ceiling is not None)
+        else:
+            y, mean, var = _MaskedBatchNorm.apply(x, mask, self.weight, self.bias, cells, self.eps)
         with torch.no_grad():
             self.num_batches_tracked += 1
             if self.momentum is None:
@@ -241,7 +264,7 @@ class MaskedNorm(nn.BatchNorm2d):
             else:
                 self.running_mean.lerp_(mean, self.momentum)
                 self.running_var.lerp_(var*cells/(cells-1).clamp_min(1), self.momentum)
-        return y
+        return y if ceiling is None or fused else act(y, ceiling)
 
 
 def act(x, ceiling):
@@ -265,14 +288,14 @@ class Block(nn.Module):
 
     def forward(self, x, mask, ceiling, count, cells):
         """x may hold junk on padding cells; every convolution input is zero there."""
-        y = self.conv1(act(self.norm1(x, mask, cells), ceiling))
+        y = self.conv1(self.norm1(x, mask, cells, ceiling))
         if self.pool is not None:
             y = y+self.pool(pool(act(y, ceiling), count))[:, :, None, None]
         if self.line is not None:
             y = y*mask
             # Recomputing the line matmuls in backward keeps training memory near the plain ResNet's.
             y = y+checkpoint(self.line, y, use_reentrant=False) if torch.is_grad_enabled() else self.line.add_to(y)
-        return x+self.conv2(act(self.norm2(y, mask, cells), ceiling))
+        return x+self.conv2(self.norm2(y, mask, cells, ceiling))
 
 
 AUX_PREFIXES = ('aux_spatial.', 'short_value.')
@@ -290,7 +313,7 @@ class HexNet(nn.Module):
     With future_target='masked', also future_masked [B,3,S,S] logits for empty/own/opponent at 20 placements.
     Aux heads share the policy's 1x1 hidden layer and the value's hidden layer.
     """
-    def __init__(self, config=None, future_target='legacy'):
+    def __init__(self, config=None, future_target='legacy', net_kernels='reference'):
         super().__init__()
         if future_target not in ('legacy', 'masked'):
             raise ValueError(f'Unknown future target: {future_target!r}')
@@ -310,12 +333,25 @@ class HexNet(nn.Module):
             self.short_value = nn.Linear(c.value_hidden, 1)
             if future_target == 'masked':
                 self.future_masked = nn.Conv2d(c.head_channels, 3, 1)  # empty, own, opponent at 20 placements
+        self.set_kernels(net_kernels)
+
+    def set_kernels(self, mode):
+        """Select execution only; parameter names, config, digest and checkpoints stay the same."""
+        if mode not in ('reference', 'fused'):
+            raise ValueError(f'Unknown net kernels: {mode!r}')
+        self.net_kernels = mode
+        for module in self.modules():
+            if isinstance(module, (LineFeatures, LineConv, MaskedNorm)):
+                module.net_kernels = mode
+        return self
 
     def forward(self, planes, mask, aux=True):
         count = mask.sum((2, 3), dtype=torch.float32)    # a bf16 sum rounds counts above 256
         cells = count.sum()
         x = self.stem(torch.cat((planes, self.lines(planes[:, :1], planes[:, 1:2], mask)), 1)*mask)
-        if torch.is_grad_enabled() or not x.is_contiguous():
+        if self.net_kernels == 'fused':
+            mask = mask.to(x.dtype)
+        elif torch.is_grad_enabled() or not x.is_contiguous():
             # Full-size masks in x's memory format keep the elementwise passes vectorized.
             mask = torch.empty_like(x).copy_(mask.expand_as(x))
         else:
@@ -324,7 +360,7 @@ class HexNet(nn.Module):
         ceiling = torch.where(mask > 0, math.inf, 0).to(x.dtype)
         for block in self.blocks:
             x = block(x, mask, ceiling, count, cells)
-        x = act(self.norm(x, mask, cells), ceiling)
+        x = self.norm(x, mask, cells, ceiling)
         pooled = pool(x, count)
         hidden, value = F.relu(self.policy_hidden(x)), F.relu(self.value_hidden(pooled))
         out = dict(policy=self.policy(hidden).flatten(1).float(), far=self.far(pooled)[:, 0].float(),
@@ -447,13 +483,13 @@ def save_model(path, model):
             time.sleep(.05*(attempt+1))
 
 
-def load_model(path, device='cpu', future_target=None):
+def load_model(path, device='cpu', future_target=None, net_kernels='reference'):
     """Load the saved mode by default; an explicit mode switch keeps shared/legacy weights and adds a fresh head."""
     data = torch.load(path, map_location=device, weights_only=True)
     if data.get('schema') != SCHEMA:
         raise ValueError(f'{path} is not a {SCHEMA} checkpoint')
     saved_target = data.get('future_target', 'legacy')
-    model = HexNet(HexNetConfig(**data['config']), future_target or saved_target)
+    model = HexNet(HexNetConfig(**data['config']), future_target or saved_target, net_kernels)
     state = data['state']
     if saved_target == 'masked' and model.future_target == 'legacy':
         state = {k: v for k, v in state.items() if not k.startswith('future_masked.')}
@@ -498,7 +534,7 @@ class DenseEvaluator:
         self.model_version = model_version or model_digest(model)
         self.device = torch.device(device)
         self.cuda = self.device.type == 'cuda'
-        self.memory_format = memory_format(model.config)
+        self.memory_format = torch.channels_last if self.cuda and model.net_kernels == 'fused' else memory_format(model.config)
         self.model = model.to(self.device, memory_format=self.memory_format).eval()
         self.max_batch = max_batch
         self.staging = {}

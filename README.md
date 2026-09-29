@@ -873,6 +873,11 @@ their gap, under separate names such as `newest_future_masked_ce` and
 
 ## Dense actor batches
 
+Both the learner and actors accept `--net-kernels fused` for optional Triton GPU kernels. The default is
+`reference`; checkpoints load in either mode. See [GPU kernels](GPU_KERNELS.md) for installation, the paired
+benchmarks, profiling commands, and the batch-256 training validation that remains blocked by the shared-card
+memory cap.
+
 `dense_selfplay.py` accepts `--games-in-flight` and `--leaf-batch` per worker, alongside `--games` per process. The
 actor heartbeat and metrics log report `mean_batch` and `full_batch_fraction`, the share of model submissions with
 exactly `leaf_batch` distinct positions. More games can supply more leaves to each call; increasing `leaf_batch`
