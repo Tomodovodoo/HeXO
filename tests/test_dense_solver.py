@@ -340,10 +340,10 @@ class Adjudication(unittest.TestCase):
         cls.opening = [tuple(m) for m in FIXTURE['positions'][PROOF]]
         cls.proof = engine.history(cls.opening, nodes=NODES)
 
-    def play(self, **changes):
+    def play(self, plies=40, **changes):
         model = tiny_model()
         s = settings(full_fraction=1., solver_root_nodes=NODES, adjudicate_proven=True, **changes)
-        game = from_position(dense_selfplay.SelfPlayGame([model, model], replace(s, max_plies=len(self.opening)+40), 5),
+        game = from_position(dense_selfplay.SelfPlayGame([model, model], replace(s, max_plies=len(self.opening)+plies), 5),
                              self.opening)
         run([game], schedule=Schedule.of(s))
         return game.episode()
@@ -361,6 +361,10 @@ class Adjudication(unittest.TestCase):
                                               [dict(r, game=0) for r in rows])
         self.assertEqual((manifest['counts']['proven_games'], manifest['counts']['line_rows']), (1, 0))
         self.assertEqual(manifest['counts']['adjudicated_plies'], episode['adjudicated']['line_plies'])
+
+    def test_a_proof_on_the_capped_ply_still_adjudicates(self):
+        episode, rows = self.play(plies=1)
+        self.assertEqual((episode['reason'], episode['winner'], len(rows)), ('proven', dense_solver.mover(self.opening), 1))
 
     def test_line_rows_play_the_certificate_to_six_without_search(self):
         episode, rows = self.play(proven_line_rows=True)

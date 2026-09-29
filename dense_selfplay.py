@@ -519,10 +519,12 @@ class SelfPlayGame:
         for tree in self.trees.values():
             tree.advance((q, r))
         self.moves.append([q, r])
-        if game.winner >= 0 or len(self.moves) >= self.settings.max_plies:
+        if game.winner >= 0:
             return False
         if self.settings.adjudicate_proven and result.get('proven'):
             self.adjudicate(player if result['proven'] > 0 else 1-player, result.get('proof'))
+            return False
+        if len(self.moves) >= self.settings.max_plies:
             return False
         self.plan()
         return True
