@@ -835,7 +835,8 @@ example, `--deblunder-weight 0.25`. Existing sidecars are not rewritten.
 `dense_selfplay.py` accepts `--games-in-flight` and `--leaf-batch` per worker, alongside `--games` per process. The
 actor heartbeat and metrics log report `mean_batch` and `full_batch_fraction`, the share of model submissions with
 exactly `leaf_batch` distinct positions. More games can supply more leaves to each call; increasing `leaf_batch`
-alone only raises the limit.
+alone only raises the limit. These are engine submission counts; the evaluator splits each submission into model
+forwards by crop size and `MAX_CELLS`.
 
 Each game owns a native CPU tree, with no fixed per-game GPU allocation. On this Windows host, 128 trees at a
 20-ply position used about 30 KiB of private memory each before search and 3.39 MiB each after a 64-simulation
