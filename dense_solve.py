@@ -39,11 +39,12 @@ plies_to_proof, saving_turns?, observed?}: an 'attack' entry at each window's fi
 a 'defence' entry at each lookback ply d with regret (1 + v)/2 and the saving_turns found there, v the recorded
 root value of the side to move at that ply (no entry where it is null); plies_to_proof is first_ply minus the
 entry's ply. Restart games add no entries at or before their restart ply; instead their recorded root value at the
-restart ply is stored as the source entry's `observed` {checkpoint, value, shard} when the game was played by the
-shard's checkpoint and no observation from a newer shard is kept (shards are solved newest first). Entries with regret below min_regret are never kept; beyond buffer_size the lowest regrets go. Every
-refresh_minutes the buffer re-reads regret from `observed` where it was recorded by the newest complete checkpoint
-of the learner variant (checkpoint becomes it), and drops entries added more than buffer_max_exports exports of that
-variant ago or whose regret fell below min_regret. No net is evaluated.
+restart ply is stored in the source entry's `observed` {checkpoint: {value, shard}} when the game was played by the
+shard's checkpoint, one observation per checkpoint, the one from the newest shard. Entries with regret below
+min_regret are never kept; beyond buffer_size the lowest regrets go. Every refresh_minutes the buffer takes regret
+from the observation of the newest complete checkpoint of the learner variant where it has one (checkpoint becomes
+it), forgets the observations of other checkpoints, and drops entries added more than buffer_max_exports exports of
+that variant ago or whose regret fell below min_regret. No net is evaluated.
 
 solver-status.json: pass counters (positions: turn starts scanned; gated: those passing the gate; hits: forward
 proofs; windows, persistent, transient, window_plies histogram of last_ply - first_ply + 1; per query kind
@@ -146,17 +147,20 @@ class RestartBuffer:
             self.entries = {self.key(e): e for e in kept}
 
     def observe(self, key, checkpoint, value, shard):
-        """Record a restart game's value at entry `key`, unless an observation from a newer shard is kept."""
-        seen = self.entries[key].get('observed') if key in self.entries else None
-        if key in self.entries and (seen is None or seen['shard'] <= shard):
-            self.entries[key]['observed'] = dict(checkpoint=checkpoint, value=value, shard=shard)
+        """Record a restart game's value at entry `key` for `checkpoint`, unless one from a newer shard is kept."""
+        if key in self.entries:
+            observed = self.entries[key].setdefault('observed', {})
+            if checkpoint not in observed or observed[checkpoint]['shard'] <= shard:
+                observed[checkpoint] = dict(value=value, shard=shard)
 
     def refresh(self, created, newest):
         """Apply observations of checkpoint `newest` and drop entries by age (`created`: export times) and regret."""
         for key, e in list(self.entries.items()):
-            seen = e.get('observed')
-            if newest and seen and seen['checkpoint'] == newest:
-                e.update(regret=regret(e['kind'], seen['value']), checkpoint=newest)
+            seen = e.get('observed', {}).get(newest)
+            if seen:
+                e.update(regret=regret(e['kind'], seen['value']), checkpoint=newest, observed={newest: seen})
+            else:
+                e.pop('observed', None)
             if sum(t > e['added_at'] for t in created) > self.max_exports or e['regret'] < self.min_regret:
                 del self.entries[key]
 
