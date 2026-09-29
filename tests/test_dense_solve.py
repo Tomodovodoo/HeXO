@@ -189,7 +189,7 @@ class PassTests(unittest.TestCase):
         self.assertTrue(windows and all(w['first_ply'] >= 5 for w in windows))
         self.assertTrue(all(e['ply'] > 5 for e in solver.buffer.entries.values() if e['shard'] == '1000000000002'))
         self.assertEqual(solver.buffer.entries[('1000000000001', 0, 5, 'attack')]['observed'],
-                         dict(checkpoint='main/000010', value=.4))
+                         dict(checkpoint='main/000010', value=.4, shard='1000000000002'))
 
 
 class RestartBufferTests(unittest.TestCase):
@@ -215,9 +215,10 @@ class RestartBufferTests(unittest.TestCase):
             buffer = dense_solve.RestartBuffer(Path(tmp)/'restarts.json', 10, 2, .1)
             for ply in range(4):
                 buffer.add(self.entry(ply, -.5, added_at=10.*ply))
-            buffer.observe(('s', 0, 1, 'attack'), 'main/000030', .6)
-            buffer.observe(('s', 0, 2, 'attack'), 'main/000020', .9)
-            buffer.observe(('s', 0, 3, 'attack'), 'main/000030', -.9)
+            buffer.observe(('s', 0, 1, 'attack'), 'main/000030', .6, '0003')
+            buffer.observe(('s', 0, 1, 'attack'), 'main/000020', .9, '0002')
+            buffer.observe(('s', 0, 2, 'attack'), 'main/000020', .9, '0002')
+            buffer.observe(('s', 0, 3, 'attack'), 'main/000030', -.9, '0003')
             buffer.refresh([5., 15., 25.], 'main/000030')
             self.assertEqual({e['ply']: (round(e['regret'], 9), e['checkpoint']) for e in buffer.entries.values()},
                              {1: (.2, 'main/000030'), 2: (.75, 'main/000010'), 3: (.95, 'main/000030')})
@@ -225,7 +226,7 @@ class RestartBufferTests(unittest.TestCase):
             self.assertEqual(sorted(e['ply'] for e in buffer.entries.values()), [2, 3])
             buffer.refresh([5., 15., 25., 35., 45.], 'main/000030')
             self.assertEqual(sorted(e['ply'] for e in buffer.entries.values()), [3])
-            buffer.observe(('s', 0, 3, 'attack'), 'main/000040', .9)
+            buffer.observe(('s', 0, 3, 'attack'), 'main/000040', .9, '0004')
             buffer.refresh([5., 15., 25., 35., 45.], 'main/000040')
             self.assertEqual(buffer.entries, {})
 
