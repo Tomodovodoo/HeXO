@@ -5,26 +5,85 @@
 <style>
 :root{font-family:system-ui,sans-serif;color:#222d35;background:#edf1f3;font-synthesis:none}*{box-sizing:border-box}body{margin:0}header{height:76px;padding:0 28px;display:flex;align-items:center;gap:24px;border-bottom:1px solid #c6d0d6;background:#fff}h1{font-size:25px;letter-spacing:-1px;margin:0}header p{color:#556671;font-size:14px}main{display:grid;grid-template-columns:1fr 290px;height:calc(100dvh - 76px)}#board{width:100%;height:100%;touch-action:none;cursor:crosshair}aside{background:#fff;padding:28px 24px;border-left:1px solid #c6d0d6;overflow:auto}h2{font-size:20px;line-height:1.3;margin:0 0 8px}p{font-size:14px;line-height:1.6;color:#556671}label{display:block;margin:22px 0 8px;font-size:13px;font-weight:650}select,button,input{font:inherit;padding:10px;border:1px solid #a5b4bd;border-radius:4px;background:#fff;color:#24333d}select,button{width:100%}button{cursor:pointer;margin-top:10px}button.primary{background:#175e83;border-color:#175e83;color:white}button:disabled{opacity:.5;cursor:wait}:focus-visible{outline:3px solid #dc8a14;outline-offset:2px}.coordinate{display:flex;gap:7px}.coordinate input{min-width:0;width:50%}#stats{font-size:12px;font-variant-numeric:tabular-nums;line-height:1.8;color:#556671;border-top:1px solid #d7dfe4;margin-top:24px;padding-top:16px}#error{color:#ad2e19;min-height:20px}.legend{display:flex;gap:16px;margin:20px 0;font-size:13px}.stone{width:12px;height:12px;display:inline-block;border-radius:50%;margin-right:5px}.blue{background:#226b95}.red{background:#c35539}@media(max-width:700px){header{height:60px;padding:0 18px}header p{font-size:12px}main{height:auto;grid-template-columns:1fr}#board{height:60dvh}aside{border-top:1px solid #c6d0d6;border-left:0;padding:20px}aside .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
 </style>
-<header><h1>HeXO</h1><p>Six in a line. Room to explore.</p></header>
+<header><h1>HeXO</h1><p>Six in a line on an infinite hex grid.</p></header>
 <main><canvas id="board" tabindex="0" aria-label="Hexagonal game board. Use the coordinate inputs to place stones with the keyboard."></canvas>
 <aside><h2 id="status">Loading board...</h2><p id="phase"></p><p id="opponent"></p>
 <div class="legend"><span><i class="stone blue"></i>Player 1</span><span><i class="stone red"></i>Player 2</span></div>
 <label for="mode">Play as</label><select id="mode"><option value="0">Player 1</option><option value="1">Player 2</option><option value="both">Both players</option></select>
+<div id="dense-controls" hidden>
+<label for="checkpoint">Model</label><select id="checkpoint"></select>
+<label><input type="checkbox" id="search-enabled" checked> Search</label>
+<label for="simulations">Simulations per stone</label><select id="simulations"><option>32</option><option>64</option><option selected>128</option><option>256</option><option>512</option><option>1024</option></select>
+<label><input type="checkbox" id="solver-enabled" checked> Solver</label>
+<label for="solver-nodes">Proof nodes per query</label><select id="solver-nodes"><option>135</option><option>2048</option><option>8192</option><option selected>32768</option><option>131072</option><option>524288</option></select>
+<button id="analyze">Suggest moves and check threats</button><p id="hint"></p><button id="clear-hint" hidden>Clear hints</button>
+</div>
+<div id="time-controls">
 <label for="budget">Search budget per turn</label><select id="budget"><option value="100">0.1 seconds</option><option value="1000" selected>1 second</option><option value="5000">5 seconds</option><option value="10000">10 seconds</option></select><p id="budget-note" hidden>Neural inference can finish after this budget. Actual time is shown after each turn.</p>
+</div>
 <div class="actions"><button class="primary" id="bot">Engine plays this turn</button><button id="new">New game</button><button id="undo">Undo stone</button><button id="center">Center view</button></div>
 <label for="q">Place by coordinate</label><div class="coordinate"><input id="q" type="number" value="0" aria-label="Axial q coordinate"><input id="r" type="number" value="0" aria-label="Axial r coordinate"></div><button id="place">Place stone</button>
 <p id="error" role="alert"></p><p>Click a cell to place. Drag to pan; scroll to zoom. Place two stones each turn after the opening. Each stone must be within eight steps of an occupied cell.</p><div id="stats">Ready for the opening.</div></aside></main>
 <script>
 const $=id=>document.getElementById(id),canvas=$('board'),ctx=canvas.getContext('2d');
-let state={cells:[],player:0,remaining:1,winner:-1},busy=false,size=24,pan={x:0,y:0},hover=null,drag=null;
+let state={cells:[],player:0,remaining:1,winner:-1},busy=false,size=24,pan={x:0,y:0},hover=null,drag=null,hints=null;
 const key=(q,r)=>`${q},${r}`,color=['#226b95','#c35539'];
 function screen(q,r){return [canvas.clientWidth/2+pan.x+size*Math.sqrt(3)*(q+r/2),canvas.clientHeight/2+pan.y+size*1.5*r]}
 function axial(x,y){x-=canvas.clientWidth/2+pan.x;y-=canvas.clientHeight/2+pan.y;let q=(Math.sqrt(3)/3*x-y/3)/size,r=2*y/3/size,s=-q-r,a=Math.round(q),b=Math.round(r),c=Math.round(s);let da=Math.abs(a-q),db=Math.abs(b-r),dc=Math.abs(c-s);if(da>db&&da>dc)a=-b-c;else if(db>dc)b=-a-c;return [a,b]}
 function legal(q,r){if(state.winner>=0||state.cells.some(c=>c[0]===q&&c[1]===r))return false;if(!state.cells.length)return q===0&&r===0;return state.cells.some(c=>Math.max(Math.abs(q-c[0]),Math.abs(r-c[1]),Math.abs(q+r-c[0]-c[1]))<=8)}
 function hex(q,r,fill,stroke){let [x,y]=screen(q,r);ctx.beginPath();for(let k=0;k<6;k++){let a=(60*k-30)*Math.PI/180;let px=x+(size-1.5)*Math.cos(a),py=y+(size-1.5)*Math.sin(a);k?ctx.lineTo(px,py):ctx.moveTo(px,py)}ctx.closePath();ctx.fillStyle=fill;ctx.fill();ctx.strokeStyle=stroke;ctx.stroke()}
-function draw(){const ratio=devicePixelRatio||1;canvas.width=Math.round(canvas.clientWidth*ratio);canvas.height=Math.round(canvas.clientHeight*ratio);ctx.scale(ratio,ratio);const w=canvas.clientWidth,h=canvas.clientHeight;let corners=[[0,0],[w,0],[0,h],[w,h]].map(([x,y])=>axial(x,y)),qs=corners.map(c=>c[0]),rs=corners.map(c=>c[1]);const occupied=new Map(state.cells.map(c=>[key(c[0],c[1]),c[2]]));for(let q=Math.min(...qs)-2;q<=Math.max(...qs)+2;q++)for(let r=Math.min(...rs)-2;r<=Math.max(...rs)+2;r++){let [x,y]=screen(q,r);if(x < -size||x>w+size||y < -size||y>h+size)continue;let p=occupied.get(key(q,r));hex(q,r,p===undefined?'#f7f9fa':color[p],p===undefined?'#dbe3e8':color[p]);}if(hover&&legal(...hover))hex(...hover,state.player===0?'#b1d4e7':'#ecc5b9',color[state.player]);if(state.cells.length){let c=state.cells.at(-1),[x,y]=screen(c[0],c[1]);ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(x,y,3,0,Math.PI*2);ctx.fill()}else{let [x,y]=screen(0,0);ctx.fillStyle='#637987';ctx.textAlign='center';ctx.font='13px system-ui';ctx.fillText('0',x,y+4)}}
-function render(){$('opponent').textContent=state.opponent||'';$('budget-note').hidden=!state.model_sha256;const won=state.winner>=0;$('status').textContent=won?`Player ${state.winner+1} wins`:busy?'Engine is thinking...':`Player ${state.player+1} to play`;$('phase').textContent=won?'Six connected. Start another game.':`${state.remaining} ${state.remaining===1?'stone':'stones'} remaining this turn`;document.querySelectorAll('button,select').forEach(el=>el.disabled=busy);draw()}
-async function call(path,args={}){busy=true;render();$('error').textContent='';try{const res=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(args)});const data=await res.json();if(!res.ok)throw Error(data.error);state=data;if(data.analysis){const a=data.analysis;const detail=a.backend?`${a.backend}${a.proof_status==='PROVEN_WIN'?' · verified winning strategy':''}`:`Depth ${a.depth} · ${a.nodes.toLocaleString()} nodes`;$('stats').textContent=`${detail} · ${Math.round(a.elapsed_ms)} ms`}return true}catch(e){$('error').textContent=e.message;return false}finally{busy=false;render()}}
+function draw(){const ratio=devicePixelRatio||1;canvas.width=Math.round(canvas.clientWidth*ratio);canvas.height=Math.round(canvas.clientHeight*ratio);ctx.scale(ratio,ratio);const w=canvas.clientWidth,h=canvas.clientHeight;let corners=[[0,0],[w,0],[0,h],[w,h]].map(([x,y])=>axial(x,y)),qs=corners.map(c=>c[0]),rs=corners.map(c=>c[1]);const occupied=new Map(state.cells.map(c=>[key(c[0],c[1]),c[2]]));for(let q=Math.min(...qs)-2;q<=Math.max(...qs)+2;q++)for(let r=Math.min(...rs)-2;r<=Math.max(...rs)+2;r++){let [x,y]=screen(q,r);if(x < -size||x>w+size||y < -size||y>h+size)continue;let p=occupied.get(key(q,r));hex(q,r,p===undefined?'#f7f9fa':color[p],p===undefined?'#dbe3e8':color[p]);}if(hover&&legal(...hover))hex(...hover,state.player===0?'#b1d4e7':'#ecc5b9',color[state.player]);if(state.cells.length){let c=state.cells.at(-1),[x,y]=screen(c[0],c[1]);ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(x,y,3,0,Math.PI*2);ctx.fill()}else{let [x,y]=screen(0,0);ctx.fillStyle='#637987';ctx.textAlign='center';ctx.font='13px system-ui';ctx.fillText('0',x,y+4)}drawHints()}
+function render(){
+  $('opponent').textContent=state.opponent||'';
+  $('budget-note').hidden=!state.model_sha256;
+  const dense=Boolean(state.dense_settings),won=state.winner>=0;
+  $('dense-controls').hidden=!dense;$('time-controls').hidden=dense;
+  if(dense&&!busy){
+    $('checkpoint').replaceChildren(...state.models.map(m=>Object.assign(document.createElement('option'),{value:m.id,textContent:m.label})));
+    $('checkpoint').value=state.dense_checkpoint;
+    $('search-enabled').checked=state.dense_settings.search;
+    $('solver-enabled').checked=state.dense_settings.solver;
+    $('simulations').value=String(state.dense_settings.simulations);
+    $('solver-nodes').value=String(state.dense_settings.solver_nodes);
+  }
+  $('status').textContent=won?`Player ${state.winner+1} wins`:busy?'Engine is thinking...':`Player ${state.player+1} to play`;
+  $('phase').textContent=won?'Six connected. Start another game.':`${state.remaining} ${state.remaining===1?'stone':'stones'} remaining this turn`;
+  document.querySelectorAll('button,select,input').forEach(el=>el.disabled=busy);
+  draw();
+}
+async function call(path,args={}){
+  busy=true;render();$('error').textContent='';
+  try{
+    const res=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(args)});
+    const data=await res.json();if(!res.ok)throw Error(data.error);state=data;
+    if(path!=='/analyze')clearHints();
+    if(data.analysis){
+      const a=data.analysis;
+      const detail=a.backend?`${a.backend}${a.proof_status==='PROVEN_WIN'?' · verified winning strategy':''}`:`Depth ${a.depth} · ${a.nodes.toLocaleString()} nodes`;
+      $('stats').textContent=`${detail} · ${Math.round(a.elapsed_ms)} ms`;
+      if(path==='/analyze'){
+        hints=a;
+        $('hint').textContent=a.winning_line.length?'Verified winning line shown. Defender moves show one covered reply.':`Suggested turn: ${a.moves.map(p=>p.join(',')).join(' then ')}. Player ${a.player+1} win estimate ${Math.round(a.win_probability*100)}%.`;
+        if(a.threat)$('hint').textContent+=' Opponent threat to answer: '+a.threat.moves.map(p=>p.join(',')).join(' and ')+'.';
+        $('clear-hint').hidden=false;
+      }
+    }
+    return true;
+  }catch(e){$('error').textContent=e.message;return false}
+  finally{busy=false;render()}
+}
+function clearHints(){hints=null;$('hint').textContent='';$('clear-hint').hidden=true}
+function drawHints(){
+  if(!hints)return;
+  const line=hints.winning_line.length?hints.winning_line:hints.moves.map(p=>[...p,hints.player]);
+  line.forEach((p,i)=>{
+    const [x,y]=screen(p[0],p[1]);ctx.beginPath();ctx.arc(x,y,size*.65,0,Math.PI*2);
+    ctx.fillStyle=p[2]===0?'#226b952a':'#c355392a';ctx.fill();ctx.lineWidth=2;ctx.strokeStyle=color[p[2]];ctx.stroke();
+    ctx.fillStyle='#142b3a';ctx.textAlign='center';ctx.font='bold 13px system-ui';ctx.fillText(String(i+1),x,y+4);
+  });
+  for(const p of hints.threat?.moves||[]){const [x,y]=screen(...p);ctx.beginPath();ctx.arc(x,y,size*.83,0,Math.PI*2);ctx.strokeStyle='#b06d0a';ctx.stroke()}
+  ctx.lineWidth=1;
+}
 async function reply(){if(!busy&&state.winner<0&&$('mode').value!=='both'&&state.player!==Number($('mode').value))await call('/bot',{ms:Number($('budget').value)})}
 async function place(q,r){if(busy)return;if($('mode').value!=='both'&&state.player!==Number($('mode').value))return;if(!legal(q,r)){ $('error').textContent='That cell is occupied or too far away.';return}if(await call('/play',{q,r}))await reply()}
 canvas.onpointerdown=e=>{drag={x:e.clientX,y:e.clientY,px:pan.x,py:pan.y,moved:false};canvas.setPointerCapture(e.pointerId)};
@@ -32,5 +91,8 @@ canvas.onpointermove=e=>{const rect=canvas.getBoundingClientRect();hover=axial(e
 canvas.onpointerup=async e=>{if(!drag)return;let moved=drag.moved;drag=null;if(!moved){const rect=canvas.getBoundingClientRect();await place(...axial(e.clientX-rect.left,e.clientY-rect.top))}};
 canvas.onpointercancel=()=>{drag=null};canvas.onwheel=e=>{e.preventDefault();size=Math.max(8,Math.min(65,size*(e.deltaY>0?.9:1.1)));draw()};
 $('place').onclick=()=>place(Number($('q').value),Number($('r').value));$('bot').onclick=()=>call('/bot',{ms:Number($('budget').value)});$('new').onclick=async()=>{if(!await call('/new'))return;pan={x:0,y:0};$('stats').textContent='Ready for the opening.';await reply();draw()};$('undo').onclick=()=>call('/undo');$('center').onclick=()=>{pan={x:0,y:0};draw()};$('mode').onchange=reply;new ResizeObserver(draw).observe(canvas);
+$('checkpoint').onchange=()=>call('/settings',{checkpoint:$('checkpoint').value});
+for(const id of ['search-enabled','solver-enabled','simulations','solver-nodes'])$(id).onchange=()=>call('/settings',{search:$('search-enabled').checked,solver:$('solver-enabled').checked,simulations:Number($('simulations').value),solver_nodes:Number($('solver-nodes').value)});
+$('analyze').onclick=()=>call('/analyze');$('clear-hint').onclick=()=>{clearHints();render()};
 fetch('/state').then(r=>r.json()).then(s=>{state=s;$('budget').value=String(s.default_budget_ms||1000);render()}).catch(e=>{$('error').textContent=e.message});
 </script></html>
