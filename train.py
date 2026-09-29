@@ -185,6 +185,15 @@ def play_game(task):
     return record, samples
 
 
+def digest(path):
+    """Hex sha256 of the file at `path`."""
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024*1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def write_json(path, data):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(data, indent=2, allow_nan=False), encoding="utf-8")

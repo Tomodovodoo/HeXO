@@ -19,17 +19,9 @@ from torch import nn
 
 from hexo import Game, ROOT, library
 from nnue_model import NNUE, SCORE_SCALE
-from train import write_json
+from train import digest, write_json
 
 SCHEMA = "hexo-klent-scalar-v1"
-
-
-def digest(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024*1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 class Model(nn.Module):

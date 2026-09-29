@@ -23,10 +23,13 @@ bootstrap_weight and short_value_horizon are learner settings; outcome_weight we
 BCE against the hard outcome of finished games (head outcome_bce, always logged), KataGo-style. The value target
 calibration map (Learner.calibrate) is fitted at startup and refitted at every export, recorded in the manifest as
 metrics.calibration (calibration_report) and handed to the render workers; value_target 'calibrated' trains on the
-newest map (hard outcomes while none is fitted). Batches are rendered by
-dense_data.Renderers worker processes (--workers) with random hex symmetries. The loss of one optimizer step is, per head, the weighted mean
-over every row of the batch that has that target, summed with the head coefficients; each crop bucket is
-a separate forward pass whose gradients accumulate (buckets padded to QUANTUM rows with inert rows).
+newest map (hard outcomes while none is fitted). Batches are rendered by dense_data.Renderers worker processes
+(--workers) with random hex symmetries; the window of this process and its workers share one policy file directory
+(dense_data.ReplayWindow). On CUDA this process runs torch on --threads CPU threads. learner-status.json reports
+data_wait_fraction, the share of the recent step time spent waiting for a rendered batch (wait_fraction). The loss
+of one optimizer step is, per head, the weighted mean over every row of the batch that has that target, summed with
+the head coefficients; each crop bucket is a separate forward pass whose gradients accumulate (buckets padded to
+QUANTUM rows with inert rows).
 Pacing: at most samples_per_row * (trained rows in all shards, cheap rows included; a historical opponent's
 plies are not trained, see dense_data.trained) samples are presented; beyond that the learner waits. The window
 is sized in full-search rows (dense_data.ReplayWindow). With phase_rows > 0 the learner alternates phases (Phase):
@@ -221,6 +224,13 @@ def status_path(run, variant):
     return run/('learner-status.json' if variant == 'main' else f'learner-status-{variant}.json')
 
 
+def wait_fraction(rate):
+    """Share of step time spent waiting for a batch over `rate` entries (finished, samples, wait, train seconds);
+    0. without entries."""
+    total = sum(r[2]+r[3] for r in rate)
+    return sum(r[2] for r in rate)/total if total > 0 else 0.
+
+
 def backlog(samples_seen, total_rows, samples_per_row):
     """Untrained backlog in rows: the part of the pacing budget samples_per_row * total_rows not yet presented,
     divided by samples_per_row, i.e. total_rows - samples_seen / samples_per_row: the rows still below the target if
@@ -360,7 +370,7 @@ class Learner:
         manifest = json.loads((saved[-1]/'manifest.json').read_text(encoding='utf-8')) if saved else None
         if saved:
             # Settings saved by the last export (including replacement perturbations) under explicit CLI overrides.
-            self.settings = replace(dense_config.LearnerSettings(**manifest['learner']), **self.overrides)
+            self.settings = replace(dense_config.section('learner', manifest['learner']), **self.overrides)
         self.cap_vram()
         self.model = self.place(hexnet.HexNet(hexnet.HexNetConfig(**asdict(config.model))))
         self.step = self.samples_seen = self.optimizer_started = self.ema_updates = 0
@@ -662,7 +672,7 @@ class Learner:
         copied = json.loads((path/'manifest.json').read_text(encoding='utf-8'))['learner']
         self.load_weights(path/'model.pt')
         self.ema = copy.deepcopy(self.model)
-        base = replace(dense_config.LearnerSettings(**copied), **{k: getattr(s, k) for k in KEEP})
+        base = replace(dense_config.section('learner', copied), **{k: getattr(s, k) for k in KEEP})
         old, self.settings = s, perturb(base, factor_rng, s.perturb)
         self.optimizer = make_optimizer(self.model, self.settings)
         self.optimizer_started = self.last_copy = self.step
@@ -682,6 +692,7 @@ def main():
     parser.add_argument('--initial', type=Path, help='hexnet checkpoint to warm start from (ignored when resuming)')
     parser.add_argument('--steps', type=int, help='stop once the step count reaches this (default: endless)')
     parser.add_argument('--workers', type=int, default=2, help='render worker processes')
+    parser.add_argument('--threads', type=int, default=1, help='torch CPU threads of this process when training on CUDA')
     dense_config.add_arguments(parser, dense_config.LearnerSettings)
     args = parser.parse_args()
     config = dense_config.load(args.run)
@@ -689,6 +700,8 @@ def main():
     overrides = {k: v for k, v in asdict(settings).items() if getattr(args, k, None) is not None}
     torch.manual_seed(config.seed)
     learner = Learner(args.run, settings, config, args.initial, overrides)
+    if learner.device.type == 'cuda':
+        torch.set_num_threads(args.threads)
     s = learner.settings
     status = dict(stage='training', variant=s.variant, error=None, samples_per_second=0.)
 
@@ -699,7 +712,7 @@ def main():
                       samples_per_row=learner.samples_seen/max(1, window.total_rows),
                       samples_per_row_target=learner.settings.samples_per_row, phase_rows=learner.settings.phase_rows,
                       backlog_rows=backlog(learner.samples_seen, window.total_rows, learner.settings.samples_per_row),
-                      lr=learner.lr(),
+                      lr=learner.lr(), data_wait_fraction=wait_fraction(rate),
                       last_export_step=learner.last_export, policy_ce=(learner.metrics or {}).get('policy_ce'),
                       value_bce=(learner.metrics or {}).get('value_bce'), vram=learner.vram())
         write_json(status_path(args.run, s.variant), status)
@@ -723,7 +736,7 @@ def main():
         def replay():
             s = learner.settings
             return dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
-                                           s.window_taper, s.validation_fraction, s.policy_cache_mb)
+                                           s.window_taper, s.validation_fraction)
         window = replay()
         sets = validation_sets(args.run, s, config.seed)
         learner.calibrate(window)

@@ -157,7 +157,6 @@ class LearnerSettings:
     window_expand_per_row: float = .4
     window_taper: float = .65
     window_capacity: int = 2000000
-    policy_cache_mb: float = 512.  # per-process LRU budget for the window's policy vectors (dense_data.ReplayWindow)
     recency: float = 0.
     bootstrap_weight: float = 1.  # weight of TD(lambda) value rows from capped games; 0 = mask
     bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only
@@ -272,7 +271,8 @@ class RunConfig:
 
 
 SECTIONS = dict(model=ModelSettings, actor=ActorSettings, learner=LearnerSettings, evaluation=EvaluationSettings)
-RETIRED = dict(evaluation=('round_games', 'model_cache', 'uncertainty_parity'))  # settings of earlier versions, ignored when a config is read
+# Settings of earlier versions, ignored when a config or a checkpoint manifest is read.
+RETIRED = dict(evaluation=('round_games', 'model_cache', 'uncertainty_parity'), learner=('policy_cache_mb',))
 
 
 def append_line(path, record):
@@ -296,8 +296,13 @@ def append_metrics(run, name, **fields):
 def from_dict(data):
     if data.get('schema') != SCHEMA:
         raise ValueError(f'Expected a {SCHEMA} configuration')
-    parts = {name: cls(**{k: v for k, v in data[name].items() if k not in RETIRED.get(name, ())}) for name, cls in SECTIONS.items()}
+    parts = {name: section(name, data[name]) for name in SECTIONS}
     return RunConfig(**{k: v for k, v in data.items() if k not in SECTIONS}, **parts)
+
+
+def section(name, values):
+    """The SECTIONS[name] settings of dict `values`, without its RETIRED keys."""
+    return SECTIONS[name](**{k: v for k, v in values.items() if k not in RETIRED.get(name, ())})
 
 
 def load(run):

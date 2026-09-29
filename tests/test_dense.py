@@ -7,6 +7,7 @@ from dataclasses import asdict, replace
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -91,6 +92,21 @@ POSITIONS = [h for h in fixed_positions() if active(h)]
 
 
 class HexcropTests(unittest.TestCase):
+    def test_position_encodes_like_a_replayed_game(self):
+        for history in fixed_positions():
+            game = Game(history)
+            if game.winner >= 0:
+                continue
+            moves = np.asarray(history, np.int64).reshape(-1, 2)
+            position = hexcrop.Position(moves)
+            self.assertEqual((position.player, position.remaining, position.winner), (game.player, game.remaining, -1))
+            for k in (0, 7):
+                a, b = hexcrop.encode_game(position, moves, symmetry=k), hexcrop.encode_game(game, moves, symmetry=k)
+                np.testing.assert_array_equal(a.planes, b.planes)
+                np.testing.assert_array_equal(a.actions, b.actions)
+            np.testing.assert_array_equal(hexcrop.native_legal(position), legal(history))
+            game.close()
+
     def test_legal_array_matches_engine_on_100_positions(self):
         self.assertGreaterEqual(len(POSITIONS), 95)
         sizes = set()
@@ -627,6 +643,10 @@ class DenseConfigTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_learner_speed_tile_explains_the_data_wait(self):
+        page = (ROOT/'web'/'training.html').read_text(encoding='utf-8')
+        self.assertIn("['Samples / second',n(l.samples_per_second,1),false,Number.isFinite(l.data_wait_fraction)?", page)
+
     def test_metrics_log_series(self):
         """Partial last lines are skipped until completed, resumed steps replace the rewound ones and
         downsampling keeps the first, last and extreme points."""
@@ -690,7 +710,9 @@ class DenseConfigTests(unittest.TestCase):
     def test_configs_with_retired_settings_load(self):
         data = asdict(dense_config.RunConfig(created_at=1.))
         data['evaluation'].update(round_games=8, model_cache=6, uncertainty_parity=1.5)
+        data['learner'].update(policy_cache_mb=512.)
         self.assertEqual(dense_config.from_dict(data), dense_config.RunConfig(created_at=1.))
+        self.assertEqual(dense_config.section('learner', data['learner']), dense_config.LearnerSettings())
         data['evaluation']['typo_games'] = 1
         with self.assertRaises(TypeError):
             dense_config.from_dict(data)
@@ -1065,6 +1087,83 @@ class DenseDataTests(unittest.TestCase):
             self.assertNotIn('000001', window.shards)
             self.assertEqual(window.index[-1], ('000004', 9))
 
+    def test_collate_is_collate_arrays_as_tensors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_games(Path(tmp)/'shards'/'000001', [(random_game(np.random.default_rng(3), 12)[0], -1, None), (winning_game(), 0, None)])
+            window = dense_data.ReplayWindow(tmp, capacity_rows=1000)
+            refs = [window.ref('000001', i) for i in range(len(window.index))]
+            rendered = dense_data.examples(window, refs, np.random.default_rng(0))
+            arrays, tensors = dense_data.collate_arrays(*rendered), dense_data.collate(*rendered)
+            self.assertEqual(list(arrays), list(tensors))
+            for size, b in arrays.items():
+                self.assertEqual(list(b), list(tensors[size]))
+                for k, v in b.items():
+                    self.assertIsInstance(v, np.ndarray)
+                    self.assertEqual(torch.from_numpy(v).dtype, tensors[size][k].dtype, k)
+                    np.testing.assert_array_equal(v, tensors[size][k].numpy())
+            self.assertEqual(arrays[min(arrays)]['value'].dtype, np.float32)
+            self.assertEqual(arrays[min(arrays)]['player'].dtype, np.int64)
+
+    def test_render_workers_draw_seeded_batches_without_torch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rng = np.random.default_rng(5)
+            write_games(Path(tmp)/'shards'/'000001', [(random_game(rng, 16)[0], -1, None), (winning_game(), 0, None),
+                                                      (random_game(rng, 20)[0], -1, None)])
+            settings = dense_config.LearnerSettings(batch=8, window_min_rows=10**6, validation_fraction=0.)
+            window = dense_data.ReplayWindow(tmp, settings.window_capacity, 10**6, policy_dir=Path(tmp)/'expected')
+            expected = []
+            for i in range(2):
+                batch = next(dense_data.batches(window, np.random.default_rng([4, i]), 8, lambda: settings))
+                expected.append({size: {k: v.tolist() for k, v in b.items()} for size, b in batch.items()})
+            stream = dense_data.Renderers(tmp, settings, [4], workers=2, depth=1)
+            try:
+                got = [next(stream) for _ in range(2)]
+            finally:
+                stream.close()
+            for batch in got:
+                self.assertEqual(sum(len(b['counts']) for b in batch.values()), 8)
+                self.assertIsInstance(batch[min(batch)]['planes'], torch.Tensor)
+                self.assertIn({size: {k: v.tolist() for k, v in b.items()} for size, b in batch.items()}, expected)
+            self.assertTrue(any((Path(tmp)/'cache'/'policies').glob('*.f32')))
+
+    def test_pipeline_benchmark_copies_newest_shards_and_times_stages(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('bench_dense_data', ROOT/'tools'/'bench_dense_data.py')
+        bench = importlib.util.module_from_spec(spec); spec.loader.exec_module(bench)
+        with tempfile.TemporaryDirectory() as tmp:
+            rng = np.random.default_rng(8)
+            for name in ('000001', '000002'):
+                write_games(Path(tmp)/'run'/'shards'/name, [(random_game(rng, 14)[0], -1, None), (winning_game(), 0, None)])
+            self.assertEqual(bench.copy_shards(Path(tmp)/'run', 1, Path(tmp)/'copy'), ['000002'])
+            self.assertEqual([p.name for p in dense_data.shard_dirs(Path(tmp)/'copy')], ['000002'])
+            settings = dense_config.LearnerSettings(batch=8, window_min_rows=10**6, validation_fraction=0.)
+            result = bench.in_process(Path(tmp)/'copy', settings, 2, Path(tmp)/'policies')
+            self.assertEqual(list(result), ['examples_per_second', 'sample_ms', 'examples_ms', 'collate_ms'])
+            self.assertTrue(all(v > 0 for v in result.values()))
+            result = bench.pooled(Path(tmp)/'copy', settings, 2, 1, Path(tmp)/'policies')
+            self.assertEqual(list(result), ['examples_per_second', 'wait_fraction', 'pad_ms', 'consumer_cores'])
+            self.assertGreater(result['examples_per_second'], 0)
+            self.assertTrue(0 <= result['wait_fraction'] <= 1)
+
+    def test_dense_data_imports_without_torch(self):
+        code = "import sys, dense_data; print('torch' in sys.modules)"
+        out = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out.strip(), 'False')
+
+    def test_start_hidden_keeps_the_parent_main_out_of_spawned_children(self):
+        script = ("import multiprocessing, sys\nimport torch\nimport dense_data\n"
+                  "if __name__ == '__main__':\n"
+                  "    probe = lambda: multiprocessing.get_context('spawn').Process(target=exec, args=(\n"
+                  "        \"import os, sys; os._exit(3 if 'torch' in sys.modules else 4)\",))\n"
+                  "    hidden, plain = probe(), probe()\n"
+                  "    dense_data.start_hidden([hidden]); plain.start(); hidden.join(); plain.join()\n"
+                  "    print(hidden.exitcode, plain.exitcode)\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp)/'main.py').write_text(script)
+            out = subprocess.run([sys.executable, str(Path(tmp)/'main.py')], cwd=ROOT, capture_output=True, text=True, check=True,
+                                 env={**os.environ, 'PYTHONPATH': str(ROOT)}).stdout
+        self.assertEqual(out.split(), ['4', '3'])
+
     def test_examples_and_collate(self):
         rng = np.random.default_rng(6)
         compact, _ = random_game(rng, 14)
@@ -1192,46 +1291,86 @@ class WindowMemoryTests(unittest.TestCase):
                     if j is not None:
                         self.assertEqual((following.row['game'], following.row['ply']), (r['game'], r['ply']+1))
 
-    def test_policy_cache_evicts_least_recently_used_shards(self):
+    def test_policies_come_from_mapped_files_shared_by_windows(self):
         with tempfile.TemporaryDirectory() as tmp:
             synthetic_run(tmp, 3, 6, 20)
-            names = [p.name for p in dense_data.shard_dirs(tmp)]
-            sizes = {n: sum(a.nbytes for a in dense_data.load_policies(Path(tmp)/'shards'/n, len(dense_data.read_shard(Path(tmp)/'shards'/n)[1])))
-                     for n in names}
-            budget = (sorted(sizes.values())[-1]+sorted(sizes.values())[-2]+1)/2**20
-            window = dense_data.ReplayWindow(tmp, 10**6, 10**6, policy_cache_mb=budget)
             _, _, data = reference_window(Path(tmp), 10**6, 10**6, 0.)
-            first = {n: window.ref(n, int(np.flatnonzero([len(r['policy']) for r in data[n][1]])[0])) for n in names}
-            for n in (names[0], names[1], names[0], names[2]):
-                np.testing.assert_array_equal(window.policy(first[n]), data[n][1][first[n].index]['policy'])
-            self.assertEqual(list(window.policies), [names[0], names[2]])
-            self.assertLessEqual(window.policy_bytes(), budget*2**20)
-            tiny = dense_data.ReplayWindow(tmp, 10**6, 10**6, policy_cache_mb=1e-6)
-            for n in names:
-                for i, r in enumerate(data[n][1]):
-                    np.testing.assert_array_equal(tiny.policy(tiny.ref(n, i)), r['policy'])
-                self.assertEqual(list(tiny.policies), [n])
+            window = dense_data.ReplayWindow(tmp, 10**6, 10**6)
+            for n, (_, rows) in data.items():
+                for i, r in enumerate(rows):
+                    policy = window.policy(window.ref(n, i))
+                    np.testing.assert_array_equal(policy, r['policy'])
+                    self.assertEqual(policy.dtype, np.float32)
+            files = sorted(p.name for p in (Path(tmp)/'cache'/'policies').iterdir())
+            self.assertEqual(files, sorted(f'{n}.f32' for n in data))
+            other = dense_data.ReplayWindow(tmp, 10**6, 10**6)
+            with unittest.mock.patch.object(dense_data, 'load_policies', side_effect=AssertionError('rewritten')):
+                for n, (_, rows) in data.items():
+                    for i, r in enumerate(rows):
+                        np.testing.assert_array_equal(other.policy(other.ref(n, i)), r['policy'])
 
-    def test_held_policies_do_not_pin_evicted_shards(self):
-        import gc
-        import weakref
+    def test_policy_file_published_by_another_process_is_used(self):
         with tempfile.TemporaryDirectory() as tmp:
-            synthetic_run(tmp, 5, 6, 20)
-            window = dense_data.ReplayWindow(tmp, 10**6, 10**6, policy_cache_mb=1e-6)
+            synthetic_run(tmp, 1, 6, 20)
             _, _, data = reference_window(Path(tmp), 10**6, 10**6, 0.)
-            held, arrays = [], []
-            for ref in window.sample(np.random.default_rng(1), 200):
-                policy = window.policy(ref)
-                arrays += [weakref.ref(a) for a in window.policies[ref.shard]]
-                np.testing.assert_array_equal(policy, data[ref.shard][1][ref.index]['policy'])
-                self.assertEqual(policy.dtype, np.float32)
-                held.append(policy)
-            self.assertGreater(len({r.shard for r in window.sample(np.random.default_rng(1), 200)}), 1)
-            gc.collect()
-            cached = {id(a) for entry in window.policies.values() for a in entry}
-            self.assertTrue(all(r() is None or id(r()) in cached for r in arrays))
-            # A view keeps its buffer's owner (the npz member's bytes, not the array) alive: policies must own theirs.
-            self.assertTrue(all(p.base is None for p in held))
+            (name, (_, rows)), = data.items()
+            window = dense_data.ReplayWindow(tmp, 10**6, 10**6, policy_dir=Path(tmp)/'elsewhere')
+            link = os.link
+
+            def published(staged, path):    # another process linked its copy first
+                link(shutil.copyfile(staged, Path(staged).with_suffix('.copy')), path)
+                raise FileExistsError(path)
+            with unittest.mock.patch.object(dense_data.os, 'link', side_effect=published):
+                ref = window.ref(name, next(i for i, r in enumerate(rows) if len(r['policy'])))
+                np.testing.assert_array_equal(window.policy(ref), rows[ref.index]['policy'])
+            (Path(tmp)/'elsewhere'/f'.{name}.{os.getpid()}.copy').unlink()
+            self.assertEqual([p.name for p in (Path(tmp)/'elsewhere').iterdir()], [f'{name}.f32'])
+
+    def test_policy_read_retries_a_file_another_process_is_deleting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 1, 6, 20)
+            _, _, data = reference_window(Path(tmp), 10**6, 10**6, 0.)
+            (name, (_, rows)), = data.items()
+            window = dense_data.ReplayWindow(tmp, 10**6, 10**6)
+            ref = window.ref(name, next(i for i, r in enumerate(rows) if len(r['policy'])))
+            window.policy(ref)
+            denied = iter(range(3))
+
+            def busy(*args, **kwargs):
+                if next(denied, None) is not None:
+                    raise PermissionError('delete pending')
+                return open(*args, **kwargs)
+            with unittest.mock.patch.object(dense_data, 'open', side_effect=busy, create=True),                     unittest.mock.patch.object(dense_data.time, 'sleep') as sleep:
+                np.testing.assert_array_equal(window.policy(ref), rows[ref.index]['policy'])
+            self.assertEqual(sleep.call_count, 3)
+            with unittest.mock.patch.object(dense_data, 'open', side_effect=PermissionError('held'), create=True),                     unittest.mock.patch.object(dense_data.time, 'sleep'), self.assertRaises(PermissionError):
+                window.policy(ref)
+
+    def test_policy_file_disagreeing_with_its_shard_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 1, 6, 20)
+            name = dense_data.shard_dirs(tmp)[0].name
+            (Path(tmp)/'cache'/'policies').mkdir(parents=True)
+            np.zeros(3, np.float32).tofile(Path(tmp)/'cache'/'policies'/f'{name}.f32')
+            window = dense_data.ReplayWindow(tmp, 10**6, 10**6)
+            full = int(np.flatnonzero(np.diff(window.shards[name].offsets) > 0)[0])
+            with self.assertRaisesRegex(ValueError, 'disagrees with its shard'):
+                window.policy(window.ref(name, full))
+
+    def test_refresh_deletes_policy_files_of_shards_outside_the_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 3, 6, 20)
+            directory = Path(tmp)/'cache'/'policies'
+            window = dense_data.ReplayWindow(tmp, 10**6, 10**6)
+            for ref in window.sample(np.random.default_rng(0), 200):
+                window.policy(ref)
+            names = sorted(window.shards)
+            self.assertEqual(sorted(p.stem for p in directory.glob('*.f32')), names)
+            np.zeros(1, np.float32).tofile(directory/'000000.f32')
+            capacity = dense_data.manifest(Path(tmp)/'shards'/names[-1])['counts']['policy_rows']//2
+            newest = dense_data.ReplayWindow(tmp, capacity, 1, policy_dir=directory)
+            self.assertEqual(list(newest.shards), [names[-1]])
+            self.assertEqual(sorted(p.stem for p in directory.glob('*.f32')), [names[-1]])
 
     def test_resident_bytes_per_row(self):
         import gc
@@ -2169,6 +2308,13 @@ class YieldTests(unittest.TestCase):
         for name in ('yield_below', 'yield_resume', 'yield_check_seconds'):
             del data['actor'][name]
         self.assertEqual(dense_config.from_dict(data).actor.yield_below, dense_config.ActorSettings.yield_below)
+
+
+class WaitFractionTests(unittest.TestCase):
+    def test_share_of_step_time_spent_waiting(self):
+        self.assertEqual(dense_learn.wait_fraction([]), 0.)
+        self.assertAlmostEqual(dense_learn.wait_fraction([(0., 256, .3, .6), (1., 256, .1, .2)]), .4/1.2)
+        self.assertEqual(dense_learn.wait_fraction([(0., 256, 0., 0.)]), 0.)
 
 
 class PhaseTests(unittest.TestCase):

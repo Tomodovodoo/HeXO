@@ -153,21 +153,6 @@ def opponent_block(weights, block, rng):
     return [ids[rng.choice(len(ids), p=w/w.sum())]]*block
 
 
-class Position:
-    """hexcrop.encode_game's view of a non-terminal native history [n, 2] without replaying it.
-    A Game is built only if legal_array needs the engine fallback (`ptr`)."""
-    winner = -1
-
-    def __init__(self, history):
-        n = len(history)
-        self.history, self.player, self.remaining = history, ((n+1)//2) % 2, 2 if n % 2 else 1
-
-    @property
-    def ptr(self):
-        self.game = Game(self.history.tolist())
-        return self.game.ptr
-
-
 class Evaluator(hexnet.DenseEvaluator):
     """DenseEvaluator over native int64 histories with a split submit/collect so the GPU runs one batch while
     the caller gathers the next. Predictions are fulfil-ready tuples (actions int64 [N, 2], logits float64 [N],
@@ -187,7 +172,7 @@ class Evaluator(hexnet.DenseEvaluator):
         samples, groups = [], {}
         for i, h in enumerate(histories):
             try:
-                samples.append(hexcrop.encode_game(Position(h), h, actions=None if legal is None else legal[i]))
+                samples.append(hexcrop.encode_game(hexcrop.Position(h), h, actions=None if legal is None else legal[i]))
             except hexcrop.SpanError:
                 samples.append(None)
                 continue
