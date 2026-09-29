@@ -940,7 +940,9 @@ class Evaluator:
     lane's pair, `direct`, plus its finished games whose colour partner still runs, with the SPRT fields for kinds
     'champion' and 'sprt'; refreshed with the status as games finish; null while idle), decision (the
     newest `verdict` of a checkpoint or variant decision, `public`, with candidate, opponent and, while pending,
-    next [[a, b], ...] lanes; null before any), pending ([`brief`] of every pending decision: the unrated
+    next [[a, b], ...] lanes; its direct score includes finished games awaiting their colour partner, while
+    p_better, delta, delta_sd and effective_pairs use complete pairs and the pooled fit refreshes at decision
+    checks; null before any), pending ([`brief`] of every pending decision: the unrated
     checkpoints against the champion, then the variants without a verdict against their checkpoints; refreshed
     every step and, for the one being decided, after every completed colour pair; it leaves once decided),
     placements_played and
@@ -1143,10 +1145,16 @@ class Evaluator:
             played = len(self.games(a, b))+len(halves) if a else 0
             done = self.direct(a, b)+oriented(halves, a, a) if a else []
             live = placed+pool.moves()
+            score = tally(done, self.test if kind in ('champion', 'sprt') else None)
+            decision = self.status['decision']
+            if decision and (decision['candidate'], decision['opponent']) == (a, b) and decision['direct']['games'] != score['games']:
+                direct = dict(decision['direct'], games=score['games'], wins=score['wins'], losses=score['losses'],
+                              capped=score['capped'], elo=score['elo_delta'], interval=score['elo_interval'])
+                decision = dict(decision, direct=direct)
             self.publish(True, stage=stage, comparison=dict(candidate=a, opponent=b, kind=kind) if a else None,
                          pool=[dict(candidate=x, opponent=y, kind=k, running=pool.running((x, y, k)), share=lanes.get((x, y, k), 0))
                                for x, y, k in shown], started_at=wall, games_played=played, games_planned=planned,
-                         tally=tally(done, self.test if kind in ('champion', 'sprt') else None), placements_played=live,
+                         tally=score, decision=decision, placements_played=live,
                          mean_placements=added[main][1]/added[main][0] if main in added else None,
                          placements_per_second=live/max(self.pacer.clock()-start, 1e-9),
                          solver=self.solver_status(pool, [name for lane in shown for name in lane[:2]]))
@@ -1651,8 +1659,7 @@ class Evaluator:
                 decided.append(decision)
             if decided or len(games) >= s.sprt_max_games or self.newer(cid):
                 return {}
-            if games:
-                self.publish(decision=dict(shown(), next=[[cid, champion]]))
+            self.publish(decision=dict(shown(), next=[[cid, champion]]))
             return {(cid, champion, 'champion'): even(min(s.pool_games, s.sprt_max_games-len(games)))}
         self.session(want, s.sprt_max_games)
         path = report_path(self.run, cid, champion)
