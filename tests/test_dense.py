@@ -1294,7 +1294,8 @@ class DenseBootstrapTests(unittest.TestCase):
             self.assertEqual((written['actor'], written['origin']), ('b'*64, 'converted'))
             self.assertEqual(dense_data.origin(dict(written, origin=None)), 'converted')    # inferred from the identity
             self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, opponent_rows=0, terminal_games=1, capped_games=1,
-                                                 proven_rows=0, restart_games=0, forced_plies=0))
+                                                 proven_rows=0, proven_games=0, line_rows=0, adjudicated_plies=0,
+                                                 restart_games=0, forced_plies=0))
             self.assertEqual(dense_bootstrap.check(target), 21)
             _, stored = dense_data.read_shard(target)
             self.assertEqual({r['game'] for r in stored}, {0, 1})
