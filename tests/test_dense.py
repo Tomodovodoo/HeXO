@@ -1702,11 +1702,16 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual(v['newest_checkpoint'], 'main/000010')
             for h in ('policy_ce', 'value_bce', 'opponent_ce', 'future_bce'):
                 self.assertTrue(math.isfinite(aggregate[h]))
+            self.assertAlmostEqual(aggregate['policy_ce'], aggregate['policy_target_entropy']+aggregate['policy_kl'], delta=1e-5)
+            self.assertGreaterEqual(aggregate['policy_top1'], 0.)
+            self.assertLessEqual(aggregate['policy_top1'], 1.)
             # Capped 8-ply games: no short-value row (the game ends within the horizon) and no outcome row.
             self.assertEqual((aggregate['short_value_bce'], aggregate['outcome_bce']), (None, None))
             self.assertEqual(manifest['metrics']['calibration'], dict(games=0, fitted=False))
             for source in dense_data.SOURCES:
                 self.assertEqual(v[f'{source}_rows'], len(sets.subsets[source, 'held']))
+                self.assertAlmostEqual(v[f'{source}_policy_ce'],
+                                       v[f'{source}_policy_target_entropy']+v[f'{source}_policy_kl'], delta=1e-5)
                 for name in ('policy_ce', 'value_bce'):
                     self.assertAlmostEqual(v[f'{source}_gap_{name}'], v[f'{source}_{name}']-v[f'{source}_train_{name}'])
             self.assertEqual((aggregate, v), (learner.validate(window), learner.validate_sources(sets)))
@@ -1715,15 +1720,35 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual(dense_learn.Learner(run, config.learner, config).step, 0)
             fields = dense_learn.validation_fields(manifest['metrics'])
             self.assertEqual(fields['next_ce'], aggregate['opponent_ce'])
+            for key in ('policy_kl', 'policy_target_entropy', 'policy_top1'):
+                self.assertEqual(fields[key], aggregate[key])
+                self.assertEqual(fields[f'fresh_{key}'], v[f'fresh_{key}'])
             dense_config.append_metrics(run, 'learner-main', step=10, validation=True, **fields)
             points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_newest_gap_policy_ce')['points']
             self.assertEqual(points, [[10, v['newest_gap_policy_ce']]])
+            self.assertEqual(dashboard.series(run, dict(created_at=0.), 'main', 'validation_policy_kl')['points'],
+                             [[10, aggregate['policy_kl']]])
+            self.assertEqual(dashboard.series(run, dict(created_at=0.), 'main', 'validation_converted_policy_top1')['points'],
+                             [[10, v['converted_policy_top1']]])
             dense_config.append_metrics(run, 'learner-main', step=20, outcome_bce=.5)
             self.assertEqual(dashboard.series(run, dict(created_at=0.), 'main', 'outcome_bce')['points'], [[20, .5]])
             self.assertIn('validation_outcome_bce', dashboard.LEARNER_METRICS)
             refs = window.sample(np.random.default_rng(0), 8)
             losses = learner.train_step(dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0))))
             self.assertTrue(math.isnan(losses[2]) and math.isnan(losses[5]) and torch.isfinite(losses[:2]).all())
+
+    def test_policy_validation_rows_on_synthetic_panel(self):
+        out = dict(policy=torch.tensor([[3., 1.], [3., 0.], [0., 1.], [0., 1.], [0., 3.]]),
+                   far=torch.tensor([0., 0., 4., 4., 0.]))
+        batch = dict(cells=torch.tensor([[0, 1, -1], [0, 1, -1], [1, -1, -1], [0, -1, -1], [0, 1, -1]]),
+                     counts=torch.tensor([3, 3, 2, 3, 2]),
+                     mask=torch.tensor([[True, True, True], [True, True, True], [True, True, False],
+                                        [True, True, True], [True, True, False]]),
+                     policy=torch.tensor([.8, .2, 0., .1, .8, .1, .2, .8, .1, .1, .8, .5, .5]))
+        ce, entropy, kl, top1 = dense_learn.policy_validation_rows(out, batch)
+        np.testing.assert_allclose(ce.numpy(), entropy.numpy()+kl.numpy(), rtol=0, atol=1e-7)
+        self.assertEqual(top1.tolist(), [1., 0., 1., 1., 1.])
+        self.assertAlmostEqual(float(top1.mean()), 4/5)
 
     def test_remaining_curve_on_outcomes_decided_in_the_last_ten_plies(self):
         """Games whose outcome is fixed only in their last 10 plies: a predictor that knows it there and says 0.5
