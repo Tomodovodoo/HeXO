@@ -95,6 +95,17 @@ def validation_fields(metrics):
     return fields or None
 
 
+def policy_validation_rows(out, batch):
+    """Policy CE, target entropy, KL and top-1 agreement for each collated row."""
+    target = torch.zeros(batch['mask'].shape).masked_scatter_(batch['mask'], batch['policy'])
+    policy, far = out['policy'].float().cpu(), out['far'].float().cpu()
+    ce = hexnet.policy_row_losses(policy, far, batch['cells'], batch['counts'], target)
+    entropy = -torch.xlogy(target, target).sum(1)
+    logits, _ = hexnet.action_logits(policy, far, batch['cells'], batch['counts'])
+    top1 = (logits.argmax(1) == target.argmax(1)).float()
+    return ce, entropy, ce-entropy, top1
+
+
 def smoothed(x, ys, grid, sigma):
     """Per y in `ys`, a float array holding per grid point g the mean of y weighted by exp(-(x-g)^2 / (2 sigma^2)),
     nan where the weights sum below 1."""
@@ -563,13 +574,20 @@ class Learner:
         rng, s = np.random.default_rng(self.config.seed), self.settings
         batches = [dense_data.collate(*dense_data.examples(window, window.sample(rng, s.batch, validation=True), rng, **self.targets()))
                    for _ in range(math.ceil(VALIDATION_ROWS/s.batch))]
-        rows = []
+        rows, policy_rows = [], []
         with torch.no_grad():
             for b in (b for batch in batches for b in batch.values()):
-                logit = forward(self.ema, b['planes'], self.device, self.memory_format)[0]['value_logit'].float().cpu()
+                out = forward(self.ema, b['planes'], self.device, self.memory_format)[0]
+                logit = out['value_logit'].float().cpu()
                 bce = torch.nn.functional.binary_cross_entropy_with_logits(logit, b['outcome'], reduction='none')
                 rows.append(np.stack([bce.numpy(), b['outcome'].numpy() != .5, b['exact'].numpy() > 0]))
-        return dict(zip(HEADS, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1))
+                mask = b['policy_weight'] > 0
+                if mask.any():
+                    policy_rows.append(torch.stack(policy_validation_rows(out, b)[1:])[:, mask].numpy())
+        policy = np.concatenate(policy_rows, 1) if policy_rows else np.empty((3, 0))
+        extra = dict(zip(('policy_target_entropy', 'policy_kl', 'policy_top1'),
+                         (float(x.mean()) if x.size else None for x in policy)))
+        return dict(zip(HEADS, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1)) | extra
 
     def subset_losses(self, sets, refs):
         """EMA weighted_means (policy_ce, value_bce) over `refs` of `sets` under symmetries drawn from a fixed seed
@@ -585,7 +603,8 @@ class Learner:
         ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
         finished (1. when winner >= 0, else 0.), value_bce, value (its target), outcome_bce, outcome (the hard
         outcome; .5 for capped games), policy_ce (against the improved policy; nan on rows without a policy
-        target), searched (searched_value at the row) and proven (the row's `proven`)."""
+        target), policy_target_entropy, policy_kl, policy_top1 (nan without a policy target), searched
+        (searched_value at the row) and proven (the row's `proven`)."""
         s = self.settings
         rng = np.random.default_rng(self.config.seed)
         rows = []
@@ -597,18 +616,18 @@ class Learner:
                 losses = []
                 for b in dense_data.collate(samples, targets).values():
                     out = forward(self.ema, b['planes'], self.device, self.memory_format)[0]
-                    target = torch.zeros(b['mask'].shape).masked_scatter_(b['mask'], b['policy'])
-                    ce = hexnet.policy_row_losses(out['policy'].float().cpu(), out['far'].float().cpu(), b['cells'], b['counts'], target)
+                    ce, entropy, kl, top1 = policy_validation_rows(out, b)
                     logit = out['value_logit'].float().cpu()
                     bce = [torch.nn.functional.binary_cross_entropy_with_logits(logit, b[k], reduction='none') for k in ('value', 'outcome')]
-                    losses += zip(bce[0].tolist(), b['value'].tolist(), bce[1].tolist(), b['outcome'].tolist(),
-                                  torch.where(b['policy_weight'] > 0, ce, math.nan).tolist())
+                    policy = [torch.where(b['policy_weight'] > 0, x, math.nan).tolist() for x in (ce, entropy, kl, top1)]
+                    losses += zip(bce[0].tolist(), b['value'].tolist(), bce[1].tolist(), b['outcome'].tolist(), *policy)
                 for i, loss in zip(order, losses):
                     ref = chunk[i]
                     e, t = ref.episode, ref.row['ply']
                     rows.append((t, len(e['moves'])-t, float(e['winner'] >= 0), *loss, searched_value(e, t),
                                  float(ref.row.get('proven', 0))))
-        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce', 'searched', 'proven')
+        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce',
+                'policy_target_entropy', 'policy_kl', 'policy_top1', 'searched', 'proven')
         return dict(zip(keys, np.array(rows, np.float64).reshape(-1, len(keys)).T))
 
     def validate_sources(self, sets):
@@ -639,10 +658,13 @@ class Learner:
                             f'{source}_gap_{name}': None if v is None or w is None else v-w})
             out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
             r = self.row_losses(sets, sets.subsets[source, 'held'])
+            p = np.isfinite(r['policy_ce'])
+            for key in ('policy_target_entropy', 'policy_kl', 'policy_top1'):
+                out[f'{source}_{key}'] = float(r[key][p].mean()) if p.any() else None
             out.update({f'{source}_{k}': v for k, v in outcome_split(r['outcome_bce'], r['finished'] > 0, r['proven'] != 0).items()})
             if source not in CURVE_SOURCES:
                 continue
-            f, p = r['finished'] > 0, np.isfinite(r['policy_ce'])
+            f = r['finished'] > 0
             out.update({f'{source}_{k}': v for k, v in remaining_curve(r['remaining'][f], r['outcome_bce'][f], r['outcome'][f]).items()})
             early, late = ply_split(r['ply'][p], r['policy_ce'][p])
             out.update({f'{source}_value_bce_by_ply': ply_curve(r['ply'][f], r['outcome_bce'][f]),
