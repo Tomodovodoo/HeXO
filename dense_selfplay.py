@@ -333,9 +333,13 @@ class Engine:
         """Start the slot's next search; True when it must wait for solver verdicts until the next visit."""
         checked(native.hxg_begin(slot.tree.ptr, slot.budget, slot.samples))
         plan = self.plans.get(id(slot))
-        if plan is None and dense_solver.active(slot.solver, self.schedule):
+        active = dense_solver.active(slot.solver, self.schedule)
+        if active:
             self.solver = self.solver or dense_solver.Solver(self.schedule, self.solver_async)
-            plan = self.plans[id(slot)] = dense_solver.Plan(self.solver)
+        if plan is None and (active or self.leaf_nodes):
+            plan = self.plans[id(slot)] = dense_solver.Plan(self.solver, self.schedule, self.leaf_nodes)
+        elif plan is not None and active and plan.solver is None:
+            plan.solver = self.solver
         return plan is not None and plan.begin(slot)
 
     def add(self, slot):

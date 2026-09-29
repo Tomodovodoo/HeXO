@@ -3150,6 +3150,43 @@ class EngineTests(unittest.TestCase):
                 tree.close()
             slot.game.close()
 
+    def test_leaf_only_solver_follows_full_certificate_and_labels_both_sides(self):
+        from tests.test_tactical_proof import FIXTURE
+        from dense_solver import Schedule
+        history = FIXTURE['positions']['1790600149713752:2:253']
+        torch.manual_seed(11)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        settings = dense_config.ActorSettings(full_sims=4, root_samples=4, full_fraction=1.,
+                                             solver_follow=True, max_plies=len(history)+24)
+        slot = dense_selfplay.SelfPlayGame([model, model], settings, 5, restart=({}, history))
+        try:
+            try:
+                engine = dense_selfplay.Engine(8, solver_async=False, schedule=Schedule.of(settings), leaf_nodes=135)
+            except FileNotFoundError:
+                self.skipTest('Prebuilt tactical library required')
+            self.addCleanup(engine.close)
+            verdict = engine.leaf_solver.history(history, nodes=135, ms=1000)
+            self.assertTrue(verdict['native_verified'])
+            self.assertGreater(verdict['proof_turns'], 1)
+            # Only the initial root reveals the certificate. Subsequent turns must retain it.
+            answers = iter([verdict])
+            with unittest.mock.patch.object(engine.leaf_solver, 'history',
+                    side_effect=lambda *a, **k: next(answers, dict(status='UNKNOWN', native_verified=False))):
+                engine.add(slot)
+                while engine.slots or engine.closing:
+                    engine.step()
+            winner = dense_data.player_at(len(history))
+            self.assertIsNone(engine.solver)
+            self.assertEqual(engine.leaf_proofs, 1)
+            self.assertEqual(slot.game.winner, winner)
+            self.assertGreater(len(slot.moves), len(history)+4)
+            self.assertEqual([r.get('proven') for r in slot.rows],
+                             [1 if r['player'] == winner else -1 for r in slot.rows])
+        finally:
+            for tree in slot.trees.values():
+                tree.close()
+            slot.game.close()
+
     def test_wide_root_proof_does_not_publish_unencodable_row(self):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
         history += [[12+5*i, 4] for i in range(56)]
