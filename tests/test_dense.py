@@ -2793,6 +2793,17 @@ class EvaluatorSearchTests(unittest.TestCase):
             self.assertEqual((len(report['games']), report['summary']['games'], report['summary']['pairs'],
                               report['metrics']['pending']), (3, 3, 1, 1))
 
+    def test_match_side_budget_must_fit_evaluation_gate_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            dense_config.save(run, dense_config.RunConfig(device='cpu', evaluation=dense_config.EvaluationSettings(
+                solver_gate_cap_nodes=256)))
+            overrides = {f'{side}_solver_{name}': None for side in 'ab' for name in asdict(dense_eval.Budgets())}
+            args = SimpleNamespace(run=run, a='main/000010', b='seal', games=2, sims=None,
+                                   **(overrides | dict(a_solver_root_nodes=512)))
+            with self.assertRaisesRegex(ValueError, 'must cover'):
+                dense_eval.match(args)
+
     def test_play_reports_a_completed_slot_before_a_later_slot_fails(self):
         model = dense_selfplay.Model(self.model, 'tiny', 'test', 'cpu', 64, 256)
         opening = [(0, 0), (1, 0), (-1, 0)]

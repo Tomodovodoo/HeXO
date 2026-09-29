@@ -319,7 +319,9 @@ def side_settings(settings, overrides):
     """One side's EvaluationSettings: `settings` with `overrides` (SIDE fields); root_samples, unless overridden,
     is at most the side's sims."""
     out = replace(settings, **overrides)
-    return out if 'root_samples' in overrides else replace(out, root_samples=min(out.root_samples, out.sims))
+    out = out if 'root_samples' in overrides else replace(out, root_samples=min(out.root_samples, out.sims))
+    Schedule.of(out)
+    return out
 
 
 def parse_settings(assignments):
@@ -2155,6 +2157,8 @@ def match(args):
     sides = {side: replace(settings, **{'solver_'+f: getattr(args, f'{side}_solver_{f}') for f in asdict(Budgets())
                                         if getattr(args, f'{side}_solver_{f}') is not None}) for side in 'ab'}
     budgets = {side: Budgets.of(s) for side, s in sides.items()}
+    for side in sides.values():
+        Schedule.of(side)
     if args.a == SEAL:
         raise ValueError('Seal plays as --b; pass the checkpoint as --a')
     if args.a == args.b and budgets['a'] == budgets['b']:

@@ -745,7 +745,7 @@ class Plan:
                         turns = defence_turns(history, result['certificate'], min(self.defence_limit, slot.budget))
                         # After our complete turn the original threat attacker is the actual mover.
                         self.defence_queries = [(turn, self.solver.submit('defence', history+turn, 'mover',
-                                                                          result['budget'])) for turn in turns]
+                                                                          self.threat.budget)) for turn in turns]
                     else:
                         cells = np.ascontiguousarray(result['moves'], np.int64).reshape(-1, 2)
                         checked(native.hxg_priority(ptr, cells, len(cells)))
