@@ -3737,6 +3737,21 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(evaluator.step())
         self.assertIsNone(evaluator.anchor())
 
+    def test_variant_registered_during_anchor_gets_the_next_turn(self):
+        evaluator = self.start(anchor_games=4, anchor_session_games=4, seal_ms=5)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        def register(pool, steps):
+            if steps == 2 and not (self.run/'variant-requests'/'main-000010@x.json').exists():
+                dense_eval.register(self.run, 'main/000010', 'x', dict(sims=1))
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=register)):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000010@x', 'main/000010')), 2)
+        self.assertEqual(len(evaluator.games('main/000010', 'seal')), 2)
+
     def test_seal_anchor_discards_failed_pair_and_continues(self):
         evaluator = self.start(anchor_games=2, seal_ms=5)
         self.export(10)

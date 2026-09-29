@@ -1971,11 +1971,11 @@ class Evaluator:
             done = self.games(a, opponent)
             if kind == 'sprt' and done and (decision := self.test(done)['decision']):
                 decided.append(decision)  # an idle SPRT rematch keeps the first bound it crosses
-            new_checkpoint = any(e[0] not in waiting and self.entry(e[0]) is None for e in checkpoints(self.run)) \
-                if kind == 'anchor' else self.backlog()
-            if kind == 'anchor' and new_checkpoint:
+            new_trial = (any(e[0] not in waiting and self.entry(e[0]) is None for e in checkpoints(self.run))
+                         or any((self.run/'variant-requests').glob('*.json'))) if kind == 'anchor' else self.backlog()
+            if kind == 'anchor' and new_trial:
                 self.anchor_turn = False
-            if new_checkpoint or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
+            if new_trial or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
         self.session(want, target)
