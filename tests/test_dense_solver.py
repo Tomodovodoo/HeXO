@@ -12,6 +12,7 @@ import torch
 import dense_config
 import dense_data
 import dense_eval
+import dense_openings
 import dense_selfplay
 from dense_solver import Budgets
 import hexnet
@@ -244,7 +245,9 @@ class InjectionPoints(unittest.TestCase):
         model = tiny_model()
         mine, theirs = Budgets(root_nodes=NODES), Budgets()
         sides = (replace(config.evaluation, solver_root_nodes=NODES), config.evaluation)
-        games = dense_eval.paired_games(model, model, 2, 'test', config, config.evaluation, None, sides=sides)
+        with tempfile.TemporaryDirectory() as run:
+            book = dense_openings.Book(run, config.evaluation)
+        games = dense_eval.paired_games(model, model, 2, 'test', config, config.evaluation, None, book, sides=sides)
         for game in games:
             colour = game.record['challenger_color']
             self.assertEqual((game.solvers[colour], game.solvers[1-colour]), (mine, theirs))
