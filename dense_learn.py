@@ -67,7 +67,7 @@ STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
-        'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows')
+        'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'future_target')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
@@ -323,7 +323,6 @@ def head_losses(model, batch, device, memory_format):
     outcome_bce is the value logit's BCE against the hard outcome of finished games."""
     b = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
     out, mask = forward(model, b['planes'], device, memory_format)
-    future = b['future'].float()
     target = torch.zeros(b['mask'].shape, device=device).masked_scatter_(b['mask'], b['policy'])
     losses = [hexnet.policy_loss(out['policy'], out['far'], b['cells'], b['counts'], target, b['policy_weight']),
               hexnet.value_loss(out['value_logit'], b['value'], b['value_weight'])]
@@ -331,7 +330,9 @@ def head_losses(model, batch, device, memory_format):
         losses += [hexnet.short_value_loss(out['short_value_logit'], b['short_value'], b['short_weight']),
                    hexnet.opponent_policy_loss(out['opponent_policy'], b['next_cells'], b['next_counts'],
                                                b['next_policy'], b['next_weight']),
-                   hexnet.future_loss(out['future'], future, mask, b['future_weight'])]
+                   hexnet.masked_future_loss(out['future_masked'], b['future'], b['planes'], b['future_weight'])
+                   if model.future_target == 'masked' else
+                   hexnet.future_loss(out['future'], b['future'].float(), mask, b['future_weight'])]
     else:
         losses += [torch.zeros((), device=device)]*3
     losses.append(hexnet.value_loss(out['value_logit'], b['outcome'], b['outcome_weight']))
@@ -403,7 +404,7 @@ class Learner:
             # Settings saved by the last export (including replacement perturbations) under explicit CLI overrides.
             self.settings = replace(dense_config.section('learner', manifest['learner']), **self.overrides)
         self.cap_vram()
-        self.model = self.place(hexnet.HexNet(hexnet.HexNetConfig(**asdict(config.model))))
+        self.model = self.place(hexnet.HexNet(hexnet.HexNetConfig(**asdict(config.model)), self.settings.future_target))
         self.step = self.samples_seen = self.optimizer_started = self.ema_updates = 0
         self.copied_from = None
         self.pacing, self.pacing_per_row, self.resumed_rows = dict(NO_BASE), self.settings.samples_per_row, None
@@ -445,24 +446,32 @@ class Learner:
         return model.to(self.device, memory_format=self.memory_format)
 
     def load_weights(self, path):
-        source = hexnet.load_model(path)
+        source = hexnet.load_model(path, future_target=self.settings.future_target)
         if source.config != self.model.config:
             raise ValueError(f'{path} has model {source.config}, the run uses {self.model.config}')
         self.model.load_state_dict(source.state_dict())
 
     def resume(self, path, manifest):
         """Load the weights, optimizer and counters of checkpoint `path` (whose manifest settings are already applied)."""
-        self.model = self.place(hexnet.load_model(path/'model.pt'))
-        self.ema = self.place(hexnet.load_model(path/'ema.pt'))
+        changed = manifest['learner'].get('future_target', 'legacy') != self.settings.future_target
+        self.model = self.place(hexnet.load_model(path/'model.pt', future_target=self.settings.future_target))
+        self.ema = self.place(hexnet.load_model(path/'ema.pt', future_target=self.settings.future_target))
+        if changed and self.settings.future_target == 'masked' and self.model.config.aux_heads:
+            self.ema.future_masked.load_state_dict(self.model.future_masked.state_dict())
         if self.model.config != hexnet.HexNetConfig(**asdict(self.config.model)):
             raise ValueError(f'{path} does not match the run model settings')
         state = torch.load(path/'optimizer.pt', map_location=self.device, weights_only=True)
         self.optimizer = make_optimizer(self.model, self.settings)
-        self.optimizer.load_state_dict(state['optimizer'])
+        if not changed:
+            self.optimizer.load_state_dict(state['optimizer'])
         for group, decay in zip(self.optimizer.param_groups, (self.settings.weight_decay, 0.)):
             group['weight_decay'] = decay
         self.step, self.samples_seen = manifest['step'], manifest['samples_seen']
         self.optimizer_started, self.ema_updates = state['optimizer_started'], state['ema_updates']
+        if changed:
+            self.optimizer_started, self.ema_updates = self.step, 0
+            dense_config.log_event(self.run, 'learner', 'info',
+                                   f'future target switched to {self.settings.future_target}; optimizer and EMA update count reset')
         self.copied_from = manifest.get('copied_from')
         self.pacing, self.pacing_per_row = dict(manifest.get('pacing', NO_BASE)), manifest['learner']['samples_per_row']
         self.resumed_rows = manifest.get('rows')
@@ -492,6 +501,10 @@ class Learner:
         s = self.settings
         return torch.tensor([1., s.value_weight, s.short_value_weight, s.opponent_policy_weight, s.future_weight, s.outcome_weight],
                             device=self.device)
+
+    @property
+    def heads(self):
+        return tuple('future_masked_ce' if h == 'future_bce' and self.settings.future_target == 'masked' else h for h in HEADS)
 
     def targets(self):
         """dense_data.examples() keyword arguments of the current settings and calibration map."""
@@ -569,16 +582,17 @@ class Learner:
                 logit = forward(self.ema, b['planes'], self.device, self.memory_format)[0]['value_logit'].float().cpu()
                 bce = torch.nn.functional.binary_cross_entropy_with_logits(logit, b['outcome'], reduction='none')
                 rows.append(np.stack([bce.numpy(), b['outcome'].numpy() != .5, b['exact'].numpy() > 0]))
-        return dict(zip(HEADS, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1))
+        return dict(zip(self.heads, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1))
 
     def subset_losses(self, sets, refs):
-        """EMA weighted_means (policy_ce, value_bce) over `refs` of `sets` under symmetries drawn from a fixed seed
+        """EMA weighted_means (policy_ce, value_bce, future loss) over `refs` under symmetries drawn from a fixed seed
         (a row keeps its symmetry while rows are appended)."""
         s = self.settings
         rng = np.random.default_rng(self.config.seed)
         batches = (dense_data.collate(*dense_data.examples(sets, refs[k:k+s.batch], rng, **self.targets()))
                    for k in range(0, len(refs), s.batch))
-        return tuple(self.weighted_means(batches)[:2])
+        means = self.weighted_means(batches)
+        return tuple(means[i] for i in (0, 1, 4))
 
     def row_losses(self, sets, refs):
         """Per-row EMA losses over `refs` under symmetries drawn from a fixed seed: float arrays with one entry per
@@ -613,7 +627,8 @@ class Learner:
 
     def validate_sources(self, sets):
         """Refresh `sets` (dense_data.ValidationSets) and return, per source, <source>_policy_ce and
-        <source>_value_bce on its held subset, <source>_train_* on its train subset, <source>_gap_* = held minus
+        <source>_value_bce and <source>_future_bce or <source>_future_masked_ce on its held subset,
+        <source>_train_* on its train subset, <source>_gap_* = held minus
         train (None when either is), <source>_rows (held rows), <source>_outcome_bce_exact(_rows) and
         <source>_outcome_bce_unproven(_rows), the outcome_split of the row_losses of the held subset, plus
         newest_checkpoint. For CURVE_SOURCES, over the
@@ -634,7 +649,7 @@ class Learner:
         out = dict(newest_checkpoint=sets.newest_checkpoint)
         for source in dense_data.SOURCES:
             held, train = (self.subset_losses(sets, sets.subsets[source, split]) for split in ('held', 'train'))
-            for name, v, w in zip(('policy_ce', 'value_bce'), held, train):
+            for name, v, w in zip(('policy_ce', 'value_bce', self.heads[4]), held, train):
                 out.update({f'{source}_{name}': v, f'{source}_train_{name}': w,
                             f'{source}_gap_{name}': None if v is None or w is None else v-w})
             out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
@@ -686,7 +701,7 @@ class Learner:
                         ema_updates=self.ema_updates), stage/'optimizer.pt')
         manifest = dict(variant=s.variant, step=self.step, samples_seen=self.samples_seen, created_at=time.time(),
                         model_sha256=hexnet.model_digest(self.model), ema_sha256=hexnet.model_digest(self.ema),
-                        metrics=dict(self.metrics or {h: None for h in HEADS}, validation=validation, validation_sources=sources,
+                        metrics=dict(self.metrics or {h: None for h in self.heads}, validation=validation, validation_sources=sources,
                                      calibration=self.calibration_report),
                         learner=asdict(s), model=asdict(self.config.model), copied_from=self.copied_from,
                         rows=window.total_rows, pacing=self.pacing)
@@ -808,6 +823,7 @@ def main():
         factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])
         dense_config.log_event(args.run, 'learner', 'info', f'{s.variant} learner started at step {learner.step}', variant=s.variant, step=learner.step,
               learner=asdict(s))
+        print(f'future loss: {learner.heads[4]}', flush=True)
         print(f'{"step":>6} {"policy":>7} {"value":>7} {"short":>7} {"opp":>7} {"future":>7} {"outcome":>7} {"lr":>8} {"rows/s":>7} {"wait":>6} {"gpu":>6} {"mem":>6}', flush=True)
         sums = torch.zeros(len(HEADS), device=learner.device); counts = torch.zeros(len(HEADS), device=learner.device)
         last_status = last_refresh = time.time()
@@ -835,13 +851,13 @@ def main():
             sums += losses.nan_to_num(); counts += losses.isfinite()
             logged = learner.step % s.log_every == 0
             if learner.step % 10 == 0 or logged or learner.step % s.export_every == 0 or learner.step == args.steps:
-                learner.metrics = {h: float(v/n) if n else None for h, v, n in zip(HEADS, sums.tolist(), counts.tolist())}
+                learner.metrics = {h: float(v/n) if n else None for h, v, n in zip(learner.heads, sums.tolist(), counts.tolist())}
                 sums.zero_(); counts.zero_()
             finished = time.perf_counter()
             rate = (rate+[(finished, s.batch, ready-started, finished-ready)])[-50:]
             if logged:
                 dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
-                                            lr=learner.lr(), **{LOGGED[h]: v for h, v in learner.metrics.items()},
+                                            lr=learner.lr(), **{LOGGED.get(h, h): v for h, v in learner.metrics.items()},
                                             samples_per_second=speed(), window_rows=window.rows, vram=learner.vram())
             if learner.step % 10 == 0:
                 wait, gpu = np.mean([r[2] for r in rate]), np.mean([r[3] for r in rate])

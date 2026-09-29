@@ -288,6 +288,51 @@ def planes_batch(histories):
 
 
 class HexNetTests(unittest.TestCase):
+    def test_masked_future_loss_scores_only_empty_crop_cells(self):
+        planes = torch.zeros(2, 8, 2, 3)
+        planes[:, 3, :, :2] = 1
+        planes[0, 0, 0, 0] = planes[0, 1, 1, 0] = 1
+        logits = torch.randn(2, 3, 2, 3, requires_grad=True)
+        target = torch.tensor([[[0, 1, 2], [1, 2, 0]], [[2, 1, 0], [0, 1, 2]]])
+        weight = torch.tensor([[1.], [0.]])
+        got = hexnet.masked_future_loss(logits, target, planes, weight)
+        expected = F.cross_entropy(logits[0, :, :, 1].T, target[0, :, 1])
+        self.assertAlmostEqual(got.item(), expected.item(), places=6)
+        got.backward()
+        self.assertTrue(torch.all(logits.grad[0, :, :, 0] == 0))  # both colours already present
+        self.assertTrue(torch.all(logits.grad[:, :, :, 2] == 0))  # crop padding
+        self.assertTrue(torch.all(logits.grad[1] == 0))           # incomplete capped horizon
+        self.assertGreater(logits.grad[0, :, :, 1].abs().sum().item(), 0)
+        self.assertEqual(hexnet.masked_future_loss(logits, target, planes, weight*0).item(), 0)
+
+    def test_future_checkpoint_modes(self):
+        legacy = hexnet.HexNet(TINY).eval()
+        _, _, planes = planes_batch(same_bucket(2))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'model.pt'
+            hexnet.save_model(path, legacy)
+            data = torch.load(path, weights_only=True)
+            del data['future_target']  # checkpoint written before this flag existed
+            torch.save(data, path)
+            self.assertEqual(hexnet.load_model(path).future_target, 'legacy')
+            torch.manual_seed(71)
+            expected = hexnet.HexNet(TINY, 'masked')
+            torch.manual_seed(71)
+            masked = hexnet.load_model(path, future_target='masked').eval()
+            self.assertTrue(torch.equal(masked.future_masked.weight, expected.future_masked.weight))
+            for key, value in legacy.state_dict().items():
+                self.assertTrue(torch.equal(masked.state_dict()[key], value), key)
+            a, b = legacy(planes, planes[:, 3:4]), masked(planes, planes[:, 3:4])
+            for key in a:
+                self.assertTrue(torch.equal(a[key], b[key]), key)
+            self.assertEqual(b['future_masked'].shape, (2, 3, *planes.shape[-2:]))
+            hexnet.save_model(path, masked)
+            loaded = hexnet.load_model(path).eval()
+            self.assertEqual(hexnet.model_digest(masked), hexnet.model_digest(loaded))
+            self.assertTrue(torch.equal(b['future_masked'], loaded(planes, planes[:, 3:4])['future_masked']))
+            restored = hexnet.load_model(path, future_target='legacy')
+            self.assertEqual(hexnet.model_digest(legacy), hexnet.model_digest(restored))
+
     def setUp(self):
         self.threads = torch.get_num_threads()
         torch.set_num_threads(2)
@@ -772,6 +817,11 @@ class DenseConfigTests(unittest.TestCase):
         base = dense_config.LearnerSettings()
         self.assertEqual((base.value_target, base.outcome_lambda, base.outcome_weight, base.calibration_games, base.validation_rows,
                           base.validation_quota), ('outcome', .98, 0., 4000, 8192, 128))
+        self.assertEqual(base.future_target, 'legacy')
+        masked = dense_config.override(base, parser.parse_args(['--future-target', 'masked']))
+        self.assertEqual(dense_data.target_options(masked)['future_target'], 'masked')
+        with self.assertRaises(ValueError):
+            dense_config.override(base, parser.parse_args(['--future-target', 'unknown']))
         fit = dense_data.Calibration((0.,)*dense_data.CALIBRATION_FEATURES, .5)
         pick = lambda s, c=fit: {k: v for k, v in dense_data.target_options(s, c).items() if k in ('outcome_lam', 'calibration', 'full_only')}
         self.assertEqual(pick(base), dict(outcome_lam=1., calibration=None, full_only=False))
@@ -788,7 +838,7 @@ class DenseConfigTests(unittest.TestCase):
             dense_config.override(base, parser.parse_args(['--value-target', 'soft']))
         # Manifests written before these settings load with the defaults.
         old = {k: v for k, v in asdict(base).items() if k not in ('value_target', 'outcome_lambda', 'outcome_weight', 'calibration_games',
-                                                                   'validation_rows', 'validation_quota')}
+                                                                   'validation_rows', 'validation_quota', 'future_target')}
         self.assertEqual(dense_config.LearnerSettings(**old), base)
         rng = np.random.default_rng(0)
         self.assertEqual(dense_learn.perturb(replace(base, outcome_lambda=1.), rng, .2).outcome_lambda, 1.)
@@ -849,6 +899,38 @@ def write_games(path, games, identity=None):
 
 
 class DenseDataTests(unittest.TestCase):
+    def test_masked_future_rendering(self):
+        moves, _ = random_game(np.random.default_rng(41), 32)
+        self.assertEqual(len(moves), 32)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_games(Path(tmp)/'shards'/'000001', [(moves, -1, None), (winning_game(), 0, None)])
+            window = dense_data.ReplayWindow(tmp, capacity_rows=1000)
+            refs = [window.ref('000001', i) for i in range(len(window.index))]
+            encode = hexcrop.encode_game
+            for symmetry in range(12):
+                with unittest.mock.patch.object(hexcrop, 'encode_game', side_effect=lambda g, h, **kw: encode(g, h, symmetry=symmetry)):
+                    samples, targets = dense_data.examples(window, refs, np.random.default_rng(0), future_target='masked')
+                for ref, sample, target in zip(refs, samples, targets):
+                    e, t = ref.episode, ref.row['ply']
+                    game = Game(e['moves'][:min(len(e['moves']), t+20)])
+                    try:
+                        # Render the future board independently in the current crop and mover's view.
+                        expected = np.zeros((sample.size, sample.size), np.uint8)
+                        qmin, rmin, ox, oy = sample.offset
+                        for q, r, colour in game.cells:
+                            x, y = np.array([q, r]) @ hexcrop.SYMMETRIES[symmetry] + (ox-qmin, oy-rmin)
+                            if 0 <= x < sample.size and 0 <= y < sample.size and sample.planes[3, y, x]:
+                                expected[y, x] = 1 if colour == sample.player else 2
+                        empty = (sample.planes[0]+sample.planes[1]) == 0
+                        expected[~empty] = 0
+                        np.testing.assert_array_equal(target['future'], expected)
+                        self.assertEqual(target['future_weight'].tolist(), [float(e['winner'] >= 0 or t+20 <= len(e['moves']))])
+                    finally:
+                        game.close()
+                for size, b in dense_data.collate(samples, targets).items():
+                    self.assertEqual(b['future'].shape, (len(b['counts']), size, size))
+                    self.assertEqual(b['future_weight'].shape, (len(b['counts']), 1))
+
     def test_value_targets(self):
         players = [dense_data.player_at(t) for t in range(7)]
         self.assertEqual(players, [0, 1, 1, 0, 0, 1, 1])
@@ -1523,6 +1605,70 @@ def source_shard(path, seed, actor, origin='actor', checkpoint=None, games=6, po
     identity = dict(source='gumbel-policy-value-v1', actor_sha256=publisher) if origin == 'converted' else \
         dict(actor_sha256=publisher, actors=sorted(set(actors)), checkpoint=checkpoint)
     return dense_data.write_shard(path, identity, episodes, rows, origin)
+
+
+class MaskedFutureLearnerTests(unittest.TestCase):
+    def test_resume_switch_and_fixed_panel_metrics(self):
+        import dashboard
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(dense_learn, 'VALIDATION_ROWS', 16), \
+                unittest.mock.patch.object(dense_learn, 'RECALIBRATION_ROWS', 16):
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x', checkpoint='main/000010', winner=0)
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=.5))
+            window = dense_data.ReplayWindow(run, 1000, 10, validation_fraction=.5)
+            sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=6)
+            learner = dense_learn.Learner(run, config.learner, config)
+            for mode in ('legacy', 'masked', 'legacy'):
+                if mode != learner.settings.future_target:
+                    previous = learner
+                    learner = dense_learn.Learner(run, config.learner, config, overrides=dict(future_target=mode))
+                    self.assertEqual((learner.step, learner.samples_seen, learner.pacing),
+                                     (previous.step, previous.samples_seen, previous.pacing))
+                    self.assertEqual(learner.optimizer.state, {})
+                    self.assertEqual(learner.optimizer_started, learner.step)
+                    for key, value in previous.model.state_dict().items():
+                        if not key.startswith('future_masked.'):
+                            self.assertTrue(torch.equal(value, learner.model.state_dict()[key]), key)
+                    if mode == 'masked':
+                        self.assertTrue(torch.equal(learner.model.future_masked.weight, learner.ema.future_masked.weight))
+                refs = window.sample(np.random.default_rng(0), 8)
+                batch = dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0), **learner.targets()))
+                losses = learner.train_step(batch)
+                self.assertTrue(torch.isfinite(losses).all())
+                if mode == 'masked':
+                    self.assertGreater(learner.model.future_masked.weight.grad.abs().sum().item(), 0)
+                    with torch.no_grad():
+                        learner.ema.future_masked.weight.zero_()
+                        learner.ema.future_masked.bias.zero_()
+                learner.metrics = dict(zip(learner.heads, losses.tolist()))
+                manifest = learner.export(window, sets)
+                name = 'future_masked_ce' if mode == 'masked' else 'future_bce'
+                other = 'future_bce' if mode == 'masked' else 'future_masked_ce'
+                self.assertIn(name, manifest['metrics'])
+                self.assertNotIn(other, manifest['metrics'])
+                self.assertIn(name, manifest['metrics']['validation'])
+                self.assertNotIn(other, manifest['metrics']['validation'])
+                panels = manifest['metrics']['validation_sources']
+                for source in ('fresh', 'newest'):
+                    self.assertIn(f'{source}_{name}', panels)
+                    self.assertNotIn(f'{source}_{other}', panels)
+                    if mode == 'masked':
+                        self.assertAlmostEqual(panels[f'{source}_{name}'], math.log(3), places=5)
+                        self.assertAlmostEqual(panels[f'{source}_train_{name}'], math.log(3), places=5)
+                        self.assertAlmostEqual(panels[f'{source}_gap_{name}'], 0, places=5)
+                fields = dense_learn.validation_fields(manifest['metrics'])
+                dense_config.append_metrics(run, 'learner-main', step=learner.step, validation=True, **fields)
+                points = dashboard.series(run, dict(created_at=0.), 'main', f'validation_newest_{name}')['points']
+                self.assertEqual(points[-1], [learner.step, panels[f'newest_{name}']])
+                resumed = dense_learn.Learner(run, config.learner, config)
+                self.assertEqual(resumed.settings.future_target, mode)
+                self.assertEqual(hexnet.model_digest(resumed.model), hexnet.model_digest(learner.model))
+                self.assertEqual(hexnet.model_digest(resumed.ema), hexnet.model_digest(learner.ema))
+                self.assertEqual(resumed.optimizer.state_dict()['param_groups'], learner.optimizer.state_dict()['param_groups'])
+                for key, state in learner.optimizer.state_dict()['state'].items():
+                    for field, value in state.items():
+                        self.assertTrue(torch.equal(value, resumed.optimizer.state_dict()['state'][key][field]))
 
 
 class ValidationSourceTests(unittest.TestCase):

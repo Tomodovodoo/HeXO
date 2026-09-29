@@ -177,6 +177,7 @@ class LearnerSettings:
     short_value_weight: float = .5
     opponent_policy_weight: float = .15
     future_weight: float = .5
+    future_target: str = 'legacy'  # legacy: occupancy BCE at 6/20; masked: empty/own/opponent CE at 20 on empty cells
     proven_value_weight: float = 2.  # value weight of rows the solver proved; their target is the proven value
     validation_fraction: float = .03
     validation_rows: int = 8192   # rows per per-source validation subset (dense_data.ValidationSets limit)
@@ -194,6 +195,8 @@ class LearnerSettings:
     def __post_init__(self):
         if self.value_target not in VALUE_TARGETS:
             raise ValueError(f'value_target must be one of {VALUE_TARGETS}, not {self.value_target!r}')
+        if self.future_target not in ('legacy', 'masked'):
+            raise ValueError(f'future_target must be legacy or masked, not {self.future_target!r}')
         if '@' in self.variant or '/' in self.variant:
             raise ValueError(f"variant {self.variant!r}: '@' marks a search-settings variant (dense_eval) and '/' a step")
         if self.phase_rows < 0:

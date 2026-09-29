@@ -597,9 +597,10 @@ def project(root, fresh=30):
     return dict(root=str(root), now=now, runs=runs)
 
 
-HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')  # dense_learn.LOGGED
+HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'future_masked_ce', 'outcome_bce')
 SOURCES = ('converted', 'fresh', 'newest')  # dense_data.SOURCES
-SOURCE_METRICS = tuple(f'{s}_{k}{h}' for s in SOURCES for k in ('', 'train_', 'gap_') for h in ('policy_ce', 'value_bce'))
+SOURCE_METRICS = tuple(f'{s}_{k}{h}' for s in SOURCES for k in ('', 'train_', 'gap_')
+                       for h in ('policy_ce', 'value_bce', 'future_bce', 'future_masked_ce'))
 CURVE_SOURCES = ('fresh', 'newest')  # dense_learn.CURVE_SOURCES
 CURVE_SCALARS = tuple(f'{s}_{k}' for s in CURVE_SOURCES
                       for k in ('value_bce_last20', 'value_horizon', 'policy_ce_early', 'policy_ce_late',

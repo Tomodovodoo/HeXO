@@ -739,11 +739,11 @@ def target_options(settings, calibration=None):
                 cheap_value_weight=settings.cheap_value_weight, full_only=settings.bootstrap_full_only,
                 outcome_lam=settings.outcome_lambda if settings.value_target == 'td' else 1.,
                 calibration=calibration if settings.value_target == 'calibrated' else None,
-                proven_weight=settings.proven_value_weight)
+                proven_weight=settings.proven_value_weight, future_target=settings.future_target)
 
 
 def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False,
-             outcome_lam=1., calibration=None, proven_weight=2.):
+             outcome_lam=1., calibration=None, proven_weight=2., future_target='legacy'):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
     Positions are encoded from the move prefix without replaying it (hexcrop.Position); the side to move and the
@@ -762,7 +762,9 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         (negated when that ply's mover is the opponent); the outcome when a finished game ends within the
         horizon; weight 0 when that root value is null or a capped game ends first;
       future uint8 [2, S, S]: crop-plane cells occupied after the next 6 / 20 placements (stones already on
-        the board included; truncated at the game end);
+        the board included; truncated at the game end). With future_target='masked', uint8 [S,S] classes
+        0 empty, 1 own, 2 opponent after 20 placements, relative to this row's mover. Only future placements
+        are rendered; the loss excludes cells occupied now. A capped game needs the full horizon;
       next_cells int64 [M], next_policy float32 [M], next_weight: the next ply's policy (the ply+1 row's
         improved policy over the ply+1 native legal list: the opponent's reply after the second stone of a
         turn, the same player's second stone after the first), each cell mapped into this crop (-1 off the
@@ -795,6 +797,13 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
             cells = occupied[:min(T, t+h)]
             future[k].reshape(-1)[cells[cells >= 0]] = 1
             known[k] = e['winner'] >= 0 or t+h <= T
+        if future_target == 'masked':
+            future = np.zeros((s.size, s.size), np.uint8)
+            for u in range(t, min(T, t+20)):
+                cell = occupied[u]
+                if cell >= 0:
+                    future.reshape(-1)[cell] = 1 if player_at(u) == me else 2
+            known = known[1:]
         nref = window.following(ref); following = (np.zeros(0, np.int64), np.zeros(0, np.float32), 0.)
         if nref is not None and len(p := window.policy(nref)):
             actions = hexcrop.legal_array(hexcrop.Position(moves[:t+1]), moves[:t+1])
@@ -820,10 +829,10 @@ def collate_arrays(samples, targets):
       mask bool [B,N] (True for the first counts[b] entries, far cells included); counts int64 [B];
       policy float32 [sum counts] in the order of cells[mask], row b at policy[offsets[b]:offsets[b+1]]
         (zeros where policy_weight is 0; far cells keep their target mass); offsets int64 [B+1];
-      future uint8 [B,2,S,S]; next_cells int64 [B,M] (-1 off the crop and on padding),
+      future uint8 [B,2,S,S] (legacy) or [B,S,S] (masked); next_cells int64 [B,M] (-1 off the crop and on padding),
         next_counts int64 [B], next_policy float32 [B,M] (zero beyond counts);
       policy_weight, value, value_weight, outcome, outcome_weight, exact, short_value, short_weight, next_weight;
-      future_weight [B,2] per horizon
+      future_weight [B,2] per horizon (legacy) or [B,1] (masked)
       (0 where a capped game ends before the horizon)
         float32 [B]; player, remaining int64 [B].
     """
