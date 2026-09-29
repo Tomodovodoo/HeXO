@@ -902,3 +902,15 @@ always score finished games against their hard outcome.
 - **Resident tables** (`solver_table_mb`, adaptive budgets only): each worker keeps its solver transposition table and proven-node set per attacker colour across queries.
 
 Foreground workers (`solver_workers`) run at below-normal priority. Actor status `solver` reports queries per second, budget mean and p95, hit rates by point and by budget band, the share of steps with a verdict wait and its mean, the overrun (wait time over step time), lead times, worker rate and utilisation, idle fraction per pool, slack utilisation (busy time over the collect time plus overrun allowance the scheduler targets), and deferred, late, dropped, followed and labelled counts.
+
+Winning certificates also record `proof_action` on actor rows, including late proof labels and forced-line rows.
+The proof pass writes an action for each proven ply in its sidecar. Readers accept older rows and sidecars without
+actions. Restart actors with their existing solver flags to collect these targets; no new actor flag is needed.
+
+The learner's `--proof-policy-weight` defaults to `0.0`, preserving existing training. A positive weight `w` uses
+`(search + w * proof) / (1 + w)` on winning rows with a witness. The proof distribution splits mass equally across
+the certificate's two placements at turn start and uses the remaining stone at mid-turn. Other searched moves
+keep their mass. Without a search policy, the proof supplies the target with policy loss weight `w`. Proven
+losing rows keep their existing policy. For a first trial, restart the learner with `--proof-policy-weight 0.5`.
+Fixed validation panels report `<source>_policy_ce_proof` and `<source>_policy_ce_proof_rows` for winning witness
+rows with a policy target, using the configured mix.

@@ -585,7 +585,7 @@ class Learner:
         ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
         finished (1. when winner >= 0, else 0.), value_bce, value (its target), outcome_bce, outcome (the hard
         outcome; .5 for capped games), policy_ce (against the improved policy; nan on rows without a policy
-        target), searched (searched_value at the row) and proven (the row's `proven`)."""
+        target), searched (searched_value at the row), proven (the row's `proven`) and proof_action (1 with a witness)."""
         s = self.settings
         rng = np.random.default_rng(self.config.seed)
         rows = []
@@ -607,8 +607,9 @@ class Learner:
                     ref = chunk[i]
                     e, t = ref.episode, ref.row['ply']
                     rows.append((t, len(e['moves'])-t, float(e['winner'] >= 0), *loss, searched_value(e, t),
-                                 float(ref.row.get('proven', 0))))
-        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce', 'searched', 'proven')
+                                 float(ref.row.get('proven', 0)), float(bool(ref.row.get('proof_action')))))
+        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce', 'searched', 'proven',
+                'proof_action')
         return dict(zip(keys, np.array(rows, np.float64).reshape(-1, len(keys)).T))
 
     def validate_sources(self, sets):
@@ -628,7 +629,9 @@ class Learner:
         finished games against the calibration_reference fitted on the source's train rows of finished games
         (searched value, plies remaining, outcome for the side to move). <source>_value_regret_proven is the mean of
         1 - p over its held rows with a proof, p the EMA's probability of the proven result (the value target), and
-        <source>_proven_rows their count; None without such rows."""
+        <source>_proven_rows their count; None without such rows. <source>_policy_ce_proof is policy CE against
+        the configured mixed target on winning rows with a witness and a policy target, with its count in
+        <source>_policy_ce_proof_rows; None without such rows. These use the fixed held panels."""
         sets.refresh()
         self.ema.eval()
         out = dict(newest_checkpoint=sets.newest_checkpoint)
@@ -639,6 +642,9 @@ class Learner:
                             f'{source}_gap_{name}': None if v is None or w is None else v-w})
             out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
             r = self.row_losses(sets, sets.subsets[source, 'held'])
+            proof = (r['proven'] > 0) & (r['proof_action'] > 0) & np.isfinite(r['policy_ce'])
+            out[f'{source}_policy_ce_proof'] = float(r['policy_ce'][proof].mean()) if proof.any() else None
+            out[f'{source}_policy_ce_proof_rows'] = int(proof.sum())
             out.update({f'{source}_{k}': v for k, v in outcome_split(r['outcome_bce'], r['finished'] > 0, r['proven'] != 0).items()})
             if source not in CURVE_SOURCES:
                 continue
