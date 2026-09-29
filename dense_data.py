@@ -581,17 +581,24 @@ class ReplayWindow:
                 base = np.full(W, 1/W)
             cap = 4/W
             if base.max() > cap:
-                low, high = 0., 1.
-                while np.minimum(base*high, cap).sum() < 1:
-                    high *= 2
-                for _ in range(50):
-                    mid = (low+high)/2
-                    if np.minimum(base*mid, cap).sum() < 1:
-                        low = mid
-                    else:
-                        high = mid
-                base = np.minimum(base*high, cap)
-                base /= base.sum()
+                if np.count_nonzero(base)*cap <= 1:
+                    order = np.arange(W-1, -1, -1) if recency > 0 else np.arange(W)
+                    full = int(1/cap)
+                    base = np.zeros(W)
+                    base[order[:full]] = cap
+                    base[order[full]] = 1-full*cap
+                else:
+                    low, high = 0., 1.
+                    while np.minimum(base*high, cap).sum() < 1:
+                        high *= 2
+                    for _ in range(50):
+                        mid = (low+high)/2
+                        if np.minimum(base*mid, cap).sum() < 1:
+                            low = mid
+                        else:
+                            high = mid
+                    base = np.minimum(base*high, cap)
+                    base /= base.sum()
             self.regret_distribution_cache[recency] = base
         return self.regret_distribution_cache[recency]
 
