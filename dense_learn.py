@@ -24,8 +24,8 @@ BCE against the hard outcome of finished games (head outcome_bce, always logged)
 calibration map (Learner.calibrate) is fitted at startup and refitted at every export, recorded in the manifest as
 metrics.calibration (calibration_report) and handed to the render workers; value_target 'calibrated' trains on the
 newest map (hard outcomes while none is fitted). Batches are rendered by dense_data.Renderers worker processes
-(--workers) with random hex symmetries; the window of this process and its workers share one policy file directory
-(dense_data.ReplayWindow). On CUDA this process runs torch on --threads CPU threads. learner-status.json reports
+(--workers) with random hex symmetries; the window of this process and its workers share the variant's policy file
+directory (policy_dir, dense_data.ReplayWindow). On CUDA this process runs torch on --threads CPU threads. learner-status.json reports
 data_wait_fraction, the share of the recent step time spent waiting for a rendered batch (wait_fraction). The loss
 of one optimizer step is, per head, the weighted mean over every row of the batch that has that target, summed with
 the head coefficients; each crop bucket is a separate forward pass whose gradients accumulate (buckets padded to
@@ -218,6 +218,12 @@ def calibration_report(calibration, games):
 def validation_sets(run, settings, seed):
     """The run's dense_data.ValidationSets sized by LearnerSettings validation_rows (limit) and validation_quota."""
     return dense_data.ValidationSets(run, settings.validation_fraction, seed, settings.validation_rows, settings.validation_quota)
+
+
+def policy_dir(run, variant):
+    """The variant's dense_data.ReplayWindow policy file directory; variants never share one, since each window deletes
+    the files of shards outside itself."""
+    return run/'cache'/'policies'/variant
 
 
 def status_path(run, variant):
@@ -736,12 +742,12 @@ def main():
         def replay():
             s = learner.settings
             return dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
-                                           s.window_taper, s.validation_fraction)
+                                           s.window_taper, s.validation_fraction, policy_dir(args.run, s.variant))
         window = replay()
         sets = validation_sets(args.run, s, config.seed)
         learner.calibrate(window)
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers,
-                                                 calibration=learner.calibration)
+                                                 calibration=learner.calibration, policy_dir=policy_dir(args.run, s.variant))
         stream = renderers()
         factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])
         dense_config.log_event(args.run, 'learner', 'info', f'{s.variant} learner started at step {learner.step}', variant=s.variant, step=learner.step,

@@ -2310,7 +2310,13 @@ class YieldTests(unittest.TestCase):
         self.assertEqual(dense_config.from_dict(data).actor.yield_below, dense_config.ActorSettings.yield_below)
 
 
-class WaitFractionTests(unittest.TestCase):
+class LearnerPipelineTests(unittest.TestCase):
+    def test_each_variant_has_its_own_policy_directory(self):
+        run = Path('run')
+        self.assertNotEqual(dense_learn.policy_dir(run, 'main'), dense_learn.policy_dir(run, 'b'))
+        self.assertNotEqual(dense_learn.policy_dir(run, 'main'), run/'cache'/'policies')
+        self.assertEqual(dense_learn.policy_dir(run, 'main').parent, run/'cache'/'policies')
+
     def test_share_of_step_time_spent_waiting(self):
         self.assertEqual(dense_learn.wait_fraction([]), 0.)
         self.assertAlmostEqual(dense_learn.wait_fraction([(0., 256, .3, .6), (1., 256, .1, .2)]), .4/1.2)

@@ -403,7 +403,8 @@ class ReplayWindow:
     place, never over an existing file, so a present file is complete), and each row's slice is read from it, so
     windows of several processes on one directory share one copy in the OS page cache and hold no file open between
     reads. Every refresh deletes the directory's files of shards outside this window (a file another process is
-    reading stays until a later refresh; a deleted file is rewritten on its next use).
+    reading stays until a later refresh; a deleted file is rewritten on its next use), so windows sharing a directory
+    must admit the same shards: one directory per learner (dense_learn.policy_dir).
     """
 
     VALUE_CACHE = 4096
