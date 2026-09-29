@@ -363,7 +363,11 @@ def make_optimizer(model, s):
 
 @torch.no_grad()
 def update_ema(ema, model, decay):
-    torch._foreach_lerp_(list(ema.parameters()), list(model.parameters()), 1-decay)
+    pairs = list(zip(ema.parameters(), model.parameters()))
+    if model.future_target == 'masked' and model.config.aux_heads:
+        pairs = [(e[:1], p[:1]) if p is model.aux_spatial.weight or p is model.aux_spatial.bias else (e, p)
+                 for e, p in pairs]  # only the opponent-policy channel of the legacy head is active
+    torch._foreach_lerp_([e for e, _ in pairs], [p for _, p in pairs], 1-decay)
 
 
 def perturb(settings, factor_rng, amount):
@@ -529,7 +533,13 @@ class Learner:
         self.optimizer.zero_grad(set_to_none=True)
         losses = batch_losses(self.model, batch, self.coefficients(), self.device, self.memory_format, True)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.settings.grad_clip, error_if_nonfinite=True)
+        # AdamW decays a whole parameter, including the two inactive channels sharing the opponent head.
+        legacy = self.model.aux_spatial.weight[1:] if self.model.future_target == 'masked' and self.model.config.aux_heads else None
+        saved = None if legacy is None else legacy.detach().clone()
         self.optimizer.step()
+        if legacy is not None:
+            with torch.no_grad():
+                legacy.copy_(saved)
         self.ema_updates += 1
         update_ema(self.ema, self.model, min(self.settings.ema, (1+self.ema_updates)/(10+self.ema_updates)))
         self.step += 1

@@ -1615,7 +1615,8 @@ class MaskedFutureLearnerTests(unittest.TestCase):
             run = Path(tmp)
             source_shard(run/'shards'/'1000000000001', 2, 'x', checkpoint='main/000010', winner=0)
             config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
-                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=.5))
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=.5,
+                                                                                 lr=.01, warmup_steps=0, weight_decay=.1))
             window = dense_data.ReplayWindow(run, 1000, 10, validation_fraction=.5)
             sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=6)
             learner = dense_learn.Learner(run, config.learner, config)
@@ -1634,10 +1635,17 @@ class MaskedFutureLearnerTests(unittest.TestCase):
                         self.assertTrue(torch.equal(learner.model.future_masked.weight, learner.ema.future_masked.weight))
                 refs = window.sample(np.random.default_rng(0), 8)
                 batch = dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0), **learner.targets()))
+                before = [p.detach().clone() for net in (learner.model, learner.ema)
+                          for p in (net.aux_spatial.weight, net.aux_spatial.bias)]
                 losses = learner.train_step(batch)
                 self.assertTrue(torch.isfinite(losses).all())
                 if mode == 'masked':
                     self.assertGreater(learner.model.future_masked.weight.grad.abs().sum().item(), 0)
+                    after = [p for net in (learner.model, learner.ema)
+                             for p in (net.aux_spatial.weight, net.aux_spatial.bias)]
+                    for old, new in zip(before, after):
+                        self.assertTrue(torch.equal(old[1:], new[1:]))  # raw and EMA legacy channels stay frozen
+                    self.assertFalse(torch.equal(before[0][:1], after[0][:1]))  # opponent policy still learns
                     with torch.no_grad():
                         learner.ema.future_masked.weight.zero_()
                         learner.ema.future_masked.bias.zero_()
