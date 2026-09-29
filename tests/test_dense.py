@@ -820,10 +820,11 @@ class DenseConfigTests(unittest.TestCase):
         prefixed = argparse.ArgumentParser()
         dense_config.add_arguments(prefixed, dense_config.ActorSettings)
         dense_config.add_arguments(prefixed, dense_config.EvaluationSettings, 'eval_')
-        args = prefixed.parse_args(['--root-samples', '8', '--eval-root-samples', '4', '--no-eval-tactics'])
+        args = prefixed.parse_args(['--root-samples', '8', '--eval-root-samples', '4', '--no-eval-tactics',
+                                    '--eval-solver-workers', '3'])
         self.assertEqual(dense_config.override(base, args).root_samples, 8)
         evaluation = dense_config.override(dense_config.EvaluationSettings(), args, 'eval_')
-        self.assertEqual((evaluation.root_samples, evaluation.tactics), (4, False))
+        self.assertEqual((evaluation.root_samples, evaluation.tactics, evaluation.solver_workers), (4, False, 3))
 
     def test_learner_target_and_validation_flags(self):
         parser = argparse.ArgumentParser()
@@ -4227,12 +4228,15 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual((len(report['games']), report['metrics']['posterior']['decision']), (10, 'max-games'))
 
     def test_posterior_decision_rejects_a_clear_loser(self):
-        evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9)
+        evaluator = self.start(decision='posterior', sprt_max_games=12, promote_confidence=.9, solver_workers=3)
         self.export(10)
         evaluator.step()
         self.export(20)
-        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
+        workers = []
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'],
+                                                               hook=lambda pool, _: workers.append(pool.engine.schedule.workers))):
             self.assertTrue(evaluator.step())
+        self.assertEqual(set(workers), {3})
         self.assertEqual(self.league()['champion'], 'main/000010')
         report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
         self.assertEqual(report['metrics']['posterior']['decision'], 'reject')

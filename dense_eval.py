@@ -126,7 +126,7 @@ from dense_config import log_event
 import dense_data
 import dense_openings
 from dense_posterior import MODEL, Posterior, parents
-from dense_solver import Budgets
+from dense_solver import Budgets, Schedule
 import hexnet
 from arena import Seal
 from dense_selfplay import Engine, checkpoints, expected, load, resolve
@@ -882,8 +882,8 @@ class Pool:
     before the next step. running() counts games in flight (`running`); moves() is the
     placements played after their openings by the games in flight. close() stops the engine's solver."""
 
-    def __init__(self, leaf_batch):
-        self.engine, self.games, self.ready = Engine(leaf_batch), {}, []
+    def __init__(self, leaf_batch, schedule=None):
+        self.engine, self.games, self.ready = Engine(leaf_batch, schedule=schedule), {}, []
         self.started = time.perf_counter()
 
     def solver(self):
@@ -1170,7 +1170,7 @@ class Evaluator:
         is negative, and with nothing running the session then waits and asks want() again. Every completed
         pair is persisted at once. For a checkpoint trial, a newer export or settle request stops new games after
         the next finished game; games already in flight drain normally."""
-        pool, waiting, added, failed = Pool(self.config.actor.leaf_batch), {}, {}, {}
+        pool, waiting, added, failed = Pool(self.config.actor.leaf_batch, Schedule.of(self.settings)), {}, {}, {}
         placed = 0
         start, wall = self.pacer.clock(), time.time()
         lanes = want()
@@ -2057,6 +2057,7 @@ def loop(args):
         raise ValueError('anchor_target_halfwidth and fill_top must be at least 0, max_expected_score in [0.5, 1]')
     dense_openings.check(settings)
     Budgets.of(settings)
+    Schedule.of(settings)
     if args.once:
         settings = replace(settings, idle_fill=False)  # fill work never runs out
     evaluator = Evaluator(run, config, settings, Pacer(1. if args.once else settings.eval_share))
