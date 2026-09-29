@@ -314,6 +314,7 @@ class Engine:
     With leaf_nodes > 0, new leaves get an in-process forced-win query before cache lookup or inference,
     bounded to leaf_nodes and 10 ms. NativeTactics verifies the returned certificate against that leaf;
     hxg_prove backs up an exact result and keeps its first turn in the tree. UNKNOWN leaves use the network.
+    A proof at the current root also reaches the usual proof-following, adjudication and exact-row path.
     This is opt-in because its CPU cost competes with producing GPU batches.
     """
 
@@ -326,6 +327,7 @@ class Engine:
         self.leaf_solver = dense_solver.NativeTactics() if leaf_nodes else None
         self.leaf_queries = self.leaf_proofs = 0
         self.leaf_seconds = 0.
+        self.leaf_roots = {}
 
     def begin(self, slot):
         """Start the slot's next search; True when it must wait for solver verdicts until the next visit."""
@@ -380,6 +382,13 @@ class Engine:
                     if plan and not plan.finish(slot, result):
                         deferred = True
                         break
+                    leaf = self.leaf_roots.pop(id(slot), None)
+                    if leaf is not None:
+                        proof, verdict = leaf
+                        stones, turns = proof.path(slot.tree.history)[1]
+                        result.update(proven=1, proof=proof, proof_turns=turns, proof_action=[list(s) for s in stones],
+                                      action=list(stones[0]), solver_nodes=result.get('solver_nodes', 0)+verdict['nodes_used'],
+                                      solver_budget=result.get('solver_budget', 0)+verdict['budget'])
                     self.searches += 1
                     if not slot.searched(result):
                         done.append(slot)
@@ -404,10 +413,25 @@ class Engine:
                     self.leaf_seconds += time.perf_counter()-before
                     self.leaf_queries += 1
                     if proof['status'] == 'PROVEN_WIN' and proof['native_verified']:
+                        if size == len(slot.tree.history):
+                            try:
+                                hexcrop.encode_game(hexcrop.Position(history), history)
+                            except hexcrop.SpanError:
+                                slot.reason = 'span'
+                                done.append(slot)
+                                progress = True
+                                break
                         moves = np.ascontiguousarray(proof['moves'], dtype=np.int64).reshape(-1, 2)
                         checked(native.hxg_prove(ptr, request, history, size, dense_data.player_at(size),
                                                 2 if size % 2 else 1, moves, len(moves)))
                         self.leaf_proofs += 1
+                        if size == len(slot.tree.history):
+                            witness = dense_solver.Proof(tuple(map(tuple, history.tolist())), proof['certificate'],
+                                                         first_turn_only=not self.schedule.follow)
+                            self.leaf_roots[id(slot)] = witness, proof
+                            if plan is not None:
+                                plan.found.append(witness)
+                                plan.proofs[dense_data.player_at(size)] = witness
                         progress = True
                         continue
                 model = slot.model
@@ -532,7 +556,7 @@ class SelfPlayGame:
             if not np.isclose(policy.sum(), 1, atol=1e-6) or np.any(policy < 0):
                 raise ValueError('Search policy is not a distribution')
             row['policy'] = policy.astype(np.float32)
-        if dense_solver.active(self.solver, self.schedule):
+        if dense_solver.active(self.solver, self.schedule) or result.get('proven'):
             row.update(proven=result['proven'], proof_turns=result['proof_turns'], solver_nodes=result['solver_nodes'],
                        solver_budget=result['solver_budget'])
             if result.get('proof_action'):

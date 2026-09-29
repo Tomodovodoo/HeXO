@@ -3071,7 +3071,8 @@ class EngineTests(unittest.TestCase):
     def test_leaf_proof_skips_inference_and_records_exact_value(self):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
-        settings = dense_config.ActorSettings(full_fraction=0., tactics=False, max_plies=len(history)+2)
+        settings = dense_config.ActorSettings(full_fraction=0., tactics=False, max_plies=len(history)+2,
+                                             adjudicate_proven=True, proven_line_rows=True)
         slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
         try:
             try:
@@ -3091,6 +3092,10 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(slot.rows[0]['proven'], 1)
             self.assertEqual(slot.values[-1], 1.)
             self.assertEqual(slot.game.winner, 0)
+            self.assertEqual(slot.reason, 'proven')
+            self.assertEqual(slot.adjudicated['winner'], 0)
+            self.assertTrue(slot.rows[-1]['line'])
+            self.assertEqual(slot.rows[0]['solver_budget'], 32)
         finally:
             for tree in slot.trees.values():
                 tree.close()
@@ -3112,6 +3117,56 @@ class EngineTests(unittest.TestCase):
             self.assertGreater(engine.evals, 0)
             self.assertEqual(engine.leaf_proofs, 0)
             self.assertFalse(slot.rows[0].get('proven'))
+        finally:
+            for tree in slot.trees.values():
+                tree.close()
+            slot.game.close()
+
+    def test_leaf_root_certificate_reaches_active_solver_plan(self):
+        from dense_solver import Schedule
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        settings = dense_config.ActorSettings(full_fraction=0., tactics=False, max_plies=len(history)+2,
+                                             solver_threat_nodes=1, solver_follow=True,
+                                             adjudicate_proven=True, proven_line_rows=True)
+        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+        try:
+            try:
+                engine = dense_selfplay.Engine(8, solver_async=False, schedule=Schedule.of(settings), leaf_nodes=32)
+            except FileNotFoundError:
+                self.skipTest('Prebuilt tactical library required')
+            self.addCleanup(engine.close)
+            engine.add(slot)
+            while engine.slots or engine.closing:
+                engine.step()
+            self.assertEqual(engine.evals, 0)
+            self.assertEqual(slot.reason, 'proven')
+            self.assertEqual(slot.adjudicated['winner'], 0)
+            self.assertEqual(slot.game.winner, 0)
+            self.assertEqual(slot.rows[0]['solver_budget'], 33)
+            self.assertTrue(all(row['proven'] == 1 for row in slot.rows))
+        finally:
+            for tree in slot.trees.values():
+                tree.close()
+            slot.game.close()
+
+    def test_wide_root_proof_does_not_publish_unencodable_row(self):
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        history += [[12+5*i, 4] for i in range(56)]
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        settings = dense_config.ActorSettings(tactics=False)
+        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+        try:
+            try:
+                engine = dense_selfplay.Engine(8, leaf_nodes=32)
+            except FileNotFoundError:
+                self.skipTest('Prebuilt tactical library required')
+            self.addCleanup(engine.close)
+            engine.add(slot)
+            while engine.slots:
+                engine.step()
+            self.assertEqual(slot.reason, 'span')
+            self.assertEqual(slot.rows, [])
         finally:
             for tree in slot.trees.values():
                 tree.close()
