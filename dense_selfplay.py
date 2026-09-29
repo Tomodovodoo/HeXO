@@ -196,7 +196,8 @@ class Evaluator(hexnet.DenseEvaluator):
                 else:
                     view[j] = 0
                     view[j, :, :planes.shape[-1], :planes.shape[-1]] = planes
-            step = self.max_batch if self.graph is not None else max(1, min(self.max_batch, MAX_CELLS//(size*size)))
+            graphed = self.graph is not None and size in self.graph.CANVASES
+            step = self.max_batch if graphed else max(1, min(self.max_batch, MAX_CELLS//(size*size)))
             for start in range(0, len(indices), step):
                 chunk = indices[start:start+step]
                 x = host[start:start+len(chunk)].to(self.device, non_blocking=True)
