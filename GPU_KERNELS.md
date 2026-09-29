@@ -101,6 +101,12 @@ mean renderer wait was 9.47 ms per batch. All windows used the same allocator
 cap. Their renderer queue order differs, so the batches are representative
 of the same corpus rather than byte-identical between processes.
 
+These reports used one warmup batch. Their first four timed steps took
+5.46 to 6.02 seconds, substantially longer than later steps. The quoted rates
+retain that startup cost. The benchmark now warms ten actual renderer batches
+before timing and records any new padded bucket shapes encountered afterward;
+new measurements must use the same warmup for every compared mode.
+
 The corrected saved-batch profile records 4585 launches, 270.64 ms in kernels,
 36.19 ms in CPU launch calls and 10,501,104 H2D bytes in 0.563 ms. Leading
 groups are cuDNN weight gradient 31.85 ms, input gradient 30.24 ms, forward

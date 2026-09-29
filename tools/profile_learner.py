@@ -563,13 +563,27 @@ def live(args):
                 counts.zero_()
                 report['metric_flush_steps'].append(learner.step)
 
-        # One complete step warms the exact renderer and learner path.
+        # Real batches introduce several padded row counts per canvas. Warming
+        # one batch leaves cuDNN setup in the measured production loop.
         warm_started = time.perf_counter()
-        warm_ready = warm_started
-        update_metrics(learner.train_step(warm_batch))
+        report['warmup_batches'] = []
+        warmed_shapes = set()
+        for index in range(args.warmup_steps):
+            if time.perf_counter()-GPU_START + args.min_seconds > 49:
+                raise TimeoutError('Insufficient child budget for warmup and the live window')
+            batch = warm_batch if index == 0 else next(stream)
+            ready = time.perf_counter()
+            update_metrics(learner.train_step(batch))
+            bucket_rows = {str(side): len(b['counts']) for side, b in batch.items()}
+            warmed_shapes.update((int(side), -(-rows//dense_learn.QUANTUM)*dense_learn.QUANTUM)
+                                 for side, rows in bucket_rows.items())
+            report['warmup_batches'].append(dict(bucket_rows=bucket_rows,
+                                                 train_step_host_seconds=time.perf_counter()-ready))
         torch.cuda.synchronize()
         report['warmup_seconds'] = time.perf_counter()-warm_started
-        report['warm_train_seconds'] = time.perf_counter()-warm_ready
+        report['warmup_steps'] = args.warmup_steps
+        report['warmup_shapes'] = sorted(warmed_shapes)
+        report['warm_train_seconds'] = sum(b['train_step_host_seconds'] for b in report['warmup_batches'])
         if time.perf_counter()-GPU_START + args.min_seconds > 49:
             raise TimeoutError('Insufficient 55-second child budget after renderer startup')
         save('measuring')
@@ -584,10 +598,14 @@ def live(args):
             losses = learner.train_step(batch)
             update_metrics(losses)
             finished = time.perf_counter()
+            bucket_rows = {str(side): len(b['counts']) for side, b in batch.items()}
+            shapes = {(int(side), -(-rows//dense_learn.QUANTUM)*dense_learn.QUANTUM)
+                      for side, rows in bucket_rows.items()}
             report['steps'].append(dict(rows=sum(len(b['counts']) for b in batch.values()),
-                                        bucket_rows={str(side): len(b['counts']) for side, b in batch.items()},
+                                        bucket_rows=bucket_rows, new_bucket_shapes=sorted(shapes-warmed_shapes),
                                         render_wait_seconds=ready-started,
                                         train_step_host_seconds=finished-ready))
+            warmed_shapes.update(shapes)
         torch.cuda.synchronize()
         ended = time.perf_counter()
         if replay_source_sha256(frozen_run, status['admitted']) != source_sha256:
@@ -625,6 +643,7 @@ def main():
     parser.add_argument('--batches', type=Path)
     parser.add_argument('--steps', type=int)
     parser.add_argument('--min-seconds', type=float, default=20.)
+    parser.add_argument('--warmup-steps', type=int, default=10)
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--modes', nargs='+', choices=('reference', 'shipped', 'fused'),
                         default=('reference', 'shipped', 'fused', 'reference'))
@@ -643,8 +662,8 @@ def main():
     if args.action in ('prepare', 'live') and args.run is None:
         parser.error(f'{args.action} requires --run')
     if args.action == 'live':
-        if len(args.modes) != 1 or args.steps < 10 or args.min_seconds < 20 or args.workers < 1:
-            parser.error('live requires one mode, at least 10 steps, 20 seconds and one worker')
+        if len(args.modes) != 1 or args.steps < 10 or args.min_seconds < 20 or args.workers < 1 or args.warmup_steps < 1:
+            parser.error('live requires one mode, at least 10 steps, 20 seconds, one worker and one warmup step')
         if args.profile:
             parser.error('profile live work in a separate measure invocation')
     elif not 3 <= args.steps <= 8:
