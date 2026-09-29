@@ -57,68 +57,94 @@ GPU deadline, and closes the measurement's own solver processes on timeout.
 
 ## Training LineConv and running statistics
 
-The learner's fused mode now packs planar and skewed line inputs in Triton,
+The learner's fused mode packs planar and skewed line inputs in Triton,
 uses the existing cuBLAS products, and gathers the result with the residual
-addition. Backward retains the reference order of bf16 additions and reduces
-tap gradients directly. The custom backward saves the input and taps, so it
-avoids recomputing the line forward through an inner activation checkpoint.
+addition. It retains those packed inputs for backward. One stencil computes
+the input gradient; three cuBLAS products and an FP32 diagonal reduction compute
+tap gradients. This removes activation recomputation and the slower direct
+tap-gradient reduction while retaining the reference's bf16 addition order.
 Normalization updates its running mean, variance and batch counter in one
 kernel. Cumulative recalibration retains the existing implementation.
 
 These changes use the existing `--net-kernels fused` flag. They add no learner
 graph flag, checkpointing flag, dependency or checkpoint format change.
 
-Production-path validation used `Learner.train_step` with model, optimizer and
-EMA state from export 85000. Three successive 256-row batches came from a
-saved real replay-window sample rendered at step 82500; both modes consumed the
-same CPU batch tensors. The source run was read-only. The owner authorized
-stopping the learner after export 85000 so measurements could use its 3328 MiB
-memory allowance. GPU children had a 55-second limit and 60-second cooldown.
+Validation used `Learner.train_step` with model, optimizer and EMA state from
+export 85000. The source run stayed read-only. The owner authorized stopping
+the learner after that export and using its 3328 MiB allocator allowance.
+GPU work has a 55-second watchdog and at least 60 seconds of cooldown.
 
-After warming all ten padded `(canvas, batch)` shapes, the reference/fused/
-reference comparison measured the following synchronized `train_step` rates.
-Each rate omits its first timed step; the reference baseline pools both phases
-by total rows divided by total time. Data rendering, collation and queue wait
-are outside these rates, while padding, transfers, losses, backward, clipping,
-optimizer and EMA are inside.
+The initial PR comparison warmed ten padded shapes and ran reference/fused/
+reference on three successive real 256-row batches saved at step 82500.
+Omitting each phase's first timed step gave 90.65 reference versus 149.10
+fused samples/s, **1.64x**. This was a short `train_step` comparison, excluding
+rendering and queue waits; it does not establish sustained learner throughput.
 
-| Mode | Steady samples/s | Peak allocated MiB |
+The matrix-gradient revision then measured 629.58 versus 710.82 samples/s,
+**1.13x** over that initial fused path, with identical inputs and saved states.
+Allocated/reserved memory rose from 1416/2102 to 1803/2720 MiB. This second
+short comparison ran under a different shared-card load; its gain must not be
+multiplied by the earlier 1.64x result. The general 2x learner target remains
+unproven pending longer renderer-inclusive comparisons.
+
+Separate CPU+CUDA profiles of a full 256-row step, with input shapes, show:
+
+| Per-step metric | Reference | Initial fused | Matrix-gradient fused |
+|---|---:|---:|---:|
+| Kernel launches | 11,174 | 6,225 | 4,335 |
+| Sum of kernel durations | 372.16 ms | 285.29 ms | 272.36 ms |
+| CPU kernel-launch calls | 113.23 ms | 55.26 ms | 32.82 ms |
+| H2D bytes | 10,502,784 | 10,501,104 | 10,501,104 |
+| H2D copy-engine time | 0.921 ms | 0.630 ms | 0.553 ms |
+
+| Leading kernel group | Reference ms | Matrix-gradient fused ms |
 |---|---:|---:|
-| Reference, first / last | 89.27 / 92.07 | 1955.54 |
-| Reference, pooled | 90.65 | 1955.54 |
-| Current fused | 149.10 | 1416.01 |
+| Dominant cuDNN weight gradient | 29.59 | 33.52 |
+| Dominant cuDNN input gradient | 29.29 | 30.17 |
+| Dominant cuDNN forward | 28.23 | 28.94 |
+| Direct LineConv input gradient | absent | 19.89 |
+| NCHW-to-NHWC conversion | 16.37 | 18.08 |
+| LineConv skew packing | separate copies | 14.61 |
 
-That is **1.64x** reference throughput and 539.53 MiB less peak allocated
-memory. The general 2x learner target remains unmet. The separately profiled
-steps measured 11,174 versus 6,225 kernels, 372.16 versus 285.29 ms summed
-kernel time, and 113.23 versus 55.26 ms of CPU kernel-launch calls. These
-profiles are separate runs, so their durations are diagnostic rather than
-components of the paired wall-time comparison. cuDNN convolutions remain near
-their reference cost; the fused line tap-gradient partials are the largest new
-kernel group at 36.61 ms. Both traces transferred about 10.5 MB host-to-device
-in 0.921 versus 0.630 ms of copy-engine time; those values do not measure DRAM
-bandwidth or total transfer wall time.
+These profiles ran in separate windows. Launch-call CPU time is measured
+submission cost, not a claim that every GPU gap is launch overhead. H2D
+copy-engine timing excludes pageable-host staging and waiting. The final trace
+spent 107.7 ms inside host `cudaMemcpyAsync` calls, mostly in three pageable
+copies; pinned staging is a separate candidate under measurement.
 
-| Leading profiled kernel | Reference ms | Fused ms |
-|---|---:|---:|
-| BF16 elementwise multiply | 38.45 | — |
-| Line tap-gradient partials | — | 36.61 |
-| Dominant cuDNN weight gradient | 29.59 | 30.57 |
-| Dominant cuDNN forward | 28.23 | 28.59 |
-| Dominant cuDNN input gradient | 29.29 | 28.28 |
+Convolution/GEMM shapes plus convolution backward give about 3.14 versus 2.95
+TFLOPs per step. Dividing by summed kernel time gives 8.43 versus 10.85 TF/s,
+19.4% versus 24.9% of the 43.5 TF/s dense bf16 peak. These are arithmetic
+estimates excluding custom-kernel arithmetic, not hardware counters. Achieved
+DRAM bandwidth remains unmeasured. CPU collation and padding measurements from
+the earlier snapshot are reported below.
 
-The trace annotations plus estimated convolution backward work give about
-3.14 versus 2.95 TFLOPs per profiled step, or 8.43 versus 10.35 TF/s when
-divided by summed kernel time: 19.4% and 23.8% of the 43.5 TF/s dense bf16
-peak. These are bounded arithmetic estimates, not hardware counters. Achieved
-DRAM bandwidth remains unmeasured. The older CPU-profiled collation and padding measurements
-below remain a separate snapshot and are not included in the rates above.
+The CUDA LineConv gradient and masked-normalization checks passed, as did CPU
+checkpoint compatibility. The new matrix path passed first-step gradients,
+model and EMA against the initial fused path on real 256-row batches. The
+initial fused path passed a first-step comparison to reference; one later
+batch exceeded the strict reference-gradient tolerance in the already-deployed
+fused baseline as well. The new candidate matched that baseline.
 
-The CUDA LineConv gradient and expanded masked-normalization checks passed.
-The real first-step losses, gradients, model and EMA met tolerance, and model
-and EMA state still met tolerance after three updates. One later batch exceeded
-the strict reference-gradient tolerance in the already-deployed fused baseline;
-the new candidate matched that baseline.
+`tools/profile_learner.py live` measures the production `Renderers.next` and
+`Learner.train_step` loop, including regret sampling, queue waits, padding,
+transfers, all losses, backward, clipping, AdamW, EMA and the usual metric
+flushes. It uses the actual checkpoint settings and a hashed copy of committed
+replay files under the worktree, so ongoing solver writes cannot change the
+comparison. Each mode must complete at least ten steps and twenty active
+seconds. CPU renderer startup occurs before the GPU watchdog begins. Run
+writes, pacing sleeps, validation and checkpoint exports are outside the
+measurement.
+
+```text
+python tools/profile_learner.py prepare --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches
+python tools/profile_learner.py live --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches --modes reference --memory-mib 3328
+python tools/profile_learner.py live --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches --modes fused --memory-mib 3328
+```
+
+Repeat reference after fused. The larger allocator cap requires a validation
+window with that memory free. Saved-batch `measure` reports are explicitly
+labelled short-window results and record SHA256 hashes of their batch payloads.
 
 Learner graphs were removed after real-workload trials: five private graphs
 with block recomputation reached 131.9 samples/s versus 146.9 eager, and one
