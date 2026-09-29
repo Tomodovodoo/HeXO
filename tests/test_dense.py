@@ -31,6 +31,7 @@ import dense_data
 import dense_bootstrap
 import dense_eval
 import dense_learn
+import dense_posterior
 import dense_selfplay
 from neural_search import NeuralSearch
 
@@ -2771,12 +2772,21 @@ def league_of(elos, champion=None, matrix=None):
     return league
 
 
+def independent(results):
+    """Posterior results from (a, b, points of a, games): the pentanomial that independent games at a's score expect."""
+    out = []
+    for a, b, w, n in results:
+        p, pairs = w/n, n/2
+        out.append((a, b, [pairs*(1-p)**2, 0., 2*pairs*p*(1-p), 0., pairs*p*p]))
+    return out
+
+
 class PosteriorTests(unittest.TestCase):
-    """dense_posterior.Posterior on synthetic results (a, b, points of a, games)."""
+    """dense_posterior.Posterior on synthetic results, most of them the pentanomial of independent games."""
 
     def test_pooled_and_direct_estimates(self):
         from dense_posterior import Posterior
-        results = [('a', 'b', 12, 20), ('a', 'c', 30, 40), ('b', 'c', 20, 40)]
+        results = independent([('a', 'b', 12, 20), ('a', 'c', 30, 40), ('b', 'c', 20, 40)])
         direct = Posterior(['a', 'b', 'c'], 'c', results, 1e4)          # a free deviation: a-b from its own games
         pooled = Posterior(['a', 'b', 'c'], 'c', results, 0.)           # transitive Bradley-Terry
         mean, sd = direct.difference('a', 'b')
@@ -2788,7 +2798,7 @@ class PosteriorTests(unittest.TestCase):
 
     def test_direct_games_dominate_a_non_transitive_triangle(self):
         from dense_posterior import Posterior
-        results = [('a', 'b', 900, 1000), ('b', 'c', 900, 1000), ('c', 'a', 900, 1000)]
+        results = independent([('a', 'b', 900, 1000), ('b', 'c', 900, 1000), ('c', 'a', 900, 1000)])
         post = Posterior(['a', 'b', 'c'], 'c', results, 30.)
         direct = 400*math.log10(9)
         self.assertAlmostEqual(post.difference('a', 'b', False)[0], 0., delta=1)  # the transitive picture: a tie
@@ -2801,8 +2811,8 @@ class PosteriorTests(unittest.TestCase):
         self.assertEqual(parents(ids), {'main/000020': 'main/000010', 'main/000030': 'main/000020', 'main/000040': 'main/000030',
                                         'main/000030@solver': 'main/000030'})
         # The champion main/000030 sits far above the anchor; the candidate splits 20-20 with it.
-        results = [('main/000020', 'main/000010', 380, 400), ('main/000030', 'main/000020', 380, 400),
-                   ('main/000040', 'main/000030', 20, 40)]
+        results = independent([('main/000020', 'main/000010', 380, 400), ('main/000030', 'main/000020', 380, 400),
+                               ('main/000040', 'main/000030', 20, 40)])
         ids = ['main/000010', 'main/000020', 'main/000030', 'main/000040']
         centred = Posterior(ids, ids[0], results, 30., parents(ids)).difference('main/000040', 'main/000030', False)[0]
         self.assertLess(abs(centred), 3.)
@@ -2813,13 +2823,48 @@ class PosteriorTests(unittest.TestCase):
         best = lambda post: min((('cand', 'champ'), ('cand', 'prev'), ('champ', 'prev')),
                                 key=lambda pair: post.after(('cand', 'champ', True), pair, 8))
         # No indirect evidence about the candidate: only direct games inform delta.
-        post = Posterior(['champ', 'prev', 'cand'], 'champ', [('champ', 'prev', 5, 10)], 30.)
+        post = Posterior(['champ', 'prev', 'cand'], 'champ', independent([('champ', 'prev', 5, 10)]), 30.)
         self.assertEqual(best(post), ('cand', 'champ'))
         # The candidate is lopsided against the champion (p ~ .95) but even with the well-measured previous
         # champion: a round against it resolves delta faster than another lopsided direct round.
-        results = [('prev', 'champ', 950, 1000), ('cand', 'champ', 38, 40)]
+        results = independent([('prev', 'champ', 950, 1000), ('cand', 'champ', 38, 40)])
         post = Posterior(['champ', 'prev', 'cand'], 'champ', results, 1.)
         self.assertEqual(best(post), ('cand', 'prev'))
+
+    def test_opening_pairs_that_sweep_widen_the_interval(self):
+        from dense_posterior import Posterior
+        # 50 pairs at an even score: the opening decides the winner of both games (25 sweeps each way).
+        swept = Posterior(['a', 'b'], 'b', [('a', 'b', [25, 0, 0, 0, 25])], 0.)
+        loose = Posterior(['a', 'b'], 'b', independent([('a', 'b', 50, 100)]), 0.)
+        self.assertAlmostEqual(swept.difference('a', 'b')[0], 0., delta=1e-6)
+        self.assertGreater(swept.difference('a', 'b')[1], 1.3*loose.difference('a', 'b')[1])
+        self.assertLess(swept.effective_pairs('a', 'b'), 30)
+        self.assertAlmostEqual(loose.effective_pairs('b', 'a'), 50.)
+
+    def test_opening_pairs_that_split_narrow_the_interval(self):
+        from dense_posterior import Posterior
+        # Every pair splits 1-1: the opening decides the colour that wins, and the pair scores exactly even.
+        split = Posterior(['a', 'b'], 'b', [('a', 'b', [0, 0, 50, 0, 0])], 0.)
+        loose = Posterior(['a', 'b'], 'b', independent([('a', 'b', 50, 100)]), 0.)
+        self.assertLess(split.difference('a', 'b')[1], .5*loose.difference('a', 'b')[1])
+        self.assertGreater(split.effective_pairs('a', 'b'), 500)
+
+    def test_balanced_decisive_pairs_keep_the_point_estimate(self):
+        from dense_posterior import Posterior, dispersion
+        # 2-0, 1-1 and 0-2 pairs in the binomial proportions of a .75 score: the pentanomial of independent games.
+        counts = [2, 0, 12, 0, 18]
+        self.assertAlmostEqual(dispersion(counts), 1.)
+        ids, games = ['a', 'b', 'c'], [('b', 'c', 20, 40)]
+        paired = Posterior(ids, 'c', [('a', 'b', counts)]+independent(games), 30.)
+        loose = Posterior(ids, 'c', independent([('a', 'b', 48, 64)]+games), 30.)
+        for x, y in zip(paired.difference('a', 'b'), loose.difference('a', 'b')):
+            self.assertAlmostEqual(x, y, places=6)
+        # Sweeps and splits in balance move the interval, not the estimate.
+        mixed = Posterior(['a', 'b'], 'b', [('a', 'b', [4, 0, 8, 0, 20])], 0.)
+        plain = Posterior(['a', 'b'], 'b', independent([('a', 'b', 48, 64)]), 0.)
+        self.assertAlmostEqual(mixed.difference('a', 'b')[0], plain.difference('a', 'b')[0], delta=1.)
+        self.assertEqual(dispersion([0, 0, 0, 0, 5]), 1.)
+        self.assertEqual(dispersion([0, 0, 0, 0, 0]), 1.)
 
 
 class OpponentSchedulerTests(unittest.TestCase):
@@ -3915,6 +3960,11 @@ class EvaluatorLoopTests(unittest.TestCase):
         pairs = [(1, 1)]*12+[(0, 0)]*5+[(1, 0)]*3
         score = sum(map(sum, pairs))/len(pairs)/2
         self.assertAlmostEqual(resumed['tally']['pair_score'], score)
+        effective = 20/dense_posterior.dispersion([5, 0, 3, 0, 12])                  # 2-0 sweeps outnumber splits
+        self.assertLess(effective, 20)
+        self.assertAlmostEqual(resumed['decision']['direct']['effective_pairs'], effective)
+        self.assertEqual([p['direct']['effective_pairs'] for p in resumed['pending']], [resumed['decision']['direct']['effective_pairs']])
+        self.assertEqual(resumed['decision']['model'], 'pentanomial')
         s = self.start(**settings).settings
         games = [dict(seed=k, challenger_color=c, winner=c if r else 1-c) for k, pair in enumerate(pairs) for c, r in enumerate(pair)]
         self.assertAlmostEqual(resumed['tally']['llr'], dense_eval.sprt(games, s.sprt_elo0, s.sprt_elo1, s.sprt_alpha, s.sprt_beta)['llr'])
@@ -3945,6 +3995,25 @@ class EvaluatorLoopTests(unittest.TestCase):
                 verdict(cid, champion), posterior=SimpleNamespace(rating=ratings.get))):
             evaluator.review()
         self.assertEqual(evaluator.league['champion'], 'main/019500')                 # P(better) alone, not out-rating it
+        path = dense_eval.report_path(self.run, 'main/025000', 'main/019500')
+        report = json.loads(path.read_text())
+        report['metrics']['posterior'] = dict(decision='reject')
+        path.write_text(json.dumps(report))
+        dense_eval._reports.clear()                                                   # rewritten within one mtime tick
+        evaluator.review()
+        self.assertEqual(evaluator.league['champion'], 'main/019500')                 # settled under another model
+        report['metrics']['posterior']['model'] = dense_posterior.MODEL
+        path.write_text(json.dumps(report))
+        dense_eval._reports.clear()
+        self.report('main/019500', 'main/025000', [1, 0])
+        reverse = dense_eval.report_path(self.run, 'main/019500', 'main/025000')
+        stored = json.loads(reverse.read_text())
+        stored['metrics']['posterior'] = dict(decision='promote')
+        reverse.write_text(json.dumps(stored))
+        dense_eval._reports.clear()
+        evaluator.review()
+        self.assertEqual(evaluator.league['champion'], 'main/019500')                 # in either orientation
+        shutil.rmtree(reverse.parent)
         evaluator.review()
         self.assertEqual((self.league()['champion'], json.loads((self.run/'champion.json').read_text())['checkpoint']),
                          ('main/025000', 'main/025000'))
@@ -4349,11 +4418,11 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(league['calibration']['count'], 0)                            # two later comparisons
         league['checkpoints'].append(entry(50))
         self.report('main/000020', 'main/000050', [1, 0]*4)
+        self.report('main/000030', 'main/000010', [1, 0, 0, 0]*2)                     # moves delta through main/000030
         dense_eval.write_league(self.run, league, config)
         reports = dense_eval.load_reports(self.run)
         post = dense_eval.Posterior([f'main/{s:06d}' for s in (10, 20, 30, 40, 50)], 'main/000010',
-                                    [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
-                                      r['summary']['games']) for r in reports], 20.,
+                                    dense_eval.observations(reports), 20.,
                                     dense_eval.parents([f'main/{s:06d}' for s in (10, 20, 30, 40, 50)]))
         mean, sd = post.difference('main/000020', 'main/000010')
         calibration = league['calibration']
@@ -4375,6 +4444,10 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.report('main/000020', 'main/000010', [1, 1, 0, 1]*4+[1, 0])              # extended: still counted
         dense_eval.write_league(self.run, league, config)
         self.assertEqual(league['calibration']['count'], 1)
+        league['checkpoints'][1]['verdict']['model'] = 'other'                        # stated under another likelihood
+        dense_eval.write_league(self.run, league, config)
+        self.assertEqual(league['calibration']['count'], 0)
+        league['checkpoints'][1]['verdict']['model'] = dense_posterior.MODEL
         league['checkpoints'][1]['verdict']['protocol']['sims'] += 1                  # decided under another protocol
         dense_eval.write_league(self.run, league, config)
         self.assertEqual(league['calibration']['count'], 0)
