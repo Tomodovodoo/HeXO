@@ -126,10 +126,15 @@ the earlier snapshot are reported below.
 
 The CUDA LineConv gradient and masked-normalization checks passed, as did CPU
 checkpoint compatibility. The new matrix path passed first-step gradients,
-model and EMA against the initial fused path on real 256-row batches. The
-initial fused path passed a first-step comparison to reference; one later
-batch exceeded the strict reference-gradient tolerance in the already-deployed
-fused baseline as well. The new candidate matched that baseline.
+model and EMA against the initial fused path on real 256-row batches.
+A fresh reference/fused comparison in one process, using export 85000 and
+the first batch of the step-82500 snapshot, still fails the peak-error check
+for two gradients. `blocks.5.pool.weight` has relative L2 error 0.956% and
+peak-scaled error 2.614%; `norm.bias` has 1.258% and 3.415%. Their L2 errors
+pass the 1.5625% bound, but their peak errors do not. Model and EMA comparisons
+pass. The same two gradient failures appeared in the initial PR candidate;
+that comparison did not establish their presence in the deployed fused path.
+Full-batch reference gradient equivalence therefore remains unresolved.
 
 `tools/profile_learner.py live` measures the production `Renderers.next` and
 `Learner.train_step` loop, including regret sampling, queue waits, padding,
