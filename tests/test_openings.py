@@ -840,7 +840,7 @@ class EvaluatorBookTests(unittest.TestCase):
         entry = lambda step: dict(id=f'main/{step:06d}', variant='main', step=step, elo=0.)
         snapshot = dict(opponent='main/000010', protocol={k: getattr(s, k) for k in dense_eval.PROTOCOL}, matchup_prior=30.,
                         reports={'main-000020-vs-main-000010': dict(games=16, digest=dense_eval.games_digest(archive['games']))})
-        league = dict(checkpoints=[entry(10), dict(entry(20), verdict=dict(snapshot, delta=10., delta_sd=40.)), entry(30), entry(40)])
+        league = dict(checkpoints=[entry(10), dict(entry(20), verdict=dict(snapshot, model=dense_eval.MODEL, delta=10., delta_sd=40.)), entry(30), entry(40)])
         self.assertEqual(dense_eval.calibration(league, [archive, current]+later)['count'], 1)
         self.assertEqual(dense_eval.calibration(league, [current]+later)['count'], 0)       # the decided games are gone
         # Archives present at the verdict (listed as earlier) are neither later comparisons nor evidence now.

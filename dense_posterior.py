@@ -1,15 +1,18 @@
 """Posterior over league ratings with per-pair matchup deviations, and the value of information of the next round.
 
-Model: a report is n games of a against b with a's points w (a capped game is half a point). Every id but the
-anchor has a rating r (Elo) with a N(r_parent, RATING_PRIOR^2) prior, its parent being the nearest earlier rated
-checkpoint of its variant (for a variant `<checkpoint>@name`, that checkpoint), N(0, RATING_PRIOR^2) without one; the
-anchor is fixed at 0. Every pair that met has
-a matchup deviation d_ab ~ N(0, matchup_prior^2) (none when matchup_prior is 0), and a's expected score against b
-is 1 / (1 + 10^(-(r_a - r_b + d_ab) / 400)), so a pair's own games outweigh the transitive picture when the two
-disagree. `Posterior` finds the mode by Newton's method and approximates the posterior by the Gaussian with the
-inverse Hessian as covariance (Laplace). `after` is the posterior variance of a quantity after one more round of
-a pairing, from that round's expected Fisher information at the mode: the Laplace form of averaging the updated
-variance over the posterior predictive outcomes of the round.
+Model: a result is the pentanomial of a against b: counts of colour-swapped opening pairs by a's points over the
+pair (0, 1/2, 1, 3/2, 2; a capped game is half a point). Every id but the anchor has a rating r (Elo) with a
+N(r_parent, RATING_PRIOR^2) prior, its parent being the nearest earlier rated checkpoint of its variant (for a
+variant `<checkpoint>@name`, that checkpoint), N(0, RATING_PRIOR^2) without one; the anchor is fixed at 0. Every
+pair that met has a matchup deviation d_ab ~ N(0, matchup_prior^2) (none when matchup_prior is 0), and a's expected
+score against b is 1 / (1 + 10^(-(r_a - r_b + d_ab) / 400)), so a pair's own games outweigh the transitive picture
+when the two disagree. An opening pair is one observation: the games of a pair are correlated through their opening,
+so each player pair's binomial likelihood of w points in n games is a quasi-likelihood divided by its dispersion
+phi, the variance of the pair points over the variance 2p(1-p) two independent games would have at the observed
+score p (`dispersion`). Its effective pair count is pairs / phi. `Posterior` finds the mode by Newton's method and
+approximates the posterior by the Gaussian with the inverse Hessian as covariance (Laplace). `after` is the
+posterior variance of a quantity after one more round of a pairing, from that round's expected Fisher information at
+the mode: the Laplace form of averaging the updated variance over the posterior predictive outcomes of the round.
 """
 import math
 
@@ -17,6 +20,26 @@ import numpy as np
 
 K = math.log(10)/400
 RATING_PRIOR = 1000.
+MODEL = 'pentanomial'
+DISPERSION_PRIOR_PAIRS = 4.  # pseudo-pairs of independent games that the dispersion estimate is shrunk toward
+
+
+def dispersion(counts):
+    """phi of a pentanomial `counts` (pairs by points 0, 1/2, 1, 3/2, 2; not necessarily whole): the variance of
+    the pair points about their mean, shrunk toward the independent 2p(1-p) by DISPERSION_PRIOR_PAIRS pseudo-pairs,
+    over 2p(1-p) at p = mean / 2. 1 without pairs or when every pair scored 0 or every pair 2; below 1 when pairs
+    split more often than independent games would (the opening decides the colour, not the player), above 1 when
+    they sweep more often (the opening favours one player)."""
+    counts = np.asarray(counts, float)
+    pairs, points = counts.sum(), np.arange(5)/2
+    if pairs <= 0:
+        return 1.
+    mean = float(counts@points)/pairs
+    independent = mean*(1-mean/2)
+    if independent <= 0:
+        return 1.
+    variance = float(counts@(points-mean)**2)/pairs
+    return (pairs*variance+DISPERSION_PRIOR_PAIRS*independent)/((pairs+DISPERSION_PRIOR_PAIRS)*independent)
 
 
 def parents(ids):
@@ -39,7 +62,8 @@ def parents(ids):
 
 
 class Posterior:
-    """Laplace posterior of `ids` (anchor fixed at 0) from results [(a, b, points of a, games)], summed per pair.
+    """Laplace posterior of `ids` (anchor fixed at 0) from results [(a, b, pentanomial counts of a)], summed per
+    player pair (module contract).
     `parents` {id: parent id} centres an id's N(., RATING_PRIOR^2) prior on its parent's rating (the prior is on
     r_id - r_parent), so an id without games sits at its parent's rating; an id without a parent in `ids` keeps
     the prior centred on 0."""
@@ -48,11 +72,13 @@ class Posterior:
         self.anchor, self.sigma = anchor, matchup_prior
         self.ids = list(dict.fromkeys(ids))
         totals = {}
-        for a, b, w, n in results:
-            key, w = ((a, b), w) if a < b else ((b, a), n-w)
-            total = totals.setdefault(key, [0., 0.])
-            total[0] += w; total[1] += n
-        self.pairs = {k: v for k, v in totals.items() if v[1] > 0}
+        for a, b, counts in results:
+            key, counts = ((a, b), np.asarray(counts, float)) if a < b else ((b, a), np.asarray(counts, float)[::-1])
+            totals[key] = totals.get(key, 0.)+counts
+        self.phi = {k: dispersion(c) for k, c in totals.items() if c.sum() > 0}
+        self.effective = {k: float(totals[k].sum())/phi for k, phi in self.phi.items()}
+        self.pairs = {k: (float(totals[k]@np.arange(5))/2/phi, 2*float(totals[k].sum())/phi)
+                      for k, phi in self.phi.items()}
         free = [i for i in self.ids if i != anchor]
         self.index = {i: k for k, i in enumerate(free)}
         if matchup_prior > 0:
@@ -93,6 +119,10 @@ class Posterior:
                 v[len(self.index)+extra.index(key)] += sign
         return v
 
+    def effective_pairs(self, a, b):
+        """Opening pairs of a against b divided by their dispersion (module contract); 0 when they never met."""
+        return self.effective.get((a, b) if a < b else (b, a), 0.)
+
     def rating(self, name):
         return 0. if name == self.anchor else float(self.mode[self.index[name]])
 
@@ -126,13 +156,14 @@ class Posterior:
         return out
 
     def after(self, target, pairing, games):
-        """Posterior variance of the target difference (a, b, matchup) after `games` more games of pairing (x, y)."""
+        """Posterior variance of the target difference (a, b, matchup) after `games` more games of pairing (x, y),
+        at the dispersion of the pairing's games so far (1 when it never met)."""
         a, b, matchup = target
         new = self.new(*([(a, b)] if matchup else []), pairing)
         cov = self.covariance(new)
         g, v = self.vector(a, b, matchup, new), self.vector(*pairing, True, new)
         mean = float(v[:len(self.mode)]@self.mode)
         p = 1/(1+math.exp(-K*mean))
-        info = K*K*games*p*(1-p)
+        info = K*K*games*p*(1-p)/self.phi.get(tuple(sorted(pairing)), 1.)
         variance, shared = float(g@cov@g), float(g@cov@v)
         return variance-info*shared**2/(1+info*float(v@cov@v))

@@ -827,12 +827,23 @@ always score finished games against their hard outcome.
 - **Promotion** (`decision`, default `posterior`). One Bradley-Terry posterior covers every rated checkpoint, the
   candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
   and against panel members. Each pair also gets a matchup deviation (prior sd `matchup_prior_elo`, default 30),
-  so a pair's own games outweigh the transitive picture when the two disagree. The candidate needs at least
+  so a pair's own games outweigh the transitive picture when the two disagree. Each colour-swapped opening pair
+  is one observation with five outcomes (0, 1/2, 1, 3/2 or 2 points; a capped game is half a point), because the
+  two games of a pair share their opening. The likelihood of each pair of players is divided by its dispersion:
+  the observed variance of the pair points over what two independent games at the same score would give, shrunk
+  toward 1 by four pseudo-pairs. Pairs that sweep (2-0 or 0-2) more often than chance widen the interval; pairs
+  that split 1-1 more often than chance narrow it, since the opening then decides the colour rather than the
+  player. The dispersion scales the weight of a pair's games, so it moves the point estimate only where priors or
+  other pairings compete with them. `evaluator-status.json` reports the effective pair count (pairs over
+  dispersion) of the direct games. The candidate needs at least
   `sprt_min_games` direct games. No separate bound applies to its rating sd: P(better) already accounts for it.
   It is promoted when it has the highest posterior rating and P(candidate - champion > `sprt_elo0`) is at least
   `promote_confidence`. It is rejected when that probability is at most 1 - `promote_confidence`. Neither
   happens while the direct-only and pooled estimates disagree beyond their intervals. `decision sprt` keeps the
-  sequential test (`sprt_elo0` 0, `sprt_elo1` 25).
+  sequential test (`sprt_elo0` 0, `sprt_elo1` 25), the generalized SPRT over the same five pair outcomes, so its
+  log-likelihood ratio carries the pair-level variance too. Each verdict records its likelihood as `model`
+  (`pentanomial`). A decision recorded under another model stays settled: the start-up review does not re-judge it
+  and the calibration diagnostic leaves it out.
 - **Calibration diagnostic.** Each posterior verdict records the sd of delta it stated. Once the checkpoint has
   three later comparisons, `league.json` `calibration` compares the realised RMS shift of delta with what a
   calibrated posterior expects (root mean of sd then squared minus sd now squared). A realised RMS well below the

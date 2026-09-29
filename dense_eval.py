@@ -41,8 +41,10 @@ half a point for each side. Pair score = candidate points / 2 over its two games
 Promotion (`decision`): 'posterior' (default) decides on the league-wide posterior (dense_posterior: Bradley-Terry
 ratings of every rated checkpoint, the candidate and Seal from every protocol-matching report, with a per-pair
 matchup deviation of prior sd matchup_prior_elo so a pair's own games dominate when they disagree with the
-transitive picture). Delta = r_candidate - r_champion + their deviation. After at least sprt_min_games direct
-games, while the direct-only and pooled 95% intervals overlap, the candidate is promoted when it has the highest
+transitive picture; each opening pair is one pentanomial observation, `observations`, so the correlation of its two
+games widens or narrows the posterior through the pair's dispersion, and a verdict records that likelihood as
+`model`). A decision recorded under another model stays settled: neither the review nor calibration re-judges it.
+Delta = r_candidate - r_champion + their deviation. After at least sprt_min_games direct games, while the direct-only and pooled 95% intervals overlap, the candidate is promoted when it has the highest
 posterior rating of the rated checkpoints and P(delta > sprt_elo0) >= promote_confidence, and rejected when that
 probability is at most 1 - promote_confidence (`Evaluator.verdict`), re-judged after every completed colour pair;
 until then direct games keep playing. On start the rule is re-applied to the existing reports (`Evaluator.review`). Direct games fill
@@ -121,7 +123,7 @@ import dense_config
 from dense_config import log_event
 import dense_data
 import dense_openings
-from dense_posterior import Posterior, parents
+from dense_posterior import MODEL, Posterior, parents
 from dense_solver import Budgets
 import hexnet
 from arena import Seal
@@ -384,6 +386,19 @@ def pair_scores(records):
     return {seed: sum(p)/2 for seed, p in pairs.items()}
 
 
+def pentanomial(records):
+    """[pairs by candidate points 0, 1/2, 1, 3/2, 2] over the colour-swapped opening pairs of `records` (`pair_scores`)."""
+    counts = [0]*5
+    for score in pair_scores(records).values():
+        counts[round(4*score)] += 1
+    return counts
+
+
+def observations(reports):
+    """The `Posterior` results of `reports`: (candidate, opponent, `pentanomial` of its games) per report."""
+    return [(r['candidate'], r['opponent'], pentanomial(r['games'])) for r in reports]
+
+
 def summary(records):
     """Draw-aware match summary: decisive wins/losses, caps, pair score, its paired Hoeffding lower bound
     and an Elo delta from the points with a +1/2 continuity correction."""
@@ -410,10 +425,7 @@ def sprt(records, elo0, elo1, alpha, beta):
     LLR = N sum_k p^_k log(p_1,k / p_0,k). H1 (promote) when LLR >= log((1-beta)/alpha), H0 when
     LLR <= log(beta/(1-alpha)), otherwise decision None.
     """
-    x = np.arange(5)/4
-    counts = np.zeros(5)
-    for score in pair_scores(records).values():
-        counts[round(4*score)] += 1
+    x, counts = np.arange(5)/4, np.array(pentanomial(records), float)
     n = counts.sum()
     phat = (counts+1e-3)/(n+5e-3)
 
@@ -682,7 +694,8 @@ def variant_heads(entries, rated=lambda c: True):
 
 def calibration(league, reports):
     """Diagnostic of the posterior's stated uncertainty; no decision reads it. For every checkpoint whose posterior
-    verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports), whose snapshotted reports
+    verdict holds its `Evaluator.snapshot` (opponent, protocol, matchup_prior, reports) and was stated under the
+    current likelihood (model dense_posterior.MODEL), whose snapshotted reports
     (every input of the verdict's posterior, the direct one among them) all still begin with the games it was decided
     on (`games_digest` of that prefix: extended at most, not replaced) and which has at least CALIBRATION_LATER later
     comparisons (reports with it under that protocol that are new or have grown since the verdict; a pairing's archive
@@ -699,7 +712,7 @@ def calibration(league, reports):
     for entry in league['checkpoints']:
         verdict, cid = entry.get('verdict') or {}, entry['id']
         if not {'opponent', 'protocol', 'matchup_prior', 'reports'} <= verdict.keys() or verdict.get('delta_sd') is None \
-                or cid not in rated or verdict['opponent'] not in rated:
+                or verdict.get('model') != MODEL or cid not in rated or verdict['opponent'] not in rated:
             continue
         key = protocol(verdict['protocol'])
         earlier = frozenset(verdict.get('earlier', ()))
@@ -721,8 +734,7 @@ def calibration(league, reports):
         model = key, verdict['matchup_prior'], earlier
         if model not in posteriors:
             ids = rated+([SEAL] if any(SEAL in (r['candidate'], r['opponent']) for r in group) else [])
-            posteriors[model] = Posterior(ids, ids[0], [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
-                                                         r['summary']['games']) for r in group], verdict['matchup_prior'], parents(ids))
+            posteriors[model] = Posterior(ids, ids[0], observations(group), verdict['matchup_prior'], parents(ids))
         mean, sd = posteriors[model].difference(cid, verdict['opponent'])
         then.append(verdict['delta_sd']); now.append(sd); shifts.append(mean-verdict['delta'])
     root = lambda values: math.sqrt(max(0., float(np.mean(values)))) if values else None
@@ -886,12 +898,12 @@ def public(verdict):
 
 def brief(cid, opponent, kind, verdict=None):
     """One status `pending` entry: {candidate, opponent, kind, p_better, delta, delta_sd, direct {games, wins,
-    losses, capped}} of `verdict` (`public` rules: the numbers are None without a direct game), without a verdict
-    the numbers None and the direct record 0."""
+    losses, capped, effective_pairs}} of `verdict` (`public` rules: the numbers are None without a direct game),
+    without a verdict the numbers None and the direct record 0."""
     shown = public(verdict) if verdict else {}
     direct = shown.get('direct', {})
     return dict(candidate=cid, opponent=opponent, kind=kind, p_better=shown.get('p_better'), delta=shown.get('delta'),
-                delta_sd=shown.get('delta_sd'), direct={k: direct.get(k, 0) for k in ('games', 'wins', 'losses', 'capped')})
+                delta_sd=shown.get('delta_sd'), direct={k: direct.get(k, 0) for k in ('games', 'wins', 'losses', 'capped', 'effective_pairs')})
 
 
 def match_entry(opponent, report):
@@ -1310,17 +1322,17 @@ class Evaluator:
         checkpoints and variants, cid, the opponent and Seal, each rating's prior centred on its parent's
         (dense_posterior.parents), so a candidate without games sits at its previous export: {decision ('promote', 'reject' or None; for a
         variant 'better', 'worse' or None), rule and threshold (the rule in force: 'posterior' with
-        promote_confidence, or with decision 'sprt' for a checkpoint 'sprt' with sprt_elo1), comparison ('champion' or
+        promote_confidence, or with decision 'sprt' for a checkpoint 'sprt' with sprt_elo1), model
+        (dense_posterior.MODEL, the likelihood the numbers come from), comparison ('champion' or
         'variant'), delta and delta_sd (r_cid - r_champion + their matchup deviation), p_better (P(delta >
         sprt_elo0)), pooled (95% interval of r_cid - r_champion without it), direct {games, wins, losses, capped,
-        elo, interval} (`tally` of their `direct` games), disagree (the direct and pooled intervals do not overlap),
-        spread (rating sd of cid and of the champion about the league mean), leader (the rated or candidate
+        elo, interval} (`tally` of their `direct` games) with effective_pairs (`Posterior.effective_pairs`), disagree
+        (the direct and pooled intervals do not overlap), spread (rating sd of cid and of the champion about the league mean), leader (the rated or candidate
         checkpoint of highest posterior rating; variants never lead)}, plus `posterior` (the Posterior) for
         pairing. A variant needs no lead."""
         s = self.settings
         ids, reports = self.inputs(cid, champion)
-        post = Posterior(ids, ids[0], [(r['candidate'], r['opponent'], r['summary']['wins']+r['summary']['capped']/2,
-                                       r['summary']['games']) for r in reports], s.matchup_prior_elo, parents(ids))
+        post = Posterior(ids, ids[0], observations(reports), s.matchup_prior_elo, parents(ids))
         mean, sd = post.difference(cid, champion)
         pooled_mean, pooled_sd = post.difference(cid, champion, False)
         pooled = [pooled_mean-1.96*pooled_sd, pooled_mean+1.96*pooled_sd]
@@ -1338,10 +1350,10 @@ class Evaluator:
             kind, rule = 'champion', s.decision
             threshold = s.sprt_elo1 if rule == 'sprt' else s.promote_confidence
             decision = judge(s, t['games'], disagree, leader == cid, p_better)
-        return dict(decision=decision, rule=rule, threshold=threshold, comparison=kind, delta=mean, delta_sd=sd,
+        return dict(decision=decision, rule=rule, threshold=threshold, model=MODEL, comparison=kind, delta=mean, delta_sd=sd,
                     p_better=p_better, pooled=pooled, direct=dict(games=t['games'], wins=t['wins'], losses=t['losses'],
-                    capped=t['capped'], elo=t['elo_delta'], interval=interval), disagree=disagree, spread=spread,
-                    leader=leader, posterior=post)
+                    capped=t['capped'], effective_pairs=post.effective_pairs(cid, champion), elo=t['elo_delta'],
+                    interval=interval), disagree=disagree, spread=spread, leader=leader, posterior=post)
 
     def inputs(self, cid, champion):
         """(ids, reports) of the `verdict` posterior on cid against the champion: the league's rated ids, the
@@ -1553,8 +1565,9 @@ class Evaluator:
     def review(self):
         """Posterior mode, once per evaluator (so after every restart or settings change): re-apply the promotion
         rule to the existing reports. Of the rated checkpoints, neither skipped nor demoted, with at least
-        sprt_min_games direct games against the champion (`direct`), those whose `verdict`
-        is `ready` with P(delta > sprt_elo0) >= promote_confidence are eligible; the one of highest posterior
+        sprt_min_games direct games against the champion (`direct`), those whose direct report's decision
+        (metrics.posterior), if any, was taken under the current likelihood (model dense_posterior.MODEL: a settled
+        decision is never re-judged under another) and whose `verdict` is `ready` with P(delta > sprt_elo0) >= promote_confidence are eligible; the one of highest posterior
         rating among them is promoted when it also out-rates the champion and every other checkpoint with those
         direct games ('decision' event 'promote on review', then the 'promotion' event; its Seal anchor is scheduled
         as for any promotion), and its entry keeps that verdict with its `snapshot`. A higher-rated checkpoint
@@ -1568,6 +1581,10 @@ class Evaluator:
                     or len(self.direct(c['id'], champion)) < s.sprt_min_games:
                 continue
             met.append(c['id'])
+            path = report_path(self.run, c['id'], champion)
+            settled = json.loads(path.read_text())['metrics'].get('posterior') if path.exists() else None
+            if settled and settled.get('model') != MODEL:
+                continue
             verdict = self.verdict(c['id'], champion)
             if ready(s, verdict['direct']['games'], verdict['disagree']) \
                     and verdict['p_better'] >= s.promote_confidence:
