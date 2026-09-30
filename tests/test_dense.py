@@ -4231,6 +4231,33 @@ class PhaseTests(unittest.TestCase):
             self.assertTrue((run/'checkpoints'/'main'/'000002'/'optimizer.pt').is_file())
             stream.close.assert_called_once_with()
 
+    def test_nonparticipating_actors_fail_the_handoff_without_training(self):
+        torch.set_num_threads(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            settings = dense_config.LearnerSettings(batch=8, samples_per_row=3., export_every=2,
+                         phase_export=True, phase_actors=1, validation_fraction=0., window_min_rows=1)
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)), learner=settings)
+            self.assertFalse(config.actor.phase_follow)
+            dense_config.save(run, config)
+            source_shard(run/'shards'/'1000000000001', 2, 'x')
+            dense_learn.write_json(run/'actor-status.json', dict(stage='playing', updated_at=time.time(), phase_ack={}))
+            stream = unittest.mock.MagicMock()
+            argv = ['dense_learn.py', '--run', str(run), '--steps', '2']
+            with unittest.mock.patch.object(sys, 'argv', argv), \
+                 unittest.mock.patch.object(dense_data, 'Renderers', return_value=stream), \
+                 unittest.mock.patch.object(dense_learn.Learner, 'train_step') as train, \
+                 unittest.mock.patch.object(dense_learn, 'ACTOR_WAIT_SECONDS', .01):
+                with self.assertRaisesRegex(TimeoutError, r'Actor workers \[0\].*--phase-follow'):
+                    dense_learn.main()
+            train.assert_not_called()
+            stream.__next__.assert_not_called()
+            stream.close.assert_called_once_with()
+            final = json.loads((run/'learner-status.json').read_text())
+            self.assertEqual((final['stage'], final['phase_request'], final['phase_waiting']), ('failed', None, [0]))
+            self.assertIn('--phase-follow', final['error'])
+            self.assertEqual((final['step'], final['samples_seen']), (0, 0))
+
 
 class ActorModelTests(unittest.TestCase):
     """dense_selfplay.resolve per model_source and the worker's switch between games."""

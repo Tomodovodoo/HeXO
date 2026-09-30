@@ -47,6 +47,7 @@ following the phase (ActorSettings.phase_follow) have the GPU to themselves whil
 every export_every-th step. phase_export collects enough pacing credit to train to the next export, then releases
 actors. phase_actors waits for that many actor workers to acknowledge drained GPU work before training or export;
 token-held phases renew their heartbeat during validation so actors remain paused until publication finishes.
+An actor handoff that remains unacknowledged for 120 seconds fails with launch instructions.
 """
 import argparse
 import copy
@@ -75,6 +76,7 @@ RECALIBRATION_ROWS = 4096
 QUANTUM = 16  # bucket rows are padded to a multiple of this
 STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
+ACTOR_WAIT_SECONDS = 120.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
         'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'deblunder_weight',
@@ -1042,11 +1044,16 @@ def main():
         if not learner.settings.phase_actors or phase_request is not None:
             return
         phase_request = f'{os.getpid()}:{time.time_ns()}'
+        deadline = time.monotonic()+ACTOR_WAIT_SECONDS
         while True:
             waiting = waiting_actors(args.run, learner.settings.phase_actors, s.variant, phase_request)
             write_status(stage='waiting-for-actors', samples_per_second=0., phase_waiting=waiting)
             if not waiting:
                 break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f'Actor workers {waiting} did not acknowledge the training phase within '
+                                   f'{ACTOR_WAIT_SECONDS:g} seconds. Start all {learner.settings.phase_actors} workers '
+                                   'with updated code and --phase-follow, or disable the handoff with --phase-actors 0.')
             time.sleep(.25)
         write_status(stage='training', samples_per_second=0., phase_waiting=[])
 
