@@ -1,12 +1,52 @@
-# HeXO · Bubble
+# Bubble
 
-Bubble is a bot for [HeXO](https://github.com/HeXO-Game/HeXO), with a native rules engine, neural search, a verified tactical solver and self-play training. HeXO remains the game and repository name. Bubble's name comes from the Pokémon move; future bots can follow the same theme, such as Wave and Waterfall.
+Bubble is a self-play bot for [HeXO](https://github.com/HeXO-Game/HeXO), the hexagonal connect-six game this repository is named after.
 
-Player one opens at the origin. Players then alternate two placements. Each stone must be empty and within hex distance eight of an existing stone. Six or more consecutive stones along any axis wins, including on the first placement of a turn.
+## The game
 
-## Build and play
+HeXO is played by two players, Cross (X) and Circle (O), on an unbounded grid of hexagons. Cells use axial coordinates `(q, r)`. The distance between two cells is
 
-Install Python 3.10 or newer, CMake 3.20 or newer, and a C++20 compiler. Run these commands from the checkout root:
+```
+distance = max(|q1 - q2|, |r1 - r2|, |(q1 + r1) - (q2 + r2)|)
+```
+
+so the six neighbours of `(0, 0)` are `(1, 0)`, `(-1, 0)`, `(0, 1)`, `(0, -1)`, `(1, -1)` and `(-1, 1)`.
+
+Turns:
+
+1. Cross opens with a single stone, and it must go on the origin `(0, 0)`.
+2. From then on the players alternate, starting with Circle, and each turn is two placements by the same player.
+3. A placement must go on an empty cell within distance 8 of any stone already on the board, of either colour. The board grows as stones spread; there is no fixed edge.
+
+Winning:
+
+- A player wins with six or more of their own stones in an unbroken line along one of the three hex axes: `(1, 0)`, `(0, 1)` or `(1, -1)`.
+- The win counts the moment the sixth stone lands. If the first placement of a turn completes a line, the game ends there and the second placement is never made.
+- There are no captures and no passes.
+
+A short example. Cross opens at `(0, 0)`. Circle plays `(1, 0)` and `(0, 1)`. Cross plays `(-1, 0)` and `(-2, 0)`, making three in a row on the `(1, 0)` axis. Circle's stone at `(1, 0)` already blocks that line on the right, so Cross can only reach six by extending left to `(-5, 0)`. Because each turn adds two stones, a player who has four in a row with both ends open threatens to finish on the next turn, and the opponent needs both of their placements to block. Much of the game is about building two such threats at once.
+
+The rules engine is `src/hexo.cpp`. `tests/reference.py` is an independent Python implementation used to check it.
+
+## What Bubble is
+
+Bubble is a KataGo-style asynchronous self-play engine that trains on one GPU. Separate processes share a run directory:
+
+- **Network.** A hex-masked ResNet with policy and value heads over bucketed board crops (`python/hexnet.py`, `python/hexcrop.py`).
+- **Actors.** Gumbel MCTS self-play with many games batched through the network (`python/dense_selfplay.py`, `src/gumbel.cpp`).
+- **Learner.** Trains on the actors' game shards through a KataGo-style replay window and exports checkpoints (`python/dense_learn.py`, `python/dense_data.py`).
+- **Evaluator.** Plays paired games from an opening book, rates checkpoints with a posterior Bradley-Terry model and decides which checkpoint the actors use (`python/dense_eval.py`, `python/dense_posterior.py`, `python/dense_openings.py`).
+- **Tactical solver.** A Rust forced-win solver with an independent certificate checker (`tools/tactical/`). The search calls it during play (`python/dense_solver.py`), and an offline proof pass labels finished games with proven results (`python/dense_solve.py`).
+- **Dashboard.** A local web page with training, evaluation and proof-pass status (`python/dashboard.py`).
+
+## Build
+
+Requirements:
+
+- Python 3.10 or newer
+- CMake 3.20 or newer and a C++20 compiler
+- Rust and Cargo with edition 2024 support, for the tactical solver
+- PyTorch 2.11 or newer, for training and neural play
 
 ```sh
 git clone https://github.com/Tomodovodoo/HeXO.git
@@ -14,18 +54,60 @@ cd HeXO
 python -m venv .venv
 ```
 
-Activate the environment with `.venv\Scripts\Activate.ps1` in PowerShell or `source .venv/bin/activate` on Linux/macOS. Then:
+Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scripts\activate.bat` in cmd.exe, `source .venv/bin/activate` on Linux and macOS), then build:
 
 ```sh
 python -m pip install -e .
+python -m pip install -r requirements/learning.txt
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel 2
-python python/play.py
+python tools/build_tactical.py
 ```
 
-Open <http://127.0.0.1:8765>. The initial opponent uses the handwritten native evaluator. Click a cell or enter axial coordinates, drag to pan, and scroll to zoom. Bubble plays one complete turn; undo removes one stone.
+For CUDA, install the PyTorch wheel for your hardware from the [PyTorch selector](https://pytorch.org/get-started/locally/). `requirements/tested.txt` pins the tested library versions. With MinGW on Windows, add `-G "MinGW Makefiles"` to the configure command and keep `g++` on `PATH`.
 
-On Windows with MinGW, add `-G "MinGW Makefiles"` to the configure command and keep `g++` on PATH. Visual Studio builds load from `build/Release/`. The editable install registers the Python modules while keeping native libraries and browser assets in this checkout. A checkout or ZIP download contains source, fixtures and the opening suite. Trained checkpoints and native binaries are generated locally.
+## Test
+
+```sh
+python -m unittest tests.test_engine tests.test_proof tests.test_notation_api tests.test_neural_search -v
+python -m unittest tests.test_dense tests.test_dense_solve tests.test_openings -v
+```
+
+The first line needs the native build and NumPy. The second also needs PyTorch.
+
+## Train
+
+Create a run and its first checkpoint:
+
+```sh
+python python/dense_config.py --run runs/bubble --device cuda
+python python/dense_learn.py --run runs/bubble --steps 0
+```
+
+Then start each process in its own terminal:
+
+```sh
+python python/dense_learn.py --run runs/bubble
+python python/dense_selfplay.py --run runs/bubble --processes 4
+python python/dense_eval.py loop --run runs/bubble --eval-anchor-games 0 --no-eval-anchor-on-promotion --eval-anchor-target-halfwidth 0
+python python/dense_solve.py --run runs/bubble
+python python/dashboard.py --run runs/bubble
+```
+
+The dashboard is at <http://127.0.0.1:8766>. `config.json` in the run directory holds the settings of the actors, learner and evaluator. A flag on one process overrides the matching setting for that process only. The proof pass takes its settings from its own flags only, so record them with the run.
+
+The three evaluator flags turn off rating games against Seal, an external bot that needs its own setup. Use `--device cpu` in `dense_config.py` to train without a GPU. The proof pass needs the tactical build. The solver inside the search is off by default; see [docs/tactical-solver.md](docs/tactical-solver.md) to enable it.
+
+## Play
+
+```sh
+python python/play.py                                         # handwritten native evaluator
+python python/play.py --dense-run runs/bubble --device cpu    # trained network from a run
+```
+
+Open <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan and scroll to zoom. The model picker lists the champion and the newest checkpoints. Search and solver have their own toggles.
+
+From Python:
 
 ```python
 from hexo import Game
@@ -40,101 +122,55 @@ finally:
     game.close()
 ```
 
-## Train Bubble
+## Notation and bot API
 
-The current stack uses the dense HexNet policy/value model. Install its dependencies:
-
-```sh
-python -m pip install -r requirements/learning.txt
-```
-
-For NVIDIA training, install a compatible CUDA PyTorch wheel using the [PyTorch installation selector](https://pytorch.org/get-started/locally/). The tested Windows environment uses PyTorch 2.11.0 with CUDA 12.6, NumPy 2.4.3 and SciPy 1.17.1. [requirements/tested.txt](requirements/tested.txt) pins those Python library versions; choose the PyTorch wheel index for your hardware.
-
-Create the run and its initial checkpoint before starting actors:
+`python/notation.py` reads and writes [HTTTX notation v1](https://github.com/hex-tic-tac-toe/hexagonal-tic-tac-toe-notation/tree/15bb7877ae020d661497e332adf0810d00d24e3e) and checks every move for legality:
 
 ```sh
-python python/dense_config.py --run runs/bubble --device cuda
-python python/dense_learn.py --run runs/bubble --steps 0
+python python/notation.py import match.txt > match.json
+python python/notation.py export match.json > match.txt
 ```
 
-Start each long-running command in a separate terminal with the same activated environment:
+`python/bot_api.py` serves the [HTTTX stateless bot API](https://github.com/hex-tic-tac-toe/htttx-bot-api/tree/37d2385f1016abe8b25798238a7d0c4a17a25dda/definitions) on localhost with `GET /capabilities.json` and `POST /stateless/v1-alpha/turn`:
 
 ```sh
-python python/dense_selfplay.py --run runs/bubble --processes 4
-python python/dense_learn.py --run runs/bubble
-python python/dense_eval.py loop --run runs/bubble --eval-anchor-games 0 --no-eval-anchor-on-promotion --eval-anchor-target-halfwidth 0
-python python/dashboard.py --run runs/bubble
+python python/bot_api.py --port 8790 --ms 100
 ```
 
-The dashboard opens at <http://127.0.0.1:8766>. The actors write game shards, the learner resumes from its latest export, and the evaluator decides checkpoint promotion. Generation and training share the GPU according to the configured pacing settings. Use `--device cpu` when creating a CPU run. A short CPU example is in [dense training](docs/dense-training.md#short-cpu-run).
+Both formats record two placements per turn, so they cannot express a win on the first placement of a turn. Export raises `NotationConflict` and the API returns HTTP 409 in that case. Details are in [docs/notation-api.md](docs/notation-api.md).
 
-For the supported GPU speedups, add `--net-kernels fused` to the actor, learner and evaluator commands. Actors can also add `--cuda-graphs`. Fused kernels need Triton; Windows uses the [triton-windows package](https://github.com/triton-lang/triton-windows). Installation, measured costs and reproduction commands are in [GPU kernels](docs/gpu-kernels.md#enable-and-reproduce). Reference kernels work without Triton.
-
-The optional tactical solver needs Rust/Cargo with edition 2024 support:
-
-```sh
-python tools/build_tactical.py
-```
-
-This writes the native solver and its source/binary manifest under `tools/tactical/target/release/`. Solver budgets default to zero in a new run. See [solver scheduling](docs/tactical-solver.md#dense-actor-solver-scheduling) for enabling proof queries and proof following. External opponents such as Seal and Strix have separate setup instructions; they are optional.
-
-## Play a trained checkpoint
-
-```sh
-python python/play.py --dense-run runs/bubble --device cpu
-```
-
-The model picker offers up to four available exports, including the champion and newest. Search and solver have separate toggles and budgets. Suggested moves, verified winning lines and opponent threats appear through the analysis button. Use `--device cuda` for GPU inference. Proof analysis requires the tactical build above; turn the solver off to play without it.
-
-## Reproduce a run
-
-Keep the Git revision, dependency versions, `config.json`, launch flags and native build metadata with your results. Flags override settings for a process, so record them alongside the configuration. The actor and learner must use the same validation fraction. Restart sampling excludes validation games and descendants of those games.
-
-`runs/<name>/` contains game shards, model/EMA/optimizer checkpoints, evaluation games, metrics and status files. Use a new directory for a new experiment. Resuming the learner restores weights and optimizer state from the newest complete export; steps since that export must be trained again. Configurations, seeds, search budgets and model hashes identify the inputs to a comparison. Adaptive solver scheduling depends on available CPU time, so identical seeds alone do not guarantee identical games.
-
-The local training run, downloaded opponent weights and research results are gitignored. To repeat a published measurement, you need the named checkpoint and shard inputs as well as the code. The [evaluation documentation](docs/dense-evaluation.md) describes ratings and decision checks. Training games reaching their placement cap have no outcome label. Evaluation scores capped games as half a point without claiming a proven draw.
-
-## Repository layout
-
-| Folder | Contents |
-|---|---|
-| `python/` | Current dense training, HexNet, rules bindings, search and server commands |
-| `python/legacy/` | Earlier pattern, NNUE and relational pipelines, including numerical helpers still shared with dense training |
-| `src/` | C++ rules, graph encoder and Gumbel search |
-| `tools/` | Build helpers, profilers and external opponent adapters |
-| `tools/tactical/` | Rust tactical solver, independent checker and vendored Strix sources |
-| `tests/` | Existing correctness tests and committed fixtures |
-| `web/` | Local game and training dashboard assets |
-| `openings/` | Committed evaluation opening suite |
-| `docs/` | Model, solver, data and evaluation details |
-| `requirements/` | Learning dependencies and tested versions |
-| `build/`, `runs/`, `artifacts/` | Generated native files, training data and local results, all gitignored |
-
-## Tests
-
-After the native build and editable install, install NumPy for the CPU search tests:
-
-```sh
-python -m pip install numpy
-python -m unittest tests.test_curriculum tests.test_proof tests.test_notation_api tests.test_neural_search -v
-```
-
-Dense tests also need the learning dependencies:
-
-```sh
-python -m unittest tests.test_dense tests.test_dense_solve tests.test_openings -v
-```
-
-For local development beside a live run, use `OMP_NUM_THREADS=2`, hide CUDA from test processes and run them at BelowNormal priority on Windows. Native binaries can be copied from a compatible existing build instead of rebuilt. Keep the tactical DLL and its matching JSON manifest together. Never remove a worktree that supplies a running process or a loaded native library.
-
-## More documentation
+## Documentation
 
 - [Dense training and value targets](docs/dense-training.md)
 - [Dense evaluation, opening books and ratings](docs/dense-evaluation.md)
-- [Verified tactical solver](docs/tactical-solver.md)
+- [Tactical solver](docs/tactical-solver.md)
 - [Neural search](docs/neural-search.md)
-- [GPU kernels and profiling](docs/gpu-kernels.md)
+- [GPU kernels](docs/gpu-kernels.md)
 - [Human corpus import](docs/human-corpus.md)
 - [Native engine and opponent matches](docs/native-engine.md)
-- [Notation and stateless API](docs/notation-api.md)
-- [Earlier pattern, NNUE and relational experiments](docs/earlier-models.md)
+- [Notation and bot API](docs/notation-api.md)
+- [Earlier NNUE and relational models](docs/earlier-models.md)
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `src/` | C++ rules engine, native Gumbel search and graph encoder |
+| `python/` | Network, actors, learner, evaluator, proof pass, dashboard, browser game and bindings |
+| `python/legacy/` | Earlier NNUE and relational models; the dense code still imports a few shared helpers from here |
+| `tools/tactical/` | Rust tactical solver, certificate checker and the vendored hexo-strix crates |
+| `tools/` | Build scripts, profilers and adapters for external opponents |
+| `web/` | Browser game and dashboard pages |
+| `openings/` | Fixed opening suite for evaluation |
+| `tests/` | Unit tests, fixtures and the Python reference rules |
+| `docs/` | Detailed notes on training, evaluation, the solver, GPU kernels and earlier models |
+| `requirements/` | Training dependencies and tested versions |
+
+`build/`, `runs/` and `artifacts/` hold native builds, training data and local results. Git ignores all three.
+
+## References
+
+- Danihelka et al., [Policy improvement by planning with Gumbel](https://openreview.net/forum?id=bERaNdoegnO), ICLR 2022. The root search and completed-Q policy targets follow this paper and [DeepMind's mctx](https://github.com/google-deepmind/mctx).
+- Wu, [Accelerating Self-Play Learning in Go](https://arxiv.org/abs/1902.10565), 2019 (KataGo). Playout-cap randomization and the replay window follow this paper.
+- [SootyOwl/hexo-strix](https://github.com/SootyOwl/hexo-strix), MIT licensed. Its solver crates are vendored in `tools/tactical/vendor/hexo-strix` and modified.
+- [Official HeXO source](https://github.com/HeXO-Game/HeXO/blob/1aea2b676733f8cdc53f8f92cb00b367af72111c/packages/shared/src/sharedTypes.ts), used to check the rules.

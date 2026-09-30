@@ -1,6 +1,6 @@
 # Earlier training models
 
-The pattern, NNUE and relational pipelines below are retained for earlier experiments. Bubble currently trains the dense HexNet stack described in [the README](../README.md#train-bubble). Measurements here belong to the named historical configurations.
+The pattern, NNUE and relational pipelines below are retained for earlier experiments. Bubble currently trains the dense HexNet stack described in [the README](../README.md#train). Measurements here belong to the named historical configurations.
 
 ## Self-play learning
 
