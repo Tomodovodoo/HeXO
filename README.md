@@ -54,7 +54,7 @@ cd HeXO
 python -m venv .venv
 ```
 
-Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `source .venv/bin/activate` elsewhere), then build:
+Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scriptsctivate.bat` in cmd.exe, `source .venv/bin/activate` on Linux and macOS), then build:
 
 ```sh
 python -m pip install -e .
@@ -94,7 +94,7 @@ python python/dense_solve.py --run runs/bubble
 python python/dashboard.py --run runs/bubble
 ```
 
-The dashboard is at <http://127.0.0.1:8766>. `config.json` in the run directory holds every setting. A flag on one process overrides the matching setting for that process only.
+The dashboard is at <http://127.0.0.1:8766>. `config.json` in the run directory holds the settings of the actors, learner and evaluator. A flag on one process overrides the matching setting for that process only. The proof pass takes its settings from its own flags only, so record them with the run.
 
 The three evaluator flags turn off rating games against Seal, an external bot that needs its own setup. Use `--device cpu` in `dense_config.py` to train without a GPU. The proof pass needs the tactical build. The solver inside the search is off by default; see [docs/tactical-solver.md](docs/tactical-solver.md) to enable it.
 
