@@ -581,7 +581,7 @@ def payoff(reports, ratings=None):
 
 def informative(p, cap):
     """Whether a pairing with expected score p (either side's) can inform the ratings: 1 - cap <= p <= cap."""
-    return 1-cap <= p <= cap
+    return max(p, 1-p) <= cap
 
 
 def closeness(p):
@@ -1518,7 +1518,8 @@ class Evaluator:
         """(a, b) of the evidence pairing for a pending posterior decision, or None: of cid and the champion each
         vs the previous champion (`met` of the champion) and vs Seal, the one whose `games` most reduce the
         posterior variance of delta (value of information, `Posterior.after`), when that beats as many direct
-        games; only pairings whose report can grow (`rematch_pair`) and that are `close`."""
+        games; only pairings whose report can grow (`rematch_pair`) and that are `close`. The decision posterior
+        also checks the score limit, including for a candidate whose league rating is not published yet."""
         s, post, previous = self.settings, verdict['posterior'], self.met(champion)
         options = []
         for a, b in ((cid, previous), (champion, previous), (cid, SEAL), (champion, SEAL)):
@@ -1532,7 +1533,8 @@ class Evaluator:
                 options.append(pair)
         known = lambda x: x in post.index or x == post.anchor
         after = lambda pair: post.after((cid, champion, True), pair, games)
-        options = [o for o in options if known(o[0]) and known(o[1])]
+        options = [o for o in options if known(o[0]) and known(o[1])
+                   and informative(expected(post.rating(o[0]), post.rating(o[1])), s.max_expected_score)]
         best = min(options, key=after, default=None)
         return best if best and after(best) < after((cid, champion)) else None
 
@@ -1874,9 +1876,11 @@ class Evaluator:
         its current reign it owes anchor_games once (anchor_on_promotion) and anchor_games more per `anchor_every`
         checkpoints rated during the reign (entries from `reign_from` on), counted against the games its Seal reports
         (`seal_reports`, every protocol) gained since reign_games, so an anchor owed when the protocol changes (a book
-        refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor."""
+        refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor.
+        Quotas apply only while the champion and Seal are `close`, as for other automatic opponents."""
         s, champion = self.settings, self.entry(self.league['champion'])
-        if not s.anchor_games or champion is None or (champion['id'], SEAL, 'anchor', s.opening_book) in self.failed_seal:
+        if not s.anchor_games or champion is None or not self.close(champion['id'], SEAL) \
+                or (champion['id'], SEAL, 'anchor', s.opening_book) in self.failed_seal:
             return None
         entries = self.league['checkpoints']
         later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])

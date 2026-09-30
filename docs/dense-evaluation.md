@@ -49,7 +49,12 @@
   rated checkpoints closest to the champion) and other optional comparisons. It then plays fill games until the
   next checkpoint appears: the champion against Seal until their interval is `anchor_target_halfwidth` narrow,
   `games` of the newest checkpoint against the previous champion, then the widest pair among the top
-  `fill_top`. Pairings where either side's expected score exceeds `max_expected_score` are never played.
+  `fill_top`. Automatic anchors, panels, evidence and idle pairings are excluded when either side's expected
+  score exceeds `max_expected_score`, even if an anchor quota is still owed. The default 0.85 permits about
+  301 Elo difference; `--eval-max-expected-score 0.9090909090909091` permits up to 400 Elo. Unknown ratings
+  remain eligible so new opponents can be rated; evidence games also check the candidate's provisional
+  posterior rating while its published league rating is pending. Direct promotion/variant trials and explicit `match`
+  commands retain their own game budgets. Historical Seal games remain part of the rating evidence.
 - **Variants.** An A/B test of search settings runs through the same pool, reports and posterior. A variant is
   a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`,
   `solver_*`), league id `<checkpoint>@<name>`:
