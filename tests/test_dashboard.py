@@ -228,6 +228,53 @@ class OpeningBookPages(unittest.TestCase):
         self.assertEqual(self.get(colour_decides=1, min_decisive=5)['rows'], [])
         self.assertEqual(len(self.get(key=self.nodes[1]['key'])['rows']), 1)
 
+    def test_book_selfplay_win_rates_share_counts_lengths_and_refresh(self):
+        book_path = self.run/'openings.json'
+        original = book_path.read_bytes()
+        image = [[r, q] for q, r in self.a]
+        image[1], image[2] = image[2], image[1]
+        empty = self.nodes[3]
+        def episode(moves, plies, winner, origin='book'):
+            return dict(moves=moves+[[9, 9]]*(plies-len(moves)), winner=winner, origin=origin,
+                        book=dict(suite='book', ply=len(moves), key=dense_openings.canonical(moves)[0]))
+        episodes = [episode(image, plies, winner) for plies, winner in [(11, 0), (21, 1), (31, 1), (41, -1)]]
+        episodes += [episode(empty['moves'], 9, 0), episode(image, 100, 0, 'selfplay'),
+                     episode(image, 200, 0, 'restart')]
+        folder = self.run/'shards/001'
+        self.write(folder/'manifest.json', dict(origin='actor', counts=dict(book_games=5)))
+        self.write(folder/'episodes.json', episodes)
+        converted = self.run/'shards/002'
+        self.write(converted/'manifest.json', dict(identity=dict(source='converted corpus')))
+        self.write(converted/'episodes.json', [episode(image, 300, 0)])
+        rows = {row['key']: row for row in self.get()['rows']}
+        a = rows[self.nodes[1]['key']]
+        self.assertEqual((a['games'], a['p1_wins'], a['p2_wins'], a['capped']), (10, 4, 3, 3))
+        self.assertAlmostEqual(a['p1_win_rate'], 4/7)
+        self.assertEqual(a['decisive_share'], .7)
+        self.assertEqual((a['report_games'], a['selfplay_games'], a['median_plies']), (6, 4, 20.5))
+        self.assertEqual(a['mean_plies'], 23.4)
+        self.assertEqual(rows[empty['key']]['p1_win_rate'], 1)
+        self.assertEqual(rows[self.nodes[0]['key']]['games'], 17)
+        self.assertEqual(self.get(key=empty['key'], min_games=1)['total'], 1)
+        self.assertEqual(next(n['games'] for n in self.get('/api/book/dag')['nodes'] if n['key']==empty['key']), 1)
+        # The histogram and book share the compact cache, even when the book revision changes.
+        read = Path.read_text
+        def cached_read(path, *args, **kwargs):
+            self.assertNotEqual(path.name, 'episodes.json')
+            return read(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', cached_read):
+            self.assertEqual(dashboard.game_lengths(self.run, 0)['games'], 7)
+            self.assertEqual(self.get(key=empty['key'])['rows'][0]['games'], 1)
+        self.write(folder.with_name('003')/'manifest.json', dict(origin='actor', counts=dict(book_games=1)))
+        self.write(folder.with_name('003')/'episodes.json', [episode(empty['moves'], 13, 1)])
+        row = self.get(key=empty['key'])['rows'][0]
+        self.assertEqual((row['games'], row['p1_win_rate'], row['mean_plies']), (2, .5, 11))
+        self.assertEqual(book_path.read_bytes(), original)
+        # Live training starts must not leak into a frozen evaluation suite's results.
+        self.write(self.run/'evaluator-status.json', dict(settings=dict(opening_suite='custom')))
+        self.write(self.run/'openings-custom.json', dict(nodes=[empty]))
+        self.assertEqual(self.get()['rows'][0]['games'], 0)
+
     def test_every_sort_and_nulls_last(self):
         rows = self.get()['rows']
         for key in dashboard.BOOK_SORTS:

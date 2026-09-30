@@ -23,12 +23,12 @@ const number = v => v==null?'·':Number.isInteger(v)?String(v):v.toFixed(2);
 const percent = v => v==null?'·':(100*v).toFixed(1);
 const timestamp = v => v==null?'·':new Date(v*1000).toISOString().slice(0,16).replace('T',' ');
 const columns = [
-  ['games','Games','Book games through this canonical prefix',number],
-  ['p1_win_rate','P1 %','First-player wins / decisive games; capped games excluded',percent],
+  ['games','Games','Evaluator and book-start self-play games through this canonical prefix',number],
+  ['p1_win_rate','P1 %','First-player wins / decisive evaluator and book-start self-play games; capped games excluded',percent],
   ['skew_z','z','Signed colour skew: (P1 wins − P2 wins) / √decisive games. Descriptive binomial score, not a paired significance test',number],
   ['decisive_share','Dec. %','Decisive games / all book games',percent],
-  ['median_plies','Median','Median total placements in matching report games, including capped games',number],
-  ['mean_plies','Mean','Mean total placements in matching report games, including capped games',number],
+  ['median_plies','Median','Median total placements in matching games, including capped games',number],
+  ['mean_plies','Mean','Mean total placements in matching games, including capped games',number],
   ['depth','Depth','Opening placements, including the first origin stone',number],
   ['champion_probability','P %','Probability of reaching this canonical position under the champion',v=>v==null?'·':(100*v).toPrecision(3)],
   ['p2_value','P2 value %','Champion value-head expected score for P2 at this position',percent],
@@ -123,7 +123,7 @@ class OpeningBook {
     for(const [key,label,title] of columns){const th=element('th',null,{'aria-sort':s.sort===key?(s.direction==='asc'?'ascending':'descending'):'none'}),b=element('button',label+(s.sort===key?(s.direction==='asc'?' ↑':' ↓'):''),{title});b.onclick=()=>this.change({sort:key,direction:s.sort===key&&s.direction==='desc'?'asc':'desc',page:1});th.append(b);tr.append(th)}
     head.append(tr);table.append(head);const body=element('tbody');
     for(const row of rows){const tr=element('tr'),board=element('td');board.title=row.key;board.append(miniature(row.moves));tr.append(board);
-      for(const [key,,title,format] of columns){const td=element('td',format(row[key]),{title});if(key==='status'){td.style.color=statusColour(row.status);td.title=row.status||'prefix'}if(key==='median_plies'||key==='mean_plies')td.title=title+` · ${row.report_games} report games`;tr.append(td)}body.append(tr)}
+      for(const [key,,title,format] of columns){const td=element('td',format(row[key]),{title});if(key==='status'){td.style.color=statusColour(row.status);td.title=row.status||'prefix'}if(key==='games'||key==='p1_win_rate')td.title=title+` · ${row.games-row.selfplay_games} evaluator, ${row.selfplay_games} self-play`;if(key==='median_plies'||key==='mean_plies')td.title=title+` · ${row.report_games+row.selfplay_games} recorded games`;tr.append(td)}body.append(tr)}
     table.append(body);wrap.append(table);return wrap;
   }
   drawDag(data,s){
