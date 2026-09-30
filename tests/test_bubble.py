@@ -148,22 +148,25 @@ class LauncherTests(unittest.TestCase):
         self.launcher.stop()
         self.assertNotIn(state['learner']['pid'], self.fake.killed)
 
-    def test_start_refuses_while_a_live_launcher_holds_the_lock(self):
-        self.fake.live.add(4242)
-        self.fake.markers[4242] = ['python', '/hexo/python/bubble.py', 'train']
-        (self.run / 'processes.lock').write_text('4242')
-        with self.assertRaises(RuntimeError):
-            self.launcher.start(self.plan)
+    def test_start_and_stop_refuse_while_the_run_is_locked(self):
+        with self.launcher.locked():
+            other = bubble.Launcher(self.run, self.fake.spawn, self.fake.arguments, self.fake.kill)
+            with self.assertRaises(RuntimeError):
+                other.start(self.plan)
+            with self.assertRaises(RuntimeError):
+                other.stop()
         self.assertEqual(self.fake.spawned, [])
-
-    def test_start_takes_over_a_lock_of_a_dead_launcher(self):
-        (self.run / 'processes.lock').write_text('4243')
         self.assertEqual(sorted(self.launcher.start(self.plan)), sorted(bubble.SERVICES))
-        self.assertFalse((self.run / 'processes.lock').exists())
 
     def test_prepare_runs_under_the_lock(self):
+        def probe():
+            other = bubble.Launcher(self.run, self.fake.spawn, self.fake.arguments, self.fake.kill)
+            with self.assertRaises(RuntimeError):
+                with other.locked():
+                    pass
+            seen.append(True)
         seen = []
-        self.launcher.start(self.plan, lambda: seen.append((self.run / 'processes.lock').exists()))
+        self.launcher.start(self.plan, probe)
         self.assertEqual(seen, [True])
 
     def test_start_records_pids_and_refuses_a_second_start(self):

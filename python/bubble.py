@@ -9,6 +9,7 @@ and `play` serves the browser game against a run's champion, a given weights fil
 Bubble, which it downloads into `runs/play` when that run has no checkpoints.
 """
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -119,63 +120,60 @@ class Launcher:
         if not any(all(path.with_name(name).exists() for name in learner_files) for path in exports):
             run_steps([sys.executable, str(PYTHON / 'dense_learn.py'), '--run', str(self.run), '--steps', '0'])
 
-    def lock(self):
-        """Create `processes.lock` exclusively, holding this process id. A lock whose owner is no longer a running
-        launcher was abandoned by a crash and is taken over."""
-        path = self.run / 'processes.lock'
+    @contextmanager
+    def locked(self):
+        """Hold the run's OS lock (`processes.lock`) so starts and stops of one run never overlap. The operating
+        system releases it when the holder exits, so a crash leaves nothing to recover."""
         self.run.mkdir(parents=True, exist_ok=True)
-        for attempt in range(2):
-            try:
-                handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-            except FileExistsError:
-                try:
-                    owner = int(path.read_text(encoding='utf-8').strip() or 0)
-                except (OSError, ValueError):
-                    owner = 0
-                if attempt or any(Path(part).name == 'bubble.py' for part in self.arguments(owner)):
-                    raise RuntimeError(f'another start is in progress for {self.run} ({path} held by pid {owner})') from None
-                stale = path.with_name(f'processes.lock.stale.{os.getpid()}')
-                try:
-                    os.replace(path, stale)   # only one launcher can move the abandoned lock aside
-                except FileNotFoundError:
-                    pass
-                stale.unlink(missing_ok=True)
-                continue
-            with os.fdopen(handle, 'w', encoding='utf-8') as stream:
-                stream.write(str(os.getpid()))
-            return path
+        handle = open(self.run / 'processes.lock', 'a+')
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise RuntimeError(f'another start or stop is in progress for {self.run}') from None
+        try:
+            yield
+        finally:
+            if os.name == 'nt':
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
 
     def start(self, plan, prepare=lambda: None):
         """Under the run lock: `prepare` the run, check nothing is running, spawn every service, publish the state."""
-        lock = self.lock()
-        state = {}
-        try:
+        with self.locked():
             prepare()
             running = self.running()
             if running:
                 raise RuntimeError(f"{', '.join(sorted(running))} already running for {self.run}; stop first")
-            for name in SERVICES:
-                script = Path(next(part for part in plan[name] if part.endswith('.py'))).name
-                pid = self.spawn(plan[name], self.run / 'logs' / name)
-                state[name] = dict(pid=pid, script=script, command=plan[name], started_at=time.time())
-            partial = self.state_file.with_suffix('.json.tmp')
-            partial.write_text(json.dumps(state, indent=2), encoding='utf-8')
-            os.replace(partial, self.state_file)
-        except BaseException:
-            for entry in state.values():
-                self.kill(entry['pid'])
-            raise
-        finally:
-            lock.unlink(missing_ok=True)
+            state = {}
+            try:
+                for name in SERVICES:
+                    script = Path(next(part for part in plan[name] if part.endswith('.py'))).name
+                    pid = self.spawn(plan[name], self.run / 'logs' / name)
+                    state[name] = dict(pid=pid, script=script, command=plan[name], started_at=time.time())
+                partial = self.state_file.with_suffix('.json.tmp')
+                partial.write_text(json.dumps(state, indent=2), encoding='utf-8')
+                os.replace(partial, self.state_file)
+            except BaseException:
+                for entry in state.values():
+                    self.kill(entry['pid'])
+                raise
         return state
 
     def stop(self):
-        state = self.state()
-        for name in reversed(SERVICES):
-            if name in state and self.alive(state[name]):
-                self.kill(state[name]['pid'])
-        if self.state_file.exists():
-            self.state_file.unlink()
+        with self.locked():
+            state = self.state()
+            for name in reversed(SERVICES):
+                if name in state and self.alive(state[name]):
+                    self.kill(state[name]['pid'])
+            self.state_file.unlink(missing_ok=True)
         return sorted(state)
 
     def status(self):
