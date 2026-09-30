@@ -54,7 +54,7 @@ cd HeXO
 python -m venv .venv
 ```
 
-Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scriptsctivate.bat` in cmd.exe, `source .venv/bin/activate` on Linux and macOS), then build:
+Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scripts\activate.bat` in cmd.exe, `source .venv/bin/activate` on Linux and macOS), then build:
 
 ```sh
 python -m pip install -e .
