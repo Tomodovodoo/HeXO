@@ -31,7 +31,7 @@ const columns = [
   ['mean_plies','Mean','Mean total placements in matching report games, including capped games',number],
   ['depth','Depth','Opening placements, including the first origin stone',number],
   ['champion_probability','P %','Probability of reaching this canonical position under the champion',v=>v==null?'·':(100*v).toPrecision(3)],
-  ['champion_value','P2 value %','Champion value-head expected score for P2 at this position',v=>v==null?'·':percent(1-v)],
+  ['p2_value','P2 value %','Champion value-head expected score for P2 at this position',percent],
   ['off_policy','Off policy','Imported training starts and their descendants, exempt from policy-reach retirement',v=>v?'Yes':'·'],
   ['status','S','Green: opening; amber: retired; grey: prefix',v=>'●'],
   ['created_at','Created','Book creation or adoption time, UTC',timestamp],

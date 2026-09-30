@@ -21,7 +21,7 @@ stay pending. Every change of the target is recorded in solver-status.json (work
 worker_switches) and as an event.
 
 Positions and queries. A game's positions are plies start..T-1 (the position before placement t; start is the
-restart ply of a restart game, else 0). attack(t, nodes) asks whether the side to move at t has a forced win,
+restart or book-prefix ply of a forced-start game, else 0). attack(t, nodes) asks whether the side to move at t has a forced win,
 threat(t, nodes) whether its opponent would have one moving now with a fresh turn (attacker 'opponent'). Budgets are
 node counts; SAFETY_MS is only a wall-clock cap. Only a native-verified PROVEN_WIN is a proof. A PROVEN_WIN without
 native verification, or an UNKNOWN whose reason is not a search verdict (dense_solver.VERDICTS), counts as a
@@ -297,7 +297,8 @@ class Solver:
     def game(self, shard, g, e):
         """(window records, buffer entries) of episode `g` of `shard`."""
         s, moves, T = self.s, e['moves'], len(e['moves'])
-        start = e['restart']['ply'] if e.get('origin') == 'restart' else 0
+        start = e['restart']['ply'] if e.get('origin') == 'restart' else \
+            e['book']['ply'] if e.get('origin') == 'book' else 0
         roots = e.get('root_values') or [None]*T
         memo = {}
 
@@ -344,7 +345,7 @@ class Solver:
             self.stats['window_plies'][plies[-1]-plies[0]+1] += 1
             candidates = [(plies[0], m, 'attack', None)] + [(d['ply'], 1-m, 'defence', d['saving_turns']) for d in defence]
             for ply, side, kind, saving in candidates:
-                if roots[ply] is None or (start and ply <= start):
+                if roots[ply] is None or (e.get('origin') == 'restart' and ply <= start):
                     continue
                 entry = dict(shard=shard, game=g, ply=ply, side_to_move=side, regret=regret(kind, roots[ply]), kind=kind,
                              added_at=self.clock(), checkpoint=None, plies_to_proof=plies[0]-ply)
