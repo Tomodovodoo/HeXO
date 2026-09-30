@@ -27,7 +27,7 @@ from tactical_proof import NativeTactics
 from tests.test_dense import source_shard, winning_game, write_games
 from tests.test_dense_solver import TINY, tiny_model
 from tests.test_tactical_proof import FIXTURE
-from train import write_json
+from legacy.train import write_json
 
 PROOF = '1790600149713752:2:253'  # the side to move wins in 4 turns; proven within 135 nodes
 SMALL = dense_solve.PassSettings(solve_nodes=135, scan_nodes=1500, saving_nodes=300, verify_fraction=1.)
@@ -757,8 +757,8 @@ class DashboardTests(unittest.TestCase):
             state = dashboard.dense_run(run, dict(created_at=0.))
             self.assertEqual((state['actor']['restart_buffer'], state['data']['restart_share_6h']), (17, .25))
             self.assertEqual((state['actor']['proofs_verified'], state['actor']['verify_timeouts']), (5, 2))
-            self.assertIn('verify_timeouts', (Path(dashboard.__file__).parent/'web'/'training.html').read_text(encoding='utf-8'))
-            self.assertIn('restart_share_6h', (Path(dashboard.__file__).parent/'web'/'training.html').read_text(encoding='utf-8'))
+            self.assertIn('verify_timeouts', (Path(dashboard.__file__).resolve().parents[1]/'web'/'training.html').read_text(encoding='utf-8'))
+            self.assertIn('restart_share_6h', (Path(dashboard.__file__).resolve().parents[1]/'web'/'training.html').read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':

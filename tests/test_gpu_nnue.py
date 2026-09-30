@@ -8,9 +8,9 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from gpu_nnue import NNUEBatch, generate_games
+from legacy.gpu_nnue import NNUEBatch, generate_games
 from hexo import Game
-from nnue_model import NNUE
+from legacy.nnue_model import NNUE
 
 
 class GPUNNUETest(unittest.TestCase):

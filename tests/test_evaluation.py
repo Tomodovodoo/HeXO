@@ -6,9 +6,9 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from evaluate import verify_trace, verify_runtime, sha, publish_failure, freeze
+from legacy.evaluate import verify_trace, verify_runtime, sha, publish_failure, freeze
 from hexo import Game
-from train import paired_metrics
+from legacy.train import paired_metrics
 
 
 class PairedEvaluation(unittest.TestCase):

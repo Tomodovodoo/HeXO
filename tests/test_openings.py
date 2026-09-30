@@ -25,7 +25,7 @@ import dense_openings
 import dense_selfplay
 import hexcrop
 import hexnet
-import train
+from legacy import train
 from tests.test_dense import TINY, scripted
 
 CHAMPION = 'main/000010'

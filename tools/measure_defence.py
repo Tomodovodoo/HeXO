@@ -13,6 +13,7 @@ import time
 
 os.environ['OMP_NUM_THREADS'] = os.environ['MKL_NUM_THREADS'] = '2'
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'python'))
 
 from dense_solver import defence_hit, defence_turns
 from tactical_proof import NativeTactics, PACKAGE, PROVEN_WIN, _assign, _memory_job

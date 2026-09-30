@@ -10,8 +10,8 @@ import numpy as np
 import torch
 
 from hexo import Game
-from nnue_model import NNUE, collate, load_replay, objective
-from reanalysis import analyze, external_replays, reconstruct, replay_inputs, run, validate_history
+from legacy.nnue_model import NNUE, collate, load_replay, objective
+from legacy.reanalysis import analyze, external_replays, reconstruct, replay_inputs, run, validate_history
 
 
 def record():

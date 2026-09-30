@@ -9,10 +9,10 @@ import unittest
 import numpy as np
 import torch
 
-from human_corpus import examples
-from klent import Model, SCHEMA
-from nnue_model import collate
-from q_warmstart import chosen_features, fit_head, main, source_hashes
+from legacy.human_corpus import examples
+from legacy.klent import Model, SCHEMA
+from legacy.nnue_model import collate
+from legacy.q_warmstart import chosen_features, fit_head, main, source_hashes
 from tests.test_human_corpus import record
 
 
@@ -26,10 +26,11 @@ class QWarmStartTest(unittest.TestCase):
     def test_replay_loader_dependency_changes_provenance(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
+            (root/'python/legacy').mkdir(parents=True)
             for name in ("q_warmstart.py", "corpus_warmstart.py", "nnue_model.py", "klent.py", "train.py", "hexo.py"):
-                (root/name).write_text("original", encoding="utf-8")
+                (root/'python'/('legacy/'+name if name != 'hexo.py' else name)).write_text("original", encoding="utf-8")
             before = source_hashes(root)
-            (root/"train.py").write_text("changed replay merger", encoding="utf-8")
+            (root/"python/legacy/train.py").write_text("changed replay merger", encoding="utf-8")
             after = source_hashes(root)
             self.assertNotEqual(before["train.py"], after["train.py"])
             self.assertEqual({k: v for k, v in before.items() if k != "train.py"},

@@ -36,6 +36,7 @@ os.environ['MKL_NUM_THREADS'] = '2'
 os.environ['OPENBLAS_NUM_THREADS'] = '2'
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT/'python'))
 from tools.profile_hexnet import guard, trace_summary
 PROCESS_START = time.perf_counter()
 DEPLOYED_KERNEL_REV = 'edb9f868dfc4c6bb38aec2032222a424e1404505'

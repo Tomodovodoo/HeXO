@@ -6,3 +6,6 @@ __pycache__/
 artifacts/
 runs/
 target/
+.claude/
+.pytest_cache/
+*.egg-info/

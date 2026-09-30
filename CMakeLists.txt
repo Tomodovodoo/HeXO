@@ -26,7 +26,6 @@ if(HEXO_SEAL_SOURCE)
     endif()
   endif()
 endif()
-# Independent encoder accelerator; no search-engine ABI changes.
 add_library(hexo_graph SHARED src/relational_graph.cpp)
 if(MSVC)
   target_compile_options(hexo_graph PRIVATE /O2 /W4)

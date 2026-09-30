@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 
-from strix_reference import REVISION, StrixReference
+from legacy.strix_reference import REVISION, StrixReference
 
 MODEL_SHA256 = "aec92391c66050e737d9b769757248b520ffc1bf44fa039db7c8abd3ef720185"
 MODEL_URL = "https://hexo.tyto.cc/model.safetensors"

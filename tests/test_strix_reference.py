@@ -10,7 +10,7 @@ import sys
 from unittest.mock import patch
 from pathlib import Path
 
-from strix_reference import StrixReference, validate_pv
+from legacy.strix_reference import StrixReference, validate_pv
 from tools import strix_corpus
 
 
@@ -137,7 +137,7 @@ class NativeReference(unittest.TestCase):
             entered.set()
             release.wait(1)
             return validate_pv(*args)
-        with patch("strix_reference.validate_pv", paused_pv):
+        with patch("legacy.strix_reference.validate_pv", paused_pv):
             worker = threading.Thread(target=lambda: results.append(self.reference.solve(stones, "P1", 1)))
             worker.start()
             try:
@@ -167,7 +167,7 @@ class NativeReference(unittest.TestCase):
                 images.append(image)
                 return real_popen(command, **kwargs)
             with StrixReference(original) as reference:
-                with patch("strix_reference.subprocess.Popen", change_source_before_launch):
+                with patch("legacy.strix_reference.subprocess.Popen", change_source_before_launch):
                     result = reference.solve([[0, 0, "P1"]], "P2", 2)
                 self.assertEqual(result["executable_sha256"], expected)
                 self.assertTrue(images[0].exists())
@@ -189,7 +189,7 @@ class NativeReference(unittest.TestCase):
         def delayed_pv(*args):
             time.sleep(.03)
             return validate_pv(*args)
-        with patch("strix_reference.validate_pv", delayed_pv):
+        with patch("legacy.strix_reference.validate_pv", delayed_pv):
             result = self.reference.solve(stones, "P1", 1, timeout_s=.005)
         self.assertEqual((result["status"], result["reason"]), ("UNKNOWN", "wall_timeout"))
         self.assertIsNone(self.reference.process)

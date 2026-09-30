@@ -12,7 +12,7 @@ from time import perf_counter
 
 import numpy as np
 from hexo import Game, ROOT, library
-from klent import _baseline, observe
+from legacy.klent import _baseline, observe
 
 
 def scalar_observe(game):
@@ -54,7 +54,7 @@ def run(trace, output, repeats=20):
                 samples[name].append(1000*(perf_counter()-start)/(repeats*len(boards)))
         result = {'revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                   'engine_sha256': hashlib.sha256(library.read_bytes()).hexdigest(),
-                  'sources': {name: hashlib.sha256((ROOT/name).read_bytes()).hexdigest()
+                  'sources': {name: hashlib.sha256((ROOT/('python/'+('legacy/'+name if name != 'hexo.py' else name) if name.endswith('.py') else name)).read_bytes()).hexdigest()
                               for name in ('src/hexo.cpp', 'src/hexo.hpp', 'hexo.py', 'klent.py')},
                   'trace_sha256': hashlib.sha256(raw).hexdigest(), 'histories': histories,
                   'legal_counts': [len(b.legal_moves()) for b in boards], 'repeats': repeats,

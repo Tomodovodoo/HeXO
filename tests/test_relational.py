@@ -3,8 +3,8 @@ import unittest
 import numpy as np
 import torch
 from hexo import Game
-from relational_encoder import encode, pack, iter_batches, transform, distance, WorkBudgetError, EDGE_NAMES
-from relational_model import RelationalNet, ModelConfig, NeuralEvaluator
+from legacy.relational_encoder import encode, pack, iter_batches, transform, distance, WorkBudgetError, EDGE_NAMES
+from legacy.relational_model import RelationalNet, ModelConfig, NeuralEvaluator
 
 
 def identities(graph, symmetry=0):
@@ -25,7 +25,7 @@ class RelationalTests(unittest.TestCase):
         self.history = [(0,0),(8,0),(16,0),(7,1),(-1,-1)]
 
     def test_native_encoder_exact_parity_and_budgets(self):
-        from relational_native import encode as native_encode
+        from legacy.relational_native import encode as native_encode
         for length in (0,1,2,5):
             for symmetry in range(12):
                 history = [transform(c,symmetry) for c in self.history[:length]]

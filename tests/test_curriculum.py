@@ -1,6 +1,6 @@
 import unittest
 
-from curriculum import family, opening_for
+from legacy.curriculum import family, opening_for
 from hexo import Game
 
 
