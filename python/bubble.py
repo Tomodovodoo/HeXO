@@ -160,7 +160,7 @@ class Launcher:
                 fcntl.flock(handle, fcntl.LOCK_UN)
             handle.close()
 
-    def start(self, plan, prepare=lambda: None):
+    def start(self, plan, prepare=lambda: None, timeout=30.):
         """Under the run lock: `prepare` the run, check nothing is running, spawn every service, publish the state."""
         with self.locked():
             prepare()
@@ -175,7 +175,7 @@ class Launcher:
                     state[name] = dict(pid=pid, script=script, command=plan[name], started_at=time.time())
                 self.publish(state)
             except BaseException:
-                survivors = {name: entry for name, entry in state.items() if not self.terminate(entry, 30.)}
+                survivors = {name: entry for name, entry in state.items() if not self.terminate(entry, timeout)}
                 if survivors:
                     self.publish(survivors)
                 raise

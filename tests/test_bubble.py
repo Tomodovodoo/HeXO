@@ -192,7 +192,7 @@ class LauncherTests(unittest.TestCase):
         launcher = bubble.Launcher(self.run, failing_spawn, self.fake.arguments, self.fake.kill)
         self.fake.stubborn.add(101)
         with self.assertRaises(OSError):
-            launcher.start(self.plan)
+            launcher.start(self.plan, timeout=0.01)
         self.assertEqual(sorted(self.fake.killed), [101, 101, 102])
         self.assertFalse(self.fake.live)
         self.assertFalse((self.run / 'processes.json').exists())
@@ -205,7 +205,7 @@ class LauncherTests(unittest.TestCase):
         self.fake.kill = lambda p, force=False: self.fake.killed.append(p)
         launcher = bubble.Launcher(self.run, failing_spawn, self.fake.arguments, self.fake.kill)
         with self.assertRaises(OSError):
-            launcher.start(self.plan)
+            launcher.start(self.plan, timeout=0.01)
         recorded = json.loads((self.run / 'processes.json').read_text())
         self.assertEqual(sorted(recorded), ['actors', 'evaluator', 'learner'])
         self.assertEqual(sorted(launcher.running()), ['actors', 'evaluator', 'learner'])
