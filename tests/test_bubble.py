@@ -254,6 +254,7 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse((self.run / 'processes.json').exists())
         self.assertEqual(self.launcher.stop(), [])
 
+    @unittest.skipUnless(os.name == 'nt', 'POSIX signals the whole process group instead')
     def test_stop_signals_surviving_workers_directly(self):
         state = self.launcher.start(self.plan)
         pid = state['actors']['pid']
@@ -261,10 +262,13 @@ class LauncherTests(unittest.TestCase):
         self.fake.survivors[pid] = [777, 778]
         self.assertIn('actors', self.launcher.running())
         original = self.fake.kill
-        self.fake.kill = lambda p, force=False: (original(p, force), self.fake.survivors.pop(pid, None))
-        self.launcher.kill = self.fake.kill
+
+        def kill(target, force=False):
+            original(target, force)
+            self.fake.survivors[pid] = [p for p in self.fake.survivors[pid] if p != target]
+        self.launcher.kill = kill
         self.launcher.stop(timeout=0.01)
-        self.assertIn(777, self.fake.killed)
+        self.assertTrue({777, 778} <= set(self.fake.killed))
         self.assertNotIn('actors', self.launcher.running())
 
     def test_stop_forces_a_service_that_ignores_the_first_signal(self):
