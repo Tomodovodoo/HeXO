@@ -72,6 +72,13 @@ class FakeModel:
 
 
 class SixProtocolTests(unittest.TestCase):
+    def test_external_anchor_needs_its_own_league_id(self):
+        for name in ('seal', '', 'main/000001'):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'external_name'):
+                dense_config.EvaluationSettings(external_engine='fake-engine', external_name=name)
+        self.assertEqual(dense_config.EvaluationSettings(external_engine='fake-engine',
+                                                          external_name='six-v2').external_name, 'six-v2')
+
     def test_server_handshake_position_errors_and_turn_sizes(self):
         player = FakePlayer([[(0, 0)], [(1, 0), (0, 1)]])
         source = io.StringIO('six\nisready\nnewgame\nposition radius 8\ngo movetime 10\n'

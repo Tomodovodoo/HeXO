@@ -33,6 +33,7 @@ For evaluation inside Bubble, set the external anchor command and its league nam
 python python/dense_eval.py loop --run runs/dense-v1 --eval-external-engine "C:/Six/sixengine.exe --net C:/Six/gen-0120.onnx --cpu" --eval-external-name six
 ```
 
-The command is split with `shlex`; quote paths containing spaces inside the command string. `seal_ms` is the
+Set a distinct `--eval-external-name` whenever you set an external command, so its results cannot be filed as
+Seal. The command is split with `shlex`; quote paths containing spaces inside the command string. `seal_ms` is the
 per-turn time for either anchor. Existing `seal` reports and league entries keep their IDs; Six results appear
 under `six` in `league.json`, reports, and the dashboard.

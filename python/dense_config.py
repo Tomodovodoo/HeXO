@@ -279,6 +279,12 @@ class EvaluationSettings:
     solver_workers: int = 1      # foreground tactical processes; fixed budgets remain unchanged
     solver_gate_cap_nodes: int = 0  # 0 keeps fixed budgets flat; otherwise gate scales toward this cap at weight 3
 
+    def __post_init__(self):
+        name = self.external_name
+        if self.external_engine and (not name or name == 'seal' or not name[0].isalpha() or
+                                     any(not (c.isalnum() or c in '_-') for c in name)):
+            raise ValueError('external_name must be a distinct league ID; set --eval-external-name')
+
 
 @dataclass(frozen=True)
 class RunConfig:
