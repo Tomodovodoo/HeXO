@@ -2333,9 +2333,21 @@ class MaskedFutureLearnerTests(unittest.TestCase):
                     learner = dense_learn.Learner(run, config.learner, config, overrides=dict(future_target=mode))
                     self.assertEqual((learner.step, learner.samples_seen, learner.pacing),
                                      (previous.step, previous.samples_seen, previous.pacing))
-                    for part in parts(learner.optimizer):
-                        self.assertEqual(part.state, {})
-                    self.assertEqual(learner.optimizer_started, learner.step)
+                    self.assertEqual((learner.optimizer_started, learner.ema_updates),
+                                     (previous.optimizer_started, previous.ema_updates))
+                    old_adamw = previous.optimizer.adamw if optimizer == 'muon' else previous.optimizer
+                    adamw = learner.optimizer.adamw if optimizer == 'muon' else learner.optimizer
+                    old_params = dict(previous.model.named_parameters())
+                    for name, param in learner.model.named_parameters():
+                        old = old_adamw.state.get(old_params.get(name), {})
+                        new = adamw.state.get(param, {})
+                        self.assertEqual(old.keys(), new.keys(), name)
+                        for field, value in old.items():
+                            self.assertTrue(torch.equal(value, new[field]), (name, field))
+                    if optimizer == 'muon':
+                        for old, new in zip(previous.optimizer.matrices, learner.optimizer.matrices):
+                            for field, value in previous.optimizer.muon.state[old].items():
+                                self.assertTrue(torch.equal(value, learner.optimizer.muon.state[new][field]))
                     for key, value in previous.model.state_dict().items():
                         if not key.startswith('future_masked.'):
                             self.assertTrue(torch.equal(value, learner.model.state_dict()[key]), key)

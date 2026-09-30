@@ -441,6 +441,27 @@ def make_optimizer(model, s):
     return torch.optim.AdamW(groups, lr=s.lr, betas=(.9, .98), fused=next(model.parameters()).is_cuda)
 
 
+def load_future_optimizer(optimizer, model, source, settings, state):
+    """Restore shared parameter states when adding/removing the masked future head; new parameters start fresh."""
+    previous = make_optimizer(source, settings)
+    if settings.optimizer == 'muon':
+        optimizer.muon.load_state_dict(state['muon'])  # selected trunk matrices do not change
+        optimizer, previous, state = optimizer.adamw, previous.adamw, state['adamw']
+    source_names = {id(p): name for name, p in source.named_parameters()}
+    memories = {source_names[id(p)]: state['state'][index]
+                for saved, group in zip(state['param_groups'], previous.param_groups)
+                for index, p in zip(saved['params'], group['params']) if index in state['state']}
+    names = {id(p): name for name, p in model.named_parameters()}
+    restored = optimizer.state_dict()
+    for i, (saved, group, current) in enumerate(zip(state['param_groups'], optimizer.param_groups,
+                                                  restored['param_groups'])):
+        restored['param_groups'][i] = dict(saved, params=current['params'])
+        for index, p in zip(current['params'], group['params']):
+            if names[id(p)] in memories:
+                restored['state'][index] = memories[names[id(p)]]
+    optimizer.load_state_dict(restored)
+
+
 @torch.no_grad()
 def update_ema(ema, model, decay):
     pairs = list(zip(ema.parameters(), model.parameters()))
@@ -544,7 +565,7 @@ class Learner:
         self.model.load_state_dict(source.state_dict())
 
     def resume(self, path, manifest):
-        """Load checkpoint weights and counters; reuse optimizer state only for the same kind and future target."""
+        """Load weights and counters; with the same optimizer kind, retain shared states across future-head changes."""
         changed = manifest['learner'].get('future_target', 'legacy') != self.settings.future_target
         self.model = self.place(hexnet.load_model(path/'model.pt', future_target=self.settings.future_target))
         self.ema = self.place(hexnet.load_model(path/'ema.pt', future_target=self.settings.future_target))
@@ -555,17 +576,22 @@ class Learner:
         state = torch.load(path/'optimizer.pt', map_location=self.device, weights_only=True)
         self.optimizer = make_optimizer(self.model, self.settings)
         saved_kind = manifest.get('optimizer_kind', manifest['learner'].get('optimizer', 'adamw'))
-        if saved_kind == self.settings.optimizer and not changed:
-            self.optimizer.load_state_dict(state['optimizer'])
+        if saved_kind == self.settings.optimizer:
+            if changed:
+                with torch.random.fork_rng(devices=[]):
+                    source = hexnet.load_model(path/'model.pt')
+                load_future_optimizer(self.optimizer, self.model, source, self.settings, state['optimizer'])
+            else:
+                self.optimizer.load_state_dict(state['optimizer'])
         adamw = self.optimizer.adamw if self.settings.optimizer == 'muon' else self.optimizer
         for group, decay in zip(adamw.param_groups, (self.settings.weight_decay, 0.)):
             group['weight_decay'] = decay
         self.step, self.samples_seen = manifest['step'], manifest['samples_seen']
-        self.optimizer_started = state['optimizer_started'] if saved_kind == self.settings.optimizer and not changed else self.step
-        self.ema_updates = 0 if changed else state['ema_updates']
+        self.optimizer_started = state['optimizer_started'] if saved_kind == self.settings.optimizer else self.step
+        self.ema_updates = state['ema_updates']
         if changed:
             dense_config.log_event(self.run, 'learner', 'info',
-                                   f'future target switched to {self.settings.future_target}; optimizer and EMA update count reset')
+                                   f'future target switched to {self.settings.future_target}; EMA update count retained')
         self.copied_from = manifest.get('copied_from')
         self.pacing, self.pacing_per_row = dict(manifest.get('pacing', NO_BASE)), manifest['learner']['samples_per_row']
         self.pacing_fraction = manifest['learner'].get('cheap_row_fraction', 1.)
@@ -631,13 +657,15 @@ class Learner:
         self.optimizer.zero_grad(set_to_none=True)
         losses = batch_losses(self.model, batch, self.coefficients(), self.device, self.memory_format, True)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.settings.grad_clip, error_if_nonfinite=True)
-        # AdamW decays a whole parameter, including the two inactive channels sharing the opponent head.
-        legacy = self.model.aux_spatial.weight[1:] if self.model.future_target == 'masked' and self.model.config.aux_heads else None
-        saved = None if legacy is None else legacy.detach().clone()
+        # AdamW decay or saved moments can move the inactive channels sharing the opponent head.
+        legacy = [p[1:] for p in (self.model.aux_spatial.weight, self.model.aux_spatial.bias)] \
+                 if self.model.future_target == 'masked' and self.model.config.aux_heads else []
+        saved = [p.detach().clone() for p in legacy]
         self.optimizer.step()
-        if legacy is not None:
+        if legacy:
             with torch.no_grad():
-                legacy.copy_(saved)
+                for p, old in zip(legacy, saved):
+                    p.copy_(old)
         self.ema_updates += 1
         update_ema(self.ema, self.model, min(self.settings.ema, (1+self.ema_updates)/(10+self.ema_updates)))
         self.step += 1
