@@ -470,6 +470,12 @@ class RestartActorTests(unittest.TestCase):
             shard='1000000000002', game=0, ply=7)])))
         self.assertIsNone(dense_selfplay.Restarts(self.run, 1., 10).draw(np.random.default_rng(0)))
 
+    def test_learner_cannot_override_the_shared_validation_split(self):
+        with unittest.mock.patch('sys.argv', ['dense_learn.py', '--run', str(self.run),
+                '--validation-fraction', '.5', '--steps', '0', '--workers', '0']):
+            with self.assertRaisesRegex(ValueError, 'actors and learners share the validation split'):
+                dense_learn.main()
+
     def test_failed_workers_are_retried_once_and_rejections_stop_the_pass(self):
         for name in ('1000000000002', '1000000000003'):
             shard_of(self.run, name, [episode(PREFIX, -1)])
