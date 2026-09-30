@@ -513,14 +513,14 @@ class RestartActorTests(unittest.TestCase):
     def test_proven_roots_share_an_extra_network_prediction(self):
         model = tiny_model()
         model.cache.capacity = 0
-        history = FIXTURE['positions'][PROOF]
+        history = [list(m) for m in winning_game()[:9]]
         settings = replace(dense_config.ActorSettings(), full_sims=4, cheap_sims=2, root_samples=2,
                            max_plies=len(history)+30, full_fraction=1., opening_random_plies=0.,
                            solver_root_nodes=135, solver_fixed_budgets=True, adjudicate_proven=True,
                            proven_line_rows=True)
         games = [dense_selfplay.SelfPlayGame([model, model], settings, seed,
                  book=(dict(ply=len(history)), history)) for seed in (3, 4)]
-        engine = dense_selfplay.Engine(64, solver_async=False)
+        engine = dense_selfplay.Engine(64, solver_async=False, leaf_nodes=135)
         self.addCleanup(engine.close)
         for game in games:
             self.addCleanup(game.game.close)
@@ -565,12 +565,36 @@ class RestartActorTests(unittest.TestCase):
         while engine.slots:
             engine.step()
         self.assertTrue(all(not row.get('proven') for row in game.rows))
-        self.assertEqual(game.network_values[6], None)
-        self.assertEqual(dense_selfplay.record_network_values([game]), [1])
         self.assertIsNotNone(game.network_values[6])
+        dense_selfplay.record_network_values([game])
+        self.assertTrue(all(value is not None for value in game.network_values[6:]))
         e, rows = game.episode()
         self.assertEqual(e['restart']['value_source'], 'network')
         self.assertEqual(e['network_values'][:6], [None]*6)
+
+    def test_unproven_rows_keep_values_without_a_cache(self):
+        model = tiny_model()
+        model.cache.capacity = 0
+        source = dict(self.buffer[0], ply=5)
+        settings = replace(dense_config.ActorSettings(), full_sims=2, cheap_sims=2, root_samples=2,
+                           max_plies=7, tactics=False, opening_random_plies=0.)
+        game = dense_selfplay.SelfPlayGame([model, model], settings, 7, restart=(source, PREFIX[:5]))
+        self.addCleanup(game.game.close)
+        for tree in game.trees.values():
+            self.addCleanup(tree.close)
+        engine = dense_selfplay.Engine(64)
+        self.addCleanup(engine.close)
+        engine.add(game)
+        while engine.slots:
+            engine.step()
+        self.assertTrue(all(not row.get('proven') for row in game.rows))
+        self.assertIsNotNone(game.network_values[5])
+        self.assertIsNone(game.network_values[6])
+        dense_selfplay.record_network_values([game])
+        expected = model.evaluator.evaluate([np.asarray(game.moves[:ply], np.int64) for ply in (5, 6)])
+        np.testing.assert_allclose(game.network_values[5:], [p[2][0] for p in expected], atol=1e-7)
+        self.assertEqual(game.network_values[:5], [None]*5)
+        self.assertEqual(engine.root_predictions, {})
 
     def test_worker_starts_games_from_the_buffer(self):
         config = dense_config.load(self.run)

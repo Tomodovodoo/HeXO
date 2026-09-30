@@ -301,9 +301,13 @@ class Engine:
         self.leaf_queries = self.leaf_proofs = 0
         self.leaf_seconds = 0.
         self.leaf_roots = {}
+        self.root_predictions = {}
 
     def begin(self, slot):
         """Start the slot's next search; True when it must wait for solver verdicts until the next visit."""
+        key = position_key(np.asarray(slot.tree.history, np.int64).reshape(-1, 2))
+        cached = slot.model.cache.get(key)
+        self.root_predictions[id(slot)] = slot.model, key, float(cached[2][0]) if cached is not None else None
         checked(native.hxg_begin(slot.tree.ptr, slot.budget, slot.samples))
         plan = self.plans.get(id(slot))
         active = dense_solver.active(slot.solver, self.schedule)
@@ -373,6 +377,7 @@ class Engine:
                         result.update(proven=1, proof=proof, proof_turns=turns, proof_action=[list(s) for s in stones],
                                       action=list(stones[0]), solver_nodes=result.get('solver_nodes', 0)+verdict['nodes_used'],
                                       solver_budget=result.get('solver_budget', 0)+verdict['budget'])
+                    result['network_value'] = self.root_predictions[id(slot)][2]
                     self.searches += 1
                     if not slot.searched(result):
                         done.append(slot)
@@ -449,6 +454,9 @@ class Engine:
                 cached = model.cache.get(key)
                 if cached is not None:
                     checked(native.hxg_fulfill(ptr, request, *cached, len(cached[0])))
+                    root = self.root_predictions[id(slot)]
+                    if root[0] is model and root[1] == key:
+                        self.root_predictions[id(slot)] = model, key, float(cached[2][0])
                     self.hits += 1
                     progress = True
                 else:
@@ -475,6 +483,9 @@ class Engine:
                 for slot, ptr, request in positions[key][1:]:
                     if slot not in stopped:
                         checked(native.hxg_fulfill(ptr, request, *prediction, len(prediction[0])))
+                        root = self.root_predictions.get(id(slot))
+                        if root is not None and root[0] is model and root[1] == key:
+                            self.root_predictions[id(slot)] = model, key, float(prediction[2][0])
                 model.cache.put(key, prediction)
         if stopped:
             for _, positions, _, _ in launched:
@@ -492,6 +503,8 @@ class Engine:
         self.inflight = launched
         if done:
             finished = set(map(id, done))
+            for key in finished:
+                self.root_predictions.pop(key, None)
             self.slots = [s for s in self.slots if id(s) not in finished]
             self.closing += [(slot, self.plans.pop(id(slot), None), time.perf_counter()+CLOSE_SECONDS) for slot in done]
         done = []
@@ -525,8 +538,8 @@ class SelfPlayGame:
     episode records origin 'restart' and `restart` (the entry's RESTART_SOURCE fields). `book` (metadata, moves)
     uses the same forced-prefix treatment and records origin 'book' plus its source metadata; ordinary games
     record origin 'selfplay'.
-    `network_values` stores cached, uncorrected predictions for trained searched plies; record_network_values
-    fills missing predictions on exact rows before the worker saves a completed episode.
+    `network_values` stores uncorrected predictions for trained searched plies; record_network_values
+    fills missing predictions before the worker saves a completed episode.
     With adjudicate_proven a proven search (+1: the side to move wins, -1: every legal move loses) plays its
     move and ends the game there (`adjudicate`)."""
 
@@ -585,8 +598,7 @@ class SelfPlayGame:
             row['proven'] = 1 if result['exact_winner'] == player else -1
         self.rows.append(row)
         self.values.append(root_value(result, player) if trained else None)
-        cached = self.model.cache.get(position_key(np.asarray(self.moves, np.int64).reshape(-1, 2))) if trained else None
-        self.network_values.append(float(cached[2][0]) if cached is not None else None)
+        self.network_values.append(result.get('network_value') if trained else None)
         self.full.append(self.is_full and trained)
         if ply < self.random_plies and result.get('proven', 0) <= 0:
             action = actions[self.rng.choice(len(policy), p=policy/policy.sum())].tolist()
@@ -706,20 +718,18 @@ class SelfPlayGame:
 
 
 def record_network_values(slots):
-    """Fill missing network predictions on trained, searched exact rows after late proof labels are applied.
+    """Fill missing network predictions on all trained searched rows before saving a completed game.
 
-    Cached predictions are saved during search. Proven roots that bypassed inference, and the first row of a
-    network-scored restart, share an extra batch per model here. Forced prefixes and generated proof lines
-    stay null. Predictions that cannot be encoded also stay null. Return submission sizes for actor metrics.
-    Search values and played moves are already fixed.
+    Root predictions are saved during search independently of cache eviction. Missing rows share an extra
+    batch per model here, including roots proved later by the offline pass. Forced prefixes and generated
+    proof lines stay null. Predictions that cannot be encoded also stay null. Return submission sizes for
+    actor metrics. Search values and played moves are already fixed.
     """
     pending, sizes = {}, []
     for slot in slots:
         for row in slot.rows:
             ply = row['ply']
-            restart = slot.restart and slot.restart.get('value_source') == 'network' and ply == slot.restart['ply']
-            if (row.get('line') or slot.values[ply] is None or slot.network_values[ply] is not None
-                    or not (row.get('proven') or restart)):
+            if row.get('line') or slot.values[ply] is None or slot.network_values[ply] is not None:
                 continue
             history = np.asarray(slot.moves[:ply], np.int64).reshape(-1, 2)
             model, key = slot.sides[row['player']], position_key(history)

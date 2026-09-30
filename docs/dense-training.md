@@ -117,8 +117,9 @@ move. A missing witness or a proven losing position supplies no new policy
 target. The optional mode's playing benefit still needs measurement.
 
 Actors also save `network_values`, the frozen network's side-to-move predictions before search corrections.
-Cached predictions are reused. When a proven searched row bypassed inference, completed games share an
-extra prediction batch per model before saving. Preset prefixes, generated proof lines and unencodable
+Root predictions are captured during inference independently of cache eviction. Completed games share an
+extra prediction batch per model for missing trained searched rows, including roots reused from older search
+subtrees or proved later by the offline pass. Preset prefixes, generated proof lines and unencodable
 positions retain null predictions. Search results and value targets keep their existing meanings.
 
 The proof pass scores attack restart entries from these predictions when available. A solver can set the
