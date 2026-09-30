@@ -27,8 +27,8 @@ struct Edge { Cell action;double logit=0,prior=0,sum=0,gumbel=0;int visits=0,pen
 // An exact winner comes with a distance: the placements within which that winner completes six from this position
 // (an edge counts its own placement) against any defence, combined by min at the winner's choices and max at the
 // loser's. It is exact for terminal and tactical results; `bound` marks an upper bound, which certificates give.
-// With graph search a node also keeps its visits `n` and utility `q` for its mover (the MCGS value).
-struct Node { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0;bool expanded=false,pending=false,bound=false;double value=0,q=0;Key position;std::vector<Edge> edges; };
+// With graph search a node also keeps its visits `n`, its utility `q` for its mover (the MCGS value) and its parents.
+struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0;bool expanded=false,pending=false,bound=false;double value=0,q=0;Key position;std::vector<Edge> edges;std::vector<std::weak_ptr<Node>> parents; };
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1;std::vector<std::vector<Cell>> own,threats; };
@@ -61,6 +61,22 @@ struct Tree {
   auto n=std::make_shared<Node>();n->player=board.player;n->position=position;n->stones=int(board.cells.size());slot=n;
   if(auto o=outcomes.find(position);o!=outcomes.end()){n->exact_winner=o->second[0];n->distance=o->second[1];n->bound=o->second[3];}
   return n;
+ }
+ // MCGS value of a graph node for its mover from its network value and its edges' visits and current values.
+ void refresh(Node& node) {
+  double total=node.value;int count=1;
+  for(auto& e:node.edges)if(e.visits){total+=e.visits*value(node,e);count+=e.visits;}
+  node.q=node.exact_winner>=0?(node.exact_winner==node.player?1:-1):total/count;
+ }
+ // After a backup changed `from`, refresh its parents other than `skip` (its parent on the backup path) and their
+ // ancestors, so no parent keeps a value from before its shared child's latest visits.
+ void propagate(Node& from,const Node* skip) {
+  std::vector<Node*> work;
+  for(auto& w:from.parents)if(auto p=w.lock())if(p.get()!=skip)work.push_back(p.get());
+  while(!work.empty()){
+   Node* p=work.back();work.pop_back();double before=p->q;refresh(*p);
+   if(p->q!=before)for(auto& w:p->parents)if(auto g=w.lock())work.push_back(g.get());
+  }
  }
  // Records a proven node's outcome for its position (graph search), keeping the shortest bound.
  void learn(const Node& node) {
@@ -171,12 +187,13 @@ struct Tree {
    ++edge.visits;--edge.pending;
    if(edge.exact_winner>=0){value=edge.exact_winner==node->player?1:-1;edge.sum=value*edge.visits;}
    else edge.sum+=value;
-   if(graph){
-    double total=node->value;int count=1;
-    for(auto& e:node->edges)if(e.visits){total+=e.visits*this->value(*node,e);count+=e.visits;}
-    ++node->n;node->q=node->exact_winner>=0?(node->exact_winner==node->player?1:-1):total/count;learn(*node);
-   }
+   if(graph){++node->n;refresh(*node);learn(*node);}
    child=node;
+  }
+  // Nodes on the path are current; their other parents are refreshed upwards.
+  if(graph && !path.edges.empty()){
+   propagate(*path.leaf,path.edges.back().first);
+   for(size_t j=1;j<path.edges.size();++j)propagate(*path.edges[j].first,path.edges[j-1].first);
   }
   if(!path.edges.empty())++completed;
  }
@@ -212,7 +229,7 @@ struct Tree {
    if(chosen<0)return 0;
    auto& edge=node->edges[chosen];if(edge.child && edge.child->pending)return 0;
    path.edges.emplace_back(node,chosen);board.make(edge.action);path.history.push_back(edge.action);
-   if(!edge.child)edge.child=child_here();
+   if(!edge.child){edge.child=child_here();if(graph)edge.child->parents.push_back(node->weak_from_this());}
    node=edge.child.get();path.leaf=node;
    if(board.winner>=0 || edge.exact_winner>=0 || node->exact_winner>=0){
     if(board.winner>=0){node->exact_winner=board.winner;node->distance=0;node->bound=false;}
@@ -264,7 +281,7 @@ struct Tree {
    position.make(witness);auto next_legal=position.legal_moves();
    auto child=std::make_shared<Node>();child->player=player;child->remaining=1;child->expanded=true;child->exact_winner=player;child->distance=distance-1;child->bound=true;
    for(auto c:next_legal){Edge e;e.action=c;e.prior=1./next_legal.size();e.eligible=c==Cell{moves[2],moves[3]};if(e.eligible){e.exact_winner=player;e.distance=distance-1;e.bound=true;}child->edges.push_back(std::move(e));}
-   if(graph){auto [p,c]=keys(position);child->position=p;child->stones=int(position.cells.size());child->n=1;child->q=1;nodes[c]=child;learn(*child);}
+   if(graph){auto [p,c]=keys(position);child->position=p;child->stones=int(position.cells.size());child->n=1;child->q=1;child->parents.push_back(node->weak_from_this());nodes[c]=child;learn(*child);}
    for(auto& e:node->edges)if(e.action==witness){e.child=std::move(child);break;}
   }
  }

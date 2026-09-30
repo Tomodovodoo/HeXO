@@ -75,6 +75,17 @@ int main(){
   gumbel::Path p;p.leaf=child.get();p.edges={{&r,0}};++r.edges[0].pending;t.backup(p,.5,false);
   assert(r.edges[0].visits==1 && std::abs(r.q-(.2-.5)/2)<1e-12 && child->n==3 && r.n==1);
   assert(std::abs(t.value(r,r.edges[1])+.5)<1e-12);}
+ // A backup through one parent of a shared child also refreshes the child's other parents.
+ {gumbel::Tree t(0);t.graph=true;
+  auto r=std::make_shared<gumbel::Node>(),a=std::make_shared<gumbel::Node>(),b=std::make_shared<gumbel::Node>(),c=std::make_shared<gumbel::Node>();
+  r->player=0;a->player=b->player=1;c->player=0;r->expanded=a->expanded=b->expanded=c->expanded=true;c->n=1;c->q=.2;
+  for(auto* x:{r.get()})for(auto child:{a,b}){gumbel::Edge e;e.child=child;e.prior=.5;x->edges.push_back(std::move(e));}
+  for(auto x:{a,b}){gumbel::Edge e;e.child=c;e.prior=1;e.visits=1;x->edges.push_back(std::move(e));c->parents.push_back(x);t.refresh(*x);}
+  a->parents.push_back(r);b->parents.push_back(r);
+  assert(std::abs(b->q+.1)<1e-12);
+  c->exact_winner=0;c->distance=1;
+  gumbel::Path p;p.leaf=c.get();p.edges={{r.get(),0},{a.get(),0}};for(auto [n,i]:p.edges)++n->edges[i].pending;t.backup(p,1);
+  assert(c->q==1 && a->q==-1 && std::abs(b->q+.5)<1e-12);}
  gumbel::Tree tree(1);tree.advance({0,0});tree.begin(16,4);
  assert(tree.sequence==std::vector<int>({0,0,0,0,1,1,1,1,2,2,3,3,4,4,5,5}));
  gumbel::Node n;n.value=.2;

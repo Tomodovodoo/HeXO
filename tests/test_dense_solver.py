@@ -452,6 +452,12 @@ class GraphSearch(unittest.TestCase):
             self.assertEqual(len(game.trees), 2)
             game.finish()
 
+    def test_book_lines_search_with_the_evaluation_graph_setting(self):
+        calls = []
+        model = type('Model', (), dict(tree=lambda self, *args: calls.append(args)))()
+        dense_openings.Line(model, [(0, 0)], 3, 4, 4, True, 1., 0, graph=True)
+        self.assertEqual(calls, [([(0, 0)], 0, True, True)])
+
     def test_one_model_with_two_graph_settings_keeps_two_trees(self):
         model = tiny_model()
         game = dense_eval.MatchGame([model, model], [(0, 0)], 1, 8, 4, True, 5, {}, graphs=(False, True))
