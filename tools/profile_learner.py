@@ -207,7 +207,7 @@ def measure(args):
     status = json.loads((args.batches/'status.json').read_text(encoding='utf-8'))
     if status.get('state') != 'complete' or len(status['batches']) < args.steps:
         raise ValueError('Need a complete snapshot with enough successive batches')
-    if status.get('settings') != asdict(settings):
+    if dense_config.section('learner', status['settings']) != settings:
         raise ValueError('Snapshot sampling/target settings differ from checkpoint manifest')
     batch_hashes = {}
     for index in range(args.steps):
@@ -443,7 +443,7 @@ def live(args):
                 or status.get('frozen_run') != str(frozen_run)
                 or status.get('checkpoint_step') != manifest['step']
                 or status.get('checkpoint_manifest_sha256') != report['checkpoint_manifest_sha256']
-                or status.get('settings') != asdict(settings)
+                or dense_config.section('learner', status['settings']) != settings
                 or status.get('rng_seed', [])[:3] != report['seed']
                 or not status.get('admitted') or not status.get('calibration')
                 or status.get('regret_entries') is None):
