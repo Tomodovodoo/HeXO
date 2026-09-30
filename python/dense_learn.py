@@ -4,7 +4,7 @@ Targets come from episodes. Exact rows use their proven result and are excluded
 from the additional outcome loss. EMA norm statistics are recalibrated at export.
 Pacing counts retained training rows since the saved pacing base. Optional phases
 hand the GPU between generation and training, waiting for actor acknowledgements
-when configured. Value targets and run files are documented in docs/dense-training.md.
+when configured; an unacknowledged handoff fails after 120 seconds. Value targets and run files are documented in docs/dense-training.md.
 """
 import argparse
 import copy
@@ -33,6 +33,7 @@ RECALIBRATION_ROWS = 4096
 QUANTUM = 16  # bucket rows are padded to a multiple of this
 STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
+ACTOR_WAIT_SECONDS = 120.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
         'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'deblunder_weight',
@@ -1000,11 +1001,16 @@ def main():
         if not learner.settings.phase_actors or phase_request is not None:
             return
         phase_request = f'{os.getpid()}:{time.time_ns()}'
+        deadline = time.monotonic()+ACTOR_WAIT_SECONDS
         while True:
             waiting = waiting_actors(args.run, learner.settings.phase_actors, s.variant, phase_request)
             write_status(stage='waiting-for-actors', samples_per_second=0., phase_waiting=waiting)
             if not waiting:
                 break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f'Actor workers {waiting} did not acknowledge the training phase within '
+                                   f'{ACTOR_WAIT_SECONDS:g} seconds. Start all {learner.settings.phase_actors} workers '
+                                   'with updated code and --phase-follow, or disable the handoff with --phase-actors 0.')
             time.sleep(.25)
         write_status(stage='training', samples_per_second=0., phase_waiting=[])
 
