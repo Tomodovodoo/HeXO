@@ -98,7 +98,7 @@ python python/notation.py export match.json > match.txt
 python python/bot_api.py --port 8790 --ms 100
 ```
 
-Notation records a game that ends on the first stone of a turn as a one-coordinate final turn. Only an unfinished mid-turn position or an empty board cannot be written; export raises `NotationConflict` for those. The API's reply must carry two pieces, so it answers 409 to a first-stone win. See [docs/notation-api.md](docs/notation-api.md).
+A final turn may hold one stone, whether it won or the turn is still open, and the origin-only board is `version[1];`. The API's reply must carry two pieces, so it answers 409 to a first-stone win. See [docs/notation-api.md](docs/notation-api.md).
 
 ## Documentation
 
