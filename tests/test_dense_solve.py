@@ -63,7 +63,8 @@ def shard_of(run, name, episodes, identity=None):
     """Write an actor shard of `episodes` (full episode dicts) with rows at every ply from its restart ply on."""
     rows = []
     for g, e in enumerate(episodes):
-        start = e['restart']['ply'] if e.get('origin') == 'restart' else 0
+        start = e['restart']['ply'] if e.get('origin') == 'restart' else \
+            e['book']['ply'] if e.get('origin') == 'book' else 0
         game = Game(e['moves'][:start])
         for t in range(start, len(e['moves'])):
             rows.append(dict(game=g, ply=t, player=game.player, remaining=game.remaining, policy=None,
@@ -254,6 +255,27 @@ class Process:
 
 
 class WorkerCountTests(unittest.TestCase):
+    def test_book_prefix_is_excluded_from_proof_queries_and_first_searched_ply_can_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = new_run(Path(tmp)/'run')
+            moves = [list(m) for m in winning_game()]
+            e = episode(moves, 0, origin='book', book=dict(ply=5))
+            e['root_values'] = [None]*5+[.4]*(len(moves)-5)
+            solver = dense_solve.Solver(run, run, SMALL, None)
+            queried = []
+
+            def query(where, history, attacker, nodes, kind):
+                queried.append(len(history))
+                return ([tuple(moves[len(history)])], 1, 'test') if attacker == 'mover' else None
+
+            solver.stats = dense_solve.new_stats()
+            with unittest.mock.patch.object(solver, 'query', side_effect=query), \
+                 unittest.mock.patch.object(dense_solve, 'worth_solving', return_value=True):
+                windows, entries = solver.game('book', 0, e)
+            self.assertTrue(queried and min(queried) >= 5)
+            self.assertTrue(all(w['first_ply'] >= 5 for w in windows))
+            self.assertTrue(any(entry['ply'] == 5 for entry in entries))
+
     def test_workers_follow_the_phased_learner(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = new_run(Path(tmp)/'run')

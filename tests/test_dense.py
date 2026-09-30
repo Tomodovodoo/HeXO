@@ -2283,7 +2283,7 @@ class DenseBootstrapTests(unittest.TestCase):
             self.assertEqual(dense_data.origin(dict(written, origin=None)), 'converted')    # inferred from the identity
             self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, opponent_rows=0, terminal_games=1, capped_games=1,
                                                  proven_rows=0, proven_games=0, line_rows=0, adjudicated_plies=0,
-                                                 restart_games=0, forced_plies=0))
+                                                 restart_games=0, book_games=0, forced_plies=0))
             self.assertEqual(dense_bootstrap.check(target), 21)
             _, stored = dense_data.read_shard(target)
             self.assertEqual({r['game'] for r in stored}, {0, 1})
@@ -3201,6 +3201,35 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_book_start_searches_only_after_prefix_and_records_source_and_counts(self):
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        settings = dense_config.ActorSettings(full_fraction=1., full_sims=2, root_samples=2,
+                                             opening_random_plies=5., tactics=False, max_plies=5)
+        history = [[0, 0], [7, 0], [8, 0]]
+        source = dict(suite='book', key='test', digest='x', ply=3, off_policy=True)
+        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, book=(source, history))
+        engine = dense_selfplay.Engine(8)
+        try:
+            engine.add(slot)
+            while engine.slots:
+                engine.step()
+            episode, rows = slot.episode()
+        finally:
+            engine.close()
+        self.assertEqual((episode['origin'], episode['book'], episode['opening_plies']), ('book', source, 3))
+        self.assertEqual(episode['moves'][:3], history)
+        self.assertEqual(episode['root_values'][:3], [None]*3)
+        self.assertTrue(all(v is not None for v in episode['root_values'][3:]))
+        self.assertEqual([r['ply'] for r in rows], [3, 4])
+        with tempfile.TemporaryDirectory() as run:
+            manifest = dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'),
+                                             [episode], [dict(r, game=0) for r in rows])
+            self.assertEqual((manifest['counts']['book_games'], manifest['counts']['restart_games'],
+                              manifest['counts']['forced_plies']), (1, 0, 3))
+        with self.assertRaises(ValueError):
+            dense_config.ActorSettings(book_fraction=.95, restart_fraction=.1)
+
     def test_cheap_search_can_descend_with_fewer_root_samples(self):
         slot = SimpleNamespace(settings=dense_config.ActorSettings(full_fraction=0.), rng=np.random.default_rng(1))
         dense_selfplay.SelfPlayGame.plan(slot)
@@ -3853,6 +3882,41 @@ class YieldTests(unittest.TestCase):
         self.assertFalse(due('paused', 'paused', dense_selfplay.METRICS_SECONDS-1))
         self.assertTrue(due('paused', 'paused', dense_selfplay.METRICS_SECONDS))
         self.assertFalse(due('playing', 'playing', 1.))
+
+    def test_historical_games_can_restart_when_book_fraction_is_zero(self):
+        settings = dense_config.ActorSettings(games_in_flight=2, shard_games=2,
+                                               historical_fraction=1., restart_fraction=1.)
+        config = replace(dense_config.RunConfig(), device='cpu', actor=settings)
+        model = SimpleNamespace(checkpoint='main/test', sha='a'*64, config=TINY)
+        historical = SimpleNamespace(models=[model], target=2, redraw=unittest.mock.Mock(),
+                                     next=lambda: (model, 0))
+        restart = (dict(ply=3), [[0, 0], [1, 0], [2, 0]])
+        restarts = SimpleNamespace(load=unittest.mock.Mock(), draw=unittest.mock.Mock(return_value=restart))
+        engine = unittest.mock.Mock(slots=[], closing=[], searches=0, evals=0, calls=0, full_calls=0, solver=None)
+        engine.add.side_effect = lambda slot: engine.slots.append(slot)
+
+        def step():
+            slots, engine.slots = engine.slots, []
+            return slots
+
+        engine.step.side_effect = step
+        slot = SimpleNamespace(opponent='main/test', episode=lambda: (
+            dict(actor=model.sha, opponent='main/test', winner=0, moves=[], reason='test'), []))
+        with unittest.mock.patch.object(dense_selfplay.dense_config, 'load', return_value=config), \
+             unittest.mock.patch.object(dense_selfplay, 'load', return_value=model), \
+             unittest.mock.patch.object(dense_selfplay, 'resolve', return_value=(model.checkpoint, None)), \
+             unittest.mock.patch.object(dense_selfplay, 'Historical', return_value=historical), \
+             unittest.mock.patch.object(dense_selfplay, 'Restarts', return_value=restarts), \
+             unittest.mock.patch.object(dense_selfplay, 'Engine', return_value=engine), \
+             unittest.mock.patch.object(dense_selfplay, 'SelfPlayGame', return_value=slot) as games, \
+             unittest.mock.patch.object(dense_selfplay, 'Yield') as gate, \
+             unittest.mock.patch.object(dense_selfplay.dense_data, 'write_shard'), \
+             unittest.mock.patch.object(dense_selfplay, 'log_event'):
+            gate.return_value.paused.return_value = False
+            dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
+        self.assertEqual(games.call_count, 2)
+        self.assertTrue(all(call.kwargs['restart'] == restart for call in games.call_args_list))
+        self.assertEqual(restarts.draw.call_count, 2)
 
     def test_learner_heartbeat_reports_its_effective_target(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -196,6 +196,17 @@ class SkewTests(unittest.TestCase):
 
 
 class FilterTests(unittest.TestCase):
+    def test_off_policy_reach_is_diagnostic_but_value_and_results_can_retire(self):
+        node = dense_openings.new_node([(0, 0), (7, 0), (8, 0)])
+        node.update(off_policy=True, champion_probability=1e-20, champion_value=.5)
+        self.assertIsNone(dense_openings.judge(node, settings()))
+        node['champion_value'] = .56  # fixed P2 score 44%, below the 45% floor
+        self.assertEqual(dense_openings.judge(node, settings()), 'value')
+        node['champion_value'] = .2  # strong P2 openings remain eligible
+        self.assertIsNone(dense_openings.judge(node, settings()))
+        node['skew'] = dense_openings.skew([0, 0, 0, 0, 30])
+        self.assertEqual(dense_openings.judge(node, settings()), 'skew')
+
     def test_skew_needs_min_games_pairs_and_an_interval_beyond_max_skew(self):
         s = settings(book_min_games=16, book_max_skew=50., book_min_prob=1e-4)
         node = lambda counts, p=1.: dict(skew=dense_openings.skew(counts), champion_probability=p)
@@ -224,6 +235,65 @@ class FilterTests(unittest.TestCase):
 class RefreshTests(unittest.TestCase):
     def book(self, run, **values):
         return dense_openings.Book(run, settings(**values))
+
+    def test_imported_pool_survives_low_policy_reach_and_reimport_preserves_retirement(self):
+        source = json.loads((dense_openings.FROZEN/'off-policy-107500-p2-ge47p5-v1.json').read_text())
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run, book_size=190, book_revisit_fraction=1.)
+            self.assertEqual(book.import_openings(source)['imported'], 190)
+            keys = {n['key'] for n in book.openings(off_policy=True)}
+            book.refresh(Uniform(radius=2), CHAMPION, np.random.default_rng(0), now=1.)
+            self.assertEqual({n['key'] for n in book.openings(off_policy=True)}, keys)
+            self.assertTrue(any(n['champion_probability'] < 1e-4 for n in book.openings()))
+            self.assertTrue(all(n['challenges'] is None for n in book.openings()))
+            node = book.openings()[0]
+            book.tally(pair(node['moves'], 1))
+            book.import_openings(source)
+            self.assertEqual(node['games'], 2)
+            book.retire(node, 'value', 2.)
+            book.prune()
+            book.import_openings(source)
+            self.assertEqual((node['status'], node['reason'], len(book.openings(off_policy=True))),
+                             ('retired', 'value', 189))
+
+    def test_off_policy_children_skip_probability_but_use_the_value_floor(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run, book_size=1, book_min_prob=.99)
+            root = opening(book, [(0, 0), (7, 0), (8, 0)])
+            root['off_policy'] = True
+            added = book.generate(Uniform(radius=2), CHAMPION, [(root['moves'], 4, None)],
+                                  np.random.default_rng(0), 1.)
+            self.assertEqual(added, 1)
+            child = next(n for n in book.openings() if n['depth'] > 3)
+            self.assertTrue(child['off_policy'])
+            self.assertLess(child['champion_probability'], .99)
+            # The same exemption applies when an origin-generated line happens to pass through an imported root.
+            line = root['moves']+[[0, 1], [0, 2]]
+            with unittest.mock.patch.object(dense_openings, 'continuations', return_value=([line]*4, [[None]*4]*4)):
+                self.assertEqual(book.generate(Uniform(radius=2), CHAMPION, [([(0, 0)], 3, None)],
+                                               np.random.default_rng(1), 2.), 1)
+            book.settings = replace(book.settings, book_min_p2_value=.6)
+            self.assertEqual(book.generate(Uniform(radius=2), CHAMPION, [(root['moves'], 4, None)],
+                                          np.random.default_rng(1), 2.), 0)
+
+    def test_import_detaches_existing_challenger_relationships(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run)
+            root = opening(book, [(0, 0), (7, 0), (8, 0)])
+            rival = opening(book, [(0, 0), (1, 0), (2, 0)])
+            child = opening(book, root['moves']+[[0, 1]])
+            rejected = opening(book, root['moves']+[[0, 2]])
+            book.retire(child, 'probability', 1.)
+            book.retire(rejected, 'value', 1.)
+            root['challenges'] = rival['key']
+            source = dict(schema=dense_openings.SCHEMA, suite='selected', nodes=[dict(root)])
+            book.import_openings(source)
+            self.assertIsNone(root['challenges'])
+            self.assertEqual((child['off_policy'], child['status'], child['reason']), (True, 'opening', None))
+            self.assertEqual((rejected['off_policy'], rejected['status'], rejected['reason']), (True, 'retired', 'value'))
+            rival['challenges'] = root['key']
+            book.import_openings(source)
+            self.assertIsNone(rival['challenges'])
 
     def test_a_first_refresh_fills_the_book_with_the_shortest_distinct_openings(self):
         with tempfile.TemporaryDirectory() as run:
@@ -480,7 +550,7 @@ class RefreshTests(unittest.TestCase):
                 book.retire(node, reason, 1.)
             stats = book.stats()
             self.assertEqual((stats['openings'], stats['retired'], stats['depths']),
-                             (1, dict(probability=1, skew=1, short_skew=0, nested=0, replaced=0), {'4': 1}))
+                         (1, dict(probability=1, value=0, skew=1, short_skew=0, nested=0, replaced=0), {'4': 1}))
             self.assertAlmostEqual(stats['mean_abs_skew'], abs(kept['skew']['elo']))
             self.assertEqual(sum(stats['histogram']['counts']), 1)
             graph = book.graph()
@@ -638,7 +708,7 @@ class SettingsTests(unittest.TestCase):
                          ('standard-v1', 5, 3, 1.5, 16, 512, .25, 6., 50., 16, 1e-4, 'uniform', ''))
         self.assertEqual((d.book_short_min_games, d.book_short_skew_z, d.book_short_quantile), (6, 2.5, .25))
         dense_openings.check(d)
-        self.assertEqual(dense_openings.suites(), ('book', 'standard-v1'))
+        self.assertEqual(dense_openings.suites(), ('book', 'off-policy-107500-p2-ge47p5-v1', 'standard-v1'))
         for bad in (dict(opening_suite='mixed-v1'), dict(opening_book='abc'), dict(book_plies=0), dict(book_plies=256),
                     dict(book_min_plies=6), dict(book_min_plies=1), dict(book_plies=11), dict(book_temperature=0.), dict(book_sims=-1),
                     dict(book_size=0), dict(book_min_games=0), dict(book_short_min_games=0),

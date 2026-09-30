@@ -546,7 +546,7 @@ def openings(run):
 
 _book_cache = {}
 BOOK_SORTS = {'games', 'p1_win_rate', 'skew_z', 'decisive_share', 'median_plies', 'mean_plies',
-              'depth', 'champion_probability', 'status', 'created_at', 'retired_at', 'reason'}
+              'depth', 'champion_probability', 'p2_value', 'off_policy', 'status', 'created_at', 'retired_at', 'reason'}
 
 
 def book_rows(run):
@@ -595,10 +595,12 @@ def book_rows(run):
     rows = []
     for node in nodes:
         row = {key: node.get(key) for key in ('key', 'moves', 'depth', 'status', 'reason', 'created_at',
-               'retired_at', 'champion_probability', 'games', 'p1_wins', 'p2_wins', 'capped', 'pairs', 'skew')}
+               'retired_at', 'champion_probability', 'champion_value', 'off_policy',
+               'games', 'p1_wins', 'p2_wins', 'capped', 'pairs', 'skew')}
         decisive = row['p1_wins'] + row['p2_wins']
         plies = lengths[row['key']]
         row.update(decisive=decisive, p1_win_rate=row['p1_wins']/decisive if decisive else None,
+                   p2_value=1-row['champion_value'] if row['champion_value'] is not None else None,
                    skew_z=(row['p1_wins']-row['p2_wins'])/math.sqrt(decisive) if decisive else None,
                    decisive_share=decisive/row['games'] if row['games'] else None,
                    report_games=len(plies), median_plies=statistics.median(plies) if plies else None,

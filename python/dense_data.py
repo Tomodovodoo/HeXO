@@ -3,7 +3,7 @@
 A shard is an immutable directory `<run>/shards/<name>/` (all digits; converted corpora use six, actors use
 millisecond time plus pid) holding
   episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search, actors?, opponent?,
-                  trained_side?, origin?, restart?}]
+                  trained_side?, origin?, restart?, book?}]
   rows.json      [{game, ply, player, remaining, target, weight, legal_sha256, proven?, proof_turns?, solver_nodes?,
                   solver_budget?, proof_action?}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
@@ -32,11 +32,13 @@ Winning rows may carry `proof_action`, the certificate's remaining placements [[
 Sidecars carry the same field as a mapping from ply strings to placements, applied by both readers. Missing
 actions preserve legacy training. `proof_policy_weight` mixes these witnesses into the search policy at learning
 time; the stored search distribution is unchanged.
-Actor episodes record `origin` ('selfplay' or 'restart'; absent: 'selfplay'). A restart game (dense_selfplay.Restarts)
+Actor episodes record `origin` ('selfplay', 'restart' or 'book'; absent: 'selfplay'). A restart game (dense_selfplay.Restarts)
 starts from a buffer position: its first `restart.ply` moves are the source game's, replayed without search, so it
 has rows only from that ply on (null root values and full_search False before it); `restart` names the source
 {shard, game, ply, kind, regret, plies_to_proof}. The manifest counts them as `restart_games` and their
 replayed plies without rows as `forced_plies`.
+Book games likewise omit rows for their forced prefix and keep null root values there. `book` records
+{suite, key, digest, ply, off_policy}; `book_games` counts them, and `forced_plies` includes their prefixes too.
 `episode.actor` is the sha256 of the evaluator being trained. Actor shards also record `actors` {"0": sha, "1": sha}
 per colour, `opponent` (null for self-play, else the checkpoint id of a frozen historical opponent) and
 `trained_side` (null for self-play, else the colour the trained evaluator played). Every ply (from the restart ply
@@ -292,7 +294,9 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
                   proven_games=sum(e.get('reason') == 'proven' for e in episodes), line_rows=sum(bool(r.get('line')) for r in rows),
                   adjudicated_plies=sum(e['adjudicated']['line_plies'] for e in episodes if e.get('adjudicated')),
                   restart_games=sum(e.get('origin') == 'restart' for e in episodes),
-                  forced_plies=sum(e['restart']['ply'] for e in episodes if e.get('origin') == 'restart'))
+                  book_games=sum(e.get('origin') == 'book' for e in episodes),
+                  forced_plies=sum(e['restart']['ply'] if e.get('origin') == 'restart' else e['book']['ply']
+                                   for e in episodes if e.get('origin') in ('restart', 'book')))
     with tempfile.TemporaryDirectory(dir=path.parent, prefix='pending-') as temporary:
         stage = Path(temporary)/'shard'
         stage.mkdir()
