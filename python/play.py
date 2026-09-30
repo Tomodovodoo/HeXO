@@ -2,9 +2,39 @@
 import argparse
 import json
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from hexo import Game
+
+
+def position_key(cells, checkpoint, settings):
+    """Use the ordered stone history seen by the server, not a board hash."""
+    return json.dumps([cells, checkpoint, settings], sort_keys=True, separators=(',', ':'))
+
+
+class AnalysisStore:
+    def __init__(self, path=None):
+        self.path = path
+        self.entries = json.loads(path.read_text(encoding='utf-8')) if path and path.exists() else {}
+
+    def get(self, cells, checkpoint, settings):
+        return self.entries.get(position_key(cells, checkpoint, settings))
+
+    def save(self, cells, checkpoint, settings, analysis):
+        entry = dict(analysis=analysis, computed_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+        updated = self.entries | {position_key(cells, checkpoint, settings): entry}
+        if self.path:
+            temporary = self.path.with_name(self.path.name + '.tmp')
+            temporary.write_text(json.dumps(updated, indent=2), encoding='utf-8')
+            temporary.replace(self.path)
+        self.entries = updated
+        return entry
+
+    def history(self, cells, checkpoint, settings):
+        return [dict(ply=ply, win_probability=entry['analysis'].get('win_probability'))
+                for ply in range(len(cells) + 1)
+                if (entry := self.get(cells[:ply], checkpoint, settings))]
 
 
 class DensePlayer:
@@ -147,6 +177,7 @@ class DensePlayer:
                         elapsed_ms=(time.perf_counter()-start)*1000, suggestions=suggestions,
                         player=player, win_probability=1. if proven else win_probability,
                         proof_status='PROVEN_WIN' if proven else 'UNKNOWN', winning_line=line, threat=threat,
+                        threat_checked=analyze and self.options['solver'],
                         solver_status=proof['status'] if proof else 'off', settings=dict(self.options))
         finally:
             local.close()
@@ -167,6 +198,12 @@ class Handler(BaseHTTPRequestHandler):
     search_checkpoint = None
     search_label = "Internal champion"
     neural_options = {}
+    notes = AnalysisStore()
+
+    def note_context(self):
+        if isinstance(self.neural, DensePlayer):
+            return self.neural.checkpoint, dict(self.neural.options)
+        return (self.search_checkpoint if self.search_run else None), None
 
     @classmethod
     def refresh_champion(cls):
@@ -203,6 +240,8 @@ class Handler(BaseHTTPRequestHandler):
         elif promoted:
             backend = "table-pvs"
         dense = isinstance(self.neural, DensePlayer)
+        checkpoint, settings = self.note_context()
+        cells = self.game.cells
         return {**self.game.state(), "opponent": f'Dense {self.neural.checkpoint}' if dense else self.label,
                 "backend": backend,
                 "checkpoint": self.neural.checkpoint if dense else self.search_checkpoint if self.search_run else promoted["id"] if promoted else None,
@@ -210,7 +249,9 @@ class Handler(BaseHTTPRequestHandler):
                 "model_sha256": self.neural.model_sha256 if self.neural else None,
                 "models": self.neural.models() if dense else [],
                 "dense_settings": self.neural.options if dense else None,
-                "dense_checkpoint": self.neural.checkpoint if dense else None}
+                "dense_checkpoint": self.neural.checkpoint if dense else None,
+                "position_analysis": self.notes.get(cells, checkpoint, settings),
+                "game_analysis": self.notes.history(cells, checkpoint, settings)}
 
     def respond(self, status, data, content_type="application/json"):
         payload = data.encode() if isinstance(data, str) else json.dumps(data).encode()
@@ -241,7 +282,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/new":
                 self.refresh_champion()
                 self.game.close()
-                Handler.game = Game()
+                type(self).game = Game()
                 if self.neural:
                     self.neural.set_history()
             elif self.path == "/play":
@@ -255,13 +296,25 @@ class Handler(BaseHTTPRequestHandler):
                     self.neural.select(args.pop('checkpoint'))
                 self.neural.configure(args)
             elif self.path == '/analyze' and isinstance(self.neural, DensePlayer):
-                analysis = self.neural.turn(self.game, analyze=True)
+                checkpoint, settings = self.note_context()
+                saved = self.notes.get(self.game.cells, checkpoint, settings)
+                if saved and args.get('force') is not True and (not settings['solver'] or
+                        saved['analysis'].get('threat_checked')):
+                    analysis = saved['analysis']
+                else:
+                    analysis = self.neural.turn(self.game, analyze=True)
+                    self.notes.save(self.game.cells, checkpoint, settings, analysis)
             elif self.path == "/bot":
                 ms = args.get("ms", 1000)
                 if type(ms) is not int or not 1 <= ms <= 30000:
                     raise ValueError("Think time must be 1..30000 ms")
                 checkpoint = self.neural.checkpoint if isinstance(self.neural, DensePlayer) else self.search_checkpoint if self.search_run else None
-                if self.neural is not None:
+                note_checkpoint, note_settings = self.note_context()
+                note_cells = self.game.cells
+                if isinstance(self.neural, DensePlayer):
+                    saved = self.notes.get(note_cells, note_checkpoint, note_settings)
+                    analysis = saved['analysis'] if saved else self.neural.turn(self.game, milliseconds=ms)
+                elif self.neural is not None:
                     analysis = self.neural.turn(self.game, milliseconds=ms)
                 elif self.model is not None:
                     self.game.load_model(self.model)
@@ -276,6 +329,8 @@ class Handler(BaseHTTPRequestHandler):
                 if self.neural is None:
                     analysis = self.game.search(ms)
                 analysis["checkpoint"] = checkpoint
+                if isinstance(self.neural, DensePlayer) and not saved:
+                    self.notes.save(note_cells, note_checkpoint, note_settings, analysis)
                 for q, r in analysis["moves"]:
                     self.game.play(q, r)
             else:
@@ -322,6 +377,8 @@ if __name__ == "__main__":
         name = args.label or "Bubble"
         Handler.label = f"{name} | {Handler.neural.mode} | {Handler.neural.model_sha256[:12]}"
     Handler.search_run = args.search_run.resolve() if args.search_run else None
+    notes_run = args.dense_run or args.run or args.search_run
+    Handler.notes = AnalysisStore(notes_run.resolve() / 'play-notes.json' if notes_run else None)
     Handler.search_label = args.label or "Internal champion"
     Handler.neural_options = dict(mode=args.neural_mode, simulations=args.simulations, device=args.device)
     Handler.refresh_champion()

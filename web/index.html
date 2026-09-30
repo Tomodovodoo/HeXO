@@ -3,7 +3,7 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bubble | Play HeXO</title>
 <style>
-:root{font-family:system-ui,sans-serif;color:#222d35;background:#edf1f3;font-synthesis:none}*{box-sizing:border-box}body{margin:0}header{height:76px;padding:0 28px;display:flex;align-items:center;gap:24px;border-bottom:1px solid #c6d0d6;background:#fff}h1{font-size:25px;letter-spacing:-1px;margin:0}header p{color:#556671;font-size:14px}main{display:grid;grid-template-columns:1fr 290px;height:calc(100dvh - 76px)}#board{width:100%;height:100%;touch-action:none;cursor:crosshair}aside{background:#fff;padding:28px 24px;border-left:1px solid #c6d0d6;overflow:auto}h2{font-size:20px;line-height:1.3;margin:0 0 8px}p{font-size:14px;line-height:1.6;color:#556671}label{display:block;margin:22px 0 8px;font-size:13px;font-weight:650}select,button,input{font:inherit;padding:10px;border:1px solid #a5b4bd;border-radius:4px;background:#fff;color:#24333d}select,button{width:100%}button{cursor:pointer;margin-top:10px}button.primary{background:#175e83;border-color:#175e83;color:white}button:disabled{opacity:.5;cursor:wait}:focus-visible{outline:3px solid #dc8a14;outline-offset:2px}.coordinate{display:flex;gap:7px}.coordinate input{min-width:0;width:50%}#stats{font-size:12px;font-variant-numeric:tabular-nums;line-height:1.8;color:#556671;border-top:1px solid #d7dfe4;margin-top:24px;padding-top:16px}#error{color:#ad2e19;min-height:20px}.legend{display:flex;gap:16px;margin:20px 0;font-size:13px}.stone{width:12px;height:12px;display:inline-block;border-radius:50%;margin-right:5px}.blue{background:#226b95}.red{background:#c35539}@media(max-width:700px){header{height:60px;padding:0 18px}header p{font-size:12px}main{height:auto;grid-template-columns:1fr}#board{height:60dvh}aside{border-top:1px solid #c6d0d6;border-left:0;padding:20px}aside .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
+:root{font-family:system-ui,sans-serif;color:#222d35;background:#edf1f3;font-synthesis:none}*{box-sizing:border-box}body{margin:0}header{height:76px;padding:0 28px;display:flex;align-items:center;gap:24px;border-bottom:1px solid #c6d0d6;background:#fff}h1{font-size:25px;letter-spacing:-1px;margin:0}header p{color:#556671;font-size:14px}main{display:grid;grid-template-columns:1fr 290px;height:calc(100dvh - 76px)}#board{width:100%;height:100%;touch-action:none;cursor:crosshair}aside{background:#fff;padding:28px 24px;border-left:1px solid #c6d0d6;overflow:auto}h2{font-size:20px;line-height:1.3;margin:0 0 8px}p{font-size:14px;line-height:1.6;color:#556671}label{display:block;margin:22px 0 8px;font-size:13px;font-weight:650}select,button,input{font:inherit;padding:10px;border:1px solid #a5b4bd;border-radius:4px;background:#fff;color:#24333d}select,button{width:100%}button{cursor:pointer;margin-top:10px}button.primary{background:#175e83;border-color:#175e83;color:white}button:disabled{opacity:.5;cursor:wait}:focus-visible{outline:3px solid #dc8a14;outline-offset:2px}.coordinate{display:flex;gap:7px}.coordinate input{min-width:0;width:50%}#stats{font-size:12px;font-variant-numeric:tabular-nums;line-height:1.8;color:#556671;border-top:1px solid #d7dfe4;margin-top:24px;padding-top:16px}#error{color:#ad2e19;min-height:20px}.legend{display:flex;gap:16px;margin:20px 0;font-size:13px}.stone{width:12px;height:12px;display:inline-block;border-radius:50%;margin-right:5px}.blue{background:#226b95}.red{background:#c35539}#analysis-panel{border-top:1px solid #d7dfe4;margin-top:22px;padding-top:16px;font-size:12px;font-variant-numeric:tabular-nums}#analysis-panel h2{font-size:16px}#analysis-fields{display:grid;grid-template-columns:1fr auto;gap:5px 10px;margin:12px 0}#analysis-fields dt{color:#556671}#analysis-fields dd{margin:0;text-align:right;overflow-wrap:anywhere}#suggestions,#game-analysis{list-style:none;margin:6px 0 12px;padding:0}#suggestions li,#game-analysis li{display:flex;justify-content:space-between;gap:8px;padding:3px 0}#game-analysis{max-height:120px;overflow:auto}#analysis-panel h3{font-size:12px;margin:15px 0 5px;color:#556671}@media(max-width:700px){header{height:60px;padding:0 18px}header p{font-size:12px}main{height:auto;grid-template-columns:1fr}#board{height:60dvh}aside{border-top:1px solid #c6d0d6;border-left:0;padding:20px}aside .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
 </style>
 <header><h1>Bubble</h1><p>A bot for HeXO. Six in a line on an infinite hex grid.</p></header>
 <main><canvas id="board" tabindex="0" aria-label="Hexagonal game board. Use the coordinate inputs to place stones with the keyboard."></canvas>
@@ -18,6 +18,7 @@
 <label for="solver-nodes">Proof nodes per query</label><select id="solver-nodes"><option>135</option><option>2048</option><option>8192</option><option selected>32768</option><option>131072</option><option>524288</option></select>
 <button id="analyze">Suggest moves and check threats</button><p id="hint"></p><button id="clear-hint" hidden>Clear hints</button>
 </div>
+<section id="analysis-panel" hidden aria-label="Position analysis"><h2>Position analysis</h2><dl id="analysis-fields"></dl><h3 title="Top candidate cells and their search probabilities">Suggestions</h3><ol id="suggestions"></ol><h3 title="Saved win probability at each stone count in this game">Game</h3><ol id="game-analysis"></ol><button id="reanalyze">Re-analyse</button></section>
 <div id="time-controls">
 <label for="budget">Search budget per turn</label><select id="budget"><option value="100">0.1 seconds</option><option value="1000" selected>1 second</option><option value="5000">5 seconds</option><option value="10000">10 seconds</option></select><p id="budget-note" hidden>Neural inference can finish after this budget. Actual time is shown after each turn.</p>
 </div>
@@ -50,7 +51,40 @@ function render(){
   $('status').textContent=won?`Player ${state.winner+1} wins`:busy?'Engine is thinking...':`Player ${state.player+1} to play`;
   $('phase').textContent=won?'Six connected. Start another game.':`${state.remaining} ${state.remaining===1?'stone':'stones'} remaining this turn`;
   document.querySelectorAll('button,select,input').forEach(el=>el.disabled=busy);
+  renderAnalysis();
   draw();
+}
+function percent(value){return value==null?'–':`${(value*100).toFixed(1)}%`}
+function renderAnalysis(){
+  const saved=state.position_analysis, a=saved?.analysis, panel=$('analysis-panel');
+  panel.hidden=!state.dense_settings;
+  if(panel.hidden)return;
+  const fields=a?[
+    ['Win',percent(a.win_probability),'Win probability for the side to move'],
+    ['Proof',a.proof_status==='PROVEN_WIN'?1:0,`Verified winning strategy: ${a.proof_status||'unknown'}`],
+    ['Threat',a.threat?1:a.threat_checked?0:'–','1 means verified threat; 0 means checked and absent; – means unchecked'],
+    ['Solver',a.solver_status==='PROVEN_WIN'?1:a.solver_status==='PROVEN_LOSS'?-1:0,`Solver status: ${a.solver_status||'unknown'}`],
+    ['Checkpoint',a.checkpoint||'–','Checkpoint used for this analysis'],
+    ['Search',Number(Boolean(a.settings?.search)),'1 means enabled'],
+    ['Simulations',a.settings?.simulations??'–','Search simulations per stone'],
+    ['Proof search',Number(Boolean(a.settings?.solver)),'1 means enabled'],
+    ['Proof nodes',a.settings?.solver_nodes??'–','Maximum proof nodes per query'],
+    ['Computed',saved.computed_at.replace('T',' ').replace('+00:00',''),'UTC time of analysis'],
+    ['ms',Math.round(a.elapsed_ms),'Elapsed analysis time in milliseconds']
+  ]:[];
+  $('analysis-fields').replaceChildren(...fields.flatMap(([name,value,tip])=>{
+    const label=document.createElement('dt'),number=document.createElement('dd');
+    label.textContent=name;label.title=tip;number.textContent=String(value);number.title=tip;
+    return [label,number];
+  }));
+  $('suggestions').replaceChildren(...(a?.suggestions||[]).map((item,i)=>{
+    const row=document.createElement('li');row.textContent=`${i+1}. ${item.move.join(', ')}   ${percent(item.probability)}`;
+    row.title='Candidate cell and probability from the search';return row;
+  }));
+  $('game-analysis').replaceChildren(...(state.game_analysis||[]).map(item=>{
+    const row=document.createElement('li');row.textContent=`${item.ply}   ${percent(item.win_probability)}`;
+    row.title=`${item.ply} stones; win probability for the side to move`;return row;
+  }));
 }
 async function call(path,args={}){
   busy=true;render();$('error').textContent='';
@@ -75,6 +109,12 @@ async function call(path,args={}){
 }
 function clearHints(){hints=null;$('hint').textContent='';$('clear-hint').hidden=true}
 function drawHints(){
+  if(state.position_analysis){
+    for(const item of state.position_analysis.analysis.suggestions||[]){
+      const [x,y]=screen(...item.move);ctx.beginPath();ctx.arc(x,y,size*.58,0,Math.PI*2);
+      ctx.fillStyle='#e5b84b55';ctx.fill();ctx.strokeStyle='#b06d0a';ctx.stroke();
+    }
+  }
   if(!hints)return;
   const line=hints.winning_line.length?hints.winning_line:hints.moves.map(p=>[...p,hints.player]);
   line.forEach((p,i)=>{
@@ -95,5 +135,6 @@ $('place').onclick=()=>place(Number($('q').value),Number($('r').value));$('bot')
 $('checkpoint').onchange=()=>call('/settings',{checkpoint:$('checkpoint').value});
 for(const id of ['search-enabled','solver-enabled','simulations','solver-nodes'])$(id).onchange=()=>call('/settings',{search:$('search-enabled').checked,solver:$('solver-enabled').checked,simulations:Number($('simulations').value),solver_nodes:Number($('solver-nodes').value)});
 $('analyze').onclick=()=>call('/analyze');$('clear-hint').onclick=()=>{clearHints();render()};
+$('reanalyze').onclick=()=>call('/analyze',{force:true});
 fetch('/state').then(r=>r.json()).then(s=>{state=s;$('budget').value=String(s.default_budget_ms||1000);render()}).catch(e=>{$('error').textContent=e.message});
 </script></html>
