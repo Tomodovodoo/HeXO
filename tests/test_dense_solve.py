@@ -687,6 +687,31 @@ class ProvenLabelTests(unittest.TestCase):
             self.assertTrue(all(t['policy_weight'] > 0 for t in dense_data.examples(
                 reader, refs, np.random.default_rng(0), proof_policy_weight=1.)[1]))
 
+    def test_certificate_policy_fills_only_missing_targets(self):
+        window = dense_data.ReplayWindow(self.run, 1000, 100)
+        actions = {'7': [list(m) for m in winning_game()[7:9]], '8': [list(winning_game()[8])]}
+        dense_solve.write_sidecar(self.run/'shards'/'000001', [dict(game=0, plies=[7, 8], proof_action=actions)])
+        window.refresh()
+        refs = [window.ref('000001', i) for i in (7, 8, 9)]
+        refs[2].row.update(proven=-1, proof_action=actions['8'])
+        ordinary = window.policy
+        def policy(ref):
+            return np.empty(0, np.float32) if ref.row['ply'] == 8 else ordinary(ref)
+        with unittest.mock.patch.object(window, 'policy', side_effect=policy):
+            samples, base = dense_data.examples(window, refs, np.random.default_rng(0))
+            _, targets = dense_data.examples(window, refs, np.random.default_rng(0),
+                    proof_policy_weight=.25, proof_policy_missing_only=True)
+            _, disabled = dense_data.examples(window, refs, np.random.default_rng(0), proof_policy_missing_only=True)
+        for i, (before, after) in enumerate(zip(base, targets)):
+            for key in before:
+                np.testing.assert_array_equal(before[key], disabled[i][key])
+                if i != 1 or key not in ('policy', 'policy_weight'):
+                    np.testing.assert_array_equal(before[key], after[key])
+        self.assertEqual(targets[1]['policy_weight'], .25)
+        selected = samples[1].actions[targets[1]['policy'] > 0].tolist()
+        self.assertEqual(selected, actions['8'])
+        self.assertAlmostEqual(float(targets[1]['policy'].sum()), 1.)
+
     def test_validation_reports_value_regret_on_proven_rows(self):
         torch.set_num_threads(2)
         torch.manual_seed(0)
