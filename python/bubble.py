@@ -107,14 +107,16 @@ def alive(pid, script, run, arguments=arguments):
     return matches(arguments(pid), script, run)
 
 
-def members(candidates, run, root):
+def members(candidates, run, root, parents=None):
     """The pids among `candidates` ({pid: argument list}) that belong to the service `root` of `run`: they name
-    the run directory, or they are multiprocessing workers whose `parent_pid=` names an accepted member."""
+    the run directory, their parent (`parents`, {pid: ppid}, or a Windows `parent_pid=` argument) is an accepted
+    member, or they are multiprocessing workers of the service's own session (`parents` maps them to `root`)."""
+    parents = parents or {}
     accepted = {root} | {pid for pid, parts in candidates.items() if run in parts}
     while True:
         added = {pid for pid, parts in candidates.items() if pid not in accepted and
-                 any(part.startswith('parent_pid=') or 'parent_pid=' in part for part in parts) and
-                 any(f'parent_pid={parent}' in ' '.join(parts) for parent in accepted)}
+                 (parents.get(pid) in accepted or
+                  any(f'parent_pid={parent}' in ' '.join(parts) for parent in accepted))}
         if not added:
             return accepted - {root}
         accepted |= added
@@ -140,23 +142,30 @@ def windows_tree(pid, run):
 
 
 def group_alive(pid, run):
-    """Whether any process started under the service `pid` still belongs to it: on POSIX a member of its process
-    group (each service starts its own session), on Windows a descendant by parent id."""
+    """Whether any process started under the service `pid` still belongs to it: on Windows a descendant by parent
+    id, on POSIX a member of its process group (each service starts its own session). A group whose leader is
+    alive but runs another run's service is not ours; workers of the service's own session count even after the
+    leader exited, since they can only have been created inside it."""
     if os.name == 'nt':
         return bool(windows_tree(pid, run))
     if not Path('/proc').is_dir():
         return False
-    group = {}
+    leader = arguments(pid)
+    if leader and run not in leader:
+        return False
+    group, parents = {}, {}
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
         try:
             fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
-            if int(fields[2]) == pid:
-                group[int(entry.name)] = arguments(int(entry.name))
+            member, ppid, pgrp, session = int(entry.name), int(fields[1]), int(fields[2]), int(fields[3])
+            if pgrp == pid:
+                group[member] = arguments(member)
+                parents[member] = pid if session == pid and any('multiprocessing' in part for part in group[member]) else ppid
         except (OSError, ValueError, IndexError):
             continue
-    return bool(members(group, run, pid))
+    return bool(members(group, run, pid, parents))
 
 
 def kill(pid, force=False):

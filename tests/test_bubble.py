@@ -103,6 +103,13 @@ class MembersTests(unittest.TestCase):
         self.assertEqual(bubble.members({40: worker(10)}, '/r', 10), {40})
         self.assertEqual(bubble.members({30: worker(99)}, '/r', 10), set())
 
+    def test_posix_workers_follow_parent_pids(self):
+        spawn = ['python', '-c', 'from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5, pipe_handle=7)']
+        candidates = {11: ['python', 'dense_learn.py', '--run', '/r'], 12: spawn, 13: spawn, 14: spawn}
+        parents = {11: 10, 12: 11, 13: 12, 14: 999}
+        self.assertEqual(bubble.members(candidates, '/r', 10, parents), {11, 12, 13})
+        self.assertEqual(bubble.members({14: spawn}, '/r', 10, {14: 10}), {14})
+
 
 class MatchTests(unittest.TestCase):
     def test_exact_run_and_script(self):
