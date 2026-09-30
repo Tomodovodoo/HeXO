@@ -73,7 +73,7 @@ class FakeModel:
 
 class SixProtocolTests(unittest.TestCase):
     def test_external_anchor_needs_its_own_league_id(self):
-        for name in ('seal', '', 'main/000001'):
+        for name in ('seal', '', 'main/000001', 'main-000001'):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'external_name'):
                 dense_config.EvaluationSettings(external_engine='fake-engine', external_name=name)
         self.assertEqual(dense_config.EvaluationSettings(external_engine='fake-engine',

@@ -281,7 +281,8 @@ class EvaluationSettings:
 
     def __post_init__(self):
         name = self.external_name
-        if self.external_engine and (not name or name == 'seal' or not name[0].isalpha() or
+        if self.external_engine and (not name or name == 'seal' or name.rpartition('-')[2].isdigit() or
+                                     not name[0].isalpha() or
                                      any(not (c.isalnum() or c in '_-') for c in name)):
             raise ValueError('external_name must be a distinct league ID; set --eval-external-name')
 
