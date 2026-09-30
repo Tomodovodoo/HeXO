@@ -90,8 +90,9 @@ final board when they end before 20 placements; capped games need all 20.
 `--future-weight` keeps its default coefficient of 0.5.
 
 Restart the learner with its existing arguments plus `--future-target masked`.
-The first mode switch preserves shared and legacy head weights and training
-counters, adds the new head, and resets the optimizer and EMA update count.
+The first mode switch preserves shared and legacy head weights, training
+counters, shared Adam moments and the EMA update count, and adds the new head.
+The new head starts without optimizer moments; its raw and EMA weights match.
 Later resumes restore the saved mode, head, and optimizer. To switch back,
 pass `--future-target legacy`. Actors and evaluators read either checkpoint
 format without extra flags.
@@ -100,6 +101,20 @@ The new loss is `future_masked_ce`; legacy remains `future_bce`. Each fixed
 validation source reports the active metric on held and training panels, plus
 their gap, under separate names such as `newest_future_masked_ce` and
 `newest_future_bce`. These are different objectives, not comparable loss values.
+
+## Certified winning moves
+
+`--proof-policy-weight w` teaches moves from verified winning certificates,
+including solver roots and generated proof continuations that have no search
+policy. Its default is 0. With `--proof-policy-missing-only`, it supplies targets
+only for those empty rows; existing search policies keep their targets and loss
+weights. For example, `--proof-policy-weight 0.25 --proof-policy-missing-only`
+gives the added rows policy loss weight 0.25. This uses the existing heads and
+rendered positions, with no additional search or inference.
+
+The certificate identifies known winning placements rather than every winning
+move. A missing witness or a proven losing position supplies no new policy
+target. The optional mode's playing benefit still needs measurement.
 
 ## Dense actor batches
 

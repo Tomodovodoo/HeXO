@@ -1203,8 +1203,12 @@ class DenseConfigTests(unittest.TestCase):
         dense_config.add_arguments(parser, dense_config.LearnerSettings)
         base = dense_config.LearnerSettings()
         self.assertEqual(base.proof_policy_weight, 0.)
+        self.assertFalse(base.proof_policy_missing_only)
         self.assertIn('proof_policy_weight', dense_learn.KEEP)
+        self.assertIn('proof_policy_missing_only', dense_learn.KEEP)
         self.assertEqual(dense_config.override(base, parser.parse_args(['--proof-policy-weight', '.5'])).proof_policy_weight, .5)
+        missing = dense_config.override(base, parser.parse_args(['--proof-policy-missing-only']))
+        self.assertTrue(dense_data.target_options(missing)['proof_policy_missing_only'])
         for weight in (-1., float('nan'), float('inf')):
             with self.assertRaises(ValueError):
                 replace(base, proof_policy_weight=weight)

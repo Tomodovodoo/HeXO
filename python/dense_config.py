@@ -159,6 +159,7 @@ class LearnerSettings:
     future_target: str = 'legacy'  # legacy: occupancy BCE at 6/20; masked: empty/own/opponent CE at 20 on empty cells
     proven_value_weight: float = 2.  # value weight of rows the solver proved; their target is the proven value
     proof_policy_weight: float = 0.  # mix (search + weight * proof)/(1 + weight); proof-only rows have this loss weight
+    proof_policy_missing_only: bool = False  # use certificate moves only on rows without a search policy
     validation_fraction: float = .03
     validation_rows: int = 8192   # rows per per-source validation subset (dense_data.ValidationSets limit)
     validation_quota: int = 128   # rows each shard may contribute to a subset (ValidationSets quota)
