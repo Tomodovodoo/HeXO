@@ -21,7 +21,7 @@
 <div id="time-controls">
 <label for="budget">Search budget per turn</label><select id="budget"><option value="100">0.1 seconds</option><option value="1000" selected>1 second</option><option value="5000">5 seconds</option><option value="10000">10 seconds</option></select><p id="budget-note" hidden>Neural inference can finish after this budget. Actual time is shown after each turn.</p>
 </div>
-<div class="actions"><button class="primary" id="bot">Bubble plays this turn</button><button id="new">New game</button><button id="undo">Undo stone</button><button id="center">Center view</button></div>
+<div class="actions"><button class="primary" id="bot">Bubble plays this turn</button><button id="new">New game</button><button id="undo">Undo stone</button><button id="center">Center view</button><button id="copy-htttx">Copy current HTTTX</button></div>
 <label for="q">Place by coordinate</label><div class="coordinate"><input id="q" type="number" value="0" aria-label="Axial q coordinate"><input id="r" type="number" value="0" aria-label="Axial r coordinate"></div><button id="place">Place stone</button>
 <p id="error" role="alert"></p><p>Click a cell to place. Drag to pan; scroll to zoom. Place two stones each turn after the opening. Each stone must be within eight steps of an occupied cell.</p><div id="stats">Ready for the opening.</div></aside></main>
 <script>
@@ -95,5 +95,15 @@ $('place').onclick=()=>place(Number($('q').value),Number($('r').value));$('bot')
 $('checkpoint').onchange=()=>call('/settings',{checkpoint:$('checkpoint').value});
 for(const id of ['search-enabled','solver-enabled','simulations','solver-nodes'])$(id).onchange=()=>call('/settings',{search:$('search-enabled').checked,solver:$('solver-enabled').checked,simulations:Number($('simulations').value),solver_nodes:Number($('solver-nodes').value)});
 $('analyze').onclick=()=>call('/analyze');$('clear-hint').onclick=()=>{clearHints();render()};
+$('copy-htttx').onclick=async()=>{
+  $('error').textContent='';
+  try{
+    const res=await fetch('/htttx');
+    if(!res.ok)throw Error((await res.json()).error);
+    await navigator.clipboard.writeText(await res.text());
+    $('copy-htttx').textContent='Copied!';
+    setTimeout(()=>$('copy-htttx').textContent='Copy current HTTTX',2000);
+  }catch(e){$('error').textContent=e.message}
+};
 fetch('/state').then(r=>r.json()).then(s=>{state=s;$('budget').value=String(s.default_budget_ms||1000);render()}).catch(e=>{$('error').textContent=e.message});
 </script></html>

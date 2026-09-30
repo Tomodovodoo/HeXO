@@ -5,6 +5,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from hexo import Game
+from notation import NotationConflict, dumps
 
 
 class DensePlayer:
@@ -225,6 +226,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, (Path(__file__).resolve().parents[1] / "web" / "index.html").read_text(encoding="utf-8"), "text/html; charset=utf-8")
         if self.path == "/state":
             return self.respond(200, self.state())
+        if self.path == "/htttx":
+            try:
+                return self.respond(200, dumps([cell[:2] for cell in self.game.cells]), "text/plain; charset=utf-8")
+            except NotationConflict as error:
+                return self.respond(409, {"error": str(error)})
         self.respond(404, {"error": "Not found"})
 
     def do_POST(self):
