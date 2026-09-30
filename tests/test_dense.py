@@ -1732,9 +1732,9 @@ class DenseDataTests(unittest.TestCase):
         moves, _ = random_game(np.random.default_rng(4), 20)
         episode, rows = episode_rows(moves, -1, [-1.]*20)
         episode['network_values'] = [-1.]*20
-        for ply, value in ((0, .8), (1, -.8), (3, 0.), (4, -.9), (6, None), (7, .8)):
+        for ply, value in ((0, .8), (1, -.8), (3, 0.), (4, -.9), (5, -.8), (6, None), (7, .8)):
             episode['network_values'][ply] = value
-        for ply in (0, 3, 4, 6):
+        for ply in (0, 3, 4, 5, 6):
             rows[ply]['proven'] = -1
         rows[1]['proven'] = 1
         rows[3]['policy'] = None
@@ -1744,7 +1744,7 @@ class DenseDataTests(unittest.TestCase):
             window = dense_data.ReplayWindow(run, capacity_rows=1000)
             weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
                        for k, w in zip(window.regret_positions, window.regret_weights)}
-            self.assertEqual(weights, {0: .9, 3: .5})
+            self.assertEqual(weights, {0: .9, 3: .5, 5: .1})
             self.assertFalse((run/'restarts.json').exists())
             targets = dense_data.examples(window, [window.ref('000001', 3)], np.random.default_rng(0))[1]
             self.assertEqual((targets[0]['value'], targets[0]['exact']), (0., 1.))
@@ -1758,11 +1758,11 @@ class DenseDataTests(unittest.TestCase):
             window.set_regret({('000001', 0, 1): .7, ('000001', 0, 3): .2})
             weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
                        for k, w in zip(window.regret_positions, window.regret_weights)}
-            self.assertEqual(weights, {0: .9, 1: .7, 3: .5})
+            self.assertEqual(weights, {0: .9, 1: .7, 3: .5, 5: .1})
             window.set_regret({})
             weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
                        for k, w in zip(window.regret_positions, window.regret_weights)}
-            self.assertEqual(weights, {0: .9, 3: .5})
+            self.assertEqual(weights, {0: .9, 3: .5, 5: .1})
 
     def test_certified_loss_priority_excludes_validation_and_legacy_predictions(self):
         moves, _ = random_game(np.random.default_rng(4), 12)

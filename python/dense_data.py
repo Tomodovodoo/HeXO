@@ -592,7 +592,7 @@ class ReplayWindow:
                 regret = (1+value)/2
                 if not 0 <= regret <= 1:
                     raise ValueError(f'Invalid network value at {name}/{row["game"]}/{row["ply"]}')
-                if regret >= .1:
+                if value >= -.8:
                     losses[i] = regret
         self.loss_regret[name] = losses
         offsets = load_offsets(path, len(rows))
