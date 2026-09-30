@@ -219,6 +219,8 @@ class EvaluationSettings:
     anchor_session_games: int = 20  # most Seal anchor games before a pending trial gets its turn
     anchor_on_promotion: bool = True  # every new champion owes anchor_games vs Seal
     seal_ms: int = 100
+    external_engine: str = ''    # Six-protocol command for the anchor; empty keeps Seal
+    external_name: str = 'seal'  # league id and dashboard label of that anchor
     decision: str = 'posterior'   # promotion rule: 'posterior' (dense_eval.Evaluator.verdict) or 'sprt'
     promote_confidence: float = .9  # posterior: P(candidate - champion > sprt_elo0) needed to promote (1 - it rejects)
     matchup_prior_elo: float = 30.  # posterior: prior sd of a pair's deviation from the transitive rating difference
