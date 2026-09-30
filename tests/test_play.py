@@ -368,6 +368,15 @@ class Registry(unittest.TestCase):
             self.assertEqual(list(found), ['bubble:alpha', 'bubble:beta', 'bubble:gamma', 'native:Native'])
             self.assertEqual(found['bubble:alpha']['checkpoints'], ['play/000150', 'main/000200', 'main/000100'])
             self.assertEqual(found['bubble:beta']['checkpoints'], [''])
+            (root / 'models/gamma').mkdir()
+            (root / 'models/gamma/ema.pt').write_bytes(b'')
+            twins = [k for k in scan(root / 'models', root / 'runs', [], None) if k.startswith('bubble:gamma')]
+            self.assertEqual(len(twins), 2)
+            (root / 'models/a').mkdir()
+            (root / 'models/a/gamma.pt').write_bytes(b'')
+            triple = scan(root / 'models', root / 'runs', [], None)
+            self.assertTrue(set(twins) < set(triple))
+            self.assertEqual({triple[k]['path'] for k in twins}, {found['bubble:gamma']['path'], root / 'models/gamma/ema.pt'})
 
 
 if __name__ == '__main__':

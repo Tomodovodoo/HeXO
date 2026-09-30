@@ -93,15 +93,12 @@ def run_checkpoints(run):
 def scan(models=None, runs=None, extra_runs=(), seal=None):
     """Every engine on offer, by id. Bubble runs come from `extra_runs`, the directories in `runs`, and `models`;
     single `.pt` exports and `<name>.json` entries ({"name", "kind": "bubble", "path"}) come from `models`.
-    Entries carry `id`, `name`, `kind`, `presets`, and for Bubble `checkpoints` plus the server-only `path`."""
-    entries, seen = OrderedDict(), set()
+    Entries carry `id`, `name`, `kind`, `presets`, and for Bubble `checkpoints` plus the server-only `path`. An id
+    is `kind:name`; entries sharing one get a suffix from their path, so an id never moves to another model."""
+    found, seen = [], set()
 
     def add(kind, name, **fields):
-        base, n = f'{kind}:{name}', 2
-        key = base
-        while key in entries:
-            key, n = f'{base}~{n}', n + 1
-        entries[key] = dict(id=key, name=name, kind=kind, presets=PRESETS[kind], **fields)
+        found.append(dict(name=name, kind=kind, presets=PRESETS[kind], **fields))
 
     def bubble(path, name=None):
         path = Path(path).resolve()
@@ -135,6 +132,12 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     add('native', 'Native')
     if seal is not None and Path(seal).exists():
         add('seal', 'Seal')
+    bases = [f"{e['kind']}:{e['name']}" for e in found]
+    entries = OrderedDict()
+    for base, entry in zip(bases, found):
+        suffix = hashlib.blake2b(str(entry.get('path')).encode(), digest_size=3).hexdigest()
+        key = base if bases.count(base) == 1 else f'{base}~{suffix}'
+        entries[key] = dict(id=key, **entry)
     return entries
 
 
