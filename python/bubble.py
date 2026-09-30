@@ -97,20 +97,25 @@ def alive(pid, script, run, arguments=arguments):
     return matches(arguments(pid), script, run)
 
 
-def windows_tree(pid):
-    """Windows: the pids of every live descendant of `pid`, found through parent process ids."""
-    query = "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }"
+def windows_tree(pid, run):
+    """Windows: the pids of every live descendant of `pid` that belongs to `run`: its command line names the run
+    directory, or it is a multiprocessing worker (whose command line names its parent instead)."""
+    query = ("Get-CimInstance Win32_Process | ForEach-Object { "
+             "\"$($_.ProcessId)|$($_.ParentProcessId)|$($_.CommandLine)\" }")
     out = subprocess.run(['powershell', '-NoProfile', '-Command', query], capture_output=True, text=True).stdout
-    children = {}
+    children, lines = {}, {}
     for line in out.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        parts = line.split('|', 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
             children.setdefault(int(parts[1]), []).append(int(parts[0]))
+            lines[int(parts[0])] = parts[2]
     found, queue = [], [pid]
     while queue:
         for child in children.get(queue.pop(), []):
-            found.append(child)
-            queue.append(child)
+            line = lines.get(child, '')
+            if run in line or 'multiprocessing' in line:
+                found.append(child)
+                queue.append(child)
     return found
 
 
@@ -118,7 +123,7 @@ def group_alive(pid, run):
     """Whether any process started under the service `pid` still exists: on POSIX a member of its process group
     (each service starts its own session) running on `run`, on Windows a live descendant by parent id."""
     if os.name == 'nt':
-        return bool(windows_tree(pid))
+        return bool(windows_tree(pid, run))
     if not Path('/proc').is_dir():
         return False
     for entry in Path('/proc').iterdir():
