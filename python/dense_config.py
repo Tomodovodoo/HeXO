@@ -259,7 +259,7 @@ class EvaluationSettings:
     anchor_target_halfwidth: float = 25.  # include champion-Seal uncertainty in fill until this 95% half-width; 0 = no Seal fill
     fill_top: int = 3             # fill comparisons that most narrow these top checkpoints' 95% rating intervals
     veto_margin: float = -30.     # actor.json skips the newest checkpoint once its Elo interval vs its champion lies below this
-    max_expected_score: float = .85  # panel, optional and fill pairings only while either side's expected score is at most this
+    max_expected_score: float = .85  # anchors, panels, evidence and idle pairings: expected score cap; 10/11 = 400 Elo
     rebase_on_promotion: bool = True  # a variant registered against the champion follows a new champion until it starts
     # Solver node budgets of both sides of every evaluation game, as ActorSettings.solver_*; 0 = off.
     solver_root_nodes: int = 0

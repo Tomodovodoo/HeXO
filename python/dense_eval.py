@@ -581,7 +581,7 @@ def payoff(reports, ratings=None):
 
 def informative(p, cap):
     """Whether a pairing with expected score p (either side's) can inform the ratings: 1 - cap <= p <= cap."""
-    return 1-cap <= p <= cap
+    return max(p, 1-p) <= cap
 
 
 def closeness(p):
@@ -1874,9 +1874,11 @@ class Evaluator:
         its current reign it owes anchor_games once (anchor_on_promotion) and anchor_games more per `anchor_every`
         checkpoints rated during the reign (entries from `reign_from` on), counted against the games its Seal reports
         (`seal_reports`, every protocol) gained since reign_games, so an anchor owed when the protocol changes (a book
-        refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor."""
+        refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor.
+        Quotas apply only while the champion and Seal are `close`, as for other automatic opponents."""
         s, champion = self.settings, self.entry(self.league['champion'])
-        if not s.anchor_games or champion is None or (champion['id'], SEAL, 'anchor', s.opening_book) in self.failed_seal:
+        if not s.anchor_games or champion is None or not self.close(champion['id'], SEAL) \
+                or (champion['id'], SEAL, 'anchor', s.opening_book) in self.failed_seal:
             return None
         entries = self.league['checkpoints']
         later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])

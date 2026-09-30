@@ -4905,6 +4905,34 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator = self.start(anchor_every=1, anchor_games=2, anchor_on_promotion=False)
         self.assertIsNone(evaluator.anchor())
 
+    def test_anchor_quota_respects_expected_score_limit(self):
+        evaluator = self.start(anchor_games=60, max_expected_score=10/11)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        champion = evaluator.entry('main/000010')
+        self.assertEqual(evaluator.anchor()[3], 60)  # Seal has no rating yet.
+        evaluator.league['anchors'] = {'seal': dict(elo=0.)}
+        for elo, allowed in ((400., True), (-400., True), (401., False), (-401., False), (200., True)):
+            champion['elo'] = elo
+            with self.subTest(elo=elo):
+                self.assertEqual(evaluator.anchor() is not None, allowed)
+        evaluator.settings = replace(evaluator.settings, max_expected_score=.85)
+        champion['elo'] = 350.
+        self.assertIsNone(evaluator.anchor())
+        self.assertFalse(dense_eval.report_path(self.run, champion['id'], 'seal').exists())
+
+    def test_distant_anchor_yields_to_pending_checkpoint(self):
+        evaluator = self.start(anchor_games=60, max_expected_score=10/11)
+        self.export(10)
+        self.assertTrue(evaluator.step())
+        evaluator.entry('main/000010')['elo'] = 500.
+        evaluator.league['anchors'] = {'seal': dict(elo=0.)}
+        self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
+        self.assertFalse(dense_eval.report_path(self.run, 'main/000010', 'seal').exists())
+
     def anchored(self):
         """An evaluator (anchor_games 4, idle rematches) that rated main/000010 (champion) before main/000020 was
         exported."""
@@ -4916,7 +4944,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         return evaluator
 
     def test_anchor_sessions_alternate_with_pending_candidates(self):
-        evaluator = self.start(anchor_games=6, anchor_session_games=2, seal_ms=5)
+        evaluator = self.start(anchor_games=6, anchor_session_games=2, seal_ms=5, max_expected_score=1.)
         self.export(10)
         self.assertTrue(evaluator.step())
         self.export(20)
@@ -4958,7 +4986,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 2)
 
     def test_candidate_arriving_during_anchor_gets_the_next_turn(self):
-        evaluator = self.start(anchor_games=4, anchor_session_games=4, seal_ms=5)
+        evaluator = self.start(anchor_games=4, anchor_session_games=4, seal_ms=5, max_expected_score=1.)
         self.export(10)
         self.assertTrue(evaluator.step())
         def export(pool, steps):
@@ -5259,6 +5287,7 @@ class EvaluatorLoopTests(unittest.TestCase):
 
     def test_newer_champion_supersedes_an_unfinished_anchor(self):
         evaluator = self.anchored()
+        evaluator.settings = replace(evaluator.settings, max_expected_score=1.)  # Exercise the full anchor quota.
         def export(pool, steps):
             if steps == 2 and not (self.run/'checkpoints'/'main'/'000030').exists():
                 self.export(30)                                             # stops the anchor after its first pair
