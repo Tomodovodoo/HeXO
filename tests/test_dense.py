@@ -3163,7 +3163,7 @@ class EvaluatorSearchTests(unittest.TestCase):
     def test_model_move_error_in_seal_match_escapes(self):
         def fail(move):
             raise RuntimeError('tree advance failed')
-        model = SimpleNamespace(tree=lambda opening, seed, tactics: SimpleNamespace(advance=fail, close=lambda: None))
+        model = SimpleNamespace(tree=lambda opening, seed, tactics, graph=False: SimpleNamespace(advance=fail, close=lambda: None))
         game = dense_eval.MatchGame([model, dense_eval.SEAL], [(0, 0), (1, 0), (-1, 0)], 1,
                                     2, 2, False, 8, {}, lambda board, ms: board.legal_moves()[:2], 5)
         try:
