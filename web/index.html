@@ -128,7 +128,7 @@ select,input,textarea{background:var(--bg);border:1px solid var(--line-2);border
 #menu button{display:flex;align-items:center;gap:8px;width:100%;border:0;background:transparent;text-align:left;padding:6px 8px}
 #menu button:hover,#menu button.on{background:var(--raise)}
 dialog{background:var(--panel);color:var(--text);border:1px solid var(--line-2);border-radius:12px;padding:14px;width:min(520px,92vw)}
-dialog::backdrop{background:rgba(2,6,23,.7)}dialog textarea{width:100%;height:180px;font:12px var(--mono);resize:none}
+dialog::backdrop{background:rgba(2,6,23,.7)}dialog textarea{width:100%;height:180px;font:12px var(--mono);resize:none}dialog textarea::placeholder{color:var(--dim)}
 /* medium and narrow */
 @media (max-width:1099px){
   #app{grid-template-columns:minmax(0,1fr) 340px;grid-template-rows:auto minmax(0,1fr);grid-template-areas:"board tabs" "board panel"}
@@ -223,7 +223,13 @@ async function poll(){
   try{const res=await fetch('/state'+(S?'?since='+S.revision:''));accept(await res.json())}catch(e){}
   setTimeout(poll,S&&S.jobs.length?350:1500);
 }
+const failures=new Set();
+function active(jobs){
+  for(const j of jobs)if(j.status==='failed'&&!failures.has(j.id)){failures.add(j.id);toast(j.error)}
+  return jobs.filter(j=>j.status!=='failed');
+}
 function accept(data){
+  data.jobs=active(data.jobs);
   if('history' in data){
     const live=!S||view>=S.history.length,before=S?S.history.length:null;
     S=data;
@@ -276,7 +282,7 @@ function paint(){
   const stones=S.history.slice(0,view),occupied=new Map(stones.map((s,i)=>[key(...s),playerAt(i)])),legal=legalSet(stones);
   const size=cam.size,corners=[[0,0],[w,0],[0,h],[w,h]].map(([x,y])=>axial(x,y)),qs=corners.map(c=>c[0]),rs=corners.map(c=>c[1]);
   ctx.lineWidth=1;
-  for(let q=Math.min(...qs)-1;q<=Math.max(...qs)+1;q++)for(let r=Math.min(...rs)-1;r<=Math.max(...rs)+1;r++){
+  for(let q=Math.min(...qs)-3;q<=Math.max(...qs)+3;q++)for(let r=Math.min(...rs)-2;r<=Math.max(...rs)+2;r++){
     const[x,y]=screen(q,r);if(x<-size||x>w+size||y<-size||y>h+size)continue;
     const k=key(q,r);if(occupied.has(k))continue;
     hexPath(x,y,size-1);

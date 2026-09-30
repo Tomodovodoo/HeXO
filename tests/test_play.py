@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from hexo import Game
-from play import Cancelled, Evaluations, Handler, PRESETS, Session, budget_of, import_history, review, scan
+from play import Cancelled, Engines, Evaluations, Handler, PRESETS, Session, budget_of, import_history, review, scan
 
 STANDARD = PRESETS['bubble']['standard']
 
@@ -52,7 +52,7 @@ class FakeEngines:
         moves = legal_turn(history)
         return dict(moves=moves, value=.5, top=[[*moves[0], .9]], proof=None, line=[], threat=[], ms=1)
 
-    def turn(self, entry, budget, history):
+    def turn(self, entry, budget, history, stop):
         return legal_turn(history)
 
 
@@ -247,6 +247,26 @@ class Jobs(unittest.TestCase):
         self.assertEqual(self.history(), [(0, 0), *map(tuple, legal_turn([(0, 0)]))])
         self.session.undo()
         self.assertEqual(self.history(), [])
+
+    def test_failures_reach_the_page_and_rescans_drop_vanished_engines(self):
+        def broken(*args):
+            raise RuntimeError('weights unreadable')
+        self.engines.evaluate = broken
+        self.session.analyse(0)
+        wait(lambda: any(j['status'] == 'failed' for j in self.session.state()['jobs']))
+        self.assertEqual(self.session.state()['jobs'][0]['error'], 'weights unreadable')
+        self.session.rescan_entries = lambda: {k: v for k, v in entries().items() if k != 'bubble:fake'}
+        self.session.rescan()
+        state = self.session.state()
+        self.assertEqual((state['seats'][1], state['analysis']['engine']), (dict(engine='human'), 'bubble:fake~2'))
+
+    def test_native_searches_are_abandoned_on_cancel(self):
+        engines = Engines('cpu')
+        started = time.time()
+        with self.assertRaises(Cancelled):
+            engines.turn(entries()['native:Native'], dict(ms=3000), [(0, 0)], lambda: time.time() - started > .2)
+        self.assertLess(time.time() - started, 1)
+        self.assertEqual(len(engines.turn(entries()['native:Native'], dict(ms=50), [(0, 0)])), 2)
 
     def test_budgets(self):
         self.assertEqual(budget_of('bubble', 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))

@@ -41,6 +41,15 @@ def turn_starts(length):
     return [0, *range(1, length, 2)]
 
 
+def review_plies(history):
+    """Positions a review evaluates: every turn start, plus the final position unless the game is over."""
+    game = replay(history)
+    try:
+        return turn_starts(len(history)) + ([len(history)] if game.winner < 0 else [])
+    finally:
+        game.close()
+
+
 def replay(history):
     """A native game with `history` played; raises ValueError on an illegal stone."""
     game = Game()
@@ -269,6 +278,7 @@ class Engines:
     def __init__(self, device, tactical_package=None, seal=None):
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
         self.bubbles, self.prover, self.seal = OrderedDict(), None, None
+        self.locks = dict(native=threading.Lock(), seal=threading.Lock())
 
     def bubble(self, path):
         path = Path(path)
@@ -292,18 +302,35 @@ class Engines:
         bubble = self.bubble(export_path(entry, checkpoint))
         return evaluate(bubble, self.solver(), history, budget['simulations'], budget['solver_nodes'], watch)
 
-    def turn(self, entry, budget, history):
-        """A turn from a non-Bubble engine."""
-        game = replay(history)
-        try:
-            if entry['kind'] == 'native':
-                return game.search(budget['ms'])['moves']
-            if self.seal is None:
-                from legacy.arena import Seal
-                self.seal = Seal()
-            return self.seal(game, budget['ms'])
-        finally:
-            game.close()
+    def turn(self, entry, budget, history, stop=lambda: False):
+        """A native or Seal turn, searched on its own thread. Their searches cannot be interrupted, so when `stop()`
+        turns true this raises Cancelled and leaves the search to finish alone; a lock per kind keeps it from
+        overlapping the next search of the same kind."""
+        kind, result = entry['kind'], {}
+        def search():
+            with self.locks[kind]:
+                game = replay(history)
+                try:
+                    if kind == 'native':
+                        result['moves'] = game.search(budget['ms'])['moves']
+                    else:
+                        if self.seal is None:
+                            from legacy.arena import Seal
+                            self.seal = Seal()
+                        result['moves'] = self.seal(game, budget['ms'])
+                except Exception as error:
+                    result['error'] = error
+                finally:
+                    game.close()
+        thread = threading.Thread(target=search, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            thread.join(.05)
+            if stop():
+                raise Cancelled()
+        if 'error' in result:
+            raise result['error']
+        return result['moves']
 
     def close(self):
         self.bubbles.clear()
@@ -321,7 +348,7 @@ class Evaluations:
 
     Each line holds `position` (the ordered stones), `engine` (see `model_key`), `simulations`, `solver_nodes`,
     the evaluation fields, `model` (a readable name) and `at`. The index keeps the newest `limit` (position, engine, budget)
-    entries; `best` returns the deepest one for a position and engine. The file is only appended to; on start a
+    entries; `best` picks the one to show for a position and engine. The file is only appended to; on start a
     dated copy is kept next to it, the newest `backups` of them."""
 
     def __init__(self, path=None, limit=200_000, backups=3):
@@ -537,7 +564,10 @@ class Session:
                         review=review(history, self.lookup, board['winner']), jobs=self.job_list())
 
     def job_list(self):
-        return [job.summary() for job in self.jobs.values() if job.status in ('queued', 'running')]
+        """Queued and running jobs, then jobs that failed in the last ten seconds with their `error`."""
+        now = time.time()
+        return [job.summary() for job in self.jobs.values()
+                if job.status in ('queued', 'running') or job.status == 'failed' and now - job.ended < 10]
 
     def poll(self, since):
         with self.lock:
@@ -661,7 +691,7 @@ class Session:
             if not self.analysis:
                 raise ValueError('Review needs a Bubble model')
             job = self.submit(Job('review', 2, self.history, seat=dict(self.analysis)))
-            job.total = len(turn_starts(len(self.history))) + 1
+            job.total = len(review_plies(self.history))
             return job.id
 
     def cancel(self, job_id):
@@ -683,9 +713,25 @@ class Session:
             self.changed()
 
     def rescan(self):
+        """Replace the engine list; a seat whose engine or checkpoint is gone becomes a person, and analysis falls
+        back to the first Bubble model."""
         entries = self.rescan_entries()
+        def valid(seat):
+            entry = entries.get(seat['engine'])
+            return entry is not None and (entry['kind'] != 'bubble' or seat['checkpoint'] in entry['checkpoints'])
         with self.lock:
-            self.entries = entries
+            previous, self.entries = self.entries, entries
+            try:
+                seats = [seat if seat['engine'] == 'human' or valid(seat) else dict(engine='human') for seat in self.seats]
+                analysis = self.analysis
+                if analysis is None or not valid(analysis):
+                    bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
+                    analysis = self.seat(bubble['id'], None, 'standard') | dict(auto=True) if bubble else None
+            except Exception:
+                self.entries = previous
+                raise
+            self.seats, self.analysis = seats, analysis
+            self.stop_moves()
             self.changed()
 
     # Working
@@ -714,7 +760,7 @@ class Session:
                     self.changed()
             except Exception as error:
                 with self.lock:
-                    job.status, job.error = 'failed', str(error)
+                    job.status, job.error, job.ended = 'failed', str(error), time.time()
                     if job.kind == 'move':
                         self.paused = True
                     self.changed()
@@ -751,16 +797,12 @@ class Session:
                 job.total = max(1, seat['budget']['simulations']) * 2
                 moves = self.evaluation(job, seat, history, exact=True)['moves']
             else:
-                moves = self.engines.turn(entry, seat['budget'], history)
+                moves = self.engines.turn(entry, seat['budget'], history, lambda: job.cancelled)
             return checked_turn(history, moves)
         if job.kind == 'analyse':
             job.total = max(1, seat['budget']['simulations']) * 2
             return self.evaluation(job, seat, history, job.force)
-        game = replay(history)
-        winner = game.winner
-        game.close()
-        plies = turn_starts(len(history)) + ([len(history)] if winner < 0 else [])
-        for ply in plies:
+        for ply in review_plies(history):
             if job.cancelled:
                 raise Cancelled()
             self.evaluation(job, seat, history[:ply])
@@ -776,6 +818,8 @@ class Session:
 def import_history(text):
     """A history from HTTTX notation, a replay file ({"history": [...]}) or a JSON list of [q, r]."""
     stripped = text.strip()
+    if not stripped:
+        raise ValueError('Nothing to import')
     if stripped.startswith(('{', '[')):
         data = json.loads(stripped)
         history = data['history'] if isinstance(data, dict) else data
