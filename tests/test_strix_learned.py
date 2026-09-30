@@ -2,10 +2,11 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 from hexo import Game
-from tools.strix_learned_adapter import MODEL_SHA256, StrixLearned, validate_turn
+from tools.strix_learned_adapter import MODEL_SHA256, StrixLearned, mirror, validate_turn
 
 
 class TurnValidation(unittest.TestCase):
@@ -38,6 +39,24 @@ class TurnValidation(unittest.TestCase):
             path.write_bytes(b"not the pinned model")
             with self.assertRaisesRegex(ValueError, "SHA256"):
                 StrixLearned(path)
+
+
+class Frame(unittest.TestCase):
+    def test_stones_and_moves_cross_into_strix_frame(self):
+        opponent = object.__new__(StrixLearned)
+        opponent.__dict__.update(timeout_ms=5000, lock=threading.Lock(), process=object(), simulations=2, actions=2,
+                                 seed=0, calls=0, executable_sha256='x')
+        sent = []
+        def exchange(request, deadline):
+            sent.append(request)
+            return dict(status='OK', moves=[list(mirror(1, 1)), list(mirror(-2, 3))])
+        opponent._exchange = exchange
+        game = Game([(0, 0), (1, 0), (2, -1)])
+        self.addCleanup(game.close)
+        self.assertEqual(opponent(game, 100), [(1, 1), (-2, 3)])
+        self.assertEqual(sent[0]['stones'], [[0, 0, 0], [1, 0, 1], [1, 1, 1]])
+        self.assertEqual(opponent.last_result['moves'], [[1, 1], [-2, 3]])
+        self.assertEqual(mirror(*mirror(4, -7)), (4, -7))
 
 
 class LearnedProcess(unittest.TestCase):

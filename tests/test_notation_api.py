@@ -49,23 +49,30 @@ class OfficialNotation(unittest.TestCase):
         self.assertEqual(loads('').history, [(0, 0)])
 
     def test_strict_turns_native_legality_and_bounds(self):
-        bad = ['1.[1,0];', '2.[1,0][2,0];', '1.[0,0][1,0];',
+        bad = ['1.[1,0];2.[2,0][3,0];', '2.[1,0][2,0];', '1.[0,0][1,0];',
                '1.[9,0][1,0];', '1.[1,0][1,0];', 'version[2];',
                'version[1]version[1];', '1.[1,0][2,0];garbage',
                '1.[1000000000001,0][1,0];']
         for source in bad:
             with self.assertRaises(ValueError, msg=source):
                 loads(source)
-        for history in ([], [(0, 0), (1, 0)], [(0, 0)]*(MAX_STONES+1)):
+        for history in ([], [(0, 0)]*(MAX_STONES+1)):
             with self.assertRaises(ValueError):
                 dumps(history)
+        self.assertEqual(dumps([(0, 0), (1, 0)]), 'version[1];\n1. [1,0];')
+        self.assertEqual(loads('1.[1,0];').history, [(0, 0), (1, 0)])
         with self.assertRaises(ValueError):
             dumps(Record([(0, 0)], {'name': 'bad]value'}, []))
 
-    def test_terminal_first_stone_conflict_and_second_stone_roundtrip(self):
+    def test_terminal_first_and_second_stone_roundtrip(self):
         history = interleave([[(q, 0) for q in range(6)], [(2*q, 6) for q in range(6)]])
-        with self.assertRaises(NotationConflict):
-            dumps(history)
+        text = dumps(history)
+        self.assertEqual(loads(text).history, history)
+        self.assertTrue(text.endswith('6. [5,0];'))
+        annotated = Record(history, {'version': '1', 'name': 'first-stone win'}, [0]*5+[2])
+        self.assertEqual(loads(dumps(annotated)), annotated)
+        with self.assertRaises(ValueError):
+            loads(text+'\n7.[15,7][16,7];')
         with self.assertRaises(ValueError):
             loads(dumps(history[:-1])+'\n6.[5,0][15,7];')
         history = interleave([[(q, 0) for q in range(5)], [(0, 2), (2, 2), (3, 2), (5, 2)]])
@@ -269,21 +276,14 @@ class PlayNotationEndpoint(unittest.TestCase):
             with urlopen(request, timeout=2) as response:
                 self.assertEqual(response.status, 200)
 
-        def conflict():
-            with self.assertRaises(HTTPError) as caught:
-                urlopen(root+'/htttx', timeout=2)
-            with caught.exception as response:
-                self.assertEqual(response.code, 409)
-                self.assertEqual(json.load(response)['error'],
-                                 'V1 requires two coordinates per recorded turn; cannot encode partial turn')
-
         try:
             play(0, 0)
             with urlopen(root+'/htttx', timeout=2) as response:
                 self.assertEqual(response.headers.get_content_type(), 'text/plain')
                 self.assertEqual(response.read().decode(), 'version[1];')
             play(1, 0)
-            conflict()
+            with urlopen(root+'/htttx', timeout=2) as response:
+                self.assertEqual(response.read().decode(), 'version[1];\n1. [1,0];')
             play(2, 0)
             with urlopen(root+'/htttx', timeout=2) as response:
                 self.assertEqual(response.read().decode(), 'version[1];\n1. [1,0][2,0];')

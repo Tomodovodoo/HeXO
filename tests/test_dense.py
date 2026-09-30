@@ -1728,6 +1728,68 @@ class DenseDataTests(unittest.TestCase):
             window.refresh_regret()
             self.assertEqual(window.regret_rows, 0)
 
+    def test_certified_loss_errors_enter_bounded_priority_without_restarts(self):
+        moves, _ = random_game(np.random.default_rng(4), 20)
+        episode, rows = episode_rows(moves, -1, [-1.]*20)
+        episode['network_values'] = [-1.]*20
+        for ply, value in ((0, .8), (1, -.8), (3, 0.), (4, -.9), (5, -.8), (6, None), (7, .8)):
+            episode['network_values'][ply] = value
+        for ply in (0, 3, 4, 5, 6):
+            rows[ply]['proven'] = -1
+        rows[1]['proven'] = 1
+        rows[3]['policy'] = None
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            dense_data.write_shard(run/'shards'/'000001', dict(actor_sha256='a'*64), [episode], rows)
+            window = dense_data.ReplayWindow(run, capacity_rows=1000)
+            weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
+                       for k, w in zip(window.regret_positions, window.regret_weights)}
+            self.assertEqual(weights, {0: .9, 3: .5, 5: .1})
+            self.assertFalse((run/'restarts.json').exists())
+            targets = dense_data.examples(window, [window.ref('000001', 3)], np.random.default_rng(0))[1]
+            self.assertEqual((targets[0]['value'], targets[0]['exact']), (0., 1.))
+            ordinary = window.sample(np.random.default_rng(19), 256)
+            disabled = window.sample(np.random.default_rng(19), 256, regret_fraction=0.)
+            self.assertEqual([(r.shard, r.index) for r in ordinary], [(r.shard, r.index) for r in disabled])
+            share = window.regret_share(256, .25)
+            probability = np.full(len(window.index), (1-share)/len(window.index))
+            probability[window.regret_positions] += share*window.regret_probabilities(share)
+            self.assertLessEqual(probability.max(), 4/len(window.index)+1e-12)
+            window.set_regret({('000001', 0, 1): .7, ('000001', 0, 3): .2})
+            weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
+                       for k, w in zip(window.regret_positions, window.regret_weights)}
+            self.assertEqual(weights, {0: .9, 1: .7, 3: .5, 5: .1})
+            window.set_regret({})
+            weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
+                       for k, w in zip(window.regret_positions, window.regret_weights)}
+            self.assertEqual(weights, {0: .9, 3: .5, 5: .1})
+
+    def test_certified_loss_priority_excludes_validation_and_legacy_predictions(self):
+        moves, _ = random_game(np.random.default_rng(4), 12)
+        episode, rows = episode_rows(moves, -1, [-1.]*12)
+        rows[0]['proven'] = -1
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            dense_data.write_shard(run/'shards'/'000001', dict(actor_sha256='a'*64), [episode], rows)
+            self.assertEqual(dense_data.ReplayWindow(run, capacity_rows=1000).regret_rows, 0)
+            episode['network_values'] = [.8]*12
+            dense_data.write_shard(run/'shards'/'000002', dict(actor_sha256='a'*64), [episode], rows)
+            held = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=1.)
+            self.assertEqual(held.regret_rows, 0)
+            refs = held.sample(np.random.default_rng(0), 64, validation=True, regret_fraction=.25)
+            self.assertEqual(len(refs), 64)
+            self.assertFalse(len(held.index))
+
+    def test_certified_loss_priority_rejects_invalid_network_predictions(self):
+        moves, _ = random_game(np.random.default_rng(4), 12)
+        episode, rows = episode_rows(moves, -1, [-1.]*12)
+        episode['network_values'] = [1.2]*12
+        rows[0]['proven'] = -1
+        with tempfile.TemporaryDirectory() as tmp:
+            dense_data.write_shard(Path(tmp)/'shards'/'000001', dict(actor_sha256='a'*64), [episode], rows)
+            with self.assertRaisesRegex(ValueError, 'Invalid network value'):
+                dense_data.ReplayWindow(tmp, capacity_rows=1000)
+
     def test_regret_cap_at_feasibility_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)

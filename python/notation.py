@@ -1,8 +1,8 @@
 """Official Hexagonal Tic Tac Toe notation v1, with native legality validation.
 
 Spec revision: hex-tic-tac-toe/hexagonal-tic-tac-toe-notation@15bb7877ae020d661497e332adf0810d00d24e3e.
-The implicit origin belongs to cross (native player 0). V1 cannot encode a
-one-placement final turn; such histories raise NotationConflict, without padding.
+The implicit origin belongs to cross (native player 0). A one-placement winning
+final turn is supported for compatibility with Tyto, without padding or truncation.
 Metadata values and optional threat annotations are preserved, not inferred.
 """
 from dataclasses import dataclass
@@ -15,7 +15,7 @@ MAX_STONES = 4097
 
 
 class NotationConflict(ValueError):
-    """A valid Hexo state that the official v1 grammar cannot represent."""
+    """A valid Hexo state that complete-turn notation cannot represent."""
 
 
 @dataclass
@@ -36,9 +36,6 @@ def _validate(history):
             if not isinstance(move, (list, tuple)) or len(move) != 2:
                 raise ValueError("Each placement must have two coordinates")
             game.play(*move)
-        if len(history) % 2 == 0:
-            reason = "first-placement terminal win" if game.winner >= 0 else "partial turn"
-            raise NotationConflict(f"V1 requires two coordinates per recorded turn; cannot encode {reason}")
     finally:
         game.close()
 
@@ -70,13 +67,17 @@ def loads(text):
                                    or int(metadata['version']) != 1):
         raise ValueError("Only notation version 1 is supported")
     rest = ''.join(text[pos:].split())
-    pattern = re.compile(r'([0-9]+)\.\[(-?[0-9]+),(-?[0-9]+)\]\[(-?[0-9]+),(-?[0-9]+)\](!*);')
+    pattern = re.compile(r'([0-9]+)\.\[(-?[0-9]+),(-?[0-9]+)\](?:\[(-?[0-9]+),(-?[0-9]+)\])?(!*);')
     history, threats, pos = [(0, 0)], [], 0
     while pos < len(rest):
         match = pattern.match(rest, pos)
         if not match or int(match[1]) != len(threats)+1:
-            raise ValueError("Expected consecutive numbered turns with exactly two coordinates")
-        history.extend(((int(match[2]), int(match[3])), (int(match[4]), int(match[5]))))
+            raise ValueError("Expected consecutive numbered turns with two coordinates, or one stone in the final turn")
+        history.append((int(match[2]), int(match[3])))
+        if match[4] is not None:
+            history.append((int(match[4]), int(match[5])))
+        elif match.end() != len(rest):
+            raise ValueError("A single-stone turn must be the final turn")
         threats.append(len(match[6]))
         pos = match.end()
     _validate(history)
@@ -90,7 +91,7 @@ def dumps(record):
     else:
         history, metadata, threats = list(record), {'version': '1'}, None
     _validate(history)
-    turns = (len(history)-1)//2
+    turns = len(history)//2
     if threats is None:
         threats = [0]*turns
     if len(threats) != turns or any(type(t) is not int or not 0 <= t <= MAX_TEXT for t in threats):
@@ -111,8 +112,9 @@ def dumps(record):
         raise ValueError("Only notation version 1 is supported")
     rows = [''.join(entries)+';'] if entries else []
     for turn, count in enumerate(threats, 1):
-        a, b = history[turn*2-1:turn*2+1]
-        rows.append(f'{turn}. [{a[0]},{a[1]}][{b[0]},{b[1]}]{"!"*count};')
+        moves = history[turn*2-1:turn*2+1]
+        coordinates = ''.join(f'[{q},{r}]' for q, r in moves)
+        rows.append(f'{turn}. {coordinates}{"!"*count};')
     text = '\n'.join(rows)
     if len(text) > MAX_TEXT:
         raise ValueError("Notation exceeds local size limit")
