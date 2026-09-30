@@ -5843,6 +5843,68 @@ class EvaluatorLoopTests(unittest.TestCase):
             self.assertTrue(evaluator.step())
         self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 8)
 
+    def test_pipeline_decisions_refill_before_color_partners_finish(self):
+        root = self.run
+        for kind in ('posterior', 'sprt', 'variant'):
+            for pipeline in (False, True):
+                with self.subTest(kind=kind, pipeline=pipeline):
+                    self.run = root/f'{kind}-{pipeline}'
+                    evaluator = self.start(decision='sprt' if kind == 'sprt' else 'posterior', pipeline=pipeline,
+                                           sprt_max_games=20, sprt_min_games=20, pool_games=6,
+                                           sprt_alpha=1e-9, sprt_beta=1e-9)
+                    self.export(10)
+                    evaluator.step()
+                    base = 'main/000010'
+                    if kind == 'variant':
+                        dense_eval.register(self.run, base, 'x', dict(sims=1))
+                        candidate = base+'@x'
+                    else:
+                        self.export(20)
+                        candidate = 'main/000020'
+                    seen = []
+                    with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1,
+                            hook=lambda pool, steps: seen.append(pool.running()), order=lambda r: r['challenger_color'])):
+                        self.assertTrue(evaluator.step())
+                    self.assertEqual(seen[:4], [6, 5, 6, 5] if pipeline else [6, 5, 4, 3])
+                    self.assertLessEqual(max(seen), 6)
+                    games = evaluator.games(candidate, base)
+                    self.assertEqual(len(games), 20)
+                    self.assertEqual(sorted((r['pair'], r['challenger_color']) for r in games),
+                                     [(pair, color) for pair in range(10) for color in (0, 1)])
+        self.run = root
+
+    def test_pipeline_refill_counts_existing_reverse_evidence(self):
+        evaluator = self.start(decision='posterior', pipeline=True, sprt_max_games=20, sprt_min_games=20, pool_games=6)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        candidate, base = 'main/000020', 'main/000010'
+        self.report(candidate, base, [-1]*4)
+        self.report(base, candidate, [-1]*6)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1,
+                order=lambda r: r['challenger_color'])):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(evaluator.direct(candidate, base)), 20)
+        self.assertEqual(len(evaluator.games(candidate, base)), 14)
+
+    def test_pipeline_variant_refill_yields_before_a_color_pair_finishes(self):
+        evaluator = self.start(decision='posterior', pipeline=True, sprt_max_games=40, sprt_min_games=40, pool_games=6)
+        self.export(10)
+        evaluator.step()
+        base = 'main/000010'
+        dense_eval.register(self.run, base, 'x', dict(sims=1))
+        seen = []
+        def arrived(pool, steps):
+            seen.append(pool.running())
+            if steps == 2:
+                self.export(20)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=arrived,
+                order=lambda r: r['challenger_color'])):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(seen, [6, 5, 4, 3, 2, 1])
+        self.assertEqual(len(evaluator.games(base+'@x', base)), 6)
+        self.assertNotIn('verdict', evaluator.variants()[0])
+
     def test_games_finished_on_creation_occupy_the_pool(self):
         pool = dense_eval.Pool(64)
         lane = ('a', 'b', 'evidence')
