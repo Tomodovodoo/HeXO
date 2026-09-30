@@ -106,7 +106,7 @@ python python/play.py                                         # handwritten nati
 python python/play.py --dense-run runs/bubble --device cpu    # trained network from a run
 ```
 
-Open <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan and scroll to zoom. The model picker lists the champion and the newest checkpoints. Search and solver have their own toggles.
+Open <http://127.0.0.1:8765>. Each side is a person or any engine found under `models/` and `runs/`; see [docs/play.md](docs/play.md).
 
 From Python:
 

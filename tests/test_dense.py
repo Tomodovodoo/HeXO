@@ -6950,75 +6950,56 @@ class EvaluatorLoopTests(unittest.TestCase):
 
 class DenseBrowser(unittest.TestCase):
     def setUp(self):
-        from play import DensePlayer
+        from play import Bubble
         self.temp = tempfile.TemporaryDirectory()
-        self.run = Path(self.temp.name)
-        for checkpoint in ('065000', '075000', '082500', '085000'):
-            path = self.run/'checkpoints/main'/checkpoint
-            path.mkdir(parents=True)
-            hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
-        (self.run/'champion.json').write_text(json.dumps(dict(checkpoint='main/065000')))
-        self.player = DensePlayer(self.run, 'cpu')
+        path = Path(self.temp.name)/'ema.pt'
+        hexnet.save_model(path, hexnet.HexNet(TINY))
+        self.bubble = Bubble(path, 'cpu')
 
     def tearDown(self):
-        self.player.close()
         self.temp.cleanup()
 
-    def test_picker_raw_policy_and_search_preserve_the_board(self):
-        game = Game([(0, 0)])
+    def complete(self, history, moves):
+        game = Game(history)
         try:
-            before = game.cells
-            self.player.configure(dict(search=False, solver=False))
-            raw = self.player.turn(game, analyze=True)
-            self.assertEqual(len(raw['moves']), 2)
-            self.assertEqual(game.cells, before)
-            self.assertEqual(len(self.player.models()), 4)
-            self.player.select('main/085000')
-            self.player.configure(dict(search=True, simulations=4))
-            searched = self.player.turn(game)
-            self.assertEqual(searched['checkpoint'], 'main/085000')
-            replay = Game([c[:2] for c in before])
-            try:
-                for move in searched['moves']:
-                    replay.play(*move)
-            finally:
-                replay.close()
-            self.assertEqual(game.cells, before)
+            side = game.player
+            for move in moves:
+                game.play(*move)
+            return game.player != side or game.winner >= 0
         finally:
             game.close()
 
-    def test_startup_selects_an_available_export(self):
-        from play import DensePlayer
-        (self.run/'checkpoints/main/065000/ema.pt').unlink()
-        player = DensePlayer(self.run, 'cpu')
-        try:
-            self.assertEqual(player.checkpoint, 'main/085000')
-        finally:
-            player.close()
+    def test_raw_policy_and_search_play_a_whole_turn(self):
+        from play import evaluate
+        history = [(0, 0)]
+        for simulations in (0, 4):
+            result = evaluate(self.bubble, None, history, simulations, 0)
+            self.assertEqual(len(result['moves']), 2)
+            self.assertTrue(self.complete(history, result['moves']))
+            self.assertTrue(0 <= result['value'] <= 1)
+            self.assertEqual(len(result['top']), 5)
+            self.assertIsNone(result['proof'])
 
-    def test_picker_discovers_exports_from_a_new_run(self):
-        for path in (self.run/'checkpoints').glob('*/*/ema.pt'):
-            path.unlink()
-        path = self.run/'checkpoints/main/000000'
-        path.mkdir(parents=True)
-        hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
-        (self.run/'champion.json').write_text(json.dumps(dict(checkpoint='main/000000')))
-        self.assertEqual(self.player.models(), [dict(id='main/000000', label='main/000000 · champion, newest')])
+    def test_cancelling_stops_the_search(self):
+        from play import Cancelled, evaluate
+        def watch(n):
+            raise Cancelled()
+        with self.assertRaises(Cancelled):
+            evaluate(self.bubble, None, [(0, 0)], 64, 0, watch)
 
-    def test_verified_line_replays_to_a_win_without_playing_the_game(self):
+    def test_verified_line_replays_to_a_win(self):
+        from play import evaluate
         history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (2, 5), (3, 5), (3, 0),
                    (-1, 3), (5, 5), (6, 5)]
-        game = Game(history)
-        result = dict(status='PROVEN_WIN', native_verified=True, moves=[[4, 0], [5, 0]],
+        result = dict(status='PROVEN_WIN', native_verified=True, moves=[[4, 0], [5, 0]], proof_turns=1,
                       certificate=dict(root=0, nodes=[dict(kind='immediate_win', action=[[4, 0], [5, 0]])]))
+        prover = unittest.mock.Mock(history=unittest.mock.Mock(return_value=result))
+        found = evaluate(self.bubble, prover, history, 4, 2048)
+        self.assertEqual((found['value'], found['proof'], found['moves']), (1., dict(winner=0, turns=1), [[4, 0], [5, 0]]))
+        game = Game(history)
         try:
-            with unittest.mock.patch.object(self.player, 'solve', side_effect=[result, dict(status='UNKNOWN')]):
-                analysis = self.player.turn(game, analyze=True)
-            self.assertEqual(analysis['proof_status'], 'PROVEN_WIN')
-            self.assertEqual(analysis['win_probability'], 1.)
-            self.assertEqual([c[:2] for c in game.cells], [list(p) for p in history])
-            for q, r, player in analysis['winning_line']:
-                self.assertEqual(player, game.player)
+            for q, r, player in found['line']:
+                self.assertEqual(player, 0)
                 game.play(q, r)
             self.assertEqual(game.winner, 0)
         finally:

@@ -1,397 +1,878 @@
-"""Local browser game. Run python python/play.py, then open http://127.0.0.1:8765."""
+"""Local browser game: people and engines on either side, analysis and review from saved evaluations.
+
+Run `python python/play.py --dense-run runs/bubble --device cpu`, then open http://127.0.0.1:8765. Engine work runs
+on one background worker thread as jobs with ids; HTTP requests only read or change the session, so the page never
+waits on an engine. See docs/play.md.
+"""
 import argparse
+import hashlib
+import heapq
+import itertools
 import json
+import shutil
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
 from hexo import Game
-from notation import NotationConflict, dumps
+from notation import NotationConflict, dumps, loads
+
+ROOT = Path(__file__).resolve().parents[1]
+PRESETS = dict(
+    bubble=dict(quick=dict(simulations=32, solver_nodes=2048), standard=dict(simulations=128, solver_nodes=32768),
+                strong=dict(simulations=512, solver_nodes=131072), deep=dict(simulations=2048, solver_nodes=524288)),
+    native=dict(quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000), deep=dict(ms=10000)),
+    seal=dict(quick=dict(ms=100), standard=dict(ms=500), strong=dict(ms=2000), deep=dict(ms=8000)))
+LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 4_000_000), ms=(10, 120_000))
+LABELS = ('win', 'found', 'kept', 'best', 'good', 'inaccuracy', 'mistake', 'blunder', 'missed', 'allowed', 'lost')
 
 
-def position_key(cells, checkpoint, settings):
-    """Use the ordered stone history seen by the server, not a board hash."""
-    return json.dumps([cells, checkpoint, settings], sort_keys=True, separators=(',', ':'))
+def player_at(ply):
+    """Side placing stone number `ply` (0-based): X opens with one stone, then two per turn."""
+    return 0 if ply == 0 else ((ply - 1) // 2 + 1) % 2
 
 
-class AnalysisStore:
-    def __init__(self, path=None):
-        self.path = path
-        self.entries = json.loads(path.read_text(encoding='utf-8')) if path and path.exists() else {}
-
-    def get(self, cells, checkpoint, settings):
-        return self.entries.get(position_key(cells, checkpoint, settings))
-
-    def save(self, cells, checkpoint, settings, analysis):
-        entry = dict(analysis=analysis, computed_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
-        updated = self.entries | {position_key(cells, checkpoint, settings): entry}
-        if self.path:
-            temporary = self.path.with_name(self.path.name + '.tmp')
-            temporary.write_text(json.dumps(updated, indent=2), encoding='utf-8')
-            temporary.replace(self.path)
-        self.entries = updated
-        return entry
-
-    def history(self, cells, checkpoint, settings):
-        return [dict(ply=ply, win_probability=entry['analysis'].get('win_probability'))
-                for ply in range(len(cells) + 1)
-                if (entry := self.get(cells[:ply], checkpoint, settings))]
+def turn_starts(length):
+    """Plies at which a turn starts, for a history of `length` stones."""
+    return [0, *range(1, length, 2)]
 
 
-class DensePlayer:
-    """Play exported dense checkpoints; analysis searches a copy of the browser game."""
-    mode = 'dense'
+def replay(history):
+    """A native game with `history` played; raises ValueError on an illegal stone."""
+    game = Game()
+    try:
+        for q, r in history:
+            game.play(int(q), int(r))
+    except Exception:
+        game.close()
+        raise
+    return game
 
-    def __init__(self, run, device, tactical_package=None):
-        self.run, self.device = run, device
-        self.tactical_package = tactical_package
-        self.evaluator = self.prover = None
-        self.checkpoint = None
-        self.options = dict(search=True, simulations=128, solver=True, solver_nodes=32768)
-        available = self.models()
-        if not available:
-            raise ValueError('No playable dense exports found')
-        self.select(available[0]['id'])
 
-    def models(self):
-        exports = sorted((p for p in (self.run/'checkpoints').glob('*/*/ema.pt') if p.parent.name.isdigit()),
-                         key=lambda p: (int(p.parent.name), p.parent.parent.name), reverse=True)
-        ids = [p.parent.relative_to(self.run/'checkpoints').as_posix() for p in exports]
-        if not ids:
-            return []
-        champion_file = self.run/'champion.json'
-        champion = json.loads(champion_file.read_text(encoding='utf-8'))['checkpoint'] if champion_file.exists() else None
-        reference = 'main/065000' if 'main/065000' in ids else ids[-1]
-        selected = []
-        for checkpoint in (champion, ids[0], reference, *ids):
-            if checkpoint in ids and checkpoint not in selected:
-                selected.append(checkpoint)
-            if len(selected) == 4:
-                break
-        labels = {champion: 'champion', ids[0]: 'newest', reference: 'reference'}
-        if champion == ids[0]:
-            labels[champion] = 'champion, newest'
-        return [dict(id=k, label=f'{k} · {labels.get(k, "earlier export")}') for k in selected]
+def checked_turn(history, moves):
+    """`moves` cut to one legal turn from `history`: stops at a win, raises ValueError when incomplete or illegal."""
+    game = replay(history)
+    try:
+        side, played = game.player, []
+        for q, r in moves:
+            game.play(int(q), int(r))
+            played.append([int(q), int(r)])
+            if game.winner >= 0 or game.player != side:
+                return played
+        raise ValueError('Engine returned an incomplete turn')
+    finally:
+        game.close()
 
-    def select(self, checkpoint):
-        if checkpoint not in {m['id'] for m in self.models()}:
-            raise ValueError('Choose one of the available checkpoints')
-        if checkpoint == self.checkpoint:
+
+# Engines
+
+
+def run_checkpoints(run):
+    """Checkpoint ids of a run directory, champion first, then newest first."""
+    exports = sorted((p for p in Path(run).glob('checkpoints/*/*/ema.pt') if p.parent.name.isdigit()),
+                     key=lambda p: (int(p.parent.name), p.parent.parent.name), reverse=True)
+    ids = [p.parent.relative_to(Path(run) / 'checkpoints').as_posix() for p in exports]
+    champion_file = Path(run) / 'champion.json'
+    champion = json.loads(champion_file.read_text(encoding='utf-8')).get('checkpoint') if champion_file.exists() else None
+    return ([champion] if champion in ids else []) + [c for c in ids if c != champion]
+
+
+def scan(models=None, runs=None, extra_runs=(), seal=None):
+    """Every engine on offer, by id. Bubble runs come from `extra_runs`, the directories in `runs`, and `models`;
+    single `.pt` exports and `<name>.json` entries ({"name", "kind": "bubble", "path"}) come from `models`.
+    Entries carry `id`, `name`, `kind`, `presets`, and for Bubble `checkpoints` plus the server-only `path`."""
+    entries, seen = OrderedDict(), set()
+
+    def add(kind, name, **fields):
+        base, n = f'{kind}:{name}', 2
+        key = base
+        while key in entries:
+            key, n = f'{base}~{n}', n + 1
+        entries[key] = dict(id=key, name=name, kind=kind, presets=PRESETS[kind], **fields)
+
+    def bubble(path, name=None):
+        path = Path(path).resolve()
+        if path in seen:
             return
+        seen.add(path)
+        if path.is_dir():
+            if checkpoints := run_checkpoints(path):
+                add('bubble', name or path.name, checkpoints=checkpoints, path=path)
+        elif path.suffix == '.pt' and path.exists():
+            add('bubble', name or (path.parent.name if path.stem == 'ema' else path.stem), checkpoints=[''], path=path)
+
+    for run in extra_runs:
+        bubble(run)
+    for folder in (runs, models):
+        if folder and Path(folder).is_dir():
+            for child in sorted(Path(folder).iterdir()):
+                if child.is_dir():
+                    bubble(child)
+    if models and Path(models).is_dir():
+        for path in sorted(Path(models).rglob('*.pt')):
+            if 'checkpoints' not in path.relative_to(models).parts:
+                bubble(path)
+        for path in sorted(Path(models).glob('*.json')):
+            try:
+                spec = json.loads(path.read_text(encoding='utf-8'))
+                if spec.get('kind') == 'bubble':
+                    bubble(path.parent / spec['path'], spec.get('name'))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+    add('native', 'Native')
+    if seal is not None and Path(seal).exists():
+        add('seal', 'Seal')
+    return entries
+
+
+class Cancelled(Exception):
+    """The job was cancelled while the engine was working."""
+
+
+class Watched:
+    """A network evaluator that reports each batch to `watch`, which may raise Cancelled."""
+
+    def __init__(self, inner, watch):
+        self.inner, self.watch = inner, watch
+
+    def evaluate(self, histories):
+        self.watch(len(histories))
+        return self.inner.evaluate(histories)
+
+
+class Bubble:
+    """One HexNet export on `device` with its evaluation cache."""
+
+    def __init__(self, path, device):
         import hexnet
         from legacy.train import digest
-        path = self.run/'checkpoints'/checkpoint/'ema.pt'
-        model = hexnet.load_model(path)
-        self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path), max_batch=16)
-        self.checkpoint, self.model_sha256 = checkpoint, digest(path)
-        self.set_history()
-
-    def configure(self, options):
-        updated = self.options | options
-        if any(type(updated[k]) is not bool for k in ('search', 'solver')):
-            raise ValueError('Search and solver must be on or off')
-        for key, maximum in (('simulations', 4096), ('solver_nodes', 1000000)):
-            if type(updated[key]) is not int or not 1 <= updated[key] <= maximum:
-                raise ValueError(f'{key} must be 1..{maximum}')
-        self.options = updated
-
-    def set_history(self, history=()):
         from neural_search import EvaluationCache
+        self.sha256 = digest(path)
+        self.evaluator = hexnet.DenseEvaluator(hexnet.load_model(path), device, self.sha256, max_batch=16)
         self.cache = EvaluationCache(4096)
 
-    def close(self):
-        self.evaluator = None
 
-    def solve(self, history, attacker='mover'):
-        from tactical_proof import NativeTactics
+def verified(result):
+    return result.get('status') == 'PROVEN_WIN' and result.get('native_verified')
+
+
+def winning_line(history, result):
+    """One legal continuation of a verified strategy as [q, r, player] stones, choosing its first covered reply."""
+    from dense_solver import Proof
+    certificate = result.get('certificate') or json.loads(result['certificate_json'])
+    proof = Proof([tuple(p) for p in history], certificate)
+    local, line = replay(history), []
+    try:
+        while local.winner < 0:
+            current = [cell[:2] for cell in local.cells]
+            move = proof.path(current)[1]
+            if move is None:
+                break
+            actions = move[0] or proof.reply(current) or local.legal_moves()[:local.remaining]
+            for action in actions:
+                line.append([*action, local.player])
+                local.play(*action)
+                if local.winner >= 0:
+                    break
+        return line
+    finally:
+        local.close()
+
+
+def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None):
+    """Bubble's turn from `history` and what it thinks of the position.
+
+    Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
+    stones as [q, r, probability]), `proof` (None or {winner, turns}), `line` (a winning line as [q, r, player]
+    when proven) and `threat` (the opponent's winning stones when the solver proved the side to move lost).
+    `simulations` 0 plays the raw policy; `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
+    before each network batch of n positions and may raise Cancelled."""
+    import numpy as np
+    from dense_selfplay import root_value
+    from neural_search import NeuralSearch
+    history = [tuple(map(int, p)) for p in history]
+    local = replay(history)
+    start, player = time.perf_counter(), local.player
+    moves, top, value, proof, line, threat = [], [], None, None, [], []
+    network = Watched(bubble.evaluator, watch)
+    try:
+        if local.winner >= 0:
+            raise ValueError('The game has finished')
+        if prover is not None and solver_nodes:
+            watch(0)
+            mine = prover.history(history, attacker='mover', nodes=solver_nodes, ms=10000)
+            if verified(mine):
+                moves, line = [list(m) for m in mine['moves']], winning_line(history, mine)
+                proof = dict(winner=player, turns=mine['proof_turns'])
+            else:
+                watch(0)
+                theirs = prover.history(history, attacker='opponent', nodes=solver_nodes, ms=10000)
+                if verified(theirs):
+                    proof = dict(winner=1 - player, turns=theirs['proof_turns'])
+                    threat = [list(m) for m in theirs['moves']]
+        while local.player == player and local.winner < 0 and not (proof and proof['winner'] == player):
+            current = [tuple(cell[:2]) for cell in local.cells]
+            if simulations:
+                tree = NeuralSearch(network, bubble.sha256, current, seed=1740, cache=bubble.cache, tactics=True)
+                try:
+                    result = tree.search(simulations, root_samples=16, batch_size=16)
+                finally:
+                    tree.close()
+                action, policy, actions = result['action'], result['policy'], result['actions']
+                stone_value = root_value(result, local.player)
+                if result.get('proven') and proof is None and not moves:
+                    proof = dict(winner=player if result['proven'] > 0 else 1 - player,
+                                 turns=(result['proof_plies'] + 1) // 2)
+            else:
+                result = network.evaluate([current])[0]
+                actions = result['actions']
+                policy = np.exp(result['logits'] - result['logits'].max())
+                policy /= policy.sum()
+                action, stone_value = actions[policy.argmax()].tolist(), float(result['q'][0])
+            if not moves:
+                top = [[*map(int, actions[i]), round(float(policy[i]), 4)] for i in np.argsort(-policy)[:5]]
+                value = (stone_value + 1) / 2
+            moves.append([int(action[0]), int(action[1])])
+            local.play(*moves[-1])
+        if proof:
+            value = 1. if proof['winner'] == player else 0.
+        return dict(moves=moves, value=round(value, 4), top=top, proof=proof, line=line, threat=threat,
+                    ms=round((time.perf_counter() - start) * 1000))
+    finally:
+        local.close()
+
+
+class Engines:
+    """Loaded engines, used only from the worker thread. Keeps the three most recent Bubble exports."""
+
+    def __init__(self, device, tactical_package=None, seal=None):
+        self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
+        self.bubbles, self.prover, self.seal = OrderedDict(), None, None
+
+    def bubble(self, path):
+        path = Path(path)
+        if path not in self.bubbles:
+            self.bubbles[path] = Bubble(path, self.device)
+            while len(self.bubbles) > 3:
+                self.bubbles.popitem(last=False)
+        self.bubbles.move_to_end(path)
+        return self.bubbles[path]
+
+    def solver(self):
         if self.prover is None:
-            self.prover = NativeTactics(**({'package': self.tactical_package} if self.tactical_package else {}))
-        return self.prover.history(history, attacker=attacker, nodes=self.options['solver_nodes'], ms=10000)
+            import tactical_proof
+            package = self.tactical_package or tactical_proof.PACKAGE
+            if not tactical_proof.library(package).exists():
+                return None
+            self.prover = tactical_proof.NativeTactics(package)
+        return self.prover
+
+    def evaluate(self, entry, checkpoint, budget, history, watch):
+        path = entry['path'] / 'checkpoints' / checkpoint / 'ema.pt' if checkpoint else entry['path']
+        return evaluate(self.bubble(path), self.solver(), history, budget['simulations'], budget['solver_nodes'], watch)
+
+    def turn(self, entry, budget, history):
+        """A turn from a non-Bubble engine."""
+        game = replay(history)
+        try:
+            if entry['kind'] == 'native':
+                return game.search(budget['ms'])['moves']
+            if self.seal is None:
+                from legacy.arena import Seal
+                self.seal = Seal()
+            return self.seal(game, budget['ms'])
+        finally:
+            game.close()
+
+    def close(self):
+        self.bubbles.clear()
+
+
+# Saved evaluations
+
+
+def position_text(history):
+    return ' '.join(f'{int(q)},{int(r)}' for q, r in history)
+
+
+class Evaluations:
+    """Append-only JSON lines, one evaluation per line, indexed in memory.
+
+    Each line holds `position` (the ordered stones), `engine` (entry name and checkpoint), `simulations`,
+    `solver_nodes`, the evaluation fields and `at`. The index keeps the newest `limit` (position, engine, budget)
+    entries; `best` returns the deepest one for a position and engine. The file is only appended to; on start a
+    dated copy is kept next to it, the newest `backups` of them."""
+
+    def __init__(self, path=None, limit=200_000, backups=3):
+        self.path, self.limit = Path(path) if path else None, limit
+        self.lock = threading.Lock()
+        self.order, self.by_position = OrderedDict(), {}
+        if self.path and self.path.exists():
+            stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+            shutil.copyfile(self.path, self.path.with_name(f'{self.path.name}.{stamp}.bak'))
+            for old in sorted(self.path.parent.glob(f'{self.path.name}.*.bak'))[:-backups]:
+                old.unlink()
+            with open(self.path, encoding='utf-8') as lines:
+                for line in lines:
+                    try:
+                        self.index(json.loads(line), line.strip())
+                    except (ValueError, KeyError, TypeError):
+                        continue
 
     @staticmethod
-    def winning_line(history, result):
-        """One legal continuation of a verified strategy, choosing its first covered defender reply."""
-        from dense_solver import Proof
-        certificate = result.get('certificate') or json.loads(result['certificate_json'])
-        proof = Proof(list(map(tuple, history)), certificate)
-        local, line = Game(history), []
+    def key(history):
+        return hashlib.blake2b(position_text(history).encode(), digest_size=16).digest()
+
+    def index(self, record, line):
+        position = hashlib.blake2b(record['position'].encode(), digest_size=16).digest()
+        budget = (record['simulations'], record['solver_nodes'])
+        full = (position, record['engine'], budget)
+        self.order.pop(full, None)
+        self.order[full] = line
+        self.by_position.setdefault((position, record['engine']), set()).add(budget)
+        while len(self.order) > self.limit:
+            (old, engine, spent), _ = self.order.popitem(last=False)
+            budgets = self.by_position[(old, engine)]
+            budgets.discard(spent)
+            if not budgets:
+                del self.by_position[(old, engine)]
+
+    def add(self, history, engine, budget, evaluation):
+        record = dict(position=position_text(history), engine=engine, simulations=budget['simulations'],
+                      solver_nodes=budget['solver_nodes'], **evaluation,
+                      at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+        line = json.dumps(record, separators=(',', ':'))
+        with self.lock:
+            if self.path:
+                with open(self.path, 'a', encoding='utf-8') as out:
+                    out.write(line + '\n')
+            self.index(record, line)
+        return record
+
+    def get(self, history, engine, budget):
+        """The saved evaluation of `history` by `engine` at exactly `budget`, or None."""
+        with self.lock:
+            line = self.order.get((self.key(history), engine, (budget['simulations'], budget['solver_nodes'])))
+        return json.loads(line) if line else None
+
+    def best(self, history, engine):
+        """The deepest saved evaluation of `history` by `engine`, or None."""
+        position = self.key(history)
+        with self.lock:
+            budgets = self.by_position.get((position, engine))
+            if not budgets:
+                return None
+            line = self.order[(position, engine, max(budgets))]
+        return json.loads(line)
+
+
+# Review
+
+
+def review(history, lookup, winner=-1):
+    """Label every complete turn of `history` from saved evaluations.
+
+    `lookup(prefix)` returns the evaluation of a position (fields of `evaluate`) or None. A turn is judged on the
+    mover's win probability before and after it; the first label that applies wins: win (made six), lost (the
+    opponent already had a proven win), kept or missed (the mover had one and kept or lost it), allowed (handed the
+    opponent one), found (proved one), best (the engine's own turn), then the loss bands good (< 0.05),
+    inaccuracy (< 0.10), mistake (< 0.20) and blunder. Turns lacking an evaluation get label None. For
+    inaccuracy and worse, missed and allowed, `better` is the engine's turn and `line` its continuation."""
+    turns = []
+    starts = turn_starts(len(history))
+    for s, e in zip(starts, [*starts[1:], len(history)]):
+        me = player_at(s)
+        stones = [list(p) for p in history[s:e]]
+        if e - s < (1 if s == 0 else 2) and not (e == len(history) and winner == me):
+            break
+        turn = dict(ply=s, player=me, stones=stones, label=None, before=None, after=None, better=None, line=None)
+        turns.append(turn)
+        if e == len(history) and winner == me:
+            turn['label'] = 'win'
+            continue
+        before, after = lookup(history[:s]), lookup(history[:e])
+        if before is None or after is None:
+            continue
+        turn['before'], turn['after'] = before['value'], 1 - after['value']
+        had = (before.get('proof') or {}).get('winner')
+        has = (after.get('proof') or {}).get('winner')
+        loss = turn['before'] - turn['after']
+        if had == 1 - me:
+            label = 'lost'
+        elif had == me:
+            label = 'kept' if has == me else 'missed'
+        elif has == 1 - me:
+            label = 'allowed'
+        elif has == me:
+            label = 'found'
+        elif before['moves'] and sorted(map(tuple, before['moves'])) == sorted(map(tuple, stones)):
+            label = 'best'
+        else:
+            label = 'good' if loss < .05 else 'inaccuracy' if loss < .1 else 'mistake' if loss < .2 else 'blunder'
+        turn['label'] = label
+        if label in ('inaccuracy', 'mistake', 'blunder', 'missed', 'allowed') and before['moves']:
+            turn['better'] = before['moves']
+            if before.get('line'):
+                turn['line'] = before['line']
+            else:
+                reply = lookup([*history[:s], *map(tuple, before['moves'])])
+                turn['line'] = [[*p, me] for p in before['moves']] + \
+                               [[*p, 1 - me] for p in (reply or {}).get('moves', [])]
+    return turns
+
+
+# Session and jobs
+
+
+class Job:
+    """One unit of engine work. `kind` is move, analyse or review; progress is `done` of `total`."""
+    ids = itertools.count(1)
+
+    def __init__(self, kind, priority, history, **fields):
+        self.id, self.kind, self.priority, self.history = next(Job.ids), kind, priority, tuple(history)
+        self.status, self.done, self.total, self.error, self.cancelled = 'queued', 0, 1, None, False
+        self.__dict__.update(fields)
+
+    def summary(self):
+        return dict(id=self.id, kind=self.kind, status=self.status, done=self.done, total=self.total,
+                    error=self.error, ply=len(self.history), side=getattr(self, 'side', None))
+
+
+def budget_of(kind, preset, custom=None):
+    """The budget of `preset` for an engine kind, or `custom` checked against LIMITS."""
+    if preset != 'custom':
+        if preset not in PRESETS[kind]:
+            raise ValueError('Unknown preset')
+        return dict(PRESETS[kind][preset])
+    budget = dict(PRESETS[kind]['standard']) | (custom or {})
+    for key, value in budget.items():
+        low, high = LIMITS[key]
+        if key not in PRESETS[kind]['standard'] or type(value) is not int or not low <= value <= high:
+            raise ValueError(f'{key} must be {low}..{high}')
+    return budget
+
+
+class Session:
+    """The game, the seats, the analysis settings and the job queue. HTTP threads call the public methods; one
+    worker thread runs the jobs through `engines`. `revision` grows with every change the page must redraw."""
+
+    def __init__(self, entries, engines, store, rescan=lambda: None):
+        self.entries, self.engines, self.store, self.rescan_entries = entries, engines, store, rescan
+        self.lock = threading.Condition()
+        self.history, self.revision, self.paused = [], 0, False
+        self.jobs, self.queue, self.order = OrderedDict(), [], itertools.count()
+        bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
+        opponent = bubble or entries['native:Native']
+        self.seats = [dict(engine='human'), self.seat(opponent['id'], None, 'standard')]
+        self.analysis = self.seat(bubble['id'], None, 'standard') | dict(auto=True) if bubble else None
+        self.worker = threading.Thread(target=self.work, daemon=True)
+        self.worker.start()
+
+    def seat(self, engine, checkpoint, preset, custom=None):
+        if engine == 'human':
+            return dict(engine='human')
+        entry = self.entries.get(engine)
+        if entry is None:
+            raise ValueError('Unknown engine')
+        if entry['kind'] == 'bubble':
+            checkpoint = entry['checkpoints'][0] if checkpoint is None else checkpoint
+            if checkpoint not in entry['checkpoints']:
+                raise ValueError('Unknown checkpoint')
+        else:
+            checkpoint = None
+        return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget_of(entry['kind'], preset, custom))
+
+    def engine_key(self, seat):
+        entry = self.entries[seat['engine']]
+        return f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
+
+    # Reading
+
+    def lookup(self, history):
+        return self.store.best(history, self.engine_key(self.analysis)) if self.analysis else None
+
+    def state(self):
+        with self.lock:
+            history, game = list(self.history), replay(self.history)
+            try:
+                board = dict(player=game.player, remaining=game.remaining, winner=game.winner)
+            finally:
+                game.close()
+            evaluations = {}
+            for ply in range(len(history) + 1):
+                if (found := self.lookup(history[:ply])) is not None:
+                    evaluations[ply] = {k: found.get(k) for k in
+                                        ('value', 'moves', 'top', 'proof', 'line', 'threat', 'simulations', 'solver_nodes')}
+            entries = [{k: v for k, v in e.items() if k != 'path'} for e in self.entries.values()]
+            return dict(revision=self.revision, history=[list(p) for p in history], **board, paused=self.paused,
+                        seats=self.seats, analysis=self.analysis, engines=entries, evaluations=evaluations,
+                        review=review(history, self.lookup, board['winner']), jobs=self.job_list())
+
+    def job_list(self):
+        return [job.summary() for job in self.jobs.values() if job.status in ('queued', 'running')]
+
+    def poll(self, since):
+        with self.lock:
+            if since == self.revision:
+                return dict(revision=self.revision, jobs=self.job_list())
+        return self.state()
+
+    # Changing
+
+    def changed(self):
+        """Call with the lock held after any change: bumps the revision and queues the jobs the change calls for."""
+        self.revision += 1
+        game = replay(self.history)
         try:
-            while local.winner < 0:
-                current = [cell[:2] for cell in local.cells]
-                move = proof.path(current)[1]
-                if move is None:
-                    break
-                actions = move[0] or proof.reply(current) or local.legal_moves()[:local.remaining]
-                for action in actions:
-                    line.append([*action, local.player])
-                    local.play(*action)
-                    if local.winner >= 0:
-                        break
-            return line
+            player, winner, remaining = game.player, game.winner, game.remaining
         finally:
-            local.close()
+            game.close()
+        seat = self.seats[player]
+        busy = any(j.kind == 'move' and j.status in ('queued', 'running') and j.history == tuple(self.history)
+                   for j in self.jobs.values())
+        if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy:
+            self.submit(Job('move', 0, self.history, side=player, seat=dict(seat)))
+        opening = not self.history or remaining == 2
+        if self.analysis and self.analysis['auto'] and winner < 0 and opening:
+            self.request_analysis(self.history, 2)
+        self.lock.notify_all()
 
-    def turn(self, game, milliseconds=None, analyze=False):
-        import numpy as np
-        from neural_search import NeuralSearch
-        from dense_selfplay import root_value
-        if game.winner >= 0:
-            raise ValueError('This game has finished')
-        history = [cell[:2] for cell in game.cells]
-        local, moves, suggestions = Game(history), [], []
-        player, start, proof, line, threat = local.player, time.perf_counter(), None, [], None
-        win_probability = None
-        try:
-            if self.options['solver']:
-                proof = self.solve(history)
-                if proof['status'] == 'PROVEN_WIN' and proof.get('native_verified'):
-                    moves = proof['moves']
-                    line = self.winning_line(history, proof)
-                if analyze:
-                    danger = self.solve(history, 'opponent')
-                    if danger['status'] == 'PROVEN_WIN' and danger.get('native_verified'):
-                        threat = dict(moves=danger['moves'], turns=danger['proof_turns'])
-            proven = bool(proof and proof['status'] == 'PROVEN_WIN' and proof.get('native_verified'))
-            while not proven and local.player == player and local.winner < 0:
-                current = [cell[:2] for cell in local.cells]
-                if self.options['search']:
-                    tree = NeuralSearch(self.evaluator, self.model_sha256, current, seed=1740,
-                                        cache=self.cache, tactics=True)
-                    try:
-                        result = tree.search(self.options['simulations'], root_samples=16, batch_size=16)
-                    finally:
-                        tree.close()
-                    action, policy, actions = result['action'], result['policy'], result['actions']
-                    value = root_value(result, local.player)
-                else:
-                    result = self.evaluator.evaluate([current])[0]
-                    actions = result['actions']
-                    policy = np.exp(result['logits']-result['logits'].max()); policy /= policy.sum()
-                    action, value = actions[policy.argmax()].tolist(), float(result['q'][0])
-                if not suggestions:
-                    suggestions = [dict(move=actions[i].tolist(), probability=float(policy[i]))
-                                   for i in np.argsort(-policy)[:5]]
-                    win_probability = (value+1)/2
-                moves.append(action)
-                local.play(*action)
-            return dict(moves=moves, backend='dense', checkpoint=self.checkpoint,
-                        elapsed_ms=(time.perf_counter()-start)*1000, suggestions=suggestions,
-                        player=player, win_probability=1. if proven else win_probability,
-                        proof_status='PROVEN_WIN' if proven else 'UNKNOWN', winning_line=line, threat=threat,
-                        threat_checked=analyze and self.options['solver'],
-                        solver_status=proof['status'] if proof else 'off', settings=dict(self.options))
-        finally:
-            local.close()
+    def submit(self, job):
+        self.jobs[job.id] = job
+        heapq.heappush(self.queue, (job.priority, next(self.order), job))
+        while len(self.jobs) > 200:
+            oldest = next(iter(self.jobs))
+            if self.jobs[oldest].status in ('queued', 'running'):
+                break
+            del self.jobs[oldest]
+        self.lock.notify_all()
+        return job
+
+    def request_analysis(self, history, priority, force=False):
+        """Queue an evaluation of `history` by the analysis engine unless it is saved or already queued."""
+        settings = dict(self.analysis)
+        for job in self.jobs.values():
+            if job.kind == 'analyse' and job.history == tuple(history) and job.seat == settings:
+                if job.status in ('queued', 'running'):
+                    return job
+                if job.status == 'failed' and not force:
+                    return None
+        saved, budget = self.lookup(history), settings['budget']
+        if not force and saved and (saved['simulations'], saved['solver_nodes']) >= (budget['simulations'], budget['solver_nodes']):
+            return None
+        return self.submit(Job('analyse', priority, history, seat=settings, force=force))
+
+    def play(self, q, r):
+        with self.lock:
+            game = replay(self.history)
+            try:
+                if game.winner >= 0 or self.seats[game.player]['engine'] != 'human':
+                    raise ValueError('It is not your turn')
+                game.play(q, r)
+            finally:
+                game.close()
+            self.history.append((q, r))
+            self.changed()
+
+    def undo(self):
+        """Take back stones to the start of the latest turn a person played, or one stone without people."""
+        with self.lock:
+            if not self.history:
+                return
+            people = [i for i, seat in enumerate(self.seats) if seat['engine'] == 'human']
+            self.history.pop()
+            while people and self.history and not (player_at(len(self.history)) in people
+                                                   and len(self.history) in turn_starts(len(self.history) + 1)):
+                self.history.pop()
+            self.stop_moves()
+            self.changed()
+
+    def load(self, history, paused):
+        """Replace the game with `history` (validated)."""
+        replay(history).close()
+        with self.lock:
+            self.history, self.paused = [tuple(map(int, p)) for p in history], paused
+            self.stop_moves()
+            self.changed()
+
+    def stop_moves(self):
+        for job in self.jobs.values():
+            if job.kind == 'move' and job.status in ('queued', 'running'):
+                job.cancelled = True
+
+    def configure_seat(self, side, engine, checkpoint=None, preset='standard', custom=None):
+        seat = self.seat(engine, checkpoint, preset, custom)
+        with self.lock:
+            self.seats[side] = seat
+            self.stop_moves()
+            self.changed()
+
+    def configure_analysis(self, engine, checkpoint=None, preset='standard', custom=None, auto=True):
+        seat = self.seat(engine, checkpoint, preset, custom)
+        if self.entries[engine]['kind'] != 'bubble' or type(auto) is not bool:
+            raise ValueError('Analysis needs a Bubble model')
+        with self.lock:
+            self.analysis = seat | dict(auto=auto)
+            self.changed()
+
+    def analyse(self, ply, force=False):
+        with self.lock:
+            if not self.analysis or not 0 <= ply <= len(self.history):
+                raise ValueError('Nothing to analyse')
+            job = self.request_analysis(self.history[:ply], 1, force)
+            self.lock.notify_all()
+            return job.id if job else None
+
+    def review_game(self):
+        with self.lock:
+            if not self.analysis:
+                raise ValueError('Review needs a Bubble model')
+            job = self.submit(Job('review', 2, self.history, seat=dict(self.analysis)))
+            job.total = len(turn_starts(len(self.history))) + 1
+            return job.id
+
+    def cancel(self, job_id):
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job and job.status in ('queued', 'running'):
+                job.cancelled = True
+                if job.kind == 'move':
+                    self.paused = True
+                if job.status == 'queued':
+                    job.status = 'cancelled'
+                self.revision += 1
+
+    def pause(self, paused):
+        with self.lock:
+            self.paused = bool(paused)
+            if self.paused:
+                self.stop_moves()
+            self.changed()
+
+    def rescan(self):
+        entries = self.rescan_entries()
+        with self.lock:
+            self.entries = entries
+            self.changed()
+
+    # Working
+
+    def work(self):
+        while True:
+            with self.lock:
+                while not self.queue:
+                    self.lock.wait()
+                job = heapq.heappop(self.queue)[2]
+                if job.cancelled:
+                    job.status = 'cancelled'
+                    continue
+                job.status = 'running'
+                self.revision += 1
+            try:
+                result = self.run(job)
+                with self.lock:
+                    job.status = 'cancelled' if job.cancelled else 'done'
+                    if job.kind == 'move' and not job.cancelled and list(job.history) == self.history:
+                        self.history.extend(tuple(p) for p in result)
+                    self.changed()
+            except Cancelled:
+                with self.lock:
+                    job.status = 'cancelled'
+                    self.changed()
+            except Exception as error:
+                with self.lock:
+                    job.status, job.error = 'failed', str(error)
+                    if job.kind == 'move':
+                        self.paused = True
+                    self.changed()
+
+    def watcher(self, job):
+        def watch(n):
+            if job.cancelled:
+                raise Cancelled()
+            job.done += n
+        return watch
+
+    def evaluation(self, job, seat, history, force=False, exact=False):
+        """The evaluation of `history` for `seat`, saved. Unless forced, a saved one is reused: at exactly the
+        seat's budget when `exact`, else at least as deep."""
+        key, budget = self.engine_key(seat), seat['budget']
+        saved = None if force else self.store.get(history, key, budget) if exact else self.store.best(history, key)
+        if saved and (saved['simulations'], saved['solver_nodes']) >= (budget['simulations'], budget['solver_nodes']):
+            return saved
+        found = self.engines.evaluate(self.entries[seat['engine']], seat['checkpoint'], seat['budget'], history,
+                                      self.watcher(job))
+        if job.cancelled:
+            raise Cancelled()
+        return self.store.add(history, key, seat['budget'], found)
+
+    def run(self, job):
+        seat, history = job.seat, list(job.history)
+        entry = self.entries[seat['engine']]
+        if job.kind == 'move':
+            if entry['kind'] == 'bubble':
+                job.total = max(1, seat['budget']['simulations']) * 2
+                moves = self.evaluation(job, seat, history, exact=True)['moves']
+            else:
+                moves = self.engines.turn(entry, seat['budget'], history)
+            return checked_turn(history, moves)
+        if job.kind == 'analyse':
+            job.total = max(1, seat['budget']['simulations']) * 2
+            return self.evaluation(job, seat, history, job.force)
+        game = replay(history)
+        winner = game.winner
+        game.close()
+        plies = turn_starts(len(history)) + ([len(history)] if winner < 0 else [])
+        for ply in plies:
+            if job.cancelled:
+                raise Cancelled()
+            self.evaluation(job, seat, history[:ply])
+            job.done += 1
+            with self.lock:
+                self.revision += 1
+        return None
 
 
-def promoted_checkpoint(run):
-    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
-    return next(c for c in summary["checkpoints"] if c["id"] == summary["incumbent"])
+# HTTP
+
+
+def import_history(text):
+    """A history from HTTTX notation, a replay file ({"history": [...]}) or a JSON list of [q, r]."""
+    stripped = text.strip()
+    if stripped.startswith(('{', '[')):
+        data = json.loads(stripped)
+        history = data['history'] if isinstance(data, dict) else data
+        if not isinstance(history, list) or any(not isinstance(p, list) or len(p) != 2 or
+                                                 any(type(v) is not int for v in p) for p in history):
+            raise ValueError('A replay holds a list of [q, r] stones')
+        return history
+    return [list(p) for p in loads(text).history]
 
 
 class Handler(BaseHTTPRequestHandler):
-    game = Game()
-    run = None
-    model = None
-    label = None
-    neural = None
-    search_run = None
-    search_checkpoint = None
-    search_label = "Internal champion"
-    neural_options = {}
-    notes = AnalysisStore()
+    session = None
+    page = ROOT / 'web' / 'index.html'
 
-    def note_context(self):
-        if isinstance(self.neural, DensePlayer):
-            return self.neural.checkpoint, dict(self.neural.options)
-        return (self.search_checkpoint if self.search_run else None), None
+    def log_message(self, *args):
+        pass
 
-    @classmethod
-    def refresh_champion(cls):
-        if cls.search_run is None:
-            return
-        league = json.loads((cls.search_run / "league.json").read_text(encoding="utf-8"))
-        number = league["champion"]
-        selected = next(c for c in league["checkpoints"] if c["id"] == number)
-        if not selected.get("promoted"):
-            raise ValueError("Search champion must be a promoted checkpoint")
-        if number == cls.search_checkpoint:
-            return
-        from legacy.relational_player import RelationalPlayer
-        directory = cls.search_run / "checkpoints" / f"{number:04d}"
-        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-        candidate = RelationalPlayer(directory / "model.pt", **cls.neural_options)
-        if candidate.model_sha256 != manifest["files"]["model.pt"]:
-            candidate.close()
-            raise ValueError("Search champion model digest changed")
-        previous = cls.neural
-        cls.neural = candidate
-        cls.search_checkpoint = number
-        cls.label = f"{cls.search_label} {number} | {candidate.mode} | {candidate.model_sha256[:12]} | updates on New game"
-        if previous:
-            previous.close()
-
-    def state(self):
-        promoted = promoted_checkpoint(self.run) if self.run else None
-        backend = "native-pvs"
-        if self.neural:
-            backend = self.neural.mode
-        elif self.model or (promoted and promoted.get("kind") == "nnue"):
-            backend = "nnue-pvs"
-        elif promoted:
-            backend = "table-pvs"
-        dense = isinstance(self.neural, DensePlayer)
-        checkpoint, settings = self.note_context()
-        cells = self.game.cells
-        return {**self.game.state(), "opponent": f'Dense {self.neural.checkpoint}' if dense else self.label,
-                "backend": backend,
-                "checkpoint": self.neural.checkpoint if dense else self.search_checkpoint if self.search_run else promoted["id"] if promoted else None,
-                "default_budget_ms": 10000 if self.neural else 1000,
-                "model_sha256": self.neural.model_sha256 if self.neural else None,
-                "models": self.neural.models() if dense else [],
-                "dense_settings": self.neural.options if dense else None,
-                "dense_checkpoint": self.neural.checkpoint if dense else None,
-                "position_analysis": self.notes.get(cells, checkpoint, settings),
-                "game_analysis": self.notes.history(cells, checkpoint, settings)}
-
-    def respond(self, status, data, content_type="application/json"):
-        payload = data.encode() if isinstance(data, str) else json.dumps(data).encode()
+    def respond(self, status, data, content_type='application/json', headers=()):
+        payload = data if isinstance(data, bytes) else data.encode() if isinstance(data, str) else json.dumps(data).encode()
         self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('Cache-Control', 'no-store')
+        for name, value in headers:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
     def do_GET(self):
-        if self.path == "/":
-            return self.respond(200, (Path(__file__).resolve().parents[1] / "web" / "index.html").read_text(encoding="utf-8"), "text/html; charset=utf-8")
-        if self.path == "/state":
-            return self.respond(200, self.state())
-        if self.path == "/htttx":
+        url, session = urlparse(self.path), self.session
+        if url.path == '/':
+            return self.respond(200, self.page.read_bytes(), 'text/html; charset=utf-8')
+        if url.path == '/state':
+            since = parse_qs(url.query).get('since', [''])[0]
+            return self.respond(200, session.poll(int(since)) if since.isdigit() else session.state())
+        if url.path == '/htttx':
             try:
-                return self.respond(200, dumps([cell[:2] for cell in self.game.cells]), "text/plain; charset=utf-8")
+                return self.respond(200, dumps(list(session.history)), 'text/plain; charset=utf-8')
             except NotationConflict as error:
-                return self.respond(409, {"error": str(error)})
-        self.respond(404, {"error": "Not found"})
+                return self.respond(409, dict(error=str(error)))
+        if url.path == '/replay':
+            names = [seat['engine'] for seat in session.seats]
+            body = dict(format='bubble-replay', version=1, players=names, history=[list(p) for p in session.history])
+            return self.respond(200, json.dumps(body), headers=[('Content-Disposition', 'attachment; filename="game.json"')])
+        if url.path == '/evaluations':
+            path = session.store.path
+            data = path.read_bytes() if path and path.exists() else b''
+            return self.respond(200, data, 'application/x-ndjson',
+                                [('Content-Disposition', 'attachment; filename="evaluations.jsonl"')])
+        self.respond(404, dict(error='Not found'))
 
     def do_POST(self):
-        # Accept only same-origin browser requests to this local service.
-        origin = self.headers.get("Origin")
+        origin = self.headers.get('Origin')
         if origin and origin != f"http://{self.headers.get('Host')}":
-            return self.respond(403, {"error": "Origin rejected"})
+            return self.respond(403, dict(error='Origin rejected'))
+        session = self.session
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            if not 0 <= length <= 4096:
-                raise ValueError("Request too large")
-            args = json.loads(self.rfile.read(length) or "{}")
-            analysis = None
-            if self.path == "/new":
-                self.refresh_champion()
-                self.game.close()
-                type(self).game = Game()
-                if self.neural:
-                    self.neural.set_history()
-            elif self.path == "/play":
-                self.game.play(args["q"], args["r"])
-            elif self.path == "/undo":
-                self.game.undo()
-                if self.neural:
-                    self.neural.set_history([cell[:2] for cell in self.game.cells])
-            elif self.path == '/settings' and isinstance(self.neural, DensePlayer):
-                if 'checkpoint' in args:
-                    self.neural.select(args.pop('checkpoint'))
-                self.neural.configure(args)
-            elif self.path == '/analyze' and isinstance(self.neural, DensePlayer):
-                checkpoint, settings = self.note_context()
-                saved = self.notes.get(self.game.cells, checkpoint, settings)
-                if saved and args.get('force') is not True and (not settings['solver'] or
-                        saved['analysis'].get('threat_checked')):
-                    analysis = saved['analysis']
-                else:
-                    analysis = self.neural.turn(self.game, analyze=True)
-                    self.notes.save(self.game.cells, checkpoint, settings, analysis)
-            elif self.path == "/bot":
-                ms = args.get("ms", 1000)
-                if type(ms) is not int or not 1 <= ms <= 30000:
-                    raise ValueError("Think time must be 1..30000 ms")
-                checkpoint = self.neural.checkpoint if isinstance(self.neural, DensePlayer) else self.search_checkpoint if self.search_run else None
-                note_checkpoint, note_settings = self.note_context()
-                note_cells = self.game.cells
-                if isinstance(self.neural, DensePlayer):
-                    saved = self.notes.get(note_cells, note_checkpoint, note_settings)
-                    analysis = saved['analysis'] if saved else self.neural.turn(self.game, milliseconds=ms)
-                elif self.neural is not None:
-                    analysis = self.neural.turn(self.game, milliseconds=ms)
-                elif self.model is not None:
-                    self.game.load_model(self.model)
-                elif self.run is not None:
-                    model = promoted_checkpoint(self.run)
-                    checkpoint = model["id"]
-                    if model.get("kind") == "nnue":
-                        self.game.load_model(self.run / model["nnue"])
-                    else:
-                        import numpy as np
-                        self.game.load_table(np.load(self.run / model["table"], allow_pickle=False))
-                if self.neural is None:
-                    analysis = self.game.search(ms)
-                analysis["checkpoint"] = checkpoint
-                if isinstance(self.neural, DensePlayer) and not saved:
-                    self.notes.save(note_cells, note_checkpoint, note_settings, analysis)
-                for q, r in analysis["moves"]:
-                    self.game.play(q, r)
+            length = int(self.headers.get('Content-Length', 0))
+            if not 0 <= length <= 1 << 20:
+                raise ValueError('Request too large')
+            args = json.loads(self.rfile.read(length) or '{}')
+            reply = {}
+            if self.path == '/play':
+                session.play(args['q'], args['r'])
+            elif self.path == '/undo':
+                session.undo()
+            elif self.path == '/new':
+                session.load([], False)
+            elif self.path == '/retry':
+                ply = args['ply']
+                if type(ply) is not int or not 0 <= ply <= len(session.history):
+                    raise ValueError('No such position')
+                session.load(session.history[:ply], False)
+            elif self.path == '/import':
+                session.load(import_history(args['text']), True)
+            elif self.path == '/seat':
+                if args.get('side') not in (0, 1):
+                    raise ValueError('Side must be 0 or 1')
+                session.configure_seat(args['side'], args['engine'], args.get('checkpoint'),
+                                       args.get('preset', 'standard'), args.get('custom'))
+            elif self.path == '/analysis':
+                session.configure_analysis(args['engine'], args.get('checkpoint'), args.get('preset', 'standard'),
+                                           args.get('custom'), args.get('auto', True))
+            elif self.path == '/analyse':
+                if type(args.get('ply')) is not int:
+                    raise ValueError('Choose a position')
+                reply = dict(job=session.analyse(args['ply'], args.get('force') is True))
+            elif self.path == '/review':
+                reply = dict(job=session.review_game())
+            elif self.path == '/cancel':
+                session.cancel(args['id'])
+            elif self.path == '/pause':
+                session.pause(args['paused'])
+            elif self.path == '/rescan':
+                session.rescan()
             else:
-                return self.respond(404, {"error": "Not found"})
-            self.respond(200, {**self.state(), "analysis": analysis})
+                return self.respond(404, dict(error='Not found'))
+            self.respond(200, session.state() | reply)
         except (ValueError, KeyError, TypeError) as error:
-            self.respond(400, {"error": str(error)})
-        except (TimeoutError, RuntimeError, OSError, StopIteration) as error:
-            self.respond(503, {"error": str(error)})
+            self.respond(400, dict(error=str(error)))
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8765)
-    opponent = parser.add_mutually_exclusive_group()
-    opponent.add_argument("--run", type=Path, help="Play against the latest promoted checkpoint in this run")
-    opponent.add_argument("--model", type=Path, help="Play against a specific NNUE export, without claiming promotion")
-    opponent.add_argument("--relational", type=Path, help="Play the actual relational policy/Q checkpoint")
-    opponent.add_argument("--search-run", type=Path, help="Use the internal search champion; refresh on New game")
-    opponent.add_argument('--dense-run', type=Path, help='Play dense exports with model, search and solver controls')
-    parser.add_argument('--tactical-package', type=Path, help='Directory containing the verified prebuilt tactical library')
-    parser.add_argument("--neural-mode", choices=("pi", "mu", "gumbel", "gumbel-proof"), default="gumbel")
-    parser.add_argument("--simulations", type=int, default=16, help="Maximum neural search simulations per placement")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--label", help="Visible opponent name")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--port', type=int, default=8765)
+    parser.add_argument('--dense-run', type=Path, help='a Bubble run; its champion is the default opponent')
+    parser.add_argument('--models', type=Path, default=ROOT / 'models', help='folder scanned for models and engines')
+    parser.add_argument('--runs', type=Path, default=ROOT / 'runs', help='folder whose runs are offered as models')
+    parser.add_argument('--evaluations', type=Path,
+                        help='saved evaluations file; default play-evaluations.jsonl in the run or models folder')
+    parser.add_argument('--tactical-package', type=Path, help='directory with the built tactical solver')
+    parser.add_argument('--device', default='auto', help='cuda, cpu, or auto: cuda when a GPU is available')
     args = parser.parse_args()
-    if args.dense_run:
+    if args.device == 'auto':
         import torch
-        torch.set_num_threads(2)
-        Handler.neural = DensePlayer(args.dense_run.resolve(), args.device, args.tactical_package)
-    Handler.run = args.run.resolve() if args.run else None
-    if Handler.run:
-        promoted_checkpoint(Handler.run)
-    Handler.model = args.model.resolve() if args.model else None
-    if Handler.model:
-        Handler.game.load_model(Handler.model)
-    if args.relational:
-        from legacy.relational_player import RelationalPlayer
-        Handler.neural = RelationalPlayer(args.relational.resolve(), mode=args.neural_mode,
-                                          simulations=args.simulations, device=args.device)
-    Handler.label = args.label or (str(Handler.model) if Handler.model else
-                                  f"Promoted checkpoint from {Handler.run.name}" if Handler.run else "Native engine")
-    if Handler.neural:
-        name = args.label or "Bubble"
-        Handler.label = f"{name} | {Handler.neural.mode} | {Handler.neural.model_sha256[:12]}"
-    Handler.search_run = args.search_run.resolve() if args.search_run else None
-    notes_run = args.dense_run or args.run or args.search_run
-    Handler.notes = AnalysisStore(notes_run.resolve() / 'play-notes.json' if notes_run else None)
-    Handler.search_label = args.label or "Internal champion"
-    Handler.neural_options = dict(mode=args.neural_mode, simulations=args.simulations, device=args.device)
-    Handler.refresh_champion()
-    print(f"Bubble is ready at http://127.0.0.1:{args.port}", flush=True)
-    try:
-        HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
-    finally:
-        Handler.game.close()
-        if Handler.neural:
-            Handler.neural.close()
+        args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    import torch
+    torch.set_num_threads(2)
+    from hexo import library
+    seal = library.with_name(library.name.replace('hexo', 'hexo_seal'))
+    runs = [args.dense_run] if args.dense_run else []
+    find = lambda: scan(args.models, args.runs, runs, seal)
+    store_path = args.evaluations or (args.dense_run or args.models) / 'play-evaluations.jsonl'
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    Handler.session = Session(find(), Engines(args.device, args.tactical_package), Evaluations(store_path), find)
+    with Handler.session.lock:
+        Handler.session.changed()
+    print(f'Bubble is ready at http://127.0.0.1:{args.port}', flush=True)
+    ThreadingHTTPServer(('127.0.0.1', args.port), Handler).serve_forever()
+
+
+if __name__ == '__main__':
+    main()

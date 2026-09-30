@@ -91,12 +91,6 @@ Elo is estimated against the frozen original checkpoint, whose rating is zero. I
 
 Run directories contain `summary.json`, append-only `events.jsonl`, replay batches, match histories, and checkpoint model/table files. Repeat the same command to perform additional iterations with the same configuration. Engine or training-source changes require a new run directory, keeping ratings comparable. A lock prevents concurrent trainers from writing the same run. If a process is forcibly killed, verify it has stopped before removing its stale `training.lock`.
 
-To play the latest promoted checkpoint:
-
-```sh
-python python/play.py --run runs/selfplay
-```
-
 For a short end-to-end run, use a separate directory:
 
 ```sh

@@ -1,5 +1,71 @@
 # Browser play
 
+```sh
+python python/bubble.py play                                  # champion of runs/bubble
+python python/play.py --dense-run runs/bubble --device cpu    # the same, directly
+```
+
+Open <http://127.0.0.1:8765>. Either side is a person or an engine, so a person can play Bubble, Bubble can
+play another checkpoint, and two engines play each other live while the page stays usable. Engine work runs on one
+background thread as jobs; the page polls `/state` and every job can be cancelled. Cancelling an engine's move
+pauses the game until Resume.
+
+## Engines
+
+The picker lists everything the server finds on start:
+
+- Bubble runs: every directory in `runs/` (or `--runs`) and `models/` (or `--models`) with
+  `checkpoints/<variant>/<step>/ema.pt`, plus `--dense-run`. The champion comes first, then the newest.
+- Bubble exports: any other `.pt` file under `models/`.
+- `models/<name>.json` for a model stored elsewhere: `{"name": "old", "kind": "bubble", "path": "../runs/x"}`.
+- Native, the handwritten engine, always.
+- Seal, when `build/libhexo_seal.dll` (or `.so`) is built with `-DHEXO_SEAL_SOURCE`.
+
+| Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms |
+|---|---|---|---|
+| Quick (Q) | 32 | 2,048 | 250 and 100 |
+| Standard (S) | 128 | 32,768 | 1,000 and 500 |
+| Strong (St) | 512 | 131,072 | 3,000 and 2,000 |
+| Deep (D) | 2,048 | 524,288 | 10,000 and 8,000 |
+
+On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at these presets. Custom
+(`⋯`) takes any simulations from 0 (raw policy) to 16,384, solver nodes up to 4,000,000 (0 turns the solver off)
+and 10 to 120,000 ms.
+
+## Analysis and review
+
+The analysis engine is a Bubble checkpoint with its own preset. With Auto on it evaluates every position where a
+turn starts, plus any position you step to. Engine moves by the same checkpoint count as evaluations, so a game
+against Bubble costs nothing extra on Bubble's turns. Review evaluates whatever is missing and labels each turn
+from the mover's win probability before and after it:
+
+| Label | Meaning |
+|---|---|
+| ★ best | the engine's own turn, stones in either order |
+| ✓ good | lost under 5% |
+| ?! inaccuracy | lost 5% to 10% |
+| ? mistake | lost 10% to 20% |
+| ?? blunder | lost 20% or more |
+| ✗ missed | had a proven win and lost it |
+| ⚑ allowed | handed the opponent a proven win |
+| ! found, = kept | proved a win, or kept one |
+| · lost | the opponent already had a proven win |
+| ◆ | six in a row |
+
+For inaccuracies and worse the board outlines the engine's turn and the panel lists its line. Keys: ← and →
+step one stone, ↑ and ↓ one turn, Home and End, F fits the board. Retry plays on from the shown position.
+Import takes HTTTX or a game file; Copy HTTTX, Game file and Evaluations export.
+
+## Saved evaluations
+
+Evaluations go to `play-evaluations.jsonl` in the `--dense-run` directory (else `models/`, or `--evaluations`),
+one JSON line each: position, engine and checkpoint, simulations, solver nodes, value, the engine's turn, top five
+first stones, proof winner and distance in turns, winning line and time. The file is only appended to. On start
+the server copies it to `play-evaluations.jsonl.<time>.bak` and keeps the newest three copies, then indexes the
+newest 200,000 evaluations in memory by position and engine; the deepest one is shown. A line is about 300 bytes
+plus 8 per stone, so 200,000 evaluations from 60-stone games take about 150 MB on disk and a similar amount of
+memory. Self-play and evaluator data never go here.
+
 ## Comparison
 
 Looked at on 2026-09-30: Strix at hexo.tyto.cc, Six at playsix.cixmango.workers.dev and its web source, Mantis
