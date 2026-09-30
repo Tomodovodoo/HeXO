@@ -18,6 +18,41 @@ import dense_openings
 from dashboard import bound_evaluation
 
 
+class GameLengths(unittest.TestCase):
+    def test_actor_windows_start_types_endings_and_recorded_lengths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            def shard(name, created, episodes, **fields):
+                folder = run/'shards'/name
+                folder.mkdir(parents=True)
+                (folder/'manifest.json').write_text(json.dumps(dict(created_at=created, **fields)), encoding='utf-8')
+                (folder/'episodes.json').write_text(json.dumps(episodes), encoding='utf-8')
+            def episode(plies, winner=0, **fields):
+                return dict(moves=[[0, 0]]*plies, winner=winner, **fields)
+            shard('1', 9999, [episode(10), episode(22, 1, origin='book', reason='proven',
+                                                  adjudicated=dict(ply=14, line_plies=8)),
+                              episode(44, -1, origin='restart', reason='span')], origin='actor')
+            shard('2', 1, [episode(400)], origin='actor')
+            shard('3', 9999, [episode(999)], identity=dict(source='converted corpus'))
+            with patch('dashboard.time.time', return_value=10000):
+                result = dashboard.game_lengths(run, 1)
+                self.assertEqual(result['games'], 3)
+                self.assertEqual(result['endings'], dict(win=1, proven=1, capped=1))
+                self.assertEqual(result['median'], 22)
+                self.assertAlmostEqual(result['mean'], 76/3)
+                self.assertEqual([(b['win'], b['proven'], b['capped']) for b in result['bins']],
+                                 [(1, 0, 0), (0, 1, 0), (0, 0, 1)])
+                self.assertEqual(dashboard.game_lengths(run, 1, 'book')['mean'], 22)
+                self.assertEqual(dashboard.game_lengths(run, 1, 'restart')['mean'], 44)
+                self.assertEqual(dashboard.game_lengths(run, 1, 'selfplay')['mean'], 10)
+                self.assertEqual(dashboard.game_lengths(run, 0)['median'], 33)
+                shard('4', 10000, [episode(30)])  # Legacy actor origin, newly published after the first request.
+                self.assertEqual(dashboard.game_lengths(run, 1)['games'], 4)
+            with patch('dashboard.time.time', return_value=20000):
+                self.assertEqual(dashboard.game_lengths(run, 1)['bins'], [])
+                self.assertIsNone(dashboard.game_lengths(run, 1)['mean'])
+
+
 class TacticalResults(unittest.TestCase):
     def test_dense_run_groups_by_opening_and_both_models(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -123,6 +158,22 @@ class OpeningBookPages(unittest.TestCase):
     def get(self, path='/api/book', **query):
         with urlopen(f'http://127.0.0.1:{self.server.server_port}{path}?'+urlencode(dict(run='synthetic', **query))) as response:
             return json.load(response)
+
+    def test_game_length_api_and_query_validation(self):
+        folder = self.run/'shards/001'
+        self.write(folder/'manifest.json', dict(origin='actor', created_at=100))
+        self.write(folder/'episodes.json', [dict(moves=[[0, 0]]*17, winner=0, reason='six-in-a-row')])
+        result = self.get('/api/game-lengths', hours=0, start='selfplay')
+        self.assertEqual((result['games'], result['median']), (1, 17))
+        for query in (dict(hours=-1), dict(start='converted')):
+            with self.assertRaises(HTTPError) as error:
+                self.get('/api/game-lengths', **query)
+            self.assertEqual(error.exception.code, 400)
+            error.exception.close()
+        self.server.RequestHandlerClass.runs = None
+        self.server.RequestHandlerClass.run = self.run
+        with urlopen(f'http://127.0.0.1:{self.server.server_port}/api/game-lengths?hours=0') as response:
+            self.assertEqual(json.load(response)['games'], 1)
 
     def test_statistics_and_canonical_prefix_matching(self):
         rows = {row['key']: row for row in self.get()['rows']}

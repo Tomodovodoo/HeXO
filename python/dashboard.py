@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 import statistics
-from collections import deque
+from collections import Counter, deque
 from functools import lru_cache
 import urllib.parse
 
@@ -408,6 +408,47 @@ def dense_manifests(folder, pattern='*/manifest.json'):
             cached = _dense_manifests[path] = (modified, manifest)
         found.append((path, cached[1]))
     return sorted(found, key=lambda item: (item[0].parent.parent.name, int(item[0].parent.name)))
+
+
+@lru_cache(maxsize=8192)
+def episode_lengths(path, modified):
+    """Compact counts from an immutable actor shard; never retain its move histories."""
+    episodes = json.loads(Path(path).read_text(encoding='utf-8'))
+    return Counter((len(e['moves']), e.get('origin', 'selfplay'),
+                    'capped' if e['winner'] < 0 else 'proven' if e.get('reason') == 'proven' else 'win')
+                   for e in episodes)
+
+
+def game_lengths(run, hours=6, start='all'):
+    """Histogram of recorded actor episode lengths, selected by shard publication time and start type."""
+    if hours not in (0, 1, 6, 24) or start not in ('all', 'selfplay', 'book', 'restart'):
+        raise ValueError('Use hours 0, 1, 6 or 24 and start all, selfplay, book or restart')
+    now, counts = time.time(), Counter()
+    for path, manifest in dense_manifests(run/'shards'):
+        origin = manifest.get('origin') or ('converted' if 'source' in manifest.get('identity', {}) else 'actor')
+        if origin != 'actor' or (hours and now-manifest.get('created_at', 0) > hours*3600):
+            continue
+        episodes = path.with_name('episodes.json')
+        for (plies, source, ending), count in episode_lengths(str(episodes), episodes.stat().st_mtime_ns).items():
+            if start == 'all' or source == start:
+                counts[plies, ending] += count
+    lengths, endings = Counter(), Counter()
+    for (plies, ending), count in counts.items():
+        lengths[plies] += count
+        endings[ending] += count
+    games = sum(lengths.values())
+    width = max(16, 2**math.ceil(math.log2((max(lengths, default=0)+1)/32)))
+    bins = [dict(low=low, high=low+width-1, win=0, proven=0, capped=0)
+            for low in range(0, max(lengths, default=-1)+1, width)]
+    for (plies, ending), count in counts.items():
+        bins[plies//width][ending] += count
+    middle, cumulative = [], 0
+    for plies, count in sorted(lengths.items()):
+        middle.extend(plies for rank in ((games-1)//2, games//2) if cumulative <= rank < cumulative+count)
+        cumulative += count
+    return dict(run=run.name, hours=hours, start=start, games=games, bins=bins, endings=endings,
+                mean=sum(plies*n for plies, n in lengths.items())/games if games else None,
+                median=sum(middle)/2 if games else None, updated_at=now)
 
 
 def provisional(league, evaluator):
@@ -976,9 +1017,19 @@ class Handler(BaseHTTPRequestHandler):
             page = "project.html" if self.runs and run is None else "training.html"
             payload = (Path(__file__).resolve().parents[1] / "web" / page).read_bytes()
             content_type = "text/html; charset=utf-8"
-        elif url.path in ("/openings.js", "/book.js"):
+        elif url.path in ("/openings.js", "/book.js", "/game-lengths.js"):
             payload = (Path(__file__).resolve().parents[1] / 'web' / url.path[1:]).read_bytes()
             content_type = "text/javascript; charset=utf-8"
+        elif url.path == '/api/game-lengths' and run:
+            try:
+                if dense_config_of(run) is None:
+                    raise ValueError('game lengths need a dense run')
+                data = game_lengths(run, int(query.get('hours', 6)), query.get('start', 'all'))
+            except (OSError, ValueError) as error:
+                self.send_error(400, str(error))
+                return
+            payload = json.dumps(data, allow_nan=False).encode()
+            content_type = 'application/json'
         elif url.path in ('/api/book', '/api/book/dag') and run:
             try:
                 if dense_config_of(run) is None:
