@@ -27,7 +27,7 @@ Run layout, shared by dense_selfplay (actor), dense_learn (learner), dense_eval 
                                        vram is hexnet.vram() of that process
   learner-status[-<variant>].json      heartbeat of a learner variant (none for main), rewritten about every 2 s;
                                        samples_per_row_target is its effective learner.samples_per_row;
-                                       phase_rows its effective learner.phase_rows and backlog_rows its
+                                       phase_rows its current phase entry threshold and backlog_rows its
                                        dense_learn.backlog; samples_per_row and backlog_rows count from the
                                        pacing base (pacing_rows, pacing_samples; dense_learn.Learner.rebase);
                                        vram is dense_learn.Learner.vram()
@@ -94,8 +94,8 @@ class ActorSettings:
     yield_below: float = .9       # 0 disables
     yield_resume: float = .975
     yield_check_seconds: float = 30.
-    # True: also pause while a learner with phase_rows > 0 is in its training phase (heartbeat stage 'training' or
-    # 'exporting'), so actors and learner alternate (dense_selfplay.Yield).
+    # True: also pause while a learner with phase_rows > 0 is waiting for actors, training or exporting,
+    # acknowledging token-held phases after queued GPU work finishes (dense_selfplay.Yield).
     phase_follow: bool = False
     # Solver points inside the search (dense_solver), node budgets; 0 = off. root: forced-win check at each turn
     # start, a proof decides the turn played; finalists: defence check of the k best mid-turn candidates at the last
@@ -170,6 +170,8 @@ class LearnerSettings:
     # Phased schedule (dense_learn.Phase); 0 = train whenever the pacing allows. > 0: idle (stage 'phase-idle')
     # until the untrained backlog (dense_learn.backlog) reaches phase_rows rows, then train until the pacing limit.
     phase_rows: int = 0
+    phase_export: bool = False  # collect enough pacing credit to train through the next checkpoint export
+    phase_actors: int = 0       # wait for workers 0..N-1 to acknowledge drained GPU work before a phase
     window_min_rows: int = 100000  # counts full-search rows only
     window_expand_per_row: float = .4
     window_taper: float = .65
@@ -231,6 +233,10 @@ class LearnerSettings:
             raise ValueError(f'cheap_row_fraction must lie in [0, 1], not {self.cheap_row_fraction}')
         if self.phase_rows < 0:
             raise ValueError(f'phase_rows must be 0 (off) or positive, not {self.phase_rows}')
+        if self.phase_actors < 0 or self.phase_actors and not (self.phase_rows or self.phase_export):
+            raise ValueError('phase_actors must be nonnegative and requires phased training')
+        if self.phase_export and min(self.export_every, self.batch, self.samples_per_row) <= 0:
+            raise ValueError('phase_export requires positive export_every, batch and samples_per_row')
         if not 0 <= self.proof_policy_weight < float('inf'):
             raise ValueError('proof_policy_weight must be finite and nonnegative')
         if not 0 <= self.regret_fraction <= 1:

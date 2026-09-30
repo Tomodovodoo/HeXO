@@ -44,15 +44,19 @@ reports retained_rows and retained_fraction of the window. The window
 is sized in full-search rows (dense_data.ReplayWindow). With phase_rows > 0 the learner alternates phases (Phase):
 it idles until the untrained backlog (backlog) reaches phase_rows, then trains until the pacing limit, so actors
 following the phase (ActorSettings.phase_follow) have the GPU to themselves while it idles; exports still fall on
-every export_every-th step.
+every export_every-th step. phase_export collects enough pacing credit to train to the next export, then releases
+actors. phase_actors waits for that many actor workers to acknowledge drained GPU work before training or export;
+token-held phases renew their heartbeat during validation so actors remain paused until publication finishes.
 """
 import argparse
 import copy
 from dataclasses import asdict, replace
 import json
 import math
+import os
 from pathlib import Path
 import shutil
+import threading
 import time
 import zlib
 
@@ -74,7 +78,8 @@ REFRESH_SECONDS = 30.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
         'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'deblunder_weight',
-        'optimizer', 'proof_policy_weight', 'future_target', 'regret_fraction', 'cheap_row_fraction')
+        'optimizer', 'proof_policy_weight', 'future_target', 'regret_fraction', 'cheap_row_fraction',
+        'phase_export', 'phase_actors')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
@@ -293,19 +298,80 @@ class Phase:
     """Phased training schedule. due(phase_rows, backlog_rows, paced) says whether the learner trains now, where
     `paced` means the pacing limit forbids the next batch. phase_rows 0: always due (the pacing limit alone decides).
     phase_rows > 0: a training phase starts once backlog_rows reaches phase_rows and lasts until `paced`; between
-    phases the learner idles. `training` is the current phase."""
+    phases the learner idles. An optional end_step releases actors at the next export. `rows` keeps the admitted
+    threshold visible throughout training and export, even as the remaining step budget shrinks."""
 
     def __init__(self):
         self.training = False
+        self.end_step = None
+        self.rows = 0
 
-    def due(self, phase_rows, backlog_rows, paced):
+    def due(self, phase_rows, backlog_rows, paced, step=0, end_step=None):
+        if self.training and self.end_step is not None and step >= self.end_step:
+            self.training, self.end_step, self.rows = False, None, 0
+            return False
         if phase_rows <= 0:
             return True
         if paced:
-            self.training = False
-        elif backlog_rows >= phase_rows:
-            self.training = True
+            self.training, self.end_step, self.rows = False, None, 0
+        elif not self.training and backlog_rows >= phase_rows:
+            self.training, self.end_step, self.rows = True, end_step, phase_rows
         return self.training
+
+
+def phase_budget(settings, step, stop=None):
+    """Rows needed to enter a phase and its optional checkpoint boundary, within the existing pacing ratio."""
+    if not settings.phase_export:
+        return settings.phase_rows, None
+    end = (step//settings.export_every+1)*settings.export_every
+    if stop is not None:
+        end = min(end, stop)
+    rows = math.ceil((end-step)*settings.batch/settings.samples_per_row)
+    return max(settings.phase_rows, rows), end
+
+
+def waiting_actors(run, workers, variant, request, now=None):
+    """Expected workers that have not acknowledged this exact phase after draining their GPU work."""
+    now, waiting = time.time() if now is None else now, []
+    for worker in range(workers):
+        path = Path(run)/('actor-status.json' if worker == 0 else f'actor-status-{worker}.json')
+        try:
+            actor = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            actor = {}
+        if actor.get('stage') != 'paused' or now-float(actor.get('updated_at') or 0.) > 120. \
+                or (actor.get('phase_ack') or {}).get(variant) != request:
+            waiting.append(worker)
+    return waiting
+
+
+class PhaseHeartbeat:
+    """Keep a token-held phase fresh during long exports; serialize renewal with ordinary status writes."""
+
+    def __init__(self, path):
+        self.path, self.status = path, {}
+        self.lock, self.stopped = threading.Lock(), threading.Event()
+        self.thread = None
+
+    def write(self, **fields):
+        with self.lock:
+            self.status.update(fields, updated_at=time.time())
+            write_json(self.path, self.status)
+            if self.thread is None and self.status.get('phase_request'):
+                self.thread = threading.Thread(target=self.renew, daemon=True)
+                self.thread.start()
+
+    def renew(self):
+        while not self.stopped.wait(STATUS_SECONDS):
+            with self.lock:
+                if self.status.get('phase_request') and self.status.get('stage') in ('waiting-for-actors', 'training', 'exporting'):
+                    self.status['updated_at'] = time.time()
+                    write_json(self.path, self.status)
+
+    def close(self):
+        self.stopped.set()
+        if self.thread is not None:
+            self.thread.join()
 
 
 def pad(bucket, quantum):
@@ -875,7 +941,7 @@ class Learner:
               checkpoint=f'{s.variant}/{self.step:06d}', metrics=manifest['metrics'])
         return manifest
 
-    def maybe_replace(self, factor_rng):
+    def maybe_replace(self, factor_rng, before_copy=None):
         """Population replacement (exploit/explore). Candidates are the latest rated, not demoted checkpoints of
         other variants (`latest_rated`); a candidate qualifies when league["differences"] holds its pair with
         this variant's latest such checkpoint and the lower bound of the (candidate minus mine) Elo interval
@@ -908,6 +974,8 @@ class Learner:
         source = max(leaders, key=lambda c: pairs[c['id'], mine['id']][2])
         path = self.run/'checkpoints'/source['id']
         copied = json.loads((path/'manifest.json').read_text(encoding='utf-8'))['learner']
+        if before_copy is not None:
+            before_copy()
         self.load_weights(path/'model.pt')
         self.ema = copy.deepcopy(self.model)
         base = replace(dense_config.section('learner', copied), **{k: getattr(s, k) for k in KEEP})
@@ -943,30 +1011,49 @@ def main():
     if learner.device.type == 'cuda':
         torch.set_num_threads(args.threads)
     s = learner.settings
-    status = dict(stage='training', variant=s.variant, error=None, samples_per_second=0.)
+    status = PhaseHeartbeat(status_path(args.run, s.variant))
+    status.status = dict(stage='training', variant=s.variant, error=None, samples_per_second=0.)
+    phase = Phase()
+    phase_request = None
 
     def write_status(**fields):
         base = learner.pacing
-        status.update(fields, updated_at=time.time(), step=learner.step, samples_seen=learner.samples_seen,
+        status.write(**dict(fields, variant=s.variant, step=learner.step, samples_seen=learner.samples_seen,
                       rows_available=window.total_rows, window_rows=window.rows, full_rows_available=window.total_full_rows,
                       window_full_rows=window.full_rows, retained_rows=window.retained_rows, retained_fraction=window.retained_fraction,
                       regret_rows=window.regret_rows, regret_effective_share=window.regret_share(
                           learner.settings.batch, learner.settings.regret_fraction, learner.settings.recency),
                       samples_per_row=(learner.samples_seen-base['samples'])/max(1, window.total_rows-base['rows']),
-                      samples_per_row_target=learner.settings.samples_per_row, phase_rows=learner.settings.phase_rows,
+                      samples_per_row_target=learner.settings.samples_per_row,
+                      phase_rows=phase.rows or max(int(bool(phase_request)), phase_budget(learner.settings, learner.step, args.steps)[0]),
+                      phase_export=learner.settings.phase_export, phase_actors=learner.settings.phase_actors,
+                      phase_request=phase_request, phase_end_step=phase.end_step,
                       backlog_rows=backlog(learner.samples_seen, window.total_rows, learner.settings.samples_per_row, base),
                       pacing_rows=base['rows'], pacing_samples=base['samples'],
                       lr=learner.lr(), data_wait_fraction=wait_fraction(rate),
                       last_export_step=learner.last_export, policy_ce=(learner.metrics or {}).get('policy_ce'),
                       value_bce=(learner.metrics or {}).get('value_bce'), vram=learner.vram(),
-                      optimizer_state_mb=learner.optimizer_state_mb())
-        write_json(status_path(args.run, s.variant), status)
+                      optimizer_state_mb=learner.optimizer_state_mb()))
+
+    def await_actors():
+        nonlocal phase_request
+        if not learner.settings.phase_actors or phase_request is not None:
+            return
+        phase_request = f'{os.getpid()}:{time.time_ns()}'
+        while True:
+            waiting = waiting_actors(args.run, learner.settings.phase_actors, s.variant, phase_request)
+            write_status(stage='waiting-for-actors', samples_per_second=0., phase_waiting=waiting)
+            if not waiting:
+                break
+            time.sleep(.25)
+        write_status(stage='training', samples_per_second=0., phase_waiting=[])
 
     def speed():
         elapsed = rate[-1][0]-rate[0][0] if rate else 0.
         return sum(r[1] for r in rate[1:])/elapsed if elapsed > 0 else 0.
 
     def export():
+        await_actors()
         write_status(stage='exporting')
         fields = validation_fields(learner.export(window, sets)['metrics'])
         window.refresh_regret()
@@ -999,23 +1086,27 @@ def main():
         print(f'{"step":>6} {"policy":>7} {"value":>7} {"short":>7} {"opp":>7} {"future":>7} {"outcome":>7} {"lr":>8} {"rows/s":>7} {"wait":>6} {"gpu":>6} {"mem":>6}', flush=True)
         sums = torch.zeros(len(HEADS), device=learner.device); counts = torch.zeros(len(HEADS), device=learner.device)
         last_status = last_refresh = time.time()
-        phase = Phase()
         while args.steps is None or learner.step < args.steps:
-            if learner.maybe_replace(factor_rng):
+            if learner.maybe_replace(factor_rng, before_copy=await_actors):
                 stream.close(); window = replay(); learner.calibrate(window); stream = renderers(); last_refresh = time.time()
             s = learner.settings
             if time.time()-last_refresh > REFRESH_SECONDS:
                 window.refresh(); last_refresh = time.time()
             learner.rebase(window.total_rows)
             limited = paced(learner.samples_seen, window.total_rows, s.samples_per_row, s.batch, learner.pacing)
-            if window.index and not phase.due(s.phase_rows, backlog(learner.samples_seen, window.total_rows, s.samples_per_row, learner.pacing), limited):
-                write_status(stage='phase-idle', samples_per_second=0.)
+            phase_rows, end_step = phase_budget(s, learner.step, args.steps)
+            if window.index and not phase.due(phase_rows, backlog(learner.samples_seen, window.total_rows, s.samples_per_row, learner.pacing),
+                                             limited, learner.step, end_step):
+                phase_request = None
+                write_status(stage='phase-idle', samples_per_second=0., phase_waiting=[])
                 rate = []; time.sleep(5.); window.refresh(); last_refresh = time.time()
                 continue
             if not window.index or limited:
-                write_status(stage='waiting-for-data', samples_per_second=0.)
+                phase_request = None
+                write_status(stage='waiting-for-data', samples_per_second=0., phase_waiting=[])
                 rate = []; time.sleep(5.); window.refresh(); last_refresh = time.time()
                 continue
+            await_actors()
             started = time.perf_counter()
             batch = next(stream)
             ready = time.perf_counter()
@@ -1043,17 +1134,21 @@ def main():
                 export()
         if learner.last_export != learner.step:
             export()
-        write_status(stage='idle', samples_per_second=0.)
+        phase_request = None
+        write_status(stage='idle', samples_per_second=0., phase_waiting=[])
     except KeyboardInterrupt:
         if 'window' in locals():
+            phase_request = None
             write_status(stage='idle', samples_per_second=0.)
         raise
     except BaseException as error:
         dense_config.log_event(args.run, 'learner', 'error', f'{s.variant} learner failed: {error!r}', variant=s.variant, step=learner.step)
         if 'window' in locals():
+            phase_request = None
             write_status(stage='failed', error=repr(error))
         raise
     finally:
+        status.close()
         if 'stream' in locals():
             stream.close()
 

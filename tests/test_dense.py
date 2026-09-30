@@ -3580,11 +3580,13 @@ class YieldTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.run, self.clock, self.wall = Path(tmp.name), [0.], [1000.]
 
-    def heartbeat(self, rate, variant='main', stage='training', age=0., target=None, phase_rows=None):
+    def heartbeat(self, rate, variant='main', stage='training', age=0., target=None, phase_rows=None, request=None):
         name = 'learner-status.json' if variant == 'main' else f'learner-status-{variant}.json'
         extra = {} if target is None else dict(samples_per_row_target=target)
         if phase_rows is not None:
             extra['phase_rows'] = phase_rows
+        if request is not None:
+            extra['phase_request'] = request
         (self.run/name).write_text(json.dumps(dict(stage=stage, variant=variant, samples_per_row=rate,
                                                    updated_at=self.wall[0]-age, **extra)))
 
@@ -3688,6 +3690,146 @@ class YieldTests(unittest.TestCase):
         self.heartbeat(3.95, variant='wide')
         self.assertFalse(gate.paused())
         self.assertFalse(self.gate(below=0., check=0.).paused())  # neither rule enabled
+
+    def test_phase_requests_track_only_fresh_followed_training_phases(self):
+        gate = self.gate(below=0., check=0., follow=True)
+        self.heartbeat(3.99, stage='waiting-for-actors', phase_rows=12000, request='first')
+        self.assertTrue(gate.paused())
+        self.assertEqual(gate.requests, dict(main='first'))
+        self.assertFalse(self.gate(check=0.).paused())
+        self.heartbeat(3.99, stage='exporting', phase_rows=12000, request='second')
+        self.heartbeat(3.99, variant='wide', phase_rows=12000, request='wide-phase')
+        self.assertTrue(gate.paused())
+        self.assertEqual(gate.requests, dict(main='second', wide='wide-phase'))
+        self.heartbeat(3.99, stage='phase-idle', phase_rows=12000, request='second')
+        self.heartbeat(3.99, variant='wide', phase_rows=12000, request='wide-phase', age=dense_selfplay.STALE_SECONDS+1)
+        self.assertFalse(gate.paused())
+        self.assertEqual(gate.requests, {})
+        self.heartbeat(3.99, phase_rows=12000)  # old learners still pause, without an acknowledgement token
+        self.assertTrue(gate.paused())
+        self.assertEqual(gate.requests, {})
+
+    def test_drain_waits_for_gpu_events_without_consuming_predictions(self):
+        events = [unittest.mock.Mock(), None, unittest.mock.Mock()]
+        engine = dense_selfplay.Engine.__new__(dense_selfplay.Engine)
+        engine.inflight = [(object(), object(), object(), (object(), object(), event, object())) for event in events]
+        pending = list(engine.inflight)
+        engine.synchronize_inflight()
+        self.assertEqual(engine.inflight, pending)
+        for event in (events[0], events[2]):
+            event.synchronize.assert_called_once_with()
+
+    def test_worker_acks_drained_phase_tokens_and_refreshes_before_refill(self):
+        self.wall[0] = time.time()
+        self.heartbeat(4., stage='phase-idle', phase_rows=100)
+        (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/old')))
+        settings = dense_config.ActorSettings(games_in_flight=2, shard_games=10, phase_follow=True,
+                                               yield_below=0., yield_check_seconds=0.)
+        config = replace(dense_config.RunConfig(), device='cpu', actor=settings)
+        order, admitted, acks = [], [], []
+
+        class Graph:
+            def close(self):
+                order.append('close old graph')
+
+        old = SimpleNamespace(checkpoint='main/old', sha='a'*64, config=TINY,
+                              evaluator=SimpleNamespace(graph=Graph()))
+        new = SimpleNamespace(checkpoint='main/new', sha='b'*64, config=TINY,
+                              evaluator=SimpleNamespace(graph=None))
+        models = {'main/old': old, 'main/new': new}
+
+        def load_model(*args):
+            checkpoint = dense_selfplay.resolve(self.run, source='newest_veto')[0]
+            order.append('load '+checkpoint)
+            return models[checkpoint]
+
+        class Slot:
+            def __init__(self, sides):
+                self.model = sides[0]
+
+            def episode(self):
+                return dict(actor=self.model.sha, opponent=None, winner=0, moves=[], reason='test'), []
+
+        def game(sides, *args, **kwargs):
+            slot = Slot(sides)
+            admitted.append(slot)
+            order.append('admit '+slot.model.checkpoint)
+            return slot
+
+        class Event:
+            def synchronize(self):
+                order.append('sync')
+
+        class Engine:
+            synchronize_inflight = dense_selfplay.Engine.synchronize_inflight
+
+            def __init__(self, *args):
+                self.slots, self.closing, self.inflight = [], [], []
+                self.searches = self.evals = self.calls = self.full_calls = 0
+                self.solver, self.steps = None, 0
+
+            def add(self, slot):
+                self.slots.append(slot)
+
+            def step(self):
+                self.steps += 1
+                if self.steps == 1:
+                    self.inflight = [(old, None, None, (None, None, Event(), None))]
+                    self_outer.heartbeat(4., stage='waiting-for-actors', phase_rows=100, request='A')
+                    return []
+                order.append('collect')
+                self.inflight = []
+                done = self.slots[:1] if self.steps == 2 else self.slots[:]
+                self.slots = self.slots[len(done):]
+                return done
+
+            def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+        self_outer = self
+        sleep_count = [0]
+
+        def sleep(_):
+            sleep_count[0] += 1
+            if sleep_count[0] == 1:
+                self.heartbeat(4., stage='training', phase_rows=100, request='B')
+            elif sleep_count[0] == 2:
+                self.heartbeat(4., stage='phase-idle', phase_rows=100)
+                (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/new')))
+            else:
+                self.fail('worker stayed paused after phase-idle')
+
+        write = dense_selfplay.write_json
+
+        def status(path, fields):
+            if Path(path).name == 'actor-status.json':
+                acks.append((fields['stage'], dict(fields['phase_ack']), len(order)))
+                order.append('ack '+str(fields['phase_ack']))
+            write(path, fields)
+
+        with unittest.mock.patch.object(dense_selfplay.dense_config, 'load', return_value=config), \
+             unittest.mock.patch.object(dense_selfplay, 'load', side_effect=load_model), \
+             unittest.mock.patch.object(dense_selfplay, 'Engine', Engine), \
+             unittest.mock.patch.object(dense_selfplay, 'SelfPlayGame', side_effect=game), \
+             unittest.mock.patch.object(dense_selfplay, 'write_json', side_effect=status), \
+             unittest.mock.patch.object(dense_selfplay.dense_data, 'write_shard'), \
+             unittest.mock.patch.object(dense_selfplay, 'log_event'), \
+             unittest.mock.patch.object(dense_selfplay.time, 'sleep', side_effect=sleep):
+            dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=3, initial_model=None))
+
+        self.assertEqual([ack for stage, ack, _ in acks if stage == 'paused'],
+                         [dict(main='A'), dict(main='B')])
+        self.assertEqual(order.count('sync'), 2)
+        self.assertLess(order.index('sync'), order.index('ack '+str(dict(main='A'))))
+        self.assertLess([i for i, item in enumerate(order) if item == 'sync'][1], order.index('ack '+str(dict(main='B'))))
+        self.assertLess(order.index('ack '+str(dict(main='B'))), order.index('collect'))
+        self.assertLess(order.index('close old graph'), order.index('load main/new'))
+        self.assertLess(order.index('load main/new'), order.index('admit main/new'))
+        self.assertEqual([slot.model for slot in admitted], [old, old, new])
+        self.assertEqual(acks[-1][:2], ('finished', {}))
 
     def test_metrics_lines_on_every_stage_change_and_periodically(self):
         due = dense_selfplay.metrics_due
@@ -3966,6 +4108,127 @@ class PhaseTests(unittest.TestCase):
         self.assertIn('phase_rows', dense_learn.KEEP)
         with self.assertRaises(ValueError):
             dense_config.LearnerSettings(phase_rows=-1)
+
+    def test_export_phase_budget_and_flags(self):
+        settings = dense_config.LearnerSettings(phase_export=True, phase_actors=4, batch=256, samples_per_row=3., export_every=2500)
+        self.assertEqual(dense_learn.phase_budget(settings, 95000), (213334, 97500))
+        self.assertEqual(dense_learn.phase_budget(settings, 96500), (85334, 97500))
+        self.assertEqual(dense_learn.phase_budget(settings, 96500, 97000), (42667, 97000))
+        self.assertEqual(dense_learn.phase_budget(replace(settings, phase_export=False, phase_rows=14000), 96500), (14000, None))
+        parser = argparse.ArgumentParser()
+        dense_config.add_arguments(parser, dense_config.LearnerSettings)
+        parsed = dense_config.override(dense_config.LearnerSettings(), parser.parse_args(['--phase-export', '--phase-actors', '4']))
+        self.assertEqual((parsed.phase_export, parsed.phase_actors), (True, 4))
+        data = asdict(dense_config.RunConfig())
+        for key in ('phase_export', 'phase_actors'):
+            self.assertIn(key, dense_learn.KEEP)
+            del data['learner'][key]
+        old = dense_config.from_dict(data).learner
+        self.assertEqual((old.phase_export, old.phase_actors), (False, 0))
+        with self.assertRaises(ValueError):
+            dense_config.LearnerSettings(phase_actors=4)
+        with self.assertRaises(ValueError):
+            replace(settings, export_every=0)
+
+    def test_export_blocks_keep_pacing_and_yield_at_each_checkpoint(self):
+        settings = dense_config.LearnerSettings(phase_export=True, batch=256, samples_per_row=3., export_every=2500)
+        phase, seen, step = dense_learn.Phase(), 96500*256, 96500
+        base = dict(rows=0, samples=seen)
+        rows, end = dense_learn.phase_budget(settings, step)
+        self.assertFalse(phase.due(rows, rows-1, False, step, end))
+        for step in range(96500, end):
+            needed, boundary = dense_learn.phase_budget(settings, step)
+            limited = dense_learn.paced(seen, rows, 3., 256, base)
+            self.assertFalse(limited)
+            self.assertTrue(phase.due(needed, dense_learn.backlog(seen, rows, 3., base), limited, step, boundary))
+            self.assertEqual(phase.rows, rows)
+            seen += 256
+        self.assertLessEqual(seen-base['samples'], 3*rows)
+        needed, boundary = dense_learn.phase_budget(settings, end)
+        self.assertFalse(phase.due(needed, 1e9, False, end, boundary))  # release even with an oversized backlog
+        self.assertFalse(phase.training)
+        self.assertIsNone(phase.end_step)
+        self.assertEqual(phase.rows, 0)
+        self.assertFalse(phase.due(needed, dense_learn.backlog(seen, rows, 3., base), True, end, boundary))
+
+    def test_phase_ack_requires_every_fresh_worker_and_the_current_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for worker, fields in enumerate((dict(stage='playing', updated_at=1000, phase_ack=dict(main='new')),
+                                             dict(stage='paused', updated_at=1000, phase_ack=dict(main='old')),
+                                             dict(stage='paused', updated_at=800, phase_ack=dict(main='new')))):
+                path = run/('actor-status.json' if worker == 0 else f'actor-status-{worker}.json')
+                path.write_text(json.dumps(fields))
+            self.assertEqual(dense_learn.waiting_actors(run, 4, 'main', 'new', now=1000), [0, 1, 2, 3])
+            for worker in range(4):
+                path = run/('actor-status.json' if worker == 0 else f'actor-status-{worker}.json')
+                path.write_text(json.dumps(dict(stage='paused', updated_at=1000, phase_ack=dict(main='new'))))
+            self.assertEqual(dense_learn.waiting_actors(run, 4, 'main', 'new', now=1000), [])
+            self.assertEqual(dense_learn.waiting_actors(run, 4, 'wide', 'new', now=1000), [0, 1, 2, 3])
+
+    def test_training_waits_for_all_acks_and_keeps_export_heartbeat_fresh(self):
+        torch.set_num_threads(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            settings = dense_config.LearnerSettings(batch=8, samples_per_row=3., export_every=2,
+                         phase_export=True, phase_actors=2, validation_fraction=0., window_min_rows=1)
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)), learner=settings)
+            dense_config.save(run, config)
+            source_shard(run/'shards'/'1000000000001', 2, 'x')
+            window = dense_data.ReplayWindow(run, 1000, 1)
+            batch = dense_data.collate(*dense_data.examples(window, window.sample(np.random.default_rng(0), 8), np.random.default_rng(0)))
+            stream = unittest.mock.MagicMock()
+            stream.__next__.return_value = batch
+            write, train, export = dense_learn.write_json, dense_learn.Learner.train_step, dense_learn.Learner.export
+            waiting, trained, exported = [], [], []
+
+            def write_status(path, status):
+                write(path, status)
+                if path.name != 'learner-status.json' or status['stage'] != 'waiting-for-actors':
+                    return
+                workers = status['phase_waiting']
+                waiting.append(list(workers))
+                if workers:
+                    actor_path = run/('actor-status.json' if workers[0] == 0 else f'actor-status-{workers[0]}.json')
+                    write(actor_path, dict(stage='paused', updated_at=time.time(), phase_ack=dict(main=status['phase_request'])))
+
+            def train_step(learner, batch):
+                status = json.loads((run/'learner-status.json').read_text())
+                self.assertEqual(dense_learn.waiting_actors(run, 2, 'main', status['phase_request']), [])
+                trained.append(learner.step)
+                return train(learner, batch)
+
+            def exporting(learner, window, sets):
+                initial = json.loads((run/'learner-status.json').read_text())
+                self.assertEqual(initial['stage'], 'exporting')
+                self.assertGreater(initial['phase_rows'], 0)
+                deadline = time.monotonic()+2
+                while time.monotonic() < deadline:
+                    current = json.loads((run/'learner-status.json').read_text())
+                    if current['updated_at'] > initial['updated_at']:
+                        break
+                    time.sleep(.01)
+                self.assertGreater(current['updated_at'], initial['updated_at'])
+                self.assertEqual(current['phase_request'], initial['phase_request'])
+                exported.append(learner.step)
+                return export(learner, window, sets)
+
+            argv = ['dense_learn.py', '--run', str(run), '--steps', '2']
+            with unittest.mock.patch.object(sys, 'argv', argv), \
+                 unittest.mock.patch.object(dense_data, 'Renderers', return_value=stream), \
+                 unittest.mock.patch.object(dense_learn, 'write_json', side_effect=write_status), \
+                 unittest.mock.patch.object(dense_learn.Learner, 'train_step', train_step), \
+                 unittest.mock.patch.object(dense_learn.Learner, 'export', exporting), \
+                 unittest.mock.patch.object(dense_learn, 'STATUS_SECONDS', .05), \
+                 unittest.mock.patch.object(dense_learn, 'RECALIBRATION_ROWS', 16):
+                dense_learn.main()
+            self.assertIn([0, 1], waiting)
+            self.assertIn([1], waiting)
+            self.assertEqual((trained, exported), ([0, 1], [2]))
+            final = json.loads((run/'learner-status.json').read_text())
+            self.assertEqual((final['stage'], final['phase_request']), ('idle', None))
+            self.assertTrue((run/'checkpoints'/'main'/'000002'/'optimizer.pt').is_file())
+            stream.close.assert_called_once_with()
 
 
 class ActorModelTests(unittest.TestCase):
