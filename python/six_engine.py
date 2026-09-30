@@ -149,7 +149,7 @@ class SixEngine:
             moves = ' '.join(f'{q} {r}' for q, r, _ in game.cells)
             self._send('position radius 8' + (f' moves {moves}' if moves else ''))
             self._send(f'go movetime {ms}')
-            line = self._expect('bestmove', self.timeout)
+            line = self._expect('bestmove', self.timeout + 3*ms/1000)
             parts = line.split()[1:]
             if len(parts) not in (2, 4):
                 raise ProtocolError(f'unreadable bestmove: {line}')

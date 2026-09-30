@@ -123,6 +123,18 @@ class SixProtocolTests(unittest.TestCase):
                         game.close()
             self.assertEqual(log.read_text().splitlines(), ['newgame', 'newgame'])
 
+    def test_client_allows_the_move_budget(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder)/'engine.py'
+            marker = Path(folder)/'slow.once'
+            script.write_text(FAKE_ENGINE)
+            with SixEngine([sys.executable, str(script), str(marker)], timeout=.2) as engine:
+                game = Game()
+                try:
+                    self.assertEqual(engine(game, 1000), [(0, 0)])
+                finally:
+                    game.close()
+
     def test_external_match_side_plays_through(self):
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder)/'engine.py'
