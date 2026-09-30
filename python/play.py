@@ -1,5 +1,6 @@
 """Local browser game. Run python python/play.py, then open http://127.0.0.1:8765."""
 import argparse
+import sys
 import json
 import time
 from datetime import datetime, timezone
@@ -47,9 +48,12 @@ class DensePlayer:
         self.tactical_package = tactical_package
         self.evaluator = self.prover = None
         self.checkpoint = None
-        import tactical_proof
-        solver = tactical_proof.library(*([tactical_package] if tactical_package else [])).exists()
-        self.options = dict(search=True, simulations=128, solver=solver, solver_nodes=32768)
+        try:
+            from tactical_proof import NativeTactics
+            self.prover = NativeTactics(**({'package': tactical_package} if tactical_package else {}))
+        except (OSError, ValueError, KeyError) as error:
+            print(f'solver off: {error}', file=sys.stderr)
+        self.options = dict(search=True, simulations=128, solver=self.prover is not None, solver_nodes=32768)
         available = self.models()
         if not available:
             raise ValueError('No playable dense exports found')
