@@ -6991,6 +6991,13 @@ class DenseBrowser(unittest.TestCase):
             self.assertEqual(len(result['top']), 5)
             self.assertIsNone(result['proof'])
 
+    def test_a_proven_turn_still_places_both_stones(self):
+        from play import evaluate
+        history = [(0, 0), (0, 4), (1, 4), (1, 0), (2, 0), (5, 5), (6, 6), (3, 0), (-5, -2), (-6, 6), (7, -6)]
+        result = evaluate(self.bubble, None, history, 16, 0)
+        self.assertEqual((result['proof'] or {}).get('winner'), 0)
+        self.assertTrue(self.complete(history, result['moves']))
+
     def test_cancelling_stops_the_search(self):
         from play import Cancelled, evaluate
         def watch(n):

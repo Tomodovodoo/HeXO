@@ -240,7 +240,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 theirs = prover.history(history, attacker='opponent', nodes=solver_nodes, ms=10000)
                 if verified(theirs):
                     threat = [list(m) for m in theirs['moves']]
-        while local.player == player and local.winner < 0 and not (proof and proof['winner'] == player):
+        solved = bool(moves)
+        while not solved and local.player == player and local.winner < 0:
             current = [tuple(cell[:2]) for cell in local.cells]
             if simulations:
                 tree = NeuralSearch(network, bubble.sha256, current, seed=1740, cache=bubble.cache, tactics=True)
