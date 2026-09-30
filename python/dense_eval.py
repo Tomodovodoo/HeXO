@@ -2212,7 +2212,7 @@ def calibrate(args):
     settings = config.evaluation
     samples = min(settings.root_samples, args.sims)
     games = [MatchGame([model, model], e['moves'], k, args.sims, samples, settings.tactics, len(e['moves'])+args.extra,
-                       dict(index=k)) for k, e in enumerate(chosen)]
+                       dict(index=k), graphs=settings.search_graph) for k, e in enumerate(chosen)]
     started = time.perf_counter()
     records = play(games, config.actor.leaf_batch)
     methods = ['masked', 'root']+[f'td{lam:g}' for lam in args.lambdas]
