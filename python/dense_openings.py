@@ -400,6 +400,8 @@ class Book:
         # Existing descendants also inherit protection; partial-turn parents do not.
         for node in list(self.nodes.values()):
             self.add(node['moves'], now)
+            if node.get('off_policy') and node['reason'] == 'probability':
+                node.update(status='opening', reason=None, retired_at=None, challenges=None)
         protected = {n['key'] for n in self.nodes.values() if n.get('off_policy')}
         for node in self.nodes.values():
             if node.get('off_policy') or node['challenges'] in protected:

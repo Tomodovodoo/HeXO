@@ -281,10 +281,16 @@ class RefreshTests(unittest.TestCase):
             book = self.book(run)
             root = opening(book, [(0, 0), (7, 0), (8, 0)])
             rival = opening(book, [(0, 0), (1, 0), (2, 0)])
+            child = opening(book, root['moves']+[[0, 1]])
+            rejected = opening(book, root['moves']+[[0, 2]])
+            book.retire(child, 'probability', 1.)
+            book.retire(rejected, 'value', 1.)
             root['challenges'] = rival['key']
             source = dict(schema=dense_openings.SCHEMA, suite='selected', nodes=[dict(root)])
             book.import_openings(source)
             self.assertIsNone(root['challenges'])
+            self.assertEqual((child['off_policy'], child['status'], child['reason']), (True, 'opening', None))
+            self.assertEqual((rejected['off_policy'], rejected['status'], rejected['reason']), (True, 'retired', 'value'))
             rival['challenges'] = root['key']
             book.import_openings(source)
             self.assertIsNone(rival['challenges'])
