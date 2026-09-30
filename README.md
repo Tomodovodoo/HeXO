@@ -45,7 +45,7 @@ cmake --build build --config Release --parallel 2
 python python/bubble.py play
 ```
 
-The last command downloads the newest [released Bubble](https://github.com/Tomodovodoo/HeXO/releases) (4.4 MB) into `runs/bubble` the first time and opens the game at <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. The page shows Bubble's win estimate and suggested moves for every position, remembers them when you step back, and copies the game as HTTTX notation. Search and solver have their own budgets on the page.
+The last command downloads the newest [released Bubble](https://github.com/Tomodovodoo/HeXO/releases) (4.4 MB) into `runs/play` the first time and opens the game at <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. The page shows Bubble's win estimate and suggested moves for every position, remembers them when you step back, and copies the game as HTTTX notation. Search and solver have their own budgets on the page.
 
 To play a particular checkpoint, point it at the file or at a run you trained:
 

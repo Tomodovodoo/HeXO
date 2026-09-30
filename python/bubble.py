@@ -5,8 +5,8 @@ Service identity is checked through the process command line, which needs Window
 `train` creates the run directory and its first checkpoint when they are missing, then starts the learner,
 the actors, the evaluator, the proof pass and the dashboard as detached processes. Their process ids go to
 `<run>/processes.json`, their output to `<run>/logs/`. `stop` ends those processes, `status` reports them,
-and `play` serves the browser game against the run's champion, a given weights file, or the newest
-released Bubble, which it downloads when the run has no checkpoints.
+and `play` serves the browser game against a run's champion, a given weights file, or the newest released
+Bubble, which it downloads into `runs/play` when that run has no checkpoints.
 """
 import argparse
 import json
@@ -256,7 +256,8 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     for name in ('train', 'stop', 'status', 'play'):
         p = sub.add_parser(name)
-        p.add_argument('--run', default='runs/bubble')
+        p.add_argument('--run', default='runs/play' if name == 'play' else 'runs/bubble',
+                       help='the run directory; play defaults to runs/play, where released weights are installed')
     train = sub.choices['train']
     train.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     train.add_argument('--actors', type=int, default=4, help='self-play processes')
