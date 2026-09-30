@@ -69,6 +69,14 @@ int main(){
   assert(play({{0,0},{2,0},{1,0},{0,2},{0,1},{4,0},{3,0}})==first);
   auto other=play({{0,0},{3,0},{4,0},{0,1},{0,2},{1,0},{2,0}});
   assert(other!=first && other->exact_winner==1 && other->distance==3);}
+ // A shared outcome installs its witness on an expanded node of the position, and an exact distance refines a
+ // same-distance bound on an unexpanded one.
+ {gumbel::Tree t(0);t.graph=true;gumbel::Node n;n.player=0;n.expanded=true;
+  for(int i=0;i<2;++i){gumbel::Edge e;e.action={i,1};n.edges.push_back(std::move(e));}
+  gumbel::Outcome won{0,5,3,true,true,{1,1}};
+  assert(t.apply(won,n) && n.exact_winner==0 && n.distance==5 && !n.edges[0].eligible && n.edges[1].eligible);
+  gumbel::Node u;u.player=1;u.exact_winner=0;u.distance=4;u.bound=true;
+  assert(t.apply(gumbel::Outcome{0,4,3,false},u) && !u.bound && !t.apply(gumbel::Outcome{0,6,3,false},u));}
  // MCGS backup: a node's value is recomputed from its edges' visits and its children's current values; a playout
  // reusing a transposed child's value leaves that child unchanged.
  {gumbel::Tree t(0);t.graph=true;gumbel::Node r;r.player=0;r.expanded=true;r.value=.2;

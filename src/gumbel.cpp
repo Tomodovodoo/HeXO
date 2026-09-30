@@ -10,6 +10,8 @@
 #include <unordered_map>
 namespace gumbel {
 struct Node;
+// A proven position: winner, distance, bound, the stones it holds and, for a win, a shortest winning first placement.
+struct Outcome { int winner=-1,distance=-1,stones=0;bool bound=false,witnessed=false;Cell witness; };
 // 128-bit order-independent keys: `position` (stones by colour, mover, remaining placements) decides the game value;
 // `context` adds the network's turn inputs (the stone placed earlier in this turn, the opponent's previous turn), the
 // same identity as dense_selfplay.position_key.
@@ -34,9 +36,9 @@ struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exac
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1;std::vector<std::vector<Cell>> own,threats; };
 struct Tree {
  Board board;std::shared_ptr<Node> root=std::make_shared<Node>();std::map<int,Path> requests;
- // Graph search (opt-in): nodes shared by turn-context key, proven outcomes {winner, distance, stones, bound} shared by
+ // Graph search (opt-in): nodes shared by turn-context key, proven outcomes shared by
  // position key. Tree search gives every edge its own child and keeps both tables empty.
- bool graph=false;std::unordered_map<Key,std::weak_ptr<Node>,KeyHash> nodes;std::unordered_map<Key,std::vector<std::weak_ptr<Node>>,KeyHash> positions;std::unordered_map<Key,std::array<int,4>,KeyHash> outcomes;
+ bool graph=false;std::unordered_map<Key,std::weak_ptr<Node>,KeyHash> nodes;std::unordered_map<Key,std::vector<std::weak_ptr<Node>>,KeyHash> positions;std::unordered_map<Key,Outcome,KeyHash> outcomes;
  std::mt19937_64 rng;int budget=0,started=0,completed=0,next_id=1,samples=0,last=0;bool tactics=false,hold=false;std::vector<int> sequence;
  // Root actions sampled first in the opening phase of the current search; ordering only (set_priority).
  std::vector<Cell> priority;
@@ -59,7 +61,7 @@ struct Tree {
   auto [position,context]=keys(board);auto& slot=nodes[context];
   if(auto n=slot.lock())return n;
   auto n=std::make_shared<Node>();n->player=board.player;n->position=position;n->stones=int(board.cells.size());slot=n;positions[position].push_back(n);
-  if(auto o=outcomes.find(position);o!=outcomes.end()){n->exact_winner=o->second[0];n->distance=o->second[1];n->bound=o->second[3];}
+  if(auto o=outcomes.find(position);o!=outcomes.end())apply(o->second,*n);
   return n;
  }
  // MCGS value of a graph node for its mover from its network value and its edges' visits and current values.
@@ -93,16 +95,38 @@ struct Tree {
  // A new or better outcome also reaches the live nodes of the same position in other turn contexts.
  void learn(const Node& node) {
   if(!graph || node.exact_winner<0)return;
-  std::array<int,4> outcome{node.exact_winner,node.distance,node.stones,node.bound};
+  Outcome outcome{node.exact_winner,node.distance,node.stones,node.bound};
+  if(node.exact_winner==node.player)for(auto& e:node.edges)if(e.eligible && e.exact_winner==node.player){outcome.witnessed=true;outcome.witness=e.action;break;}
   auto [o,added]=outcomes.try_emplace(node.position,outcome);
-  const bool better=o->second[0]==node.exact_winner && (node.distance<o->second[1] || (node.distance==o->second[1] && !node.bound && o->second[3]));
+  const auto& old=o->second;
+  const bool better=old.winner==node.exact_winner && (node.distance<old.distance || (node.distance==old.distance && ((!node.bound && old.bound)
+   || (outcome.witnessed && !old.witnessed))));
   if(!added && !better)return;
   o->second=outcome;
-  if(auto list=positions.find(node.position);list!=positions.end())for(auto& w:std::vector(list->second))if(auto n=w.lock())if(n.get()!=&node)share(node,*n);
+  if(auto list=positions.find(node.position);list!=positions.end())for(auto& w:std::vector(list->second))if(auto n=w.lock())if(n.get()!=&node)share(node,o->second,*n);
  }
- // Gives `into`, a node of the same position in another turn context, the verdicts `from` holds: its proven edges
- // (the legal moves are the same) or, when either is unexpanded, the node's own outcome; then updates its parents.
- void share(const Node& from,Node& into) {
+ // Installs a proven outcome on a node of its position: an unexpanded node takes the verdict; an expanded node takes
+ // the witness as a winning edge, or for a loss every unproven edge as a bounded loss, and is settled. True when
+ // anything improved.
+ bool apply(const Outcome& o,Node& into) {
+  auto improves=[&](int winner,int distance,bool bound,int w,int d,bool b){return w!=winner || d>distance || (d==distance && b && !bound);};
+  if(!into.expanded){
+   if(into.exact_winner>=0 && !improves(o.winner,o.distance,o.bound,into.exact_winner,into.distance,into.bound))return false;
+   into.exact_winner=o.winner;into.distance=o.distance;into.bound=o.bound;return true;
+  }
+  bool changed=false;
+  for(auto& e:into.edges){
+   if(o.winner==into.player?!(o.witnessed && e.action==o.witness):e.exact_winner>=0)continue;
+   if(e.exact_winner<0 || improves(o.winner,o.distance,o.winner==into.player?o.bound:true,e.exact_winner,e.distance,e.bound)){
+    e.exact_winner=o.winner;e.distance=o.distance;e.bound=o.winner==into.player?o.bound:true;changed=true;
+   }
+  }
+  if(changed)settle(into);
+  return changed;
+ }
+ // Gives `into`, a node of the same position in another turn context, the verdicts `from` holds: all its proven edges
+ // when both are expanded (the legal moves are the same), else its outcome; then updates its parents.
+ void share(const Node& from,const Outcome& outcome,Node& into) {
   bool changed=false;
   if(from.expanded && into.expanded && from.edges.size()==into.edges.size()){
    for(size_t i=0;i<from.edges.size();++i){
@@ -112,9 +136,7 @@ struct Tree {
     }
    }
    if(changed)settle(into);
-  } else if(!into.expanded && (into.exact_winner<0 || into.distance>from.distance)){
-   into.exact_winner=from.exact_winner;into.distance=from.distance;into.bound=from.bound;changed=true;
-  }
+  } else changed=apply(outcome,into);
   if(changed){refresh(into);propagate(into,nullptr);}
  }
  // Completed Q (mctx mixed value, min-max rescale, (50 + max visits) * 0.1) over the eligible edges only: proven
@@ -289,6 +311,7 @@ struct Tree {
   // A retained proven loss covers every legal continuation even if this node had not needed expansion yet.
   if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges){edge.exact_winner=node.exact_winner;edge.distance=node.distance;edge.bound=true;}
   if(tactics)classify(path,node);
+  if(graph)if(auto o=outcomes.find(node.position);o!=outcomes.end() && o->second.winner==node.player)apply(o->second,node);
   // A certificate adds its witness as a winning edge; settle keeps any shorter tactical win found by classify.
   if(exact>=0){for(auto& edge:node.edges)if(edge.action==witness && (edge.exact_winner!=exact || edge.distance>distance)){edge.exact_winner=exact;edge.distance=distance;edge.bound=true;}settle(node);}
   node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);requests.erase(found);
@@ -327,11 +350,14 @@ struct Tree {
    for(auto& [key,list]:positions)std::erase_if(list,[](const auto& w){return w.expired();});
    std::erase_if(positions,[](const auto& entry){return entry.second.empty();});
    // Stones are never removed, so positions with fewer stones than the board can not recur.
-   std::erase_if(outcomes,[&](const auto& entry){return entry.second[2]<int(board.cells.size());});
+   std::erase_if(outcomes,[&](const auto& entry){return entry.second.stones<int(board.cells.size());});
   }
-  // A root won without a known witness (a winning edge classified without a child, or a shared outcome) needs one.
-  // Reconstruct immediate tactical choices on the actual board; general certificates retain their two-placement child.
-  if((winner==root->player || root->exact_winner==root->player) && !root->expanded && board.winner<0){
+  // A root won without a known witness (a winning edge classified without a child, or a shared outcome that kept
+  // none) needs one. A shared witness is installed when the root expands; otherwise immediate tactical choices are
+  // reconstructed on the actual board, and general certificates retain their two-placement child.
+  auto shared=graph?outcomes.find(root->position):outcomes.end();
+  const bool witnessed=shared!=outcomes.end() && shared->second.winner==root->player && shared->second.witnessed;
+  if((winner==root->player || root->exact_winner==root->player) && !root->expanded && board.winner<0 && !witnessed){
    root->exact_winner=-1;
    if(tactics){Path path;capture(path);if(!path.own.empty()){root->expanded=true;root->remaining=path.remaining;for(auto c:path.legal){Edge e;e.action=c;e.prior=1./path.legal.size();root->edges.push_back(std::move(e));}classify(path,*root);}}
   }
