@@ -850,6 +850,9 @@ class Plan:
             for q, r in self.pruned:
                 checked(native.hxg_mark_exact(slot.tree.ptr, int(q), int(r), 1-player))
             result.update(slot.tree.result(0, 0, 0, 0))
+            if result['action'] is None:
+                # All sampled candidates were lost; choose an unvisited survivor from the improved policy.
+                result['action'] = result['actions'][int(np.argmax(result['policy']))].tolist()
         result.update(proven=0, proof_turns=0)
         move = self.move(player, history) if active(slot.solver, self.schedule) or self.leaf_nodes else None
         if move is not None:

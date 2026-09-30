@@ -3304,41 +3304,44 @@ class EngineTests(unittest.TestCase):
         action = [4,-1]
         leaf_history = history+[action]
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
-        settings = dense_config.ActorSettings(full_fraction=0., solver_follow=True, max_plies=len(history)+1)
-        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
-        try:
-            try:
-                engine = dense_selfplay.Engine(8, schedule=Schedule.of(settings), leaf_nodes=32)
-            except FileNotFoundError:
-                self.skipTest('Prebuilt tactical library required')
-            self.addCleanup(engine.close)
-            verdict = engine.leaf_solver.history(leaf_history, nodes=32, ms=1000)
-            self.assertTrue(verdict['native_verified'])
-            actions = np.asarray(slot.game.legal_moves(), np.int64)
-            logits = np.zeros(len(actions))
-            logits[(actions == action).all(1)] = 100.
-            model.cache.put(dense_selfplay.position_key(np.asarray(history)),
-                            (actions, logits, np.zeros(len(actions))))
-            with unittest.mock.patch.object(engine.leaf_solver, 'history', side_effect=lambda h, **k:
-                    verdict if h == leaf_history else dict(status='UNKNOWN', native_verified=False)), \
-                 unittest.mock.patch.object(slot, 'searched', wraps=slot.searched) as searched:
-                engine.add(slot)
-                for _ in range(200):
-                    if not engine.slots and not engine.closing:
-                        break
-                    engine.step()
-                self.assertFalse(engine.slots or engine.closing)
-            result = searched.call_args_list[0].args[0]
-            self.assertEqual(result['completed'], slot.budget)
-            self.assertEqual(result['pruned'], [action])
-            self.assertEqual(result['action'], [5,-1])
-            self.assertEqual(result['policy'][(result['actions'] == action).all(1)].item(), 0.)
-            self.assertEqual(result['exact_winner'], -1)
-            self.assertFalse(slot.rows[0].get('proven'))
-        finally:
-            for tree in slot.trees.values():
-                tree.close()
-            slot.game.close()
+        for samples in (1, 4):
+            with self.subTest(samples=samples):
+                settings = dense_config.ActorSettings(full_fraction=0., cheap_root_samples=samples,
+                    solver_follow=True, max_plies=len(history)+1)
+                slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+                try:
+                    try:
+                        engine = dense_selfplay.Engine(8, schedule=Schedule.of(settings), leaf_nodes=32)
+                    except FileNotFoundError:
+                        self.skipTest('Prebuilt tactical library required')
+                    self.addCleanup(engine.close)
+                    verdict = engine.leaf_solver.history(leaf_history, nodes=32, ms=1000)
+                    self.assertTrue(verdict['native_verified'])
+                    actions = np.asarray(slot.game.legal_moves(), np.int64)
+                    logits = np.zeros(len(actions))
+                    logits[(actions == action).all(1)] = 100.
+                    model.cache.put(dense_selfplay.position_key(np.asarray(history)),
+                                    (actions, logits, np.zeros(len(actions))))
+                    with unittest.mock.patch.object(engine.leaf_solver, 'history', side_effect=lambda h, **k:
+                            verdict if h == leaf_history else dict(status='UNKNOWN', native_verified=False)), \
+                         unittest.mock.patch.object(slot, 'searched', wraps=slot.searched) as searched:
+                        engine.add(slot)
+                        for _ in range(200):
+                            if not engine.slots and not engine.closing:
+                                break
+                            engine.step()
+                        self.assertFalse(engine.slots or engine.closing)
+                    result = searched.call_args_list[0].args[0]
+                    self.assertEqual(result['completed'], slot.budget)
+                    self.assertEqual(result['pruned'], [action])
+                    self.assertEqual(result['action'], [5,-1])
+                    self.assertEqual(result['policy'][(result['actions'] == action).all(1)].item(), 0.)
+                    self.assertEqual(result['exact_winner'], -1)
+                    self.assertFalse(slot.rows[0].get('proven'))
+                finally:
+                    for tree in slot.trees.values():
+                        tree.close()
+                    slot.game.close()
 
     def test_opponent_second_stone_proof_prunes_only_a_complete_root_turn(self):
         from dense_solver import Schedule
