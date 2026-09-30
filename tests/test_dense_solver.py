@@ -134,7 +134,7 @@ class NativeEntries(unittest.TestCase):
         drive(search, 8)
         actions, visits, _, _, _ = stats(search)
         for i in np.flatnonzero(visits):
-            checked(native.hxg_mark_exact(search.ptr, *actions[i], 0))
+            checked(native.hxg_mark_exact(search.ptr, *actions[i], 0, 3))
         result = search.result(0, 0, 0, 0)
         self.assertEqual(result['exact_winner'], -1)
         self.assertIsNotNone(result['action'])
