@@ -23,8 +23,8 @@ const number = v => v==null?'·':Number.isInteger(v)?String(v):v.toFixed(2);
 const percent = v => v==null?'·':(100*v).toFixed(1);
 const timestamp = v => v==null?'·':new Date(v*1000).toISOString().slice(0,16).replace('T',' ');
 const columns = [
-  ['games','Games','Evaluator and book-start self-play games through this canonical prefix',number],
-  ['p1_win_rate','P1 %','First-player wins / decisive evaluator and book-start self-play games; capped games excluded',percent],
+  ['games','Games','Evaluator and same-model book-start self-play games through this canonical prefix',number],
+  ['p1_win_rate','P1 %','First-player wins / decisive evaluator and same-model book-start self-play games; capped games excluded',percent],
   ['skew_z','z','Signed colour skew: (P1 wins − P2 wins) / √decisive games. Descriptive binomial score, not a paired significance test',number],
   ['decisive_share','Dec. %','Decisive games / all book games',percent],
   ['median_plies','Median','Median total placements in matching games, including capped games',number],

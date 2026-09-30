@@ -420,8 +420,17 @@ def episode_summary(path, modified):
     return Counter((len(e['moves']), e.get('origin', 'selfplay'),
                     'capped' if e['winner'] < 0 else 'proven' if e.get('reason') == 'proven' else 'win',
                     e['winner'], tuple(map(tuple, e['moves'][:e['book']['ply']]))
-                    if e.get('origin') == 'book' and e.get('book', {}).get('suite') == dense_openings.LIVE else ())
+                    if e.get('origin') == 'book' and not e.get('opponent')
+                    and e.get('book', {}).get('suite') == dense_openings.LIVE else ())
                    for e in episodes)
+
+
+def counted_median(counts):
+    total, cumulative, middle = sum(counts.values()), 0, []
+    for value, count in sorted(counts.items()):
+        middle.extend(value for rank in ((total-1)//2, total//2) if cumulative <= rank < cumulative+count)
+        cumulative += count
+    return sum(middle)/2 if total else None
 
 
 def game_lengths(run, hours=6, start='all'):
@@ -447,13 +456,9 @@ def game_lengths(run, hours=6, start='all'):
             for low in range(0, max(lengths, default=-1)+1, width)]
     for (plies, ending), count in counts.items():
         bins[plies//width][ending] += count
-    middle, cumulative = [], 0
-    for plies, count in sorted(lengths.items()):
-        middle.extend(plies for rank in ((games-1)//2, games//2) if cumulative <= rank < cumulative+count)
-        cumulative += count
     return dict(run=run.name, hours=hours, start=start, games=games, bins=bins, endings=endings,
                 mean=sum(plies*n for plies, n in lengths.items())/games if games else None,
-                median=sum(middle)/2 if games else None, updated_at=now)
+                median=counted_median(lengths), updated_at=now)
 
 
 def provisional(league, evaluator):
@@ -661,7 +666,7 @@ def book_rows(run):
         return cached[1]
     data = read_json(book, {})
     nodes, counted = data.get('nodes', []), data.get('counted')
-    lengths = {node['key']: [] for node in nodes}
+    lengths = {node['key']: Counter() for node in nodes}
     matched = {}
     def prefixes(moves):
         if moves not in matched:
@@ -683,8 +688,8 @@ def book_rows(run):
         for game in games:
             moves = tuple(map(tuple, game['opening']))
             for key in prefixes(moves):
-                lengths[key].append(game['plies'])
-    report_games = {key: len(plies) for key, plies in lengths.items()}
+                lengths[key][game['plies']] += 1
+    report_games = {key: sum(plies.values()) for key, plies in lengths.items()}
     actor_results = Counter()
     for path, modified in shards:
         for (plies, _, _, winner, moves), count in episode_summary(path, modified).items():
@@ -692,7 +697,7 @@ def book_rows(run):
                 continue
             for key in prefixes(moves):
                 actor_results[key, winner] += count
-                lengths[key].extend([plies]*count)
+                lengths[key][plies] += count
     rows = []
     for node in nodes:
         row = {key: node.get(key) for key in ('key', 'moves', 'depth', 'status', 'reason', 'created_at',
@@ -704,13 +709,14 @@ def book_rows(run):
             row[field] += actor_results[row['key'], winner]
         decisive = row['p1_wins'] + row['p2_wins']
         plies = lengths[row['key']]
+        recorded = sum(plies.values())
         row.update(decisive=decisive, p1_win_rate=row['p1_wins']/decisive if decisive else None,
                    p2_value=1-row['champion_value'] if row['champion_value'] is not None else None,
                    skew_z=(row['p1_wins']-row['p2_wins'])/math.sqrt(decisive) if decisive else None,
                    decisive_share=decisive/row['games'] if row['games'] else None,
                    report_games=report_games[row['key']], selfplay_games=actor_games,
-                   median_plies=statistics.median(plies) if plies else None,
-                   mean_plies=statistics.fmean(plies) if plies else None,
+                   median_plies=counted_median(plies),
+                   mean_plies=sum(p*n for p, n in plies.items())/recorded if recorded else None,
                    parents=node.get('parents', dense_openings.parents(node['moves'])))
         rows.append(row)
     _book_cache[run] = revision, rows

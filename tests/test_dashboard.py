@@ -239,9 +239,9 @@ class OpeningBookPages(unittest.TestCase):
                         book=dict(suite='book', ply=len(moves), key=dense_openings.canonical(moves)[0]))
         episodes = [episode(image, plies, winner) for plies, winner in [(11, 0), (21, 1), (31, 1), (41, -1)]]
         episodes += [episode(empty['moves'], 9, 0), episode(image, 100, 0, 'selfplay'),
-                     episode(image, 200, 0, 'restart')]
+                     episode(image, 200, 0, 'restart'), dict(episode(image, 150, 0), opponent='older-model')]
         folder = self.run/'shards/001'
-        self.write(folder/'manifest.json', dict(origin='actor', counts=dict(book_games=5)))
+        self.write(folder/'manifest.json', dict(origin='actor', counts=dict(book_games=6)))
         self.write(folder/'episodes.json', episodes)
         converted = self.run/'shards/002'
         self.write(converted/'manifest.json', dict(identity=dict(source='converted corpus')))
@@ -263,7 +263,7 @@ class OpeningBookPages(unittest.TestCase):
             self.assertNotEqual(path.name, 'episodes.json')
             return read(path, *args, **kwargs)
         with patch.object(Path, 'read_text', cached_read):
-            self.assertEqual(dashboard.game_lengths(self.run, 0)['games'], 7)
+            self.assertEqual(dashboard.game_lengths(self.run, 0)['games'], 8)
             self.assertEqual(self.get(key=empty['key'])['rows'][0]['games'], 1)
         self.write(folder.with_name('003')/'manifest.json', dict(origin='actor', counts=dict(book_games=1)))
         self.write(folder.with_name('003')/'episodes.json', [episode(empty['moves'], 13, 1)])
@@ -274,6 +274,18 @@ class OpeningBookPages(unittest.TestCase):
         self.write(self.run/'evaluator-status.json', dict(settings=dict(opening_suite='custom')))
         self.write(self.run/'openings-custom.json', dict(nodes=[empty]))
         self.assertEqual(self.get()['rows'][0]['games'], 0)
+
+    def test_repeated_book_results_keep_weighted_lengths(self):
+        folder = self.run/'shards/001'
+        self.write(folder/'manifest.json', dict(origin='actor', counts=dict(book_games=10**9+1)))
+        self.write(folder/'episodes.json', [])
+        moves = tuple(map(tuple, self.a))
+        summary = {(10, 'book', 'win', 0, moves): 10**9, (30, 'book', 'win', 1, moves): 1}
+        with patch.object(dashboard, 'episode_summary', return_value=summary):
+            row = self.get(key=self.nodes[1]['key'])['rows'][0]
+        self.assertEqual(row['games'], 10**9+7)
+        self.assertEqual(row['median_plies'], 10)
+        self.assertAlmostEqual(row['mean_plies'], (10**10+160)/(10**9+7))
 
     def test_every_sort_and_nulls_last(self):
         rows = self.get()['rows']
