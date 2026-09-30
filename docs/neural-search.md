@@ -2,6 +2,8 @@
 
 `NeuralSearch` is the placement-level neural player. The separate `hexo_gumbel` library compiles the exact rules and owns a tree with edge-local visits. No Board pointer crosses library boundaries.
 
+Rebuild `hexo_gumbel` when updating this Python API: completion now uses the native `hxg_done` entry.
+
 ```python
 from neural_search import NeuralSearch
 search = NeuralSearch(evaluator, model_version="checkpoint-sha256", history=[(0, 0)])
@@ -19,7 +21,11 @@ The behavioral references are DeepMind Mctx's [action selection](https://github.
 
 `milliseconds` is a cooperative budget checked between batches. It cannot interrupt an in-flight evaluator call. Reports include actual elapsed time. A budget exhausted before any sampled action completes returns `action=None`. Callers must handle this explicitly. Errors cancel outstanding reservations before propagating.
 
-Verified tactical certificates can supply exact search values and legal proof moves. Exact terminal outcomes also back up numeric values. A principal variation or an unsuccessful proof search cannot establish an exact result; sampled losses alone do not certify a position.
+Verified tactical certificates and terminal outcomes supply exact absolute winners. Each backup copies a solved child's winner to its incoming edge and settles the ancestors: one winning edge proves a win for that node's mover; a loss requires every legal edge to be proven for the opponent. This uses the actual mover, including consecutive placements by the same player. Unknown and unvisited actions remain obligations even when their neural values are exactly ±1. Proven losing edges leave selection and policy while alternatives remain. Exact outcomes override earlier numerical averages in both Q transforms and reports.
+
+An exact root stops requesting simulations immediately. Already reserved evaluations drain before `hxg_done` permits tree advancement; `completed` remains the number actually backed up, which can be below the requested cap or zero for an immediately proven root. Exact roots can select a witnessed action without any visits. Retained winning subtrees and certified second placements survive advancement. Immediate tactical second placements can be reconstructed without inference. A principal variation or an unsuccessful solver query cannot establish an exact result; sampled losses alone do not certify a position.
+
+Actors and evaluators use this completion condition. Actor rows and root values retain the exact outcome, including with a solver Plan active. With proven adjudication enabled, a tree proof can end the game; certificate-generated continuation rows still require an actual strategy certificate. A tree-derived proof does not claim a solver certificate or a measured proof length (`proof_turns=0`).
 
 Validation includes complete legal support, root sampling without replacement, phase transitions, subtree reuse, fresh budgets, pending cancellation, exact cache keys, malformed action-order rejection and first-stone terminal handling. The native test exhausts player/sign assignments for paths through four edges and checks the halving schedule and mixed-Q arithmetic. A finite independent payoff-tree test also verifies that recursive opponent replies overturn an optimistic shallow estimate. These are algorithm checks, not a claim of exhaustive solution of infinite-grid Hexo or demonstrated search-strength scaling. A diagnostic static-evaluator game finished in 29 placements with independent legality and winner validation. Frozen relational-model strength and scaling remain to be measured.
 

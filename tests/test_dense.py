@@ -3201,6 +3201,41 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_native_exact_root_stops_early_and_supplies_actor_labels_with_and_without_plan(self):
+        import dense_solver
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        for planned in (False, True):
+            with self.subTest(planned=planned):
+                model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+                settings = replace(dense_config.ActorSettings(), full_sims=65536, full_fraction=1.,
+                                   root_samples=16, opening_random_plies=0., adjudicate_proven=True,
+                                   proven_line_rows=False, solver_root_nodes=1 if planned else 0)
+                slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+                engine = dense_selfplay.Engine(8, solver_async=False)
+                try:
+                    if planned:
+                        try:
+                            engine.solver = dense_solver.Solver(engine.schedule, asynchronous=False)
+                        except FileNotFoundError:
+                            self.skipTest('Prebuilt tactical library required')
+                    with unittest.mock.patch.object(slot, 'searched', wraps=slot.searched) as searched:
+                        engine.add(slot)
+                        for _ in range(20):
+                            if not engine.slots and not engine.closing:
+                                break
+                            engine.step()
+                        self.assertFalse(engine.slots or engine.closing)
+                    result = searched.call_args.args[0]
+                    self.assertEqual((result['completed'], result['exact_winner'], result['proven']), (0, 0, 1))
+                    self.assertEqual((slot.rows[0]['proven'], slot.values[len(history)]), (1, 1.))
+                    self.assertEqual((slot.reason, slot.adjudicated['winner']), ('proven', 0))
+                    self.assertEqual(engine.searches, 1)
+                finally:
+                    engine.close()
+                    for tree in slot.trees.values():
+                        tree.close()
+                    slot.game.close()
+
     def test_book_start_searches_only_after_prefix_and_records_source_and_counts(self):
         torch.set_num_threads(2)
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)

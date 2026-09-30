@@ -1,6 +1,7 @@
 #include "../src/gumbel.cpp"
 #include <cassert>
 #include <iostream>
+#include <functional>
 int main(){
  // Exhaust all player-transition patterns up to four edges and terminal values.
  for(int depth=1;depth<=4;++depth)for(int mask=0;mask<(1<<(depth+1));++mask)for(double value:{-1.,-.25,0.,.75,1.}){
@@ -10,6 +11,33 @@ int main(){
   tree.backup(path,value);
   for(int i=0;i<depth;++i){auto& e=nodes[i].edges[0];assert(e.visits==1 && e.pending==0);assert(e.sum==(nodes[i].player==nodes.back().player?value:-value));}
  }
+ // Independently enumerate partial binary proof trees. A numerical +-1 is deliberately used for every
+ // UNKNOWN leaf; it must never supply a proof. Include consecutive placements by the same player and
+ // late, outstanding backups after an ancestor has already become exact.
+ for(int depth=1;depth<=3;++depth)for(int players=0;players<(1<<(depth+1));++players){
+  int leaves=1<<depth,states=1;for(int i=0;i<leaves;++i)states*=3;
+  for(int assignment=0;assignment<states;++assignment){
+   gumbel::Tree t(0);std::vector<gumbel::Node*> level{t.root.get()};std::vector<std::vector<std::pair<gumbel::Node*,int>>> paths(1);
+   for(int d=0;d<depth;++d){std::vector<gumbel::Node*> next;std::vector<std::vector<std::pair<gumbel::Node*,int>>> next_paths;
+    for(int i=0;i<int(level.size());++i){auto* node=level[i];node->player=(players>>d)&1;node->expanded=true;
+     for(int j=0;j<2;++j){gumbel::Edge e;e.prior=.5;e.child=std::make_unique<gumbel::Node>();next.push_back(e.child.get());node->edges.push_back(std::move(e));auto p=paths[i];p.emplace_back(node,j);next_paths.push_back(std::move(p));}
+    }level=std::move(next);paths=std::move(next_paths);
+   }
+   std::vector<int> observed(leaves,-1);int encoded=assignment;
+   std::function<int(int,int)> expected=[&](int d,int offset){
+    if(d==depth)return observed[offset];int player=(players>>d)&1;
+    int a=expected(d+1,offset),b=expected(d+1,offset+(1<<(depth-d-1)));
+    return a==player || b==player?player:a==1-player && b==1-player?1-player:-1;
+   };
+   for(int i=0;i<leaves;++i){int verdict=encoded%3-1;encoded/=3;observed[i]=verdict;level[i]->player=(players>>depth)&1;level[i]->exact_winner=verdict;
+    gumbel::Path p;p.leaf=level[i];p.edges=paths[i];for(auto [node,index]:p.edges)++node->edges[index].pending;
+    t.backup(p,i%2?1:-1);assert(t.root->exact_winner==expected(0,0));
+    for(auto [node,index]:p.edges){auto& e=node->edges[index];assert(e.pending==0);assert(e.exact_winner==e.child->exact_winner);if(e.exact_winner>=0)assert(e.sum==(e.exact_winner==node->player?e.visits:-e.visits));}
+   }
+  }
+ }
+ // Neither an empty nor an unexpanded action list can certify a loss.
+ {gumbel::Tree t(0);gumbel::Node node;node.player=0;t.settle(node);assert(node.exact_winner==-1);node.edges.emplace_back();node.edges[0].exact_winner=1;t.settle(node);assert(node.exact_winner==-1);}
  gumbel::Tree tree(1);tree.advance({0,0});tree.begin(16,4);
  assert(tree.sequence==std::vector<int>({0,0,0,0,1,1,1,1,2,2,3,3,4,4,5,5}));
  gumbel::Node n;n.value=.2;
@@ -26,5 +54,5 @@ int main(){
  tree.root->edges[1].logit=0;tree.root->edges[1].gumbel=0;tree.root->edges[1].visits=10000;tree.root->edges[1].sum=10000;
  for(auto& e:tree.root->edges)e.epoch=0;
  int request=tree.request();assert(request>0 && tree.requests.at(request).edges.front().second==0);tree.cancel();
- std::cout<<"Exhaustive backup sign patterns, sequential-halving schedule and mixed-Q transform passed\n";
+ std::cout<<"Exhaustive backup signs and partial proof trees, sequential-halving schedule and mixed-Q transform passed\n";
 }

@@ -100,7 +100,7 @@ def drive(search, budget, on_hold=lambda: None):
             native.hxg_legal(search.ptr, request, legal.ctypes.data)
             zeros = np.zeros(len(legal))
             checked(native.hxg_fulfill(search.ptr, request, legal, zeros, zeros, len(legal)))
-        elif native.hxg_completed(search.ptr) >= budget:
+        elif native.hxg_done(search.ptr):
             return holds
         else:
             raise AssertionError('search stalled')
@@ -492,7 +492,7 @@ class Adjudication(unittest.TestCase):
         slot = type('Slot', (), dict(tree=type('Tree', (), dict(history=history, ptr=None,
                                      result=lambda *args: dict(action=list(action))))(),
                                      solver=Budgets(finalists=2, finalist_nodes=NODES)))()
-        result = dict(action=list(action))
+        result = dict(action=list(action), exact_winner=-1)
         with mock.patch.object(dense_solver, 'native', mock.Mock(hxg_exact=lambda ptr: 1-dense_solver.mover(history))):
             self.assertTrue(plan.finish(slot, result))
         self.assertEqual((result['proven'], result['proof']), (-1, mine))
@@ -630,7 +630,7 @@ class Scheduler(unittest.TestCase):
         player = dense_solver.mover(history)
         plan.root = root = query('root')
         plan.deep[player] = deep = query('deep')
-        result = dict(action=[3, 0])
+        result = dict(action=[3, 0], exact_winner=-1)
         self.assertFalse(plan.finish(slot, result))
         self.assertTrue(plan.awaiting_finish)
         self.assertFalse(plan.ready(slot))

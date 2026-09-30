@@ -20,11 +20,13 @@ struct Tree {
  std::map<Cell,double> defence;
  double bonus(const Edge& e)const {auto i=defence.find(e.action);return i==defence.end()?0:i->second;}
  explicit Tree(uint64_t seed):rng(seed){}
+ bool done()const {return requests.empty() && (board.winner>=0 || (root->expanded && root->exact_winner>=0) || completed>=budget);}
+ double value(const Node& node,const Edge& e)const {return e.exact_winner>=0?(e.exact_winner==node.player?1:-1):e.visits?e.sum/e.visits:node.value;}
  std::vector<double> transformed(Node& node) {
   double weighted=0,mass=0;int total=0,maximum=0;
-  for(auto& e:node.edges) {total+=e.visits;maximum=std::max(maximum,e.visits);if(e.visits){weighted+=e.prior*e.sum/e.visits;mass+=e.prior;}}
+  for(auto& e:node.edges) {total+=e.visits;maximum=std::max(maximum,e.visits);if(e.visits){weighted+=e.prior*value(node,e);mass+=e.prior;}}
   double mixed=(node.value+total*(mass?weighted/mass:node.value))/(total+1);
-  std::vector<double> q;for(auto& e:node.edges)q.push_back(e.visits?e.sum/e.visits:mixed);
+  std::vector<double> q;for(auto& e:node.edges)q.push_back(e.exact_winner>=0 || e.visits?value(node,e):mixed);
   auto [lo,hi]=std::minmax_element(q.begin(),q.end());double a=*lo,range=std::max(1e-8,*hi-a);
   for(auto& x:q)x=(x-a)/range*(50+maximum)*0.1;
   return q;
@@ -67,6 +69,8 @@ struct Tree {
  // winning edges eligible; with no edge left undecided the node is lost and every edge stays eligible; otherwise
  // the lost edges are ineligible.
  void settle(Node& node) {
+  // Only expansion installs the complete legal action list. A pending/unexpanded leaf is never a universal proof.
+  if(!node.expanded || node.edges.empty())return;
   bool winning=false,safe=false;
   for(auto& edge:node.edges){if(edge.exact_winner==node.player)winning=true;else if(edge.exact_winner<0)safe=true;}
   if(winning)node.exact_winner=node.player;
@@ -90,14 +94,22 @@ struct Tree {
   for(auto& e:root->edges){e.epoch=0;double u=std::generate_canonical<double,53>(rng);e.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));}
  }
  void backup(Path& path,double value) {
-  int player=path.leaf->player;
-  for(auto i=path.edges.rbegin();i!=path.edges.rend();++i){auto& [node,index]=*i;auto& edge=node->edges[index];if(player!=node->player)value=-value;player=node->player;edge.sum+=value;++edge.visits;--edge.pending;}
+  Node* child=path.leaf;
+  for(auto i=path.edges.rbegin();i!=path.edges.rend();++i){
+   auto& [node,index]=*i;auto& edge=node->edges[index];
+   if(child->player!=node->player)value=-value;
+   if(child->exact_winner>=0 && edge.exact_winner!=child->exact_winner){edge.exact_winner=child->exact_winner;settle(*node);}
+   ++edge.visits;--edge.pending;
+   if(edge.exact_winner>=0){value=edge.exact_winner==node->player?1:-1;edge.sum=value*edge.visits;}
+   else edge.sum+=value;
+   child=node;
+  }
   if(!path.edges.empty())++completed;
  }
  // Next leaf request id; 0 when nothing can be requested now, -1 after a simulation that ended on an exact edge or
  // node, and -3 while a hold is armed and the search stands, with no request pending, at `last`.
  int request() {
-  if(board.winner>=0)return 0;
+  if(board.winner>=0 || (root->expanded && root->exact_winner>=0))return 0;
   if(hold && started==last)return requests.empty()?-3:0;
   if(started>=budget)return 0;
   // Descends by make on the tree's own board; Restore undoes every placement on return.
@@ -115,6 +127,9 @@ struct Tree {
     // Marked-lost candidates can leave a round short of candidates; the best of the latest-eliminated ones step in.
     int reached=-1;
     if(chosen<0)for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch>considered)continue;double score=e.gumbel+e.logit+q[i]+bonus(e);if(e.epoch>reached || (e.epoch==reached && score>best)){reached=e.epoch;best=score;chosen=i;}}
+    // Proofs may leave fewer survivors than this round scheduled. If all survivors already finished its
+    // layer, continue the least-visited survivor rather than waiting for an eliminated action forever.
+    if(chosen<0){int least=std::numeric_limits<int>::max();for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible)continue;double score=e.gumbel+e.logit+q[i]+bonus(e);if(e.epoch<least || (e.epoch==least && score>best)){least=e.epoch;best=score;chosen=i;}}}
    } else {
     double maxlog=-1e300,total=0;int visits=0;for(int i=0;i<int(q.size());++i){q[i]=node->edges[i].eligible?q[i]+node->edges[i].logit:-std::numeric_limits<double>::infinity();maxlog=std::max(maxlog,q[i]);visits+=node->edges[i].visits+node->edges[i].pending;}
     for(auto& x:q){x=std::exp(x-maxlog);total+=x;}
@@ -125,7 +140,7 @@ struct Tree {
    path.edges.emplace_back(node,chosen);board.make(edge.action);path.history.push_back(edge.action);
    if(!edge.child){edge.child=std::make_unique<Node>();edge.child->player=board.player;}
    node=edge.child.get();path.leaf=node;
-   if(board.winner>=0 || edge.exact_winner>=0 || node->exact_winner>=0){int winner=board.winner>=0?board.winner:edge.exact_winner>=0?edge.exact_winner:node->exact_winner;for(auto [parent,index]:path.edges)++parent->edges[index].pending;++root->edges[path.edges.front().second].epoch;++started;backup(path,winner==node->player?1:-1);return -1;}
+   if(board.winner>=0 || edge.exact_winner>=0 || node->exact_winner>=0){int winner=board.winner>=0?board.winner:edge.exact_winner>=0?edge.exact_winner:node->exact_winner;node->exact_winner=winner;for(auto [parent,index]:path.edges)++parent->edges[index].pending;++root->edges[path.edges.front().second].epoch;++started;backup(path,winner==node->player?1:-1);return -1;}
   }
   if(node->pending)return 0;
   node->pending=true;node->player=board.player;capture(path);
@@ -142,9 +157,12 @@ struct Tree {
   // Only root edges read their Gumbel noise and begin() redraws it, so interior edges just advance the stream.
   const bool at_root=&node==root.get();
   node.value=0;node.edges.reserve(count);for(int i=0;i<count;++i){Edge edge;edge.action=legal[i];edge.logit=logits[i]-maximum;edge.prior=weights[i]/total;node.value+=edge.prior*values[i];double u=std::generate_canonical<double,53>(rng);if(at_root)edge.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));node.edges.push_back(std::move(edge));}
+  node.expanded=true;
+  // A retained proven loss covers every legal continuation even if this node had not needed expansion yet.
+  if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges)edge.exact_winner=node.exact_winner;
   if(tactics)classify(path,node);
   if(exact>=0){node.exact_winner=exact;for(auto& edge:node.edges){edge.eligible=edge.action==witness;if(edge.eligible)edge.exact_winner=exact;}}
-  node.expanded=true;node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);requests.erase(found);
+  node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);requests.erase(found);
  }
  void prove(int id,const int64_t* history,int count,int player,int remaining,const int64_t* moves,int move_count){
   auto found=requests.find(id);if(found==requests.end())throw std::runtime_error("Unknown proof request");
@@ -167,9 +185,16 @@ struct Tree {
   }
  }
  void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].pending;if(!path.edges.empty()){--root->edges[path.edges.front().second].epoch;--started;}}requests.clear();}
- void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::unique_ptr<Node> next;priority.clear();defence.clear();hold=false;
-  for(auto& e:root->edges)if(e.action==action){next=std::move(e.child);break;}
+ void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::unique_ptr<Node> next;int winner=-1;priority.clear();defence.clear();hold=false;
+  for(auto& e:root->edges)if(e.action==action){winner=e.exact_winner;next=std::move(e.child);break;}
   board.make(action);root=next?std::move(next):std::make_unique<Node>();root->player=board.player;budget=started=completed=0;
+  if(winner>=0 && winner!=root->player)root->exact_winner=winner;
+  // A winning edge classified without a child needs a second-placement witness. Reconstruct immediate
+  // tactical choices on the actual board; general certificates already retain their two-placement child.
+  if(winner==root->player && !root->expanded && board.winner<0){
+   root->exact_winner=-1;
+   if(tactics){Path path;capture(path);if(!path.own.empty()){root->expanded=true;for(auto c:path.legal){Edge e;e.action=c;e.prior=1./path.legal.size();root->edges.push_back(std::move(e));}classify(path,*root);}}
+  }
  }
 };
 thread_local std::string error;
@@ -191,9 +216,11 @@ HX_API int hxg_fulfill(void* p,int id,const int64_t* a,const double* logits,cons
 HX_API int hxg_prove(void* p,int id,const int64_t* h,int n,int player,int remaining,const int64_t* moves,int count){try{static_cast<gumbel::Tree*>(p)->prove(id,h,n,player,remaining,moves,count);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API void hxg_cancel(void* p){static_cast<gumbel::Tree*>(p)->cancel();}
 HX_API int hxg_advance(void* p,int64_t q,int64_t r){try{static_cast<gumbel::Tree*>(p)->advance({q,r});return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double* scores){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto q=t.transformed(n);int max_epoch=0;for(auto& e:n.edges)if(e.eligible)max_epoch=std::max(max_epoch,e.epoch);for(int i=0;i<int(n.edges.size());++i){auto& e=n.edges[i];if(actions){actions[2*i]=e.action.q;actions[2*i+1]=e.action.r;visits[i]=e.visits;values[i]=e.exact_winner>=0?(e.exact_winner==n.player?1:-1):e.visits?e.sum/e.visits:n.value;scores[i]=e.eligible && max_epoch && e.epoch==max_epoch?e.gumbel+e.logit+q[i]+t.bonus(e):-std::numeric_limits<double>::infinity();}}return int(n.edges.size());}
+HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double* scores){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto q=t.transformed(n);int max_epoch=0;for(auto& e:n.edges)if(e.eligible)max_epoch=std::max(max_epoch,e.epoch);for(int i=0;i<int(n.edges.size());++i){auto& e=n.edges[i];if(actions){actions[2*i]=e.action.q;actions[2*i+1]=e.action.r;visits[i]=e.visits;values[i]=t.value(n,e);scores[i]=e.eligible && (n.exact_winner>=0 || (max_epoch && e.epoch==max_epoch))?e.gumbel+e.logit+q[i]+t.bonus(e):-std::numeric_limits<double>::infinity();}}return int(n.edges.size());}
 HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto q=t.transformed(n);double maximum=-1e300,total=0;for(int i=0;i<int(q.size());++i){q[i]=n.edges[i].eligible?q[i]+n.edges[i].logit+t.bonus(n.edges[i]):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,q[i]);}for(auto& v:q){v=std::exp(v-maximum);total+=v;}if(out)for(int i=0;i<int(q.size());++i)out[i]=q[i]/total;return int(q.size());}
 HX_API int hxg_completed(void* p){return static_cast<gumbel::Tree*>(p)->completed;}
+// Completion includes an exact root, but never permits advancement while leaf reservations are outstanding.
+HX_API int hxg_done(void* p){return static_cast<gumbel::Tree*>(p)->done();}
 // Arms (enabled != 0) or clears the hold of the current search: hxg_next returns -3 once the search reaches its last
 // halving boundary (the end of the search when it never halves) with no request pending, until the hold is cleared.
 HX_API int hxg_hold(void* p,int enabled){static_cast<gumbel::Tree*>(p)->hold=enabled!=0;return 1;}
