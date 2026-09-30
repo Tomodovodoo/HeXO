@@ -136,7 +136,8 @@ class Launcher:
         return {name: entry for name, entry in self.state().items() if self.alive(entry)}
 
     def alive(self, entry):
-        return alive(entry['pid'], entry['script'], str(self.run), self.arguments)
+        """The service leader still runs this run's script, or, on POSIX, children of its group still exist."""
+        return alive(entry['pid'], entry['script'], str(self.run), self.arguments) or group_alive(entry['pid'])
 
     def prepare(self, device, run_steps):
         """Create the run configuration and the first checkpoint when either is missing; `run_steps` runs a command."""
@@ -224,7 +225,7 @@ class Launcher:
     def gone(self, entry, timeout):
         """True once neither the service nor, on POSIX, any process left in its group exists."""
         deadline = time.time() + timeout
-        while self.alive(entry) or group_alive(entry['pid']):
+        while self.alive(entry):
             if time.time() > deadline:
                 return False
             time.sleep(0.2)
