@@ -62,7 +62,7 @@ Start each long-running command in a separate terminal with the same activated e
 ```sh
 python python/dense_selfplay.py --run runs/bubble --processes 4
 python python/dense_learn.py --run runs/bubble
-python python/dense_eval.py loop --run runs/bubble --anchor-games 0 --no-anchor-on-promotion --anchor-target-halfwidth 0
+python python/dense_eval.py loop --run runs/bubble --eval-anchor-games 0 --no-eval-anchor-on-promotion --eval-anchor-target-halfwidth 0
 python python/dashboard.py --run runs/bubble
 ```
 
