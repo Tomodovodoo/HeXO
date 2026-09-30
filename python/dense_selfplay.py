@@ -244,6 +244,15 @@ def position_key(history):
     return n, history[order].tobytes(), turn.tobytes(), previous.tobytes()
 
 
+def policy_target(result, player):
+    """Whether a finished search's improved policy is a policy target. A search that backed up no simulation on an
+    exact root repeats the network prior: a lost root (every move lost) records none, a won root records its
+    policy, which covers only proven winning moves, unless every legal move wins."""
+    if result['completed'] or result['exact_winner'] < 0:
+        return True
+    return result['exact_winner'] == player and not np.all(result['policy'] > 0)
+
+
 def root_value(result, player):
     """Side-to-move value of a finished search: the solver's exact value when it proved one (result `proven`), else
     exact +-1 when the tree root is exact, else child values under the improved policy. Unvisited child values
@@ -585,7 +594,7 @@ class SelfPlayGame:
         row = dict(ply=ply, player=player, remaining=game.remaining, legal_sha256=dense_data.legal_digest(actions),
                    policy=None)
         policy = result['policy']
-        if self.is_full and trained:
+        if self.is_full and trained and policy_target(result, player):
             if not np.isclose(policy.sum(), 1, atol=1e-6) or np.any(policy < 0):
                 raise ValueError('Search policy is not a distribution')
             row['policy'] = policy.astype(np.float32)

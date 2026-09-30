@@ -43,6 +43,11 @@ int main(){
  gumbel::Node n;n.value=.2;
  for(int i=0;i<3;++i){gumbel::Edge e;e.prior=1./3;e.visits=i==0?2:0;e.sum=i==0?1.:0;n.edges.push_back(std::move(e));}
  auto q=tree.transformed(n);assert(std::abs(q[0]-5.2)<1e-10 && q[1]==0 && q[2]==0);
+ // A proven loss (ineligible, Q -1 with more visits) sets neither the range, the mixed value nor the visit scale.
+ {gumbel::Node m;m.value=.2;m.player=0;
+  for(int i=0;i<3;++i){gumbel::Edge e;e.prior=1./3;e.visits=i<2?2:9;e.sum=i==0?1.:-1.;m.edges.push_back(std::move(e));}
+  m.edges[2].exact_winner=1;m.edges[2].eligible=false;
+  auto r=tree.transformed(m);assert(std::abs(r[0]-5.2)<1e-10 && std::abs(r[1])<1e-12);}
  // Final selection excludes eliminated actions despite a larger stale score.
  tree.root->expanded=true;tree.root->value=0;
  for(int i=0;i<2;++i){gumbel::Edge e;e.action={i,1};e.prior=.5;e.logit=i?0:100;e.epoch=i?4:1;tree.root->edges.push_back(std::move(e));}

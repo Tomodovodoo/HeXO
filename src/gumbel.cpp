@@ -22,13 +22,18 @@ struct Tree {
  explicit Tree(uint64_t seed):rng(seed){}
  bool done()const {return requests.empty() && (board.winner>=0 || (root->expanded && root->exact_winner>=0) || completed>=budget);}
  double value(const Node& node,const Edge& e)const {return e.exact_winner>=0?(e.exact_winner==node.player?1:-1):e.visits?e.sum/e.visits:node.value;}
+ // Completed Q (mctx mixed value, min-max rescale, (50 + max visits) * 0.1) over the eligible edges only: proven
+ // losses and the non-winning edges of a won node set neither the mixed value, the visit scale nor the range.
+ // Entries of ineligible edges are returned on the same scale but every caller discards them.
  std::vector<double> transformed(Node& node) {
   double weighted=0,mass=0;int total=0,maximum=0;
-  for(auto& e:node.edges) {total+=e.visits;maximum=std::max(maximum,e.visits);if(e.visits){weighted+=e.prior*value(node,e);mass+=e.prior;}}
-  double mixed=(node.value+total*(mass?weighted/mass:node.value))/(total+1);
-  std::vector<double> q;for(auto& e:node.edges)q.push_back(e.exact_winner>=0 || e.visits?value(node,e):mixed);
-  auto [lo,hi]=std::minmax_element(q.begin(),q.end());double a=*lo,range=std::max(1e-8,*hi-a);
-  for(auto& x:q)x=(x-a)/range*(50+maximum)*0.1;
+  for(auto& e:node.edges)if(e.eligible){total+=e.visits;maximum=std::max(maximum,e.visits);if(e.visits){weighted+=e.prior*value(node,e);mass+=e.prior;}}
+  double mixed=(node.value+total*(mass?weighted/mass:node.value))/(total+1),lo=1e300,hi=-1e300;
+  std::vector<double> q;
+  for(auto& e:node.edges){q.push_back(e.exact_winner>=0 || e.visits?value(node,e):mixed);if(e.eligible){lo=std::min(lo,q.back());hi=std::max(hi,q.back());}}
+  if(lo>hi)lo=hi=0;
+  double range=std::max(1e-8,hi-lo);
+  for(auto& x:q)x=(x-lo)/range*(50+maximum)*0.1;
   return q;
  }
  // `last` is the simulation index where the final candidate count begins (the last halving boundary), or the

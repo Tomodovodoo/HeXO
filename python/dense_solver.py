@@ -3,8 +3,9 @@
 Points (Budgets: settings solver_root_nodes, solver_finalists, solver_finalist_nodes, solver_threat_nodes, plus
 Schedule.deep_nodes; 0 = off):
   root       at a turn start (a search with two placements left): does the side to move have a forced win? A proof
-             decides the move played for the whole turn, the certificate's first turn (both stones); the search, its
-             tree and its recorded policy are unchanged and the rows of both placements get the exact value +1
+             decides the move played for the whole turn, the certificate's first turn (both stones). The search runs
+             unchanged; at its end the certificate stone is marked exact-won (hxg_mark_exact), so the recorded
+             policy covers only proven winning stones, and the rows of both placements get the exact value +1
              (`proven`).
   threat     at a turn start: would the opponent have a forced win if it moved now with a fresh turn? Root actions on
              the certificate's threat cells are sampled first in the search's opening phase (hxg_priority). Ordering
@@ -14,8 +15,9 @@ Schedule.deep_nodes; 0 = off):
              compatible second stones get the same treatment next search. No proof labels or pruning follow.
   finalists  in a mid-turn search, at its last halving boundary (its end when it never halves): for each of the
              `finalists` best candidates b (hxg_stats scores), does the opponent have a forced win after our turn
-             ends with b? After the scheduled visits finish, a proof marks b exact-lost (hxg_mark_exact: Q -1,
-             ineligible), so the final selection discards it and the improved policy gives it no mass.
+             ends with b? A proof marks b exact-lost when its verdict is consumed (hxg_mark_exact: Q -1, ineligible), so
+             the remaining visits go to the survivors, the final selection discards b and the improved policy gives it
+             no mass.
   deep       background proof of a committed turn: at each turn start, does the side that just moved win against
              every defence of the turn it played (a root_moves query on the position before that turn)?
 Only native-verified PROVEN_WIN results act as proofs; UNKNOWN is never a loss. Proofs of positions on the game (root, deep,
@@ -809,6 +811,7 @@ class Plan:
                 proven, result = query.result()
                 self.spent(result)
                 if proven:
+                    checked(native.hxg_mark_exact(ptr, int(action[0]), int(action[1]), 1-mover(slot.tree.history)))
                     self.turns = max(self.turns, int(result['proof_turns']))
                     self.pruned.append(action)
                     self.proven(query, slot.tree.history)
@@ -875,7 +878,7 @@ class Plan:
             self.spent(self.deep[player].result()[1])
             self.proven(self.deep.pop(player), history)
         if self.pruned:
-            # Finalist certificates exclude proven losses from both choice and policy.
+            # Finalist and leaf certificates exclude proven losses from both choice and policy (marking is idempotent).
             for q, r in self.pruned:
                 checked(native.hxg_mark_exact(slot.tree.ptr, int(q), int(r), 1-player))
             result.update(slot.tree.result(0, 0, 0, 0))
@@ -886,7 +889,12 @@ class Plan:
         result.update(proven=0 if winner < 0 else 1 if winner == player else -1, proof_turns=0)
         move = self.move(player, history) if active(slot.solver, self.schedule) or self.leaf_nodes else None
         if move is not None:
-            result.update(action=list(move[0][0]), proven=1, proof_turns=move[1], proof=self.proofs[player],
+            q, r = map(int, move[0][0])
+            if native.hxg_exact(slot.tree.ptr) < 0:
+                # The certificate stone wins, so the improved policy is restricted to proven winning stones.
+                checked(native.hxg_mark_exact(slot.tree.ptr, q, r, player))
+                result.update(slot.tree.result(0, 0, 0, 0))
+            result.update(action=[q, r], proven=1, proof_turns=move[1], proof=self.proofs[player],
                           proof_action=[list(a) for a in move[0]])
             if self.solver is not None:
                 self.solver.stats['followed'] += self.following
