@@ -56,7 +56,7 @@
   posterior rating while its published league rating is pending. Direct promotion/variant trials and explicit `match`
   commands retain their own game budgets. Historical Seal games remain part of the rating evidence.
 - **Variants.** An A/B test of search settings runs through the same pool, reports and posterior. A variant is
-  a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`,
+  a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`, `search_graph`,
   `solver_*`), league id `<checkpoint>@<name>`:
 
   ```text
