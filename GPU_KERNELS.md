@@ -1,6 +1,6 @@
 # Opt-in dense GPU kernels
 
-`--net-kernels fused` selects Triton kernels for fixed line features, masked normalization with activation and its backward pass, and inference LineConv. Actors also use channels-last with this mode. The learner keeps the current NCHW layout and the reference differentiable LineConv. `reference` remains the default.
+`--net-kernels fused` selects Triton kernels for fixed line features, masked normalization with activation and its backward pass, and LineConv. Actors also use channels-last with this mode. Training keeps NCHW and the reference cuBLAS line products, with fused staging, residual additions and tap-gradient reductions. `reference` remains the default.
 
 Keep cuDNN for HexConv. This checkout already implements each hex convolution as one masked 3x3 convolution. Its tensor-core kernels are the largest single cost, but the avoidable work is around them: small synchronous index transfers, layout copies, full-activation normalization intermediates, and the matrices and skewed copies used by inference LineConv. The direct LineConv kernel tiles pixels and channels together, which makes channels-last usable without those matrices. Normalization preserves the reference's bf16 rounding points and centred variance computation.
 
@@ -54,6 +54,113 @@ evaluator inputs with `python tools/profile_evaluator.py prepare --run runs/dens
 Run `python tools/profile_evaluator.py live --kernels reference`, then `fused`,
 then `reference`. The shared guard enforces headroom, cooldown and a 55-second
 GPU deadline, and closes the measurement's own solver processes on timeout.
+
+## Training LineConv and running statistics
+
+`--net-kernels fused` keeps the learner's NCHW layout, cuDNN hex convolutions
+and cuBLAS LineConv products. Triton packs the planar and skewed inputs,
+gathers their outputs with the residual addition, and reduces tap gradients.
+Backward retains the packed inputs and uses three cuBLAS products for input
+gradients. Checkpoint tensors and default `reference` loading are unchanged.
+
+Masked normalization combines activation gating, gradient products and
+input-gradient application. One kernel updates the running statistics and
+batch counter. Mean and backward channel sums retain PyTorch's reduction
+order because small FP32 differences can alter bf16 correction coefficients
+and downstream gradients. LineConv preserves the reference's bf16 rounding
+at directional and residual additions. Cumulative recalibration is unchanged.
+
+The existing CUDA checks pass for masked normalization and random and real
+full-model forward/backward. A real 256-row `Learner.train_step` from export
+85000 passed every first-step gradient, model tensor and EMA tensor against
+reference, under the unchanged two-bf16-epsilon bound of 1.5625% plus the
+existing absolute allowance. Worst scaled gradient error was 0.218%; model
+and EMA errors were 0.000617% and 0.00000571%. Checkpoints load in both modes.
+
+The final throughput comparison uses the actual `Renderers.next` and
+`Learner.train_step` loop, including queue waits, padding, transfers, all
+losses, backward, clipping, AdamW, EMA and metric flushes. Each fresh process
+warms ten real training steps, then measures at least twenty active seconds
+with a final GPU synchronization. Renderer startup, pacing sleeps, validation
+and exports are excluded. No run files are written.
+
+All four windows use export 85000's model, optimizer, EMA and settings, two
+production renderers, the same frozen corpus of 1,647 committed replay shards,
+and a 3328 MiB allocator cap. The competing encoder experiment had finished;
+the existing evaluator and other live processes were left running. Renderer
+queue order varies, so the windows sample the same corpus without claiming
+an identical timed batch sequence.
+
+| September 30 UTC report start | Mode | Timed steps | Active seconds | Samples/s | Peak allocated/reserved MiB |
+|---|---|---:|---:|---:|---:|
+| 00:26:47 | Reference | 37 | 20.43 | 463.60 | 1956 / 2916 |
+| 00:33:29 | Corrected fused | 51 | 20.00 | 652.67 | 1818 / 2766 |
+| 00:35:43 | Deployed fused | 45 | 20.61 | 559.01 | 1528 / 2158 |
+| 00:37:38 | Reference | 33 | 20.06 | 421.13 | 1956 / 2916 |
+
+Pooling reference rows and active seconds gives **442.55 samples/s**.
+Corrected fused is **1.47x reference** and **1.17x deployed fused**. The twofold
+learner target was not reached; the owner accepted these results for delivery.
+These are short production-loop windows, not a forecast of throughput while
+four actors and the learner compete for the card.
+
+All windows recorded zero allocator retries and OOMs. Mean renderer wait was
+8.23-9.75 ms per batch. New padded shapes still occurred after warmup, and
+their setup cost remains in the measured rates. Fused processed about 1.3%
+more padded cells per batch than the reference windows. GPU work lasted
+32.8-33.6 seconds per child, with a 55-second watchdog, at least 60 seconds
+idle between measurements, BelowNormal priority and two CPU threads. Each
+child set the initial 12% allocator fraction before using the separately
+authorized larger allowance.
+
+`shipped` pins merged PR 179's kernels at
+`edb9f868dfc4c6bb38aec2032222a424e1404505`. Reports are
+`artifacts/gpu-kernels/learner-live-*-20260930*.json`, with the first reference
+under `artifacts/learner-profile`. The summary and source report paths are in
+`artifacts/gpu-kernels/learner-live-warm10-summary.json`. All four share window
+SHA-256 `2041a012701e703ee21c9a123b1b917995bd45bbedae590cb2028ae55b12fa4e`.
+
+Earlier 395.78 and 557.67 samples/s reports used different warmup, GPU load
+and code revisions. The 395.78 window included first-use setup and competed
+with the encoder experiment; 557.67 used a superseded kernel. Neither rate
+should be compared directly with the final table or compounded with its gain.
+The saved-batch 2.09x result excluded rendering and never established the
+production-loop target.
+
+CPU/CUDA profiling with input shapes on a saved real 256-row step gives:
+
+| Per-step metric | Original reference | Corrected fused |
+|---|---:|---:|
+| Kernel launches | 11,174 | 4,585 |
+| Sum of kernel durations | 372.16 ms | 270.64 ms |
+| CPU kernel-launch call time | 113.23 ms | 36.19 ms |
+| H2D copy-engine time | 0.921 ms | 0.563 ms |
+
+The leading corrected kernel groups are cuDNN weight gradient at 31.85 ms,
+input gradient at 30.24 ms, forward at 29.01 ms, layout conversion at 16.93 ms,
+line skew packing at 14.10 ms, channel reductions at 10.33 ms and norm
+gradient products at 9.96 ms. H2D traffic totals 10,501,104 bytes. Estimated
+convolution/GEMM arithmetic is 3.046 TFLOPs, giving 11.25 TF/s over summed
+kernel time, 25.9% of the dense bf16 peak. DRAM counters were unavailable;
+achieved DRAM bandwidth is not claimed. The two profiles ran in different
+shared-card windows. The corrected device timeline had 233.64 ms of gaps
+while the encoder experiment was active; those gaps are not measured launch
+overhead. CPU collation and padding measurements appear below.
+
+Learner graphs and `torch.compile` are not part of this change. Tested private
+graphs were slower and approached the memory cap; the compile probe failed
+while lowering custom Triton calls. The measured implementation needs only
+the existing optional Triton installation, with no compiler or toolkit install.
+
+```text
+python tools/profile_learner.py prepare --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches
+python tools/profile_learner.py live --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches --modes reference --memory-mib 3328 --warmup-steps 10
+python tools/profile_learner.py live --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches --modes fused --memory-mib 3328 --warmup-steps 10
+```
+
+Repeat reference after fused. The larger allowance requires a validation
+window with that memory free. Saved-batch `measure` reports are explicitly
+labelled short-window results and hash every batch payload.
 
 ## Actor CUDA graphs
 

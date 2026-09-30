@@ -769,6 +769,7 @@ class FusedCudaTests(unittest.TestCase):
             ceiling = torch.where(mask > 0, math.inf, 0).to(x.dtype)
             cells = mask.sum(dtype=torch.float32)
             reference = hexnet.MaskedNorm(16).cuda()
+            reference.momentum = .7 if fmt == torch.channels_last else .1
             with torch.no_grad():
                 reference.weight.normal_()
                 reference.bias.normal_()
@@ -786,6 +787,8 @@ class FusedCudaTests(unittest.TestCase):
                 self.assert_bf16_close(a, b)
             torch.testing.assert_close(reference.running_mean, fused.running_mean)
             torch.testing.assert_close(reference.running_var, fused.running_var)
+            torch.testing.assert_close(reference.num_batches_tracked, fused.num_batches_tracked)
+            self.assertEqual(fused.num_batches_tracked.item(), 1)
 
     @torch.inference_mode()
     def test_line_kernels_match_reference(self):
@@ -814,6 +817,26 @@ class FusedCudaTests(unittest.TestCase):
                     fused.add_to(b)
                     tol = .02 if dtype == torch.bfloat16 else 2e-5
                     torch.testing.assert_close(a, b, atol=tol, rtol=tol)
+
+    def test_training_line_residual_gradients(self):
+        from hexnet_kernels import line_train_add
+
+        torch.manual_seed(3070)
+        line = hexnet.LineConv(8, 11).cuda()
+        with torch.no_grad():
+            line.weight.normal_(0, .2)
+        fused = copy.deepcopy(line)
+        x = torch.randn(3, 8, 24, 24, device='cuda', dtype=torch.bfloat16).requires_grad_()
+        x_fused = x.detach().clone().requires_grad_()
+        grad = torch.randn_like(x)
+        with torch.autocast('cuda', torch.bfloat16):
+            expected = x+line(x)
+            actual = line_train_add(x_fused, fused.weight)
+        expected_grads = torch.autograd.grad(expected, (x, line.weight), grad)
+        actual_grads = torch.autograd.grad(actual, (x_fused, fused.weight), grad)
+        self.assert_bf16_close(expected, actual)
+        for reference, candidate in zip(expected_grads, actual_grads):
+            self.assert_bf16_close(reference, candidate)
 
     def test_model_random_and_real_forward_backward(self):
         torch.manual_seed(3070)

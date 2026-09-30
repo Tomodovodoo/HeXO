@@ -226,6 +226,36 @@ def _finish(Partial, Mean, Var, Inv, Cells, X, T,
 
 
 @tr.jit
+def _running_update(Mean, Var, RunningMean, RunningVar, Tracked, Cells,
+                    C: tl.constexpr, MOM: tl.constexpr, K: tl.constexpr):
+    c = tl.arange(0, K)
+    valid = c < C
+    mean = tl.load(Mean+c, valid, 0)
+    var = tl.load(Var+c, valid, 0)
+    old_mean = tl.load(RunningMean+c, valid, 0)
+    old_var = tl.load(RunningVar+c, valid, 0)
+    cells = tl.load(Cells)
+    unbiased = tl.div_rn(var*cells, tl.maximum(cells-1., 1.))
+    # Match ATen's float32 lerp branch for scalar weights (native/Lerp.h).
+    if MOM < .5:
+        new_mean = old_mean + MOM*(mean-old_mean)
+        new_var = old_var + MOM*(unbiased-old_var)
+    else:
+        new_mean = mean-(mean-old_mean)*(1.-MOM)
+        new_var = unbiased-(unbiased-old_var)*(1.-MOM)
+    tl.store(RunningMean+c, new_mean, valid)
+    tl.store(RunningVar+c, new_var, valid)
+    tl.store(Tracked, tl.load(Tracked)+1)
+
+
+def norm_update(norm, mean, var, cells):
+    """Update fused training norm buffers in one launch; caller skips checkpoint replay."""
+    _running_update[(1,)](mean, var, norm.running_mean, norm.running_var,
+                          norm.num_batches_tracked, cells, mean.numel(), norm.momentum,
+                          tr.next_power_of_2(mean.numel()), enable_fp_fusion=False)
+
+
+@tr.jit
 def _normalized(x,mean,inv,weight,bias,D:tl.constexpr):
     shift=mean.to(D).to(tl.float32)
     centred=(x-shift).to(D).to(tl.float32)
@@ -255,29 +285,22 @@ def _xhat(x,mean,inv,D:tl.constexpr):
     return tl.fma(centred,inv.to(D).to(tl.float32),bias).to(D).to(tl.float32)
 
 
-@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'GS', 'T'])
-def _grad_reduce(X,M,G,Mean,Inv,Weight,Bias,Partial,N,H,W,
-                 XS,MS,GS,C:tl.constexpr,T,ACT:tl.constexpr,K:tl.constexpr):
-    c,t=tl.program_id(0),tl.program_id(1)
-    i=t*K+tl.arange(0,K)
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'GS', 'OS', 'PS'])
+def _grad_products(X,M,G,Gated,Product,Mean,Inv,Weight,Bias,N,H,W,
+                   XS,MS,GS,OS,PS,ACT:tl.constexpr,K:tl.constexpr):
+    c=tl.program_id(0)
+    i=tl.program_id(1)*K+tl.arange(0,K)
     x=tl.load(X+_offset(i,c,H,W,XS),i<N,0).to(tl.float32)
     g=tl.load(G+_offset(i,c,H,W,GS),i<N,0).to(tl.float32)
+    inv=tl.load(Inv+c)
     if ACT:
         m=tl.load(M+_offset(i,c,H,W,MS),i<N,0)
-        y=_normalized(x,tl.load(Mean+c),tl.load(Inv+c),tl.load(Weight+c),tl.load(Bias+c),X.dtype.element_ty)
+        y=_normalized(x,tl.load(Mean+c),inv,tl.load(Weight+c),tl.load(Bias+c),X.dtype.element_ty)
         g=tl.where((y>=0)&((m>0)|(y<=0)),g,0.)
-    h=_xhat(x,tl.load(Mean+c),tl.load(Inv+c),X.dtype.element_ty)
-    dw=(g*h).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(Partial+c*T+t,tl.sum(g,0))
-    tl.store(Partial+(C+c)*T+t,tl.sum(tl.where(i<N,dw,0),0))
-
-
-@tr.jit(do_not_specialize=['T'])
-def _grad_finish(Partial,Db,Dw,C:tl.constexpr,T,K:tl.constexpr):
-    c=tl.program_id(0)
-    i=tl.arange(0,K)
-    tl.store(Db+c,tl.sum(tl.load(Partial+c*T+i,i<T,0),0))
-    tl.store(Dw+c,tl.sum(tl.load(Partial+(C+c)*T+i,i<T,0),0))
+    g=g.to(Gated.dtype.element_ty).to(tl.float32)
+    h=_xhat(x,tl.load(Mean+c),inv,X.dtype.element_ty)
+    tl.store(Gated+_offset(i,c,H,W,OS),g,i<N)
+    tl.store(Product+_offset(i,c,H,W,PS),(g*h).to(Product.dtype.element_ty),i<N)
 
 
 @tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'GS', 'DS'])
@@ -309,15 +332,15 @@ class MaskedBatchNorm(torch.autograd.Function):
         n,k=b*h*w,1024
         t=tr.cdiv(n,k)
         partial=torch.empty((c,t),device=x.device,dtype=torch.float32)
-        mean=torch.empty_like(weight)
+        # Match ATen's reduction order. Sub-ULP mean differences can change
+        # BF16 activations enough to exceed the full-model gradient tolerance.
+        mean=(x*mask).sum((0,2,3),dtype=torch.float32)/cells
         var=torch.empty_like(weight)
         inv=torch.empty_like(weight)
         y=torch.empty_like(x)
         ms=mask.stride() if mask.shape[1]==c else (mask.stride(0),0,*mask.stride()[2:])
         grid=(c,t)
         common=dict(N=n,H=h,W=w,XS=x.stride(),MS=ms,T=t,K=k,enable_fp_fusion=False)
-        _reduce[grid](x,mask,mean,partial,VAR=False,**common)
-        _finish[(c,)](partial,mean,var,inv,cells,x,t,eps,False,tr.next_power_of_2(t),enable_fp_fusion=False)
         _reduce[grid](x,mask,mean,partial,VAR=True,**common)
         _finish[(c,)](partial,mean,var,inv,cells,x,t,eps,True,tr.next_power_of_2(t),enable_fp_fusion=False)
         _apply[grid](x,mask,y,mean,inv,weight,bias,n,h,w,x.stride(),ms,y.stride(),activate,k,enable_fp_fusion=False)
@@ -331,12 +354,176 @@ class MaskedBatchNorm(torch.autograd.Function):
         b,c,h,w=x.shape
         n,k=b*h*w,1024
         t=tr.cdiv(n,k)
-        partial=torch.empty((2,c,t),device=x.device,dtype=torch.float32)
-        db,dw=torch.empty_like(weight),torch.empty_like(weight)
+        gated=torch.empty_like(grad)
+        product=torch.empty_like(grad,dtype=torch.promote_types(grad.dtype,x.dtype))
         dx=torch.empty_like(x)
         ms=mask.stride() if mask.shape[1]==c else (mask.stride(0),0,*mask.stride()[2:])
-        _grad_reduce[(c,t)](x,mask,grad,mean,inv,weight,bias,partial,n,h,w,x.stride(),ms,grad.stride(),c,t,ctx.activate,k,enable_fp_fusion=False)
-        _grad_finish[(c,)](partial,db,dw,c,t,tr.next_power_of_2(t),enable_fp_fusion=False)
-        _grad_apply[(c,t)](x,mask,grad,dx,mean,inv,weight,bias,db,dw,cells,n,h,w,
-                            x.stride(),ms,grad.stride(),dx.stride(),ctx.activate,k,enable_fp_fusion=False)
-        return (dx,None,dw,db,None,None,None)[:len(ctx.needs_input_grad)]
+        _grad_products[(c,t)](x,mask,grad,gated,product,mean,inv,weight,bias,n,h,w,
+                               x.stride(),ms,grad.stride(),gated.stride(),product.stride(),
+                               ctx.activate,k,enable_fp_fusion=False)
+        # Preserve the reference reduction order before rounding the correction
+        # coefficients to bf16. A different tree can change those coefficients.
+        db=gated.sum((0,2,3),dtype=mean.dtype)
+        dw=product.sum((0,2,3),dtype=mean.dtype)
+        _grad_apply[(c,t)](x,mask,gated,dx,mean,inv,weight,bias,db,dw,cells,n,h,w,
+                            x.stride(),ms,gated.stride(),dx.stride(),False,k,enable_fp_fusion=False)
+        return (dx,None,dw.to(weight.dtype),db.to(weight.dtype),None,None,None)[:len(ctx.needs_input_grad)]
+
+
+# Training LineConv keeps the reference Toeplitz bmm operations and BF16
+# rounding. Only their NCHW staging, output gather, and tap gradients differ.
+@tr.jit(do_not_specialize=['B', 'H', 'W'])
+def _train_line_skew(X, Skew, B, H, W, C:tl.constexpr, K:tl.constexpr):
+    wide=H+W-1
+    i=tl.program_id(0)*K+tl.arange(0,K)
+    j,b=i%wide,i//wide%B
+    y,c=i//(wide*B)%H,i//(wide*B*H)
+    x=j-y
+    valid=i<C*H*B*wide
+    value=tl.load(X+((b*C+c)*H+y)*W+x,valid&(x>=0)&(x<W),0)
+    tl.store(Skew+i,value,valid)
+
+
+@tr.jit(do_not_specialize=['B', 'H', 'W'])
+def _train_line_planar(X, Planar, B, H, W, C:tl.constexpr, K:tl.constexpr):
+    i=tl.program_id(0)*K+tl.arange(0,K)
+    x,b=i%W,i//W%B
+    y,c=i//(W*B)%H,i//(W*B*H)
+    valid=i<C*H*B*W
+    tl.store(Planar+i,tl.load(X+((b*C+c)*H+y)*W+x,valid,0),valid)
+
+
+@tr.jit(do_not_specialize=['B', 'H', 'W'])
+def _train_line_gather(HV,Diagonal,X,Y,B,H,W,C:tl.constexpr,K:tl.constexpr):
+    i=tl.program_id(0)*K+tl.arange(0,K)
+    x,y=i%W,i//W%H
+    c,b=i//(W*H)%C,i//(W*H*C)
+    valid=i<B*C*H*W
+    wide=H+W-1
+    planar=((c*H+y)*B+b)*W+x
+    skew=((c*H+y)*B+b)*wide+x+y
+    hv=tl.load(HV+planar,valid,0).to(tl.float32)
+    dd=tl.load(Diagonal+skew,valid,0).to(tl.float32)
+    line=(hv+dd).to(Y.dtype.element_ty).to(tl.float32)
+    tl.store(Y+i,line+tl.load(X+i,valid,0).to(tl.float32),valid)
+
+
+@tr.jit(do_not_specialize=['B', 'H', 'W'])
+def _train_line_gather_dx(DH,DV,DD,G,DX,B,H,W,C:tl.constexpr,K:tl.constexpr):
+    i=tl.program_id(0)*K+tl.arange(0,K)
+    x,y=i%W,i//W%H
+    c,b=i//(H*W)%C,i//(C*H*W)
+    valid=i<B*C*H*W
+    wide=H+W-1
+    planar=((c*H+y)*B+b)*W+x
+    skew=((c*H+y)*B+b)*wide+x+y
+    h=tl.load(DH+planar,valid,0).to(tl.float32)
+    v=tl.load(DV+planar,valid,0).to(tl.float32)
+    d=tl.load(DD+skew,valid,0).to(tl.float32)
+    hv=(h+v).to(G.dtype.element_ty).to(tl.float32)
+    residual=(hv+tl.load(G+i,valid,0).to(tl.float32)).to(G.dtype.element_ty).to(tl.float32)
+    tl.store(DX+i,residual+d,valid)
+
+
+@tr.jit
+def _train_line_tap_diagonals(DH,DV,DD,DW,S:tl.constexpr,L:tl.constexpr,
+                              I:tl.constexpr,T:tl.constexpr):
+    c,axis=tl.program_id(0),tl.program_id(1)
+    tap=tl.arange(0,T)
+    i=tl.arange(0,I)
+    centre=L//2
+    if axis==0:
+        matrix=DH
+        j=i[None,:]+centre-tap[:,None]
+    elif axis==1:
+        matrix=DV
+        j=i[None,:]+tap[:,None]-centre
+    else:
+        matrix=DD
+        j=i[None,:]+L-1-centre-tap[:,None]
+    valid=(tap[:,None]<L)&(i[None,:]<S)&(j>=0)&(j<S)
+    values=tl.load(matrix+c*S*S+i[None,:]*S+j,valid,0).to(tl.float32)
+    tl.store(DW+(c*3+axis)*L+tap,tl.sum(values,1),tap<L)
+
+
+@tr.jit(do_not_specialize=['side'])
+def _train_line_three_toeplitz(Weight,Matrices,side,C:tl.constexpr,L:tl.constexpr,K:tl.constexpr):
+    group=tl.program_id(0)
+    axis,c=group//C,group%C
+    position=tl.program_id(1)*K+tl.arange(0,K)
+    row,column=position//side,position%side
+    difference=row-column
+    centre=L//2
+    tap=tl.where(axis==2,L-1-centre-difference,difference+centre)
+    value=tl.load(Weight+(c*3+axis)*L+tap,
+                  (position<side*side)&(tap>=0)&(tap<L),0)
+    tl.store(Matrices+group*side*side+position,value,position<side*side)
+
+
+def _train_line_matrices(weight,side):
+    c,_,length=weight.shape
+    matrices=torch.empty((3,c,side,side),dtype=weight.dtype,device=weight.device)
+    _train_line_three_toeplitz[(3*c,tr.cdiv(side*side,256))](
+        weight,matrices,side,c,length,256)
+    return matrices[0],matrices[1].transpose(1,2),matrices[2].transpose(1,2)
+
+
+class _TrainLineAdd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,x,weight):
+        b,c,h,w=x.shape
+        weight_bf16=weight.to(x.dtype)
+        horizontal,vertical,diagonal=_train_line_matrices(weight_bf16,h)
+        wide=h+w-1
+        skew=torch.empty((c,h,b,wide),dtype=x.dtype,device=x.device)
+        _train_line_skew[(tr.cdiv(skew.numel(),256),)](x,skew,b,h,w,c,256)
+        dd=torch.bmm(diagonal,skew.view(c,h,b*wide)).view(c,h,b,wide)
+        planar=torch.empty((c,h,b,w),dtype=x.dtype,device=x.device)
+        _train_line_planar[(tr.cdiv(planar.numel(),256),)](x,planar,b,h,w,c,256)
+        hv=torch.bmm(planar.view(c,h*b,w),horizontal).view(c,h,b*w)
+        hv.baddbmm_(vertical.to(hv.dtype),planar.view(c,h,b*w).to(hv.dtype))
+        out=torch.empty_like(x,memory_format=torch.contiguous_format)
+        _train_line_gather[(tr.cdiv(x.numel(),256),)](hv,dd,x,out,b,h,w,c,256)
+        ctx.save_for_backward(planar,skew,weight_bf16)
+        ctx.shape=b,c,h,w
+        return out
+
+    @staticmethod
+    def backward(ctx,grad):
+        planar_x,skew_x,weight=ctx.saved_tensors
+        b,c,h,w=ctx.shape
+        line_grad=grad.to(weight.dtype).contiguous()
+        dx=dw=None
+        wide=h+w-1
+        planar_g=torch.empty_like(planar_x)
+        _train_line_planar[(tr.cdiv(planar_g.numel(),256),)](
+            line_grad,planar_g,b,h,w,c,256)
+        skew_g=torch.empty_like(skew_x)
+        _train_line_skew[(tr.cdiv(skew_g.numel(),256),)](
+            line_grad,skew_g,b,h,w,c,256)
+        if ctx.needs_input_grad[1]:
+            dh=torch.bmm(planar_x.view(c,h*b,w).transpose(1,2),
+                         planar_g.view(c,h*b,w))
+            dv=torch.bmm(planar_g.view(c,h,b*w),
+                         planar_x.view(c,h,b*w).transpose(1,2))
+            dd=torch.bmm(skew_g.view(c,h,b*wide),
+                         skew_x.view(c,h,b*wide).transpose(1,2))
+            l=weight.shape[-1]
+            dw=torch.empty((c,3,l),dtype=torch.float32,device=grad.device)
+            _train_line_tap_diagonals[(c,3)](
+                dh,dv,dd,dw,h,l,tr.next_power_of_2(h),tr.next_power_of_2(l))
+            del dh,dv,dd
+        if ctx.needs_input_grad[0]:
+            horizontal,vertical,diagonal=_train_line_matrices(weight,h)
+            dh=torch.bmm(planar_g.view(c,h*b,w),horizontal.transpose(1,2)).view(c,h,b,w)
+            dv=torch.bmm(vertical.transpose(1,2),planar_g.view(c,h,b*w)).view(c,h,b,w)
+            dd=torch.bmm(diagonal.transpose(1,2),skew_g.view(c,h,b*wide)).view(c,h,b,wide)
+            dx=torch.empty((b,c,h,w),device=grad.device,dtype=line_grad.dtype)
+            _train_line_gather_dx[(tr.cdiv(dx.numel(),256),)](
+                dh,dv,dd,line_grad,dx,b,h,w,c,256)
+        return dx,dw
+
+
+def line_train_add(x,weight):
+    """Residual LineConv for contiguous NCHW CUDA bf16 activations and fp32 taps."""
+    return _TrainLineAdd.apply(x,weight)

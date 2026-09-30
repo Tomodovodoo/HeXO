@@ -253,8 +253,11 @@ class MaskedNorm(nn.BatchNorm2d):
         else:
             y, mean, var = _MaskedBatchNorm.apply(x, mask, self.weight, self.bias, cells, self.eps)
         with torch.no_grad():
-            self.num_batches_tracked += 1
-            if self.momentum is None:
+            if fused and self.momentum is not None:
+                from hexnet_kernels import norm_update
+                norm_update(self, mean, var, cells)
+            elif self.momentum is None:
+                self.num_batches_tracked += 1
                 seen, self.cells_seen = self.cells_seen, self.cells_seen+float(cells)
                 w, delta = float(cells)/self.cells_seen, mean-self.running_mean
                 biased = self.running_var*max(seen-1, 0)/max(seen, 1)
@@ -262,6 +265,7 @@ class MaskedNorm(nn.BatchNorm2d):
                 self.running_mean.add_(delta*w)
                 self.running_var.copy_(biased*self.cells_seen/max(self.cells_seen-1, 1))
             else:
+                self.num_batches_tracked += 1
                 self.running_mean.lerp_(mean, self.momentum)
                 self.running_var.lerp_(var*cells/(cells-1).clamp_min(1), self.momentum)
         return y if ceiling is None or fused else act(y, ceiling)
@@ -293,8 +297,15 @@ class Block(nn.Module):
             y = y+self.pool(pool(act(y, ceiling), count))[:, :, None, None]
         if self.line is not None:
             y = y*mask
-            # Recomputing the line matmuls in backward keeps training memory near the plain ResNet's.
-            y = y+checkpoint(self.line, y, use_reentrant=False) if torch.is_grad_enabled() else self.line.add_to(y)
+            train_line = (getattr(self.line, 'net_kernels', 'reference') == 'fused' and
+                          self.training and torch.is_grad_enabled() and y.is_cuda and
+                          y.dtype == torch.bfloat16 and y.is_contiguous() and
+                          y.stride(1) != 1 and self.line.weight.dtype == torch.float32)
+            if train_line:
+                from hexnet_kernels import line_train_add
+                y = line_train_add(y, self.line.weight)
+            else:
+                y = y+checkpoint(self.line, y, use_reentrant=False) if torch.is_grad_enabled() else self.line.add_to(y)
         return x+self.conv2(self.norm2(y, mask, cells, ceiling))
 
 
