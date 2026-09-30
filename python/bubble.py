@@ -1,5 +1,7 @@
 """Start, stop and inspect a Bubble training run, or play against it.
 
+Service identity is checked through the process command line, which needs Windows or a /proc file system.
+
 `train` creates the run directory and its first checkpoint when they are missing, then starts the learner,
 the actors, the evaluator, the proof pass and the dashboard as detached processes. Their process ids go to
 `<run>/processes.json`, their output to `<run>/logs/`. `stop` ends those processes, `status` reports them,
@@ -67,8 +69,7 @@ def arguments(pid):
     try:
         return [part.decode(errors='replace') for part in Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0') if part]
     except OSError:
-        line = subprocess.run(['ps', '-o', 'args=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
-        return shlex.split(line) if line else []
+        return []
 
 
 def matches(parts, script, run):
@@ -116,16 +117,27 @@ class Launcher:
         if not any(path.with_name('manifest.json').exists() for path in exports):
             run_steps([sys.executable, str(PYTHON / 'dense_learn.py'), '--run', str(self.run), '--steps', '0'])
 
-    def start(self, plan):
-        """Spawn every service; `processes.json.tmp` is the exclusive lock while services start, so two starts cannot
-        both pass the running check."""
+    STALE_LOCK_SECONDS = 60
+
+    def lock(self):
+        """Create `processes.json.tmp` exclusively; a lock older than STALE_LOCK_SECONDS with no service of this
+        run alive is abandoned and taken over."""
         partial = self.state_file.with_suffix('.json.tmp')
-        try:
-            handle = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-        except FileExistsError:
-            raise RuntimeError(f'another start is in progress for {self.run} ({partial} exists)') from None
+        for attempt in range(2):
+            try:
+                return os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL), partial
+            except FileExistsError:
+                age = time.time() - partial.stat().st_mtime if partial.exists() else 0
+                if attempt or age < self.STALE_LOCK_SECONDS or self.running():
+                    raise RuntimeError(f'another start is in progress for {self.run} ({partial} exists)') from None
+                partial.unlink(missing_ok=True)
+
+    def start(self, plan, prepare=lambda: None):
+        """Under the run lock: `prepare` the run, check nothing is running, spawn every service, publish the state."""
+        handle, partial = self.lock()
         state = {}
         try:
+            prepare()
             running = self.running()
             if running:
                 raise RuntimeError(f"{', '.join(sorted(running))} already running for {self.run}; stop first")
@@ -245,9 +257,10 @@ def main():
     args = parser.parse_args()
     launcher = Launcher(args.run)
     if args.command == 'train':
-        launcher.prepare(resolve_device(args.device), lambda command: subprocess.run(command, cwd=ROOT, check=True))
         plan = commands(launcher.run, args.actors, args.dashboard_port, args.seal, args.net_kernels)
-        for name, entry in launcher.start(plan).items():
+        prepare = lambda: launcher.prepare(resolve_device(args.device),
+                                           lambda command: subprocess.run(command, cwd=ROOT, check=True))
+        for name, entry in launcher.start(plan, prepare).items():
             print(f'{name:<10} pid {entry["pid"]}')
         print(f'dashboard  http://127.0.0.1:{args.dashboard_port}  logs {launcher.run / "logs"}')
     elif args.command == 'stop':

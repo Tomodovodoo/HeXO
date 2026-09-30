@@ -1,5 +1,7 @@
 import json
+import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -130,6 +132,18 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.launcher.start(self.plan)
         self.assertEqual(self.fake.spawned, [])
+
+    def test_start_takes_over_an_abandoned_lock(self):
+        lock = self.run / 'processes.json.tmp'
+        lock.write_text('')
+        stale = time.time() - 2 * bubble.Launcher.STALE_LOCK_SECONDS
+        os.utime(lock, (stale, stale))
+        self.assertEqual(sorted(self.launcher.start(self.plan)), sorted(bubble.SERVICES))
+
+    def test_prepare_runs_under_the_lock(self):
+        seen = []
+        self.launcher.start(self.plan, lambda: seen.append((self.run / 'processes.json.tmp').exists()))
+        self.assertEqual(seen, [True])
 
     def test_start_records_pids_and_refuses_a_second_start(self):
         state = self.launcher.start(self.plan)
