@@ -500,7 +500,8 @@ def dense_run(run, config, fresh=30):
     league = status(run/'league.json')
     evaluator['provisional'] = provisional(league, evaluator)
     return dict(name=run.name, config=config, actor=actor, actors=actors, learners=learners, evaluator=evaluator,
-                league=league, champion=champion, checkpoints=checkpoints, data=data, now=now)
+                league=league, external_ratings=external_ratings(run, league), champion=champion,
+                checkpoints=checkpoints, data=data, now=now)
 
 
 _jsonl = {}
@@ -667,6 +668,38 @@ def rated(run):
             if finite(c.get('elo')) and isinstance(c.get('step'), int)]
 
 
+def external_ratings(run, league):
+    """Provisional match estimates translated through their reference checkpoint's current league rating.
+
+    These are display references only. Source reports, checkpoint bytes and the league's zero must still match.
+    Combine the paired-match standard error with the published reference interval's approximate standard error.
+    """
+    checkpoints = {c['id']: c for c in league.get('checkpoints', []) if not c.get('skipped')}
+    zero = next(iter(checkpoints), None)
+    ratings = {}
+    for path in sorted((run/'matches').glob('*/*-elo-estimate.json')):
+        saved = read_json(path, {})
+        if saved.get('schema') != 'hexo-external-elo-estimate-v1': continue
+        match, estimate, opponent = saved['match'], saved['estimate'], saved['opponent']
+        reference = checkpoints.get(match['local_checkpoint'], {})
+        interval = reference.get('elo_interval')
+        if saved['scale']['zero_checkpoint'] != zero or reference.get('ema_sha256') != match['checkpoint_sha256'] \
+                or not finite(reference.get('elo')) or not interval or not all(finite(v) for v in interval): continue
+        report = path.parent/match['report']
+        if not report.is_file(): continue
+        stat = report.stat()
+        if report_digest(report, stat.st_mtime_ns, stat.st_size) != match['report_sha256']: continue
+        key = f"{opponent['model_id']}:{opponent['difficulty']}"
+        if key in ratings and ratings[key]['calculated_at'] >= saved['calculated_at']: continue
+        elo = reference['elo']-estimate['85k_minus_pulsatrix_elo']
+        width = 1.96*math.hypot((interval[1]-interval[0])/3.92, estimate['pair_adjusted_delta_sd'])
+        ratings[key] = dict(label=opponent.get('label', f"{opponent['model_id']} {opponent['difficulty']}"),
+                            elo=elo, elo_interval=[elo-width, elo+width], provisional=True, games=match['games'],
+                            reference=match['local_checkpoint'], note=saved.get('display_note', estimate['assumption']),
+                            source=str(path.relative_to(run)), calculated_at=saved['calculated_at'])
+    return ratings
+
+
 def project(root, fresh=30):
     """/api/project: every dense run directly under `root`, oldest first."""
     now, runs = time.time(), []
@@ -692,6 +725,7 @@ def project(root, fresh=30):
                          learner_heartbeat={v: s['age'] for v, s in learners.items()},
                          learner_stage={v: s.get('stage') for v, s in learners.items()},
                          actor_heartbeat=min(ages, default=None), actor_processes=len(actors),
+                         external_ratings=external_ratings(run, read_json(run/'league.json', {})),
                          logs=sorted(p.stem for p in (run/'metrics').glob('*.jsonl'))))
     return dict(root=str(root), now=now, runs=runs)
 
@@ -761,7 +795,9 @@ def actor_points(run):
 
 
 def series(run, config, variant, metric, x='step', max_points=1000, from_step=0):
-    """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval; seal_delta: the direct-match
+    """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval; seal_elo: the published
+    Seal rating and interval across the run's rated checkpoint coordinates; external_elo:<id>: a provisional
+    external match estimate on that same scale; seal_delta: the direct-match
     Elo minus Seal of each anchored checkpoint, league anchors.seal.matches) sorted by x and
     downsampled after dropping steps below from_step when x is 'step'; x is the learner step or hours since
     the run's created_at. Actor and GPU metrics have hours only. CURVE_METRICS have their own x only ('remaining' or 'ply'): [[grid point, y or null where unsupported], ...]
@@ -791,6 +827,14 @@ def series(run, config, variant, metric, x='step', max_points=1000, from_step=0)
         points = sorted((c['step'] if x == 'step' else hours(c['created_at']), c['elo'],
                          *(c['elo_interval'] if isinstance(c.get('elo_interval'), list) else (c['elo'], c['elo'])))
                         for c in rated(run) if c.get('variant') == variant and (x == 'step' or finite(c['created_at'])))
+    elif metric == 'seal_elo' or metric.startswith('external_elo:'):
+        league = read_json(run/'league.json', {})
+        reference = ((league.get('anchors') or {}).get('seal') or {}) if metric == 'seal_elo' else \
+                    external_ratings(run, league).get(metric.removeprefix('external_elo:'), {})
+        elo, interval = reference.get('elo'), reference.get('elo_interval')
+        points = sorted((c['step'] if x == 'step' else hours(c['created_at']), elo,
+                         *(interval if isinstance(interval, list) else (elo, elo)))
+                        for c in rated(run) if finite(elo) and (x == 'step' or finite(c['created_at'])))
     elif metric == 'seal_delta':
         made = {c['id']: c['created_at'] for c in rated(run)}
         league = read_json(run/'league.json', {})

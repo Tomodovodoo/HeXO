@@ -1010,6 +1010,86 @@ class DenseConfigTests(unittest.TestCase):
             self.assertEqual((kept[0], kept[-1]), (points[0], points[-1]))
             self.assertIn((777, 100.), kept)
 
+    def test_seal_series_uses_published_rating_on_the_league_scale(self):
+        import dashboard
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            league = dict(checkpoints=[dict(id='main/000010', variant='main', step=10, elo=100.),
+                                       dict(id='side/000020', variant='side', step=20, elo=600.)],
+                          anchors=dict(seal=dict(elo=-300., elo_interval=[-350., -250.],
+                                                matches=[dict(checkpoint='main/000010', elo_delta=55.)])))
+            for cid, created in (('main/000010', 3600.), ('side/000020', 7200.)):
+                path = run/'checkpoints'/cid/'manifest.json'
+                path.parent.mkdir(parents=True)
+                dense_eval.write_json(path, dict(created_at=created))
+            dense_eval.write_json(run/'league.json', league)
+            config = dict(created_at=0.)
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_elo')['points'],
+                             [[10, -300., -350., -250.], [20, -300., -350., -250.]])
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_elo', 'hours')['points'],
+                             [[1., -300., -350., -250.], [2., -300., -350., -250.]])
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_elo', from_step=20)['points'],
+                             [[20, -300., -350., -250.]])
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_delta')['points'], [[10, 55.]])
+            league['anchors']['seal'].update(elo=450., elo_interval=[400., 500.])
+            dense_eval.write_json(run/'league.json', league)
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_elo')['points'][-1], [20, 450., 400., 500.])
+            league['anchors'] = {}
+            dense_eval.write_json(run/'league.json', league)
+            self.assertEqual(dashboard.series(run, config, 'main', 'seal_elo')['points'], [])
+
+    def test_external_rating_follows_reference_and_checks_saved_evidence(self):
+        import dashboard
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            league = dict(checkpoints=[dict(id='main/000500', variant='main', step=500, elo=0.),
+                                       dict(id='main/085000', variant='main', step=85000, elo=1379.,
+                                            elo_interval=[1220., 1538.], ema_sha256='checkpoint')])
+            for cid, created in (('main/000500', 3600.), ('main/085000', 7200.)):
+                path = run/'checkpoints'/cid/'manifest.json'
+                path.parent.mkdir(parents=True)
+                dense_eval.write_json(path, dict(created_at=created))
+            dense_eval.write_json(run/'league.json', league)
+            folder = run/'matches'/'standard'
+            folder.mkdir(parents=True)
+            report = folder/'report.json'
+            dense_eval.write_json(report, dict(wins=42, losses=22))
+            saved = dict(schema='hexo-external-elo-estimate-v1', calculated_at='2026-09-30',
+                         scale=dict(zero_checkpoint='main/000500'),
+                         match=dict(local_checkpoint='main/085000', checkpoint_sha256='checkpoint', games=64,
+                                    report='report.json', report_sha256=hashlib.sha256(report.read_bytes()).hexdigest()),
+                         opponent=dict(model_id='pulsatrix-10-best', difficulty='standard', label='Pulsatrix Standard'),
+                         estimate={'85k_minus_pulsatrix_elo': 112., 'pair_adjusted_delta_sd': 37.,
+                                   'assumption': 'Budget differs'})
+            dense_eval.write_json(folder/'pulsatrix-elo-estimate.json', saved)
+            key = 'pulsatrix-10-best:standard'
+            rating = dashboard.external_ratings(run, league)[key]
+            width = math.hypot(159., 1.96*37.)
+            self.assertEqual((rating['elo'], rating['provisional'], rating['games']), (1267., True, 64))
+            self.assertEqual(rating['elo_interval'], [1267.-width, 1267.+width])
+            config = dict(created_at=0.)
+            metric = 'external_elo:'+key
+            self.assertEqual(dashboard.series(run, config, 'side', metric)['points'],
+                             [[500, 1267., *rating['elo_interval']], [85000, 1267., *rating['elo_interval']]])
+            self.assertEqual(dashboard.series(run, config, 'main', metric, 'hours')['points'],
+                             [[1., 1267., *rating['elo_interval']], [2., 1267., *rating['elo_interval']]])
+            self.assertEqual(len(dashboard.series(run, config, 'main', metric, from_step=2000)['points']), 1)
+            self.assertEqual(dashboard.dense_run(run, config)['external_ratings'][key], rating)
+            self.assertEqual(dashboard.read_json(run/'league.json'), league)
+            reference = league['checkpoints'][1]
+            reference.update(elo=1479., elo_interval=[1320., 1638.])
+            self.assertEqual(dashboard.external_ratings(run, league)[key]['elo'], 1367.)
+            self.assertAlmostEqual(dashboard.external_ratings(run, league)[key]['elo_interval'][0], 1367.-width)
+            reference['ema_sha256'] = 'different checkpoint'
+            self.assertEqual(dashboard.external_ratings(run, league), {})
+            reference['ema_sha256'] = 'checkpoint'
+            league['checkpoints'][0]['id'] = 'main/000000'
+            self.assertEqual(dashboard.external_ratings(run, league), {})
+            league['checkpoints'][0]['id'] = 'main/000500'
+            report.write_text('{"wins": 43, "losses": 21}')
+            self.assertEqual(dashboard.external_ratings(run, league), {})
+            self.assertEqual(dashboard.series(run, config, 'main', metric)['points'], [])
+
     def test_provisional_league_row(self):
         """The league row of an unrated candidate under evaluation comes from the status tally, offset by the
         opponent's league Elo (Seal: its anchor Elo); rated candidates and idle evaluators have none."""
