@@ -57,206 +57,110 @@ GPU deadline, and closes the measurement's own solver processes on timeout.
 
 ## Training LineConv and running statistics
 
-The learner's fused mode packs planar and skewed line inputs in Triton,
-uses the existing cuBLAS products, and gathers the result with the residual
-addition. It retains those packed inputs for backward. Three cuBLAS products
-compute the input gradient; three more products and an FP32 diagonal reduction
-compute tap gradients. A fused gather adds the residual gradient in the
-reference's bf16 order. This removes activation recomputation and the slower
-direct tap-gradient reduction.
-Normalization updates its running mean, variance and batch counter in one
-kernel. Its mean and backward sums use PyTorch's reduction order: sub-ULP
-differences in these sums can change the bf16 correction coefficients and
-amplify downstream. Triton still combines the elementwise activation,
-gradient products and input-gradient calculation. Cumulative recalibration
-retains the existing implementation.
+`--net-kernels fused` keeps the learner's NCHW layout, cuDNN hex convolutions
+and cuBLAS LineConv products. Triton packs the planar and skewed inputs,
+gathers their outputs with the residual addition, and reduces tap gradients.
+Backward retains the packed inputs and uses three cuBLAS products for input
+gradients. Checkpoint tensors and default `reference` loading are unchanged.
 
-These changes use the existing `--net-kernels fused` flag. They add no learner
-graph flag, checkpointing flag, dependency or checkpoint format change.
+Masked normalization combines activation gating, gradient products and
+input-gradient application. One kernel updates the running statistics and
+batch counter. Mean and backward channel sums retain PyTorch's reduction
+order because small FP32 differences can alter bf16 correction coefficients
+and downstream gradients. LineConv preserves the reference's bf16 rounding
+at directional and residual additions. Cumulative recalibration is unchanged.
 
-Validation used `Learner.train_step` with model, optimizer and EMA state from
-export 85000. The source run stayed read-only. The owner authorized stopping
-the learner after that export and using its 3328 MiB allocator allowance.
-GPU work has a 55-second watchdog and at least 60 seconds of cooldown.
+The existing CUDA checks pass for masked normalization and random and real
+full-model forward/backward. A real 256-row `Learner.train_step` from export
+85000 passed every first-step gradient, model tensor and EMA tensor against
+reference, under the unchanged two-bf16-epsilon bound of 1.5625% plus the
+existing absolute allowance. Worst scaled gradient error was 0.218%; model
+and EMA errors were 0.000617% and 0.00000571%. Checkpoints load in both modes.
 
-The corrected revision passed the affected random/real full-model and
-masked-normalization CUDA checks at export 85000, plus the full-batch
-gradient/model/EMA comparison described below. Four fresh production-loop
-windows then used the same frozen corpus and settings with a 2560 MiB cap.
-Another thread's encoder experiment shared the card throughout. These windows
-include rendering, queue waits, padding, transfers, training and metric
-flushes, and exclude renderer startup and one full warmup step.
+The final throughput comparison uses the actual `Renderers.next` and
+`Learner.train_step` loop, including queue waits, padding, transfers, all
+losses, backward, clipping, AdamW, EMA and metric flushes. Each fresh process
+warms ten real training steps, then measures at least twenty active seconds
+with a final GPU synchronization. Renderer startup, pacing sleeps, validation
+and exports are excluded. No run files are written.
 
-| UTC report start, September 29 | Mode | Timed steps | Active seconds | Rows/s |
-|---|---|---:|---:|---:|
-| 22:57:08 | Reference | 23 | 20.82 | 282.77 |
-| 22:58:58 | Deployed fused | 25 | 20.58 | 310.91 |
-| 23:00:47 | Corrected fused | 31 | 20.05 | 395.78 |
-| 23:02:34 | Reference | 21 | 20.54 | 261.67 |
+All four windows use export 85000's model, optimizer, EMA and settings, two
+production renderers, the same frozen corpus of 1,647 committed replay shards,
+and a 3328 MiB allocator cap. The competing encoder experiment had finished;
+the existing evaluator and other live processes were left running. Renderer
+queue order varies, so the windows sample the same corpus without claiming
+an identical timed batch sequence.
 
-The pooled reference rate is 272.29 rows/s. Corrected fused is **1.45x
-reference** and **1.27x deployed fused**. The learner's 2x target remains
-unmet. The corrected window reached 1818/2558 MiB allocated/reserved; its
-mean renderer wait was 9.47 ms per batch. All windows used the same allocator
-cap. Their renderer queue order differs, so the batches are representative
-of the same corpus rather than byte-identical between processes.
+| September 30 UTC report start | Mode | Timed steps | Active seconds | Samples/s | Peak allocated/reserved MiB |
+|---|---|---:|---:|---:|---:|
+| 00:26:47 | Reference | 37 | 20.43 | 463.60 | 1956 / 2916 |
+| 00:33:29 | Corrected fused | 51 | 20.00 | 652.67 | 1818 / 2766 |
+| 00:35:43 | Deployed fused | 45 | 20.61 | 559.01 | 1528 / 2158 |
+| 00:37:38 | Reference | 33 | 20.06 | 421.13 | 1956 / 2916 |
 
-These reports used one warmup batch. Their first four timed steps took
-5.46 to 6.02 seconds, substantially longer than later steps. The quoted rates
-retain that startup cost. The benchmark now warms ten actual renderer batches
-before timing and records any new padded bucket shapes encountered afterward;
-new measurements must use the same warmup for every compared mode.
+Pooling reference rows and active seconds gives **442.55 samples/s**.
+Corrected fused is **1.47x reference** and **1.17x deployed fused**. The twofold
+learner target was not reached; the owner accepted these results for delivery.
+These are short production-loop windows, not a forecast of throughput while
+four actors and the learner compete for the card.
 
-The corrected saved-batch profile records 4585 launches, 270.64 ms in kernels,
-36.19 ms in CPU launch calls and 10,501,104 H2D bytes in 0.563 ms. Leading
-groups are cuDNN weight gradient 31.85 ms, input gradient 30.24 ms, forward
-29.01 ms, NCHW-to-NHWC conversion 16.93 ms, line skew packing 14.10 ms,
-PyTorch channel reductions 10.33 ms and norm gradient products 9.96 ms.
-Convolution/GEMM arithmetic including convolution backward totals about
-3.046 TFLOPs, or 11.25 TF/s over summed kernel time, 25.9% of the dense bf16
-peak. This remains an arithmetic estimate; DRAM counters were unavailable.
-The device interval contains 271.92 ms of activity and 233.64 ms of gaps
-while the encoder experiment shares the GPU. Those gaps are not measured
-launch overhead. The three warmed saved-batch steps recorded no allocator
-retries or OOMs. The live windows did not yet record allocator retry counts.
+All windows recorded zero allocator retries and OOMs. Mean renderer wait was
+8.23-9.75 ms per batch. New padded shapes still occurred after warmup, and
+their setup cost remains in the measured rates. Fused processed about 1.3%
+more padded cells per batch than the reference windows. GPU work lasted
+32.8-33.6 seconds per child, with a 55-second watchdog, at least 60 seconds
+idle between measurements, BelowNormal priority and two CPU threads. Each
+child set the initial 12% allocator fraction before using the separately
+authorized larger allowance.
 
-The older measurements below predate the input-gradient and normalization
-corrections and used different shared-card load and memory limits. Their
-rates must not be multiplied by the current comparison or attributed to
-the corrected revision.
+`shipped` pins merged PR 179's kernels at
+`edb9f868dfc4c6bb38aec2032222a424e1404505`. Reports are
+`artifacts/gpu-kernels/learner-live-*-20260930*.json`, with the first reference
+under `artifacts/learner-profile`. The summary and source report paths are in
+`artifacts/gpu-kernels/learner-live-warm10-summary.json`. All four share window
+SHA-256 `2041a012701e703ee21c9a123b1b917995bd45bbedae590cb2028ae55b12fa4e`.
 
-The initial PR comparison warmed ten padded shapes and ran reference/fused/
-reference on three successive real 256-row batches saved at step 82500.
-Omitting each phase's first timed step gave 90.65 reference versus 149.10
-fused samples/s, **1.64x**. This was a short `train_step` comparison, excluding
-rendering and queue waits; it does not establish sustained learner throughput.
+Earlier 395.78 and 557.67 samples/s reports used different warmup, GPU load
+and code revisions. The 395.78 window included first-use setup and competed
+with the encoder experiment; 557.67 used a superseded kernel. Neither rate
+should be compared directly with the final table or compounded with its gain.
+The saved-batch 2.09x result excluded rendering and never established the
+production-loop target.
 
-The matrix-gradient revision then measured 629.58 versus 710.82 samples/s,
-**1.13x** over that initial fused path, with identical inputs and saved states.
-Allocated/reserved memory rose from 1416/2102 to 1803/2720 MiB. This second
-short comparison ran under a different shared-card load; its gain must not be
-multiplied by the earlier 1.64x result. The renderer-inclusive results below
-measure the final path directly and remain below the general 2x learner target.
+CPU/CUDA profiling with input shapes on a saved real 256-row step gives:
 
-Separate CPU+CUDA profiles of a full 256-row step, with input shapes, show:
-
-| Per-step metric | Reference | Initial fused | Matrix-gradient fused |
-|---|---:|---:|---:|
-| Kernel launches | 11,174 | 6,225 | 4,335 |
-| Sum of kernel durations | 372.16 ms | 285.29 ms | 272.36 ms |
-| CPU kernel-launch calls | 113.23 ms | 55.26 ms | 32.82 ms |
-| H2D bytes | 10,502,784 | 10,501,104 | 10,501,104 |
-| H2D copy-engine time | 0.921 ms | 0.630 ms | 0.553 ms |
-
-| Leading kernel group | Reference ms | Matrix-gradient fused ms |
+| Per-step metric | Original reference | Corrected fused |
 |---|---:|---:|
-| Dominant cuDNN weight gradient | 29.59 | 33.52 |
-| Dominant cuDNN input gradient | 29.29 | 30.17 |
-| Dominant cuDNN forward | 28.23 | 28.94 |
-| Direct LineConv input gradient | absent | 19.89 |
-| NCHW-to-NHWC conversion | 16.37 | 18.08 |
-| LineConv skew packing | separate copies | 14.61 |
+| Kernel launches | 11,174 | 4,585 |
+| Sum of kernel durations | 372.16 ms | 270.64 ms |
+| CPU kernel-launch call time | 113.23 ms | 36.19 ms |
+| H2D copy-engine time | 0.921 ms | 0.563 ms |
 
-These profiles ran in separate windows. Launch-call CPU time is measured
-submission cost, not a claim that every GPU gap is launch overhead. H2D
-copy-engine timing excludes pageable-host staging and waiting. The final trace
-spent 107.7 ms inside host `cudaMemcpyAsync` calls, mostly in three pageable
-copies. Those three calls overlapped 101.5 ms of active GPU work out of
-104.8 ms total, so their host duration is not removable wall time. The device
-timeline spans 350.8 ms, including 273.6 ms of kernels, copies and memsets and
-77.2 ms of fragmented idle time. Pinning each padded bucket measured 726.15 samples/s versus 726.44
-for the surrounding unpinned phases, with identical first-step losses. It
-provided no measurable throughput gain and is not included.
+The leading corrected kernel groups are cuDNN weight gradient at 31.85 ms,
+input gradient at 30.24 ms, forward at 29.01 ms, layout conversion at 16.93 ms,
+line skew packing at 14.10 ms, channel reductions at 10.33 ms and norm
+gradient products at 9.96 ms. H2D traffic totals 10,501,104 bytes. Estimated
+convolution/GEMM arithmetic is 3.046 TFLOPs, giving 11.25 TF/s over summed
+kernel time, 25.9% of the dense bf16 peak. DRAM counters were unavailable;
+achieved DRAM bandwidth is not claimed. The two profiles ran in different
+shared-card windows. The corrected device timeline had 233.64 ms of gaps
+while the encoder experiment was active; those gaps are not measured launch
+overhead. CPU collation and padding measurements appear below.
 
-Convolution/GEMM shapes plus convolution backward give about 3.14 versus 2.95
-TFLOPs per step. Dividing by summed kernel time gives 8.43 versus 10.85 TF/s,
-19.4% versus 24.9% of the 43.5 TF/s dense bf16 peak. These are arithmetic
-estimates excluding custom-kernel arithmetic, not hardware counters. Achieved
-DRAM bandwidth remains unmeasured. CPU collation and padding measurements from
-the earlier snapshot are reported below.
-
-The earlier matrix path passed first-step gradients, model and EMA against
-the initial fused path, but failed the full-batch reference peak-error check
-for `blocks.5.pool.weight` and `norm.bias`. Preserving the reference mean
-reduction fixed that comparison: every gradient, model tensor and EMA tensor
-passed, with worst scaled gradient error 0.971% against the unchanged 1.5625%
-bound. The newer checkpoint also exposed a small-batch `blocks.2.pool.bias`
-failure. Isolating normalization and LineConv showed contributions from both;
-preserving normalization's backward reductions and cuBLAS input-gradient
-products fixed the affected random/real model tests. The final combined
-revision also passed every first-step gradient, model and EMA comparison
-against reference on the saved real 256-row batch, with worst scaled gradient
-error 0.218%, model error 0.000617% and EMA error 0.00000571%. This check used
-a 2560 MiB cap; peak allocated/reserved memory was 1956/2184 MiB for reference
-and 1818/2104 MiB for fused. The two timed steps after the first step measured
-260.54 versus 545.55 rows/s, 2.09x, while another GPU experiment was active.
-That short comparison does not establish the production-loop target.
-
-The benchmark's `shipped` mode now loads the normalization implementation from
-merged PR 179, commit `edb9f868dfc4c6bb38aec2032222a424e1404505`, and records its
-kernel blob. It therefore remains a comparison against the deployed code
-after the current normalization implementation changes.
-
-`tools/profile_learner.py live` measures the production `Renderers.next` and
-`Learner.train_step` loop, including regret sampling, queue waits, padding,
-transfers, all losses, backward, clipping, AdamW, EMA and the usual metric
-flushes. It uses the actual checkpoint settings and a hashed copy of committed
-replay files under the worktree, so ongoing solver writes cannot change the
-comparison. Each mode must complete at least ten steps and twenty active
-seconds. CPU renderer startup occurs before the GPU watchdog begins. Run
-writes, pacing sleeps, validation and checkpoint exports are outside the
-measurement.
-
-Five fresh-process windows on September 29 used export 85000's model,
-optimizer, EMA and learner settings, the same frozen replay corpus (1,647
-committed shards), two renderers and a 3328 MiB allocator cap. `shipped` means
-the previously deployed fused normalization with reference training LineConv;
-`fused` means the new matrix-gradient training path. Each process consumed one
-rendered batch for a full warmup `train_step`, then timed successive real
-batches. The rate includes queue waiting and a final GPU synchronization, but
-excludes the roughly 18 to 19 seconds of CPU renderer startup and the warmup step.
-
-| UTC start | Mode | Timed steps | Active seconds | Rows/s |
-|---|---|---:|---:|---:|
-| 21:04:26 | Original reference | 28 | 20.54 | 349.02 |
-| 21:06:14 | Deployed fused (`shipped`) | 27 | 20.41 | 338.58 |
-| 21:08:31 | New fused | 44 | 20.20 | 557.67 |
-| 21:10:27 | Deployed fused (`shipped`) | 35 | 20.46 | 437.85 |
-| 21:13:27 | Original reference | 27 | 20.23 | 341.73 |
-
-Pooling each repeated mode as total timed rows divided by total active time
-gives **345.40 rows/s reference** and **388.27 rows/s deployed fused**. The
-single new-fused window is **557.67 rows/s**, or **1.61x reference** and
-**1.44x deployed fused** by those pooled rates. The two deployed-fused windows
-span 338.58 to 437.85 rows/s under changing shared-card load; the new path has
-only one live observation. Render workers have independent seeded streams and
-their queue arrival order varies, so these are comparable workload windows,
-not identical batch sequences. The **2x reference target was not met** in
-this test. These live rates supersede the separate short-window ratios for
-assessing learner-loop throughput; neither short-window gain is compounded.
+Learner graphs and `torch.compile` are not part of this change. Tested private
+graphs were slower and approached the memory cap; the compile probe failed
+while lowering custom Triton calls. The measured implementation needs only
+the existing optional Triton installation, with no compiler or toolkit install.
 
 ```text
 python tools/profile_learner.py prepare --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches
-python tools/profile_learner.py live --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches --modes reference --memory-mib 3328
-python tools/profile_learner.py live --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches --modes fused --memory-mib 3328
+python tools/profile_learner.py live --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches --modes reference --memory-mib 3328 --warmup-steps 10
+python tools/profile_learner.py live --run /path/to/runs/dense-v1 --checkpoint /path/to/checkpoints/main/085000 --batches artifacts/learner-profile/batches --modes fused --memory-mib 3328 --warmup-steps 10
 ```
 
-Repeat reference after fused. The larger allocator cap requires a validation
+Repeat reference after fused. The larger allowance requires a validation
 window with that memory free. Saved-batch `measure` reports are explicitly
-labelled short-window results and record SHA256 hashes of their batch payloads.
-The five live reports and their per-step bucket counts are under
-`artifacts/gpu-kernels/learner-live-*.json`.
-
-Learner graphs were removed after real-workload trials: five private graphs
-with block recomputation reached 131.9 samples/s versus 146.9 eager, and one
-40x40 graph reached 140.7 versus 145.3 while reserving 3324 MiB. Actor graphs
-remain available as described below.
-
-A bounded `torch.compile` trial on the real 40x40 training bucket failed in
-PyTorch 2.11 Inductor while lowering the custom Triton kernels' runtime stride
-tuples. The error was `TypeError: '<=' not supported between instances of
-'tuple' and 'int'`. It exited after 38.4 seconds without a compiled performance
-result. No compiler or toolkit was installed, and compile mode is not shipped.
+labelled short-window results and hash every batch payload.
 
 ## Actor CUDA graphs
 
