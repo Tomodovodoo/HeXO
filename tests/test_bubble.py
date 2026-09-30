@@ -91,7 +91,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(target.name, '125000')
         self.assertEqual((target / 'ema.pt').read_bytes(), b'weights')
         self.assertTrue((target / 'manifest.json').exists())
-        self.assertFalse((self.run / 'checkpoints' / 'download').exists())
+        self.assertEqual([p.name for p in (self.run / 'checkpoints').iterdir()], ['play'])
 
 
 class MatchTests(unittest.TestCase):

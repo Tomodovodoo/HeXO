@@ -314,25 +314,28 @@ def install(run, source, step, variant='play'):
     target = Path(run) / 'checkpoints' / checkpoint
     target.mkdir(parents=True, exist_ok=True)
     manifest = Path(source).with_name('manifest.json')
+    stamp = f'.{os.getpid()}.tmp'
     for name, path in (('ema.pt', Path(source)), ('manifest.json', manifest)):
         if path.exists():
-            shutil.copyfile(path, target / (name + '.tmp'))
-            os.replace(target / (name + '.tmp'), target / name)
+            shutil.copyfile(path, target / (name + stamp))
+            os.replace(target / (name + stamp), target / name)
     champion = Path(run) / 'champion.json'
-    champion.with_suffix('.json.tmp').write_text(json.dumps(dict(checkpoint=checkpoint)), encoding='utf-8')
-    os.replace(champion.with_suffix('.json.tmp'), champion)
+    champion.with_suffix(f'.json{stamp}').write_text(json.dumps(dict(checkpoint=checkpoint)), encoding='utf-8')
+    os.replace(champion.with_suffix(f'.json{stamp}'), champion)
     return target
 
 
 def download(run, fetch=fetch):
     """Fetch the newest released Bubble into `run`. `releases/latest` redirects to the release's tag page, whose
-    number is the checkpoint step; the assets are then read from that release."""
+    number is the checkpoint step; the assets are then read from that release. Staging and temporary names are
+    unique per process, so concurrent installs never touch each other's files."""
     from urllib.error import HTTPError
     _, tag_page = fetch(RELEASES + 'latest')
     tag = tag_page.rstrip('/').rsplit('/', 1)[-1]
     step = int(re.search(r'(\d+)', tag).group(1))
-    staging = Path(run) / 'checkpoints' / 'download'
-    staging.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    (Path(run) / 'checkpoints').mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix='download.', dir=Path(run) / 'checkpoints'))
     (staging / 'ema.pt').write_bytes(fetch(f'{RELEASES}download/{tag}/ema.pt')[0])
     try:
         (staging / 'manifest.json').write_bytes(fetch(f'{RELEASES}download/{tag}/manifest.json')[0])
