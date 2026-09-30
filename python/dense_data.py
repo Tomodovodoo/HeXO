@@ -539,6 +539,9 @@ class ReplayWindow:
     agrees; full-search and exact rows are always retained (`retained`). The training index holds retained rows
     only (regret priority draws included), the validation index every held-out row. At fraction 1 every row is
     retained and nothing is filtered.
+    Priority also includes searched, certified losses whose saved network prediction has error at least 0.1.
+    Those errors are cached when a shard loads and share the existing regret sampler and fourfold exposure cap;
+    computing them needs no inference or solver calls and creates no actor restart entries.
     Counts: `total_rows` is the pacing count, the retained trained rows (see `trained`) of all shards, held-out
     rows included; `rows` the window's trained rows (retained or not); `retained_rows` the training index and
     `retained_fraction` its share of the window's trained rows outside the validation split (1 without any);
@@ -572,13 +575,26 @@ class ReplayWindow:
         self.policy_dir = self.run_dir/'cache'/'policies' if policy_dir is None else Path(policy_dir)
         self.manifests = {}; self.shards = {}; self.values = OrderedDict()
         self.unlabelled = set(); self.deblunders = {}
-        self.regret_mtime = None; self.regret_entries = {}
+        self.regret_mtime = None; self.regret_entries = {}; self.loss_regret = {}
         self.refresh()
         self.refresh_regret()
 
     def load(self, name):
         path = self.run_dir/'shards'/name
         episodes, rows = read_shard(path, policies=False)
+        losses = {}
+        for row in rows:
+            if row.get('proven') != -1 or row.get('line'):
+                continue
+            predictions = episodes[row['game']].get('network_values')
+            value = predictions[row['ply']] if predictions is not None else None
+            if value is not None:
+                regret = (1+value)/2
+                if not 0 <= regret <= 1:
+                    raise ValueError(f'Invalid network value at {name}/{row["game"]}/{row["ply"]}')
+                if regret >= .1:
+                    losses[name, row['game'], row['ply']] = regret
+        self.loss_regret[name] = losses
         offsets = load_offsets(path, len(rows))
         labels, self.deblunders[name] = proof_annotations(path)
         if labels is None:
@@ -626,6 +642,7 @@ class ReplayWindow:
         for name in set(self.shards) - {n for n, _ in admitted}:
             del self.shards[name]; self.unlabelled.discard(name)
             del self.deblunders[name]
+            del self.loss_regret[name]
             for key in [k for k in self.values if k[0] == name]:
                 del self.values[key]
         self.prune({n for n, _ in admitted})
@@ -656,10 +673,14 @@ class ReplayWindow:
         self.index, self.validation = (Rows(names, flat(ids), flat(rows)) for ids, rows in parts)
         self.rows = candidates+len(self.validation)
         self.retained_rows = len(self.index); self.retained_fraction = self.retained_rows/candidates if candidates else 1.
+        priorities = dict(self.regret_entries)
+        for name in names:
+            for key, regret in self.loss_regret[name].items():
+                priorities[key] = max(priorities.get(key, 0.), regret)
         self.regret_positions = np.array([k for k, (name, i) in enumerate(self.index)
-                                          if (name, int(self.shards[name].game[i]), int(self.shards[name].ply[i]))
-                                          in self.regret_entries], np.int32) if self.regret_entries else np.zeros(0, np.int32)
-        self.regret_weights = np.array([self.regret_entries[(name, int(self.shards[name].game[i]),
+                                           if (name, int(self.shards[name].game[i]), int(self.shards[name].ply[i]))
+                                           in priorities], np.int32) if priorities else np.zeros(0, np.int32)
+        self.regret_weights = np.array([priorities[(name, int(self.shards[name].game[i]),
                                                              int(self.shards[name].ply[i]))]
                                         for name, i in (self.index[k] for k in self.regret_positions)], np.float64)
         self.regret_rows = len(self.regret_positions)
@@ -717,7 +738,7 @@ class ReplayWindow:
             self.set_regret(entries)
 
     def set_regret(self, entries):
-        """Use one captured buffer snapshot for this window's priority rows."""
+        """Use a captured restart buffer alongside the certified loss errors."""
         if entries != self.regret_entries:
             self.regret_entries = entries
             self.refresh()
