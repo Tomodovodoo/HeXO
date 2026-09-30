@@ -5374,56 +5374,87 @@ class EvaluatorLoopTests(unittest.TestCase):
         verdict = evaluator.verdict('main/000030', 'main/000020')
         self.assertEqual(evaluator.lanes(verdict, 'main/000030', 'main/000020'), {('main/000030', 'main/000020', 'champion'): 16})
 
-    def test_fill_order_seal_then_generalization_then_the_widest_ladder_pair(self):
-        """Fill priority: the champion vs Seal while their interval is wide, then one round of the newest rated
-        checkpoint vs the previous champion, then the widest ladder pair; a waiting checkpoint interrupts."""
-        evaluator = self.start(idle_fill=True, anchor_target_halfwidth=1e-3, seal_ms=5, fill_top=3)
+    def test_fill_repairs_shared_rating_uncertainty_through_older_checkpoints(self):
+        """An uncertain early bridge dominates the leading ratings; more top-versus-top games barely help."""
+        evaluator = self.start(idle_fill=True, anchor_target_halfwidth=0, fill_top=2, games=64)
+        self.export(10, 20, 30, 40)
+        self.report('main/000020', 'main/000010', [1, 1]*3+[0, 0]*2)
+        self.report('main/000030', 'main/000020', [1, 1]*60+[0, 0]*40)
+        self.report('main/000040', 'main/000030', [1, 1]*60+[0, 0]*40)
+        entry = lambda step: dict(id=f'main/{step:06d}', variant='main', step=step, elo=0., matches=[])
+        evaluator.league.update(champion='main/000040', checkpoints=[entry(step) for step in (10, 20, 30, 40)])
+        dense_eval.write_league(self.run, evaluator.league, evaluator.config)
+        chosen, opponent, kind, games = evaluator.fill()
+        self.assertEqual({chosen['id'], opponent}, {'main/000010', 'main/000030'})
+        self.assertEqual((kind, games), ('fill', 64))
+        plan = evaluator.status['fill_uncertainty']
+        self.assertEqual({t['a'] for t in plan['targets']}, {'main/000030', 'main/000040'})
+        self.assertGreater(plan['expected_reduction'], 40)
+        for target in plan['targets']:
+            self.assertGreater(target['halfwidth']-target['expected_halfwidth'], 20)
+        # Archives contribute to the same posterior as the published rating, even after a protocol change.
+        path = dense_eval.report_path(self.run, 'main/000020', 'main/000010')
+        path.rename(path.with_name('report-old.json'))
+        archived = evaluator.fill()
+        self.assertEqual({archived[0]['id'], archived[1]}, {chosen['id'], opponent})
+        self.assertAlmostEqual(evaluator.status['fill_uncertainty']['expected_reduction'], plan['expected_reduction'])
+        # After filling the bridge, the next selection uses the updated evidence.
+        self.report('main/000020', 'main/000010', [1, 1]*600+[0, 0]*400)
+        dense_eval.write_league(self.run, evaluator.league, evaluator.config)
+        next_entry, next_opponent, _, _ = evaluator.fill()
+        self.assertNotEqual({next_entry['id'], next_opponent}, {chosen['id'], opponent})
+        # A locked decision report in each orientation cannot be extended by fill.
+        for a, b in ((next_entry['id'], next_opponent), (next_opponent, next_entry['id'])):
+            self.report(a, b, [1, 0])
+            report = dense_eval.report_path(self.run, a, b)
+            payload = json.loads(report.read_text())
+            payload['metrics']['posterior'] = dict(decision='promote')
+            report.write_text(json.dumps(payload))
+        alternative = evaluator.fill()
+        self.assertNotEqual({alternative[0]['id'], alternative[1]}, {next_entry['id'], next_opponent})
+
+    def test_fill_seal_targets_failures_and_disabled_work(self):
+        evaluator = self.start(idle_fill=True, anchor_target_halfwidth=1e-3, seal_ms=5, fill_top=0)
         self.export(10)
         self.assertTrue(evaluator.step())
-        test = evaluator.test
-        evaluator.test = lambda records: dict(test(records), decision='H1')
-        self.export(20)
-        self.assertTrue(evaluator.step())                          # main/000020 beats main/000010
-        evaluator.test = test
-        self.export(30)
-        self.assertTrue(evaluator.step())                          # main/000030 meets main/000020
-        self.assertEqual(self.league()['champion'], 'main/000020')
-        self.assertEqual(evaluator.fill()[1:], ('seal', 'fill', 2))  # no Seal games yet: the interval is unbounded
+        self.assertEqual(evaluator.fill()[1:], ('seal', 'fill', 2))
+        plan = evaluator.status['fill_uncertainty']
+        self.assertEqual([(t['a'], t['b']) for t in plan['targets']], [('main/000010', 'seal')])
+        self.assertGreater(plan['expected_reduction'], 0)
         self.assertTrue(evaluator.step())
-        self.assertEqual(len(evaluator.sealed('main/000020')['games']), 2)
-        status = json.loads((self.run/'evaluator-status.json').read_text())
-        self.assertEqual((status['comparison']['kind'], status['comparison']['opponent']), ('fill', 'seal'))
+        self.assertEqual(len(evaluator.sealed('main/000010')['games']), 2)
+        evaluator.failed_seal.add(('main/000010', 'seal', 'fill', evaluator.settings.opening_book))
+        self.assertIsNone(evaluator.fill())
+        self.assertIsNone(evaluator.status['fill_uncertainty'])
+        evaluator.failed_seal.clear()
         evaluator.settings = replace(evaluator.settings, anchor_target_halfwidth=1e9)
-        entry, opponent, kind, _ = evaluator.fill()
-        self.assertEqual((entry['id'], opponent, kind), ('main/000030', 'main/000010', 'generalization'))
+        self.assertIsNone(evaluator.fill())
+        evaluator.settings = replace(evaluator.settings, anchor_target_halfwidth=1e-3, idle_fill=False)
+        self.assertIsNone(evaluator.fill())
+
+    def test_fill_respects_score_ceiling_and_drains_when_a_checkpoint_arrives(self):
+        evaluator = self.start(idle_fill=True, anchor_target_halfwidth=0, fill_top=2)
+        self.export(10)
         self.assertTrue(evaluator.step())
-        self.assertIn('main/000010', self.league()['matrix']['main/000030'])
-        self.assertEqual({frozenset((d['a'], d['b'])) for d in self.league()['ladder']},
-                         {frozenset(p) for p in (('main/000010', 'main/000020'), ('main/000010', 'main/000030'), ('main/000020', 'main/000030'))})
-        entry, opponent, kind, _ = evaluator.fill()                # generalization is played once
-        self.assertEqual(kind, 'fill')
-        self.assertNotEqual(opponent, 'seal')
-        growable = [d for d in self.league()['ladder'] if dense_eval.rematch_pair(self.run, d['a'], d['b'], evaluator.settings)]
-        self.assertEqual({entry['id'], opponent}, {max(growable, key=lambda d: d['interval'][1]-d['interval'][0])[k] for k in 'ab'})
-        evaluator.failed_seal.add((entry['id'], 'seal', kind, evaluator.settings.opening_book))
+        self.export(20)
         self.assertTrue(evaluator.step())
-        self.assertTrue(dense_eval.report_path(self.run, entry['id'], opponent).exists())
-        targets = [f'{entry["id"]} vs {opponent}']
-        entry, opponent, _, _ = evaluator.fill()                   # re-chosen from the updated ladder
-        targets = list(dict.fromkeys(targets+[f'{entry["id"]} vs {opponent}']))
+        evaluator.settings = replace(evaluator.settings, max_expected_score=.5)
+        evaluator.league['checkpoints'][-1]['elo'] = 500.
+        self.assertIsNone(evaluator.fill())
+        evaluator.settings = replace(evaluator.settings, max_expected_score=1.)
+        entry, opponent, _, _ = evaluator.fill()
         path = dense_eval.report_path(self.run, entry['id'], opponent)
         before = len(json.loads(path.read_text())['games']) if path.exists() else 0
         def export(pool, steps):
-            if steps == 1 and not (self.run/'checkpoints'/'main'/'000040').exists():
-                self.export(40)
+            if steps == 1 and not (self.run/'checkpoints'/'main'/'000030').exists():
+                self.export(30)
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=export)):
-            self.assertTrue(evaluator.step())                      # a new export drains the fill work
-        self.assertEqual(len(json.loads(path.read_text())['games']), before+2)   # the pair in flight counts
+            self.assertTrue(evaluator.step())
+        self.assertEqual(len(json.loads(path.read_text())['games']), before+2)
         self.assertTrue(evaluator.step())
-        self.assertIn('main/000040', {c['id'] for c in self.league()['checkpoints']})
+        self.assertIn('main/000030', {c['id'] for c in self.league()['checkpoints']})
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
-        self.assertEqual([e['target'] for e in events if e['kind'] == 'fill'],
-                         ['seal', 'generalization main/000030 vs main/000010', *targets, None])
+        self.assertEqual([e['target'] for e in events if e['kind'] == 'fill'], [f'{entry["id"]} vs {opponent}', None])
 
     def report(self, a, b, results):
         """Write report a-vs-b of colour pairs whose candidate results (1 win, 0 loss, .5 cap) are `results`."""
