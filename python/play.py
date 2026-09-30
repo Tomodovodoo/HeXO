@@ -187,8 +187,9 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
-    stones as [q, r, probability]), `proof` (None or {winner, turns}), `line` (a winning line as [q, r, player]
-    when proven) and `threat` (the opponent's winning stones when the solver proved the side to move lost).
+    stones as [q, r, probability]), `proof` (None or {winner, turns}: the solver proved a win for the side to move,
+    or the search proved the position exact), `line` (a winning line as [q, r, player] when the solver proved it)
+    and `threat` (the stones of a forced win the opponent would have if it moved now).
     `simulations` 0 plays the raw policy; `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
     before each network batch of n positions and may raise Cancelled."""
     import numpy as np
@@ -212,7 +213,6 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 watch(0)
                 theirs = prover.history(history, attacker='opponent', nodes=solver_nodes, ms=10000)
                 if verified(theirs):
-                    proof = dict(winner=1 - player, turns=theirs['proof_turns'])
                     threat = [list(m) for m in theirs['moves']]
         while local.player == player and local.winner < 0 and not (proof and proof['winner'] == player):
             current = [tuple(cell[:2]) for cell in local.cells]

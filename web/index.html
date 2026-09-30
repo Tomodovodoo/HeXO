@@ -51,7 +51,7 @@ select,input,textarea{background:var(--bg);border:1px solid var(--line-2);border
 .spacer{flex:1}
 /* board */
 #board-wrap{grid-area:board;position:relative;min-width:0;min-height:0;background:var(--board);overflow:hidden;
-  box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--turn) 30%,transparent),inset 0 0 70px -36px var(--turn);transition:box-shadow .4s}
+  box-shadow:inset 0 0 0 2px color-mix(in srgb,var(--turn) 55%,transparent);transition:box-shadow .4s}
 #board{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair;display:block}
 #marks{position:absolute;inset:0;pointer-events:none}
 .mark{position:absolute;left:0;top:0;width:var(--s);height:var(--s);margin:calc(var(--s)/-2) 0 0 calc(var(--s)/-2);
@@ -84,7 +84,7 @@ select,input,textarea{background:var(--bg);border:1px solid var(--line-2);border
 .evalbar i{position:absolute;inset:0;background:var(--x);transform-origin:left;transform:scaleX(.5);transition:transform .6s cubic-bezier(.2,.8,.2,1)}
 .evalbar b{position:absolute;top:0;bottom:0;display:flex;align-items:center;padding:0 10px;font:700 13px var(--mono);color:#0b1222;z-index:1}
 .evalbar b:last-child{right:0}
-.evalbar.idle i{transform:scaleX(.5)!important}.evalbar.idle{opacity:.35}
+.evalbar{transition:opacity .3s}.evalbar.idle i{transform:scaleX(.5)!important}.evalbar.idle{opacity:.35}.evalbar.stale{opacity:.5}
 .evalbar.pending::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);
   animation:sweep 1.2s linear infinite}
 @keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
@@ -147,7 +147,6 @@ dialog::backdrop{background:rgba(2,6,23,.7)}dialog textarea{width:100%;height:18
   #app:not([data-tab=game]) #study{display:contents}
   #analysis,#review{grid-area:panel;background:var(--panel);padding:10px;overflow:hidden}
   #app:not([data-tab=review]) #review,#app[data-tab=review] #analysis{display:none}
-  #board-wrap{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--turn) 30%,transparent),inset 0 0 40px -24px var(--turn)}
   .panel{padding:10px;gap:10px}#moves{margin:0 -10px}
   .detail{min-height:0}
 }
@@ -187,7 +186,7 @@ dialog::backdrop{background:rgba(2,6,23,.7)}dialog textarea{width:100%;height:18
       <div class="top" id="top"></div>
     </div>
     <div class="part" id="review">
-      <div class="head"><span class="empty" id="accuracy"></span><span class="spacer"></span><button id="review">Review</button></div>
+      <div class="head"><span class="empty" id="accuracy"></span><span class="spacer"></span><button id="review-go">Review</button></div>
       <svg id="graph" preserveAspectRatio="none"></svg>
       <div id="moves"></div>
       <div class="detail" id="detail"></div>
@@ -226,12 +225,13 @@ async function poll(){
 }
 function accept(data){
   if(data.history){
-    const live=!S||view>=S.history.length,before=S?S.history.length:0;
+    const live=!S||view>=S.history.length,before=S?S.history.length:null;
     S=data;
     if(live||view>S.history.length)view=S.history.length;
-    const now=performance.now();
-    for(let i=before;i<S.history.length;i++)landed.set(key(...S.history[i]),now+(i-before)*90);
-    if(!fitted||before>S.history.length+2||(before===0&&S.history.length>2))fit();
+    const now=performance.now(),grown=before===null?0:S.history.length-before;
+    if(grown>0&&grown<=2)for(let i=before;i<S.history.length;i++)landed.set(key(...S.history[i]),now+(i-before)*110);
+    const off=grown>0&&S.history.slice(-grown).some(([q,r])=>{const[x,y]=screen(q,r);return x<40||y<40||x>canvas.clientWidth-40||y>canvas.clientHeight-70});
+    if(!fitted||before===null||grown<0||grown>2||(off&&view===S.history.length))fit();
     renderPanels();
   }else{S.jobs=data.jobs}
   renderJobs();draw();
@@ -399,10 +399,11 @@ function renderEngineHead(){
 }
 function selectedTurn(){if(!S||!view)return null;return S.review.find(t=>t.ply<=view-1&&view-1<t.ply+t.stones.length)||null}
 function renderStudy(){
-  const ev=S.evaluations[view],side=playerAt(view),bar=$('evalbar');
-  const x=ev?(side===0?ev.value:1-ev.value):null,job=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view);
-  bar.classList.toggle('idle',!ev);bar.classList.toggle('pending',!!job);
-  if(ev)bar.firstChild.style.transform=`scaleX(${x})`;
+  const ev=S.evaluations[view],side=playerAt(view),bar=$('evalbar'),job=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view);
+  const near=ev?view:Math.max(-1,...Object.keys(S.evaluations).map(Number).filter(p=>p<view)),shown=S.evaluations[near];
+  const x=shown?(playerAt(near)===0?shown.value:1-shown.value):null;
+  bar.classList.toggle('idle',!shown);bar.classList.toggle('stale',!!shown&&!ev);bar.classList.toggle('pending',!!job);
+  if(shown)bar.firstChild.style.transform=`scaleX(${x})`;
   $('xv').textContent=ev?pct(x):'';$('ov').textContent=ev?pct(1-x):'';
   const proof=ev&&ev.proof;$('xproof').textContent=proof&&proof.winner===0?'X +'+proof.turns:'';$('oproof').textContent=proof&&proof.winner===1?'O +'+proof.turns:'';
   $('xproof').style.color=COLORS[0];$('oproof').style.color=COLORS[1];
@@ -438,7 +439,7 @@ function renderMoves(){
     const row=el('div',{class:'turn'+(t===sel?' sel':'')},el('span',{},i+1),
       el('span',{class:'st'},t.stones.map(p=>el('span',{style:`--c:${COLORS[t.player]}`},p[0]+','+p[1]))),
       label?el('span',{class:'glyph'+(fresh?' new':''),style:`--c:var(${label[1]})`},label[0]):el('span'),
-      el('span',{class:'loss'},loss!=null&&loss>0?'−'+loss:''));
+      el('span',{class:'loss'},loss>0&&!['best','win','found','kept'].includes(t.label)?'−'+loss:''));
     row.onclick=()=>go(t.ply+t.stones.length);return row}));
   for(const t of S.review)seenLabels.set(t.ply,t.label);
   const bad=['inaccuracy','mistake','blunder','missed','allowed'];
@@ -473,7 +474,7 @@ function renderJobs(){
     const bar=box.querySelector('.bar')||el('div',{class:'bar'},el('i'));const x=box.querySelector('.x')||el('button',{class:'x','aria-label':'Cancel'},'×');
     x.onclick=()=>post('/cancel',{id:job.id});bar.firstChild.style.transform=`scaleX(${job.status==='queued'?0:Math.min(1,job.done/job.total)})`;
     if(!box.children.length)box.append(bar,x)}
-  const review=$('review'),rjob=S.jobs.find(j=>j.kind==='review');review.textContent=rjob?`${rjob.done} / ${rjob.total}  ×`:'Review';
+  const review=$('review-go'),rjob=S.jobs.find(j=>j.kind==='review');review.textContent=rjob?`${rjob.done} / ${rjob.total}  ×`:'Review';
   review.onclick=()=>rjob?post('/cancel',{id:rjob.id}):post('/review');
   const pending=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);$('evalbar').classList.toggle('pending',pending);
 }
