@@ -145,7 +145,8 @@ class StrixLearned(StrixReference):
             moves = validate_turn(game, [list(mirror(*m)) for m in returned])
             if time.monotonic() >= deadline:
                 raise queue.Empty
-            result.update(wall_ms=(time.monotonic()-start)*1000, executable_sha256=self.executable_sha256,
+            result.update(moves=[list(m) for m in moves], wall_ms=(time.monotonic()-start)*1000,
+                          executable_sha256=self.executable_sha256,
                           model_sha256=MODEL_SHA256)
             self.last_result = result
             return moves

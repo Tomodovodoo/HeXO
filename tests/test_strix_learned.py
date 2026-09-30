@@ -55,6 +55,7 @@ class Frame(unittest.TestCase):
         self.addCleanup(game.close)
         self.assertEqual(opponent(game, 100), [(1, 1), (-2, 3)])
         self.assertEqual(sent[0]['stones'], [[0, 0, 0], [1, 0, 1], [1, 1, 1]])
+        self.assertEqual(opponent.last_result['moves'], [[1, 1], [-2, 3]])
         self.assertEqual(mirror(*mirror(4, -7)), (4, -7))
 
 
