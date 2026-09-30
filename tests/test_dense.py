@@ -5836,6 +5836,9 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.export(10)
         self.assertTrue(evaluator.step())
         self.assertIsNone(evaluator.fill())
+        evaluator.settings = replace(evaluator.settings, idle_fill=True, anchor_target_halfwidth=0)
+        self.assertIsNone(evaluator.fill())  # only the fixed zero checkpoint exists: no comparison or free parameter
+        self.assertIsNone(evaluator.status['fill_uncertainty'])
         self.assertFalse(evaluator.step())
 
     def test_pool_size_does_not_change_the_games(self):

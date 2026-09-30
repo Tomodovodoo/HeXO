@@ -1904,6 +1904,8 @@ class Evaluator:
             return None
         reports = [r for r in load_reports(self.run) if r['candidate'] in ids and r['opponent'] in ids+[SEAL]]
         names = ids+([SEAL] if s.anchor_target_halfwidth > 0 or any(r['opponent'] == SEAL for r in reports) else [])
+        if len(names) < 2:
+            return None
         post = Posterior(names, ids[0], observations(reports), 0., parents(names))
         best = sorted((c for c in checkpoints if not c.get('demoted')), key=lambda c: -post.rating(c['id']))[:s.fill_top]
         targets = [(c['id'], post.anchor, False) for c in best if c['id'] != post.anchor]
