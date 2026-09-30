@@ -24,12 +24,16 @@ to use a native NNUE export; capabilities identify its SHA256. Otherwise the
 adapter uses the handwritten evaluator. This command does not register a bot
 with any external service.
 
-Both published formats require exactly two placements per recorded turn or API
-move, while the API also forbids placements after a win. A first-placement win
-cannot satisfy both requirements. Notation export raises `NotationConflict` for
-that case, partial turns, and empty boards. The API returns HTTP 409 for origin
-turns, partial turns, already-terminal boards, or a chosen first-placement win;
-it never pads a winning move. Full two-placement wins are supported.
+The published notation grammar specifies two placements per turn. For Tyto
+compatibility, notation also accepts and exports a single winning stone on the
+final turn. Native validation requires that stone to end the game, and rejects
+any later placements. Exports preserve every stone without padding or truncation.
+Nonterminal partial turns and empty boards raise `NotationConflict`.
+
+The stateless API's published schema still requires exactly two response pieces
+and forbids placements after a win. It returns HTTP 409 for origin turns, partial
+turns, already-terminal boards, or a chosen first-placement win. Full
+two-placement wins are supported.
 
 The stateless board is unordered. The adapter reconstructs a legal ordering of
 exactly the supplied cells and checks counts and `to_move`; it never assumes array
