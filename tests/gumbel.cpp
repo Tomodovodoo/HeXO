@@ -63,7 +63,9 @@ int main(){
  {gumbel::Tree t(0);t.graph=true;
   auto play=[&](std::vector<Cell> moves){t.board=Board{};for(auto c:moves)t.board.make(c);return t.child_here();};
   auto first=play({{0,0},{1,0},{2,0},{0,1},{0,2},{3,0},{4,0}});
+  auto live=play({{0,0},{1,0},{3,0},{0,1},{0,2},{2,0},{4,0}});
   first->exact_winner=1;first->distance=3;t.learn(*first);
+  assert(live!=first && live->exact_winner==1 && live->distance==3);   // an existing context learns it too
   assert(play({{0,0},{2,0},{1,0},{0,2},{0,1},{4,0},{3,0}})==first);
   auto other=play({{0,0},{3,0},{4,0},{0,1},{0,2},{1,0},{2,0}});
   assert(other!=first && other->exact_winner==1 && other->distance==3);}

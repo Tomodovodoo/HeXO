@@ -36,7 +36,7 @@ struct Tree {
  Board board;std::shared_ptr<Node> root=std::make_shared<Node>();std::map<int,Path> requests;
  // Graph search (opt-in): nodes shared by turn-context key, proven outcomes {winner, distance, stones, bound} shared by
  // position key. Tree search gives every edge its own child and keeps both tables empty.
- bool graph=false;std::unordered_map<Key,std::weak_ptr<Node>,KeyHash> nodes;std::unordered_map<Key,std::array<int,4>,KeyHash> outcomes;
+ bool graph=false;std::unordered_map<Key,std::weak_ptr<Node>,KeyHash> nodes;std::unordered_map<Key,std::vector<std::weak_ptr<Node>>,KeyHash> positions;std::unordered_map<Key,std::array<int,4>,KeyHash> outcomes;
  std::mt19937_64 rng;int budget=0,started=0,completed=0,next_id=1,samples=0,last=0;bool tactics=false,hold=false;std::vector<int> sequence;
  // Root actions sampled first in the opening phase of the current search; ordering only (set_priority).
  std::vector<Cell> priority;
@@ -58,7 +58,7 @@ struct Tree {
   if(!graph){auto n=std::make_shared<Node>();n->player=board.player;return n;}
   auto [position,context]=keys(board);auto& slot=nodes[context];
   if(auto n=slot.lock())return n;
-  auto n=std::make_shared<Node>();n->player=board.player;n->position=position;n->stones=int(board.cells.size());slot=n;
+  auto n=std::make_shared<Node>();n->player=board.player;n->position=position;n->stones=int(board.cells.size());slot=n;positions[position].push_back(n);
   if(auto o=outcomes.find(position);o!=outcomes.end()){n->exact_winner=o->second[0];n->distance=o->second[1];n->bound=o->second[3];}
   return n;
  }
@@ -77,7 +77,7 @@ struct Tree {
   for(auto& w:from.parents)if(auto p=w.lock())if(p.get()!=skip)work.emplace_back(p.get(),&from);
   while(!work.empty()){
    auto [p,c]=work.back();work.pop_back();
-   const double before=p->q;const int winner=p->exact_winner,distance=p->distance;
+   const double before=p->q;const int winner=p->exact_winner,distance=p->distance;const bool bound=p->bound;
    if(c->exact_winner>=0){
     bool changed=false;
     for(auto& e:p->edges)if(e.child.get()==c && (e.exact_winner!=c->exact_winner || e.distance!=c->distance+1 || e.bound!=c->bound)){
@@ -86,15 +86,36 @@ struct Tree {
     if(changed){settle(*p);learn(*p);}
    }
    refresh(*p);
-   if(p->q!=before || p->exact_winner!=winner || p->distance!=distance)for(auto& w:p->parents)if(auto g=w.lock())work.emplace_back(g.get(),p);
+   if(p->q!=before || p->exact_winner!=winner || p->distance!=distance || p->bound!=bound)for(auto& w:p->parents)if(auto g=w.lock())work.emplace_back(g.get(),p);
   }
  }
  // Records a proven node's outcome for its position (graph search), keeping the shortest bound.
+ // A new or better outcome also reaches the live nodes of the same position in other turn contexts.
  void learn(const Node& node) {
   if(!graph || node.exact_winner<0)return;
   std::array<int,4> outcome{node.exact_winner,node.distance,node.stones,node.bound};
   auto [o,added]=outcomes.try_emplace(node.position,outcome);
-  if(!added && o->second[0]==node.exact_winner && (node.distance<o->second[1] || (node.distance==o->second[1] && !node.bound)))o->second=outcome;
+  const bool better=o->second[0]==node.exact_winner && (node.distance<o->second[1] || (node.distance==o->second[1] && !node.bound && o->second[3]));
+  if(!added && !better)return;
+  o->second=outcome;
+  if(auto list=positions.find(node.position);list!=positions.end())for(auto& w:std::vector(list->second))if(auto n=w.lock())if(n.get()!=&node)share(node,*n);
+ }
+ // Gives `into`, a node of the same position in another turn context, the verdicts `from` holds: its proven edges
+ // (the legal moves are the same) or, when either is unexpanded, the node's own outcome; then updates its parents.
+ void share(const Node& from,Node& into) {
+  bool changed=false;
+  if(from.expanded && into.expanded && from.edges.size()==into.edges.size()){
+   for(size_t i=0;i<from.edges.size();++i){
+    auto& f=from.edges[i];auto& e=into.edges[i];
+    if(f.exact_winner>=0 && f.action==e.action && (e.exact_winner!=f.exact_winner || e.distance>f.distance || (e.distance==f.distance && e.bound && !f.bound))){
+     e.exact_winner=f.exact_winner;e.distance=f.distance;e.bound=f.bound;changed=true;
+    }
+   }
+   if(changed)settle(into);
+  } else if(!into.expanded && (into.exact_winner<0 || into.distance>from.distance)){
+   into.exact_winner=from.exact_winner;into.distance=from.distance;into.bound=from.bound;changed=true;
+  }
+  if(changed){refresh(into);propagate(into,nullptr);}
  }
  // Completed Q (mctx mixed value, min-max rescale, (50 + max visits) * 0.1) over the eligible edges only: proven
  // losses and the non-winning edges of a won node set neither the mixed value, the visit scale nor the range.
@@ -292,7 +313,7 @@ struct Tree {
    position.make(witness);auto next_legal=position.legal_moves();
    auto child=std::make_shared<Node>();child->player=player;child->remaining=1;child->expanded=true;child->exact_winner=player;child->distance=distance-1;child->bound=true;
    for(auto c:next_legal){Edge e;e.action=c;e.prior=1./next_legal.size();e.eligible=c==Cell{moves[2],moves[3]};if(e.eligible){e.exact_winner=player;e.distance=distance-1;e.bound=true;}child->edges.push_back(std::move(e));}
-   if(graph){auto [p,c]=keys(position);child->position=p;child->stones=int(position.cells.size());child->n=1;child->q=1;child->parents.push_back(node->weak_from_this());nodes[c]=child;learn(*child);}
+   if(graph){auto [p,c]=keys(position);child->position=p;child->stones=int(position.cells.size());child->n=1;child->q=1;child->parents.push_back(node->weak_from_this());nodes[c]=child;positions[p].push_back(child);learn(*child);}
    for(auto& e:node->edges)if(e.action==witness){e.child=std::move(child);break;}
   }
  }
@@ -303,6 +324,8 @@ struct Tree {
   if(winner>=0 && winner!=root->player){root->exact_winner=winner;root->distance=distance-1;root->bound=bound;}
   if(graph){
    std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
+   for(auto& [key,list]:positions)std::erase_if(list,[](const auto& w){return w.expired();});
+   std::erase_if(positions,[](const auto& entry){return entry.second.empty();});
    // Stones are never removed, so positions with fewer stones than the board can not recur.
    std::erase_if(outcomes,[&](const auto& entry){return entry.second[2]<int(board.cells.size());});
   }
@@ -324,8 +347,8 @@ HX_API int hxg_tactics(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(
 // Switches graph search on (enabled != 0) or off before the root is expanded: transposed turn contexts share one node
 // and proven outcomes are shared by position.
 HX_API int hxg_graph(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(p);if(t.root->expanded || !t.requests.empty())return 0;
- t.graph=enabled!=0;t.nodes.clear();t.outcomes.clear();
- if(t.graph){auto [position,context]=gumbel::keys(t.board);t.root->position=position;t.root->stones=int(t.board.cells.size());t.nodes[context]=t.root;}
+ t.graph=enabled!=0;t.nodes.clear();t.outcomes.clear();t.positions.clear();
+ if(t.graph){auto [position,context]=gumbel::keys(t.board);t.root->position=position;t.root->stones=int(t.board.cells.size());t.nodes[context]=t.root;t.positions[position].push_back(t.root);}
  return 1;}
 // Diagnostic census of the structure reachable from the root: out = {nodes, expanded, exact, expanded nodes whose turn
 // context was already expanded elsewhere (tree duplicates; 0 in a graph)}.
