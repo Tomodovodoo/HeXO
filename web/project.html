@@ -12,6 +12,7 @@ main{max-width:1400px;margin:auto;padding:24px 32px}h2{font-size:16px;margin:0;c
 canvas{display:block;width:100%;height:260px;touch-action:pan-y}.tip{position:absolute;pointer-events:none;background:rgba(20,20,19,.96);border:1px solid var(--ring);border-radius:6px;padding:6px 8px;font-size:11px;line-height:1.5;color:var(--ink2);z-index:3;white-space:nowrap;font-variant-numeric:tabular-nums}.tip b{color:var(--ink);font-weight:600}.tip div{display:flex;gap:6px;align-items:center}.tip .near{color:var(--ink);background:rgba(57,135,229,.18)}
 .panel.full{position:fixed;inset:12px;z-index:10;display:flex;flex-direction:column;box-shadow:0 0 0 100vmax rgba(0,0,0,.85)}.panel.full canvas{flex:1;height:auto;min-height:0}.panel.full .legend{max-height:none}.panel.full .panel-head h2 button{cursor:zoom-out}
 @media(max-width:760px){main{padding:16px}header{padding:14px 16px}.grid{grid-template-columns:1fr}canvas{height:220px}}
+.panel.history .legend{max-height:none}
 </style>
 <header><h1>Bubble</h1><span>Dense run comparison</span><label class="smooth">Smoothing <input id="smooth" type="range" min="0" max="0.99" step="0.01"> <output id="smooth-value"></output></label><label class="smooth">from step <input id="from-step" type="number" min="0" step="500"></label><div id="status" role="status">Connecting...</div></header>
 <main>
@@ -36,7 +37,7 @@ const PANELS=[
 {id:'vvalue',title:'Validation value BCE',metric:'validation_value_bce',sources:'value_bce',xs:['step','hours'],log:true,note:'EMA weights, one point per export. Solid: held-out rows of the window; dashed: fixed held-out rows per source'},
 {id:'vgap',title:'Policy CE gap',sources:'gap_policy_ce',xs:['step','hours'],note:'Per source: fixed held-out rows minus fixed training rows, EMA weights'},
 {id:'vgapvalue',title:'Value BCE gap',sources:'gap_value_bce',xs:['step','hours'],note:'Per source: fixed held-out rows minus fixed training rows, EMA weights'},
-{id:'vcurve',title:'Value loss by plies remaining',sources:'value_curve',prefix:'',from:['fresh','newest'],xs:['remaining'],zero:true,ref:Math.LN2,note:'Latest checkpoint, EMA weights: value BCE of held-out rows of finished games against their outcome, Gaussian smoothing over 4 plies. Faint line: 0.693 (no information)'},
+{id:'vcurve',title:'Value loss by plies remaining',history:'value_curve',xs:['remaining'],zero:true,ref:Math.LN2,note:'EMA weights, held-out finished games. Colour runs from older purple curves to the thick gold latest curve; lower loss is better. Hover to compare checkpoints at the same distance. Faint line: 0.693 for a 50/50 prediction.'},
 {id:'pcurve',title:'Policy CE by ply',sources:'policy_ce_curve',prefix:'',from:['fresh','newest'],xs:['ply'],zero:true,note:'Latest checkpoint, EMA weights: policy CE of held-out full-search rows, Gaussian smoothing over 4 plies'},
 {id:'vply',title:'Value BCE by ply',sources:'value_bce_by_ply',prefix:'',from:['fresh','newest'],xs:['ply'],zero:true,ref:Math.LN2,note:'Latest checkpoint, EMA weights: value BCE of held-out rows of finished games against their outcome, Gaussian smoothing over 4 plies. Faint line: 0.693 (no information)'},
 {id:'vsurf',title:'Value BCE surface',surface:'value_surface',label:'BCE',centre:Math.LN2,xs:['ply'],note:'Latest checkpoint, EMA weights: mean value BCE of held-out rows of finished games per 16-ply cell, blank under 8 rows. Centre: 0.693 (no information)'},
@@ -60,7 +61,7 @@ const ema=(pts,w)=>{let m=0,n=0;return pts.map(q=>{m=m*w+(1-w)*q[1];n++;return [
 const XLABEL={step:'Step',hours:'Time (hours)',remaining:'Plies remaining',ply:'Ply'},xfmt=(x,v)=>x==='hours'?v.toFixed(2)+' h':x==='remaining'?`${Math.round(v)} plies`:x==='ply'?`ply ${Math.round(v)}`:`${Math.round(v)}`;
 const tick=v=>Math.abs(v)>=1e-3||v===0?v.toLocaleString(undefined,{maximumFractionDigits:6}):v.toExponential(1);
 const age=s=>s==null?'-':s<90?`${Math.round(s)} s`:s<5400?`${Math.round(s/60)} min`:s<172800?`${(s/3600).toFixed(1)} h`:`${Math.round(s/86400)} d`;
-function swatch(i,dash){const s=style(i,dash),e=document.createElementNS('http://www.w3.org/2000/svg','svg');e.setAttribute('class','swatch');e.setAttribute('width',22);e.setAttribute('height',4);
+function swatch(i,dash,color){const s=style(i,dash);if(color)s.color=color;const e=document.createElementNS('http://www.w3.org/2000/svg','svg');e.setAttribute('class','swatch');e.setAttribute('width',22);e.setAttribute('height',4);
 e.innerHTML=`<line x1="0" y1="2" x2="22" y2="2" stroke="${s.color}" stroke-width="3" stroke-dasharray="${s.dash.join(' ')||'none'}"/>`;return e}
 function cell(tr,content,cls){const td=document.createElement('td');if(content instanceof Node)td.append(content);else td.textContent=content;if(cls)td.className=cls;tr.append(td);return td}
 function renderTable(){const body=$('rows'),chosen=new Set(selected().map(r=>r.key));body.replaceChildren();
@@ -72,30 +73,30 @@ const lh=r.run.learner_heartbeat[r.variant];cell(tr,lh==null?'-':`${r.run.learne
 cell(tr,r.run.actor_processes?`${r.run.actor_processes} proc, ${age(r.run.actor_heartbeat)} ago`:'-',r.run.actor_heartbeat!=null&&r.run.actor_heartbeat<30?'live':'stale');
 const a=document.createElement('a');a.href='/?run='+encodeURIComponent(r.run.name);a.textContent='Open';cell(tr,a);body.append(tr)}
 const n=selected().length;$('showing').textContent=state.selected?`Showing ${n} of ${rows.length} runs`:`Showing first ${Math.min(10,rows.length)} runs`}
-function panelSeries(p){const out=[],seen=new Set(),paired=new Set(),external=new Set();for(const r of selected()){if(p.perRun){if(seen.has(r.run.name))continue;seen.add(r.run.name)}
+function panelSeries(p){if(p.history)return [];const out=[],seen=new Set(),paired=new Set(),external=new Set();for(const r of selected()){if(p.perRun){if(seen.has(r.run.name))continue;seen.add(r.run.name)}
 if(p.metric)out.push({key:p.perRun?r.run.name:r.key,label:p.perRun?r.run.name:r.key,run:r.run,variant:p.perRun?'main':r.variant,index:r.index,metric:p.metric});
 if(p.pair&&(!p.pair.perRun||!paired.has(r.run.name))){paired.add(r.run.name);const key=p.pair.perRun?r.run.name:r.key;out.push({key:`${key}|${p.pair.metric}`,label:`${key} ${p.pair.label}`,run:r.run,variant:r.variant,index:r.index,metric:p.pair.metric,dash:p.pair.dash})}
 if(p.external&&!external.has(r.run.name)){external.add(r.run.name);for(const[id,v]of Object.entries(r.run.external_ratings||{})){const metric=`external_elo:${id}`;out.push({key:`${r.run.name}|${metric}`,label:`${r.run.name} ${v.label} (provisional)`,run:r.run,variant:'main',index:r.index+3,metric,dash:[9,4],note:v.note})}}
 if(p.sources)for(const[src,dash]of Object.entries(SOURCES))if(!p.from||p.from.includes(src))out.push({key:`${r.key}|${src}`,label:`${r.key} · ${p.sources.startsWith('gap')?'gap':'held-out'} ${src}`,run:r.run,variant:r.variant,index:r.index,metric:`${p.prefix??'validation_'}${src}_${p.sources}`,dash})}return out}
 const SURFACE_SOURCES=['fresh','newest'];
-const surfOf=p=>{const rs=selected(),r=rs.find(x=>x.key===state.srun[p.id])||rs[0],src=SURFACE_SOURCES.includes(state.src[p.id])?state.src[p.id]:SURFACE_SOURCES[0];return {r,src,k:r&&`${r.run.name}|${r.variant}|${src}_${p.surface}|surface`}};
+const surfOf=p=>{const rs=selected(),r=rs.find(x=>x.key===state.srun[p.id])||rs[0],src=SURFACE_SOURCES.includes(state.src[p.id])?state.src[p.id]:SURFACE_SOURCES[0];return {r,src,k:r&&`${r.run.name}|${r.variant}|${src}_${p.surface||p.history}|${p.surface?'surface':'history'}`}};
 const xOf=p=>p.xs.includes(state.x[p.id])?state.x[p.id]:p.xs[0];
 const fromOf=p=>xOf(p)==='step'?state.fromStep:0;
 const cacheKey=(s,p)=>`${s.run.name}|${s.variant}|${s.metric}|${xOf(p)}`;
 async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k),from=fromOf(p),x=xOf(p),now=project.now;if(hit&&hit.from===from&&(hit.poll===now||(!s.run.live&&now-hit.poll<60)))continue;
 jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:s.metric,x,max_points:1000,from_step:from});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${s.metric} of ${s.label}: HTTP ${res.status}`);const points=(await res.json()).points,cur=cache.get(k);if(from===fromOf(p)&&!(cur?.from===from&&cur.poll>now))cache.set(k,{poll:now,from,points})})}
-for(const p of PANELS){if(!p.surface)continue;const s=surfOf(p),hit=s.r&&cache.get(s.k);if(!s.r||hit&&(hit.poll===project.now||(!s.r.run.live&&project.now-hit.poll<60)))continue;
-jobs.push(async()=>{const q=new URLSearchParams({run:s.r.run.name,variant:s.r.variant,metric:`${s.src}_${p.surface}`});const res=await fetch('/api/surface?'+q);if(!res.ok)throw Error(`${p.title} of ${s.r.key}: HTTP ${res.status}`);cache.set(s.k,{poll:project.now,grid:await res.json()})})}
+for(const p of PANELS){if(!p.surface&&!p.history)continue;const s=surfOf(p),hit=s.r&&cache.get(s.k);if(!s.r||hit&&(hit.poll===project.now||(!s.r.run.live&&project.now-hit.poll<60)))continue;
+jobs.push(async()=>{const q=new URLSearchParams({run:s.r.run.name,variant:s.r.variant,metric:`${s.src}_${p.surface||p.history}`});if(p.history){q.set('history','1');q.set('x',xOf(p))}const res=await fetch((p.history?'/api/series?':'/api/surface?')+q);if(!res.ok)throw Error(`${p.title} of ${s.r.key}: HTTP ${res.status}`);cache.set(s.k,{poll:project.now,grid:await res.json()})})}
 let failure=null;const worker=async()=>{while(jobs.length){try{await jobs.shift()()}catch(e){failure=e}}};await Promise.all(Array.from({length:6},worker));if(failure)throw failure}
 function trace(pts,sx,sy,ctx){let gap=true;pts.forEach((q,i)=>{if(q[1]==null){gap=true;return}const x=sx(q[0]),y=sy(q[1]),alone=gap&&(i+1>=pts.length||pts[i+1][1]==null);if(alone){ctx.moveTo(x+1.5,y);ctx.arc(x,y,1.5,0,7)}else ctx[gap?'moveTo':'lineTo'](x,y);gap=false})}
 function ticks(lo,hi,n){const step0=(hi-lo)/n||1,mag=10**Math.floor(Math.log10(step0)),e=step0/mag,step=(e>=7.5?10:e>=3.5?5:e>=1.5?2:1)*mag,out=[];for(let v=Math.ceil(lo/step)*step;v<=hi+step*1e-9;v+=step)out.push(+v.toPrecision(12));return out}
 function logTicks(lo,hi){const out=[];for(let d=Math.floor(Math.log10(lo));d<=Math.ceil(Math.log10(hi));d++)for(const m of[1,2,5]){const v=m*10**d;if(v>=lo&&v<=hi)out.push(v)}return out.length>=3?out:ticks(lo,hi,4).filter(v=>v>0)}
-function buildPanels(){const grid=$('grid');for(const p of PANELS){const el=document.createElement('section');el.className='panel';el.id='panel-'+p.id;
+function buildPanels(){const grid=$('grid');for(const p of PANELS){const el=document.createElement('section');el.className='panel'+(p.history?' history':'');el.id='panel-'+p.id;
 el.innerHTML=`<div class="panel-head"><h2><button title="Expand or restore this panel"></button></h2><div class="tools"></div></div><div class="showing"></div><div class="legend"></div><canvas role="img"></canvas>${p.note?`<p class="note"></p>`:''}<div class="tip" hidden></div>`;
 el.querySelector('h2 button').textContent=p.title;el.querySelector('canvas').setAttribute('aria-label',p.title+' by run');if(p.note)el.querySelector('.note').textContent=p.note;
 el.querySelector('h2 button').onclick=()=>{state.full=state.full===p.id?null:p.id;save();layout()};const tools=el.querySelector('.tools');
 if(p.xs.length>1)for(const x of p.xs){const b=document.createElement('button');b.textContent=x==='step'?'Step':'Hours';b.dataset.x=x;b.onclick=()=>{state.x[p.id]=x;save();refresh()};tools.append(b)}
-if(p.surface){const sel=document.createElement('select');sel.setAttribute('aria-label','Run');sel.onchange=()=>{state.srun[p.id]=sel.value;save();refresh()};tools.append(sel);
+if(p.surface||p.history){const sel=document.createElement('select');sel.setAttribute('aria-label','Run');sel.onchange=()=>{state.srun[p.id]=sel.value;save();refresh()};tools.append(sel);
 for(const src of SURFACE_SOURCES){const b=document.createElement('button');b.textContent=src;b.dataset.src=src;b.onclick=()=>{state.src[p.id]=src;save();refresh()};tools.append(b)}}
 if(p.log){const b=document.createElement('button');b.textContent='Log';b.className='log';b.onclick=()=>{state.log[p.id]=!state.log[p.id];save();draw(p)};tools.append(b)}
 const c=el.querySelector('canvas');c.onpointermove=e=>{const r=c.getBoundingClientRect();draw(p,[e.clientX-r.left,e.clientY-r.top])};c.onpointerleave=()=>draw(p);p.el=el;grid.append(el)}
@@ -123,12 +124,22 @@ if(!hover)return;const i=Math.floor((hover[0]-L)/cw),j=Math.floor((h-B-hover[1])
 ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.strokeRect(L+i*cw,h-B-(j+1)*ch,cw,ch);tip.replaceChildren();
 for(const [k,t] of [['b',`ply ${g.ply_bins[i]}-${g.ply_bins[i]+width-1}`],['div',`remaining ${g.remaining_bins[j]}-${g.remaining_bins[j]+width-1}`],['div',`${p.label} ${fmt(g.values[i][j])}`],['div',`n ${g.counts[i][j]}`]]){const e=document.createElement(k);e.textContent=t;tip.append(e)}
 placeTip(el,c,tip,hover)}
+const HISTORY_COLORS=['#8c83bc','#708cca','#58a4d4','#4db7b7','#92c98c','#efcd73'];
+function historySeries(p){const s=surfOf(p),rs=selected(),el=p.el,sel=el.querySelector('select'),keys=rs.map(r=>r.key).join('|');
+if(sel.dataset.keys!==keys){sel.replaceChildren(...rs.map(r=>new Option(r.key,r.key)));sel.dataset.keys=keys}sel.hidden=rs.length<2;if(s.r)sel.value=s.r.key;
+el.querySelectorAll('.tools button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.src===s.src));
+let history=(s.r&&cache.get(s.k)?.grid.history||[]).filter(c=>c.step>=state.fromStep&&c.points.some(q=>q[1]!=null));const latest=history.at(-1);
+if(s.src==='fresh'&&Number.isFinite(latest?.rows))history=history.filter(c=>c.rows===latest.rows);
+el.querySelector('.note').textContent=p.note+(s.src==='newest'?' Newest uses different actor games as the checkpoint changes.':Number.isFinite(latest?.rows)?` Shown fresh checkpoints each have ${latest.rows.toLocaleString()} held-out source rows.`:'');
+const count=Math.min(6,history.length);return Array.from({length:count},(_,i)=>{const c=history[count===1?0:Math.round(i*(history.length-1)/(count-1))],last=i===count-1,index=last?5:Math.round(i*4/Math.max(1,count-2));
+return {key:c.checkpoint,metric:p.history,label:`${c.step.toLocaleString()}${last?' · latest':''}`,raw:c.points,index,color:HISTORY_COLORS[index],alpha:last?1:.45+i*.08,width:last?2.75:1.4,
+note:`${c.checkpoint}${c.rows!=null?` · ${c.rows.toLocaleString()} source rows`:''}${c.source_checkpoint?` · games from ${c.source_checkpoint}`:''}`}})}
 function draw(p,hover){if(p.surface)return drawSurface(p,hover);const el=p.el,c=el.querySelector('canvas'),ctx=c.getContext('2d'),ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight,x=xOf(p),log=p.log&&state.log[p.id];
 c.width=w*ratio;c.height=h*ratio;ctx.setTransform(ratio,0,0,ratio,0,0);el.querySelectorAll('.tools button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.x?b.dataset.x===x:!!log));
-const series=panelSeries(p).map(s=>{const raw=(cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale&&v!=null?v*p.scale:v)).filter(q=>(q[1]==null||!log||q[1]>0)&&(x!=='step'||q[0]>=state.fromStep));return {...s,raw,points:p.smooth&&state.smooth>0?ema(raw,state.smooth):raw}});
-const legend=el.querySelector('.legend');legend.replaceChildren(...series.map(s=>{const e=document.createElement('span');e.title=s.note||'';e.append(swatch(s.index,s.dash),s.label,(s.metric==='seal_elo'||s.metric.startsWith('external_elo:'))&&s.raw.length?' '+fmt(s.raw[0][1]):'');return e}));
+const series=(p.history?historySeries(p):panelSeries(p)).map(s=>{const raw=(s.raw||cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale&&v!=null?v*p.scale:v)).filter(q=>(q[1]==null||!log||q[1]>0)&&(x!=='step'||q[0]>=state.fromStep));return {...s,raw,points:p.smooth&&state.smooth>0?ema(raw,state.smooth):raw}});
+const legend=el.querySelector('.legend');legend.replaceChildren(...series.map(s=>{const e=document.createElement('span');e.title=s.note||'';if(s.color)e.style.color=s.color;e.append(swatch(s.index,s.dash,s.color),s.label,(s.metric==='seal_elo'||s.metric.startsWith('external_elo:'))&&s.raw.length?' '+fmt(s.raw[0][1]):'');return e}));
 if(p.external)el.querySelector('.note').textContent=[p.note,...series.filter(s=>s.note).map(s=>s.note)].join(' ');
-const total=p.perRun?new Set(rows.map(r=>r.run.name)).size:rows.length,shown=new Set(selected().map(r=>p.perRun?r.run.name:r.key)).size;el.querySelector('.showing').textContent=shown<total?`Showing first ${shown} of ${total} runs`:`Showing ${shown} runs`;
+const total=p.perRun?new Set(rows.map(r=>r.run.name)).size:rows.length,shown=new Set(selected().map(r=>p.perRun?r.run.name:r.key)).size;el.querySelector('.showing').textContent=p.history?(surfOf(p).r?`${surfOf(p).r.key} · held-out ${surfOf(p).src} · older → newer`:''):shown<total?`Showing first ${shown} of ${total} runs`:`Showing ${shown} runs`;
 const tip=el.querySelector('.tip');tip.hidden=true;const all=series.flatMap(s=>s.raw).filter(q=>q[1]!=null);ctx.font='11px system-ui';
 if(!all.length){ctx.fillStyle='#898781';ctx.fillText(series.length?'No measurements yet':'No runs selected',16,h/2);return}
 let x0=Math.min(...all.map(q=>q[0])),x1=Math.max(...all.map(q=>q[0])),ys=all.flatMap(q=>q.slice(1)).filter(v=>!log||v>0),y0=Math.min(...ys),y1=Math.max(...ys);
@@ -141,19 +152,19 @@ ctx.textAlign='center';ctx.textBaseline='top';for(const v of ticks(x0,x1,Math.ma
 ctx.strokeStyle='#383835';ctx.beginPath();ctx.moveTo(L,h-B+.5);ctx.lineTo(w-R,h-B+.5);ctx.stroke();ctx.textAlign='right';ctx.fillText(XLABEL[x],w-R,h-B+17);
 ctx.save();ctx.beginPath();ctx.rect(L,T-4,w-L-R,h-T-B+8);ctx.clip();
 if(p.ref!=null){const yy=Math.round(sy(p.ref))+.5;ctx.globalAlpha=.35;ctx.strokeStyle='#c3c2b7';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(L,yy);ctx.lineTo(w-R,yy);ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=1}
-for(const s of series){const st=style(s.index,s.dash),pts=s.points;if(!pts.length)continue;
+for(const s of series){const st=s.color?{color:s.color,dash:[]}:style(s.index,s.dash),pts=s.points;if(!pts.length)continue;
 if(s.raw!==pts){ctx.globalAlpha=.25;ctx.strokeStyle=st.color;ctx.lineWidth=1;ctx.beginPath();trace(s.raw,sx,sy,ctx);ctx.stroke();ctx.globalAlpha=1}
 if(p.band&&pts[0].length>3){ctx.globalAlpha=.16;ctx.fillStyle=st.color;ctx.beginPath();pts.forEach((q,i)=>ctx[i?'lineTo':'moveTo'](sx(q[0]),sy(q[3])));[...pts].reverse().forEach(q=>ctx.lineTo(sx(q[0]),sy(q[2])));ctx.fill();ctx.globalAlpha=1}
-ctx.strokeStyle=st.color;ctx.setLineDash(st.dash);ctx.lineWidth=1.75;ctx.lineJoin='round';ctx.beginPath();trace(pts,sx,sy,ctx);ctx.stroke();ctx.setLineDash([]);
+ctx.globalAlpha=s.alpha??1;ctx.strokeStyle=st.color;ctx.setLineDash(st.dash);ctx.lineWidth=s.width??1.75;ctx.lineJoin='round';ctx.beginPath();trace(pts,sx,sy,ctx);ctx.stroke();ctx.setLineDash([]);
 const dots=pts.filter(q=>q[1]!=null);if(p.band||dots.length<40){ctx.fillStyle=st.color;for(const q of dots){ctx.beginPath();ctx.arc(sx(q[0]),sy(q[1]),p.band?3:2,0,7);ctx.fill()}}}
 ctx.restore();if(!hover||hover[0]<L||hover[0]>w-R)return;
 const at=x0+(hover[0]-L)/(w-L-R)*(x1-x0),tol=(x1-x0)*.02,hits=[];
 for(const s of series){const pts=s.points.filter(q=>q[1]!=null);if(!pts.length||at<pts[0][0]-tol||at>pts.at(-1)[0]+tol)continue;let lo=0,hi=pts.length-1;while(hi-lo>1){const m=(lo+hi)>>1;pts[m][0]<at?lo=m:hi=m}hits.push({s,q:Math.abs(pts[lo][0]-at)<=Math.abs(pts[hi][0]-at)?pts[lo]:pts[hi]})}
 ctx.strokeStyle='#c3c2b7';ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(Math.round(hover[0])+.5,T);ctx.lineTo(Math.round(hover[0])+.5,h-B);ctx.stroke();ctx.setLineDash([]);
 if(!hits.length)return;hits.sort((a,b)=>b.q[1]-a.q[1]);const near=hits.reduce((a,b)=>Math.abs(sy(b.q[1])-hover[1])<Math.abs(sy(a.q[1])-hover[1])?b:a);
-for(const {s,q} of hits){ctx.fillStyle=style(s.index,s.dash).color;ctx.strokeStyle='#1a1a19';ctx.lineWidth=2;ctx.beginPath();ctx.arc(sx(q[0]),sy(q[1]),q===near.q?5:3.5,0,7);ctx.fill();ctx.stroke()}
+for(const {s,q} of hits){ctx.fillStyle=s.color||style(s.index,s.dash).color;ctx.strokeStyle='#1a1a19';ctx.lineWidth=2;ctx.beginPath();ctx.arc(sx(q[0]),sy(q[1]),q===near.q?5:3.5,0,7);ctx.fill();ctx.stroke()}
 tip.replaceChildren();const head=document.createElement('b');head.textContent=x==='step'?`Step ${Math.round(at).toLocaleString()}`:xfmt(x,at);tip.append(head);
-for(const hit of hits){const row=document.createElement('div');if(hit===near)row.className='near';const t=document.createElement('span');t.textContent=`${hit.s.label}: ${fmt(hit.q[1])}${hit.q.length>3?` [${fmt(hit.q[2])}, ${fmt(hit.q[3])}]`:''} @ ${xfmt(x,hit.q[0])}`;row.append(swatch(hit.s.index,hit.s.dash),t);tip.append(row)}
+for(const hit of hits){const row=document.createElement('div');if(hit===near)row.className='near';const t=document.createElement('span');t.textContent=`${hit.s.label}: ${fmt(hit.q[1])}${hit.q.length>3?` [${fmt(hit.q[2])}, ${fmt(hit.q[3])}]`:''} @ ${xfmt(x,hit.q[0])}`;row.append(swatch(hit.s.index,hit.s.dash,hit.s.color),t);tip.append(row)}
 placeTip(el,c,tip,hover)}
 async function refresh(){renderTable();try{await fetchSeries();$('status').className='';$('status').textContent=`${project.runs.length} dense runs in ${project.root}, updated ${new Date(project.now*1000).toLocaleTimeString()}`}catch(e){$('status').className='error';$('status').textContent=e.message}PANELS.forEach(p=>draw(p))}
 async function poll(){try{const res=await fetch('/api/project');if(!res.ok)throw Error('Project data unavailable: HTTP '+res.status);project=await res.json();bookView.setRuns(project.runs.map(r=>r.name));

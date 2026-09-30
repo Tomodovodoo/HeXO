@@ -794,7 +794,7 @@ def actor_points(run):
     return out
 
 
-def series(run, config, variant, metric, x='step', max_points=1000, from_step=0):
+def series(run, config, variant, metric, x='step', max_points=1000, from_step=0, history=False):
     """/api/series: [[x, y], ...] (elo: [[x, elo, low, high], ...] with the 95% interval; seal_elo: the published
     Seal rating and interval across the run's rated checkpoint coordinates; external_elo:<id>: a provisional
     external match estimate on that same scale; seal_delta: the direct-match
@@ -803,6 +803,7 @@ def series(run, config, variant, metric, x='step', max_points=1000, from_step=0)
     the run's created_at. Actor and GPU metrics have hours only. CURVE_METRICS have their own x only ('remaining' or 'ply'): [[grid point, y or null where unsupported], ...]
     over every point of the manifest's <x>_grid (not downsampled) of the newest checkpoint manifest of
     `variant` holding that curve (metrics.validation_sources), whose id is added as `checkpoint` (None without one).
+    With history=True, curves also include every saved checkpoint's curve, step and source row count in `history`.
     Raises ValueError for an unknown metric or x."""
     created = config.get('created_at') or 0.
     hours = lambda t: (t-created)/3600
@@ -811,9 +812,16 @@ def series(run, config, variant, metric, x='step', max_points=1000, from_step=0)
         found = [(path, v) for path, m in dense_manifests(run/'checkpoints'/variant)
                  if isinstance(v := (m.get('metrics') or {}).get('validation_sources'), dict) and isinstance(v.get(metric), list)]
         path, v = found[-1] if found else (None, {})
-        points = [[g, y if finite(y) else None] for g, y in zip(v.get(f'{x}_grid') or [], v.get(metric) or [])]
-        return dict(run=run.name, variant=variant, metric=metric, x=x, count=len(points), points=points,
-                    checkpoint=path and f'{variant}/{path.parent.name}')
+        curve = lambda v: [[g, y if finite(y) else None] for g, y in zip(v.get(f'{x}_grid') or [], v.get(metric) or [])]
+        points = curve(v)
+        out = dict(run=run.name, variant=variant, metric=metric, x=x, count=len(points), points=points,
+                   checkpoint=path and f'{variant}/{path.parent.name}')
+        if history:
+            source = metric.split('_', 1)[0]
+            out['history'] = [dict(checkpoint=f'{variant}/{p.parent.name}', step=int(p.parent.name),
+                                   rows=v.get(f'{source}_rows'), source_checkpoint=v.get('newest_checkpoint') if source == 'newest' else None,
+                                   points=curve(v)) for p, v in found if int(p.parent.name) >= from_step]
+        return out
     if x not in ('step', 'hours'): raise ValueError(f'unknown x {x!r}')
     if metric in LEARNER_METRICS:
         validation, key = metric.startswith('validation_'), metric.removeprefix('validation_')
@@ -955,7 +963,7 @@ class Handler(BaseHTTPRequestHandler):
                     variant, metric = query.get('variant', 'main'), query.get('metric', '')
                     data = surface(run, variant, metric) if url.path == "/api/surface" else series(
                         run, config, variant, metric, query.get('x', 'step'), max(10, min(20000, int(query.get('max_points', 1000)))),
-                        int(query.get('from_step', 0)))
+                        int(query.get('from_step', 0)), history=query.get('history') == '1')
             except ValueError as error:
                 self.send_error(400, str(error))
                 return
