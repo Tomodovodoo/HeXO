@@ -360,6 +360,13 @@ class Engine:
             self.solver.close()
             self.solver = None
 
+    def synchronize_inflight(self):
+        """Finish submitted GPU work without consuming predictions or advancing any tree."""
+        for _, _, _, handle in self.inflight:
+            event = handle[2]
+            if event is not None:
+                event.synchronize()
+
     def step(self):
         pending, count, done, progress, deferred = {}, 0, [], False, False
         self.completed = done
@@ -828,10 +835,10 @@ class Yield:
         self.run, self.target, self.below, self.resume, self.check_seconds = Path(run), target, below, resume, check_seconds
         self.follow, self.clock, self.now, self.checked = follow, clock, now, None
         self.state, self.behind, self.reason = False, False, 'not checked'
+        self.requests = {}
 
     def training(self):
-        """The fresh heartbeats of learners that are training or exporting, 'variant' filled in from the file name
-        where missing."""
+        """Fresh learner heartbeats that need actors paused, with a variant for each."""
         found = []
         for path in sorted(self.run.glob('learner-status*.json')):
             try:
@@ -839,8 +846,11 @@ class Yield:
             except (OSError, ValueError):
                 continue
             fresh = self.now()-float(status.get('updated_at') or 0) <= STALE_SECONDS
-            if fresh and status.get('stage') in ('training', 'exporting'):
-                found.append(dict(status, variant=status.get('variant', path.stem)))
+            stage = status.get('stage')
+            if fresh and (stage in ('training', 'exporting') or (self.follow and stage == 'waiting-for-actors')):
+                variant = status.get('variant') or ('main' if path.name == 'learner-status.json'
+                                                    else path.stem.removeprefix('learner-status-'))
+                found.append(dict(status, variant=variant))
         return found
 
     def lowest(self, statuses):
@@ -860,6 +870,9 @@ class Yield:
             return self.state
         self.checked = self.clock()
         statuses = self.training()
+        self.requests = {s['variant']: s['phase_request'] for s in statuses
+                         if self.follow and (s.get('phase_rows') or 0) > 0
+                         and isinstance(s.get('phase_request'), str) and s['phase_request']}
         lowest = self.lowest(statuses) if self.below else None
         if lowest is None:
             self.behind, self.reason = False, 'no training learner heartbeat'
@@ -918,6 +931,7 @@ def worker(args):
     gate = Yield(run, config.learner.samples_per_row, settings.yield_below, settings.yield_resume, settings.yield_check_seconds,
                  settings.phase_follow)
     paused_since, paused_total = None, 0.
+    phase_ack, token_pause = {}, False
 
     def status(stage):
         """Rewrite the heartbeat; append a metrics line whenever the stage changes and otherwise every
@@ -931,6 +945,7 @@ def worker(args):
         g = state['games_completed']
         fields = dict(
             stage=stage, updated_at=time.time(), checkpoint=model.checkpoint, actor_sha256=model.sha,
+            phase_ack=dict(phase_ack),
             games_completed=g, games_total=target, positions=state['positions'], active_games=len(engine.slots),
             batch_calls=engine.calls,
             placements_per_second=(state['positions']-p)/max(1e-9, now-t), evals_per_second=(engine.evals-e)/max(1e-9, now-t),
@@ -950,8 +965,24 @@ def worker(args):
             logged, stage_logged = now, stage
             dense_config.append_metrics(run, f'actor-{args.worker}', **{k: fields[k] for k in METRICS})
 
-    def publish():
+    def refresh_sources():
         nonlocal model
+        if resolve(run, args.initial_model, settings.model_source, config.learner.variant)[0] != model.checkpoint:
+            graph = model.evaluator.graph
+            if graph is not None:
+                graph.close()
+                model.evaluator.graph = None
+                del graph
+            previous, model = model.checkpoint, load(run, config, args.initial_model)
+            log_event(run, 'actor', 'actor_model', f'worker {args.worker} switched from {previous} to {model.checkpoint} '
+                      f'({model.sha[:12]}, {settings.model_source}); games in progress finish with the previous model',
+                      process=args.worker, checkpoint=model.checkpoint, previous=previous, reason=settings.model_source)
+        if historical:
+            historical.redraw(model.checkpoint, model.sha)
+        if restarts:
+            restarts.load()
+
+    def publish():
         now = time.perf_counter()
         name = shard_name()
         actors = sorted({e['actor'] for e in episodes})
@@ -975,40 +1006,42 @@ def worker(args):
         print(json.dumps(fields), flush=True)
         since.update(time=now, positions=state['positions'], evals=engine.evals)
         episodes.clear(); rows.clear()
-        if resolve(run, args.initial_model, settings.model_source, config.learner.variant)[0] != model.checkpoint:
-            graph = model.evaluator.graph
-            if graph is not None:
-                graph.close()
-                model.evaluator.graph = None
-                del graph
-            previous, model = model.checkpoint, load(run, config, args.initial_model)
-            log_event(run, 'actor', 'actor_model', f'worker {args.worker} switched from {previous} to {model.checkpoint} '
-                      f'({model.sha[:12]}, {settings.model_source}); games in progress finish with the previous model',
-                      process=args.worker, checkpoint=model.checkpoint, previous=previous, reason=settings.model_source)
-        if historical:
-            historical.redraw(model.checkpoint, model.sha)
-        if restarts:
-            restarts.load()
+        refresh_sources()
+
+    def fill_slots():
+        nonlocal started
+        while len(engine.slots) < settings.games_in_flight and (args.games is None or started < args.games):
+            seed = seeds.spawn(1)[0].generate_state(1, np.uint64)[0].item()
+            if historical and historical.models and sum(g.opponent is not None for g in engine.slots) < historical.target:
+                opponent, learner = historical.next()
+                sides = [model, opponent] if learner == 0 else [opponent, model]
+                engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint))
+            else:
+                restart = restarts.draw(restart_rng) if restarts and restart_rng.random() < settings.restart_fraction else None
+                engine.add(SelfPlayGame([model, model], settings, seed, restart=restart))
+            started += 1
 
     try:
         last = 0.
         while True:
-            while len(engine.slots) < settings.games_in_flight and (args.games is None or started < args.games):
-                seed = seeds.spawn(1)[0].generate_state(1, np.uint64)[0].item()
-                if historical and historical.models and sum(g.opponent is not None for g in engine.slots) < historical.target:
-                    opponent, learner = historical.next()
-                    sides = [model, opponent] if learner == 0 else [opponent, model]
-                    engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint))
-                else:
-                    restart = restarts.draw(restart_rng) if restarts and restart_rng.random() < settings.restart_fraction else None
-                    engine.add(SelfPlayGame([model, model], settings, seed, restart=restart))
-                started += 1
-            if not engine.slots and not engine.closing:
+            if not engine.slots and not engine.closing and args.games is not None and started >= args.games:
                 break
             if gate.paused():
-                if paused_since is None:
+                if not gate.requests and not token_pause:
+                    fill_slots()
+                phase_ack = {variant: token for variant, token in gate.requests.items()
+                             if phase_ack.get(variant) == token}
+                pending_ack = {variant: token for variant, token in gate.requests.items()
+                               if phase_ack.get(variant) != token}
+                entered = paused_since is None
+                if entered:
                     paused_since = time.perf_counter()
                     log_event(run, 'actor', 'info', f'worker {args.worker} paused: {gate.reason}', process=args.worker)
+                if pending_ack:
+                    engine.synchronize_inflight()
+                    phase_ack.update(pending_ack)
+                    token_pause = True
+                if entered or pending_ack:
                     status('paused'); last = time.perf_counter()
                 time.sleep(1.)
                 if time.perf_counter()-last >= 2:
@@ -1016,8 +1049,15 @@ def worker(args):
                 continue
             if paused_since is not None:
                 paused_total += time.perf_counter()-paused_since; paused_since = None
+                phase_ack = {}
+                if token_pause:
+                    refresh_sources()
+                    token_pause = False
                 log_event(run, 'actor', 'info', f'worker {args.worker} resumed: {gate.reason}', process=args.worker)
                 status('playing'); last = time.perf_counter()
+            fill_slots()
+            if not engine.slots and not engine.closing:
+                break
             before = engine.searches
             for slot in engine.step():
                 episode, items = slot.episode()
