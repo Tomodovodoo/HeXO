@@ -138,7 +138,7 @@ python python/notation.py export match.json > match.txt
 python python/bot_api.py --port 8790 --ms 100
 ```
 
-Both formats record two placements per turn, so they cannot express a win on the first placement of a turn. Export raises `NotationConflict` and the API returns HTTP 409 in that case. Details are in [docs/notation-api.md](docs/notation-api.md).
+Notation accepts and exports a single winning stone on the final turn, as Tyto does. The stateless API's exactly-two-pieces schema still returns HTTP 409 for that case. Details are in [docs/notation-api.md](docs/notation-api.md).
 
 ## Documentation
 
