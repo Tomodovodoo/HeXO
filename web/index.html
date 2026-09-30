@@ -98,8 +98,6 @@ async function call(path,args={}){
       $('stats').textContent=`${detail} · ${Math.round(a.elapsed_ms)} ms`;
       if(path==='/analyze'){
         hints=a;
-        $('hint').textContent=a.winning_line.length?'Verified winning line shown. Defender moves show one covered reply.':`Suggested turn: ${a.moves.map(p=>p.join(',')).join(' then ')}. Player ${a.player+1} win estimate ${Math.round(a.win_probability*100)}%.`;
-        if(a.threat)$('hint').textContent+=' Opponent threat to answer: '+a.threat.moves.map(p=>p.join(',')).join(' and ')+'.';
         $('clear-hint').hidden=false;
       }
     }
