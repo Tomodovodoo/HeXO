@@ -2,32 +2,6 @@
 
 Bubble is a self-play bot for [HeXO](https://github.com/HeXO-Game/HeXO), the hexagonal connect-six game this repository is named after.
 
-## The game
-
-HeXO is played by two players, Cross (X) and Circle (O), on an unbounded grid of hexagons. Cells use axial coordinates `(q, r)`. The distance between two cells is
-
-```
-distance = max(|q1 - q2|, |r1 - r2|, |(q1 + r1) - (q2 + r2)|)
-```
-
-so the six neighbours of `(0, 0)` are `(1, 0)`, `(-1, 0)`, `(0, 1)`, `(0, -1)`, `(1, -1)` and `(-1, 1)`.
-
-Turns:
-
-1. Cross opens with a single stone, and it must go on the origin `(0, 0)`.
-2. From then on the players alternate, starting with Circle, and each turn is two placements by the same player.
-3. A placement must go on an empty cell within distance 8 of any stone already on the board, of either colour. The board grows as stones spread; there is no fixed edge.
-
-Winning:
-
-- A player wins with six or more of their own stones in an unbroken line along one of the three hex axes: `(1, 0)`, `(0, 1)` or `(1, -1)`.
-- The win counts the moment the sixth stone lands. If the first placement of a turn completes a line, the game ends there and the second placement is never made.
-- There are no captures and no passes.
-
-A short example. Cross opens at `(0, 0)`. Circle plays `(1, 0)` and `(0, 1)`. Cross plays `(-1, 0)` and `(-2, 0)`, making three in a row on the `(1, 0)` axis. Circle's stone at `(1, 0)` already blocks that line on the right, so Cross can only reach six by extending left to `(-5, 0)`. Because each turn adds two stones, a player who has four in a row with both ends open threatens to finish on the next turn, and the opponent needs both of their placements to block. Much of the game is about building two such threats at once.
-
-The rules engine is `src/hexo.cpp`. `tests/reference.py` is an independent Python implementation used to check it.
-
 ## What Bubble is
 
 Bubble is a KataGo-style asynchronous self-play engine that trains on one GPU. Separate processes share a run directory:
@@ -65,6 +39,33 @@ python tools/build_tactical.py
 ```
 
 For CUDA, install the PyTorch wheel for your hardware from the [PyTorch selector](https://pytorch.org/get-started/locally/). `requirements/tested.txt` pins the tested library versions. With MinGW on Windows, add `-G "MinGW Makefiles"` to the configure command and keep `g++` on `PATH`.
+
+## The game
+
+HeXO is played by two players, Cross (X) and Circle (O), on an unbounded grid of hexagons. Cells use axial coordinates `(q, r)`. The distance between two cells is
+
+```
+distance = max(|q1 - q2|, |r1 - r2|, |(q1 + r1) - (q2 + r2)|)
+```
+
+so the six neighbours of `(0, 0)` are `(1, 0)`, `(-1, 0)`, `(0, 1)`, `(0, -1)`, `(1, -1)` and `(-1, 1)`.
+
+Turns:
+
+1. Cross opens with a single stone, and it must go on the origin `(0, 0)`.
+2. From then on the players alternate, starting with Circle, and each turn is two placements by the same player.
+3. A placement must go on an empty cell within distance 8 of any stone already on the board, of either colour. The board grows as stones spread; there is no fixed edge.
+
+Winning:
+
+- A player wins with six or more of their own stones in an unbroken line along one of the three hex axes: `(1, 0)`, `(0, 1)` or `(1, -1)`.
+- The win counts the moment the sixth stone lands. If the first placement of a turn completes a line, the game ends there and the second placement is never made.
+- There are no captures and no passes.
+
+A short example. Cross opens at `(0, 0)`. Circle plays `(1, 0)` and `(0, 1)`. Cross plays `(-1, 0)` and `(-2, 0)`, making three in a row on the `(1, 0)` axis. Circle's stone at `(1, 0)` already blocks that line on the right, so Cross can only reach six by extending left to `(-5, 0)`. Because each turn adds two stones, a player who has four in a row with both ends open threatens to finish on the next turn, and the opponent needs both of their placements to block. Much of the game is about building two such threats at once.
+
+The rules engine is `src/hexo.cpp`. `tests/reference.py` is an independent Python implementation used to check it.
+
 
 ## Test
 
