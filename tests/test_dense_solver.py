@@ -544,6 +544,25 @@ class Adjudication(unittest.TestCase):
         self.assertEqual((result['proven'], result['proof']), (-1, mine))
         self.assertNotIn('proof_action', result)
 
+    def test_a_shorter_tree_win_replaces_the_certificate_move(self):
+        try:
+            solver = dense_solver.Solver(Schedule(), asynchronous=False)
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        history, player = tuple(self.opening), dense_solver.mover(self.opening)
+        plan = dense_solver.Plan(solver)
+        plan.proofs[player] = Proof(history, self.proof['certificate'])
+        slot = type('Slot', (), dict(tree=type('Tree', (), dict(history=history, ptr=None))(),
+                                     solver=Budgets(root_nodes=NODES)))()
+        result = dict(action=[9, 9], exact_winner=player, proof_plies=1, proof_action=[[9, 9]])
+        self.assertTrue(plan.finish(slot, result))
+        self.assertEqual((result['action'], result['proven'], result['proof_plies']), ([9, 9], 1, 1))
+        self.assertNotIn('proof', result)
+        result = dict(action=[9, 9], exact_winner=player, proof_plies=99, proof_action=[[9, 9]])
+        self.assertTrue(plan.finish(slot, result))
+        turns = self.proof['proof_turns']
+        self.assertEqual((result['action'], result['proof_plies']), (list(self.proof['moves'][0]), 2+4*(turns-1)))
+
     def test_a_proof_on_the_capped_ply_still_adjudicates(self):
         episode, rows = self.play(plies=1)
         self.assertEqual((episode['reason'], episode['winner'], len(rows)), ('proven', dense_solver.mover(self.opening), 1))
