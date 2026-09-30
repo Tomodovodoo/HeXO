@@ -125,19 +125,25 @@ struct Tree {
   if(changed)settle(into);
   return changed;
  }
+ // Copies to `into` every edge proof of `from`, another expanded node of the same position (the legal moves and their
+ // order are the same), that is new or tighter; true when anything changed. The caller settles `into`.
+ bool copy(const Node& from,Node& into) {
+  bool changed=false;
+  if(from.edges.size()!=into.edges.size())return false;
+  for(size_t i=0;i<from.edges.size();++i){
+   auto& f=from.edges[i];auto& e=into.edges[i];
+   if(f.exact_winner>=0 && f.action==e.action && (e.exact_winner!=f.exact_winner || e.distance>f.distance || (e.distance==f.distance && e.bound && !f.bound))){
+    e.exact_winner=f.exact_winner;e.distance=f.distance;e.bound=f.bound;changed=true;
+   }
+  }
+  return changed;
+ }
  // Gives `into`, a node of the same position in another turn context, the verdicts `from` holds: all its proven edges
  // when both are expanded (the legal moves are the same), else its outcome; then updates its parents.
  void share(const Node& from,const Outcome& outcome,Node& into) {
   bool changed=false;
-  if(from.expanded && into.expanded && from.edges.size()==into.edges.size()){
-   for(size_t i=0;i<from.edges.size();++i){
-    auto& f=from.edges[i];auto& e=into.edges[i];
-    if(f.exact_winner>=0 && f.action==e.action && (e.exact_winner!=f.exact_winner || e.distance>f.distance || (e.distance==f.distance && e.bound && !f.bound))){
-     e.exact_winner=f.exact_winner;e.distance=f.distance;e.bound=f.bound;changed=true;
-    }
-   }
-   if(changed)settle(into);
-  } else changed=apply(outcome,into);
+  if(from.expanded && into.expanded){if((changed=copy(from,into)))settle(into);}
+  else changed=apply(outcome,into);
   if(changed){refresh(into);propagate(into,nullptr);}
  }
  // Completed Q (mctx mixed value, min-max rescale, (50 + max visits) * 0.1) over the eligible edges only: proven
@@ -312,7 +318,13 @@ struct Tree {
   // A retained proven loss covers every legal continuation even if this node had not needed expansion yet.
   if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges){edge.exact_winner=node.exact_winner;edge.distance=node.distance;edge.bound=true;}
   if(tactics)classify(path,node);
-  if(graph)if(auto o=outcomes.find(node.position);o!=outcomes.end() && o->second.winner==node.player)apply(o->second,node);
+  if(graph){
+   // A live expanded peer of the position hands over its edge proofs (exact resistances included); a shared win's
+   // witness covers the case where no peer holds them.
+   if(auto list=positions.find(node.position);list!=positions.end())
+    for(auto& w:std::vector(list->second))if(auto peer=w.lock())if(peer.get()!=&node && peer->expanded && copy(*peer,node))settle(node);
+   if(auto o=outcomes.find(node.position);o!=outcomes.end() && o->second.winner==node.player)apply(o->second,node);
+  }
   // A certificate adds its witness as a winning edge; settle keeps any shorter tactical win found by classify.
   if(exact>=0){for(auto& edge:node.edges)if(edge.action==witness && (edge.exact_winner!=exact || edge.distance>distance)){edge.exact_winner=exact;edge.distance=distance;edge.bound=true;}settle(node);}
   node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);requests.erase(found);

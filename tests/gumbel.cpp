@@ -104,6 +104,19 @@ int main(){
   int64_t moves[]={3,3,3,4};t.prove(id,hist.data(),int(h.size()),0,2,moves,2,2);
   auto edge=std::find_if(t.root->edges.begin(),t.root->edges.end(),[](auto& e){return e.action==Cell{3,3};});
   assert(edge->child==existing && existing->exact_winner==0 && existing->distance==5 && existing->bound);}
+ // Expanding another context of a proven loss takes a live peer's exact resistances, not only the shared bound.
+ {gumbel::Tree t(0);t.graph=true;
+  for(auto c:std::vector<Cell>{{0,0},{1,0},{2,0},{0,1},{0,2},{3,0}})t.advance(c);
+  t.board.make({4,0});auto peer=t.child_here();auto legal=t.board.legal_moves();t.board.undo();
+  peer->expanded=true;peer->remaining=2;
+  for(size_t i=0;i<legal.size();++i){gumbel::Edge e;e.action=legal[i];e.exact_winner=1;e.distance=i==0?9:3;peer->edges.push_back(std::move(e));}
+  t.settle(*peer);t.learn(*peer);assert(peer->exact_winner==1 && peer->distance==9 && !peer->bound);
+  gumbel::Tree u(0);u.graph=true;u.outcomes=t.outcomes;u.positions=t.positions;
+  for(auto c:std::vector<Cell>{{0,0},{1,0},{3,0},{0,1},{0,2},{2,0},{4,0}})u.advance(c);
+  assert(u.root->exact_winner==1 && !u.root->expanded);
+  u.begin(4,2);int id=u.request();auto& l=u.requests.at(id).legal;std::vector<int64_t> a;for(auto c:l){a.push_back(c.q);a.push_back(c.r);}
+  std::vector<double> z(l.size());u.fulfill(id,a.data(),z.data(),z.data(),int(l.size()));
+  assert(u.root->distance==9 && !u.root->bound && u.root->edges[0].eligible && !u.root->edges[1].eligible);}
  // MCGS backup: a node's value is recomputed from its edges' visits and its children's current values; a playout
  // reusing a transposed child's value leaves that child unchanged.
  {gumbel::Tree t(0);t.graph=true;gumbel::Node r;r.player=0;r.expanded=true;r.value=.2;
