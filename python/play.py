@@ -300,13 +300,15 @@ class Engines:
         self.locks = dict(native=threading.Lock(), seal=threading.Lock())
 
     def bubble(self, path):
-        path = Path(path)
-        if path not in self.bubbles:
-            self.bubbles[path] = Bubble(path, self.device)
+        """The loaded export at `path`, reloaded when the file changes."""
+        stat = Path(path).stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        if key not in self.bubbles:
+            self.bubbles[key] = Bubble(path, self.device)
             while len(self.bubbles) > 3:
                 self.bubbles.popitem(last=False)
-        self.bubbles.move_to_end(path)
-        return self.bubbles[path]
+        self.bubbles.move_to_end(key)
+        return self.bubbles[key]
 
     def solver(self):
         if self.prover is None:
@@ -318,8 +320,17 @@ class Engines:
         return self.prover
 
     def evaluate(self, entry, checkpoint, budget, history, watch):
-        bubble = self.bubble(export_path(entry, checkpoint))
-        return evaluate(bubble, self.solver(), history, budget['simulations'], budget['solver_nodes'], watch)
+        """`evaluate` with the entry's export; returns the evaluation, the budget it really had (no solver nodes
+        when the solver is not built) and the key of the weights it used (see `model_key`)."""
+        bubble, spent = self.bubble(export_path(entry, checkpoint)), self.effective(budget)
+        found = evaluate(bubble, self.solver(), history, spent['simulations'], spent['solver_nodes'], watch)
+        return found, spent, bubble.sha256[:16]
+
+    def effective(self, budget):
+        """`budget` as it can run here: no solver nodes when the tactical library is not built."""
+        import tactical_proof
+        built = tactical_proof.library(self.tactical_package or tactical_proof.PACKAGE).exists()
+        return budget if built else budget | dict(solver_nodes=0)
 
     def turn(self, entry, budget, history, stop=lambda: False):
         """A native or Seal turn, searched on its own thread. Their searches cannot be interrupted, so when `stop()`
@@ -637,7 +648,7 @@ class Session:
                     return job
                 if job.status == 'failed' and not force:
                     return None
-        if not force and self.store.covering(history, self.engine_key(settings), settings['budget']):
+        if not force and self.store.covering(history, self.engine_key(settings), self.engines.effective(settings['budget'])):
             return None
         return self.submit(Job('analyse', priority, history, seat=settings, force=force))
 
@@ -796,17 +807,17 @@ class Session:
     def evaluation(self, job, seat, history, force=False, exact=False):
         """The evaluation of `history` for `seat`, saved. Unless forced, a saved one is reused: at exactly the
         seat's budget when `exact`, else at least as deep."""
-        key, budget = self.engine_key(seat), seat['budget']
+        key, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
         saved = None if force else self.store.get(history, key, budget) if exact else self.store.covering(history, key, budget)
         if saved:
             return saved
-        found = self.engines.evaluate(self.entries[seat['engine']], seat['checkpoint'], seat['budget'], history,
-                                      self.watcher(job, job.kind != 'review'))
+        found, spent, weights = self.engines.evaluate(self.entries[seat['engine']], seat['checkpoint'], budget,
+                                                      history, self.watcher(job, job.kind != 'review'))
         if job.cancelled:
             raise Cancelled()
         entry = self.entries[seat['engine']]
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
-        return self.store.add(history, key, seat['budget'], found | dict(model=model))
+        return self.store.add(history, weights, spent, found | dict(model=model))
 
     def run(self, job):
         seat, history = job.seat, list(job.history)

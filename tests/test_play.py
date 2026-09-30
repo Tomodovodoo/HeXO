@@ -10,7 +10,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from hexo import Game
-from play import Cancelled, Engines, Evaluations, Handler, PRESETS, Session, budget_of, import_history, review, scan
+from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, Session, budget_of, export_path, import_history,
+                  model_key, review, scan)
 
 STANDARD = PRESETS['bubble']['standard']
 
@@ -50,7 +51,11 @@ class FakeEngines:
             time.sleep(.01)
         watch(budget['simulations'])
         moves = legal_turn(history)
-        return dict(moves=moves, value=.5, top=[[*moves[0], .9]], proof=None, line=[], threat=[], ms=1)
+        found = dict(moves=moves, value=.5, top=[[*moves[0], .9]], proof=None, line=[], threat=[], ms=1)
+        return found, budget, model_key(export_path(entry, checkpoint))
+
+    def effective(self, budget):
+        return budget
 
     def turn(self, entry, budget, history, stop):
         return legal_turn(history)

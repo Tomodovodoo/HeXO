@@ -6998,6 +6998,19 @@ class DenseBrowser(unittest.TestCase):
         self.assertEqual((result['proof'] or {}).get('winner'), 0)
         self.assertTrue(self.complete(history, result['moves']))
 
+    def test_engines_reload_changed_weights_and_record_the_budget_they_ran(self):
+        from play import Engines
+        path = Path(self.temp.name)/'ema.pt'
+        engines = Engines('cpu', tactical_package=Path(self.temp.name)/'missing')
+        first = engines.bubble(path)
+        self.assertIs(engines.bubble(path), first)
+        hexnet.save_model(path, hexnet.HexNet(TINY))
+        os.utime(path, ns=(1, 1))
+        self.assertIsNot(engines.bubble(path), first)
+        entry = dict(kind='bubble', path=path)
+        found, spent, weights = engines.evaluate(entry, '', dict(simulations=0, solver_nodes=2048), [(0, 0)], lambda n: None)
+        self.assertEqual((spent, weights), (dict(simulations=0, solver_nodes=0), engines.bubble(path).sha256[:16]))
+
     def test_cancelling_stops_the_search(self):
         from play import Cancelled, evaluate
         def watch(n):
