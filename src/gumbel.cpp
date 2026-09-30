@@ -74,24 +74,27 @@ struct Tree {
   settle(node);
  }
  // Node verdict, distance and eligibility from its edges' exact winners. A won node offers its shortest guaranteed
- // wins (least upper bound). A lost node offers every loss that may resist longest: those whose distance reaches
- // the largest lower bound among its losses. An exact distance is its own lower bound. A bounded loss is not a
- // one-turn loss when tactics classified the node, so the mover's remaining stones, the opponent's turn, the
- // mover's next turn and one more opponent stone come first: remaining + 5; without tactics its lower bound is 1.
- // Otherwise only the unproven edges stay eligible.
+ // wins (least upper bound); its distance is exact when an exact edge attains it and no bounded win could be faster.
+ // A lost node offers every loss that may resist longest: those whose distance reaches the largest lower bound among
+ // its losses. An exact distance is its own lower bound. When tactics classified the node, a bounded result is not a
+ // one-turn result: a bounded win needs the mover's remaining stones, the opponent's turn and one more stone
+ // (remaining + 3); a bounded loss also lets the mover play its next turn first (remaining + 5). Without tactics a
+ // bound's lower bound is 1. Otherwise only the unproven edges stay eligible.
  void settle(Node& node) {
   // Only expansion installs the complete legal action list. A pending/unexpanded leaf is never a universal proof.
   if(!node.expanded || node.edges.empty())return;
-  bool winning=false,safe=false,loose=false;int fastest=std::numeric_limits<int>::max(),slowest=0,longest=0;
-  auto lower=[&](const Edge& e){return e.bound?(tactics?node.remaining+5:1):e.distance;};
+  const int none=std::numeric_limits<int>::max();
+  bool winning=false,safe=false,attained=false;int fastest=none,slowest=0,longest=0,quickest=none;
+  auto lower=[&](const Edge& e,int turn){return e.bound?(tactics?node.remaining+turn:1):e.distance;};
   for(auto& edge:node.edges){
-   if(edge.exact_winner==node.player){winning=true;fastest=std::min(fastest,edge.distance);loose|=edge.bound;}
+   if(edge.exact_winner==node.player){winning=true;fastest=std::min(fastest,edge.distance);quickest=std::min(quickest,lower(edge,3));}
    else if(edge.exact_winner<0)safe=true;
-   else {slowest=std::max(slowest,edge.distance);longest=std::max(longest,lower(edge));}
+   else {slowest=std::max(slowest,edge.distance);longest=std::max(longest,lower(edge,5));}
   }
+  for(auto& edge:node.edges)attained|=edge.exact_winner==node.player && !edge.bound && edge.distance==fastest;
   for(auto& edge:node.edges)edge.eligible=winning?edge.exact_winner==node.player && edge.distance==fastest
    :!safe?edge.distance>=longest:edge.exact_winner<0;
-  if(winning){node.exact_winner=node.player;node.distance=fastest;node.bound=loose && fastest>1;}
+  if(winning){node.exact_winner=node.player;node.distance=fastest;node.bound=!attained || quickest<fastest;}
   else if(!safe){node.exact_winner=1-node.player;node.distance=slowest;node.bound=slowest>longest;}
  }
  // Records an externally proven winner of the root edge `action` within `distance` placements (the edge's own

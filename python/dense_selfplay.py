@@ -385,10 +385,13 @@ class Engine:
                     if leaf is not None:
                         proof, verdict = leaf
                         stones, turns = proof.path(slot.tree.history)[1]
-                        result.update(proven=1, proof=proof, proof_turns=turns, proof_action=[list(s) for s in stones],
-                                      proof_plies=dense_solver.proof_plies(len(stones), turns),
-                                      action=list(stones[0]), solver_nodes=result.get('solver_nodes', 0)+verdict['nodes_used'],
+                        bound = dense_solver.proof_plies(len(stones), turns)
+                        result.update(solver_nodes=result.get('solver_nodes', 0)+verdict['nodes_used'],
                                       solver_budget=result.get('solver_budget', 0)+verdict['budget'])
+                        # A shorter win the tree proved meanwhile keeps its own move, witness and distance.
+                        if not (result['proven'] > 0 and result.get('proof_plies', bound) < bound):
+                            result.update(proven=1, proof=proof, proof_turns=turns, proof_action=[list(s) for s in stones],
+                                          proof_plies=bound, action=list(stones[0]))
                     result['network_value'] = self.root_predictions[id(slot)][2]
                     self.searches += 1
                     if not slot.searched(result):

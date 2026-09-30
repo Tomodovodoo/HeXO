@@ -49,6 +49,15 @@ int main(){
   for(int i=0;i<4;++i){gumbel::Edge e;e.exact_winner=1;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
   t.settle(n);assert(n.exact_winner==1 && n.distance==20 && n.bound);
   assert(n.edges[0].eligible==!tactics && !n.edges[1].eligible && n.edges[2].eligible && n.edges[3].eligible);}
+ // A won node's distance is exact when an exact edge attains it and no bounded win could be faster.
+ for(int slow:{20,4}){gumbel::Tree t(0);t.tactics=true;gumbel::Node n;n.player=0;n.remaining=1;n.expanded=true;
+  int d[]={2,slow};bool b[]={false,true};
+  for(int i=0;i<2;++i){gumbel::Edge e;e.exact_winner=0;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
+  t.settle(n);assert(n.exact_winner==0 && n.distance==2 && !n.bound && n.edges[0].eligible && !n.edges[1].eligible);}
+ {gumbel::Tree t(0);t.tactics=true;gumbel::Node n;n.player=0;n.remaining=1;n.expanded=true;
+  int d[]={9,20};bool b[]={false,true};
+  for(int i=0;i<2;++i){gumbel::Edge e;e.exact_winner=0;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
+  t.settle(n);assert(n.distance==9 && n.bound);}
  gumbel::Tree tree(1);tree.advance({0,0});tree.begin(16,4);
  assert(tree.sequence==std::vector<int>({0,0,0,0,1,1,1,1,2,2,3,3,4,4,5,5}));
  gumbel::Node n;n.value=.2;
