@@ -41,16 +41,19 @@ def checked(ok):
         raise ValueError(native.hxg_error().decode())
 
 class EvaluationCache:
-    """Exact colored-state/phase/model keys. No visit statistics are shared."""
+    """Colored stones, turn context and model keys. No visit statistics are shared."""
     def __init__(self, capacity=4096):
         self.capacity, self.entries = capacity, OrderedDict()
 
     def key(self, history, version):
-        # Requests come from native legal histories. Exact tuples resolve hash
-        # collisions and retain colors, phase and model without rebuilding a board.
+        # Dense inputs also identify this turn's first stone and the opponent's previous turn.
         size=len(history)
+        start = size if size % 2 or size == 0 else size-1
+        turn = tuple((int(q), int(r)) for q, r in history[start:size])
+        previous = tuple(sorted((int(q), int(r)) for q, r in history[max(0, start-2):start]))
         return (version, ((size+1)//2)%2, 2 if size%2 else 1,
-                tuple(sorted((int(q),int(r),((i+1)//2)%2) for i,(q,r) in enumerate(history))))
+                tuple(sorted((int(q),int(r),((i+1)//2)%2) for i,(q,r) in enumerate(history))),
+                turn, previous)
 
     def get(self, key):
         value = self.entries.get(key)
