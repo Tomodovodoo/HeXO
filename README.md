@@ -144,6 +144,7 @@ Both formats record two placements per turn, so they cannot express a win on the
 
 - [Dense training and value targets](docs/dense-training.md)
 - [Dense evaluation, opening books and ratings](docs/dense-evaluation.md)
+- [Six engine protocol and arena matches](docs/six-engine.md)
 - [Tactical solver](docs/tactical-solver.md)
 - [Neural search](docs/neural-search.md)
 - [GPU kernels](docs/gpu-kernels.md)

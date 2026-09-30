@@ -468,7 +468,8 @@ def provisional(league, evaluator):
     if comparison.get('candidate') in entries or comparison.get('candidate') in decided:
         return None
     opponent = comparison.get('opponent')
-    base = ((league.get('anchors') or {}).get('seal') or {}).get('elo') if opponent == 'seal' else (entries.get(opponent) or {}).get('elo')
+    anchors = league.get('anchors') or {}
+    base = (anchors[opponent] if opponent in anchors else entries.get(opponent) or {}).get('elo')
     interval = tally.get('elo_interval')
     known = finite(base) and finite(tally.get('elo_delta'))
     return dict(id=comparison.get('candidate'), opponent=opponent, **{k: tally.get(k) for k in ('wins', 'losses', 'capped', 'games')},
@@ -805,6 +806,7 @@ def project(root, fresh=30):
                          learner_heartbeat={v: s['age'] for v, s in learners.items()},
                          learner_stage={v: s.get('stage') for v, s in learners.items()},
                          actor_heartbeat=min(ages, default=None), actor_processes=len(actors),
+                         anchors=read_json(run/'league.json', {}).get('anchors', {}),
                          external_ratings=external_ratings(run, read_json(run/'league.json', {})),
                          logs=sorted(p.stem for p in (run/'metrics').glob('*.jsonl'))))
     return dict(root=str(root), now=now, runs=runs)
@@ -915,10 +917,13 @@ def series(run, config, variant, metric, x='step', max_points=1000, from_step=0,
         points = sorted((c['step'] if x == 'step' else hours(c['created_at']), c['elo'],
                          *(c['elo_interval'] if isinstance(c.get('elo_interval'), list) else (c['elo'], c['elo'])))
                         for c in rated(run) if c.get('variant') == variant and (x == 'step' or finite(c['created_at'])))
-    elif metric == 'seal_elo' or metric.startswith('external_elo:'):
+    elif metric == 'seal_elo' or metric.startswith(('anchor_elo:', 'external_elo:')):
         league = read_json(run/'league.json', {})
-        reference = ((league.get('anchors') or {}).get('seal') or {}) if metric == 'seal_elo' else \
-                    external_ratings(run, league).get(metric.removeprefix('external_elo:'), {})
+        if metric.startswith('external_elo:'):
+            reference = external_ratings(run, league).get(metric.removeprefix('external_elo:'), {})
+        else:
+            name = 'seal' if metric == 'seal_elo' else metric.removeprefix('anchor_elo:')
+            reference = (league.get('anchors') or {}).get(name, {})
         elo, interval = reference.get('elo'), reference.get('elo_interval')
         points = sorted((c['step'] if x == 'step' else hours(c['created_at']), elo,
                          *(interval if isinstance(interval, list) else (elo, elo)))
