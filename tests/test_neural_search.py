@@ -163,7 +163,7 @@ class NeuralTree(unittest.TestCase):
         pending = [search.request() for _ in range(4)]
         actions = search.result(0, 0, 0, 0)['actions']
         # This entry represents a caller-verified proof; the synthetic outcome is not a game certificate.
-        self.assertTrue(native.hxg_mark_exact(search.ptr, *map(int, actions[0]), 1))
+        self.assertTrue(native.hxg_mark_exact(search.ptr, *map(int, actions[0]), 1, 1))
         self.assertFalse(native.hxg_done(search.ptr))
         self.assertEqual(search.request()[0], 0)
         for request, history in pending:
@@ -240,6 +240,42 @@ class NeuralTree(unittest.TestCase):
         self.assertLessEqual(result['visits'][i], 3)
         self.assertNotEqual(result['action'], list(a))
         self.assertEqual(result['exact_winner'], -1)
+
+    def test_exact_roots_report_the_shortest_win_and_the_longest_resistance(self):
+        # Player 0 has five in a row with two placements left: either end wins with the first stone.
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]]
+        search = NeuralSearch(Uniform(), 'shortest', history, tactics=True)
+        self.addCleanup(search.close)
+        result = search.search(8)
+        self.assertEqual((result['proven'], result['proof_plies']), (1, 1))
+        self.assertEqual(sorted(result['proof_action']), [[-1,0],[5,0]])
+        self.assertIn(result['action'], [[-1,0],[5,0]])
+        self.assertEqual(np.count_nonzero(result['policy']), 2)
+        # Player 1 has one placement left against player 0's five (open at (5,0)) and open four on r=3: every move
+        # loses, and blocking the five is the only one that makes player 0 need two placements instead of one.
+        history = [[0,0],[-1,0],[-1,1],[1,0],[2,0],[-2,5],[6,-3],[3,0],[4,0],[0,6],[7,-5],[0,3],[1,3],[-5,6],[8,-6],
+                   [2,3],[3,3],[-6,-2]]
+        search = NeuralSearch(Uniform(), 'longest', history, tactics=True)
+        self.addCleanup(search.close)
+        result = search.search(8)
+        self.assertEqual((result['proven'], result['proof_plies']), (-1, 3))
+        self.assertEqual(result['actions'][np.flatnonzero(result['policy'])].tolist(), [[5,0]])
+        self.assertEqual(result['action'], [5,0])
+
+    def test_a_longer_certificate_keeps_the_shorter_tactical_win(self):
+        # Player 0 completes six with one stone; a (stub-verified) certificate names a slower turn elsewhere.
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]]
+        class Slow:
+            def history(self, history, ms, certificate=None, **kwargs):
+                return dict(status='PROVEN_WIN', native_verified=True, moves=[[-3,-3],[-3,-2]], proof_turns=3)
+        search = NeuralSearch(Uniform(), 'longer-certificate', history, tactics=True, proof_solver=Slow())
+        self.addCleanup(search.close)
+        self.assertTrue(native.hxg_begin(search.ptr, 8, 4))
+        request, pending = search.request()
+        self.assertTrue(search.fulfill_proof(request, pending, dict()))
+        result = search.search(8)
+        self.assertEqual((result['proven'], result['proof_plies']), (1, 1))
+        self.assertIn(result['action'], [[-1,0],[5,0]])
 
     def searcher(self, history=(), seed=7, evaluator=None):
         search = NeuralSearch(evaluator or Uniform(), 'test-v1', history, seed)

@@ -29,12 +29,13 @@ bind('hxg_completed', C.c_int, ptr)
 bind('hxg_done', C.c_int, ptr)
 bind('hxg_tactics', C.c_int, ptr, C.c_int)
 bind('hxg_exact', C.c_int, ptr)
-bind('hxg_prove', C.c_int, ptr, C.c_int, ints, C.c_int, C.c_int, C.c_int, ints, C.c_int)
+bind('hxg_distance', C.c_int, ptr)
+bind('hxg_prove', C.c_int, ptr, C.c_int, ints, C.c_int, C.c_int, C.c_int, ints, C.c_int, C.c_int)
 bind('hxg_hold', C.c_int, ptr, C.c_int)
 bind('hxg_priority', C.c_int, ptr, ints, C.c_int)
 if hasattr(native, 'hxg_defence'):
     bind('hxg_defence', C.c_int, ptr, ints, doubles, C.c_int)
-bind('hxg_mark_exact', C.c_int, ptr, C.c_int64, C.c_int64, C.c_int)
+bind('hxg_mark_exact', C.c_int, ptr, C.c_int64, C.c_int64, C.c_int, C.c_int)
 HOLD = -3  # hxg_next: the search waits at its armed hold
 
 def checked(ok):
@@ -142,7 +143,8 @@ class NeuralSearch:
         try:
             h = np.ascontiguousarray(history, dtype=np.int64).reshape(-1, 2)
             checked(native.hxg_prove(self.ptr, request, h, len(h), game.player,
-                                    game.remaining, np.ascontiguousarray(moves, dtype=np.int64), len(moves)))
+                                    game.remaining, np.ascontiguousarray(moves, dtype=np.int64), len(moves),
+                                    int(result['proof_turns'])))
         finally:
             game.close()
         return True
@@ -158,12 +160,15 @@ class NeuralSearch:
         selected = int(np.argmax(scores)) if n and np.isfinite(scores).any() else None
         winner = native.hxg_exact(self.ptr)
         proven = 0 if winner < 0 else 1 if winner == ((len(self.history)+1)//2)%2 else -1
+        # A won root offers only its shortest winning moves, so those are the finite scores.
+        shortest = [actions[i].tolist() for i in range(n) if np.isfinite(scores[i])] if proven > 0 else []
         return dict(action=actions[selected].tolist() if selected is not None else None,
                     actions=actions, visits=visits, values=values, policy=policy,
                     completed=native.hxg_completed(self.ptr), evaluated=evaluated, cache_hits=hits,
                     elapsed_ms=(finished-start)*1000,
                     exact_winner=winner,
                     proven=proven, proof_turns=0, solver_nodes=0, solver_budget=0,
+                    proof_plies=native.hxg_distance(self.ptr) if proven else 0, proof_action=shortest,
                     proof_status=('UNKNOWN' if winner < 0 else
                                   'PROVEN_WIN' if proven > 0 else 'PROVEN_LOSS'))
 

@@ -134,7 +134,7 @@ class NativeEntries(unittest.TestCase):
         drive(search, 8)
         actions, visits, _, _, _ = stats(search)
         for i in np.flatnonzero(visits):
-            checked(native.hxg_mark_exact(search.ptr, *actions[i], 0))
+            checked(native.hxg_mark_exact(search.ptr, *actions[i], 0, 3))
         result = search.result(0, 0, 0, 0)
         self.assertEqual(result['exact_winner'], -1)
         self.assertIsNotNone(result['action'])
@@ -146,15 +146,18 @@ class NativeEntries(unittest.TestCase):
         drive(search, 8)
         actions, _, _, _, _ = stats(search)
         mover = 1
-        checked(native.hxg_mark_exact(search.ptr, *actions[0], 1-mover))
+        checked(native.hxg_mark_exact(search.ptr, *actions[0], 1-mover, 3))
         actions, _, values, scores, policy = stats(search)
         self.assertEqual((values[0], policy[0], scores[0]), (-1., 0., -np.inf))
         self.assertEqual(native.hxg_exact(search.ptr), -1)
-        self.assertFalse(native.hxg_mark_exact(search.ptr, 99, 99, 0))
-        for action in actions:
-            checked(native.hxg_mark_exact(search.ptr, *action, 1-mover))
-        self.assertEqual(native.hxg_exact(search.ptr), 1-mover)
-        self.assertTrue(np.all(stats(search)[4] > 0))   # a lost root keeps every edge eligible
+        self.assertFalse(native.hxg_mark_exact(search.ptr, 99, 99, 0, 3))
+        self.assertFalse(native.hxg_mark_exact(search.ptr, *actions[1], 0, 0))   # a distance counts the edge
+        for i, action in enumerate(actions):
+            checked(native.hxg_mark_exact(search.ptr, *action, 1-mover, 7 if i == 5 else 3))
+        self.assertEqual((native.hxg_exact(search.ptr), native.hxg_distance(search.ptr)), (1-mover, 7))
+        _, _, _, scores, policy = stats(search)
+        # Marked distances are certificate bounds: none rules out a faster loss elsewhere, so every edge stays.
+        self.assertTrue(np.all(policy > 0) and np.all(np.isfinite(scores)))
 
     def test_marked_candidates_are_replaced_without_stalling(self):
         search = self.tree()
@@ -164,7 +167,7 @@ class NativeEntries(unittest.TestCase):
             actions, _, _, scores, _ = stats(search)
             for i in np.flatnonzero(np.isfinite(scores))[:3]:
                 marked.append(actions[i])
-                checked(native.hxg_mark_exact(search.ptr, *actions[i], 0))
+                checked(native.hxg_mark_exact(search.ptr, *actions[i], 0, 3))
         checked(native.hxg_begin(search.ptr, 16, 4))
         checked(native.hxg_hold(search.ptr, 1))
         self.assertEqual(drive(search, 16, prune), [8])
@@ -314,6 +317,8 @@ class InjectionPoints(unittest.TestCase):
         episode, rows = on.episode()
         self.assertEqual(episode['moves'][len(opening):], proof['moves'])
         self.assertEqual([(r['proven'], r['proof_turns']) for r in rows], [(1, proof['proof_turns'])]*2)
+        turns = proof['proof_turns']
+        self.assertEqual([r['proof_plies'] for r in rows], [2+4*(turns-1), 1+4*(turns-1)])
         self.assertEqual(rows[0]['solver_nodes'], proof['nodes_used'])
         self.assertEqual(episode['root_values'], [1., 1.])
         self.assertEqual(episode['solver'], dict(root_nodes=NODES, finalists=0, finalist_nodes=0, threat_nodes=0,
@@ -450,15 +455,12 @@ class Proofs(unittest.TestCase):
         winner = dense_solver.mover(self.opening)
         self.assertEqual(episode['winner'], winner)
         labels, move = Proof(self.opening, self.result['certificate']).path([tuple(m) for m in episode['moves']])
-        # The marked certificate stone proves the defender's next root lost, so the defender stops searching and may
-        # leave the certificate with an uncovered reply; the tree then wins at once. Every row keeps its exact label.
-        plies = [r['ply'] for r in rows]
-        self.assertEqual([p for p, _, _ in labels], plies[:len(labels)])
-        self.assertGreaterEqual(len(labels), 4)
+        # The proven-lost defender plays its longest resistance, a covered reply, so the game stays on the certificate.
+        self.assertEqual([p for p, _, _ in labels], [r['ply'] for r in rows])
         self.assertEqual([r['proven'] for r in rows], [1 if r['player'] == winner else -1 for r in rows])
-        # The loser asks at each of its turn starts, the winner at least once.
-        self.assertGreaterEqual(summary['root_queries'], 1+len([r for r in rows if r['player'] != winner and r['remaining'] == 2]))
-        self.assertGreaterEqual(summary['followed'], 1)
+        # One root query for the winner; the loser asks at each of its turn starts.
+        self.assertEqual(summary['root_queries'], 1+len([r for r in rows if r['player'] != winner and r['remaining'] == 2]))
+        self.assertEqual(summary['followed'], len([r for r in rows if r['player'] == winner])-1)  # all but the root's
 
     def test_deep_proof_of_a_committed_turn_is_followed(self):
         first = [tuple(c) for c in self.result['moves']]
@@ -475,7 +477,7 @@ class Proofs(unittest.TestCase):
         self.assertGreater(summary['deep_hit_rate'], 0)
         # The defender's turn after the committed one is labelled lost; the winner follows the proof from then on.
         self.assertEqual([r['proven'] for r in rows], [1 if r['player'] == winner else -1 for r in rows])
-        self.assertGreaterEqual(summary['followed'], 1)   # adopted at its first search end
+        self.assertEqual(summary['followed'], len([r for r in rows if r['player'] == winner])-1)  # adopted at its first search end
 
 
 class Adjudication(unittest.TestCase):
@@ -541,6 +543,25 @@ class Adjudication(unittest.TestCase):
             self.assertTrue(plan.finish(slot, result))
         self.assertEqual((result['proven'], result['proof']), (-1, mine))
         self.assertNotIn('proof_action', result)
+
+    def test_a_shorter_tree_win_replaces_the_certificate_move(self):
+        try:
+            solver = dense_solver.Solver(Schedule(), asynchronous=False)
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        history, player = tuple(self.opening), dense_solver.mover(self.opening)
+        plan = dense_solver.Plan(solver)
+        plan.proofs[player] = Proof(history, self.proof['certificate'])
+        slot = type('Slot', (), dict(tree=type('Tree', (), dict(history=history, ptr=None))(),
+                                     solver=Budgets(root_nodes=NODES)))()
+        result = dict(action=[9, 9], exact_winner=player, proof_plies=1, proof_action=[[9, 9]])
+        self.assertTrue(plan.finish(slot, result))
+        self.assertEqual((result['action'], result['proven'], result['proof_plies']), ([9, 9], 1, 1))
+        self.assertNotIn('proof', result)
+        result = dict(action=[9, 9], exact_winner=player, proof_plies=99, proof_action=[[9, 9]])
+        self.assertTrue(plan.finish(slot, result))
+        turns = self.proof['proof_turns']
+        self.assertEqual((result['action'], result['proof_plies']), (list(self.proof['moves'][0]), 2+4*(turns-1)))
 
     def test_a_proof_on_the_capped_ply_still_adjudicates(self):
         episode, rows = self.play(plies=1)

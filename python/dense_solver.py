@@ -471,6 +471,14 @@ class Solver:
                 pool.close()
 
 
+def proof_plies(remaining, turns, attacker=True):
+    """Placements within which a certificate's attacker completes six from a position with `remaining` placements
+    left for its mover and `turns` attacker turns left on the certificate's longest path (the completing turn
+    included): the attacker's current placements, then two defender and two attacker placements per further turn;
+    a defender to move first plays out its `remaining` placements."""
+    return remaining+(0 if attacker else 2)+4*(turns-1)
+
+
 def mover(history):
     """The side to move after `history` placements (one opening placement, then turns of two)."""
     return ((len(history)+1)//2) % 2
@@ -811,7 +819,8 @@ class Plan:
                 proven, result = query.result()
                 self.spent(result)
                 if proven:
-                    checked(native.hxg_mark_exact(ptr, int(action[0]), int(action[1]), 1-mover(slot.tree.history)))
+                    distance = 1+proof_plies(len(result['moves']), int(result['proof_turns']))
+                    checked(native.hxg_mark_exact(ptr, int(action[0]), int(action[1]), 1-mover(slot.tree.history), distance))
                     self.turns = max(self.turns, int(result['proof_turns']))
                     self.pruned.append(action)
                     self.proven(query, slot.tree.history)
@@ -852,7 +861,7 @@ class Plan:
 
     def finish(self, slot, result):
         """Before the move is played: consume the root verdict (and, with fixed budgets, the mover's pending deep
-        verdict at a turn start), play the kept proof's stone, and set result proven (+1 proof, -1 a root the
+        verdict at a turn start), play the kept proof's stone unless the tree proved a shorter win, and set result proven (+1 proof, -1 a root the
         finalist marks left exact-lost, else 0), proof_turns, solver_nodes (nodes spent on this search's queries),
         solver_budget (their granted budgets), pruned (the finalists marked lost), proof_action (the remaining
         winning placements for proven +1) and proof: with proven +1 the
@@ -878,9 +887,7 @@ class Plan:
             self.spent(self.deep[player].result()[1])
             self.proven(self.deep.pop(player), history)
         if self.pruned:
-            # Finalist and leaf certificates exclude proven losses from both choice and policy (marking is idempotent).
-            for q, r in self.pruned:
-                checked(native.hxg_mark_exact(slot.tree.ptr, int(q), int(r), 1-player))
+            # Finalist marks and leaf certificates (propagated natively) already exclude these losses in the tree.
             result.update(slot.tree.result(0, 0, 0, 0))
             if result['action'] is None:
                 # All sampled candidates were lost; choose an unvisited survivor from the improved policy.
@@ -888,14 +895,18 @@ class Plan:
         winner = result['exact_winner']
         result.update(proven=0 if winner < 0 else 1 if winner == player else -1, proof_turns=0)
         move = self.move(player, history) if active(slot.solver, self.schedule) or self.leaf_nodes else None
+        bound = proof_plies(len(move[0]), move[1]) if move is not None else None
+        if move is not None and winner == player and result.get('proof_plies', bound) < bound:
+            # The tree already proved a shorter win than the certificate: play the tree's shortest winning move.
+            move = None
         if move is not None:
             q, r = map(int, move[0][0])
-            if native.hxg_exact(slot.tree.ptr) < 0:
+            if winner < 0:
                 # The certificate stone wins, so the improved policy is restricted to proven winning stones.
-                checked(native.hxg_mark_exact(slot.tree.ptr, q, r, player))
+                checked(native.hxg_mark_exact(slot.tree.ptr, q, r, player, bound))
                 result.update(slot.tree.result(0, 0, 0, 0))
             result.update(action=[q, r], proven=1, proof_turns=move[1], proof=self.proofs[player],
-                          proof_action=[list(a) for a in move[0]])
+                          proof_action=[list(a) for a in move[0]], proof_plies=bound)
             if self.solver is not None:
                 self.solver.stats['followed'] += self.following
         elif self.pruned and native.hxg_exact(slot.tree.ptr) == 1-mover(history):

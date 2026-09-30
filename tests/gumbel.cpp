@@ -24,20 +24,40 @@ int main(){
     }level=std::move(next);paths=std::move(next_paths);
    }
    std::vector<int> observed(leaves,-1);int encoded=assignment;
-   std::function<int(int,int)> expected=[&](int d,int offset){
-    if(d==depth)return observed[offset];int player=(players>>d)&1;
-    int a=expected(d+1,offset),b=expected(d+1,offset+(1<<(depth-d-1)));
-    return a==player || b==player?player:a==1-player && b==1-player?1-player:-1;
+   // (winner, distance): the shortest win at the winner's choice, the longest resistance at the loser's.
+   std::function<std::pair<int,int>(int,int)> expected=[&](int d,int offset)->std::pair<int,int>{
+    if(d==depth)return {observed[offset],observed[offset]<0?-1:offset%3};int player=(players>>d)&1;
+    auto a=expected(d+1,offset),b=expected(d+1,offset+(1<<(depth-d-1)));
+    if(a.first==player || b.first==player)return {player,1+std::min(a.first==player?a.second:1<<20,b.first==player?b.second:1<<20)};
+    if(a.first==1-player && b.first==1-player)return {1-player,1+std::max(a.second,b.second)};
+    return {-1,-1};
    };
-   for(int i=0;i<leaves;++i){int verdict=encoded%3-1;encoded/=3;observed[i]=verdict;level[i]->player=(players>>depth)&1;level[i]->exact_winner=verdict;
+   for(int i=0;i<leaves;++i){int verdict=encoded%3-1;encoded/=3;observed[i]=verdict;level[i]->player=(players>>depth)&1;level[i]->exact_winner=verdict;level[i]->distance=verdict<0?-1:i%3;
     gumbel::Path p;p.leaf=level[i];p.edges=paths[i];for(auto [node,index]:p.edges)++node->edges[index].pending;
-    t.backup(p,i%2?1:-1);assert(t.root->exact_winner==expected(0,0));
+    t.backup(p,i%2?1:-1);auto want=expected(0,0);assert(t.root->exact_winner==want.first);if(want.first>=0)assert(t.root->distance==want.second);
     for(auto [node,index]:p.edges){auto& e=node->edges[index];assert(e.pending==0);assert(e.exact_winner==e.child->exact_winner);if(e.exact_winner>=0)assert(e.sum==(e.exact_winner==node->player?e.visits:-e.visits));}
    }
   }
  }
  // Neither an empty nor an unexpanded action list can certify a loss.
  {gumbel::Tree t(0);gumbel::Node node;node.player=0;t.settle(node);assert(node.exact_winner==-1);node.edges.emplace_back();node.edges[0].exact_winner=1;t.settle(node);assert(node.exact_winner==-1);}
+ // A lost node keeps every loss that may resist longest. With tactics a bounded loss outlasts every one-turn loss
+ // (at least remaining + 5 placements); without tactics a bound may hide a faster loss, so it only drops losses
+ // that are certainly shorter.
+ for(bool tactics:{true,false}){gumbel::Tree t(0);t.tactics=tactics;gumbel::Node n;n.player=0;n.remaining=1;n.expanded=true;
+  int d[]={3,2,20,7};bool b[]={false,false,true,true};
+  for(int i=0;i<4;++i){gumbel::Edge e;e.exact_winner=1;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
+  t.settle(n);assert(n.exact_winner==1 && n.distance==20 && n.bound);
+  assert(n.edges[0].eligible==!tactics && !n.edges[1].eligible && n.edges[2].eligible && n.edges[3].eligible);}
+ // A won node's distance is exact when an exact edge attains it and no bounded win could be faster.
+ for(int slow:{20,4}){gumbel::Tree t(0);t.tactics=true;gumbel::Node n;n.player=0;n.remaining=1;n.expanded=true;
+  int d[]={2,slow};bool b[]={false,true};
+  for(int i=0;i<2;++i){gumbel::Edge e;e.exact_winner=0;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
+  t.settle(n);assert(n.exact_winner==0 && n.distance==2 && !n.bound && n.edges[0].eligible && !n.edges[1].eligible);}
+ {gumbel::Tree t(0);t.tactics=true;gumbel::Node n;n.player=0;n.remaining=1;n.expanded=true;
+  int d[]={9,20};bool b[]={false,true};
+  for(int i=0;i<2;++i){gumbel::Edge e;e.exact_winner=0;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
+  t.settle(n);assert(n.distance==9 && n.bound);}
  gumbel::Tree tree(1);tree.advance({0,0});tree.begin(16,4);
  assert(tree.sequence==std::vector<int>({0,0,0,0,1,1,1,1,2,2,3,3,4,4,5,5}));
  gumbel::Node n;n.value=.2;

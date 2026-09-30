@@ -7,8 +7,11 @@
 #include <string>
 namespace gumbel {
 struct Node;
-struct Edge { Cell action;double logit=0,prior=0,sum=0,gumbel=0;int visits=0,pending=0,epoch=0,exact_winner=-1;bool eligible=true;std::unique_ptr<Node> child; };
-struct Node { int player=0,exact_winner=-1;bool expanded=false,pending=false;double value=0;std::vector<Edge> edges; };
+struct Edge { Cell action;double logit=0,prior=0,sum=0,gumbel=0;int visits=0,pending=0,epoch=0,exact_winner=-1,distance=-1;bool eligible=true,bound=false;std::unique_ptr<Node> child; };
+// An exact winner comes with a distance: the placements within which that winner completes six from this position
+// (an edge counts its own placement) against any defence, combined by min at the winner's choices and max at the
+// loser's. It is exact for terminal and tactical results; `bound` marks an upper bound, which certificates give.
+struct Node { int player=0,remaining=1,exact_winner=-1,distance=-1;bool expanded=false,pending=false,bound=false;double value=0;std::vector<Edge> edges; };
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1;std::vector<std::vector<Cell>> own,threats; };
@@ -55,42 +58,54 @@ struct Tree {
  void classify(const Path& path,Node& node) {
   const auto& own=path.own;const auto& threats=path.threats;
   auto contains=[](const std::vector<Cell>& completion,Cell c){return std::find(completion.begin(),completion.end(),c)!=completion.end();};
+  constexpr int none=std::numeric_limits<int>::max();
+  // The opponent's fastest completion left open by `a` (and `b`), none when every threat is hit.
+  auto open=[&](Cell a,const Cell* b){int k=none;for(auto& t:threats)if(!contains(t,a) && !(b && contains(t,*b)))k=std::min(k,int(t.size()));return k;};
   for(auto& edge:node.edges){
    // Every completion cell is within five of an existing stone, hence legal.
-   bool win=false;
-   for(auto& completion:own)if(completion.size()<size_t(path.remaining) || contains(completion,edge.action))win=true;
-   if(win){edge.exact_winner=path.player;continue;}
-   auto first=std::find_if(threats.begin(),threats.end(),[&](const auto& completion){return !contains(completion,edge.action);});
-   bool cover=first==threats.end();
-   if(!cover && path.remaining==2)for(auto second:*first){
-    bool all=true;for(auto& completion:threats)if(!contains(completion,edge.action) && !contains(completion,second))all=false;
-    if(all){cover=true;break;}
-   }
-   if(!cover)edge.exact_winner=1-path.player;
+   int win=none;
+   for(auto& completion:own){int n=int(completion.size());if(contains(completion,edge.action))win=std::min(win,n);else if(n<path.remaining)win=std::min(win,n+1);}
+   if(win!=none){edge.exact_winner=path.player;edge.distance=win;edge.bound=false;continue;}
+   // A lost edge resists longest with the second stone that leaves the slowest completion open.
+   int lost=open(edge.action,nullptr);
+   if(lost!=none && path.remaining==2)for(auto& t:threats){for(auto second:t){int k=open(edge.action,&second);lost=std::max(lost,k);if(k==none)break;}if(lost==none)break;}
+   if(lost!=none){edge.exact_winner=1-path.player;edge.distance=path.remaining+lost;edge.bound=false;}
   }
   settle(node);
  }
- // Node verdict and eligibility from its edges' exact winners: a winning edge makes the node won and leaves only
- // winning edges eligible; with no edge left undecided the node is lost and every edge stays eligible; otherwise
- // the lost edges are ineligible.
+ // Node verdict, distance and eligibility from its edges' exact winners. A won node offers its shortest guaranteed
+ // wins (least upper bound); its distance is exact when an exact edge attains it and no bounded win could be faster.
+ // A lost node offers every loss that may resist longest: those whose distance reaches the largest lower bound among
+ // its losses. An exact distance is its own lower bound. When tactics classified the node, a bounded result is not a
+ // one-turn result: a bounded win needs the mover's remaining stones, the opponent's turn and one more stone
+ // (remaining + 3); a bounded loss also lets the mover play its next turn first (remaining + 5). Without tactics a
+ // bound's lower bound is 1. Otherwise only the unproven edges stay eligible.
  void settle(Node& node) {
   // Only expansion installs the complete legal action list. A pending/unexpanded leaf is never a universal proof.
   if(!node.expanded || node.edges.empty())return;
-  bool winning=false,safe=false;
-  for(auto& edge:node.edges){if(edge.exact_winner==node.player)winning=true;else if(edge.exact_winner<0)safe=true;}
-  if(winning)node.exact_winner=node.player;
-  else if(!safe)node.exact_winner=1-node.player;
-  for(auto& edge:node.edges)edge.eligible=winning?edge.exact_winner==node.player:(!safe || edge.exact_winner<0);
+  const int none=std::numeric_limits<int>::max();
+  bool winning=false,safe=false,attained=false;int fastest=none,slowest=0,longest=0,quickest=none;
+  auto lower=[&](const Edge& e,int turn){return e.bound?(tactics?node.remaining+turn:1):e.distance;};
+  for(auto& edge:node.edges){
+   if(edge.exact_winner==node.player){winning=true;fastest=std::min(fastest,edge.distance);quickest=std::min(quickest,lower(edge,3));}
+   else if(edge.exact_winner<0)safe=true;
+   else {slowest=std::max(slowest,edge.distance);longest=std::max(longest,lower(edge,5));}
+  }
+  for(auto& edge:node.edges)attained|=edge.exact_winner==node.player && !edge.bound && edge.distance==fastest;
+  for(auto& edge:node.edges)edge.eligible=winning?edge.exact_winner==node.player && edge.distance==fastest
+   :!safe?edge.distance>=longest:edge.exact_winner<0;
+  if(winning){node.exact_winner=node.player;node.distance=fastest;node.bound=!attained || quickest<fastest;}
+  else if(!safe){node.exact_winner=1-node.player;node.distance=slowest;node.bound=slowest>longest;}
  }
- // Records an externally proven winner of the root edge `action`: its value becomes exact (Q = +-1 for the
- // root's mover) and the root is settled, so a lost edge leaves the remaining halving rounds and the final
- // selection. A root that is already exact is left unchanged.
- void mark(Cell action,int winner) {
-  if(!root->expanded || (winner!=0 && winner!=1))throw std::runtime_error("Mark needs an expanded root and a winner");
+ // Records an externally proven winner of the root edge `action` within `distance` placements (the edge's own
+ // included): its value becomes exact (Q = +-1 for the root's mover) and the root is settled, so a lost edge leaves
+ // the remaining halving rounds and the final selection. A root that is already exact is left unchanged.
+ void mark(Cell action,int winner,int distance) {
+  if(!root->expanded || (winner!=0 && winner!=1) || distance<1)throw std::runtime_error("Mark needs an expanded root, a winner and a distance");
   auto edge=std::find_if(root->edges.begin(),root->edges.end(),[&](const Edge& e){return e.action==action;});
   if(edge==root->edges.end())throw std::runtime_error("Mark action is not a root edge");
   if(root->exact_winner>=0)return;
-  edge->exact_winner=winner;edge->sum=winner==root->player?edge->visits:-edge->visits;settle(*root);
+  edge->exact_winner=winner;edge->distance=distance;edge->bound=true;edge->sum=winner==root->player?edge->visits:-edge->visits;settle(*root);
  }
  void begin(int simulations,int sample) {
   if(!requests.empty()||simulations<1||sample<1)throw std::runtime_error("Invalid search budget or pending requests");
@@ -103,7 +118,7 @@ struct Tree {
   for(auto i=path.edges.rbegin();i!=path.edges.rend();++i){
    auto& [node,index]=*i;auto& edge=node->edges[index];
    if(child->player!=node->player)value=-value;
-   if(child->exact_winner>=0 && edge.exact_winner!=child->exact_winner){edge.exact_winner=child->exact_winner;settle(*node);}
+   if(child->exact_winner>=0 && (edge.exact_winner!=child->exact_winner || edge.distance!=child->distance+1 || edge.bound!=child->bound)){edge.exact_winner=child->exact_winner;edge.distance=child->distance+1;edge.bound=child->bound;settle(*node);}
    ++edge.visits;--edge.pending;
    if(edge.exact_winner>=0){value=edge.exact_winner==node->player?1:-1;edge.sum=value*edge.visits;}
    else edge.sum+=value;
@@ -145,7 +160,10 @@ struct Tree {
    path.edges.emplace_back(node,chosen);board.make(edge.action);path.history.push_back(edge.action);
    if(!edge.child){edge.child=std::make_unique<Node>();edge.child->player=board.player;}
    node=edge.child.get();path.leaf=node;
-   if(board.winner>=0 || edge.exact_winner>=0 || node->exact_winner>=0){int winner=board.winner>=0?board.winner:edge.exact_winner>=0?edge.exact_winner:node->exact_winner;node->exact_winner=winner;for(auto [parent,index]:path.edges)++parent->edges[index].pending;++root->edges[path.edges.front().second].epoch;++started;backup(path,winner==node->player?1:-1);return -1;}
+   if(board.winner>=0 || edge.exact_winner>=0 || node->exact_winner>=0){
+    if(board.winner>=0){node->exact_winner=board.winner;node->distance=0;node->bound=false;}
+    else if(edge.exact_winner>=0 && node->exact_winner<0){node->exact_winner=edge.exact_winner;node->distance=edge.distance-1;node->bound=edge.bound;}
+    int winner=node->exact_winner;for(auto [parent,index]:path.edges)++parent->edges[index].pending;++root->edges[path.edges.front().second].epoch;++started;backup(path,winner==node->player?1:-1);return -1;}
   }
   if(node->pending)return 0;
   node->pending=true;node->player=board.player;capture(path);
@@ -153,7 +171,7 @@ struct Tree {
   if(!path.edges.empty()){++root->edges[path.edges.front().second].epoch;++started;}
   int id=next_id++;requests.emplace(id,std::move(path));return id;
  }
- void fulfill(int id,const int64_t* actions,const double* logits,const double* values,int count,int exact=-1,Cell witness={}){
+ void fulfill(int id,const int64_t* actions,const double* logits,const double* values,int count,int exact=-1,Cell witness={},int distance=-1){
   auto found=requests.find(id);if(found==requests.end())throw std::runtime_error("Unknown request");auto& path=found->second;
   const auto& legal=path.legal;
   if(count!=int(legal.size())||count<1)throw std::runtime_error("Incomplete legal actions");
@@ -162,43 +180,47 @@ struct Tree {
   // Only root edges read their Gumbel noise and begin() redraws it, so interior edges just advance the stream.
   const bool at_root=&node==root.get();
   node.value=0;node.edges.reserve(count);for(int i=0;i<count;++i){Edge edge;edge.action=legal[i];edge.logit=logits[i]-maximum;edge.prior=weights[i]/total;node.value+=edge.prior*values[i];double u=std::generate_canonical<double,53>(rng);if(at_root)edge.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));node.edges.push_back(std::move(edge));}
-  node.expanded=true;
+  node.expanded=true;node.remaining=path.remaining;
   // A retained proven loss covers every legal continuation even if this node had not needed expansion yet.
-  if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges)edge.exact_winner=node.exact_winner;
+  if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges){edge.exact_winner=node.exact_winner;edge.distance=node.distance;edge.bound=true;}
   if(tactics)classify(path,node);
-  if(exact>=0){node.exact_winner=exact;for(auto& edge:node.edges){edge.eligible=edge.action==witness;if(edge.eligible)edge.exact_winner=exact;}}
+  // A certificate adds its witness as a winning edge; settle keeps any shorter tactical win found by classify.
+  if(exact>=0){for(auto& edge:node.edges)if(edge.action==witness && (edge.exact_winner!=exact || edge.distance>distance)){edge.exact_winner=exact;edge.distance=distance;edge.bound=true;}settle(node);}
   node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);requests.erase(found);
  }
- void prove(int id,const int64_t* history,int count,int player,int remaining,const int64_t* moves,int move_count){
+ // Installs a caller-verified certificate at pending leaf `id`: its first turn `moves` and `turns`, the most attacker
+ // turns on any certificate path, which bound the win within move_count + 4 * (turns - 1) placements.
+ void prove(int id,const int64_t* history,int count,int player,int remaining,const int64_t* moves,int move_count,int turns){
   auto found=requests.find(id);if(found==requests.end())throw std::runtime_error("Unknown proof request");
   auto& path=found->second;
   if(count!=int(path.history.size()))throw std::runtime_error("Proof history mismatch");
   Board position;for(int i=0;i<count;++i){Cell c{history[2*i],history[2*i+1]};if(c!=path.history[i])throw std::runtime_error("Proof history mismatch");position.make(c);}
-  if(move_count<1 || move_count>remaining)throw std::runtime_error("Invalid proof turn");
+  if(move_count<1 || move_count>remaining || turns<1)throw std::runtime_error("Invalid proof turn");
+  const int distance=move_count+4*(turns-1);
   Cell witness{moves[0],moves[1]};
   if(player!=position.player || remaining!=position.remaining || !position.legal(witness))throw std::runtime_error("Proof phase or move mismatch");
   Board after=position;for(int i=0;i<move_count;++i){Cell c{moves[2*i],moves[2*i+1]};if(!after.legal(c))throw std::runtime_error("Illegal proof turn");after.make(c);}
   if(after.winner<0 && after.player==player)throw std::runtime_error("Incomplete proof turn");
   Node* node=path.leaf;
   auto legal=position.legal_moves();std::vector<int64_t> actions;for(auto c:legal){actions.push_back(c.q);actions.push_back(c.r);}
-  std::vector<double> zeros(legal.size());fulfill(id,actions.data(),zeros.data(),zeros.data(),int(legal.size()),player,witness);
+  std::vector<double> zeros(legal.size());fulfill(id,actions.data(),zeros.data(),zeros.data(),int(legal.size()),player,witness,distance);
   if(move_count==2){
    position.make(witness);auto next_legal=position.legal_moves();
-   auto child=std::make_unique<Node>();child->player=player;child->expanded=true;child->exact_winner=player;
-   for(auto c:next_legal){Edge e;e.action=c;e.prior=1./next_legal.size();e.eligible=c==Cell{moves[2],moves[3]};if(e.eligible)e.exact_winner=player;child->edges.push_back(std::move(e));}
+   auto child=std::make_unique<Node>();child->player=player;child->remaining=1;child->expanded=true;child->exact_winner=player;child->distance=distance-1;child->bound=true;
+   for(auto c:next_legal){Edge e;e.action=c;e.prior=1./next_legal.size();e.eligible=c==Cell{moves[2],moves[3]};if(e.eligible){e.exact_winner=player;e.distance=distance-1;e.bound=true;}child->edges.push_back(std::move(e));}
    for(auto& e:node->edges)if(e.action==witness){e.child=std::move(child);break;}
   }
  }
  void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].pending;if(!path.edges.empty()){--root->edges[path.edges.front().second].epoch;--started;}}requests.clear();}
- void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::unique_ptr<Node> next;int winner=-1;priority.clear();defence.clear();hold=false;
-  for(auto& e:root->edges)if(e.action==action){winner=e.exact_winner;next=std::move(e.child);break;}
+ void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::unique_ptr<Node> next;int winner=-1,distance=-1;bool bound=false;priority.clear();defence.clear();hold=false;
+  for(auto& e:root->edges)if(e.action==action){winner=e.exact_winner;distance=e.distance;bound=e.bound;next=std::move(e.child);break;}
   board.make(action);root=next?std::move(next):std::make_unique<Node>();root->player=board.player;budget=started=completed=0;
-  if(winner>=0 && winner!=root->player)root->exact_winner=winner;
+  if(winner>=0 && winner!=root->player){root->exact_winner=winner;root->distance=distance-1;root->bound=bound;}
   // A winning edge classified without a child needs a second-placement witness. Reconstruct immediate
   // tactical choices on the actual board; general certificates already retain their two-placement child.
   if(winner==root->player && !root->expanded && board.winner<0){
    root->exact_winner=-1;
-   if(tactics){Path path;capture(path);if(!path.own.empty()){root->expanded=true;for(auto c:path.legal){Edge e;e.action=c;e.prior=1./path.legal.size();root->edges.push_back(std::move(e));}classify(path,*root);}}
+   if(tactics){Path path;capture(path);if(!path.own.empty()){root->expanded=true;root->remaining=path.remaining;for(auto c:path.legal){Edge e;e.action=c;e.prior=1./path.legal.size();root->edges.push_back(std::move(e));}classify(path,*root);}}
   }
  }
 };
@@ -210,6 +232,8 @@ HX_API void* hxg_new(uint64_t seed){try{return new gumbel::Tree(seed);}catch(...
 HX_API void hxg_free(void* p){delete static_cast<gumbel::Tree*>(p);}
 HX_API int hxg_tactics(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(p);if(t.root->expanded || !t.requests.empty())return 0;t.tactics=enabled!=0;return 1;}
 HX_API int hxg_exact(void* p){auto& t=*static_cast<gumbel::Tree*>(p);return t.board.winner>=0?t.board.winner:t.root->exact_winner;}
+// Placements within which hxg_exact's winner completes six from the root (0 on a finished board), -1 when not exact.
+HX_API int hxg_distance(void* p){auto& t=*static_cast<gumbel::Tree*>(p);return t.board.winner>=0?0:t.root->exact_winner>=0?t.root->distance:-1;}
 HX_API int hxg_begin(void* p,int simulations,int sample){try{static_cast<gumbel::Tree*>(p)->begin(simulations,sample);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxg_next(void* p){try{return static_cast<gumbel::Tree*>(p)->request();}catch(const std::exception& e){gumbel::error=e.what();return -2;}}
 HX_API int hxg_history(void* p,int id,int64_t* out){auto& h=static_cast<gumbel::Tree*>(p)->requests.at(id).history;if(out)for(int i=0;i<int(h.size());++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}
@@ -218,7 +242,7 @@ HX_API int hxg_legal(void* p,int id,int64_t* out){auto& l=static_cast<gumbel::Tr
 HX_API int hxg_fulfill(void* p,int id,const int64_t* a,const double* logits,const double* q,int n){try{static_cast<gumbel::Tree*>(p)->fulfill(id,a,logits,q,n);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Caller must independently verify the strategy certificate before this entry.
 // Exact history and placement phase prevent applying it to a different request.
-HX_API int hxg_prove(void* p,int id,const int64_t* h,int n,int player,int remaining,const int64_t* moves,int count){try{static_cast<gumbel::Tree*>(p)->prove(id,h,n,player,remaining,moves,count);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxg_prove(void* p,int id,const int64_t* h,int n,int player,int remaining,const int64_t* moves,int count,int turns){try{static_cast<gumbel::Tree*>(p)->prove(id,h,n,player,remaining,moves,count,turns);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API void hxg_cancel(void* p){static_cast<gumbel::Tree*>(p)->cancel();}
 HX_API int hxg_advance(void* p,int64_t q,int64_t r){try{static_cast<gumbel::Tree*>(p)->advance({q,r});return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Final selection among eligible edges at the highest epoch this search reached; when proofs removed every visited edge
@@ -241,6 +265,7 @@ HX_API int hxg_defence(void* p,const int64_t* cells,const double* bonuses,int n)
  t.defence.clear();for(int i=0;i<n;++i)t.defence[{cells[2*i],cells[2*i+1]}]=bonuses[i];
  t.schedule(t.root->expanded?int(std::count_if(t.root->edges.begin(),t.root->edges.end(),[](auto& e){return e.eligible;})):int(t.board.legal_moves().size()));return 1;
  }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-// Caller must hold a verified proof that `winner` wins after root edge (q, r); see Tree::mark.
-HX_API int hxg_mark_exact(void* p,int64_t q,int64_t r,int winner){try{static_cast<gumbel::Tree*>(p)->mark({q,r},winner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+// Caller must hold a verified proof that `winner` wins after root edge (q, r) within `distance` placements, the
+// edge's own included; see Tree::mark.
+HX_API int hxg_mark_exact(void* p,int64_t q,int64_t r,int winner,int distance){try{static_cast<gumbel::Tree*>(p)->mark({q,r},winner,distance);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 }
