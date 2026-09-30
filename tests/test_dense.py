@@ -736,6 +736,17 @@ class FusedCudaTests(unittest.TestCase):
             for name in out:
                 torch.testing.assert_close(out[name], snapshot[name], rtol=0, atol=0)
         runner.close()
+        reserved = torch.cuda.memory_reserved()
+        for _ in range(4):
+            replacement = ActorGraph(model)
+            out = replacement(inputs[0])
+            for name in out:
+                torch.testing.assert_close(out[name], saved[0][name], rtol=0, atol=0)
+            replacement.close()
+            self.assertLessEqual(torch.cuda.memory_reserved(), reserved+2*2**20)
+        for out, snapshot in zip(outputs, saved):
+            for name in out:
+                torch.testing.assert_close(out[name], snapshot[name], rtol=0, atol=0)
 
     @torch.inference_mode()
     def test_actor_shapes_reuse_compiled_kernels(self):

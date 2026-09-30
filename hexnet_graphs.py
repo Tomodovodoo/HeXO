@@ -1,7 +1,8 @@
 """Bounded same-canvas CUDA graphs for a frozen HexNet evaluator.
 
-One instance belongs to one model. Captures share a memory pool and run on one
-stream; outputs are copied to caller-owned storage before another replay.
+One instance belongs to one model. Instances reuse a device stream and lock so
+BLAS workspaces do not accumulate with captures or checkpoint changes. Captures
+share a model's memory pool; outputs are copied before another replay.
 """
 
 import threading
@@ -14,6 +15,8 @@ class ActorGraph:
     CANVASES = (24, 32, 40, 48, 64)
     BATCHES = (8, 16, 32)
     MAX_CELLS = 110592
+    STREAMS = {}
+    LOCK = threading.Lock()
 
     def __init__(self, model, max_incremental_bytes=384*1024*1024):
         if model.training or model.net_kernels != 'fused':
@@ -23,11 +26,14 @@ class ActorGraph:
             raise ValueError('ActorGraph requires a CUDA model')
         self.model = model
         self.device = device
-        self.stream = torch.cuda.Stream(device=device)
-        self.stream.wait_stream(torch.cuda.current_stream(device))
+        self.lock = self.LOCK
+        with self.lock:
+            if device not in self.STREAMS:
+                self.STREAMS[device] = torch.cuda.Stream(device=device)
+            self.stream = self.STREAMS[device]
+            self.stream.wait_stream(torch.cuda.current_stream(device))
         self.pool = torch.cuda.graph_pool_handle()
         self.graphs = {}
-        self.lock = threading.Lock()
         self.before_reserved = torch.cuda.memory_reserved(device)
         self.max_incremental_bytes = max_incremental_bytes
         self.incremental_reserved_bytes = 0
@@ -46,16 +52,11 @@ class ActorGraph:
         static_input = template.clone(memory_format=torch.channels_last)
         static_packed = torch.empty((capacity, side*side+2), device=self.device, dtype=torch.float32)
 
-        warm_stream = torch.cuda.Stream(device=self.device)
-        warm_stream.wait_stream(self.stream)
-        static_input.record_stream(warm_stream)
-        static_packed.record_stream(warm_stream)
-        with torch.cuda.stream(warm_stream), torch.inference_mode(), \
+        with torch.cuda.stream(self.stream), torch.inference_mode(), \
                 torch.autocast('cuda', torch.bfloat16, cache_enabled=False):
             warm = self.model(static_input, static_input[:, 3:4], aux=False)
             static_packed.copy_(torch.cat((warm['policy'], warm['far'][:, None],
                                            warm['value_logit'][:, None]), dim=1))
-        self.stream.wait_stream(warm_stream)
         del warm
 
         graph = torch.cuda.CUDAGraph()
@@ -153,3 +154,4 @@ class ActorGraph:
         with self.lock:
             self.stream.synchronize()
             self.graphs.clear()
+            torch.cuda.empty_cache()
