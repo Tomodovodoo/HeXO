@@ -3843,7 +3843,8 @@ class YieldTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)/'run'
             made = subprocess.run([sys.executable, str(ROOT/'dense_config.py'), '--run', str(run), '--device', 'cpu',
-                                   '--blocks', '1', '--channels', '16'], capture_output=True, text=True, cwd=ROOT, timeout=60)
+                                   '--blocks', '1', '--channels', '16', '--validation-fraction', '0'],
+                                  capture_output=True, text=True, cwd=ROOT, timeout=60)
             self.assertEqual(made.returncode, 0, made.stderr)
             write_games(run/'shards'/'000001', [(winning_game(), 0, None)]*8)
             done = subprocess.run([sys.executable, str(ROOT/'dense_learn.py'), '--run', str(run), '--steps', '1',
