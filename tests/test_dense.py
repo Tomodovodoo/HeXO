@@ -3883,6 +3883,41 @@ class YieldTests(unittest.TestCase):
         self.assertTrue(due('paused', 'paused', dense_selfplay.METRICS_SECONDS))
         self.assertFalse(due('playing', 'playing', 1.))
 
+    def test_historical_games_can_restart_when_book_fraction_is_zero(self):
+        settings = dense_config.ActorSettings(games_in_flight=2, shard_games=2,
+                                               historical_fraction=1., restart_fraction=1.)
+        config = replace(dense_config.RunConfig(), device='cpu', actor=settings)
+        model = SimpleNamespace(checkpoint='main/test', sha='a'*64, config=TINY)
+        historical = SimpleNamespace(models=[model], target=2, redraw=unittest.mock.Mock(),
+                                     next=lambda: (model, 0))
+        restart = (dict(ply=3), [[0, 0], [1, 0], [2, 0]])
+        restarts = SimpleNamespace(load=unittest.mock.Mock(), draw=unittest.mock.Mock(return_value=restart))
+        engine = unittest.mock.Mock(slots=[], closing=[], searches=0, evals=0, calls=0, full_calls=0, solver=None)
+        engine.add.side_effect = lambda slot: engine.slots.append(slot)
+
+        def step():
+            slots, engine.slots = engine.slots, []
+            return slots
+
+        engine.step.side_effect = step
+        slot = SimpleNamespace(opponent='main/test', episode=lambda: (
+            dict(actor=model.sha, opponent='main/test', winner=0, moves=[], reason='test'), []))
+        with unittest.mock.patch.object(dense_selfplay.dense_config, 'load', return_value=config), \
+             unittest.mock.patch.object(dense_selfplay, 'load', return_value=model), \
+             unittest.mock.patch.object(dense_selfplay, 'resolve', return_value=(model.checkpoint, None)), \
+             unittest.mock.patch.object(dense_selfplay, 'Historical', return_value=historical), \
+             unittest.mock.patch.object(dense_selfplay, 'Restarts', return_value=restarts), \
+             unittest.mock.patch.object(dense_selfplay, 'Engine', return_value=engine), \
+             unittest.mock.patch.object(dense_selfplay, 'SelfPlayGame', return_value=slot) as games, \
+             unittest.mock.patch.object(dense_selfplay, 'Yield') as gate, \
+             unittest.mock.patch.object(dense_selfplay.dense_data, 'write_shard'), \
+             unittest.mock.patch.object(dense_selfplay, 'log_event'):
+            gate.return_value.paused.return_value = False
+            dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
+        self.assertEqual(games.call_count, 2)
+        self.assertTrue(all(call.kwargs['restart'] == restart for call in games.call_args_list))
+        self.assertEqual(restarts.draw.call_count, 2)
+
     def test_learner_heartbeat_reports_its_effective_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)/'run'

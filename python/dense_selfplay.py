@@ -924,7 +924,7 @@ def worker(args):
     restarts = Restarts(run, settings.restart_temperature, settings.max_plies) if settings.restart_fraction > 0 else None
     restart_rng = np.random.default_rng(seeds.spawn(1)[0]) if restarts else None
     book_starts = BookStarts(run, settings.max_plies) if settings.book_fraction > 0 else None
-    start_rng = np.random.default_rng(seeds.spawn(1)[0]) if book_starts else None
+    start_rng = np.random.default_rng(seeds.spawn(1)[0]) if book_starts else restart_rng
     engine = Engine(settings.leaf_batch, settings.solver_async, dense_solver.Schedule.of(settings), settings.solver_leaf_nodes)
     began, solver_failures = time.perf_counter(), 0
     state = dict(published(run, args.worker), error=None)
@@ -1025,7 +1025,7 @@ def worker(args):
         while len(engine.slots) < settings.games_in_flight and (args.games is None or started < args.games):
             seed = seeds.spawn(1)[0].generate_state(1, np.uint64)[0].item()
             book, restart = None, None
-            if book_starts:
+            if start_rng is not None:
                 # Unconditional shares, also when historical opponents are enabled. Failed restart/book draws
                 # become ordinary starts, rather than increasing the other source's allocation.
                 draw = start_rng.random()
@@ -1038,8 +1038,6 @@ def worker(args):
                 sides = [model, opponent] if learner == 0 else [opponent, model]
                 engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint, restart=restart, book=book))
             else:
-                if book_starts is None:
-                    restart = restarts.draw(restart_rng) if restarts and restart_rng.random() < settings.restart_fraction else None
                 engine.add(SelfPlayGame([model, model], settings, seed, restart=restart, book=book))
             started += 1
 
