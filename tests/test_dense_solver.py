@@ -489,7 +489,8 @@ class Adjudication(unittest.TestCase):
         plan.pruned = [list(action)]
         plan.found = [Proof(self.opening[:-2], self.proof['certificate']),
                       mine := Proof(self.opening, self.proof['certificate'])]
-        slot = type('Slot', (), dict(tree=type('Tree', (), dict(history=history, ptr=None))(),
+        slot = type('Slot', (), dict(tree=type('Tree', (), dict(history=history, ptr=None,
+                                     result=lambda *args: dict(action=list(action))))(),
                                      solver=Budgets(finalists=2, finalist_nodes=NODES)))()
         result = dict(action=list(action))
         with mock.patch.object(dense_solver, 'native', mock.Mock(hxg_exact=lambda ptr: 1-dense_solver.mover(history))):
