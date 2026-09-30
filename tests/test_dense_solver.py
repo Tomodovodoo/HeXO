@@ -415,6 +415,27 @@ class LostRoots(unittest.TestCase):
         self.assertEqual(len(episode['moves']), len(self.HISTORY)+2)
 
 
+class GraphSearch(unittest.TestCase):
+    """The opt-in graph search through actors and evaluation games."""
+
+    def test_selfplay_with_graph_search_writes_ordinary_rows(self):
+        model = tiny_model()
+        s = settings(full_fraction=1., search_graph=True, max_plies=10, opening_random_plies=0.)
+        game = dense_selfplay.SelfPlayGame([model, model], s, 3)
+        self.assertTrue(all(t.census()['nodes'] >= 1 for t in game.trees.values()))
+        run([game])
+        episode, rows = game.episode()
+        self.assertEqual(len(rows), len(episode['moves']))
+        self.assertTrue(all(abs(float(r['policy'].sum())-1) < 1e-5 for r in rows if r['policy'] is not None))
+
+    def test_one_model_with_two_graph_settings_keeps_two_trees(self):
+        model = tiny_model()
+        game = dense_eval.MatchGame([model, model], [(0, 0)], 1, 8, 4, True, 5, {}, graphs=(False, True))
+        self.assertEqual(len(game.trees), 2)
+        run([game])
+        self.assertEqual(len(game.moves), 5)
+
+
 class Proofs(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

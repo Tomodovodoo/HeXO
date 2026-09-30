@@ -52,6 +52,20 @@ turn context because the game value does not depend on it, so a new node of a pr
 never removes stones, so the graph is acyclic and a position with fewer stones than the board can not recur; both
 tables drop such entries when the tree advances. Keys are two independent 64-bit sums of mixed cell hashes.
 
+**Measured** (CPU, champion `main/110000`, 20 real positions per row, sequential leaves, tree against graph):
+
+| Simulations | Evaluations per simulation | Expanded nodes | Repeated turn contexts | Playouts reusing a transposed child | Policy entropy | Same move |
+|---|---|---|---|---|---|---|
+| 16 | 1.062 / 1.019 | 17.0 / 16.3 | 0.7 / 0 | 0 / 0.7 | 0.665 / 0.671 | 20/20 |
+| 64 | 1.016 / 0.902 | 65.0 / 57.7 | 7.9 / 0 | 0 / 7.3 | 0.698 / 0.685 | 20/20 |
+| 128 | 1.008 / 0.867 | 129.0 / 111.0 | 19.4 / 0 | 0 / 18.1 | 0.581 / 0.558 | 18/20 |
+
+Equal-simulation CPU matches, graph against tree, same checkpoint, colour-paired openings from recent games:
+- 16 simulations: 9.5/20 (0.475 ± 0.166). Games are capped at 120 placements, and 9 of them were capped.
+- 64 simulations: 9.0/16 (0.562 ± 0.217). The graph used 53.8 evaluations per search against 64.1.
+
+Together that is 18.5/36. The samples are small and show no strength difference either way, so `search_graph` stays off until the evaluator's paired comparison, for example `dense_eval.py variant ... --set search_graph=true`.
+
 ## Keeping analysis across placements
 
 **What is kept today.** `advance` (`src/gumbel.cpp`, `Tree::advance`) moves the root to the played edge's child and keeps that whole subtree: its visits, values, network priors and proofs. The siblings of the played move are freed. They are unreachable, because stones are never removed.
