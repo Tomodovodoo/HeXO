@@ -49,16 +49,18 @@ class OfficialNotation(unittest.TestCase):
         self.assertEqual(loads('').history, [(0, 0)])
 
     def test_strict_turns_native_legality_and_bounds(self):
-        bad = ['1.[1,0];', '2.[1,0][2,0];', '1.[0,0][1,0];',
+        bad = ['1.[1,0];2.[2,0][3,0];', '2.[1,0][2,0];', '1.[0,0][1,0];',
                '1.[9,0][1,0];', '1.[1,0][1,0];', 'version[2];',
                'version[1]version[1];', '1.[1,0][2,0];garbage',
                '1.[1000000000001,0][1,0];']
         for source in bad:
             with self.assertRaises(ValueError, msg=source):
                 loads(source)
-        for history in ([], [(0, 0), (1, 0)], [(0, 0)]*(MAX_STONES+1)):
+        for history in ([], [(0, 0)]*(MAX_STONES+1)):
             with self.assertRaises(ValueError):
                 dumps(history)
+        self.assertEqual(dumps([(0, 0), (1, 0)]), 'version[1];\n1. [1,0];')
+        self.assertEqual(loads('1.[1,0];').history, [(0, 0), (1, 0)])
         with self.assertRaises(ValueError):
             dumps(Record([(0, 0)], {'name': 'bad]value'}, []))
 
