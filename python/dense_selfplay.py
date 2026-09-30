@@ -301,9 +301,13 @@ class Engine:
         self.leaf_queries = self.leaf_proofs = 0
         self.leaf_seconds = 0.
         self.leaf_roots = {}
+        self.root_predictions = {}
 
     def begin(self, slot):
         """Start the slot's next search; True when it must wait for solver verdicts until the next visit."""
+        key = position_key(np.asarray(slot.tree.history, np.int64).reshape(-1, 2))
+        cached = slot.model.cache.get(key)
+        self.root_predictions[id(slot)] = slot.model, key, float(cached[2][0]) if cached is not None else None
         checked(native.hxg_begin(slot.tree.ptr, slot.budget, slot.samples))
         plan = self.plans.get(id(slot))
         active = dense_solver.active(slot.solver, self.schedule)
@@ -373,6 +377,7 @@ class Engine:
                         result.update(proven=1, proof=proof, proof_turns=turns, proof_action=[list(s) for s in stones],
                                       action=list(stones[0]), solver_nodes=result.get('solver_nodes', 0)+verdict['nodes_used'],
                                       solver_budget=result.get('solver_budget', 0)+verdict['budget'])
+                    result['network_value'] = self.root_predictions[id(slot)][2]
                     self.searches += 1
                     if not slot.searched(result):
                         done.append(slot)
@@ -449,6 +454,9 @@ class Engine:
                 cached = model.cache.get(key)
                 if cached is not None:
                     checked(native.hxg_fulfill(ptr, request, *cached, len(cached[0])))
+                    root = self.root_predictions[id(slot)]
+                    if root[0] is model and root[1] == key:
+                        self.root_predictions[id(slot)] = model, key, float(cached[2][0])
                     self.hits += 1
                     progress = True
                 else:
@@ -475,6 +483,9 @@ class Engine:
                 for slot, ptr, request in positions[key][1:]:
                     if slot not in stopped:
                         checked(native.hxg_fulfill(ptr, request, *prediction, len(prediction[0])))
+                        root = self.root_predictions.get(id(slot))
+                        if root is not None and root[0] is model and root[1] == key:
+                            self.root_predictions[id(slot)] = model, key, float(prediction[2][0])
                 model.cache.put(key, prediction)
         if stopped:
             for _, positions, _, _ in launched:
@@ -492,6 +503,8 @@ class Engine:
         self.inflight = launched
         if done:
             finished = set(map(id, done))
+            for key in finished:
+                self.root_predictions.pop(key, None)
             self.slots = [s for s in self.slots if id(s) not in finished]
             self.closing += [(slot, self.plans.pop(id(slot), None), time.perf_counter()+CLOSE_SECONDS) for slot in done]
         done = []
@@ -525,7 +538,9 @@ class SelfPlayGame:
     episode records origin 'restart' and `restart` (the entry's RESTART_SOURCE fields). `book` (metadata, moves)
     uses the same forced-prefix treatment and records origin 'book' plus its source metadata; ordinary games
     record origin 'selfplay'.
-    With adjudicate_proven a proven search (+1: the side to move wins, -1: every candidate it kept loses) plays its
+    `network_values` stores uncorrected predictions for trained searched plies; record_network_values
+    fills missing predictions before the worker saves a completed episode.
+    With adjudicate_proven a proven search (+1: the side to move wins, -1: every legal move loses) plays its
     move and ends the game there (`adjudicate`)."""
 
     def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None):
@@ -546,6 +561,7 @@ class SelfPlayGame:
                       for k, model in enumerate(dict.fromkeys(sides))}
         self.game, self.moves, self.rows = Game(forced), forced, []
         self.values, self.full = [None]*len(forced), [False]*len(forced)
+        self.network_values = [None]*len(forced)
         self.plan()
 
     @property
@@ -582,6 +598,7 @@ class SelfPlayGame:
             row['proven'] = 1 if result['exact_winner'] == player else -1
         self.rows.append(row)
         self.values.append(root_value(result, player) if trained else None)
+        self.network_values.append(result.get('network_value') if trained else None)
         self.full.append(self.is_full and trained)
         if ply < self.random_plies and result.get('proven', 0) <= 0:
             action = actions[self.rng.choice(len(policy), p=policy/policy.sum())].tolist()
@@ -631,6 +648,7 @@ class SelfPlayGame:
                 if proven > 0:
                     self.rows[-1]['proof_action'] = full.action(self.moves)
                 self.values.append(float(proven) if trained(player) else None)
+                self.network_values.append(None)
                 self.full.append(False)
                 game.play(q, r)
                 self.moves.append([q, r])
@@ -684,17 +702,52 @@ class SelfPlayGame:
                        opening_plies=min(forced+self.random_plies, len(self.moves)), actor=self.sides[self.learner].sha,
                        actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
                        trained_side=None if self.opponent is None else self.learner,
-                       root_values=self.values, full_search=self.full,
+                       root_values=self.values, network_values=self.network_values, full_search=self.full,
                        origin='book' if self.book is not None else 'restart' if self.restart else 'selfplay')
         if self.book is not None:
             episode['book'] = self.book
         if self.restart:
             episode['restart'] = {k: self.restart[k] for k in RESTART_SOURCE}
+            if 'value_source' in self.restart:
+                episode['restart']['value_source'] = self.restart['value_source']
         if dense_solver.active(self.solver, self.schedule):
             episode['solver'] = dense_solver.record(self.solver, self.schedule)
         if self.adjudicated:
             episode['adjudicated'] = self.adjudicated
         return episode, self.rows
+
+
+def record_network_values(slots):
+    """Fill missing network predictions on all trained searched rows before saving a completed game.
+
+    Root predictions are saved during search independently of cache eviction. Missing rows share an extra
+    batch per model here, including roots proved later by the offline pass. Forced prefixes and generated
+    proof lines stay null. Predictions that cannot be encoded also stay null. Return submission sizes for
+    actor metrics. Search values and played moves are already fixed.
+    """
+    pending, sizes = {}, []
+    for slot in slots:
+        for row in slot.rows:
+            ply = row['ply']
+            if row.get('line') or slot.values[ply] is None or slot.network_values[ply] is not None:
+                continue
+            history = np.asarray(slot.moves[:ply], np.int64).reshape(-1, 2)
+            model, key = slot.sides[row['player']], position_key(history)
+            cached = model.cache.get(key)
+            if cached is not None:
+                slot.network_values[ply] = float(cached[2][0])
+            else:
+                pending.setdefault(model, {}).setdefault(key, [history]).append((slot, ply))
+    for model, positions in pending.items():
+        predictions = model.evaluator.evaluate([items[0] for items in positions.values()])
+        sizes.append(len(positions))
+        for (key, items), prediction in zip(positions.items(), predictions):
+            if prediction is None:
+                continue
+            model.cache.put(key, prediction)
+            for slot, ply in items[1:]:
+                slot.network_values[ply] = float(prediction[2][0])
+    return sizes
 
 
 class BookStarts:
@@ -1079,7 +1132,10 @@ def worker(args):
             if not engine.slots and not engine.closing:
                 break
             before = engine.searches
-            for slot in engine.step():
+            finished = engine.step()
+            for size in record_network_values(finished):
+                engine.evals += size; engine.calls += 1; engine.full_calls += size == engine.leaf_batch
+            for slot in finished:
                 episode, items = slot.episode()
                 if episode['reason'] == 'span':
                     log_event(run, 'actor', 'error', f'worker {args.worker}: game ended at ply {len(episode["moves"])}, '

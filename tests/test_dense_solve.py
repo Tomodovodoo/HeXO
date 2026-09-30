@@ -155,6 +155,22 @@ class PassTests(unittest.TestCase):
             solver, tactics, windows = self.solve(self.run.parent/'closed')
         self.assertEqual((tactics.calls, windows, solver.stats['gated']), ([], [], 0))
 
+    def test_network_error_survives_solver_corrected_search_values(self):
+        e = dict(episode(self.moves, self.mover), root_values=[1.]*len(self.moves),
+                 network_values=[-.6]*len(self.moves))
+        shard_of(self.run, '1000000000002', [e])
+        solver, _, windows = self.solve(name='1000000000002')
+        attacks = [entry for entry in solver.buffer.entries.values() if entry['kind'] == 'attack']
+        self.assertTrue(attacks)
+        self.assertTrue(all(entry['regret'] == .8 and entry['value_source'] == 'network' for entry in attacks))
+        self.assertTrue(all(entry['regret'] == 1. and 'value_source' not in entry
+                            for entry in solver.buffer.entries.values() if entry['kind'] == 'defence'))
+        self.assertTrue(all(w['search_value_at_first_ply'] == 1. for w in windows))
+        del e['network_values']
+        shard_of(self.run, '1000000000003', [e])
+        legacy, _, _ = self.solve(self.run.parent/'legacy', name='1000000000003')
+        self.assertFalse(any(entry['kind'] == 'attack' for entry in legacy.buffer.entries.values()))
+
     def test_same_shard_same_sidecar_and_buffer(self):
         outputs = []
         for k in range(2):
@@ -236,6 +252,22 @@ class PassTests(unittest.TestCase):
         self.assertTrue(all(e['ply'] > 5 for e in solver.buffer.entries.values() if e['shard'] == '1000000000002'))
         self.assertEqual(solver.buffer.entries[('1000000000001', 0, 5, 'attack')]['observed'],
                          {'main/000010': dict(value=.4, shard='1000000000002')})
+
+    def test_network_restart_observations_keep_the_network_source(self):
+        source = dict(shard='1000000000001', game=0, ply=5, kind='attack', regret=.8, plies_to_proof=0,
+                      value_source='network')
+        moves = [list(m) for m in winning_game()]
+        e = dict(episode(moves, 0, origin='restart', restart=source),
+                 root_values=[None]*5+[1.]*(len(moves)-5),
+                 network_values=[None]*5+[-.6]*(len(moves)-5))
+        shard_of(self.run, '1000000000002', [e])
+        result = dense_solve.Solver(self.run, self.run, SMALL, self.engine).solve('1000000000002')
+        key = [source['shard'], source['game'], source['ply'], source['kind']]
+        self.assertEqual(result['observations'], [(key, 'main/000010', -.6, 'network')])
+        del e['network_values']
+        shard_of(self.run, '1000000000003', [e])
+        result = dense_solve.Solver(self.run, self.run, SMALL, self.engine).solve('1000000000003')
+        self.assertEqual(result['observations'], [])
 
 
 class Process:
@@ -375,6 +407,21 @@ class RestartBufferTests(unittest.TestCase):
             buffer.refresh([], 'main/000030', solved=lambda shard: shard == 't')
             self.assertEqual((buffer.waiting, round(buffer.entries['s', 0, 1, 'attack']['regret'], 9)), ({}, .2))
 
+    def test_network_entries_ignore_search_observations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            buffer = dense_solve.RestartBuffer(Path(tmp)/'restarts.json', 10, 2, .1)
+            key = ('s', 0, 1, 'attack')
+            buffer.observe(key, 'main/000030', -.6, '0003', 'network')
+            buffer.add(dict(self.entry(1, -.6), value_source='network'))
+            buffer.observe(key, 'main/000030', 1., '0004')
+            buffer.refresh([], 'main/000030')
+            self.assertEqual(buffer.entries[key]['regret'], .8)
+            self.assertEqual(buffer.entries[key]['observed'],
+                             {'main/000030': dict(value=-.6, shard='0003', value_source='network')})
+            buffer.observe(key, 'main/000040', .9, '0005', 'network')
+            buffer.refresh([], 'main/000040')
+            self.assertEqual(buffer.entries, {})
+
     def test_one_shot_pass_refreshes_after_its_last_shard(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = new_run(Path(tmp)/'run')
@@ -442,6 +489,8 @@ class RestartActorTests(unittest.TestCase):
         self.assertNotIn('restart', plain)
         self.assertEqual((restart['moves'][:6], restart['opening_plies']), (PREFIX, 6))
         self.assertEqual(restart['root_values'][:6], [None]*6)
+        self.assertEqual(restart['network_values'][:6], [None]*6)
+        self.assertEqual(len(restart['network_values']), len(restart['moves']))
         self.assertEqual(restart['full_search'][:6], [False]*6)
         self.assertTrue(all(v is not None for v in restart['root_values'][6:]))
         self.assertEqual([r['ply'] for r in rows], list(range(6, len(restart['moves']))))
@@ -460,6 +509,92 @@ class RestartActorTests(unittest.TestCase):
         samples, targets = dense_data.examples(window, [r for r in trained if r.shard == '1000000000002'],
                                                np.random.default_rng(0))
         self.assertEqual(len(samples), len(plies))
+
+    def test_proven_roots_share_an_extra_network_prediction(self):
+        model = tiny_model()
+        model.cache.capacity = 0
+        history = [list(m) for m in winning_game()[:9]]
+        settings = replace(dense_config.ActorSettings(), full_sims=4, cheap_sims=2, root_samples=2,
+                           max_plies=len(history)+30, full_fraction=1., opening_random_plies=0.,
+                           solver_root_nodes=135, solver_fixed_budgets=True, adjudicate_proven=True,
+                           proven_line_rows=True)
+        games = [dense_selfplay.SelfPlayGame([model, model], settings, seed,
+                 book=(dict(ply=len(history)), history)) for seed in (3, 4)]
+        engine = dense_selfplay.Engine(64, solver_async=False, leaf_nodes=135)
+        self.addCleanup(engine.close)
+        for game in games:
+            self.addCleanup(game.game.close)
+            for tree in game.trees.values():
+                self.addCleanup(tree.close)
+            engine.add(game)
+        while engine.slots or engine.closing:
+            engine.step()
+        ply = len(history)
+        self.assertEqual([game.values[ply] for game in games], [1., 1.])
+        self.assertEqual([game.network_values[ply] for game in games], [None, None])
+        self.assertTrue(all(any(row.get('line') for row in game.rows) for game in games))
+        before = [game.moves.copy() for game in games]
+        expected = model.evaluator.evaluate([np.asarray(history, np.int64)])[0][2][0]
+        model.cache.capacity = 256
+        with unittest.mock.patch.object(model.evaluator, 'evaluate', wraps=model.evaluator.evaluate) as evaluate:
+            self.assertEqual(dense_selfplay.record_network_values(games), [1])
+            self.assertEqual(evaluate.call_count, 1)
+            self.assertEqual([game.network_values[ply] for game in games], [expected, expected])
+            self.assertEqual([game.moves for game in games], before)
+            self.assertEqual([game.values[ply] for game in games], [1., 1.])
+            self.assertTrue(all(game.network_values[row['ply']] is None
+                                for game in games for row in game.rows if row.get('line')))
+            for game in games:
+                game.network_values[ply] = None
+            self.assertEqual(dense_selfplay.record_network_values(games), [])
+            self.assertEqual(evaluate.call_count, 1)
+
+    def test_network_restart_gets_a_prediction_without_a_new_proof(self):
+        model = tiny_model()
+        model.cache.capacity = 0
+        source = dict(self.buffer[0], value_source='network')
+        settings = replace(dense_config.ActorSettings(), full_sims=2, cheap_sims=2, root_samples=2,
+                           max_plies=8, tactics=False, opening_random_plies=0.)
+        game = dense_selfplay.SelfPlayGame([model, model], settings, 7, restart=(source, PREFIX))
+        self.addCleanup(game.game.close)
+        for tree in game.trees.values():
+            self.addCleanup(tree.close)
+        engine = dense_selfplay.Engine(64)
+        self.addCleanup(engine.close)
+        engine.add(game)
+        while engine.slots:
+            engine.step()
+        self.assertTrue(all(not row.get('proven') for row in game.rows))
+        self.assertIsNotNone(game.network_values[6])
+        dense_selfplay.record_network_values([game])
+        self.assertTrue(all(value is not None for value in game.network_values[6:]))
+        e, rows = game.episode()
+        self.assertEqual(e['restart']['value_source'], 'network')
+        self.assertEqual(e['network_values'][:6], [None]*6)
+
+    def test_unproven_rows_keep_values_without_a_cache(self):
+        model = tiny_model()
+        model.cache.capacity = 0
+        source = dict(self.buffer[0], ply=5)
+        settings = replace(dense_config.ActorSettings(), full_sims=2, cheap_sims=2, root_samples=2,
+                           max_plies=7, tactics=False, opening_random_plies=0.)
+        game = dense_selfplay.SelfPlayGame([model, model], settings, 7, restart=(source, PREFIX[:5]))
+        self.addCleanup(game.game.close)
+        for tree in game.trees.values():
+            self.addCleanup(tree.close)
+        engine = dense_selfplay.Engine(64)
+        self.addCleanup(engine.close)
+        engine.add(game)
+        while engine.slots:
+            engine.step()
+        self.assertTrue(all(not row.get('proven') for row in game.rows))
+        self.assertIsNotNone(game.network_values[5])
+        self.assertIsNone(game.network_values[6])
+        dense_selfplay.record_network_values([game])
+        expected = model.evaluator.evaluate([np.asarray(game.moves[:ply], np.int64) for ply in (5, 6)])
+        np.testing.assert_allclose(game.network_values[5:], [p[2][0] for p in expected], atol=1e-7)
+        self.assertEqual(game.network_values[:5], [None]*5)
+        self.assertEqual(engine.root_predictions, {})
 
     def test_worker_starts_games_from_the_buffer(self):
         config = dense_config.load(self.run)
