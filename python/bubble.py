@@ -76,8 +76,13 @@ def spawn(command, log):
 
 
 def arguments_of(line):
-    """The arguments of a Windows command line, quotes removed."""
-    return [part.strip('"') for part in shlex.split(line, posix=False)] if line else []
+    """The arguments of a Windows command line, quotes removed; a line shlex cannot parse is split on spaces."""
+    if not line:
+        return []
+    try:
+        return [part.strip('"') for part in shlex.split(line, posix=False)]
+    except ValueError:
+        return line.split()
 
 
 def arguments(pid):
@@ -102,10 +107,17 @@ def alive(pid, script, run, arguments=arguments):
     return matches(arguments(pid), script, run)
 
 
-def belongs(parts, run):
-    """Whether a process with argument list `parts` is part of the run: it names the run directory, or it is a
-    multiprocessing worker (whose command line names its parent instead)."""
-    return run in parts or any('multiprocessing' in part for part in parts)
+def members(candidates, run, root):
+    """The pids among `candidates` ({pid: argument list}) that belong to the service `root` of `run`: they name
+    the run directory, or they are multiprocessing workers whose `parent_pid=` names an accepted member."""
+    accepted = {root} | {pid for pid, parts in candidates.items() if run in parts}
+    while True:
+        added = {pid for pid, parts in candidates.items() if pid not in accepted and
+                 any(part.startswith('parent_pid=') or 'parent_pid=' in part for part in parts) and
+                 any(f'parent_pid={parent}' in ' '.join(parts) for parent in accepted)}
+        if not added:
+            return accepted - {root}
+        accepted |= added
 
 
 def windows_tree(pid, run):
@@ -119,32 +131,32 @@ def windows_tree(pid, run):
         if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
             children.setdefault(int(parts[1]), []).append(int(parts[0]))
             lines[int(parts[0])] = parts[2]
-    found, queue = [], [pid]
+    descendants, queue = {}, [pid]
     while queue:
         for child in children.get(queue.pop(), []):
-            if belongs(arguments_of(lines.get(child, '')), run):
-                found.append(child)
-                queue.append(child)
-    return found
+            descendants[child] = arguments_of(lines.get(child, ''))
+            queue.append(child)
+    return sorted(members(descendants, run, pid))
 
 
 def group_alive(pid, run):
-    """Whether any process started under the service `pid` still exists: on POSIX a member of its process group
-    (each service starts its own session) running on `run`, on Windows a live descendant by parent id."""
+    """Whether any process started under the service `pid` still belongs to it: on POSIX a member of its process
+    group (each service starts its own session), on Windows a descendant by parent id."""
     if os.name == 'nt':
         return bool(windows_tree(pid, run))
     if not Path('/proc').is_dir():
         return False
+    group = {}
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
         try:
             fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
-            if int(fields[2]) == pid and belongs(arguments(int(entry.name)), run):
-                return True
+            if int(fields[2]) == pid:
+                group[int(entry.name)] = arguments(int(entry.name))
         except (OSError, ValueError, IndexError):
             continue
-    return False
+    return bool(members(group, run, pid))
 
 
 def kill(pid, force=False):
@@ -305,11 +317,16 @@ def exports(run):
 
 
 def install(run, source, step, variant='play'):
-    """Copy the weights file `source` into `run` as checkpoint `variant/step` and make it the champion. The `play`
-    variant keeps such installs apart from the learner's own exports. Files land under temporary names and are
-    renamed, so a reader never sees a half-written checkpoint."""
+    """Copy the weights file `source` into `run` as checkpoint `variant/step` and make it the champion, under the
+    run's lock so installs never interleave. The `play` variant keeps such installs apart from the learner's own
+    exports. Files land under temporary names and are renamed, so a reader never sees a half-written checkpoint."""
     if not Path(source).is_file():
         raise FileNotFoundError(f'no weights file at {source}')
+    with Launcher(run).locked():
+        return _install(run, source, step, variant)
+
+
+def _install(run, source, step, variant):
     checkpoint = f'{variant}/{step:06d}'
     target = Path(run) / 'checkpoints' / checkpoint
     target.mkdir(parents=True, exist_ok=True)

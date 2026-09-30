@@ -94,6 +94,16 @@ class ModelTests(unittest.TestCase):
         self.assertEqual([p.name for p in (self.run / 'checkpoints').iterdir()], ['play'])
 
 
+class MembersTests(unittest.TestCase):
+    def test_workers_follow_accepted_parents_only(self):
+        worker = lambda parent: ['python', '-c', f'from multiprocessing.spawn import spawn_main; spawn_main(parent_pid={parent}, pipe_handle=1)']
+        candidates = {11: ['python', 'dense_learn.py', '--run', '/r'], 12: worker(11), 13: worker(12),
+                      21: ['python', 'dense_learn.py', '--run', '/other'], 22: worker(21), 30: worker(99)}
+        self.assertEqual(bubble.members(candidates, '/r', 10), {11, 12, 13})
+        self.assertEqual(bubble.members({40: worker(10)}, '/r', 10), {40})
+        self.assertEqual(bubble.members({30: worker(99)}, '/r', 10), set())
+
+
 class MatchTests(unittest.TestCase):
     def test_exact_run_and_script(self):
         parts = ['python', '-u', '/hexo/python/dense_learn.py', '--run', '/runs/my bubble']
