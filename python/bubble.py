@@ -97,10 +97,29 @@ def alive(pid, script, run, arguments=arguments):
     return matches(arguments(pid), script, run)
 
 
+def windows_tree(pid):
+    """Windows: the pids of every live descendant of `pid`, found through parent process ids."""
+    query = "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }"
+    out = subprocess.run(['powershell', '-NoProfile', '-Command', query], capture_output=True, text=True).stdout
+    children = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found, queue = [], [pid]
+    while queue:
+        for child in children.get(queue.pop(), []):
+            found.append(child)
+            queue.append(child)
+    return found
+
+
 def group_alive(pid, run):
-    """POSIX: whether any process of the group `pid` (each service starts its own session) still runs on `run`.
-    Members are found through /proc, so a reused group id with unrelated members does not count."""
-    if os.name == 'nt' or not Path('/proc').is_dir():
+    """Whether any process started under the service `pid` still exists: on POSIX a member of its process group
+    (each service starts its own session) running on `run`, on Windows a live descendant by parent id."""
+    if os.name == 'nt':
+        return bool(windows_tree(pid))
+    if not Path('/proc').is_dir():
         return False
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
@@ -351,6 +370,8 @@ def main():
             run = ROOT / 'runs' / 'play'
             install(run, args.model, int(digits[-1]) if digits else 0)
         elif not exports(run):
+            if run != (ROOT / 'runs' / 'play').resolve():
+                sys.exit(f'no checkpoints under {run}; pass --model, or use the default run to download a release')
             print(f'no checkpoints under {run}; downloading the latest released Bubble')
             print(f'installed {download(run)}')
         sys.exit(subprocess.call([sys.executable, str(PYTHON / 'play.py'), '--dense-run', str(run),
