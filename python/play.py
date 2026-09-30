@@ -380,6 +380,8 @@ if __name__ == "__main__":
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.dense_model and not args.dense_run:
         args.dense_run = Path(__file__).resolve().parents[1] / 'runs' / 'play'
+    if args.dense_model:
+        args.dense_run.mkdir(parents=True, exist_ok=True)
     if args.dense_run:
         import torch
         torch.set_num_threads(2)
