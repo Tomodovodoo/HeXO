@@ -5087,6 +5087,17 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator = self.start(anchor_every=1, anchor_games=2, anchor_on_promotion=False)
         self.assertIsNone(evaluator.anchor())
 
+    def test_switching_anchor_resets_the_reign_baseline(self):
+        self.export(10)
+        evaluator = self.start()
+        self.assertTrue(evaluator.step())
+        league = self.league()
+        league.update(reign_anchor='seal', reign_games=10)
+        (self.run/'league.json').write_text(json.dumps(league))
+        evaluator = self.start(external_engine='fake-engine', external_name='six', anchor_games=2)
+        self.assertEqual((evaluator.anchor_id, evaluator.league['reign_games']), ('six', 0))
+        self.assertEqual(evaluator.anchor()[1:], ('six', 'anchor', 2))
+
     def test_anchor_quota_respects_expected_score_limit(self):
         evaluator = self.start(anchor_games=60, max_expected_score=10/11)
         self.export(10)

@@ -107,6 +107,7 @@ Both formats record two stones per turn, so a win on the first stone of a turn c
 - [Search: Gumbel MCTS, tree reuse](docs/neural-search.md)
 - [Outcomes on the search graph](docs/search-outcomes.md)
 - [Tactical solver and its scheduling](docs/tactical-solver.md)
+- [Six: Bubble as a Six engine, Six as an opponent](docs/six-engine.md)
 - [GPU kernels](docs/gpu-kernels.md)
 - [Native engine, Seal adapter, tests](docs/native-engine.md)
 - [Notation and bot API](docs/notation-api.md)

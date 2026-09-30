@@ -43,8 +43,9 @@ class DensePlayer:
     """Play exported dense checkpoints; analysis searches a copy of the browser game."""
     mode = 'dense'
 
-    def __init__(self, run, device, tactical_package=None):
+    def __init__(self, run, device, tactical_package=None, model=None):
         self.run, self.device = run, device
+        self.model_path = Path(model).resolve() if model else None
         self.tactical_package = tactical_package
         self.evaluator = self.prover = None
         self.checkpoint = None
@@ -60,6 +61,11 @@ class DensePlayer:
         self.select(available[0]['id'])
 
     def models(self):
+        if self.model_path:
+            path = self.model_path
+            checkpoint = (f'{path.parent.parent.name}/{path.parent.name}'
+                          if path.name == 'ema.pt' and path.parent.parent.parent.name == 'checkpoints' else path.stem)
+            return [dict(id=checkpoint, label=checkpoint)]
         exports = sorted((p for p in (self.run/'checkpoints').glob('*/*/ema.pt') if p.parent.name.isdigit()),
                          key=lambda p: (int(p.parent.name), p.parent.parent.name), reverse=True)
         ids = [p.parent.relative_to(self.run/'checkpoints').as_posix() for p in exports]
@@ -86,7 +92,7 @@ class DensePlayer:
             return
         import hexnet
         from legacy.train import digest
-        path = self.run/'checkpoints'/checkpoint/'ema.pt'
+        path = self.model_path or self.run/'checkpoints'/checkpoint/'ema.pt'
         model = hexnet.load_model(path)
         self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path), max_batch=16)
         self.checkpoint, self.model_sha256 = checkpoint, digest(path)

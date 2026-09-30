@@ -8,7 +8,7 @@ The evaluator keeps `pool_games` (64) games in flight on one engine, so the GPU 
 
 While a promotion decision is pending, direct games against the champion take the whole pool until `sprt_min_games` (64) are complete. After that, at most `evidence_share` (1/4) of the pool goes to whichever other pairing most reduces the posterior variance of the decision. A newer checkpoint supersedes the trial: its running games finish and count, and the verdict settles on all of them.
 
-After a decision the evaluator plays the champion's Seal anchor, a panel of the closest rated checkpoints, and fill games that sharpen the widest intervals, until the next checkpoint appears. Pairings whose expected score exceeds `max_expected_score` (0.85, about 300 Elo) are skipped.
+The anchor opponent is Seal by default; `--eval-external-engine` with `--eval-external-name` rates champions against any engine that speaks the Six protocol under its own league id ([six-engine.md](six-engine.md)). After a decision the evaluator plays the champion's anchor, a panel of the closest rated checkpoints, and fill games that sharpen the widest intervals, until the next checkpoint appears. Pairings whose expected score exceeds `max_expected_score` (0.85, about 300 Elo) are skipped.
 
 ## Ratings and promotion
 
