@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / 'python'
 SERVICES = ('learner', 'actors', 'evaluator', 'proof', 'dashboard')
-RELEASES = 'https://api.github.com/repos/Tomodovodoo/HeXO/releases/latest'
+LATEST = 'https://github.com/Tomodovodoo/HeXO/releases/latest/download/'
 
 
 def resolve_device(device):
@@ -175,14 +175,10 @@ class Launcher:
 
 
 def fetch(url):
-    """GET `url`; a GITHUB_TOKEN in the environment authorises access to a private repository's releases."""
+    """GET `url`; returns the body and the final URL after redirects."""
     from urllib.request import Request, urlopen
-    accept = 'application/octet-stream' if '/releases/assets/' in url else 'application/vnd.github+json'
-    headers = {'User-Agent': 'bubble', 'Accept': accept}
-    if os.environ.get('GITHUB_TOKEN'):
-        headers['Authorization'] = 'Bearer ' + os.environ['GITHUB_TOKEN']
-    with urlopen(Request(url, headers=headers)) as response:
-        return response.read()
+    with urlopen(Request(url, headers={'User-Agent': 'bubble'})) as response:
+        return response.read(), response.geturl()
 
 
 def exports(run):
@@ -204,16 +200,16 @@ def install(run, source, step, variant='main'):
 
 def download(run, fetch=fetch):
     """Fetch the newest released Bubble into `run`; the release tag's number is the checkpoint step."""
-    release = json.loads(fetch(RELEASES))
-    assets = {asset['name']: asset['url'] for asset in release['assets']}
-    if 'ema.pt' not in assets:
-        raise RuntimeError(f"release {release['tag_name']} has no ema.pt")
-    step = int(re.search(r'(\d+)', release['tag_name']).group(1))
+    from urllib.error import HTTPError
+    weights, final = fetch(LATEST + 'ema.pt')
+    step = int(re.search(r'(\d+)', final.rsplit('/', 2)[-2]).group(1))
     staging = Path(run) / 'checkpoints' / 'download'
     staging.mkdir(parents=True, exist_ok=True)
-    (staging / 'ema.pt').write_bytes(fetch(assets['ema.pt']))
-    if 'manifest.json' in assets:
-        (staging / 'manifest.json').write_bytes(fetch(assets['manifest.json']))
+    (staging / 'ema.pt').write_bytes(weights)
+    try:
+        (staging / 'manifest.json').write_bytes(fetch(LATEST + 'manifest.json')[0])
+    except HTTPError:
+        pass
     target = install(run, staging / 'ema.pt', step)
     shutil.rmtree(staging)
     return target

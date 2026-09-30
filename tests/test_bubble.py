@@ -67,15 +67,14 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(bubble.exports(self.run), [target / 'ema.pt'])
 
     def test_download_uses_the_release_tag_as_step(self):
-        release = dict(tag_name='bubble-122500', assets=[
-            dict(name='ema.pt', url='u/ema'), dict(name='manifest.json', url='u/man')])
-        responses = {bubble.RELEASES: json.dumps(release).encode(), 'u/ema': b'weights', 'u/man': b'{}'}
-        target = bubble.download(self.run, responses.__getitem__)
-        self.assertEqual(target.name, '122500')
+        def fetch(url):
+            name = url.rsplit('/', 1)[-1]
+            return {'ema.pt': b'weights', 'manifest.json': b'{}'}[name],                 f'https://github.com/Tomodovodoo/HeXO/releases/download/bubble-125000/{name}'
+        target = bubble.download(self.run, fetch)
+        self.assertEqual(target.name, '125000')
         self.assertEqual((target / 'ema.pt').read_bytes(), b'weights')
+        self.assertTrue((target / 'manifest.json').exists())
         self.assertFalse((self.run / 'checkpoints' / 'download').exists())
-        with self.assertRaises(RuntimeError):
-            bubble.download(self.run, lambda url: json.dumps(dict(tag_name='x-1', assets=[])).encode())
 
 
 class MatchTests(unittest.TestCase):
