@@ -3265,6 +3265,8 @@ class EngineTests(unittest.TestCase):
                     result = searched.call_args.args[0]
                     self.assertEqual((result['completed'], result['exact_winner'], result['proven']), (0, 0, 1))
                     self.assertEqual((slot.rows[0]['proven'], slot.values[len(history)]), (1, 1.))
+                    # Zero simulations on a won root: the target covers only the winning completions.
+                    self.assertTrue(0 < np.count_nonzero(slot.rows[0]['policy']) < len(slot.rows[0]['policy']))
                     self.assertEqual((slot.reason, slot.adjudicated['winner']), ('proven', 0))
                     self.assertEqual(engine.searches, 1)
                 finally:
@@ -3272,6 +3274,15 @@ class EngineTests(unittest.TestCase):
                     for tree in slot.trees.values():
                         tree.close()
                     slot.game.close()
+
+    def test_zero_simulation_exact_roots_record_only_informative_policies(self):
+        def result(completed, winner, policy):
+            return dict(completed=completed, exact_winner=winner, policy=np.asarray(policy, float))
+        self.assertTrue(dense_selfplay.policy_target(result(3, -1, [.5, .5]), 0))
+        self.assertTrue(dense_selfplay.policy_target(result(3, 1, [.5, .5]), 0))
+        self.assertTrue(dense_selfplay.policy_target(result(0, 0, [1., 0.]), 0))     # wins are a strict subset
+        self.assertFalse(dense_selfplay.policy_target(result(0, 0, [.5, .5]), 0))    # every move wins
+        self.assertFalse(dense_selfplay.policy_target(result(0, 1, [.5, .5]), 0))    # the network prior of a loss
 
     def test_tactical_start_reports_the_historical_opponents_value_without_training_its_rows(self):
         torch.set_num_threads(2)

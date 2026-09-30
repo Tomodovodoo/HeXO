@@ -289,7 +289,7 @@ class InjectionPoints(unittest.TestCase):
     def tearDownClass(cls):
         torch.set_num_threads(cls.threads)
 
-    def test_root_proof_plays_the_certificate_turn_and_keeps_the_search_policy(self):
+    def test_root_proof_plays_the_certificate_turn_and_teaches_its_stones(self):
         opening = FIXTURE['positions'][PROOF]
         proof = self.engine.history(opening, nodes=NODES)
         self.assertEqual(proof['status'], 'PROVEN_WIN')
@@ -307,12 +307,16 @@ class InjectionPoints(unittest.TestCase):
         self.assertEqual(episode['solver'], dict(root_nodes=NODES, finalists=0, finalist_nodes=0, threat_nodes=0,
                                                  schedule=asdict(Schedule()),
                                                  build_hash=self.engine.metadata['binary_sha256']))
-        policy = rows[0]['policy']
-        self.assertGreater(int((policy > 0).sum()), 1)
-        self.assertLess(float(policy.max()), 1-1e-3)
-        # The proof decides only the move: the search and its recorded policy are those of the solver-off game.
+        # Each placement's certificate stone is marked exact-won, so its policy row holds only that stone.
         _, plain = off.episode()
-        np.testing.assert_array_equal(policy, plain[0]['policy'])
+        for k, row in enumerate(rows):
+            legal = Game([tuple(m) for m in episode['moves'][:len(opening)+k]])
+            try:
+                index = [list(c[:2]) for c in legal.legal_moves()].index(list(proof['moves'][k]))
+            finally:
+                legal.close()
+            self.assertEqual((int(np.count_nonzero(row['policy'])), float(row['policy'][index])), (1, 1.))
+            self.assertGreater(int(np.count_nonzero(plain[k]['policy'])), 1)
         self.assertNotIn('proven', plain[0])
 
     def test_finalist_proof_prunes_the_candidate(self):
@@ -329,6 +333,8 @@ class InjectionPoints(unittest.TestCase):
         for action in result['pruned']:
             i = actions.index(action)
             self.assertEqual((result['values'][i], result['policy'][i]), (-1., 0.))
+            # Marked when the verdict arrives at the hold, so the last round's visits go to the survivors.
+            self.assertLess(result['visits'][i], plain['visits'][i])
             self.assertGreater(plain['policy'][i], 0.)
             self.assertNotEqual(result['action'], action)
             after = self.engine.history(opening+[action], nodes=NODES)

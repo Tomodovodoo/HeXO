@@ -194,6 +194,53 @@ class NeuralTree(unittest.TestCase):
         search.advance(result['action'])
         self.assertEqual(search.search(65536)['exact_winner'], 0)
 
+    def test_forced_block_policy_ignores_proven_losing_moves(self):
+        # Player 1's four on r=3 is blocked at (0,3); player 0 has one placement left, so every move except
+        # (5,3) and (6,3) is a proven loss. The better block must keep its full completed-Q margin.
+        history = [(0,0),(1,3),(2,3),(0,3),(5,-3),(3,3),(4,3),(-3,-2)]
+        better, worse = (5,3), (6,3)
+        class Blocks(Uniform):
+            def evaluate(self, histories):
+                predictions = super().evaluate(histories)
+                for h, prediction in zip(histories, predictions):
+                    first = tuple(h[len(history)]) if len(h) > len(history) else None
+                    prediction['q'][:] = -.1 if first == better else .1 if first == worse else 0.
+                return predictions
+        search = NeuralSearch(Blocks(), 'forced-block', history, 7, tactics=True)
+        self.addCleanup(search.close)
+        result = search.search(16, root_samples=16, batch_size=1)
+        actions = result['actions'].tolist()
+        good, bad = actions.index(list(better)), actions.index(list(worse))
+        self.assertEqual(np.count_nonzero(result['policy']), 2)
+        np.testing.assert_allclose([result['values'][good], result['values'][bad]], [.1, -.1])
+        self.assertGreater(result['policy'][good], .99)
+        self.assertEqual(result['action'], list(better))
+
+    def test_refutation_two_opponent_placements_deep_proves_the_root_move_lost(self):
+        # Player 1 holds two open threes. After a, the prior leads to c then d: two open fours, so every move of
+        # player 0 is lost there. The other root moves are only estimated at -0.95; the refuted a must not be played.
+        history = [(0,0),(0,4),(1,4),(5,-4),(-2,-3),(2,4),(-4,0),(4,-1),(6,-2),(-4,1),(-4,2),(7,-6)]
+        a, c, d = (8,-8), (3,4), (-4,3)
+        class Refutation(Uniform):
+            def evaluate(self, histories):
+                predictions = super().evaluate(histories)
+                for h, prediction in zip(histories, predictions):
+                    tail = [tuple(m) for m in h[len(history):]]
+                    on_line = not tail or tail[0] == a
+                    favourite = {0: a, 1: c, 2: d}.get(len(tail)) if on_line else None
+                    if favourite is not None:
+                        prediction['logits'][(prediction['actions'] == favourite).all(axis=1)] = 8.
+                    prediction['q'][:] = 0. if on_line else .95
+                return predictions
+        search = NeuralSearch(Refutation(), 'refutation', history, 3, tactics=True)
+        self.addCleanup(search.close)
+        result = search.search(64, root_samples=16, batch_size=1)
+        i = result['actions'].tolist().index(list(a))
+        self.assertEqual((result['values'][i], result['policy'][i]), (-1., 0.))
+        self.assertLessEqual(result['visits'][i], 3)
+        self.assertNotEqual(result['action'], list(a))
+        self.assertEqual(result['exact_winner'], -1)
+
     def searcher(self, history=(), seed=7, evaluator=None):
         search = NeuralSearch(evaluator or Uniform(), 'test-v1', history, seed)
         self.addCleanup(search.close)
