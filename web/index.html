@@ -379,7 +379,7 @@ function renderSeat(side){
   const pick=el('button',{class:'pick'},el('span',{class:'kind'},kind),el('span',{},name));
   const items=[{id:'human',kind:'you',name:'Human'},...S.engines.map(e=>({id:e.id,kind:e.kind,name:e.name}))];
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,seat.engine,it=>post('/seat',{side,engine:it.id}));
-  const send=ch=>post('/seat',{side,engine:seat.engine,checkpoint:seat.checkpoint,preset:seat.preset,...ch});
+  const send=ch=>post('/seat',{side,engine:seat.engine,checkpoint:seat.checkpoint,preset:seat.preset,custom:seat.budget,...ch});
   box.replaceChildren(el('div',{class:'seat-head'},el('i',{class:'hexdot'}),pick),
     ...(seat.engine==='human'?[]:seatControls(seat,kind,send)),el('div',{class:'busy',id:'busy'+side}));
   box.classList.toggle('active',S.winner<0&&S.player===side);
@@ -389,8 +389,8 @@ function renderEngineHead(){
   if(!a){head.replaceChildren(el('span',{class:'empty'},'—'));return}
   const [kind,name]=engineName(a),pick=el('button',{class:'pick'},el('span',{class:'kind'},kind),el('span',{},name));
   const items=S.engines.filter(e=>e.kind==='bubble').map(e=>({id:e.id,kind:e.kind,name:e.name}));
-  const send=ch=>post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,auto:a.auto,...ch});
-  pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,a.engine,it=>send({engine:it.id,checkpoint:null}));
+  const send=ch=>post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.budget,auto:a.auto,...ch});
+  pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,a.engine,it=>send({engine:it.id,checkpoint:null,preset:'standard',custom:undefined}));
   const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},el('i'),'Auto');
   auto.onclick=()=>send({auto:!a.auto});
   const again=el('button',{'aria-label':'Analyse again'},'↻');again.onclick=()=>post('/analyse',{ply:view,force:true});

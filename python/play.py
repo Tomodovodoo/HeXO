@@ -29,7 +29,6 @@ PRESETS = dict(
     native=dict(quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000), deep=dict(ms=10000)),
     seal=dict(quick=dict(ms=100), standard=dict(ms=500), strong=dict(ms=2000), deep=dict(ms=8000)))
 LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 4_000_000), ms=(10, 120_000))
-LABELS = ('win', 'found', 'kept', 'best', 'good', 'inaccuracy', 'mistake', 'blunder', 'missed', 'allowed', 'lost')
 
 
 def player_at(ply):
@@ -387,14 +386,13 @@ class Evaluations:
         return json.loads(line) if line else None
 
     def best(self, history, engine):
-        """The deepest saved evaluation of `history` by `engine`, or None."""
+        """The saved evaluation of `history` by `engine` to show, or None: one holding a proof first, since a proof
+        is exact, then the most simulations, then the most solver nodes."""
         position = self.key(history)
         with self.lock:
-            budgets = self.by_position.get((position, engine))
-            if not budgets:
-                return None
-            line = self.order[(position, engine, max(budgets))]
-        return json.loads(line)
+            lines = [self.order[(position, engine, b)] for b in self.by_position.get((position, engine), ())]
+        found = [json.loads(line) for line in lines]
+        return max(found, key=lambda e: (e.get('proof') is not None, e['simulations'], e['solver_nodes']), default=None)
 
 
 # Review
@@ -721,11 +719,13 @@ class Session:
                         self.paused = True
                     self.changed()
 
-    def watcher(self, job):
+    def watcher(self, job, count=True):
+        """A network-batch callback that stops a cancelled job and, when `count`, adds batch sizes to its progress."""
         def watch(n):
             if job.cancelled:
                 raise Cancelled()
-            job.done += n
+            if count:
+                job.done += n
         return watch
 
     def evaluation(self, job, seat, history, force=False, exact=False):
@@ -736,7 +736,7 @@ class Session:
         if saved:
             return saved
         found = self.engines.evaluate(self.entries[seat['engine']], seat['checkpoint'], seat['budget'], history,
-                                      self.watcher(job))
+                                      self.watcher(job, job.kind != 'review'))
         if job.cancelled:
             raise Cancelled()
         entry = self.entries[seat['engine']]

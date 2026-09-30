@@ -96,6 +96,9 @@ class Store(unittest.TestCase):
         store.add([], 'e', dict(simulations=128, solver_nodes=131072), dict(value=.2, moves=[]))
         self.assertEqual(store.covering([], 'e', STANDARD)['value'], .2)
         self.assertEqual(store.covering([], 'e', dict(simulations=64, solver_nodes=0))['value'], .1)
+        self.assertEqual(store.best([], 'e')['value'], .1)
+        store.add([], 'e', dict(simulations=32, solver_nodes=131072), dict(value=1., moves=[], proof=dict(winner=0, turns=2)))
+        self.assertEqual(store.best([], 'e')['value'], 1.)
 
     def test_index_keeps_the_newest_entries(self):
         store = Evaluations(limit=2)
@@ -210,8 +213,9 @@ class Jobs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'])
         calls = len(self.engines.calls)
         self.assertIsNone(self.session.analyse(1))
-        self.session.review_game()
+        job = self.session.jobs[self.session.review_game()]
         wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual((job.done, job.total), (3, 3))
         self.assertEqual(len(self.engines.calls), calls + 2)
         self.assertEqual([t['label'] for t in self.session.state()['review']], ['best', 'good'])
         self.session.configure_analysis('bubble:fake', preset='deep', auto=False)
