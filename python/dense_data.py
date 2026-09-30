@@ -4,8 +4,8 @@ A shard is an immutable directory `<run>/shards/<name>/` (all digits; converted 
 millisecond time plus pid) holding
   episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search, actors?, opponent?,
                   trained_side?, origin?, restart?, book?}]
-  rows.json      [{game, ply, player, remaining, target, weight, legal_sha256, proven?, proof_turns?, solver_nodes?,
-                  solver_budget?, proof_action?}]
+  rows.json      [{game, ply, player, remaining, target, weight, legal_sha256, proven?, proof_turns?, proof_plies?,
+                  solver_nodes?, solver_budget?, proof_action?}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
   manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows,
@@ -21,14 +21,17 @@ for capped games ('cap' at the ply limit, 'span' when a searched position does n
 move at that ply, or null). The learner derives every target from the episode (`examples`); the stored
 `row.target`/`row.weight` (p(win) or null, weight) are informational and optional. Rows of games played with the
 solver (episode `solver`, dense_solver.record) carry `proven` (+1 / -1: the side to move wins / loses by a verified
-proof, 0: unproven), `proof_turns` (attacker turns of that proof, 0 when unproven), `solver_nodes` (solver work
+proof, 0: unproven), `proof_turns` (attacker turns of a certificate, 0 when unproven or proven by the search tree),
+`proof_plies` (on proven rows: placements within which the favoured side completes six from this row, exact for
+tree and tactical proofs, an upper bound from certificates; absent on older rows and sidecar labels), `solver_nodes` (solver work
 spent on the ply's search) and `solver_budget` (the node budgets granted to its queries); absent means 0. The
 manifest counts the proven rows as `proven_rows`. Readers (ReplayWindow, ValidationSets) also set proven = +1 on the
 rows a sidecar lists (proof_labels) once it appears. A game ended at a proof (actor adjudicate_proven) has reason
 'proven', its winner and `adjudicated` {ply, winner, line_plies: placements of the certificate's forced line from
 there}; rows of that line played without search carry `line` True and no policy. The manifest counts
 `proven_games`, `line_rows` and `adjudicated_plies`.
-Winning rows may carry `proof_action`, the certificate's remaining placements [[q,r], ...] at that row.
+Winning rows may carry `proof_action`: the certificate's remaining placements [[q,r], ...] at that row, or for a
+win proven by the search tree its shortest winning moves.
 Sidecars carry the same field as a mapping from ply strings to placements, applied by both readers. Missing
 actions preserve legacy training. `proof_policy_weight` mixes these witnesses into the search policy at learning
 time; the stored search distribution is unchanged.
@@ -324,8 +327,8 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
             raise ValueError('Malformed shard row')
         if len(p) and (not np.isfinite(p).all() or np.any(p < 0) or not np.isclose(p.sum(), 1, atol=1e-4)):
             raise ValueError('Invalid policy target')
-    keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256', 'proven', 'proof_turns', 'solver_nodes',
-            'solver_budget', 'line', 'proof_action')
+    keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256', 'proven', 'proof_turns', 'proof_plies',
+            'solver_nodes', 'solver_budget', 'line', 'proof_action')
     counts = dict(games=len(episodes), rows=len(rows), policy_rows=sum(len(p) > 0 for p in policies),
                   opponent_rows=sum(not trained(episodes[r['game']], r['ply']) for r in rows),
                   terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes),

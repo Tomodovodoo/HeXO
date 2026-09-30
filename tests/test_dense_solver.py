@@ -146,15 +146,18 @@ class NativeEntries(unittest.TestCase):
         drive(search, 8)
         actions, _, _, _, _ = stats(search)
         mover = 1
-        checked(native.hxg_mark_exact(search.ptr, *actions[0], 1-mover))
+        checked(native.hxg_mark_exact(search.ptr, *actions[0], 1-mover, 3))
         actions, _, values, scores, policy = stats(search)
         self.assertEqual((values[0], policy[0], scores[0]), (-1., 0., -np.inf))
         self.assertEqual(native.hxg_exact(search.ptr), -1)
-        self.assertFalse(native.hxg_mark_exact(search.ptr, 99, 99, 0))
-        for action in actions:
-            checked(native.hxg_mark_exact(search.ptr, *action, 1-mover))
-        self.assertEqual(native.hxg_exact(search.ptr), 1-mover)
-        self.assertTrue(np.all(stats(search)[4] > 0))   # a lost root keeps every edge eligible
+        self.assertFalse(native.hxg_mark_exact(search.ptr, 99, 99, 0, 3))
+        self.assertFalse(native.hxg_mark_exact(search.ptr, *actions[1], 0, 0))   # a distance counts the edge
+        for i, action in enumerate(actions):
+            checked(native.hxg_mark_exact(search.ptr, *action, 1-mover, 7 if i == 5 else 3))
+        self.assertEqual((native.hxg_exact(search.ptr), native.hxg_distance(search.ptr)), (1-mover, 7))
+        _, _, _, scores, policy = stats(search)
+        # A lost root offers only its longest resistance.
+        self.assertEqual((list(np.flatnonzero(policy)), list(np.flatnonzero(np.isfinite(scores)))), ([5], [5]))
 
     def test_marked_candidates_are_replaced_without_stalling(self):
         search = self.tree()
@@ -164,7 +167,7 @@ class NativeEntries(unittest.TestCase):
             actions, _, _, scores, _ = stats(search)
             for i in np.flatnonzero(np.isfinite(scores))[:3]:
                 marked.append(actions[i])
-                checked(native.hxg_mark_exact(search.ptr, *actions[i], 0))
+                checked(native.hxg_mark_exact(search.ptr, *actions[i], 0, 3))
         checked(native.hxg_begin(search.ptr, 16, 4))
         checked(native.hxg_hold(search.ptr, 1))
         self.assertEqual(drive(search, 16, prune), [8])

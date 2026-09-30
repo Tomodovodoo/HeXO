@@ -163,7 +163,7 @@ class NeuralTree(unittest.TestCase):
         pending = [search.request() for _ in range(4)]
         actions = search.result(0, 0, 0, 0)['actions']
         # This entry represents a caller-verified proof; the synthetic outcome is not a game certificate.
-        self.assertTrue(native.hxg_mark_exact(search.ptr, *map(int, actions[0]), 1))
+        self.assertTrue(native.hxg_mark_exact(search.ptr, *map(int, actions[0]), 1, 1))
         self.assertFalse(native.hxg_done(search.ptr))
         self.assertEqual(search.request()[0], 0)
         for request, history in pending:

@@ -386,6 +386,7 @@ class Engine:
                         proof, verdict = leaf
                         stones, turns = proof.path(slot.tree.history)[1]
                         result.update(proven=1, proof=proof, proof_turns=turns, proof_action=[list(s) for s in stones],
+                                      proof_plies=dense_solver.proof_plies(len(stones), turns),
                                       action=list(stones[0]), solver_nodes=result.get('solver_nodes', 0)+verdict['nodes_used'],
                                       solver_budget=result.get('solver_budget', 0)+verdict['budget'])
                     result['network_value'] = self.root_predictions[id(slot)][2]
@@ -423,7 +424,7 @@ class Engine:
                                 break
                         moves = np.ascontiguousarray(proof['moves'], dtype=np.int64).reshape(-1, 2)
                         checked(native.hxg_prove(ptr, request, history, size, dense_data.player_at(size),
-                                                2 if size % 2 else 1, moves, len(moves)))
+                                                2 if size % 2 else 1, moves, len(moves), int(proof['proof_turns'])))
                         self.leaf_proofs += 1
                         root_size = len(slot.tree.history)
                         opponent_second = size == root_size+2 and root_size % 2 == 0
@@ -601,10 +602,10 @@ class SelfPlayGame:
         if dense_solver.active(self.solver, self.schedule) or result.get('proven'):
             row.update(proven=result['proven'], proof_turns=result['proof_turns'], solver_nodes=result['solver_nodes'],
                        solver_budget=result['solver_budget'])
-            if result.get('proof_action'):
+            if result['proven'] > 0 and result.get('proof_action'):
                 row['proof_action'] = result['proof_action']
-        if not row.get('proven') and result['exact_winner'] >= 0:
-            row['proven'] = 1 if result['exact_winner'] == player else -1
+            if result['proven']:
+                row['proof_plies'] = result['proof_plies']
         self.rows.append(row)
         self.values.append(root_value(result, player) if trained else None)
         tactical = self.book is not None and self.book.get('tactical') is not None and ply == self.book['ply']
@@ -654,7 +655,8 @@ class SelfPlayGame:
                 proven = 1 if player == winner else -1
                 self.rows.append(dict(ply=len(self.moves), player=player, remaining=game.remaining,
                                       legal_sha256=dense_data.legal_digest(legal), policy=None, proven=proven,
-                                      proof_turns=turns, solver_nodes=0, solver_budget=0, line=True))
+                                      proof_turns=turns, proof_plies=dense_solver.proof_plies(game.remaining, turns, proven > 0),
+                                      solver_nodes=0, solver_budget=0, line=True))
                 if proven > 0:
                     self.rows[-1]['proof_action'] = full.action(self.moves)
                 self.values.append(float(proven) if trained(player) else None)
@@ -698,7 +700,7 @@ class SelfPlayGame:
             row.setdefault('proof_action', proof_action)
         if row.get('proven'):
             return 0
-        row.update(proven=proven, proof_turns=turns)
+        row.update(proven=proven, proof_turns=turns, proof_plies=dense_solver.proof_plies(row['remaining'], turns, proven > 0))
         return 1
 
     def episode(self):

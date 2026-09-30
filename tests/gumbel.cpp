@@ -24,14 +24,17 @@ int main(){
     }level=std::move(next);paths=std::move(next_paths);
    }
    std::vector<int> observed(leaves,-1);int encoded=assignment;
-   std::function<int(int,int)> expected=[&](int d,int offset){
-    if(d==depth)return observed[offset];int player=(players>>d)&1;
-    int a=expected(d+1,offset),b=expected(d+1,offset+(1<<(depth-d-1)));
-    return a==player || b==player?player:a==1-player && b==1-player?1-player:-1;
+   // (winner, distance): the shortest win at the winner's choice, the longest resistance at the loser's.
+   std::function<std::pair<int,int>(int,int)> expected=[&](int d,int offset)->std::pair<int,int>{
+    if(d==depth)return {observed[offset],observed[offset]<0?-1:offset%3};int player=(players>>d)&1;
+    auto a=expected(d+1,offset),b=expected(d+1,offset+(1<<(depth-d-1)));
+    if(a.first==player || b.first==player)return {player,1+std::min(a.first==player?a.second:1<<20,b.first==player?b.second:1<<20)};
+    if(a.first==1-player && b.first==1-player)return {1-player,1+std::max(a.second,b.second)};
+    return {-1,-1};
    };
-   for(int i=0;i<leaves;++i){int verdict=encoded%3-1;encoded/=3;observed[i]=verdict;level[i]->player=(players>>depth)&1;level[i]->exact_winner=verdict;
+   for(int i=0;i<leaves;++i){int verdict=encoded%3-1;encoded/=3;observed[i]=verdict;level[i]->player=(players>>depth)&1;level[i]->exact_winner=verdict;level[i]->distance=verdict<0?-1:i%3;
     gumbel::Path p;p.leaf=level[i];p.edges=paths[i];for(auto [node,index]:p.edges)++node->edges[index].pending;
-    t.backup(p,i%2?1:-1);assert(t.root->exact_winner==expected(0,0));
+    t.backup(p,i%2?1:-1);auto want=expected(0,0);assert(t.root->exact_winner==want.first);if(want.first>=0)assert(t.root->distance==want.second);
     for(auto [node,index]:p.edges){auto& e=node->edges[index];assert(e.pending==0);assert(e.exact_winner==e.child->exact_winner);if(e.exact_winner>=0)assert(e.sum==(e.exact_winner==node->player?e.visits:-e.visits));}
    }
   }
