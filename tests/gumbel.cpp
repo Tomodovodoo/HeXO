@@ -77,6 +77,18 @@ int main(){
   assert(t.apply(won,n) && n.exact_winner==0 && n.distance==5 && !n.edges[0].eligible && n.edges[1].eligible);
   gumbel::Node u;u.player=1;u.exact_winner=0;u.distance=4;u.bound=true;
   assert(t.apply(gumbel::Outcome{0,4,3,false},u) && !u.bound && !t.apply(gumbel::Outcome{0,6,3,false},u));}
+ // Advancing into another context of a position proven won with a witness keeps the verdict; the root still expands
+ // on the first request, which installs the witness as its only eligible move.
+ {gumbel::Tree u(0);u.graph=true;
+  for(auto c:std::vector<Cell>{{0,0},{1,0},{3,0},{0,1},{0,2},{4,0}})u.advance(c);
+  u.board.make({2,0});auto position=gumbel::keys(u.board).first;u.board.undo();
+  u.outcomes[position]=gumbel::Outcome{0,3,7,true,true,{5,0}};u.advance({2,0});
+  assert(!u.root->expanded && u.root->exact_winner==0);
+  u.begin(8,4);int id=u.request();assert(id>0 && u.requests.at(id).edges.empty());
+  auto& legal=u.requests.at(id).legal;std::vector<int64_t> a;for(auto c:legal){a.push_back(c.q);a.push_back(c.r);}
+  std::vector<double> z(legal.size());u.fulfill(id,a.data(),z.data(),z.data(),int(legal.size()));
+  assert(u.done() && u.root->exact_winner==0);
+  for(auto& e:u.root->edges)assert(e.eligible==(e.action==Cell{5,0}));}
  // MCGS backup: a node's value is recomputed from its edges' visits and its children's current values; a playout
  // reusing a transposed child's value leaves that child unchanged.
  {gumbel::Tree t(0);t.graph=true;gumbel::Node r;r.player=0;r.expanded=true;r.value=.2;

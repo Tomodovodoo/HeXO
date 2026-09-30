@@ -353,7 +353,8 @@ struct Tree {
    std::erase_if(outcomes,[&](const auto& entry){return entry.second.stones<int(board.cells.size());});
   }
   // A root won without a known witness (a winning edge classified without a child, or a shared outcome that kept
-  // none) needs one. A shared witness is installed when the root expands; otherwise immediate tactical choices are
+  // none) needs one. A shared witness is installed when the root expands, which the first request does even for an
+  // exact root (only an expanded exact root stops the search); otherwise immediate tactical choices are
   // reconstructed on the actual board, and general certificates retain their two-placement child.
   auto shared=graph?outcomes.find(root->position):outcomes.end();
   const bool witnessed=shared!=outcomes.end() && shared->second.winner==root->player && shared->second.witnessed;
