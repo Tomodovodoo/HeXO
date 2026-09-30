@@ -5,6 +5,9 @@
 `dense_config.py` (override per process with `--eval-*`).
 `python python/dense_eval.py settle --run runs/dense-v1 --checkpoint main/032500` asks the running evaluator to settle that checkpoint on its completed games at its next step.
 
+The anchor defaults to Seal. Pass `--eval-external-engine` and `--eval-external-name` to use a Six-protocol
+engine under its own league ID; `seal_ms` remains the turn budget. See [Six engine protocol](six-engine.md).
+
 - **Promotion** (`decision`, default `posterior`). One Bradley-Terry posterior covers every rated checkpoint, the
   candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
   and against panel members. Each pair also gets a matchup deviation (prior sd `matchup_prior_elo`, default 30),
