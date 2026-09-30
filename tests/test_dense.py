@@ -3273,6 +3273,41 @@ class EngineTests(unittest.TestCase):
                         tree.close()
                     slot.game.close()
 
+    def test_tactical_start_reports_the_historical_opponents_value_without_training_its_rows(self):
+        torch.set_num_threads(2)
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY), f'sha-{k}', f'model-{k}', 'cpu', 8, 0) for k in range(2)]
+        settings = dense_config.ActorSettings(full_fraction=1., full_sims=2, root_samples=2,
+                                             opening_random_plies=0., tactics=False, max_plies=6)
+        case = json.loads((ROOT/'openings'/'tactical'/'known-loss-v1.json').read_text())['nodes'][0]
+        source = dict(suite='book', key=case['key'], ply=3, off_policy=True,
+                      tactical={k: case['tactical'][k] for k in ('winner', 'source')})
+        slot = dense_selfplay.SelfPlayGame(models, settings, 1, learner=1, opponent='model-0',
+                                          book=(source, case['moves']))
+        engine = dense_selfplay.Engine(8)
+        try:
+            engine.add(slot)
+            while engine.slots:
+                engine.step()
+            self.assertIsNotNone(slot.network_values[3])
+            self.assertIsNone(slot.network_values[4])  # ordinary opponent rows remain excluded
+            self.assertEqual(slot.values[:5], [None]*5)
+            slot.network_values[3] = None  # a root bypassed by proof still needs a reporting prediction
+            with unittest.mock.patch.object(models[0].evaluator, 'evaluate', wraps=models[0].evaluator.evaluate) as evaluate:
+                dense_selfplay.record_network_values([slot])
+                self.assertEqual(evaluate.call_count, 1)
+            self.assertIsNotNone(slot.network_values[3])
+            self.assertIsNone(slot.network_values[4])
+            episode, rows = slot.episode()
+        finally:
+            engine.close()
+        with tempfile.TemporaryDirectory() as run:
+            manifest = dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='sha-1'),
+                                             [episode], [dict(r, game=0) for r in rows])
+            self.assertEqual(manifest['tactical'][0]['actors'], {'0': 'sha-0', '1': 'sha-1'})
+            self.assertAlmostEqual(manifest['tactical'][0]['p2_value'], (1-episode['network_values'][3])/2)
+            window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0.)
+            self.assertEqual([window.ref(name, i).row['ply'] for name, i in window.index], [5])
+
     def test_book_start_searches_only_after_prefix_and_records_source_and_counts(self):
         torch.set_num_threads(2)
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
