@@ -140,10 +140,10 @@ STATUS_SECONDS = 2.
 # Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
 PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'opening_book', 'seal_ms',
             'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes',
-            'solver_defence', 'solver_defence_candidates', 'solver_gate_cap_nodes')
+            'solver_defence', 'solver_defence_candidates', 'solver_gate_cap_nodes', 'pipeline')
 PROTOCOL_DEFAULTS = dict(opening_book='', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
                          solver_threat_nodes=0, solver_defence=False, solver_defence_candidates=8,
-                         solver_gate_cap_nodes=0)
+                         solver_gate_cap_nodes=0, pipeline=False)
 CHAMPION = 'champion'  # the symbolic base of a variant, bound to the champion when its comparison starts
 # The PROTOCOL fields of one side's search, which a variant may override; max_plies, opening_suite, seal_ms
 # and opening_book belong to the game.

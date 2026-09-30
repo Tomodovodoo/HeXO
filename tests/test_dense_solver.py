@@ -754,6 +754,33 @@ class Scheduler(unittest.TestCase):
             return records, decisions
         self.assertEqual(played(True), played(False))
 
+        # Histories at the first disagreement in evaluator-pipeline's paired session
+        # (pairs 22, 27 and 31).  Force singleton inference so a different engine
+        # batch cannot change a prediction for the same position.
+        openings = [
+            [(0, 0), (2, -2), (0, -1), (2, -3), (-2, -1), (-2, 0), (1, -3), (2, -4), (0, -3)],
+            [(0, 0), (0, -1), (2, -2), (3, -2), (-1, 0), (-2, 0), (-1, 1), (1, 0)],
+            [(0, 0), (-1, 0), (-1, -1), (-1, 2), (-2, 1), (-2, 0), (-1, -2), (-1, -3),
+             (0, -2), (-2, -1), (-3, -1), (-4, -1)],
+        ]
+        budgets = Budgets(root_nodes=2048, finalists=2, finalist_nodes=2048, threat_nodes=2048)
+        def replay(nonblocking):
+            model = tiny_model()
+            submit, collect = model.evaluator.submit, model.evaluator.collect
+            model.evaluator.submit = lambda histories, legal=None: [
+                submit([history], [legal[i]] if legal is not None else None)
+                for i, history in enumerate(histories)]
+            model.evaluator.collect = lambda handles: [collect(handle)[0] for handle in handles]
+            games = [match(model, opening, budgets, sims=64, samples=16, plies=16-len(opening))
+                     for opening in openings]
+            schedule = Schedule(workers=3, gate_weight=3., fixed_gate_cap=True, gate_cap_nodes=32768,
+                                nonblocking_fixed=nonblocking)
+            records = dense_eval.play(games, 64, schedule=schedule)
+            decisions = [[(tuple(r['action']), r['proven'], r['proof_turns'], r['solver_nodes'],
+                           r['solver_budget'], r['pruned']) for r in game.results] for game in games]
+            return [(r['moves'], r['winner'], r['reason']) for r in records], decisions
+        self.assertEqual(replay(True), replay(False))
+
     def test_evaluation_pool_uses_configured_solver_workers(self):
         settings = dense_config.EvaluationSettings(solver_workers=3)
         schedule = Schedule.of(settings)

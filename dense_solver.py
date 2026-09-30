@@ -28,8 +28,9 @@ decide a move.
 Schedule.fixed_budgets (evaluation, engine verification and tests): every query spends its point's fixed node
 budget (deep: deep_nodes, awaited at the mover's next turn-start search end; a deep query the game never reaches
 there is dropped) and every verdict is awaited where it is needed, so a verdict is a function of (position,
-attacker, budget, build) and a seeded run repeats exactly on either backend. With nonblocking_fixed, a game waits
-for its required verdicts by yielding its Engine slot, allowing other games to search while the proof runs.
+attacker, budget, build). With nonblocking_fixed, a game waits for its required verdicts by yielding its Engine
+slot, allowing other games to search while the proof runs. Fixed budgets do not promise the same move sequence
+across batching schedules: immediate cache hits versus delayed leaf evaluations can change native visit selection.
 Otherwise (actors) budgets follow the measured slack and verdicts are polled:
   budget     a query's allowance is slack_fraction * (lead - GUARD_MS, plus the step's overrun allowance for root
              and finalist queries, which may be waited for) minus its pool's reserved work per worker, in nodes at the pool's measured rate (the RATE_QUANTILE of recent queries, at most RATE), clamped

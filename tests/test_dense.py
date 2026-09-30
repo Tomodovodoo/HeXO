@@ -5774,6 +5774,13 @@ class EvaluatorLoopTests(unittest.TestCase):
             evaluator.step()
         path = dense_eval.report_path(self.run, 'main/000020', 'main/000010')
         first = json.loads(path.read_text())
+        legacy = dict(first, settings={k: v for k, v in first['settings'].items() if k != 'pipeline'})
+        pipelined = replace(evaluator.settings, pipeline=True)
+        self.assertTrue(dense_eval.same_protocol(legacy, evaluator.settings))
+        self.assertFalse(dense_eval.same_protocol(legacy, pipelined))
+        new = dict(first, settings=dict(first['settings'], pipeline=True))
+        self.assertTrue(dense_eval.same_protocol(new, pipelined))
+        self.assertFalse(dense_eval.same_protocol(new, evaluator.settings))
         evaluator = self.start(sprt_max_games=6, sims=3)                        # e.g. restarted with --eval-sims 3
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
             self.assertTrue(evaluator.step())
