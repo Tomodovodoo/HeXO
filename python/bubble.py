@@ -173,14 +173,18 @@ class Launcher:
                     script = Path(next(part for part in plan[name] if part.endswith('.py'))).name
                     pid = self.spawn(plan[name], self.run / 'logs' / name)
                     state[name] = dict(pid=pid, script=script, command=plan[name], started_at=time.time())
-                partial = self.state_file.with_suffix('.json.tmp')
-                partial.write_text(json.dumps(state, indent=2), encoding='utf-8')
-                os.replace(partial, self.state_file)
+                self.publish(state)
             except BaseException:
-                for entry in state.values():
-                    self.terminate(entry, 30.)
+                survivors = {name: entry for name, entry in state.items() if not self.terminate(entry, 30.)}
+                if survivors:
+                    self.publish(survivors)
                 raise
         return state
+
+    def publish(self, state):
+        partial = self.state_file.with_suffix('.json.tmp')
+        partial.write_text(json.dumps(state, indent=2), encoding='utf-8')
+        os.replace(partial, self.state_file)
 
     def stop(self, timeout=30.):
         """End every recorded service and wait until each has exited, forcing it after `timeout` seconds on POSIX;
