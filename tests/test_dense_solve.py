@@ -441,17 +441,34 @@ class RestartActorTests(unittest.TestCase):
 
     def test_worker_starts_games_from_the_buffer(self):
         config = dense_config.load(self.run)
+        for fraction, origin in ((0., 'restart'), (1., 'selfplay')):
+            with self.subTest(validation_fraction=fraction):
+                (self.run/'config.json').unlink()
+                dense_config.save(self.run, replace(config, learner=replace(config.learner, validation_fraction=fraction),
+                    actor=dense_config.ActorSettings(games_in_flight=2, leaf_batch=64, full_sims=2, cheap_sims=2,
+                        root_samples=2, max_plies=10, cache_positions=256, shard_games=2, restart_fraction=1.)))
+                dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
+                name = [p.name for p in dense_data.shard_dirs(self.run)][-1]
+                episodes, _ = dense_data.read_shard(self.run/'shards'/name, policies=False)
+                self.assertEqual([e['origin'] for e in episodes], [origin, origin])
+                self.assertEqual(dense_data.manifest(self.run/'shards'/name)['counts']['restart_games'],
+                                 2 if origin == 'restart' else 0)
+                if origin == 'restart':
+                    for e in episodes:
+                        self.assertEqual(e['moves'][:e['restart']['ply']], PREFIX[:e['restart']['ply']])
+
+    def test_validation_ancestor_is_not_restarted(self):
+        config = dense_config.load(self.run)
         (self.run/'config.json').unlink()
-        dense_config.save(self.run, replace(config, actor=dense_config.ActorSettings(
-            games_in_flight=2, leaf_batch=64, full_sims=2, cheap_sims=2, root_samples=2, max_plies=10,
-            cache_positions=256, shard_games=2, restart_fraction=1.)))
-        dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
-        name = [p.name for p in dense_data.shard_dirs(self.run)][-1]
-        episodes, _ = dense_data.read_shard(self.run/'shards'/name, policies=False)
-        self.assertEqual([e['origin'] for e in episodes], ['restart', 'restart'])
-        self.assertEqual(dense_data.manifest(self.run/'shards'/name)['counts']['restart_games'], 2)
-        for e in episodes:
-            self.assertEqual(e['moves'][:e['restart']['ply']], PREFIX[:e['restart']['ply']])
+        dense_config.save(self.run, replace(config, learner=replace(config.learner, validation_fraction=.5)))
+        ancestor = episode(PREFIX+[[5, 5], [6, 6]], -1)
+        child = episode(PREFIX+[[5, 5], [7, 6]], -1, origin='restart', restart=self.buffer[0])
+        self.assertTrue(dense_data.holdout(ancestor, .5))
+        self.assertFalse(dense_data.holdout(child, .5))
+        shard_of(self.run, '1000000000002', [child])
+        (self.run/'restarts.json').write_text(json.dumps(dict(entries=[dict(self.buffer[0],
+            shard='1000000000002', game=0, ply=7)])))
+        self.assertIsNone(dense_selfplay.Restarts(self.run, 1., 10).draw(np.random.default_rng(0)))
 
     def test_failed_workers_are_retried_once_and_rejections_stop_the_pass(self):
         for name in ('1000000000002', '1000000000003'):
