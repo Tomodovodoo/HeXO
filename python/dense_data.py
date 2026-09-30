@@ -1012,13 +1012,14 @@ def target_options(settings, calibration=None):
                 outcome_lam=settings.outcome_lambda if settings.value_target == 'td' else 1.,
                 calibration=calibration if settings.value_target == 'calibrated' else None,
                 proven_weight=settings.proven_value_weight, proof_policy_weight=settings.proof_policy_weight,
+                proof_policy_missing_only=settings.proof_policy_missing_only,
                 deblunder_weight=settings.deblunder_weight, future_target=settings.future_target,
                 short_value_target=settings.short_value_target)
 
 
 def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False,
              outcome_lam=1., calibration=None, proven_weight=2., deblunder_weight=0., proof_policy_weight=0., future_target='legacy',
-             short_value_target='future'):
+             short_value_target='future', proof_policy_missing_only=False):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
     Positions are encoded from the move prefix without replaying it (hexcrop.Position); the side to move and the
@@ -1027,7 +1028,8 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
       policy, policy_weight: the row's improved policy (weight 0 when empty). With proof_policy_weight > 0,
         a proven win carrying proof_action mixes (search + weight * proof)/(1 + weight), where proof is uniform
         over the certificate's remaining placements. Without search, use proof with loss weight equal to
-        proof_policy_weight. Losing rows and rows without a witness keep their original policy;
+        proof_policy_weight. With proof_policy_missing_only, certificate targets apply only when the search
+        policy is empty. Losing rows and rows without a witness keep their original policy;
       value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam, calibration) at the ply;
         weight 1 for finished games, `bootstrap_weight` for capped games with root values, 0 otherwise, times
         `cheap_value_weight` for cheap-search rows; a row with a nonzero `proven` instead gets the proven value
@@ -1065,7 +1067,8 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         value_weight = weights[t]*(1. if e['winner'] >= 0 else bootstrap_weight)*(1. if len(policy) else cheap_value_weight)
         proven = ref.row.get('proven', 0)
         policy_weight = float(len(policy) > 0)
-        if proof_policy_weight > 0 and proven > 0 and ref.row.get('proof_action'):
+        if (proof_policy_weight > 0 and proven > 0 and ref.row.get('proof_action')
+                and (not proof_policy_missing_only or not len(policy))):
             action = np.asarray(ref.row['proof_action'], np.int64).reshape(-1, 2)
             matches = (s.actions[:, None, :] == action[None, :, :]).all(2)
             if not matches.any(0).all():
