@@ -236,6 +236,37 @@ class RefreshTests(unittest.TestCase):
     def book(self, run, **values):
         return dense_openings.Book(run, settings(**values))
 
+    def test_tactical_import_keeps_training_starts_out_of_evaluation_and_retirement(self):
+        source = json.loads((dense_openings.FROZEN/'tactical'/'known-loss-v1.json').read_text())
+        case = source['nodes'][0]
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run, book_size=1, book_revisit_fraction=0.)
+            normal = opening(book, [(0, 0), (1, 0), (-1, 0)])
+            node = opening(book, case['moves'])
+            book.tally(pair(node['moves'], 2))
+            book.retire(node, 'value', 1.)
+            book.import_openings(source, now=2.)
+            self.assertEqual((node['status'], node['games'], node['tactical']['winner']), ('tactical', 2, 0))
+            self.assertEqual([n['key'] for n in book.training_openings()], [case['key']])
+            with unittest.mock.patch.object(dense_openings, 'reach', side_effect=lambda model, positions:
+                                            [(1e-20, 1.) if dense_openings.canonical(m)[0] == case['key'] else (1., .5)
+                                             for m in positions]):
+                book.refresh(Uniform(radius=2), CHAMPION, np.random.default_rng(0), now=3.)
+            self.assertEqual((node['champion_value'], node['scored_by']), (1., CHAMPION))
+            book.prune()
+            book.import_openings(source, now=4.)
+            self.assertEqual(book.stats()['tactical_openings'], 1)
+            starts = dense_selfplay.BookStarts(run, 384)
+            for seed in range(12):
+                self.assertEqual(dense_openings.canonical(book.draw(seed))[0], normal['key'])
+                metadata, moves = starts.draw(np.random.default_rng(seed))
+                self.assertEqual(dense_openings.canonical(moves)[0], case['key'])
+                self.assertEqual(metadata['tactical'], {k: case['tactical'][k] for k in ('winner', 'source')})
+                self.assertEqual(metadata['ply'], 3)
+            # Reimporting the older off-policy source must not restore this case to Elo.
+            book.import_openings(dict(source, nodes=[dict(case, status='opening')]))
+            self.assertEqual(node['status'], 'tactical')
+
     def test_imported_pool_survives_low_policy_reach_and_reimport_preserves_retirement(self):
         source = json.loads((dense_openings.FROZEN/'off-policy-107500-p2-ge47p5-v1.json').read_text())
         with tempfile.TemporaryDirectory() as run:

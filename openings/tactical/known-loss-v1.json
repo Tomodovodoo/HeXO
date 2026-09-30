@@ -1,0 +1,33 @@
+{
+  "schema": "hexo-opening-book-v2",
+  "suite": "known-loss-v1",
+  "selection": "Manually established results for training and separate conversion reporting. These are not balanced Elo openings or native solver certificates.",
+  "nodes": [
+    {
+      "key": "0,0|-11,3 -8,0",
+      "moves": [[0, 0], [-8, 0], [-11, 3]],
+      "status": "tactical",
+      "tactical": {
+        "winner": 0,
+        "source": "Tom, manual finding 2026-09-30",
+        "statement": "P2 forcibly loses from [0,0][8,0][8,3]. An isolated open three cannot be defended without help. This label covers the exact opening class; the supplied continuation illustrates the finding and is not a complete strategy certificate.",
+        "line": [
+          [0, 0],
+          [8, 0], [8, 3],
+          [-1, 1], [-2, 2],
+          [8, 2], [-3, 3],
+          [-1, 0], [8, 1],
+          [1, 0], [-1, 2],
+          [0, -1], [2, -2],
+          [1, -1], [-2, 1],
+          [0, -2], [0, -3],
+          [0, 1], [0, -4],
+          [-1, -2], [1, -2],
+          [-2, -2], [3, -2],
+          [2, -3], [2, -1],
+          [1, -3], [3, -4]
+        ]
+      }
+    }
+  ]
+}

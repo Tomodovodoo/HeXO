@@ -107,3 +107,16 @@ At every refresh the champion's symmetry-averaged value head checks each active 
 deeper continuations. Generation and adoption use the same `book_min_p2_value` floor, default 45%.
 This is a fixed P2 score of `1 - champion_value`, with no upper P2 cutoff. A lower score retires the node as
 `value`. It is a raw value-head check; the saved admission search is a separate estimate.
+
+Manually established losses belong in the separate tactical training pool. With the evaluator stopped, import:
+
+```text
+python python/dense_openings.py import --run R --source openings/tactical/known-loss-v1.json
+```
+
+This catalog records Tom's P1-win finding for the exact `[0,0][8,0][8,3]` opening, its source and illustrative
+line. Import changes that class to `tactical`, including when the value filter has already retired it.
+Actors can still draw it through `--book-fraction`; evaluation draws and value/skew retirement exclude it.
+The claim applies to this class under board symmetry, not every isolated three. It is manual source evidence,
+not a native solver certificate. The dashboard's Tactical openings table reports conversion from actor games
+and mean raw P2 value separately for each pair of model hashes. These games never enter league ratings.

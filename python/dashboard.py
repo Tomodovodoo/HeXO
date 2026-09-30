@@ -493,15 +493,49 @@ def dense_run(run, config, fresh=30):
         variant, step = path.parent.parent.name, int(path.parent.name)
         per_variant.setdefault(variant, []).append(dict(manifest, variant=variant, step=step, id=f'{variant}/{step:06d}'))
     for rows in per_variant.values(): checkpoints += rows[-50:]  # Newest 50 per variant.
+    league = status(run/'league.json')
+    names = {row['ema_sha256']: row['id'] for row in league.get('checkpoints', [])
+             if row.get('ema_sha256') and row.get('id')}
+    for shard in shards:
+        identity = shard.get('identity') or {}
+        if identity.get('actor_sha256') and identity.get('checkpoint'):
+            names.setdefault(identity['actor_sha256'], identity['checkpoint'])
+    for current in actors:
+        if current.get('actor_sha256') and current.get('checkpoint'):
+            names.setdefault(current['actor_sha256'], current['checkpoint'])
+    tactical = {}
+    for shard in shards:
+        for case in shard.get('tactical') or []:
+            p1, p2 = case['actors']['0'], case['actors']['1']
+            key = case['opening'], p1, p2
+            row = tactical.setdefault(key, dict(opening=case['opening'], expected_winner=case['expected_winner'],
+                                                p1_sha256=p1, p2_sha256=p2,
+                                                games=0, conversions=0, opposite_wins=0, capped=0,
+                                                p2_value_sum=0., p2_value_count=0, sources=set()))
+            row['games'] += 1
+            row['conversions'] += case['winner'] == case['expected_winner']
+            row['opposite_wins'] += case['winner'] == 1-case['expected_winner']
+            row['capped'] += case['winner'] == -1
+            if case['p2_value'] is not None:
+                row['p2_value_sum'] += case['p2_value']
+                row['p2_value_count'] += 1
+            row['sources'].add(case['source'])
+    tactical = [dict(opening=row['opening'], expected_winner=row['expected_winner'],
+                     p1_sha256=row['p1_sha256'], p2_sha256=row['p2_sha256'],
+                     p1_model=names.get(row['p1_sha256'], row['p1_sha256'][:12]),
+                     p2_model=names.get(row['p2_sha256'], row['p2_sha256'][:12]), games=row['games'],
+                     conversions=row['conversions'], opposite_wins=row['opposite_wins'], capped=row['capped'],
+                     mean_p2_value=row['p2_value_sum']/row['p2_value_count'] if row['p2_value_count'] else None,
+                     sources=sorted(row['sources'])) for row in tactical.values()]
+    tactical.sort(key=lambda row: (row['opening'], row['p1_model'], row['p2_model']))
     champion = status(run/'champion.json')
     champion['age'] = beat(champion)
     evaluator = status(run/'evaluator-status.json')
     evaluator['heartbeat'] = beat(evaluator)
-    league = status(run/'league.json')
     evaluator['provisional'] = provisional(league, evaluator)
     return dict(name=run.name, config=config, actor=actor, actors=actors, learners=learners, evaluator=evaluator,
                 league=league, external_ratings=external_ratings(run, league), champion=champion,
-                checkpoints=checkpoints, data=data, now=now)
+                checkpoints=checkpoints, tactical=tactical, data=data, now=now)
 
 
 _jsonl = {}
@@ -621,7 +655,7 @@ def book_page(run, query):
     colour = query.get('colour_decides', '0')
     decisive = int(query.get('min_decisive') or 10)
     if page < 1 or not 1 <= size <= 200 or sort not in BOOK_SORTS or direction not in ('asc', 'desc') or \
-            status not in ('', 'opening', 'retired', 'prefix') or reason not in ('', *dense_openings.REASONS) or \
+            status not in ('', 'opening', 'retired', 'prefix', 'tactical') or reason not in ('', *dense_openings.REASONS) or \
             minimum < 0 or (depth is not None and depth < 0) or colour not in ('0', '1') or decisive < 1:
         raise ValueError('Invalid book page, sort or filter')
     rows = [row for row in book_rows(run)

@@ -143,6 +143,13 @@ Actors reload the read-only book snapshot at shard and learner-phase boundaries.
 root values. Search and training begin after that prefix, using the normal full/cheap search schedule and
 solver settings. The manifest's `forced_plies` includes both book and restart prefixes.
 
+Imported `tactical` entries also participate in this allocation and remain available when their predicted value
+falls below the ordinary book cutoff. Their `book.tactical` metadata supplies a fixed value target only at the
+position immediately after the forced prefix. The P1-win case has a P2 target of 0. Its weight uses
+`proven_weight`, and that row's observed-outcome loss is disabled so a later blunder cannot contradict the
+opening label. Later rows use their normal targets. Manual labels never set native `proven` flags or end a game.
+Actual winners and raw network predictions are preserved for separate tactical conversion statistics.
+
 Both the learner and actors accept `--net-kernels fused` for optional Triton GPU kernels. The default is
 `reference`; checkpoints load in either mode. See [GPU kernels](gpu-kernels.md) for installation, the paired
 benchmarks, profiling commands, and the batch-256 training validation that remains blocked by the shared-card

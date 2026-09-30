@@ -1296,6 +1296,43 @@ def write_games(path, games, identity=None):
 
 
 class DenseDataTests(unittest.TestCase):
+    def test_manual_opening_result_labels_only_that_position_and_preserves_played_result(self):
+        import dense_openings
+        case = json.loads((ROOT/'openings'/'tactical'/'known-loss-v1.json').read_text())['nodes'][0]
+        # P1 later loses despite the supplied winning opening. The game's result must remain a loss.
+        moves = case['tactical']['line'][:7]
+        episode, rows = episode_rows(moves, 1, [None]*3+[.2]*4)
+        episode.update(origin='book', opening_plies=3,
+                       book=dict(key=case['key'], ply=3, tactical={k: case['tactical'][k] for k in ('winner', 'source')}),
+                       network_values=[None]*3+[.6]*4, actors={'0': 'p1-sha', '1': 'p2-sha'})
+        rows = rows[3:]
+        rows[0]['policy'] = None  # a cheap opening row still teaches the known result
+        with tempfile.TemporaryDirectory() as run:
+            path = Path(run)/'shards'/'000001'
+            manifest = dense_data.write_shard(path, dict(actor_sha256='test'), [episode], rows)
+            result = manifest['tactical'][0]
+            self.assertEqual((result['expected_winner'], result['winner'], result['actors']), (0, 1, episode['actors']))
+            self.assertAlmostEqual(result['p2_value'], .2)
+            self.assertEqual(manifest['counts']['proven_rows'], 0)
+            window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0., cheap_row_fraction=0.)
+            self.assertEqual((len(window.index), window.total_rows), (4, 4))
+            refs = [window.ref('000001', i) for i in range(4)]
+            targets = dense_data.examples(window, refs, np.random.default_rng(0), proven_weight=2.)[1]
+            root = targets[0]
+            self.assertEqual((root['value'], root['value_weight'], root['outcome'], root['outcome_weight']), (1., 2., 0., 0.))
+            self.assertEqual([t['exact'] for t in targets], [1., 0., 0., 0.])
+            self.assertEqual(targets[1]['value'], 0.)  # P1's next placement has no manual label
+            self.assertTrue(all(ref.row['proven'] == 0 for ref in refs))
+            self.assertTrue(all(ref.episode['winner'] == 1 for ref in refs))
+            # Validation refs carry the original episode rather than the compact replay representation.
+            original = dense_data.Ref('000001', 0, rows[0], episode)
+            self.assertEqual(dense_data.examples(window, [original], np.random.default_rng(0))[1][0]['value'], 1.)
+            wrong = dict(episode, book=dict(episode['book'], key=dense_openings.canonical(moves[:2])[0]))
+            with self.assertRaisesRegex(ValueError, 'does not identify'):
+                dense_data.known_result(wrong, 3)
+            with self.assertRaisesRegex(ValueError, 'contradicts'):
+                dense_data.examples(window, [original._replace(row=dict(rows[0], proven=-1))], np.random.default_rng(0))
+
     def test_average_auxiliary_preserves_the_main_outcome_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
@@ -3235,6 +3272,41 @@ class EngineTests(unittest.TestCase):
                     for tree in slot.trees.values():
                         tree.close()
                     slot.game.close()
+
+    def test_tactical_start_reports_the_historical_opponents_value_without_training_its_rows(self):
+        torch.set_num_threads(2)
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY), f'sha-{k}', f'model-{k}', 'cpu', 8, 0) for k in range(2)]
+        settings = dense_config.ActorSettings(full_fraction=1., full_sims=2, root_samples=2,
+                                             opening_random_plies=0., tactics=False, max_plies=6)
+        case = json.loads((ROOT/'openings'/'tactical'/'known-loss-v1.json').read_text())['nodes'][0]
+        source = dict(suite='book', key=case['key'], ply=3, off_policy=True,
+                      tactical={k: case['tactical'][k] for k in ('winner', 'source')})
+        slot = dense_selfplay.SelfPlayGame(models, settings, 1, learner=1, opponent='model-0',
+                                          book=(source, case['moves']))
+        engine = dense_selfplay.Engine(8)
+        try:
+            engine.add(slot)
+            while engine.slots:
+                engine.step()
+            self.assertIsNotNone(slot.network_values[3])
+            self.assertIsNone(slot.network_values[4])  # ordinary opponent rows remain excluded
+            self.assertEqual(slot.values[:5], [None]*5)
+            slot.network_values[3] = None  # a root bypassed by proof still needs a reporting prediction
+            with unittest.mock.patch.object(models[0].evaluator, 'evaluate', wraps=models[0].evaluator.evaluate) as evaluate:
+                dense_selfplay.record_network_values([slot])
+                self.assertEqual(evaluate.call_count, 1)
+            self.assertIsNotNone(slot.network_values[3])
+            self.assertIsNone(slot.network_values[4])
+            episode, rows = slot.episode()
+        finally:
+            engine.close()
+        with tempfile.TemporaryDirectory() as run:
+            manifest = dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='sha-1'),
+                                             [episode], [dict(r, game=0) for r in rows])
+            self.assertEqual(manifest['tactical'][0]['actors'], {'0': 'sha-0', '1': 'sha-1'})
+            self.assertAlmostEqual(manifest['tactical'][0]['p2_value'], (1-episode['network_values'][3])/2)
+            window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0.)
+            self.assertEqual([window.ref(name, i).row['ply'] for name, i in window.index], [5])
 
     def test_book_start_searches_only_after_prefix_and_records_source_and_counts(self):
         torch.set_num_threads(2)

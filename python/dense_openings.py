@@ -324,6 +324,11 @@ class Book:
         return sorted((n for n in self.nodes.values() if n['status'] == 'opening'
                        and (not off_policy or n.get('off_policy'))), key=lambda n: n['key'])
 
+    def training_openings(self):
+        """Off-policy starts plus manually labelled tactical cases, which never enter the Elo draw."""
+        return sorted((n for n in self.nodes.values() if n['status'] == 'tactical'
+                       or n['status'] == 'opening' and n.get('off_policy')), key=lambda n: n['key'])
+
     def digest(self):
         """The state reports are played under: '' for a frozen book (its suite fixes its openings and their weights),
         else the sha256 of its draw rule (`weighting`) and the opening keys, so a change of either names a new state."""
@@ -373,7 +378,8 @@ class Book:
         """Import a v2 book's active positions as off-policy starts, preserving live results and retirements.
 
         An explicit import can revive a probability retirement, since these positions no longer use that rule.
-        Other retirements remain final, including after prune. Repeating an import does not reset statistics.
+        Other retirements remain final, including after prune. A tactical import changes the exact opening to a
+        training-only case with an attributed manual result. Repeating an import does not reset statistics.
         """
         if self.frozen or source.get('schema') != SCHEMA:
             raise ValueError('Off-policy imports need a live destination and a v2 source book')
@@ -382,17 +388,30 @@ class Book:
         imported = []
         # Validate the whole input before changing the destination, including the native placement order.
         for entry in source['nodes']:
-            if entry['status'] != 'opening':
+            if entry['status'] not in ('opening', 'tactical'):
                 continue
             if not 2 <= len(entry['moves']) <= MAX_PLIES or canonical(entry['moves'])[0] != entry['key']:
                 raise ValueError(f"Invalid imported opening {entry['key']!r}")
             game = Game([tuple(m) for m in entry['moves']])
+            terminal = game.winner >= 0
             game.close()
+            if entry['status'] == 'tactical':
+                result = entry['tactical']
+                if terminal or type(result['winner']) is not int or result['winner'] not in (0, 1) or not result['source']:
+                    raise ValueError('A tactical opening needs a nonterminal position, winner 0/1 and attribution')
+                line = result.get('line')
+                if line is not None:
+                    if canonical(line[:len(entry['moves'])])[0] != entry['key']:
+                        raise ValueError('Tactical illustration does not start at its opening')
+                    game = Game([tuple(m) for m in line])
+                    game.close()
             imported.append(entry)
         for entry in imported:
             node = self.add(entry['moves'], now)
             node.update(off_policy=True, off_policy_source=source['suite'])
-            if node['status'] is None or node['reason'] == 'probability':
+            if entry['status'] == 'tactical':
+                node.update(status='tactical', tactical=entry['tactical'], reason=None, retired_at=None, challenges=None)
+            elif node['status'] is None or node['reason'] == 'probability':
                 node.update(status='opening', reason=None, retired_at=None, challenges=None,
                             checkpoint=source.get('refreshed_by'), created_at=now)
             if 'analysis' in entry:
@@ -410,7 +429,8 @@ class Book:
             keys=sorted({n['key'] for n in imported}), selection=source.get('selection'))
         self.data['refreshed_at'] = 0.  # current champion must re-score the new starts at its next refresh
         self.save()
-        return dict(imported=len(imported), off_policy_openings=len(self.openings(off_policy=True)))
+        return dict(imported=len(imported), off_policy_openings=len(self.openings(off_policy=True)),
+                    tactical_openings=sum(n['status'] == 'tactical' for n in self.nodes.values()))
 
     def tally(self, pair):
         """Count a completed colour pair on every node its opening passed through that is in the book."""
@@ -504,7 +524,7 @@ class Book:
         s, now = self.settings, time.time() if now is None else now
         retired = dict.fromkeys(REASONS, 0)
         openings = self.openings()
-        self.score(model, checkpoint, openings)
+        self.score(model, checkpoint, openings+[n for n in self.nodes.values() if n['status'] == 'tactical'])
         lengths = [n['mean_plies'] for n in openings if n.get('mean_plies') is not None]
         short_limit = float(np.quantile(lengths, s.book_short_quantile)) if lengths else None
 
@@ -663,6 +683,7 @@ class Book:
         return dict(suite=self.suite, frozen=self.frozen, digest=self.digest(), refreshed_by=self.data['refreshed_by'],
                     refreshed_at=self.data['refreshed_at'], nodes=len(self.nodes), openings=len(openings),
                     off_policy_openings=len(self.openings(off_policy=True)),
+                    tactical_openings=sum(n['status'] == 'tactical' for n in self.nodes.values()),
                     challengers=sum(n['challenges'] is not None for n in openings),
                     retired={r: sum(n['reason'] == r for n in self.nodes.values()) for r in REASONS},
                     depths={str(d): sum(n['depth'] == d for n in openings) for d in sorted({n['depth'] for n in openings})},

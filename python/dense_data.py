@@ -39,6 +39,10 @@ has rows only from that ply on (null root values and full_search False before it
 replayed plies without rows as `forced_plies`.
 Book games likewise omit rows for their forced prefix and keep null root values there. `book` records
 {suite, key, digest, ply, off_policy}; `book_games` counts them, and `forced_plies` includes their prefixes too.
+An optional book `tactical` {winner, source} is a manually labelled result at exactly `book.ply`. It supplies
+that row's value target, disables its observed-outcome loss, and retains it even when cheap rows are dropped.
+It never sets `proven`, overrides played results, or labels later positions. The manifest's optional `tactical`
+list records actual results, both actor hashes and the raw P2 prediction there, separately from Elo reports.
 `episode.actor` is the sha256 of the evaluator being trained. Actor shards also record `actors` {"0": sha, "1": sha}
 per colour, `opponent` (null for self-play, else the checkpoint id of a frozen historical opponent) and
 `trained_side` (null for self-play, else the colour the trained evaluator played). Every ply (from the restart ply
@@ -70,7 +74,7 @@ SCHEMA = 'hexo-dense-shard-v1'
 FILES = ('episodes.json', 'rows.json', 'targets.npz')
 SIDECAR = 'proofs.jsonl'
 Ref = namedtuple('Ref', 'shard index row episode')
-Shard = namedtuple('Shard', 'game ply player remaining proven proof_action legal offsets following start moves roots searched has_roots '
+Shard = namedtuple('Shard', 'game ply player remaining proven known_result proof_action legal offsets following start moves roots searched has_roots '
                              'has_search winner side held')
 FUTURE = (6, 20)
 ORIGINS = ('converted', 'actor')
@@ -107,6 +111,41 @@ def trained(episode, ply):
     """Whether `ply` was played by the evaluator being trained: every ply unless the episode records a `trained_side`."""
     side = episode.get('trained_side')
     return side is None or player_at(ply) == side
+
+
+def known_result(episode, ply):
+    """Manual tactical result (+1/-1 for the mover) at exactly the labelled opening, else 0.
+
+    This is supervised source data, not a native proof or a claim about later positions after either side moves.
+    """
+    book = episode.get('book') or {}
+    result = book.get('tactical')
+    if result is None or ply != book['ply']:
+        return 0
+    from dense_openings import canonical
+    if type(result['winner']) is not int or result['winner'] not in (0, 1) or not result['source'] \
+            or canonical(episode['moves'][:ply])[0] != book['key']:
+        raise ValueError('Tactical result does not identify this opening')
+    return 1 if player_at(ply) == result['winner'] else -1
+
+
+def tactical_results(episodes):
+    """Per-game tactical conversion and raw P2 predictions, kept outside league evaluation reports."""
+    out = []
+    for episode in episodes:
+        book = episode.get('book') or {}
+        result = book.get('tactical')
+        if result is None:
+            continue
+        ply = book['ply']
+        known_result(episode, ply)  # validate provenance even if the game produced no training row
+        predictions = episode.get('network_values') or []
+        value = predictions[ply] if len(predictions) > ply else None
+        out.append(dict(opening=book['key'], expected_winner=result['winner'], winner=episode['winner'],
+                        actors=episode.get('actors') or {'0': episode['actor'], '1': episode['actor']},
+                        p2_value=None if value is None else (1+value*(1 if player_at(ply) == 1 else -1))/2,
+                        source=result['source']))
+    return out
 
 
 def calibration_features(v, h):
@@ -306,6 +345,8 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
                             probabilities=np.concatenate(policies+[np.zeros(0, np.float32)]))
         manifest = dict(schema=SCHEMA, created_at=time.time(), origin=origin, identity=identity, actor=identity['actor_sha256'],
                         files={name: digest(stage/name) for name in FILES}, counts=counts)
+        if tactical := tactical_results(episodes):
+            manifest['tactical'] = tactical
         write_json(stage/'manifest.json', manifest)
         stage.rename(path)
     return manifest
@@ -546,6 +587,7 @@ class ReplayWindow:
             game=game, ply=ply.astype(np.int16), player=np.array([r['player'] for r in rows], np.int8),
             remaining=np.array([r['remaining'] for r in rows], np.int8),
             proven=np.array([r.get('proven', 0) for r in rows], np.int8),
+            known_result=np.array([known_result(episodes[r['game']], r['ply']) for r in rows], np.int8),
             proof_action={i: r['proof_action'] for i, r in enumerate(rows) if r.get('proof_action')},
             legal=np.frombuffer(bytes.fromhex(''.join(r['legal_sha256'] for r in rows)), np.uint8).reshape(-1, 32),
             offsets=offsets, following=np.array([where.get((g, t+1), -1) for g, t in zip(game.tolist(), ply.tolist())], np.int32),
@@ -603,7 +645,7 @@ class ReplayWindow:
             held = s.held[s.game[i]]
             train = i[~held]; candidates += len(train)
             if self.cheap_row_fraction < 1:
-                train = train[retained(self.seed, name, full, s.proven, self.cheap_row_fraction)[train]]
+                train = train[retained(self.seed, name, full, (s.proven != 0) | (s.known_result != 0), self.cheap_row_fraction)[train]]
             for (ids, rows), chosen in zip(parts, (train, i[held])):
                 ids.append(np.full(len(chosen), k, np.int32)); rows.append(chosen)
         names = [name for name, _ in self.admitted]
@@ -639,7 +681,8 @@ class ReplayWindow:
         episodes = json.loads((path/'episodes.json').read_text()); rows = json.loads((path/'rows.json').read_text())
         labels = proof_labels(path)
         game = np.array([r['game'] for r in rows], np.int32); ply = np.array([r['ply'] for r in rows], np.int32)
-        proven = np.array([r.get('proven') or (r['game'], r['ply']) in (labels or ()) for r in rows], np.int8)
+        proven = np.array([r.get('proven') or known_result(episodes[r['game']], r['ply'])
+                           or (r['game'], r['ply']) in (labels or ()) for r in rows], np.int8)
         side = np.array([-1 if e.get('trained_side') is None else e['trained_side'] for e in episodes], np.int8)
         full = np.diff(load_offsets(path, len(rows))) > 0
         keep = trained_rows(side, game, ply) & retained(self.seed, name, full, proven, self.cheap_row_fraction)
@@ -751,6 +794,8 @@ class ReplayWindow:
         s = self.shards[name]; g = int(s.game[i]); a, b = int(s.start[g]), int(s.start[g+1])
         row = dict(game=g, ply=int(s.ply[i]), player=int(s.player[i]), remaining=int(s.remaining[i]),
                    proven=int(s.proven[i]), legal_sha256=s.legal[i].tobytes().hex())
+        if s.known_result[i]:
+            row['known_result'] = int(s.known_result[i])
         if i in s.proof_action:
             row['proof_action'] = s.proof_action[i]
         if deblunder_row(row, int(s.winner[g]), self.deblunders[name]):
@@ -1070,6 +1115,10 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         values, weights = window.value_targets(ref, lam, full_only, outcome_lam, calibration)
         value_weight = weights[t]*(1. if e['winner'] >= 0 else bootstrap_weight)*(1. if len(policy) else cheap_value_weight)
         proven = ref.row.get('proven', 0)
+        manual = ref.row.get('known_result', 0) or known_result(e, t)
+        if proven and manual and proven != manual:
+            raise ValueError(f'Native proof contradicts manual opening result: {ref.shard}/{ref.index}')
+        fixed = proven or manual
         policy_weight = float(len(policy) > 0)
         if (proof_policy_weight > 0 and proven > 0 and ref.row.get('proof_action')
                 and (not proof_policy_missing_only or not len(policy))):
@@ -1121,15 +1170,15 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
                 following = (cells, p/p.sum(), 1.)
         samples.append(s)
         out.append(dict(policy=policy, policy_weight=policy_weight,
-                        value=float(proven > 0) if proven else .5 if values[t] is None else values[t],
-                        value_weight=proven_weight if proven else value_weight,
+                        value=float(fixed > 0) if fixed else .5 if values[t] is None else values[t],
+                        value_weight=proven_weight if fixed else value_weight,
                         outcome=float(me == e['winner']) if e['winner'] >= 0 else .5,
-                        outcome_weight=value_weight if e['winner'] >= 0 and not proven else 0., exact=float(proven != 0),
+                        outcome_weight=value_weight if e['winner'] >= 0 and not fixed else 0., exact=float(fixed != 0),
                         short_value=short[0], short_weight=short[1], future=future, future_weight=known,
                         next_cells=following[0], next_policy=following[1], next_weight=following[2]))
         if deblunder_weight:
             target = out[-1]
-            changed = bool(ref.row.get('deblunder') and not proven)
+            changed = bool(ref.row.get('deblunder') and not fixed)
             target['deblundered'] = float(changed)
             target['outcome_target'] = target['outcome']
             if changed:

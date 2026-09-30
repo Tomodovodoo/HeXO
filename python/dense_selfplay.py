@@ -9,6 +9,7 @@ GPU use with the learner. Settings are defined in dense_config.ActorSettings.
 import argparse
 from collections import OrderedDict, deque
 from dataclasses import asdict, fields, replace
+import hashlib
 import json
 import math
 import os
@@ -597,7 +598,8 @@ class SelfPlayGame:
             row['proven'] = 1 if result['exact_winner'] == player else -1
         self.rows.append(row)
         self.values.append(root_value(result, player) if trained else None)
-        self.network_values.append(result.get('network_value') if trained else None)
+        tactical = self.book is not None and self.book.get('tactical') is not None and ply == self.book['ply']
+        self.network_values.append(result.get('network_value') if trained or tactical else None)
         self.full.append(self.is_full and trained)
         if ply < self.random_plies and result.get('proven', 0) <= 0:
             action = actions[self.rng.choice(len(policy), p=policy/policy.sum())].tolist()
@@ -717,18 +719,20 @@ class SelfPlayGame:
 
 
 def record_network_values(slots):
-    """Fill missing network predictions on all trained searched rows before saving a completed game.
+    """Fill missing predictions on trained rows and the tactical opening before saving a completed game.
 
     Root predictions are saved during search independently of cache eviction. Missing rows share an extra
     batch per model here, including roots proved later by the offline pass. Forced prefixes and generated
     proof lines stay null. Predictions that cannot be encoded also stay null. Return submission sizes for
-    actor metrics. Search values and played moves are already fixed.
+    actor metrics. The tactical opening also records an untrained opponent's head for reporting only.
+    Search values and played moves are already fixed.
     """
     pending, sizes = {}, []
     for slot in slots:
         for row in slot.rows:
             ply = row['ply']
-            if row.get('line') or slot.values[ply] is None or slot.network_values[ply] is not None:
+            tactical = slot.book is not None and slot.book.get('tactical') is not None and ply == slot.book['ply']
+            if row.get('line') or (slot.values[ply] is None and not tactical) or slot.network_values[ply] is not None:
                 continue
             history = np.asarray(slot.moves[:ply], np.int64).reshape(-1, 2)
             model, key = slot.sides[row['player']], position_key(history)
@@ -750,7 +754,7 @@ def record_network_values(slots):
 
 
 class BookStarts:
-    """Read-only snapshot of the live off-policy pool, reloaded with other sources at shard/phase boundaries.
+    """Read-only snapshot of off-policy and tactical starts, reloaded at shard/phase boundaries.
 
     Draw classes uniformly, then orientations uniformly. An empty eligible pool yields an ordinary game.
     Metadata identifies the book state; the forced prefix has no training rows or invented root values.
@@ -763,15 +767,19 @@ class BookStarts:
     def load(self):
         from dense_openings import Book, LIVE
         book = Book(self.run, suite=LIVE)
-        self.nodes = [n for n in book.openings(off_policy=True) if n['depth'] < self.max_plies]
-        self.digest = book.digest()
+        self.nodes = [n for n in book.training_openings() if n['depth'] < self.max_plies]
+        self.digest = hashlib.sha256(json.dumps([(n['key'], n.get('tactical')) for n in self.nodes],
+                                              sort_keys=True).encode()).hexdigest()
 
     def draw(self, rng):
         if not self.nodes:
             return None
         node = self.nodes[int(rng.integers(len(self.nodes)))]
         moves = np.asarray(node['moves'], np.int64) @ hexcrop.SYMMETRIES[rng.integers(len(hexcrop.SYMMETRIES))]
-        return dict(suite='book', key=node['key'], digest=self.digest, ply=len(moves), off_policy=True), moves.tolist()
+        metadata = dict(suite='book', key=node['key'], digest=self.digest, ply=len(moves), off_policy=True)
+        if node['status'] == 'tactical':
+            metadata['tactical'] = {k: node['tactical'][k] for k in ('winner', 'source')}
+        return metadata, moves.tolist()
 
 
 class Restarts:
