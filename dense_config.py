@@ -289,6 +289,7 @@ class EvaluationSettings:
     book_weighting: str = 'uniform'
     opening_book: str = ''        # Book.digest of the live book the games are played under; stamped by the evaluator
     eval_share: float = .12       # ceiling on the evaluator's playing share of wall time (dense_eval.Pacer)
+    busy_share: float = 1.        # short-burst playing ceiling while actors or learners are active; 1 disables it
     extra_opponents: int = 2      # panel opponents drawn per rated checkpoint with probability ~ p(1-p), idle only
     idle_rematch: bool = True     # replay decision-relevant comparisons while no checkpoint awaits rating
     idle_fill: bool = True        # after all other work, play fill games until a checkpoint awaits rating
