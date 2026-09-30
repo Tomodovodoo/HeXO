@@ -44,7 +44,7 @@ const PANELS=[
 {id:'psurf',title:'Policy CE surface',surface:'policy_surface',label:'CE',xs:['ply'],note:'Latest checkpoint, EMA weights: mean policy CE of held-out full-search rows per 16-ply cell, blank under 8 rows. Centre: mean over cells'},
 {id:'horizon',title:'Value horizon',sources:'value_horizon',from:['fresh','newest'],xs:['step','hours'],zero:true,note:'Plies remaining at which the smoothed held-out value BCE first exceeds ln 2 / 2 = 0.347 (halfway between perfect and chance)'},
 {id:'regret',title:'Value regret',sources:'value_regret',from:['fresh','newest'],xs:['step','hours'],note:'Held-out value BCE minus that of a calibration of the searched root value and plies remaining, fitted on training rows'},
-{id:'elo',title:'Elo',metric:'elo',xs:['step','hours'],band:true,pair:{metric:'seal_elo',label:'Seal',dash:[5,4],perRun:true},note:'Each run has its own league scale (first rated checkpoint = 0); shading is the 95% interval. Dashed: the current Seal rating on that same scale'},
+{id:'elo',title:'Elo',metric:'elo',xs:['step','hours'],band:true,external:true,pair:{metric:'seal_elo',label:'Seal',dash:[5,4],perRun:true},note:'Each run has its own league scale (first rated checkpoint = 0); shading is the 95% interval. Dashed: current Seal ratings and provisional external estimates. External intervals exclude uncertainty from differences in playing budgets'},
 {id:'seal-delta',title:'Elo versus Seal',metric:'seal_delta',xs:['step','hours'],zero:true,note:'Direct-match Elo difference from each checkpoint\'s games against Seal, with a half-point correction. Zero means an even score; this is separate from the joint league rating'},
 {id:'sps',title:'Samples / s',metric:'samples_per_second',smooth:true,xs:['step','hours'],zero:true},
 {id:'pps',title:'Placements / s',metric:'placements_per_second',smooth:true,xs:['hours'],perRun:true,zero:true,note:'All actor workers of a run'},
@@ -73,9 +73,10 @@ const lh=r.run.learner_heartbeat[r.variant];cell(tr,lh==null?'-':`${r.run.learne
 cell(tr,r.run.actor_processes?`${r.run.actor_processes} proc, ${age(r.run.actor_heartbeat)} ago`:'-',r.run.actor_heartbeat!=null&&r.run.actor_heartbeat<30?'live':'stale');
 const a=document.createElement('a');a.href='/?run='+encodeURIComponent(r.run.name);a.textContent='Open';cell(tr,a);body.append(tr)}
 const n=selected().length;$('showing').textContent=state.selected?`Showing ${n} of ${rows.length} runs`:`Showing first ${Math.min(10,rows.length)} runs`}
-function panelSeries(p){const out=[],seen=new Set(),paired=new Set();for(const r of selected()){if(p.perRun){if(seen.has(r.run.name))continue;seen.add(r.run.name)}
+function panelSeries(p){const out=[],seen=new Set(),paired=new Set(),external=new Set();for(const r of selected()){if(p.perRun){if(seen.has(r.run.name))continue;seen.add(r.run.name)}
 if(p.metric)out.push({key:p.perRun?r.run.name:r.key,label:p.perRun?r.run.name:r.key,run:r.run,variant:p.perRun?'main':r.variant,index:r.index,metric:p.metric});
 if(p.pair&&(!p.pair.perRun||!paired.has(r.run.name))){paired.add(r.run.name);const key=p.pair.perRun?r.run.name:r.key;out.push({key:`${key}|${p.pair.metric}`,label:`${key} ${p.pair.label}`,run:r.run,variant:r.variant,index:r.index,metric:p.pair.metric,dash:p.pair.dash})}
+if(p.external&&!external.has(r.run.name)){external.add(r.run.name);for(const[id,v]of Object.entries(r.run.external_ratings||{})){const metric=`external_elo:${id}`;out.push({key:`${r.run.name}|${metric}`,label:`${r.run.name} ${v.label} (provisional)`,run:r.run,variant:'main',index:r.index+3,metric,dash:[9,4],note:v.note})}}
 if(p.sources)for(const[src,dash]of Object.entries(SOURCES))if(!p.from||p.from.includes(src))out.push({key:`${r.key}|${src}`,label:`${r.key} · ${p.sources.startsWith('gap')?'gap':'held-out'} ${src}`,run:r.run,variant:r.variant,index:r.index,metric:`${p.prefix??'validation_'}${src}_${p.sources}`,dash})}return out}
 const SURFACE_SOURCES=['fresh','newest'];
 const surfOf=p=>{const rs=selected(),r=rs.find(x=>x.key===state.srun[p.id])||rs[0],src=SURFACE_SOURCES.includes(state.src[p.id])?state.src[p.id]:SURFACE_SOURCES[0];return {r,src,k:r&&`${r.run.name}|${r.variant}|${src}_${p.surface}|surface`}};
@@ -126,8 +127,9 @@ placeTip(el,c,tip,hover)}
 function draw(p,hover){if(p.surface)return drawSurface(p,hover);const el=p.el,c=el.querySelector('canvas'),ctx=c.getContext('2d'),ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight,x=xOf(p),log=p.log&&state.log[p.id];
 c.width=w*ratio;c.height=h*ratio;ctx.setTransform(ratio,0,0,ratio,0,0);el.querySelectorAll('.tools button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.x?b.dataset.x===x:!!log));
 const series=panelSeries(p).map(s=>{const raw=(cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale&&v!=null?v*p.scale:v)).filter(q=>(q[1]==null||!log||q[1]>0)&&(x!=='step'||q[0]>=state.fromStep));return {...s,raw,points:p.smooth&&state.smooth>0?ema(raw,state.smooth):raw}});
-const legend=el.querySelector('.legend');legend.replaceChildren(...series.map(s=>{const e=document.createElement('span');e.append(swatch(s.index,s.dash),s.label,s.metric==='seal_elo'&&s.raw.length?' '+fmt(s.raw[0][1]):'');return e}));
-const total=p.perRun?new Set(rows.map(r=>r.run.name)).size:rows.length,shown=new Set(series.map(s=>s.index)).size;el.querySelector('.showing').textContent=shown<total?`Showing first ${shown} of ${total} runs`:`Showing ${shown} runs`;
+const legend=el.querySelector('.legend');legend.replaceChildren(...series.map(s=>{const e=document.createElement('span');e.title=s.note||'';e.append(swatch(s.index,s.dash),s.label,(s.metric==='seal_elo'||s.metric.startsWith('external_elo:'))&&s.raw.length?' '+fmt(s.raw[0][1]):'');return e}));
+if(p.external)el.querySelector('.note').textContent=[p.note,...series.filter(s=>s.note).map(s=>s.note)].join(' ');
+const total=p.perRun?new Set(rows.map(r=>r.run.name)).size:rows.length,shown=new Set(selected().map(r=>p.perRun?r.run.name:r.key)).size;el.querySelector('.showing').textContent=shown<total?`Showing first ${shown} of ${total} runs`:`Showing ${shown} runs`;
 const tip=el.querySelector('.tip');tip.hidden=true;const all=series.flatMap(s=>s.raw).filter(q=>q[1]!=null);ctx.font='11px system-ui';
 if(!all.length){ctx.fillStyle='#898781';ctx.fillText(series.length?'No measurements yet':'No runs selected',16,h/2);return}
 let x0=Math.min(...all.map(q=>q[0])),x1=Math.max(...all.map(q=>q[0])),ys=all.flatMap(q=>q.slice(1)).filter(v=>!log||v>0),y0=Math.min(...ys),y1=Math.max(...ys);
