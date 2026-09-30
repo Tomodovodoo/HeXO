@@ -1,6 +1,6 @@
 # Native engine
 
-Build instructions are in [the README](../README.md#build-and-play).
+Build instructions are in [the README](../README.md#build).
 
 ## Engine
 

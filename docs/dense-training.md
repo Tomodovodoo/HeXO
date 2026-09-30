@@ -1,6 +1,6 @@
 # Dense training
 
-The current Bubble learner uses HexNet. Start a new run using the commands in [the README](../README.md#train-bubble). Run layouts and settings are defined in [dense_config.py](../python/dense_config.py).
+The current Bubble learner uses HexNet. Start a new run using the commands in [the README](../README.md#train). Run layouts and settings are defined in [dense_config.py](../python/dense_config.py).
 
 ## Short CPU run
 
