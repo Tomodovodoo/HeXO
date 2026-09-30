@@ -156,8 +156,8 @@ class NativeEntries(unittest.TestCase):
             checked(native.hxg_mark_exact(search.ptr, *action, 1-mover, 7 if i == 5 else 3))
         self.assertEqual((native.hxg_exact(search.ptr), native.hxg_distance(search.ptr)), (1-mover, 7))
         _, _, _, scores, policy = stats(search)
-        # A lost root offers only its longest resistance.
-        self.assertEqual((list(np.flatnonzero(policy)), list(np.flatnonzero(np.isfinite(scores)))), ([5], [5]))
+        # Marked distances are certificate bounds: none rules out a faster loss elsewhere, so every edge stays.
+        self.assertTrue(np.all(policy > 0) and np.all(np.isfinite(scores)))
 
     def test_marked_candidates_are_replaced_without_stalling(self):
         search = self.tree()

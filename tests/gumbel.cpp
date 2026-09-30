@@ -41,6 +41,14 @@ int main(){
  }
  // Neither an empty nor an unexpanded action list can certify a loss.
  {gumbel::Tree t(0);gumbel::Node node;node.player=0;t.settle(node);assert(node.exact_winner==-1);node.edges.emplace_back();node.edges[0].exact_winner=1;t.settle(node);assert(node.exact_winner==-1);}
+ // A lost node keeps every loss that may resist longest. With tactics a bounded loss outlasts every one-turn loss
+ // (at least remaining + 5 placements); without tactics a bound may hide a faster loss, so it only drops losses
+ // that are certainly shorter.
+ for(bool tactics:{true,false}){gumbel::Tree t(0);t.tactics=tactics;gumbel::Node n;n.player=0;n.remaining=1;n.expanded=true;
+  int d[]={3,2,20,7};bool b[]={false,false,true,true};
+  for(int i=0;i<4;++i){gumbel::Edge e;e.exact_winner=1;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
+  t.settle(n);assert(n.exact_winner==1 && n.distance==20 && n.bound);
+  assert(n.edges[0].eligible==!tactics && !n.edges[1].eligible && n.edges[2].eligible && n.edges[3].eligible);}
  gumbel::Tree tree(1);tree.advance({0,0});tree.begin(16,4);
  assert(tree.sequence==std::vector<int>({0,0,0,0,1,1,1,1,2,2,3,3,4,4,5,5}));
  gumbel::Node n;n.value=.2;

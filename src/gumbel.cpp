@@ -7,11 +7,11 @@
 #include <string>
 namespace gumbel {
 struct Node;
-struct Edge { Cell action;double logit=0,prior=0,sum=0,gumbel=0;int visits=0,pending=0,epoch=0,exact_winner=-1,distance=-1;bool eligible=true;std::unique_ptr<Node> child; };
+struct Edge { Cell action;double logit=0,prior=0,sum=0,gumbel=0;int visits=0,pending=0,epoch=0,exact_winner=-1,distance=-1;bool eligible=true,bound=false;std::unique_ptr<Node> child; };
 // An exact winner comes with a distance: the placements within which that winner completes six from this position
-// (an edge counts its own placement) against any defence. Exact for terminal and tactical results, an upper bound
-// from certificates, combined by min at the winner's choices and max at the loser's.
-struct Node { int player=0,exact_winner=-1,distance=-1;bool expanded=false,pending=false;double value=0;std::vector<Edge> edges; };
+// (an edge counts its own placement) against any defence, combined by min at the winner's choices and max at the
+// loser's. It is exact for terminal and tactical results; `bound` marks an upper bound, which certificates give.
+struct Node { int player=0,remaining=1,exact_winner=-1,distance=-1;bool expanded=false,pending=false,bound=false;double value=0;std::vector<Edge> edges; };
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1;std::vector<std::vector<Cell>> own,threats; };
@@ -65,26 +65,34 @@ struct Tree {
    // Every completion cell is within five of an existing stone, hence legal.
    int win=none;
    for(auto& completion:own){int n=int(completion.size());if(contains(completion,edge.action))win=std::min(win,n);else if(n<path.remaining)win=std::min(win,n+1);}
-   if(win!=none){edge.exact_winner=path.player;edge.distance=win;continue;}
+   if(win!=none){edge.exact_winner=path.player;edge.distance=win;edge.bound=false;continue;}
    // A lost edge resists longest with the second stone that leaves the slowest completion open.
    int lost=open(edge.action,nullptr);
    if(lost!=none && path.remaining==2)for(auto& t:threats){for(auto second:t){int k=open(edge.action,&second);lost=std::max(lost,k);if(k==none)break;}if(lost==none)break;}
-   if(lost!=none){edge.exact_winner=1-path.player;edge.distance=path.remaining+lost;}
+   if(lost!=none){edge.exact_winner=1-path.player;edge.distance=path.remaining+lost;edge.bound=false;}
   }
   settle(node);
  }
- // Node verdict, distance and eligibility from its edges' exact winners: a winning edge makes the node won at its
- // shortest winning distance; with no edge left undecided the node is lost at its longest distance; otherwise the
- // lost edges are ineligible.
+ // Node verdict, distance and eligibility from its edges' exact winners. A won node offers its shortest guaranteed
+ // wins (least upper bound). A lost node offers every loss that may resist longest: those whose distance reaches
+ // the largest lower bound among its losses. An exact distance is its own lower bound. A bounded loss is not a
+ // one-turn loss when tactics classified the node, so the mover's remaining stones, the opponent's turn, the
+ // mover's next turn and one more opponent stone come first: remaining + 5; without tactics its lower bound is 1.
+ // Otherwise only the unproven edges stay eligible.
  void settle(Node& node) {
   // Only expansion installs the complete legal action list. A pending/unexpanded leaf is never a universal proof.
   if(!node.expanded || node.edges.empty())return;
-  bool winning=false,safe=false;int fastest=std::numeric_limits<int>::max(),slowest=0;
-  for(auto& edge:node.edges){if(edge.exact_winner==node.player){winning=true;fastest=std::min(fastest,edge.distance);}else if(edge.exact_winner<0)safe=true;else slowest=std::max(slowest,edge.distance);}
-  if(winning){node.exact_winner=node.player;node.distance=fastest;}
-  else if(!safe){node.exact_winner=1-node.player;node.distance=slowest;}
-  // A won node offers only its shortest wins, a lost node its longest resistance, otherwise every unproven edge.
-  for(auto& edge:node.edges)edge.eligible=winning?edge.exact_winner==node.player && edge.distance==fastest:!safe?edge.distance==slowest:edge.exact_winner<0;
+  bool winning=false,safe=false,loose=false;int fastest=std::numeric_limits<int>::max(),slowest=0,longest=0;
+  auto lower=[&](const Edge& e){return e.bound?(tactics?node.remaining+5:1):e.distance;};
+  for(auto& edge:node.edges){
+   if(edge.exact_winner==node.player){winning=true;fastest=std::min(fastest,edge.distance);loose|=edge.bound;}
+   else if(edge.exact_winner<0)safe=true;
+   else {slowest=std::max(slowest,edge.distance);longest=std::max(longest,lower(edge));}
+  }
+  for(auto& edge:node.edges)edge.eligible=winning?edge.exact_winner==node.player && edge.distance==fastest
+   :!safe?edge.distance>=longest:edge.exact_winner<0;
+  if(winning){node.exact_winner=node.player;node.distance=fastest;node.bound=loose && fastest>1;}
+  else if(!safe){node.exact_winner=1-node.player;node.distance=slowest;node.bound=slowest>longest;}
  }
  // Records an externally proven winner of the root edge `action` within `distance` placements (the edge's own
  // included): its value becomes exact (Q = +-1 for the root's mover) and the root is settled, so a lost edge leaves
@@ -94,7 +102,7 @@ struct Tree {
   auto edge=std::find_if(root->edges.begin(),root->edges.end(),[&](const Edge& e){return e.action==action;});
   if(edge==root->edges.end())throw std::runtime_error("Mark action is not a root edge");
   if(root->exact_winner>=0)return;
-  edge->exact_winner=winner;edge->distance=distance;edge->sum=winner==root->player?edge->visits:-edge->visits;settle(*root);
+  edge->exact_winner=winner;edge->distance=distance;edge->bound=true;edge->sum=winner==root->player?edge->visits:-edge->visits;settle(*root);
  }
  void begin(int simulations,int sample) {
   if(!requests.empty()||simulations<1||sample<1)throw std::runtime_error("Invalid search budget or pending requests");
@@ -107,7 +115,7 @@ struct Tree {
   for(auto i=path.edges.rbegin();i!=path.edges.rend();++i){
    auto& [node,index]=*i;auto& edge=node->edges[index];
    if(child->player!=node->player)value=-value;
-   if(child->exact_winner>=0 && (edge.exact_winner!=child->exact_winner || edge.distance!=child->distance+1)){edge.exact_winner=child->exact_winner;edge.distance=child->distance+1;settle(*node);}
+   if(child->exact_winner>=0 && (edge.exact_winner!=child->exact_winner || edge.distance!=child->distance+1 || edge.bound!=child->bound)){edge.exact_winner=child->exact_winner;edge.distance=child->distance+1;edge.bound=child->bound;settle(*node);}
    ++edge.visits;--edge.pending;
    if(edge.exact_winner>=0){value=edge.exact_winner==node->player?1:-1;edge.sum=value*edge.visits;}
    else edge.sum+=value;
@@ -150,8 +158,8 @@ struct Tree {
    if(!edge.child){edge.child=std::make_unique<Node>();edge.child->player=board.player;}
    node=edge.child.get();path.leaf=node;
    if(board.winner>=0 || edge.exact_winner>=0 || node->exact_winner>=0){
-    if(board.winner>=0){node->exact_winner=board.winner;node->distance=0;}
-    else if(edge.exact_winner>=0 && node->exact_winner<0){node->exact_winner=edge.exact_winner;node->distance=edge.distance-1;}
+    if(board.winner>=0){node->exact_winner=board.winner;node->distance=0;node->bound=false;}
+    else if(edge.exact_winner>=0 && node->exact_winner<0){node->exact_winner=edge.exact_winner;node->distance=edge.distance-1;node->bound=edge.bound;}
     int winner=node->exact_winner;for(auto [parent,index]:path.edges)++parent->edges[index].pending;++root->edges[path.edges.front().second].epoch;++started;backup(path,winner==node->player?1:-1);return -1;}
   }
   if(node->pending)return 0;
@@ -169,12 +177,12 @@ struct Tree {
   // Only root edges read their Gumbel noise and begin() redraws it, so interior edges just advance the stream.
   const bool at_root=&node==root.get();
   node.value=0;node.edges.reserve(count);for(int i=0;i<count;++i){Edge edge;edge.action=legal[i];edge.logit=logits[i]-maximum;edge.prior=weights[i]/total;node.value+=edge.prior*values[i];double u=std::generate_canonical<double,53>(rng);if(at_root)edge.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));node.edges.push_back(std::move(edge));}
-  node.expanded=true;
+  node.expanded=true;node.remaining=path.remaining;
   // A retained proven loss covers every legal continuation even if this node had not needed expansion yet.
-  if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges){edge.exact_winner=node.exact_winner;edge.distance=node.distance;}
+  if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges){edge.exact_winner=node.exact_winner;edge.distance=node.distance;edge.bound=true;}
   if(tactics)classify(path,node);
   // A certificate adds its witness as a winning edge; settle keeps any shorter tactical win found by classify.
-  if(exact>=0){for(auto& edge:node.edges)if(edge.action==witness && (edge.exact_winner!=exact || edge.distance>distance)){edge.exact_winner=exact;edge.distance=distance;}settle(node);}
+  if(exact>=0){for(auto& edge:node.edges)if(edge.action==witness && (edge.exact_winner!=exact || edge.distance>distance)){edge.exact_winner=exact;edge.distance=distance;edge.bound=true;}settle(node);}
   node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);requests.erase(found);
  }
  // Installs a caller-verified certificate at pending leaf `id`: its first turn `moves` and `turns`, the most attacker
@@ -195,21 +203,21 @@ struct Tree {
   std::vector<double> zeros(legal.size());fulfill(id,actions.data(),zeros.data(),zeros.data(),int(legal.size()),player,witness,distance);
   if(move_count==2){
    position.make(witness);auto next_legal=position.legal_moves();
-   auto child=std::make_unique<Node>();child->player=player;child->expanded=true;child->exact_winner=player;child->distance=distance-1;
-   for(auto c:next_legal){Edge e;e.action=c;e.prior=1./next_legal.size();e.eligible=c==Cell{moves[2],moves[3]};if(e.eligible){e.exact_winner=player;e.distance=distance-1;}child->edges.push_back(std::move(e));}
+   auto child=std::make_unique<Node>();child->player=player;child->remaining=1;child->expanded=true;child->exact_winner=player;child->distance=distance-1;child->bound=true;
+   for(auto c:next_legal){Edge e;e.action=c;e.prior=1./next_legal.size();e.eligible=c==Cell{moves[2],moves[3]};if(e.eligible){e.exact_winner=player;e.distance=distance-1;e.bound=true;}child->edges.push_back(std::move(e));}
    for(auto& e:node->edges)if(e.action==witness){e.child=std::move(child);break;}
   }
  }
  void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].pending;if(!path.edges.empty()){--root->edges[path.edges.front().second].epoch;--started;}}requests.clear();}
- void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::unique_ptr<Node> next;int winner=-1,distance=-1;priority.clear();defence.clear();hold=false;
-  for(auto& e:root->edges)if(e.action==action){winner=e.exact_winner;distance=e.distance;next=std::move(e.child);break;}
+ void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::unique_ptr<Node> next;int winner=-1,distance=-1;bool bound=false;priority.clear();defence.clear();hold=false;
+  for(auto& e:root->edges)if(e.action==action){winner=e.exact_winner;distance=e.distance;bound=e.bound;next=std::move(e.child);break;}
   board.make(action);root=next?std::move(next):std::make_unique<Node>();root->player=board.player;budget=started=completed=0;
-  if(winner>=0 && winner!=root->player){root->exact_winner=winner;root->distance=distance-1;}
+  if(winner>=0 && winner!=root->player){root->exact_winner=winner;root->distance=distance-1;root->bound=bound;}
   // A winning edge classified without a child needs a second-placement witness. Reconstruct immediate
   // tactical choices on the actual board; general certificates already retain their two-placement child.
   if(winner==root->player && !root->expanded && board.winner<0){
    root->exact_winner=-1;
-   if(tactics){Path path;capture(path);if(!path.own.empty()){root->expanded=true;for(auto c:path.legal){Edge e;e.action=c;e.prior=1./path.legal.size();root->edges.push_back(std::move(e));}classify(path,*root);}}
+   if(tactics){Path path;capture(path);if(!path.own.empty()){root->expanded=true;root->remaining=path.remaining;for(auto c:path.legal){Edge e;e.action=c;e.prior=1./path.legal.size();root->edges.push_back(std::move(e));}classify(path,*root);}}
   }
  }
 };
