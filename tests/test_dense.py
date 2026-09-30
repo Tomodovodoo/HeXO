@@ -1296,6 +1296,43 @@ def write_games(path, games, identity=None):
 
 
 class DenseDataTests(unittest.TestCase):
+    def test_manual_opening_result_labels_only_that_position_and_preserves_played_result(self):
+        import dense_openings
+        case = json.loads((ROOT/'openings'/'tactical'/'known-loss-v1.json').read_text())['nodes'][0]
+        # P1 later loses despite the supplied winning opening. The game's result must remain a loss.
+        moves = case['tactical']['line'][:7]
+        episode, rows = episode_rows(moves, 1, [None]*3+[.2]*4)
+        episode.update(origin='book', opening_plies=3,
+                       book=dict(key=case['key'], ply=3, tactical={k: case['tactical'][k] for k in ('winner', 'source')}),
+                       network_values=[None]*3+[.6]*4, actors={'0': 'p1-sha', '1': 'p2-sha'})
+        rows = rows[3:]
+        rows[0]['policy'] = None  # a cheap opening row still teaches the known result
+        with tempfile.TemporaryDirectory() as run:
+            path = Path(run)/'shards'/'000001'
+            manifest = dense_data.write_shard(path, dict(actor_sha256='test'), [episode], rows)
+            result = manifest['tactical'][0]
+            self.assertEqual((result['expected_winner'], result['winner'], result['actors']), (0, 1, episode['actors']))
+            self.assertAlmostEqual(result['p2_value'], .2)
+            self.assertEqual(manifest['counts']['proven_rows'], 0)
+            window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0., cheap_row_fraction=0.)
+            self.assertEqual((len(window.index), window.total_rows), (4, 4))
+            refs = [window.ref('000001', i) for i in range(4)]
+            targets = dense_data.examples(window, refs, np.random.default_rng(0), proven_weight=2.)[1]
+            root = targets[0]
+            self.assertEqual((root['value'], root['value_weight'], root['outcome'], root['outcome_weight']), (1., 2., 0., 0.))
+            self.assertEqual([t['exact'] for t in targets], [1., 0., 0., 0.])
+            self.assertEqual(targets[1]['value'], 0.)  # P1's next placement has no manual label
+            self.assertTrue(all(ref.row['proven'] == 0 for ref in refs))
+            self.assertTrue(all(ref.episode['winner'] == 1 for ref in refs))
+            # Validation refs carry the original episode rather than the compact replay representation.
+            original = dense_data.Ref('000001', 0, rows[0], episode)
+            self.assertEqual(dense_data.examples(window, [original], np.random.default_rng(0))[1][0]['value'], 1.)
+            wrong = dict(episode, book=dict(episode['book'], key=dense_openings.canonical(moves[:2])[0]))
+            with self.assertRaisesRegex(ValueError, 'does not identify'):
+                dense_data.known_result(wrong, 3)
+            with self.assertRaisesRegex(ValueError, 'contradicts'):
+                dense_data.examples(window, [original._replace(row=dict(rows[0], proven=-1))], np.random.default_rng(0))
+
     def test_average_auxiliary_preserves_the_main_outcome_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)

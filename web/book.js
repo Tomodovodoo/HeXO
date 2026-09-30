@@ -18,7 +18,7 @@ css.textContent = `
 document.head.append(css);
 const element = (tag, text, attrs={}) => {const e=document.createElement(tag);if(text!=null)e.textContent=text;for(const [k,v] of Object.entries(attrs))e.setAttribute(k,v);return e};
 const svg = (tag, attrs={}) => {const e=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v] of Object.entries(attrs))e.setAttribute(k,v);return e};
-const statusColour = status => status==='opening'?'#199e70':status==='retired'?'#c98500':'#898781';
+const statusColour = status => status==='opening'?'#199e70':status==='retired'?'#c98500':status==='tactical'?'#865db0':'#898781';
 const number = v => v==null?'·':Number.isInteger(v)?String(v):v.toFixed(2);
 const percent = v => v==null?'·':(100*v).toFixed(1);
 const timestamp = v => v==null?'·':new Date(v*1000).toISOString().slice(0,16).replace('T',' ');
@@ -33,7 +33,7 @@ const columns = [
   ['champion_probability','P %','Probability of reaching this canonical position under the champion',v=>v==null?'·':(100*v).toPrecision(3)],
   ['p2_value','P2 value %','Champion value-head expected score for P2 at this position',percent],
   ['off_policy','Off policy','Imported training starts and their descendants, exempt from policy-reach retirement',v=>v?'Yes':'·'],
-  ['status','S','Green: opening; amber: retired; grey: prefix',v=>'●'],
+  ['status','S','Green: opening; amber: retired; purple: tactical; grey: prefix',v=>'●'],
   ['created_at','Created','Book creation or adoption time, UTC',timestamp],
   ['retired_at','Retired','Retirement time, UTC',timestamp],
   ['reason','Reason','Retirement reason',v=>v||'·']
@@ -61,7 +61,7 @@ class OpeningBook {
     this.controls=element('div',null,{class:'book-controls'});this.panel.append(this.controls);
     this.runSelect=element('select',null,{'aria-label':'Book run'});this.runSelect.onchange=()=>this.change({run:this.runSelect.value,page:1});this.controls.append(this.runSelect);
     this.filters=[];
-    this.status=this.select('Status','status',[['','All'],['opening','Opening'],['retired','Retired'],['prefix','Prefix']]);
+    this.status=this.select('Status','status',[['','All'],['opening','Opening'],['retired','Retired'],['tactical','Tactical'],['prefix','Prefix']]);
     this.reason=this.select('Reason','reason',[['','All'],['probability','Probability'],['value','Value'],['skew','Skew'],['short_skew','Short skew'],['nested','Nested'],['replaced','Replaced']]);
     this.minGames=this.input('Games ≥','min_games',0,0);this.depth=this.input('Depth','depth','',0);
     this.colour=this.input('Colour decides','colour_decides',false,0,'checkbox');

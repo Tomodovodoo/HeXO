@@ -18,6 +18,32 @@ import dense_openings
 from dashboard import bound_evaluation
 
 
+class TacticalResults(unittest.TestCase):
+    def test_dense_run_groups_by_opening_and_both_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            shard = run/'shards/000001/manifest.json'
+            shard.parent.mkdir(parents=True)
+            (run/'league.json').write_text(json.dumps(dict(checkpoints=[dict(id='main/000020',
+                                                                      ema_sha256='b'*64)])), encoding='utf-8')
+            self.assertEqual(dashboard.dense_run(run, {})['tactical'], [])
+            cases = [dict(opening='opening-a', expected_winner=1, winner=winner,
+                          actors={'0': 'a'*64, '1': p2}, p2_value=value, source='manual log')
+                     for winner, p2, value in [(1, 'b'*64, .8), (0, 'b'*64, .6),
+                                               (-1, 'b'*64, None), (1, 'c'*64, .9)]]
+            shard.write_text(json.dumps(dict(identity=dict(actor_sha256='a'*64, checkpoint='main/000010'),
+                                             tactical=cases)), encoding='utf-8')
+            rows = dashboard.dense_run(run, {})['tactical']
+            self.assertEqual(len(rows), 2)
+            first = next(row for row in rows if row['p2_sha256'] == 'b'*64)
+            self.assertEqual((first['p1_model'], first['p2_model']), ('main/000010', 'main/000020'))
+            self.assertEqual(next(row for row in rows if row['p2_sha256'] == 'c'*64)['p2_model'], 'c'*12)
+            self.assertEqual((first['games'], first['conversions'], first['opposite_wins'], first['capped']),
+                             (3, 1, 1, 1))
+            self.assertAlmostEqual(first['mean_p2_value'], .7)
+            self.assertEqual(first['sources'], ['manual log'])
+
+
 class EvaluationBinding(unittest.TestCase):
     def test_latest_checkpoint_identity_and_legacy_binding(self):
         with tempfile.TemporaryDirectory() as directory:
