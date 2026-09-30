@@ -3211,6 +3211,68 @@ class EngineTests(unittest.TestCase):
                         tree.close()
                     slot.game.close()
 
+    def test_opponent_second_stone_proof_prunes_only_a_complete_root_turn(self):
+        from dense_solver import Schedule
+        base = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        cases = ((base+[[-1,3]], [[7,6],[-1,4]], True),
+                 (base, [[4,0],[7,6]], False))
+        for history, path, prunes in cases:
+            with self.subTest(prunes=prunes):
+                model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+                settings = dense_config.ActorSettings(full_fraction=0., tactics=False, solver_follow=True,
+                    max_plies=len(history)+1)
+                slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+                try:
+                    try:
+                        engine = dense_selfplay.Engine(8, schedule=Schedule.of(settings), leaf_nodes=32)
+                    except FileNotFoundError:
+                        self.skipTest('Prebuilt tactical library required')
+                    self.addCleanup(engine.close)
+                    leaf_history = history+path
+                    verdict = engine.leaf_solver.history(leaf_history, nodes=32, ms=1000)
+                    self.assertTrue(verdict['native_verified'])
+                    for prefix, action in ((history, path[0]), (history+path[:1], path[1])):
+                        position = Game(prefix)
+                        try:
+                            actions = np.asarray(position.legal_moves(), np.int64)
+                        finally:
+                            position.close()
+                        logits = np.full(len(actions), -1000.)
+                        for i, cell in enumerate(actions):
+                            if cell.tolist() == action:
+                                logits[i] = 100.
+                            elif cell.tolist() == [5,3]:
+                                logits[i] = 0.
+                        model.cache.put(dense_selfplay.position_key(np.asarray(prefix)),
+                                        (actions, logits, np.zeros(len(actions))))
+                    # Only the depth-two state reveals a proof. The high prior used to choose the losing move.
+                    with unittest.mock.patch.object(engine.leaf_solver, 'history', side_effect=lambda h, **k:
+                            verdict if h == leaf_history else dict(status='UNKNOWN', native_verified=False)), \
+                         unittest.mock.patch.object(slot, 'searched', wraps=slot.searched) as searched:
+                        engine.add(slot)
+                        plan = engine.plans[id(slot)]
+                        while engine.slots or engine.closing:
+                            engine.step()
+                    result = searched.call_args_list[0].args[0]
+                    self.assertEqual(result['pruned'], [path[0]] if prunes else [])
+                    self.assertEqual(result['action'], [5,3] if prunes else path[0])
+                    self.assertEqual(result['exact_winner'], -1)
+                    self.assertFalse(slot.rows[0].get('proven'))
+                    if prunes:
+                        next_history = history+path[:1]
+                        witness = next(p for p in plan.found if p.base == tuple(map(tuple, next_history)))
+                        certificate = dict(verdict['certificate'], nodes=witness.nodes, root=witness.root)
+                        self.assertTrue(engine.leaf_solver.history(next_history,
+                            certificate=certificate, ms=1000)['native_verified'])
+                        plan.begin(SimpleNamespace(tree=SimpleNamespace(history=next_history), solver=slot.solver))
+                        self.assertTrue(plan.following)
+                        self.assertEqual(plan.move(dense_data.player_at(len(next_history)), next_history)[0],
+                                         list(map(tuple, [path[1], *verdict['moves']])))
+                finally:
+                    for tree in slot.trees.values():
+                        tree.close()
+                    slot.game.close()
+
     def test_leaf_root_certificate_reaches_active_solver_plan(self):
         from dense_solver import Schedule
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]

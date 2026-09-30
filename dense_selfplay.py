@@ -316,7 +316,8 @@ class Engine:
     hxg_prove backs up an exact result and keeps its first turn in the tree. UNKNOWN leaves use the network.
     A proof at the current root also reaches the usual proof-following, adjudication and exact-row path.
     Immediate child proofs exclude losing root moves. A winning first stone extends the certificate to
-    the root's two-stone turn. Deeper leaf proofs remain
+    the root's two-stone turn. After a root's last stone, a proof after the opponent's first stone also
+    certifies that opponent's whole turn and excludes the root move. Other deeper leaf proofs remain
     numeric backups because one continuation does not prove the intervening choices.
     This is opt-in because its CPU cost competes with producing GPU batches.
     """
@@ -433,28 +434,35 @@ class Engine:
                                                 2 if size % 2 else 1, moves, len(moves)))
                         self.leaf_proofs += 1
                         root_size = len(slot.tree.history)
-                        if size <= root_size+1:
+                        opponent_second = size == root_size+2 and root_size % 2 == 0
+                        if size <= root_size+1 or opponent_second:
                             witness = dense_solver.Proof(tuple(map(tuple, history.tolist())), proof['certificate'],
                                                          first_turn_only=not self.schedule.follow)
-                            if size == root_size+1:
+                            if size > root_size:
                                 winner = dense_data.player_at(size)
                                 plan.found.append(witness)
+                                if opponent_second or winner == dense_data.player_at(root_size):
+                                    # Include the first stone in the certificate's winning turn. For an
+                                    # opponent reply this proves the root move losing; for our first stone
+                                    # it proves the root winning. No opponent choice is crossed.
+                                    certificate = proof['certificate']
+                                    nodes = list(certificate['nodes'])
+                                    i = certificate['root']
+                                    nodes[i] = dict(nodes[i], action=[history[-1].tolist(), *nodes[i]['action']])
+                                    witness = dense_solver.Proof(tuple(map(tuple, history[:-1].tolist())),
+                                        dict(certificate, nodes=nodes), first_turn_only=not self.schedule.follow)
                                 if winner != dense_data.player_at(root_size):
-                                    checked(native.hxg_mark_exact(ptr, int(history[-1, 0]), int(history[-1, 1]), winner))
-                                    plan.pruned.append(history[-1].tolist())
+                                    if opponent_second:
+                                        plan.found.append(witness)
+                                    action = history[root_size]
+                                    checked(native.hxg_mark_exact(ptr, int(action[0]), int(action[1]), winner))
+                                    plan.pruned.append(action.tolist())
                                     plan.turns = max(plan.turns, proof['proof_turns'])
                                     plan.spent(proof)
                                     progress = True
                                     continue
-                                # This is the same mover's second stone. Include its first stone in the
-                                # certificate's first turn to prove the preceding root as well. Finish the
-                                # current schedule: marking a win mid-round would strand its other samples.
-                                certificate = proof['certificate']
-                                nodes = list(certificate['nodes'])
-                                i = certificate['root']
-                                nodes[i] = dict(nodes[i], action=[history[-1].tolist(), *nodes[i]['action']])
-                                witness = dense_solver.Proof(tuple(map(tuple, slot.tree.history)),
-                                    dict(certificate, nodes=nodes), first_turn_only=not self.schedule.follow)
+                                # Finish the current schedule: marking a win mid-round would strand its
+                                # other samples.
                             self.leaf_roots[id(slot)] = witness, proof
                             if plan is not None:
                                 plan.found.append(witness)
