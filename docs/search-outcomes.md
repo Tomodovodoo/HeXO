@@ -23,27 +23,32 @@ external certificate solver (`tools/tactical`) proves continuous-threat wins aga
 within which the winner can complete six from this position against any defence, stored on the node and on each edge
 (edge distance = 1 + child distance). Terminal nodes have distance 0. `classify` distances are exact: a completing
 edge is 1, a first stone of a two-cell completion is 2, and a forced loss adds the opponent's fastest uncovered
-completion after the mover's best remaining cover. Certificates give an upper bound from `proof_turns`: `remaining +
-4 * (proof_turns - 1)` from the certificate's root.
+completion after the mover's best remaining cover. Certificates give an upper bound from `proof_turns`: the first
+turn's placements plus `4 * (proof_turns - 1)` from the certificate's root. A `bound` flag marks distances that are
+only upper bounds and travels with them.
 
-**Propagation.** A node is won when any edge is won for its mover, with the minimum winning distance; it is lost when
-every legal edge is lost, with the maximum distance (the loser's longest resistance). Both are upper bounds on the
-minimax distance and exact where every leaf distance is exact. The same-mover case needs nothing special because
-winners are absolute.
+**Propagation.** A node is won when any edge is won for its mover, with the least winning distance: the shortest
+guaranteed win. It is lost when every legal edge is lost, with the largest distance. The same-mover case needs nothing
+special because winners are absolute. Upper bounds cannot rank losses by themselves: a loose certificate bound may
+hide a faster loss. So a lost node keeps as candidates every loss whose distance reaches the largest lower bound
+among its losses. An exact distance is its own lower bound. A bounded loss that `classify` did not mark is not a
+one-turn loss, so it resists at least the mover's remaining placements, the opponent's turn, the mover's next turn and
+one more opponent stone: `remaining + 5`. Without tactics a bound's lower bound is 1.
 
 **Selection.** Proven-lost edges are ineligible while an alternative exists; a won node offers only its shortest
 winning edges; an exact node or edge ends the descent without inference; an exact root stops the search. Completed Q
 is taken over eligible edges only.
 
-**Final move and targets.** A won root plays a shortest win; a lost root plays the longest resistance, then the
-search score. The policy target of a won root covers only its shortest winning moves; a lost root records none.
+**Final move and targets.** A won root plays a shortest guaranteed win. A lost root plays among the losses that may
+resist longest, then by search score. A tree win shorter than a followed certificate replaces the certificate's move. The policy target of a won root covers only its shortest winning moves; a lost root records none.
 
 ## What rows carry
 
 Every row with `proven` +1 or -1 also carries `proof_plies`: the distance above, from that row's position, for the
 side the proof favours (+1: the side to move wins within that many placements; -1: the opponent does). Sources: the
 tree's exact root, a certificate (`remaining + 4 * (turns - 1)` for the attacker, `remaining + 2 + 4 * (turns - 1)`
-for the defender) and forced-line rows. Tree-proven wins also carry `proof_action`: the shortest winning moves at that
+for the defender) and forced-line rows. It is exact for terminal and tactical proofs and an upper bound whenever a
+certificate is involved. Tree-proven wins also carry `proof_action`: the shortest winning moves at that
 row. The learner does not read `proof_plies` yet; it is the target for a moves-left style head and for weighting
 exact rows by how near the result is.
 
