@@ -63,8 +63,12 @@ class DensePlayer:
     def models(self):
         if self.model_path:
             path = self.model_path
-            checkpoint = (f'{path.parent.parent.name}/{path.parent.name}'
-                          if path.name == 'ema.pt' and path.parent.parent.parent.name == 'checkpoints' else path.stem)
+            name = (f'{path.parent.parent.name}/{path.parent.name}'
+                    if path.name == 'ema.pt' and path.parent.parent.parent.name == 'checkpoints' else path.stem)
+            if not hasattr(self, 'model_digest'):
+                from legacy.train import digest
+                self.model_digest = digest(path)
+            checkpoint = f'{name}@{self.model_digest[:12]}'  # notes and caches are keyed by the weights, not the file name
             return [dict(id=checkpoint, label=checkpoint)]
         exports = sorted((p for p in (self.run/'checkpoints').glob('*/*/ema.pt') if p.parent.name.isdigit()),
                          key=lambda p: (int(p.parent.name), p.parent.parent.name), reverse=True)
