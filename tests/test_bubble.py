@@ -190,9 +190,10 @@ class LauncherTests(unittest.TestCase):
                 raise OSError('no more processes')
             return self.fake.spawn(command, log)
         launcher = bubble.Launcher(self.run, failing_spawn, self.fake.arguments, self.fake.kill)
+        self.fake.stubborn.add(101)
         with self.assertRaises(OSError):
             launcher.start(self.plan)
-        self.assertEqual(len(self.fake.killed), 2)
+        self.assertEqual(sorted(self.fake.killed), [101, 101, 102])
         self.assertFalse(self.fake.live)
         self.assertFalse((self.run / 'processes.json').exists())
 

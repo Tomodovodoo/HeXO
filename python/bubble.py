@@ -55,10 +55,13 @@ def commands(run, actors=4, dashboard_port=8766, seal=False, kernels='reference'
 
 
 def tactical_built():
-    """True when the tactical solver library and its build identity file exist."""
-    import tactical_proof
-    binary = tactical_proof.library()
-    return binary.exists() and binary.with_suffix(binary.suffix + '.json').exists()
+    """True when the tactical solver loads with a matching build identity."""
+    try:
+        from tactical_proof import NativeTactics
+        NativeTactics()
+    except (OSError, ValueError, KeyError):
+        return False
+    return True
 
 
 def spawn(command, log):
@@ -175,7 +178,7 @@ class Launcher:
                 os.replace(partial, self.state_file)
             except BaseException:
                 for entry in state.values():
-                    self.kill(entry['pid'])
+                    self.terminate(entry, 30.)
                 raise
         return state
 
@@ -188,13 +191,18 @@ class Launcher:
                 entry = state.get(name)
                 if entry is None or not self.alive(entry):
                     continue
-                self.kill(entry['pid'])
-                if not self.gone(entry, timeout):
-                    self.kill(entry['pid'], force=True)
-                    if not self.gone(entry, timeout):
-                        raise RuntimeError(f"{name} (pid {entry['pid']}) did not exit; its record is kept")
+                if not self.terminate(entry, timeout):
+                    raise RuntimeError(f"{name} (pid {entry['pid']}) did not exit; its record is kept")
             self.state_file.unlink(missing_ok=True)
         return sorted(state)
+
+    def terminate(self, entry, timeout):
+        """Kill the service and wait until it is gone, forcing it once after `timeout` seconds."""
+        self.kill(entry['pid'])
+        if self.gone(entry, timeout):
+            return True
+        self.kill(entry['pid'], force=True)
+        return self.gone(entry, timeout)
 
     def gone(self, entry, timeout):
         deadline = time.time() + timeout
