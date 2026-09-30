@@ -12,6 +12,7 @@ from dataclasses import asdict, replace
 import hashlib
 import json
 import math
+import shlex
 from pathlib import Path
 import time
 import uuid
@@ -27,19 +28,30 @@ from dense_posterior import MODEL, Posterior, parents
 from dense_solver import Budgets, Schedule
 import hexnet
 from legacy.arena import Seal
+from six_engine import SixEngine
 from dense_selfplay import Engine, checkpoints, expected, load, resolve
 from hexo import Game
 from legacy.klent import digest
 from legacy.train import paired_metrics, write_json
 
 SEAL = 'seal'
+
+
+def anchor_name(settings):
+    return settings.external_name if settings.external_engine else SEAL
+
+
+def anchor_engine(settings):
+    return SixEngine(shlex.split(settings.external_engine)) if settings.external_engine else Seal()
+
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
 # Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
 PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'opening_book', 'seal_ms',
+            'external_engine', 'external_name',
             'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes',
             'solver_defence', 'solver_defence_candidates', 'solver_gate_cap_nodes', 'pipeline')
-PROTOCOL_DEFAULTS = dict(opening_book='', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
+PROTOCOL_DEFAULTS = dict(opening_book='', external_engine='', external_name='seal', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
                          solver_threat_nodes=0, solver_defence=False, solver_defence_candidates=8,
                          solver_gate_cap_nodes=0, pipeline=False)
 CHAMPION = 'champion'  # the symbolic base of a variant, bound to the champion when its comparison starts
@@ -52,8 +64,8 @@ CALIBRATION_LATER = 3     # later comparisons of a decided checkpoint before `ca
 RATING_NOTE = ('Bradley-Terry over paired comparisons (caps count half a point to each side); each opening pair is one '
                'observation, with counts pooled across reports and uncertainty adjusted for pair correlation; weak '
                '1000 Elo Gaussian priors on rating differences between adjacent checkpoints; 95% Laplace credible '
-               'intervals from joint posterior draws; the first evaluated checkpoint is fixed at 0. Seal is one '
-               'more node rated jointly from its anchor games, so its Elo is estimated, not assumed.')
+               'intervals from joint posterior draws; the first evaluated checkpoint is fixed at 0. Each anchor is '
+               'rated jointly from its games, so its Elo is estimated, not assumed.')
 
 
 class MatchGame:
@@ -65,8 +77,9 @@ class MatchGame:
     one tree, searched with colour 0's tactics."""
 
     def __init__(self, sides, opening, seed, sims, samples, tactics, max_plies, record, seal=None, seal_ms=0,
-                 solvers=(None, None)):
+                 solvers=(None, None), anchor=SEAL):
         self.sides, self.max_plies, self.seal, self.seal_ms, self.record = sides, max_plies, seal, seal_ms, record
+        self.anchor = anchor
         self.solvers = solvers
         self.reason, self.error = None, None
         per = lambda value: tuple(value) if isinstance(value, (tuple, list)) else (value, value)
@@ -74,12 +87,12 @@ class MatchGame:
         self.game, self.moves = Game([tuple(m) for m in opening]), [list(m) for m in opening]
         self.trees = {}
         for colour, side in enumerate(sides):
-            if side != SEAL and id(side) not in self.trees:
+            if side != self.anchor and id(side) not in self.trees:
                 self.trees[id(side)] = side.tree([tuple(m) for m in opening], seed*2+colour, tactics[colour])
         try:
             self.seal_turns()
         except Exception as error:
-            if SEAL not in sides:
+            if self.anchor not in sides:
                 raise
             self.error = f'{type(error).__name__}: {error}'
 
@@ -113,25 +126,25 @@ class MatchGame:
         self.moves.append([q, r])
 
     def seal_turns(self):
-        while not self.over() and self.sides[self.game.player] == SEAL:
+        while not self.over() and self.sides[self.game.player] == self.anchor:
             side, turn = self.game.player, self.seal(self.game, self.seal_ms)
             if not 1 <= len(turn) <= 2:
-                raise ValueError(f'Seal returned {len(turn)} moves for {self.game.remaining} placements')
+                raise ValueError(f'{self.anchor} returned {len(turn)} moves for {self.game.remaining} placements')
             for q, r in turn[:self.game.remaining]:
                 if not self.game.legal(q, r):
-                    raise ValueError(f'Seal played an illegal placement {q}, {r}')
+                    raise ValueError(f'{self.anchor} played an illegal placement {q}, {r}')
                 self.play(int(q), int(r))
                 if self.over():
                     break
             if not self.over() and self.game.player == side:
-                raise ValueError('Seal did not complete its turn')
+                raise ValueError(f'{self.anchor} did not complete its turn')
 
     def searched(self, result):
         self.play(*map(int, result['action']))
         try:
             self.seal_turns()
         except Exception as error:
-            if SEAL not in self.sides:
+            if self.anchor not in self.sides:
                 raise
             self.error = f'{type(error).__name__}: {error}'
         return not self.over()
@@ -203,7 +216,7 @@ def paired_games(challenger, rival, games, label, config, settings, seal, book, 
             out.append(MatchGame(players, opening, seed, [s.sims for s in search], [s.root_samples for s in search],
                                  [s.tactics for s in search], settings.max_plies,
                                  dict(record, pair=pair, seed=seed, opening=[list(m) for m in opening], challenger_color=colour),
-                                 seal, settings.seal_ms, [Budgets.of(s) for s in search]))
+                                 seal, settings.seal_ms, [Budgets.of(s) for s in search], anchor_name(settings)))
     return out
 
 
@@ -459,7 +472,8 @@ def make_report(candidate, opponent, records, shas, settings, overrides=None, re
     settings} of its variant sides) is stored when not empty; `report_id` is the report's `id` (a new one when
     None), kept while pairs are appended."""
     return dict(id=report_id or uuid.uuid4().hex, candidate=candidate, opponent=opponent, created_at=time.time(),
-                candidate_sha256=shas[candidate], opponent_sha256=SEAL if opponent == SEAL else shas[opponent],
+                candidate_sha256=shas[candidate],
+                opponent_sha256=opponent if opponent == anchor_name(settings) else shas[opponent],
                 settings=asdict(settings), **({'overrides': overrides} if overrides else {}),
                 metrics=paired_metrics(records), summary=summary(records), games=records)
 
@@ -688,7 +702,7 @@ def calibration(league, reports):
             continue
         model = key, verdict['matchup_prior'], earlier
         if model not in posteriors:
-            ids = rated+([SEAL] if any(SEAL in (r['candidate'], r['opponent']) for r in group) else [])
+            ids = rated+list(dict.fromkeys(r['opponent'] for r in group if r['opponent'] not in rated))
             posteriors[model] = Posterior(ids, ids[0], observations(group), verdict['matchup_prior'], parents(ids))
         mean, sd = posteriors[model].difference(cid, verdict['opponent'])
         then.append(verdict['delta_sd']); now.append(sd); shifts.append(mean-verdict['delta'])
@@ -709,9 +723,14 @@ def write_league(run, league, config, top=None):
     ids = [c['id'] for c in league['checkpoints'] if not c.get('skipped')]
     variants = [v for v in league['variants'] if v['checkpoint'] in ids]
     rated = ids+[v['id'] for v in variants]
-    reports = [r for r in load_reports(run) if r['candidate'] in rated and (r['opponent'] in rated or r['opponent'] == SEAL)]
-    seal_games = sum(len(r['games']) for r in reports if r['opponent'] == SEAL)
-    names = rated+([SEAL] if seal_games else [])
+    all_ids = {c['id'] for c in league['checkpoints']+league['variants']}
+    all_reports = load_reports(run)
+    known_anchors = {SEAL, anchor_name(config.evaluation), *league.get('anchors', {}),
+                     *(r['opponent'] for r in all_reports if r['candidate'] in rated and r['opponent'] not in all_ids)}
+    reports = [r for r in all_reports if r['candidate'] in rated and
+               r['opponent'] in rated+list(known_anchors)]
+    anchors = list(dict.fromkeys(r['opponent'] for r in reports if r['opponent'] not in rated)) or [anchor_name(config.evaluation)]
+    names = rated+anchors
     point, intervals, draws = rate(names, ids[0], reports, seed=config.seed) if ids else ({}, {}, {})
     for c in league['checkpoints']+league['variants']:
         c['elo'], c['elo_interval'] = point.get(c['id']), intervals.get(c['id'])
@@ -724,16 +743,20 @@ def write_league(run, league, config, top=None):
     best = sorted((c['id'] for c in league['checkpoints'] if point.get(c['id']) is not None and not c.get('demoted')),
                   key=lambda k: -point[k])[:league['ladder_top']]
     league['ladder'] = [difference(a, b) for i, a in enumerate(best) for b in best[i+1:]]
-    anchored = {}  # checkpoint -> its Seal results summed over its reports (archives included), in league order
-    for r in sorted((r for r in reports if r['opponent'] == SEAL and r['candidate'] in ids), key=lambda r: ids.index(r['candidate'])):
-        total = anchored.setdefault(r['candidate'], dict(wins=0, losses=0, capped=0, games=0))
-        for k in total:
-            total[k] += r['summary'][k]
     points = lambda t: t['wins']+t['capped']/2
-    matches = [dict(checkpoint=cid, **t, elo_delta=400*math.log10((points(t)+.5)/(t['games']-points(t)+.5)))
-               for cid, t in anchored.items()]
-    league['anchors'] = {SEAL: dict(elo=point.get(SEAL), elo_interval=intervals.get(SEAL), games=seal_games, matches=matches,
-                                    latest_delta=matches[-1]['elo_delta'] if matches else None)}
+    league['anchors'] = {}
+    for anchor in anchors:
+        anchored = {}
+        for r in sorted((r for r in reports if r['opponent'] == anchor and r['candidate'] in ids),
+                        key=lambda r: ids.index(r['candidate'])):
+            total = anchored.setdefault(r['candidate'], dict(wins=0, losses=0, capped=0, games=0))
+            for k in total:
+                total[k] += r['summary'][k]
+        matches = [dict(checkpoint=cid, **t, elo_delta=400*math.log10((points(t)+.5)/(t['games']-points(t)+.5)))
+                   for cid, t in anchored.items()]
+        league['anchors'][anchor] = dict(elo=point.get(anchor), elo_interval=intervals.get(anchor),
+                                         games=sum(len(r['games']) for r in reports if r['opponent'] == anchor),
+                                         matches=matches, latest_delta=matches[-1]['elo_delta'] if matches else None)
     league['matrix'] = payoff(reports, point)
     league['calibration'] = calibration(league, reports)
     league['openings'] = dense_openings.summary(run, reports)
@@ -961,10 +984,16 @@ class Evaluator:
         self.openings = dense_openings.Book(run, settings)
         missed = self.openings.reconcile(dense_openings.stamp(run))
         settings = replace(settings, opening_book=self.openings.digest())
+        config = replace(config, evaluation=settings)
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
+        self.anchor_id = anchor_name(settings)
         self.busy_pacer = BusyPacer(run, settings.busy_share, clock=pacer.clock, sleep=pacer.sleep)
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
+        if self.league.get('champion') and self.league.get('reign_anchor', SEAL) != self.anchor_id:
+            self.league.update(reign_anchor=self.anchor_id, reign_pooled=True,
+                               reign_games=sum(len(r['games']) for r in self.seal_reports(self.league['champion'])))
+            write_json(path, self.league)
         self.pool_reign()
         if self.league['checkpoints'] and (missed or 'matrix' not in self.league or 'calibration' not in self.league
                                            or self.league.get('ladder_top') != settings.fill_top):
@@ -994,7 +1023,7 @@ class Evaluator:
         settings' Budgets, `sides` {name: Budgets} of the players whose own budgets (`side`) differ from them, and
         `queries`; None while every budget in use is 0."""
         budgets = Budgets.of(self.settings)
-        sides = {name: Budgets.of(self.side(name)) for name in dict.fromkeys(names) if name != SEAL}
+        sides = {name: Budgets.of(self.side(name)) for name in dict.fromkeys(names) if name != self.anchor_id}
         sides = {name: b for name, b in sides.items() if b != budgets}
         if not budgets.active and not any(b.active for b in sides.values()):
             return None
@@ -1052,8 +1081,8 @@ class Evaluator:
         instance of its checkpoint's weights; games in flight hold their own models, so a dropped model lives
         until its last game finishes."""
         for name in names:
-            if name == SEAL:
-                self.seal = self.seal or Seal()
+            if name == self.anchor_id:
+                self.seal = self.seal or anchor_engine(self.settings)
             elif name not in self.models:
                 self.models[name] = load(self.run, self.config, source=(name, self.weights(name)))
         for name in [n for n in self.models if n not in names]:
@@ -1109,7 +1138,7 @@ class Evaluator:
         side searching with its own settings (`side`)."""
         a, b, _ = lane
         pair, self.next[a, b] = self.next[a, b], self.next[a, b]+1
-        pool.add(lane, paired_games(self.models[a], SEAL if b == SEAL else self.models[b], 2, a, self.config, self.settings,
+        pool.add(lane, paired_games(self.models[a], self.anchor_id if b == self.anchor_id else self.models[b], 2, a, self.config, self.settings,
                                     self.seal, self.openings, pair, (self.side(a), self.side(b)), candidate=a, opponent=b))
 
     def persist(self, a, b, kind, pair):
@@ -1118,7 +1147,7 @@ class Evaluator:
         game stopped by 'span' is logged."""
         records = self.book[a, b] = self.book[a, b]+pair
         for name in (a, b):
-            if name != SEAL and name not in self.shas:
+            if name != self.anchor_id and name not in self.shas:
                 self.shas[name] = digest(self.weights(name))
         report = make_report(a, b, records, self.shas, self.settings,
                              {name: self.overrides(name) for name in (a, b) if self.overrides(name)}, self.ids[a, b])
@@ -1229,7 +1258,7 @@ class Evaluator:
                     active = {lane for lane, _ in pool.games.values()} | {lane for lane, _ in pool.ready}
                     active.update(lane for lane, groups in waiting.items() if any(groups.values()))
                     active.update(lanes)
-                    names = {name for lane in active for name in lane[:2] if name != SEAL}
+                    names = {name for lane in active for name in lane[:2] if name != self.anchor_id}
                     key = completed, tuple(sorted(names)), len(used_pairs)
                     if key == miss and self.pacer.clock()-miss_at < 1.:
                         break
@@ -1286,10 +1315,10 @@ class Evaluator:
                     del waiting[lane][record['pair']]
                     if any('error' in game for game in group):
                         failed[lane] = failed.get(lane, 0)+1
-                        if lane[1] == SEAL and failed[lane] == 2:
+                        if lane[1] == self.anchor_id and failed[lane] == 2:
                             self.failed_seal.add((*lane, self.settings.opening_book))
-                            log_event(self.run, 'evaluator', 'error', f'{lane[0]} vs Seal ({lane[2]}): paused after '
-                                      f'{failed[lane]} failed pairs', candidate=lane[0], opponent=SEAL)
+                            log_event(self.run, 'evaluator', 'error', f'{lane[0]} vs {self.anchor_id} ({lane[2]}): paused after '
+                                      f'{failed[lane]} failed pairs', candidate=lane[0], opponent=self.anchor_id)
                     else:
                         self.persist(*lane, sorted(group, key=lambda r: r['challenger_color']))
                         completed += 1
@@ -1349,7 +1378,7 @@ class Evaluator:
     def close(self, a, b):
         """Whether the league's current Elo of a and b (Seal: anchors.seal.elo) makes their pairing `informative`
         under max_expected_score; a side without an Elo counts as informative."""
-        elo = lambda k: self.league.get('anchors', {}).get(SEAL, {}).get('elo') if k == SEAL else (self.entry(k) or {}).get('elo')
+        elo = lambda k: self.league.get('anchors', {}).get(self.anchor_id, {}).get('elo') if k == self.anchor_id else (self.entry(k) or {}).get('elo')
         ea, eb = elo(a), elo(b)
         return ea is None or eb is None or informative(expected(ea, eb), self.settings.max_expected_score)
 
@@ -1478,7 +1507,7 @@ class Evaluator:
         interval = t['elo_interval']
         disagree = bool(interval) and (interval[1] < pooled[0] or interval[0] > pooled[1])
         spread = [post.spread(cid), post.spread(champion)]
-        leader = max((i for i in ids if i != SEAL and not split_id(i)[1] and not (self.entry(i) or {}).get('demoted')),
+        leader = max((i for i in ids if i != self.anchor_id and not split_id(i)[1] and not (self.entry(i) or {}).get('demoted')),
                      key=post.rating)
         p_better = .5*math.erfc((s.sprt_elo0-mean)/(max(sd, 1e-9)*math.sqrt(2)))
         if split_id(cid)[1]:
@@ -1498,9 +1527,9 @@ class Evaluator:
         champion, cid and Seal when it has a report among them; every protocol-matching report among those."""
         rated = [c['id'] for c in self.league['checkpoints']+self.variants() if c.get('elo') is not None and not c.get('skipped')]
         ids = list(dict.fromkeys(rated+[champion, cid]))
-        reports = [r for r in load_reports(self.run, self.settings) if r['candidate'] in ids+[SEAL] and r['opponent'] in ids+[SEAL]]
-        if any(SEAL in (r['candidate'], r['opponent']) for r in reports):
-            ids.append(SEAL)
+        reports = [r for r in load_reports(self.run, self.settings) if r['candidate'] in ids+[self.anchor_id] and r['opponent'] in ids+[self.anchor_id]]
+        if any(self.anchor_id in (r['candidate'], r['opponent']) for r in reports):
+            ids.append(self.anchor_id)
         return ids, reports
 
     def snapshot(self, cid, champion):
@@ -1522,13 +1551,13 @@ class Evaluator:
         also checks the score limit, including for a candidate whose league rating is not published yet."""
         s, post, previous = self.settings, verdict['posterior'], self.met(champion)
         options = []
-        for a, b in ((cid, previous), (champion, previous), (cid, SEAL), (champion, SEAL)):
+        for a, b in ((cid, previous), (champion, previous), (cid, self.anchor_id), (champion, self.anchor_id)):
             if not b or b == a or (a, b, 'evidence', s.opening_book) in self.failed_seal or not self.close(a, b):
                 continue
-            if b == SEAL:
-                path = report_path(self.run, a, SEAL)
+            if b == self.anchor_id:
+                path = report_path(self.run, a, self.anchor_id)
                 if not path.exists() or same_protocol(json.loads(path.read_text()), s):
-                    options.append((a, SEAL))
+                    options.append((a, self.anchor_id))
             elif pair := rematch_pair(self.run, a, b, s):
                 options.append(pair)
         known = lambda x: x in post.index or x == post.anchor
@@ -1844,16 +1873,17 @@ class Evaluator:
 
     def sealed(self, cid):
         """The champion-vs-Seal report of cid, or None."""
-        path = report_path(self.run, cid, SEAL)
+        path = report_path(self.run, cid, self.anchor_id)
         return json.loads(path.read_text()) if path.is_file() else None
 
     def seal_reports(self, cid):
         """cid's reports against Seal under every protocol: its report.json and those archived beside it."""
-        return [r for r in load_reports(self.run) if r['candidate'] == cid and r['opponent'] == SEAL]
+        return [r for r in load_reports(self.run) if r['candidate'] == cid and r['opponent'] == self.anchor_id]
 
     def crown(self, cid):
         """Make cid champion and start its reign: reign_from, reign_games and reign_pooled (league contract)."""
         self.league.update(champion=cid, reign_from=len(self.league['checkpoints']), reign_pooled=True,
+                           reign_anchor=self.anchor_id,
                            reign_games=sum(len(r['games']) for r in self.seal_reports(cid)))
 
     def pool_reign(self):
@@ -1872,21 +1902,21 @@ class Evaluator:
         write_json(self.run/'league.json', self.league)
 
     def anchor(self):
-        """(champion entry, SEAL, 'anchor', games left) while the current champion owes Seal games, else None. In
+        """(champion entry, self.anchor_id, 'anchor', games left) while the current champion owes Seal games, else None. In
         its current reign it owes anchor_games once (anchor_on_promotion) and anchor_games more per `anchor_every`
         checkpoints rated during the reign (entries from `reign_from` on), counted against the games its Seal reports
         (`seal_reports`, every protocol) gained since reign_games, so an anchor owed when the protocol changes (a book
         refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor.
         Quotas apply only while the champion and Seal are `close`, as for other automatic opponents."""
         s, champion = self.settings, self.entry(self.league['champion'])
-        if not s.anchor_games or champion is None or not self.close(champion['id'], SEAL) \
-                or (champion['id'], SEAL, 'anchor', s.opening_book) in self.failed_seal:
+        if not s.anchor_games or champion is None or not self.close(champion['id'], self.anchor_id) \
+                or (champion['id'], self.anchor_id, 'anchor', s.opening_book) in self.failed_seal:
             return None
         entries = self.league['checkpoints']
         later = sum(not c.get('skipped') for c in entries[self.league.get('reign_from', entries.index(champion)+1):])
         played = sum(len(r['games']) for r in self.seal_reports(champion['id']))-self.league.get('reign_games', 0)
         left = s.anchor_games*(s.anchor_on_promotion+later//s.anchor_every)-played
-        return (champion, SEAL, 'anchor', left) if left > 0 else None
+        return (champion, self.anchor_id, 'anchor', left) if left > 0 else None
 
     def optional(self, exclude=(), models=None):
         """(league entry of the candidate side, opponent, kind, games) of the first optional comparison, else None:
@@ -1897,7 +1927,7 @@ class Evaluator:
         champion = [c for c in self.league['checkpoints'] if c['id'] == self.league['champion']]
         for a, b, kind, games in [n for c in champion for n in self.needs(c)] + (self.rematches() if s.idle_rematch else []) \
                 + [n for c in self.heads() for n in self.needs(c)]:
-            if (a, b) not in excluded and (models is None or len(models | {name for name in (a, b) if name != SEAL}) <= 3):
+            if (a, b) not in excluded and (models is None or len(models | {name for name in (a, b) if name != self.anchor_id}) <= 3):
                 return self.entry(a), b, kind, games
         rated = [c for c in self.league['checkpoints'] if not c.get('skipped')]
         for index in reversed(range(len(rated))):
@@ -1937,15 +1967,15 @@ class Evaluator:
         ids += [v['id'] for v in self.variants() if v['checkpoint'] in ids and v.get('elo') is not None]
         if not ids:
             return None
-        reports = [r for r in load_reports(self.run) if r['candidate'] in ids and r['opponent'] in ids+[SEAL]]
-        names = ids+([SEAL] if s.anchor_target_halfwidth > 0 or any(r['opponent'] == SEAL for r in reports) else [])
+        reports = [r for r in load_reports(self.run) if r['candidate'] in ids and r['opponent'] in ids+[self.anchor_id]]
+        names = ids+([self.anchor_id] if s.anchor_target_halfwidth > 0 or any(r['opponent'] == self.anchor_id for r in reports) else [])
         if len(names) < 2:
             return None
         post = Posterior(names, ids[0], observations(reports), 0., parents(names))
         best = sorted((c for c in checkpoints if not c.get('demoted')), key=lambda c: -post.rating(c['id']))[:s.fill_top]
         targets = [(c['id'], post.anchor, False) for c in best if c['id'] != post.anchor]
-        if s.anchor_target_halfwidth > 0 and 1.96*post.difference(champion['id'], SEAL, False)[1] > s.anchor_target_halfwidth:
-            targets.append((champion['id'], SEAL, False))
+        if s.anchor_target_halfwidth > 0 and 1.96*post.difference(champion['id'], self.anchor_id, False)[1] > s.anchor_target_halfwidth:
+            targets.append((champion['id'], self.anchor_id, False))
         if not targets:
             return None
         before = [1.96*post.difference(a, b, False)[1] for a, b, _ in targets]
@@ -1953,9 +1983,9 @@ class Evaluator:
         for i, a in enumerate(names):
             for b in names[i+1:]:
                 if not self.close(a, b) or models is not None \
-                        and len(models | {name for name in (a, b) if name != SEAL}) > 3:
+                        and len(models | {name for name in (a, b) if name != self.anchor_id}) > 3:
                     continue
-                if b == SEAL:
+                if b == self.anchor_id:
                     if s.anchor_target_halfwidth <= 0 or (a, b, 'fill', s.opening_book) in self.failed_seal:
                         continue
                     pair = a, b
@@ -2098,7 +2128,7 @@ class Evaluator:
                     self.set_anchor_turn(True)
                     return True
         task = anchor_task or self.anchor() or self.optional() or self.fill()
-        self.filling(None if task is None or task[2] not in ('fill', 'generalization') else 'seal' if task[1] == SEAL
+        self.filling(None if task is None or task[2] not in ('fill', 'generalization') else self.anchor_id if task[1] == self.anchor_id
                      else f'{"generalization " if task[2] == "generalization" else ""}{task[0]["id"]} vs {task[1]}')
         if task is None:
             return False
@@ -2191,6 +2221,9 @@ def loop(args):
         evaluator.publish(True, stage='failed', error=message)
         log_event(run, 'evaluator', 'error', message, comparison=evaluator.status['comparison'])
         raise
+    finally:
+        if evaluator.seal is not None and hasattr(evaluator.seal, 'close'):
+            evaluator.seal.close()
 
 
 def calibrate(args):
@@ -2259,7 +2292,10 @@ def match(args):
     """Paired match of --a against --b; each side has its own model instance, trees and solver budgets."""
     run = Path(args.run)
     config = kernel_config(dense_config.load(run), getattr(args, 'net_kernels', None))
-    settings = config.evaluation
+    settings = replace(config.evaluation,
+                       external_engine=getattr(args, 'eval_external_engine', None) or config.evaluation.external_engine,
+                       external_name=getattr(args, 'eval_external_name', None) or config.evaluation.external_name)
+    anchor = anchor_name(settings)
     if args.sims:
         settings = replace(settings, sims=args.sims, root_samples=min(settings.root_samples, args.sims))
     sides = {side: replace(settings, **{'solver_'+f: getattr(args, f'{side}_solver_{f}') for f in asdict(Budgets())
@@ -2267,13 +2303,13 @@ def match(args):
     budgets = {side: Budgets.of(s) for side, s in sides.items()}
     for side in sides.values():
         Schedule.of(side)
-    if args.a == SEAL:
+    if args.a == anchor:
         raise ValueError('Seal plays as --b; pass the checkpoint as --a')
     if args.a == args.b and budgets['a'] == budgets['b']:
         raise ValueError('A match needs two distinct players: other checkpoints or other solver budgets')
     models = {}
     for side, name in (('a', args.a), ('b', args.b)):
-        if name != SEAL:
+        if name != anchor:
             path = Path(name) if Path(name).is_file() else run/'checkpoints'/name/'ema.pt'
             models[side] = load(run, config, source=(name, path))
     book = dense_openings.Book(run, settings)
@@ -2283,7 +2319,7 @@ def match(args):
     target.parent.mkdir(parents=True, exist_ok=True)
     report = dict(id=uuid.uuid4().hex, candidate=args.a, opponent=args.b, created_at=time.time(),
                   candidate_sha256=models['a'].sha,
-                  opponent_sha256=SEAL if args.b == SEAL else models['b'].sha,
+                  opponent_sha256=anchor if args.b == anchor else models['b'].sha,
                   settings=asdict(settings), solver={side: asdict(b) for side, b in budgets.items()}, games=[])
 
     def record(finished):
@@ -2293,10 +2329,15 @@ def match(args):
         report.update(games=finished, summary=tally(finished), metrics=paired_metrics(finished, args.games))
         write_json(target, report)
 
-    records = play(paired_games(models['a'], SEAL if args.b == SEAL else models['b'], args.games,
-                                f'match/{args.a}/{args.b}', config, settings, Seal() if args.b == SEAL else None, book,
-                                sides=(sides['a'], sides['b']), candidate=args.a, opponent=args.b),
-                   config.actor.leaf_batch, heartbeat=record, schedule=Schedule.of(settings))
+    external = anchor_engine(settings) if args.b == anchor else None
+    try:
+        records = play(paired_games(models['a'], anchor if args.b == anchor else models['b'], args.games,
+                                    f'match/{args.a}/{args.b}', config, settings, external, book,
+                                    sides=(sides['a'], sides['b']), candidate=args.a, opponent=args.b),
+                       config.actor.leaf_batch, heartbeat=record, schedule=Schedule.of(settings))
+    finally:
+        if external is not None and hasattr(external, 'close'):
+            external.close()
     record(records)
     print(json.dumps(dict(summary=report['summary'], metrics=report['metrics'], seconds=time.perf_counter()-started,
                           solver=report['solver'], report=str(target)), indent=2))
@@ -2332,6 +2373,7 @@ def main():
     p = sub.add_parser('match'); p.add_argument('--run', required=True); p.add_argument('--a', required=True)
     p.add_argument('--net-kernels', choices=('reference', 'fused'), help='model kernels for this process')
     p.add_argument('--b', required=True); p.add_argument('--games', type=int, default=32); p.add_argument('--sims', type=int)
+    p.add_argument('--eval-external-engine'); p.add_argument('--eval-external-name')
     for side in 'ab':
         for name, default in asdict(Budgets()).items():
             kind = dict(action=argparse.BooleanOptionalAction) if isinstance(default, bool) else dict(type=int)

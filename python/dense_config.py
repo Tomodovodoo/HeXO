@@ -219,6 +219,8 @@ class EvaluationSettings:
     anchor_session_games: int = 20  # most Seal anchor games before a pending trial gets its turn
     anchor_on_promotion: bool = True  # every new champion owes anchor_games vs Seal
     seal_ms: int = 100
+    external_engine: str = ''    # Six-protocol command for the anchor; empty keeps Seal
+    external_name: str = 'seal'  # league id and dashboard label of that anchor
     decision: str = 'posterior'   # promotion rule: 'posterior' (dense_eval.Evaluator.verdict) or 'sprt'
     promote_confidence: float = .9  # posterior: P(candidate - champion > sprt_elo0) needed to promote (1 - it rejects)
     matchup_prior_elo: float = 30.  # posterior: prior sd of a pair's deviation from the transitive rating difference
@@ -276,6 +278,13 @@ class EvaluationSettings:
     solver_defence_candidates: int = 8
     solver_workers: int = 1      # foreground tactical processes; fixed budgets remain unchanged
     solver_gate_cap_nodes: int = 0  # 0 keeps fixed budgets flat; otherwise gate scales toward this cap at weight 3
+
+    def __post_init__(self):
+        name = self.external_name
+        if self.external_engine and (not name or name == 'seal' or name.rpartition('-')[2].isdigit() or
+                                     not name[0].isalpha() or
+                                     any(not (c.isalnum() or c in '_-') for c in name)):
+            raise ValueError('external_name must be a distinct league ID; set --eval-external-name')
 
 
 @dataclass(frozen=True)
