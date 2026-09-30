@@ -70,8 +70,11 @@ class ModelTests(unittest.TestCase):
 
     def test_download_uses_the_release_tag_as_step(self):
         def fetch(url):
+            if url.endswith('/latest'):
+                return b'', 'https://github.com/Tomodovodoo/HeXO/releases/tag/bubble-125000'
+            self.assertIn('/download/bubble-125000/', url)
             name = url.rsplit('/', 1)[-1]
-            return {'ema.pt': b'weights', 'manifest.json': b'{}'}[name],                 f'https://github.com/Tomodovodoo/HeXO/releases/download/bubble-125000/{name}'
+            return {'ema.pt': b'weights', 'manifest.json': b'{}'}[name], 'https://release-assets.example/x/y'
         target = bubble.download(self.run, fetch)
         self.assertEqual(target.name, '125000')
         self.assertEqual((target / 'ema.pt').read_bytes(), b'weights')
@@ -127,22 +130,22 @@ class LauncherTests(unittest.TestCase):
         self.launcher.stop()
         self.assertNotIn(state['learner']['pid'], self.fake.killed)
 
-    def test_start_refuses_while_another_start_holds_the_lock(self):
-        (self.run / 'processes.json.tmp').write_text('')
+    def test_start_refuses_while_a_live_launcher_holds_the_lock(self):
+        self.fake.live.add(4242)
+        self.fake.markers[4242] = ['python', '/hexo/python/bubble.py', 'train']
+        (self.run / 'processes.lock').write_text('4242')
         with self.assertRaises(RuntimeError):
             self.launcher.start(self.plan)
         self.assertEqual(self.fake.spawned, [])
 
-    def test_start_takes_over_an_abandoned_lock(self):
-        lock = self.run / 'processes.json.tmp'
-        lock.write_text('')
-        stale = time.time() - 2 * bubble.Launcher.STALE_LOCK_SECONDS
-        os.utime(lock, (stale, stale))
+    def test_start_takes_over_a_lock_of_a_dead_launcher(self):
+        (self.run / 'processes.lock').write_text('4243')
         self.assertEqual(sorted(self.launcher.start(self.plan)), sorted(bubble.SERVICES))
+        self.assertFalse((self.run / 'processes.lock').exists())
 
     def test_prepare_runs_under_the_lock(self):
         seen = []
-        self.launcher.start(self.plan, lambda: seen.append((self.run / 'processes.json.tmp').exists()))
+        self.launcher.start(self.plan, lambda: seen.append((self.run / 'processes.lock').exists()))
         self.assertEqual(seen, [True])
 
     def test_start_records_pids_and_refuses_a_second_start(self):

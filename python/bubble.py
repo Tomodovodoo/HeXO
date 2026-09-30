@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / 'python'
 SERVICES = ('learner', 'actors', 'evaluator', 'proof', 'dashboard')
-LATEST = 'https://github.com/Tomodovodoo/HeXO/releases/latest/download/'
+RELEASES = 'https://github.com/Tomodovodoo/HeXO/releases/'
 
 
 def resolve_device(device):
@@ -117,24 +117,29 @@ class Launcher:
         if not any(path.with_name('manifest.json').exists() for path in exports):
             run_steps([sys.executable, str(PYTHON / 'dense_learn.py'), '--run', str(self.run), '--steps', '0'])
 
-    STALE_LOCK_SECONDS = 60
-
     def lock(self):
-        """Create `processes.json.tmp` exclusively; a lock older than STALE_LOCK_SECONDS with no service of this
-        run alive is abandoned and taken over."""
-        partial = self.state_file.with_suffix('.json.tmp')
+        """Create `processes.lock` exclusively, holding this process id. A lock whose owner is no longer a running
+        launcher was abandoned by a crash and is taken over."""
+        path = self.run / 'processes.lock'
         for attempt in range(2):
             try:
-                return os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL), partial
+                handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
             except FileExistsError:
-                age = time.time() - partial.stat().st_mtime if partial.exists() else 0
-                if attempt or age < self.STALE_LOCK_SECONDS or self.running():
-                    raise RuntimeError(f'another start is in progress for {self.run} ({partial} exists)') from None
-                partial.unlink(missing_ok=True)
+                try:
+                    owner = int(path.read_text(encoding='utf-8').strip() or 0)
+                except (OSError, ValueError):
+                    owner = 0
+                if attempt or any(Path(part).name == 'bubble.py' for part in self.arguments(owner)):
+                    raise RuntimeError(f'another start is in progress for {self.run} ({path} held by pid {owner})') from None
+                path.unlink(missing_ok=True)
+                continue
+            with os.fdopen(handle, 'w', encoding='utf-8') as stream:
+                stream.write(str(os.getpid()))
+            return path
 
     def start(self, plan, prepare=lambda: None):
         """Under the run lock: `prepare` the run, check nothing is running, spawn every service, publish the state."""
-        handle, partial = self.lock()
+        lock = self.lock()
         state = {}
         try:
             prepare()
@@ -145,18 +150,15 @@ class Launcher:
                 script = Path(next(part for part in plan[name] if part.endswith('.py'))).name
                 pid = self.spawn(plan[name], self.run / 'logs' / name)
                 state[name] = dict(pid=pid, script=script, command=plan[name], started_at=time.time())
-            with os.fdopen(handle, 'w', encoding='utf-8') as stream:
-                json.dump(state, stream, indent=2)
+            partial = self.state_file.with_suffix('.json.tmp')
+            partial.write_text(json.dumps(state, indent=2), encoding='utf-8')
             os.replace(partial, self.state_file)
         except BaseException:
             for entry in state.values():
                 self.kill(entry['pid'])
-            try:
-                os.close(handle)
-            except OSError:
-                pass
-            partial.unlink(missing_ok=True)
             raise
+        finally:
+            lock.unlink(missing_ok=True)
         return state
 
     def stop(self):
@@ -222,15 +224,17 @@ def install(run, source, step, variant='main'):
 
 
 def download(run, fetch=fetch):
-    """Fetch the newest released Bubble into `run`; the release tag's number is the checkpoint step."""
+    """Fetch the newest released Bubble into `run`. `releases/latest` redirects to the release's tag page, whose
+    number is the checkpoint step; the assets are then read from that release."""
     from urllib.error import HTTPError
-    weights, final = fetch(LATEST + 'ema.pt')
-    step = int(re.search(r'(\d+)', final.rsplit('/', 2)[-2]).group(1))
+    _, tag_page = fetch(RELEASES + 'latest')
+    tag = tag_page.rstrip('/').rsplit('/', 1)[-1]
+    step = int(re.search(r'(\d+)', tag).group(1))
     staging = Path(run) / 'checkpoints' / 'download'
     staging.mkdir(parents=True, exist_ok=True)
-    (staging / 'ema.pt').write_bytes(weights)
+    (staging / 'ema.pt').write_bytes(fetch(f'{RELEASES}download/{tag}/ema.pt')[0])
     try:
-        (staging / 'manifest.json').write_bytes(fetch(LATEST + 'manifest.json')[0])
+        (staging / 'manifest.json').write_bytes(fetch(f'{RELEASES}download/{tag}/manifest.json')[0])
     except HTTPError:
         pass
     target = install(run, staging / 'ema.pt', step)
