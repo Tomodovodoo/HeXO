@@ -36,8 +36,6 @@ def _validate(history):
             if not isinstance(move, (list, tuple)) or len(move) != 2:
                 raise ValueError("Each placement must have two coordinates")
             game.play(*move)
-        if len(history) % 2 == 0 and game.winner < 0:
-            raise NotationConflict("V1 requires two coordinates per recorded turn; cannot encode partial turn")
     finally:
         game.close()
 
@@ -74,12 +72,12 @@ def loads(text):
     while pos < len(rest):
         match = pattern.match(rest, pos)
         if not match or int(match[1]) != len(threats)+1:
-            raise ValueError("Expected consecutive numbered turns with two coordinates or one winning final stone")
+            raise ValueError("Expected consecutive numbered turns with two coordinates, or one stone in the final turn")
         history.append((int(match[2]), int(match[3])))
         if match[4] is not None:
             history.append((int(match[4]), int(match[5])))
         elif match.end() != len(rest):
-            raise ValueError("A single-stone turn must be the final winning turn")
+            raise ValueError("A single-stone turn must be the final turn")
         threats.append(len(match[6]))
         pos = match.end()
     _validate(history)

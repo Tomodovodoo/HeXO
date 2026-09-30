@@ -274,21 +274,15 @@ class PlayNotationEndpoint(unittest.TestCase):
             with urlopen(request, timeout=2) as response:
                 self.assertEqual(response.status, 200)
 
-        def conflict():
-            with self.assertRaises(HTTPError) as caught:
-                urlopen(root+'/htttx', timeout=2)
-            with caught.exception as response:
-                self.assertEqual(response.code, 409)
-                self.assertEqual(json.load(response)['error'],
-                                 'V1 requires two coordinates per recorded turn; cannot encode partial turn')
-
         try:
             play(0, 0)
             with urlopen(root+'/htttx', timeout=2) as response:
                 self.assertEqual(response.headers.get_content_type(), 'text/plain')
                 self.assertEqual(response.read().decode(), 'version[1];')
             play(1, 0)
-            conflict()
+            with urlopen(root+'/htttx', timeout=2) as response:
+                self.assertEqual(response.read().decode(), 'version[1];
+1. [1,0];')
             play(2, 0)
             with urlopen(root+'/htttx', timeout=2) as response:
                 self.assertEqual(response.read().decode(), 'version[1];\n1. [1,0][2,0];')
