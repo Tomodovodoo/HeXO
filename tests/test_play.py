@@ -331,6 +331,15 @@ class Http(unittest.TestCase):
                 self.post(path, body)
             self.assertEqual(caught.exception.code, 400)
             caught.exception.close()
+        final = [(0, 0), (0, 5), (1, 5), (5, 0), (-5, 0), (2, 5), (3, 5), (0, -5), (0, -6), (4, 5), (-2, 5),
+                 (0, -7), (0, -8), (5, 5)]
+        self.post('/new')
+        self.session.load(final, True)
+        text = self.get('/htttx')
+        self.assertTrue(text.endswith('7. [5,5];'))
+        self.post('/new')
+        state = self.post('/import', dict(text=text))
+        self.assertEqual((state['history'], state['winner']), ([list(p) for p in final], 1))
         with self.assertRaises(HTTPError) as caught:
             self.post('/new', headers={'Origin': 'http://example.com'})
         self.assertEqual(caught.exception.code, 403)

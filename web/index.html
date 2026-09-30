@@ -259,7 +259,7 @@ function fit(){
 function hexPath(x,y,s){ctx.beginPath();for(let k=0;k<6;k++){const a=(60*k-30)*Math.PI/180;const px=x+s*Math.cos(a),py=y+s*Math.sin(a);k?ctx.lineTo(px,py):ctx.moveTo(px,py)}ctx.closePath()}
 let legalCache={id:null,set:null};
 function legalSet(stones){
-  const id=stones.length+':'+(stones.at(-1)||'');if(legalCache.id===id)return legalCache.set;
+  const id=stones.join(';');if(legalCache.id===id)return legalCache.set;
   const set=new Set();if(!stones.length)set.add('0,0');
   for(const[q,r]of stones)for(let dq=-8;dq<=8;dq++)for(let dr=Math.max(-8,-dq-8);dr<=Math.min(8,-dq+8);dr++)set.add(key(q+dq,r+dr));
   return(legalCache={id,set}).set;

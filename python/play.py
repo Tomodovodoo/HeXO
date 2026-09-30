@@ -209,6 +209,25 @@ def winning_line(history, result):
         local.close()
 
 
+def interruptible(call, watch):
+    """`call()` on its own thread, polling `watch(0)` meanwhile; when `watch` raises, the call is left to finish
+    alone and the exception propagates."""
+    result = {}
+    def run():
+        try:
+            result['value'] = call()
+        except Exception as error:
+            result['error'] = error
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        thread.join(.05)
+        watch(0)
+    if 'error' in result:
+        raise result['error']
+    return result['value']
+
+
 def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None):
     """Bubble's turn from `history` and what it thinks of the position.
 
@@ -230,14 +249,13 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         if local.winner >= 0:
             raise ValueError('The game has finished')
         if prover is not None and solver_nodes:
-            watch(0)
-            mine = prover.history(history, attacker='mover', nodes=solver_nodes, ms=10000)
+            mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=10000), watch)
             if verified(mine):
                 moves, line = [list(m) for m in mine['moves']], winning_line(history, mine)
                 proof = dict(winner=player, turns=mine['proof_turns'])
             else:
-                watch(0)
-                theirs = prover.history(history, attacker='opponent', nodes=solver_nodes, ms=10000)
+                theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=10000),
+                                       watch)
                 if verified(theirs):
                     threat = [list(m) for m in theirs['moves']]
         solved = bool(moves)
@@ -934,11 +952,14 @@ def main():
     parser.add_argument('--tactical-package', type=Path, help='directory with the built tactical solver')
     parser.add_argument('--device', default='auto', help='cuda, cpu, or auto: cuda when a GPU is available')
     args = parser.parse_args()
-    if args.device == 'auto':
+    try:
         import torch
-        args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    import torch
-    torch.set_num_threads(2)
+        torch.set_num_threads(2)
+        cuda = torch.cuda.is_available()
+    except ImportError:
+        cuda = False
+    if args.device == 'auto':
+        args.device = 'cuda' if cuda else 'cpu'
     from hexo import library
     seal = library.with_name(library.name.replace('hexo', 'hexo_seal'))
     runs = [args.dense_run] if args.dense_run else []

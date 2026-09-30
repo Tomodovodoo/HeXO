@@ -7005,6 +7005,17 @@ class DenseBrowser(unittest.TestCase):
         with self.assertRaises(Cancelled):
             evaluate(self.bubble, None, [(0, 0)], 64, 0, watch)
 
+    def test_cancelling_leaves_a_slow_solver_behind(self):
+        from play import Cancelled, evaluate
+        prover = unittest.mock.Mock(history=unittest.mock.Mock(side_effect=lambda *a, **k: time.sleep(2)))
+        started = time.time()
+        def watch(n):
+            if time.time() - started > .2:
+                raise Cancelled()
+        with self.assertRaises(Cancelled):
+            evaluate(self.bubble, prover, [(0, 0)], 4, 2048, watch)
+        self.assertLess(time.time() - started, 1)
+
     def test_verified_line_replays_to_a_win(self):
         from play import evaluate
         history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (2, 5), (3, 5), (3, 0),
