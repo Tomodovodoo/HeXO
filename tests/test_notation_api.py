@@ -62,10 +62,15 @@ class OfficialNotation(unittest.TestCase):
         with self.assertRaises(ValueError):
             dumps(Record([(0, 0)], {'name': 'bad]value'}, []))
 
-    def test_terminal_first_stone_conflict_and_second_stone_roundtrip(self):
+    def test_terminal_first_and_second_stone_roundtrip(self):
         history = interleave([[(q, 0) for q in range(6)], [(2*q, 6) for q in range(6)]])
-        with self.assertRaises(NotationConflict):
-            dumps(history)
+        text = dumps(history)
+        self.assertEqual(loads(text).history, history)
+        self.assertTrue(text.endswith('6. [5,0];'))
+        annotated = Record(history, {'version': '1', 'name': 'first-stone win'}, [0]*5+[2])
+        self.assertEqual(loads(dumps(annotated)), annotated)
+        with self.assertRaises(ValueError):
+            loads(text+'\n7.[15,7][16,7];')
         with self.assertRaises(ValueError):
             loads(dumps(history[:-1])+'\n6.[5,0][15,7];')
         history = interleave([[(q, 0) for q in range(5)], [(0, 2), (2, 2), (3, 2), (5, 2)]])
