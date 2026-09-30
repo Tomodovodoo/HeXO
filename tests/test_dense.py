@@ -4051,6 +4051,51 @@ class ActorModelTests(unittest.TestCase):
 
 
 class PacerTests(unittest.TestCase):
+    def test_busy_pacer_waits_for_gpu_before_yielding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run, now, slept, order = Path(tmp), [200.], [], []
+            (run/'actor-status.json').write_text(json.dumps(dict(stage='playing', updated_at=200.)))
+            def sleep(seconds):
+                order.append('sleep'); slept.append(seconds); now[0] += seconds
+            def finish_gpu():
+                order.append('gpu'); now[0] += .04
+            pacer = dense_eval.BusyPacer(run, .5, clock=lambda: now[0], sleep=sleep, now=lambda: now[0])
+            pool = dense_eval.Pool(1)
+            event = unittest.mock.Mock()
+            event.synchronize.side_effect = finish_gpu
+            handle = (None, None, event, None)
+            pool.engine.inflight = [(None, None, None, handle)]
+            now[0] += .12
+            pacer.played(200., now[0])
+            pacer.wait(pool.synchronize)
+            self.assertEqual(order, ['gpu', 'sleep'])
+            self.assertAlmostEqual(sum(slept), .16)  # includes the asynchronous GPU tail
+            self.assertEqual(pool.engine.inflight, [(None, None, None, handle)])
+            event.synchronize.assert_called_once_with()
+            (run/'actor-status.json').write_text(json.dumps(dict(stage='paused', updated_at=now[0])))
+            now[0] += 1.
+            pacer.played(now[0]-.2, now[0])
+            pacer.wait(pool.synchronize)
+            self.assertEqual(len(slept), 1)
+            (run/'learner-status.json').write_text(json.dumps(dict(stage='training', updated_at=now[0])))
+            now[0] += 1.
+            pacer.played(now[0]-.2, now[0])
+            pacer.wait(pool.synchronize)
+            self.assertAlmostEqual(sum(slept), .4)  # no idle credit carried into the next busy period
+
+    def test_busy_pacer_ignores_inactive_and_stale_status_and_defaults_off(self):
+        for share, stage, age in ((.5, 'paused', 0), (.5, 'playing', 121), (1., 'playing', 0)):
+            with self.subTest(share=share, stage=stage, age=age), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp)/'actor-status-3.json').write_text(json.dumps(dict(stage=stage, updated_at=200.-age)))
+                synchronize, sleep = unittest.mock.Mock(), unittest.mock.Mock()
+                pacer = dense_eval.BusyPacer(tmp, share, clock=lambda: 200., sleep=sleep, now=lambda: 200.)
+                pacer.played(190., 200.)
+                pacer.wait(synchronize)
+                synchronize.assert_not_called()
+                sleep.assert_not_called()
+        with self.assertRaises(ValueError):
+            dense_eval.BusyPacer('.', 0.)
+
     def test_share_ceiling_with_a_fake_clock(self):
         now, slept, ticks = [0.], [], []
         def sleep(seconds):
@@ -5584,6 +5629,31 @@ class EvaluatorLoopTests(unittest.TestCase):
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
             evaluator.step()
         self.assertEqual(sum(charged), 10.)                                 # two pairs started, 5 s each
+
+    def test_busy_pacing_keeps_complete_pairs_and_throttles_the_drain(self):
+        evaluator = self.start(sprt_max_games=8, pool_games=4, busy_share=.5, pipeline=True)
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        (self.run/'learner-status.json').write_text(json.dumps(dict(stage='exporting', updated_at=time.time())))
+        now, slept, steps = [0.], [], []
+        def sleep(seconds):
+            slept.append(seconds); now[0] += seconds
+        evaluator.pacer = dense_eval.Pacer(1., clock=lambda: now[0], sleep=sleep)
+        evaluator.busy_pacer = dense_eval.BusyPacer(self.run, .5, clock=lambda: now[0], sleep=sleep)
+        def work(pool, step):
+            now[0] += .2
+            steps.append(step)
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=work)):
+            evaluator.step()
+        games = evaluator.games('main/000020', 'main/000010')
+        self.assertEqual(len(games), 8)
+        self.assertEqual(sorted([g['challenger_color'] for g in games if g['pair'] == pair]
+                                for pair in {g['pair'] for g in games}), [[0, 1]]*4)
+        self.assertEqual(len(steps), 8)
+        self.assertAlmostEqual(sum(slept), 1.6)  # eight 200 ms bursts, including the draining games
+        status = json.loads((self.run/'evaluator-status.json').read_text())
+        self.assertEqual(status['eval_share'], .5)
 
     def test_a_long_throttle_rechecks_the_pairing(self):
         evaluator = self.start(sprt_max_games=4)

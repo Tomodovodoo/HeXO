@@ -20,7 +20,8 @@ Run layout: dense_config. Subcommands
              and resumes the pairing (a candidate whose report against the champion exists is rated first). A
              pairing change or a newer checkpoint stops new games of the old pairing while its running games
              finish and count. All play is paced by `eval_share` (Pacer: no new game while its credit is
-             negative); --eval-* flags override evaluation settings for this process (reports record the
+             negative). Optional busy_share also inserts short sleeps between engine bursts while actors or
+             learners are active, after finishing queued GPU work; --eval-* flags override evaluation settings for this process (reports record the
              effective settings). Writes evaluations/<a>-vs-<b>/report.json, league.json, champion.json on
              promotion, evaluator-status.json (Evaluator.publish) and events. Every pairing, Seal anchors included,
              draws its openings from the opening book of opening_suite (dense_openings: the live book 'book' or a
@@ -890,6 +891,56 @@ class Pacer:
             self.refill(self.clock())
 
 
+class BusyPacer:
+    """Limit playing duty under fresh actor/learner activity, without banking idle credit.
+
+    After at least 100 ms of charged work, wait for the evaluator's queued GPU work and then yield
+    work * (1/share - 1) seconds. This controls wall time, not a measured fraction of GPU capacity.
+    """
+
+    def __init__(self, run, share, clock=time.monotonic, sleep=time.sleep, now=time.time):
+        if not 0 < share <= 1:
+            raise ValueError('busy_share must be in (0, 1]')
+        self.run, self.share, self.clock, self.sleep, self.now = Path(run), share, clock, sleep, now
+        self.work, self.checked, self.busy = 0., -float('inf'), False
+
+    def occupied(self):
+        if self.share == 1:
+            return False
+        if self.clock()-self.checked >= 1.:
+            self.checked, self.busy = self.clock(), False
+            for pattern, stages in (('actor-status*.json', ('playing',)),
+                                    ('learner-status*.json', ('training', 'exporting'))):
+                for path in self.run.glob(pattern):
+                    try:
+                        status = json.loads(path.read_text(encoding='utf-8'))
+                    except (OSError, ValueError):
+                        continue
+                    if self.now()-float(status.get('updated_at') or 0.) <= 120. and status.get('stage') in stages:
+                        self.busy = True
+                        return True
+        return self.busy
+
+    def played(self, start, end):
+        if self.share < 1:
+            self.work += end-start
+
+    def wait(self, synchronize, tick=lambda: None):
+        if not self.occupied():
+            self.work = 0.
+            return
+        if self.work < .1:
+            return
+        started = self.clock()
+        synchronize()
+        delay = (self.work+self.clock()-started)*(1/self.share-1)
+        self.work = 0.
+        until = self.clock()+delay
+        while self.clock() < until:
+            tick()
+            self.sleep(min(1., max(0., until-self.clock())))
+
+
 class Pool:
     """A continuous pool of MatchGames on one Engine, the evaluator's counterpart of the actors' games in flight.
     Games belong to lanes (any hashable pairing key); add(lane, games) starts them at once, step() advances the
@@ -908,6 +959,12 @@ class Pool:
 
     def close(self):
         self.engine.close()
+
+    def synchronize(self):
+        """Finish queued GPU work without collecting predictions or advancing any game."""
+        for _, _, _, handle in self.engine.inflight:
+            if handle[2] is not None:
+                handle[2].synchronize()
 
     def add(self, lane, games):
         for game in games:
@@ -1008,6 +1065,7 @@ class Evaluator:
         missed = self.openings.reconcile(dense_openings.stamp(run))
         settings = replace(settings, opening_book=self.openings.digest())
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
+        self.busy_pacer = BusyPacer(run, settings.busy_share, clock=pacer.clock, sleep=pacer.sleep)
         path = self.run/'league.json'
         self.league = json.loads(path.read_text()) if path.exists() else dict(champion=None, checkpoints=[])
         self.pool_reign()
@@ -1051,8 +1109,10 @@ class Evaluator:
         self.status.update(fields)
         if force or time.monotonic()-self.written >= STATUS_SECONDS:
             self.written = time.monotonic()
+            ceiling = self.busy_pacer.share if self.busy_pacer.occupied() else 1.
             write_json(self.run/'evaluator-status.json',
-                       dict(self.status, updated_at=time.time(), eval_share_used=self.pacer.used(), vram=hexnet.vram()))
+                       dict(self.status, updated_at=time.time(), eval_share=min(self.pacer.share, ceiling),
+                            eval_share_used=self.pacer.used(), vram=hexnet.vram()))
             self.point()
 
     def point(self):
@@ -1233,6 +1293,7 @@ class Evaluator:
                          placements_per_second=live/max(self.pacer.clock()-start, 1e-9),
                          solver=self.solver_status(pool, [name for lane in shown for name in lane[:2]]))
         while True:
+            self.busy_pacer.wait(pool.synchronize, lambda: show('throttled'))
             lanes = dict(primary)
             now = self.pacer.clock()
             if auxiliary is not None and not stopping and now-gate_at >= 1.:
@@ -1296,7 +1357,9 @@ class Evaluator:
                             and extra_started+2 <= 2*self.settings.pool_games:
                         self.start(pool, lane)
                         extra_started += 2
-                self.pacer.played(tick, self.pacer.clock())
+                end = self.pacer.clock()
+                self.pacer.played(tick, end)
+                self.busy_pacer.played(tick, end)
             if not pool.running():
                 if lanes and not ready:
                     self.pacer.wait(lambda: show('throttled', True))
@@ -1304,9 +1367,12 @@ class Evaluator:
                     continue
                 break
             show('playing')
+            self.busy_pacer.wait(pool.synchronize, lambda: show('throttled'))
             tick = self.pacer.clock()
             results = pool.step()
-            self.pacer.played(tick, self.pacer.clock())
+            end = self.pacer.clock()
+            self.pacer.played(tick, end)
+            self.busy_pacer.played(tick, end)
             paired = False
             for lane, record in results:
                 if stop is not None and not stopping and stop():
