@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -68,11 +69,20 @@ def command_line(pid):
         return subprocess.run(['ps', '-o', 'args=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
 
 
-def alive(pid, needles):
-    """True when `pid` exists and its command line contains every string in `needles` (the service script and the
-    run directory), so a reused pid, or the same service of another run, never passes for this service."""
-    line = command_line(pid)
-    return all(needle in line for needle in needles)
+def arguments(line):
+    """The arguments of a command line, quotes removed."""
+    return [part.strip('"') for part in shlex.split(line, posix=os.name != 'nt')] if line else []
+
+
+def matches(line, script, run):
+    """True when command line `line` runs `script` (by file name) on exactly the run directory `run`."""
+    parts = arguments(line)
+    return any(Path(part).name == script for part in parts) and run in parts
+
+
+def alive(pid, script, run, command_line=command_line):
+    """True when `pid` is this run's `script`, so a reused pid, or the same service of another run, never passes."""
+    return matches(command_line(pid), script, run)
 
 
 def kill(pid):
@@ -89,15 +99,18 @@ def kill(pid):
 class Launcher:
     """Service bookkeeping for one run directory; `spawn`, `alive` and `kill` are injectable for tests."""
 
-    def __init__(self, run, spawn=spawn, alive=alive, kill=kill):
-        self.run, self.spawn, self.alive, self.kill = Path(run).resolve(), spawn, alive, kill
+    def __init__(self, run, spawn=spawn, command_line=command_line, kill=kill):
+        self.run, self.spawn, self.command_line, self.kill = Path(run).resolve(), spawn, command_line, kill
         self.state_file = self.run / 'processes.json'
 
     def state(self):
         return json.loads(self.state_file.read_text(encoding='utf-8')) if self.state_file.exists() else {}
 
     def running(self):
-        return {name: entry for name, entry in self.state().items() if self.alive(entry['pid'], entry['needles'])}
+        return {name: entry for name, entry in self.state().items() if self.alive(entry)}
+
+    def alive(self, entry):
+        return alive(entry['pid'], entry['script'], str(self.run), self.command_line)
 
     def prepare(self, device, run_steps):
         """Create the run configuration and the first checkpoint when either is missing; `run_steps` runs a command."""
@@ -116,18 +129,21 @@ class Launcher:
             for name in SERVICES:
                 script = Path(next(part for part in plan[name] if part.endswith('.py'))).name
                 pid = self.spawn(plan[name], self.run / 'logs' / name)
-                state[name] = dict(pid=pid, needles=[script, str(self.run)], command=plan[name], started_at=time.time())
-            self.state_file.write_text(json.dumps(state, indent=2), encoding='utf-8')
+                state[name] = dict(pid=pid, script=script, command=plan[name], started_at=time.time())
+            partial = self.state_file.with_suffix('.json.tmp')
+            partial.write_text(json.dumps(state, indent=2), encoding='utf-8')
+            os.replace(partial, self.state_file)
         except BaseException:
             for entry in state.values():
                 self.kill(entry['pid'])
+            self.state_file.with_suffix('.json.tmp').unlink(missing_ok=True)
             raise
         return state
 
     def stop(self):
         state = self.state()
         for name in reversed(SERVICES):
-            if name in state and self.alive(state[name]['pid'], state[name]['needles']):
+            if name in state and self.alive(state[name]):
                 self.kill(state[name]['pid'])
         if self.state_file.exists():
             self.state_file.unlink()
@@ -143,7 +159,7 @@ class Launcher:
             if entry is None:
                 lines.append(f'{name:<10} not started')
                 continue
-            life = 'alive' if self.alive(entry['pid'], entry['needles']) else 'gone'
+            life = 'alive' if self.alive(entry) else 'gone'
             detail = ''
             path = self.run / files.get(name, '')
             if name in files and path.exists():

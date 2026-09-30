@@ -18,11 +18,11 @@ class FakeProcesses:
         self.spawned.append((command, log))
         self.next_pid += 1
         self.live.add(self.next_pid)
-        self.markers[self.next_pid] = ' '.join(command)
+        self.markers[self.next_pid] = ' '.join(f'"{part}"' for part in command)
         return self.next_pid
 
-    def alive(self, pid, needles):
-        return pid in self.live and all(needle in self.markers.get(pid, '') for needle in needles)
+    def command_line(self, pid):
+        return self.markers[pid] if pid in self.live else ''
 
     def kill(self, pid):
         self.killed.append(pid)
@@ -78,13 +78,25 @@ class ModelTests(unittest.TestCase):
             bubble.download(self.run, lambda url: json.dumps(dict(tag_name='x-1', assets=[])).encode())
 
 
+class MatchTests(unittest.TestCase):
+    def test_exact_run_and_script(self):
+        windows = sys.platform == 'win32'
+        run = r'E:\runs\bubble' if windows else '/runs/bubble'
+        script = r'E:\HeXO\python\dense_learn.py' if windows else '/hexo/python/dense_learn.py'
+        line = f'python -u "{script}" --run "{run}"'
+        self.assertTrue(bubble.matches(line, 'dense_learn.py', run))
+        self.assertFalse(bubble.matches(line, 'dense_learn.py', run + '-old'))
+        self.assertFalse(bubble.matches(line, 'dense_eval.py', run))
+        self.assertFalse(bubble.matches('', 'dense_learn.py', run))
+
+
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.directory = TemporaryDirectory()
         self.run = Path(self.directory.name) / 'run'
         self.run.mkdir()
         self.fake = FakeProcesses()
-        self.launcher = bubble.Launcher(self.run, self.fake.spawn, self.fake.alive, self.fake.kill)
+        self.launcher = bubble.Launcher(self.run, self.fake.spawn, self.fake.command_line, self.fake.kill)
         self.plan = bubble.commands(self.run)
 
     def tearDown(self):
@@ -108,11 +120,11 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_run_path_is_absolute(self):
-        self.assertTrue(bubble.Launcher('runs/x', self.fake.spawn, self.fake.alive, self.fake.kill).run.is_absolute())
+        self.assertTrue(bubble.Launcher('runs/x', self.fake.spawn, self.fake.command_line, self.fake.kill).run.is_absolute())
 
     def test_reused_pid_is_not_a_service(self):
         state = self.launcher.start(self.plan)
-        self.fake.markers[state['learner']['pid']] = ' '.join(bubble.commands(Path('runs/other'))['learner'])
+        self.fake.markers[state['learner']['pid']] = ' '.join(bubble.commands(Path(f'{self.run}-old'))['learner'])
         self.assertNotIn('learner', self.launcher.running())
         self.launcher.stop()
         self.assertNotIn(state['learner']['pid'], self.fake.killed)
@@ -130,7 +142,7 @@ class LauncherTests(unittest.TestCase):
             if log.name == 'evaluator':
                 raise OSError('no more processes')
             return self.fake.spawn(command, log)
-        launcher = bubble.Launcher(self.run, failing_spawn, self.fake.alive, self.fake.kill)
+        launcher = bubble.Launcher(self.run, failing_spawn, self.fake.command_line, self.fake.kill)
         with self.assertRaises(OSError):
             launcher.start(self.plan)
         self.assertEqual(len(self.fake.killed), 2)
