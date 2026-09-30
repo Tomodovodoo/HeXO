@@ -97,6 +97,19 @@ def alive(pid, script, run, arguments=arguments):
     return matches(arguments(pid), script, run)
 
 
+def group_alive(pid):
+    """POSIX: whether any process of the group `pid` (each service starts its own session) still exists."""
+    if os.name == 'nt':
+        return False
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def kill(pid, force=False):
     """End the process group; on Windows everything the process started, on POSIX with SIGTERM or, when `force`,
     SIGKILL."""
@@ -209,8 +222,9 @@ class Launcher:
         return self.gone(entry, timeout)
 
     def gone(self, entry, timeout):
+        """True once neither the service nor, on POSIX, any process left in its group exists."""
         deadline = time.time() + timeout
-        while self.alive(entry):
+        while self.alive(entry) or group_alive(entry['pid']):
             if time.time() > deadline:
                 return False
             time.sleep(0.2)

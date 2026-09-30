@@ -66,7 +66,7 @@ The tactical solver needs Rust and Cargo with edition 2024 support:
 python tools/build_tactical.py
 ```
 
-Without it the search and the proof pass run without proofs. Check the build with the tests:
+Without it the search plays without proofs and the launcher skips the proof pass until the solver is built. Check the build with the tests:
 
 ```sh
 python -m unittest tests.test_engine tests.test_neural_search tests.test_proof tests.test_notation_api -v
@@ -79,7 +79,7 @@ python -m unittest tests.test_dense tests.test_dense_solve tests.test_openings t
 python python/bubble.py train --run runs/bubble
 ```
 
-That creates the run and its first checkpoint, then starts the learner, four actors, the evaluator, the proof pass and the dashboard at <http://127.0.0.1:8766>. Everything the run produces stays under `runs/bubble`: game shards, checkpoints, ratings, logs.
+That creates the run and its first checkpoint, then starts the learner, four actors, the evaluator, the proof pass (once the solver is built) and the dashboard at <http://127.0.0.1:8766>. Everything the run produces stays under `runs/bubble`: game shards, checkpoints, ratings, logs.
 
 ```sh
 python python/bubble.py status --run runs/bubble
