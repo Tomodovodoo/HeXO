@@ -291,8 +291,8 @@ class EvaluationSettings:
     extra_opponents: int = 2      # panel opponents drawn per rated checkpoint with probability ~ p(1-p), idle only
     idle_rematch: bool = True     # replay decision-relevant comparisons while no checkpoint awaits rating
     idle_fill: bool = True        # after all other work, play fill games until a checkpoint awaits rating
-    anchor_target_halfwidth: float = 25.  # fill Seal games until the champion-Seal Elo interval is this narrow; 0 = never
-    fill_top: int = 3             # then fill the widest Elo-difference interval among this many top-rated checkpoints
+    anchor_target_halfwidth: float = 25.  # include champion-Seal uncertainty in fill until this 95% half-width; 0 = no Seal fill
+    fill_top: int = 3             # fill comparisons that most narrow these top checkpoints' 95% rating intervals
     veto_margin: float = -30.     # actor.json skips the newest checkpoint once its Elo interval vs its champion lies below this
     max_expected_score: float = .85  # panel, optional and fill pairings only while either side's expected score is at most this
     rebase_on_promotion: bool = True  # a variant registered against the champion follows a new champion until it starts

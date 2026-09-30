@@ -7,10 +7,10 @@ Run layout: dense_config. Subcommands
              champion owes Seal games, capped anchor sessions (`Evaluator.anchor`) alternate with pending trials. Then
              the optional comparisons (`Evaluator.optional`): panels and idle rematches, then, newest rated
              checkpoint first, `previous_games` vs the previous rated checkpoint of the variant; then, with
-             idle_fill (off with --once), fill work until a checkpoint waits (`Evaluator.fill`): the champion vs
-             Seal until their Elo interval is anchor_target_halfwidth narrow, then `games` of the newest rated
-             checkpoint vs the previous champion ('generalization': does its edge carry beyond the incumbent it
-             met), then the widest pair of the league ladder. Fill games are ordinary reports; the champion's fill
+             idle_fill (off with --once), fill work until a checkpoint waits (`Evaluator.fill`): pairings that most
+             reduce the 95% Elo intervals of the top `fill_top` checkpoints, and the champion-Seal
+             difference while wider than anchor_target_halfwidth. Opponents come from the whole rated league,
+             so fill can repair uncertainty shared through earlier comparisons. Fill games are ordinary reports; the champion's fill
              games vs Seal also count toward its scheduled anchors. Panel, optional and fill pairings are played
              only while `informative` (expected score at most max_expected_score for either side).
              Play: one continuous pool of pool_games games in flight on one engine (`Pool`, `Evaluator.session`),
@@ -993,7 +993,9 @@ class Evaluator:
     placements_per_second (the session's placements after openings, including the
     games in flight, and per second), mean_placements (per finished game of the main lane in the session, null
     before any),
-    settings (the effective EvaluationSettings), eval_share (the Pacer's share: 1 with --once), backlog (unrated
+    settings (the effective EvaluationSettings), net_kernels (this process's model kernel mode), fill_uncertainty
+    (the current fill plan's targets and predicted 95% half-widths; None for other work),
+    eval_share (the Pacer's share: 1 with --once), backlog (unrated
     checkpoint ids at the last step), eval_share_used (Pacer.used), vram (hexnet.vram()), error, solver (the solver
     settings' dense_solver.Budgets, `sides` {player: Budgets} of the session's players with their own budgets
     (variants), and the session's query statistics, Pool.solver, as `queries`; None while every budget in use is
@@ -1022,6 +1024,7 @@ class Evaluator:
                            games_planned=0, tally=None, decision=None, pending=[], placements_played=0, mean_placements=None,
                            placements_per_second=None, settings=asdict(settings), eval_share=pacer.share, backlog=[],
                            eval_share_used=0., error=None, solver=self.solver_status(None),
+                           net_kernels=config.actor.net_kernels, fill_uncertainty=None,
                            anchor_turn=self.anchor_turn, anchor_champion=self.league['champion'])
 
     def set_anchor_turn(self, turn):
@@ -1881,37 +1884,65 @@ class Evaluator:
         return entry.get('panel', {}).get('incumbent') or next((m['opponent'] for m in entry.get('matches', [])), None)
 
     def fill(self):
-        """(league entry, opponent, kind, games) of the next fill work with idle_fill, else None; only `close`
-        pairings, `games` each. (1) The champion vs Seal ('fill') while anchor_target_halfwidth > 0 and the
-        half-width of the 95% interval of their Elo difference (`rate` over the champion's Seal reports alone,
-        `seal_reports`) exceeds it (no report yet counts as wide). (2) Once, the
-        newest rated, not demoted checkpoint vs the previous champion ('generalization'): the champion that the
-        champion it met had met (`met` twice), when the two have no games yet. (3) The league ladder pair with
-        the widest interval whose report can grow (`rematch_pair`, 'fill')."""
+        """Next fill comparison, maximizing the expected reduction in summed 95% interval half-widths.
+
+        Targets are the top `fill_top` checkpoints' ratings on the published league scale, plus champion minus
+        Seal while its half-width exceeds anchor_target_halfwidth. Fit the same pooled, zero-matchup posterior
+        as `rate`, including archived protocols. Any rated league pair may reduce those targets through shared
+        covariance, even when neither player is a target. Only `close`, growable comparisons may play; Seal is
+        allowed with anchor_target_halfwidth > 0, excluding failed pairs. Rechoose after each `games` round.
+        `fill_uncertainty` records the selected pair's current and predicted half-widths, not a guaranteed result.
+        """
         s, champion = self.settings, self.entry(self.league['champion'])
+        self.status['fill_uncertainty'] = None
         if not s.idle_fill or champion is None:
             return None
-        reports = self.seal_reports(champion['id'])
-        if s.anchor_target_halfwidth > 0 and (champion['id'], SEAL, 'fill', s.opening_book) not in self.failed_seal \
-                and self.close(champion['id'], SEAL):
-            low, high = rate([champion['id'], SEAL], champion['id'], reports, seed=self.config.seed)[1][SEAL] if reports \
-                else (-math.inf, math.inf)
-            if (high-low)/2 > s.anchor_target_halfwidth:
-                return champion, SEAL, 'fill', s.games
-        newest = [c for c in self.league['checkpoints'] if c.get('elo') is not None and not c.get('demoted')][-1:]
-        for c in newest:
-            previous = self.met(self.met(c['id']))
-            if previous and previous != c['id'] and (self.entry(previous) or {}).get('elo') is not None \
-                    and previous not in self.league.get('matrix', {}).get(c['id'], {}) and self.close(c['id'], previous):
-                return c, previous, 'generalization', s.games
-        for d in sorted(self.league.get('ladder', []), key=lambda d: d['interval'][0]-d['interval'][1]):
-            if self.close(d['a'], d['b']) and (pair := rematch_pair(self.run, d['a'], d['b'], s)):
-                return self.entry(pair[0]), pair[1], 'fill', s.games
-        return None
+        checkpoints = [c for c in self.league['checkpoints'] if c.get('elo') is not None and not c.get('skipped')]
+        ids = [c['id'] for c in checkpoints]
+        ids += [v['id'] for v in self.variants() if v['checkpoint'] in ids and v.get('elo') is not None]
+        if not ids:
+            return None
+        reports = [r for r in load_reports(self.run) if r['candidate'] in ids and r['opponent'] in ids+[SEAL]]
+        names = ids+([SEAL] if s.anchor_target_halfwidth > 0 or any(r['opponent'] == SEAL for r in reports) else [])
+        if len(names) < 2:
+            return None
+        post = Posterior(names, ids[0], observations(reports), 0., parents(names))
+        best = sorted((c for c in checkpoints if not c.get('demoted')), key=lambda c: -post.rating(c['id']))[:s.fill_top]
+        targets = [(c['id'], post.anchor, False) for c in best if c['id'] != post.anchor]
+        if s.anchor_target_halfwidth > 0 and 1.96*post.difference(champion['id'], SEAL, False)[1] > s.anchor_target_halfwidth:
+            targets.append((champion['id'], SEAL, False))
+        if not targets:
+            return None
+        before = [1.96*post.difference(a, b, False)[1] for a, b, _ in targets]
+        chosen, gain, predicted = None, 0., None
+        for i, a in enumerate(names):
+            for b in names[i+1:]:
+                if not self.close(a, b):
+                    continue
+                if b == SEAL:
+                    if s.anchor_target_halfwidth <= 0 or (a, b, 'fill', s.opening_book) in self.failed_seal:
+                        continue
+                    pair = a, b
+                else:
+                    pair = rematch_pair(self.run, a, b, s)
+                if pair is None:
+                    continue
+                after = [1.96*math.sqrt(max(0., post.after(t, pair, s.games))) for t in targets]
+                reduction = sum(x-y for x, y in zip(before, after))
+                if reduction > gain:
+                    chosen, gain, predicted = pair, reduction, after
+        if chosen is None:
+            return None
+        self.status['fill_uncertainty'] = dict(candidate=chosen[0], opponent=chosen[1], games=s.games,
+                                               expected_reduction=gain, targets=[dict(a=a, b=b, halfwidth=x,
+                                               expected_halfwidth=y) for (a, b, _), x, y in zip(targets, before, predicted)])
+        return self.entry(chosen[0]), chosen[1], 'fill', s.games
 
     def filling(self, target):
         """Log a 'fill' event when fill work starts, changes target ('seal', '<a> vs <b>' or 'generalization <a> vs
         <b>') or ends (None)."""
+        if target is None:
+            self.status['fill_uncertainty'] = None
         if target != self.fill_target:
             log_event(self.run, 'evaluator', 'fill', f'fill: {target}' if target else f'fill ended: {self.fill_target}',
                       target=target)
