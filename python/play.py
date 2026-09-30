@@ -102,6 +102,8 @@ class DensePlayer:
         updated = self.options | options
         if any(type(updated[k]) is not bool for k in ('search', 'solver')):
             raise ValueError('Search and solver must be on or off')
+        if updated['solver'] and self.prover is None:
+            raise ValueError('The tactical solver is not built; run python tools/build_tactical.py')
         for key, maximum in (('simulations', 4096), ('solver_nodes', 1000000)):
             if type(updated[key]) is not int or not 1 <= updated[key] <= maximum:
                 raise ValueError(f'{key} must be 1..{maximum}')
@@ -115,9 +117,6 @@ class DensePlayer:
         self.evaluator = None
 
     def solve(self, history, attacker='mover'):
-        from tactical_proof import NativeTactics
-        if self.prover is None:
-            self.prover = NativeTactics(**({'package': self.tactical_package} if self.tactical_package else {}))
         return self.prover.history(history, attacker=attacker, nodes=self.options['solver_nodes'], ms=10000)
 
     @staticmethod
