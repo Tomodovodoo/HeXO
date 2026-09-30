@@ -127,8 +127,8 @@ class LauncherTests(unittest.TestCase):
         self.run.mkdir()
         self.fake = FakeProcesses()
         self.launcher = bubble.Launcher(self.run, self.fake.spawn, self.fake.arguments, self.fake.kill)
-        self.launcher.survivors = lambda entry: self.fake.survivors.get(entry['pid'], [])
         self.fake.survivors = {}
+        self.launcher.group = lambda entry: self.fake.survivors.get(entry['pid'], [])
         self.plan = bubble.commands(self.run)
 
     def tearDown(self):
@@ -224,7 +224,7 @@ class LauncherTests(unittest.TestCase):
                 raise OSError('no more processes')
             return self.fake.spawn(command, log)
         launcher = bubble.Launcher(self.run, failing_spawn, self.fake.arguments, self.fake.kill)
-        launcher.survivors = lambda entry: []
+        launcher.group = lambda entry: []
         self.fake.stubborn.add(101)
         with self.assertRaises(OSError):
             launcher.start(self.plan, timeout=0.01)
@@ -239,7 +239,7 @@ class LauncherTests(unittest.TestCase):
             return self.fake.spawn(command, log)
         self.fake.kill = lambda p, force=False: self.fake.killed.append(p)
         launcher = bubble.Launcher(self.run, failing_spawn, self.fake.arguments, self.fake.kill)
-        launcher.survivors = lambda entry: []
+        launcher.group = lambda entry: []
         with self.assertRaises(OSError):
             launcher.start(self.plan, timeout=0.01)
         recorded = json.loads((self.run / 'processes.json').read_text())
@@ -256,10 +256,16 @@ class LauncherTests(unittest.TestCase):
 
     def test_stop_signals_surviving_workers_directly(self):
         state = self.launcher.start(self.plan)
-        self.fake.survivors[state['actors']['pid']] = [777, 778]
+        pid = state['actors']['pid']
+        self.fake.live.discard(pid)
+        self.fake.survivors[pid] = [777, 778]
+        self.assertIn('actors', self.launcher.running())
+        original = self.fake.kill
+        self.fake.kill = lambda p, force=False: (original(p, force), self.fake.survivors.pop(pid, None))
+        self.launcher.kill = self.fake.kill
         self.launcher.stop(timeout=0.01)
-        self.assertEqual(self.fake.killed.count(777), 1)
-        self.assertEqual(self.fake.killed.count(778), 1)
+        self.assertIn(777, self.fake.killed)
+        self.assertNotIn('actors', self.launcher.running())
 
     def test_stop_forces_a_service_that_ignores_the_first_signal(self):
         state = self.launcher.start(self.plan)

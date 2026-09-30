@@ -142,18 +142,18 @@ def windows_tree(pid, run):
     return sorted(members(descendants, run, pid))
 
 
-def group_alive(pid, run):
-    """Whether any process started under the service `pid` still belongs to it: on Windows a descendant by parent
-    id, on POSIX a member of its process group (each service starts its own session). A group whose leader is
-    alive but runs another run's service is not ours; workers of the service's own session count even after the
-    leader exited, since they can only have been created inside it."""
+def group_members(pid, run):
+    """The pids of processes started under the service `pid` that still belong to it: on Windows its descendants
+    by parent id, on POSIX the members of its process group (each service starts its own session). A POSIX group
+    whose leader is alive but runs another run's service is not ours; workers of the service's own session count
+    even after the leader exited, since they can only have been created inside it."""
     if os.name == 'nt':
-        return bool(windows_tree(pid, run))
+        return windows_tree(pid, run)
     if not Path('/proc').is_dir():
-        return False
+        return []
     leader = arguments(pid)
     if leader and run not in leader:
-        return False
+        return []
     group, parents = {}, {}
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
@@ -166,7 +166,7 @@ def group_alive(pid, run):
                 parents[member] = pid if session == pid and any('multiprocessing' in part for part in group[member]) else ppid
         except (OSError, ValueError, IndexError):
             continue
-    return bool(members(group, run, pid, parents))
+    return sorted(members(group, run, pid, parents))
 
 
 def kill(pid, force=False):
@@ -195,8 +195,11 @@ class Launcher:
         return {name: entry for name, entry in self.state().items() if self.alive(entry)}
 
     def alive(self, entry):
-        """The service leader still runs this run's script, or, on POSIX, children of its group still exist."""
-        return alive(entry['pid'], entry['script'], str(self.run), self.arguments) or group_alive(entry['pid'], str(self.run))
+        """The service leader still runs this run's script, or workers started under it still exist."""
+        return alive(entry['pid'], entry['script'], str(self.run), self.arguments) or bool(self.group(entry))
+
+    def group(self, entry):
+        return group_members(entry['pid'], str(self.run))
 
     def variant(self):
         """The learner's checkpoint variant from the run configuration, `main` for a run without one."""
@@ -284,16 +287,12 @@ class Launcher:
         """Kill the service and its surviving workers and wait until all are gone, forcing once after `timeout`."""
         for force in (False, True):
             self.kill(entry['pid'], force)
-            for pid in self.survivors(entry):
-                self.kill(pid, force)
+            if os.name == 'nt':   # taskkill's tree option reaches nothing once the leader is gone; POSIX signals the group
+                for pid in self.group(entry):
+                    self.kill(pid, force)
             if self.gone(entry, timeout):
                 return True
         return False
-
-    def survivors(self, entry):
-        """Workers of the service that outlive their leader and need their own signal: on Windows its descendants
-        (taskkill's tree option reaches nothing once the leader is gone); on POSIX the group signal covers them."""
-        return windows_tree(entry['pid'], str(self.run)) if os.name == 'nt' else []
 
     def gone(self, entry, timeout):
         """True once neither the service nor, on POSIX, any process left in its group exists."""
