@@ -281,8 +281,7 @@ class PlayNotationEndpoint(unittest.TestCase):
                 self.assertEqual(response.read().decode(), 'version[1];')
             play(1, 0)
             with urlopen(root+'/htttx', timeout=2) as response:
-                self.assertEqual(response.read().decode(), 'version[1];
-1. [1,0];')
+                self.assertEqual(response.read().decode(), 'version[1];\n1. [1,0];')
             play(2, 0)
             with urlopen(root+'/htttx', timeout=2) as response:
                 self.assertEqual(response.read().decode(), 'version[1];\n1. [1,0][2,0];')
