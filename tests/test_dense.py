@@ -2902,12 +2902,23 @@ class ValidationSourceTests(unittest.TestCase):
                 path = run/'checkpoints'/'main'/f'{step:06d}'
                 path.mkdir(parents=True)
                 (path/'manifest.json').write_text(json.dumps(dict(step=step, metrics=dict(
-                    validation_sources=dict(remaining_grid=grid, newest_value_curve=values)))))
+                    validation_sources=dict(remaining_grid=grid, newest_value_curve=values, newest_rows=step,
+                                            newest_checkpoint=f'main/{step-1:06d}')))))
             out = dashboard.series(run, dict(created_at=0.), 'main', 'newest_value_curve', 'remaining')
             self.assertEqual(out['checkpoint'], 'main/000010')
             self.assertEqual(out['points'], [[g, y] for g, y in zip(grid, curve)])
             self.assertEqual([y for _, y in out['points'][1:6]], [.2, None, None, None, .6])
             json.dumps(out, allow_nan=False)
+            self.assertNotIn('history', out)
+            saved = dashboard.series(run, {}, 'main', 'newest_value_curve', 'remaining', history=True)
+            self.assertEqual([c['step'] for c in saved['history']], [5, 10])
+            self.assertEqual(saved['history'][0]['points'], [[g, .9] for g in grid])
+            self.assertEqual(saved['history'][1]['points'], out['points'])
+            self.assertEqual(saved['history'][1]['rows'], 10)
+            self.assertEqual(saved['history'][1]['source_checkpoint'], 'main/000009')
+            recent = dashboard.series(run, {}, 'main', 'newest_value_curve', 'remaining', from_step=8, history=True)
+            self.assertEqual(recent['history'], saved['history'][1:])
+            json.dumps(saved, allow_nan=False)
 
     def test_export_recalibrates_ema_norm_statistics(self):
         """The raw model drifts (here: perturbed weights) after the EMA was taken. The exported EMA must carry norm
