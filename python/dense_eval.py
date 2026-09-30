@@ -1518,7 +1518,8 @@ class Evaluator:
         """(a, b) of the evidence pairing for a pending posterior decision, or None: of cid and the champion each
         vs the previous champion (`met` of the champion) and vs Seal, the one whose `games` most reduce the
         posterior variance of delta (value of information, `Posterior.after`), when that beats as many direct
-        games; only pairings whose report can grow (`rematch_pair`) and that are `close`."""
+        games; only pairings whose report can grow (`rematch_pair`) and that are `close`. The decision posterior
+        also checks the score limit, including for a candidate whose league rating is not published yet."""
         s, post, previous = self.settings, verdict['posterior'], self.met(champion)
         options = []
         for a, b in ((cid, previous), (champion, previous), (cid, SEAL), (champion, SEAL)):
@@ -1532,7 +1533,8 @@ class Evaluator:
                 options.append(pair)
         known = lambda x: x in post.index or x == post.anchor
         after = lambda pair: post.after((cid, champion, True), pair, games)
-        options = [o for o in options if known(o[0]) and known(o[1])]
+        options = [o for o in options if known(o[0]) and known(o[1])
+                   and informative(expected(post.rating(o[0]), post.rating(o[1])), s.max_expected_score)]
         best = min(options, key=after, default=None)
         return best if best and after(best) < after((cid, champion)) else None
 

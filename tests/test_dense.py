@@ -5085,14 +5085,17 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(any(event['kind'] == 'error' and 'paused after 2 failed pairs' in event['message']
                             for event in events))
 
-    def test_paused_seal_evidence_is_not_selected(self):
-        evaluator = self.start()
+    def test_evidence_respects_score_limit_and_paused_pairs(self):
+        evaluator = self.start(max_expected_score=10/11)
         candidate, champion = 'main/000020', 'main/000010'
-        evaluator.met = lambda name: None
-        evaluator.close = lambda a, b: True
+        ratings = {candidate: 401., champion: 500., 'seal': 0.}
         post = SimpleNamespace(index={candidate, champion, 'seal'}, anchor=champion,
+                               rating=ratings.__getitem__,
                                after=lambda comparison, pair, games=None: 0 if pair[1] == 'seal' else 1)
         verdict = dict(posterior=post)
+        self.assertIsNone(evaluator.entry(candidate))  # The provisional rating must still enforce the limit.
+        self.assertIsNone(evaluator.evidence(verdict, candidate, champion, 2))
+        ratings[candidate] = 400.
         self.assertEqual(evaluator.evidence(verdict, candidate, champion, 2), (candidate, 'seal'))
         for name in (candidate, champion):
             evaluator.failed_seal.add((name, 'seal', 'evidence', evaluator.settings.opening_book))
