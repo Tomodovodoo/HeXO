@@ -5,6 +5,7 @@ on one background worker thread as jobs with ids; HTTP requests only read or cha
 waits on an engine. See docs/play.md.
 """
 import argparse
+import functools
 import hashlib
 import heapq
 import itertools
@@ -127,6 +128,23 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     if seal is not None and Path(seal).exists():
         add('seal', 'Seal')
     return entries
+
+
+def export_path(entry, checkpoint):
+    """The weights file of a Bubble entry at `checkpoint`."""
+    return entry['path'] / 'checkpoints' / checkpoint / 'ema.pt' if checkpoint else entry['path']
+
+
+@functools.lru_cache(maxsize=256)
+def file_digest(path, modified_ns, size):
+    from legacy.train import digest
+    return digest(path)
+
+
+def model_key(path):
+    """Evaluations are keyed by the weights they came from: the first 16 hex digits of the file's SHA-256."""
+    stat = Path(path).stat()
+    return file_digest(str(path), stat.st_mtime_ns, stat.st_size)[:16]
 
 
 class Cancelled(Exception):
@@ -272,8 +290,8 @@ class Engines:
         return self.prover
 
     def evaluate(self, entry, checkpoint, budget, history, watch):
-        path = entry['path'] / 'checkpoints' / checkpoint / 'ema.pt' if checkpoint else entry['path']
-        return evaluate(self.bubble(path), self.solver(), history, budget['simulations'], budget['solver_nodes'], watch)
+        bubble = self.bubble(export_path(entry, checkpoint))
+        return evaluate(bubble, self.solver(), history, budget['simulations'], budget['solver_nodes'], watch)
 
     def turn(self, entry, budget, history):
         """A turn from a non-Bubble engine."""
@@ -302,8 +320,8 @@ def position_text(history):
 class Evaluations:
     """Append-only JSON lines, one evaluation per line, indexed in memory.
 
-    Each line holds `position` (the ordered stones), `engine` (entry name and checkpoint), `simulations`,
-    `solver_nodes`, the evaluation fields and `at`. The index keeps the newest `limit` (position, engine, budget)
+    Each line holds `position` (the ordered stones), `engine` (see `model_key`), `simulations`, `solver_nodes`,
+    the evaluation fields, `model` (a readable name) and `at`. The index keeps the newest `limit` (position, engine, budget)
     entries; `best` returns the deepest one for a position and engine. The file is only appended to; on start a
     dated copy is kept next to it, the newest `backups` of them."""
 
@@ -357,6 +375,15 @@ class Evaluations:
         """The saved evaluation of `history` by `engine` at exactly `budget`, or None."""
         with self.lock:
             line = self.order.get((self.key(history), engine, (budget['simulations'], budget['solver_nodes'])))
+        return json.loads(line) if line else None
+
+    def covering(self, history, engine, budget):
+        """The deepest saved evaluation of `history` by `engine` whose simulations and solver nodes both reach
+        `budget`'s, or None."""
+        position, need = self.key(history), (budget['simulations'], budget['solver_nodes'])
+        with self.lock:
+            enough = [b for b in self.by_position.get((position, engine), ()) if b[0] >= need[0] and b[1] >= need[1]]
+            line = self.order[(position, engine, max(enough))] if enough else None
         return json.loads(line) if line else None
 
     def best(self, history, engine):
@@ -487,8 +514,7 @@ class Session:
         return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget_of(entry['kind'], preset, custom))
 
     def engine_key(self, seat):
-        entry = self.entries[seat['engine']]
-        return f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
+        return model_key(export_path(self.entries[seat['engine']], seat['checkpoint']))
 
     # Reading
 
@@ -564,8 +590,7 @@ class Session:
                     return job
                 if job.status == 'failed' and not force:
                     return None
-        saved, budget = self.lookup(history), settings['budget']
-        if not force and saved and (saved['simulations'], saved['solver_nodes']) >= (budget['simulations'], budget['solver_nodes']):
+        if not force and self.store.covering(history, self.engine_key(settings), settings['budget']):
             return None
         return self.submit(Job('analyse', priority, history, seat=settings, force=force))
 
@@ -707,14 +732,16 @@ class Session:
         """The evaluation of `history` for `seat`, saved. Unless forced, a saved one is reused: at exactly the
         seat's budget when `exact`, else at least as deep."""
         key, budget = self.engine_key(seat), seat['budget']
-        saved = None if force else self.store.get(history, key, budget) if exact else self.store.best(history, key)
-        if saved and (saved['simulations'], saved['solver_nodes']) >= (budget['simulations'], budget['solver_nodes']):
+        saved = None if force else self.store.get(history, key, budget) if exact else self.store.covering(history, key, budget)
+        if saved:
             return saved
         found = self.engines.evaluate(self.entries[seat['engine']], seat['checkpoint'], seat['budget'], history,
                                       self.watcher(job))
         if job.cancelled:
             raise Cancelled()
-        return self.store.add(history, key, seat['budget'], found)
+        entry = self.entries[seat['engine']]
+        model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
+        return self.store.add(history, key, seat['budget'], found | dict(model=model))
 
     def run(self, job):
         seat, history = job.seat, list(job.history)

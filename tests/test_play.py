@@ -56,9 +56,16 @@ class FakeEngines:
         return legal_turn(history)
 
 
+RUN = tempfile.TemporaryDirectory()
+for number in (1, 2):
+    (Path(RUN.name) / f'checkpoints/main/00000{number}').mkdir(parents=True)
+    (Path(RUN.name) / f'checkpoints/main/00000{number}/ema.pt').write_bytes(bytes([number]))
+
+
 def entries():
-    return {'bubble:fake': dict(id='bubble:fake', name='fake', kind='bubble', presets=PRESETS['bubble'],
-                                checkpoints=['main/000002', 'main/000001'], path=Path('.')),
+    bubble = dict(kind='bubble', presets=PRESETS['bubble'], checkpoints=['main/000002', 'main/000001'], path=Path(RUN.name))
+    return {'bubble:fake': dict(bubble, id='bubble:fake', name='fake'),
+            'bubble:fake~2': dict(bubble, id='bubble:fake~2', name='fake', checkpoints=['main/000001']),
             'native:Native': dict(id='native:Native', name='Native', kind='native', presets=PRESETS['native'])}
 
 
@@ -81,6 +88,14 @@ class Store(unittest.TestCase):
             self.assertEqual(reloaded.get([(0, 0)], 'run/a', dict(simulations=32, solver_nodes=2048))['value'], .3)
             self.assertEqual(len(list(Path(directory).glob('evaluations.jsonl.*.bak'))), 3)
             self.assertEqual(len(path.read_text().splitlines()), 4)
+
+    def test_reuse_needs_every_budget_dimension(self):
+        store = Evaluations()
+        store.add([], 'e', dict(simulations=512, solver_nodes=0), dict(value=.1, moves=[]))
+        self.assertIsNone(store.covering([], 'e', STANDARD))
+        store.add([], 'e', dict(simulations=128, solver_nodes=131072), dict(value=.2, moves=[]))
+        self.assertEqual(store.covering([], 'e', STANDARD)['value'], .2)
+        self.assertEqual(store.covering([], 'e', dict(simulations=64, solver_nodes=0))['value'], .1)
 
     def test_index_keeps_the_newest_entries(self):
         store = Evaluations(limit=2)
@@ -205,6 +220,19 @@ class Jobs(unittest.TestCase):
         self.session.configure_analysis('bubble:fake', preset='quick', auto=False)
         self.assertIsNone(self.session.analyse(1))
         self.assertEqual(self.session.state()['evaluations'][1]['simulations'], PRESETS['bubble']['deep']['simulations'])
+
+    def test_evaluations_follow_the_weights_not_the_name(self):
+        self.session.configure_seat(1, 'human')
+        self.session.analyse(0)
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertIsNotNone(self.session.state()['evaluations'].get(0))
+        self.session.configure_analysis('bubble:fake', 'main/000001', auto=False)
+        self.assertIsNone(self.session.state()['evaluations'].get(0))
+        self.session.analyse(0)
+        wait(lambda: not self.session.state()['jobs'])
+        self.session.configure_analysis('bubble:fake~2', auto=False)
+        self.assertIsNotNone(self.session.state()['evaluations'].get(0))
+        self.assertEqual(len(self.engines.calls), 2)
 
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
