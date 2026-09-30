@@ -133,7 +133,7 @@ class Line:
         self.model, self.plies, self.temperature, self.reason, self.solver = model, plies, temperature, None, None
         self.budget, self.samples = sims, min(samples, sims)
         self.rng, self.moves, self.shares = np.random.default_rng(seed), [tuple(m) for m in start], []
-        self.tree = model.tree(list(self.moves), seed, tactics, graph)
+        self.tree = model.tree(list(self.moves), seed, tactics, graph=True) if graph else model.tree(list(self.moves), seed, tactics)
 
     def searched(self, result):
         visits = result['visits'].astype(np.float64)

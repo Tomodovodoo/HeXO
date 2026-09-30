@@ -454,7 +454,7 @@ class GraphSearch(unittest.TestCase):
 
     def test_book_lines_search_with_the_evaluation_graph_setting(self):
         calls = []
-        model = type('Model', (), dict(tree=lambda self, *args: calls.append(args)))()
+        model = type('Model', (), dict(tree=lambda self, *args, graph=False: calls.append(args+(graph,))))()
         dense_openings.Line(model, [(0, 0)], 3, 4, 4, True, 1., 0, graph=True)
         self.assertEqual(calls, [([(0, 0)], 0, True, True)])
 

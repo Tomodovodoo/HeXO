@@ -90,7 +90,8 @@ class MatchGame:
         for colour, side in enumerate(sides):
             key = id(side), self.graphs[colour]
             if side != self.anchor and key not in self.trees:
-                self.trees[key] = side.tree([tuple(m) for m in opening], seed*2+colour, tactics[colour], self.graphs[colour])
+                args = [tuple(m) for m in opening], seed*2+colour, tactics[colour]
+                self.trees[key] = side.tree(*args, graph=True) if self.graphs[colour] else side.tree(*args)
         try:
             self.seal_turns()
         except Exception as error:
