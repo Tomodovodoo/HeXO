@@ -1,122 +1,37 @@
-## Dense evaluator
+# Evaluation
 
-`dense_eval.py loop` rates each new dense checkpoint against the champion and keeps the league in
-`league.json`; its module docstring is the full contract, and every setting is an `EvaluationSettings` field in
-`dense_config.py` (override per process with `--eval-*`).
-`python python/dense_eval.py settle --run runs/dense-v1 --checkpoint main/032500` asks the running evaluator to settle that checkpoint on its completed games at its next step.
+`python python/dense_eval.py loop --run R` rates every new checkpoint against the champion and keeps the league in `league.json`. Every setting is a field of `EvaluationSettings` in `python/dense_config.py`, overridden per process with `--eval-*` flags. `python python/dense_eval.py settle --run R --checkpoint main/032500` asks the running evaluator to settle that checkpoint on its completed games.
 
-- **Promotion** (`decision`, default `posterior`). One Bradley-Terry posterior covers every rated checkpoint, the
-  candidate and Seal, and it uses every report: direct games, games against the previous champion, against Seal
-  and against panel members. Each pair also gets a matchup deviation (prior sd `matchup_prior_elo`, default 30),
-  so a pair's own games outweigh the transitive picture when the two disagree. Each colour-swapped opening pair
-  is one observation with five outcomes (0, 1/2, 1, 3/2 or 2 points; a capped game is half a point), because the
-  two games of a pair share their opening. The likelihood of each pair of players is divided by its dispersion:
-  the observed variance of the pair points over what two independent games at the same score would give, shrunk
-  toward 1 by four pseudo-pairs. Pairs that sweep (2-0 or 0-2) more often than chance widen the interval; pairs
-  that split 1-1 more often than chance narrow it, since the opening then decides the colour rather than the
-  player. The dispersion scales the weight of a pair's games, so it moves the point estimate only where priors or
-  other pairings compete with them. `evaluator-status.json` reports the effective pair count (pairs over
-  dispersion) of the direct games. The candidate needs at least
-  `sprt_min_games` direct games. No separate bound applies to its rating sd: P(better) already accounts for it.
-  It is promoted when it has the highest posterior rating and P(candidate - champion > `sprt_elo0`) is at least
-  `promote_confidence`. It is rejected when that probability is at most 1 - `promote_confidence`. Neither
-  happens while the direct-only and pooled estimates disagree beyond their intervals. `decision sprt` keeps the
-  sequential test (`sprt_elo0` 0, `sprt_elo1` 25), the generalized SPRT over the same five pair outcomes, so its
-  log-likelihood ratio carries the pair-level variance too. Each verdict records its likelihood as `model`
-  (`pentanomial`). A decision recorded under another model stays settled: the start-up review does not re-judge it
-  and the calibration diagnostic leaves it out.
-- **Calibration diagnostic.** Each posterior verdict records the sd of delta it stated. Once the checkpoint has
-  three later comparisons, `league.json` `calibration` compares the realised RMS shift of delta with what a
-  calibrated posterior expects (root mean of sd then squared minus sd now squared). A realised RMS well below the
-  expected one means the posterior overstates its variance. No decision reads it.
-- **Continuous pool.** Like the actors, the evaluator keeps `pool_games` (64) games in flight on one engine. When
-  a game ends, the next opening of its pairing starts at once (both colours together), so the GPU batch stays
-  full. Each completed colour pair is written to its report immediately, so a restart loses only the games in
-  flight, and the evaluation resumes where it stopped.
-- **Direct games first.** While a promotion decision is pending, direct games against the champion take the
-  whole pool until `sprt_min_games` (64) of them are complete. After that, at most `evidence_share` (1/4) of
-  the pool may go to the evidence pairing whose games most reduce the posterior variance of the decision: the
-  candidate or champion against the previous champion or Seal. The pairing is re-chosen after every
-  completed colour pair. A newer checkpoint or a pairing change stops new games of the old pairing; its
-  running games finish and count. A superseded decision settles on all of them: the candidate is promoted when
-  P(candidate - champion > `sprt_elo0`) is at least `promote_confidence`, whether or not the other readiness
-  conditions hold (`decision sprt` settles the same way). On every start the evaluator re-applies the rule to
-  the reports on disk, and a rated checkpoint that already passes it is crowned at once.
-- **Streaming.** `evaluator-status.json` carries the pool composition, the running tally of the current
-  comparison (every recorded game of the pair, in either role and across restarts, updated per finished game) and the pending verdict. The dashboard shows all three, including a
-  provisional league row for the candidate.
-- **Idle work.** After the decision, the evaluator plays the champion's Seal anchor, the adaptive panel (the
-  rated checkpoints closest to the champion) and other optional comparisons. It then plays fill games until the
-  next checkpoint appears: the champion against Seal until their interval is `anchor_target_halfwidth` narrow,
-  `games` of the newest checkpoint against the previous champion, then the widest pair among the top
-  `fill_top`. Automatic anchors, panels, evidence and idle pairings are excluded when either side's expected
-  score exceeds `max_expected_score`, even if an anchor quota is still owed. The default 0.85 permits about
-  301 Elo difference; `--eval-max-expected-score 0.9090909090909091` permits up to 400 Elo. Unknown ratings
-  remain eligible so new opponents can be rated; evidence games also check the candidate's provisional
-  posterior rating while its published league rating is pending. Direct promotion/variant trials and explicit `match`
-  commands retain their own game budgets. Historical Seal games remain part of the rating evidence.
-- **Variants.** An A/B test of search settings runs through the same pool, reports and posterior. A variant is
-  a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`,
-  `solver_*`), league id `<checkpoint>@<name>`:
+## Games
 
-  ```text
-  python python/dense_eval.py variant --run runs/dense-v1 --checkpoint main/032500 --name solver --set solver_root_nodes=135 --set solver_finalists=2 --set solver_finalist_nodes=135 --set solver_threat_nodes=135
-  ```
+The evaluator keeps `pool_games` (64) games in flight on one engine, so the GPU batch stays full. Every pairing draws colour-swapped openings from the opening book, and each finished colour pair is written to its report at once, so a restart loses only the games in flight. Games that reach the placement cap count half a point each way.
 
-  The running evaluator picks it up once no checkpoint waits and decides it against its checkpoint: 'better'
-  once P(variant - checkpoint > `sprt_elo0`) reaches `promote_confidence`, 'worse' once it falls to 1 -
-  `promote_confidence`, 'max-games' at `sprt_max_games`. Variants are rated in the league and shown in the
-  checkpoint history, but they never become champion and never reach the actors. `--checkpoint champion` registers against whichever checkpoint is champion when the comparison starts; with `rebase_on_promotion` (default on) a variant registered against the champion also follows a new champion until it starts.
-- **Opening books** (`dense_openings.py`). Every pairing, Seal anchors included, draws its colour-swapped openings from
-  the book of `opening_suite`. Each completed pair is recorded on every node its opening passed through, so the
-  statistics of a node cover its whole subtree. A book is a DAG of symmetry-reduced positions, and a frozen suite
-  is a book file too: `openings/standard-v1.json` is the old evaluation suite with its original distribution.
-  With `--eval-opening-suite book`, the live book `openings.json` holds `book_size` (512) settled openings of 3 to
-  `book_plies` (5) placements. Each is the shortest plausible, unused prefix of a line sampled at
-  `book_temperature` from the visit counts of `book_sims` (16) searches. Generation skips prefixes of active openings;
-  when a child extends an opening, the parent retires as `nested` at refresh. At every champion change and every
-  `book_refresh_hours` (6) the champion re-scores the openings. It retires the implausible ones (policy
-  probability below `book_min_prob`) and the skewed ones (first-player skew interval beyond ±`book_max_skew`
-  Elo after `book_min_games` pairs); a skewed opening makes way for a child. It also retires an opening with at least
-  `book_short_min_games` (6) decisive games when its first-player win z-score reaches `book_short_skew_z` (2.5) and its
-  mean game length is below the `book_short_quantile` (0.25) of played openings' mean lengths. The champion also challenges
-  `book_revisit_fraction` of the settled openings with alternatives at the same depth, and the more balanced one
-  stays. Retired openings are replaced until the target is met again. On start a book counts every report pair it
-  has not counted yet (the first time, a live book imports the other suites' reports too), and a refresh adopts
-  the plausible, balanced positions among them. A report is reused
-  only under the book state it was played in: a refresh that changes the openings starts comparisons afresh.
-  `league.json` `openings` holds P1/P2 results overall and per player, and each book's counts, depths and skew
-  histogram. `/api/openings` serves the DAG with its statistics. `python python/dense_openings.py refresh|stats|prune
-  --run R` refreshes, inspects or prunes a book; run the writing commands while the evaluator is stopped.
+While a promotion decision is pending, direct games against the champion take the whole pool until `sprt_min_games` (64) are complete. After that, at most `evidence_share` (1/4) of the pool goes to whichever other pairing most reduces the posterior variance of the decision. A newer checkpoint supersedes the trial: its running games finish and count, and the verdict settles on all of them.
 
-Import the selected off-policy pool while the evaluator is stopped:
+After a decision the evaluator plays the champion's Seal anchor, a panel of the closest rated checkpoints, and fill games that sharpen the widest intervals, until the next checkpoint appears. Pairings whose expected score exceeds `max_expected_score` (0.85, about 300 Elo) are skipped.
 
-```text
-python python/dense_openings.py import --run R --source openings/off-policy-107500-p2-ge47p5-v1.json
+## Ratings and promotion
+
+One Bradley-Terry posterior covers every rated checkpoint, the candidate and Seal, using every report. Each colour-swapped opening pair is one observation with five outcomes (0 to 2 points), because both games share an opening, and each pairing's likelihood is divided by its dispersion, the observed variance of pair points over the binomial one. Pairs that sweep more often than chance widen the interval; pairs that split more often narrow it. Each pair of players also gets a matchup deviation with prior sd `matchup_prior_elo` (30), so a pair's own games outweigh the transitive picture when they disagree.
+
+A candidate is promoted when it has the highest posterior rating and P(candidate beats champion by more than `sprt_elo0`) is at least `promote_confidence` (0.8); rejected when that probability is at most 0.2; and left running while the direct-only and pooled estimates disagree beyond their intervals. On start the evaluator re-applies the rule to the reports on disk. `decision sprt` keeps a generalised SPRT over the same pair outcomes instead.
+
+`league.json` also records a calibration diagnostic: for every posterior verdict, the stated sd of the rating difference against how far it later moved.
+
+## Variants
+
+A variant is a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`, `solver_*`), rated in the league as `<checkpoint>@<name>`:
+
+```sh
+python python/dense_eval.py variant --run R --checkpoint champion --name solver --set solver_root_nodes=135 --set solver_finalists=2 --set solver_finalist_nodes=135 --set solver_threat_nodes=135
 ```
 
-This source contains 190 legal, symmetry-distinct two-stone openings outside the sampled DAG, selected at
-107.5k with 1,024 simulations and 32,768 proof nodes per query for P2 expected score at least 47.5%.
-Those search estimates are saved under each node's `analysis`; they are not proofs of balance.
-Import preserves existing results. Repeating it does not revive a value or game-evidence retirement.
+The evaluator decides it against its own checkpoint with the promotion rule. Variants never become champion and never reach the actors; they are how a search setting earns its place before it is switched on for the run.
 
-Imported nodes and their descendants carry `off_policy: true`. Policy reach remains visible but cannot retire
-them or block generation/adoption. Imported starts also skip policy-sibling challenges and nested retirement,
-so policy preferences cannot replace the selected training pool. Value and played-game skew rules still apply.
-At every refresh the champion's symmetry-averaged value head checks each active book position, including
-deeper continuations. Generation and adoption use the same `book_min_p2_value` floor, default 45%.
-This is a fixed P2 score of `1 - champion_value`, with no upper P2 cutoff. A lower score retires the node as
-`value`. It is a raw value-head check; the saved admission search is a separate estimate.
+## Opening book
 
-Manually established losses belong in the separate tactical training pool. With the evaluator stopped, import:
+`python/dense_openings.py` keeps `openings.json`, a DAG of symmetry-reduced positions. Each completed pair is recorded on every node its opening passed through. The live book holds `book_size` (512) openings of 3 to `book_plies` (5) placements, each the shortest plausible unused prefix of a line sampled from the champion's own searches. At every champion change and every `book_refresh_hours` (6) the champion re-scores the book and retires openings that are implausible (policy below `book_min_prob`), skewed toward one colour beyond `book_max_skew` Elo, short and skewed, or nested inside a child; retired openings are replaced. A refresh that changes the openings starts comparisons afresh.
 
-```text
-python python/dense_openings.py import --run R --source openings/tactical/known-loss-v1.json
-```
+Imported openings are different: `python python/dense_openings.py import --run R --source openings/off-policy-107500-p2-ge47p5-v1.json` adds two-stone openings outside the sampled DAG that the actors draw through `--book-fraction`. They are marked `off_policy`, cannot be retired by policy reach, and only the value floor `book_min_p2_value` (45%) and played-game skew can retire them. `openings/tactical/known-loss-v1.json` imports openings with a known result as a separate `tactical` pool: actors train on them, evaluation never draws them, and the dashboard reports how often the actors convert the known win. Run the writing commands (`import`, `refresh`, `prune`) while the evaluator is stopped.
 
-This catalog records Tom's P1-win finding for the exact `[0,0][8,0][8,3]` opening, its source and illustrative
-line. Import changes that class to `tactical`, including when the value filter has already retired it.
-Actors can still draw it through `--book-fraction`; evaluation draws and value/skew retirement exclude it.
-The claim applies to this class under board symmetry, not every isolated three. It is manual source evidence,
-not a native solver certificate. The dashboard's Tactical openings table reports conversion from actor games
-and mean raw P2 value separately for each pair of model hashes. These games never enter league ratings.
+`league.json` `openings` holds first and second player results overall and per player; `/api/openings` on the dashboard serves the DAG with its statistics.

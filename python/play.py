@@ -360,9 +360,12 @@ if __name__ == "__main__":
     parser.add_argument('--tactical-package', type=Path, help='Directory containing the verified prebuilt tactical library')
     parser.add_argument("--neural-mode", choices=("pi", "mu", "gumbel", "gumbel-proof"), default="gumbel")
     parser.add_argument("--simulations", type=int, default=16, help="Maximum neural search simulations per placement")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto", help="cuda, cpu, or auto: cuda when a GPU is available")
     parser.add_argument("--label", help="Visible opponent name")
     args = parser.parse_args()
+    if args.device == "auto" and (args.dense_run or args.relational):
+        import torch
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.dense_run:
         import torch
         torch.set_num_threads(2)

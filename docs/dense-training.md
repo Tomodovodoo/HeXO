@@ -1,10 +1,10 @@
-# Dense training
+# Training
 
-The current Bubble learner uses HexNet. Start a new run using the commands in [the README](../README.md#train). Run layouts and settings are defined in [dense_config.py](../python/dense_config.py).
+The learner (`python/dense_learn.py`) trains HexNet on the actors' game shards. Every setting is a field of the dataclasses in `python/dense_config.py`, saved in the run's `config.json`; a flag on the command line overrides it for that process only. Start a run with `python python/bubble.py train`, as in the README.
 
-## Short CPU run
+## A short CPU run
 
-Run from the checkout root after the native build, editable install and learning dependency install. This exercises collection, checkpoint export and resuming in a small new directory.
+This checks that collection, export and resume work, in a few minutes and without a GPU:
 
 ```sh
 python python/dense_config.py --run runs/bubble-short --device cpu --blocks 2 --channels 32 --pool-every 2 --batch 32 --window-min-rows 8 --warmup-steps 1 --export-every 1 --validation-rows 16 --validation-quota 16 --games-in-flight 4 --leaf-batch 8 --full-sims 4 --cheap-sims 4 --root-samples 4 --max-plies 16 --shard-games 4
@@ -13,157 +13,42 @@ python python/dense_selfplay.py --run runs/bubble-short --games 4
 python python/dense_learn.py --run runs/bubble-short --steps 1 --workers 1
 ```
 
-The short games can reach their placement cap. Their outcomes stay masked; search values supply the bootstrap target. This example checks that the pipeline runs, without establishing model strength. Solver queries and external opponents are disabled by default.
+The games hit their placement cap, so their outcomes stay masked and the search values supply the value target. It proves nothing about strength.
 
-## Dense learner value targets
+## Rows
 
-`dense_learn.py` derives the value target of every row from its episode
-(`dense_data.value_targets`). Capped games always use TD(`td_lambda`) over the
-searched root values. For finished games, `--value-target` chooses the target:
+An actor writes one row per placement. A full-search row (the `full_fraction` of placements, 128 simulations in the live run) carries the improved search policy as its policy target and a value target. A cheap-search row (12 simulations) carries a value target at weight `cheap_value_weight` (0.25) and no policy target; `--cheap-row-fraction f` keeps a hash-chosen share `f` of them, and `f = 0` is KataGo's choice of not training on them at all. Rows with an exact label, from a proof or a forced line, are always kept at value weight `proven_value_weight` (2) and their outcome loss is masked.
 
-- `outcome` (the default): the hard result, 1 for the side that won and 0 for
-  the side that lost.
-- `td`: TD(`outcome_lambda`, default 0.98). The recursion is the capped-game one,
-  started from the outcome at the last ply.
-- `calibrated`: P(side to move wins | v, h), where v is the searched root value
-  at the ply and h is the plies remaining. A null value carries the previous one
-  forward along the game. Before the first search value, the target is the base
-  rate.
+Actors also store the network's own value prediction for each root, before search. The proof pass uses it to find positions where the network was wrong although the solver knew better.
 
-The `calibrated` map is a ridge-regularised logistic regression that is shrunk
-toward the base rate. Its inputs are the product of degree-1 B-splines in
-log2(h) (knots 1, 2, 4, ..., 256) with [1, logit((1+v)/2)]. The learner fits it
-from the newest `calibration_games` (4000) finished training games in the
-replay window, at startup and again at every export, in about 2 s of CPU. Each
-export trains the render workers on its new map until the next one. Where
-search values carry no information, the map returns the base rate. Near the
-end of a game it returns about the outcome. With fewer than 200 finished games,
-`calibrated` falls back to `outcome`. Each checkpoint records its map as
-`metrics.calibration`: the coefficients, plus a table over v in -1..1 in steps
-of 0.25 and h in 0..160 in steps of 8.
+## Value targets
 
-With `--bootstrap-full-only`, all three chains (the capped TD chain, `td` and
-`calibrated`) use only full-search root values. `--outcome-weight w` adds a
-KataGo-style value-logit BCE against the hard outcome, with weight w. That head,
-`outcome_bce`, is always logged. The validation curves by plies remaining
-always score finished games against their hard outcome.
+`--value-target` picks how a finished game labels its rows:
 
-`--deblunder-weight w`, default 0, uses transient wins found by `dense_solve.py`
-to soften a losing owner's earlier value targets. The proof pass writes
-`deblunder` records automatically on newly solved shards. For that owner's
-rows before the window, after the previous proof window or from game start,
-the learner uses `w * 1 + (1 - w) * original_outcome` as the win probability
-for both value losses. This replaces the calibrated or TD target on those
-rows. Exact labels take precedence, and these soft rows remain unproven.
-The original outcome stays available for diagnostics. Validation reports
-`value_bce_deblundered` and `deblundered_rows`, also per source.
-Restart the proof pass with its existing flags and the learner with, for
-example, `--deblunder-weight 0.25`. Existing sidecars are not rewritten.
+- `outcome`: the hard result.
+- `td`: TD(`outcome_lambda`) over the searched root values, started from the outcome.
+- `calibrated`: P(side to move wins | search value, plies remaining). The map is a shrunk logistic regression on B-splines of log2(plies remaining) times the search value, refitted from the newest `calibration_games` (4000) finished games at every export. Far from the end it returns the base rate; near the end it returns the outcome. Below 200 finished games it falls back to `outcome`.
 
-### Cheap rows
+Capped games always use TD over root values. `--bootstrap-full-only` restricts every chain to full-search values. `--outcome-weight w` adds a separate value-logit loss against the hard outcome, logged as `outcome_bce` and always reported on validation by plies remaining.
 
-Most self-play rows come from cheap searches: they have no policy target and
-their value weight is `cheap_value_weight` (0.25). `--cheap-row-fraction f`
-(default 1) keeps only a share f of these ordinary cheap rows in training.
-Full-search rows and rows with an exact label (a proof, including forced-line
-rows) are always kept. Each row is kept or dropped by a hash of the run seed,
-the shard name and the row index, so the learner, its render workers and every
-restart agree. f = 0 matches KataGo, which does not train on cheap rows.
+`--deblunder-weight w` softens the earlier value targets of a player who later blundered a proven win, using the proof pass's `deblunder` records: those rows get `w` toward a win. Exact labels take precedence.
 
-Pacing counts kept rows only, so `samples_per_row` stays the number of
-presentations per kept row: at f = 0.5 a shard adds fewer rows to the pacing
-budget, and each kept row is seen as often as before. Changing f on a restart
-moves the pacing base to the current count, as a change of `samples_per_row`
-does. Held-out validation rows are all scored whatever f is.
-`learner-status.json` reports `retained_rows` (the kept training rows of the
-window) and `retained_fraction` (their share of the window's training rows).
-At f < 1 the learner reads every shard's rows once at startup to count them.
+## Policy targets
 
-## Dense learner future occupancy
+The policy target is the improved policy of the root search over the moves it considered. Three sources add to it:
 
-`--future-target legacy` is the default. It keeps the occupancy BCE at 6 and
-20 placements, including stones already on the board. `--future-target masked`
-uses a fresh three-class head at 20 placements: empty, own, or opponent from
-the current mover's view. Cross-entropy is averaged over currently empty cells
-inside each crop, then over rows with a known target. Finished games use their
-final board when they end before 20 placements; capped games need all 20.
-`--future-weight` keeps its default coefficient of 0.5.
+- `--proof-policy-weight w` mixes the certificate's winning stones into winning rows, `(search + w * proof) / (1 + w)`; with `--proof-policy-missing-only` it only fills rows that have no search policy, such as solver roots and forced-line rows.
+- `--regret-fraction f` draws a share `f` of each batch from the proof pass's regret buffer, positions where the network's value was furthest from a proven result.
+- `--future-target masked` adds a three-class occupancy head (empty, own, opponent) at 20 placements ahead, weight `--future-weight` (0.5). The default `legacy` keeps the older occupancy targets at 6 and 20 placements. Switching keeps the shared weights and optimizer state.
 
-Restart the learner with its existing arguments plus `--future-target masked`.
-The first mode switch preserves shared and legacy head weights, training
-counters, shared Adam moments and the EMA update count, and adds the new head.
-The new head starts without optimizer moments; its raw and EMA weights match.
-Later resumes restore the saved mode, head, and optimizer. To switch back,
-pass `--future-target legacy`. Actors and evaluators read either checkpoint
-format without extra flags.
+## Window and pacing
 
-The new loss is `future_masked_ce`; legacy remains `future_bce`. Each fixed
-validation source reports the active metric on held and training panels, plus
-their gap, under separate names such as `newest_future_masked_ce` and
-`newest_future_bce`. These are different objectives, not comparable loss values.
+The replay window follows KataGo: at least `window_min_rows` full-search rows, then it grows by `window_expand_per_row` times the extra rows, tapered by the exponent `window_taper`. Pacing keeps `samples_per_row` presentations per kept row; changing it, or the cheap-row fraction, resets the pacing base at the current row count. The learner and actors alternate in phases: actors play until `phase_rows` new rows exist, then pause while the learner trains through them, and the evaluator yields while either is busy. `learner-status.json` reports the window size, retained rows, pacing backlog and phase state.
 
-## Certified winning moves
+## Book and restart starts
 
-`--proof-policy-weight w` teaches moves from verified winning certificates,
-including solver roots and generated proof continuations that have no search
-policy. Its default is 0. With `--proof-policy-missing-only`, it supplies targets
-only for those empty rows; existing search policies keep their targets and loss
-weights. For example, `--proof-policy-weight 0.25 --proof-policy-missing-only`
-gives the added rows policy loss weight 0.25. This uses the existing heads and
-rendered positions, with no additional search or inference.
+`--book-fraction` starts that share of new games from the opening book's off-policy pool, with a random hex symmetry, and `--restart-fraction` from the proof pass's restart buffer. Preset stones produce no rows; search and training start after them. A tactical opening from `openings/tactical/` fixes the value target of the first position after its prefix, so a later blunder cannot contradict the opening's known result.
 
-The certificate identifies known winning placements rather than every winning
-move. A missing witness or a proven losing position supplies no new policy
-target. The optional mode's playing benefit still needs measurement.
+## Kernels
 
-Actors also save `network_values`, the frozen network's side-to-move predictions before search corrections.
-Root predictions are captured during inference independently of cache eviction. Completed games share an
-extra prediction batch per model for missing trained searched rows, including roots reused from older search
-subtrees or proved later by the offline pass. Preset prefixes, generated proof lines and unencodable
-positions retain null predictions. Search results and value targets keep their existing meanings.
-
-The proof pass scores attack restart entries from these predictions when available. A solver can set the
-search value to +1 while the network predicts a loss; the network error then remains eligible for regret
-sampling. Such entries record `value_source: network`, and restart observations use that same source.
-Defence entries and older episodes without network predictions retain search regret. The existing sampling
-cap and loss weights still apply. This repairs coverage of certified value errors; its learning benefit needs
-measurement.
-
-## Dense actor batches
-
-`--book-fraction 0.25 --restart-fraction 0.1` allocates 25% of newly started games to the live off-policy
-opening pool, 10% to the restart buffer, and the remaining 65% to ordinary starts. The book fraction defaults
-to 0. Classes in the eligible off-policy pool are sampled uniformly, with a random hex symmetry; ordinary
-book entries do not consume this allocation. These start shares also apply with historical opponents enabled.
-An empty eligible pool or unavailable restart source produces an ordinary start. The actor heartbeat reports
-the configured fractions and eligible pool size; shard events and manifests count completed book/restart games.
-
-Actors reload the read-only book snapshot at shard and learner-phase boundaries. Book games store origin
-`book` and `{suite, key, digest, ply, off_policy}` metadata. The preset stones have no training rows and null
-root values. Search and training begin after that prefix, using the normal full/cheap search schedule and
-solver settings. The manifest's `forced_plies` includes both book and restart prefixes.
-
-Imported `tactical` entries also participate in this allocation and remain available when their predicted value
-falls below the ordinary book cutoff. Their `book.tactical` metadata supplies a fixed value target only at the
-position immediately after the forced prefix. The P1-win case has a P2 target of 0. Its weight uses
-`proven_weight`, and that row's observed-outcome loss is disabled so a later blunder cannot contradict the
-opening label. Later rows use their normal targets. Manual labels never set native `proven` flags or end a game.
-Actual winners and raw network predictions are preserved for separate tactical conversion statistics.
-
-Both the learner and actors accept `--net-kernels fused` for optional Triton GPU kernels. The default is
-`reference`; checkpoints load in either mode. See [GPU kernels](gpu-kernels.md) for installation, the paired
-benchmarks, profiling commands, and the batch-256 training validation that remains blocked by the shared-card
-memory cap.
-
-`dense_selfplay.py` accepts `--games-in-flight` and `--leaf-batch` per worker, alongside `--games` per process. The
-actor heartbeat and metrics log report `mean_batch` and `full_batch_fraction`, the share of model submissions with
-exactly `leaf_batch` distinct positions. More games can supply more leaves to each call; increasing `leaf_batch`
-alone only raises the limit. These are engine submission counts; the evaluator splits each submission into model
-forwards by crop size and `MAX_CELLS`.
-
-Each game owns a native CPU tree, with no fixed per-game GPU allocation. On this Windows host, 128 trees at a
-20-ply position used about 30 KiB of private memory each before search and 3.39 MiB each after a 64-simulation
-search with tactics enabled, measured without a model or GPU. An additional inference row makes an 8-plane bf16
-GPU input of `8 * size * size * 2` bytes, or 36 KiB at a 48x48 crop. One 96-channel bf16 activation at that size
-is 432 KiB per row; the network also needs other activations and temporary buffers. Crop size changes the cost
-quadratically, so these tensor sizes are not a measured peak VRAM increase.
+`--net-kernels fused` on the learner, actors and evaluator selects the Triton kernels described in [gpu-kernels.md](gpu-kernels.md). Checkpoints load in either mode.
