@@ -386,6 +386,13 @@ def download(run, fetch=fetch):
     return target
 
 
+def positive(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError('must be at least 1')
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest='command', required=True)
@@ -395,7 +402,7 @@ def main():
                        help='the run directory; play defaults to runs/play, where released weights are installed')
     train = sub.choices['train']
     train.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
-    train.add_argument('--actors', type=int, default=4, help='self-play processes')
+    train.add_argument('--actors', type=positive, default=4, help='self-play processes')
     train.add_argument('--dashboard-port', type=int, default=8766)
     train.add_argument('--seal', action='store_true', help='rate champions against Seal (needs the Seal build)')
     train.add_argument('--net-kernels', choices=['reference', 'fused'], default='reference')
