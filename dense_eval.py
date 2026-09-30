@@ -1177,18 +1177,23 @@ class Evaluator:
                 log_event(self.run, 'evaluator', 'error', f'{a} vs {b} pair {record["pair"]}: game counted as capped at ply '
                           f'{record["plies"]}, a searched position spans more than the largest crop', candidate=a, opponent=b)
 
-    def session(self, want, planned, trial=None, auxiliary=None):
+    def session(self, want, planned, stop=None, auxiliary=None, budget=None):
         """Play the pool until want() asks for nothing and the games in flight have finished; returns {lane:
         games finished}. want() -> {(a, b, kind): games in flight wanted, even}, asked at the start and after every
         completed colour pair; a finished game's slot is refilled before the next engine step, and a lane want()
         drops (or shrinks) starts no new games while its running games finish and count. Games in flight never
         exceed pool_games; a lane's games (in flight or finished while their colour partner runs) never exceed
         the games it wants, nor per kind those wanted of that kind, so a draining lane's games count against its
-        replacement's and a half-finished pair's slot is not refilled past a budget. The Pacer is charged for
+        replacement's and a half-finished pair's slot is not refilled past a budget. In pipeline mode, budget()
+        may give {(a, b): games remaining}: those pairings use physical slots for their lane/kind shares, while
+        running games and finished halves together must fit the remaining budget. This keeps decision pools
+        full when one colour finishes sooner; at most pool_games finished halves await their partners, and
+        only complete pairs enter a verdict. The Pacer is charged for
         engine steps and for starting games (Seal plays its first turns then); no game starts while its credit
         is negative, and with nothing running the session then waits and asks want() again. Every completed
-        pair is persisted at once. For a checkpoint trial, a newer export or settle request stops new games after
-        the next finished game; games already in flight drain normally. When auxiliary is supplied, free slots
+        pair is persisted at once. stop(), when supplied, stops new games after the next finished game (a
+        newer export, settle request, or a checkpoint interrupting a variant); games in flight drain normally.
+        When auxiliary is supplied, free slots
         may launch independent idle lanes up to two poolfuls per session; admissions stop for higher-priority work,
         but every launched colour pair still drains and is persisted."""
         pool, waiting, added, failed = Pool(self.config.actor.leaf_batch, Schedule.of(self.settings)), {}, {}, {}
@@ -1246,13 +1251,16 @@ class Evaluator:
             shown.update(lanes)
             ready = self.pacer.ready()
             if lanes and ready:
+                remaining = budget() if self.settings.pipeline and budget is not None else {}
                 kinds = {kind: sum(n for lane, n in lanes.items() if lane[2] == kind) for _, _, kind in lanes}
                 halves = lambda match: sum(len(g) for held, groups in waiting.items() if match(held) for g in groups.values())
                 held = lambda lane: pool.running(lane)+halves(lambda h: h == lane)
-                kind_held = lambda kind: pool.running(kind=kind)+halves(lambda h: h[2] == kind)
+                occupied = lambda lane: pool.running(lane) if lane[:2] in remaining else held(lane)
+                kind_held = lambda kind: pool.running(kind=kind)+halves(lambda h: h[2] == kind and h[:2] not in remaining)
                 tick = self.pacer.clock()  # starting games plays Seal's first turns: playing time
                 for lane, share in lanes.items():
-                    while held(lane)+2 <= share and kind_held(lane[2])+2 <= kinds[lane[2]] \
+                    while occupied(lane)+2 <= share and kind_held(lane[2])+2 <= kinds[lane[2]] \
+                            and held(lane)+2 <= remaining.get(lane[:2], share) \
                             and pool.running()+2 <= self.settings.pool_games \
                             and (lane in primary or extra_started+2 <= 2*self.settings.pool_games):
                         self.start(pool, lane)
@@ -1301,7 +1309,7 @@ class Evaluator:
             self.pacer.played(tick, self.pacer.clock())
             paired = False
             for lane, record in results:
-                if trial and not stopping and (self.newer(trial[0]) or self.requested(trial[0]) and self.games(*trial)):
+                if stop is not None and not stopping and stop():
                     stopping = True
                     primary = {}
                 moves = record['plies']-len(record['opening'])
@@ -1600,7 +1608,9 @@ class Evaluator:
             self.publish(decision=dict(public(verdict), candidate=cid, opponent=champion, next=[list(l[:2]) for l in lanes]))
             return lanes
         while True:  # the games in flight can undo a verdict that stopped the session: then play on
-            added = self.session(want, s.sprt_max_games, (cid, champion))
+            added = self.session(want, s.sprt_max_games,
+                                 stop=lambda: self.newer(cid) or self.requested(cid) and self.games(cid, champion),
+                                 budget=lambda: {(cid, champion): s.sprt_max_games-len(self.direct(cid, champion))})
             for (a, b, _), games in added.items():
                 if a != cid and games:
                     self.record(a, b, json.loads(report_path(self.run, a, b).read_text()))
@@ -1708,7 +1718,8 @@ class Evaluator:
             self.publish(decision=dict(public(verdict), candidate=cid, opponent=base, next=[list(l[:2]) for l in lanes]))
             return lanes
         while True:
-            added = self.session(want, s.sprt_max_games)
+            added = self.session(want, s.sprt_max_games, stop=self.backlog if s.pipeline else None,
+                                 budget=lambda: {(cid, base): s.sprt_max_games-len(self.direct(cid, base))})
             if 'bound_at' not in entry and report_path(self.run, cid, base).exists():
                 entry['bound_at'] = time.time()
                 write_league(self.run, self.league, self.config, self.settings.fill_top)
@@ -1799,7 +1810,9 @@ class Evaluator:
                 return {}
             self.publish(decision=dict(shown(), next=[[cid, champion]]))
             return {(cid, champion, 'champion'): even(min(s.pool_games, s.sprt_max_games-len(games)))}
-        self.session(want, s.sprt_max_games, (cid, champion))
+        self.session(want, s.sprt_max_games,
+                     stop=lambda: self.newer(cid) or self.requested(cid) and self.games(cid, champion),
+                     budget=lambda: {(cid, champion): s.sprt_max_games-len(self.games(cid, champion))})
         path = report_path(self.run, cid, champion)
         if not self.games(cid, champion):  # no game under the active protocol
             return {}, None
@@ -2143,7 +2156,8 @@ class Evaluator:
             if new_trial or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
-        added = self.session(want, target, auxiliary=self.pipeline_task if s.pipeline and kind != 'sprt' else None)
+        added = self.session(want, target, auxiliary=self.pipeline_task if s.pipeline and kind != 'sprt' else None,
+                             budget=(lambda: {(a, opponent): target-len(self.games(a, opponent))}) if kind == 'sprt' else None)
         path = report_path(self.run, a, opponent)
         if path.exists():
             report = json.loads(path.read_text())
