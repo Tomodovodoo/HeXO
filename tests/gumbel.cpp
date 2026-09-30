@@ -96,6 +96,14 @@ int main(){
   auto one=make({{0,0},{1,0},{2,0},{0,1},{0,2},{3,0},{4,0}}),two=make({{0,0},{1,0},{3,0},{0,1},{0,2},{2,0},{4,0}});
   for(int i:{0,1}){one->edges[i].exact_winner=0;one->edges[i].distance=2;t.settle(*one);t.learn(*one);}
   assert(two->exact_winner==0 && two->edges[0].eligible && two->edges[1].eligible && !two->edges[2].eligible);}
+ // A two-stone certificate whose witness context already has a node gives that node the second stone.
+ {gumbel::Tree t(0);t.graph=true;t.root->position=gumbel::keys(t.board).first;
+  for(auto c:std::vector<Cell>{{0,0},{1,0},{2,0}})t.advance(c);
+  t.board.make({3,3});auto existing=t.child_here();t.board.undo();
+  t.begin(4,2);int id=t.request();auto h=t.requests.at(id).history;std::vector<int64_t> hist;for(auto c:h){hist.push_back(c.q);hist.push_back(c.r);}
+  int64_t moves[]={3,3,3,4};t.prove(id,hist.data(),int(h.size()),0,2,moves,2,2);
+  auto edge=std::find_if(t.root->edges.begin(),t.root->edges.end(),[](auto& e){return e.action==Cell{3,3};});
+  assert(edge->child==existing && existing->exact_winner==0 && existing->distance==5 && existing->bound);}
  // MCGS backup: a node's value is recomputed from its edges' visits and its children's current values; a playout
  // reusing a transposed child's value leaves that child unchanged.
  {gumbel::Tree t(0);t.graph=true;gumbel::Node r;r.player=0;r.expanded=true;r.value=.2;

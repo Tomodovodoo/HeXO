@@ -334,7 +334,18 @@ struct Tree {
   auto legal=position.legal_moves();std::vector<int64_t> actions;for(auto c:legal){actions.push_back(c.q);actions.push_back(c.r);}
   std::vector<double> zeros(legal.size());fulfill(id,actions.data(),zeros.data(),zeros.data(),int(legal.size()),player,witness,distance);
   if(move_count==2){
-   position.make(witness);auto next_legal=position.legal_moves();
+   position.make(witness);
+   if(graph){
+    // An existing node of this turn context takes the second stone as its witness instead of being replaced.
+    auto [p,c]=keys(position);
+    if(auto existing=nodes[c].lock()){
+     existing->parents.push_back(node->weak_from_this());
+     if(apply(Outcome{player,distance-1,int(position.cells.size()),true,true,Cell{moves[2],moves[3]}},*existing)){refresh(*existing);learn(*existing);}
+     for(auto& e:node->edges)if(e.action==witness){e.child=existing;break;}
+     return;
+    }
+   }
+   auto next_legal=position.legal_moves();
    auto child=std::make_shared<Node>();child->player=player;child->remaining=1;child->expanded=true;child->exact_winner=player;child->distance=distance-1;child->bound=true;
    for(auto c:next_legal){Edge e;e.action=c;e.prior=1./next_legal.size();e.eligible=c==Cell{moves[2],moves[3]};if(e.eligible){e.exact_winner=player;e.distance=distance-1;e.bound=true;}child->edges.push_back(std::move(e));}
    if(graph){auto [p,c]=keys(position);child->position=p;child->stones=int(position.cells.size());child->n=1;child->q=1;child->parents.push_back(node->weak_from_this());nodes[c]=child;positions[p].push_back(child);learn(*child);}
