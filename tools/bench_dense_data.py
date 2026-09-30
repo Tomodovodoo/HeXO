@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'python'))
 import dense_config
 import dense_data
 import dense_learn

@@ -12,9 +12,9 @@ import time
 
 import torch
 from hexo import Game, ROOT, library
-from relational_encoder import pack
-from relational_native import encode, _load
-from relational_model import ModelConfig, RelationalNet
+from legacy.relational_encoder import pack
+from legacy.relational_native import encode, _load
+from legacy.relational_model import ModelConfig, RelationalNet
 
 
 def history_fixture(count):
@@ -73,7 +73,7 @@ def run(output):
                   precision='BF16 projections, FP32 softmax/normalization/reductions/residuals',
                   engine_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
                   graph_engine_sha256=hashlib.sha256(Path(_load()._name).read_bytes()).hexdigest(),
-                  source_hashes={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest()
+                  source_hashes={name:hashlib.sha256((ROOT/('python/'+('legacy/'+name if name != 'hexo.py' else name) if name.endswith('.py') else name)).read_bytes()).hexdigest()
                                  for name in ('relational_encoder.py','relational_native.py','relational_model.py','src/relational_graph.cpp')})
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(report,indent=2)+'\n')

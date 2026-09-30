@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from hexo import Game
-from relational_player import RelationalPlayer
+from legacy.relational_player import RelationalPlayer
 from tactical_proof import MAX_NODES
 
 
@@ -118,7 +118,7 @@ class DirectPlayer(unittest.TestCase):
         from pathlib import Path
         from tempfile import TemporaryDirectory
         from types import SimpleNamespace
-        from relational_evaluate import freeze
+        from legacy.relational_evaluate import freeze
         with TemporaryDirectory() as directory:
             output = Path(directory)/'evaluation'
             args = SimpleNamespace(output=output, games=2, seal_ms=100, neural_ms=1000,
@@ -160,7 +160,7 @@ class DirectPlayer(unittest.TestCase):
         actor.tree.search.side_effect = search
         game = Game([(0,0)])
         try:
-            with patch('relational_player.time.perf_counter', side_effect=lambda:clock[0]):
+            with patch('legacy.relational_player.time.perf_counter', side_effect=lambda:clock[0]):
                 result = actor.turn(game)
             self.assertEqual(result['moves'], [[8,0],[16,0]])
             self.assertEqual(result['elapsed_ms'], 1000)
@@ -175,7 +175,7 @@ class DirectPlayer(unittest.TestCase):
         import shutil
         from tempfile import TemporaryDirectory
         from types import SimpleNamespace
-        from relational_evaluate import freeze
+        from legacy.relational_evaluate import freeze
         with TemporaryDirectory() as directory:
             root = Path(directory)
             checkpoint, seal = root/'model.pt', root/'seal.dll'
@@ -193,8 +193,8 @@ class DirectPlayer(unittest.TestCase):
             def git_snapshot(command, **kwargs):
                 self.assertFalse(output.exists())
                 return 'source-revision' if command[1] == 'rev-parse' else ''
-            with patch('relational_evaluate.shutil.copyfile', side_effect=copy), patch(
-                    'relational_evaluate.subprocess.check_output', side_effect=git_snapshot):
+            with patch('legacy.relational_evaluate.shutil.copyfile', side_effect=copy), patch(
+                    'legacy.relational_evaluate.subprocess.check_output', side_effect=git_snapshot):
                 freeze(args)
             provenance = json.loads((output/'provenance.json').read_text())
             self.assertFalse(provenance['dirty'])

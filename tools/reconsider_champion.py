@@ -51,8 +51,9 @@ def reconsider_locked(run, source, candidate, expected_champion, apply):
     config=read_json(config_path);league=read_json(league_path)
     if config.get('run')!=str(run):raise ValueError('Run path disagrees with config identity')
     sys.path.insert(0,str(source))
-    from search_train import pessimistic_promotion, source_identity, runtime_identity, verify_artifact
-    from train import paired_metrics, write_json
+    sys.path.insert(0,str(source/'python'))
+    from legacy.search_train import pessimistic_promotion, source_identity, runtime_identity, verify_artifact
+    from legacy.train import paired_metrics, write_json
     if config.get('sources')!=source_identity() or config.get('runtime')!=runtime_identity():
         raise ValueError('Engine source or runtime disagrees with active run identity')
     history=bound_history(run,config)

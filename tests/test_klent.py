@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from hexo import Game
-from klent import (Model, act, collect, improved_policy, load_corpus, loss, main,
+from legacy.klent import (Model, act, collect, improved_policy, load_corpus, loss, main,
                    observe, pack, rebuild, save_corpus, signed_returns, fit)
 from dashboard import klent_run
 
@@ -60,8 +60,8 @@ class KlentTest(unittest.TestCase):
             if optimized:
                 result = fit(model, actor, value, episodes, rows, args, 1, progress=updates.append)
             else:
-                with patch("klent.rebuild", side_effect=lambda r,e,**kw: rebuild(r,e)), \
-                     patch("klent.pack", side_effect=lambda o,d,**kw: pack(o,d)), \
+                with patch("legacy.klent.rebuild", side_effect=lambda r,e,**kw: rebuild(r,e)), \
+                     patch("legacy.klent.pack", side_effect=lambda o,d,**kw: pack(o,d)), \
                      patch.object(model.nnue, "position_features", side_effect=lambda b: model.nnue.features(b)[0]):
                     result = fit(model, actor, value, episodes, rows, args, 1, progress=updates.append)
             models.append(model.state_dict())
@@ -239,7 +239,7 @@ class KlentTest(unittest.TestCase):
             mu[obs["legal"].index(winning[cursor[0]])] = 1
             cursor[0] += 1
             return [(mu, .2, 0., 0.)]
-        with patch("klent.act", side_effect=scripted):
+        with patch("legacy.klent.act", side_effect=scripted):
             episodes, rows = collect(Model(), self.args(games=1, envs=1, max_plies=20, lambda_return=1), 1)
         self.assertEqual(episodes[0]["winner"], 0)
         self.assertEqual(len(rows), 12)
@@ -269,12 +269,12 @@ class KlentTest(unittest.TestCase):
     def test_finished_corpus_reused_after_interrupted_fit(self):
         with tempfile.TemporaryDirectory() as folder:
             args = self.args(run=str(Path(folder)/"run"))
-            with patch("klent.fit", side_effect=RuntimeError("interrupted fit")):
+            with patch("legacy.klent.fit", side_effect=RuntimeError("interrupted fit")):
                 with self.assertRaisesRegex(RuntimeError, "interrupted fit"):
                     main(args)
             corpus = Path(args.run)/"corpus/0001/policies.npz"
             before = corpus.read_bytes()
-            with patch("klent.collect", side_effect=AssertionError("must reuse corpus")):
+            with patch("legacy.klent.collect", side_effect=AssertionError("must reuse corpus")):
                 main(args)
             self.assertEqual(corpus.read_bytes(), before)
             self.assertTrue((Path(args.run)/"checkpoints/0001/klent.pt").exists())
@@ -295,7 +295,7 @@ class KlentTest(unittest.TestCase):
         self.assertGreater(abs(gpu[1]), .01)
 
     def test_q_initialization_requires_matching_representation(self):
-        from klent import SCHEMA
+        from legacy.klent import SCHEMA
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             model = Model()

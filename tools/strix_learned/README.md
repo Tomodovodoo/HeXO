@@ -55,7 +55,7 @@ the adapter does not use PyTorch, a GPU, or a remote service.
 ## Run and verify
 
 ```sh
-python arena.py --opponent strix --strix-model EXTERNAL_MODEL.safetensors --strix-sims 2 --strix-actions 2 --strix-timeout-ms 5000 --games 2 --ms 100 --max-stones 80 --seed 20261002 --output artifacts/strix-learned.json
+python python/legacy/arena.py --opponent strix --strix-model EXTERNAL_MODEL.safetensors --strix-sims 2 --strix-actions 2 --strix-timeout-ms 5000 --games 2 --ms 100 --max-stones 80 --seed 20261002 --output artifacts/strix-learned.json
 ```
 
 `--strix-sims` controls simulations per placement; the second placement is

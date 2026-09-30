@@ -1243,7 +1243,7 @@ class DenseConfigTests(unittest.TestCase):
     def test_command_line_creates_a_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)/'run'
-            done = subprocess.run([sys.executable, str(ROOT/'dense_config.py'), '--run', str(run), '--device', 'cpu',
+            done = subprocess.run([sys.executable, str(ROOT/'python/dense_config.py'), '--run', str(run), '--device', 'cpu',
                                    '--blocks', '2', '--lr', '0.001', '--no-aux-heads', '--eval-games', '8'],
                                   capture_output=True, text=True, cwd=ROOT, timeout=60)
             self.assertEqual(done.returncode, 0, done.stderr)
@@ -1794,7 +1794,7 @@ class DenseDataTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp)/'main.py').write_text(script)
             out = subprocess.run([sys.executable, str(Path(tmp)/'main.py')], cwd=ROOT, capture_output=True, text=True, check=True,
-                                 env={**os.environ, 'PYTHONPATH': str(ROOT)}).stdout
+                                 env={**os.environ, 'PYTHONPATH': str(ROOT/'python')}).stdout
         self.assertEqual(out.split(), ['4', '3'])
 
     def test_examples_and_collate(self):
@@ -3842,12 +3842,12 @@ class YieldTests(unittest.TestCase):
     def test_learner_heartbeat_reports_its_effective_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)/'run'
-            made = subprocess.run([sys.executable, str(ROOT/'dense_config.py'), '--run', str(run), '--device', 'cpu',
+            made = subprocess.run([sys.executable, str(ROOT/'python/dense_config.py'), '--run', str(run), '--device', 'cpu',
                                    '--blocks', '1', '--channels', '16', '--validation-fraction', '0'],
                                   capture_output=True, text=True, cwd=ROOT, timeout=60)
             self.assertEqual(made.returncode, 0, made.stderr)
             write_games(run/'shards'/'000001', [(winning_game(), 0, None)]*8)
-            done = subprocess.run([sys.executable, str(ROOT/'dense_learn.py'), '--run', str(run), '--steps', '1',
+            done = subprocess.run([sys.executable, str(ROOT/'python/dense_learn.py'), '--run', str(run), '--steps', '1',
                                    '--workers', '1', '--batch', '8', '--window-min-rows', '1', '--samples-per-row', '7.5',
                                    '--validation-fraction', '0', '--log-every', '1', '--vram-reserved-mb', '1500'],
                                   capture_output=True, text=True, cwd=ROOT, timeout=300)
@@ -6728,6 +6728,7 @@ class DenseBrowser(unittest.TestCase):
             path = self.run/'checkpoints/main'/checkpoint
             path.mkdir(parents=True)
             hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
+        (self.run/'champion.json').write_text(json.dumps(dict(checkpoint='main/065000')))
         self.player = DensePlayer(self.run, 'cpu')
 
     def tearDown(self):
@@ -6762,9 +6763,18 @@ class DenseBrowser(unittest.TestCase):
         (self.run/'checkpoints/main/065000/ema.pt').unlink()
         player = DensePlayer(self.run, 'cpu')
         try:
-            self.assertEqual(player.checkpoint, 'main/075000')
+            self.assertEqual(player.checkpoint, 'main/085000')
         finally:
             player.close()
+
+    def test_picker_discovers_exports_from_a_new_run(self):
+        for path in (self.run/'checkpoints').glob('*/*/ema.pt'):
+            path.unlink()
+        path = self.run/'checkpoints/main/000000'
+        path.mkdir(parents=True)
+        hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
+        (self.run/'champion.json').write_text(json.dumps(dict(checkpoint='main/000000')))
+        self.assertEqual(self.player.models(), [dict(id='main/000000', label='main/000000 · champion, newest')])
 
     def test_verified_line_replays_to_a_win_without_playing_the_game(self):
         history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (2, 5), (3, 5), (3, 0),

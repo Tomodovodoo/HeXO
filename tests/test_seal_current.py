@@ -11,7 +11,7 @@ from tools.seal_current import REVISION, WEIGHTS_SHA256, sha, build
 
 class SealCurrentContract(unittest.TestCase):
     def test_frozen_opponent_copies_dependencies_and_rejects_changed_inputs(self):
-        from relational_opponents import freeze_opponent, load_opponent
+        from legacy.relational_opponents import freeze_opponent, load_opponent
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root/'tools').mkdir()
@@ -28,7 +28,7 @@ class SealCurrentContract(unittest.TestCase):
             runtime.write_bytes(b'host system runtime')
             dependencies = ({'runtime.dll': ('runtime.dll', b'private dependency')},
                             {str(runtime): sha(runtime)}, {'seal.dll': ['runtime.dll']})
-            with patch('relational_opponents._dependencies', return_value=dependencies):
+            with patch('legacy.relational_opponents._dependencies', return_value=dependencies):
                 metadata = freeze_opponent('seal-current', root/'frozen',
                     dict(binary=binary, source_root=root))
             self.assertEqual((root/'frozen/build/runtime.dll').read_bytes(), b'private dependency')
@@ -39,7 +39,7 @@ class SealCurrentContract(unittest.TestCase):
                     path = root/'frozen'/name
                     content = path.read_bytes()
                     path.write_bytes(content+b'changed')
-                    with patch('relational_opponents._module') as launch:
+                    with patch('legacy.relational_opponents._module') as launch:
                         with self.assertRaisesRegex(ValueError, 'Frozen opponent input changed'):
                             load_opponent(metadata, root/'frozen')
                         launch.assert_not_called()

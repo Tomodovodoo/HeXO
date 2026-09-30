@@ -10,9 +10,9 @@ from unittest.mock import patch
 import torch
 
 from hexo import Game
-from nnue_model import NNUE
-from train import _run_training, initial_artifacts, initialize_nnue
-import train
+from legacy.nnue_model import NNUE
+from legacy.train import _run_training, initial_artifacts, initialize_nnue
+from legacy import train
 
 
 class WarmStartTest(unittest.TestCase):

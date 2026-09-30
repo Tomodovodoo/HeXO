@@ -12,8 +12,8 @@ from time import perf_counter
 import numpy as np
 import torch
 from hexo import ROOT, library
-from klent import Model, chunks, pack, rebuild
-from nnue_model import SCORE_SCALE
+from legacy.klent import Model, chunks, pack, rebuild
+from legacy.nnue_model import SCORE_SCALE
 
 
 def run(corpus, checkpoint, output, positions=128, trials=3):
@@ -70,7 +70,7 @@ def run(corpus, checkpoint, output, positions=128, trials=3):
     report = dict(device='cpu', threads=2, seed=seed, indices=list(map(int, indices)), rows=len(selected),
                   batch=args.batch, cells=args.cells, centers=args.centers, trials=trials,
                   source_revision=subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT, text=True).strip(),
-                  source_hashes={name: hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in ('klent.py','nnue_model.py','hexo.py')},
+                  source_hashes={name: hashlib.sha256((ROOT/('python/'+('legacy/'+name if name != 'hexo.py' else name) if name.endswith('.py') else name)).read_bytes()).hexdigest() for name in ('klent.py','nnue_model.py','hexo.py')},
                   engine_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
                   corpus_hashes={name:hashlib.sha256((corpus/name).read_bytes()).hexdigest() for name in ('rows.json','episodes.json','policies.npz')},
                   model_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),

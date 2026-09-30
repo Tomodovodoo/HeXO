@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from hexo import Game
-from strix_root import StrixRoot
+from legacy.strix_root import StrixRoot
 from tests.benchmark import pair_admission
 
 MOVES = [(0,0),(0,3),(1,3),(1,0),(2,0),(3,3),(4,3),(3,0),(4,0),(5,3),(6,3)]

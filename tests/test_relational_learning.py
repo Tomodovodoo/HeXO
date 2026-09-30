@@ -9,13 +9,13 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from human_corpus import digest as history_digest, owner
-from klent import digest
-from relational_data import human_examples
-from relational_diagnostics import evaluate as diagnose
-from relational_model import ModelConfig, RelationalNet
-from relational_train import collect, fit, load_model, main, rebuild, save_model, graph
-from relational_warmstart import fit as warmstart
+from legacy.human_corpus import digest as history_digest, owner
+from legacy.klent import digest
+from legacy.relational_data import human_examples
+from legacy.relational_diagnostics import evaluate as diagnose
+from legacy.relational_model import ModelConfig, RelationalNet
+from legacy.relational_train import collect, fit, load_model, main, rebuild, save_model, graph
+from legacy.relational_warmstart import fit as warmstart
 from tests.test_human_corpus import record
 
 
@@ -49,7 +49,7 @@ def fixture(root):
 
 class RelationalLearningTests(unittest.TestCase):
     def test_stratified_rejects_invalid_clipping_and_unsupported_previous_kind(self):
-        from relational_stratified import fit as stratified
+        from legacy.relational_stratified import fit as stratified
         for clip in (0,-1,float('inf'),float('nan')):
             with self.assertRaisesRegex(ValueError,'Positive fitting'):
                 stratified(self.args(grad_clip=clip))
@@ -57,13 +57,13 @@ class RelationalLearningTests(unittest.TestCase):
             root=Path(folder);previous=root/'previous';previous.mkdir()
             (previous/'manifest.json').write_text(json.dumps({'identity':{'kind':'relational-human-stratified-v1'}}))
             args=self.args(output=str(root/'next'),previous_run=str(previous))
-            with patch('relational_stratified.source_identity',return_value={}),patch('relational_stratified.verify'):
+            with patch('legacy.relational_stratified.source_identity',return_value={}),patch('legacy.relational_stratified.verify'):
                 with self.assertRaisesRegex(ValueError,'initial human warmstart'):
                     stratified(args)
 
     def test_stratified_selection_excludes_replay_and_enforces_both_quotas(self):
         from collections import Counter
-        from relational_stratified import select
+        from legacy.relational_stratified import select
         histories={key:[None]*20 for key in ('a','b','c')}
         rows=[dict(game=key,ply=ply) for key in histories for ply in range(20)]
         previous=rows[:3]+rows[17:20]
@@ -146,16 +146,16 @@ class RelationalLearningTests(unittest.TestCase):
             def changed_file(*unused):
                 fixtures.write_text('{}')
                 return {'source':'same'}
-            with patch('relational_diagnostics.source_identity',side_effect=changed_file):
+            with patch('legacy.relational_diagnostics.source_identity',side_effect=changed_file):
                 result=diagnose(checkpoint,fixtures,args)
             self.assertEqual(result['fixtures_sha256'],expected)
             fixtures.write_text(json.dumps({'positions':[]}))
-            with patch('relational_diagnostics.source_identity',side_effect=[{'source':'before'},{'source':'after'}]):
+            with patch('legacy.relational_diagnostics.source_identity',side_effect=[{'source':'before'},{'source':'after'}]):
                 with self.assertRaisesRegex(ValueError,'changed during evaluation'):
                     diagnose(checkpoint,fixtures,args)
 
     def test_terminal_teacher_uses_actual_reply_and_rejects_wrong_outcome(self):
-        from relational_teacher import examples, verify_terminal
+        from legacy.relational_teacher import examples, verify_terminal
         for limit in (0,-1):
             with self.assertRaisesRegex(ValueError,'Positive family'):
                 examples(SimpleNamespace(train_families=32,validation_families=8,negative_actions=limit))
@@ -251,7 +251,7 @@ class RelationalLearningTests(unittest.TestCase):
             self.assertFalse((root/'run/training.lock').exists())
 
     def test_terminal_reward_and_actual_control_change(self):
-        from relational_encoder import pack
+        from legacy.relational_encoder import pack
         model=RelationalNet(config())
         moves=record()['moves']
         ply=[0]
@@ -263,7 +263,7 @@ class RelationalLearningTests(unittest.TestCase):
             ply[0]+=1
             return batch,logits,torch.full_like(logits,.25)
         args=self.args(games=1,envs=1,max_plies=20)
-        with patch('relational_train.outputs',side_effect=scripted):
+        with patch('legacy.relational_train.outputs',side_effect=scripted):
             episodes,rows=collect(model,args,1)
         self.assertEqual(episodes[0]['winner'],0)
         self.assertEqual(len(rows),12)

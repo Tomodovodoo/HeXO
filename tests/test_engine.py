@@ -6,7 +6,7 @@ from tests.reference import AXES, Reference, has_cover, interleave
 
 try:
     import torch
-    from gpu_games import BatchedHexo
+    from legacy.gpu_games import BatchedHexo
 except ImportError:
     torch = None
 
@@ -18,7 +18,7 @@ class NativeRules(unittest.TestCase):
         return game
 
     def test_tt_injection_preserves_board_and_returns_complete_legal_turn(self):
-        from curriculum import opening_for
+        from legacy.curriculum import opening_for
         for seed in range(12):
             game = self.make_game(opening_for(20261001+seed, evaluation=True))
             before = (game.key, game.state(), game.evaluation, game.features())
@@ -221,7 +221,7 @@ class NativeRules(unittest.TestCase):
                 self.assertFalse(reference.completions(0))
 
 
-@unittest.skipIf(torch is None, "PyTorch is optional; install requirements-learning.txt for GPU rules checks")
+@unittest.skipIf(torch is None, "PyTorch is optional; install requirements/learning.txt for GPU rules checks")
 class BatchedRules(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

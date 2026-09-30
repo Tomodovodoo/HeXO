@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-from human_corpus import digest, examples, prepare, snapshot_key, validate
-from corpus_warmstart import verified_shards
+from legacy.human_corpus import digest, examples, prepare, snapshot_key, validate
+from legacy.corpus_warmstart import verified_shards
 from hexo import Game
 
 
@@ -64,7 +64,7 @@ class HumanCorpusTests(unittest.TestCase):
             (directory/"hexo_human_corpus.jsonl").write_text("\n".join(json.dumps(r) for r in [a, a, b]))
             excluded = directory/"benchmark.json"
             excluded.write_text(json.dumps({"games": [{"moves": a["moves"]}]}))
-            with patch("human_corpus.provenance", return_value={"metadata": {"n_games": 3}}):
+            with patch("legacy.human_corpus.provenance", return_value={"metadata": {"n_games": 3}}):
                 rows, report = prepare(directory, 7, [excluded])
             self.assertEqual(len(rows), 2)
             self.assertEqual(len(report["duplicates"]), 1)

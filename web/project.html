@@ -1,4 +1,4 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HeXO | Run comparison</title>
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Bubble | Run comparison</title>
 <style>
 :root{--page:#0d0d0d;--surface:#1a1a19;--raised:#232321;--ink:#fff;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--ring:rgba(255,255,255,.1);--accent:#3987e5;font-family:system-ui,sans-serif;color:var(--ink2);background:var(--page);color-scheme:dark}
 *{box-sizing:border-box}body{margin:0;background:var(--page)}header{border-bottom:1px solid var(--ring);padding:18px 32px;display:flex;gap:24px;align-items:baseline;flex-wrap:wrap}h1{font-size:22px;letter-spacing:-.6px;margin:0;color:var(--ink)}header span{font-size:14px;color:var(--muted)}header .smooth{font-size:13px;display:flex;gap:8px;align-items:center}header .smooth input{width:140px;accent-color:var(--accent)}header .smooth #from-step{width:80px;font:inherit}header output{font-variant-numeric:tabular-nums;min-width:2.5em}#status{margin-left:auto;font-size:13px}#status.error{color:#e66767}
@@ -13,7 +13,7 @@ canvas{display:block;width:100%;height:260px;touch-action:pan-y}.tip{position:ab
 .panel.full{position:fixed;inset:12px;z-index:10;display:flex;flex-direction:column;box-shadow:0 0 0 100vmax rgba(0,0,0,.85)}.panel.full canvas{flex:1;height:auto;min-height:0}.panel.full .legend{max-height:none}.panel.full .panel-head h2 button{cursor:zoom-out}
 @media(max-width:760px){main{padding:16px}header{padding:14px 16px}.grid{grid-template-columns:1fr}canvas{height:220px}}
 </style>
-<header><h1>HeXO</h1><span>Dense run comparison</span><label class="smooth">Smoothing <input id="smooth" type="range" min="0" max="0.99" step="0.01"> <output id="smooth-value"></output></label><label class="smooth">from step <input id="from-step" type="number" min="0" step="500"></label><div id="status" role="status">Connecting...</div></header>
+<header><h1>Bubble</h1><span>Dense run comparison</span><label class="smooth">Smoothing <input id="smooth" type="range" min="0" max="0.99" step="0.01"> <output id="smooth-value"></output></label><label class="smooth">from step <input id="from-step" type="number" min="0" step="500"></label><div id="status" role="status">Connecting...</div></header>
 <main>
 <section class="runs"><div class="bar"><h2>Runs</h2><small id="showing"></small><button id="first">First 10</button><button id="none">None</button></div>
 <div class="table-scroll"><table><thead><tr><th></th><th></th><th>Run</th><th>Variant</th><th>Step</th><th>Elo (95%)</th><th>Champion</th><th>Learner</th><th>Actors</th><th>Detail</th></tr></thead><tbody id="rows"></tbody></table></div></section>

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bubble-hexo"
+version = "0.1.0"
+description = "Bubble, a self-play learning bot for HeXO"
+requires-python = ">=3.10"
+dynamic = ["optional-dependencies"]
+
+[tool.setuptools]
+package-dir = {"" = "python", "tools" = "tools", "tests" = "tests"}
+packages = ["legacy", "tools", "tests"]
+py-modules = [
+  "bot_api",
+  "dashboard",
+  "dense_bootstrap",
+  "dense_check",
+  "dense_config",
+  "dense_data",
+  "dense_eval",
+  "dense_learn",
+  "dense_openings",
+  "dense_posterior",
+  "dense_selfplay",
+  "dense_solve",
+  "dense_solver",
+  "forcing_material",
+  "hexcrop",
+  "hexnet",
+  "hexnet_graphs",
+  "hexnet_kernels",
+  "hexo",
+  "neural_search",
+  "notation",
+  "play",
+  "proof",
+  "tactical_proof",
+]
+
+[tool.setuptools.dynamic.optional-dependencies]
+learning = {file = ["requirements/learning.txt"]}

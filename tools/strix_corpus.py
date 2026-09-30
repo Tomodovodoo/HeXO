@@ -7,7 +7,8 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from strix_reference import REVISION, StrixReference
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'python'))
+from legacy.strix_reference import REVISION, StrixReference
 
 
 def main():

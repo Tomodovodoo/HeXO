@@ -8,8 +8,8 @@ import numpy as np
 import torch
 
 from hexo import Game
-from nnue_model import NNUE, collate, objective
-from train import nnue_example, pack_nnue, play_game
+from legacy.nnue_model import NNUE, collate, objective
+from legacy.train import nnue_example, pack_nnue, play_game
 
 
 class NNUETest(unittest.TestCase):
