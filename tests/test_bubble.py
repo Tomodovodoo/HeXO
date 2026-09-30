@@ -12,16 +12,17 @@ class FakeProcesses:
     """Records spawned commands and lets tests decide which pids are alive."""
 
     def __init__(self):
-        self.spawned, self.killed, self.live, self.next_pid = [], [], set(), 100
+        self.spawned, self.killed, self.live, self.markers, self.next_pid = [], [], set(), {}, 100
 
     def spawn(self, command, log):
         self.spawned.append((command, log))
         self.next_pid += 1
         self.live.add(self.next_pid)
+        self.markers[self.next_pid] = Path(next(part for part in command if part.endswith('.py'))).name
         return self.next_pid
 
-    def alive(self, pid):
-        return pid in self.live
+    def alive(self, pid, marker):
+        return pid in self.live and self.markers.get(pid) == marker
 
     def kill(self, pid):
         self.killed.append(pid)
@@ -64,10 +65,26 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual([Path(c[1]).name for c in calls], ['dense_config.py', 'dense_learn.py'])
         self.assertEqual(calls[0][calls[0].index('--device') + 1], 'cpu')
         (self.run / 'config.json').write_text('{}')
-        (self.run / 'checkpoints' / 'main').mkdir(parents=True)
+        export = self.run / 'checkpoints' / 'main' / '000000'
+        export.mkdir(parents=True)
+        calls.clear()
+        self.launcher.prepare('cpu', calls.append)
+        self.assertEqual([Path(c[1]).name for c in calls], ['dense_learn.py'])
+        (export / 'ema.pt').write_bytes(b'')
+        (export / 'manifest.json').write_text('{}')
         calls.clear()
         self.launcher.prepare('cpu', calls.append)
         self.assertEqual(calls, [])
+
+    def test_run_path_is_absolute(self):
+        self.assertTrue(bubble.Launcher('runs/x', self.fake.spawn, self.fake.alive, self.fake.kill).run.is_absolute())
+
+    def test_reused_pid_is_not_a_service(self):
+        state = self.launcher.start(self.plan)
+        self.fake.markers[state['learner']['pid']] = 'unrelated.py'
+        self.assertNotIn('learner', self.launcher.running())
+        self.launcher.stop()
+        self.assertNotIn(state['learner']['pid'], self.fake.killed)
 
     def test_start_records_pids_and_refuses_a_second_start(self):
         state = self.launcher.start(self.plan)
