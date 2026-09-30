@@ -75,12 +75,17 @@ def spawn(command, log):
     return subprocess.Popen(command, cwd=ROOT, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL, **flags).pid
 
 
+def arguments_of(line):
+    """The arguments of a Windows command line, quotes removed."""
+    return [part.strip('"') for part in shlex.split(line, posix=False)] if line else []
+
+
 def arguments(pid):
     """The argument list of the process `pid`, or [] when no such process exists."""
     if os.name == 'nt':
         query = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"
         line = subprocess.run(['powershell', '-NoProfile', '-Command', query], capture_output=True, text=True).stdout.strip()
-        return [part.strip('"') for part in shlex.split(line, posix=False)] if line else []
+        return arguments_of(line)
     try:
         return [part.decode(errors='replace') for part in Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0') if part]
     except OSError:
@@ -97,9 +102,14 @@ def alive(pid, script, run, arguments=arguments):
     return matches(arguments(pid), script, run)
 
 
+def belongs(parts, run):
+    """Whether a process with argument list `parts` is part of the run: it names the run directory, or it is a
+    multiprocessing worker (whose command line names its parent instead)."""
+    return run in parts or any('multiprocessing' in part for part in parts)
+
+
 def windows_tree(pid, run):
-    """Windows: the pids of every live descendant of `pid` that belongs to `run`: its command line names the run
-    directory, or it is a multiprocessing worker (whose command line names its parent instead)."""
+    """Windows: the pids of every live descendant of `pid` that belongs to `run`."""
     query = ("Get-CimInstance Win32_Process | ForEach-Object { "
              "\"$($_.ProcessId)|$($_.ParentProcessId)|$($_.CommandLine)\" }")
     out = subprocess.run(['powershell', '-NoProfile', '-Command', query], capture_output=True, text=True).stdout
@@ -112,8 +122,7 @@ def windows_tree(pid, run):
     found, queue = [], [pid]
     while queue:
         for child in children.get(queue.pop(), []):
-            line = lines.get(child, '')
-            if run in line or 'multiprocessing' in line:
+            if belongs(arguments_of(lines.get(child, '')), run):
                 found.append(child)
                 queue.append(child)
     return found
@@ -131,7 +140,7 @@ def group_alive(pid, run):
             continue
         try:
             fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
-            if int(fields[2]) == pid and run in arguments(int(entry.name)):
+            if int(fields[2]) == pid and belongs(arguments(int(entry.name)), run):
                 return True
         except (OSError, ValueError, IndexError):
             continue
