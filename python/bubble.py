@@ -58,31 +58,27 @@ def spawn(command, log):
     return subprocess.Popen(command, cwd=ROOT, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL, **flags).pid
 
 
-def command_line(pid):
-    """The command line of the process `pid`, or '' when no such process exists."""
+def arguments(pid):
+    """The argument list of the process `pid`, or [] when no such process exists."""
     if os.name == 'nt':
         query = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"
-        return subprocess.run(['powershell', '-NoProfile', '-Command', query], capture_output=True, text=True).stdout.strip()
+        line = subprocess.run(['powershell', '-NoProfile', '-Command', query], capture_output=True, text=True).stdout.strip()
+        return [part.strip('"') for part in shlex.split(line, posix=False)] if line else []
     try:
-        return Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace')
+        return [part.decode(errors='replace') for part in Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0') if part]
     except OSError:
-        return subprocess.run(['ps', '-o', 'args=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+        line = subprocess.run(['ps', '-o', 'args=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+        return shlex.split(line) if line else []
 
 
-def arguments(line):
-    """The arguments of a command line, quotes removed."""
-    return [part.strip('"') for part in shlex.split(line, posix=os.name != 'nt')] if line else []
-
-
-def matches(line, script, run):
-    """True when command line `line` runs `script` (by file name) on exactly the run directory `run`."""
-    parts = arguments(line)
+def matches(parts, script, run):
+    """True when argument list `parts` runs `script` (by file name) on exactly the run directory `run`."""
     return any(Path(part).name == script for part in parts) and run in parts
 
 
-def alive(pid, script, run, command_line=command_line):
+def alive(pid, script, run, arguments=arguments):
     """True when `pid` is this run's `script`, so a reused pid, or the same service of another run, never passes."""
-    return matches(command_line(pid), script, run)
+    return matches(arguments(pid), script, run)
 
 
 def kill(pid):
@@ -99,8 +95,8 @@ def kill(pid):
 class Launcher:
     """Service bookkeeping for one run directory; `spawn`, `alive` and `kill` are injectable for tests."""
 
-    def __init__(self, run, spawn=spawn, command_line=command_line, kill=kill):
-        self.run, self.spawn, self.command_line, self.kill = Path(run).resolve(), spawn, command_line, kill
+    def __init__(self, run, spawn=spawn, arguments=arguments, kill=kill):
+        self.run, self.spawn, self.arguments, self.kill = Path(run).resolve(), spawn, arguments, kill
         self.state_file = self.run / 'processes.json'
 
     def state(self):
@@ -110,7 +106,7 @@ class Launcher:
         return {name: entry for name, entry in self.state().items() if self.alive(entry)}
 
     def alive(self, entry):
-        return alive(entry['pid'], entry['script'], str(self.run), self.command_line)
+        return alive(entry['pid'], entry['script'], str(self.run), self.arguments)
 
     def prepare(self, device, run_steps):
         """Create the run configuration and the first checkpoint when either is missing; `run_steps` runs a command."""
@@ -121,22 +117,33 @@ class Launcher:
             run_steps([sys.executable, str(PYTHON / 'dense_learn.py'), '--run', str(self.run), '--steps', '0'])
 
     def start(self, plan):
-        running = self.running()
-        if running:
-            raise RuntimeError(f"{', '.join(sorted(running))} already running for {self.run}; stop first")
+        """Spawn every service; `processes.json.tmp` is the exclusive lock while services start, so two starts cannot
+        both pass the running check."""
+        partial = self.state_file.with_suffix('.json.tmp')
+        try:
+            handle = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        except FileExistsError:
+            raise RuntimeError(f'another start is in progress for {self.run} ({partial} exists)') from None
         state = {}
         try:
+            running = self.running()
+            if running:
+                raise RuntimeError(f"{', '.join(sorted(running))} already running for {self.run}; stop first")
             for name in SERVICES:
                 script = Path(next(part for part in plan[name] if part.endswith('.py'))).name
                 pid = self.spawn(plan[name], self.run / 'logs' / name)
                 state[name] = dict(pid=pid, script=script, command=plan[name], started_at=time.time())
-            partial = self.state_file.with_suffix('.json.tmp')
-            partial.write_text(json.dumps(state, indent=2), encoding='utf-8')
+            with os.fdopen(handle, 'w', encoding='utf-8') as stream:
+                json.dump(state, stream, indent=2)
             os.replace(partial, self.state_file)
         except BaseException:
             for entry in state.values():
                 self.kill(entry['pid'])
-            self.state_file.with_suffix('.json.tmp').unlink(missing_ok=True)
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+            partial.unlink(missing_ok=True)
             raise
         return state
 
@@ -186,15 +193,19 @@ def exports(run):
 
 
 def install(run, source, step, variant='main'):
-    """Copy the weights file `source` into `run` as checkpoint `variant/step` and make it the champion."""
+    """Copy the weights file `source` into `run` as checkpoint `variant/step` and make it the champion. Files land
+    under temporary names and are renamed, so a reader never sees a half-written checkpoint."""
     checkpoint = f'{variant}/{step:06d}'
     target = Path(run) / 'checkpoints' / checkpoint
     target.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, target / 'ema.pt')
     manifest = Path(source).with_name('manifest.json')
-    if manifest.exists():
-        shutil.copyfile(manifest, target / 'manifest.json')
-    (Path(run) / 'champion.json').write_text(json.dumps(dict(checkpoint=checkpoint)), encoding='utf-8')
+    for name, path in (('ema.pt', Path(source)), ('manifest.json', manifest)):
+        if path.exists():
+            shutil.copyfile(path, target / (name + '.tmp'))
+            os.replace(target / (name + '.tmp'), target / name)
+    champion = Path(run) / 'champion.json'
+    champion.with_suffix('.json.tmp').write_text(json.dumps(dict(checkpoint=checkpoint)), encoding='utf-8')
+    os.replace(champion.with_suffix('.json.tmp'), champion)
     return target
 
 
