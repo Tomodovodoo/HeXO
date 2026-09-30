@@ -1177,7 +1177,7 @@ class Evaluator:
                 log_event(self.run, 'evaluator', 'error', f'{a} vs {b} pair {record["pair"]}: game counted as capped at ply '
                           f'{record["plies"]}, a searched position spans more than the largest crop', candidate=a, opponent=b)
 
-    def session(self, want, planned, trial=None):
+    def session(self, want, planned, trial=None, auxiliary=None):
         """Play the pool until want() asks for nothing and the games in flight have finished; returns {lane:
         games finished}. want() -> {(a, b, kind): games in flight wanted, even}, asked at the start and after every
         completed colour pair; a finished game's slot is refilled before the next engine step, and a lane want()
@@ -1188,11 +1188,16 @@ class Evaluator:
         engine steps and for starting games (Seal plays its first turns then); no game starts while its credit
         is negative, and with nothing running the session then waits and asks want() again. Every completed
         pair is persisted at once. For a checkpoint trial, a newer export or settle request stops new games after
-        the next finished game; games already in flight drain normally."""
+        the next finished game; games already in flight drain normally. When auxiliary is supplied, free slots
+        may launch independent idle lanes up to two poolfuls per session; admissions stop for higher-priority work,
+        but every launched colour pair still drains and is persisted."""
         pool, waiting, added, failed = Pool(self.config.actor.leaf_batch, Schedule.of(self.settings)), {}, {}, {}
         placed, completed, shown_completed = 0, 0, 0
+        gate_at, gate_open, miss, miss_at = -float('inf'), False, None, 0.
         start, wall = self.pacer.clock(), time.time()
-        lanes = want()
+        primary, extra, extra_started = want(), {}, 0
+        used_pairs = {(x, y) for a, b, _ in primary for x, y in ((a, b), (b, a))}
+        lanes = dict(primary)
         stopping = False
         shown = dict(lanes)
 
@@ -1223,9 +1228,20 @@ class Evaluator:
                          placements_per_second=live/max(self.pacer.clock()-start, 1e-9),
                          solver=self.solver_status(pool, [name for lane in shown for name in lane[:2]]))
         while True:
+            lanes = dict(primary)
+            now = self.pacer.clock()
+            if auxiliary is not None and not stopping and now-gate_at >= 1.:
+                gate_open, gate_at = self.pipeline_ready(), now
+            may_refill = auxiliary is not None and not stopping and gate_open
+            if may_refill and extra_started < 2*self.settings.pool_games:
+                lanes.update({lane: even(min(self.settings.pool_games, target-len(self.games(*lane[:2]))))
+                              for lane, target in extra.items() if len(self.games(*lane[:2])) < target})
             for a, b, _ in lanes:
                 self.open(a, b)
-            self.use(*dict.fromkeys(name for lane in lanes for name in lane[:2]))
+            live = {lane for lane, _ in pool.games.values()} | {lane for lane, _ in pool.ready}
+            live.update(lane for lane, groups in waiting.items() if any(groups.values()))
+            held_lanes = (*lanes, *live) if auxiliary else lanes
+            self.use(*dict.fromkeys(name for lane in held_lanes for name in lane[:2]))
             shown.update(lanes)
             ready = self.pacer.ready()
             if lanes and ready:
@@ -1236,13 +1252,46 @@ class Evaluator:
                 tick = self.pacer.clock()  # starting games plays Seal's first turns: playing time
                 for lane, share in lanes.items():
                     while held(lane)+2 <= share and kind_held(lane[2])+2 <= kinds[lane[2]] \
-                            and pool.running()+2 <= self.settings.pool_games:
+                            and pool.running()+2 <= self.settings.pool_games \
+                            and (lane in primary or extra_started+2 <= 2*self.settings.pool_games):
                         self.start(pool, lane)
+                        if lane in extra:
+                            extra_started += 2
+                while may_refill and extra_started+2 <= 2*self.settings.pool_games \
+                        and pool.running()+2 <= self.settings.pool_games:
+                    active = {lane for lane, _ in pool.games.values()} | {lane for lane, _ in pool.ready}
+                    active.update(lane for lane, groups in waiting.items() if any(groups.values()))
+                    active.update(lanes)
+                    names = {name for lane in active for name in lane[:2] if name != SEAL}
+                    key = completed, tuple(sorted(names)), len(used_pairs)
+                    if key == miss and self.pacer.clock()-miss_at < 1.:
+                        break
+                    task = auxiliary(used_pairs, names)
+                    if task is None:
+                        miss, miss_at = key, self.pacer.clock()
+                        break
+                    miss = None
+                    entry, opponent, kind, games = task
+                    lane = (entry['id'], opponent, kind)
+                    target = games if kind == 'previous' else len(self.games(*lane[:2]))+games
+                    if target-len(self.games(*lane[:2])) < 2:
+                        used_pairs.update((lane[:2], (opponent, entry['id'])))
+                        continue
+                    used_pairs.update((lane[:2], (opponent, entry['id'])))
+                    extra[lane] = target
+                    self.open(*lane[:2])
+                    self.use(*dict.fromkeys(name for held_lane in (*active, lane) for name in held_lane[:2]))
+                    lanes[lane] = even(min(self.settings.pool_games, target-len(self.games(*lane[:2]))))
+                    shown[lane] = lanes[lane]
+                    while held(lane)+2 <= lanes[lane] and pool.running()+2 <= self.settings.pool_games \
+                            and extra_started+2 <= 2*self.settings.pool_games:
+                        self.start(pool, lane)
+                        extra_started += 2
                 self.pacer.played(tick, self.pacer.clock())
             if not pool.running():
                 if lanes and not ready:
                     self.pacer.wait(lambda: show('throttled', True))
-                    lanes = want()  # the wait may have outlasted the pairing (a newer checkpoint)
+                    primary = want()  # the wait may have outlasted the pairing (a newer checkpoint)
                     continue
                 break
             show('playing')
@@ -1253,7 +1302,7 @@ class Evaluator:
             for lane, record in results:
                 if trial and not stopping and (self.newer(trial[0]) or self.requested(trial[0]) and self.games(*trial)):
                     stopping = True
-                    lanes = {}
+                    primary = {}
                 moves = record['plies']-len(record['opening'])
                 placed += moves
                 group = waiting.setdefault(lane, {}).setdefault(record['pair'], [])
@@ -1278,7 +1327,7 @@ class Evaluator:
                     paired = True
             if paired:
                 wanted = want()
-                lanes = {} if stopping else wanted
+                primary = {} if stopping else wanted
         show('playing', True)
         pool.close()
         seconds = self.pacer.clock()-start
@@ -1858,22 +1907,25 @@ class Evaluator:
         left = s.anchor_games*(s.anchor_on_promotion+later//s.anchor_every)-played
         return (champion, SEAL, 'anchor', left) if left > 0 else None
 
-    def optional(self):
+    def optional(self, exclude=(), models=None):
         """(league entry of the candidate side, opponent, kind, games) of the first optional comparison, else None:
         the current champion's panel ('panel', 'incumbent'), idle rematches (`rematches`, with idle_rematch),
         the panels of the variant heads, newest first, then the newest rated checkpoint missing its
         previous-checkpoint comparison (when previous_games > 0 and the two are `close`)."""
-        s = self.settings
+        s, excluded = self.settings, set(exclude)
         champion = [c for c in self.league['checkpoints'] if c['id'] == self.league['champion']]
         for a, b, kind, games in [n for c in champion for n in self.needs(c)] + (self.rematches() if s.idle_rematch else []) \
                 + [n for c in self.heads() for n in self.needs(c)]:
-            return self.entry(a), b, kind, games
+            if (a, b) not in excluded and (models is None or len(models | {name for name in (a, b) if name != SEAL}) <= 3):
+                return self.entry(a), b, kind, games
         rated = [c for c in self.league['checkpoints'] if not c.get('skipped')]
         for index in reversed(range(len(rated))):
             c = rated[index]
             earlier = [p for p in rated[:index] if p['variant'] == c['variant'] and p['step'] < c['step']]
             if earlier and s.previous_games and (previous := max(earlier, key=lambda p: p['step'])['id']) \
-                    not in {m['opponent'] for m in c['matches']} and self.close(c['id'], previous):
+                    not in {m['opponent'] for m in c['matches']} and self.close(c['id'], previous) \
+                    and (c['id'], previous) not in excluded \
+                    and (models is None or len(models | {c['id'], previous}) <= 3):
                 return c, previous, 'previous', s.previous_games
         return None
 
@@ -1883,7 +1935,7 @@ class Evaluator:
         entry = self.entry(cid) or {}
         return entry.get('panel', {}).get('incumbent') or next((m['opponent'] for m in entry.get('matches', [])), None)
 
-    def fill(self):
+    def fill(self, exclude=(), models=None):
         """Next fill comparison, maximizing the expected reduction in summed 95% interval half-widths.
 
         Targets are the top `fill_top` checkpoints' ratings on the published league scale, plus champion minus
@@ -1894,7 +1946,9 @@ class Evaluator:
         `fill_uncertainty` records the selected pair's current and predicted half-widths, not a guaranteed result.
         """
         s, champion = self.settings, self.entry(self.league['champion'])
-        self.status['fill_uncertainty'] = None
+        excluded = set(exclude)
+        if not excluded:
+            self.status['fill_uncertainty'] = None
         if not s.idle_fill or champion is None:
             return None
         checkpoints = [c for c in self.league['checkpoints'] if c.get('elo') is not None and not c.get('skipped')]
@@ -1917,7 +1971,8 @@ class Evaluator:
         chosen, gain, predicted = None, 0., None
         for i, a in enumerate(names):
             for b in names[i+1:]:
-                if not self.close(a, b):
+                if not self.close(a, b) or models is not None \
+                        and len(models | {name for name in (a, b) if name != SEAL}) > 3:
                     continue
                 if b == SEAL:
                     if s.anchor_target_halfwidth <= 0 or (a, b, 'fill', s.opening_book) in self.failed_seal:
@@ -1925,7 +1980,7 @@ class Evaluator:
                     pair = a, b
                 else:
                     pair = rematch_pair(self.run, a, b, s)
-                if pair is None:
+                if pair is None or pair in excluded:
                     continue
                 after = [1.96*math.sqrt(max(0., post.after(t, pair, s.games))) for t in targets]
                 reduction = sum(x-y for x, y in zip(before, after))
@@ -1933,10 +1988,27 @@ class Evaluator:
                     chosen, gain, predicted = pair, reduction, after
         if chosen is None:
             return None
-        self.status['fill_uncertainty'] = dict(candidate=chosen[0], opponent=chosen[1], games=s.games,
-                                               expected_reduction=gain, targets=[dict(a=a, b=b, halfwidth=x,
-                                               expected_halfwidth=y) for (a, b, _), x, y in zip(targets, before, predicted)])
+        if not excluded:
+            self.status['fill_uncertainty'] = dict(candidate=chosen[0], opponent=chosen[1], games=s.games,
+                                                   expected_reduction=gain, targets=[dict(a=a, b=b, halfwidth=x,
+                                                   expected_halfwidth=y) for (a, b, _), x, y in zip(targets, before, predicted)])
         return self.entry(chosen[0]), chosen[1], 'fill', s.games
+
+    def pipeline_ready(self):
+        """New idle work must yield to a checkpoint, variant trial, or due opening-book refresh."""
+        return not self.backlog() and not any('verdict' not in v and v['checkpoint'] for v in self.variants()) \
+            and not any((self.run/'variant-requests').glob('*.json')) \
+            and not self.openings.due(self.league['champion'], time.time())
+
+    def pipeline_task(self, blocked, names):
+        """Next independent idle comparison fitting at most three live neural models."""
+        excluded = set(blocked)
+        while task := self.optional(excluded, names):
+            entry, opponent, kind, _ = task
+            if kind != 'sprt':
+                return task
+            excluded.update(((entry['id'], opponent), (opponent, entry['id'])))
+        return self.fill(excluded, names)
 
     def filling(self, target):
         """Log a 'fill' event when fill work starts, changes target ('seal', '<a> vs <b>' or 'generalization <a> vs
@@ -2070,7 +2142,7 @@ class Evaluator:
             if new_trial or len(done) >= target or decided or (a, opponent, kind, s.opening_book) in self.failed_seal:
                 return {}
             return {(a, opponent, kind): even(min(s.pool_games, target-len(done)))}
-        self.session(want, target)
+        added = self.session(want, target, auxiliary=self.pipeline_task if s.pipeline and kind != 'sprt' else None)
         path = report_path(self.run, a, opponent)
         if path.exists():
             report = json.loads(path.read_text())
@@ -2082,6 +2154,13 @@ class Evaluator:
                     and not entry.get('demoted'):
                 self.promote(entry['id'], opponent)
                 write_league(self.run, self.league, self.config, self.settings.fill_top)
+        for lane in added:
+            if lane[:2] == (a, opponent):
+                continue
+            other = report_path(self.run, *lane[:2])
+            if other.exists():
+                self.record(*lane[:2], json.loads(other.read_text()))
+        if path.exists() or added:
             self.settle()
         return True
 

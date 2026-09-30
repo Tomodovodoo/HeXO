@@ -28,8 +28,9 @@ decide a move.
 Schedule.fixed_budgets (evaluation, engine verification and tests): every query spends its point's fixed node
 budget (deep: deep_nodes, awaited at the mover's next turn-start search end; a deep query the game never reaches
 there is dropped) and every verdict is awaited where it is needed, so a verdict is a function of (position,
-attacker, budget, build) and a seeded run repeats exactly on either backend. Otherwise (actors) budgets follow the
-measured slack and verdicts are polled:
+attacker, budget, build) and a seeded run repeats exactly on either backend. With nonblocking_fixed, a game waits
+for its required verdicts by yielding its Engine slot, allowing other games to search while the proof runs.
+Otherwise (actors) budgets follow the measured slack and verdicts are polled:
   budget     a query's allowance is slack_fraction * (lead - GUARD_MS, plus the step's overrun allowance for root
              and finalist queries, which may be waited for) minus its pool's reserved work per worker, in nodes at the pool's measured rate (the RATE_QUANTILE of recent queries, at most RATE), clamped
              to [min_nodes, cap_nodes]; `lead` is the LEAD_QUANTILE of the measured times from submission to the
@@ -114,8 +115,9 @@ class Budgets:
 class Schedule:
     """How one process runs its queries (module contract); the defaults are fixed budgets, one worker, no deep
     proofs, no following. `workers` foreground worker processes (the asynchronous backend); adaptive deep proofs
-    add one."""
+    add one. `nonblocking_fixed` preserves fixed verdicts while yielding only their waiting game."""
     fixed_budgets: bool = True
+    nonblocking_fixed: bool = False
     workers: int = 1
     slack_fraction: float = .95
     overrun_fraction: float = .05
@@ -137,12 +139,15 @@ class Schedule:
             raise ValueError('Invalid solver schedule')
         if self.deep_nodes and not self.follow:
             raise ValueError('solver_deep_nodes needs solver_follow: deep proofs act only by being followed')
+        if self.nonblocking_fixed and not self.fixed_budgets:
+            raise ValueError('nonblocking_fixed requires fixed_budgets')
 
     @classmethod
     def of(cls, settings):
         """The schedule of settings' solver_* fields; absent fields use the defaults."""
         values = {f.name: getattr(settings, 'solver_'+f.name, f.default) for f in fields(cls)}
         if isinstance(settings, EvaluationSettings):
+            values['nonblocking_fixed'] = bool(getattr(settings, 'pipeline', False))
             if settings.solver_gate_cap_nodes and settings.solver_gate_cap_nodes < max(
                     settings.solver_root_nodes, settings.solver_finalist_nodes, settings.solver_threat_nodes):
                 raise ValueError('solver_gate_cap_nodes must cover every enabled evaluation query budget')
@@ -647,6 +652,7 @@ class Plan:
         self.defence_queries, self.defences, self.defence_base = [], [], ()
         self.defence_limit = 8
         self.nodes, self.budget, self.turns, self.pruned, self.following, self.deferrals = 0, 0, 0, [], False, 0
+        self.awaiting_finish = False
 
     def spent(self, result):
         self.nodes += int(result.get('nodes_used') or 0)
@@ -697,6 +703,7 @@ class Plan:
         history = tuple(map(tuple, tree.history))
         self.threat = self.root = self.finalists = None
         self.nodes, self.budget, self.turns, self.pruned, self.following, self.deferrals = 0, 0, 0, [], False, 0
+        self.awaiting_finish = False
         if not history:
             return False
         player, other = mover(history), 1-mover(history)
@@ -730,8 +737,12 @@ class Plan:
         return self.threat is not None
 
     def defer(self, queries):
-        """Adaptive budgets: False (defer the slot) while the verdicts of `queries` are not all in and the search may
-        still wait for them; after DEFER_VISITS deferrals the missing ones become late proofs and True."""
+        """Yield this slot for missing fixed verdicts, or use adaptive overrun and late-proof rules."""
+        if self.schedule.nonblocking_fixed:
+            if all(query.ready() for query in queries):
+                return True
+            self.solver.stats['deferred'] += 1
+            return False
         if all(self.solver.consume(q, block=True) for q in queries):
             return True
         if self.deferrals < DEFER_VISITS:
@@ -747,7 +758,18 @@ class Plan:
         """Apply threat ordering or verified defence candidates, and finalist marks. False defers
         the slot to its next visit."""
         ptr = slot.tree.ptr
+        if self.awaiting_finish:
+            history = tuple(map(tuple, slot.tree.history))
+            player = mover(history)
+            required = ([self.root] if self.root is not None else [])
+            if len(history) % 2 and player in self.deep:
+                required.append(self.deep[player])
+            if not self.defer(required):
+                return False
+            self.awaiting_finish = False
         if self.threat is not None:
+            if self.schedule.nonblocking_fixed and not self.defer([self.threat]):
+                return False
             if self.solver.consume(self.threat, block=False):
                 proven, result = self.threat.result()
                 self.spent(result)
@@ -836,6 +858,13 @@ class Plan:
         it (else None). False defers the slot to its next visit."""
         history = tuple(map(tuple, slot.tree.history))
         player = mover(history)
+        if self.schedule.nonblocking_fixed:
+            required = ([self.root] if self.root is not None else [])
+            if self.schedule.fixed_budgets and len(history) % 2 and player in self.deep:
+                required.append(self.deep[player])
+            if not self.defer(required):
+                self.awaiting_finish = True
+                return False
         if self.root is not None:
             if not self.schedule.fixed_budgets and not self.defer([self.root]):
                 return False

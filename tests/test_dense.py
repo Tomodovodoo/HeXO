@@ -5808,6 +5808,47 @@ class EvaluatorLoopTests(unittest.TestCase):
         s = dense_config.EvaluationSettings()
         self.assertEqual((s.sprt_elo0, s.sprt_elo1, s.pool_games, s.sprt_min_games, s.evidence_share, s.idle_fill,
                           s.max_expected_score), (0., 25., 64, 64, .25, True, .85))
+        self.assertFalse(s.pipeline)
+
+    def test_pipeline_refills_draining_pairs_with_finite_independent_work(self):
+        evaluator = self.start(pool_games=4, pipeline=True)
+        self.export(10, 20, 30)
+        evaluator.league['champion'] = 'main/000030'
+        evaluator.league['checkpoints'] = [dict(id=f'main/{step:06d}', variant='main', step=step, elo=0.,
+                                                elo_interval=None, matches=[]) for step in (10, 20, 30)]
+        primary = ('main/000030', 'main/000010', 'panel')
+        other = [('main/000030', 'main/000020', 'panel'), ('main/000020', 'main/000010', 'panel')]
+        def choose(blocked, names):
+            for a, b, kind in other:
+                if (a, b) not in blocked and len(names | {a, b}) <= 3:
+                    return evaluator.entry(a), b, kind, 4
+            return None
+        seen = []
+        def watch(pool, steps):
+            seen.append((pool.running(), {lane for lane, _ in pool.games.values()}))
+        with unittest.mock.patch.object(evaluator, 'pipeline_ready', return_value=True), \
+             unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=watch)):
+            added = evaluator.session(lambda: {primary: dense_eval.even(4-len(evaluator.games(*primary[:2])))}
+                                      if len(evaluator.games(*primary[:2])) < 4 else {}, 4, auxiliary=choose)
+        self.assertEqual(added, {primary: 4, other[0]: 4, other[1]: 4})
+        self.assertLessEqual(max(n for n, _ in seen), 4)
+        self.assertTrue(any(primary in lanes and other[0] in lanes for _, lanes in seen))
+
+    def test_pipeline_selector_respects_pair_models_and_backlog(self):
+        evaluator = self.start(pipeline=True, extra_opponents=2)
+        self.export(10, 20, 30, 40)
+        ids = {step: f'main/{step:06d}' for step in (10, 20, 30, 40)}
+        entries = [dict(id=ids[step], variant='main', step=step, elo=0., elo_interval=None, matches=[])
+                   for step in ids]
+        entries[-1]['panel'] = dict(incumbent=ids[10])
+        evaluator.league.update(champion=ids[40], checkpoints=entries)
+        self.assertTrue(evaluator.pipeline_ready())
+        blocked = {(ids[40], ids[30]), (ids[30], ids[40])}
+        task = evaluator.pipeline_task(blocked, {ids[40], ids[10], ids[30]})
+        self.assertEqual((task[0]['id'], task[1], task[2]), (ids[10], ids[30], 'incumbent'))
+        self.assertIsNone(evaluator.pipeline_task(blocked, {ids[40], ids[10], ids[30], ids[20]}))
+        self.export(50)
+        self.assertFalse(evaluator.pipeline_ready())
 
     def test_existing_panels_skip_uninformative_members(self):
         """Panel members are re-derived (a stored list is ignored) and include only those within
