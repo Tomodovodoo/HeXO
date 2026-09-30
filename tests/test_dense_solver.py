@@ -573,12 +573,213 @@ class Scheduler(unittest.TestCase):
         self.assertEqual(Schedule.of(dense_config.ActorSettings()), Schedule())
         self.assertEqual(Schedule.of(dense_config.EvaluationSettings()), Schedule())
         self.assertEqual(Schedule.of(dense_config.EvaluationSettings(solver_workers=3)).workers, 3)
+        self.assertTrue(Schedule.of(dense_config.EvaluationSettings(pipeline=True)).nonblocking_fixed)
+        self.assertFalse(Schedule.of(dense_config.ActorSettings()).nonblocking_fixed)
         self.assertTrue(Schedule().fixed_budgets)
         for bad in (dict(deep_nodes=100), dict(workers=0), dict(min_nodes=600), dict(cap_nodes=9000),
                     dict(overrun_fraction=-.1), dict(deep_nodes=70000, follow=True), dict(gate_weight=101),
-                    dict(table_mb=257)):
+                    dict(table_mb=257), dict(nonblocking_fixed=True, fixed_budgets=False)):
             with self.assertRaises(ValueError):
                 Schedule(**bad)
+
+    def test_nonblocking_fixed_keeps_each_required_verdict_until_its_phase(self):
+        schedule = Schedule(nonblocking_fixed=True, follow=True, deep_nodes=NODES)
+        solver = mock.Mock(schedule=schedule)
+        solver.leads = {point: [] for point in dense_solver.POINTS}
+        solver.stats = dict(deferred=0, late=0, dropped=0, followed=0)
+        solver.consume.side_effect = lambda query, block: query.ready(block=True)
+        history = ((0, 0), (1, 0), (-1, 0))
+        slot = mock.Mock()
+        slot.tree.history = history
+        slot.solver = Budgets(root_nodes=NODES, threat_nodes=NODES, finalists=1, finalist_nodes=NODES)
+        slot.budget = 8
+
+        def query(point):
+            future = Future()
+            return dense_solver.Query(solver, point, history, NODES, future)
+
+        def unknown(q):
+            q.future.set_result(dict(status='UNKNOWN', reason='no verified strategy',
+                                     nodes_used=NODES, budget=NODES))
+
+        plan = dense_solver.Plan(solver)
+        plan.threat = threat = query('threat')
+        for _ in range(dense_solver.DEFER_VISITS+2):
+            self.assertFalse(plan.ready(slot))
+            self.assertIs(plan.threat, threat)
+        unknown(threat)
+        self.assertTrue(plan.ready(slot))
+        self.assertEqual(plan.nodes, NODES)
+
+        plan.defence_queries = [(((0, 1), (1, 1)), defence := query('defence'))]
+        plan.apply_defences = mock.Mock()
+        self.assertFalse(plan.ready(slot))
+        unknown(defence)
+        self.assertTrue(plan.ready(slot))
+        self.assertEqual(plan.defences, [((0, 1), (1, 1))])
+        plan.apply_defences.assert_called_once_with(slot)
+
+        plan.finalists = [([2, 0], finalist := query('finalist'))]
+        with mock.patch.object(dense_solver.native, 'hxg_hold', return_value=1) as hold:
+            self.assertFalse(plan.ready(slot))
+            self.assertIsNotNone(plan.finalists)
+            unknown(finalist)
+            self.assertTrue(plan.ready(slot))
+            hold.assert_called_once_with(slot.tree.ptr, 0)
+
+        player = dense_solver.mover(history)
+        plan.root = root = query('root')
+        plan.deep[player] = deep = query('deep')
+        result = dict(action=[3, 0])
+        self.assertFalse(plan.finish(slot, result))
+        self.assertTrue(plan.awaiting_finish)
+        self.assertFalse(plan.ready(slot))
+        unknown(root)
+        self.assertFalse(plan.ready(slot))
+        self.assertIs(plan.root, root)
+        self.assertIn(player, plan.deep)
+        unknown(deep)
+        self.assertTrue(plan.ready(slot))
+        self.assertFalse(plan.awaiting_finish)
+        self.assertTrue(plan.finish(slot, result))
+        self.assertEqual((result['solver_nodes'], result['solver_budget']), (5*NODES, 5*NODES))
+        self.assertEqual((solver.stats['late'], solver.stats['dropped'], plan.late), (0, 0, []))
+        self.assertEqual(solver.stats['deferred'], dense_solver.DEFER_VISITS+7)
+
+    def test_nonblocking_fixed_waits_only_its_game(self):
+        class FixedSolver:
+            """Deterministic fixed-budget verdicts, with one controllable delayed query."""
+            def __init__(self, schedule, asynchronous=True):
+                self.schedule = schedule
+                self.leads = {point: [] for point in dense_solver.POINTS}
+                self.stats = dict(deferred=0, late=0, dropped=0, followed=0)
+                self.orphans = []
+                self.pending_once = None
+                self.idle_calls = 0
+
+            def submit(self, point, history, attacker, nodes, root_moves=None):
+                future = self.pending_once
+                self.pending_once = None
+                if future is None:
+                    future = Future()
+                    future.set_result(dict(status='UNKNOWN', reason='no verified strategy',
+                                           nodes_used=nodes, budget=nodes))
+                return dense_solver.Query(self, point, tuple(map(tuple, history)), nodes, future)
+
+            def consume(self, query, block):
+                return query.ready(block=True)
+
+            def account(self, point, result):
+                pass
+
+            def tick(self, step_ms, collect_ms):
+                pass
+
+            def idle(self):
+                self.idle_calls += 1
+
+            def close(self):
+                pass
+
+        model = tiny_model()
+        opening = [(0, 0), (1, 0), (-1, 0)]
+        budgets = Budgets(threat_nodes=NODES)
+        schedule = Schedule(nonblocking_fixed=True)
+        engine = dense_selfplay.Engine(64, solver_async=False, schedule=schedule)
+        waiting = match(model, opening, budgets, sims=4, plies=2)
+        other = match(model, opening, Budgets(), sims=4, plies=2)
+        pending = Future()
+        try:
+            engine.solver = FixedSolver(schedule, asynchronous=False)
+            engine.solver.pending_once = pending
+            engine.add(waiting)
+            engine.add(other)
+            engine.step()
+            self.assertEqual(len(waiting.moves), len(opening))
+            self.assertGreater(engine.evals, 0)
+            for _ in range(dense_solver.DEFER_VISITS+1):
+                engine.step()
+            self.assertEqual(len(waiting.moves), len(opening))
+            pending.set_result(dict(status='UNKNOWN', reason='no verified strategy',
+                                    nodes_used=NODES, budget=NODES))
+            for _ in range(200):
+                if not engine.slots and not engine.closing:
+                    break
+                engine.step()
+            self.assertFalse(engine.slots or engine.closing)
+            self.assertEqual((engine.solver.stats['late'], engine.solver.stats['dropped']), (0, 0))
+        finally:
+            engine.close()
+
+        # A completed search waiting at root must also yield before hxg_next,
+        # so an all-waiting pool idles instead of spinning on request == 0.
+        root_engine = dense_selfplay.Engine(64, solver_async=False, schedule=schedule)
+        root_game = match(model, opening, Budgets(root_nodes=NODES), sims=4, plies=1)
+        root_pending = Future()
+        try:
+            root_engine.solver = FixedSolver(schedule, asynchronous=False)
+            root_engine.solver.pending_once = root_pending
+            root_engine.add(root_game)
+            for _ in range(100):
+                root_engine.step()
+                if root_engine.plans[id(root_game)].awaiting_finish:
+                    break
+            self.assertTrue(root_engine.plans[id(root_game)].awaiting_finish)
+            before_idle = root_engine.solver.idle_calls
+            root_engine.step()
+            self.assertGreater(root_engine.solver.idle_calls, before_idle)
+            root_pending.set_result(dict(status='UNKNOWN', reason='no verified strategy',
+                                         nodes_used=NODES, budget=NODES))
+            for _ in range(100):
+                if not root_engine.slots and not root_engine.closing:
+                    break
+                root_engine.step()
+            self.assertFalse(root_engine.slots or root_engine.closing)
+        finally:
+            root_engine.close()
+
+    def test_nonblocking_fixed_preserves_seeded_match_results(self):
+        try:
+            NativeTactics()
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+        proof_opening = FIXTURE['positions'][PROOF]
+        proof_budgets = Budgets(root_nodes=NODES, finalists=2, finalist_nodes=NODES, threat_nodes=NODES)
+        def played(nonblocking):
+            games = [match(tiny_model(), proof_opening, proof_budgets, sims=8, plies=2) for _ in range(2)]
+            records = dense_eval.play(games, 64, schedule=Schedule(workers=2, nonblocking_fixed=nonblocking))
+            decisions = [[(r['action'], r['proven'], r['proof_turns'], r['solver_nodes'],
+                           r['solver_budget'], r['pruned']) for r in game.results] for game in games]
+            self.assertTrue(any(r[1] for game in decisions for r in game))
+            return records, decisions
+        self.assertEqual(played(True), played(False))
+
+        # Histories at the first disagreement in evaluator-pipeline's paired session
+        # (pairs 22, 27 and 31).  Force singleton inference so a different engine
+        # batch cannot change a prediction for the same position.
+        openings = [
+            [(0, 0), (2, -2), (0, -1), (2, -3), (-2, -1), (-2, 0), (1, -3), (2, -4), (0, -3)],
+            [(0, 0), (0, -1), (2, -2), (3, -2), (-1, 0), (-2, 0), (-1, 1), (1, 0)],
+            [(0, 0), (-1, 0), (-1, -1), (-1, 2), (-2, 1), (-2, 0), (-1, -2), (-1, -3),
+             (0, -2), (-2, -1), (-3, -1), (-4, -1)],
+        ]
+        budgets = Budgets(root_nodes=2048, finalists=2, finalist_nodes=2048, threat_nodes=2048)
+        def replay(nonblocking):
+            model = tiny_model()
+            submit, collect = model.evaluator.submit, model.evaluator.collect
+            model.evaluator.submit = lambda histories, legal=None: [
+                submit([history], [legal[i]] if legal is not None else None)
+                for i, history in enumerate(histories)]
+            model.evaluator.collect = lambda handles: [collect(handle)[0] for handle in handles]
+            games = [match(model, opening, budgets, sims=64, samples=16, plies=16-len(opening))
+                     for opening in openings]
+            schedule = Schedule(workers=3, gate_weight=3., fixed_gate_cap=True, gate_cap_nodes=32768,
+                                nonblocking_fixed=nonblocking)
+            records = dense_eval.play(games, 64, schedule=schedule)
+            decisions = [[(tuple(r['action']), r['proven'], r['proof_turns'], r['solver_nodes'],
+                           r['solver_budget'], r['pruned']) for r in game.results] for game in games]
+            return [(r['moves'], r['winner'], r['reason']) for r in records], decisions
+        self.assertEqual(replay(True), replay(False))
 
     def test_evaluation_pool_uses_configured_solver_workers(self):
         settings = dense_config.EvaluationSettings(solver_workers=3)

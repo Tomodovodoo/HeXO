@@ -5786,6 +5786,13 @@ class EvaluatorLoopTests(unittest.TestCase):
             evaluator.step()
         path = dense_eval.report_path(self.run, 'main/000020', 'main/000010')
         first = json.loads(path.read_text())
+        legacy = dict(first, settings={k: v for k, v in first['settings'].items() if k != 'pipeline'})
+        pipelined = replace(evaluator.settings, pipeline=True)
+        self.assertTrue(dense_eval.same_protocol(legacy, evaluator.settings))
+        self.assertFalse(dense_eval.same_protocol(legacy, pipelined))
+        new = dict(first, settings=dict(first['settings'], pipeline=True))
+        self.assertTrue(dense_eval.same_protocol(new, pipelined))
+        self.assertFalse(dense_eval.same_protocol(new, evaluator.settings))
         evaluator = self.start(sprt_max_games=6, sims=3)                        # e.g. restarted with --eval-sims 3
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
             self.assertTrue(evaluator.step())
@@ -5872,6 +5879,76 @@ class EvaluatorLoopTests(unittest.TestCase):
         s = dense_config.EvaluationSettings()
         self.assertEqual((s.sprt_elo0, s.sprt_elo1, s.pool_games, s.sprt_min_games, s.evidence_share, s.idle_fill,
                           s.max_expected_score), (0., 25., 64, 64, .25, True, .85))
+        self.assertFalse(s.pipeline)
+
+    def test_pipeline_refills_draining_pairs_with_finite_independent_work(self):
+        evaluator = self.start(pool_games=4, pipeline=True)
+        self.export(10, 20, 30)
+        evaluator.league['champion'] = 'main/000030'
+        evaluator.league['checkpoints'] = [dict(id=f'main/{step:06d}', variant='main', step=step, elo=0.,
+                                                elo_interval=None, matches=[]) for step in (10, 20, 30)]
+        primary = ('main/000030', 'main/000010', 'panel')
+        other = [('main/000030', 'main/000020', 'panel'), ('main/000020', 'main/000010', 'panel')]
+        def choose(blocked, names):
+            for a, b, kind in other:
+                if (a, b) not in blocked and len(names | {a, b}) <= 3:
+                    return evaluator.entry(a), b, kind, 4
+            return None
+        seen = []
+        def watch(pool, steps):
+            seen.append((pool.running(), {lane for lane, _ in pool.games.values()}))
+        with unittest.mock.patch.object(evaluator, 'pipeline_ready', return_value=True), \
+             unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=watch)):
+            added = evaluator.session(lambda: {primary: dense_eval.even(4-len(evaluator.games(*primary[:2])))}
+                                      if len(evaluator.games(*primary[:2])) < 4 else {}, 4, auxiliary=choose)
+        self.assertEqual(added, {primary: 4, other[0]: 4, other[1]: 4})
+        self.assertLessEqual(max(n for n, _ in seen), 4)
+        self.assertTrue(any(primary in lanes and other[0] in lanes for _, lanes in seen))
+
+    def test_pipeline_selector_respects_pair_models_and_backlog(self):
+        evaluator = self.start(pipeline=True, extra_opponents=2)
+        self.export(10, 20, 30, 40)
+        ids = {step: f'main/{step:06d}' for step in (10, 20, 30, 40)}
+        entries = [dict(id=ids[step], variant='main', step=step, elo=0., elo_interval=None, matches=[])
+                   for step in ids]
+        entries[-1]['panel'] = dict(incumbent=ids[10])
+        evaluator.league.update(champion=ids[40], checkpoints=entries)
+        self.assertTrue(evaluator.pipeline_ready())
+        blocked = {(ids[40], ids[30]), (ids[30], ids[40])}
+        task = evaluator.pipeline_task(blocked, {ids[40], ids[10], ids[30]})
+        self.assertEqual((task[0]['id'], task[1], task[2]), (ids[10], ids[30], 'incumbent'))
+        self.assertIsNone(evaluator.pipeline_task(blocked, {ids[40], ids[10], ids[30], ids[20]}))
+        self.export(50)
+        self.assertFalse(evaluator.pipeline_ready())
+
+    def test_pipeline_pauses_admitted_seal_lane_after_failed_pairs(self):
+        evaluator = self.start(pool_games=4, pipeline=True, seal_ms=5)
+        self.export(10, 20)
+        a, b = 'main/000020', 'main/000010'
+        evaluator.league['checkpoints'] = [dict(id=cid, variant='main', step=int(cid.split('/')[1]),
+                                                elo=0., elo_interval=None, matches=[]) for cid in (b, a)]
+        primary, seal = (a, b, 'panel'), (a, dense_eval.SEAL, 'fill')
+        marker = (*seal, evaluator.settings.opening_book)
+        after_pause = []
+        start = evaluator.start
+        def tracked(pool, lane):
+            if lane == seal and marker in evaluator.failed_seal:
+                after_pause.append(evaluator.next[a, dense_eval.SEAL])
+            start(pool, lane)
+        def choose(blocked, names):
+            return (evaluator.entry(a), dense_eval.SEAL, 'fill', 8) if seal[:2] not in blocked else None
+        class Failing(scripted()):
+            def step(self):
+                return [(lane, dict(record, error='failed proof') if lane == seal else record)
+                        for lane, record in super().step()]
+        with unittest.mock.patch.object(evaluator, 'pipeline_ready', return_value=True), \
+             unittest.mock.patch.object(evaluator, 'start', side_effect=tracked), \
+             unittest.mock.patch.object(dense_eval, 'Pool', Failing):
+            evaluator.session(lambda: {primary: dense_eval.even(4-len(evaluator.games(a, b)))}
+                              if len(evaluator.games(a, b)) < 4 else {}, 4, auxiliary=choose)
+        self.assertIn(marker, evaluator.failed_seal)
+        self.assertEqual(evaluator.next[a, dense_eval.SEAL], 3)  # budget still had room for a fourth pair
+        self.assertFalse(after_pause)
 
     def test_existing_panels_skip_uninformative_members(self):
         """Panel members are re-derived (a stored list is ignored) and include only those within

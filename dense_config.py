@@ -241,6 +241,7 @@ class LearnerSettings:
 class EvaluationSettings:
     games: int = 64               # games of each optional comparison (panel top-up, fill), colour-swapped opening pairs
     pool_games: int = 64          # evaluation games in flight; a finished game is replaced at once
+    pipeline: bool = False        # use free slots for independent idle comparisons while a session drains
     evidence_share: float = .25   # posterior: most of the pool evidence games may take while a decision is pending
     previous_games: int = 0       # vs the previous rated checkpoint of the variant, only while idle; 0 = never
     sims: int = 64
