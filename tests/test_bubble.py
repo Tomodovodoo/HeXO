@@ -18,11 +18,11 @@ class FakeProcesses:
         self.spawned.append((command, log))
         self.next_pid += 1
         self.live.add(self.next_pid)
-        self.markers[self.next_pid] = Path(next(part for part in command if part.endswith('.py'))).name
+        self.markers[self.next_pid] = ' '.join(command)
         return self.next_pid
 
-    def alive(self, pid, marker):
-        return pid in self.live and self.markers.get(pid) == marker
+    def alive(self, pid, needles):
+        return pid in self.live and all(needle in self.markers.get(pid, '') for needle in needles)
 
     def kill(self, pid):
         self.killed.append(pid)
@@ -45,6 +45,37 @@ class CommandTests(unittest.TestCase):
         plan = bubble.commands(Path('runs/x'), kernels='fused')
         for name in ('learner', 'actors', 'evaluator'):
             self.assertEqual(plan[name][plan[name].index('--net-kernels') + 1], 'fused', name)
+
+
+class ModelTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = TemporaryDirectory()
+        self.run = Path(self.directory.name) / 'run'
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_install_places_weights_and_champion(self):
+        source = Path(self.directory.name) / 'ema.pt'
+        source.write_bytes(b'weights')
+        source.with_name('manifest.json').write_text('{}')
+        target = bubble.install(self.run, source, 122500)
+        self.assertEqual(target, self.run / 'checkpoints' / 'main' / '122500')
+        self.assertEqual((target / 'ema.pt').read_bytes(), b'weights')
+        self.assertTrue((target / 'manifest.json').exists())
+        self.assertEqual(json.loads((self.run / 'champion.json').read_text())['checkpoint'], 'main/122500')
+        self.assertEqual(bubble.exports(self.run), [target / 'ema.pt'])
+
+    def test_download_uses_the_release_tag_as_step(self):
+        release = dict(tag_name='bubble-122500', assets=[
+            dict(name='ema.pt', url='u/ema'), dict(name='manifest.json', url='u/man')])
+        responses = {bubble.RELEASES: json.dumps(release).encode(), 'u/ema': b'weights', 'u/man': b'{}'}
+        target = bubble.download(self.run, responses.__getitem__)
+        self.assertEqual(target.name, '122500')
+        self.assertEqual((target / 'ema.pt').read_bytes(), b'weights')
+        self.assertFalse((self.run / 'checkpoints' / 'download').exists())
+        with self.assertRaises(RuntimeError):
+            bubble.download(self.run, lambda url: json.dumps(dict(tag_name='x-1', assets=[])).encode())
 
 
 class LauncherTests(unittest.TestCase):
@@ -81,7 +112,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_reused_pid_is_not_a_service(self):
         state = self.launcher.start(self.plan)
-        self.fake.markers[state['learner']['pid']] = 'unrelated.py'
+        self.fake.markers[state['learner']['pid']] = ' '.join(bubble.commands(Path('runs/other'))['learner'])
         self.assertNotIn('learner', self.launcher.running())
         self.launcher.stop()
         self.assertNotIn(state['learner']['pid'], self.fake.killed)

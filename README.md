@@ -36,18 +36,25 @@ cd HeXO
 python -m venv .venv
 ```
 
-Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scripts\activate.bat` in cmd.exe, `source .venv/bin/activate` on Linux and macOS), then:
+Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scriptsctivate.bat` in cmd.exe, `source .venv/bin/activate` on Linux and macOS), then:
 
 ```sh
 python -m pip install -e . -r requirements/learning.txt
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel 2
-python python/bubble.py play --run runs/bubble
+python python/bubble.py play
 ```
 
-Open <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. The page shows Bubble's win estimate and suggested moves for every position, remembers them when you step back, and copies the game as HTTTX notation. The model picker lists the champion and the newest checkpoints of the run, and search and solver have their own budgets.
+The last command downloads the newest released Bubble (4.4 MB) into `runs/bubble` the first time and opens the game at <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. The page shows Bubble's win estimate and suggested moves for every position, remembers them when you step back, and copies the game as HTTTX notation. Search and solver have their own budgets on the page.
 
-Bubble plays from the checkpoints in a run directory, so this needs a run you trained (see below) or a copy of one. Without a run, `python python/play.py` serves the handwritten native engine instead. A GPU is used when PyTorch sees one; add `--device cpu` to play on the CPU.
+To play a particular checkpoint, point it at the file or at a run you trained:
+
+```sh
+python python/bubble.py play --model path/to/ema.pt
+python python/bubble.py play --run runs/dense-v1
+```
+
+With a run, the model picker lists its champion, its newest export and two more. A GPU is used when PyTorch sees one; add `--device cpu` otherwise. Without any weights, `python python/play.py` serves the handwritten native engine.
 
 ## Build Bubble
 

@@ -14,7 +14,7 @@ After a decision the evaluator plays the champion's Seal anchor, a panel of the 
 
 One Bradley-Terry posterior covers every rated checkpoint, the candidate and Seal, using every report. Each colour-swapped opening pair is one observation with five outcomes (0 to 2 points), because both games share an opening, and each pairing's likelihood is divided by its dispersion, the observed variance of pair points over the binomial one. Pairs that sweep more often than chance widen the interval; pairs that split more often narrow it. Each pair of players also gets a matchup deviation with prior sd `matchup_prior_elo` (30), so a pair's own games outweigh the transitive picture when they disagree.
 
-A candidate is promoted when it has the highest posterior rating and P(candidate beats champion by more than `sprt_elo0`) is at least `promote_confidence` (0.8); rejected when that probability is at most 0.2; and left running while the direct-only and pooled estimates disagree beyond their intervals. On start the evaluator re-applies the rule to the reports on disk. `decision sprt` keeps a generalised SPRT over the same pair outcomes instead.
+A candidate is promoted when it has the highest posterior rating and P(candidate beats champion by more than `sprt_elo0`) is at least `promote_confidence` (0.9); rejected when that probability is at most `1 - promote_confidence`; and left running while the direct-only and pooled estimates disagree beyond their intervals. On start the evaluator re-applies the rule to the reports on disk. `decision sprt` keeps a generalised SPRT over the same pair outcomes instead.
 
 `league.json` also records a calibration diagnostic: for every posterior verdict, the stated sd of the rating difference against how far it later moved.
 

@@ -3,11 +3,14 @@
 `train` creates the run directory and its first checkpoint when they are missing, then starts the learner,
 the actors, the evaluator, the proof pass and the dashboard as detached processes. Their process ids go to
 `<run>/processes.json`, their output to `<run>/logs/`. `stop` ends those processes, `status` reports them,
-and `play` serves the browser game against the run's champion.
+and `play` serves the browser game against the run's champion, a given weights file, or the newest
+released Bubble, which it downloads when the run has no checkpoints.
 """
 import argparse
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / 'python'
 SERVICES = ('learner', 'actors', 'evaluator', 'proof', 'dashboard')
+RELEASES = 'https://api.github.com/repos/Tomodovodoo/HeXO/releases/latest'
 
 
 def resolve_device(device):
@@ -64,9 +68,11 @@ def command_line(pid):
         return subprocess.run(['ps', '-o', 'args=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
 
 
-def alive(pid, marker):
-    """True when `pid` exists and its command line names `marker`, so a reused pid never passes for a service."""
-    return marker in command_line(pid)
+def alive(pid, needles):
+    """True when `pid` exists and its command line contains every string in `needles` (the service script and the
+    run directory), so a reused pid, or the same service of another run, never passes for this service."""
+    line = command_line(pid)
+    return all(needle in line for needle in needles)
 
 
 def kill(pid):
@@ -91,7 +97,7 @@ class Launcher:
         return json.loads(self.state_file.read_text(encoding='utf-8')) if self.state_file.exists() else {}
 
     def running(self):
-        return {name: entry for name, entry in self.state().items() if self.alive(entry['pid'], entry['marker'])}
+        return {name: entry for name, entry in self.state().items() if self.alive(entry['pid'], entry['needles'])}
 
     def prepare(self, device, run_steps):
         """Create the run configuration and the first checkpoint when either is missing; `run_steps` runs a command."""
@@ -108,9 +114,9 @@ class Launcher:
         state = {}
         try:
             for name in SERVICES:
-                marker = next(part for part in plan[name] if part.endswith('.py'))
+                script = Path(next(part for part in plan[name] if part.endswith('.py'))).name
                 pid = self.spawn(plan[name], self.run / 'logs' / name)
-                state[name] = dict(pid=pid, marker=Path(marker).name, command=plan[name], started_at=time.time())
+                state[name] = dict(pid=pid, needles=[script, str(self.run)], command=plan[name], started_at=time.time())
             self.state_file.write_text(json.dumps(state, indent=2), encoding='utf-8')
         except BaseException:
             for entry in state.values():
@@ -121,7 +127,7 @@ class Launcher:
     def stop(self):
         state = self.state()
         for name in reversed(SERVICES):
-            if name in state and self.alive(state[name]['pid'], state[name]['marker']):
+            if name in state and self.alive(state[name]['pid'], state[name]['needles']):
                 self.kill(state[name]['pid'])
         if self.state_file.exists():
             self.state_file.unlink()
@@ -137,7 +143,7 @@ class Launcher:
             if entry is None:
                 lines.append(f'{name:<10} not started')
                 continue
-            life = 'alive' if self.alive(entry['pid'], entry['marker']) else 'gone'
+            life = 'alive' if self.alive(entry['pid'], entry['needles']) else 'gone'
             detail = ''
             path = self.run / files.get(name, '')
             if name in files and path.exists():
@@ -150,6 +156,51 @@ class Launcher:
         if champion.exists():
             lines.append(f"champion   {json.loads(champion.read_text(encoding='utf-8'))['checkpoint']}")
         return lines
+
+
+def fetch(url):
+    """GET `url`; a GITHUB_TOKEN in the environment authorises access to a private repository's releases."""
+    from urllib.request import Request, urlopen
+    accept = 'application/octet-stream' if '/releases/assets/' in url else 'application/vnd.github+json'
+    headers = {'User-Agent': 'bubble', 'Accept': accept}
+    if os.environ.get('GITHUB_TOKEN'):
+        headers['Authorization'] = 'Bearer ' + os.environ['GITHUB_TOKEN']
+    with urlopen(Request(url, headers=headers)) as response:
+        return response.read()
+
+
+def exports(run):
+    return sorted(Path(run).glob('checkpoints/*/*/ema.pt'))
+
+
+def install(run, source, step, variant='main'):
+    """Copy the weights file `source` into `run` as checkpoint `variant/step` and make it the champion."""
+    checkpoint = f'{variant}/{step:06d}'
+    target = Path(run) / 'checkpoints' / checkpoint
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target / 'ema.pt')
+    manifest = Path(source).with_name('manifest.json')
+    if manifest.exists():
+        shutil.copyfile(manifest, target / 'manifest.json')
+    (Path(run) / 'champion.json').write_text(json.dumps(dict(checkpoint=checkpoint)), encoding='utf-8')
+    return target
+
+
+def download(run, fetch=fetch):
+    """Fetch the newest released Bubble into `run`; the release tag's number is the checkpoint step."""
+    release = json.loads(fetch(RELEASES))
+    assets = {asset['name']: asset['url'] for asset in release['assets']}
+    if 'ema.pt' not in assets:
+        raise RuntimeError(f"release {release['tag_name']} has no ema.pt")
+    step = int(re.search(r'(\d+)', release['tag_name']).group(1))
+    staging = Path(run) / 'checkpoints' / 'download'
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / 'ema.pt').write_bytes(fetch(assets['ema.pt']))
+    if 'manifest.json' in assets:
+        (staging / 'manifest.json').write_bytes(fetch(assets['manifest.json']))
+    target = install(run, staging / 'ema.pt', step)
+    shutil.rmtree(staging)
+    return target
 
 
 def main():
@@ -166,6 +217,8 @@ def main():
     train.add_argument('--net-kernels', choices=['reference', 'fused'], default='reference')
     play = sub.choices['play']
     play.add_argument('--port', type=int, default=8765)
+    play.add_argument('--model', type=Path, help="an ema.pt file to play instead of the run's checkpoints")
+    play.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     args = parser.parse_args()
     launcher = Launcher(args.run)
     if args.command == 'train':
@@ -180,8 +233,16 @@ def main():
     elif args.command == 'status':
         print('\n'.join(launcher.status()))
     else:
-        sys.exit(subprocess.call([sys.executable, str(PYTHON / 'play.py'), '--dense-run', str(launcher.run),
-                                  '--port', str(args.port)], cwd=ROOT))
+        run = launcher.run
+        if args.model:
+            digits = re.findall(r'\d+', str(args.model.resolve().parent.name))
+            run = ROOT / 'runs' / 'play'
+            install(run, args.model, int(digits[-1]) if digits else 0)
+        elif not exports(run):
+            print(f'no checkpoints under {run}; downloading the latest released Bubble')
+            print(f'installed {download(run)}')
+        sys.exit(subprocess.call([sys.executable, str(PYTHON / 'play.py'), '--dense-run', str(run),
+                                  '--port', str(args.port), '--device', args.device], cwd=ROOT))
 
 
 if __name__ == '__main__':
