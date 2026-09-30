@@ -306,6 +306,12 @@ class IsolatedTactics:
         finally:
             self.lock.release()
 
+    def abort(self):
+        """End the running query now: it returns UNKNOWN and the worker restarts in the background."""
+        process = self.process
+        if process is not None:
+            process.kill()
+
     def close(self):
         with self.lock:
             if self.replacement:

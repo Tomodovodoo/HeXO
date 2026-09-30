@@ -311,19 +311,26 @@ class Engines:
         return self.bubbles[key]
 
     def solver(self):
+        """The tactical solver in its own process, so a cancelled query can be ended; None when not built."""
         if self.prover is None:
             import tactical_proof
             package = self.tactical_package or tactical_proof.PACKAGE
             if not tactical_proof.library(package).exists():
                 return None
-            self.prover = tactical_proof.NativeTactics(package)
+            self.prover = tactical_proof.IsolatedTactics(package, priority='below_normal')
         return self.prover
 
     def evaluate(self, entry, checkpoint, budget, history, watch):
         """`evaluate` with the entry's export; returns the evaluation, the budget it really had (no solver nodes
         when the solver is not built) and the key of the weights it used (see `model_key`)."""
         bubble, spent = self.bubble(export_path(entry, checkpoint)), self.effective(budget)
-        found = evaluate(bubble, self.solver(), history, spent['simulations'], spent['solver_nodes'], watch)
+        solver = self.solver()
+        try:
+            found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch)
+        except Cancelled:
+            if solver is not None:
+                solver.abort()
+            raise
         return found, spent, bubble.sha256[:16]
 
     def effective(self, budget):
