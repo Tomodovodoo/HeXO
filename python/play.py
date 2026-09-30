@@ -535,10 +535,10 @@ class Session:
         busy = any(j.kind == 'move' and j.status in ('queued', 'running') and j.history == tuple(self.history)
                    for j in self.jobs.values())
         if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy:
-            self.submit(Job('move', 0, self.history, side=player, seat=dict(seat)))
+            self.submit(Job('move', 1, self.history, side=player, seat=dict(seat)))
         opening = not self.history or remaining == 2
         if self.analysis and self.analysis['auto'] and winner < 0 and opening:
-            self.request_analysis(self.history, 2)
+            self.request_analysis(self.history, 1)
         self.lock.notify_all()
 
     def submit(self, job):
@@ -553,11 +553,14 @@ class Session:
         return job
 
     def request_analysis(self, history, priority, force=False):
-        """Queue an evaluation of `history` by the analysis engine unless it is saved or already queued."""
+        """Queue an evaluation of `history` by the analysis engine unless it is saved or already queued at the same
+        or a more urgent `priority` (lower runs first)."""
         settings = dict(self.analysis)
         for job in self.jobs.values():
             if job.kind == 'analyse' and job.history == tuple(history) and job.seat == settings:
-                if job.status in ('queued', 'running'):
+                if job.status == 'queued' and job.priority > priority:
+                    job.cancelled, job.status = True, 'cancelled'
+                elif job.status in ('queued', 'running'):
                     return job
                 if job.status == 'failed' and not force:
                     return None
@@ -623,7 +626,10 @@ class Session:
         with self.lock:
             if not self.analysis or not 0 <= ply <= len(self.history):
                 raise ValueError('Nothing to analyse')
-            job = self.request_analysis(self.history[:ply], 1, force)
+            for job in self.jobs.values():
+                if job.kind == 'analyse' and job.priority == 0 and job.status == 'queued':
+                    job.cancelled, job.status = True, 'cancelled'
+            job = self.request_analysis(self.history[:ply], 0, force)
             self.lock.notify_all()
             return job.id if job else None
 

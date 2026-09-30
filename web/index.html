@@ -108,6 +108,8 @@ select,input,textarea{background:var(--bg);border:1px solid var(--line-2);border
 .glyph{width:22px;height:18px;border-radius:4px;display:grid;place-items:center;font:800 11px/1 system-ui;color:#0b1222;background:var(--c)}
 .glyph.new{animation:pop .35s cubic-bezier(.3,1.6,.5,1) both}
 .loss{text-align:right;color:var(--dim)}
+#accuracy{display:flex;gap:14px;min-width:0}.tally{display:flex;align-items:center;gap:6px;font:12px var(--mono);color:var(--muted)}
+.tally>span{display:flex;align-items:center;gap:3px}.tally .hexdot{width:11px;height:12px}
 .detail{border:1px solid var(--line);border-radius:var(--r);padding:10px;display:grid;gap:6px;min-height:92px;background:var(--raise)}
 .detail h3{margin:0;font-size:15px;display:flex;align-items:center;gap:8px;text-transform:capitalize}
 .detail .nums{font:12px var(--mono);color:var(--muted);display:flex;gap:12px;flex-wrap:wrap}
@@ -185,6 +187,7 @@ dialog::backdrop{background:rgba(2,6,23,.7)}dialog textarea{width:100%;height:18
       <div class="top" id="top"></div>
     </div>
     <div class="part" id="review">
+      <div class="head"><span class="empty" id="accuracy"></span><span class="spacer"></span><button id="review">Review</button></div>
       <svg id="graph" preserveAspectRatio="none"></svg>
       <div id="moves"></div>
       <div class="detail" id="detail"></div>
@@ -283,7 +286,7 @@ function paint(){
   const now=performance.now();let moving=false;
   const win=S.winner>=0&&view===S.history.length?new Set(sixLine(stones).map(s=>key(...s))):new Set();
   stones.forEach(([q,r],i)=>{
-    const[x,y]=screen(q,r),k=key(q,r),t0=landed.get(k);let s=size-1.5,a=1;
+    const[x,y]=screen(q,r),k=key(q,r),t0=landed.get(k);let s=size*.9,a=1;
     if(MOTION&&t0!==undefined){const t=(now-t0)/260;if(t<0){a=0}else if(t<1){const e=1-Math.pow(1-t,3);s*=1.35-.35*e;a=e;moving=true}else landed.delete(k)}
     if(!a)return;ctx.globalAlpha=a;hexPath(x,y,s);ctx.fillStyle=COLORS[playerAt(i)];ctx.fill();
     if(win.has(k)){ctx.lineWidth=3;ctx.strokeStyle='#fff';ctx.stroke();ctx.lineWidth=1}
@@ -391,8 +394,7 @@ function renderEngineHead(){
   const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},el('i'),'Auto');
   auto.onclick=()=>send({auto:!a.auto});
   const again=el('button',{'aria-label':'Analyse again'},'↻');again.onclick=()=>post('/analyse',{ply:view,force:true});
-  const review=el('button',{id:'review'},'Review');review.onclick=()=>post('/review');
-  const box=el('div',{class:'stack',style:'flex:1;min-width:0'},el('div',{class:'head'},pick,auto,again,review),...seatControls(a,'bubble',send));
+  const box=el('div',{class:'stack',style:'flex:1;min-width:0'},el('div',{class:'head'},pick,auto,again),...seatControls(a,'bubble',send));
   head.replaceChildren(box);
 }
 function selectedTurn(){if(!S||!view)return null;return S.review.find(t=>t.ply<=view-1&&view-1<t.ply+t.stones.length)||null}
@@ -439,12 +441,16 @@ function renderMoves(){
       el('span',{class:'loss'},loss!=null&&loss>0?'−'+loss:''));
     row.onclick=()=>go(t.ply+t.stones.length);return row}));
   for(const t of S.review)seenLabels.set(t.ply,t.label);
+  const bad=['inaccuracy','mistake','blunder','missed','allowed'];
+  $('accuracy').replaceChildren(...[0,1].flatMap(p=>{const counts=bad.map(l=>[l,S.review.filter(t=>t.player===p&&t.label===l).length]).filter(c=>c[1]);
+    return counts.length?[el('span',{class:'tally'},el('i',{class:'hexdot',style:`--c:${COLORS[p]}`}),
+      counts.map(([l,n])=>el('span',{},el('span',{class:'glyph',style:`--c:var(${LABEL[l][1]})`},LABEL[l][0]),n)))]:[]}));
   if(atEnd&&view===S.history.length)box.scrollTop=box.scrollHeight;else box.scrollTop=keep;
   const s=box.querySelector('.sel');if(s&&(s.offsetTop<box.scrollTop||s.offsetTop>box.scrollTop+box.clientHeight-24))s.scrollIntoView({block:'nearest'});
 }
 function renderDetail(){
   const t=selectedTurn(),d=$('detail');
-  if(!t||!t.label){const job=S.jobs.find(j=>j.kind==='review');d.replaceChildren(el('span',{class:'empty'},job?`${job.done} / ${job.total}`:(t?'·':'')));return}
+  if(!t||!t.label){const job=S.jobs.find(j=>j.kind==='review');d.replaceChildren();return}
   const[g,c]=LABEL[t.label],nums=[];
   if(t.before!=null)nums.push(el('span',{},pct(t.before)+' → '+pct(t.after)));
   if(t.better)nums.push(el('span',{style:`color:${COLORS[t.player]}`},'★ '+t.better.map(p=>p.join(',')).join('  ')));
@@ -467,8 +473,8 @@ function renderJobs(){
     const bar=box.querySelector('.bar')||el('div',{class:'bar'},el('i'));const x=box.querySelector('.x')||el('button',{class:'x','aria-label':'Cancel'},'×');
     x.onclick=()=>post('/cancel',{id:job.id});bar.firstChild.style.transform=`scaleX(${job.status==='queued'?0:Math.min(1,job.done/job.total)})`;
     if(!box.children.length)box.append(bar,x)}
-  const review=$('review');if(review){const job=S.jobs.find(j=>j.kind==='review');review.textContent=job?`${job.done}/${job.total} ×`:'Review';
-    review.onclick=()=>job?post('/cancel',{id:job.id}):post('/review')}
+  const review=$('review'),rjob=S.jobs.find(j=>j.kind==='review');review.textContent=rjob?`${rjob.done} / ${rjob.total}  ×`:'Review';
+  review.onclick=()=>rjob?post('/cancel',{id:rjob.id}):post('/review');
   const pending=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);$('evalbar').classList.toggle('pending',pending);
 }
 
