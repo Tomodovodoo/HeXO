@@ -522,19 +522,26 @@ class SelfPlayGame:
     records `solver` (dense_solver.record) and `label` marks rows a proof decided after they were searched.
     `restart` (entry, moves) starts the game after `moves`, the forced opening of a restart buffer `entry`: those
     plies get no row, a null root value and full_search False, no opening ply is sampled after them, and the
-    episode records origin 'restart' and `restart` (the entry's RESTART_SOURCE fields); other games record origin
-    'selfplay'.
+    episode records origin 'restart' and `restart` (the entry's RESTART_SOURCE fields). `book` (metadata, moves)
+    uses the same forced-prefix treatment and records origin 'book' plus its source metadata; ordinary games
+    record origin 'selfplay'.
     With adjudicate_proven a proven search (+1: the side to move wins, -1: every candidate it kept loses) plays its
     move and ends the game there (`adjudicate`)."""
 
-    def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None):
+    def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None):
         self.sides, self.settings, self.seed, self.reason, self.adjudicated = sides, settings, seed, None, None
         self.solver, self.schedule = dense_solver.Budgets.of(settings), dense_solver.Schedule.of(settings)
         self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
+        if restart is not None and book is not None:
+            raise ValueError('A game cannot start from both a restart and an opening book')
         self.restart, forced = (None, []) if restart is None else (restart[0], [[int(q), int(r)] for q, r in restart[1]])
+        self.book = None if book is None else book[0]
+        if book is not None:
+            forced = [[int(q), int(r)] for q, r in book[1]]
+        self.forced_plies = len(forced)
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) \
-            if settings.opening_random_plies > 0 and restart is None else 0
+            if settings.opening_random_plies > 0 and restart is None and book is None else 0
         self.trees = {model: model.tree([tuple(m) for m in forced], seed+k, settings.tactics)
                       for k, model in enumerate(dict.fromkeys(sides))}
         self.game, self.moves, self.rows = Game(forced), forced, []
@@ -672,12 +679,15 @@ class SelfPlayGame:
         self.game.close()
         for tree in self.trees.values():
             tree.close()
-        forced = self.restart['ply'] if self.restart else 0
+        forced = self.forced_plies
         episode = dict(moves=self.moves, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
                        opening_plies=min(forced+self.random_plies, len(self.moves)), actor=self.sides[self.learner].sha,
                        actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
                        trained_side=None if self.opponent is None else self.learner,
-                       root_values=self.values, full_search=self.full, origin='restart' if self.restart else 'selfplay')
+                       root_values=self.values, full_search=self.full,
+                       origin='book' if self.book is not None else 'restart' if self.restart else 'selfplay')
+        if self.book is not None:
+            episode['book'] = self.book
         if self.restart:
             episode['restart'] = {k: self.restart[k] for k in RESTART_SOURCE}
         if dense_solver.active(self.solver, self.schedule):
@@ -685,6 +695,31 @@ class SelfPlayGame:
         if self.adjudicated:
             episode['adjudicated'] = self.adjudicated
         return episode, self.rows
+
+
+class BookStarts:
+    """Read-only snapshot of the live off-policy pool, reloaded with other sources at shard/phase boundaries.
+
+    Draw classes uniformly, then orientations uniformly. An empty eligible pool yields an ordinary game.
+    Metadata identifies the book state; the forced prefix has no training rows or invented root values.
+    """
+
+    def __init__(self, run, max_plies):
+        self.run, self.max_plies = run, max_plies
+        self.load()
+
+    def load(self):
+        from dense_openings import Book, LIVE
+        book = Book(self.run, suite=LIVE)
+        self.nodes = [n for n in book.openings(off_policy=True) if n['depth'] < self.max_plies]
+        self.digest = book.digest()
+
+    def draw(self, rng):
+        if not self.nodes:
+            return None
+        node = self.nodes[int(rng.integers(len(self.nodes)))]
+        moves = np.asarray(node['moves'], np.int64) @ hexcrop.SYMMETRIES[rng.integers(len(hexcrop.SYMMETRIES))]
+        return dict(suite='book', key=node['key'], digest=self.digest, ply=len(moves), off_policy=True), moves.tolist()
 
 
 class Restarts:
@@ -888,6 +923,8 @@ def worker(args):
         historical.redraw(model.checkpoint, model.sha)
     restarts = Restarts(run, settings.restart_temperature, settings.max_plies) if settings.restart_fraction > 0 else None
     restart_rng = np.random.default_rng(seeds.spawn(1)[0]) if restarts else None
+    book_starts = BookStarts(run, settings.max_plies) if settings.book_fraction > 0 else None
+    start_rng = np.random.default_rng(seeds.spawn(1)[0]) if book_starts else None
     engine = Engine(settings.leaf_batch, settings.solver_async, dense_solver.Schedule.of(settings), settings.solver_leaf_nodes)
     began, solver_failures = time.perf_counter(), 0
     state = dict(published(run, args.worker), error=None)
@@ -925,6 +962,8 @@ def worker(args):
             paused_seconds=paused_total+(time.perf_counter()-paused_since if paused_since is not None else 0.),
             vram=hexnet.vram(), error=state['error'],
             solver=engine.solver.summary(now-began) if engine.solver else None)
+        fields.update(book_fraction=settings.book_fraction, restart_fraction=settings.restart_fraction,
+                      off_policy_openings=len(book_starts.nodes) if book_starts else 0)
         write_json(status_path, fields)
         if fields['solver'] and fields['solver']['failures'] > solver_failures:
             solver_failures = fields['solver']['failures']
@@ -950,6 +989,8 @@ def worker(args):
             historical.redraw(model.checkpoint, model.sha)
         if restarts:
             restarts.load()
+        if book_starts:
+            book_starts.load()
 
     def publish():
         now = time.perf_counter()
@@ -971,6 +1012,8 @@ def worker(args):
                       mean_plies=sum(len(e['moves']) for e in episodes)/games,
                       placements_per_second=(state['positions']-since['positions'])/elapsed,
                       evals_per_second=(engine.evals-since['evals'])/elapsed, process=args.worker, opponents=opponents)
+        fields.update(book_games=sum(e.get('origin') == 'book' for e in episodes),
+                      restart_games=sum(e.get('origin') == 'restart' for e in episodes))
         log_event(run, 'actor', 'shard', f'shard {name}: {games} games, {len(rows)} rows', **fields)
         print(json.dumps(fields), flush=True)
         since.update(time=now, positions=state['positions'], evals=engine.evals)
@@ -981,13 +1024,23 @@ def worker(args):
         nonlocal started
         while len(engine.slots) < settings.games_in_flight and (args.games is None or started < args.games):
             seed = seeds.spawn(1)[0].generate_state(1, np.uint64)[0].item()
+            book, restart = None, None
+            if book_starts:
+                # Unconditional shares, also when historical opponents are enabled. Failed restart/book draws
+                # become ordinary starts, rather than increasing the other source's allocation.
+                draw = start_rng.random()
+                if draw < settings.book_fraction:
+                    book = book_starts.draw(start_rng)
+                elif draw < settings.book_fraction+settings.restart_fraction:
+                    restart = restarts.draw(restart_rng) if restarts else None
             if historical and historical.models and sum(g.opponent is not None for g in engine.slots) < historical.target:
                 opponent, learner = historical.next()
                 sides = [model, opponent] if learner == 0 else [opponent, model]
-                engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint))
+                engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint, restart=restart, book=book))
             else:
-                restart = restarts.draw(restart_rng) if restarts and restart_rng.random() < settings.restart_fraction else None
-                engine.add(SelfPlayGame([model, model], settings, seed, restart=restart))
+                if book_starts is None:
+                    restart = restarts.draw(restart_rng) if restarts and restart_rng.random() < settings.restart_fraction else None
+                engine.add(SelfPlayGame([model, model], settings, seed, restart=restart, book=book))
             started += 1
 
     try:
@@ -1057,7 +1110,7 @@ def worker(args):
 
 def published(run, worker, since=0.):
     """Cumulative counts from shards written by actor worker `worker` at or after `since`: positions are rows
-    (searched plies), plies are rows plus the forced plies of restart games."""
+    (searched plies), plies are rows plus the forced plies of restart and book games."""
     totals = dict(games_completed=0, positions=0, shards_written=0, terminal=0, plies=0)
     for m in (dense_data.manifest(path) for path in dense_data.shard_dirs(run)):
         if m['identity'].get('process') == worker and m['created_at'] >= since:

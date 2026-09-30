@@ -32,7 +32,7 @@ GROW_ROUNDS = 8     # generation rounds per refresh while settled openings are m
 SCORE_BATCH = 512   # positions per policy call
 SKEW_EDGES = list(range(-200, 201, 25))  # histogram bins of `Book.stats`, the outer bins open-ended
 MAX_PLIES = 10      # longest book line: P2's sixth stone is the 11th placement, so no book position is terminal
-REASONS = ('probability', 'skew', 'short_skew', 'nested', 'replaced')
+REASONS = ('probability', 'value', 'skew', 'short_skew', 'nested', 'replaced')
 
 
 def turns(moves):
@@ -209,8 +209,11 @@ def judge(node, settings, short_limit=None):
         return 'skew'
     if short_skewed(node, settings, short_limit):
         return 'short_skew'
+    value = node.get('champion_value')
+    if value is not None and 1-value < settings.book_min_p2_value:
+        return 'value'
     p = node['champion_probability']
-    return 'probability' if p is not None and p < settings.book_min_prob else None
+    return 'probability' if not node.get('off_policy') and p is not None and p < settings.book_min_prob else None
 
 
 def worst(node):
@@ -223,7 +226,7 @@ def new_node(moves, now=0.):
     return dict(key=key, moves=moves, depth=len(moves), status=None, reason=None, challenges=None, probability=None,
                 visit_share=None, checkpoint=None, created_at=now, retired_at=None, champion_probability=None, champion_value=None,
                 scored_by=None, games=0, p1_wins=0, p2_wins=0, capped=0, plies_sum=0, plies_games=0,
-                mean_plies=None, pairs=[0]*5, skew=skew([0]*5))
+                mean_plies=None, pairs=[0]*5, skew=skew([0]*5), off_policy=False)
 
 
 def suites():
@@ -251,12 +254,14 @@ def check(settings):
             or min(s.book_sims, s.book_max_skew, s.book_short_skew_z) < 0 \
             or min(s.book_size, s.book_min_games, s.book_short_min_games) < 1 \
             or not 0 <= s.book_short_quantile <= 1 or not 0 <= s.book_revisit_fraction <= 1 or s.book_refresh_hours <= 0 \
-            or not 0 <= s.book_min_prob < 1 or s.book_weighting not in ('uniform', 'least_played'):
+            or not 0 <= s.book_min_prob < 1 or not 0 <= s.book_min_p2_value <= 1 \
+            or s.book_weighting not in ('uniform', 'least_played'):
         raise ValueError(f'need 2 <= book_min_plies <= book_plies <= {MAX_PLIES}, book_plies < max_plies, '
                          'book_temperature > 0, book_sims and '
                          'book_max_skew and book_short_skew_z >= 0, book_size, book_min_games and '
                          'book_short_min_games >= 1, book_short_quantile and book_revisit_fraction in [0, 1], '
-                         "book_refresh_hours > 0, book_min_prob in [0, 1) and book_weighting 'uniform' or 'least_played'")
+                         "book_refresh_hours > 0, book_min_prob in [0, 1), book_min_p2_value in [0, 1] "
+                         "and book_weighting 'uniform' or 'least_played'")
 
 
 def pairs_of(report):
@@ -314,9 +319,10 @@ class Book:
         self._missing_plies = {n['key'] for n in self.nodes.values() if 'plies_games' not in n}
         self._legacy_counted = dict(self.data['counted'])
 
-    def openings(self):
+    def openings(self, off_policy=False):
         """The openings (status 'opening'), by key."""
-        return sorted((n for n in self.nodes.values() if n['status'] == 'opening'), key=lambda n: n['key'])
+        return sorted((n for n in self.nodes.values() if n['status'] == 'opening'
+                       and (not off_policy or n.get('off_policy'))), key=lambda n: n['key'])
 
     def digest(self):
         """The state reports are played under: '' for a frozen book (its suite fixes its openings and their weights),
@@ -331,12 +337,12 @@ class Book:
         return not self.frozen and (self.data['refreshed_by'] != champion
                                     or now-self.data['refreshed_at'] >= self.settings.book_refresh_hours*3600)
 
-    def draw(self, seed):
+    def draw(self, seed, off_policy=False):
         """The moves of an opening drawn by `seed`: in proportion to `weight` in a frozen book, else uniformly, or with
         book_weighting 'least_played' in proportion to 1 / (1 + its pairs); played in one of the 12 symmetric
         orientations, chosen uniformly by `seed`, so every image of a class is equally likely (a frozen weight of
         class's number of images makes every physical opening equally likely). ValueError without openings."""
-        openings = self.openings()
+        openings = self.openings(off_policy)
         if not openings:
             raise ValueError(f'{self.path} has no opening; the evaluator refreshes a live book once a champion exists')
         w = np.array([n['weight'] if self.frozen else 1/(1+n['skew']['pairs']) if self.data['weighting'] == 'least_played'
@@ -347,12 +353,62 @@ class Book:
 
     def add(self, moves, now):
         """The node of `moves`, adding it and its missing prefix nodes."""
+        off_policy = False
         for k in range(1, len(moves)+1):
             key = canonical(moves[:k])[0]
             if key not in self.nodes:
                 self.nodes[key] = new_node(moves[:k], now)
                 self.data['nodes'].append(self.nodes[key])
+            off_policy |= bool(self.nodes[key].get('off_policy'))
+            if off_policy:
+                self.nodes[key]['off_policy'] = True
         return self.nodes[canonical(moves)[0]]
+
+    def off_policy(self, moves):
+        """Whether this position or an ancestor is an imported off-policy start."""
+        return any(self.nodes.get(canonical(moves[:d])[0], {}).get('off_policy')
+                   for d in range(1, len(moves)+1))
+
+    def import_openings(self, source, now=None):
+        """Import a v2 book's active positions as off-policy starts, preserving live results and retirements.
+
+        An explicit import can revive a probability retirement, since these positions no longer use that rule.
+        Other retirements remain final, including after prune. Repeating an import does not reset statistics.
+        """
+        if self.frozen or source.get('schema') != SCHEMA:
+            raise ValueError('Off-policy imports need a live destination and a v2 source book')
+        from legacy.train import Game
+        now = time.time() if now is None else now
+        imported = []
+        # Validate the whole input before changing the destination, including the native placement order.
+        for entry in source['nodes']:
+            if entry['status'] != 'opening':
+                continue
+            if not 2 <= len(entry['moves']) <= MAX_PLIES or canonical(entry['moves'])[0] != entry['key']:
+                raise ValueError(f"Invalid imported opening {entry['key']!r}")
+            game = Game([tuple(m) for m in entry['moves']])
+            game.close()
+            imported.append(entry)
+        for entry in imported:
+            node = self.add(entry['moves'], now)
+            node.update(off_policy=True, off_policy_source=source['suite'])
+            if node['status'] is None or node['reason'] == 'probability':
+                node.update(status='opening', reason=None, retired_at=None, challenges=None,
+                            checkpoint=source.get('refreshed_by'), created_at=now)
+            if 'analysis' in entry:
+                node['analysis'] = entry['analysis']
+        # Existing descendants also inherit protection; partial-turn parents do not.
+        for node in list(self.nodes.values()):
+            self.add(node['moves'], now)
+        protected = {n['key'] for n in self.nodes.values() if n.get('off_policy')}
+        for node in self.nodes.values():
+            if node.get('off_policy') or node['challenges'] in protected:
+                node['challenges'] = None
+        self.data.setdefault('off_policy_imports', {})[source['suite']] = dict(
+            keys=sorted({n['key'] for n in imported}), selection=source.get('selection'))
+        self.data['refreshed_at'] = 0.  # current champion must re-score the new starts at its next refresh
+        self.save()
+        return dict(imported=len(imported), off_policy_openings=len(self.openings(off_policy=True)))
 
     def tally(self, pair):
         """Count a completed colour pair on every node its opening passed through that is in the book."""
@@ -454,7 +510,7 @@ class Book:
             covered = {canonical(n['moves'][:d])[0] for n in self.openings() for d in range(1, n['depth'])}
             retired_keys = set()
             for node in self.openings():
-                if node['key'] in covered:
+                if node['key'] in covered and not node.get('off_policy'):
                     self.retire(node, 'nested', now)
                     retired_keys.add(node['key'])
                     retired['nested'] += 1
@@ -485,6 +541,8 @@ class Book:
                 winner['challenges'] = None
         challenged = {n['challenges'] for n in self.openings()}
         settled = [n for n in self.openings() if n['challenges'] is None and n['key'] not in challenged and n['depth'] > 1]
+        # Imported starts should teach the policy their positions, rather than be replaced by policy siblings.
+        settled = [n for n in settled if not n.get('off_policy')]
         chosen = rng.permutation(len(settled))[:round(s.book_revisit_fraction*len(settled))]
         added = self.generate(model, checkpoint, [(settled[k]['moves'][:-1], settled[k]['depth'], settled[k]['key'])
                                                   for k in sorted(chosen)], rng, now, leaf_batch)
@@ -519,7 +577,7 @@ class Book:
         self.score(model, checkpoint, pool)
         taken = 0
         for node in pool:
-            if taken < count and node['key'] not in used and node['champion_probability'] >= s.book_min_prob:
+            if taken < count and node['key'] not in used and judge(node, s, short_limit) is None:
                 node.update(status='opening', probability=node['champion_probability'], checkpoint=checkpoint, created_at=now)
                 used.update(canonical(node['moves'][:d])[0] for d in range(1, node['depth']+1))
                 taken += 1
@@ -554,11 +612,15 @@ class Book:
         flat = list({key: moves for options in prefixes for key, moves, _ in options}.items())
         scores = dict(zip((key for key, _ in flat), reach(model, [moves for _, moves in flat])))
         added, taken = 0, set()
-        for k, (_, _, challenged) in enumerate(starts):
+        for k, (start, _, challenged) in enumerate(starts):
+            off_policy = self.off_policy(start) \
+                or bool(self.nodes.get(challenged, {}).get('off_policy'))
             fit = []
             for options in prefixes[k*ALTERNATIVES:(k+1)*ALTERNATIVES]:
                 key, moves, share = next((o for o in options if o[0] not in covered and o[0] not in taken
-                                          and scores[o[0]][0] >= s.book_min_prob),
+                                          and (off_policy or self.off_policy(o[1])
+                                               or scores[o[0]][0] >= s.book_min_prob)
+                                          and 1-scores[o[0]][1] >= s.book_min_p2_value),
                                          (None, None, None))
                 if key is not None:
                     fit.append((len(moves), abs(scores[key][1]-.5), key, moves, share))
@@ -571,13 +633,15 @@ class Book:
             node.update(status='opening', challenges=challenged, probability=scores[key][0], visit_share=share,
                         checkpoint=checkpoint, created_at=now, champion_probability=scores[key][0],
                         champion_value=scores[key][1], scored_by=checkpoint)
+            node['off_policy'] = bool(node.get('off_policy')) or off_policy
             added += 1
         return added
     def prune(self):
         """Remove the retired openings without games and then the null-status nodes without games that no remaining
         opening or retired opening passes through; returns how many nodes were removed."""
         before = len(self.nodes)
-        keep = {k: n for k, n in self.nodes.items() if not (n['status'] == 'retired' and not n['games'])}
+        keep = {k: n for k, n in self.nodes.items()
+                if not (n['status'] == 'retired' and not n['games'] and not n.get('off_policy'))}
         needed = {canonical(n['moves'][:d])[0] for n in keep.values() if n['status'] for d in range(1, n['depth']+1)}
         self.nodes = {k: n for k, n in keep.items() if n['status'] or n['games'] or k in needed or n['depth'] == 1}
         self.data['nodes'] = list(self.nodes.values())
@@ -596,6 +660,7 @@ class Book:
             counts[min(max(int(np.searchsorted(edges, v, 'right'))-1, 0), len(counts)-1)] += 1
         return dict(suite=self.suite, frozen=self.frozen, digest=self.digest(), refreshed_by=self.data['refreshed_by'],
                     refreshed_at=self.data['refreshed_at'], nodes=len(self.nodes), openings=len(openings),
+                    off_policy_openings=len(self.openings(off_policy=True)),
                     challengers=sum(n['challenges'] is not None for n in openings),
                     retired={r: sum(n['reason'] == r for n in self.nodes.values()) for r in REASONS},
                     depths={str(d): sum(n['depth'] == d for n in openings) for d in sorted({n['depth'] for n in openings})},
@@ -650,7 +715,7 @@ def main():
                                                  'write the book (refresh also stamps report ids, stamp): run '
                                                  'them while the evaluator is stopped.')
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('refresh', 'stats', 'prune'):
+    for name in ('refresh', 'stats', 'prune', 'import'):
         p = sub.add_parser(name)
         p.add_argument('--run', required=True)
         p.add_argument('--suite', default=LIVE)
@@ -660,6 +725,8 @@ def main():
             p.add_argument('--net-kernels', choices=('reference', 'fused'), help='model kernels for this process')
         if name == 'stats':
             p.add_argument('--nodes', action='store_true', help='also print the DAG (nodes and edges)')
+        if name == 'import':
+            p.add_argument('--source', required=True, type=Path, help='v2 book containing off-policy openings')
     args = parser.parse_args()
     config = dense_config.load(args.run)
     settings = replace(dense_config.override(config.evaluation, args, 'eval_'), opening_suite=args.suite)
@@ -675,6 +742,8 @@ def main():
         book.reconcile(stamp(args.run))
         now = time.time()
         out = book.refresh(model, champion, np.random.default_rng(int(now)), now, config.actor.leaf_batch)
+    elif args.command == 'import':
+        out = book.import_openings(json.loads(args.source.read_text()))
     elif args.command == 'prune':
         out = dict(removed=book.prune(), **book.stats())
     else:

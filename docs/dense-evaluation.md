@@ -88,3 +88,22 @@
   `league.json` `openings` holds P1/P2 results overall and per player, and each book's counts, depths and skew
   histogram. `/api/openings` serves the DAG with its statistics. `python python/dense_openings.py refresh|stats|prune
   --run R` refreshes, inspects or prunes a book; run the writing commands while the evaluator is stopped.
+
+Import the selected off-policy pool while the evaluator is stopped:
+
+```text
+python python/dense_openings.py import --run R --source openings/off-policy-107500-p2-ge47p5-v1.json
+```
+
+This source contains 190 legal, symmetry-distinct two-stone openings outside the sampled DAG, selected at
+107.5k with 1,024 simulations and 32,768 proof nodes per query for P2 expected score at least 47.5%.
+Those search estimates are saved under each node's `analysis`; they are not proofs of balance.
+Import preserves existing results. Repeating it does not revive a value or game-evidence retirement.
+
+Imported nodes and their descendants carry `off_policy: true`. Policy reach remains visible but cannot retire
+them or block generation/adoption. Imported starts also skip policy-sibling challenges and nested retirement,
+so policy preferences cannot replace the selected training pool. Value and played-game skew rules still apply.
+At every refresh the champion's symmetry-averaged value head checks each active book position, including
+deeper continuations. Generation and adoption use the same `book_min_p2_value` floor, default 45%.
+This is a fixed P2 score of `1 - champion_value`, with no upper P2 cutoff. A lower score retires the node as
+`value`. It is a raw value-head check; the saved admission search is a separate estimate.

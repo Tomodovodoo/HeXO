@@ -2283,7 +2283,7 @@ class DenseBootstrapTests(unittest.TestCase):
             self.assertEqual(dense_data.origin(dict(written, origin=None)), 'converted')    # inferred from the identity
             self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, opponent_rows=0, terminal_games=1, capped_games=1,
                                                  proven_rows=0, proven_games=0, line_rows=0, adjudicated_plies=0,
-                                                 restart_games=0, forced_plies=0))
+                                                 restart_games=0, book_games=0, forced_plies=0))
             self.assertEqual(dense_bootstrap.check(target), 21)
             _, stored = dense_data.read_shard(target)
             self.assertEqual({r['game'] for r in stored}, {0, 1})
@@ -3201,6 +3201,35 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_book_start_searches_only_after_prefix_and_records_source_and_counts(self):
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        settings = dense_config.ActorSettings(full_fraction=1., full_sims=2, root_samples=2,
+                                             opening_random_plies=5., tactics=False, max_plies=5)
+        history = [[0, 0], [7, 0], [8, 0]]
+        source = dict(suite='book', key='test', digest='x', ply=3, off_policy=True)
+        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, book=(source, history))
+        engine = dense_selfplay.Engine(8)
+        try:
+            engine.add(slot)
+            while engine.slots:
+                engine.step()
+            episode, rows = slot.episode()
+        finally:
+            engine.close()
+        self.assertEqual((episode['origin'], episode['book'], episode['opening_plies']), ('book', source, 3))
+        self.assertEqual(episode['moves'][:3], history)
+        self.assertEqual(episode['root_values'][:3], [None]*3)
+        self.assertTrue(all(v is not None for v in episode['root_values'][3:]))
+        self.assertEqual([r['ply'] for r in rows], [3, 4])
+        with tempfile.TemporaryDirectory() as run:
+            manifest = dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'),
+                                             [episode], [dict(r, game=0) for r in rows])
+            self.assertEqual((manifest['counts']['book_games'], manifest['counts']['restart_games'],
+                              manifest['counts']['forced_plies']), (1, 0, 3))
+        with self.assertRaises(ValueError):
+            dense_config.ActorSettings(book_fraction=.95, restart_fraction=.1)
+
     def test_cheap_search_can_descend_with_fewer_root_samples(self):
         slot = SimpleNamespace(settings=dense_config.ActorSettings(full_fraction=0.), rng=np.random.default_rng(1))
         dense_selfplay.SelfPlayGame.plan(slot)

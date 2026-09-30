@@ -31,6 +31,8 @@ const columns = [
   ['mean_plies','Mean','Mean total placements in matching report games, including capped games',number],
   ['depth','Depth','Opening placements, including the first origin stone',number],
   ['champion_probability','P %','Probability of reaching this canonical position under the champion',v=>v==null?'·':(100*v).toPrecision(3)],
+  ['champion_value','P2 value %','Champion value-head expected score for P2 at this position',v=>v==null?'·':percent(1-v)],
+  ['off_policy','Off policy','Imported training starts and their descendants, exempt from policy-reach retirement',v=>v?'Yes':'·'],
   ['status','S','Green: opening; amber: retired; grey: prefix',v=>'●'],
   ['created_at','Created','Book creation or adoption time, UTC',timestamp],
   ['retired_at','Retired','Retirement time, UTC',timestamp],
@@ -60,7 +62,7 @@ class OpeningBook {
     this.runSelect=element('select',null,{'aria-label':'Book run'});this.runSelect.onchange=()=>this.change({run:this.runSelect.value,page:1});this.controls.append(this.runSelect);
     this.filters=[];
     this.status=this.select('Status','status',[['','All'],['opening','Opening'],['retired','Retired'],['prefix','Prefix']]);
-    this.reason=this.select('Reason','reason',[['','All'],['probability','Probability'],['skew','Skew'],['replaced','Replaced']]);
+    this.reason=this.select('Reason','reason',[['','All'],['probability','Probability'],['value','Value'],['skew','Skew'],['short_skew','Short skew'],['nested','Nested'],['replaced','Replaced']]);
     this.minGames=this.input('Games ≥','min_games',0,0);this.depth=this.input('Depth','depth','',0);
     this.colour=this.input('Colour decides','colour_decides',false,0,'checkbox');
     this.minDecisive=this.input('Decisive ≥','min_decisive',10,1);

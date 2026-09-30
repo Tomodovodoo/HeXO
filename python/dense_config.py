@@ -95,6 +95,7 @@ class ActorSettings:
     # of restarts.json, drawn with probability proportional to regret^(1/restart_temperature); 0 = never.
     restart_fraction: float = 0.
     restart_temperature: float = 1.
+    book_fraction: float = 0.  # share of all games starting from live off-policy book positions
     net_kernels: str = 'reference'  # opt-in Triton features, normalization and inference LineConv
     cuda_graphs: bool = False  # reuse bounded CUDA graphs for frozen fused actor models
 
@@ -107,6 +108,8 @@ class ActorSettings:
             raise ValueError('cuda_graphs requires net_kernels=fused')
         if not 0 <= self.restart_fraction <= 1 or not self.restart_temperature > 0:
             raise ValueError('restart_fraction must lie in [0, 1] and restart_temperature must be positive')
+        if not 0 <= self.book_fraction <= 1 or self.book_fraction+self.restart_fraction > 1:
+            raise ValueError('book_fraction and restart_fraction must be nonnegative and sum to at most 1')
 
 
 VALUE_TARGETS = ('outcome', 'td', 'calibrated')
@@ -233,7 +236,9 @@ class EvaluationSettings:
     # skew interval wholly beyond +-book_max_skew Elo, or after book_short_min_games decisive games when its P1 win
     # z-score reaches book_short_skew_z and its mean length falls below the book_short_quantile of played openings.
     # Skewed openings are replaced by a child below book_plies. An opening also retires when the
-    # champion's policy probability of it is below book_min_prob; each refresh the champion challenges a random
+    # champion's policy probability of it is below book_min_prob (off-policy nodes are exempt), or its P2 value
+    # head is below book_min_p2_value. Off-policy starts also skip policy-sibling challenges; each refresh otherwise
+    # the champion challenges a random
     # book_revisit_fraction of the settled openings with an alternative at the same depth. book_weighting 'uniform'
     # or 'least_played' (weight 1 / (1 + pairs)) chooses how matches draw openings.
     book_plies: int = 5
@@ -249,6 +254,7 @@ class EvaluationSettings:
     book_short_skew_z: float = 2.5
     book_short_quantile: float = .25
     book_min_prob: float = 1e-4
+    book_min_p2_value: float = .45  # champion value-head floor, fixed P2 perspective; no upper cutoff
     book_weighting: str = 'uniform'
     opening_book: str = ''        # Book.digest of the live book the games are played under; stamped by the evaluator
     eval_share: float = .12       # ceiling on the evaluator's playing share of wall time (dense_eval.Pacer)

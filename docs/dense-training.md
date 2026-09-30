@@ -118,6 +118,18 @@ target. The optional mode's playing benefit still needs measurement.
 
 ## Dense actor batches
 
+`--book-fraction 0.25 --restart-fraction 0.1` allocates 25% of newly started games to the live off-policy
+opening pool, 10% to the restart buffer, and the remaining 65% to ordinary starts. The book fraction defaults
+to 0. Classes in the eligible off-policy pool are sampled uniformly, with a random hex symmetry; ordinary
+book entries do not consume this allocation. These start shares also apply with historical opponents enabled.
+An empty eligible pool or unavailable restart source produces an ordinary start. The actor heartbeat reports
+the configured fractions and eligible pool size; shard events and manifests count completed book/restart games.
+
+Actors reload the read-only book snapshot at shard and learner-phase boundaries. Book games store origin
+`book` and `{suite, key, digest, ply, off_policy}` metadata. The preset stones have no training rows and null
+root values. Search and training begin after that prefix, using the normal full/cheap search schedule and
+solver settings. The manifest's `forced_plies` includes both book and restart prefixes.
+
 Both the learner and actors accept `--net-kernels fused` for optional Triton GPU kernels. The default is
 `reference`; checkpoints load in either mode. See [GPU kernels](gpu-kernels.md) for installation, the paired
 benchmarks, profiling commands, and the batch-256 training validation that remains blocked by the shared-card
