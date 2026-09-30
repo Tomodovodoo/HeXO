@@ -172,7 +172,8 @@ def live(args):
             return dense_eval.MatchGame(players, prefix['opening'], seed, settings.sims,
                                         settings.root_samples, settings.tactics, settings.max_plies,
                                         dict(slot=slot, pair=pair, challenger_color=colour,
-                                             opening=prefix['opening']), solvers=(budget, budget))
+                                             opening=prefix['opening']), solvers=(budget, budget),
+                                        graphs=settings.search_graph)
 
         pool = dense_eval.Pool(config.actor.leaf_batch, Schedule.of(settings))
         pool.add(lane, [game_for(slot) for slot in range(64)])
