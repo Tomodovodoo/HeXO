@@ -262,6 +262,21 @@ class NeuralTree(unittest.TestCase):
         self.assertEqual(result['actions'][np.flatnonzero(result['policy'])].tolist(), [[5,0]])
         self.assertEqual(result['action'], [5,0])
 
+    def test_a_longer_certificate_keeps_the_shorter_tactical_win(self):
+        # Player 0 completes six with one stone; a (stub-verified) certificate names a slower turn elsewhere.
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]]
+        class Slow:
+            def history(self, history, ms, certificate=None, **kwargs):
+                return dict(status='PROVEN_WIN', native_verified=True, moves=[[-3,-3],[-3,-2]], proof_turns=3)
+        search = NeuralSearch(Uniform(), 'longer-certificate', history, tactics=True, proof_solver=Slow())
+        self.addCleanup(search.close)
+        self.assertTrue(native.hxg_begin(search.ptr, 8, 4))
+        request, pending = search.request()
+        self.assertTrue(search.fulfill_proof(request, pending, dict()))
+        result = search.search(8)
+        self.assertEqual((result['proven'], result['proof_plies']), (1, 1))
+        self.assertIn(result['action'], [[-1,0],[5,0]])
+
     def searcher(self, history=(), seed=7, evaluator=None):
         search = NeuralSearch(evaluator or Uniform(), 'test-v1', history, seed)
         self.addCleanup(search.close)

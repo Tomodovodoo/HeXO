@@ -173,7 +173,8 @@ struct Tree {
   // A retained proven loss covers every legal continuation even if this node had not needed expansion yet.
   if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges){edge.exact_winner=node.exact_winner;edge.distance=node.distance;}
   if(tactics)classify(path,node);
-  if(exact>=0){node.exact_winner=exact;node.distance=distance;for(auto& edge:node.edges){edge.eligible=edge.action==witness;if(edge.eligible){edge.exact_winner=exact;edge.distance=distance;}}}
+  // A certificate adds its witness as a winning edge; settle keeps any shorter tactical win found by classify.
+  if(exact>=0){for(auto& edge:node.edges)if(edge.action==witness && (edge.exact_winner!=exact || edge.distance>distance)){edge.exact_winner=exact;edge.distance=distance;}settle(node);}
   node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);requests.erase(found);
  }
  // Installs a caller-verified certificate at pending leaf `id`: its first turn `moves` and `turns`, the most attacker
