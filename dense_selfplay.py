@@ -455,7 +455,6 @@ class Engine:
                                     if opponent_second:
                                         plan.found.append(witness)
                                     action = history[root_size]
-                                    checked(native.hxg_mark_exact(ptr, int(action[0]), int(action[1]), winner))
                                     plan.pruned.append(action.tolist())
                                     plan.turns = max(plan.turns, proof['proof_turns'])
                                     plan.spent(proof)

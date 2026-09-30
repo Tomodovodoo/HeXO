@@ -14,8 +14,8 @@ Schedule.deep_nodes; 0 = off):
              compatible second stones get the same treatment next search. No proof labels or pruning follow.
   finalists  in a mid-turn search, at its last halving boundary (its end when it never halves): for each of the
              `finalists` best candidates b (hxg_stats scores), does the opponent have a forced win after our turn
-             ends with b? A proof marks b exact-lost (hxg_mark_exact: Q -1, ineligible), so the remaining rounds and
-             the final selection discard it and the improved policy gives it no mass.
+             ends with b? After the scheduled visits finish, a proof marks b exact-lost (hxg_mark_exact: Q -1,
+             ineligible), so the final selection discards it and the improved policy gives it no mass.
   deep       background proof of a committed turn: at each turn start, does the side that just moved win against
              every defence of the turn it played (a root_moves query on the position before that turn)?
 Only native-verified PROVEN_WIN results act as proofs; UNKNOWN is never a loss. Proofs of positions on the game (root, deep,
@@ -755,7 +755,7 @@ class Plan:
         return True
 
     def ready(self, slot):
-        """Apply threat ordering or verified defence candidates, and finalist marks. False defers
+        """Apply threat ordering or verified defence candidates, and retain finalist proofs. False defers
         the slot to its next visit."""
         ptr = slot.tree.ptr
         if self.awaiting_finish:
@@ -802,14 +802,12 @@ class Plan:
         if self.finalists is not None:
             if not self.defer([query for _, query in self.finalists]):
                 return False
-            winner = 1-mover(slot.tree.history)
             for action, query in self.finalists:
                 if query in self.late:
                     continue
                 proven, result = query.result()
                 self.spent(result)
                 if proven:
-                    checked(native.hxg_mark_exact(ptr, int(action[0]), int(action[1]), winner))
                     self.turns = max(self.turns, int(result['proof_turns']))
                     self.pruned.append(action)
                     self.proven(query, slot.tree.history)
@@ -875,6 +873,15 @@ class Plan:
         if self.schedule.fixed_budgets and len(history) % 2 and player in self.deep:
             self.spent(self.deep[player].result()[1])
             self.proven(self.deep.pop(player), history)
+        if self.pruned:
+            # Removing a candidate mid-round can strand the native visit schedule. Keep the exact leaf
+            # backups, finish its scheduled visits, then exclude proven losses from both choice and policy.
+            for q, r in self.pruned:
+                checked(native.hxg_mark_exact(slot.tree.ptr, int(q), int(r), 1-player))
+            result.update(slot.tree.result(0, 0, 0, 0))
+            if result['action'] is None:
+                # All sampled candidates were lost; choose an unvisited survivor from the improved policy.
+                result['action'] = result['actions'][int(np.argmax(result['policy']))].tolist()
         result.update(proven=0, proof_turns=0)
         move = self.move(player, history) if active(slot.solver, self.schedule) or self.leaf_nodes else None
         if move is not None:
