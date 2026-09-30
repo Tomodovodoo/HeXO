@@ -110,6 +110,9 @@ class NeuralTree(unittest.TestCase):
         result = search.search(8)
         self.assertEqual(result['exact_winner'], 1)
         self.assertEqual(result['proof_status'], 'PROVEN_LOSS')
+        self.assertEqual(result['completed'], 0)
+        self.assertEqual(result['proven'], -1)
+        self.assertIsNotNone(result['action'])
         self.assertTrue(np.all(result['values'] == -1))
         self.assertEqual(len(result['actions']), 372)
         # A current-player completion takes precedence over mandatory defense.
@@ -119,6 +122,9 @@ class NeuralTree(unittest.TestCase):
         result = search.search(8)
         self.assertEqual(result['exact_winner'], 0)
         self.assertEqual(result['proof_status'], 'PROVEN_WIN')
+        self.assertEqual(result['completed'], 0)
+        self.assertEqual(result['proven'], 1)
+        self.assertEqual(search.search(65536)['evaluated'], 0)
         search.advance(result['action'])
         game = Game(search.history)
         if game.winner < 0:
@@ -127,6 +133,66 @@ class NeuralTree(unittest.TestCase):
             game = Game(search.history)
         self.assertEqual(game.winner, 0)
         game.close()
+
+    def test_terminal_child_propagates_and_stops_without_tactics(self):
+        history = [(0,0),(0,2),(1,2),(1,0),(2,0),(2,2),(3,2),(3,0),(4,0),(-2,2),(-3,2)]
+        class Winning(Uniform):
+            def evaluate(self, histories):
+                predictions = super().evaluate(histories)
+                for h, prediction in zip(histories, predictions):
+                    g = Game(h)
+                    for i, action in enumerate(prediction['actions']):
+                        g.play(*map(int, action))
+                        prediction['logits'][i] = 100 if g.winner >= 0 else -100
+                        g.undo()
+                    g.close()
+                return predictions
+        search = self.searcher(history, evaluator=Winning())
+        result = search.search(65536, root_samples=2, batch_size=8)
+        self.assertEqual((result['exact_winner'], result['completed'], result['evaluated']), (0, 1, 1))
+        self.assertEqual(result['proven'], 1)
+        self.assertEqual(np.count_nonzero(result['policy']), 1)
+        search.advance(result['action'])
+        self.assertIsNone(search.search(65536)['action'])
+
+    def test_proven_root_waits_for_reserved_leaves_and_reuses_witness(self):
+        search = self.searcher([(0,0)])
+        self.assertTrue(native.hxg_begin(search.ptr, 64, 4))
+        request, history = search.request()
+        search.fulfill(request, Uniform().evaluate([history])[0])
+        pending = [search.request() for _ in range(4)]
+        actions = search.result(0, 0, 0, 0)['actions']
+        # This entry represents a caller-verified proof; the synthetic outcome is not a game certificate.
+        self.assertTrue(native.hxg_mark_exact(search.ptr, *map(int, actions[0]), 1))
+        self.assertFalse(native.hxg_done(search.ptr))
+        self.assertEqual(search.request()[0], 0)
+        for request, history in pending:
+            search.fulfill(request, Uniform().evaluate([history])[0])
+        self.assertTrue(native.hxg_done(search.ptr))
+        result = search.search(65536)
+        self.assertEqual((result['completed'], result['evaluated'], result['proven']), (0, 0, 1))
+        self.assertEqual(result['action'], actions[0].tolist())
+
+    def test_two_placement_terminal_proof_propagates_and_keeps_second_stone(self):
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        class Line(Uniform):
+            def evaluate(self, histories):
+                predictions = super().evaluate(histories)
+                for h, prediction in zip(histories, predictions):
+                    move = [-1,0] if len(h) == len(history) else [4,0]
+                    prediction['logits'][:] = -100
+                    prediction['logits'][(prediction['actions'] == move).all(axis=1)] = 100
+                return predictions
+        search = self.searcher(history, evaluator=Line())
+        result = search.search(65536, root_samples=1, batch_size=8)
+        self.assertEqual((result['action'], result['exact_winner'], result['completed'], result['evaluated']),
+                         ([-1,0], 0, 2, 2))
+        search.advance(result['action'])
+        result = search.search(65536)
+        self.assertEqual((result['action'], result['exact_winner'], result['completed'], result['evaluated']),
+                         ([4,0], 0, 0, 0))
+        search.advance(result['action'])
+        self.assertEqual(search.search(65536)['exact_winner'], 0)
 
     def searcher(self, history=(), seed=7, evaluator=None):
         search = NeuralSearch(evaluator or Uniform(), 'test-v1', history, seed)

@@ -875,15 +875,15 @@ class Plan:
             self.spent(self.deep[player].result()[1])
             self.proven(self.deep.pop(player), history)
         if self.pruned:
-            # Removing a candidate mid-round can strand the native visit schedule. Keep the exact leaf
-            # backups, finish its scheduled visits, then exclude proven losses from both choice and policy.
+            # Finalist certificates exclude proven losses from both choice and policy.
             for q, r in self.pruned:
                 checked(native.hxg_mark_exact(slot.tree.ptr, int(q), int(r), 1-player))
             result.update(slot.tree.result(0, 0, 0, 0))
             if result['action'] is None:
                 # All sampled candidates were lost; choose an unvisited survivor from the improved policy.
                 result['action'] = result['actions'][int(np.argmax(result['policy']))].tolist()
-        result.update(proven=0, proof_turns=0)
+        winner = result['exact_winner']
+        result.update(proven=0 if winner < 0 else 1 if winner == player else -1, proof_turns=0)
         move = self.move(player, history) if active(slot.solver, self.schedule) or self.leaf_nodes else None
         if move is not None:
             result.update(action=list(move[0][0]), proven=1, proof_turns=move[1], proof=self.proofs[player],

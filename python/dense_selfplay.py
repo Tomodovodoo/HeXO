@@ -286,8 +286,9 @@ class Engine:
     A proof at the current root also reaches the usual proof-following, adjudication and exact-row path.
     Immediate child proofs exclude losing root moves. A winning first stone extends the certificate to
     the root's two-stone turn. After a root's last stone, a proof after the opponent's first stone also
-    certifies that opponent's whole turn and excludes the root move. Other deeper leaf proofs remain
-    numeric backups because one continuation does not prove the intervening choices.
+    certifies that opponent's whole turn and excludes the root move. Native backups propagate deeper exact
+    outcomes using one winning continuation at the winner's nodes and complete reply coverage at the loser's.
+    Exact roots stop before the simulation cap after outstanding leaf evaluations drain.
     This is opt-in because its CPU cost competes with producing GPU batches.
     """
 
@@ -363,7 +364,7 @@ class Engine:
                         break
                     continue
                 if request == 0:
-                    if native.hxg_completed(ptr) < slot.budget:
+                    if not native.hxg_done(ptr):
                         break
                     progress = True
                     result = slot.tree.result(0, 0, 0, 0)
@@ -441,8 +442,6 @@ class Engine:
                                     plan.spent(proof)
                                     progress = True
                                     continue
-                                # Finish the current schedule: marking a win mid-round would strand its
-                                # other samples.
                             self.leaf_roots[id(slot)] = witness, proof
                             if plan is not None:
                                 plan.found.append(witness)

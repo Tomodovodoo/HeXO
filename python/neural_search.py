@@ -26,6 +26,7 @@ bind('hxg_advance', C.c_int, ptr, C.c_int64, C.c_int64)
 bind('hxg_stats', C.c_int, ptr, ptr, ptr, ptr, ptr)
 bind('hxg_policy', C.c_int, ptr, ptr)
 bind('hxg_completed', C.c_int, ptr)
+bind('hxg_done', C.c_int, ptr)
 bind('hxg_tactics', C.c_int, ptr, C.c_int)
 bind('hxg_exact', C.c_int, ptr)
 bind('hxg_prove', C.c_int, ptr, C.c_int, ints, C.c_int, C.c_int, C.c_int, ints, C.c_int)
@@ -156,13 +157,15 @@ class NeuralSearch:
         native.hxg_policy(self.ptr, policy.ctypes.data)
         selected = int(np.argmax(scores)) if n and np.isfinite(scores).any() else None
         winner = native.hxg_exact(self.ptr)
+        proven = 0 if winner < 0 else 1 if winner == ((len(self.history)+1)//2)%2 else -1
         return dict(action=actions[selected].tolist() if selected is not None else None,
                     actions=actions, visits=visits, values=values, policy=policy,
                     completed=native.hxg_completed(self.ptr), evaluated=evaluated, cache_hits=hits,
                     elapsed_ms=(finished-start)*1000,
                     exact_winner=winner,
+                    proven=proven, proof_turns=0, solver_nodes=0, solver_budget=0,
                     proof_status=('UNKNOWN' if winner < 0 else
-                                  'PROVEN_WIN' if winner == ((len(self.history)+1)//2)%2 else 'PROVEN_LOSS'))
+                                  'PROVEN_WIN' if proven > 0 else 'PROVEN_LOSS'))
 
 
 
@@ -209,7 +212,7 @@ class SearchCoordinator:
                     game.close()
             def finished(i):
                 now = time.perf_counter()
-                done = native.hxg_completed(searches[i].ptr) >= budgets[i]
+                done = native.hxg_done(searches[i].ptr)
                 expired = limits[i] is not None and (now-starts[i])*1000 >= limits[i]
                 if done or expired:
                     active.discard(i)
