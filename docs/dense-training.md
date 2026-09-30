@@ -116,6 +116,18 @@ The certificate identifies known winning placements rather than every winning
 move. A missing witness or a proven losing position supplies no new policy
 target. The optional mode's playing benefit still needs measurement.
 
+Actors also save `network_values`, the frozen network's side-to-move predictions before search corrections.
+Cached predictions are reused. When a proven searched row bypassed inference, completed games share an
+extra prediction batch per model before saving. Preset prefixes, generated proof lines and unencodable
+positions retain null predictions. Search results and value targets keep their existing meanings.
+
+The proof pass scores attack restart entries from these predictions when available. A solver can set the
+search value to +1 while the network predicts a loss; the network error then remains eligible for regret
+sampling. Such entries record `value_source: network`, and restart observations use that same source.
+Defence entries and older episodes without network predictions retain search regret. The existing sampling
+cap and loss weights still apply. This repairs coverage of certified value errors; its learning benefit needs
+measurement.
+
 ## Dense actor batches
 
 `--book-fraction 0.25 --restart-fraction 0.1` allocates 25% of newly started games to the live off-policy

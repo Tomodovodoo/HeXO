@@ -52,9 +52,12 @@ Each transient window whose owner lost also adds {kind: 'deblunder', game, first
 uses these only with a positive --deblunder-weight; existing sidecars stay unchanged on restart.
 
 Restart buffer (RestartBuffer). Entries {shard, game, ply, side_to_move, regret, kind, added_at, checkpoint,
-plies_to_proof, saving_turns?, observed?}: an 'attack' entry at each window's first ply with regret (1 - v)/2, and
+plies_to_proof, value_source?, saving_turns?, observed?}: an 'attack' entry at each window's first ply with regret (1 - v)/2, and
 a 'defence' entry at each lookback ply d with regret (1 + v)/2 and the saving_turns found there, v the recorded
-root value of the side to move at that ply (no entry where it is null); plies_to_proof is first_ply minus the
+root value of the side to move at that ply (no entry where it is null). Attack entries use network_values when
+available and record value_source 'network', so solver-corrected +1 values cannot hide network errors.
+Defence entries and legacy games keep search values. Observations must match the entry's value_source;
+plies_to_proof is first_ply minus the
 entry's ply. Restart games add no entries at or before their restart ply; instead their recorded root value at the
 restart ply is stored in the source entry's `observed` {checkpoint: {value, shard}} when the game was played by the
 shard's checkpoint, one observation per checkpoint, the one from the newest shard; an observation of an entry not
@@ -199,7 +202,7 @@ def merge(total, part):
 
 class RestartBuffer:
     """restarts.json {updated_at, entries, waiting} (module contract), held as {key: entry} with key (shard, game,
-    ply, kind) and waiting observations {key: {checkpoint: {value, shard}}}."""
+    ply, kind) and waiting observations {key: {checkpoint: {value, shard, value_source?}}}."""
 
     def __init__(self, path, size, max_exports, min_regret):
         self.path, self.size, self.max_exports, self.min_regret = Path(path), size, max_exports, min_regret
@@ -219,7 +222,7 @@ class RestartBuffer:
         if entry['regret'] >= self.min_regret and key not in self.entries:
             self.entries[key] = entry
             for checkpoint, seen in self.waiting.pop(key, {}).items():
-                self.observe(key, checkpoint, seen['value'], seen['shard'])
+                self.observe(key, checkpoint, seen['value'], seen['shard'], seen.get('value_source', 'search'))
             self.trim()
 
     def trim(self):
@@ -227,13 +230,17 @@ class RestartBuffer:
             kept = sorted(self.entries.values(), key=lambda e: -e['regret'])[:self.size]
             self.entries = {self.key(e): e for e in kept}
 
-    def observe(self, key, checkpoint, value, shard):
+    def observe(self, key, checkpoint, value, shard, value_source='search'):
         """Record a restart game's value at entry `key` for `checkpoint`, unless one from a newer shard is kept; for
-        an entry not kept yet, in `waiting`."""
+        an entry not kept yet, in `waiting`. Ignore observations from a different value source."""
         entry = self.entries.get(key)
+        if entry and entry.get('value_source', 'search') != value_source:
+            return
         observed = entry.setdefault('observed', {}) if entry else self.waiting.setdefault(key, {})
         if checkpoint not in observed or observed[checkpoint]['shard'] <= shard:
             observed[checkpoint] = dict(value=value, shard=shard)
+            if value_source != 'search':
+                observed[checkpoint]['value_source'] = value_source
 
     def refresh(self, created, newest, solved=lambda shard: False):
         """Apply observations of checkpoint `newest`, drop entries by age (`created`: export times) and regret, and
@@ -300,6 +307,7 @@ class Solver:
         start = e['restart']['ply'] if e.get('origin') == 'restart' else \
             e['book']['ply'] if e.get('origin') == 'book' else 0
         roots = e.get('root_values') or [None]*T
+        network = e.get('network_values') or [None]*T
         memo = {}
 
         def attack(t, nodes):
@@ -347,8 +355,11 @@ class Solver:
             for ply, side, kind, saving in candidates:
                 if roots[ply] is None or (e.get('origin') == 'restart' and ply <= start):
                     continue
-                entry = dict(shard=shard, game=g, ply=ply, side_to_move=side, regret=regret(kind, roots[ply]), kind=kind,
+                value = network[ply] if kind == 'attack' and network[ply] is not None else roots[ply]
+                entry = dict(shard=shard, game=g, ply=ply, side_to_move=side, regret=regret(kind, value), kind=kind,
                              added_at=self.clock(), checkpoint=None, plies_to_proof=plies[0]-ply)
+                if kind == 'attack' and network[ply] is not None:
+                    entry['value_source'] = 'network'
                 entries.append(entry if kind == 'attack' else dict(entry, saving_turns=saving))
         return windows, entries
 
@@ -372,7 +383,7 @@ class Solver:
 
     def solve(self, name):
         """The result of shard `name`: {windows, entries (checkpoint: the shard's), observations [(key, checkpoint,
-        value)] of its restart games, stats (this shard's counters)}."""
+        value, value_source?)] of its restart games, stats (this shard's counters)}."""
         self.stats = new_stats()
         path = self.run/'shards'/name
         manifest = dense_data.verify(path)
@@ -386,7 +397,12 @@ class Solver:
             source = e.get('restart') if e.get('origin') == 'restart' else None
             if source and e['actor'] == identity.get('actor_sha256') and e['root_values'][source['ply']] is not None:
                 key = [source['shard'], source['game'], source['ply'], source['kind']]
-                observations.append((key, identity.get('checkpoint'), e['root_values'][source['ply']]))
+                if source.get('value_source') == 'network':
+                    value = (e.get('network_values') or [None]*len(e['moves']))[source['ply']]
+                    if value is not None:
+                        observations.append((key, identity.get('checkpoint'), value, 'network'))
+                else:
+                    observations.append((key, identity.get('checkpoint'), e['root_values'][source['ply']]))
         deblunders = [dict(kind='deblunder', game=w['game'], first_ply=w['first_ply'], owner=w['mover'])
                       for w in windows if not w['persistent'] and episodes[w['game']]['winner'] == 1-w['mover']]
         return dict(windows=windows, deblunders=deblunders, entries=entries, observations=observations, stats=self.stats)
@@ -409,8 +425,8 @@ class Pass:
         """Add a shard's result to the buffer and the counters, then save the buffer and write the sidecar."""
         for entry in result['entries']:
             self.buffer.add(entry)
-        for key, checkpoint, value in result['observations']:
-            self.buffer.observe(tuple(key), checkpoint, value, name)
+        for key, checkpoint, value, *source in result['observations']:
+            self.buffer.observe(tuple(key), checkpoint, value, name, *source)
         merge(self.stats, result['stats'])
         self.stats['shards_done'] += 1
         self.buffer.save()
