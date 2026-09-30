@@ -1,8 +1,7 @@
 # Browser play
 
 ```sh
-python python/bubble.py play                                  # champion of runs/bubble
-python python/play.py --dense-run runs/bubble --device cpu    # the same, directly
+python python/play.py --dense-run runs/bubble --device cpu
 ```
 
 Open <http://127.0.0.1:8765>. Either side is a person or an engine, so a person can play Bubble, Bubble can

@@ -59,7 +59,7 @@ select,input,textarea{background:var(--bg);border:1px solid var(--line-2);border
 .ring::before{content:"";position:absolute;inset:0;clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);
   background:var(--c);-webkit-mask:linear-gradient(#000 0 0);opacity:.9}
 .ring::after{content:"";position:absolute;inset:3px;clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);background:var(--board);opacity:.92}
-.mark>span{position:relative;z-index:1;color:var(--c)}
+.mark>.label{position:relative;z-index:1;color:var(--c)}
 .pulse{animation:pulse 1.6s ease-in-out infinite}
 @keyframes pulse{50%{transform:scale(1.12);opacity:.65}}
 .ghost{opacity:.4}
@@ -224,7 +224,7 @@ async function poll(){
   setTimeout(poll,S&&S.jobs.length?350:1500);
 }
 function accept(data){
-  if(data.history){
+  if('history' in data){
     const live=!S||view>=S.history.length,before=S?S.history.length:null;
     S=data;
     if(live||view>S.history.length)view=S.history.length;
@@ -305,10 +305,11 @@ function paint(){
 function placeMarks(){
   const box=$('marks'),marks=[],ev=S.evaluations[view],turn=selectedTurn(),s=cam.size*1.9;
   const add=(q,r,cls,color,text,badge)=>marks.push({q,r,cls,color,text,badge});
-  if(turn&&turn.label){const[g,c]=LABEL[turn.label];
+  const done=turn&&turn.label&&view===turn.ply+turn.stones.length;
+  if(done){const[g,c]=LABEL[turn.label];
     turn.stones.forEach((p,i)=>add(p[0],p[1],'','',null,i===turn.stones.length-1?[g,c]:null));
     for(const p of turn.better||[])add(p[0],p[1],'ring ghost',COLORS[turn.player],'')}
-  if(ev&&!(turn&&turn.better&&view===turn.ply+turn.stones.length)){
+  if(ev&&!(done&&turn.better)){
     if(ev.line&&ev.line.length)ev.line.slice(0,12).forEach((p,i)=>add(p[0],p[1],'ring'+(i?'':' pulse'),COLORS[p[2]],i+1));
     else ev.top.forEach((p,i)=>add(p[0],p[1],'ring'+(i?' ghost':' pulse'),COLORS[playerAt(view)],i+1));
     for(const p of ev.threat||[])add(p[0],p[1],'ring',COLORS[1-playerAt(view)],'!');
@@ -317,7 +318,7 @@ function placeMarks(){
   [...box.children].forEach((d,i)=>{const m=marks[i];if(!m){d.style.display='none';return}
     const[x,y]=screen(m.q,m.r);d.style.display='';d.className='mark '+m.cls;
     d.style.setProperty('--s',s+'px');d.style.setProperty('--c',m.color);d.style.translate=`${x}px ${y}px`;
-    const inner=d.firstChild||d.appendChild(el('span'));inner.className='';inner.style.transform=`scale(${Math.min(1,cam.size/22)})`;
+    const inner=d.firstChild||d.appendChild(el('span'));inner.className='label';inner.style.transform=`scale(${Math.min(1,cam.size/22)})`;
     inner.replaceChildren(m.text!=null&&m.text!==''?el('b',{},String(m.text)):'');
     const bd=d.querySelector('.badge');
     if(m.badge){const b=bd||d.appendChild(el('span',{class:'badge'}));b.textContent=m.badge[0];b.style.setProperty('--c',`var(${m.badge[1]})`)}
@@ -393,7 +394,7 @@ function renderEngineHead(){
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,a.engine,it=>send({engine:it.id,checkpoint:null,preset:'standard',custom:undefined}));
   const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},el('i'),'Auto');
   auto.onclick=()=>send({auto:!a.auto});
-  const again=el('button',{'aria-label':'Analyse again'},'↻');again.onclick=()=>post('/analyse',{ply:view,force:true});
+  const again=el('button',{id:'again','aria-label':'Analyse again'},'↻');
   const box=el('div',{class:'stack',style:'flex:1;min-width:0'},el('div',{class:'head'},pick,auto,again),...seatControls(a,'bubble',send));
   head.replaceChildren(box);
 }
@@ -447,7 +448,7 @@ function renderMoves(){
     return counts.length?[el('span',{class:'tally'},el('i',{class:'hexdot',style:`--c:${COLORS[p]}`}),
       counts.map(([l,n])=>el('span',{},el('span',{class:'glyph',style:`--c:var(${LABEL[l][1]})`},LABEL[l][0]),n)))]:[]}));
   if(atEnd&&view===S.history.length)box.scrollTop=box.scrollHeight;else box.scrollTop=keep;
-  const s=box.querySelector('.sel');if(s&&(s.offsetTop<box.scrollTop||s.offsetTop>box.scrollTop+box.clientHeight-24))s.scrollIntoView({block:'nearest'});
+  const s=box.querySelector('.sel');if(s&&renderMoves.view!==view)s.scrollIntoView({block:'nearest'});renderMoves.view=view;
 }
 function renderDetail(){
   const t=selectedTurn(),d=$('detail');
@@ -456,7 +457,7 @@ function renderDetail(){
   if(t.before!=null)nums.push(el('span',{},pct(t.before)+' → '+pct(t.after)));
   if(t.better)nums.push(el('span',{style:`color:${COLORS[t.player]}`},'★ '+t.better.map(p=>p.join(',')).join('  ')));
   d.replaceChildren(el('h3',{},el('span',{class:'glyph',style:`--c:var(${c})`},g),t.label),el('div',{class:'nums'},nums),
-    ...(t.line&&t.line.length?[el('div',{class:'nums'},t.line.slice(0,8).map(p=>el('span',{style:`color:${COLORS[p[2]]}`},p[0]+','+p[1])))]:[]));
+    ...(t.line&&t.line.length>(t.better||[]).length?[el('div',{class:'nums'},t.line.slice(0,8).map(p=>el('span',{style:`color:${COLORS[p[2]]}`},p[0]+','+p[1])))]:[]));
 }
 function renderPanels(){
   if(!S)return;
@@ -476,7 +477,12 @@ function renderJobs(){
     if(!box.children.length)box.append(bar,x)}
   const review=$('review-go'),rjob=S.jobs.find(j=>j.kind==='review');review.textContent=rjob?`${rjob.done} / ${rjob.total}  ×`:'Review';
   review.onclick=()=>rjob?post('/cancel',{id:rjob.id}):post('/review');
-  const pending=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);$('evalbar').classList.toggle('pending',pending);
+  const pending=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view),analysing=S.jobs.filter(j=>j.kind==='analyse');
+  $('evalbar').classList.toggle('pending',pending);
+  const again=$('again');if(again){again.textContent=analysing.length?'×':'↻';
+    again.onclick=async()=>{if(!analysing.length)return post('/analyse',{ply:view,force:true});
+      const a=S.analysis;if(a.auto)await post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.budget,auto:false});
+      for(const j of analysing)await post('/cancel',{id:j.id})}}
 }
 
 /* game actions */
