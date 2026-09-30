@@ -1,6 +1,7 @@
 """Start, stop and inspect a Bubble training run, or play against it.
 
-Service identity is checked through the process command line, which needs Windows or a /proc file system.
+Services are identified through their command lines, which needs Windows or a /proc file system; on other
+systems `train`, `stop` and `status` refuse to run.
 
 `train` creates the run directory and its first checkpoint when they are missing, then starts the learner,
 the actors, the evaluator, the proof pass and the dashboard as detached processes. Their process ids go to
@@ -197,12 +198,19 @@ class Launcher:
         """The service leader still runs this run's script, or, on POSIX, children of its group still exist."""
         return alive(entry['pid'], entry['script'], str(self.run), self.arguments) or group_alive(entry['pid'], str(self.run))
 
+    def variant(self):
+        """The learner's checkpoint variant from the run configuration, `main` for a run without one."""
+        try:
+            return json.loads((self.run / 'config.json').read_text(encoding='utf-8'))['learner']['variant']
+        except (OSError, ValueError, KeyError, TypeError):
+            return 'main'
+
     def prepare(self, device, run_steps):
         """Create the run configuration and the first checkpoint when either is missing; `run_steps` runs a command."""
         if not (self.run / 'config.json').exists():
             run_steps([sys.executable, str(PYTHON / 'dense_config.py'), '--run', str(self.run), '--device', device])
         # Play-only installs (variant `play`, weights without optimizer state) never count as a learner checkpoint.
-        exports = (self.run / 'checkpoints' / 'main').glob('*/ema.pt')
+        exports = (self.run / 'checkpoints' / self.variant()).glob('*/ema.pt')
         learner_files = ('model.pt', 'optimizer.pt', 'manifest.json')
         if not any(all(path.with_name(name).exists() for name in learner_files) for path in exports):
             run_steps([sys.executable, str(PYTHON / 'dense_learn.py'), '--run', str(self.run), '--steps', '0'])
@@ -390,6 +398,8 @@ def main():
     play.add_argument('--model', type=Path, help="an ema.pt file to play instead of the run's checkpoints")
     play.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     args = parser.parse_args()
+    if args.command in ('train', 'stop', 'status') and os.name != 'nt' and not Path('/proc').is_dir():
+        sys.exit('bubble.py manages services on Windows and Linux only: it identifies them through /proc')
     launcher = Launcher(args.run)
     if args.command == 'train':
         proof = tactical_built()

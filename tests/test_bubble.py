@@ -154,6 +154,16 @@ class LauncherTests(unittest.TestCase):
         self.launcher.prepare('cpu', calls.append)
         self.assertEqual(calls, [])
 
+    def test_prepare_probes_the_configured_variant(self):
+        (self.run / 'config.json').write_text(json.dumps(dict(learner=dict(variant='alt'))))
+        export = self.run / 'checkpoints' / 'alt' / '000000'
+        export.mkdir(parents=True)
+        for name in ('ema.pt', 'model.pt', 'optimizer.pt', 'manifest.json'):
+            (export / name).write_bytes(b'')
+        calls = []
+        self.launcher.prepare('cpu', calls.append)
+        self.assertEqual(calls, [])
+
     def test_downloaded_weights_do_not_count_as_a_learner_checkpoint(self):
         source = Path(self.directory.name) / 'ema.pt'
         source.write_bytes(b'weights')
