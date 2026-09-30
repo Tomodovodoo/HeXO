@@ -47,7 +47,9 @@ class DensePlayer:
         self.tactical_package = tactical_package
         self.evaluator = self.prover = None
         self.checkpoint = None
-        self.options = dict(search=True, simulations=128, solver=True, solver_nodes=32768)
+        import tactical_proof
+        solver = tactical_proof.library(*([tactical_package] if tactical_package else [])).exists()
+        self.options = dict(search=True, simulations=128, solver=solver, solver_nodes=32768)
         available = self.models()
         if not available:
             raise ValueError('No playable dense exports found')

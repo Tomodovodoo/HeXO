@@ -36,7 +36,7 @@ cd HeXO
 python -m venv .venv
 ```
 
-Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scriptsctivate.bat` in cmd.exe, `source .venv/bin/activate` on Linux and macOS), then:
+Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scripts\activate.bat` in cmd.exe, `source .venv/bin/activate` on Linux and macOS), then:
 
 ```sh
 python -m pip install -e . -r requirements/learning.txt
@@ -54,7 +54,7 @@ python python/bubble.py play --model path/to/ema.pt
 python python/bubble.py play --run runs/dense-v1
 ```
 
-With a run, the model picker lists its champion, its newest export and two more. A GPU is used when PyTorch sees one; add `--device cpu` otherwise. Without any weights, `python python/play.py` serves the handwritten native engine.
+With a run, the model picker lists its champion, its newest export and two more. A GPU is used when PyTorch sees one; add `--device cpu` otherwise. The solver toggle needs the Rust build from the next section; without it Bubble plays on search alone. Without any weights, `python python/play.py` serves the handwritten native engine.
 
 ## Build Bubble
 
