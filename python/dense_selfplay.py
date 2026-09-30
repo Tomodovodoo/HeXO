@@ -605,7 +605,7 @@ class SelfPlayGame:
             if result['proven'] > 0 and result.get('proof_action'):
                 row['proof_action'] = result['proof_action']
             if result['proven']:
-                row['proof_plies'] = result['proof_plies']
+                row['proof_plies'] = result.get('proof_plies', 0)
         self.rows.append(row)
         self.values.append(root_value(result, player) if trained else None)
         tactical = self.book is not None and self.book.get('tactical') is not None and ply == self.book['ply']
@@ -700,7 +700,9 @@ class SelfPlayGame:
             row.setdefault('proof_action', proof_action)
         if row.get('proven'):
             return 0
-        row.update(proven=proven, proof_turns=turns, proof_plies=dense_solver.proof_plies(row['remaining'], turns, proven > 0))
+        row.update(proven=proven, proof_turns=turns)
+        if 'remaining' in row:
+            row['proof_plies'] = dense_solver.proof_plies(row['remaining'], turns, proven > 0)
         return 1
 
     def episode(self):

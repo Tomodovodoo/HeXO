@@ -317,6 +317,8 @@ class InjectionPoints(unittest.TestCase):
         episode, rows = on.episode()
         self.assertEqual(episode['moves'][len(opening):], proof['moves'])
         self.assertEqual([(r['proven'], r['proof_turns']) for r in rows], [(1, proof['proof_turns'])]*2)
+        turns = proof['proof_turns']
+        self.assertEqual([r['proof_plies'] for r in rows], [2+4*(turns-1), 1+4*(turns-1)])
         self.assertEqual(rows[0]['solver_nodes'], proof['nodes_used'])
         self.assertEqual(episode['root_values'], [1., 1.])
         self.assertEqual(episode['solver'], dict(root_nodes=NODES, finalists=0, finalist_nodes=0, threat_nodes=0,

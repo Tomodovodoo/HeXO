@@ -894,8 +894,6 @@ class Plan:
                 result['action'] = result['actions'][int(np.argmax(result['policy']))].tolist()
         winner = result['exact_winner']
         result.update(proven=0 if winner < 0 else 1 if winner == player else -1, proof_turns=0)
-        if winner < 0:
-            result.update(proof_plies=0, proof_action=[])
         move = self.move(player, history) if active(slot.solver, self.schedule) or self.leaf_nodes else None
         if move is not None:
             q, r = map(int, move[0][0])
