@@ -75,7 +75,7 @@ int main(){
   gumbel::Path p;p.leaf=child.get();p.edges={{&r,0}};++r.edges[0].pending;t.backup(p,.5,false);
   assert(r.edges[0].visits==1 && std::abs(r.q-(.2-.5)/2)<1e-12 && child->n==3 && r.n==1);
   assert(std::abs(t.value(r,r.edges[1])+.5)<1e-12);}
- // A backup through one parent of a shared child also refreshes the child's other parents.
+ // A backup through one parent of a shared child also brings the child's other parents up to date, verdicts included.
  {gumbel::Tree t(0);t.graph=true;
   auto r=std::make_shared<gumbel::Node>(),a=std::make_shared<gumbel::Node>(),b=std::make_shared<gumbel::Node>(),c=std::make_shared<gumbel::Node>();
   r->player=0;a->player=b->player=1;c->player=0;r->expanded=a->expanded=b->expanded=c->expanded=true;c->n=1;c->q=.2;
@@ -85,7 +85,8 @@ int main(){
   assert(std::abs(b->q+.1)<1e-12);
   c->exact_winner=0;c->distance=1;
   gumbel::Path p;p.leaf=c.get();p.edges={{r.get(),0},{a.get(),0}};for(auto [n,i]:p.edges)++n->edges[i].pending;t.backup(p,1);
-  assert(c->q==1 && a->q==-1 && std::abs(b->q+.5)<1e-12);}
+  // b's only edge leads to the proven win for player 0, so b is proven lost like a.
+  assert(c->q==1 && a->q==-1 && b->q==-1 && b->exact_winner==0 && b->edges[0].exact_winner==0 && b->edges[0].distance==2);}
  gumbel::Tree tree(1);tree.advance({0,0});tree.begin(16,4);
  assert(tree.sequence==std::vector<int>({0,0,0,0,1,1,1,1,2,2,3,3,4,4,5,5}));
  gumbel::Node n;n.value=.2;

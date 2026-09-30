@@ -68,14 +68,25 @@ struct Tree {
   for(auto& e:node.edges)if(e.visits){total+=e.visits*value(node,e);count+=e.visits;}
   node.q=node.exact_winner>=0?(node.exact_winner==node.player?1:-1):total/count;
  }
- // After a backup changed `from`, refresh its parents other than `skip` (its parent on the backup path) and their
- // ancestors, so no parent keeps a value from before its shared child's latest visits.
+ // After a backup changed `from`, bring its parents other than `skip` (its parent on the backup path) and their
+ // ancestors up to date: an exact child's winner, distance and bound are copied to each incoming edge and the parent
+ // is settled, then its value is refreshed, so no parent keeps a verdict or value from before its shared child's
+ // latest visits.
  void propagate(Node& from,const Node* skip) {
-  std::vector<Node*> work;
-  for(auto& w:from.parents)if(auto p=w.lock())if(p.get()!=skip)work.push_back(p.get());
+  std::vector<std::pair<Node*,Node*>> work;
+  for(auto& w:from.parents)if(auto p=w.lock())if(p.get()!=skip)work.emplace_back(p.get(),&from);
   while(!work.empty()){
-   Node* p=work.back();work.pop_back();double before=p->q;refresh(*p);
-   if(p->q!=before)for(auto& w:p->parents)if(auto g=w.lock())work.push_back(g.get());
+   auto [p,c]=work.back();work.pop_back();
+   const double before=p->q;const int winner=p->exact_winner,distance=p->distance;
+   if(c->exact_winner>=0){
+    bool changed=false;
+    for(auto& e:p->edges)if(e.child.get()==c && (e.exact_winner!=c->exact_winner || e.distance!=c->distance+1 || e.bound!=c->bound)){
+     e.exact_winner=c->exact_winner;e.distance=c->distance+1;e.bound=c->bound;changed=true;
+    }
+    if(changed){settle(*p);learn(*p);}
+   }
+   refresh(*p);
+   if(p->q!=before || p->exact_winner!=winner || p->distance!=distance)for(auto& w:p->parents)if(auto g=w.lock())work.emplace_back(g.get(),p);
   }
  }
  // Records a proven node's outcome for its position (graph search), keeping the shortest bound.
