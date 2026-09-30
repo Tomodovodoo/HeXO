@@ -127,6 +127,8 @@ class LauncherTests(unittest.TestCase):
         self.run.mkdir()
         self.fake = FakeProcesses()
         self.launcher = bubble.Launcher(self.run, self.fake.spawn, self.fake.arguments, self.fake.kill)
+        self.launcher.survivors = lambda entry: self.fake.survivors.get(entry['pid'], [])
+        self.fake.survivors = {}
         self.plan = bubble.commands(self.run)
 
     def tearDown(self):
@@ -222,6 +224,7 @@ class LauncherTests(unittest.TestCase):
                 raise OSError('no more processes')
             return self.fake.spawn(command, log)
         launcher = bubble.Launcher(self.run, failing_spawn, self.fake.arguments, self.fake.kill)
+        launcher.survivors = lambda entry: []
         self.fake.stubborn.add(101)
         with self.assertRaises(OSError):
             launcher.start(self.plan, timeout=0.01)
@@ -236,6 +239,7 @@ class LauncherTests(unittest.TestCase):
             return self.fake.spawn(command, log)
         self.fake.kill = lambda p, force=False: self.fake.killed.append(p)
         launcher = bubble.Launcher(self.run, failing_spawn, self.fake.arguments, self.fake.kill)
+        launcher.survivors = lambda entry: []
         with self.assertRaises(OSError):
             launcher.start(self.plan, timeout=0.01)
         recorded = json.loads((self.run / 'processes.json').read_text())
@@ -249,6 +253,13 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(sorted(self.fake.killed), sorted(e['pid'] for n, e in state.items() if n != 'proof'))
         self.assertFalse((self.run / 'processes.json').exists())
         self.assertEqual(self.launcher.stop(), [])
+
+    def test_stop_signals_surviving_workers_directly(self):
+        state = self.launcher.start(self.plan)
+        self.fake.survivors[state['actors']['pid']] = [777, 778]
+        self.launcher.stop(timeout=0.01)
+        self.assertEqual(self.fake.killed.count(777), 1)
+        self.assertEqual(self.fake.killed.count(778), 1)
 
     def test_stop_forces_a_service_that_ignores_the_first_signal(self):
         state = self.launcher.start(self.plan)

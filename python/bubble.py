@@ -281,12 +281,19 @@ class Launcher:
         return sorted(state)
 
     def terminate(self, entry, timeout):
-        """Kill the service and wait until it is gone, forcing it once after `timeout` seconds."""
-        self.kill(entry['pid'])
-        if self.gone(entry, timeout):
-            return True
-        self.kill(entry['pid'], force=True)
-        return self.gone(entry, timeout)
+        """Kill the service and its surviving workers and wait until all are gone, forcing once after `timeout`."""
+        for force in (False, True):
+            self.kill(entry['pid'], force)
+            for pid in self.survivors(entry):
+                self.kill(pid, force)
+            if self.gone(entry, timeout):
+                return True
+        return False
+
+    def survivors(self, entry):
+        """Workers of the service that outlive their leader and need their own signal: on Windows its descendants
+        (taskkill's tree option reaches nothing once the leader is gone); on POSIX the group signal covers them."""
+        return windows_tree(entry['pid'], str(self.run)) if os.name == 'nt' else []
 
     def gone(self, entry, timeout):
         """True once neither the service nor, on POSIX, any process left in its group exists."""
