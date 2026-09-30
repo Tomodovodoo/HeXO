@@ -156,6 +156,16 @@ class LauncherTests(unittest.TestCase):
         self.launcher.prepare('cpu', calls.append)
         self.assertEqual(calls, [])
 
+    def test_prepare_checks_device_and_phase_actors_of_an_existing_run(self):
+        (self.run / 'config.json').write_text(json.dumps(dict(device='cuda', learner=dict(phase_actors=6))))
+        calls = []
+        with self.assertRaises(RuntimeError):
+            self.launcher.prepare('cpu', calls.append, 4)
+        with self.assertRaises(RuntimeError):
+            self.launcher.prepare('auto', calls.append, 4)
+        self.launcher.prepare('auto', calls.append, 6)
+        self.assertEqual([Path(c[1]).name for c in calls], ['dense_learn.py'])
+
     def test_prepare_probes_the_configured_variant(self):
         (self.run / 'config.json').write_text(json.dumps(dict(learner=dict(variant='alt'))))
         export = self.run / 'checkpoints' / 'alt' / '000000'

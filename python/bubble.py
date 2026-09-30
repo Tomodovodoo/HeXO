@@ -204,14 +204,31 @@ class Launcher:
     def variant(self):
         """The learner's checkpoint variant from the run configuration, `main` for a run without one."""
         try:
-            return json.loads((self.run / 'config.json').read_text(encoding='utf-8'))['learner']['variant']
-        except (OSError, ValueError, KeyError, TypeError):
+            return (self.config() or {})['learner']['variant']
+        except (KeyError, TypeError):
             return 'main'
 
-    def prepare(self, device, run_steps):
-        """Create the run configuration and the first checkpoint when either is missing; `run_steps` runs a command."""
-        if not (self.run / 'config.json').exists():
-            run_steps([sys.executable, str(PYTHON / 'dense_config.py'), '--run', str(self.run), '--device', device])
+    def config(self):
+        try:
+            return json.loads((self.run / 'config.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return None
+
+    def prepare(self, device, run_steps, actors=None):
+        """Create the run configuration (on `device`, `auto` resolved then) and the first checkpoint when either is
+        missing; `run_steps` runs a command. An existing run must agree with an explicit `device`, and its phase
+        schedule may not wait for more workers than `actors` starts."""
+        config = self.config()
+        if config is None:
+            run_steps([sys.executable, str(PYTHON / 'dense_config.py'), '--run', str(self.run), '--device',
+                       resolve_device(device)])
+        else:
+            saved = config.get('device', device)
+            if device != 'auto' and device != saved:
+                raise RuntimeError(f'{self.run} is configured for {saved}; pass --device {saved} or start a new run')
+            phase_actors = (config.get('learner') or {}).get('phase_actors', 0)
+            if actors is not None and phase_actors > actors:
+                raise RuntimeError(f'{self.run} phases wait for {phase_actors} actors; pass --actors {phase_actors} or more')
         # Play-only installs (variant `play`, weights without optimizer state) never count as a learner checkpoint.
         exports = (self.run / 'checkpoints' / self.variant()).glob('*/ema.pt')
         learner_files = ('model.pt', 'optimizer.pt', 'manifest.json')
@@ -419,8 +436,8 @@ def main():
         if not proof:
             print('proof pass skipped: build the tactical solver first (python tools/build_tactical.py)')
         plan = commands(launcher.run, args.actors, args.dashboard_port, args.seal, args.net_kernels, proof)
-        prepare = lambda: launcher.prepare(resolve_device(args.device),
-                                           lambda command: subprocess.run(command, cwd=ROOT, check=True))
+        prepare = lambda: launcher.prepare(args.device, lambda command: subprocess.run(command, cwd=ROOT, check=True),
+                                           args.actors)
         for name, entry in launcher.start(plan, prepare).items():
             print(f'{name:<10} pid {entry["pid"]}')
         print(f'dashboard  http://127.0.0.1:{args.dashboard_port}  logs {launcher.run / "logs"}')
