@@ -13,6 +13,11 @@ MODEL_SHA256 = "aec92391c66050e737d9b769757248b520ffc1bf44fa039db7c8abd3ef720185
 MODEL_URL = "https://hexo.tyto.cc/model.safetensors"
 
 
+def mirror(q, r):
+    """Strix's axial frame from ours and back: HTTTX (q, r) is Strix (q + r, -r), and the map is its own inverse."""
+    return q + r, -r
+
+
 def validate_turn(game, moves):
     """Validate each stone with HeXO's native rules, then restore the position."""
     if not isinstance(moves, list) or not 1 <= len(moves) <= game.remaining:
@@ -127,12 +132,17 @@ class StrixLearned(StrixReference):
                 raise queue.Empty
             if self.process is None:
                 self._load(deadline)
-            result = self._exchange(dict(stones=cells,player=game.player,remaining=game.remaining,
+            stones = [[*mirror(q, r), p] for q, r, p in cells]
+            result = self._exchange(dict(stones=stones,player=game.player,remaining=game.remaining,
                 simulations=self.simulations,actions=self.actions,seed=(self.seed+self.calls) % (1 << 64)),deadline)
             self.calls += 1
             if result.get("status") != "OK":
                 raise RuntimeError(f"Strix learned did not select a turn: {result}")
-            moves = validate_turn(game, result.get("moves"))
+            returned = result.get("moves")
+            if not isinstance(returned, list) or any(not isinstance(m, list) or len(m) != 2 or
+                                                     any(type(v) is not int for v in m) for m in returned):
+                raise ValueError("Strix returned invalid coordinates")
+            moves = validate_turn(game, [list(mirror(*m)) for m in returned])
             if time.monotonic() >= deadline:
                 raise queue.Empty
             result.update(wall_ms=(time.monotonic()-start)*1000, executable_sha256=self.executable_sha256,
