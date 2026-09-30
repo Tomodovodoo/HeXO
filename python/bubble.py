@@ -395,7 +395,7 @@ def main():
     train.add_argument('--net-kernels', choices=['reference', 'fused'], default='reference')
     play = sub.choices['play']
     play.add_argument('--port', type=int, default=8765)
-    play.add_argument('--model', type=Path, help="an ema.pt file to play instead of the run's checkpoints")
+    play.add_argument('--model', type=Path, help="an ema.pt file to play, passed straight to the server")
     play.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     args = parser.parse_args()
     if args.command in ('train', 'stop', 'status') and os.name != 'nt' and not Path('/proc').is_dir():
@@ -419,15 +419,15 @@ def main():
     else:
         run = launcher.run
         if args.model:
-            digits = re.findall(r'\d+', str(args.model.resolve().parent.name))
-            run = ROOT / 'runs' / 'play'
-            install(run, args.model, int(digits[-1]) if digits else 0)
+            if not args.model.is_file():
+                sys.exit(f'no weights file at {args.model}')
         elif not exports(run):
             if run != (ROOT / 'runs' / 'play').resolve():
                 sys.exit(f'no checkpoints under {run}; pass --model, or use the default run to download a release')
             print(f'no checkpoints under {run}; downloading the latest released Bubble')
             print(f'installed {download(run)}')
-        sys.exit(subprocess.call([sys.executable, str(PYTHON / 'play.py'), '--dense-run', str(run),
+        model = ['--dense-model', str(args.model.resolve())] if args.model else []
+        sys.exit(subprocess.call([sys.executable, str(PYTHON / 'play.py'), '--dense-run', str(run), *model,
                                   '--port', str(args.port), '--device', args.device], cwd=ROOT))
 
 

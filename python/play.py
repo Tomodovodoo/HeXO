@@ -368,19 +368,22 @@ if __name__ == "__main__":
     opponent.add_argument("--relational", type=Path, help="Play the actual relational policy/Q checkpoint")
     opponent.add_argument("--search-run", type=Path, help="Use the internal search champion; refresh on New game")
     opponent.add_argument('--dense-run', type=Path, help='Play dense exports with model, search and solver controls')
+    parser.add_argument('--dense-model', type=Path, help='Play one dense export file; notes go to --dense-run or runs/play')
     parser.add_argument('--tactical-package', type=Path, help='Directory containing the verified prebuilt tactical library')
     parser.add_argument("--neural-mode", choices=("pi", "mu", "gumbel", "gumbel-proof"), default="gumbel")
     parser.add_argument("--simulations", type=int, default=16, help="Maximum neural search simulations per placement")
     parser.add_argument("--device", default="auto", help="cuda, cpu, or auto: cuda when a GPU is available")
     parser.add_argument("--label", help="Visible opponent name")
     args = parser.parse_args()
-    if args.device == "auto" and (args.dense_run or args.relational or args.search_run):
+    if args.device == "auto" and (args.dense_run or args.dense_model or args.relational or args.search_run):
         import torch
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.dense_model and not args.dense_run:
+        args.dense_run = Path(__file__).resolve().parents[1] / 'runs' / 'play'
     if args.dense_run:
         import torch
         torch.set_num_threads(2)
-        Handler.neural = DensePlayer(args.dense_run.resolve(), args.device, args.tactical_package)
+        Handler.neural = DensePlayer(args.dense_run.resolve(), args.device, args.tactical_package, args.dense_model)
     Handler.run = args.run.resolve() if args.run else None
     if Handler.run:
         promoted_checkpoint(Handler.run)
