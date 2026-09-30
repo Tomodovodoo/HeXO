@@ -19,6 +19,19 @@ from dashboard import bound_evaluation
 
 
 class GameLengths(unittest.TestCase):
+    def test_repeated_mature_run_requests_do_not_reread_episodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            shards = [(run/'shards'/str(i)/'manifest.json', dict(origin='actor')) for i in range(8200)]
+            with patch('dashboard.dense_manifests', return_value=shards), \
+                 patch.object(Path, 'stat') as stat, \
+                 patch.object(Path, 'read_text', return_value='[{"moves": [[0, 0]], "winner": 0}]') as read:
+                stat.return_value.st_mtime_ns = 1
+                self.assertEqual(dashboard.game_lengths(run, 0)['games'], 8200)
+                self.assertEqual(read.call_count, 8200)
+                self.assertEqual(dashboard.game_lengths(run, 0)['games'], 8200)
+                self.assertEqual(read.call_count, 8200)
+
     def test_actor_windows_start_types_endings_and_recorded_lengths(self):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)

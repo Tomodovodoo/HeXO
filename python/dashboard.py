@@ -410,9 +410,12 @@ def dense_manifests(folder, pattern='*/manifest.json'):
     return sorted(found, key=lambda item: (item[0].parent.parent.name, int(item[0].parent.name)))
 
 
-@lru_cache(maxsize=8192)
+@lru_cache(maxsize=None)
 def episode_lengths(path, modified):
-    """Compact counts from an immutable actor shard; never retain its move histories."""
+    """Compact counts from an immutable actor shard; never retain its move histories.
+
+    Keep every visited shard: an oldest-first scan larger than a bounded LRU would evict the next scan's entries.
+    """
     episodes = json.loads(Path(path).read_text(encoding='utf-8'))
     return Counter((len(e['moves']), e.get('origin', 'selfplay'),
                     'capped' if e['winner'] < 0 else 'proven' if e.get('reason') == 'proven' else 'win')
