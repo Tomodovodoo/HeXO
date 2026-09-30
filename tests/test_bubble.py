@@ -15,6 +15,7 @@ class FakeProcesses:
 
     def __init__(self):
         self.spawned, self.killed, self.live, self.markers, self.next_pid = [], [], set(), {}, 100
+        self.stubborn = set()
 
     def spawn(self, command, log):
         self.spawned.append((command, log))
@@ -26,9 +27,10 @@ class FakeProcesses:
     def arguments(self, pid):
         return self.markers[pid] if pid in self.live else []
 
-    def kill(self, pid):
+    def kill(self, pid, force=False):
         self.killed.append(pid)
-        self.live.discard(pid)
+        if pid not in self.stubborn or force:
+            self.live.discard(pid)
 
 
 class CommandTests(unittest.TestCase):
@@ -196,6 +198,23 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(sorted(self.fake.killed), sorted(e['pid'] for n, e in state.items() if n != 'proof'))
         self.assertFalse((self.run / 'processes.json').exists())
         self.assertEqual(self.launcher.stop(), [])
+
+    def test_stop_forces_a_service_that_ignores_the_first_signal(self):
+        state = self.launcher.start(self.plan)
+        self.fake.stubborn.add(state['learner']['pid'])
+        self.assertEqual(self.launcher.stop(timeout=0.01), sorted(bubble.SERVICES))
+        self.assertEqual(self.fake.killed.count(state['learner']['pid']), 2)
+        self.assertFalse((self.run / 'processes.json').exists())
+
+    def test_stop_keeps_records_of_a_service_that_will_not_exit(self):
+        state = self.launcher.start(self.plan)
+        pid = state['evaluator']['pid']
+        self.fake.stubborn.add(pid)
+        self.fake.kill = lambda p, force=False: self.fake.killed.append(p)
+        self.launcher.kill = self.fake.kill
+        with self.assertRaises(RuntimeError):
+            self.launcher.stop(timeout=0.01)
+        self.assertTrue((self.run / 'processes.json').exists())
 
     def test_status_reports_life_and_stage(self):
         state = self.launcher.start(self.plan)

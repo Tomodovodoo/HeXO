@@ -83,13 +83,14 @@ def alive(pid, script, run, arguments=arguments):
     return matches(arguments(pid), script, run)
 
 
-def kill(pid):
-    """End the process and, on Windows, everything it started."""
+def kill(pid, force=False):
+    """End the process group; on Windows everything the process started, on POSIX with SIGTERM or, when `force`,
+    SIGKILL."""
     if os.name == 'nt':
         subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True)
     else:
         try:
-            os.killpg(pid, signal.SIGTERM)
+            os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
         except OSError:
             pass
 
@@ -167,14 +168,30 @@ class Launcher:
                 raise
         return state
 
-    def stop(self):
+    def stop(self, timeout=30.):
+        """End every recorded service and wait until each has exited, forcing it after `timeout` seconds on POSIX;
+        the records are removed only once all are gone, so a following start never overlaps a stopping service."""
         with self.locked():
             state = self.state()
             for name in reversed(SERVICES):
-                if name in state and self.alive(state[name]):
-                    self.kill(state[name]['pid'])
+                entry = state.get(name)
+                if entry is None or not self.alive(entry):
+                    continue
+                self.kill(entry['pid'])
+                if not self.gone(entry, timeout):
+                    self.kill(entry['pid'], force=True)
+                    if not self.gone(entry, timeout):
+                        raise RuntimeError(f"{name} (pid {entry['pid']}) did not exit; its record is kept")
             self.state_file.unlink(missing_ok=True)
         return sorted(state)
+
+    def gone(self, entry, timeout):
+        deadline = time.time() + timeout
+        while self.alive(entry):
+            if time.time() > deadline:
+                return False
+            time.sleep(0.2)
+        return True
 
     def status(self):
         """One line per service: alive or gone, plus what its status file says."""
