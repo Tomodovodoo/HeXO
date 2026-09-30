@@ -58,6 +58,23 @@ int main(){
   int d[]={9,20};bool b[]={false,true};
   for(int i=0;i<2;++i){gumbel::Edge e;e.exact_winner=0;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
   t.settle(n);assert(n.distance==9 && n.bound);}
+ // Graph search: both orders of each turn meet in one node; another turn partition of the same stones is another
+ // context but inherits the proven outcome of the position.
+ {gumbel::Tree t(0);t.graph=true;
+  auto play=[&](std::vector<Cell> moves){t.board=Board{};for(auto c:moves)t.board.make(c);return t.child_here();};
+  auto first=play({{0,0},{1,0},{2,0},{0,1},{0,2},{3,0},{4,0}});
+  first->exact_winner=1;first->distance=3;t.learn(*first);
+  assert(play({{0,0},{2,0},{1,0},{0,2},{0,1},{4,0},{3,0}})==first);
+  auto other=play({{0,0},{3,0},{4,0},{0,1},{0,2},{1,0},{2,0}});
+  assert(other!=first && other->exact_winner==1 && other->distance==3);}
+ // MCGS backup: a node's value is recomputed from its edges' visits and its children's current values; a playout
+ // reusing a transposed child's value leaves that child unchanged.
+ {gumbel::Tree t(0);t.graph=true;gumbel::Node r;r.player=0;r.expanded=true;r.value=.2;
+  auto child=std::make_shared<gumbel::Node>();child->player=1;child->expanded=true;child->n=3;child->q=.5;
+  for(int i=0;i<2;++i){gumbel::Edge e;e.child=child;e.prior=.5;r.edges.push_back(std::move(e));}
+  gumbel::Path p;p.leaf=child.get();p.edges={{&r,0}};++r.edges[0].pending;t.backup(p,.5,false);
+  assert(r.edges[0].visits==1 && std::abs(r.q-(.2-.5)/2)<1e-12 && child->n==3 && r.n==1);
+  assert(std::abs(t.value(r,r.edges[1])+.5)<1e-12);}
  gumbel::Tree tree(1);tree.advance({0,0});tree.begin(16,4);
  assert(tree.sequence==std::vector<int>({0,0,0,0,1,1,1,1,2,2,3,3,4,4,5,5}));
  gumbel::Node n;n.value=.2;
