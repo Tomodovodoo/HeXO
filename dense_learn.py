@@ -1008,6 +1008,8 @@ def main():
     overrides = {k: v for k, v in asdict(settings).items() if getattr(args, k, None) is not None}
     torch.manual_seed(config.seed)
     learner = Learner(args.run, settings, config, args.initial, overrides, net_kernels=args.net_kernels)
+    if learner.settings.validation_fraction != config.learner.validation_fraction:
+        raise ValueError('validation_fraction must match config.json; actors and learners share the validation split')
     if learner.device.type == 'cuda':
         torch.set_num_threads(args.threads)
     s = learner.settings
