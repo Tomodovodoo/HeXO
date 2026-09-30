@@ -75,6 +75,11 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(json.loads((self.run / 'champion.json').read_text())['checkpoint'], 'play/122500')
         self.assertEqual(bubble.exports(self.run), [target / 'ema.pt'])
 
+    def test_install_rejects_a_missing_file(self):
+        with self.assertRaises(FileNotFoundError):
+            bubble.install(self.run, Path(self.directory.name) / 'missing.pt', 1)
+        self.assertFalse((self.run / 'champion.json').exists())
+
     def test_download_uses_the_release_tag_as_step(self):
         def fetch(url):
             if url.endswith('/latest'):

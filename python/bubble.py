@@ -97,17 +97,21 @@ def alive(pid, script, run, arguments=arguments):
     return matches(arguments(pid), script, run)
 
 
-def group_alive(pid):
-    """POSIX: whether any process of the group `pid` (each service starts its own session) still exists."""
-    if os.name == 'nt':
+def group_alive(pid, run):
+    """POSIX: whether any process of the group `pid` (each service starts its own session) still runs on `run`.
+    Members are found through /proc, so a reused group id with unrelated members does not count."""
+    if os.name == 'nt' or not Path('/proc').is_dir():
         return False
-    try:
-        os.killpg(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+            if int(fields[2]) == pid and run in arguments(int(entry.name)):
+                return True
+        except (OSError, ValueError, IndexError):
+            continue
+    return False
 
 
 def kill(pid, force=False):
@@ -137,7 +141,7 @@ class Launcher:
 
     def alive(self, entry):
         """The service leader still runs this run's script, or, on POSIX, children of its group still exist."""
-        return alive(entry['pid'], entry['script'], str(self.run), self.arguments) or group_alive(entry['pid'])
+        return alive(entry['pid'], entry['script'], str(self.run), self.arguments) or group_alive(entry['pid'], str(self.run))
 
     def prepare(self, device, run_steps):
         """Create the run configuration and the first checkpoint when either is missing; `run_steps` runs a command."""
@@ -271,6 +275,8 @@ def install(run, source, step, variant='play'):
     """Copy the weights file `source` into `run` as checkpoint `variant/step` and make it the champion. The `play`
     variant keeps such installs apart from the learner's own exports. Files land under temporary names and are
     renamed, so a reader never sees a half-written checkpoint."""
+    if not Path(source).is_file():
+        raise FileNotFoundError(f'no weights file at {source}')
     checkpoint = f'{variant}/{step:06d}'
     target = Path(run) / 'checkpoints' / checkpoint
     target.mkdir(parents=True, exist_ok=True)
