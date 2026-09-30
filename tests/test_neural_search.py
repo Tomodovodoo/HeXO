@@ -201,6 +201,34 @@ class NeuralTree(unittest.TestCase):
         self.assertNotEqual(a, cache.key([(0, 0), (2, 0), (1, 0)], 'b'))
         self.assertNotEqual(a, cache.key([(0, 0), (1, 0)], 'a'))
 
+    def test_cache_separates_dense_turn_context(self):
+        import hexcrop
+        histories = (
+            ([(0,0),(1,0),(2,0),(0,1),(0,2),(3,0),(4,0)],
+             [(0,0),(3,0),(4,0),(0,1),(0,2),(1,0),(2,0)], 7),
+            ([(0,0),(1,0),(2,0),(0,1),(0,2),(3,0)],
+             [(0,0),(3,0),(2,0),(0,1),(0,2),(1,0)], 6),
+        )
+        for first, second, plane in histories:
+            with self.subTest(plane=plane):
+                a, b = hexcrop.encode(first), hexcrop.encode(second)
+                np.testing.assert_array_equal(a.actions, b.actions)
+                np.testing.assert_array_equal(a.planes[:6], b.planes[:6])
+                self.assertFalse(np.array_equal(a.planes[plane], b.planes[plane]))
+                cache = EvaluationCache()
+                cache.put(cache.key(first, 'dense'), 'prediction for first')
+                self.assertIsNone(cache.get(cache.key(second, 'dense')))
+
+    def test_cache_reuses_reordered_stones_with_same_dense_inputs(self):
+        import hexcrop
+        first = [(0,0),(1,0),(2,0),(0,1),(0,2),(3,0),(4,0)]
+        second = [(0,0),(2,0),(1,0),(0,2),(0,1),(4,0),(3,0)]
+        a, b = hexcrop.encode(first), hexcrop.encode(second)
+        np.testing.assert_array_equal(a.planes, b.planes)
+        cache = EvaluationCache()
+        cache.put(cache.key(first, 'dense'), 'same prediction')
+        self.assertEqual(cache.get(cache.key(second, 'dense')), 'same prediction')
+
     def test_first_placement_win_stops_and_terminal_is_exact(self):
         history = [(0,0),(0,2),(1,2),(1,0),(2,0),(2,2),(3,2),(3,0),(4,0),(-2,2),(-3,2)]
         game = Game(history)
