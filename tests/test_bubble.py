@@ -45,6 +45,11 @@ class CommandTests(unittest.TestCase):
         self.assertIn('--eval-anchor-games', plan['evaluator'])
         self.assertNotIn('--eval-anchor-games', bubble.commands(Path('runs/x'), seal=True)['evaluator'])
 
+    def test_proof_pass_is_optional(self):
+        plan = bubble.commands(Path('runs/x'), proof=False)
+        self.assertNotIn('proof', plan)
+        self.assertEqual(set(plan) | {'proof'}, set(bubble.SERVICES))
+
     def test_kernels_reach_gpu_services(self):
         plan = bubble.commands(Path('runs/x'), kernels='fused')
         for name in ('learner', 'actors', 'evaluator'):
@@ -225,6 +230,12 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(lines['learner'].startswith('alive') and 'training 42' in lines['learner'])
         self.assertTrue(lines['actors'].startswith('gone'))
         self.assertEqual(lines['champion'], 'main/000500')
+
+    def test_start_without_the_proof_pass(self):
+        state = self.launcher.start(bubble.commands(self.run, proof=False))
+        self.assertNotIn('proof', state)
+        self.assertTrue(any(line.startswith('proof') and line.endswith('not started') for line in self.launcher.status()))
+        self.assertEqual(self.launcher.stop(), sorted(set(bubble.SERVICES) - {'proof'}))
 
     def test_status_before_start(self):
         self.assertTrue(all(line.endswith('not started') for line in self.launcher.status()))

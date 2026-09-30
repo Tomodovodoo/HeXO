@@ -35,19 +35,30 @@ def resolve_device(device):
     return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-def commands(run, actors=4, dashboard_port=8766, seal=False, kernels='reference'):
-    """The command line of every service for `run`, as argument lists starting with the interpreter."""
+def commands(run, actors=4, dashboard_port=8766, seal=False, kernels='reference', proof=True):
+    """The command line of every service for `run`, as argument lists starting with the interpreter; the proof pass
+    only when `proof`, since it needs the tactical solver build."""
     python = [sys.executable, '-u']
     evaluator = [*python, str(PYTHON / 'dense_eval.py'), 'loop', '--run', str(run), '--net-kernels', kernels]
     if not seal:
         evaluator += ['--eval-anchor-games', '0', '--no-eval-anchor-on-promotion', '--eval-anchor-target-halfwidth', '0']
-    return dict(
+    plan = dict(
         learner=[*python, str(PYTHON / 'dense_learn.py'), '--run', str(run), '--net-kernels', kernels],
         actors=[*python, str(PYTHON / 'dense_selfplay.py'), '--run', str(run), '--processes', str(actors),
                 '--net-kernels', kernels],
         evaluator=evaluator,
         proof=[*python, str(PYTHON / 'dense_solve.py'), '--run', str(run)],
         dashboard=[*python, str(PYTHON / 'dashboard.py'), '--run', str(run), '--port', str(dashboard_port)])
+    if not proof:
+        del plan['proof']
+    return plan
+
+
+def tactical_built():
+    """True when the tactical solver library and its build identity file exist."""
+    import tactical_proof
+    binary = tactical_proof.library()
+    return binary.exists() and binary.with_suffix(binary.suffix + '.json').exists()
 
 
 def spawn(command, log):
@@ -155,7 +166,7 @@ class Launcher:
                 raise RuntimeError(f"{', '.join(sorted(running))} already running for {self.run}; stop first")
             state = {}
             try:
-                for name in SERVICES:
+                for name in [name for name in SERVICES if name in plan]:
                     script = Path(next(part for part in plan[name] if part.endswith('.py'))).name
                     pid = self.spawn(plan[name], self.run / 'logs' / name)
                     state[name] = dict(pid=pid, script=script, command=plan[name], started_at=time.time())
@@ -286,7 +297,10 @@ def main():
     args = parser.parse_args()
     launcher = Launcher(args.run)
     if args.command == 'train':
-        plan = commands(launcher.run, args.actors, args.dashboard_port, args.seal, args.net_kernels)
+        proof = tactical_built()
+        if not proof:
+            print('proof pass skipped: build the tactical solver first (python tools/build_tactical.py)')
+        plan = commands(launcher.run, args.actors, args.dashboard_port, args.seal, args.net_kernels, proof)
         prepare = lambda: launcher.prepare(resolve_device(args.device),
                                            lambda command: subprocess.run(command, cwd=ROOT, check=True))
         for name, entry in launcher.start(plan, prepare).items():
