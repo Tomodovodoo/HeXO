@@ -1235,7 +1235,8 @@ class Evaluator:
             may_refill = auxiliary is not None and not stopping and gate_open
             if may_refill and extra_started < 2*self.settings.pool_games:
                 lanes.update({lane: even(min(self.settings.pool_games, target-len(self.games(*lane[:2]))))
-                              for lane, target in extra.items() if len(self.games(*lane[:2])) < target})
+                              for lane, target in extra.items() if len(self.games(*lane[:2])) < target
+                              and (*lane, self.settings.opening_book) not in self.failed_seal})
             for a, b, _ in lanes:
                 self.open(a, b)
             live = {lane for lane, _ in pool.games.values()} | {lane for lane, _ in pool.ready}

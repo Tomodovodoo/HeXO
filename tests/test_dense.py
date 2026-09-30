@@ -5850,6 +5850,35 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.export(50)
         self.assertFalse(evaluator.pipeline_ready())
 
+    def test_pipeline_pauses_admitted_seal_lane_after_failed_pairs(self):
+        evaluator = self.start(pool_games=4, pipeline=True, seal_ms=5)
+        self.export(10, 20)
+        a, b = 'main/000020', 'main/000010'
+        evaluator.league['checkpoints'] = [dict(id=cid, variant='main', step=int(cid.split('/')[1]),
+                                                elo=0., elo_interval=None, matches=[]) for cid in (b, a)]
+        primary, seal = (a, b, 'panel'), (a, dense_eval.SEAL, 'fill')
+        marker = (*seal, evaluator.settings.opening_book)
+        after_pause = []
+        start = evaluator.start
+        def tracked(pool, lane):
+            if lane == seal and marker in evaluator.failed_seal:
+                after_pause.append(evaluator.next[a, dense_eval.SEAL])
+            start(pool, lane)
+        def choose(blocked, names):
+            return (evaluator.entry(a), dense_eval.SEAL, 'fill', 8) if seal[:2] not in blocked else None
+        class Failing(scripted()):
+            def step(self):
+                return [(lane, dict(record, error='failed proof') if lane == seal else record)
+                        for lane, record in super().step()]
+        with unittest.mock.patch.object(evaluator, 'pipeline_ready', return_value=True), \
+             unittest.mock.patch.object(evaluator, 'start', side_effect=tracked), \
+             unittest.mock.patch.object(dense_eval, 'Pool', Failing):
+            evaluator.session(lambda: {primary: dense_eval.even(4-len(evaluator.games(a, b)))}
+                              if len(evaluator.games(a, b)) < 4 else {}, 4, auxiliary=choose)
+        self.assertIn(marker, evaluator.failed_seal)
+        self.assertEqual(evaluator.next[a, dense_eval.SEAL], 3)  # budget still had room for a fourth pair
+        self.assertFalse(after_pause)
+
     def test_existing_panels_skip_uninformative_members(self):
         """Panel members are re-derived (a stored list is ignored) and include only those within
         max_expected_score."""
