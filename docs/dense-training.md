@@ -7,7 +7,7 @@ The current Bubble learner uses HexNet. Start a new run using the commands in [t
 Run from the checkout root after the native build, editable install and learning dependency install. This exercises collection, checkpoint export and resuming in a small new directory.
 
 ```sh
-python python/dense_config.py --run runs/bubble-short --device cpu --blocks 2 --channels 32 --pool-every 2 --batch 8 --window-min-rows 8 --warmup-steps 1 --export-every 1 --games-in-flight 4 --leaf-batch 8 --full-sims 4 --cheap-sims 4 --root-samples 4 --max-plies 16 --shard-games 4
+python python/dense_config.py --run runs/bubble-short --device cpu --blocks 2 --channels 32 --pool-every 2 --batch 32 --window-min-rows 8 --warmup-steps 1 --export-every 1 --validation-rows 16 --validation-quota 16 --games-in-flight 4 --leaf-batch 8 --full-sims 4 --cheap-sims 4 --root-samples 4 --max-plies 16 --shard-games 4
 python python/dense_learn.py --run runs/bubble-short --steps 0 --workers 1
 python python/dense_selfplay.py --run runs/bubble-short --games 4
 python python/dense_learn.py --run runs/bubble-short --steps 1 --workers 1

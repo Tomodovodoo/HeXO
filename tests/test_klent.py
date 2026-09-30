@@ -101,7 +101,7 @@ class KlentTest(unittest.TestCase):
             root = Path(folder)
             (root/"checkpoints/0000").mkdir(parents=True)
             initial = {"schema": "hexo-klent-scalar-v1", "identity": {"config": {"games": 2}},
-                       "metrics": None, "files": {"legacy.klent.pt": "initial-actor"}}
+                       "metrics": None, "files": {"klent.pt": "initial-actor"}}
             (root/"checkpoints/0000/manifest.json").write_text(json.dumps(initial))
             # Collection can publish its corpus and crash before replacing stale status.
             (root/"status.json").write_text(json.dumps({"iteration": 1, "stage": "collection", "positions": 4}))

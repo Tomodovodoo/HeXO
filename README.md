@@ -62,7 +62,7 @@ Start each long-running command in a separate terminal with the same activated e
 ```sh
 python python/dense_selfplay.py --run runs/bubble --processes 4
 python python/dense_learn.py --run runs/bubble
-python python/dense_eval.py loop --run runs/bubble
+python python/dense_eval.py loop --run runs/bubble --anchor-games 0 --no-anchor-on-promotion --anchor-target-halfwidth 0
 python python/dashboard.py --run runs/bubble
 ```
 
@@ -112,9 +112,10 @@ The local training run, downloaded opponent weights and research results are git
 
 ## Tests
 
-After the native build and editable install, a small CPU selection is:
+After the native build and editable install, install NumPy for the CPU search tests:
 
 ```sh
+python -m pip install numpy
 python -m unittest tests.test_curriculum tests.test_proof tests.test_notation_api tests.test_neural_search -v
 ```
 

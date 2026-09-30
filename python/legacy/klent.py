@@ -363,7 +363,7 @@ def main(args):
         value_optimizer = torch.optim.Adam(model.nnue.value.parameters(), lr=args.lr, fused=args.device == "cuda")
         def checkpoint(stage):
             torch.save({"schema": SCHEMA, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                        "value_optimizer": value_optimizer.state_dict()}, stage/"legacy.klent.pt")
+                        "value_optimizer": value_optimizer.state_dict()}, stage/"klent.pt")
             torch.save(model.nnue.state_dict(), stage/"model.pt")
             torch.save({"schema": SCHEMA, "model_sha256": digest(stage/"model.pt"),
                         "state": model.q.state_dict()}, stage/"q.pt")
@@ -377,14 +377,14 @@ def main(args):
                 if index:
                     prior = run/"checkpoints"/f"{index-1:04d}"
                     corpus = run/"corpus"/f"{index:04d}"
-                    corpus_identity = {**identity, "iteration": index, "actor_sha256": digest(prior/"legacy.klent.pt"),
+                    corpus_identity = {**identity, "iteration": index, "actor_sha256": digest(prior/"klent.pt"),
                                        "policy": "softmax((Q+beta*logpi)/(alpha+beta))",
                                        "returns": "signed-lambda-v1-cap-bootstrap", "actions": "full-legal"}
                     verify(corpus, corpus_identity)
                     if digest(corpus/"manifest.json") != manifest["metrics"]["corpus_manifest_sha256"]:
                         raise ValueError("Consumed KLENT corpus manifest changed")
             latest = checkpoints[-1]
-            saved = torch.load(latest/"legacy.klent.pt", map_location=args.device, weights_only=True)
+            saved = torch.load(latest/"klent.pt", map_location=args.device, weights_only=True)
             if saved["schema"] != SCHEMA:
                 raise ValueError("Unknown KLENT checkpoint schema")
             model.load_state_dict(saved["model"], strict=True)
@@ -409,7 +409,7 @@ def main(args):
             started = time.perf_counter()
             if args.device == "cuda":
                 torch.cuda.reset_peak_memory_stats()
-            corpus_identity = {**identity, "iteration": number, "actor_sha256": digest(latest/"legacy.klent.pt"),
+            corpus_identity = {**identity, "iteration": number, "actor_sha256": digest(latest/"klent.pt"),
                                "policy": "softmax((Q+beta*logpi)/(alpha+beta))",
                                "returns": "signed-lambda-v1-cap-bootstrap", "actions": "full-legal"}
             corpus = run/"corpus"/f"{number:04d}"

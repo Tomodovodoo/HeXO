@@ -190,7 +190,7 @@ def _module(path, reference=None, source_bytes=None):
     module = importlib.util.module_from_spec(spec)
     if reference is not None:
         def import_reference(name, *args, **kwargs):
-            return reference if name == 'legacy.strix_reference' else builtins.__import__(name, *args, **kwargs)
+            return reference if name in ('strix_reference', 'legacy.strix_reference') else builtins.__import__(name, *args, **kwargs)
         module.__dict__['__builtins__'] = dict(vars(builtins), __import__=import_reference)
     if source_bytes is None:
         spec.loader.exec_module(module)

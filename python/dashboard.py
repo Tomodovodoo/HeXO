@@ -286,7 +286,7 @@ def klent_run(run):
             continue
         identity, schema = manifest["identity"], manifest["schema"]
         checkpoints.append({"id": int(path.parent.name), "metrics": manifest.get("metrics"),
-                            "actor_sha256": manifest.get("files", {}).get("legacy.klent.pt")})
+                            "actor_sha256": manifest.get("files", {}).get("klent.pt")})
     if not schema:
         return None
     status = read_json(run/"status.json", {})
