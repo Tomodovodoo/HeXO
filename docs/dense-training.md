@@ -43,7 +43,7 @@ The policy target is the improved policy of the root search over the moves it co
 
 ## Window and pacing
 
-The replay window follows KataGo: at least `window_min_rows` full-search rows, then it grows by `window_expand_per_row` times the extra rows, tapered by the exponent `window_taper`. Pacing keeps `samples_per_row` presentations per kept row; changing it, or the cheap-row fraction, resets the pacing base at the current row count. The learner and actors alternate in phases: actors play until `phase_rows` new rows exist, then pause while the learner trains through them, and the evaluator yields while either is busy. `learner-status.json` reports the window size, retained rows, pacing backlog and phase state.
+The replay window follows KataGo: at least `window_min_rows` full-search rows, then it grows by `window_expand_per_row` times the extra rows, tapered by the exponent `window_taper`. Pacing keeps `samples_per_row` presentations per kept row; changing it, or the cheap-row fraction, resets the pacing base at the current row count. Phases are off in a new run. With `--phase-rows N` on the learner and `--phase-follow` on the actors, the two alternate: actors play until N new rows exist, then pause while the learner trains through them, and the evaluator yields while either is busy. That is how the live run shared one GPU; without it, all three compete for the card at once. `learner-status.json` reports the window size, retained rows, pacing backlog and phase state.
 
 ## Book and restart starts
 

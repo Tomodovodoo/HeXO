@@ -100,10 +100,15 @@ class Launcher:
         if running:
             raise RuntimeError(f"{', '.join(sorted(running))} already running for {self.run}; stop first")
         state = {}
-        for name in SERVICES:
-            pid = self.spawn(plan[name], self.run / 'logs' / name)
-            state[name] = dict(pid=pid, command=plan[name], started_at=time.time())
-        self.state_file.write_text(json.dumps(state, indent=2), encoding='utf-8')
+        try:
+            for name in SERVICES:
+                pid = self.spawn(plan[name], self.run / 'logs' / name)
+                state[name] = dict(pid=pid, command=plan[name], started_at=time.time())
+            self.state_file.write_text(json.dumps(state, indent=2), encoding='utf-8')
+        except BaseException:
+            for entry in state.values():
+                self.kill(entry['pid'])
+            raise
         return state
 
     def stop(self):

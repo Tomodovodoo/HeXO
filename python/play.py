@@ -363,7 +363,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="auto", help="cuda, cpu, or auto: cuda when a GPU is available")
     parser.add_argument("--label", help="Visible opponent name")
     args = parser.parse_args()
-    if args.device == "auto" and (args.dense_run or args.relational):
+    if args.device == "auto" and (args.dense_run or args.relational or args.search_run):
         import torch
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.dense_run:

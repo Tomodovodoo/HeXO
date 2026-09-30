@@ -77,6 +77,18 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.launcher.start(self.plan)
 
+    def test_failed_start_kills_what_it_spawned(self):
+        def failing_spawn(command, log):
+            if log.name == 'evaluator':
+                raise OSError('no more processes')
+            return self.fake.spawn(command, log)
+        launcher = bubble.Launcher(self.run, failing_spawn, self.fake.alive, self.fake.kill)
+        with self.assertRaises(OSError):
+            launcher.start(self.plan)
+        self.assertEqual(len(self.fake.killed), 2)
+        self.assertFalse(self.fake.live)
+        self.assertFalse((self.run / 'processes.json').exists())
+
     def test_stop_kills_live_processes_and_clears_state(self):
         state = self.launcher.start(self.plan)
         self.fake.live.discard(state['proof']['pid'])
