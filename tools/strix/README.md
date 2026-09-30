@@ -3,7 +3,7 @@
 This separate executable calls the MIT-licensed [SootyOwl/hexo-strix](https://github.com/SootyOwl/hexo-strix/tree/5a771e572553a8bd8e010112b2ce65f16e5afa1b)
 `hexo-solver` library at revision `5a771e572553a8bd8e010112b2ce65f16e5afa1b`.
 Cargo pins that revision and the checked-in lockfile pins Rust dependencies.
-No Strix implementation is copied into HeXO. The external source carries its
+This executable links the upstream library. The external source carries its
 [MIT license](https://github.com/SootyOwl/hexo-strix/blob/5a771e572553a8bd8e010112b2ce65f16e5afa1b/LICENSE).
 If distributing a linked executable, include that license, copyright notice,
 and dependency notices. No executable is committed here.
@@ -11,6 +11,7 @@ and dependency notices. No executable is committed here.
 Install Rust with edition 2024 support and a native linker, then from the HeXO root:
 
 ```sh
+python -m pip install -e .
 cargo build --release --locked --manifest-path tools/strix/Cargo.toml
 python -m unittest tests.test_strix_reference -v
 ```
@@ -19,7 +20,7 @@ The local Windows verification used Rust 1.98.1, the GNU Windows target, and
 MinGW. CUDA, PyTorch, MCTS, and neural checkpoints are unnecessary.
 
 ```python
-from strix_reference import StrixReference
+from legacy.strix_reference import StrixReference
 
 with StrixReference() as solver:
     result = solver.solve([[q, 0, "P1"] for q in range(4)], "P1", 2,
@@ -47,7 +48,7 @@ flag to false itself.
 
 ## Result scope
 
-Only IDTT is exposed in this first adapter. Tight and wide are explicit options.
+This adapter exposes IDTT. Tight and wide are explicit options.
 Depth counts attacker turns including the completing turn. Every response
 includes attacker, remaining placements, generator, budgets, and fixed rules:
 six or more in a line, radius 8, no match move cap. Negative results apply only
