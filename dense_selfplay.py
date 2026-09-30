@@ -716,11 +716,14 @@ class Restarts:
     empty; unreadable: the previous entries are kept) and keeps the entries whose ply is below `max_plies`, so every
     restart game searches at least one ply. draw(rng) returns (entry, moves) for an entry drawn with probability
     proportional to regret^(1/temperature), `moves` the first entry['ply'] moves of its source game, or None when
-    no entry is kept or the source shard is gone. The moves of the RESTART_SHARDS most recently used source shards are kept."""
+    no entry is kept or the source shard is gone. Validation source games and their restart descendants are
+    rejected, so the worker starts an ordinary game instead. The RESTART_SHARDS most recently used source shards
+    are kept."""
 
     def __init__(self, run, temperature, max_plies):
         self.run, self.temperature, self.max_plies = Path(run), temperature, max_plies
-        self.entries, self.games, self.p = [], OrderedDict(), None
+        self.validation_fraction = dense_config.load(self.run).learner.validation_fraction
+        self.entries, self.shards, self.p = [], OrderedDict(), None
         self.load()
 
     def load(self):
@@ -740,23 +743,36 @@ class Restarts:
         weights[positive] = np.exp(logs-logs.max())
         self.p = weights/weights.sum()
 
-    def moves(self, shard):
-        if shard not in self.games:
+    def episodes(self, shard):
+        if shard not in self.shards:
             path = self.run/'shards'/shard/'episodes.json'
             if not path.exists():
                 return None
-            self.games[shard] = [e['moves'] for e in json.loads(path.read_text(encoding='utf-8'))]
-            while len(self.games) > RESTART_SHARDS:
-                self.games.popitem(last=False)
-        self.games.move_to_end(shard)
-        return self.games[shard]
+            self.shards[shard] = json.loads(path.read_text(encoding='utf-8'))
+            while len(self.shards) > RESTART_SHARDS:
+                self.shards.popitem(last=False)
+        self.shards.move_to_end(shard)
+        return self.shards[shard]
 
     def draw(self, rng):
         if self.p is None:
             return None
         entry = self.entries[rng.choice(len(self.entries), p=self.p)]
-        games = self.moves(entry['shard'])
-        return None if games is None else (entry, games[entry['game']][:entry['ply']])
+        episodes = self.episodes(entry['shard'])
+        if episodes is None:
+            return None
+        episode = episodes[entry['game']]
+        moves = episode['moves'][:entry['ply']]
+        while True:
+            if dense_data.holdout(episode, self.validation_fraction):
+                return None
+            source = episode.get('restart')
+            if source is None:
+                return entry, moves
+            episodes = self.episodes(source['shard'])
+            if episodes is None:
+                return None
+            episode = episodes[source['game']]
 
 
 class Historical:
