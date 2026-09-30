@@ -128,6 +128,18 @@ class NativeEntries(unittest.TestCase):
             checked(native.hxg_hold(search.ptr, 1))
             self.assertEqual(drive(search, budget), [boundary], (budget, samples))
 
+    def test_proofs_of_every_visited_move_leave_the_unvisited_survivors(self):
+        search = self.tree()
+        checked(native.hxg_begin(search.ptr, 8, 4))
+        drive(search, 8)
+        actions, visits, _, _, _ = stats(search)
+        for i in np.flatnonzero(visits):
+            checked(native.hxg_mark_exact(search.ptr, *actions[i], 0))
+        result = search.result(0, 0, 0, 0)
+        self.assertEqual(result['exact_winner'], -1)
+        self.assertIsNotNone(result['action'])
+        self.assertEqual(visits[actions.index(result['action'])], 0)
+
     def test_mark_exact_gives_q_minus_one_and_settles_the_root(self):
         search = self.tree()
         checked(native.hxg_begin(search.ptr, 8, 4))
@@ -374,6 +386,28 @@ def line(certificate):
     first = nodes[certificate['root']]
     reply = nodes[first['child']]['responses'][0]
     return first['action'], reply['action'], nodes[reply['child']]['action']
+
+
+class LostRoots(unittest.TestCase):
+    """A proven-lost side without adjudication still plays a legal move (evaluation and self-play)."""
+    HISTORY = [(0,0),(1,5),(3,3),(-2,2),(-1,1),(2,4),(0,6),(1,-1)]   # every move of player 1 loses
+
+    def test_evaluation_game_plays_on_from_a_lost_root(self):
+        model = tiny_model()
+        game = match(model, self.HISTORY, None, sims=64, samples=16, plies=2)
+        run([game])
+        self.assertEqual(game.results[0]['exact_winner'], 1)
+        self.assertIsNotNone(game.results[0]['action'])
+        self.assertGreater(len(game.moves), len(self.HISTORY))
+
+    def test_selfplay_without_adjudication_plays_on_from_a_lost_root(self):
+        model = tiny_model()
+        s = settings(full_fraction=1., adjudicate_proven=False, max_plies=len(self.HISTORY)+2)
+        game = from_position(dense_selfplay.SelfPlayGame([model, model], s, 3), self.HISTORY)
+        run([game])
+        episode, rows = game.episode()
+        self.assertEqual([r['proven'] for r in rows[:1]], [-1])
+        self.assertEqual(len(episode['moves']), len(self.HISTORY)+2)
 
 
 class Proofs(unittest.TestCase):
