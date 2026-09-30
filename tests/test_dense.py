@@ -3291,6 +3291,58 @@ class EngineTests(unittest.TestCase):
                         tree.close()
                     slot.game.close()
 
+    def test_child_proof_finishes_search_with_only_two_tactical_candidates(self):
+        from dense_solver import Schedule
+        # A position from the fused actor probe: after one candidate is proved losing, its surviving
+        # alternative has already been visited. Pruning during the round used to strand the schedule.
+        history = [[0,0],[1,0],[-1,1],[1,1],[2,-1],[3,-1],[0,-2],[-1,-2],[1,-3],[-1,-3],
+                   [2,-5],[0,-4],[4,-7],[4,-6],[5,-9],[6,-10],[3,-4],[5,-4],[7,-10],[5,-5],
+                   [7,-9],[6,-7],[-2,-4],[-2,-3],[1,-6],[1,-7],[4,-4],[4,-3],[2,-8],[0,-5],
+                   [6,-3],[6,-4],[-1,-5],[7,-1],[8,-1],[8,-2],[7,0],[12,-1],[13,-2],[11,-1],
+                   [14,-3],[12,0],[12,1],[12,-2],[13,0],[12,2],[10,2],[12,3],[11,1],[9,2],
+                   [11,2],[8,2],[13,2],[6,-1],[9,1],[10,1]]
+        action = [4,-1]
+        leaf_history = history+[action]
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        for samples in (1, 4):
+            with self.subTest(samples=samples):
+                settings = dense_config.ActorSettings(full_fraction=0., cheap_root_samples=samples,
+                    solver_follow=True, max_plies=len(history)+1)
+                slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+                try:
+                    try:
+                        engine = dense_selfplay.Engine(8, schedule=Schedule.of(settings), leaf_nodes=32)
+                    except FileNotFoundError:
+                        self.skipTest('Prebuilt tactical library required')
+                    self.addCleanup(engine.close)
+                    verdict = engine.leaf_solver.history(leaf_history, nodes=32, ms=1000)
+                    self.assertTrue(verdict['native_verified'])
+                    actions = np.asarray(slot.game.legal_moves(), np.int64)
+                    logits = np.zeros(len(actions))
+                    logits[(actions == action).all(1)] = 100.
+                    model.cache.put(dense_selfplay.position_key(np.asarray(history)),
+                                    (actions, logits, np.zeros(len(actions))))
+                    with unittest.mock.patch.object(engine.leaf_solver, 'history', side_effect=lambda h, **k:
+                            verdict if h == leaf_history else dict(status='UNKNOWN', native_verified=False)), \
+                         unittest.mock.patch.object(slot, 'searched', wraps=slot.searched) as searched:
+                        engine.add(slot)
+                        for _ in range(200):
+                            if not engine.slots and not engine.closing:
+                                break
+                            engine.step()
+                        self.assertFalse(engine.slots or engine.closing)
+                    result = searched.call_args_list[0].args[0]
+                    self.assertEqual(result['completed'], slot.budget)
+                    self.assertEqual(result['pruned'], [action])
+                    self.assertEqual(result['action'], [5,-1])
+                    self.assertEqual(result['policy'][(result['actions'] == action).all(1)].item(), 0.)
+                    self.assertEqual(result['exact_winner'], -1)
+                    self.assertFalse(slot.rows[0].get('proven'))
+                finally:
+                    for tree in slot.trees.values():
+                        tree.close()
+                    slot.game.close()
+
     def test_opponent_second_stone_proof_prunes_only_a_complete_root_turn(self):
         from dense_solver import Schedule
         base = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
