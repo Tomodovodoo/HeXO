@@ -89,6 +89,13 @@ int main(){
   std::vector<double> z(legal.size());u.fulfill(id,a.data(),z.data(),z.data(),int(legal.size()));
   assert(u.done() && u.root->exact_winner==0);
   for(auto& e:u.root->edges)assert(e.eligible==(e.action==Cell{5,0}));}
+ // A second equally short win proven in one expanded context reaches an expanded peer, though the outcome is unchanged.
+ {gumbel::Tree t(0);t.graph=true;
+  auto make=[&](std::vector<Cell> moves){t.board=Board{};for(auto c:moves)t.board.make(c);auto n=t.child_here();n->expanded=true;
+   for(int i=0;i<3;++i){gumbel::Edge e;e.action={9,i};n->edges.push_back(std::move(e));}return n;};
+  auto one=make({{0,0},{1,0},{2,0},{0,1},{0,2},{3,0},{4,0}}),two=make({{0,0},{1,0},{3,0},{0,1},{0,2},{2,0},{4,0}});
+  for(int i:{0,1}){one->edges[i].exact_winner=0;one->edges[i].distance=2;t.settle(*one);t.learn(*one);}
+  assert(two->exact_winner==0 && two->edges[0].eligible && two->edges[1].eligible && !two->edges[2].eligible);}
  // MCGS backup: a node's value is recomputed from its edges' visits and its children's current values; a playout
  // reusing a transposed child's value leaves that child unchanged.
  {gumbel::Tree t(0);t.graph=true;gumbel::Node r;r.player=0;r.expanded=true;r.value=.2;

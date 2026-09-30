@@ -101,8 +101,9 @@ struct Tree {
   const auto& old=o->second;
   const bool better=old.winner==node.exact_winner && (node.distance<old.distance || (node.distance==old.distance && ((!node.bound && old.bound)
    || (outcome.witnessed && !old.witnessed))));
-  if(!added && !better)return;
-  o->second=outcome;
+  if(added || better)o->second=outcome;
+  // Peers take any improvement: a better outcome, or a new edge proof of an expanded node under an unchanged one.
+  if(!added && !better && !node.expanded)return;
   if(auto list=positions.find(node.position);list!=positions.end())for(auto& w:std::vector(list->second))if(auto n=w.lock())if(n.get()!=&node)share(node,o->second,*n);
  }
  // Installs a proven outcome on a node of its position: an unexpanded node takes the verdict; an expanded node takes
