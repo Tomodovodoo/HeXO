@@ -113,14 +113,17 @@ class Launcher:
         """Create the run configuration and the first checkpoint when either is missing; `run_steps` runs a command."""
         if not (self.run / 'config.json').exists():
             run_steps([sys.executable, str(PYTHON / 'dense_config.py'), '--run', str(self.run), '--device', device])
+        # Play-only installs (variant `play`, weights without optimizer state) never count as a learner checkpoint.
         exports = (self.run / 'checkpoints' / 'main').glob('*/ema.pt')
-        if not any(path.with_name('manifest.json').exists() for path in exports):
+        learner_files = ('model.pt', 'optimizer.pt', 'manifest.json')
+        if not any(all(path.with_name(name).exists() for name in learner_files) for path in exports):
             run_steps([sys.executable, str(PYTHON / 'dense_learn.py'), '--run', str(self.run), '--steps', '0'])
 
     def lock(self):
         """Create `processes.lock` exclusively, holding this process id. A lock whose owner is no longer a running
         launcher was abandoned by a crash and is taken over."""
         path = self.run / 'processes.lock'
+        self.run.mkdir(parents=True, exist_ok=True)
         for attempt in range(2):
             try:
                 handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
@@ -131,7 +134,12 @@ class Launcher:
                     owner = 0
                 if attempt or any(Path(part).name == 'bubble.py' for part in self.arguments(owner)):
                     raise RuntimeError(f'another start is in progress for {self.run} ({path} held by pid {owner})') from None
-                path.unlink(missing_ok=True)
+                stale = path.with_name(f'processes.lock.stale.{os.getpid()}')
+                try:
+                    os.replace(path, stale)   # only one launcher can move the abandoned lock aside
+                except FileNotFoundError:
+                    pass
+                stale.unlink(missing_ok=True)
                 continue
             with os.fdopen(handle, 'w', encoding='utf-8') as stream:
                 stream.write(str(os.getpid()))
@@ -206,9 +214,10 @@ def exports(run):
     return sorted(Path(run).glob('checkpoints/*/*/ema.pt'))
 
 
-def install(run, source, step, variant='main'):
-    """Copy the weights file `source` into `run` as checkpoint `variant/step` and make it the champion. Files land
-    under temporary names and are renamed, so a reader never sees a half-written checkpoint."""
+def install(run, source, step, variant='play'):
+    """Copy the weights file `source` into `run` as checkpoint `variant/step` and make it the champion. The `play`
+    variant keeps such installs apart from the learner's own exports. Files land under temporary names and are
+    renamed, so a reader never sees a half-written checkpoint."""
     checkpoint = f'{variant}/{step:06d}'
     target = Path(run) / 'checkpoints' / checkpoint
     target.mkdir(parents=True, exist_ok=True)

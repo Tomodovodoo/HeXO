@@ -62,10 +62,10 @@ class ModelTests(unittest.TestCase):
         source.write_bytes(b'weights')
         source.with_name('manifest.json').write_text('{}')
         target = bubble.install(self.run, source, 122500)
-        self.assertEqual(target, self.run / 'checkpoints' / 'main' / '122500')
+        self.assertEqual(target, self.run / 'checkpoints' / 'play' / '122500')
         self.assertEqual((target / 'ema.pt').read_bytes(), b'weights')
         self.assertTrue((target / 'manifest.json').exists())
-        self.assertEqual(json.loads((self.run / 'champion.json').read_text())['checkpoint'], 'main/122500')
+        self.assertEqual(json.loads((self.run / 'champion.json').read_text())['checkpoint'], 'play/122500')
         self.assertEqual(bubble.exports(self.run), [target / 'ema.pt'])
 
     def test_download_uses_the_release_tag_as_step(self):
@@ -118,7 +118,25 @@ class LauncherTests(unittest.TestCase):
         (export / 'manifest.json').write_text('{}')
         calls.clear()
         self.launcher.prepare('cpu', calls.append)
+        self.assertEqual([Path(c[1]).name for c in calls], ['dense_learn.py'])
+        for name in ('model.pt', 'optimizer.pt'):
+            (export / name).write_bytes(b'')
+        calls.clear()
+        self.launcher.prepare('cpu', calls.append)
         self.assertEqual(calls, [])
+
+    def test_downloaded_weights_do_not_count_as_a_learner_checkpoint(self):
+        source = Path(self.directory.name) / 'ema.pt'
+        source.write_bytes(b'weights')
+        bubble.install(self.run, source, 125000)
+        (self.run / 'config.json').write_text('{}')
+        calls = []
+        self.launcher.prepare('cpu', calls.append)
+        self.assertEqual([Path(c[1]).name for c in calls], ['dense_learn.py'])
+
+    def test_start_creates_a_missing_run_directory(self):
+        launcher = bubble.Launcher(self.run / 'fresh', self.fake.spawn, self.fake.arguments, self.fake.kill)
+        self.assertEqual(sorted(launcher.start(bubble.commands(self.run / 'fresh'))), sorted(bubble.SERVICES))
 
     def test_run_path_is_absolute(self):
         self.assertTrue(bubble.Launcher('runs/x', self.fake.spawn, self.fake.arguments, self.fake.kill).run.is_absolute())
