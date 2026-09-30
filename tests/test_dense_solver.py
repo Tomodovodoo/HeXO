@@ -455,15 +455,12 @@ class Proofs(unittest.TestCase):
         winner = dense_solver.mover(self.opening)
         self.assertEqual(episode['winner'], winner)
         labels, move = Proof(self.opening, self.result['certificate']).path([tuple(m) for m in episode['moves']])
-        # The marked certificate stone proves the defender's next root lost, so the defender stops searching and may
-        # leave the certificate with an uncovered reply; the tree then wins at once. Every row keeps its exact label.
-        plies = [r['ply'] for r in rows]
-        self.assertEqual([p for p, _, _ in labels], plies[:len(labels)])
-        self.assertGreaterEqual(len(labels), 4)
+        # The proven-lost defender plays its longest resistance, a covered reply, so the game stays on the certificate.
+        self.assertEqual([p for p, _, _ in labels], [r['ply'] for r in rows])
         self.assertEqual([r['proven'] for r in rows], [1 if r['player'] == winner else -1 for r in rows])
-        # The loser asks at each of its turn starts, the winner at least once.
-        self.assertGreaterEqual(summary['root_queries'], 1+len([r for r in rows if r['player'] != winner and r['remaining'] == 2]))
-        self.assertGreaterEqual(summary['followed'], 1)
+        # One root query for the winner; the loser asks at each of its turn starts.
+        self.assertEqual(summary['root_queries'], 1+len([r for r in rows if r['player'] != winner and r['remaining'] == 2]))
+        self.assertEqual(summary['followed'], len([r for r in rows if r['player'] == winner])-1)  # all but the root's
 
     def test_deep_proof_of_a_committed_turn_is_followed(self):
         first = [tuple(c) for c in self.result['moves']]
@@ -480,7 +477,7 @@ class Proofs(unittest.TestCase):
         self.assertGreater(summary['deep_hit_rate'], 0)
         # The defender's turn after the committed one is labelled lost; the winner follows the proof from then on.
         self.assertEqual([r['proven'] for r in rows], [1 if r['player'] == winner else -1 for r in rows])
-        self.assertGreaterEqual(summary['followed'], 1)   # adopted at its first search end
+        self.assertEqual(summary['followed'], len([r for r in rows if r['player'] == winner])-1)  # adopted at its first search end
 
 
 class Adjudication(unittest.TestCase):
