@@ -12,6 +12,26 @@ from play import AnalysisStore, DensePlayer, Handler, position_key
 
 
 class AnalysisNotes(unittest.TestCase):
+    def test_dense_worker_plays_a_clocked_complete_turn_on_cpu(self):
+        import hexnet
+        from timed_engine import TimedEngine, legal_turn
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'ema.pt'
+            model = hexnet.HexNet(hexnet.HexNetConfig(blocks=1, channels=8, pool_every=1,
+                                line_length=5, value_hidden=8, head_channels=4))
+            hexnet.save_model(path, model)
+            with TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
+                                  solver=dict(enabled=False))) as engine:
+                game = Game([[0, 0]])
+                try:
+                    result = engine.turn(game, 1000)
+                    self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+                    self.assertGreater(result.get('evaluated', 0), 0)
+                    self.assertEqual(result['backend'], 'dense')
+                    self.assertEqual(result['model_sha256'], engine.model_sha256)
+                finally:
+                    game.close()
+
     def test_position_key_tracks_order_checkpoint_and_settings(self):
         cells = [[0, 0, 0], [1, 0, 1], [2, 0, 1]]
         settings = dict(search=True, simulations=128, solver=True, solver_nodes=32768)

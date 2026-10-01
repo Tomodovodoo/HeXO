@@ -24,6 +24,7 @@ py-modules = [
   "dense_learn",
   "dense_openings",
   "dense_posterior",
+  "dense_player",
   "dense_selfplay",
   "dense_solve",
   "dense_solver",
@@ -38,7 +39,13 @@ py-modules = [
   "play",
   "proof",
   "tactical_proof",
+  "time_control",
+  "timed_engine",
+  "timed_match",
+  "timed_api",
+  "six_engine",
 ]
 
 [tool.setuptools.dynamic.optional-dependencies]
 learning = {file = ["requirements/learning.txt"]}
+api = {file = ["requirements/api.txt"]}

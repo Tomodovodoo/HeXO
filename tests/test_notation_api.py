@@ -1,4 +1,6 @@
 import json
+import asyncio
+import importlib.util
 import random
 import socket
 import threading
@@ -101,8 +103,9 @@ class OfficialAPI(unittest.TestCase):
         self.assertEqual(len(self.reconstructed(data).cells), 3)
 
     def test_phase_terminal_type_and_resource_rejections(self):
-        cases = [({'to_move':'x','cells':[]}, 409),
-                 (board([(0,0),(1,0)]), 409),
+        self.assertEqual(self.reconstructed({'to_move':'x','cells':[]}).remaining, 1)
+        self.assertEqual(self.reconstructed(board([(0,0),(1,0)])).remaining, 1)
+        cases = [({'to_move':'o','cells':[]}, 400),
                  ({'to_move':'x','cells':[{'q':0,'r':0,'p':'x'}]}, 400),
                  ({'to_move':'o','cells':[{'q':0,'r':0,'p':'x'}]*2}, 400),
                  ({'to_move':'o','cells':[{'q':False,'r':0,'p':'x'}]}, 400),
@@ -126,7 +129,7 @@ class OfficialAPI(unittest.TestCase):
             self.reconstructed(board(history))
         self.assertEqual(caught.exception.status, 409)
 
-    def test_schema_moves_echo_limits_and_first_stone_conflict(self):
+    def test_schema_moves_echo_limits_and_winning_first_stone(self):
         adapter = Adapter(ms=1, width=4)
         response = adapter.turn({'board':board([(0,0)]), 'request_id':73, 'time_limit':.1})
         self.assertEqual(response['request_id'], 73)
@@ -146,9 +149,15 @@ class OfficialAPI(unittest.TestCase):
             adapter.turn({'board':board([(0,0)]), 'time_limit':0})
         self.assertEqual(caught.exception.status, 408)
         history = interleave([[(q,0) for q in range(6)], [(2*q,6) for q in range(6)]])[:-1]
-        with self.assertRaises(APIError) as caught:
-            adapter.turn({'board':board(history)})
-        self.assertEqual(caught.exception.status, 409)
+        response = adapter.turn({'board':board(history)})
+        self.assertEqual(len(response['move']['pieces']), 1)
+        game = Game(history)
+        try:
+            game.play(**response['move']['pieces'][0])
+            self.assertGreaterEqual(game.winner, 0)
+        finally:
+            game.close()
+
 
     def test_incomplete_body_times_out_and_server_recovers(self):
         httpd = server(Adapter(ms=1, width=4), port=0, read_timeout=.1)
@@ -292,6 +301,441 @@ class PlayNotationEndpoint(unittest.TestCase):
             httpd.server_close()
             thread.join()
             Handler.game.close()
+
+
+class TimedClocks(unittest.TestCase):
+    def test_half_turn_pause_increment_and_exact_deadline(self):
+        from timed_match import Match
+        clock = [0]
+        match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='human')),
+                           time_control=dict(base_ms=1000, increment_ms=200), turn_cap_ms=1000), now=lambda: clock[0])
+        self.addCleanup(match.close)
+        match.start()
+        clock[0] = 100_000_000
+        state = match.submit([[1, 0]], 0, 0, partial=True)
+        self.assertEqual((state['running'], state['remaining'], state['circle_ms']), ('o', 1, 900))
+        clock[0] = 150_000_000
+        match.pause()
+        clock[0] = 900_000_000
+        state = match.resume()
+        self.assertEqual(state['circle_ms'], 850)
+        clock[0] += 100_000_000
+        state = match.submit([[2, 0]], state['turn_id'], state['revision'], partial=True)
+        self.assertEqual((state['running'], state['circle_ms']), ('x', 950))
+        clock[0] += 1_000_000_000
+        state = match.submit([[0, 1], [0, 2]], state['turn_id'], state['revision'])
+        self.assertEqual(state['result'], dict(winner='o', reason='time'))
+        self.assertEqual(len(state['history']), 3)
+        self.assertEqual(state['turn_cap_remaining_ms'], 0)
+        self.assertEqual(match.turn_spent_ns, 1_000_000_000)
+
+    def test_winning_turn_retains_its_elapsed_time(self):
+        from timed_match import Match
+        clock = [0]
+        history = [[0, 0], [0, 3], [1, 3], [1, 0], [2, 0], [3, 3],
+                   [4, 3], [3, 0], [4, 0], [5, 3], [6, 3]]
+        match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='human')),
+                           history=history, time_control='1', turn_cap_ms=100), now=lambda: clock[0])
+        self.addCleanup(match.close)
+        match.start()
+        clock[0] = 50_000_000
+        result = match.submit([[5, 0]], 0, 0)
+        self.assertEqual(result['result'], dict(winner='x', reason='win'))
+        self.assertEqual((match.turn_spent_ns, result['turn_cap_remaining_ms']), (50_000_000, 50))
+
+    def test_receipt_before_deadline_is_atomic_with_watchdog(self):
+        from timed_match import Match, play_turn
+        clock = [0]
+        thinking, release, watchdog_started = (threading.Event() for _ in range(3))
+        class Engine:
+            def turn(self, *_args, **_kwargs):
+                thinking.set()
+                release.wait(1)
+                return dict(moves=[[1, 0], [2, 0]])
+        match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='native')),
+                           time_control='1'), now=lambda: clock[0])
+        self.addCleanup(match.close)
+        match.start()
+        clock[0] = 900_000_000
+        reply_thread = threading.Thread(target=play_turn, args=(match, Engine()))
+        reply_thread.start()
+        watchdog = None
+        try:
+            self.assertTrue(thinking.wait(1))
+            with match.lock:
+                def tick():
+                    watchdog_started.set()
+                    match.tick()
+                watchdog = threading.Thread(target=tick)
+                watchdog.start()
+                self.assertTrue(watchdog_started.wait(1))
+                release.set()
+                until = time.monotonic()+1
+                while match.receipt[2][0] is None and time.monotonic() < until:
+                    time.sleep(.001)
+                self.assertEqual(match.receipt[2][0], 900_000_000)
+                clock[0] = 1_100_000_000
+        finally:
+            release.set()
+            reply_thread.join(1)
+            if watchdog:
+                watchdog.join(1)
+        self.assertFalse(reply_thread.is_alive())
+        self.assertEqual(match.snapshot()['history'], [[0, 0], [1, 0], [2, 0]])
+        self.assertIsNone(match.result)
+        self.assertEqual(match.snapshot()['circle_ms'], 100)
+
+    def test_restore_is_paused_and_half_turn_round_trips(self):
+        from timed_match import Match
+        clock = [0]
+        with TemporaryDirectory() as directory:
+            match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='human')),
+                               time_control='1+0.2'), now=lambda: clock[0], directory=directory)
+            match.start()
+            clock[0] = 100_000_000
+            match.submit([[1, 0]], 0, 0, partial=True)
+            match.pause()
+            self.assertEqual(loads(match.notation()).history, [(0, 0), (1, 0)])
+            self.assertNotIn('timecontrol', loads(match.notation()).metadata)
+            restored = Match.restore(match.directory, now=lambda: 9_000_000_000)
+            try:
+                self.assertEqual(restored.state, 'paused')
+                self.assertIsNone(restored.clock.running)
+                self.assertEqual(restored.snapshot()['circle_ms'], 900)
+                self.assertEqual(restored.created, match.created)
+            finally:
+                match.close()
+                restored.close()
+
+    def test_future_increment_does_not_extend_current_clock(self):
+        from time_control import allowance
+        budget = allowance(dict(cross_ms=15, circle_ms=1000, increment_ms=10000), 0)
+        self.assertLessEqual(budget['hard_ms'], 15)
+        self.assertEqual(budget['hard_ms']-budget['reserve_ms'], 5)
+        budget = allowance(dict(cross_ms=15, circle_ms=1000, increment_ms=0), 0)
+        self.assertGreater(budget['hard_ms']-budget['reserve_ms'], 0)
+
+    def test_native_controller_returns_a_complete_turn_by_its_allowance(self):
+        from timed_engine import TimedEngine, legal_turn
+        for cap in (0, -1):
+            with self.assertRaisesRegex(ValueError, 'simulation cap'):
+                TimedEngine(dict(kind='bubble', search=dict(max_simulations=cap)))
+        with TimedEngine(dict(kind='native')) as engine:
+            game = Game([[0, 0]])
+            try:
+                started = time.monotonic()
+                result = engine.turn(game, 30)
+                self.assertLess(time.monotonic()-started, .5)
+                self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+                engine.lock.acquire()
+                try:
+                    started = time.monotonic()
+                    queued = engine.turn(game, 30)
+                    self.assertLess(time.monotonic()-started, .2)
+                    self.assertEqual(queued['stop_reason'], 'busy')
+                    self.assertEqual(legal_turn([[0, 0]], queued['moves']), queued['moves'])
+                finally:
+                    engine.lock.release()
+                stopped = threading.Event()
+                stopped.set()
+                result = engine.turn(game, 1000, cancel=stopped)
+                self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+            finally:
+                game.close()
+
+    def test_http_opponent_failures_keep_timeout_and_illegal_results(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from timed_engine import TimedEngine
+        from timed_match import Match, play_turn
+        class Handler(BaseHTTPRequestHandler):
+            mode = 'timeout'
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(dict(stateless=dict(versions={'v1-alpha': {}}))).encode())
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                mode = self.mode
+                if mode == 'timeout':
+                    time.sleep(1)
+                self.send_response(408 if mode == 'http_timeout' else 200)
+                self.end_headers()
+                piece = dict(q='bad' if mode == 'coordinates' else 0, r=0)
+                try:
+                    self.wfile.write(json.dumps(dict(move=dict(pieces=[piece]))).encode())
+                except ConnectionError:
+                    pass
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for mode in ('timeout', 'http_timeout', 'coordinates', 'occupied'):
+                with self.subTest(mode=mode):
+                    Handler.mode = mode
+                    with TimedEngine(dict(kind='htttx', url=f'http://127.0.0.1:{server.server_port}')) as engine:
+                        match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='htttx')),
+                                           time_control='5'))
+                        try:
+                            match.start()
+                            result = play_turn(match, engine)
+                            self.assertEqual(result['result'], dict(winner='x', reason='engine_timeout' if mode in ('timeout', 'http_timeout') else 'illegal'))
+                            self.assertEqual(result['history'], [[0, 0]])
+                        finally:
+                            match.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+
+@unittest.skipUnless(importlib.util.find_spec('aiohttp'), 'Install the api extra')
+class TimedAPI(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        from timed_api import create_app
+        from timed_engine import legal_turn
+        self.calls = []
+        self.engines = []
+        calls = self.calls
+        engines = self.engines
+        class Engine:
+            identity = dict(checkpoint='fake')
+            def __init__(self, config):
+                self.closed = False
+                engines.append(self)
+            def turn(self, game, milliseconds=None, *, clock=None, cancel=None, publish=None):
+                history = [list(c[:2]) for c in game.cells]
+                calls.append((history, clock))
+                for _ in range(10):
+                    if cancel and cancel.is_set():
+                        break
+                    time.sleep(.002)
+                return dict(moves=legal_turn(history), win_probability=.6)
+            def close(self):
+                self.closed = True
+        self.client = TestClient(TestServer(create_app(engine_factory=Engine)))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+
+    async def test_match_places_live_clock_stream_and_pause(self):
+        created = await self.client.post('/matches', json=dict(players=dict(cross=dict(kind='human'),
+            circle=dict(kind='human')), time_control=dict(base_ms=10000, increment_ms=2000)))
+        state = await created.json()
+        root = '/matches/'+state['match_id']
+        for _ in range(20):
+            state = await (await self.client.get(root)).json()
+            if state['state'] == 'ready':
+                break
+            await asyncio.sleep(.01)
+        state = await (await self.client.post(root+'/start')).json()
+        state = await (await self.client.post(root+'/place', json=dict(q=1, r=0,
+                            turn_id=state['turn_id'], revision=state['revision']))).json()
+        self.assertEqual((state['remaining'], state['running']), (1, 'o'))
+        feed = await self.client.get(root+'/events')
+        event = json.loads((await feed.content.readline()).decode().removeprefix('data: '))
+        self.assertEqual(event['running'], 'o')
+        feed.close()
+        state = await (await self.client.post(root+'/pause')).json()
+        self.assertEqual(state['state'], 'paused')
+        balance = state['circle_ms']
+        await asyncio.sleep(.02)
+        state = await (await self.client.get(root)).json()
+        self.assertEqual(state['circle_ms'], balance)
+        notation = await (await self.client.get(root+'/notation')).text()
+        self.assertEqual(loads(notation).history, [(0, 0), (1, 0)])
+
+    async def test_websocket_clock_and_interrupt_roll_back_previous(self):
+        from timed_engine import legal_turn
+        ws = await self.client.ws_connect('/bws/v1-alpha/game')
+        await ws.send_json(dict(type='config', **{'x-bubble-clock': dict(version=1,
+            cross_ms=5000, circle_ms=6000, increment_ms=100)}))
+        await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=1,
+                               move_time_limit=.2))
+        first = await ws.receive_json(timeout=1)
+        self.assertEqual(first['request_id'], 1)
+        self.assertLessEqual(self.calls[-1][1]['circle_ms'], 6000)
+        own = first['move']['pieces']
+        history = [[0, 0]]+[[p['q'], p['r']] for p in own]
+        reply = legal_turn(history)
+        previous = [dict(side='o', pieces=own),
+                    dict(side='x', pieces=[dict(q=q, r=r) for q, r in reply])]
+        await ws.send_json(dict(type='move_request', side='o', previous=previous, request_id=2))
+        await asyncio.sleep(.003)
+        await ws.send_json(dict(type='interrupt', request_id=2))
+        await ws.send_json(dict(type='move_request', side='o', previous=previous, request_id=3))
+        response = await ws.receive_json(timeout=1)
+        self.assertEqual(response['request_id'], 3)
+        self.assertEqual(self.calls[-1][0], history+reply)
+        await ws.close()
+
+    async def test_server_shutdown_closes_an_open_bot_session(self):
+        ws = await self.client.ws_connect('/bws/v1-alpha/game')
+        await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=1))
+        await ws.receive_json(timeout=1)
+        await asyncio.wait_for(self.client.close(), 1)
+        self.assertTrue(all(engine.closed for engine in self.engines))
+
+    async def test_finished_match_releases_its_engines(self):
+        created = await self.client.post('/matches', json=dict(players=dict(cross=dict(kind='native'),
+            circle=dict(kind='human')), time_control='10'))
+        root = '/matches/'+(await created.json())['match_id']
+        for _ in range(50):
+            state = await (await self.client.get(root)).json()
+            if state['state'] == 'ready':
+                break
+            await asyncio.sleep(.01)
+        await self.client.post(root+'/start')
+        state = await (await self.client.post(root+'/resign', json=dict(side='o'))).json()
+        self.assertEqual(state['state'], 'finished')
+        for _ in range(50):
+            if self.engines[-1].closed:
+                break
+            await asyncio.sleep(.01)
+        self.assertTrue(self.engines[-1].closed)
+        self.assertFalse(self.engines[0].closed)
+
+    async def test_resumed_match_waits_for_abandoned_worker(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from aiohttp.test_utils import TestClient, TestServer
+        from timed_api import create_app
+        arrived, release = threading.Event(), threading.Event()
+        class Handler(BaseHTTPRequestHandler):
+            calls = 0
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(dict(stateless=dict(versions={'v1-alpha': {}}))).encode())
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                Handler.calls += 1
+                if Handler.calls == 1:
+                    arrived.set()
+                    release.wait(.4)
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    self.wfile.write(json.dumps(dict(move=dict(pieces=[dict(q=1, r=0), dict(q=2, r=0)]))).encode())
+                except ConnectionError:
+                    pass
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = TestClient(TestServer(create_app()))
+        await client.start_server()
+        try:
+            created = await client.post('/matches', json=dict(players=dict(cross=dict(kind='human'),
+                circle=dict(kind='htttx', url=f'http://127.0.0.1:{server.server_port}')), time_control='10'))
+            root = '/matches/'+(await created.json())['match_id']
+            for _ in range(100):
+                state = await (await client.get(root)).json()
+                if state['state'] == 'ready':
+                    break
+                await asyncio.sleep(.01)
+            self.assertEqual(state['state'], 'ready')
+            await client.post(root+'/start')
+            self.assertTrue(await asyncio.to_thread(arrived.wait, 1))
+            self.assertEqual((await client.post(root+'/pause')).status, 200)
+            self.assertEqual((await client.post(root+'/resume')).status, 200)
+            await asyncio.sleep(.03)
+            release.set()
+            for _ in range(100):
+                state = await (await client.get(root)).json()
+                if state['result'] or len(state['history']) == 3:
+                    break
+                await asyncio.sleep(.01)
+            self.assertIsNone(state['result'])
+            self.assertEqual(state['history'], [[0, 0], [1, 0], [2, 0]])
+        finally:
+            release.set()
+            await client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    async def test_websocket_evaluation_echoes_request_id(self):
+        ws = await self.client.ws_connect('/bws/v1-alpha/game')
+        await ws.send_json(dict(type='eval_request', side='o', request_id=7))
+        response = await ws.receive_json(timeout=1)
+        self.assertEqual((response['type'], response['request_id']), ('eval_response', 7))
+        await ws.close()
+
+    async def test_interrupt_during_send_cannot_restore_old_history(self):
+        from aiohttp import web
+        from timed_engine import legal_turn
+        blocked, release = asyncio.Event(), asyncio.Event()
+        original_send = web.WebSocketResponse.send_json
+        async def delayed_send(socket, data, *args, **kwargs):
+            if data.get('request_id') == 2 and data.get('type') == 'move_response':
+                blocked.set()
+                await release.wait()
+            return await original_send(socket, data, *args, **kwargs)
+        with patch.object(web.WebSocketResponse, 'send_json', delayed_send):
+            ws = await self.client.ws_connect('/bws/v1-alpha/game')
+            try:
+                await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=1))
+                first = await ws.receive_json(timeout=1)
+                own = first['move']['pieces']
+                advanced = [[0, 0]]+[[p['q'], p['r']] for p in own]
+                previous = [dict(side='o', pieces=own),
+                            dict(side='x', pieces=[dict(q=q, r=r) for q, r in legal_turn(advanced)])]
+                await ws.send_json(dict(type='move_request', side='o', previous=previous, request_id=2))
+                await asyncio.wait_for(blocked.wait(), 1)
+                await ws.send_json(dict(type='interrupt', request_id=2))
+                await ws.send_json(dict(type='setup'))
+                await ws.send_json(dict(type='config', **{'x-bubble-clock': dict(version=1,
+                    cross_ms=2000, circle_ms=2000, increment_ms=100)}))
+                await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=3))
+                self.assertEqual((await ws.receive_json(timeout=1))['request_id'], 3)
+                self.assertEqual(self.calls[-1][1]['increment_ms'], 100)
+                self.assertGreater(self.calls[-1][1]['circle_ms'], 1900)
+                release.set()
+                self.assertEqual((await ws.receive_json(timeout=1))['request_id'], 2)
+                await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=4))
+                self.assertEqual((await ws.receive_json(timeout=1))['request_id'], 4)
+                self.assertEqual(self.calls[-1][0], [[0, 0]])
+            finally:
+                release.set()
+                await ws.close()
+
+    async def test_restored_match_records_the_resumed_engines(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        from timed_api import create_app
+        from timed_match import Match
+        with TemporaryDirectory() as folder:
+            original = Match(dict(players=dict(cross=dict(kind='native'), circle=dict(kind='human')),
+                                  time_control='10', identities=[dict(checkpoint='old'), dict(checkpoint='human')]),
+                             directory=folder)
+            original.start()
+            original.pause()
+            root = '/matches/'+original.id
+            directory = original.directory
+            original.close()
+            class Engine:
+                identity = dict(checkpoint='new')
+                def __init__(self, config):
+                    pass
+                def close(self):
+                    pass
+            client = TestClient(TestServer(create_app(directory=folder, engine_factory=Engine)))
+            await client.start_server()
+            try:
+                response = await client.post(root+'/resume')
+                self.assertEqual(response.status, 200)
+                await client.post(root+'/pause')
+                spec = json.loads((directory/'spec.json').read_text())
+                self.assertEqual(spec['identities'][0]['checkpoint'], 'new')
+                events = [json.loads(line) for line in (directory/'events.jsonl').read_text().splitlines()]
+                change = next(event for event in events if event['type'] == 'engines')
+                self.assertEqual(change['previous_identities'][0]['checkpoint'], 'old')
+                self.assertEqual(change['identities'][0]['checkpoint'], 'new')
+            finally:
+                await client.close()
 
 
 if __name__ == '__main__':

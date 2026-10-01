@@ -8,8 +8,9 @@ python python/six_engine.py serve --run runs/dense-v1 --device cpu --simulations
 
 `--model path/to/ema.pt` selects one export directly instead of `--run`. `--device auto` uses CUDA when available;
 `cpu` keeps it off the GPU. The server accepts `position radius 8 moves ...`, `go`, `stop`, and the standard
-handshake and game commands. It rejects `setup`, `tomove`, and other radii. `go movetime` is advisory: Bubble
-uses its configured simulation and solver budgets.
+handshake and game commands. It rejects `setup`, `tomove`, and other radii. `go movetime` limits the complete
+turn. `xtime`, `otime`, `xinc`, `oinc` supply full clocks; the UCI clock names are also accepted. `stop` and
+`isready` remain responsive during search. See [timed matches and the clock API](time-controls.md).
 
 In a Six checkout, add these four lines inside `parse_spec` in `arena/engines.py`. Set the two paths to this
 checkout and the desired run. The Python executable should have Bubble's dependencies installed.
