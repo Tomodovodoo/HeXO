@@ -4103,10 +4103,10 @@ class YieldTests(unittest.TestCase):
 
         class Slot:
             def __init__(self, sides):
-                self.model = sides[0]
+                self.model, self.rows = sides[0], []
 
             def episode(self):
-                return dict(actor=self.model.sha, opponent=None, winner=0, moves=[], reason='test'), []
+                return dict(actor=self.model.sha, opponent=None, winner=0, moves=[], reason='test'), self.rows
 
         def game(sides, *args, **kwargs):
             slot = Slot(sides)
@@ -4214,7 +4214,7 @@ class YieldTests(unittest.TestCase):
             return slots
 
         engine.step.side_effect = step
-        slot = SimpleNamespace(opponent='main/test', episode=lambda: (
+        slot = SimpleNamespace(opponent='main/test', rows=[], episode=lambda: (
             dict(actor=model.sha, opponent='main/test', winner=0, moves=[], reason='test'), []))
         with unittest.mock.patch.object(dense_selfplay.dense_config, 'load', return_value=config), \
              unittest.mock.patch.object(dense_selfplay, 'load', return_value=model), \
@@ -5554,7 +5554,7 @@ class EvaluatorLoopTests(unittest.TestCase):
             evaluator.step()
         report = json.loads(dense_eval.report_path(self.run, 'main/000010', 'seal').read_text())
         self.assertEqual([g['pair'] for g in report['games']], [0, 0])
-        evaluator = self.start(anchor_games=4, seal_ms=5, idle_rematch=True)
+        evaluator = self.start(anchor_games=4, seal_ms=5, idle_rematch=True, max_expected_score=1.)
         self.assertEqual(evaluator.anchor()[1:], ('seal', 'anchor', 2))
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: 1-r['challenger_color'])):
             self.assertTrue(evaluator.step())                               # the waiting candidate goes next
