@@ -30,7 +30,7 @@ The picker lists everything the server finds on start:
 | Deep (D) | 2,048 | 524,288 | 10,000 and 8,000 |
 
 On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at these presets. Custom
-(`⋯`) takes any simulations from 0 (raw policy) to 16,384, solver nodes up to 4,000,000 (0 turns the solver off)
+(`⋯`) takes any simulations from 0 (raw policy) to 16,384, solver nodes up to 1,500,000 (0 turns the solver off; the solver gets up to a minute)
 and 10 to 120,000 ms.
 
 ## Analysis and review

@@ -34,7 +34,7 @@ PRESETS = dict(
                 strong=dict(simulations=512, solver_nodes=131072), deep=dict(simulations=2048, solver_nodes=524288)),
     native=dict(quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000), deep=dict(ms=10000)),
     seal=dict(quick=dict(ms=100), standard=dict(ms=500), strong=dict(ms=2000), deep=dict(ms=8000)))
-LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 4_000_000), ms=(10, 120_000))
+LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 1_500_000), ms=(10, 120_000))
 
 
 def player_at(ply):
@@ -295,19 +295,20 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     local = replay(history)
     start, player = time.perf_counter(), local.player
     moves, top, value, proof, line, threat, solved = [], [], None, None, [], [], True
+    deadline = min(60_000, max(10_000, solver_nodes // 8))
     network = Watched(bubble.evaluator, watch)
     try:
         if local.winner >= 0:
             raise ValueError('The game has finished')
         if prover is not None and solver_nodes:
-            mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=10000), watch,
-                                 prover.abort)
+            mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=deadline),
+                                 watch, prover.abort)
             solved = searched(mine)
             if verified(mine):
                 moves, line = [list(m) for m in mine['moves']], winning_line(history, mine)
                 proof = dict(winner=player, turns=mine['proof_turns'])
             else:
-                theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=10000),
+                theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline),
                                        watch, prover.abort)
                 solved = solved and searched(theirs)
                 if verified(theirs):
@@ -890,6 +891,10 @@ class Session:
             history = self.history if history is None else history
             if not self.analysis or tuple(history) != tuple(self.history[:len(history)]):
                 raise ValueError('Review needs a Bubble model and a position of this game')
+            for job in self.jobs.values():
+                same = job.history == tuple(history) and job.seat == self.analysis
+                if job.kind == 'review' and job.status in ('queued', 'running') and same:
+                    return job.id
             job = self.submit(Job('review', 2, history, seat=dict(self.analysis), tries=tries))
             job.total = len(review_plies(history))
             return job.id

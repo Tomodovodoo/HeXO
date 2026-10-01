@@ -246,6 +246,7 @@ class Jobs(unittest.TestCase):
         calls = len(self.engines.calls)
         self.assertIsNone(self.session.analyse(1))
         job = self.session.jobs[self.session.review_game()]
+        self.assertEqual(self.session.review_game(), job.id)
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual((job.done, job.total), (3, 3))
         self.assertEqual(len(self.engines.calls), calls + 2)
