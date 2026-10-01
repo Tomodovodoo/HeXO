@@ -7021,77 +7021,129 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.start()
         self.assertIn('calibration', self.league())                                    # added on start
 
+class DenseTimedWorker(unittest.TestCase):
+    def test_dense_worker_plays_a_clocked_complete_turn_on_cpu(self):
+        from timed_engine import TimedEngine, legal_turn
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'ema.pt'
+            model = hexnet.HexNet(hexnet.HexNetConfig(blocks=1, channels=8, pool_every=1,
+                                line_length=5, value_hidden=8, head_channels=4))
+            hexnet.save_model(path, model)
+            with TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
+                                  solver=dict(enabled=False))) as engine:
+                game = Game([[0, 0]])
+                try:
+                    result = engine.turn(game, 1000)
+                    self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+                    self.assertGreater(result.get('evaluated', 0), 0)
+                    self.assertEqual(result['backend'], 'dense')
+                    self.assertEqual(result['model_sha256'], engine.model_sha256)
+                finally:
+                    game.close()
+
+
 class DenseBrowser(unittest.TestCase):
     def setUp(self):
-        from play import DensePlayer
+        from play import Bubble
         self.temp = tempfile.TemporaryDirectory()
-        self.run = Path(self.temp.name)
-        for checkpoint in ('065000', '075000', '082500', '085000'):
-            path = self.run/'checkpoints/main'/checkpoint
-            path.mkdir(parents=True)
-            hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
-        (self.run/'champion.json').write_text(json.dumps(dict(checkpoint='main/065000')))
-        self.player = DensePlayer(self.run, 'cpu')
+        path = Path(self.temp.name)/'ema.pt'
+        hexnet.save_model(path, hexnet.HexNet(TINY))
+        self.bubble = Bubble(path, 'cpu')
 
     def tearDown(self):
-        self.player.close()
         self.temp.cleanup()
 
-    def test_picker_raw_policy_and_search_preserve_the_board(self):
-        game = Game([(0, 0)])
+    def complete(self, history, moves):
+        game = Game(history)
         try:
-            before = game.cells
-            self.player.configure(dict(search=False, solver=False))
-            raw = self.player.turn(game, analyze=True)
-            self.assertEqual(len(raw['moves']), 2)
-            self.assertEqual(game.cells, before)
-            self.assertEqual(len(self.player.models()), 4)
-            self.player.select('main/085000')
-            self.player.configure(dict(search=True, simulations=4))
-            searched = self.player.turn(game)
-            self.assertEqual(searched['checkpoint'], 'main/085000')
-            replay = Game([c[:2] for c in before])
-            try:
-                for move in searched['moves']:
-                    replay.play(*move)
-            finally:
-                replay.close()
-            self.assertEqual(game.cells, before)
+            side = game.player
+            for move in moves:
+                game.play(*move)
+            return game.player != side or game.winner >= 0
         finally:
             game.close()
 
-    def test_startup_selects_an_available_export(self):
-        from play import DensePlayer
-        (self.run/'checkpoints/main/065000/ema.pt').unlink()
-        player = DensePlayer(self.run, 'cpu')
-        try:
-            self.assertEqual(player.checkpoint, 'main/085000')
-        finally:
-            player.close()
+    def test_raw_policy_and_search_play_a_whole_turn(self):
+        from play import evaluate
+        history = [(0, 0)]
+        for simulations in (0, 4):
+            result = evaluate(self.bubble, None, history, simulations, 0)
+            self.assertEqual(len(result['moves']), 2)
+            self.assertTrue(self.complete(history, result['moves']))
+            self.assertTrue(0 <= result['value'] <= 1)
+            self.assertEqual(len(result['top']), 5)
+            self.assertIsNone(result['proof'])
 
-    def test_picker_discovers_exports_from_a_new_run(self):
-        for path in (self.run/'checkpoints').glob('*/*/ema.pt'):
-            path.unlink()
-        path = self.run/'checkpoints/main/000000'
-        path.mkdir(parents=True)
-        hexnet.save_model(path/'ema.pt', hexnet.HexNet(TINY))
-        (self.run/'champion.json').write_text(json.dumps(dict(checkpoint='main/000000')))
-        self.assertEqual(self.player.models(), [dict(id='main/000000', label='main/000000 · champion, newest')])
+    def test_a_proven_turn_still_places_both_stones(self):
+        from play import evaluate
+        history = [(0, 0), (0, 4), (1, 4), (1, 0), (2, 0), (5, 5), (6, 6), (3, 0), (-5, -2), (-6, 6), (7, -6)]
+        result = evaluate(self.bubble, None, history, 16, 0)
+        self.assertEqual((result['proof'] or {}).get('winner'), 0)
+        self.assertTrue(self.complete(history, result['moves']))
 
-    def test_verified_line_replays_to_a_win_without_playing_the_game(self):
+    def test_engines_reload_changed_weights_and_record_the_budget_they_ran(self):
+        from play import Engines
+        path = Path(self.temp.name)/'ema.pt'
+        engines = Engines('cpu', tactical_package=Path(self.temp.name)/'missing')
+        first = engines.bubble(path)
+        self.assertIs(engines.bubble(path), first)
+        hexnet.save_model(path, hexnet.HexNet(TINY))
+        os.utime(path, ns=(1, 1))
+        self.assertIsNot(engines.bubble(path), first)
+        entry = dict(kind='bubble', path=path)
+        found, spent, weights = engines.evaluate(entry, '', dict(simulations=0, solver_nodes=2048), [(0, 0)], lambda n: None)
+        with unittest.mock.patch.object(engines, 'solver') as solver:
+            engines.evaluate(entry, '', dict(simulations=0, solver_nodes=0), [(0, 0)], lambda n: None)
+        solver.assert_not_called()
+        self.assertEqual((spent, weights), (dict(simulations=0, solver_nodes=0), engines.bubble(path).sha256[:16] + ':none'))
+
+    def test_solver_failures_do_not_count_as_checked(self):
+        from play import evaluate
+        for result, solved in ((dict(status='UNKNOWN', reason='tactical worker starting'), False),
+                               (dict(status='UNKNOWN', reason='no verified strategy'), True),
+                               (dict(status='UNKNOWN', reason='defender counterwin'), True)):
+            prover = unittest.mock.Mock(history=unittest.mock.Mock(return_value=result))
+            self.assertEqual(evaluate(self.bubble, prover, [(0, 0)], 0, 2048)['solved'], solved)
+
+    def test_cancelling_stops_the_search(self):
+        from play import Cancelled, evaluate
+        def watch(n):
+            raise Cancelled()
+        with self.assertRaises(Cancelled):
+            evaluate(self.bubble, None, [(0, 0)], 64, 0, watch)
+
+    def test_cancelling_leaves_a_slow_solver_behind(self):
+        from play import Cancelled, evaluate
+        prover = unittest.mock.Mock(history=unittest.mock.Mock(side_effect=lambda *a, **k: time.sleep(2)))
+        started = time.time()
+        def watch(n):
+            if time.time() - started > .2:
+                raise Cancelled()
+        with self.assertRaises(Cancelled):
+            evaluate(self.bubble, prover, [(0, 0)], 4, 2048, watch)
+        self.assertLess(time.time() - started, 1)
+        prover.abort.assert_called_once()
+        idle = unittest.mock.Mock(history=unittest.mock.Mock(return_value=dict(status='UNKNOWN', reason='no verified strategy')))
+        def network(n):
+            if n:
+                raise Cancelled()
+        with self.assertRaises(Cancelled):
+            evaluate(self.bubble, idle, [(0, 0)], 4, 2048, network)
+        idle.abort.assert_not_called()
+
+    def test_verified_line_replays_to_a_win(self):
+        from play import evaluate
         history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (2, 5), (3, 5), (3, 0),
                    (-1, 3), (5, 5), (6, 5)]
-        game = Game(history)
-        result = dict(status='PROVEN_WIN', native_verified=True, moves=[[4, 0], [5, 0]],
+        result = dict(status='PROVEN_WIN', native_verified=True, moves=[[4, 0], [5, 0]], proof_turns=1,
                       certificate=dict(root=0, nodes=[dict(kind='immediate_win', action=[[4, 0], [5, 0]])]))
+        prover = unittest.mock.Mock(history=unittest.mock.Mock(return_value=result))
+        found = evaluate(self.bubble, prover, history, 4, 2048)
+        self.assertEqual((found['value'], found['proof'], found['moves']), (1., dict(winner=0, turns=1), [[4, 0], [5, 0]]))
+        game = Game(history)
         try:
-            with unittest.mock.patch.object(self.player, 'solve', side_effect=[result, dict(status='UNKNOWN')]):
-                analysis = self.player.turn(game, analyze=True)
-            self.assertEqual(analysis['proof_status'], 'PROVEN_WIN')
-            self.assertEqual(analysis['win_probability'], 1.)
-            self.assertEqual([c[:2] for c in game.cells], [list(p) for p in history])
-            for q, r, player in analysis['winning_line']:
-                self.assertEqual(player, game.player)
+            for q, r, player in found['line']:
+                self.assertEqual(player, 0)
                 game.play(q, r)
             self.assertEqual(game.winner, 0)
         finally:

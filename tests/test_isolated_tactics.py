@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -55,6 +56,19 @@ class Isolation(unittest.TestCase):
         self.assertIn('hard deadline', hung['reason'])
         self.assertEqual((hung['attacker'], hung['build_hash'], hung['nodes_used']), ('mover', None, 0))
         self.assertEqual(self.tactics.stats['kills'], 1)
+        self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
+
+    def test_abort_ends_a_running_query_and_the_next_one_proceeds(self):
+        pid = self.tactics.history([[0, 0]], ms=10000)['pid']
+        results = []
+        query = threading.Thread(target=lambda: results.append(self.tactics.history([[1, 1]], ms=20000)))
+        query.start()
+        time.sleep(.3)
+        start = time.perf_counter()
+        self.tactics.abort()
+        query.join(5)
+        self.assertLess(time.perf_counter()-start, 1)
+        self.assertEqual(results[0]['status'], 'UNKNOWN')
         self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
 
     def test_abandoned_native_work_replaces_child(self):

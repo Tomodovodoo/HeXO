@@ -42,7 +42,7 @@ cmake --build build --config Release --parallel 2
 python python/bubble.py play
 ```
 
-The last command downloads the newest [released Bubble](https://github.com/Tomodovodoo/HeXO/releases) (4.4 MB) into `runs/play` the first time and opens the game at <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. The page shows Bubble's win estimate and suggested moves for every position, remembers them when you step back, and copies the game as HTTTX notation. Search and solver have their own budgets on the page.
+The last command downloads the newest [released Bubble](https://github.com/Tomodovodoo/HeXO/releases) (4.4 MB) into `runs/play` the first time and opens the game at <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. Either side can be you, Bubble, the native engine or Seal, so engines can also play each other while you watch. The page shows Bubble's win estimate and suggested moves, saves every evaluation, labels each turn from best to blunder, and imports and exports HTTTX. [docs/play.md](docs/play.md) has the details.
 
 To play a particular checkpoint, point it at the file or at a run you trained:
 
@@ -51,7 +51,7 @@ python python/bubble.py play --model path/to/ema.pt
 python python/bubble.py play --run runs/dense-v1
 ```
 
-With a run, the model picker lists its champion, its newest export and two more. A GPU is used when PyTorch sees one; add `--device cpu` otherwise. The solver toggle needs the Rust build from the next section; without it Bubble plays on search alone. Without any weights, `python python/play.py` serves the handwritten native engine.
+The engine picker also lists every run under `runs/` and every model under `models/`, champion first. A GPU is used when PyTorch sees one; add `--device cpu` otherwise. The solver needs the Rust build from the next section; without it Bubble plays on search alone. Without any weights, `python python/play.py` serves the handwritten native engine.
 
 ## Build Bubble
 

@@ -6,7 +6,6 @@ import socket
 import threading
 import time
 import unittest
-from http.server import HTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -16,7 +15,6 @@ from urllib.request import Request, urlopen
 from bot_api import APIError, Adapter, MAX_CELLS, board_game, server
 from hexo import Game
 from notation import MAX_STONES, NotationConflict, Record, dumps, loads
-from play import Handler as PlayHandler
 from tests.reference import interleave
 
 
@@ -267,40 +265,6 @@ class OfficialAPI(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
             thread.join()
-
-
-class PlayNotationEndpoint(unittest.TestCase):
-    def test_current_history_and_conflict(self):
-        class Handler(PlayHandler):
-            game = Game()
-
-        httpd = HTTPServer(('127.0.0.1', 0), Handler)
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        thread.start()
-        root = f'http://127.0.0.1:{httpd.server_port}'
-
-        def play(q, r):
-            request = Request(root+'/play', json.dumps({'q': q, 'r': r}).encode(),
-                              {'Content-Type': 'application/json'})
-            with urlopen(request, timeout=2) as response:
-                self.assertEqual(response.status, 200)
-
-        try:
-            play(0, 0)
-            with urlopen(root+'/htttx', timeout=2) as response:
-                self.assertEqual(response.headers.get_content_type(), 'text/plain')
-                self.assertEqual(response.read().decode(), 'version[1];')
-            play(1, 0)
-            with urlopen(root+'/htttx', timeout=2) as response:
-                self.assertEqual(response.read().decode(), 'version[1];\n1. [1,0];')
-            play(2, 0)
-            with urlopen(root+'/htttx', timeout=2) as response:
-                self.assertEqual(response.read().decode(), 'version[1];\n1. [1,0][2,0];')
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-            thread.join()
-            Handler.game.close()
 
 
 class TimedClocks(unittest.TestCase):
