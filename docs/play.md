@@ -11,6 +11,117 @@ play another checkpoint, and two engines play each other live while the page sta
 background thread as jobs; the page polls `/state` and every job can be cancelled. Cancelling an engine's move
 pauses the game until Resume.
 
+## Watch a bot match
+
+The match command is a thin HTTP client. It uses an existing player on the port, or starts an idle one,
+then submits the batch and prints the watch URL:
+
+```sh
+python python/bubble.py match "dense-v1@champion@strong" "Six@standard" --run runs/dense-v1 --openings narrow --unique-openings 16 --port 8772
+```
+
+Open <http://127.0.0.1:8772> to watch all 32 games, with the running score, analysis and move timeline.
+The server plays each opening twice with colours swapped. It keeps running when the browser is closed,
+and leaves the final board available when the batch finishes. Pause holds play and the next game; Stop match
+ends the batch. Position edits and player changes become available again after stopping.
+
+`python python/bubble.py models --port 8772` lists the same catalogue as the browser picker. Match names are
+case-insensitive catalogue names, exact ids, unique engine kinds, or paths to `.pt` exports. Use
+`dense-v1@main/150000`, `dense-v1@150000` or `dense-v1@champion` for checkpoints. `bubble:150000` also works
+when that step identifies one available Bubble run. Ambiguous names are rejected.
+
+A seat combines an engine, preset or custom budget, and a device. For example:
+
+```sh
+python python/bubble.py match "dense-v1@150000{simulations=512,solver_nodes=131072}" "Six@standard" --port 8772 --unique-openings 16 --a-device cpu
+```
+
+`@quick`, `@standard`, `@strong` and `@deep` use the UI's presets; `--preset` supplies the default for both seats.
+Custom keys are the engine's own: Bubble has `simulations` and `solver_nodes`, Six has `nodes` (positions),
+Strix/Pulsatrix has `simulations`, and Native/Seal has `ms`. Unknown keys are rejected. `--a-device` and
+`--b-device` choose CPU or CUDA for a Bubble seat. Six uses the backend in its catalogue entry.
+
+The clock belongs to the match and applies to both seats:
+
+| Mode | Command option | Behaviour |
+|---|---|---|
+| Fixed | No clock option | Each seat spends its configured search budget |
+| Per turn | `--move 5s` | Five seconds covers both stones; no banking |
+| Game | `--tc 180+2` | 180 seconds per player, plus two seconds after a complete turn |
+
+Engines warm before clocks start. Under a clock, search budgets are ceilings: Bubble caps simulations
+across the whole turn and keeps solver work inside the allowance; Six receives nodes plus movetime or
+both clocks and increments; Native and Seal receive the smaller of their ms ceiling and the allocated time.
+Strix/Pulsatrix clock requests are rejected because their current adapter cannot return an interrupted
+search's best move. Fixed-budget games remain supported. Timing uses the clock/controller from the existing
+timed engine; CPU/GPU and backend identities are saved, since they affect clocked strength.
+
+Opening selection reads the player's existing `openings.json` from `--run`, or an explicit `--book path`:
+
+| Range | Selection of N unique openings |
+|---|---|
+| `narrow` | The N highest recorded champion policy probabilities; ties use the canonical opening key |
+| `wide` | A seeded sample without replacement from all active in-policy openings, the default |
+| `all` | A seeded sample without replacement including active off-policy openings |
+
+The probabilities are the book's saved whole-opening reach probabilities. N sets the resulting cutoff;
+no model inference is needed to select the set. Retired and separately labelled tactical cases stay outside
+these comparison pools. The book file, its digest, scoring checkpoint, cutoff and selected positions are
+saved with the batch. The selection stays fixed if the live book refreshes. `--seed` controls sampling and
+order and a random hex symmetry. Both colour assignments use the same orientation. `--games 32` also selects
+16 unique book openings; an impossible opening count fails before play starts.
+An explicit `--games` larger than twice `--unique-openings` repeats the selected opening cycle.
+
+Without a book the default is the origin opening. `--opening start.htttx` supplies a custom position; repeat
+it for several paired positions. `--max-placements 512` caps a game after the current turn, reported separately
+from wins. Repeating identical openings and deterministic settings can repeat identical games.
+
+Results go to a fresh `artifacts/play/<match>/` directory, or `--out <new-directory>`. Every completed game
+gets a replay JSON and HTTTX file before the next game starts. `summary.json` records scores, player sources,
+full Bubble weight digests, engine/network file digests, backend/device, budgets and opening selection.
+Per-turn records include elapsed time and work counts where the adapter reports them; unavailable counts are
+null. Complete colour pairs use the evaluator's pentanomial scoring and `dense_posterior.Posterior` for a
+relative Elo estimate and 95% interval. These exploratory results stay in the batch directory and do not
+change the training league or its calibrated-opponent scoreboard.
+
+```sh
+python python/bubble.py match status --port 8772
+python python/bubble.py match pause --port 8772
+python python/bubble.py match resume --port 8772
+python python/bubble.py match stop --port 8772
+python python/bubble.py match --resume artifacts/play/<match> --port 8772
+```
+
+Every completed turn saves `current.json`. A saved batch resumes from its last completed turn, preserving
+completed games, colour pairing and clock balances. An interrupted search may need to run again. An OS lock
+prevents two players resuming the same batch. Resuming rejects changed checkpoint or engine files.
+Engine failures pause and report an error. A clock overrun loses on time. A batch cannot take over an
+unfinished human game; choose another port or reset that board explicitly.
+
+The HTTP API uses the same session that the browser displays. On an existing player:
+
+```sh
+curl "http://127.0.0.1:8772/openings?range=narrow&count=16"
+curl -X POST http://127.0.0.1:8772/match -H "Content-Type: application/json" -d '{"players":["dense-v1","Six"],"opening_range":"narrow","unique_openings":16,"preset":"standard","seed":0}'
+```
+
+| Request | Result |
+|---|---|
+| `GET /state` | Engines, current board, jobs, match progress and score |
+| `GET /models` | Player catalogue, checkpoints, budgets and clock support |
+| `GET /openings?range=narrow&count=16&seed=0` | Preview the exact selected opening set, read-only |
+| `POST /match` | Start with `players`, `games` or `unique_openings`, `opening_range`, `seed`, and optional `book` or `output` |
+| `GET /match` | Match specification, score, completed results and paused state |
+| `POST /match` with `{"action":"pause"}`, `resume` or `stop` | Control the current batch |
+| `POST /match` with `{"action":"resume","batch":"path/to/batch"}` | Load and resume a saved batch |
+| `GET /match/results` | Download the batch specification and completed results |
+| `GET /match/replay?game=1` | Download a completed game's HTTTX |
+| `GET /replay`, `GET /htttx` | Export the visible game |
+
+A player specification can also be `{"engine":"dense-v1","checkpoint":"main/150000","preset":"custom","custom":{"simulations":128,"solver_nodes":32768}}`.
+Clock JSON is `{"mode":"fixed"}`, `{"mode":"move","ms":5000}`, or `{"mode":"game","tc":"180+2"}`.
+The API is loopback-only. Each player port holds one visible game; use a separate port for another simultaneous match.
+
 ## Engines
 
 The picker lists everything the server finds on start:

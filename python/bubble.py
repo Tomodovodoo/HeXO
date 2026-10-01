@@ -428,6 +428,113 @@ def positive(text):
     return value
 
 
+def player_request(port, path, body=None):
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
+    request = Request(f'http://127.0.0.1:{port}{path}', None if body is None else json.dumps(body).encode(),
+                      headers={'Content-Type': 'application/json'})
+    try:
+        with urlopen(request, timeout=15) as response:
+            return json.load(response)
+    except HTTPError as error:
+        try:
+            message = json.load(error).get('error', str(error))
+        except (ValueError, AttributeError):
+            message = str(error)
+        raise RuntimeError(message) from error
+
+
+def ensure_player(args, start=True):
+    """Reuse the selected player, or start an idle server without touching training services."""
+    from urllib.error import URLError
+    try:
+        catalogue = player_request(args.port, '/models')
+    except RuntimeError as error:
+        raise RuntimeError(f'Port {args.port} does not offer the current player API; choose another port') from error
+    except URLError as error:
+        if not start or not isinstance(error.reason, ConnectionRefusedError):
+            raise
+        folder = ROOT / 'artifacts' / 'play'
+        folder.mkdir(parents=True, exist_ok=True)
+        log = folder / f'server-{args.port}.log'
+        command = [sys.executable, '-u', str(PYTHON / 'play.py'), '--idle', '--port', str(args.port),
+                   '--device', args.device, '--evaluations', str(folder / f'server-{args.port}-evaluations.jsonl')]
+        for option, value in (('--dense-run', args.run), ('--models', args.models), ('--book', args.book)):
+            if value is not None:
+                command += [option, str(value.resolve())]
+        options = (dict(creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS |
+                       subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.BELOW_NORMAL_PRIORITY_CLASS)
+                   if os.name == 'nt' else dict(start_new_session=True))
+        with log.open('ab') as output:
+            process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                       env=os.environ | dict(OMP_NUM_THREADS='2'), **options)
+        (folder / f'server-{args.port}.json').write_text(json.dumps(dict(pid=process.pid, command=command)), encoding='utf-8')
+        deadline = time.monotonic() + 30
+        while True:
+            if process.poll() is not None:
+                raise RuntimeError(f'Player exited; see {log}')
+            try:
+                catalogue = player_request(args.port, '/models')
+                break
+            except URLError:
+                if time.monotonic() >= deadline:
+                    process.terminate()
+                    process.wait(timeout=5)
+                    raise RuntimeError(f'Player did not become ready; see {log}')
+                time.sleep(.1)
+    if catalogue.get('api') != 'bubble-player-v1':
+        raise RuntimeError(f'Port {args.port} belongs to another service')
+    return catalogue
+
+
+def player_client(args):
+    action = args.players[0] if args.command == 'match' and len(args.players) == 1 else None
+    controls = ('status', 'pause', 'resume', 'stop')
+    resume = args.command == 'match' and args.resume
+    if args.command == 'match' and not resume and action not in controls and len(args.players) != 2:
+        raise ValueError('Choose two players, or status, pause, resume or stop')
+    catalogue = ensure_player(args, start=bool(resume) or action not in controls)
+    if args.command == 'models':
+        for model in catalogue['models']:
+            print(f"{model['id']}  [{model['kind']}; {'clocks supported' if model['clocks'] else 'fixed budget only'}]")
+            if model.get('checkpoints'):
+                print('  ' + ', '.join(model['checkpoints']))
+        return
+    if resume:
+        if args.players:
+            raise ValueError('--resume loads the saved players; omit player names')
+        state = player_request(args.port, '/match', dict(action='resume', batch=str(args.resume.resolve())))
+    elif action == 'status':
+        state = player_request(args.port, '/match')
+    elif action in controls:
+        state = player_request(args.port, '/match', dict(action=action))
+    else:
+        players = [dict(engine=engine, **({'device': device} if device else {}))
+                   for engine, device in zip(args.players, (args.a_device, args.b_device))]
+        body = dict(players=players, games=args.games, preset=args.preset, opening_range=args.openings,
+                    unique_openings=args.unique_openings, seed=args.seed, max_placements=args.max_placements)
+        if args.opening:
+            body['opening_texts'] = [path.read_text(encoding='utf-8') for path in args.opening]
+        if args.tc:
+            body['clock'] = dict(mode='game', tc=args.tc)
+        elif args.move:
+            body['clock'] = dict(mode='move', ms=args.move)
+        if args.book:
+            body['book'] = str(args.book.resolve())
+        if args.out:
+            body['output'] = str(args.out.resolve())
+        state = player_request(args.port, '/match', body)
+    match = state.get('match')
+    print(f'Watch: http://127.0.0.1:{args.port}')
+    if match:
+        print(f"{match['completed']}/{match['games']} games; wins {match['wins']}; capped {match['capped']}")
+        print(f"Results: {match['output']}")
+        if match.get('error'):
+            print(match['error'])
+    else:
+        print('No batch on this player')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest='command', required=True)
@@ -445,7 +552,36 @@ def main():
     play.add_argument('--port', type=int, default=8765)
     play.add_argument('--model', type=Path, help="an ema.pt file to play, passed straight to the server")
     play.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    for command in ('models', 'match'):
+        client = sub.add_parser(command, help='inspect or control the live browser player')
+        client.add_argument('--port', type=int, default=8765)
+        client.add_argument('--run', type=Path, help='run offered by an automatically started player')
+        client.add_argument('--models', type=Path, help='engine catalogue directory for an automatically started player')
+        client.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
+        client.add_argument('--book', type=Path, help='opening book; read only')
+    match = sub.choices['match']
+    match.add_argument('players', nargs='*', help='two catalogue names, or status/pause/resume/stop')
+    match.add_argument('--games', type=positive)
+    match.add_argument('--unique-openings', type=positive)
+    match.add_argument('--openings', choices=['narrow', 'wide', 'all'])
+    match.add_argument('--opening', type=Path, action='append', help='custom HTTTX or replay opening, repeatable')
+    match.add_argument('--seed', type=int, default=0)
+    match.add_argument('--preset', choices=['quick', 'standard', 'strong', 'deep'], default='standard')
+    from time_control import duration
+    clocks = match.add_mutually_exclusive_group()
+    clocks.add_argument('--tc', help='shared game clock in seconds+increment, e.g. 180+2')
+    clocks.add_argument('--move', type=duration, help='shared time per complete turn, e.g. 5s')
+    match.add_argument('--a-device', choices=['cpu', 'cuda'])
+    match.add_argument('--b-device', choices=['cpu', 'cuda'])
+    match.add_argument('--out', type=Path)
+    match.add_argument('--resume', type=Path, help='resume a saved batch directory from its last completed turn')
+    match.add_argument('--max-placements', type=positive, default=512)
     args = parser.parse_args()
+    if args.command in ('models', 'match'):
+        try:
+            return player_client(args)
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.exit(1, f'{error}\n')
     if args.command in ('train', 'stop', 'status') and os.name != 'nt' and not Path('/proc').is_dir():
         sys.exit('bubble.py manages services on Windows and Linux only: it identifies them through /proc')
     launcher = Launcher(args.run)

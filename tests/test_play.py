@@ -14,7 +14,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from hexo import Game
-from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, budget_of,
+from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings, budget_of,
                   export_path, import_history, model_key, presets_of, proof_turns, review, scan, six_backend)
 from process_tree import TreeProcess
 
@@ -80,6 +80,9 @@ class FakeEngines:
 
     def turn(self, entry, budget, history, stop):
         return legal_turn(history)
+
+    def close(self):
+        self.release.set()
 
 
 RUN = tempfile.TemporaryDirectory()
@@ -629,6 +632,23 @@ class Http(unittest.TestCase):
         self.post('/cancel', dict(id=state['jobs'][0]['id']))
         wait(lambda: not self.session.state()['jobs'])
 
+    def test_match_api_starts_reports_results_and_preserves_live_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                state = self.post('/match', dict(players=['Native', 'Native'], games=2,
+                                                output=str(Path(directory) / 'match'), max_placements=3))
+                self.assertEqual(state['match']['games'], 2)
+                wait(lambda: not self.session.match_worker.is_alive())
+                live = json.loads(self.get('/state'))
+                result = json.loads(self.get('/match/results'))
+                self.assertEqual((live['match']['completed'], result['capped']), (2, 2))
+                self.assertEqual(len(live['history']), 3)
+                self.assertEqual(self.post('/match/stop')['match']['active'], False)
+                self.post('/new')
+                self.assertIsNone(json.loads(self.get('/state'))['match'])
+            finally:
+                self.session.close()
+
     def test_import_export_retry_and_origin(self):
         self.post('/seat', dict(side=1, engine='human'))
         state = self.post('/import', dict(text='version[1];\n1. [1,0][2,0];'))
@@ -672,6 +692,143 @@ class Http(unittest.TestCase):
         caught.exception.close()
         local = {'Origin': f'http://localhost:{port}', 'Host': f'localhost:{port}'}
         self.assertEqual(self.post('/new', headers=local)['history'], [])
+
+
+class Matches(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.engines = FakeEngines()
+        registry = entries()
+        registry['native:Other'] = registry['native:Native'] | dict(id='native:Other', name='Other')
+        self.session = Session(registry, self.engines, Evaluations())
+        self.session.configure_analysis('bubble:fake', auto=False)
+        self.addCleanup(self.session.close)
+        self.output = Path(self.directory.name) / 'match'
+
+    def test_real_winners_are_counted_for_the_right_bot_after_swapping(self):
+        opening = [(0, 0), (0, 5), (1, 5), (5, 0), (-5, 0), (2, 5), (3, 5), (0, -5), (0, -6),
+                   (4, 5), (-2, 5), (0, -7), (0, -8)]
+        self.engines.turn = lambda *args: [[5, 5]]
+        self.session.start_match(['Native', 'Other'], output=self.output, openings=[opening])
+        wait(lambda: not self.session.match_worker.is_alive())
+        summary = json.loads((self.output / 'summary.json').read_text())
+        self.assertEqual((summary['completed'], summary['wins'], summary['capped']), (2, [1, 1], 0))
+        first = json.loads((self.output / 'game-0001.json').read_text())
+        second = json.loads((self.output / 'game-0002.json').read_text())
+        self.assertEqual(first['history'], second['history'])
+        self.assertEqual(first['players'], second['players'][::-1])
+        self.assertEqual(import_history((self.output / 'game-0002.htttx').read_text()), second['history'])
+        self.assertTrue(self.session.paused)
+
+    def test_pause_holds_the_next_game_and_settings_cannot_change_mid_match(self):
+        self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
+        wait(lambda: self.session.match['completed'] == 1)
+        self.session.pause(True)
+        for change in (lambda: self.session.load([], True), lambda: self.session.undo(),
+                       lambda: self.session.configure_seat(0, 'human'), lambda: self.session.rescan()):
+            with self.assertRaises(ValueError):
+                change()
+        time.sleep(2.1)
+        self.assertEqual(self.session.match['completed'], 1)
+        self.session.pause(False)
+        wait(lambda: not self.session.match_worker.is_alive())
+        self.assertEqual(self.session.match['capped'], 2)
+        self.assertEqual(self.session.match['wins'], [0, 0])
+
+    def test_engine_failure_pauses_without_inventing_a_result_and_stop_saves_position(self):
+        self.engines.turn = unittest.mock.Mock(side_effect=ValueError('engine failed'))
+        self.session.start_match(['Native', 'Other'], output=self.output)
+        wait(lambda: self.session.match['error'] is not None)
+        self.assertEqual((self.session.paused, self.session.match['completed']), (True, 0))
+        self.session.stop_match()
+        wait(lambda: not self.session.match_worker.is_alive())
+        self.assertEqual(json.loads((self.output / 'current.json').read_text())['history'], [[0, 0]])
+        self.assertEqual(json.loads((self.output / 'summary.json').read_text())['error'], 'engine failed')
+
+    def test_book_counts_cutoff_repeatability_and_read_only_selection(self):
+        path = Path(self.directory.name) / 'book.json'
+        nodes = [dict(key=str(i), status='opening', moves=[[0, 0], [i, 0], [i, 1]], off_policy=i == 4,
+                      champion_probability=.1*i, scored_by='main/123') for i in range(1, 5)]
+        nodes += [nodes[0] | dict(key='retired', status='retired'),
+                  nodes[0] | dict(key='tactical', status='tactical')]
+        raw = json.dumps(dict(schema='hexo-opening-book-v2', nodes=nodes, refreshed_by='main/123'))
+        path.write_text(raw)
+        narrow = book_openings(path, 'narrow', 2, 17)
+        self.assertEqual({n['key'] for n in narrow['nodes']}, {'2', '3'})
+        self.assertEqual((narrow['unique_openings'], narrow['policy_cutoff']), (2, .2))
+        self.assertEqual(narrow, book_openings(path, 'narrow', 2, 17))
+        self.assertEqual(len(book_openings(path, 'wide')['nodes']), 3)
+        self.assertEqual(len(book_openings(path, 'all')['nodes']), 4)
+        self.assertEqual(path.read_text(), raw)
+        with self.assertRaisesRegex(ValueError, '3 unique openings'):
+            book_openings(path, 'wide', 4)
+        self.session.start_match(['Native', 'Other'], output=self.output, book=path,
+                                 opening_range='narrow', unique_openings=2, max_placements=5)
+        wait(lambda: not self.session.match_worker.is_alive())
+        self.assertEqual(self.session.match['games'], 4)
+        games = [json.loads(p.read_text()) for p in sorted(self.output.glob('game-*.json'))]
+        keys = [g['opening']['key'] for g in games]
+        self.assertEqual(keys, [keys[0], keys[0], keys[2], keys[2]])
+        self.assertNotEqual(keys[0], keys[2])
+
+    def test_bad_match_specifications_do_not_change_the_board_or_start_jobs(self):
+        for players, kwargs in [(['fake', 'Native'], {}), (['Native', 'Other'], dict(games=0)),
+                                (['Native', 'Other'], dict(unique_openings=2, games=2)),
+                                (['Native', 'Other'], dict(max_placements=0))]:
+            with self.assertRaises(ValueError):
+                self.session.start_match(players, output=self.output, **kwargs)
+        self.assertIsNone(self.session.match)
+        self.assertEqual(self.session.history, [])
+        self.assertFalse(self.output.exists())
+
+    def test_resume_keeps_completed_games_and_pair_accounting(self):
+        self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
+        wait(lambda: self.session.match['completed'] == 1)
+        self.session.stop_match()
+        wait(lambda: not self.session.match_worker.is_alive())
+        first = (self.output / 'game-0001.json').read_bytes()
+        self.session.resume_match(self.output)
+        wait(lambda: not self.session.match_worker.is_alive())
+        self.assertEqual((self.output / 'game-0001.json').read_bytes(), first)
+        self.assertEqual(self.session.match['completed'], 2)
+        self.assertEqual(self.session.match['pentanomial'], [0, 0, 1, 0, 0])
+        self.assertEqual(len(list(self.output.glob('game-*.json'))), 2)
+
+    def test_seat_specs_resolve_presets_checkpoint_steps_and_custom_budgets(self):
+        seat = self.session.match_seat('bubble:2@quick', 'standard')
+        self.assertEqual((seat['engine'], seat['checkpoint'], seat['device']), ('bubble:fake', 'main/000002', 'cpu'))
+        self.assertEqual(seat['budget'], PRESETS['bubble']['quick'])
+        custom = self.session.match_seat('bubble:2{simulations=512,solver_nodes=0}', 'standard')
+        self.assertEqual(custom['budget'], dict(simulations=512, solver_nodes=0))
+        with self.assertRaisesRegex(ValueError, 'not a budget'):
+            self.session.match_seat('Native{simulations=128}', 'standard')
+
+    def test_clock_deadline_discards_late_moves_and_records_time_result(self):
+        with unittest.mock.patch('timed_engine.TimedEngine') as engine:
+            engine.return_value.identity = dict(kind='fake')
+            engine.return_value.turn.side_effect = lambda game, *a, **kw: (
+                time.sleep(.06) or dict(moves=legal_turn([c[:2] for c in game.cells]), elapsed_ms=60))
+            self.session.start_match(['Native', 'Other'], games=1, output=self.output,
+                                     clock=dict(mode='move', ms=20))
+            wait(lambda: not self.session.match_worker.is_alive())
+        result = json.loads((self.output / 'game-0001.json').read_text())
+        self.assertEqual((result['winner'], result['reason'], result['history']), (0, 'time', [[0, 0]]))
+        self.assertEqual(self.session.match['wins'], [1, 0])
+
+    def test_a_batch_cannot_take_over_an_unfinished_human_game(self):
+        self.session.configure_seat(1, 'human')
+        self.session.play(0, 0)
+        with self.assertRaisesRegex(ValueError, 'human game'):
+            self.session.start_match(['Native', 'Other'], output=self.output)
+        self.assertEqual(self.session.history, [(0, 0)])
+
+    def test_simulations_only_adapter_refuses_a_clock_before_start(self):
+        self.session.entries['strix:Strix'] = dict(id='strix:Strix', name='Strix', kind='strix',
+            presets=PRESETS['strix'], model=Path(RUN.name) / 'checkpoints/main/000001/ema.pt')
+        with self.assertRaisesRegex(ValueError, 'cannot enforce a clock'):
+            self.session.start_match(['Native', 'Strix'], output=self.output, clock=dict(mode='game', tc='180+2'))
+        self.assertFalse(self.output.exists())
 
 
 class Proofs(unittest.TestCase):

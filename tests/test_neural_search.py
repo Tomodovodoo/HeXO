@@ -16,6 +16,22 @@ class Uniform:
         return out
 
 class NeuralTree(unittest.TestCase):
+    def test_timed_turn_reserves_simulations_for_both_stones(self):
+        import threading
+        from types import SimpleNamespace
+        from timed_engine import dense_turn, legal_turn
+        player = SimpleNamespace(evaluator=Uniform(), model_sha256='turn-cap', checkpoint='test',
+                                 cache=EvaluationCache(64), prover=None, options=dict(search=True, solver=False))
+        progress = []
+        result = dense_turn(player, [(0, 0)], dict(normal_ms=1000, hard_ms=1500, reserve_ms=10, simulations=8),
+                            threading.Event(), publish=lambda r: progress.append(dict(r)))
+        self.addCleanup(player._timed_tree.close)
+        counts = [r['completed'] for r in progress if r['completed']]
+        self.assertGreaterEqual(len(counts), 2)
+        self.assertLess(counts[0], counts[-1])
+        self.assertLessEqual(result['completed'], 8)
+        self.assertEqual(legal_turn([(0, 0)], result['moves']), result['moves'])
+
     def test_timed_interruption_does_not_select_from_a_partial_comparison(self):
         class Interrupted(Uniform):
             calls = 0

@@ -255,11 +255,16 @@ class SixProtocolTests(unittest.TestCase):
             try:
                 with SixEngine([sys.executable, str(script), str(log)], timeout=5, mirrored=True) as engine:
                     self.assertEqual(engine(game, nodes=500), [(1, 0), (1, 1)])
+                    self.assertEqual(engine(game, ms=2000, nodes=500), [(1, 0), (1, 1)])
+                    self.assertEqual(engine(game, nodes=500,
+                                            clock=dict(cross_ms=10000, circle_ms=9000, increment_ms=200)), [(1, 0), (1, 1)])
             finally:
                 game.close()
             lines = log.read_text().splitlines()
             self.assertIn('position radius 8 moves 0 0 1 1 1 2', lines)
             self.assertIn('go nodes 500', lines)
+            self.assertIn('go nodes 500 movetime 2000', lines)
+            self.assertIn('go nodes 500 xtime 10000 otime 9000 xinc 200 oinc 200', lines)
 
     def test_client_starts_each_game(self):
         with tempfile.TemporaryDirectory() as folder:
