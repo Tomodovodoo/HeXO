@@ -1,5 +1,6 @@
 """Local browser game. Run python python/play.py, then open http://127.0.0.1:8765."""
 import argparse
+import sys
 import json
 import time
 from datetime import datetime, timezone
@@ -48,7 +49,12 @@ class DensePlayer:
         self.tactical_package = tactical_package
         self.evaluator = self.prover = None
         self.checkpoint = None
-        self.options = dict(search=True, simulations=128, solver=True, solver_nodes=32768)
+        try:
+            from tactical_proof import NativeTactics
+            self.prover = NativeTactics(**({'package': tactical_package} if tactical_package else {}))
+        except (OSError, ValueError, KeyError) as error:
+            print(f'solver off: {error}', file=sys.stderr)
+        self.options = dict(search=True, simulations=128, solver=self.prover is not None, solver_nodes=32768)
         available = self.models()
         if not available:
             raise ValueError('No playable dense exports found')
@@ -57,8 +63,12 @@ class DensePlayer:
     def models(self):
         if self.model_path:
             path = self.model_path
-            checkpoint = (f'{path.parent.parent.name}/{path.parent.name}'
-                          if path.name == 'ema.pt' and path.parent.parent.parent.name == 'checkpoints' else path.stem)
+            name = (f'{path.parent.parent.name}/{path.parent.name}'
+                    if path.name == 'ema.pt' and path.parent.parent.parent.name == 'checkpoints' else path.stem)
+            if not hasattr(self, 'model_digest'):
+                from legacy.train import digest
+                self.model_digest = digest(path)
+            checkpoint = f'{name}@{self.model_digest[:12]}'  # notes and caches are keyed by the weights, not the file name
             return [dict(id=checkpoint, label=checkpoint)]
         exports = sorted((p for p in (self.run/'checkpoints').glob('*/*/ema.pt') if p.parent.name.isdigit()),
                          key=lambda p: (int(p.parent.name), p.parent.parent.name), reverse=True)
@@ -96,6 +106,8 @@ class DensePlayer:
         updated = self.options | options
         if any(type(updated[k]) is not bool for k in ('search', 'solver')):
             raise ValueError('Search and solver must be on or off')
+        if updated['solver'] and self.prover is None:
+            raise ValueError('The tactical solver is not built; run python tools/build_tactical.py')
         for key, maximum in (('simulations', 4096), ('solver_nodes', 1000000)):
             if type(updated[key]) is not int or not 1 <= updated[key] <= maximum:
                 raise ValueError(f'{key} must be 1..{maximum}')
@@ -109,9 +121,6 @@ class DensePlayer:
         self.evaluator = None
 
     def solve(self, history, attacker='mover'):
-        from tactical_proof import NativeTactics
-        if self.prover is None:
-            self.prover = NativeTactics(**({'package': self.tactical_package} if self.tactical_package else {}))
         return self.prover.history(history, attacker=attacker, nodes=self.options['solver_nodes'], ms=10000)
 
     @staticmethod
@@ -363,16 +372,24 @@ if __name__ == "__main__":
     opponent.add_argument("--relational", type=Path, help="Play the actual relational policy/Q checkpoint")
     opponent.add_argument("--search-run", type=Path, help="Use the internal search champion; refresh on New game")
     opponent.add_argument('--dense-run', type=Path, help='Play dense exports with model, search and solver controls')
+    parser.add_argument('--dense-model', type=Path, help='Play one dense export file; notes go to --dense-run or runs/play')
     parser.add_argument('--tactical-package', type=Path, help='Directory containing the verified prebuilt tactical library')
     parser.add_argument("--neural-mode", choices=("pi", "mu", "gumbel", "gumbel-proof"), default="gumbel")
     parser.add_argument("--simulations", type=int, default=16, help="Maximum neural search simulations per placement")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto", help="cuda, cpu, or auto: cuda when a GPU is available")
     parser.add_argument("--label", help="Visible opponent name")
     args = parser.parse_args()
+    if args.device == "auto" and (args.dense_run or args.dense_model or args.relational or args.search_run):
+        import torch
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.dense_model and not args.dense_run:
+        args.dense_run = Path(__file__).resolve().parents[1] / 'runs' / 'play'
+    if args.dense_model:
+        args.dense_run.mkdir(parents=True, exist_ok=True)
     if args.dense_run:
         import torch
         torch.set_num_threads(2)
-        Handler.neural = DensePlayer(args.dense_run.resolve(), args.device, args.tactical_package)
+        Handler.neural = DensePlayer(args.dense_run.resolve(), args.device, args.tactical_package, args.dense_model)
     Handler.run = args.run.resolve() if args.run else None
     if Handler.run:
         promoted_checkpoint(Handler.run)

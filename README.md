@@ -1,26 +1,34 @@
-# Bubble
+# Hi, I'm Bubble!
 
-Bubble is a self-play bot for [HeXO](https://github.com/HeXO-Game/HeXO), the hexagonal connect-six game this repository is named after.
+I play [HeXO](https://github.com/HeXO-Game/HeXO), connect six on a hexagonal board with no edges. Cross opens with one stone at the origin. After that every turn is two stones, each placed within eight cells of a stone already on the board. Six in a row along any of the three axes wins on the spot, even if it is the first stone of a turn.
 
-## What Bubble is
+I learned the game from scratch on one RTX 3070 Ti. This repository holds my rules engine, my search, the training loop that made me and a browser page where you can play me.
 
-Bubble is a KataGo-style asynchronous self-play engine that trains on one GPU. Separate processes share a run directory:
+## How I made Bubble
 
-- **Network.** A hex-masked ResNet with policy and value heads over bucketed board crops (`python/hexnet.py`, `python/hexcrop.py`).
-- **Actors.** Gumbel MCTS self-play with many games batched through the network (`python/dense_selfplay.py`, `src/gumbel.cpp`).
-- **Learner.** Trains on the actors' game shards through a KataGo-style replay window and exports checkpoints (`python/dense_learn.py`, `python/dense_data.py`).
-- **Evaluator.** Plays paired games from an opening book, rates checkpoints with a posterior Bradley-Terry model and decides which checkpoint the actors use (`python/dense_eval.py`, `python/dense_posterior.py`, `python/dense_openings.py`).
-- **Tactical solver.** A Rust forced-win solver with an independent certificate checker (`tools/tactical/`). The search calls it during play (`python/dense_solver.py`), and an offline proof pass labels finished games with proven results (`python/dense_solve.py`).
-- **Dashboard.** A local web page with training, evaluation and proof-pass status (`python/dashboard.py`).
+Bubble is a hex-masked residual network with a policy head and a value head. It trains on one GPU in a loop that runs as separate processes on one run directory:
 
-## Build
+- Actors play Bubble against itself with Gumbel MCTS, the AlphaZero recipe with a root search that improves the policy from a handful of simulations per stone.
+- A learner trains on those games from a replay window sized the KataGo way, and exports a checkpoint every few thousand steps. The actors switch to it at once.
+- An evaluator plays every checkpoint against the champion on colour-swapped opening pairs and rates them with a posterior Bradley-Terry model. Promotion is a posterior probability, not an SPRT.
+- A tactical solver proves forced wins with certificates that an independent checker verifies. It started as the solver of [Strix](https://github.com/SootyOwl/hexo-strix) (MIT), vendored and changed in many places.
+- A proof pass uses the spare CPU to re-check finished games, and a dashboard shows the run.
 
-Requirements:
+## Decisions that made Bubble stronger
 
-- Python 3.10 or newer
-- CMake 3.20 or newer and a C++20 compiler
-- Rust and Cargo with edition 2024 support, for the tactical solver
-- PyTorch 2.11 or newer, for training and neural play
+The rules make HeXO a tactical game: two stones per turn means a four with open ends is already a win. Most of what worked came from taking that seriously.
+
+- Exact tactics inside the search. Every placement in the tree is checked for an immediate win or a forced block, and the solver answers three questions at every turn start: can I force a win, can the opponent, and does my chosen move lose by force. A proven game is adjudicated and its forced line becomes training rows with exact labels.
+- Proven outcomes live on the search graph. A proof propagates up the tree with its distance, so the search plays the shortest win, resists longest when lost, and never spends simulations on a settled node. The search also shares evaluations between positions that only differ in move order.
+- Spare CPU hunts blunders. The proof pass scans finished games for forced wins that the search missed, labels those positions exactly, and feeds the worst misses back as restart positions for new games.
+- Value targets know how far the end is. A calibrated map turns the search value and the plies remaining into a win probability, blended with the outcome. Rows with an exact label get double weight and no outcome noise.
+- The opening book pushes play off policy. A symmetry-reduced DAG of openings with paired colour statistics retires skewed or nested openings, and imported off-policy and known-loss openings put the actors in positions the policy would avoid, so the value head has to learn them.
+- Policy and value must agree. Value targets follow the improved search policy, positions the network gets most wrong are resampled, and full-search rows carry the policy target while cheap-search rows only carry value.
+- The evaluator is honest. Each opening pair is one pentanomial observation, a superseded trial settles on the games it played, fill games sharpen intervals, and anchor matches against Seal keep the scale grounded.
+- Kernels. On advice from Vladdy, who wrote [Mantis Shrimp](https://github.com/Cmiller132/Hexo-Shrimp-Bot), the network runs on fused Triton kernels with CUDA graphs: actors got 2.8 times faster and the learner 1.5 times.
+- One GPU, shared. Actors and learner alternate in phases paced by rows produced, and the evaluator yields whenever either of them is busy.
+
+## Play Bubble
 
 ```sh
 git clone https://github.com/Tomodovodoo/HeXO.git
@@ -28,151 +36,78 @@ cd HeXO
 python -m venv .venv
 ```
 
-Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scripts\activate.bat` in cmd.exe, `source .venv/bin/activate` on Linux and macOS), then build:
+Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scripts\activate.bat` in cmd.exe, `source .venv/bin/activate` on Linux and macOS), then:
 
 ```sh
-python -m pip install -e .
-python -m pip install -r requirements/learning.txt
+python -m pip install -e . -r requirements/learning.txt
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel 2
+python python/bubble.py play
+```
+
+The last command downloads the newest [released Bubble](https://github.com/Tomodovodoo/HeXO/releases) (4.4 MB) into `runs/play` the first time and opens the game at <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. The page shows Bubble's win estimate and suggested moves for every position, remembers them when you step back, and copies the game as HTTTX notation. Search and solver have their own budgets on the page.
+
+To play a particular checkpoint, point it at the file or at a run you trained:
+
+```sh
+python python/bubble.py play --model path/to/ema.pt
+python python/bubble.py play --run runs/dense-v1
+```
+
+With a run, the model picker lists its champion, its newest export and two more. A GPU is used when PyTorch sees one; add `--device cpu` otherwise. The solver toggle needs the Rust build from the next section; without it Bubble plays on search alone. Without any weights, `python python/play.py` serves the handwritten native engine.
+
+## Build Bubble
+
+You need Python 3.10 or newer, CMake 3.20 or newer with a C++20 compiler, and PyTorch 2.11 or newer. Install the CUDA build of PyTorch for your card from the [PyTorch selector](https://pytorch.org/get-started/locally/); `requirements/tested.txt` pins the versions this run used. With MinGW on Windows, add `-G "MinGW Makefiles"` to the configure command and keep `g++` on `PATH`.
+
+The tactical solver needs Rust and Cargo with edition 2024 support:
+
+```sh
 python tools/build_tactical.py
 ```
 
-For CUDA, install the PyTorch wheel for your hardware from the [PyTorch selector](https://pytorch.org/get-started/locally/). `requirements/tested.txt` pins the tested library versions. With MinGW on Windows, add `-G "MinGW Makefiles"` to the configure command and keep `g++` on `PATH`.
-
-## The game
-
-HeXO is played by two players, Cross (X) and Circle (O), on an unbounded grid of hexagons. Cells use axial coordinates `(q, r)`. The distance between two cells is
-
-```
-distance = max(|q1 - q2|, |r1 - r2|, |(q1 + r1) - (q2 + r2)|)
-```
-
-so the six neighbours of `(0, 0)` are `(1, 0)`, `(-1, 0)`, `(0, 1)`, `(0, -1)`, `(1, -1)` and `(-1, 1)`.
-
-Turns:
-
-1. Cross opens with a single stone, and it must go on the origin `(0, 0)`.
-2. From then on the players alternate, starting with Circle, and each turn is two placements by the same player.
-3. A placement must go on an empty cell within distance 8 of any stone already on the board, of either colour. The board grows as stones spread; there is no fixed edge.
-
-Winning:
-
-- A player wins with six or more of their own stones in an unbroken line along one of the three hex axes: `(1, 0)`, `(0, 1)` or `(1, -1)`.
-- The win counts the moment the sixth stone lands. If the first placement of a turn completes a line, the game ends there and the second placement is never made.
-- There are no captures and no passes.
-
-A short example. Cross opens at `(0, 0)`. Circle plays `(1, 0)` and `(0, 1)`. Cross plays `(-1, 0)` and `(-2, 0)`, making three in a row on the `(1, 0)` axis. Circle's stone at `(1, 0)` already blocks that line on the right, so Cross can only reach six by extending left to `(-5, 0)`. Because each turn adds two stones, a player who has four in a row with both ends open threatens to finish on the next turn, and the opponent needs both of their placements to block. Much of the game is about building two such threats at once.
-
-The rules engine is `src/hexo.cpp`. `tests/reference.py` is an independent Python implementation used to check it.
-
-
-## Test
+Without it the search plays without proofs and the launcher skips the proof pass until the solver is built. Check the build with the tests:
 
 ```sh
-python -m unittest tests.test_engine tests.test_proof tests.test_notation_api tests.test_neural_search -v
-python -m unittest tests.test_dense tests.test_dense_solve tests.test_openings -v
+python -m unittest tests.test_engine tests.test_neural_search tests.test_proof tests.test_notation_api -v
+python -m unittest tests.test_dense tests.test_dense_solve tests.test_openings tests.test_bubble -v
 ```
 
-The first line needs the native build and NumPy. The second also needs PyTorch.
-
-## Train
-
-Create a run and its first checkpoint:
+## Train Bubble
 
 ```sh
-python python/dense_config.py --run runs/bubble --device cuda
-python python/dense_learn.py --run runs/bubble --steps 0
+python python/bubble.py train --run runs/bubble
 ```
 
-Then start each process in its own terminal:
+That creates the run and its first checkpoint, then starts the learner, four actors, the evaluator, the proof pass (once the solver is built) and the dashboard at <http://127.0.0.1:8766>. Everything the run produces stays under `runs/bubble`: game shards, checkpoints, ratings, logs.
 
 ```sh
-python python/dense_learn.py --run runs/bubble
-python python/dense_selfplay.py --run runs/bubble --processes 4
-python python/dense_eval.py loop --run runs/bubble --eval-anchor-games 0 --no-eval-anchor-on-promotion --eval-anchor-target-halfwidth 0
-python python/dense_solve.py --run runs/bubble
-python python/dashboard.py --run runs/bubble
+python python/bubble.py status --run runs/bubble
+python python/bubble.py stop --run runs/bubble
 ```
 
-The dashboard is at <http://127.0.0.1:8766>. `config.json` in the run directory holds the settings of the actors, learner and evaluator. A flag on one process overrides the matching setting for that process only. The proof pass takes its settings from its own flags only, so record them with the run.
+Stopping and starting again resumes from the newest checkpoint. Settings live in `config.json` of the run; pass `--help` to any of the `python/dense_*.py` scripts for the flags that override them. Two options worth knowing: `--net-kernels fused` uses the Triton kernels ([docs/gpu-kernels.md](docs/gpu-kernels.md)), and `--seal` rates champions against Seal once its adapter is built ([docs/native-engine.md](docs/native-engine.md)). A CPU-only run works with `--device cpu`, slowly.
 
-The three evaluator flags turn off rating games against Seal, an external bot that needs its own setup. Use `--device cpu` in `dense_config.py` to train without a GPU. The proof pass needs the tactical build. The solver inside the search is off by default; see [docs/tactical-solver.md](docs/tactical-solver.md) to enable it.
+## Notation
 
-## Play
-
-```sh
-python python/play.py                                         # handwritten native evaluator
-python python/play.py --dense-run runs/bubble --device cpu    # trained network from a run
-```
-
-Open <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan and scroll to zoom. The model picker lists the champion and the newest checkpoints. Search and solver have their own toggles.
-
-From Python:
-
-```python
-from hexo import Game
-
-game = Game()
-try:
-    game.play(0, 0)
-    for q, r in game.search(ms=100)["moves"]:
-        game.play(q, r)
-    print(game.state())
-finally:
-    game.close()
-```
-
-## Notation and bot API
-
-`python/notation.py` reads and writes [HTTTX notation v1](https://github.com/hex-tic-tac-toe/hexagonal-tic-tac-toe-notation/tree/15bb7877ae020d661497e332adf0810d00d24e3e) and checks every move for legality:
+`python/notation.py` reads and writes [HTTTX notation v1](https://github.com/hex-tic-tac-toe/hexagonal-tic-tac-toe-notation/tree/15bb7877ae020d661497e332adf0810d00d24e3e), and `python/bot_api.py` serves the [HTTTX stateless bot API](https://github.com/hex-tic-tac-toe/htttx-bot-api/tree/37d2385f1016abe8b25798238a7d0c4a17a25dda/definitions) on localhost:
 
 ```sh
 python python/notation.py import match.txt > match.json
 python python/notation.py export match.json > match.txt
-```
-
-`python/bot_api.py` serves the [HTTTX stateless bot API](https://github.com/hex-tic-tac-toe/htttx-bot-api/tree/37d2385f1016abe8b25798238a7d0c4a17a25dda/definitions) on localhost with `GET /capabilities.json` and `POST /stateless/v1-alpha/turn`:
-
-```sh
 python python/bot_api.py --port 8790 --ms 100
 ```
 
-Notation accepts and exports a single winning stone on the final turn, as Tyto does. The stateless API's exactly-two-pieces schema still returns HTTP 409 for that case. Details are in [docs/notation-api.md](docs/notation-api.md).
+A final turn may hold one stone, whether it won or the turn is still open, and the origin-only board is `version[1];`. The API's reply must carry two pieces, so it answers 409 to a first-stone win. See [docs/notation-api.md](docs/notation-api.md).
 
 ## Documentation
 
-- [Dense training and value targets](docs/dense-training.md)
-- [Dense evaluation, opening books and ratings](docs/dense-evaluation.md)
-- [Six engine protocol and arena matches](docs/six-engine.md)
-- [Tactical solver](docs/tactical-solver.md)
-- [Neural search](docs/neural-search.md)
+- [Training: value targets, cheap rows, book starts](docs/dense-training.md)
+- [Evaluation: promotion, opening books, variants](docs/dense-evaluation.md)
+- [Search: Gumbel MCTS, tree reuse](docs/neural-search.md)
+- [Outcomes on the search graph](docs/search-outcomes.md)
+- [Tactical solver and its scheduling](docs/tactical-solver.md)
+- [Six: Bubble as a Six engine, Six as an opponent](docs/six-engine.md)
 - [GPU kernels](docs/gpu-kernels.md)
-- [Human corpus import](docs/human-corpus.md)
-- [Native engine and opponent matches](docs/native-engine.md)
+- [Native engine, Seal adapter, tests](docs/native-engine.md)
 - [Notation and bot API](docs/notation-api.md)
-- [Earlier NNUE and relational models](docs/earlier-models.md)
-
-## Repository layout
-
-| Path | Contents |
-|---|---|
-| `src/` | C++ rules engine, native Gumbel search and graph encoder |
-| `python/` | Network, actors, learner, evaluator, proof pass, dashboard, browser game and bindings |
-| `python/legacy/` | Earlier NNUE and relational models; the dense code still imports a few shared helpers from here |
-| `tools/tactical/` | Rust tactical solver, certificate checker and the vendored hexo-strix crates |
-| `tools/` | Build scripts, profilers and adapters for external opponents |
-| `web/` | Browser game and dashboard pages |
-| `openings/` | Fixed opening suite for evaluation |
-| `tests/` | Unit tests, fixtures and the Python reference rules |
-| `docs/` | Detailed notes on training, evaluation, the solver, GPU kernels and earlier models |
-| `requirements/` | Training dependencies and tested versions |
-
-`build/`, `runs/` and `artifacts/` hold native builds, training data and local results. Git ignores all three.
-
-## References
-
-- Danihelka et al., [Policy improvement by planning with Gumbel](https://openreview.net/forum?id=bERaNdoegnO), ICLR 2022. The root search and completed-Q policy targets follow this paper and [DeepMind's mctx](https://github.com/google-deepmind/mctx).
-- Wu, [Accelerating Self-Play Learning in Go](https://arxiv.org/abs/1902.10565), 2019 (KataGo). Playout-cap randomization and the replay window follow this paper.
-- [SootyOwl/hexo-strix](https://github.com/SootyOwl/hexo-strix), MIT licensed. Its solver crates are vendored in `tools/tactical/vendor/hexo-strix` and modified.
-- [Official HeXO source](https://github.com/HeXO-Game/HeXO/blob/1aea2b676733f8cdc53f8f92cb00b367af72111c/packages/shared/src/sharedTypes.ts), used to check the rules.
