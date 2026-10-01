@@ -36,17 +36,18 @@ def resolve_device(device):
     return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-def commands(run, actors=4, dashboard_port=8766, seal=False, kernels='reference', proof=True):
+def commands(run, actors=4, dashboard_port=8766, seal=False, kernels=None, proof=True):
     """The command line of every service for `run`, as argument lists starting with the interpreter; the proof pass
-    only when `proof`, since it needs the tactical solver build."""
+    only when `proof`, since it needs the tactical solver build. `kernels` overrides the run's configured network
+    kernels only when given."""
     python = [sys.executable, '-u']
-    evaluator = [*python, str(PYTHON / 'dense_eval.py'), 'loop', '--run', str(run), '--net-kernels', kernels]
+    net = ['--net-kernels', kernels] if kernels else []
+    evaluator = [*python, str(PYTHON / 'dense_eval.py'), 'loop', '--run', str(run), *net]
     if not seal:
         evaluator += ['--eval-anchor-games', '0', '--no-eval-anchor-on-promotion', '--eval-anchor-target-halfwidth', '0']
     plan = dict(
-        learner=[*python, str(PYTHON / 'dense_learn.py'), '--run', str(run), '--net-kernels', kernels],
-        actors=[*python, str(PYTHON / 'dense_selfplay.py'), '--run', str(run), '--processes', str(actors),
-                '--net-kernels', kernels],
+        learner=[*python, str(PYTHON / 'dense_learn.py'), '--run', str(run), *net],
+        actors=[*python, str(PYTHON / 'dense_selfplay.py'), '--run', str(run), '--processes', str(actors), *net],
         evaluator=evaluator,
         proof=[*python, str(PYTHON / 'dense_solve.py'), '--run', str(run)],
         dashboard=[*python, str(PYTHON / 'dashboard.py'), '--run', str(run), '--port', str(dashboard_port)])
@@ -214,10 +215,11 @@ class Launcher:
         except (OSError, ValueError):
             return None
 
-    def prepare(self, device, run_steps, actors=None):
+    def prepare(self, device, run_steps, actors=None, tactical=True):
         """Create the run configuration (on `device`, `auto` resolved then) and the first checkpoint when either is
-        missing; `run_steps` runs a command. An existing run must agree with an explicit `device`, and its phase
-        schedule may not wait for more workers than `actors` starts."""
+        missing; `run_steps` runs a command. An existing run must agree with an explicit `device`, its phase
+        schedule may not wait for more workers than `actors` starts, and its solver budgets need the tactical
+        build (`tactical`)."""
         config = self.config()
         if config is None:
             run_steps([sys.executable, str(PYTHON / 'dense_config.py'), '--run', str(self.run), '--device',
@@ -232,6 +234,11 @@ class Launcher:
             if phase_actors > 0 and not (config.get('actor') or {}).get('phase_follow', False):
                 raise RuntimeError(f'{self.run} phases wait for actors that never acknowledge them; '
                                    'set actor.phase_follow to true in its config.json')
+            budgets = [value for section in ('actor', 'evaluation') for key, value in (config.get(section) or {}).items()
+                       if key.startswith('solver_') and key.endswith('_nodes') and isinstance(value, int)]
+            if not tactical and any(budgets):
+                raise RuntimeError(f'{self.run} uses solver budgets but the tactical solver is not built; '
+                                   'run python tools/build_tactical.py or set the solver_*_nodes settings to 0')
         # Play-only installs (variant `play`, weights without optimizer state) never count as a learner checkpoint.
         exports = (self.run / 'checkpoints' / self.variant()).glob('*/ema.pt')
         learner_files = ('model.pt', 'optimizer.pt', 'manifest.json')
@@ -425,7 +432,7 @@ def main():
     train.add_argument('--actors', type=positive, default=4, help='self-play processes')
     train.add_argument('--dashboard-port', type=int, default=8766)
     train.add_argument('--seal', action='store_true', help='rate champions against Seal (needs the Seal build)')
-    train.add_argument('--net-kernels', choices=['reference', 'fused'], default='reference')
+    train.add_argument('--net-kernels', choices=['reference', 'fused'], help="override the run's configured kernels")
     play = sub.choices['play']
     play.add_argument('--port', type=int, default=8765)
     play.add_argument('--model', type=Path, help="an ema.pt file to play, passed straight to the server")
@@ -440,7 +447,7 @@ def main():
             print('proof pass skipped: build the tactical solver first (python tools/build_tactical.py)')
         plan = commands(launcher.run, args.actors, args.dashboard_port, args.seal, args.net_kernels, proof)
         prepare = lambda: launcher.prepare(args.device, lambda command: subprocess.run(command, cwd=ROOT, check=True),
-                                           args.actors)
+                                           args.actors, proof)
         for name, entry in launcher.start(plan, prepare).items():
             print(f'{name:<10} pid {entry["pid"]}')
         print(f'dashboard  http://127.0.0.1:{args.dashboard_port}  logs {launcher.run / "logs"}')

@@ -50,10 +50,12 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn('proof', plan)
         self.assertEqual(set(plan) | {'proof'}, set(bubble.SERVICES))
 
-    def test_kernels_reach_gpu_services(self):
+    def test_kernels_reach_gpu_services_only_when_given(self):
         plan = bubble.commands(Path('runs/x'), kernels='fused')
         for name in ('learner', 'actors', 'evaluator'):
             self.assertEqual(plan[name][plan[name].index('--net-kernels') + 1], 'fused', name)
+        for command in bubble.commands(Path('runs/x')).values():
+            self.assertNotIn('--net-kernels', command)
 
 
 class ModelTests(unittest.TestCase):
@@ -169,6 +171,14 @@ class LauncherTests(unittest.TestCase):
                                                               actor=dict(phase_follow=True))))
         self.launcher.prepare('auto', calls.append, 6)
         self.assertEqual([Path(c[1]).name for c in calls], ['dense_learn.py'])
+
+    def test_prepare_requires_the_tactical_build_for_solver_budgets(self):
+        (self.run / 'config.json').write_text(json.dumps(dict(actor=dict(solver_root_nodes=135))))
+        with self.assertRaises(RuntimeError):
+            self.launcher.prepare('auto', lambda c: None, 4, tactical=False)
+        self.launcher.prepare('auto', lambda c: None, 4, tactical=True)
+        (self.run / 'config.json').write_text(json.dumps(dict(actor=dict(solver_root_nodes=0))))
+        self.launcher.prepare('auto', lambda c: None, 4, tactical=False)
 
     def test_prepare_probes_the_configured_variant(self):
         (self.run / 'config.json').write_text(json.dumps(dict(learner=dict(variant='alt'))))
