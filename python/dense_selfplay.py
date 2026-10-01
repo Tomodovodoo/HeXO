@@ -586,8 +586,12 @@ class SelfPlayGame:
         return self.trees[self.model]
 
     def plan(self):
+        """Draw the next search's kind (full with probability full_fraction), budget and root samples. With
+        full_turns, the second stone of a turn whose first stone this game searched keeps that stone's kind."""
         s = self.settings
-        self.is_full = bool(self.rng.random() < s.full_fraction)
+        ply = len(self.moves) if s.full_turns else 0
+        if not (ply and ply % 2 == 0 and ply > self.forced_plies):
+            self.is_full = bool(self.rng.random() < s.full_fraction)
         self.budget = s.full_sims if self.is_full else s.cheap_sims
         self.samples = s.root_samples if self.is_full else min(s.root_samples, s.cheap_root_samples, s.cheap_sims)
 

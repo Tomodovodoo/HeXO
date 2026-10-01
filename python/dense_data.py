@@ -1081,6 +1081,21 @@ def crop_index(s, points):
     return np.where(inside, y*s.size+x, -1)
 
 
+def pair_policy(policy, actions, second_actions, second_policy, weight):
+    """(policy + weight * second)/(1 + weight) over `actions`, a first stone's legal list, where second is
+    `second_policy` (over `second_actions`, the legal list after the first stone) restricted to `actions` and
+    renormalised. A turn's two stones reach the same position in either order, so a good second stone is also a
+    good first stone. Returns `policy` unchanged when no second-stone mass lands on `actions`."""
+    index = {cell: i for i, cell in enumerate(map(tuple, np.asarray(actions).tolist()))}
+    second = np.zeros(len(actions), np.float64)
+    for cell, p in zip(map(tuple, np.asarray(second_actions).tolist()), second_policy):
+        if cell in index:
+            second[index[cell]] += p
+    if second.sum() <= 0:
+        return policy
+    return ((policy + weight*second/second.sum())/(1+weight)).astype(np.float32)
+
+
 def target_options(settings, calibration=None):
     """examples() keyword arguments from a LearnerSettings and the current Calibration: finished games get
     outcome_lambda only with value_target 'td' and `calibration` only with 'calibrated' (hard outcomes while
@@ -1091,13 +1106,14 @@ def target_options(settings, calibration=None):
                 calibration=calibration if settings.value_target == 'calibrated' else None,
                 proven_weight=settings.proven_value_weight, proof_policy_weight=settings.proof_policy_weight,
                 proof_policy_missing_only=settings.proof_policy_missing_only,
+                pair_policy_weight=settings.pair_policy_weight,
                 deblunder_weight=settings.deblunder_weight, future_target=settings.future_target,
                 short_value_target=settings.short_value_target)
 
 
 def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False,
              outcome_lam=1., calibration=None, proven_weight=2., deblunder_weight=0., proof_policy_weight=0., future_target='legacy',
-             short_value_target='future', proof_policy_missing_only=False):
+             short_value_target='future', proof_policy_missing_only=False, pair_policy_weight=0.):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
     Positions are encoded from the move prefix without replaying it (hexcrop.Position); the side to move and the
@@ -1107,7 +1123,9 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         a proven win carrying proof_action mixes (search + weight * proof)/(1 + weight), where proof is uniform
         over the certificate's remaining placements. Without search, use proof with loss weight equal to
         proof_policy_weight. With proof_policy_missing_only, certificate targets apply only when the search
-        policy is empty. Losing rows and rows without a witness keep their original policy;
+        policy is empty. Losing rows and rows without a witness keep their original policy. With
+        pair_policy_weight > 0, a first stone whose search policy and second stone's search policy both exist
+        first takes pair_policy(policy, ..., pair_policy_weight);
       value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam, calibration) at the ply;
         weight 1 for finished games, `bootstrap_weight` for capped games with root values, 0 otherwise, times
         `cheap_value_weight` for cheap-search rows; a row with a nonzero `proven` instead gets the proven value
@@ -1148,7 +1166,15 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         if proven and manual and proven != manual:
             raise ValueError(f'Native proof contradicts manual opening result: {ref.shard}/{ref.index}')
         fixed = proven or manual
+        nref = window.following(ref)
+        next_policy = window.policy(nref) if nref is not None else np.zeros(0, np.float32)
+        if len(next_policy):
+            next_actions = hexcrop.legal_array(hexcrop.Position(moves[:t+1]), moves[:t+1])
+            if len(next_actions) != len(next_policy) or legal_digest(next_actions) != nref.row['legal_sha256']:
+                raise ValueError(f'Next-ply legal list disagrees with row: {nref.shard}/{nref.index}')
         policy_weight = float(len(policy) > 0)
+        if pair_policy_weight > 0 and s.remaining == 2 and len(policy) and len(next_policy):
+            policy = pair_policy(policy, s.actions, next_actions, next_policy, pair_policy_weight)
         if (proof_policy_weight > 0 and proven > 0 and ref.row.get('proof_action')
                 and (not proof_policy_missing_only or not len(policy))):
             action = np.asarray(ref.row['proof_action'], np.int64).reshape(-1, 2)
@@ -1189,12 +1215,9 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
                 if cell >= 0:
                     future.reshape(-1)[cell] = 1 if player_at(u) == me else 2
             known = known[1:]
-        nref = window.following(ref); following = (np.zeros(0, np.int64), np.zeros(0, np.float32), 0.)
-        if nref is not None and len(p := window.policy(nref)):
-            actions = hexcrop.legal_array(hexcrop.Position(moves[:t+1]), moves[:t+1])
-            if len(actions) != len(p) or legal_digest(actions) != nref.row['legal_sha256']:
-                raise ValueError(f'Next-ply legal list disagrees with row: {nref.shard}/{nref.index}')
-            cells = crop_index(s, actions); p = np.where(cells >= 0, p, 0).astype(np.float32)
+        following = (np.zeros(0, np.int64), np.zeros(0, np.float32), 0.)
+        if len(next_policy):
+            cells = crop_index(s, next_actions); p = np.where(cells >= 0, next_policy, 0).astype(np.float32)
             if p.sum() > 0:
                 following = (cells, p/p.sum(), 1.)
         samples.append(s)

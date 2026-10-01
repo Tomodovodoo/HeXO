@@ -32,6 +32,7 @@ class ActorSettings:
     full_sims: int = 64          # recorded policy targets come from these searches
     cheap_sims: int = 12         # value-only positions; no policy row
     full_fraction: float = .25   # KataGo playout-cap randomization share
+    full_turns: bool = False     # a turn's second stone repeats its first stone's full or cheap draw
     root_samples: int = 16       # Gumbel m
     cheap_root_samples: int = 4  # leave cheap searches enough visits to descend beyond the root
     max_plies: int = 256
@@ -164,6 +165,7 @@ class LearnerSettings:
     proven_value_weight: float = 2.  # value weight of rows the solver proved; their target is the proven value
     proof_policy_weight: float = 0.  # mix (search + weight * proof)/(1 + weight); proof-only rows have this loss weight
     proof_policy_missing_only: bool = False  # use certificate moves only on rows without a search policy
+    pair_policy_weight: float = 0.  # first stones mix (search + weight * second stone's search)/(1 + weight)
     validation_fraction: float = .03
     validation_rows: int = 8192   # rows per per-source validation subset (dense_data.ValidationSets limit)
     validation_quota: int = 128   # rows each shard may contribute to a subset (ValidationSets quota)
@@ -200,6 +202,8 @@ class LearnerSettings:
             raise ValueError('phase_export requires positive export_every, batch and samples_per_row')
         if not 0 <= self.proof_policy_weight < float('inf'):
             raise ValueError('proof_policy_weight must be finite and nonnegative')
+        if not 0 <= self.pair_policy_weight < float('inf'):
+            raise ValueError('pair_policy_weight must be finite and nonnegative')
         if not 0 <= self.regret_fraction <= 1:
             raise ValueError('regret_fraction must lie in [0, 1]')
 

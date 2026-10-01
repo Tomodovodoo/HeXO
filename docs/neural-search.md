@@ -18,7 +18,7 @@ The root samples `root_samples` moves without replacement by Gumbel-top-k over t
 
 Values are stored from the mover's view and flip sign only when the mover changes, so a turn's two placements back up without a sign flip. Terminal boards and the one-turn tactics oracle give exact values, and the solver adds certificates; how those propagate is in [search-outcomes.md](search-outcomes.md).
 
-`advance(action)` keeps the played move's subtree, with its visits, values and proofs, and frees the rest. In self-play both colours share one tree per model, so the opponent's search deepens the tree the next turn reads. Reused visits act as priors: the halving schedule restarts and the Gumbel noise is redrawn at every search.
+`advance(action)` keeps the played move's subtree, with its visits, values and proofs, and frees the rest. In self-play both colours share one tree per model, so the opponent's search deepens the tree the next turn reads. Fixed-budget play in `play.py` and `dense_player.py` keeps one tree for the whole turn, so the second stone's search starts from the continuation the first stone's search grew. Reused visits act as priors: the halving schedule restarts and the Gumbel noise is redrawn at every search.
 
 `NeuralSearch(..., graph=True)` (actor and evaluation setting `search_graph`, off by default) turns the tree into a transposition graph with Monte-Carlo graph search backups, shared proofs by position and `census()` diagnostics; see [search-outcomes.md](search-outcomes.md).
 

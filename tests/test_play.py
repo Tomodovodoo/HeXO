@@ -681,6 +681,50 @@ class Proofs(unittest.TestCase):
         self.assertEqual([proof_turns(p, 2, False) for p in (3, 4, 7, 8)], [1, 1, 2, 2])
 
 
+class TurnTrees(unittest.TestCase):
+    """A fixed-budget play turn searches its second stone in the tree its first stone grew."""
+
+    def setUp(self):
+        import hexnet
+        import neural_search
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.path = Path(self.folder.name)/'ema.pt'
+        hexnet.save_model(self.path, hexnet.HexNet(hexnet.HexNetConfig(
+            blocks=1, channels=8, pool_every=1, line_length=5, value_hidden=8, head_channels=4)))
+        self.trees = []
+        trees = self.trees
+
+        class Spy(neural_search.NeuralSearch):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.searched = []
+                trees.append(self)
+
+            def search(self, *args, **kwargs):
+                result = super().search(*args, **kwargs)
+                self.searched.append((list(self.history), result['completed'], int(result['visits'].sum())))
+                return result
+        patcher = unittest.mock.patch.object(neural_search, 'NeuralSearch', Spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_play_evaluation_keeps_one_tree_for_the_turn(self):
+        import hexnet
+        import neural_search
+        from play import evaluate
+        from types import SimpleNamespace
+        model = hexnet.load_model(self.path)
+        bubble = SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=16), sha256='tiny',
+                                 cache=neural_search.EvaluationCache())
+        moves = evaluate(bubble, None, [(0, 0)], 32, 0)['moves']
+        self.assertEqual(len(self.trees), 1)
+        tree = self.trees[0]
+        self.assertEqual([h for h, _, _ in tree.searched], [[(0, 0)], [(0, 0), tuple(moves[0])]])
+        self.assertGreater(tree.searched[1][2], tree.searched[1][1])
+        self.assertIsNone(tree.ptr)
+
+
 class Registry(unittest.TestCase):
     def test_six_takes_the_fastest_backend_it_can_load(self):
         library = lambda kind: SIX_LIBRARIES[kind][os.name != 'nt']

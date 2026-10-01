@@ -386,7 +386,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     history = [tuple(map(int, p)) for p in history]
     local = replay(history)
     start, player = time.perf_counter(), local.player
-    moves, top, value, proof, line, threat, solved = [], [], None, None, [], [], True
+    moves, top, value, proof, line, threat, solved, tree = [], [], None, None, [], [], True, None
     deadline = min(60_000, max(10_000, solver_nodes // 8))
     network = Watched(bubble.evaluator, watch)
     try:
@@ -409,11 +409,9 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         while not given and local.player == player and local.winner < 0:
             current = [tuple(cell[:2]) for cell in local.cells]
             if simulations:
-                tree = NeuralSearch(network, bubble.sha256, current, seed=1740, cache=bubble.cache, tactics=True)
-                try:
-                    result = tree.search(simulations, root_samples=16, batch_size=16)
-                finally:
-                    tree.close()
+                if tree is None:
+                    tree = NeuralSearch(network, bubble.sha256, current, seed=1740, cache=bubble.cache, tactics=True)
+                result = tree.search(simulations, root_samples=16, batch_size=16)
                 action, policy, actions = result['action'], result['policy'], result['actions']
                 stone_value = root_value(result, local.player)
                 proven = result.get('proven') or 0
@@ -431,11 +429,15 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 value = (stone_value + 1) / 2
             moves.append([int(action[0]), int(action[1])])
             local.play(*moves[-1])
+            if tree is not None:
+                tree.advance(tuple(moves[-1]))
         if proof:
             value = 1. if proof['winner'] == player else 0.
         return dict(moves=moves, value=round(value, 4), top=top, proof=proof, line=line, threat=threat,
                     solved=solved, ms=round((time.perf_counter() - start) * 1000))
     finally:
+        if tree is not None:
+            tree.close()
         local.close()
 
 
