@@ -869,16 +869,17 @@ class Session:
             self.changed()
 
     def rescan(self):
-        """Replace the engine list. A seat follows its engine to a new id when only the id changed; a seat whose
-        engine or checkpoint is gone becomes a person, and analysis falls back to the first Bubble model."""
+        """Replace the engine list. A seat follows its engine, matched by kind and path, to its id in the new list;
+        a seat whose engine or checkpoint is gone becomes a person, and analysis falls back to the first Bubble
+        model."""
         entries = self.rescan_entries()
         identity = lambda e: (e['kind'], str(e.get('path') or e.get('command') or e.get('model')))
         def follow(seat):
             old = self.entries.get(seat['engine'])
-            moved = next((e['id'] for e in entries.values() if old and identity(e) == identity(old)), seat['engine'])
+            moved = next((e['id'] for e in entries.values() if old and identity(e) == identity(old)), None)
             return seat | dict(engine=moved)
         def valid(seat):
-            entry = entries.get(seat['engine'])
+            entry = entries.get(seat['engine']) if seat['engine'] else None
             return entry is not None and (entry['kind'] != 'bubble' or seat['checkpoint'] in entry['checkpoints'])
         with self.lock:
             followed = [seat if seat['engine'] == 'human' else follow(seat) for seat in self.seats]

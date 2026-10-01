@@ -213,14 +213,14 @@ async function poll(){
   setTimeout(poll,S&&S.jobs.length?350:1500);
 }
 const failures=new Set();
-function active(jobs){
-  for(const j of jobs)if(j.status==='failed'&&!failures.has(j.id)){failures.add(j.id);toast(j.error)}
+function active(jobs,instance){
+  for(const j of jobs){const id=instance+':'+j.id;if(j.status==='failed'&&!failures.has(id)){failures.add(id);toast(j.error)}}
   return jobs.filter(j=>j.status!=='failed');
 }
 function accept(data){
   if(S&&data.instance===S.instance&&data.revision<S.revision)return;
   if(S&&!('history' in data)&&data.instance!==S.instance){S.revision=-1;return}
-  data.jobs=active(data.jobs);
+  data.jobs=active(data.jobs,data.instance);
   if('history' in data){
     const live=!S||view>=S.history.length,before=S?S.history.length:null;
     S=data;

@@ -383,6 +383,13 @@ class Jobs(unittest.TestCase):
         self.session.rescan_entries = lambda: renamed
         self.session.rescan()
         self.assertEqual(self.session.state()['analysis']['engine'], 'bubble:fake')
+        with tempfile.TemporaryDirectory() as directory:
+            elsewhere = {k: v for k, v in renamed.items()}
+            elsewhere['bubble:fake'] = dict(renamed['bubble:fake'], path=Path(directory))
+            self.session.configure_seat(1, 'bubble:fake')
+            self.session.rescan_entries = lambda: elsewhere
+            self.session.rescan()
+            self.assertEqual(self.session.state()['seats'][1], dict(engine='human'))
 
     def test_cancelled_native_searches_end_and_the_next_starts_at_once(self):
         engines = Engines('cpu')
