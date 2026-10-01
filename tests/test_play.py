@@ -833,7 +833,8 @@ class Formats(unittest.TestCase):
         self.assertEqual(formats.rectilinear_loads('x A0 H2.2 o A1 G2.2'),
                          formats.rectilinear_loads('o, d @(0, 0) x A0 H2.2 o A1 G2.2'))
         self.assertEqual(formats.rectilinear_loads('c-x'), [[0, 0]])
-        for bad in ('xx', 'o/xo, q @(1, 1) o A0 B1', 'x(!', 'xz'):
+        self.assertEqual(len(formats.rectilinear_loads('x, o A0 A1 x B1')), 4)
+        for bad in ('xx', 'o/xo, q @(1, 1) o A0 B1', 'x(!', 'xz', 'x, o A0 x A1 A2', 'x, o A0 A1 A2'):
             with self.assertRaises(ValueError):
                 formats.rectilinear_loads(bad)
 

@@ -211,9 +211,11 @@ def rectilinear_loads(text):
     while pools['x'] or pools['o']:
         stones += [pools[mover].pop(0), pools[mover].pop(0)]
         mover = first if mover == second else second
-    for player, moves in turns:
+    for index, (player, moves) in enumerate(turns):
         if player != mover:
             raise ValueError(f'BKE turn by {player} where {mover} moves')
+        if len(moves) > 2 or len(moves) < 2 and index < len(turns) - 1:
+            raise ValueError(f'BKE turn {index + 1} has {len(moves)} stones; every turn but the last has two')
         stones += moves
         mover = first if mover == second else second
     if len(set(stones)) != len(stones):
