@@ -782,7 +782,8 @@ class Pacer:
     """Ceiling on the evaluator's playing share of wall time, a token bucket: credit accrues at `share` per
     wall second, capped at `share * window` while not playing (a new pacer starts full), playing spends
     `weight` per second, and wait(tick) sleeps while credit is negative, calling tick()
-    before each sleep of at most 10 s; share 1 with weight 1 never waits. used() is the weighted playing
+    before each sleep of at most a second and returning early once tick() returns true; share 1 with weight 1
+    never waits. used() is the weighted playing
     share of the last `window` seconds (of the pacer's lifetime while shorter)."""
 
     def __init__(self, share, window=PACE_WINDOW, clock=time.monotonic, sleep=time.sleep):
@@ -814,9 +815,8 @@ class Pacer:
 
     def wait(self, tick=lambda: None):
         self.refill(self.clock())
-        while self.credit < -1e-6:
-            tick()
-            self.sleep(min(10., -self.credit/self.share))
+        while self.credit < -1e-6 and not tick():
+            self.sleep(min(1., -self.credit/self.share))
             self.refill(self.clock())
 
 
@@ -1192,7 +1192,7 @@ class Evaluator:
         is negative, and with nothing running the session then waits and asks want() again. Every completed
         pair is persisted at once. stop(), when supplied (a newer export, settle request, or a checkpoint
         interrupting a variant), is asked after every engine step that finishes a game and at least once a
-        second while the pool plays or busy pacing holds it; once it holds, the session abandons every game in flight and every finished
+        second while the session plays or either pacer holds it; once it holds, the session abandons every game in flight and every finished
         half awaiting its colour partner, publishes the idle status at once and logs an 'abandon' event with
         the main lane, games_abandoned and halves_discarded.
         Status shows the session's pairing from its first pass. When auxiliary is supplied, free slots
@@ -1242,8 +1242,8 @@ class Evaluator:
                     abandoned = pool.running(), sum(len(group) for groups in waiting.values() for group in groups.values())
             return abandoned is not None
 
-        def throttle():
-            show('throttled')
+        def throttle(force=False):
+            show('throttled', force)
             return halt()
         while True:
             self.busy_pacer.wait(pool.synchronize, throttle)
@@ -1317,7 +1317,9 @@ class Evaluator:
                 self.busy_pacer.played(tick, end)
             if not pool.running():
                 if lanes and not ready:
-                    self.pacer.wait(lambda: show('throttled', True))
+                    self.pacer.wait(lambda: throttle(True))
+                    if abandoned:
+                        break
                     primary = want()  # the wait may have outlasted the pairing (a newer checkpoint)
                     continue
                 break

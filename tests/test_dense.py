@@ -4838,7 +4838,7 @@ class PacerTests(unittest.TestCase):
         pacer.wait(lambda: ticks.append(now[0]))
         # 25 s of credit + 10 s accrued while playing - 40 s played: 5 s of debt repaid at a quarter per second.
         self.assertAlmostEqual(sum(slept), 20.)
-        self.assertLessEqual(max(slept), 10.)
+        self.assertLessEqual(max(slept), 1.)
         self.assertEqual(len(ticks), len(slept))
         self.assertAlmostEqual(pacer.used(), 40/60)
         now[0] = 1000.
@@ -5817,6 +5817,27 @@ class EvaluatorLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([(e['candidate'], e['games_abandoned'], e['halves_discarded']) for e in events if e['kind'] == 'abandon'],
                          [('main/000030', 4, 0)])
+
+    def test_supersession_is_noticed_while_the_share_pacer_holds_an_empty_pool(self):
+        evaluator = self.start(sprt_max_games=40, pool_games=4)
+        self.export(10)
+        evaluator.step()
+        self.export(30)
+        now, slept = [0.], []
+        def sleep(seconds):
+            if not slept:
+                self.export(40)
+            slept.append(seconds)
+            now[0] += seconds
+        evaluator.pacer = dense_eval.Pacer(.5, clock=lambda: now[0], sleep=sleep)
+        evaluator.pacer.credit = -100.
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(slept, [1.])
+        self.assertTrue(evaluator.entry('main/000030')['skipped'])
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([(e['candidate'], e['games_abandoned'], e['halves_discarded']) for e in events if e['kind'] == 'abandon'],
+                         [('main/000030', 0, 0)])
 
     def test_the_pool_refills_as_games_finish(self):
         """Games stream one at a time: a finished game's slot is refilled before the next step, and the status
