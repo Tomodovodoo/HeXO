@@ -15,10 +15,12 @@ from urllib.request import Request, urlopen
 
 from hexo import Game
 from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings, budget_of,
-                  export_path, file_digest, file_identity, import_history, model_key, presets_of, proof_turns, review, scan, six_backend)
+                  export_path, file_digest, file_identity, import_history, model_key, presets_of, proof_turns, review, scan, site_history,
+                  six_backend)
 from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
+SITE = Path(__file__).parent / 'fixtures' / 'hexo-site'
 
 
 def legal_turn(history):
@@ -69,7 +71,7 @@ class FakeEngines:
             time.sleep(.01)
         watch(budget['simulations'])
         moves = legal_turn(history)
-        found = dict(moves=moves, value=.5, top=[[*moves[0], .9]], proof=None, line=[], threat=[], ms=1)
+        found = dict(moves=moves, value=.5, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1)
         return found, budget, f'{model_key(export_path(entry, checkpoint))}:none'
 
     def solver_build(self):
@@ -147,6 +149,19 @@ class Store(unittest.TestCase):
         self.assertEqual(store.best([], 'e')['value'], .1)
         store.add([], 'e', dict(simulations=32, solver_nodes=131072), dict(value=1., moves=[], top=[], proof=dict(winner=0, turns=2)))
         self.assertEqual(store.best([], 'e')['value'], 1.)
+
+    def test_evaluations_without_move_values_are_shown_last_and_never_reused(self):
+        store = Evaluations()
+        store.add([], 'e', dict(simulations=512, solver_nodes=0), dict(value=.1, moves=[], top=[[0, 0, 1.]]))
+        self.assertIsNone(store.covering([], 'e', dict(simulations=32, solver_nodes=0)))
+        store.add([], 'e', dict(simulations=32, solver_nodes=0), dict(value=.2, moves=[], top=[[0, 0, 1., .2]]))
+        self.assertEqual(store.covering([], 'e', dict(simulations=32, solver_nodes=0))['value'], .2)
+        self.assertEqual(store.best([], 'e')['value'], .2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'evaluations.jsonl'
+            path.write_text(json.dumps(dict(position='', engine='e', simulations=1, solver_nodes=0, value=.3, moves=[],
+                                            top=[[0, 0, 1., 'x']])), encoding='utf-8')
+            self.assertIsNone(Evaluations(path).best([], 'e'))
 
     def test_index_keeps_the_newest_entries(self):
         store = Evaluations(limit=2)
@@ -447,6 +462,12 @@ class Jobs(unittest.TestCase):
         self.assertFalse(self.session.worker.is_alive())
         self.assertEqual(closed, [True])
 
+    def test_a_stone_placed_on_a_paused_game_gets_its_answer(self):
+        self.session.pause(True)
+        self.session.play(0, 0)
+        wait(lambda: len(self.history()) == 3)
+        self.assertFalse(self.session.paused)
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
@@ -660,6 +681,12 @@ class Http(unittest.TestCase):
             finally:
                 self.session.close()
 
+    def test_import_loads_a_hexo_site_link(self):
+        with unittest.mock.patch('play.fetch_json', return_value=SiteImport.sandbox) as fetch:
+            state = self.post('/import', dict(text='https://hexo.did.science/sandbox/2mdyn02'))
+        fetch.assert_called_once_with('https://hexo.did.science/api/sandbox-positions/2mdyn02')
+        self.assertEqual((len(state['history']), state['paused']), (7, True))
+
     def test_import_export_retry_and_origin(self):
         self.post('/seat', dict(side=1, engine='human'))
         state = self.post('/import', dict(text='version[1];\n1. [1,0][2,0];'))
@@ -703,6 +730,47 @@ class Http(unittest.TestCase):
         caught.exception.close()
         local = {'Origin': f'http://localhost:{port}', 'Host': f'localhost:{port}'}
         self.assertEqual(self.post('/new', headers=local)['history'], [])
+
+
+class SiteImport(unittest.TestCase):
+    """Recorded API answers of hexo.did.science; hexo.mineking.dev serves the same API under /proxy/api."""
+    game = json.loads((SITE / 'finished-game.json').read_text(encoding='utf-8'))
+    sandbox = json.loads((SITE / 'sandbox-position.json').read_text(encoding='utf-8'))
+
+    def fetched(self, url, answer):
+        asked = []
+        history = site_history(url, lambda api: asked.append(api) or answer)
+        return history, asked
+
+    def test_games_and_sandbox_positions_become_htttx_histories(self):
+        history, asked = self.fetched('https://hexo.did.science/games/8211f449-5020-4a5a-9a93-581c5f720aac', self.game)
+        self.assertEqual(asked, ['https://hexo.did.science/api/finished-games/8211f449-5020-4a5a-9a93-581c5f720aac'])
+        self.assertEqual((len(history), history[:3]), (39, [[0, 0], [1, 2], [2, 1]]))
+        game = Game(history)
+        self.assertEqual(game.winner, 1)
+        game.close()
+        _, asked = self.fetched('https://hexo.mineking.dev/account/games/8211f449-5020-4a5a-9a93-581c5f720aac/', self.game)
+        self.assertEqual(asked, ['https://hexo.mineking.dev/proxy/api/finished-games/8211f449-5020-4a5a-9a93-581c5f720aac'])
+        history, asked = self.fetched('https://hexo.mineking.dev/sandbox/2MDYN02', self.sandbox)
+        self.assertEqual(asked, ['https://hexo.mineking.dev/proxy/api/sandbox-positions/2mdyn02'])
+        self.assertEqual(history, [[0, 0], [1, -1], [0, 1], [1, 0], [-1, 0], [2, 0], [-4, 0]])
+
+    def test_other_text_is_left_alone_and_bad_links_are_refused(self):
+        for text in ('version[1];\n1. [1,0][2,0];', 'https://example.com/games/1', '[[0, 0]]'):
+            self.assertIsNone(site_history(text, self.fail))
+        with self.assertRaises(ValueError):
+            site_history('https://hexo.did.science/leaderboard', self.fail)
+        moved = json.loads(json.dumps(self.sandbox))
+        for cell in moved['gamePosition']['cells']:
+            cell['x'] += 3
+        self.assertEqual(self.fetched('https://hexo.did.science/sandbox/2mdyn02', moved)[0][:2], [[0, 0], [1, -1]])
+        swapped = json.loads(json.dumps(self.sandbox))
+        swapped['gamePosition']['cells'][1]['player'] = 'player-1'
+        with self.assertRaises(ValueError):
+            self.fetched('https://hexo.did.science/sandbox/2mdyn02', swapped)
+
+    def fail(self, url):
+        raise AssertionError(f'fetched {url}')
 
 
 class Matches(unittest.TestCase):
@@ -968,7 +1036,10 @@ class TurnTrees(unittest.TestCase):
         model = hexnet.load_model(self.path)
         bubble = SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=16), sha256='tiny',
                                  cache=neural_search.EvaluationCache())
-        moves = evaluate(bubble, None, [(0, 0)], 32, 0)['moves']
+        found = evaluate(bubble, None, [(0, 0)], 32, 0)
+        moves = found['moves']
+        for top in (found['top'], evaluate(bubble, None, [(0, 0)], 0, 0)['top']):
+            self.assertTrue(top and all(len(t) == 4 and 0 <= t[3] <= 1 for t in top))
         self.assertEqual(len(self.trees), 1)
         tree = self.trees[0]
         self.assertEqual([h for h, _, _ in tree.searched], [[(0, 0)], [(0, 0), tuple(moves[0])]])
@@ -1015,6 +1086,7 @@ class Registry(unittest.TestCase):
             self.assertEqual(list(found), ['six:Six gen-0120 · CPU', 'six:Six gen-0100 · CPU', 'six:shrimp',
                                            'strix:Strix', 'native:Native'])
             six = found['six:Six gen-0120 · CPU']
+            self.assertEqual((six['label'], six['variant'], found['six:shrimp']['label']), ('Six', 'gen-0120 · CPU', 'shrimp'))
             self.assertEqual((six['command'][1:], six['mirrored']),
                              (['--net', str(models / 'six/gen-0120.onnx'), '--cpu'], True))
             shrimp = found['six:shrimp']
@@ -1042,6 +1114,8 @@ class Registry(unittest.TestCase):
             self.assertEqual(list(found), ['bubble:alpha', 'bubble:broken', 'bubble:beta', 'bubble:gamma', 'native:Native'])
             self.assertEqual(found['bubble:alpha']['checkpoints'], ['play/000150', 'main/000200', 'main/000100'])
             self.assertEqual(found['bubble:beta']['checkpoints'], [''])
+            self.assertEqual([found[k]['label'] for k in ('bubble:alpha', 'bubble:broken', 'bubble:gamma')],
+                             ['Bubble', 'broken', 'gamma'])
             (root / 'models/gamma').mkdir()
             (root / 'models/gamma/ema.pt').write_bytes(b'')
             twins = [k for k in scan(root / 'models', root / 'runs', [], None) if k.startswith('bubble:gamma')]

@@ -42,7 +42,7 @@ cmake --build build --config Release --parallel 2
 python python/bubble.py play
 ```
 
-The last command downloads the newest [released Bubble](https://github.com/Tomodovodoo/HeXO/releases) (4.4 MB) into `runs/play` the first time and opens the game at <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. Either side can be you, Bubble, the native engine or Seal, so engines can also play each other while you watch. The page shows Bubble's win estimate and suggested moves, saves every evaluation, labels each turn from best to blunder, and imports and exports HTTTX. [docs/play.md](docs/play.md) has the details.
+The last command downloads the newest [released Bubble](https://github.com/Tomodovodoo/HeXO/releases) (4.4 MB) into `runs/play` the first time and opens the game at <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. Either side can be you, Bubble, the native engine or Seal, so engines can also play each other while you watch. The page shows Bubble's win estimate and suggested moves, saves every evaluation, labels each turn from best to blunder, and imports HTTTX or a hexo.did.science or hexo.mineking.dev game or sandbox link. [docs/play.md](docs/play.md) has the details.
 
 To play a particular checkpoint, point it at the file or at a run you trained:
 
@@ -52,6 +52,8 @@ python python/bubble.py play --run runs/dense-v1
 ```
 
 The engine picker also lists every run under `runs/` and every model under `models/`, champion first. A GPU is used when PyTorch sees one; add `--device cpu` otherwise. The solver needs the Rust build from the next section; without it Bubble plays on search alone. Without any weights, `python python/play.py` serves the handwritten native engine.
+
+Other engines go in `models/` (or `--models`), then the rescan button in the picker: a Six folder with `sixengine.exe` and its `gen-*.onnx` networks, or a JSON entry such as `{"name": "Strix", "kind": "strix", "model": "strix.safetensors"}` beside its model file. [docs/play.md#engines](docs/play.md#engines) lists the files per engine and the entry format for Strix, Shrimp and other Six-protocol engines.
 
 ## Build Bubble
 

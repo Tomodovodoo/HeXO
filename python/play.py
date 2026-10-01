@@ -23,6 +23,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -45,6 +47,9 @@ PRESETS = dict(
                deep=dict(simulations=512)))
 LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 1_500_000), ms=(10, 120_000), nodes=(1, 50_000_000))
 KIND_LIMITS = dict(strix=dict(simulations=(1, 16384)))
+HEXO_SITES = {'hexo.did.science': 'https://hexo.did.science/api',
+              'hexo.mineking.dev': 'https://hexo.mineking.dev/proxy/api'}
+SHOWN = ('id', 'name', 'label', 'variant', 'kind', 'presets', 'checkpoints')
 # Each library Six's backends need, as its Windows and its POSIX file name
 SIX_LIBRARIES = dict(cuda=('cudart64_12.dll', 'libcudart.so.12'), cudnn=('cudnn64_9.dll', 'libcudnn.so.9'),
                      tensorrt=('nvinfer_10.dll', 'libnvinfer.so.10'), directml=('DirectML.dll', None),
@@ -238,29 +243,31 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     `models`. A directory in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once per network,
     on the backend `six_backend` finds. `models/<name>.json` adds one entry: {"name", "kind": "bubble", "path"},
     {"name", "kind": "six", "command", "mirrored", "presets"} or {"name", "kind": "strix", "model"}, paths
-    relative to the file. Entries carry `id`, `name`, `kind`, `presets`, and the server-only `path` and
-    `checkpoints` (Bubble), `command`, `cwd`, `mirrored` and `libraries` (Six protocol) or `model` (Strix). An id
-    is `kind:name`; entries sharing one get a suffix from their path, command or model, so an id never moves to
-    another engine."""
+    relative to the file. Entries carry `id`, `name`, `kind`, `presets`, `label` (the name the page shows; the
+    runs in `extra_runs` are labelled Bubble), and the server-only `path` and `checkpoints` (Bubble), `command`,
+    `cwd`, `mirrored` and `libraries` (Six protocol) or `model` (Strix). Six folder entries share the label Six
+    and add `variant`, their network and backend. An id is `kind:name`; entries sharing one get a suffix from
+    their path, command or model, so an id never moves to another engine."""
     found, seen = [], set()
     models = models and Path(models).resolve()
 
-    def add(kind, name, presets=None, **fields):
-        found.append(dict(name=name, kind=kind, presets=presets_of(kind, presets), **fields))
+    def add(kind, name, presets=None, label=None, **fields):
+        found.append(dict(name=name, label=label or name, kind=kind, presets=presets_of(kind, presets), **fields))
 
-    def bubble(path, name=None):
+    def bubble(path, name=None, label=None):
         path = Path(path).resolve()
         if path in seen:
             return
         seen.add(path)
         if path.is_dir():
             if checkpoints := run_checkpoints(path):
-                add('bubble', name or path.name, checkpoints=checkpoints, path=path)
+                add('bubble', name or path.name, label=label, checkpoints=checkpoints, path=path)
         elif path.suffix == '.pt' and path.exists():
-            add('bubble', name or (path.parent.name if path.stem == 'ema' else path.stem), checkpoints=[''], path=path)
+            add('bubble', name or (path.parent.name if path.stem == 'ema' else path.stem), label=label,
+                checkpoints=[''], path=path)
 
     for run in extra_runs:
-        bubble(run)
+        bubble(run, label='Bubble')
     for folder in (runs, models):
         if folder and Path(folder).is_dir():
             for child in sorted(Path(folder).iterdir()):
@@ -276,8 +283,9 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                 continue
             backend, flags, libraries = six_backend(folder)
             for network in sorted(folder.glob('gen-*.onnx'), reverse=True):
-                add('six', f'Six {network.stem} · {backend}', command=[str(binary), '--net', str(network), *flags],
-                    cwd=folder, mirrored=True, libraries=libraries)
+                add('six', f'Six {network.stem} · {backend}', label='Six', variant=f'{network.stem} · {backend}',
+                    command=[str(binary), '--net', str(network), *flags], cwd=folder, mirrored=True,
+                    libraries=libraries)
         for path in sorted(Path(models).glob('*.json')):
             try:
                 spec = json.loads(path.read_text(encoding='utf-8'))
@@ -442,9 +450,9 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
-    stones as [q, r, probability]), `proof` (None or {winner, turns}: the solver proved a win for the side to move,
-    or the search proved the position exact), `line` (a winning line as [q, r, player] when the solver proved it)
-    and `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a
+    stones as [q, r, probability, win probability of the side to move after that stone]), `proof` (None or
+    {winner, turns}: the solver proved a win for the side to move, or the search proved the position exact),
+    `line` (a winning line as [q, r, player] when the solver proved it) and `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a
     solver query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
     `simulations` 0 plays the raw policy; `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
     before each network batch of n positions and may raise Cancelled."""
@@ -484,6 +492,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                     tree = NeuralSearch(network, bubble.sha256, current, seed=1740, cache=bubble.cache, tactics=True)
                 result = tree.search(simulations, root_samples=16, batch_size=16)
                 action, policy, actions = result['action'], result['policy'], result['actions']
+                values = result['values']
                 completed += result.get('completed', 0)
                 stone_value = root_value(result, local.player)
                 proven = result.get('proven') or 0
@@ -495,9 +504,11 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 actions = result['actions']
                 policy = np.exp(result['logits'] - result['logits'].max())
                 policy /= policy.sum()
-                action, stone_value = actions[policy.argmax()].tolist(), float(result['q'][0])
+                values = result['q']
+                action, stone_value = actions[policy.argmax()].tolist(), float(values[0])
             if not moves:
-                top = [[*map(int, actions[i]), round(float(policy[i]), 4)] for i in np.argsort(-policy)[:5]]
+                top = [[*map(int, actions[i]), round(float(policy[i]), 4), round((float(values[i]) + 1) / 2, 4)]
+                       for i in np.argsort(-policy)[:5]]
                 value = (stone_value + 1) / 2
             moves.append([int(action[0]), int(action[1])])
             local.play(*moves[-1])
@@ -712,10 +723,18 @@ def well_formed(record):
     proof = record.get('proof')
     return (isinstance(record.get('position'), str) and isinstance(record.get('engine'), str)
             and all(type(record.get(k)) is int for k in ('simulations', 'solver_nodes'))
-            and number(record.get('value')) and cells(record.get('moves'), 2) and cells(record.get('top'), 3, number)
+            and number(record.get('value')) and cells(record.get('moves'), 2)
+            and isinstance(record.get('top'), list)
+            and all(isinstance(c, list) and len(c) in (3, 4) and cells([c[:3]], 3, number) and all(map(number, c[3:]))
+                    for c in record['top'])
             and cells(record.get('line', []), 3) and cells(record.get('threat', []), 2)
             and (proof is None or isinstance(proof, dict) and proof.get('winner') in (0, 1)
                  and type(proof.get('turns')) is int))
+
+
+def valued(record):
+    """True when every top move of a saved evaluation carries its value."""
+    return all(len(move) > 3 for move in record['top'])
 
 
 class Evaluations:
@@ -794,21 +813,24 @@ class Evaluations:
 
     def covering(self, history, engine, budget):
         """The deepest saved evaluation of `history` by `engine` whose simulations and solver nodes both reach
-        `budget`'s, or None."""
+        `budget`'s and whose top moves carry their values, or None."""
         position, need = self.key(history), (budget['simulations'], budget['solver_nodes'])
         with self.lock:
-            enough = [b for b in self.by_position.get((position, engine), ()) if b[0] >= need[0] and b[1] >= need[1]]
-            line = self.order[(position, engine, max(enough))] if enough else None
-        return json.loads(line) if line else None
+            enough = sorted((b for b in self.by_position.get((position, engine), ())
+                             if b[0] >= need[0] and b[1] >= need[1]), reverse=True)
+            lines = [self.order[(position, engine, b)] for b in enough]
+        return next((r for r in map(json.loads, lines) if valued(r)), None)
 
     def best(self, history, engine):
         """The saved evaluation of `history` by `engine` to show, or None: one holding a proof first, since a proof
-        is exact, then the most simulations, then the most solver nodes."""
+        is exact, then one whose top moves carry their values, then the most simulations, then the most solver
+        nodes."""
         position = self.key(history)
         with self.lock:
             lines = [self.order[(position, engine, b)] for b in self.by_position.get((position, engine), ())]
         found = [json.loads(line) for line in lines]
-        return max(found, key=lambda e: (e.get('proof') is not None, e['simulations'], e['solver_nodes']), default=None)
+        return max(found, key=lambda e: (e.get('proof') is not None, valued(e), e['simulations'], e['solver_nodes']),
+                   default=None)
 
 
 # Review
@@ -920,6 +942,7 @@ class Session:
         self.archive = Path(archive) if archive else None
         self.study_store = study_store
         self.saved_matches, self.study, self.saved_game = {}, None, None
+        self.models_folder = None
         self.lock = threading.Condition()
         self.history, self.revision, self.paused = [], 0, False
         self.instance, self.closing = os.urandom(4).hex(), False
@@ -963,9 +986,8 @@ class Session:
     # Reading
 
     def models(self):
-        shown = ('id', 'name', 'kind', 'presets', 'checkpoints')
         with self.lock:
-            return [{k: e[k] for k in shown if k in e} |
+            return [{k: e[k] for k in SHOWN if k in e} |
                     dict(clocks=e['kind'] in ('bubble', 'six', 'native', 'seal')) for e in self.entries.values()]
 
     def lookup(self, history):
@@ -984,14 +1006,13 @@ class Session:
                 if (found := self.lookup(history[:ply])) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'line', 'threat', 'simulations', 'solver_nodes')}
-            shown = ('id', 'name', 'kind', 'presets', 'checkpoints')
-            entries = [{k: e[k] for k in shown if k in e} for e in self.entries.values()]
+            entries = [{k: e[k] for k in SHOWN if k in e} for e in self.entries.values()]
             return dict(instance=self.instance, revision=self.revision, history=[list(p) for p in history], **board,
                         paused=self.paused, seats=self.seats, analysis=self.analysis, engines=entries,
                         match={k: v for k, v in self.match.items() if k not in ('results', 'openings', 'opening_selection')}
                         if self.match else None,
                         clock=self.match_clock.json() if self.match_clock else None,
-                        saved_game=self.saved_game,
+                        saved_game=self.saved_game, models_folder=self.models_folder,
                         evaluations=evaluations,
                         review=review(history, self.lookup, board['winner']), jobs=self.job_list())
 
@@ -1069,6 +1090,7 @@ class Session:
         return self.submit(Job('analyse', priority, history, seat=settings, force=force))
 
     def play(self, q, r):
+        """Place a person's stone; placing one resumes a paused game, so the engine seat answers it."""
         with self.lock:
             self.match_editable()
             game = replay(self.history)
@@ -1079,6 +1101,7 @@ class Session:
             finally:
                 game.close()
             self.history.append((q, r))
+            self.paused = False
             self.changed()
 
     def undo(self):
@@ -1315,7 +1338,8 @@ class Session:
             self.entries[entry['id']] = entry
             selector = entry['id']
         name = selector.casefold()
-        matches = [e for e in self.entries.values() if name in (e['id'].casefold(), e['name'].casefold())]
+        matches = [e for e in self.entries.values()
+                   if name in (e['id'].casefold(), e['name'].casefold(), e.get('label', '').casefold())]
         if not matches:
             matches = [e for e in self.entries.values() if name == e['kind']]
         if not matches and name.startswith('bubble:') and name[7:].isdigit():
@@ -1950,6 +1974,53 @@ def import_history(text):
     return [list(p) for p in loads(text).history]
 
 
+def fetch_json(url):
+    """The JSON body at `url`, at most 4 MB; ValueError when it cannot be had."""
+    request = urllib.request.Request(url, headers={'User-Agent': 'bubble-player', 'Accept': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read(4 << 20))
+    except urllib.error.HTTPError as error:
+        raise ValueError('No game or position at that link' if error.code == 404
+                         else f'{urlparse(url).hostname} answered {error.code}') from error
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise ValueError(f'Cannot reach {urlparse(url).hostname}') from error
+
+
+def site_history(text, fetch=None):
+    """The stones of a finished game or a sandbox position on a HeXO site, from its page URL, or None when `text`
+    is not such a URL. Sites, with the API the page itself reads: HEXO_SITES. Pages are /games/<id>,
+    /account/games/<id> and /sandbox/<id>. A site's (x, y) is HTTTX's (x + y, -y), and the first stone is moved to
+    the origin. `fetch(url)` returns the JSON at an API url, `fetch_json` by default. Raises ValueError for stones
+    out of turn order or illegal ones."""
+    url = urlparse(text.strip())
+    if url.scheme not in ('http', 'https') or url.hostname not in HEXO_SITES:
+        return None
+    found = re.fullmatch(r'/(?:account/)?(games|sandbox)/([A-Za-z0-9-]{1,64})/?', url.path)
+    if not found:
+        raise ValueError('Paste the link of a finished game or a saved sandbox position')
+    page, ident = found.groups()
+    fetch = fetch or fetch_json
+    if page == 'games':
+        data = fetch(f'{HEXO_SITES[url.hostname]}/finished-games/{ident}')
+        stones = sorted(data['moves'], key=lambda m: m['moveNumber'])
+        placed = [(m['x'], m['y'], m['playerId']) for m in stones]
+    else:
+        data = fetch(f'{HEXO_SITES[url.hostname]}/sandbox-positions/{ident.lower()}')
+        stones = sorted(data['gamePosition']['cells'], key=lambda c: c['moveId'])
+        placed = [(c['x'], c['y'], c['player']) for c in stones]
+    if not placed or any(type(x) is not int or type(y) is not int for x, y, _ in placed):
+        raise ValueError('That link holds no stones')
+    sides = {}
+    for ply, (_, _, owner) in enumerate(placed):
+        if sides.setdefault(owner, player_at(ply)) != player_at(ply):
+            raise ValueError(f'Stone {ply + 1} breaks the turn order of one stone, then two each')
+    origin = placed[0][0] + placed[0][1], -placed[0][1]
+    history = [[x + y - origin[0], -y - origin[1]] for x, y, _ in placed]
+    replay(history).close()
+    return history
+
+
 class Handler(BaseHTTPRequestHandler):
     session = None
     page = ROOT / 'web' / 'index.html'
@@ -2082,7 +2153,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('No such position')
                 session.load(session.history[:ply], False)
             elif self.path == '/import':
-                session.load(import_history(args['text']), True)
+                session.load(site_history(args['text']) or import_history(args['text']), True)
             elif self.path == '/seat':
                 if args.get('side') not in (0, 1):
                     raise ValueError('Side must be 0 or 1')
@@ -2235,6 +2306,7 @@ def main():
                                   Evaluations(None if args.match else store_path), find, book,
                                   archive=ROOT / 'artifacts' / 'play' / 'matches',
                                   study_store=ROOT / 'artifacts' / 'play' / f'study-{args.port}.jsonl')
+        Handler.session.models_folder = str(args.models.resolve())
         try:
             if args.match:
                 players = [dict(engine=name, checkpoint=getattr(args, f'{side}_checkpoint'),
