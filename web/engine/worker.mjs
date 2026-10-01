@@ -167,13 +167,15 @@ onmessage = async ({data}) => {
     else if (data.type === 'evaluate') {
       const leaves = data.histories.map(history => ({history, actions: native.legal(history)}));
       const predictions = await network.evaluate(leaves);
-      postMessage({type: 'result', id: data.id, result: predictions.map((p, i) => ({actions: leaves[i].actions, logits: Array.from(p.logits), q: p.q[0]}))});
+      postMessage({type: 'result', id: data.id, result: predictions.map((p, i) => ({actions: leaves[i].actions, logits: Array.from(p.logits), q: Array.from(p.q)}))});
     }
     else if (data.type === 'search') {
       const tree = new NeuralSearch(native, {seed: 1740, tactics: true, history: data.history});
       try {
         const result = await tree.search({simulations: data.simulations, rootSamples: 16, batchSize: data.batchSize ?? 16,
-          cache: new EvaluationCache(4096), version: network.version, evaluate: leaves => network.evaluate(leaves)});
+          cache: new EvaluationCache(4096), version: network.version, evaluate: leaves => network.evaluate(leaves),
+          stop: () => cancelled.has(data.id)});
+        if (result.stopped) throw new Cancelled();
         postMessage({type: 'result', id: data.id, result: {action: result.action, completed: result.completed, elapsed_ms: result.elapsed_ms,
           evaluated: result.evaluated, batches: result.inference_batches, network_ms: result.network_ms, policy: result.policy,
           actions: result.actions}});

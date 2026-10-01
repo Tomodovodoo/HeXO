@@ -103,7 +103,8 @@ async function run(key, task) {
         posting = false;
       }
     } else {
-      const {simulations, solver_nodes} = PRESETS[task.preset], record = {...result, simulations, solver_nodes, engine: ID};
+      const {simulations, solver_nodes} = PRESETS[task.preset];
+      const record = {...result, simulations, solver_nodes: result.solved ? solver_nodes : 0, engine: ID};
       analyses.set(`${task.preset}|${hk(task.history)}`, record);
       const s = state();
       if (s && hk(s.history.slice(0, task.history.length)) === hk(task.history)) {
