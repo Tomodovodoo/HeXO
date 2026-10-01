@@ -445,6 +445,13 @@ struct CandidateGuard {
     }
     ~CandidateGuard(){b.candidates=nullptr;}
 };
+struct CandidatePause {
+    Board& b;CandidateCache* saved;
+    // Leaf tactics and scalar probes do not rank moves. Their make/undo must
+    // finish before the parent's candidate cache is reattached.
+    explicit CandidatePause(Board& board,bool pause=true):b(board),saved(b.candidates) {if(pause) b.candidates=nullptr;}
+    ~CandidatePause(){b.candidates=saved;}
+};
 struct Restore {
     Board& b; size_t size;
     explicit Restore(Board& b):b(b),size(b.history.size()){}
@@ -470,7 +477,7 @@ struct Search {
         auto completions=b.completions(b.player,b.remaining);
         std::stable_sort(completions.begin(),completions.end(),[](const auto& a,const auto& z){return a.size()<z.size();});
         for(const auto& e:completions) {
-            Restore restore(b);
+            CandidatePause pause(b);Restore restore(b);
             Turn t;
             for(auto c:e) { if(!b.legal(c)) break; t.cells[t.count++]=c;b.make(c);if(b.winner>=0) return t; }
         }
@@ -614,7 +621,7 @@ struct Search {
         std::unordered_set<uint64_t> seen;
         auto add=[&](Turn t,bool mandatory=false) {
             if(t.count<1 || t.count>2 || t.count>b.remaining) return;
-            Restore restore(b);
+            CandidatePause pause(b);Restore restore(b);
             for(int i=0;i<t.count;++i) {
                 if(!b.legal(t.cells[i])) return;
                 b.make(t.cells[i]);
@@ -697,7 +704,7 @@ struct Search {
         if(moves.empty()) return b.score(b.player);
         int best=-mate-1;Turn best_turn=moves.front();bool first=true;
         for(const auto& t:moves) {
-            Restore restore(b);int side=b.player;apply(b,t);
+            CandidatePause pause(b,depth==1);Restore restore(b);int side=b.player;apply(b,t);
             int score;
             if(b.winner==side) score=mate;
             else if(first) score=-negamax(b,depth-1,-beta,-alpha);
@@ -790,7 +797,7 @@ struct Search {
                     if(inject_tt) frozen_hints=tt;
                     int best=-mate-1;Turn iteration=chosen;
                     for(auto& t:roots) {
-                        check();Restore branch(b);int side=b.player;apply(b,t);
+                        check();CandidatePause pause(b,depth==1);Restore branch(b);int side=b.player;apply(b,t);
                         int score=b.winner==side?mate:-negamax(b,depth-1,-mate-1,-best);
                         t.score=score;
                         if(score>best) {best=score;iteration=t;}
