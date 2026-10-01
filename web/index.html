@@ -193,7 +193,7 @@ const $=id=>document.getElementById(id),SQ3=Math.sqrt(3),COLORS=['#fbbf24','#38b
 const LABEL={win:['◆','--best'],found:['!','--best'],kept:['=','--best'],best:['★','--best'],good:['✓','--good'],
   inaccuracy:['?!','--inaccuracy'],mistake:['?','--mistake'],blunder:['??','--blunder'],missed:['✗','--proof'],allowed:['⚑','--proof'],lost:['·','--dim']};
 const PRESETS=['quick','standard','strong','deep','custom'],SHORT={quick:'Q',standard:'S',strong:'St',deep:'D',custom:'⋯'};
-let S=null,view=0,cam={x:0,y:0,size:26},hover=null,drag=null,fitted=false,seenLabels=new Map(),landed=new Map(),known=0,asked=new Set();
+let S=null,view=0,cam={x:0,y:0,size:26},hover=null,drag=null,fitted=false,seenLabels=new Map(),landed=new Map(),asked=new Map();
 const canvas=$('board'),ctx=canvas.getContext('2d'),overlay=$('marks'),mctx=overlay.getContext('2d');
 const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const key=(q,r)=>q+','+r,dist=(a,b,c,d)=>Math.max(Math.abs(a-c),Math.abs(b-d),Math.abs(a+b-c-d));
@@ -426,10 +426,15 @@ function renderStudy(){
   $('top').replaceChildren(...top.map((t,i)=>{const d=el('div',{},el('span',{},i+1),el('span',{},t[0]+', '+t[1]),
     el('em',{style:`--c:${COLORS[side]};transform:scaleX(${t[2]/max})`}),el('span',{style:'text-align:right'},(t[2]*100).toFixed(1)));
     d.onclick=()=>{const[sx,sy]=screen(t[0],t[1]);cam.x+=canvas.clientWidth/2-sx;cam.y+=canvas.clientHeight/2-sy;draw()};return d}));
-  const need=S.analysis&&S.analysis.budget,short=!ev||need&&(ev.simulations<need.simulations||ev.solver_nodes<need.solver_nodes);
-  if(short&&S.analysis&&S.analysis.auto&&!job&&view<=S.history.length&&!(S.winner>=0&&view===S.history.length)){
-    const tag=S.revision+':'+view;if(!asked.has(tag)){asked.add(tag);post('/analyse',{ply:view})}}
+  autoAnalyse();
   renderGraph();renderMoves();renderDetail();
+}
+function autoAnalyse(){
+  const ev=S.evaluations[view],need=S.analysis&&S.analysis.budget,job=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);
+  const short=!ev||need&&(ev.simulations<need.simulations||ev.solver_nodes<need.solver_nodes);
+  if(!short||!S.analysis||!S.analysis.auto||job||(S.winner>=0&&view===S.history.length))return;
+  const tag=S.history.slice(0,view).join(';'),now=Date.now();
+  if(now-(asked.get(tag)||0)>31000){asked.set(tag,now);post('/analyse',{ply:view})}
 }
 function renderGraph(){
   const g=$('graph'),W=300,H=92,n=Math.max(1,S.history.length),X=p=>p/n*W,Y=v=>(1-v)*H;
@@ -485,6 +490,7 @@ function renderPanels(){
 }
 function renderJobs(){
   if(!S)return;
+  autoAnalyse();
   for(const side of[0,1]){const box=$('busy'+side);if(!box)continue;const job=S.jobs.find(j=>j.kind==='move'&&j.side===side);
     if(!job){box.replaceChildren();continue}
     const bar=box.querySelector('.bar')||el('div',{class:'bar'},el('i'));const x=box.querySelector('.x')||el('button',{class:'x','aria-label':'Cancel'},'×');
