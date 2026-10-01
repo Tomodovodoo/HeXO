@@ -155,6 +155,8 @@ class Store(unittest.TestCase):
         store = Evaluations()
         store.add([], 'e', dict(simulations=512, solver_nodes=0), dict(value=.1, moves=[], top=[[0, 0, 1.]]))
         self.assertIsNone(store.covering([], 'e', dict(simulations=32, solver_nodes=0)))
+        store.add([], 'e', dict(simulations=0, solver_nodes=0), dict(value=.4, moves=[], top=[[0, 0, 1.]]))
+        self.assertEqual(store.covering([], 'e', dict(simulations=0, solver_nodes=0))['value'], .4)
         store.add([], 'e', dict(simulations=32, solver_nodes=0), dict(value=.2, moves=[], top=[[0, 0, 1., .2]]))
         self.assertEqual(store.covering([], 'e', dict(simulations=32, solver_nodes=0))['value'], .2)
         self.assertEqual(store.best([], 'e')['value'], .2)
@@ -1139,8 +1141,8 @@ class TurnTrees(unittest.TestCase):
                                  cache=neural_search.EvaluationCache())
         found = evaluate(bubble, None, [(0, 0)], 32, 0)
         moves = found['moves']
-        for top in (found['top'], evaluate(bubble, None, [(0, 0)], 0, 0)['top']):
-            self.assertTrue(top and all(len(t) == 4 and 0 <= t[3] <= 1 for t in top))
+        self.assertTrue(found['top'] and all(len(t) == 4 and 0 <= t[3] <= 1 for t in found['top']))
+        self.assertTrue(all(len(t) == 3 for t in evaluate(bubble, None, [(0, 0)], 0, 0)['top']))
         self.assertEqual(len(self.trees), 1)
         tree = self.trees[0]
         self.assertEqual([h for h, _, _ in tree.searched], [[(0, 0)], [(0, 0), tuple(moves[0])]])
@@ -1217,6 +1219,8 @@ class Registry(unittest.TestCase):
             self.assertEqual(found['bubble:beta']['checkpoints'], [''])
             self.assertEqual([found[k]['label'] for k in ('bubble:alpha', 'bubble:broken', 'bubble:gamma')],
                              ['Bubble', 'broken', 'gamma'])
+            both = scan(None, None, [root / 'elsewhere/net.pt', root / 'runs/alpha'], None)
+            self.assertEqual([e['label'] for e in both.values() if e['kind'] == 'bubble'], ['Bubble', 'alpha'])
             (root / 'models/gamma').mkdir()
             (root / 'models/gamma/ema.pt').write_bytes(b'')
             twins = [k for k in scan(root / 'models', root / 'runs', [], None) if k.startswith('bubble:gamma')]

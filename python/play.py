@@ -250,7 +250,7 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     on the backend `six_backend` finds. `models/<name>.json` adds one entry: {"name", "kind": "bubble", "path"},
     {"name", "kind": "six", "command", "mirrored", "presets"} or {"name", "kind": "strix", "model"}, paths
     relative to the file. Entries carry `id`, `name`, `kind`, `presets`, `label` (the name the page shows; the
-    runs in `extra_runs` are labelled Bubble), and the server-only `path` and `checkpoints` (Bubble), `command`,
+    first run in `extra_runs` is labelled Bubble), and the server-only `path` and `checkpoints` (Bubble), `command`,
     `cwd`, `mirrored` and `libraries` (Six protocol) or `model` (Strix). Six folder entries share the label Six
     and add `variant`, their network and backend. An id is `kind:name`; entries sharing one get a suffix from
     their path, command or model, so an id never moves to another engine."""
@@ -272,8 +272,8 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
             add('bubble', name or (path.parent.name if path.stem == 'ema' else path.stem), label=label,
                 checkpoints=[''], path=path)
 
-    for run in extra_runs:
-        bubble(run, label='Bubble')
+    for index, run in enumerate(extra_runs):
+        bubble(run, label=None if index else 'Bubble')
     for folder in (runs, models):
         if folder and Path(folder).is_dir():
             for child in sorted(Path(folder).iterdir()):
@@ -456,7 +456,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
-    stones as [q, r, probability, win probability of the side to move after that stone]), `proof` (None or
+    stones as [q, r, probability, win probability of the side to move after that stone; absent for the raw
+    policy]), `proof` (None or
     {winner, turns}: the solver proved a win for the side to move, or the search proved the position exact),
     `line` (a winning line as [q, r, player] when the solver proved it) and `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a
     solver query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
@@ -510,10 +511,11 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 actions = result['actions']
                 policy = np.exp(result['logits'] - result['logits'].max())
                 policy /= policy.sum()
-                values = result['q']
-                action, stone_value = actions[policy.argmax()].tolist(), float(values[0])
+                values = None
+                action, stone_value = actions[policy.argmax()].tolist(), float(result['q'][0])
             if not moves:
-                top = [[*map(int, actions[i]), round(float(policy[i]), 4), round((float(values[i]) + 1) / 2, 4)]
+                top = [[*map(int, actions[i]), round(float(policy[i]), 4),
+                        *([] if values is None else [round((float(values[i]) + 1) / 2, 4)])]
                        for i in np.argsort(-policy)[:5]]
                 value = (stone_value + 1) / 2
             moves.append([int(action[0]), int(action[1])])
@@ -739,8 +741,9 @@ def well_formed(record):
 
 
 def valued(record):
-    """True when every top move of a saved evaluation carries its value."""
-    return all(len(move) > 3 for move in record['top'])
+    """True when every top move of a saved evaluation carries its value, or the evaluation is the raw policy,
+    which has no value per move."""
+    return record['simulations'] == 0 or all(len(move) > 3 for move in record['top'])
 
 
 class Evaluations:
