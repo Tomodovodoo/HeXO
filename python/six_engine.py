@@ -178,15 +178,17 @@ class SixEngine:
     """An external Six-protocol opponent with the call shape of legacy.arena.Seal.
 
     A `mirrored` engine uses Six's frame, so positions and moves pass through `mirror`. `path` directories go in
-    front of PATH for the engine process, for the libraries of its GPU backend; `cwd` is its working folder."""
+    front of PATH (and LD_LIBRARY_PATH off Windows) for the engine process, for the libraries of its GPU backend;
+    `cwd` is its working folder."""
 
     def __init__(self, command, timeout=30., *, cancel=None, mirrored=False, cwd=None, path=()):
         self.command = shlex.split(command) if isinstance(command, str) else list(command)
         self.timeout = timeout
         self.cancel = cancel
         self.mirrored, self.cwd = mirrored, cwd
-        self.env = {**os.environ, 'PATH': os.pathsep.join([*map(str, path), os.environ.get('PATH', '')])} \
-            if path else None
+        loader = ('PATH',) if os.name == 'nt' else ('PATH', 'LD_LIBRARY_PATH')
+        self.env = {**os.environ, **{name: os.pathsep.join([*map(str, path), os.environ.get(name, '')])
+                                     for name in loader}} if path else None
         self.game = None
         self.proc = None
         self._start()

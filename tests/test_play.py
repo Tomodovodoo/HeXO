@@ -250,6 +250,21 @@ class Jobs(unittest.TestCase):
             finally:
                 session.close()
 
+    def test_a_silent_engine_can_be_cancelled_during_its_handshake(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / 'engine.py'
+            script.write_text('import time\ntime.sleep(60)\n')
+            entry = dict(id='six:mute', name='mute', kind='six', presets=presets_of('six', None),
+                         command=[sys.executable, str(script)], cwd=Path(folder), mirrored=False, libraries=[])
+            engines = Engines('cpu')
+            started = time.time()
+            try:
+                with self.assertRaises(Cancelled):
+                    engines.turn(entry, dict(nodes=10), [], lambda: time.time() - started > .5)
+                self.assertLess(time.time() - started, 5)
+            finally:
+                engines.close()
+
     def test_cancel_stops_a_thinking_engine_and_pauses(self):
         self.engines.hold = True
         self.session.play(0, 0)
@@ -505,6 +520,8 @@ class Jobs(unittest.TestCase):
                 budget_of(bubble, 'custom', custom)
         with self.assertRaises(ValueError):
             budget_of(PRESETS['native'], 'heavy')
+        self.assertEqual(presets_of('six', dict(quick=dict(args=['--visits', '8'])))['quick'],
+                         dict(nodes=6000, args=['--visits', '8']))
         shrimp = presets_of('six', dict(quick=dict(nodes=1, args=['--visits', '32'])))
         self.assertEqual(budget_of(shrimp, 'custom', dict(nodes=9, args=['--visits', '1'])), dict(nodes=9))
         self.assertEqual(budget_of(shrimp, 'quick'), dict(nodes=1, args=['--visits', '32']))

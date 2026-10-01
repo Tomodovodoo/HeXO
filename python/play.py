@@ -147,7 +147,7 @@ def presets_of(kind, spec):
                 continue
             if key not in LIMITS or type(value) is not int or not LIMITS[key][0] <= value <= LIMITS[key][1]:
                 raise ValueError(f'bad {key} in preset {name}')
-        presets[name] = budget
+        presets[name] = presets[name] | budget
     return presets
 
 
@@ -527,24 +527,25 @@ class Engines:
         from six_engine import ProtocolError, SixEngine
         command = [*entry['command'], *budget.get('args', ())]
         key = (*command, entry['mirrored'])
-        if key not in self.external:
-            self.external[key] = SixEngine(command, mirrored=entry['mirrored'], cwd=entry['cwd'],
-                                           path=entry['libraries'], cancel=threading.Event())
-        engine, done = self.external[key], threading.Event()
-        engine.cancel.clear()
+        cancel = self.external[key].cancel if key in self.external else threading.Event()
+        cancel.clear()
+        done = threading.Event()
 
         def watch():
             while not done.wait(.05):
                 if stop():
-                    engine.cancel.set()
+                    cancel.set()
                     return
 
         threading.Thread(target=watch, daemon=True).start()
         game = replay(history)
         try:
-            return engine(game, budget.get('ms'), nodes=budget.get('nodes'))
+            if key not in self.external:
+                self.external[key] = SixEngine(command, mirrored=entry['mirrored'], cwd=entry['cwd'],
+                                               path=entry['libraries'], cancel=cancel)
+            return self.external[key](game, budget.get('ms'), nodes=budget.get('nodes'))
         except ProtocolError:
-            if engine.cancel.is_set():
+            if cancel.is_set():
                 raise Cancelled() from None
             raise
         finally:
