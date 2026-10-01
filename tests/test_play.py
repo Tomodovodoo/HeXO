@@ -1,6 +1,7 @@
 """Play server: evaluation store, review labels, background jobs and the HTTP surface, with fake engines."""
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -13,7 +14,7 @@ from urllib.request import Request, urlopen
 
 from hexo import Game
 from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, Session, budget_of, export_path, import_history,
-                  model_key, proof_turns, review, scan)
+                  model_key, presets_of, proof_turns, review, scan, six_backend)
 
 STANDARD = PRESETS['bubble']['standard']
 
@@ -29,6 +30,19 @@ def legal_turn(history):
         return moves
     finally:
         game.close()
+
+
+SLOW_ENGINE = """import sys
+stones = False
+for raw in sys.stdin:
+    words = raw.split()
+    if not words: continue
+    if words[0] == 'six': print('sixok', flush=True)
+    elif words[0] == 'isready': print('readyok', flush=True)
+    elif words[0] == 'position': stones = len(words) > 3
+    elif words[0] == 'go' and not stones: print('bestmove 0 0', flush=True)
+    elif words[0] == 'quit': break
+"""
 
 
 def wait(condition, timeout=10):
@@ -206,6 +220,35 @@ class Jobs(unittest.TestCase):
         self.assertEqual(self.engines.calls[0][:2], ('main/000002', STANDARD))
         with self.assertRaises(ValueError):
             self.session.configure_seat(1, 'bubble:fake', 'main/000009')
+
+    def test_six_protocol_engines_play_and_end_on_cancel(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / 'engine.py'
+            script.write_text(SLOW_ENGINE)
+            entry = dict(id='six:slow', name='slow', kind='six', presets=presets_of('six', None),
+                         command=[sys.executable, str(script)], cwd=Path(folder), mirrored=True, libraries=[])
+            engines = Engines('cpu')
+            session = Session(entries() | {'six:slow': entry}, engines, Evaluations())
+            try:
+                session.configure_analysis('bubble:fake', auto=False)
+                session.configure_seat(1, 'native:Native', preset='quick')
+                session.configure_seat(0, 'six:slow')
+                self.assertEqual(json.loads(json.dumps(session.state()))['engines'][-1], dict(
+                    id='six:slow', name='slow', kind='six', presets=presets_of('six', None)))
+                wait(lambda: len(session.history) == 1)
+                session.pause(True)
+                session.load([(0, 0), (1, 0), (2, 0)], False)
+                thinking = lambda: [j['id'] for j in session.state()['jobs'] if j['status'] == 'running' and j['ply'] == 3]
+                wait(thinking)
+                started = time.time()
+                session.cancel(thinking()[0])
+                wait(lambda: not session.state()['jobs'])
+                self.assertLess(time.time() - started, 5)
+                self.assertEqual(session.history, [(0, 0), (1, 0), (2, 0)])
+                session.pause(False)
+                wait(lambda: any(j['status'] == 'running' and j['ply'] == 3 for j in session.state()['jobs']))
+            finally:
+                session.close()
 
     def test_cancel_stops_a_thinking_engine_and_pauses(self):
         self.engines.hold = True
@@ -455,12 +498,19 @@ class Jobs(unittest.TestCase):
                 self.assertEqual(isolated.call_count, 2)
 
     def test_budgets(self):
-        self.assertEqual(budget_of('bubble', 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
+        bubble = PRESETS['bubble']
+        self.assertEqual(budget_of(bubble, 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
         for custom in (dict(simulations=10 ** 6), dict(ms=5), dict(simulations='8')):
             with self.assertRaises(ValueError):
-                budget_of('bubble', 'custom', custom)
+                budget_of(bubble, 'custom', custom)
         with self.assertRaises(ValueError):
-            budget_of('native', 'heavy')
+            budget_of(PRESETS['native'], 'heavy')
+        shrimp = presets_of('six', dict(quick=dict(nodes=1, args=['--visits', '32'])))
+        self.assertEqual(budget_of(shrimp, 'custom', dict(nodes=9, args=['--visits', '1'])), dict(nodes=9))
+        self.assertEqual(budget_of(shrimp, 'quick'), dict(nodes=1, args=['--visits', '32']))
+        for spec in (dict(heavy=dict(nodes=1)), dict(quick=dict(nodes=0)), dict(quick=dict(args='--x')), [1]):
+            with self.assertRaises(ValueError):
+                presets_of('six', spec)
 
 
 class Http(unittest.TestCase):
@@ -552,6 +602,44 @@ class Proofs(unittest.TestCase):
 
 
 class Registry(unittest.TestCase):
+    def test_six_takes_the_fastest_backend_it_can_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            six, libraries = Path(directory) / 'six', Path(directory) / 'gpu'
+            six.mkdir()
+            libraries.mkdir()
+            with unittest.mock.patch('importlib.util.find_spec', return_value=None), \
+                    unittest.mock.patch.dict(os.environ, dict(PATH=str(libraries))):
+                self.assertEqual(six_backend(six), ('CPU', ['--cpu'], []))
+                (six / 'DirectML.dll').write_bytes(b'')
+                self.assertEqual(six_backend(six)[:2], ('DirectML', []))
+                for name in ('cudart64_12.dll', 'cudnn64_9.dll'):
+                    (libraries / name).write_bytes(b'')
+                self.assertEqual(six_backend(six)[:2], ('CUDA', []))
+                (libraries / 'nvinfer_10.dll').write_bytes(b'')
+                self.assertEqual(six_backend(six)[:2], ('TensorRT', ['--trt']))
+
+    def test_six_folders_and_engine_entries_are_found(self):
+        with tempfile.TemporaryDirectory() as directory:
+            models = Path(directory)
+            (models / 'six').mkdir()
+            for name in ('sixengine.exe', 'gen-0100.onnx', 'gen-0120.onnx'):
+                (models / 'six' / name).write_bytes(b'')
+            (models / 'shrimp.json').write_text(json.dumps(dict(
+                kind='six', command='python driver.py', presets=dict(quick=dict(nodes=1, args=['--visits', '32'])))))
+            (models / 'strix.json').write_text(json.dumps(dict(name='Strix', kind='strix', model='strix.safetensors')))
+            (models / 'broken.json').write_text(json.dumps(dict(kind='six', command=[], presets=dict(odd={}))))
+            with unittest.mock.patch('play.six_backend', return_value=('CPU', ['--cpu'], [])):
+                found = scan(models, None, [], None)
+            self.assertEqual(list(found), ['six:Six gen-0120 · CPU', 'six:Six gen-0100 · CPU', 'six:shrimp',
+                                           'strix:Strix', 'native:Native'])
+            six = found['six:Six gen-0120 · CPU']
+            self.assertEqual((six['command'][1:], six['mirrored']),
+                             (['--net', str(models / 'six/gen-0120.onnx'), '--cpu'], True))
+            shrimp = found['six:shrimp']
+            self.assertEqual((shrimp['command'], shrimp['mirrored']), (['python', 'driver.py'], False))
+            self.assertEqual(shrimp['presets']['quick'], dict(nodes=1, args=['--visits', '32']))
+            self.assertEqual(found['strix:Strix']['presets']['deep'], dict(simulations=512))
+
     def test_runs_models_and_entries_are_found(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

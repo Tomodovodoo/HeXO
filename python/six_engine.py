@@ -169,22 +169,33 @@ def serve(player, source=sys.stdin, out=sys.stdout):
         game.close()
 
 
-class SixEngine:
-    """An external Six-protocol opponent with the call shape of legacy.arena.Seal."""
+def mirror(q, r):
+    """Six's and Strix's axial frame from ours and back: HTTTX (q, r) is their (q + r, -r); its own inverse."""
+    return q + r, -r
 
-    def __init__(self, command, timeout=30., *, cancel=None):
+
+class SixEngine:
+    """An external Six-protocol opponent with the call shape of legacy.arena.Seal.
+
+    A `mirrored` engine uses Six's frame, so positions and moves pass through `mirror`. `path` directories go in
+    front of PATH for the engine process, for the libraries of its GPU backend; `cwd` is its working folder."""
+
+    def __init__(self, command, timeout=30., *, cancel=None, mirrored=False, cwd=None, path=()):
         self.command = shlex.split(command) if isinstance(command, str) else list(command)
         self.timeout = timeout
         self.cancel = cancel
+        self.mirrored, self.cwd = mirrored, cwd
+        self.env = {**os.environ, 'PATH': os.pathsep.join([*map(str, path), os.environ.get('PATH', '')])} \
+            if path else None
         self.game = None
         self.proc = None
         self._start()
 
     def _start(self):
         self.lines = queue.Queue()
-        self.proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, text=True, encoding='utf-8', bufsize=1,
-                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        self.proc = subprocess.Popen(self.command, cwd=self.cwd, env=self.env, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding='utf-8',
+                                     bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
         try:
             self._send('six')
@@ -228,7 +239,9 @@ class SixEngine:
             if line.startswith(prefix):
                 return line
 
-    def __call__(self, game, ms):
+    def __call__(self, game, ms=None, nodes=None):
+        """The engine's turn for `game`, searched for `nodes` nodes when given, else for `ms` milliseconds."""
+        frame = mirror if self.mirrored else (lambda q, r: (q, r))
         try:
             if self.proc is None:
                 self._start()
@@ -237,15 +250,15 @@ class SixEngine:
                 self._send('isready')
                 self._expect('readyok', self.timeout)
                 self.game = game
-            moves = ' '.join(f'{q} {r}' for q, r, _ in game.cells)
+            moves = ' '.join('%d %d' % frame(q, r) for q, r, _ in game.cells)
             self._send('position radius 8' + (f' moves {moves}' if moves else ''))
-            self._send(f'go movetime {ms}')
-            line = self._expect('bestmove', self.timeout + 3*ms/1000)
+            self._send(f'go nodes {nodes}' if nodes else f'go movetime {ms}')
+            line = self._expect('bestmove', self.timeout + (nodes / 1000 if nodes else 3*ms/1000))
             parts = line.split()[1:]
             if len(parts) not in (2, 4):
                 raise IllegalReply(f'unreadable bestmove: {line}')
             numbers = [int(v) for v in parts]
-            turn = list(zip(numbers[::2], numbers[1::2]))
+            turn = [frame(q, r) for q, r in zip(numbers[::2], numbers[1::2])]
             probe = Game([tuple(c[:2]) for c in game.cells])
             try:
                 played = []

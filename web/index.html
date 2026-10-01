@@ -383,7 +383,7 @@ function seatControls(seat,kind,send,extra){
   const seg=el('div',{class:'seg'},PRESETS.map(p=>{const b=el('button',{class:seat.preset===p?'on':'','aria-label':p},SHORT[p]);
     b.onclick=()=>send({preset:p,custom:p==='custom'?seat.budget:undefined});return b}));
   box.push(seg);
-  if(seat.preset==='custom'){box.push(el('div',{class:'custom'},Object.entries(seat.budget).map(([k,v])=>{
+  if(seat.preset==='custom'){box.push(el('div',{class:'custom'},Object.entries(seat.budget).filter(([k,v])=>typeof v==='number').map(([k,v])=>{
     const i=el('input',{type:'number',value:v,'aria-label':k,min:0});
     i.onchange=()=>send({preset:'custom',custom:{...seat.budget,[k]:Number(i.value)}});return i})))}
   if(extra)box.push(extra);

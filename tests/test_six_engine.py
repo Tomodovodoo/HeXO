@@ -44,6 +44,19 @@ for raw in sys.stdin:
 '''
 
 
+RECORDING_ENGINE = '''import sys
+log = open(sys.argv[1], 'a')
+for raw in sys.stdin:
+    log.write(raw); log.flush()
+    words = raw.split()
+    if not words: continue
+    if words[0] == 'six': print('sixok', flush=True)
+    elif words[0] == 'isready': print('readyok', flush=True)
+    elif words[0] == 'go': print('bestmove 1 0 2 -1', flush=True)
+    elif words[0] == 'quit': break
+'''
+
+
 class FakePlayer:
     checkpoint = 'main/000001'
     model_sha256 = 'abcdef1234567890'
@@ -200,6 +213,21 @@ class SixProtocolTests(unittest.TestCase):
                     self.assertEqual(result['history'], [[0, 0]])
                 finally:
                     match.close()
+
+    def test_client_mirrors_coordinates_and_sends_node_budgets(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder)/'engine.py'
+            script.write_text(RECORDING_ENGINE)
+            log = Path(folder)/'log.txt'
+            game = Game([(0, 0), (2, -1), (3, -2)])
+            try:
+                with SixEngine([sys.executable, str(script), str(log)], timeout=5, mirrored=True) as engine:
+                    self.assertEqual(engine(game, nodes=500), [(1, 0), (1, 1)])
+            finally:
+                game.close()
+            lines = log.read_text().splitlines()
+            self.assertIn('position radius 8 moves 0 0 1 1 1 2', lines)
+            self.assertIn('go nodes 500', lines)
 
     def test_client_starts_each_game(self):
         with tempfile.TemporaryDirectory() as folder:

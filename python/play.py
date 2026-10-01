@@ -14,6 +14,7 @@ import json
 import math
 import os
 import queue
+import shlex
 import shutil
 import subprocess
 import sys
@@ -33,8 +34,13 @@ PRESETS = dict(
     bubble=dict(quick=dict(simulations=32, solver_nodes=2048), standard=dict(simulations=128, solver_nodes=32768),
                 strong=dict(simulations=512, solver_nodes=131072), deep=dict(simulations=2048, solver_nodes=524288)),
     native=dict(quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000), deep=dict(ms=10000)),
-    seal=dict(quick=dict(ms=100), standard=dict(ms=500), strong=dict(ms=2000), deep=dict(ms=8000)))
-LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 1_500_000), ms=(10, 120_000))
+    seal=dict(quick=dict(ms=100), standard=dict(ms=500), strong=dict(ms=2000), deep=dict(ms=8000)),
+    six=dict(quick=dict(nodes=6000), standard=dict(nodes=30000), strong=dict(nodes=135000), deep=dict(nodes=500000)),
+    strix=dict(quick=dict(simulations=8), standard=dict(simulations=64), strong=dict(simulations=128),
+               deep=dict(simulations=512)))
+LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 1_500_000), ms=(10, 120_000), nodes=(1, 50_000_000))
+SIX_LIBRARIES = dict(cuda=('cudart64_12.dll', 'libcudart.so.12'), cudnn=('cudnn64_9.dll', 'libcudnn.so.9'),
+                     tensorrt=('nvinfer_10.dll', 'libnvinfer.so.10'), directml=('DirectML.dll',))
 
 
 def player_at(ply):
@@ -103,15 +109,63 @@ def run_checkpoints(run):
     return ([champion] if champion in ids else []) + [c for c in ids if c != champion]
 
 
+def six_backend(folder):
+    """The fastest backend `sixengine` in `folder` can run here, as (name, flags, PATH directories to add):
+    TensorRT when its library and CUDA's are found, then CUDA, then DirectML (the DirectML build ships
+    DirectML.dll), then the CPU. Libraries are looked for in the folder, PyTorch's and TensorRT's Python
+    packages, and PATH."""
+    import importlib.util
+
+    def package(name, *parts):
+        spec = importlib.util.find_spec(name)
+        return Path(spec.submodule_search_locations[0], *parts) if spec and spec.submodule_search_locations else None
+
+    extra = [d for d in (Path(folder), package('torch', 'lib'), package('tensorrt_libs')) if d and d.is_dir()]
+    dirs = [*extra, *map(Path, filter(None, os.environ.get('PATH', '').split(os.pathsep)))]
+
+    def found(kind):
+        return any((d / name).exists() for d in dirs for name in SIX_LIBRARIES[kind])
+
+    if found('cuda') and found('cudnn'):
+        return ('TensorRT', ['--trt'], extra) if found('tensorrt') else ('CUDA', [], extra)
+    if any((Path(folder) / name).exists() for name in SIX_LIBRARIES['directml']):
+        return 'DirectML', [], extra
+    return 'CPU', ['--cpu'], []
+
+
+def presets_of(kind, spec):
+    """The presets of an engine entry: the kind's defaults, overridden per preset by `spec`. Six-protocol presets
+    may add `args`, extra command-line arguments for an engine whose strength is set at launch, like Shrimp."""
+    presets = {name: dict(budget) for name, budget in PRESETS[kind].items()}
+    if not isinstance(spec or {}, dict):
+        raise ValueError('presets must be an object')
+    for name, budget in (spec or {}).items():
+        if name not in presets or not isinstance(budget, dict):
+            raise ValueError(f'unknown preset {name}')
+        for key, value in budget.items():
+            if key == 'args' and kind == 'six' and isinstance(value, list) and all(isinstance(v, str) for v in value):
+                continue
+            if key not in LIMITS or type(value) is not int or not LIMITS[key][0] <= value <= LIMITS[key][1]:
+                raise ValueError(f'bad {key} in preset {name}')
+        presets[name] = budget
+    return presets
+
+
 def scan(models=None, runs=None, extra_runs=(), seal=None):
-    """Every engine on offer, by id. Bubble runs come from `extra_runs`, the directories in `runs`, and `models`;
-    single `.pt` exports and `<name>.json` entries ({"name", "kind": "bubble", "path"}) come from `models`.
-    Entries carry `id`, `name`, `kind`, `presets`, and for Bubble `checkpoints` plus the server-only `path`. An id
-    is `kind:name`; entries sharing one get a suffix from their path, so an id never moves to another model."""
+    """Every engine on offer, by id.
+
+    Bubble runs come from `extra_runs`, the directories in `runs`, and `models`; single `.pt` exports come from
+    `models`. A directory in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once per network,
+    on the backend `six_backend` finds. `models/<name>.json` adds one entry: {"name", "kind": "bubble", "path"},
+    {"name", "kind": "six", "command", "mirrored", "presets"} or {"name", "kind": "strix", "model"}, paths
+    relative to the file. Entries carry `id`, `name`, `kind`, `presets`, and the server-only `path` and
+    `checkpoints` (Bubble), `command`, `cwd`, `mirrored` and `libraries` (Six protocol) or `model` (Strix). An id
+    is `kind:name`; entries sharing one get a suffix from their path, command or model, so an id never moves to
+    another engine."""
     found, seen = [], set()
 
-    def add(kind, name, **fields):
-        found.append(dict(name=name, kind=kind, presets=PRESETS[kind], **fields))
+    def add(kind, name, presets=None, **fields):
+        found.append(dict(name=name, kind=kind, presets=presets_of(kind, presets), **fields))
 
     def bubble(path, name=None):
         path = Path(path).resolve()
@@ -135,12 +189,28 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
         for path in sorted(Path(models).rglob('*.pt')):
             if 'checkpoints' not in path.relative_to(models).parts:
                 bubble(path)
+        for folder in sorted(p for p in Path(models).iterdir() if p.is_dir()):
+            binary = next((folder / n for n in ('sixengine.exe', 'sixengine') if (folder / n).exists()), None)
+            if binary:
+                backend, flags, libraries = six_backend(folder)
+            for network in sorted(folder.glob('gen-*.onnx'), reverse=True) if binary else ():
+                add('six', f'Six {network.stem} · {backend}', command=[str(binary), '--net', str(network), *flags],
+                    cwd=folder, mirrored=True, libraries=libraries)
         for path in sorted(Path(models).glob('*.json')):
             try:
                 spec = json.loads(path.read_text(encoding='utf-8'))
-                if spec.get('kind') == 'bubble':
-                    bubble(path.parent / spec['path'], spec.get('name'))
-            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                name, kind = spec.get('name') or path.stem, spec.get('kind')
+                if kind == 'bubble':
+                    bubble(path.parent / spec['path'], name)
+                elif kind == 'six':
+                    command = shlex.split(spec['command']) if isinstance(spec['command'], str) else list(spec['command'])
+                    first = path.parent / command[0]
+                    command[0] = str(first) if first.exists() else command[0]
+                    add('six', name, spec.get('presets'), command=command, cwd=path.parent,
+                        mirrored=spec.get('mirrored') is True, libraries=[])
+                elif kind == 'strix':
+                    add('strix', name, spec.get('presets'), model=(path.parent / spec['model']).resolve())
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
                 continue
     add('native', 'Native')
     if seal is not None and Path(seal).exists():
@@ -148,7 +218,8 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     bases = [f"{e['kind']}:{e['name']}" for e in found]
     entries = OrderedDict()
     for base, entry in zip(bases, found):
-        suffix = hashlib.blake2b(str(entry.get('path')).encode(), digest_size=3).hexdigest()
+        identity = entry.get('path') or entry.get('command') or entry.get('model')
+        suffix = hashlib.blake2b(str(identity).encode(), digest_size=3).hexdigest()
         key = base if bases.count(base) == 1 else f'{base}~{suffix}'
         entries[key] = dict(id=key, **entry)
     return entries
@@ -358,6 +429,7 @@ class Engines:
     def __init__(self, device, tactical_package=None, seal=None):
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
         self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
+        self.external = {}
         self.children = {}
 
     def bubble(self, path):
@@ -414,10 +486,12 @@ class Engines:
             return 'none'
 
     def turn(self, entry, budget, history, stop=lambda: False):
-        """A native or Seal turn. Their searches cannot be interrupted in process, so each kind searches in a child
-        process; when `stop()` turns true the child is killed, a fresh one starts on the next turn, and this raises
-        Cancelled."""
+        """A turn from a non-Bubble engine. A Six-protocol engine is ended when `stop()` turns true. Native, Seal and
+        Strix searches cannot be interrupted in process, so each kind searches in a child process; when `stop()`
+        turns true the child is killed and a fresh one starts on the next turn. Both raise Cancelled."""
         kind = entry['kind']
+        if kind == 'six':
+            return self.protocol(entry, budget, history, stop)
         if kind not in self.children or self.children[kind][0].poll() is not None:
             child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'search', kind],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding='utf-8',
@@ -430,7 +504,8 @@ class Engines:
             threading.Thread(target=pump, daemon=True).start()
             self.children[kind] = child, lines
         child, lines = self.children[kind]
-        child.stdin.write(json.dumps(dict(ms=budget['ms'], history=[list(p) for p in history])) + '\n')
+        request = dict(budget, history=[list(p) for p in history], model=str(entry.get('model')))
+        child.stdin.write(json.dumps(request) + '\n')
         child.stdin.flush()
         while True:
             try:
@@ -446,6 +521,35 @@ class Engines:
         if 'error' in answer:
             raise RuntimeError(answer['error'])
         return answer['moves']
+
+    def protocol(self, entry, budget, history, stop):
+        """A turn from a Six-protocol engine, kept running between turns, one process per command line."""
+        from six_engine import ProtocolError, SixEngine
+        command = [*entry['command'], *budget.get('args', ())]
+        key = (*command, entry['mirrored'])
+        if key not in self.external:
+            self.external[key] = SixEngine(command, mirrored=entry['mirrored'], cwd=entry['cwd'],
+                                           path=entry['libraries'], cancel=threading.Event())
+        engine, done = self.external[key], threading.Event()
+        engine.cancel.clear()
+
+        def watch():
+            while not done.wait(.05):
+                if stop():
+                    engine.cancel.set()
+                    return
+
+        threading.Thread(target=watch, daemon=True).start()
+        game = replay(history)
+        try:
+            return engine(game, budget.get('ms'), nodes=budget.get('nodes'))
+        except ProtocolError:
+            if engine.cancel.is_set():
+                raise Cancelled() from None
+            raise
+        finally:
+            done.set()
+            game.close()
 
     @staticmethod
     def end(child):
@@ -464,6 +568,9 @@ class Engines:
         if self.prover is not None:
             self.prover.close()
             self.prover = None
+        for engine in self.external.values():
+            engine.close()
+        self.external.clear()
 
 
 # Saved evaluations
@@ -660,19 +767,25 @@ class Job:
                     error=self.error, ply=len(self.history), side=getattr(self, 'side', None))
 
 
-def budget_of(kind, preset, custom=None):
-    """The budget of `preset` for an engine kind, or `custom` checked against LIMITS."""
+def budget_of(presets, preset, custom=None):
+    """The budget of `preset` from an entry's `presets`, or the standard budget with `custom` values checked
+    against LIMITS (a preset's launch `args` are not custom)."""
     if preset != 'custom':
-        if preset not in PRESETS[kind]:
+        if preset not in presets:
             raise ValueError('Unknown preset')
-        return dict(PRESETS[kind][preset])
+        return dict(presets[preset])
     if custom is not None and not isinstance(custom, dict):
         raise ValueError('A custom budget is an object of numbers')
-    budget = dict(PRESETS[kind]['standard']) | (custom or {})
-    for key, value in budget.items():
+    budget = dict(presets['standard'])
+    for key, value in (custom or {}).items():
+        if key == 'args':
+            continue
+        if key not in budget or key not in LIMITS:
+            raise ValueError(f'{key} is not a budget of this engine')
         low, high = LIMITS[key]
-        if key not in PRESETS[kind]['standard'] or type(value) is not int or not low <= value <= high:
+        if type(value) is not int or not low <= value <= high:
             raise ValueError(f'{key} must be {low}..{high}')
+        budget[key] = value
     return budget
 
 
@@ -706,7 +819,7 @@ class Session:
                 raise ValueError('Unknown checkpoint')
         else:
             checkpoint = None
-        return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget_of(entry['kind'], preset, custom))
+        return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget_of(entry['presets'], preset, custom))
 
     def engine_key(self, seat):
         """Evaluations are keyed by the weights and the solver build that produced them ('none' for a budget
@@ -736,7 +849,8 @@ class Session:
                 if (found := self.lookup(history[:ply])) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'line', 'threat', 'simulations', 'solver_nodes')}
-            entries = [{k: v for k, v in e.items() if k != 'path'} for e in self.entries.values()]
+            shown = ('id', 'name', 'kind', 'presets', 'checkpoints')
+            entries = [{k: e[k] for k in shown if k in e} for e in self.entries.values()]
             return dict(instance=self.instance, revision=self.revision, history=[list(p) for p in history], **board,
                         paused=self.paused, seats=self.seats, analysis=self.analysis, engines=entries,
                         evaluations=evaluations,
@@ -1208,17 +1322,28 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def search_child(kind):
-    """The child process of `Engines.turn`: one JSON line {ms, history} in, one line {moves} or {error} out."""
-    engine = None
-    if kind == 'seal':
-        from legacy.arena import Seal
-        engine = Seal()
+    """The child process of `Engines.turn`: one JSON line {history, the budget, model} in, one line {moves} or
+    {error} out."""
+    engines = {}
     for line in sys.stdin:
         try:
             request = json.loads(line)
             game = replay(request['history'])
             try:
-                moves = game.search(request['ms'])['moves'] if kind == 'native' else engine(game, request['ms'])
+                if kind == 'native':
+                    moves = game.search(request['ms'])['moves']
+                elif kind == 'seal':
+                    if 'seal' not in engines:
+                        from legacy.arena import Seal
+                        engines['seal'] = Seal()
+                    moves = engines['seal'](game, request['ms'])
+                else:
+                    sys.path.insert(0, str(ROOT))
+                    from tools.strix_learned_adapter import StrixLearned
+                    key = (request['model'], request['simulations'])
+                    if key not in engines:
+                        engines[key] = StrixLearned(request['model'], simulations=request['simulations'])
+                    moves = engines[key](game, 0)
             finally:
                 game.close()
             answer = dict(moves=[list(map(int, m)) for m in moves])
