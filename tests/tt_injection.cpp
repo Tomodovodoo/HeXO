@@ -70,6 +70,20 @@ int main() {
                 assert(cached==fresh);
             };
             check_cache();
+            if(step==10 && trial<4) {
+                auto key=position.hash();auto features=position.features;
+                Search cached_search(10000,4);
+                int cached_value=cached_search.negamax(position,2,-mate-1,mate+1);
+                assert(position.hash()==key && position.features==features);
+                check_cache();
+                position.candidates=nullptr;
+                Search fresh_search(10000,4);
+                int fresh_value=fresh_search.negamax(position,2,-mate-1,mate+1);
+                position.candidates=&cache.cache;
+                assert(cached_value==fresh_value && cached_search.nodes==fresh_search.nodes);
+                assert(position.hash()==key && position.features==features);
+                check_cache();
+            }
             for(auto first:Search::candidates(position,4)) {
                 Restore restore(position);position.make(first);
                 if(position.winner>=0) continue;
