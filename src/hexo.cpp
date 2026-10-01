@@ -457,14 +457,14 @@ struct Turn {
 void apply(Board& b,const Turn& t) { for(int i=0;i<t.count && b.winner<0;++i) b.make(t.cells[i]); }
 constexpr int mate=10000000;
 struct Timeout {};
-struct Entry { uint64_t key=0; int depth=-1,score=0,flag=0; Turn best; };
+struct Entry { uint64_t key=0; Turn best; };
 struct Search {
     Clock::time_point deadline;
     int width;
     uint64_t nodes=0;
     std::vector<Entry> tt, frozen_hints;
     bool inject_tt=false;
-    Search(int ms,int width,bool table=true):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(table?1<<16:0){}
+    Search(int ms,int width,bool inject=false):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(inject?1<<16:0),inject_tt(inject){}
     void check() const { if(Clock::now()>=deadline) throw Timeout{}; }
     Turn immediate(Board& b) {
         auto completions=b.completions(b.player,b.remaining);
@@ -688,27 +688,13 @@ struct Search {
         if(b.winner>=0) return b.winner==b.player?mate:-mate;
         if(immediate(b).count) return mate;
         if(depth<=0) return unavoidable_loss(b)?-mate:b.score(b.player);
-        uint64_t key=b.hash();auto& entry=tt[key&(tt.size()-1)];
-        if(!inject_tt && entry.key==key && entry.depth>=depth) {
-            if(entry.flag==0) return entry.score;
-            if(entry.flag==1 && entry.score>=beta) return entry.score;
-            if(entry.flag==2 && entry.score<=alpha) return entry.score;
+        Turn hint{};
+        if(inject_tt) {
+            uint64_t key=b.hash();const auto& entry=frozen_hints[key&(frozen_hints.size()-1)];
+            if(entry.key==key) hint=entry.best;
         }
-        const auto& move_entry=inject_tt?frozen_hints[key&(frozen_hints.size()-1)]:entry;
-        const Turn hint=move_entry.key==key?move_entry.best:Turn{};
-        const int original=alpha;
-        auto moves=turns(b,true,inject_tt?hint:Turn{});
+        auto moves=turns(b,true,hint);
         if(moves.empty()) return b.score(b.player);
-        // Only reorder the selected, independently validated turns. Injecting a
-        // hash move before truncation would change this selective search tree.
-        // Keep the actual generated turn, including early first-stone wins.
-        if(!inject_tt && hint.count>=1 && hint.count<=2) {
-            auto found=std::find_if(moves.begin(),moves.end(),[&](const Turn& t) {
-                return t.count==hint.count && t.cells[0]==hint.cells[0] &&
-                    (t.count==1 || t.cells[1]==hint.cells[1]);
-            });
-            if(found!=moves.end()) std::rotate(moves.begin(),found,found+1);
-        }
         int best=-mate-1;Turn best_turn=moves.front();bool first=true;
         for(const auto& t:moves) {
             Restore restore(b);int side=b.player;apply(b,t);
@@ -723,7 +709,7 @@ struct Search {
             if(score>best) {best=score;best_turn=t;}
             alpha=std::max(alpha,score);if(alpha>=beta) break;
         }
-        entry={key,depth,best,best<=original?2:best>=beta?1:0,best_turn};
+        if(inject_tt) {uint64_t key=b.hash();tt[key&(tt.size()-1)]={key,best_turn};}
         return best;
     }
     std::vector<Turn> diversify(Board& b,std::vector<Turn> base,int seconds,int cap,bool timed=true) {
@@ -849,7 +835,7 @@ int hx_search_tt(void* p,int ms,int depth,int width,int seconds,int cap,HxResult
     if(ms<1 || depth<1 || width<2 || width>128 ||
         ((seconds || cap) && (seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024))) return 0;
     try {
-        auto start=Clock::now();Search search(ms,width);search.inject_tt=true;
+        auto start=Clock::now();Search search(ms,width,true);
         *out=search.run(*static_cast<Board*>(p),depth,seconds,cap);
         out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;
     } catch(...) {return 0;}

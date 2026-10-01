@@ -6,8 +6,11 @@
 
 Native updates candidate scores only along the lines changed by a placement. It
 ranks the second stone from an exact evaluation delta, avoiding a full make/unmake
-for every proposed pair. The cache lasts for one search; the transposition table
-remains 4 MiB. No weights, model, external solver or new dependency is required.
+for every proposed pair. The candidate cache lasts for one search. Ordinary
+Native search uses no transposition table. The experimental Python
+`tt_injection=True` option keeps its separate previous-iteration move hints;
+it is off by default and never caches score bounds.
+No weights, model, external solver or new dependency is required.
 The optional NNUE search keeps its existing candidate evaluation.
 
 ```python
