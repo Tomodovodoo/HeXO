@@ -1559,12 +1559,14 @@ class Session:
         return seat | dict(name=entry['name'] + (f"/{seat['checkpoint']}" if seat['checkpoint'] else ''), source=source)
 
     def start_match(self, players, games=None, preset='standard', output=None, openings=None, max_placements=512,
-                    book=None, opening_range=None, unique_openings=None, seed=0, evaluations=None, clock=None):
+                    book=None, opening_range=None, unique_openings=None, seed=0, evaluations=None, clock=None,
+                    replace=False):
+        """Start a batch on this board; an unfinished game against a person is refused unless `replace`."""
         with self.lock:
             self.match_editable()
             board = replay(self.history)
             try:
-                if self.history and board.winner < 0 and any(s['engine'] == 'human' for s in self.seats):
+                if self.history and board.winner < 0 and any(s['engine'] == 'human' for s in self.seats) and not replace:
                     raise ValueError('A human game is on this board; use a new player port or finish/reset that game')
             finally:
                 board.close()
@@ -2423,7 +2425,8 @@ class Handler(BaseHTTPRequestHandler):
                     session.start_match(args['players'], args.get('games'), args.get('preset', 'standard'),
                                         args.get('output'), openings, args.get('max_placements', 512),
                                         args.get('book'), args.get('opening_range'), args.get('unique_openings'),
-                                        args.get('seed', 0), clock=args.get('clock'))
+                                        args.get('seed', 0), clock=args.get('clock'),
+                                        replace=args.get('replace') is True)
                 elif action == 'resume' and args.get('batch'):
                     session.resume_match(args['batch'])
                 elif action in ('pause', 'resume'):

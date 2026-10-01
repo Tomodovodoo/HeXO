@@ -131,7 +131,7 @@ curl -X POST http://127.0.0.1:8772/match -H "Content-Type: application/json" -d 
 | `GET /state` | Engines, current board, jobs, match progress and score |
 | `GET /models` | Player catalogue, checkpoints, budgets and clock support |
 | `GET /openings?range=narrow&count=16&seed=0` | Preview the exact selected opening set, read-only |
-| `POST /match` | Start with `players`, `games` or `unique_openings`, `opening_range`, `seed`, and optional `book` or `output` |
+| `POST /match` | Start with `players`, `games` or `unique_openings`, `opening_range`, `seed`, and optional `book`, `output` or `replace` (clear an unfinished game against a person) |
 | `GET /match` | Match specification, score, completed results and paused state |
 | `POST /match` with `{"action":"pause"}`, `resume` or `stop` | Control the current batch |
 | `POST /match` with `{"action":"resume","batch":"path/to/batch"}` | Load and resume a saved batch |

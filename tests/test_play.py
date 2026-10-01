@@ -1218,6 +1218,9 @@ class Matches(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'human game'):
             self.session.start_match(['Native', 'Other'], output=self.output)
         self.assertEqual(self.session.history, [(0, 0)])
+        self.session.start_match(['Native', 'Other'], games=2, output=self.output, max_placements=3, replace=True)
+        wait(lambda: not self.session.match_worker.is_alive())
+        self.assertEqual(self.session.match['completed'], 2)
 
     def test_simulations_only_adapter_refuses_a_clock_before_start(self):
         self.session.entries['strix:Strix'] = dict(id='strix:Strix', name='Strix', kind='strix',
