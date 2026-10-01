@@ -14,7 +14,7 @@ search.close()
 
 ## Gumbel MCTS
 
-The root samples `root_samples` moves without replacement by Gumbel-top-k over the logits, then spends the simulation budget in sequential halving rounds; with 64 simulations and 16 samples that is 16x1, 8x2, 4x4, 2x8. Below the root, selection is deterministic: the improved policy (softmax of logits plus the completed Q) minus the visit frequency, as in DeepMind's [mctx](https://github.com/google-deepmind/mctx). Completed Q gives unvisited moves the mixed value and normalises over the eligible moves only. The chosen action is the sampled move with the highest score after the last round, and the policy target is the improved policy over the sampled moves.
+The root samples `root_samples` moves without replacement by Gumbel-top-k over the logits, then spends the simulation budget in sequential halving rounds; with 64 simulations and 16 samples that is 16x1, 8x2, 4x4, 2x8. Below the root, selection is deterministic: the improved policy (softmax of logits plus the completed Q) minus the visit frequency, as in DeepMind's [mctx](https://github.com/google-deepmind/mctx). Completed Q gives unvisited moves the mixed value and normalises over the eligible moves only. The chosen action is the sampled move with the highest score after the last round. The policy target covers every eligible legal move, including unvisited moves whose Q is completed with the mixed value.
 
 Values are stored from the mover's view and flip sign only when the mover changes, so a turn's two placements back up without a sign flip. Terminal boards and the one-turn tactics oracle give exact values, and the solver adds certificates; how those propagate is in [search-outcomes.md](search-outcomes.md).
 
