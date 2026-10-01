@@ -1127,6 +1127,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         policy is empty. Losing rows and rows without a witness keep their original policy. With
         pair_policy_weight > 0, a first stone whose search policy and second stone's search policy both exist
         first takes pair_policy(policy, ..., pair_policy_weight);
+      paired: whether the row took that pair step (not collated);
       value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam, calibration) at the ply;
         weight 1 for finished games, `bootstrap_weight` for capped games with root values, 0 otherwise, times
         `cheap_value_weight` for cheap-search rows; a row with a nonzero `proven` instead gets the proven value
@@ -1174,7 +1175,8 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
             if len(next_actions) != len(next_policy) or legal_digest(next_actions) != nref.row['legal_sha256']:
                 raise ValueError(f'Next-ply legal list disagrees with row: {nref.shard}/{nref.index}')
         policy_weight = float(len(policy) > 0)
-        if pair_policy_weight > 0 and s.remaining == 2 and len(policy) and len(next_policy):
+        paired = bool(pair_policy_weight > 0 and s.remaining == 2 and len(policy) and len(next_policy))
+        if paired:
             policy = pair_policy(policy, s.actions, next_actions, next_policy, pair_policy_weight)
         if (proof_policy_weight > 0 and proven > 0 and ref.row.get('proof_action')
                 and (not proof_policy_missing_only or not len(policy))):
@@ -1222,7 +1224,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
             if p.sum() > 0:
                 following = (cells, p/p.sum(), 1.)
         samples.append(s)
-        out.append(dict(policy=policy, policy_weight=policy_weight,
+        out.append(dict(policy=policy, policy_weight=policy_weight, paired=paired,
                         value=float(fixed > 0) if fixed else .5 if values[t] is None else values[t],
                         value_weight=proven_weight if fixed else value_weight,
                         outcome=float(me == e['winner']) if e['winner'] >= 0 else .5,

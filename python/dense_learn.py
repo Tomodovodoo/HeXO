@@ -67,15 +67,63 @@ def validation_fields(metrics):
 
 
 def policy_validation_rows(out, batch):
-    """Policy CE, target entropy, KL and top-1 agreement for each collated row."""
+    """Policy CE, target entropy, KL, top-1 agreement, top-2 membership and argmax mass for each collated row.
+    The network's argmax is every entry tied for its highest logit: top-1 holds when one of them ties for the
+    highest target mass, top-2 when one of them has positive target mass at least the second highest, and argmax
+    mass is their mean target probability."""
     target = torch.zeros(batch['mask'].shape).masked_scatter_(batch['mask'], batch['policy'])
     policy, far = out['policy'].float().cpu(), out['far'].float().cpu()
     ce = hexnet.policy_row_losses(policy, far, batch['cells'], batch['counts'], target)
     entropy = -torch.xlogy(target, target).sum(1)
     logits, _ = hexnet.action_logits(policy, far, batch['cells'], batch['counts'])
-    top1 = ((logits == logits.max(1, keepdim=True).values) &
-            (target == target.max(1, keepdim=True).values)).any(1).float()
-    return ce, entropy, ce-entropy, top1
+    argmax = logits == logits.amax(1, keepdim=True)
+    top1 = (argmax & (target == target.amax(1, keepdim=True))).any(1).float()
+    second = target.topk(min(2, target.shape[1]), 1).values[:, -1:]
+    top2 = (argmax & (target >= second) & (target > 0)).any(1).float()
+    mass = (target*argmax).sum(1)/argmax.sum(1)
+    return ce, entropy, ce-entropy, top1, top2, mass
+
+
+def pair_policy_rows(out, batch, samples, pairs):
+    """Top-1 membership in the played pair for each row: whether an entry tied for the highest logit is one of
+    the row's two `pairs` moves (the stones of this ply and the next). Samples follow the bucket's order; rows
+    whose pair is None return nan."""
+    logits, _ = hexnet.action_logits(out['policy'].float().cpu(), out['far'].float().cpu(),
+                                    batch['cells'], batch['counts'])
+    played = torch.zeros(logits.shape, dtype=torch.bool)
+    for i, (sample, pair) in enumerate(zip(samples, pairs)):
+        if pair is not None:
+            played[i, :len(sample.actions)] = torch.from_numpy((sample.actions[:, None, :] == pair[None]).all(2).any(1))
+    top1 = (played & (logits == logits.amax(1, keepdim=True))).any(1).float()
+    return torch.where(torch.tensor([pair is not None for pair in pairs]), top1, math.nan)
+
+
+def played_pair(ref, target):
+    """The moves of ply t and t+1 of the ref's episode as an int64 [2, 2] array when `target` took a pair policy
+    target (dense_data.examples' `paired`), else None."""
+    if not target['paired']:
+        return None
+    t = ref.row['ply']
+    return np.asarray(ref.episode['moves'], np.int64).reshape(-1, 2)[t:t+2]
+
+
+def policy_summary(weight, placements, entropy, kl, top1, top2, argmax_mass, pair_top1):
+    """Means weighted by `weight` over rows with positive weight: policy_target_entropy and policy_kl;
+    policy_top1, policy_top2 and policy_argmax_mass with policy_rows, overall and for each stone of a turn
+    (policy_first_*, policy_second_*); policy_pair_top1 over rows with a finite pair_top1, with policy_pair_rows.
+    A mean is None without rows."""
+    weight, placements, entropy, kl, top1, top2, argmax_mass, pair_top1 = (
+        np.asarray(x, np.float64) for x in (weight, placements, entropy, kl, top1, top2, argmax_mass, pair_top1))
+    known = weight > 0
+    mean = lambda x, m: float(np.average(x[m], weights=weight[m])) if m.any() else None
+    result = dict(policy_target_entropy=mean(entropy, known), policy_kl=mean(kl, known))
+    for suffix, selected in (('', known), ('_first', known & (placements == 2)), ('_second', known & (placements == 1))):
+        prefix = 'policy'+suffix
+        result[prefix+'_rows'] = int(selected.sum())
+        result |= {f'{prefix}_{name}': mean(x, selected) for name, x in (('top1', top1), ('top2', top2),
+                                                                         ('argmax_mass', argmax_mass))}
+    paired = known & np.isfinite(pair_top1)
+    return result | dict(policy_pair_top1=mean(pair_top1, paired), policy_pair_rows=int(paired.sum()))
 
 
 def certified_policy_rows(out, batch, samples, rows):
@@ -764,7 +812,7 @@ class Learner:
 
     def validate(self, window):
         """EMA weighted_means (eval mode) over VALIDATION_ROWS held-out rows drawn with a fixed sampling seed, by
-        head, plus policy-weighted entropy, KL and top-1, outcome_split and certified winning-move recognition
+        head, plus the policy-weighted policy_summary, outcome_split and certified winning-move recognition
         on the same rows, including rows without a policy training target; None without held-out rows."""
         if not window.validation:
             return None
@@ -778,26 +826,24 @@ class Learner:
             batches.append(batch)
             for size, bucket in batch.items():
                 indices = [i for i, sample in enumerate(samples) if sample.size == size]
-                rendered.append((bucket, [samples[i] for i in indices], [refs[i].row for i in indices]))
+                rendered.append((bucket, [samples[i] for i in indices], [refs[i].row for i in indices],
+                                 [played_pair(refs[i], targets[i]) for i in indices]))
         rows, policy_rows, certified_rows, deblundered = [], [], [], []
         with torch.no_grad():
-            for b, samples, witnesses in rendered:
+            for b, samples, witnesses, pairs in rendered:
                 out = forward(self.ema, b['planes'], self.device, self.memory_format)[0]
                 certified_rows.append(np.stack([*(x.numpy() for x in certified_policy_rows(out, b, samples, witnesses)),
                                                 b['remaining'].numpy()]))
                 logit = out['value_logit'].float().cpu()
                 bce = torch.nn.functional.binary_cross_entropy_with_logits(logit, b['outcome'], reduction='none')
                 rows.append(np.stack([bce.numpy(), b['outcome'].numpy() != .5, b['exact'].numpy() > 0]))
-                mask = b['policy_weight'] > 0
-                if mask.any():
-                    policy_rows.append(torch.stack([b['policy_weight'], *policy_validation_rows(out, b)[1:]])[:, mask].numpy())
+                policy_rows.append(torch.stack([b['policy_weight'], b['remaining'].float(), *policy_validation_rows(out, b)[1:],
+                                                pair_policy_rows(out, b, samples, pairs)]).numpy())
                 if s.deblunder_weight:
                     value_bce = torch.nn.functional.binary_cross_entropy_with_logits(logit, b['value'], reduction='none')
                     deblundered.append(np.stack([value_bce.numpy(), b['deblundered'].numpy()]))
-        policy = np.concatenate(policy_rows, 1) if policy_rows else np.empty((4, 0))
-        extra = dict(zip(('policy_target_entropy', 'policy_kl', 'policy_top1'),
-                         (float(np.average(x, weights=policy[0])) if x.size else None for x in policy[1:])))
-        result = (dict(zip(self.heads, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1)) | extra
+        result = (dict(zip(self.heads, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1))
+                  | policy_summary(*np.concatenate(policy_rows, 1))
                   | certified_policy_summary(*np.concatenate(certified_rows, 1)))
         if s.deblunder_weight:
             result.update(deblunder_split(*np.concatenate(deblundered, 1)))
@@ -818,7 +864,8 @@ class Learner:
         ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
         finished (1. when winner >= 0, else 0.), value_bce, value (its target), outcome_bce, outcome (the hard
         outcome; .5 for capped games), policy_ce (against the improved policy; nan on rows without a policy
-        target), policy_target_entropy, policy_kl, policy_top1 (nan without a policy target), searched
+        target), policy_target_entropy, policy_kl, policy_top1, policy_top2, policy_argmax_mass (nan without a
+        policy target), policy_pair_top1 (pair_policy_rows; nan without a policy target or a pair target), searched
         (searched_value at the row), proven (the row's `proven`), proof_action (1 with a witness)
         and deblundered (0/1). certified_policy_mass and certified_policy_top1 measure the winning witness
         independently of training targets (nan without one); placements is the stones remaining this turn."""
@@ -834,12 +881,14 @@ class Learner:
                 for b in dense_data.collate(samples, targets).values():
                     indices = order[len(losses):len(losses)+len(b['counts'])]
                     out = forward(self.ema, b['planes'], self.device, self.memory_format)[0]
-                    ce, entropy, kl, top1 = policy_validation_rows(out, b)
+                    pair = pair_policy_rows(out, b, [samples[i] for i in indices],
+                                            [played_pair(chunk[i], targets[i]) for i in indices])
                     certified = certified_policy_rows(out, b, [samples[i] for i in indices],
                                                        [chunk[i].row for i in indices])
                     logit = out['value_logit'].float().cpu()
                     bce = [torch.nn.functional.binary_cross_entropy_with_logits(logit, b[k], reduction='none') for k in ('value', 'outcome')]
-                    policy = [torch.where(b['policy_weight'] > 0, x, math.nan).tolist() for x in (ce, entropy, kl, top1)]
+                    policy = [torch.where(b['policy_weight'] > 0, x, math.nan).tolist()
+                              for x in (*policy_validation_rows(out, b), pair)]
                     losses += zip(bce[0].tolist(), b['value'].tolist(), bce[1].tolist(), b['outcome'].tolist(),
                                   *policy, *(x.tolist() for x in certified))
                 for i, loss in zip(order, losses):
@@ -849,7 +898,8 @@ class Learner:
                                  float(ref.row.get('proven', 0)), float(bool(ref.row.get('proof_action'))),
                                  targets[i].get('deblundered', 0.), ref.row['remaining']))
         keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce',
-                'policy_target_entropy', 'policy_kl', 'policy_top1', 'certified_policy_mass', 'certified_policy_top1',
+                'policy_target_entropy', 'policy_kl', 'policy_top1', 'policy_top2', 'policy_argmax_mass',
+                'policy_pair_top1', 'certified_policy_mass', 'certified_policy_top1',
                 'searched', 'proven', 'proof_action', 'deblundered', 'placements')
         return dict(zip(keys, np.array(rows, np.float64).reshape(-1, len(keys)).T))
 
@@ -874,7 +924,8 @@ class Learner:
         <source>_proven_rows their count; None without such rows. <source>_policy_ce_proof is policy CE against
         the configured mixed target on winning rows with a witness and a policy target, with its count in
         <source>_policy_ce_proof_rows; None without such rows. <source>_certified_policy[_first|_second]_(mass,
-        top1, rows) scores the winning witness even where policy training is disabled. These use the fixed held panels."""
+        top1, rows) scores the winning witness even where policy training is disabled. The policy_summary of
+        the held rows with a policy target is reported under <source>_ prefixed keys. These use the fixed held panels."""
         sets.refresh()
         self.ema.eval()
         out = dict(newest_checkpoint=sets.newest_checkpoint)
@@ -891,8 +942,9 @@ class Learner:
             out[f'{source}_policy_ce_proof'] = float(r['policy_ce'][proof].mean()) if proof.any() else None
             out[f'{source}_policy_ce_proof_rows'] = int(proof.sum())
             p = np.isfinite(r['policy_ce'])
-            for key in ('policy_target_entropy', 'policy_kl', 'policy_top1'):
-                out[f'{source}_{key}'] = float(r[key][p].mean()) if p.any() else None
+            out.update({f'{source}_{k}': v for k, v in policy_summary(p, r['placements'], *(r[k] for k in (
+                'policy_target_entropy', 'policy_kl', 'policy_top1', 'policy_top2', 'policy_argmax_mass',
+                'policy_pair_top1'))).items()})
             out.update({f'{source}_{k}': v for k, v in outcome_split(r['outcome_bce'], r['finished'] > 0, r['proven'] != 0).items()})
             if self.settings.deblunder_weight:
                 out.update({f'{source}_{k}': v for k, v in deblunder_split(r['value_bce'], r['deblundered']).items()})
