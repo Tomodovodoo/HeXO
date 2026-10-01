@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 
 from hexo import Game
 from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, Session, budget_of, export_path, import_history,
-                  model_key, review, scan)
+                  model_key, proof_turns, review, scan)
 
 STANDARD = PRESETS['bubble']['standard']
 
@@ -476,6 +476,13 @@ class Http(unittest.TestCase):
         caught.exception.close()
         local = {'Origin': f'http://localhost:{port}', 'Host': f'localhost:{port}'}
         self.assertEqual(self.post('/new', headers=local)['history'], [])
+
+
+class Proofs(unittest.TestCase):
+    def test_placements_become_the_winners_turns(self):
+        self.assertEqual([proof_turns(p, 2, True) for p in (1, 2, 5, 6, 9, 10)], [1, 1, 2, 2, 3, 3])
+        self.assertEqual([proof_turns(p, 1, True) for p in (1, 4, 5)], [1, 2, 2])
+        self.assertEqual([proof_turns(p, 2, False) for p in (3, 4, 7, 8)], [1, 1, 2, 2])
 
 
 class Registry(unittest.TestCase):

@@ -239,6 +239,14 @@ def winning_line(history, result):
         local.close()
 
 
+def proof_turns(plies, remaining, mover_wins):
+    """The winner's turns in a proof `plies` placements long, from a position where the side to move has
+    `remaining` stones left in its turn and every later turn is two stones."""
+    if mover_wins:
+        return 1 if plies <= remaining else 1 + -(-(plies - remaining) // 4)
+    return -(-(plies - remaining) // 4)
+
+
 def interruptible(call, watch, abort):
     """`call()` on its own thread, polling `watch(0)` meanwhile; when `watch` raises, `abort()` ends the call and
     the exception propagates."""
@@ -307,9 +315,10 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                     tree.close()
                 action, policy, actions = result['action'], result['policy'], result['actions']
                 stone_value = root_value(result, local.player)
-                if result.get('proven') and proof is None and not moves:
-                    proof = dict(winner=player if result['proven'] > 0 else 1 - player,
-                                 turns=(result['proof_plies'] + 1) // 2)
+                proven = result.get('proven') or 0
+                if proof is None and (proven > 0 or proven < 0 and not moves):
+                    proof = dict(winner=player if proven > 0 else 1 - player,
+                                 turns=proof_turns(result['proof_plies'], local.remaining, proven > 0))
             else:
                 result = network.evaluate([current])[0]
                 actions = result['actions']
