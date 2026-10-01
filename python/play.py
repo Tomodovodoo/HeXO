@@ -448,6 +448,27 @@ def position_text(history):
     return ' '.join(f'{int(q)},{int(r)}' for q, r in history)
 
 
+def well_formed(record):
+    """True for a dict with the fields of a saved evaluation, each of the right shape."""
+    def number(v):
+        return type(v) in (int, float)
+
+    def cells(v, size, third=lambda x: type(x) is int):
+        """A list of [q, r] or [q, r, x] items with integer coordinates and a third value passing `third`."""
+        return isinstance(v, list) and all(isinstance(c, list) and len(c) == size and type(c[0]) is int
+                                           and type(c[1]) is int and (size == 2 or third(c[2])) for c in v)
+
+    if not isinstance(record, dict):
+        return False
+    proof = record.get('proof')
+    return (isinstance(record.get('position'), str) and isinstance(record.get('engine'), str)
+            and all(type(record.get(k)) is int for k in ('simulations', 'solver_nodes'))
+            and number(record.get('value')) and cells(record.get('moves'), 2) and cells(record.get('top'), 3, number)
+            and cells(record.get('line', []), 3) and cells(record.get('threat', []), 2)
+            and (proof is None or isinstance(proof, dict) and proof.get('winner') in (0, 1)
+                 and type(proof.get('turns')) is int))
+
+
 class Evaluations:
     """Append-only JSON lines, one evaluation per line, indexed in memory.
 
@@ -483,13 +504,8 @@ class Evaluations:
         return hashlib.blake2b(position_text(history).encode(), digest_size=16).digest()
 
     def index(self, record, line):
-        """Index one record; ValueError when it lacks a text position and engine, integer budgets, a numeric value
-        or the lists of moves and top stones."""
-        if not (isinstance(record, dict) and isinstance(record.get('position'), str)
-                and isinstance(record.get('engine'), str)
-                and all(type(record.get(k)) is int for k in ('simulations', 'solver_nodes'))
-                and type(record.get('value')) in (int, float)
-                and all(isinstance(record.get(k), list) for k in ('moves', 'top'))):
+        """Index one record; ValueError unless `well_formed(record)`."""
+        if not well_formed(record):
             raise ValueError('Not an evaluation record')
         position = hashlib.blake2b(record['position'].encode(), digest_size=16).digest()
         budget = (record['simulations'], record['solver_nodes'])

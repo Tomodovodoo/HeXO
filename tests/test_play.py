@@ -105,6 +105,8 @@ class Store(unittest.TestCase):
             Evaluations(path).add([], 'e', STANDARD, dict(value=.1, moves=[], top=[]))
             with open(path, 'a', encoding='utf-8') as out:
                 out.write('[1]\n{"position": 5, "engine": "e", "simulations": 1, "solver_nodes": 1}\n')
+                out.write(json.dumps(dict(position='0,0', engine='e', simulations=1, solver_nodes=1, value=.5,
+                                          moves=[[0]], top=[])) + '\n')
                 out.write('{"position": "0,0", "eng')
             Evaluations(path).add([(0, 0)], 'e', STANDARD, dict(value=.2, moves=[], top=[]))
             reloaded = Evaluations(path)
