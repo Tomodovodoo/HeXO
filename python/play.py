@@ -172,6 +172,7 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     is `kind:name`; entries sharing one get a suffix from their path, command or model, so an id never moves to
     another engine."""
     found, seen = [], set()
+    models = models and Path(models).resolve()
 
     def add(kind, name, presets=None, **fields):
         found.append(dict(name=name, kind=kind, presets=presets_of(kind, presets), **fields))

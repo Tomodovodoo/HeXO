@@ -31,10 +31,11 @@ def _kernel32():
 
 class TreeProcess(subprocess.Popen):
     """A Popen whose kill() ends the process and every process it started. On Windows they share a job object,
-    which also ends them when this process exits or when the leader is reaped; elsewhere they share a session."""
+    which also ends them when this process exits or when the leader is reaped; elsewhere they share a session, which
+    is killed when the leader is killed or reaped."""
 
     def __init__(self, args, **kwargs):
-        self.job = None
+        self.job, self.session_ended = None, False
         if os.name != 'nt':
             super().__init__(args, start_new_session=True, **kwargs)
             return
@@ -66,6 +67,12 @@ class TreeProcess(subprocess.Popen):
             self.kernel32.CloseHandle(self.job)
             self.job = None
 
+    def _end_session(self):
+        if not self.session_ended:
+            self.session_ended = True
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.pid, signal.SIGKILL)
+
     def kill(self):
         if self.job:
             self.kernel32.TerminateJobObject(self.job, 1)
@@ -74,13 +81,16 @@ class TreeProcess(subprocess.Popen):
                 time.sleep(.01)
             self._release()
         elif os.name != 'nt':
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(self.pid, signal.SIGKILL)
+            self._end_session()
         super().kill()
 
     terminate = kill
 
     def wait(self, timeout=None):
+        """Reap the process and end what it left running: closing the job on Windows, signalling the session
+        elsewhere."""
         code = super().wait(timeout)
         self._release()
+        if os.name != 'nt':
+            self._end_session()
         return code

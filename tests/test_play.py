@@ -1,6 +1,7 @@
 """Play server: evaluation store, review labels, background jobs and the HTTP surface, with fake engines."""
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,6 +16,7 @@ from urllib.request import Request, urlopen
 from hexo import Game
 from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SearchChild, Session, budget_of, export_path,
                   import_history, model_key, presets_of, proof_turns, review, scan, six_backend)
+from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
 
@@ -512,6 +514,25 @@ class Jobs(unittest.TestCase):
             time.sleep(.3)
             self.assertEqual(beat.read_text(), last)
             self.assertFalse(temporary.exists())
+
+    def test_reaping_a_tree_process_ends_what_it_left_running(self):
+        with tempfile.TemporaryDirectory() as folder:
+            beat = Path(folder) / 'beat'
+            (Path(folder) / 'grandchild.py').write_text(
+                'import pathlib, sys, time\n'
+                'while True:\n'
+                '    pathlib.Path(sys.argv[1]).write_text(str(time.time()))\n'
+                '    time.sleep(.02)\n')
+            leader = TreeProcess([sys.executable, '-c', 'import subprocess, sys; subprocess.Popen(sys.argv[1:])',
+                                  sys.executable, str(Path(folder) / 'grandchild.py'), str(beat)],
+                                 stdout=subprocess.DEVNULL)
+            wait(beat.exists)
+            wait(lambda: leader.poll() is not None)
+            leader.wait()
+            time.sleep(.1)
+            last = beat.read_text()
+            time.sleep(.3)
+            self.assertEqual(beat.read_text(), last)
 
     def test_solver_identity_follows_the_built_library(self):
         import tactical_proof
