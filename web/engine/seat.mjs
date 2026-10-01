@@ -1,6 +1,7 @@
 /* "Bubble (browser)" for web/index.html: a seat and an analysis engine that run entirely in this browser.
- * The server sees a browser seat as a human seat and receives its stones through /play; browser analyses are
- * shown in place of the server's for the positions they cover. Choices persist per browser (localStorage). */
+ * The server sees a browser seat as a human seat and receives its stones through /play; like server engines a
+ * browser seat waits while the game is paused. Browser analyses are shown in place of the server's for the
+ * positions they cover. Choices persist per browser (localStorage). */
 import {BubbleEngine, PRESETS} from './bubble.mjs';
 
 const ID = 'browser:bubble', ENTRY = {id: ID, kind: 'bubble', name: 'Bubble (browser)', checkpoints: []};
@@ -58,7 +59,7 @@ function schedule() {
   const s = state();
   if (!s || posting) return;
   const side = s.player, preset = config.seats[side];
-  const move = s.winner < 0 && preset && !s.match?.active && s.seats[side].engine === 'human';
+  const move = s.winner < 0 && preset && !s.paused && !s.match?.active && s.seats[side].engine === 'human';
   const prefix = s.history.slice(0, viewed());
   const analyse = config.analysis && !(s.winner >= 0 && prefix.length === s.history.length)
     && !analyses.has(`${config.analysis}|${hk(prefix)}`);
@@ -84,7 +85,7 @@ async function run(key, task) {
       posting = true;
       try {
         for (const [q, r] of result.moves) {
-          if (hk(state().history) !== hk(task.history) || !(await original.post('/play', {q, r}))) break;
+          if (state().paused || hk(state().history) !== hk(task.history) || !(await original.post('/play', {q, r}))) break;
           task.history.push([q, r]);
         }
       } finally {
@@ -166,6 +167,8 @@ function install() {
   };
   page.renderPanels = () => {
     original.renderPanels();
+    const pause = document.getElementById('pause');
+    if (pause && config.seats.some(Boolean)) pause.disabled = false;
     schedule();
   };
   page.renderJobs = () => {
