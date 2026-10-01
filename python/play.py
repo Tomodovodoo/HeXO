@@ -214,7 +214,9 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                 if kind == 'bubble':
                     bubble(path.parent / spec['path'], name)
                 elif kind == 'six':
-                    command = shlex.split(spec['command']) if isinstance(spec['command'], str) else list(spec['command'])
+                    command = spec['command']
+                    if not isinstance(command, list) or not command or not all(isinstance(c, str) for c in command):
+                        raise ValueError('command must be a list of arguments')
                     first = path.parent / command[0]
                     command[0] = str(first) if first.exists() else command[0]
                     add('six', name, spec.get('presets'), command=command, cwd=path.parent,

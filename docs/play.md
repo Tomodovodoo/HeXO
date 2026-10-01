@@ -24,7 +24,8 @@ The picker lists everything the server finds on start:
 - Six: a folder in `models/` holding `sixengine.exe` and `gen-NNNN.onnx` networks shows one entry per network,
   labelled with the backend it runs on: TensorRT, CUDA, DirectML or CPU, the first whose libraries are found.
   Six seats search by nodes, so a preset plays the same strength on any hardware.
-- Any engine speaking the Six protocol: `models/<name>.json` with `{"name", "kind": "six", "command", "mirrored"}`.
+- Any engine speaking the Six protocol: `models/<name>.json` with `{"name", "kind": "six", "command", "mirrored"}`,
+  `command` a list of arguments.
   Set `"mirrored": true` for engines in Six's frame, where HTTTX `(q, r)` is `(q + r, -r)`.
 - Strix: `models/<name>.json` with `{"name", "kind": "strix", "model": "model.safetensors"}`.
 

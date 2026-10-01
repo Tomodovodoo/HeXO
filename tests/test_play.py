@@ -697,9 +697,10 @@ class Registry(unittest.TestCase):
             for name in ('sixengine.exe', 'gen-0100.onnx', 'gen-0120.onnx'):
                 (models / 'six' / name).write_bytes(b'')
             (models / 'shrimp.json').write_text(json.dumps(dict(
-                kind='six', command='python driver.py', presets=dict(quick=dict(nodes=1, args=['--visits', '32'])))))
+                kind='six', command=['python', 'driver.py'], presets=dict(quick=dict(nodes=1, args=['--visits', '32'])))))
             (models / 'strix.json').write_text(json.dumps(dict(name='Strix', kind='strix', model='strix.safetensors')))
             (models / 'broken.json').write_text(json.dumps(dict(kind='six', command=[], presets=dict(odd={}))))
+            (models / 'spaced.json').write_text(json.dumps(dict(kind='six', command='six --cpu')))
             with unittest.mock.patch('play.six_backend', return_value=('CPU', ['--cpu'], [])):
                 found = scan(models, None, [], None)
             self.assertEqual(list(found), ['six:Six gen-0120 · CPU', 'six:Six gen-0100 · CPU', 'six:shrimp',
