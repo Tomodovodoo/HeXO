@@ -139,9 +139,16 @@ async function bench({batches = [1, 16, 64], sizes = [24, 32], repeats = 10}) {
 
 async function load(options = {}) {
   native = new Native(await createModule());
-  const device = await probe(options.prefer);
+  let device = await probe(options.prefer);
   const report = fraction => postMessage({type: 'progress', fraction: .95 * fraction});
-  network = await Network.create(new URL('./', import.meta.url), {model: options.model, device, progress: report, threads: options.threads});
+  const create = () => Network.create(new URL('./', import.meta.url), {model: options.model, device, progress: report, threads: options.threads});
+  try {
+    network = await create();
+  } catch (error) {
+    if (device.provider !== 'webgpu' || options.prefer) throw error;
+    device = {provider: 'wasm', precisions: ['fp32'], adapter: '', fallback: String(error.message || error)};
+    network = await create();
+  }
   cache = new EvaluationCache(4096);
   const t = performance.now();
   for (const history of [[[0, 0]], [[0, 0], [1, 0], [0, 1], [5, 0], [6, 0]]]) {
@@ -150,7 +157,7 @@ async function load(options = {}) {
     await network.evaluate(new Array(16).fill(leaf));
   }
   postMessage({type: 'progress', fraction: 1});
-  return {provider: device.provider, precision: network.precision, timings: network.timings, adapter: device.adapter,
+  return {provider: device.provider, precision: network.precision, timings: network.timings, adapter: device.adapter, fallback: device.fallback,
     threads: network.threads, isolated: Boolean(globalThis.crossOriginIsolated), warmup_ms: Math.round(performance.now() - t),
     model: network.version};
 }

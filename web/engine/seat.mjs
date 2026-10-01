@@ -1,8 +1,9 @@
 /* "Bubble (browser)" for web/index.html: a seat and an analysis engine that run entirely in this browser.
  * The server sees a browser seat as a human seat and receives its stones through /play; like server engines a
- * browser seat waits while the game is paused, and cancelling its move pauses the game. Browser analyses are shown
- * in place of the server's for the positions they cover. A task that failed is not retried until the position, preset
- * or engine choice changes. Choices persist per browser (localStorage). */
+ * browser seat waits while the game is paused, cancelling its move pauses the game, and Undo steps back over its
+ * turns to the people's last turn. Browser analyses are shown in place of the server's for the positions they cover.
+ * A task that failed is not retried until the position, preset or engine choice changes. Choices persist per browser
+ * (localStorage). */
 import {BubbleEngine, PRESETS} from './bubble.mjs';
 
 const ID = 'browser:bubble', LABEL = 'Bubble (browser)', ENTRY = {id: ID, kind: 'bubble', name: LABEL, label: LABEL, checkpoints: []};
@@ -147,6 +148,9 @@ function install() {
       }
     }
     if (path === '/analyse' && config.analysis) return Promise.resolve(s);
+    if (path === '/undo' && s && config.seats.some(Boolean)) {
+      return original.post('/undo', {people: [0, 1].filter(side => s.seats[side].engine === 'human' && !config.seats[side])});
+    }
     return original.post(path, body);
   };
   page.shown = seat => {

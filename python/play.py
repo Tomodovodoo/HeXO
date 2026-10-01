@@ -1129,13 +1129,18 @@ class Session:
             self.paused = False
             self.changed()
 
-    def undo(self):
-        """Take back stones to the start of the latest turn a person played, or one stone without people."""
+    def undo(self, people=None):
+        """Take back stones to the start of the latest turn a person played, or one stone without people. `people`
+        (sides) overrides the human seats, for a page that plays a seat itself (the browser engine)."""
+        if people is not None and (not isinstance(people, list) or any(side not in (0, 1) or type(side) is not int
+                                                                        for side in people)):
+            raise ValueError('People must be a list of sides')
         with self.lock:
             self.match_editable()
             if not self.history:
                 return
-            people = [i for i, seat in enumerate(self.seats) if seat['engine'] == 'human']
+            if people is None:
+                people = [i for i, seat in enumerate(self.seats) if seat['engine'] == 'human']
             self.history.pop()
             while people and self.history and not (player_at(len(self.history)) in people
                                                    and len(self.history) in turn_starts(len(self.history) + 1)):
@@ -2246,7 +2251,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/play':
                 session.play(args['q'], args['r'])
             elif self.path == '/undo':
-                session.undo()
+                session.undo(args.get('people'))
             elif self.path == '/new':
                 session.load([], False)
             elif self.path == '/retry':

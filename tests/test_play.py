@@ -519,6 +519,16 @@ class Jobs(unittest.TestCase):
         self.session.undo()
         self.assertEqual(self.history(), [])
 
+    def test_undo_skips_a_seat_the_page_plays(self):
+        self.session.configure_seat(1, 'human')
+        self.session.play(0, 0)
+        self.session.play(1, 0)
+        self.session.play(2, 0)
+        self.session.undo([0])
+        self.assertEqual(self.history(), [])
+        with self.assertRaises(ValueError):
+            self.session.undo([2])
+
     def test_failures_reach_the_page_and_rescans_drop_vanished_engines(self):
         def broken(*args):
             raise RuntimeError('weights unreadable')
