@@ -13,10 +13,11 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import formats
 from hexo import Game
 from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings, budget_of,
-                  export_path, file_digest, file_identity, import_history, model_key, presets_of, proof_turns, review, scan, site_history,
-                  six_backend)
+                  export, export_path, file_digest, file_identity, import_history, linked_history, model_key, presets_of,
+                  proof_turns, read_game, review, scan, six_backend)
 from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
@@ -605,6 +606,16 @@ class Jobs(unittest.TestCase):
         shrimp = presets_of('six', dict(quick=dict(nodes=1, args=['--visits', '32'])))
         self.assertEqual(budget_of(shrimp, 'custom', dict(nodes=9, args=['--visits', '1'])), dict(nodes=9))
         self.assertEqual(budget_of(shrimp, 'quick'), dict(nodes=1, args=['--visits', '32']))
+        lightning = {kind: presets_of(kind, None)['lightning'] for kind in PRESETS}
+        self.assertEqual(lightning, dict(bubble=dict(simulations=8, solver_nodes=2048), native=dict(ms=100),
+                                         seal=dict(ms=50), six=dict(nodes=1500), strix=dict(simulations=2)))
+        self.assertEqual([list(PRESETS[kind]) for kind in PRESETS], [['lightning', 'quick', 'standard', 'strong', 'deep', 'dangerous']] * 5)
+        self.assertEqual(presets_of('six', dict(quick=dict(nodes=1)))['lightning'], dict(nodes=1500))
+        self.assertEqual({kind: presets_of(kind, None)['dangerous'] for kind in PRESETS},
+                         dict(bubble=dict(simulations=65536, solver_nodes=4_000_000), native=dict(ms=60000),
+                              seal=dict(ms=30000), six=dict(nodes=2_000_000), strix=dict(simulations=4096)))
+        self.assertEqual(budget_of(PRESETS['bubble'], 'custom', dict(simulations=65536, solver_nodes=4_000_000)),
+                         dict(simulations=65536, solver_nodes=4_000_000))
         for spec in (dict(heavy=dict(nodes=1)), dict(quick=dict(nodes=0)), dict(quick=dict(args='--x')), [1],
                      dict(quick=dict(ms=1000))):
             with self.assertRaises(ValueError):
@@ -686,6 +697,11 @@ class Http(unittest.TestCase):
             state = self.post('/import', dict(text='https://hexo.did.science/sandbox/2mdyn02'))
         fetch.assert_called_once_with('https://hexo.did.science/api/sandbox-positions/2mdyn02')
         self.assertEqual((len(state['history']), state['paused']), (7, True))
+        state = self.post('/import', dict(text=Formats.GAME))
+        self.assertEqual((len(state['history']), state['winner']), (91, 1))
+        shown = json.loads(self.get('/export?format=rectilinear&ply=3'))
+        self.assertEqual(formats.rectilinear_loads(shown['text']), state['history'][:3])
+        self.assertEqual(json.loads(self.get('/export?format=tyto'))['text'], formats.tyto_dumps(state['history']))
 
     def test_import_export_retry_and_origin(self):
         self.post('/seat', dict(side=1, engine='human'))
@@ -733,14 +749,17 @@ class Http(unittest.TestCase):
 
 
 class SiteImport(unittest.TestCase):
-    """Recorded API answers of hexo.did.science; hexo.mineking.dev serves the same API under /proxy/api."""
+    """Recorded API answers: hexo.did.science (hexo.mineking.dev serves the same API under /proxy/api) and
+    hexo.tyto.cc."""
     game = json.loads((SITE / 'finished-game.json').read_text(encoding='utf-8'))
     sandbox = json.loads((SITE / 'sandbox-position.json').read_text(encoding='utf-8'))
+    shared = json.loads((SITE / 'sandbox-z108lz7.json').read_text(encoding='utf-8'))
+    tyto = json.loads((SITE / 'tyto-game.json').read_text(encoding='utf-8'))
 
     def fetched(self, url, answer):
         asked = []
-        history = site_history(url, lambda api: asked.append(api) or answer)
-        return history, asked
+        history = linked_history(url, lambda api, body=None: asked.append((api, body)) or answer)
+        return history, [api for api, _ in asked]
 
     def test_games_and_sandbox_positions_become_htttx_histories(self):
         history, asked = self.fetched('https://hexo.did.science/games/8211f449-5020-4a5a-9a93-581c5f720aac', self.game)
@@ -749,17 +768,29 @@ class SiteImport(unittest.TestCase):
         game = Game(history)
         self.assertEqual(game.winner, 1)
         game.close()
-        _, asked = self.fetched('https://hexo.mineking.dev/account/games/8211f449-5020-4a5a-9a93-581c5f720aac/', self.game)
+        _, asked = self.fetched('https://hexo.mineking.dev/games/8211f449-5020-4a5a-9a93-581c5f720aac/', self.game)
         self.assertEqual(asked, ['https://hexo.mineking.dev/proxy/api/finished-games/8211f449-5020-4a5a-9a93-581c5f720aac'])
         history, asked = self.fetched('https://hexo.mineking.dev/sandbox/2MDYN02', self.sandbox)
         self.assertEqual(asked, ['https://hexo.mineking.dev/proxy/api/sandbox-positions/2mdyn02'])
         self.assertEqual(history, [[0, 0], [1, -1], [0, 1], [1, 0], [-1, 0], [2, 0], [-4, 0]])
+        history, asked = self.fetched('https://hexo.did.science/sandbox/z108lz7', self.shared)
+        self.assertEqual((len(history), history[:3]), (18, [[0, 0], [3, 0], [1, 2]]))
+
+    def test_tyto_analysis_and_game_links(self):
+        self.assertEqual(linked_history('https://hexo.tyto.cc/analysis#c=BAEIAw', self.offline), [[0, 0], [1, 1], [2, 2]])
+        asked = []
+        history = linked_history('https://hexo.tyto.cc/#g=ebb77124-db4c-4c42-979c-3e4d49244cec',
+                                 lambda api, body=None: asked.append((api, body)) or self.tyto)
+        self.assertEqual(asked, [('https://hexo.tyto.cc/game_htttx', dict(game_id='ebb77124-db4c-4c42-979c-3e4d49244cec'))])
+        self.assertEqual(history, import_history(self.tyto['htttx']))
+        with self.assertRaises(ValueError):
+            linked_history('https://hexo.tyto.cc/analysis', self.offline)
 
     def test_other_text_is_left_alone_and_bad_links_are_refused(self):
         for text in ('version[1];\n1. [1,0][2,0];', 'https://example.com/games/1', '[[0, 0]]'):
-            self.assertIsNone(site_history(text, self.fail))
+            self.assertIsNone(linked_history(text, self.offline))
         with self.assertRaises(ValueError):
-            site_history('https://hexo.did.science/leaderboard', self.fail)
+            linked_history('https://hexo.did.science/leaderboard', self.offline)
         moved = json.loads(json.dumps(self.sandbox))
         for cell in moved['gamePosition']['cells']:
             cell['x'] += 3
@@ -769,7 +800,72 @@ class SiteImport(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.fetched('https://hexo.did.science/sandbox/2mdyn02', swapped)
 
-    def fail(self, url):
+    def offline(self, url, body=None):
+        raise AssertionError(f'fetched {url}')
+
+
+class Formats(unittest.TestCase):
+    """Rectilinear notation (MineKing9534/HeXO) and Tyto analysis links (SootyOwl/hexo-strix)."""
+    GAME = ('o/xo, q @(1, 1) x A0 C2.1 o A1 B2.0 x C1.2 B4.0 o B1.0 C1.0 x D1.0 C4.1 o E4.3 B3.0 x C4.0 D3.3 o C3.2 '
+            'E3.3 x C3.1 F4.1 o D4.1 E3.2 x E3.0 F4.2 o D4.0 D4.2 x D4.3 F4.3 o F4.4 D5.1 x D5.0 F3.1 o G3.2 F3.2 x '
+            'H3.2 G3.1 o E3.1 G3.4 x F3.4 F3.0 o G3.3 H3.4 x D2.3 I3.5 o F2.5 E5.1 x F5.1 G2.5 o H3.0 K3.4 x L3.4 '
+            'G2.4 o G2.6 K3.0 x L3.0 M2.12 o L3.3 E5.0 x F4.5 N2.12 o O2.12 K2.10 x I2.8 M3.2 o M2.10 N2.10 x I3.3 '
+            'O2.10 o J3.4 K2.7 x I3.2 I3.4 o I3.0 I3.6 x K2.8 M3.3 o M3.1 M2.9 x L3.2 J3.1 o K3.2 K3.1 x K3.3 N2.11 '
+            'o L2.8 D3.1 x O2.11 I2.5 o F3.3 H3.5')
+
+    def test_a_rectilinear_game_reads_and_writes_back(self):
+        history = formats.rectilinear_loads(self.GAME)
+        game = Game(history)
+        self.assertEqual((len(history), game.winner, history[:3]), (91, 1, [[0, 0], [-1, 1], [1, 0]]))
+        game.close()
+        text, spans = formats.rectilinear_dumps(history)
+        self.assertTrue(text.startswith('x, b @(0, 0) o A0 A2 x B2.1 B5.1'))
+        self.assertEqual(formats.rectilinear_loads(text), history)
+        self.assertEqual([text[a:b] for a, b in spans[:3]], ['x', 'A0', 'A2'])
+        self.assertEqual(formats.rectilinear_dumps([[0, 0]]), ('x', [(0, 0 + 1)]))
+
+    def test_rings_follow_the_reference_parser(self):
+        _, turns = formats.bke_turns('b@(1,0): o A0 A1 x B3.1 B3.2', implicit=False)
+        self.assertEqual([(player, set(cells)) for player, cells in turns],
+                         [('o', {(1, -1), (2, -1)}), ('x', {(-1, 2), (0, 2)})])
+        history = formats.rectilinear_loads('x A0 H2.2 o A1 G2.2')
+        self.assertEqual((len(history), history[0]), (5, [0, 0]))
+        self.assertEqual(formats.rectilinear_loads('x A0 H2.2 o A1 G2.2'),
+                         formats.rectilinear_loads('o, d @(0, 0) x A0 H2.2 o A1 G2.2'))
+        self.assertEqual(formats.rectilinear_loads('c-x'), [[0, 0]])
+        for bad in ('xx', 'o/xo, q @(1, 1) o A0 B1', 'x(!', 'xz'):
+            with self.assertRaises(ValueError):
+                formats.rectilinear_loads(bad)
+
+    def test_tyto_links_both_ways(self):
+        for history, code in (([(0, 0), (1, 1)], 'BAE'), ([(0, 0), (1, 1), (2, 2)], 'BAEIAw'),
+                              ([(0, 0), (1, 0), (-1, 2), (3, -1), (0, -2)], 'AgACAwQCAwQ')):
+            self.assertEqual(formats.tyto_dumps(history), formats.TYTO + code)
+            self.assertEqual(formats.tyto_loads(code), [list(p) for p in history])
+        far = formats.tyto_dumps([(0, 0), (1, 0), (2, 0), (3, -1), (70, -1)])
+        with self.assertRaises(ValueError):
+            formats.tyto_loads(far[len(formats.TYTO):])
+        with self.assertRaises(ValueError):
+            formats.tyto_loads('BA')
+
+    def test_pasted_text_of_any_kind_is_read(self):
+        self.assertEqual(read_game('version[1];\n1. [1,0][2,0];', self.offline), [[0, 0], [1, 0], [2, 0]])
+        self.assertEqual(len(read_game(self.GAME, self.offline)), 91)
+        self.assertEqual(read_game('https://hexo.tyto.cc/analysis#c=BAE', self.offline), [[0, 0], [1, 1]])
+        with self.assertRaisesRegex(ValueError, 'Illegal'):
+            read_game('version[1];\n1. [1,0][1,0];', self.offline)
+
+    def test_exports_mark_each_stone(self):
+        history = [(0, 0), (1, 0), (-1, 2), (3, -1), (0, -2)]
+        htttx = export(history, 'htttx')
+        self.assertEqual([[htttx['text'][a:b], q, r] for a, b, q, r in htttx['spans']],
+                         [['[1,0]', 1, 0], ['[-1,2]', -1, 2], ['[3,-1]', 3, -1], ['[0,-2]', 0, -2]])
+        rectilinear = export(history, 'rectilinear')
+        self.assertEqual(formats.rectilinear_loads(rectilinear['text']), [list(p) for p in history])
+        self.assertEqual([s[2:] for s in rectilinear['spans']], [list(p) for p in history])
+        self.assertEqual(export(history, 'tyto'), dict(text=formats.TYTO + 'AgACAwQCAwQ', spans=[]))
+
+    def offline(self, url, body=None):
         raise AssertionError(f'fetched {url}')
 
 
@@ -957,6 +1053,7 @@ class Matches(unittest.TestCase):
         seat = self.session.match_seat('bubble:2@quick', 'standard')
         self.assertEqual((seat['engine'], seat['checkpoint'], seat['device']), ('bubble:fake', 'main/000002', 'cpu'))
         self.assertEqual(seat['budget'], PRESETS['bubble']['quick'])
+        self.assertEqual(self.session.match_seat('Native@lightning', 'standard')['budget'], dict(ms=100))
         custom = self.session.match_seat('bubble:2{simulations=512,solver_nodes=0}', 'standard')
         self.assertEqual(custom['budget'], dict(simulations=512, solver_nodes=0))
         with self.assertRaisesRegex(ValueError, 'not a budget'):

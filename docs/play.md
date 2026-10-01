@@ -42,7 +42,7 @@ A seat combines an engine, preset or custom budget, and a device. For example:
 python python/bubble.py match "dense-v1@150000{simulations=512,solver_nodes=131072}" "Six@standard" --port 8772 --unique-openings 16 --a-device cpu
 ```
 
-`@quick`, `@standard`, `@strong` and `@deep` use the UI's presets; `--preset` supplies the default for both seats.
+`@lightning`, `@quick`, `@standard`, `@strong`, `@deep` and `@dangerous` use the UI's presets; `--preset` supplies the default for both seats.
 Custom keys are the engine's own: Bubble has `simulations` and `solver_nodes`, Six has `nodes` (positions),
 Strix/Pulsatrix has `simulations`, and Native/Seal has `ms`. Unknown keys are rejected. `--a-device` and
 `--b-device` choose CPU or CUDA for a Bubble seat. Six uses the backend in its catalogue entry.
@@ -187,19 +187,23 @@ Getting the files:
   Python. Engines run in the models folder, so relative arguments resolve there.
 - Seal: build with `-DHEXO_SEAL_SOURCE=<HexTicTacToe checkout>`.
 
-Strength is a row of hexagons, smallest to largest: Quick, Standard, Strong, Deep, then Custom.
+Strength is a slider from Faster to Smarter with six stops, marked by growing hexagons and a hazard sign for the
+last; arrow keys move it one stop. The sliders button beside it opens the custom budget.
 
 | Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms | Six protocol nodes | Strix simulations |
 |---|---|---|---|---|---|
+| Lightning | 8 | 2,048 | 100 and 50 | 1,500 | 2 |
 | Quick | 32 | 2,048 | 250 and 100 | 6,000 | 8 |
 | Standard | 128 | 32,768 | 1,000 and 500 | 30,000 | 64 |
 | Strong | 512 | 131,072 | 3,000 and 2,000 | 135,000 | 128 |
 | Deep | 2,048 | 524,288 | 10,000 and 8,000 | 500,000 | 512 |
+| Dangerous | 65,536 | 4,000,000 | 60,000 and 30,000 | 2,000,000 | 4,096 |
 
-On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at these presets. Custom
-shows the engine's own fields: Search (simulations, 0 plays the raw policy, up to 16,384) and Solver (nodes, 0 turns
-it off, up to 1,500,000; the solver gets up to a minute) for Bubble, Positions for Six, Search for Strix, and 10 to
-120,000 ms for Native and Seal.
+On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at Quick to Deep;
+Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows a progress line (a moving one when
+the engine reports no progress) and its cancel button. The custom budget shows the engine's own fields: Search
+(simulations, 0 plays the raw policy, up to 65,536) and Solver (nodes, 0 turns it off, up to 4,000,000; the solver
+gets up to a minute) for Bubble, Positions for Six, Search for Strix, and 10 to 120,000 ms for Native and Seal.
 
 ## Analysis and review
 
@@ -225,10 +229,25 @@ For inaccuracies and worse the board outlines the engine's turn and the panel li
 step one stone, ↑ and ↓ one turn, Home and End, F fits the board. Retry plays on from the shown position.
 Changing the analysis engine, checkpoint or strength evaluates the shown position again at once.
 
-Import takes HTTTX, a replay file, or the link of a finished game or saved sandbox position on hexo.did.science or
-hexo.mineking.dev (`/games/<id>`, `/account/games/<id>`, `/sandbox/<id>`). The server reads the site's public API
-(`/api/finished-games/<id>`, `/api/sandbox-positions/<id>`; mineking.dev serves it under `/proxy/api`), turns the
-site's `(x, y)` into HTTTX's `(x + y, -y)` and moves the first stone to the origin. Copy HTTTX copies the shown game.
+Import reads whatever is pasted:
+
+| Pasted | Read as |
+|---|---|
+| `version[1]; 1. [1,0][2,0];` | HTTTX, or a replay file or JSON list of `[q, r]` |
+| `x, d @(0, 0) o A0 A1 x B2 B3` | Rectilinear notation (MineKing9534/HeXO): drawn stones, then BKE turns |
+| `https://hexo.tyto.cc/analysis#c=BAE` | a Tyto analysis link, decoded on the spot |
+| `https://hexo.tyto.cc/#g=<id>` | a Tyto game, from the site's `POST /game_htttx` |
+| `https://hexo.did.science/games/<id>`, `/account/games/<id>`, `/sandbox/<id>` | a finished game or saved sandbox position, from `/api/finished-games/<id>` or `/api/sandbox-positions/<id>` |
+| `https://hexo.mineking.dev/games/<id>`, `/sandbox/<id>` | the same, from the API mirror under `/proxy/api` |
+
+The server does the fetching, without accounts or tokens. These sites draw HTTTX's `(q, r)` at `(q + r, -r)`; the
+first stone moves to the origin, and in Rectilinear notation the player who moved first becomes cross. Drawn stones
+must form complete turns, since a drawing has no move order.
+
+The clipboard button above the move list copies the shown position as HTTTX; the menu beside it shows it as HTTTX,
+Rectilinear and a Tyto analysis link, each with its own copy button. Hovering a stone's token there rings that cell
+on the board, and hovering a stone on the board marks its tokens. `GET /export?format=htttx|rectilinear|tyto&ply=N`
+returns the same text with each stone's span.
 
 ## Saved evaluations
 

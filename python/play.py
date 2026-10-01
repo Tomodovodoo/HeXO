@@ -31,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import formats
 from hexo import Game
 from notation import NotationConflict, dumps, loads
 from process_tree import TreeProcess
@@ -38,14 +39,19 @@ from time_control import Clock, TimeControl, duration, milliseconds
 
 ROOT = Path(__file__).resolve().parents[1]
 PRESETS = dict(
-    bubble=dict(quick=dict(simulations=32, solver_nodes=2048), standard=dict(simulations=128, solver_nodes=32768),
-                strong=dict(simulations=512, solver_nodes=131072), deep=dict(simulations=2048, solver_nodes=524288)),
-    native=dict(quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000), deep=dict(ms=10000)),
-    seal=dict(quick=dict(ms=100), standard=dict(ms=500), strong=dict(ms=2000), deep=dict(ms=8000)),
-    six=dict(quick=dict(nodes=6000), standard=dict(nodes=30000), strong=dict(nodes=135000), deep=dict(nodes=500000)),
-    strix=dict(quick=dict(simulations=8), standard=dict(simulations=64), strong=dict(simulations=128),
-               deep=dict(simulations=512)))
-LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 1_500_000), ms=(10, 120_000), nodes=(1, 50_000_000))
+    bubble=dict(lightning=dict(simulations=8, solver_nodes=2048), quick=dict(simulations=32, solver_nodes=2048),
+                standard=dict(simulations=128, solver_nodes=32768), strong=dict(simulations=512, solver_nodes=131072),
+                deep=dict(simulations=2048, solver_nodes=524288), dangerous=dict(simulations=65536, solver_nodes=4_000_000)),
+    native=dict(lightning=dict(ms=100), quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000),
+                deep=dict(ms=10000), dangerous=dict(ms=60000)),
+    seal=dict(lightning=dict(ms=50), quick=dict(ms=100), standard=dict(ms=500), strong=dict(ms=2000), deep=dict(ms=8000),
+              dangerous=dict(ms=30000)),
+    six=dict(lightning=dict(nodes=1500), quick=dict(nodes=6000), standard=dict(nodes=30000), strong=dict(nodes=135000),
+             deep=dict(nodes=500000), dangerous=dict(nodes=2_000_000)),
+    strix=dict(lightning=dict(simulations=2), quick=dict(simulations=8), standard=dict(simulations=64),
+               strong=dict(simulations=128), deep=dict(simulations=512), dangerous=dict(simulations=4096)))
+PRESET_NAMES = list(PRESETS['bubble'])
+LIMITS = dict(simulations=(0, 65536), solver_nodes=(0, 4_000_000), ms=(10, 120_000), nodes=(1, 50_000_000))
 KIND_LIMITS = dict(strix=dict(simulations=(1, 16384)))
 HEXO_SITES = {'hexo.did.science': 'https://hexo.did.science/api',
               'hexo.mineking.dev': 'https://hexo.mineking.dev/proxy/api'}
@@ -1324,7 +1330,7 @@ class Session:
                                  for k, v in (item.split('=', 1) for item in custom.split(','))})
         if '@' in selector:
             selector, suffix = selector.rsplit('@', 1)
-            specification['preset' if suffix in ('quick', 'standard', 'strong', 'deep') else 'checkpoint'] = suffix
+            specification['preset' if suffix in PRESET_NAMES else 'checkpoint'] = suffix
             if '@' in selector:
                 selector, specification['checkpoint'] = selector.rsplit('@', 1)
         if Path(selector).is_file() and Path(selector).suffix == '.pt':
@@ -1974,9 +1980,12 @@ def import_history(text):
     return [list(p) for p in loads(text).history]
 
 
-def fetch_json(url):
-    """The JSON body at `url`, at most 4 MB; ValueError when it cannot be had."""
-    request = urllib.request.Request(url, headers={'User-Agent': 'bubble-player', 'Accept': 'application/json'})
+def fetch_json(url, body=None):
+    """The JSON answer of `url`, at most 4 MB, to a GET, or to a POST of `body` as JSON; ValueError when it cannot
+    be had."""
+    request = urllib.request.Request(url, None if body is None else json.dumps(body).encode(),
+                                     {'User-Agent': 'bubble-player', 'Accept': 'application/json',
+                                      'Content-Type': 'application/json'})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read(4 << 20))
@@ -1987,20 +1996,31 @@ def fetch_json(url):
         raise ValueError(f'Cannot reach {urlparse(url).hostname}') from error
 
 
-def site_history(text, fetch=None):
-    """The stones of a finished game or a sandbox position on a HeXO site, from its page URL, or None when `text`
-    is not such a URL. Sites, with the API the page itself reads: HEXO_SITES. Pages are /games/<id>,
-    /account/games/<id> and /sandbox/<id>. A site's (x, y) is HTTTX's (x + y, -y), and the first stone is moved to
-    the origin. `fetch(url)` returns the JSON at an API url, `fetch_json` by default. Raises ValueError for stones
-    out of turn order or illegal ones."""
+def linked_history(text, fetch=None):
+    """The stones behind a link, or None when `text` is not a link of these sites:
+
+    - hexo.did.science and hexo.mineking.dev: /games/<id>, /account/games/<id> and /sandbox/<id>, read from the API
+      the site's own page reads (HEXO_SITES). A site's (x, y) is HTTTX's (x + y, -y); the first stone is moved to
+      the origin.
+    - hexo.tyto.cc: an analysis link `#c=<code>` (decoded here) or a game link `#g=<id>`, whose HTTTX the site
+      answers to a POST of {"game_id"} to /game_htttx.
+
+    `fetch(url, body=None)` returns the JSON answer, `fetch_json` by default. Raises ValueError for other pages of
+    these sites, stones out of turn order and illegal stones."""
     url = urlparse(text.strip())
-    if url.scheme not in ('http', 'https') or url.hostname not in HEXO_SITES:
+    if url.scheme not in ('http', 'https') or url.hostname not in (*HEXO_SITES, 'hexo.tyto.cc'):
         return None
+    fetch = fetch or fetch_json
+    if url.hostname == 'hexo.tyto.cc':
+        if url.fragment.startswith('c='):
+            return formats.tyto_loads(url.fragment[2:])
+        if re.fullmatch(r'g=[A-Za-z0-9-]{1,64}', url.fragment):
+            return import_history(fetch('https://hexo.tyto.cc/game_htttx', dict(game_id=url.fragment[2:]))['htttx'])
+        raise ValueError('Paste a Tyto analysis (#c=) or game (#g=) link')
     found = re.fullmatch(r'/(?:account/)?(games|sandbox)/([A-Za-z0-9-]{1,64})/?', url.path)
     if not found:
         raise ValueError('Paste the link of a finished game or a saved sandbox position')
     page, ident = found.groups()
-    fetch = fetch or fetch_json
     if page == 'games':
         data = fetch(f'{HEXO_SITES[url.hostname]}/finished-games/{ident}')
         stones = sorted(data['moves'], key=lambda m: m['moveNumber'])
@@ -2019,6 +2039,40 @@ def site_history(text, fetch=None):
     history = [[x + y - origin[0], -y - origin[1]] for x, y, _ in placed]
     replay(history).close()
     return history
+
+
+def read_game(text, fetch=None):
+    """The history in pasted `text`, whichever it is: a link (`linked_history`), HTTTX, a replay file, a JSON list
+    of [q, r], or Rectilinear notation. A text that is none of them raises the HTTTX error when it looks like
+    HTTTX, else the Rectilinear one."""
+    linked = linked_history(text, fetch)
+    if linked is not None:
+        return linked
+    try:
+        return import_history(text)
+    except ValueError as error:
+        try:
+            return formats.rectilinear_loads(text)
+        except ValueError as other:
+            raise (error if '[' in text and ';' in text else other) from None
+
+
+def export(history, kind):
+    """`history` written as `kind` (htttx, rectilinear or tyto): {text, spans}, where each span [start, end, q, r]
+    marks the token of one stone."""
+    history = [tuple(p) for p in history]
+    if kind == 'htttx':
+        text = dumps(history)
+        tokens = re.finditer(r'\[-?\d+,-?\d+\]', text[text.index(';'):])
+        offset = text.index(';')
+        spans = [(m.start() + offset, m.end() + offset) for m in tokens]
+        return dict(text=text, spans=[[*span, *p] for span, p in zip(spans, history[1:])])
+    if kind == 'rectilinear':
+        text, spans = formats.rectilinear_dumps(history)
+        return dict(text=text, spans=[[*span, *p] for span, p in zip(spans, history)])
+    if kind == 'tyto':
+        return dict(text=formats.tyto_dumps(history), spans=[])
+    raise ValueError('Format must be htttx, rectilinear or tyto')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2095,6 +2149,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, dumps(list(session.history)), 'text/plain; charset=utf-8')
             except NotationConflict as error:
                 return self.respond(409, dict(error=str(error)))
+        if url.path == '/export':
+            try:
+                query = parse_qs(url.query)
+                history = list(session.history)
+                ply = int(query.get('ply', [len(history)])[0])
+                return self.respond(200, export(history[:max(0, ply)], query.get('format', ['htttx'])[0]))
+            except ValueError as error:
+                return self.respond(409 if isinstance(error, NotationConflict) else 400, dict(error=str(error)))
         if url.path == '/replay':
             names = [seat['engine'] for seat in session.seats]
             body = dict(format='bubble-replay', version=1, players=names, history=[list(p) for p in session.history])
@@ -2153,7 +2215,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('No such position')
                 session.load(session.history[:ply], False)
             elif self.path == '/import':
-                session.load(site_history(args['text']) or import_history(args['text']), True)
+                session.load(read_game(args['text']), True)
             elif self.path == '/seat':
                 if args.get('side') not in (0, 1):
                     raise ValueError('Side must be 0 or 1')
@@ -2257,13 +2319,13 @@ def main():
     parser.add_argument('--list-engines', action='store_true', help='list engine ids, names and checkpoints, then exit')
     parser.add_argument('--match', nargs=2, metavar=('A', 'B'), help='play a batch using engine names, ids or unique kinds')
     parser.add_argument('--games', type=int, help='games in --match; defaults to 2 per requested unique opening, else 2')
-    parser.add_argument('--preset', choices=['quick', 'standard', 'strong', 'deep'], default='standard')
+    parser.add_argument('--preset', choices=PRESET_NAMES, default='standard')
     clocks = parser.add_mutually_exclusive_group()
     clocks.add_argument('--tc', help='shared game clock, seconds+increment, e.g. 180+2')
     clocks.add_argument('--move', type=duration, help='shared time per complete turn, e.g. 5s')
     for side in ('a', 'b'):
         parser.add_argument(f'--{side}-checkpoint', help=f'checkpoint of engine {side.upper()} in --match')
-        parser.add_argument(f'--{side}-preset', choices=['quick', 'standard', 'strong', 'deep'])
+        parser.add_argument(f'--{side}-preset', choices=PRESET_NAMES)
     parser.add_argument('--opening', type=Path, action='append', help='HTTTX or replay opening; repeat for paired openings')
     parser.add_argument('--book', type=Path, help='read-only v2 opening book; defaults to openings.json in --dense-run')
     parser.add_argument('--openings', choices=['narrow', 'wide', 'all'], help='book selection, default wide')
