@@ -1774,7 +1774,18 @@ class Session:
                     with self.lock:
                         clock = self.match_clock.json() if self.match['clock']['mode'] == 'game' else None
                         move_ms = self.match_clock.json()['cross_ms' if job.side == 0 else 'circle_ms'] if clock is None else None
-                    found = self.timed_engines[side].turn(game, move_ms, clock=clock, cancel=job, publish=publish)
+                    try:
+                        found = self.timed_engines[side].turn(game, move_ms, clock=clock, cancel=job, publish=publish)
+                    except TimeoutError:
+                        # External adapters stop before the response reserve. Let the host clock
+                        # finish that allowance, then score the timeout instead of pausing the batch.
+                        with self.lock:
+                            self.lock.wait_for(lambda: job.cancelled or self.match_clock.expired(),
+                                timeout=max(0, self.match_clock.remaining()[job.side]/1e9))
+                        if job.cancelled:
+                            raise Cancelled()
+                        job.measurements = dict(stop_reason='deadline')
+                        return []
                     if job.cancelled:
                         raise Cancelled()
                     job.measurements = {k: found.get(k) for k in ('elapsed_ms', 'completed', 'evaluated', 'solver_nodes',

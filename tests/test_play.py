@@ -826,16 +826,20 @@ class Matches(unittest.TestCase):
             self.session.match_seat('Native{simulations=128}', 'standard')
 
     def test_clock_deadline_discards_late_moves_and_records_time_result(self):
-        with unittest.mock.patch('timed_engine.TimedEngine') as engine:
-            engine.return_value.identity = dict(kind='fake')
-            engine.return_value.turn.side_effect = lambda game, *a, **kw: (
-                time.sleep(.06) or dict(moves=legal_turn([c[:2] for c in game.cells]), elapsed_ms=60))
-            self.session.start_match(['Native', 'Other'], games=1, output=self.output,
-                                     clock=dict(mode='move', ms=20))
-            wait(lambda: not self.session.match_worker.is_alive())
-        result = json.loads((self.output / 'game-0001.json').read_text())
-        self.assertEqual((result['winner'], result['reason'], result['history']), (0, 'time', [[0, 0]]))
-        self.assertEqual(self.session.match['wins'], [1, 0])
+        late_reply = lambda game, *a, **kw: (
+            time.sleep(.06) or dict(moves=legal_turn([c[:2] for c in game.cells]), elapsed_ms=60))
+        for name, reply in [('late', late_reply), ('timeout', TimeoutError('Opponent exceeded its allowance'))]:
+            with self.subTest(name=name), unittest.mock.patch('timed_engine.TimedEngine') as engine:
+                engine.return_value.identity = dict(kind='fake')
+                engine.return_value.turn.side_effect = reply
+                output = self.output / name
+                self.session.start_match(['Native', 'Other'], games=1, output=output,
+                                         clock=dict(mode='move', ms=20))
+                wait(lambda: not self.session.match_worker.is_alive())
+                result = json.loads((output / 'game-0001.json').read_text())
+                self.assertEqual((result['winner'], result['reason'], result['history']), (0, 'time', [[0, 0]]))
+                self.assertEqual(self.session.match['wins'], [1, 0])
+                self.assertIsNone(self.session.match['error'])
 
     def test_a_batch_cannot_take_over_an_unfinished_human_game(self):
         self.session.configure_seat(1, 'human')
