@@ -30,10 +30,13 @@ class SealLibrary:
         count = self.lib.seal_move(data, len(history), ((len(history)+1)//2)%2,
                                    1 if len(history)%2 == 0 else 2, ms, out)
         elapsed = (time.perf_counter()-start)*1000
-        if count not in (1, 2):
-            raise RuntimeError(f"Seal failed or exceeded its supported board range ({count})")
-        return {"moves": [(out[2*i], out[2*i+1]) for i in range(count)],
-                "score": None, "nodes": None, "depth": None, "elapsed_ms": elapsed, "wall_ms": elapsed}
+        if count not in (-1, 1, 2):
+            raise RuntimeError(f"Seal failed ({count})")
+        result = {"moves": [(out[2*i], out[2*i+1]) for i in range(max(0, count))],
+                  "score": None, "nodes": None, "depth": None, "elapsed_ms": elapsed, "wall_ms": elapsed}
+        if count == -1:
+            result["invalid"] = "Seal coordinate range exceeded"
+        return result
 
 
 class NativeLibrary:
@@ -121,12 +124,17 @@ def native_comparison(args):
             history = list(opening)
             board = Game(history)
             searches = []
+            invalid = None
             candidate_colour = index % 2
             try:
                 while board.winner < 0 and len(history)+board.remaining <= args.max_stones:
                     side = board.player
                     engine = "candidate" if side == candidate_colour else "baseline"
                     result = engines[engine].search(history, args.ms, args.depth or 12, args.width)
+                    if result.get("invalid"):
+                        invalid = result["invalid"]
+                        searches.append({"engine": engine, "ply": len(history), **result})
+                        break
                     if not result["moves"]:
                         raise RuntimeError("Nonterminal search returned no move")
                     for move in result["moves"]:
@@ -135,14 +143,16 @@ def native_comparison(args):
                     if board.winner < 0 and board.player == side:
                         raise RuntimeError("Search returned an incomplete turn")
                     searches.append({"engine": engine, "ply": len(history), **result})
-                score = (0.5 if board.winner < 0 else float(board.winner == candidate_colour))
+                score = None if invalid else (0.5 if board.winner < 0 else float(board.winner == candidate_colour))
                 games.append({"index": index, "opening": opening, "candidate_colour": candidate_colour,
-                              "winner": board.winner, "score": score, "history": history, "searches": searches})
+                              "winner": board.winner, "score": score, "invalid": invalid,
+                              "history": history, "searches": searches})
             finally:
                 board.close()
-            scores = [g["score"] for g in games]
+            scores = [g["score"] for g in games if g["score"] is not None]
             report.update(games=games, summary={"wins": scores.count(1), "losses": scores.count(0),
-                                               "capped": scores.count(0.5), "score": statistics.mean(scores)})
+                                               "capped": scores.count(0.5), "invalid": len(games)-len(scores),
+                                               "score": statistics.mean(scores) if scores else None})
             if args.output:
                 destination = Path(args.output)
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -150,11 +160,14 @@ def native_comparison(args):
                 temporary.write_text(json.dumps(report, indent=2)+"\n")
                 temporary.replace(destination)
             print(f"game {index+1}/{args.games}: {report['summary']}", flush=True)
-        pairs = [sum(g["score"] for g in games[i:i+2])/2 for i in range(0, len(games)-1, 2)]
+        pairs = [sum(g["score"] for g in games[i:i+2])/2 for i in range(0, len(games)-1, 2)
+                 if all(g["score"] is not None for g in games[i:i+2])]
         from legacy.arena import wilson
-        report["summary"]["paired_score_95"] = wilson(sum(pairs), len(pairs))
+        report["summary"]["paired_score"] = statistics.mean(pairs) if pairs else None
+        report["summary"]["paired_score_95"] = wilson(sum(pairs), len(pairs)) if pairs else None
+        report["summary"]["invalid_pairs"] = len(games)//2-len(pairs)
         report["summary"]["pentanomial"] = [sum(round(p*4)==i for p in pairs) for i in range(5)]
-        report["notes"] = "Equal wall-time budgets, one CPU thread, alternating colours; capped games count as half, not proven draws. Conservative Wilson interval treats each opening pair as one observation."
+        report["notes"] = "Equal wall-time budgets, one CPU thread, alternating colours; capped games count as half, not proven draws. Invalid games stay in the log and are unscored; paired statistics exclude both games of an incomplete pair. Conservative Wilson interval treats each complete opening pair as one observation."
         return report
     fixture = json.loads((ROOT/"tests/fixtures/tactical_positions.json").read_text())
     positions = list(fixture["positions"].items())
