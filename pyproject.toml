@@ -28,6 +28,7 @@ py-modules = [
   "dense_selfplay",
   "dense_solve",
   "dense_solver",
+  "export_web",
   "forcing_material",
   "hexcrop",
   "hexnet",
@@ -50,3 +51,4 @@ py-modules = [
 [tool.setuptools.dynamic.optional-dependencies]
 learning = {file = ["requirements/learning.txt"]}
 api = {file = ["requirements/api.txt"]}
+web = {file = ["requirements/web.txt"]}

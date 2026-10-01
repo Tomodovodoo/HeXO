@@ -18,20 +18,35 @@ const cancelled = new Set(), solverWaits = new Map();
 
 class Cancelled extends Error {}
 
-function solve(history, options) {
+/** The solver's answer to one query of turn `owner`; queries run one at a time in the solver worker. */
+function solve(owner, history, options) {
+  return new Promise((resolve, reject) => {
+    const id = ++solverCalls;
+    solverWaits.set(id, {owner, history, options, resolve, reject});
+    send(id);
+  });
+}
+
+function send(id) {
   if (!solver) {
     solver = new Worker(new URL('solver-worker.mjs', import.meta.url), {type: 'module'});
     solver.onmessage = ({data}) => { solverWaits.get(data.id)?.resolve(data.result); solverWaits.delete(data.id); };
   }
-  const id = ++solverCalls;
-  return new Promise((resolve, reject) => { solverWaits.set(id, {resolve, reject}); solver.postMessage({id, history, options}); });
+  const {history, options} = solverWaits.get(id);
+  solver.postMessage({id, history, options});
 }
 
-function stopSolver() {
-  solver?.terminate();
+/** Ends the solver queries of turn `owner`: the solver worker is replaced and other turns' queries are resent. */
+function stopSolver(owner) {
+  if (![...solverWaits.values()].some(wait => wait.owner === owner)) return;
+  solver.terminate();
   solver = null;
-  for (const wait of solverWaits.values()) wait.reject(new Cancelled());
-  solverWaits.clear();
+  for (const [id, wait] of solverWaits) {
+    if (wait.owner !== owner) continue;
+    wait.reject(new Cancelled());
+    solverWaits.delete(id);
+  }
+  for (const id of solverWaits.keys()) send(id);
 }
 
 const verified = r => r.status === 'PROVEN_WIN' && r.native_verified;
@@ -51,7 +66,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
   const deadline = Math.min(60000, Math.max(10000, Math.floor(solverNodes / 8)));
   try {
     if (solverNodes) {
-      const mine = await solve(history, {attacker: 'mover', nodes: solverNodes, ms: deadline});
+      const mine = await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: deadline});
       check();
       solved = searched(mine);
       solverUsed += mine.nodes_used || 0;
@@ -60,7 +75,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
         line = winningLine(native, history, mine.certificate);
         proof = {winner: player, turns: mine.proof_turns};
       } else {
-        const theirs = await solve(history, {attacker: 'opponent', nodes: solverNodes, ms: deadline});
+        const theirs = await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: deadline});
         check();
         solved = solved && searched(theirs);
         solverUsed += theirs.nodes_used || 0;
@@ -141,7 +156,7 @@ async function load(options = {}) {
 onmessage = async ({data}) => {
   if (data.type === 'cancel') {
     cancelled.add(data.id);
-    stopSolver();
+    stopSolver(data.id);
     return;
   }
   try {

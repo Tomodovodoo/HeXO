@@ -61,6 +61,7 @@ class Recorder:
         return results
 
 
+@unittest.skipUnless(importlib.util.find_spec('onnxruntime'), 'needs onnx and onnxruntime (requirements/web.txt)')
 class Export(unittest.TestCase):
     def test_graphs_match_the_reference_path(self):
         model = random_model()

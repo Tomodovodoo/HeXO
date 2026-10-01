@@ -107,9 +107,18 @@ async function run(key, task) {
   schedule();
 }
 
+/** Adds the browser entry to a state's engines and drops browser seats the server has given another engine. */
+function adopt(data) {
+  if (data.engines && !data.engines.some(e => e.id === ID)) data.engines.push(ENTRY);
+  if (data.seats && data.seats.some((seat, side) => config.seats[side] && seat.engine !== 'human')) {
+    config.seats = config.seats.map((preset, side) => data.seats[side].engine === 'human' ? preset : null);
+    save();
+  }
+}
+
 function install() {
   page.accept = data => {
-    if (data.engines && !data.engines.some(e => e.id === ID)) data.engines.push(ENTRY);
+    adopt(data);
     inject(data);
     original.accept(data);
     schedule();
@@ -164,7 +173,10 @@ function install() {
     progress();
   };
   const s = state();
-  if (s) { if (!s.engines.some(e => e.id === ID)) s.engines.push(ENTRY); page.renderPanels(); }
+  if (s) {
+    adopt(s);
+    page.renderPanels();
+  }
 }
 
 if (HOOKS.every(name => typeof original[name] === 'function')) install();
