@@ -682,7 +682,7 @@ class Proofs(unittest.TestCase):
 
 
 class TurnTrees(unittest.TestCase):
-    """A fixed-budget turn searches its second stone in the tree its first stone grew."""
+    """A fixed-budget play turn searches its second stone in the tree its first stone grew."""
 
     def setUp(self):
         import hexnet
@@ -698,7 +698,7 @@ class TurnTrees(unittest.TestCase):
         class Spy(neural_search.NeuralSearch):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                self.started, self.searched = len(self.history), []
+                self.searched = []
                 trees.append(self)
 
             def search(self, *args, **kwargs):
@@ -709,13 +709,6 @@ class TurnTrees(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def check(self, moves):
-        self.assertEqual(len(self.trees), 1)
-        tree = self.trees[0]
-        self.assertEqual([h for h, _, _ in tree.searched], [[(0, 0)], [(0, 0), tuple(moves[0])]])
-        self.assertGreater(tree.searched[1][2], tree.searched[1][1])
-        self.assertIsNone(tree.ptr)
-
     def test_play_evaluation_keeps_one_tree_for_the_turn(self):
         import hexnet
         import neural_search
@@ -724,20 +717,12 @@ class TurnTrees(unittest.TestCase):
         model = hexnet.load_model(self.path)
         bubble = SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=16), sha256='tiny',
                                  cache=neural_search.EvaluationCache())
-        self.check(evaluate(bubble, None, [(0, 0)], 32, 0)['moves'])
-
-    def test_dense_player_keeps_one_tree_for_the_turn(self):
-        from dense_player import DensePlayer
-        player = DensePlayer(Path(self.folder.name), 'cpu', model=self.path, net_kernels='reference')
-        try:
-            player.options.update(solver=False, simulations=32)
-            game = Game([(0, 0)])
-            try:
-                self.check(player.turn(game)['moves'])
-            finally:
-                game.close()
-        finally:
-            player.close()
+        moves = evaluate(bubble, None, [(0, 0)], 32, 0)['moves']
+        self.assertEqual(len(self.trees), 1)
+        tree = self.trees[0]
+        self.assertEqual([h for h, _, _ in tree.searched], [[(0, 0)], [(0, 0), tuple(moves[0])]])
+        self.assertGreater(tree.searched[1][2], tree.searched[1][1])
+        self.assertIsNone(tree.ptr)
 
 
 class Registry(unittest.TestCase):

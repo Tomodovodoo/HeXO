@@ -411,8 +411,6 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
             if simulations:
                 if tree is None:
                     tree = NeuralSearch(network, bubble.sha256, current, seed=1740, cache=bubble.cache, tactics=True)
-                else:
-                    tree.advance(tuple(moves[-1]))
                 result = tree.search(simulations, root_samples=16, batch_size=16)
                 action, policy, actions = result['action'], result['policy'], result['actions']
                 stone_value = root_value(result, local.player)
@@ -431,6 +429,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 value = (stone_value + 1) / 2
             moves.append([int(action[0]), int(action[1])])
             local.play(*moves[-1])
+            if tree is not None:
+                tree.advance(tuple(moves[-1]))
         if proof:
             value = 1. if proof['winner'] == player else 0.
         return dict(moves=moves, value=round(value, 4), top=top, proof=proof, line=line, threat=threat,
