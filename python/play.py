@@ -1013,7 +1013,7 @@ class Session:
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
         if spent['solver_nodes'] < budget['solver_nodes'] and job.kind == 'analyse':
             with self.lock:
-                tried = (tuple(history), weights, budget['simulations'], budget['solver_nodes'])
+                tried = (tuple(history), key, budget['simulations'], budget['solver_nodes'])
                 tries = self.retries[tried] = self.retries.get(tried, 0) + 1
             if tries <= 3:
                 timer = threading.Timer(31, self.retry, args=(list(history),))
