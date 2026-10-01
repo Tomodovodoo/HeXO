@@ -374,6 +374,16 @@ class Jobs(unittest.TestCase):
         self.engines.release.set()
         wait(lambda: len(self.history()) >= 3)
 
+    def test_closing_cancels_work_and_stops_the_worker(self):
+        closed = []
+        self.engines.close = lambda: closed.append(True)
+        self.engines.hold = True
+        self.session.analyse(0, force=True)
+        wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']))
+        self.session.close()
+        self.assertFalse(self.session.worker.is_alive())
+        self.assertEqual(closed, [True])
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)

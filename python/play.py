@@ -679,7 +679,7 @@ class Session:
         self.entries, self.engines, self.store, self.rescan_entries = entries, engines, store, rescan
         self.lock = threading.Condition()
         self.history, self.revision, self.paused = [], 0, False
-        self.instance = os.urandom(4).hex()
+        self.instance, self.closing = os.urandom(4).hex(), False
         self.retries = {}
         self.jobs, self.queue, self.order = OrderedDict(), [], itertools.count()
         bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
@@ -957,11 +957,24 @@ class Session:
 
     # Working
 
+    def close(self, timeout=30):
+        """Cancel every job, wait for the worker to stop, then close the engines."""
+        with self.lock:
+            self.closing = True
+            for job in self.jobs.values():
+                if job.status in ('queued', 'running'):
+                    job.cancelled = True
+            self.lock.notify_all()
+        self.worker.join(timeout)
+        self.engines.close()
+
     def work(self):
         while True:
             with self.lock:
-                while not self.queue:
+                while not self.queue and not self.closing:
                     self.lock.wait()
+                if self.closing:
+                    return
                 job = heapq.heappop(self.queue)[2]
                 if job.cancelled:
                     job.status = 'cancelled'
@@ -1243,7 +1256,7 @@ def main():
     try:
         ThreadingHTTPServer(('127.0.0.1', args.port), Handler).serve_forever()
     finally:
-        Handler.session.engines.close()
+        Handler.session.close()
 
 
 if __name__ == '__main__':
