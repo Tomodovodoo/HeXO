@@ -827,17 +827,23 @@ class Session:
             self.changed()
 
     def rescan(self):
-        """Replace the engine list; a seat whose engine or checkpoint is gone becomes a person, and analysis falls
-        back to the first Bubble model."""
+        """Replace the engine list. A seat follows its engine to a new id when only the id changed; a seat whose
+        engine or checkpoint is gone becomes a person, and analysis falls back to the first Bubble model."""
         entries = self.rescan_entries()
+        identity = lambda e: (e['kind'], str(e.get('path') or e.get('command') or e.get('model')))
+        def follow(seat):
+            old = self.entries.get(seat['engine'])
+            moved = next((e['id'] for e in entries.values() if old and identity(e) == identity(old)), seat['engine'])
+            return seat | dict(engine=moved)
         def valid(seat):
             entry = entries.get(seat['engine'])
             return entry is not None and (entry['kind'] != 'bubble' or seat['checkpoint'] in entry['checkpoints'])
         with self.lock:
+            followed = [seat if seat['engine'] == 'human' else follow(seat) for seat in self.seats]
+            analysis = follow(self.analysis) if self.analysis else None
             previous, self.entries = self.entries, entries
             try:
-                seats = [seat if seat['engine'] == 'human' or valid(seat) else dict(engine='human') for seat in self.seats]
-                analysis = self.analysis
+                seats = [seat if seat['engine'] == 'human' or valid(seat) else dict(engine='human') for seat in followed]
                 if analysis is None or not valid(analysis):
                     bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
                     analysis = self.seat(bubble['id'], None, 'standard') | dict(auto=True) if bubble else None

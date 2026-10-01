@@ -325,6 +325,11 @@ class Jobs(unittest.TestCase):
         self.session.rescan()
         state = self.session.state()
         self.assertEqual((state['seats'][1], state['analysis']['engine']), (dict(engine='human'), 'bubble:fake~2'))
+        renamed = {k: v for k, v in entries().items() if k != 'bubble:fake'}
+        renamed['bubble:fake'] = dict(renamed.pop('bubble:fake~2'), id='bubble:fake')
+        self.session.rescan_entries = lambda: renamed
+        self.session.rescan()
+        self.assertEqual(self.session.state()['analysis']['engine'], 'bubble:fake')
 
     def test_cancelled_native_searches_end_and_the_next_starts_at_once(self):
         engines = Engines('cpu')
