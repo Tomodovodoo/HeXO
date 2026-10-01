@@ -103,7 +103,12 @@ int main(){
   t.begin(4,2);int id=t.request();auto h=t.requests.at(id).history;std::vector<int64_t> hist;for(auto c:h){hist.push_back(c.q);hist.push_back(c.r);}
   int64_t moves[]={3,3,3,4};t.prove(id,hist.data(),int(h.size()),0,2,moves,2,2);
   auto edge=std::find_if(t.root->edges.begin(),t.root->edges.end(),[](auto& e){return e.action==Cell{3,3};});
-  assert(edge->child==existing && existing->exact_winner==0 && existing->distance==5 && existing->bound);}
+  assert(edge->child==existing && existing->exact_winner==0 && existing->distance==5 && existing->bound);
+  // Playing the first stone keeps the verdict, and the first request expands the root with the second stone.
+  t.advance({3,3});assert(t.root==existing && t.root->exact_winner==0);
+  t.begin(4,2);id=t.request();auto& l=t.requests.at(id).legal;std::vector<int64_t> a;for(auto c:l){a.push_back(c.q);a.push_back(c.r);}
+  std::vector<double> z(l.size());t.fulfill(id,a.data(),z.data(),z.data(),int(l.size()));
+  for(auto& e:t.root->edges)assert(e.eligible==(e.action==Cell{3,4}));}
  // Expanding another context of a proven loss takes a live peer's exact resistances, not only the shared bound.
  {gumbel::Tree t(0);t.graph=true;
   for(auto c:std::vector<Cell>{{0,0},{1,0},{2,0},{0,1},{0,2},{3,0}})t.advance(c);

@@ -352,7 +352,11 @@ struct Tree {
     auto [p,c]=keys(position);
     if(auto existing=nodes[c].lock()){
      existing->parents.push_back(node->weak_from_this());
-     if(apply(Outcome{player,distance-1,int(position.cells.size()),true,true,Cell{moves[2],moves[3]}},*existing)){refresh(*existing);learn(*existing);}
+     const Outcome o{player,distance-1,int(position.cells.size()),true,true,Cell{moves[2],moves[3]}};
+     if(apply(o,*existing))refresh(*existing);
+     // The outcome keeps the witness even while the node is unexpanded; peers take it too.
+     auto& kept=outcomes[p];if(kept.winner!=player || o.distance<kept.distance || !kept.witnessed)kept=o;
+     for(auto& w:std::vector(positions[p]))if(auto peer=w.lock())if(peer!=existing)share(*existing,o,*peer);
      for(auto& e:node->edges)if(e.action==witness){e.child=existing;break;}
      return;
     }
