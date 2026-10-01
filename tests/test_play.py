@@ -72,6 +72,10 @@ for number in (1, 2):
     (Path(RUN.name) / f'checkpoints/main/00000{number}/ema.pt').write_bytes(bytes([number]))
 
 
+def tearDownModule():
+    RUN.cleanup()
+
+
 def entries():
     bubble = dict(kind='bubble', presets=PRESETS['bubble'], checkpoints=['main/000002', 'main/000001'], path=Path(RUN.name))
     return {'bubble:fake': dict(bubble, id='bubble:fake', name='fake'),

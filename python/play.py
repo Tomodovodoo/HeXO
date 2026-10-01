@@ -429,9 +429,7 @@ class Engines:
                 break
             except queue.Empty:
                 if stop():
-                    child.kill()
-                    child.stdin.close()
-                    del self.children[kind]
+                    self.end(self.children.pop(kind)[0])
                     raise Cancelled() from None
         if line is None:
             raise RuntimeError(f'{kind} search process exited')
@@ -440,10 +438,23 @@ class Engines:
             raise RuntimeError(answer['error'])
         return answer['moves']
 
+    @staticmethod
+    def end(child):
+        """Kill a search child and reap it with its pipes."""
+        child.kill()
+        child.wait()
+        child.stdin.close()
+        child.stdout.close()
+
     def close(self):
+        """Release the models and end every child process."""
         self.bubbles.clear()
         for child, _ in self.children.values():
-            child.kill()
+            self.end(child)
+        self.children.clear()
+        if self.prover is not None:
+            self.prover.close()
+            self.prover = None
 
 
 # Saved evaluations
@@ -1200,7 +1211,10 @@ def main():
     with Handler.session.lock:
         Handler.session.changed()
     print(f'Bubble is ready at http://127.0.0.1:{args.port}', flush=True)
-    ThreadingHTTPServer(('127.0.0.1', args.port), Handler).serve_forever()
+    try:
+        ThreadingHTTPServer(('127.0.0.1', args.port), Handler).serve_forever()
+    finally:
+        Handler.session.engines.close()
 
 
 if __name__ == '__main__':
