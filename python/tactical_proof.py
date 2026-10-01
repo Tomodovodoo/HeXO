@@ -44,7 +44,7 @@ import threading
 import time
 
 PROVEN_WIN, UNKNOWN = 'PROVEN_WIN', 'UNKNOWN'
-PACKAGE = Path(__file__).resolve().parents[1]/'tools/tactical'
+PACKAGE = Path(os.environ.get('HEXO_TACTICAL_PACKAGE', Path(__file__).resolve().parents[1]/'tools/tactical'))
 MAX_NODES = 10000000
 MAX_TABLE_MB = 256  # resident table per attacker colour; two of them stay well inside a worker's 1536 MB cap
 DEFAULT_NODES, DEFAULT_MS = 2500, 1000

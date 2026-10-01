@@ -16,6 +16,22 @@ class Uniform:
         return out
 
 class NeuralTree(unittest.TestCase):
+    def test_timed_interruption_does_not_select_from_a_partial_comparison(self):
+        class Interrupted(Uniform):
+            calls = 0
+            def evaluate(self, histories):
+                self.calls += 1
+                return super().evaluate(histories)
+        evaluator = Interrupted()
+        search = NeuralSearch(evaluator, 'timed-comparison', [(0, 0)])
+        self.addCleanup(search.close)
+        result = search.search(128, root_samples=16, batch_size=1, anytime=True,
+                               stop=lambda: evaluator.calls >= 2)
+        self.assertIsNone(result['action'])
+        self.assertGreater(result['completed'], 0)
+        result = search.search(8, root_samples=4, batch_size=1, anytime=True)
+        self.assertIn(tuple(result['action']), map(tuple, result['actions']))
+
     def test_unknown_proofs_reserve_inference_across_large_batches(self):
         from unittest.mock import patch
         clock, spent = [0.], [0.]

@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import threading
+import time
 
 from hexo import Game
 from six_engine import ProtocolError, SixEngine, serve
@@ -72,6 +74,50 @@ class FakeModel:
 
 
 class SixProtocolTests(unittest.TestCase):
+    def test_stop_and_isready_work_during_blocked_search(self):
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        class Slow(FakePlayer):
+            def turn(self, game, milliseconds=None):
+                entered.set()
+                try:
+                    release.wait(1)
+                    return {'moves': [(1, 0), (0, 1)]}
+                finally:
+                    finished.set()
+        def commands():
+            yield 'position radius 8 moves 0 0\n'
+            yield 'go movetime 500\n'
+            entered.wait(1)
+            yield 'isready\n'
+            yield 'stop\n'
+            yield 'quit\n'
+        out = io.StringIO()
+        started = time.monotonic()
+        try:
+            serve(Slow([]), commands(), out)
+            self.assertLess(time.monotonic()-started, .4)
+            self.assertIn('readyok', out.getvalue())
+            self.assertEqual(out.getvalue().count('bestmove'), 1)
+        finally:
+            release.set()
+            finished.wait(1)
+
+    def test_go_passes_full_clocks_and_own_increment(self):
+        from timed_engine import TimedEngine
+        from timed_engine import legal_turn
+        class Player(TimedEngine):
+            checkpoint, model_sha256 = 'fake', 'abc'
+            def __init__(self):
+                self.clocks = []
+            def turn(self, game, milliseconds=None, *, clock=None, cancel=None, publish=None):
+                self.clocks.append(clock)
+                return dict(moves=legal_turn([c[:2] for c in game.cells]))
+        player, out = Player(), io.StringIO()
+        serve(player, io.StringIO('position radius 8 moves 0 0\n'
+              'go xtime 60000 otime 50000 xinc 1000 oinc 500\nquit\n'), out)
+        self.assertEqual(player.clocks, [dict(cross_ms=60000, circle_ms=50000, increment_ms=500)])
+        self.assertIn('bestmove', out.getvalue())
+
     def test_external_anchor_needs_its_own_league_id(self):
         for name in ('seal', '', 'main/000001', 'main-000001'):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'external_name'):
@@ -115,6 +161,45 @@ class SixProtocolTests(unittest.TestCase):
                     self.assertEqual(engine(game, 1), [(0, 0)])
                 finally:
                     game.close()
+
+    def test_cancel_closes_external_search_without_restarting_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script, marker = Path(folder)/'engine.py', Path(folder)/'slow.once'
+            script.write_text(FAKE_ENGINE)
+            cancelled = threading.Event()
+            with SixEngine([sys.executable, str(script), str(marker)], cancel=cancelled) as engine:
+                child = engine.proc
+                game = Game()
+                timer = threading.Timer(.05, cancelled.set)
+                timer.start()
+                try:
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(ProtocolError, 'cancelled'):
+                        engine(game, 1000)
+                    self.assertLess(time.monotonic()-started, .5)
+                    self.assertIsNotNone(child.poll())
+                    self.assertIsNone(engine.proc)
+                finally:
+                    timer.join()
+                    game.close()
+
+    def test_timed_match_does_not_invent_an_external_opponents_move(self):
+        from timed_engine import TimedEngine
+        from timed_match import Match, play_turn
+        with tempfile.TemporaryDirectory() as folder:
+            script, marker = Path(folder)/'engine.py', Path(folder)/'slow.once'
+            script.write_text(FAKE_ENGINE)
+            with TimedEngine(dict(kind='six', command=[sys.executable, str(script), str(marker)])) as engine:
+                match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='six')),
+                                   time_control='10', turn_cap_ms=30))
+                try:
+                    match.start()
+                    result = play_turn(match, engine)
+                    self.assertEqual(result['result']['winner'], 'x')
+                    self.assertIn(result['result']['reason'], ('engine_timeout', 'time'))
+                    self.assertEqual(result['history'], [[0, 0]])
+                finally:
+                    match.close()
 
     def test_client_starts_each_game(self):
         with tempfile.TemporaryDirectory() as folder:

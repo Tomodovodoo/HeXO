@@ -7021,6 +7021,27 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.start()
         self.assertIn('calibration', self.league())                                    # added on start
 
+class DenseTimedWorker(unittest.TestCase):
+    def test_dense_worker_plays_a_clocked_complete_turn_on_cpu(self):
+        from timed_engine import TimedEngine, legal_turn
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'ema.pt'
+            model = hexnet.HexNet(hexnet.HexNetConfig(blocks=1, channels=8, pool_every=1,
+                                line_length=5, value_hidden=8, head_channels=4))
+            hexnet.save_model(path, model)
+            with TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
+                                  solver=dict(enabled=False))) as engine:
+                game = Game([[0, 0]])
+                try:
+                    result = engine.turn(game, 1000)
+                    self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+                    self.assertGreater(result.get('evaluated', 0), 0)
+                    self.assertEqual(result['backend'], 'dense')
+                    self.assertEqual(result['model_sha256'], engine.model_sha256)
+                finally:
+                    game.close()
+
+
 class DenseBrowser(unittest.TestCase):
     def setUp(self):
         from play import Bubble
@@ -7083,15 +7104,6 @@ class DenseBrowser(unittest.TestCase):
                                (dict(status='UNKNOWN', reason='defender counterwin'), True)):
             prover = unittest.mock.Mock(history=unittest.mock.Mock(return_value=result))
             self.assertEqual(evaluate(self.bubble, prover, [(0, 0)], 0, 2048)['solved'], solved)
-
-    def test_six_protocol_player_plays_a_turn(self):
-        from six_engine import BubblePlayer
-        player = BubblePlayer(Path(self.temp.name)/'ema.pt', 'cpu', 4, 2048)
-        game = Game([(0, 0)])
-        try:
-            self.assertTrue(self.complete([(0, 0)], player.turn(game)['moves']))
-        finally:
-            game.close()
 
     def test_cancelling_stops_the_search(self):
         from play import Cancelled, evaluate
