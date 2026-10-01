@@ -167,7 +167,7 @@ def file_digest(identity):
 
 
 @functools.lru_cache(maxsize=8)
-def file_build(package, modified_ns):
+def file_build(package, record, binary):
     """The solver build of `package`, or 'none' when its record is unreadable."""
     import tactical_proof
     try:
@@ -402,8 +402,7 @@ class Engines:
         record = binary.with_name(binary.name + '.json')
         if not (binary.exists() and record.exists()):
             return 'none'
-        stat = record.stat()
-        return file_build(str(package), stat.st_mtime_ns)
+        return file_build(str(package), file_identity(record), file_identity(binary))
 
     def turn(self, entry, budget, history, stop=lambda: False):
         """A native or Seal turn. Their searches cannot be interrupted in process, so each kind searches in a child

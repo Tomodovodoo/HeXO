@@ -232,8 +232,12 @@ def main():
     parser.add_argument('--simulations', type=int, default=128)
     parser.add_argument('--solver-nodes', type=int, default=32768)
     args = parser.parse_args()
+    from play import LIMITS, run_checkpoints
+    for name, value in (('simulations', args.simulations), ('solver_nodes', args.solver_nodes)):
+        low, high = LIMITS[name]
+        if not low <= value <= high:
+            parser.error(f'--{name.replace("_", "-")} must be {low}..{high}')
     import torch
-    from play import run_checkpoints
     device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
     model = args.model or args.run / 'checkpoints' / run_checkpoints(args.run)[0] / 'ema.pt'
     serve(BubblePlayer(model, device, args.simulations, args.solver_nodes))
