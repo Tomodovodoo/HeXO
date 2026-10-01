@@ -684,8 +684,8 @@ class Session:
         finally:
             game.close()
         seat = self.seats[player]
-        busy = any(j.kind == 'move' and j.status in ('queued', 'running') and j.history == tuple(self.history)
-                   for j in self.jobs.values())
+        busy = any(j.kind == 'move' and j.status in ('queued', 'running') and not j.cancelled
+                   and j.history == tuple(self.history) for j in self.jobs.values())
         if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy:
             self.submit(Job('move', 1, self.history, side=player, seat=dict(seat)))
         opening = not self.history or remaining == 2
@@ -757,6 +757,8 @@ class Session:
         for job in self.jobs.values():
             if job.kind == 'move' and job.status in ('queued', 'running'):
                 job.cancelled = True
+                if job.status == 'queued':
+                    job.status = 'cancelled'
 
     def configure_seat(self, side, engine, checkpoint=None, preset='standard', custom=None):
         seat = self.seat(engine, checkpoint, preset, custom)

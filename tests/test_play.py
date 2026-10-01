@@ -271,6 +271,17 @@ class Jobs(unittest.TestCase):
         self.session.configure_analysis('bubble:fake', preset='deep', auto=False)
         wait(lambda: not self.session.state()['jobs'])
 
+    def test_a_move_queued_behind_analysis_is_replaced_after_a_change(self):
+        self.session.configure_seat(1, 'human')
+        self.session.play(0, 0)
+        self.engines.hold = True
+        self.session.analyse(1, force=True)
+        wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']))
+        self.session.configure_seat(1, 'bubble:fake')
+        self.session.configure_seat(1, 'bubble:fake', 'main/000001')
+        self.engines.release.set()
+        wait(lambda: len(self.history()) == 3)
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
