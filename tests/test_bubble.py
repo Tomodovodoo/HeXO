@@ -56,6 +56,8 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(plan[name][plan[name].index('--net-kernels') + 1], 'fused', name)
         for command in bubble.commands(Path('runs/x')).values():
             self.assertNotIn('--net-kernels', command)
+        self.assertIn('--no-cuda-graphs', bubble.commands(Path('runs/x'), kernels='reference')['actors'])
+        self.assertNotIn('--no-cuda-graphs', plan['actors'])
 
 
 class ModelTests(unittest.TestCase):
@@ -177,7 +179,7 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.launcher.prepare('auto', lambda c: None, 4, tactical=False)
         self.launcher.prepare('auto', lambda c: None, 4, tactical=True)
-        (self.run / 'config.json').write_text(json.dumps(dict(actor=dict(solver_root_nodes=0))))
+        (self.run / 'config.json').write_text(json.dumps(dict(actor=dict(solver_root_nodes=0, solver_cap_nodes=512))))
         self.launcher.prepare('auto', lambda c: None, 4, tactical=False)
 
     def test_prepare_probes_the_configured_variant(self):

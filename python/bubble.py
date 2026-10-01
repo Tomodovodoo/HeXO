@@ -42,12 +42,13 @@ def commands(run, actors=4, dashboard_port=8766, seal=False, kernels=None, proof
     kernels only when given."""
     python = [sys.executable, '-u']
     net = ['--net-kernels', kernels] if kernels else []
+    graphs = ['--no-cuda-graphs'] if kernels == 'reference' else []   # CUDA graphs exist only for fused kernels
     evaluator = [*python, str(PYTHON / 'dense_eval.py'), 'loop', '--run', str(run), *net]
     if not seal:
         evaluator += ['--eval-anchor-games', '0', '--no-eval-anchor-on-promotion', '--eval-anchor-target-halfwidth', '0']
     plan = dict(
         learner=[*python, str(PYTHON / 'dense_learn.py'), '--run', str(run), *net],
-        actors=[*python, str(PYTHON / 'dense_selfplay.py'), '--run', str(run), '--processes', str(actors), *net],
+        actors=[*python, str(PYTHON / 'dense_selfplay.py'), '--run', str(run), '--processes', str(actors), *net, *graphs],
         evaluator=evaluator,
         proof=[*python, str(PYTHON / 'dense_solve.py'), '--run', str(run)],
         dashboard=[*python, str(PYTHON / 'dashboard.py'), '--run', str(run), '--port', str(dashboard_port)])
@@ -234,8 +235,9 @@ class Launcher:
             if phase_actors > 0 and not (config.get('actor') or {}).get('phase_follow', False):
                 raise RuntimeError(f'{self.run} phases wait for actors that never acknowledge them; '
                                    'set actor.phase_follow to true in its config.json')
-            budgets = [value for section in ('actor', 'evaluation') for key, value in (config.get(section) or {}).items()
-                       if key.startswith('solver_') and key.endswith('_nodes') and isinstance(value, int)]
+            queries = ('solver_root_nodes', 'solver_finalist_nodes', 'solver_threat_nodes', 'solver_leaf_nodes',
+                       'solver_deep_nodes')   # the budgets that enable queries; caps and floors only bound them
+            budgets = [(config.get(section) or {}).get(key, 0) for section in ('actor', 'evaluation') for key in queries]
             if not tactical and any(budgets):
                 raise RuntimeError(f'{self.run} uses solver budgets but the tactical solver is not built; '
                                    'run python tools/build_tactical.py or set the solver_*_nodes settings to 0')
