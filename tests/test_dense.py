@@ -2515,6 +2515,78 @@ class MaskedFutureLearnerTests(unittest.TestCase):
 
 
 class ValidationSourceTests(unittest.TestCase):
+    def test_held_validation_scores_missing_certificates_independently_of_policy_weight(self):
+        moves = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (3, 5), (4, 5),
+                 (3, 0), (-1, 1), (6, 6), (7, 7), (4, 0), (5, 0)]
+        game = Game(moves)
+        self.assertEqual(game.winner, 0)
+        game.close()
+        episode, rows = episode_rows(moves, 0)
+        for ply, witness in ((11, [[4, 0], [5, 0]]), (12, [[5, 0]])):
+            rows[ply].update(policy=None, proven=1, proof_action=witness, line=True)
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(dense_learn, 'VALIDATION_ROWS', 32):
+            run = Path(tmp)
+            dense_data.write_shard(run/'shards'/'1000000000001', dict(actor_sha256='x'), [episode], rows)
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=1.))
+            window = dense_data.ReplayWindow(run, 1000, 10, validation_fraction=1.)
+            window.refresh()
+            learner = dense_learn.Learner(run, config.learner, config)
+            metrics = learner.validate(window)
+            self.assertGreater(metrics['certified_policy_first_rows'], 0)
+            self.assertGreater(metrics['certified_policy_second_rows'], 0)
+            self.assertEqual(metrics['certified_policy_rows'], metrics['certified_policy_first_rows']+
+                             metrics['certified_policy_second_rows'])
+            learner.settings = replace(learner.settings, proof_policy_weight=.25, proof_policy_missing_only=True)
+            weighted = learner.validate(window)
+            for key, value in metrics.items():
+                if key.startswith('certified_policy'):
+                    self.assertEqual(value, weighted[key], key)
+            refs = [window.ref('1000000000001', ply) for ply in (11, 12)]
+            learner.settings = replace(learner.settings, proof_policy_weight=0.)
+            per_row = learner.row_losses(window, refs)
+            self.assertTrue(np.isnan(per_row['policy_ce']).all())
+            self.assertTrue(np.isfinite(per_row['certified_policy_mass']).all())
+            self.assertEqual(per_row['placements'].tolist(), [2., 1.])
+
+    def test_certified_policy_scores_empty_targets_and_conditional_second_stones(self):
+        out = dict(policy=torch.tensor([[.6, .3, .1], [.1, .6, .3], [.4, .3, .3]]).log(),
+                   far=torch.tensor([.1, .7, .1]).log())
+        batch = dict(cells=torch.tensor([[2, 0, 1], [2, -1, -1], [2, 0, 1]]),
+                     counts=torch.tensor([3, 2, 3]), policy_weight=torch.zeros(3))
+        samples = [SimpleNamespace(actions=np.array([[10, 0], [11, 0], [12, 0]])),
+                   SimpleNamespace(actions=np.array([[10, 0], [100, 0]])),
+                   SimpleNamespace(actions=np.array([[10, 0], [11, 0], [12, 0]]))]
+        rows = [dict(proven=1, remaining=2, proof_action=[[10, 0], [12, 0]]),
+                dict(proven=1, remaining=1, proof_action=[[100, 0]]),
+                dict(proven=-1, remaining=1, proof_action=[[10, 0]])]
+        mass, top1 = dense_learn.certified_policy_rows(out, batch, samples, rows)
+        torch.testing.assert_close(mass, torch.tensor([.4, .7, math.nan]), equal_nan=True)
+        torch.testing.assert_close(top1, torch.tensor([0., 1., math.nan]), equal_nan=True)
+        summary = dense_learn.certified_policy_summary(mass, top1, [r['remaining'] for r in rows])
+        self.assertEqual(summary['certified_policy_rows'], 2)
+        self.assertAlmostEqual(summary['certified_policy_mass'], .55)
+        self.assertEqual(summary['certified_policy_top1'], .5)
+        self.assertAlmostEqual(summary['certified_policy_first_mass'], .4)
+        self.assertEqual(summary['certified_policy_first_top1'], 0.)
+        self.assertEqual(summary['certified_policy_second_rows'], 1)
+        self.assertEqual(summary['certified_policy_second_top1'], 1.)
+        empty = dense_learn.certified_policy_summary([math.nan], [math.nan], [1])
+        self.assertEqual(empty['certified_policy_rows'], 0)
+        self.assertIsNone(empty['certified_policy_second_mass'])
+        # Far cells share a split logit; recognition must not depend on which tied cell comes first.
+        tied = dict(policy=torch.tensor([[.1, .6, .3]]).log(), far=torch.tensor([.7]).log())
+        far_batch = dict(cells=torch.tensor([[2, -1, -1]]), counts=torch.tensor([3]))
+        witness = [dict(proven=1, proof_action=[[101, 0]])]
+        for actions in ([[10, 0], [100, 0], [101, 0]], [[10, 0], [101, 0], [100, 0]]):
+            mass, top1 = dense_learn.certified_policy_rows(tied, far_batch,
+                [SimpleNamespace(actions=np.array(actions))], witness)
+            torch.testing.assert_close(mass, torch.tensor([.35]))
+            self.assertEqual(top1.tolist(), [1.])
+        rows[0]['proof_action'] = [[999, 999]]
+        with self.assertRaisesRegex(ValueError, 'not legal'):
+            dense_learn.certified_policy_rows(out, batch, samples, rows)
+
     def test_origin_inference(self):
         self.assertEqual(dense_data.origin(dict(origin='actor', identity=dict(source='x'))), 'actor')
         self.assertEqual(dense_data.origin(dict(identity=dict(source='gumbel-policy-value-v1', actor_sha256='a'))), 'converted')

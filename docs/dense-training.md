@@ -35,11 +35,13 @@ Capped games always use TD over root values. `--bootstrap-full-only` restricts e
 
 ## Policy targets
 
-The policy target is the improved policy of the root search over the moves it considered. Three sources add to it:
+The policy target is the root search's improved policy over every eligible legal move. Unvisited moves receive a mixed value estimate. Three sources add to it:
 
 - `--proof-policy-weight w` mixes the certificate's winning stones into winning rows, `(search + w * proof) / (1 + w)`; with `--proof-policy-missing-only` it only fills rows that have no search policy, such as solver roots and forced-line rows.
 - `--regret-fraction f` draws a share `f` of each batch from the proof pass's regret buffer, positions where the network's value was furthest from a proven result.
 - `--future-target masked` adds a three-class occupancy head (empty, own, opponent) at 20 placements ahead, weight `--future-weight` (0.5). The default `legacy` keeps the older occupancy targets at 6 and 20 placements. Switching keeps the shared weights and optimizer state.
+
+At export, held replay validation reports `certified_policy_mass`, the probability assigned to its certified winning stones, and `certified_policy_top1`, whether any stone tied for highest policy belongs to that certificate. These include winning rows with a witness even when their policy training target is empty. `certified_policy_first_*` and `certified_policy_second_*` split the measurements by placements remaining in the turn; each group includes its row count. Source-specific fixed panels report the same fields on their existing full-search rows. They measure recognition of a verified continuation independently of proof-policy weighting, rather than agreement with a changing search target.
 
 ## Window and pacing
 
