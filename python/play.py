@@ -5,6 +5,7 @@ on one background worker thread as jobs with ids; HTTP requests only read or cha
 waits on an engine. See docs/play.md.
 """
 import argparse
+import contextlib
 import functools
 import hashlib
 import heapq
@@ -876,13 +877,22 @@ class Session:
             self.lock.notify_all()
             return job.id if job else None
 
-    def review_game(self):
+    def review_game(self, history=None, tries=0):
+        """Queue a review of `history` (the game by default); a review whose solver checks failed queues itself
+        again half a minute later, up to three times."""
         with self.lock:
-            if not self.analysis:
-                raise ValueError('Review needs a Bubble model')
-            job = self.submit(Job('review', 2, self.history, seat=dict(self.analysis)))
-            job.total = len(review_plies(self.history))
+            history = self.history if history is None else history
+            if not self.analysis or tuple(history) != tuple(self.history[:len(history)]):
+                raise ValueError('Review needs a Bubble model and a position of this game')
+            job = self.submit(Job('review', 2, history, seat=dict(self.analysis), tries=tries))
+            job.total = len(review_plies(history))
             return job.id
+
+    def review_again(self, history, seat, tries):
+        with self.lock:
+            if self.analysis == seat:
+                with contextlib.suppress(ValueError):
+                    self.review_game(history, tries)
 
     def cancel(self, job_id):
         with self.lock:
@@ -1029,16 +1039,22 @@ class Session:
         if job.kind == 'analyse':
             job.total = max(1, seat['budget']['simulations']) * 2
             return self.evaluation(job, seat, history, job.force)
+        incomplete = False
         for index, ply in enumerate(review_plies(history)):
             if job.cancelled:
                 raise Cancelled()
             with self.lock:
                 if self.queue and self.queue[0][0] < job.priority:
                     raise Yielded()
-            self.evaluation(job, seat, history[:ply])
+            record = self.evaluation(job, seat, history[:ply])
+            incomplete |= record['solver_nodes'] < self.engines.effective(seat['budget'])['solver_nodes']
             job.done = index + 1
             with self.lock:
                 self.revision += 1
+        if incomplete and job.tries < 3:
+            timer = threading.Timer(31, self.review_again, args=(list(history), dict(seat), job.tries + 1))
+            timer.daemon = True
+            timer.start()
         return None
 
 
