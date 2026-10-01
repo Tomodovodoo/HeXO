@@ -1077,6 +1077,31 @@ class Scheduler(unittest.TestCase):
         finally:
             pool.close()
 
+    def test_closing_a_pool_aborts_its_running_query(self):
+        started = threading.Event()
+
+        class Blocking:
+            def __init__(self, priority=None):
+                self.aborted = threading.Event()
+
+            def history(self, history, **request):
+                started.set()
+                self.aborted.wait(60)
+                return dict(status='UNKNOWN', reason='aborted', nodes_used=0)
+
+            def abort(self):
+                self.aborted.set()
+
+            def close(self):
+                pass
+        with mock.patch.object(dense_solver, 'IsolatedTactics', Blocking):
+            pool = dense_solver.Pool(1, None)
+        pool.submit(0., 5., [[0, 0]], dict(nodes=10**9, ms=60000))
+        self.assertTrue(started.wait(10))
+        start = time.perf_counter()
+        pool.close()
+        self.assertLess(time.perf_counter()-start, 5.)
+
     def test_a_late_verdict_defers_its_game_once_then_finishes_in_the_background(self):
         try:
             solver = dense_solver.Solver(Schedule(fixed_budgets=False))
