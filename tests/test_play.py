@@ -260,6 +260,17 @@ class Jobs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual([len(call[2]) for call in self.engines.calls], [0, 3, 1, 5])
 
+    def test_changing_the_analysis_engine_cancels_its_old_work(self):
+        self.session.configure_seat(1, 'human')
+        self.session.play(0, 0)
+        self.engines.hold = True
+        self.session.analyse(1, force=True)
+        wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']))
+        self.session.configure_analysis('bubble:fake', auto=True)
+        self.assertEqual(self.session.state()['jobs'][0]['status'], 'running')
+        self.session.configure_analysis('bubble:fake', preset='deep', auto=False)
+        wait(lambda: not self.session.state()['jobs'])
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
@@ -304,11 +315,15 @@ class Jobs(unittest.TestCase):
             record.write_text(json.dumps(dict(binary_sha256='a' * 64)))
             self.assertEqual((engines.solver_build(), engines.solver()), ('none', (None, 'none')))
             binary.write_bytes(b'')
+            record.write_text('{"binary_')
+            self.assertEqual(engines.solver_build(), 'none')
+            record.write_text(json.dumps(dict(binary_sha256='a' * 64)))
+            os.utime(record, ns=(10 ** 18, 10 ** 18))
             with unittest.mock.patch.object(tactical_proof, 'IsolatedTactics') as isolated:
                 first, build = engines.solver()
                 self.assertEqual((build, engines.solver()[0]), ('aaaaaaaa', first))
                 record.write_text(json.dumps(dict(binary_sha256='b' * 64)))
-                os.utime(record, ns=(1, 1))
+                os.utime(record, ns=(2 * 10 ** 18, 2 * 10 ** 18))
                 second, build = engines.solver()
                 self.assertEqual(build, 'bbbbbbbb')
                 first.abort.assert_called_once()

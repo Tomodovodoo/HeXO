@@ -160,8 +160,12 @@ def file_digest(path, modified_ns, size):
 
 @functools.lru_cache(maxsize=8)
 def file_build(package, modified_ns):
+    """The solver build of `package`, or 'none' when its record is unreadable."""
     import tactical_proof
-    return tactical_proof.build_hash(package)[:8]
+    try:
+        return tactical_proof.build_hash(package)[:8]
+    except (OSError, ValueError, KeyError, TypeError):
+        return 'none'
 
 
 def model_key(path):
@@ -766,6 +770,12 @@ class Session:
         if self.entries[engine]['kind'] != 'bubble' or type(auto) is not bool:
             raise ValueError('Analysis needs a Bubble model')
         with self.lock:
+            for job in self.jobs.values():
+                settings = {k: v for k, v in getattr(job, 'seat', {}).items() if k != 'auto'}
+                if job.kind in ('analyse', 'review') and job.status in ('queued', 'running') and settings != seat:
+                    job.cancelled = True
+                    if job.status == 'queued':
+                        job.status = 'cancelled'
             self.analysis = seat | dict(auto=auto)
             self.changed()
 
