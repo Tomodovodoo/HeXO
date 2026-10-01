@@ -55,7 +55,7 @@ LIMITS = dict(simulations=(0, 65536), solver_nodes=(0, 4_000_000), ms=(10, 120_0
 KIND_LIMITS = dict(strix=dict(simulations=(1, 16384)))
 HEXO_SITES = {'hexo.did.science': 'https://hexo.did.science/api',
               'hexo.mineking.dev': 'https://hexo.mineking.dev/proxy/api'}
-SHOWN = ('id', 'name', 'label', 'variant', 'kind', 'presets', 'checkpoints')
+SHOWN = ('id', 'name', 'label', 'kind', 'presets', 'checkpoints')
 # Each library Six's backends need, as its Windows and its POSIX file name
 SIX_LIBRARIES = dict(cuda=('cudart64_12.dll', 'libcudart.so.12'), cudnn=('cudnn64_9.dll', 'libcudnn.so.9'),
                      tensorrt=('nvinfer_10.dll', 'libnvinfer.so.10'), directml=('DirectML.dll', None),
@@ -246,14 +246,14 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     """Every engine on offer, by id.
 
     Bubble runs come from `extra_runs`, the directories in `runs`, and `models`; single `.pt` exports come from
-    `models`. A directory in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once per network,
-    on the backend `six_backend` finds. `models/<name>.json` adds one entry: {"name", "kind": "bubble", "path"},
+    `models`. A directory in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once, on the
+    backend `six_backend` finds, labelled with that backend; its networks are its `checkpoints`, newest first. `models/<name>.json` adds one entry: {"name", "kind": "bubble", "path"},
     {"name", "kind": "six", "command", "mirrored", "presets"} or {"name", "kind": "strix", "model"}, paths
     relative to the file. Entries carry `id`, `name`, `kind`, `presets`, `label` (the name the page shows; the
-    first run in `extra_runs` is labelled Bubble), and the server-only `path` and `checkpoints` (Bubble), `command`,
-    `cwd`, `mirrored` and `libraries` (Six protocol) or `model` (Strix). Six folder entries share the label Six
-    and add `variant`, their network and backend. An id is `kind:name`; entries sharing one get a suffix from
-    their path, command or model, so an id never moves to another engine."""
+    first run in `extra_runs` is labelled Bubble), `checkpoints` (Bubble checkpoints or Six networks), and the
+    server-only `path` (Bubble), `command`, `cwd`, `mirrored`, `libraries` and, for a Six folder, `networks`
+    ({name: path}) and `backend` (Six protocol, see `command_of`) or `model` (Strix). An id is `kind:name`;
+    entries sharing one get a suffix from their path, command or model, so an id never moves to another engine."""
     found, seen = [], set()
     models = models and Path(models).resolve()
 
@@ -288,10 +288,10 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
             if not binary.exists():
                 continue
             backend, flags, libraries = six_backend(folder)
-            for network in sorted(folder.glob('gen-*.onnx'), reverse=True):
-                add('six', f'Six {network.stem} · {backend}', label='Six', variant=f'{network.stem} · {backend}',
-                    command=[str(binary), '--net', str(network), *flags], cwd=folder, mirrored=True,
-                    libraries=libraries)
+            networks = {n.stem: n for n in sorted(folder.glob('gen-*.onnx'), reverse=True)}
+            if networks:
+                add('six', f'Six · {backend}', label=backend, checkpoints=list(networks), networks=networks,
+                    backend=backend, command=[str(binary), *flags], cwd=folder, mirrored=True, libraries=libraries)
         for path in sorted(Path(models).glob('*.json')):
             try:
                 spec = json.loads(path.read_text(encoding='utf-8'))
@@ -321,6 +321,14 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
         key = base if bases.count(base) == 1 else f'{base}~{suffix}'
         entries[key] = dict(id=key, **entry)
     return entries
+
+
+def command_of(entry, checkpoint):
+    """The command line of a Six-protocol entry at `checkpoint`: a Six folder's engine with `--net` and that
+    network, any other entry's own command."""
+    if not entry.get('networks'):
+        return list(entry['command'])
+    return [entry['command'][0], '--net', str(entry['networks'][checkpoint]), *entry['command'][1:]]
 
 
 def export_path(entry, checkpoint):
@@ -626,15 +634,16 @@ class Engines:
         except OSError:
             return 'none'
 
-    def turn(self, entry, budget, history, stop=lambda: False):
-        """A turn from a non-Bubble engine. A Six-protocol engine's search is stopped when `stop()` turns true.
+    def turn(self, entry, budget, history, stop=lambda: False, checkpoint=None):
+        """A turn from a non-Bubble engine, a Six folder's at network `checkpoint`. A Six-protocol engine's search
+        is stopped when `stop()` turns true.
         Native, Seal and Strix searches cannot be interrupted in process, so each kind searches in a SearchChild;
         when `stop()` turns true the child and everything it started are killed and a fresh one starts on the next
         turn. Both raise Cancelled."""
         self.last_turn = {}
         kind = entry['kind']
         if kind == 'six':
-            return self.protocol(entry, budget, history, stop)
+            return self.protocol(entry, budget, history, stop, checkpoint)
         if kind == 'strix' and not history:
             return [[0, 0]]   # the only legal first stone; Strix searches only once it is on the board
         if kind in self.children and self.children[kind].process.poll() is not None:
@@ -661,11 +670,16 @@ class Engines:
         self.last_turn = answer.get('measurements', {})
         return answer['moves']
 
-    def protocol(self, entry, budget, history, stop):
-        """A turn from a Six-protocol engine, kept running between turns, one process per command line."""
+    def protocol(self, entry, budget, history, stop, checkpoint=None):
+        """A turn from a Six-protocol engine, kept running between turns, one process per command line: a new
+        preset reuses the process, a new network or launch `args` starts another. For a Six folder the two most
+        recently used networks stay running, so two seats on different networks do not restart each turn; older
+        ones are closed."""
         from six_engine import ProtocolError, SixEngine
-        command = [*entry['command'], *budget.get('args', ())]
+        command = [*command_of(entry, checkpoint), *budget.get('args', ())]
         key = (*command, entry['mirrored'])
+        if key in self.external:
+            self.external[key] = self.external.pop(key)
         cancel = self.external[key].cancel if key in self.external else threading.Event()
         cancel.clear()
         done = threading.Event()
@@ -681,6 +695,8 @@ class Engines:
         try:
             if key not in self.external:
                 print(f"{entry['name']}: {shlex.join(command)}", flush=True)
+                for old in [k for k in self.external if entry.get('networks') and k[0] == command[0]][:-1]:
+                    self.external.pop(old).close()
                 self.external[key] = SixEngine(command, mirrored=entry['mirrored'], cwd=entry['cwd'],
                                                path=entry['libraries'], cancel=cancel, log=True,
                                                startup=900)
@@ -973,7 +989,7 @@ class Session:
         entry = self.entries.get(engine)
         if entry is None:
             raise ValueError('Unknown engine')
-        if entry['kind'] == 'bubble':
+        if entry.get('checkpoints'):
             checkpoint = entry['checkpoints'][0] if checkpoint is None else checkpoint
             if checkpoint not in entry['checkpoints']:
                 raise ValueError('Unknown checkpoint')
@@ -1374,7 +1390,9 @@ class Session:
         seat = self.seat(entry['id'], checkpoint, specification.get('preset', preset),
                          specification.get('custom'))
         source = {k: str(v) if isinstance(v, Path) else v for k, v in entry.items()
-                  if k in ('kind', 'name', 'path', 'command', 'cwd', 'model', 'mirrored')}
+                  if k in ('kind', 'name', 'path', 'cwd', 'model', 'mirrored')}
+        if entry['kind'] == 'six':
+            source['command'] = command_of(entry, seat['checkpoint'])
         if 'libraries' in entry:
             source['libraries'] = list(map(str, entry['libraries']))
         if entry['kind'] == 'bubble':
@@ -1385,14 +1403,15 @@ class Session:
                 raise ValueError('Bubble device must be cpu or cuda')
         elif 'device' in specification:
             raise ValueError('Choose the external engine backend from its catalogue entry')
-        source['device'] = seat.get('device', entry['name'].rsplit(' · ', 1)[-1] if entry['kind'] == 'six' else 'cpu')
+        source['device'] = seat.get('device', entry.get('backend') or entry['name'].rsplit(' · ', 1)[-1]
+                                    if entry['kind'] == 'six' else 'cpu')
         from hexo import library
         files = [library]
         if entry['kind'] == 'bubble':
             files += [library.with_name(library.name.replace('hexo', 'hexo_gumbel'))]
             source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] else 'none'
         elif entry['kind'] == 'six':
-            command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in entry['command']]
+            command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in source['command']]
             files += [path for path in command_files if path.is_file()]
         elif entry['kind'] == 'strix':
             files += [Path(entry['model'])]
@@ -1559,7 +1578,7 @@ class Session:
                     entry = {k: Path(v) if k in ('path', 'model') else v for k, v in source.items()
                              if k in ('kind', 'path', 'command', 'cwd', 'model', 'mirrored', 'libraries')}
                     entry.update(id=seat['engine'], name=source.get('name', seat['name']), presets=PRESETS[source['kind']])
-                    if source['kind'] == 'bubble':
+                    if seat['checkpoint'] is not None:
                         entry['checkpoints'] = [seat['checkpoint']]
                     registry[seat['engine']] = entry
                 number = len(results)+1
@@ -1606,7 +1625,7 @@ class Session:
                         max_simulations=max(1, budget['simulations'])),
                         solver=dict(enabled=budget['solver_nodes'] > 0, nodes=max(1, budget['solver_nodes'])))
         if kind == 'six':
-            return dict(kind=kind, command=entry['command'] + budget.get('args', []),
+            return dict(kind=kind, command=command_of(entry, seat['checkpoint']) + budget.get('args', []),
                         cwd=str(entry.get('cwd') or ROOT), path=list(map(str, entry.get('libraries', []))),
                         mirrored=entry.get('mirrored', False), nodes=budget['nodes'])
         return dict(kind=kind, max_ms=budget['ms'])
@@ -1746,7 +1765,7 @@ class Session:
             return seat | dict(engine=moved)
         def valid(seat):
             entry = entries.get(seat['engine']) if seat['engine'] else None
-            return entry is not None and (entry['kind'] != 'bubble' or seat['checkpoint'] in entry['checkpoints'])
+            return entry is not None and (not entry.get('checkpoints') or seat['checkpoint'] in entry['checkpoints'])
         with self.lock:
             self.match_editable()
             followed = [seat if seat['engine'] == 'human' else follow(seat) for seat in self.seats]
@@ -1936,7 +1955,7 @@ class Session:
                 counts = dict(completed=0 if cached else found.get('actual_completed'),
                               solver_nodes=0 if cached else found.get('actual_solver_nodes'), cached=cached)
             else:
-                moves = self.engines.turn(entry, seat['budget'], history, lambda: job.cancelled)
+                moves = self.engines.turn(entry, seat['budget'], history, lambda: job.cancelled, seat['checkpoint'])
                 counts = getattr(self.engines, 'last_turn', {})
             job.measurements = dict(elapsed_ms=(time.monotonic()-started)*1000, completed=None, nodes=None,
                                     evaluated=job.done if entry['kind'] == 'bubble' else None, stop_reason='budget') | counts

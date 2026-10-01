@@ -34,7 +34,8 @@ ends the batch. Position edits and player changes become available again after s
 `python python/bubble.py models --port 8772` lists the same catalogue as the browser picker. Match names are
 case-insensitive catalogue names, exact ids, unique engine kinds, or paths to `.pt` exports. Use
 `dense-v1@main/150000`, `dense-v1@150000` or `dense-v1@champion` for checkpoints. `bubble:150000` also works
-when that step identifies one available Bubble run. Ambiguous names are rejected.
+when that step identifies one available Bubble run. A Six folder's network is its checkpoint: `Six@gen-0455`, the
+newest by default. Ambiguous names are rejected.
 
 A seat combines an engine, preset or custom budget, and a device. For example:
 
@@ -150,7 +151,7 @@ at the bottom of the picker, or restart the server.
 | Engine | What goes in the models folder | Picker |
 |---|---|---|
 | Bubble | a run folder with `checkpoints/<variant>/<step>/ema.pt` (champion first), or any `.pt` export, for example `models/old/ema.pt` | the folder or file name; checkpoints in the select |
-| Six | a folder, for example `models/six/`, with `sixengine.exe` (`sixengine` on Linux) and `gen-NNNN.onnx` networks | Six; networks and backend in the select |
+| Six | a folder, for example `models/six/`, with `sixengine.exe` (`sixengine` on Linux) and `gen-NNNN.onnx` networks | Six with its backend; networks in the select, newest first |
 | Strix | `strix.json` and the model file beside it | the JSON's name |
 | Shrimp, or any engine speaking the Six protocol | `shrimp.json` | the JSON's name |
 
@@ -178,7 +179,8 @@ Getting the files:
   Runtime's GPU DLLs (among them `onnxruntime_providers_cuda.dll`) beside `sixengine.exe`, and `cudart64_12.dll` and
   `cudnn64_9.dll` on PATH, beside it, or in an installed PyTorch's `torch/lib`. TensorRT adds
   `onnxruntime_providers_tensorrt.dll` beside the engine and `nvinfer_10.dll`, for example from `pip install tensorrt`;
-  the first game builds the plan beside the network, which takes a few minutes. The fastest backend whose libraries
+  the first game builds the plan beside the network, which takes a few minutes. A running Six keeps its process
+across presets; choosing another network starts one for it, and the two most recently used networks stay running. The fastest backend whose libraries
   are found wins: TensorRT, CUDA, DirectML, CPU. Six searches by nodes, so a preset plays the same on any hardware.
 - Strix: `python tools/build_strix_learned.py <hexo-strix checkout>` (Rust and MinGW) builds the engine into
   `tools/strix_learned/target/release`; the public model is `https://hexo.tyto.cc/model.safetensors`.

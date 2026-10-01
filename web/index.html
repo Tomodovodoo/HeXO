@@ -74,10 +74,10 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .track.dragging .thumb,.track.dragging .fill{transition:none}
 .ib.on{color:var(--c,var(--x));border-color:color-mix(in srgb,var(--c,var(--x)) 50%,transparent)}
 .custom{display:grid;grid-template-columns:repeat(auto-fit,minmax(0,1fr));gap:6px}
-.field{position:relative;display:block}
+.field{position:relative;display:block;border-radius:8px;background:var(--bg)}
 .field span{position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:10px;font-weight:700;letter-spacing:.08em;
-  text-transform:uppercase;color:var(--dim);pointer-events:none}
-.field input{width:100%;font:12px var(--mono);text-align:right;padding-left:64px}
+  text-transform:uppercase;color:var(--dim);opacity:.55;pointer-events:none}
+.field input{position:relative;width:100%;font:12px var(--mono);text-align:right;background:transparent}
 .bar{position:relative;height:3px;border-radius:2px;background:var(--line);overflow:hidden}
 .bar i{display:block;height:100%;background:var(--c,var(--text));transform-origin:left;transform:scaleX(0);transition:transform .3s ease-out}
 .bar.running::after{content:"";position:absolute;top:0;bottom:0;left:0;width:30%;
@@ -521,13 +521,7 @@ let menuFor=null,pinned=false;
 function badge(kind,label){return[el('span',{class:'kind','data-k':kind},kind),label&&label.toLowerCase()!==kind?el('span',{class:'name'},label):null]}
 function entryOf(id){return S.engines.find(x=>x.id===id)}
 function shown(seat){if(seat.engine==='human')return['you',null];const e=entryOf(seat.engine);return e?[e.kind,e.label||e.name]:['?',seat.engine]}
-function family(entry){return S.engines.filter(e=>e.kind===entry.kind&&e.variant&&entry.variant&&e.label===entry.label)}
-function pickItems(filter){
-  const items=[],seen=new Set();
-  for(const e of S.engines.filter(filter)){const group=family(e);if(group.length){const id=e.kind+'\n'+e.label;if(seen.has(id))continue;seen.add(id)}
-    items.push({id:e.id,ids:group.length?group.map(g=>g.id):[e.id],kind:e.kind,label:e.label||e.name})}
-  return items;
-}
+function pickItems(filter){return S.engines.filter(filter).map(e=>({id:e.id,ids:[e.id],kind:e.kind,label:e.label||e.name}))}
 function openMenu(anchor,items,current,choose){
   const m=$('menu');menuFor=anchor;anchor.classList.add('on');$('seats').classList.toggle('open',!!anchor.closest('#seats'));
   const rows=items.map(it=>{const b=el('button',{class:it.ids.includes(current)?'on':''},...badge(it.kind,it.label));
@@ -568,11 +562,9 @@ function strength(seat,send,id,config){
 }
 function seatControls(seat,send,id,config){
   const box=[],entry=entryOf(seat.engine);if(!entry)return box;
-  if(entry.kind==='bubble'&&entry.checkpoints.length>1){const sel=el('select',{'aria-label':'Checkpoint'},entry.checkpoints.map((c,i)=>el('option',{value:c},c+(i===0?' ★':''))));
+  if(entry.checkpoints?.length>1){const sel=el('select',{'aria-label':entry.kind==='six'?'Network':'Checkpoint'},
+      entry.checkpoints.map((c,i)=>el('option',{value:c},c+(i===0&&entry.kind==='bubble'?' ★':''))));
     sel.value=seat.checkpoint;sel.onchange=()=>send({checkpoint:sel.value});box.push(sel)}
-  const group=family(entry);
-  if(group.length>1){const sel=el('select',{'aria-label':'Network'},group.map(g=>el('option',{value:g.id},g.variant)));
-    sel.value=entry.id;sel.onchange=()=>send({engine:sel.value});box.push(sel)}
   box.push(strength(seat,send,id,config));
   if(seat.preset==='custom'||configured.has(id))box.push(el('div',{class:'custom'},Object.entries(seat.budget).filter(([k,v])=>typeof v==='number').map(([k,v])=>{
     const i=el('input',{type:'number',inputmode:'numeric',value:v,'aria-label':FIELDS[k]||k,min:0});
