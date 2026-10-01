@@ -42,8 +42,9 @@ PRESETS = dict(
                deep=dict(simulations=512)))
 LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 1_500_000), ms=(10, 120_000), nodes=(1, 50_000_000))
 KIND_LIMITS = dict(strix=dict(simulations=(1, 16384)))
+# Each library Six's backends need, as its Windows and its POSIX file name
 SIX_LIBRARIES = dict(cuda=('cudart64_12.dll', 'libcudart.so.12'), cudnn=('cudnn64_9.dll', 'libcudnn.so.9'),
-                     tensorrt=('nvinfer_10.dll', 'libnvinfer.so.10'), directml=('DirectML.dll',),
+                     tensorrt=('nvinfer_10.dll', 'libnvinfer.so.10'), directml=('DirectML.dll', None),
                      cuda_build=('onnxruntime_providers_cuda.dll', 'libonnxruntime_providers_cuda.so'),
                      tensorrt_build=('onnxruntime_providers_tensorrt.dll', 'libonnxruntime_providers_tensorrt.so'))
 
@@ -130,7 +131,8 @@ def six_backend(folder):
     dirs = [*extra, *map(Path, filter(None, listed.split(os.pathsep)))]
 
     def found(kind, where=dirs):
-        return any((d / name).exists() for d in where for name in SIX_LIBRARIES[kind])
+        name = SIX_LIBRARIES[kind][os.name != 'nt']
+        return name is not None and any((d / name).exists() for d in where)
 
     if found('cuda_build', [Path(folder)]) and found('cuda') and found('cudnn'):
         if found('tensorrt_build', [Path(folder)]) and found('tensorrt'):

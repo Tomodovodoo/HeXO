@@ -14,8 +14,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from hexo import Game
-from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SearchChild, Session, budget_of, export_path,
-                  import_history, model_key, presets_of, proof_turns, review, scan, six_backend)
+from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, budget_of,
+                  export_path, import_history, model_key, presets_of, proof_turns, review, scan, six_backend)
 from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
@@ -683,6 +683,7 @@ class Proofs(unittest.TestCase):
 
 class Registry(unittest.TestCase):
     def test_six_takes_the_fastest_backend_it_can_load(self):
+        library = lambda kind: SIX_LIBRARIES[kind][os.name != 'nt']
         with tempfile.TemporaryDirectory() as directory:
             six, libraries = Path(directory) / 'six', Path(directory) / 'gpu'
             six.mkdir()
@@ -690,17 +691,17 @@ class Registry(unittest.TestCase):
             with unittest.mock.patch('importlib.util.find_spec', return_value=None), \
                     unittest.mock.patch.dict(os.environ, dict(PATH=str(libraries))):
                 self.assertEqual(six_backend(six), ('CPU', ['--cpu'], []))
-                for name in ('cudart64_12.dll', 'cudnn64_9.dll', 'nvinfer_10.dll'):
-                    (libraries / name).write_bytes(b'')
+                for kind in ('cuda', 'cudnn', 'tensorrt'):
+                    (libraries / library(kind)).write_bytes(b'')
                 self.assertEqual(six_backend(six), ('CPU', ['--cpu'], []))
                 (six / 'DirectML.dll').write_bytes(b'')
-                self.assertEqual(six_backend(six)[:2], ('DirectML', []))
+                self.assertEqual(six_backend(six)[:2], ('DirectML', []) if os.name == 'nt' else ('CPU', ['--cpu']))
                 (six / 'DirectML.dll').unlink()
-                (six / 'onnxruntime_providers_cuda.dll').write_bytes(b'')
+                (six / library('cuda_build')).write_bytes(b'')
                 self.assertEqual(six_backend(six)[:2], ('CUDA', []))
-                (six / 'onnxruntime_providers_tensorrt.dll').write_bytes(b'')
+                (six / library('tensorrt_build')).write_bytes(b'')
                 self.assertEqual(six_backend(six)[:2], ('TensorRT', ['--trt']))
-                (libraries / 'nvinfer_10.dll').unlink()
+                (libraries / library('tensorrt')).unlink()
                 self.assertEqual(six_backend(six)[:2], ('CUDA', []))
 
     def test_six_folders_and_engine_entries_are_found(self):
