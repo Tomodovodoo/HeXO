@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 
 import formats
 from hexo import Game
-from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings, budget_of,
+from play import (command_of, Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings, budget_of,
                   export, export_path, file_digest, file_identity, import_history, linked_history, model_key, presets_of,
                   proof_turns, read_game, review, scan, six_backend)
 from process_tree import TreeProcess
@@ -63,7 +63,7 @@ class FakeEngines:
     """Plays the first legal cells; `hold` makes evaluations wait until cancelled or released."""
 
     def __init__(self):
-        self.calls, self.hold, self.release = [], False, threading.Event()
+        self.calls, self.turns, self.hold, self.release = [], [], False, threading.Event()
 
     def evaluate(self, entry, checkpoint, budget, history, watch):
         self.calls.append((checkpoint, dict(budget), [tuple(p) for p in history]))
@@ -81,7 +81,8 @@ class FakeEngines:
     def effective(self, budget):
         return budget
 
-    def turn(self, entry, budget, history, stop):
+    def turn(self, entry, budget, history, stop, checkpoint=None):
+        self.turns.append((entry['id'], checkpoint, dict(budget)))
         return legal_turn(history)
 
     def close(self):
@@ -470,6 +471,43 @@ class Jobs(unittest.TestCase):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
         self.assertFalse(self.session.paused)
+
+    def test_six_seats_play_the_chosen_network(self):
+        six = dict(id='six:Six · CPU', name='Six · CPU', label='CPU', kind='six', presets=PRESETS['six'],
+                   checkpoints=['gen-2', 'gen-1'], networks={'gen-2': Path('gen-2.onnx'), 'gen-1': Path('gen-1.onnx')},
+                   command=['sixengine', '--cpu'], cwd=Path('.'), mirrored=True, libraries=[])
+        self.session.entries[six['id']] = six
+        self.session.configure_seat(1, six['id'], preset='quick')
+        self.assertEqual(self.session.seats[1]['checkpoint'], 'gen-2')
+        self.session.configure_seat(1, six['id'], 'gen-1', 'lightning')
+        self.session.play(0, 0)
+        wait(lambda: len(self.history()) == 3)
+        self.assertEqual(self.engines.turns[-1], (six['id'], 'gen-1', dict(nodes=1500)))
+        with self.assertRaises(ValueError):
+            self.session.configure_seat(1, six['id'], 'gen-3')
+
+    def test_a_six_process_lives_across_presets_and_two_networks(self):
+        started, closed = [], []
+
+        class Fake:
+            def __init__(self, command, **options):
+                self.command, self.cancel, self.info = command, options['cancel'], {}
+                started.append(command)
+
+            def __call__(self, game, ms, nodes=None):
+                return legal_turn([tuple(cell[:2]) for cell in game.cells])
+
+            def close(self):
+                closed.append(self.command)
+
+        six = dict(kind='six', name='Six', command=['sixengine', '--cpu'], cwd=Path('.'), mirrored=True, libraries=[],
+                   networks={f'gen-{n}': Path(f'gen-{n}.onnx') for n in range(3)})
+        engines = Engines('cpu')
+        with unittest.mock.patch('six_engine.SixEngine', Fake):
+            for network, nodes in (('gen-2', 30000), ('gen-2', 6000), ('gen-1', 6000), ('gen-2', 6000), ('gen-0', 6000)):
+                engines.turn(six, dict(nodes=nodes), [], checkpoint=network)
+        self.assertEqual([c[2] for c in started], ['gen-2.onnx', 'gen-1.onnx', 'gen-0.onnx'])
+        self.assertEqual([c[2] for c in closed], ['gen-1.onnx'])
 
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
@@ -999,6 +1037,24 @@ class Matches(unittest.TestCase):
             self.assertEqual(seat['source']['files'][str(path.resolve())],
                              file_digest(file_identity(path)))
 
+    def test_six_networks_are_checkpoints_of_one_entry(self):
+        folder = Path(self.directory.name)
+        for name in ('sixengine.exe', 'gen-0001.onnx', 'gen-0002.onnx'):
+            (folder / name).write_bytes(name.encode())
+        self.session.entries['six:Six · CPU'] = dict(
+            id='six:Six · CPU', name='Six · CPU', label='CPU', kind='six', presets=PRESETS['six'],
+            checkpoints=['gen-0002', 'gen-0001'], backend='CPU', cwd=folder, mirrored=True, libraries=[],
+            networks={n: folder / f'{n}.onnx' for n in ('gen-0002', 'gen-0001')},
+            command=[str(folder / 'sixengine.exe'), '--cpu'])
+        seat = self.session.match_seat('six@gen-0001', 'quick')
+        self.assertEqual((seat['checkpoint'], seat['name'], seat['source']['device']), ('gen-0001', 'Six · CPU/gen-0001', 'CPU'))
+        self.assertEqual(seat['source']['command'], [str(folder / 'sixengine.exe'), '--net', str(folder / 'gen-0001.onnx'), '--cpu'])
+        self.assertIn(str((folder / 'gen-0001.onnx').resolve()), seat['source']['files'])
+        self.assertNotIn(str((folder / 'gen-0002.onnx').resolve()), seat['source']['files'])
+        self.assertEqual(self.session.match_seat('Six', 'quick')['checkpoint'], 'gen-0002')
+        with self.assertRaises(ValueError):
+            self.session.match_seat('Six@gen-0009', 'quick')
+
     def test_resume_keeps_completed_games_and_pair_accounting(self):
         self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
         wait(lambda: self.session.match['completed'] == 1)
@@ -1196,12 +1252,13 @@ class Registry(unittest.TestCase):
             (models / 'spaced.json').write_text(json.dumps(dict(kind='six', command='six --cpu')))
             with unittest.mock.patch('play.six_backend', return_value=('CPU', ['--cpu'], [])):
                 found = scan(models, None, [], None)
-            self.assertEqual(list(found), ['six:Six gen-0120 · CPU', 'six:Six gen-0100 · CPU', 'six:shrimp',
-                                           'strix:Strix', 'native:Native'])
-            six = found['six:Six gen-0120 · CPU']
-            self.assertEqual((six['label'], six['variant'], found['six:shrimp']['label']), ('Six', 'gen-0120 · CPU', 'shrimp'))
-            self.assertEqual((six['command'][1:], six['mirrored']),
-                             (['--net', str(models / 'six/gen-0120.onnx'), '--cpu'], True))
+            self.assertEqual(list(found), ['six:Six · CPU', 'six:shrimp', 'strix:Strix', 'native:Native'])
+            six = found['six:Six · CPU']
+            self.assertEqual((six['label'], six['checkpoints'], found['six:shrimp']['label']),
+                             ('CPU', ['gen-0120', 'gen-0100'], 'shrimp'))
+            self.assertEqual((command_of(six, 'gen-0100')[1:], six['mirrored']),
+                             (['--net', str(models / 'six/gen-0100.onnx'), '--cpu'], True))
+            self.assertEqual(command_of(found['six:shrimp'], None), ['python', 'driver.py'])
             shrimp = found['six:shrimp']
             self.assertEqual((shrimp['command'], shrimp['mirrored']), (['python', 'driver.py'], False))
             self.assertEqual(shrimp['presets']['quick'], dict(nodes=1, args=['--visits', '32']))
