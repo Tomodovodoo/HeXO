@@ -402,9 +402,10 @@ class Engines:
         package = self.tactical_package or tactical_proof.PACKAGE
         binary = tactical_proof.library(package)
         record = binary.with_name(binary.name + '.json')
-        if not (binary.exists() and record.exists()):
+        try:
+            return file_build(str(package), file_identity(record), file_identity(binary))
+        except OSError:
             return 'none'
-        return file_build(str(package), file_identity(record), file_identity(binary))
 
     def turn(self, entry, budget, history, stop=lambda: False):
         """A native or Seal turn. Their searches cannot be interrupted in process, so each kind searches in a child
@@ -549,6 +550,11 @@ class Evaluations:
                     out.write(line + '\n')
             self.index(record, line)
         return record
+
+    def export(self):
+        """The whole file, read while no record is being appended."""
+        with self.lock:
+            return self.path.read_bytes() if self.path and self.path.exists() else b''
 
     def get(self, history, engine, budget):
         """The saved evaluation of `history` by `engine` at exactly `budget`, or None."""
@@ -1123,9 +1129,7 @@ class Handler(BaseHTTPRequestHandler):
             body = dict(format='bubble-replay', version=1, players=names, history=[list(p) for p in session.history])
             return self.respond(200, json.dumps(body), headers=[('Content-Disposition', 'attachment; filename="game.json"')])
         if url.path == '/evaluations':
-            path = session.store.path
-            data = path.read_bytes() if path and path.exists() else b''
-            return self.respond(200, data, 'application/x-ndjson',
+            return self.respond(200, session.store.export(), 'application/x-ndjson',
                                 [('Content-Disposition', 'attachment; filename="evaluations.jsonl"')])
         self.respond(404, dict(error='Not found'))
 
