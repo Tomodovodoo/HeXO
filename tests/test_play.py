@@ -697,7 +697,7 @@ class Registry(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             models = Path(directory)
             (models / 'six').mkdir()
-            for name in ('sixengine.exe', 'gen-0100.onnx', 'gen-0120.onnx'):
+            for name in ('sixengine.exe' if os.name == 'nt' else 'sixengine', 'gen-0100.onnx', 'gen-0120.onnx'):
                 (models / 'six' / name).write_bytes(b'')
             (models / 'shrimp.json').write_text(json.dumps(dict(
                 kind='six', command=['python', 'driver.py'], presets=dict(quick=dict(nodes=1, args=['--visits', '32'])))))

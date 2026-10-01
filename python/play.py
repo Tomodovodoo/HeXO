@@ -201,8 +201,8 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
             if 'checkpoints' not in path.relative_to(models).parts:
                 bubble(path)
         for folder in sorted(p for p in Path(models).iterdir() if p.is_dir()):
-            binary = next((folder / n for n in ('sixengine.exe', 'sixengine') if (folder / n).exists()), None)
-            if binary is None:
+            binary = folder / ('sixengine.exe' if os.name == 'nt' else 'sixengine')
+            if not binary.exists():
                 continue
             backend, flags, libraries = six_backend(folder)
             for network in sorted(folder.glob('gen-*.onnx'), reverse=True):
@@ -1357,8 +1357,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def search_child(kind):
     """The child process of `Engines.turn`: one JSON line {history, the budget, model} in, one line {moves} or
-    {error} out."""
-    engines = {}
+    {error} out. A Strix child keeps the two most recent settings loaded, one per seat."""
+    engines = OrderedDict()
     for line in sys.stdin:
         try:
             request = json.loads(line)
@@ -1379,6 +1379,9 @@ def search_child(kind):
                         from tools.strix_learned_adapter import StrixLearned
                         engines[key] = StrixLearned(request['model'], simulations=request['simulations'],
                                                     timeout_ms=min(600_000, max(5_000, 250 * request['simulations'])))
+                        while len(engines) > 2:
+                            engines.popitem(last=False)[1].close()
+                    engines.move_to_end(key)
                     moves = engines[key](game, 0)
             finally:
                 game.close()
