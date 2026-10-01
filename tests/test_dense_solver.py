@@ -476,6 +476,26 @@ class Proofs(unittest.TestCase):
         cls.opening = [tuple(m) for m in FIXTURE['positions'][PROOF]]
         cls.result = engine.history(cls.opening, nodes=NODES)
 
+    def test_seeded_replies_complete_only_covered_defender_turns(self):
+        base = [tuple(m) for m in FIXTURE['positions']['1790600287230040:25:213']]
+        result = NativeTactics().history(base, nodes=5000)
+        self.assertTrue(result['native_verified'])
+        proof = Proof(base, result['certificate'])
+        first = [tuple(c) for c in result['moves']]
+        history = base+first
+        _, _, node, _ = proof.walk(history)
+        covered = {tuple(sorted(map(tuple, r['action']))) for r in node['responses']}
+        self.assertEqual(proof.reply(history), [tuple(c) for c in node['responses'][0]['action']])
+        seen = set()
+        for seed in range(16):
+            rng = np.random.default_rng(seed)
+            reply = proof.reply(history, rng)
+            self.assertEqual(reply, proof.reply(history, np.random.default_rng(seed)))
+            second = proof.reply(history+reply[:1], rng)
+            self.assertIn(tuple(sorted(reply[:1]+second)), covered)
+            seen.add(tuple(sorted(reply)))
+        self.assertGreater(len(seen), 1)
+
     def test_path_walks_the_game_labels_both_sides_and_names_the_next_stones(self):
         certificate, base = self.result['certificate'], self.opening
         first, reply, second = ([tuple(c) for c in turn] for turn in line(certificate))
@@ -540,6 +560,42 @@ class Adjudication(unittest.TestCase):
             raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
         cls.opening = [tuple(m) for m in FIXTURE['positions'][PROOF]]
         cls.proof = engine.history(cls.opening, nodes=NODES)
+
+    def test_seeded_line_rows_vary_defences_and_preserve_certified_wins(self):
+        model = tiny_model()
+        base = [tuple(m) for m in FIXTURE['positions']['1790600287230040:25:213']]
+        result = NativeTactics().history(base, nodes=5000)
+        self.assertTrue(result['native_verified'])
+        s = settings(proven_line_rows=True, max_plies=len(base)+40)
+        proof = Proof(base, result['certificate'])
+        first = [tuple(c) for c in result['moves']]
+        _, _, node, _ = proof.walk(base+first)
+        covered = {tuple(sorted(map(tuple, r['action']))) for r in node['responses']}
+        winner = dense_solver.mover(base)
+        lines, replies = {}, set()
+        for seed in [*range(12), 3]:
+            game = from_position(dense_selfplay.SelfPlayGame([model, model], s, seed), base)
+            try:
+                with mock.patch.object(model.evaluator, 'evaluate', side_effect=AssertionError('No neural search needed')):
+                    game.adjudicate(winner, proof)
+                self.assertEqual(game.game.winner, winner)
+                offset = len(base)+len(first)
+                reply = tuple(sorted(map(tuple, game.moves[offset:offset+2])))
+                self.assertIn(reply, covered)
+                replies.add(reply)
+                for row in game.rows:
+                    self.assertEqual(row['proven'], 1 if row['player'] == winner else -1)
+                    self.assertIsNone(row['policy'])
+                    if row['player'] == winner:
+                        self.assertIn(game.moves[row['ply']], row['proof_action'])
+                if seed in lines:
+                    self.assertEqual(game.moves, lines[seed])
+                lines[seed] = game.moves
+            finally:
+                game.game.close()
+                for tree in game.trees.values():
+                    tree.close()
+        self.assertGreater(len(replies), 1)
 
     def play(self, plies=40, **changes):
         model = tiny_model()

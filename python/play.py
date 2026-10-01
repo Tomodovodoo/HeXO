@@ -454,7 +454,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     history = [tuple(map(int, p)) for p in history]
     local = replay(history)
     start, player = time.perf_counter(), local.player
-    moves, top, value, proof, line, threat, solved = [], [], None, None, [], [], True
+    moves, top, value, proof, line, threat, solved, tree = [], [], None, None, [], [], True, None
     completed = solver_used = 0
     deadline = min(60_000, max(10_000, solver_nodes // 8))
     network = Watched(bubble.evaluator, watch)
@@ -480,11 +480,9 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         while not given and local.player == player and local.winner < 0:
             current = [tuple(cell[:2]) for cell in local.cells]
             if simulations:
-                tree = NeuralSearch(network, bubble.sha256, current, seed=1740, cache=bubble.cache, tactics=True)
-                try:
-                    result = tree.search(simulations, root_samples=16, batch_size=16)
-                finally:
-                    tree.close()
+                if tree is None:
+                    tree = NeuralSearch(network, bubble.sha256, current, seed=1740, cache=bubble.cache, tactics=True)
+                result = tree.search(simulations, root_samples=16, batch_size=16)
                 action, policy, actions = result['action'], result['policy'], result['actions']
                 completed += result.get('completed', 0)
                 stone_value = root_value(result, local.player)
@@ -503,12 +501,16 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 value = (stone_value + 1) / 2
             moves.append([int(action[0]), int(action[1])])
             local.play(*moves[-1])
+            if tree is not None:
+                tree.advance(tuple(moves[-1]))
         if proof:
             value = 1. if proof['winner'] == player else 0.
         return dict(moves=moves, value=round(value, 4), top=top, proof=proof, line=line, threat=threat,
                     solved=solved, ms=round((time.perf_counter() - start) * 1000),
                     actual_completed=completed, actual_solver_nodes=solver_used)
     finally:
+        if tree is not None:
+            tree.close()
         local.close()
 
 
@@ -1268,7 +1270,8 @@ class Session:
             files += [library.with_name(library.name.replace('hexo', 'hexo_gumbel'))]
             source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] else 'none'
         elif entry['kind'] == 'six':
-            files += [Path(arg) for arg in entry['command'] if Path(arg).is_file()]
+            command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in entry['command']]
+            files += [path for path in command_files if path.is_file()]
         elif entry['kind'] == 'strix':
             files += [Path(entry['model'])]
         elif entry['kind'] == 'seal':
@@ -1288,7 +1291,8 @@ class Session:
                 board.close()
             if unique_openings is not None and (type(unique_openings) is not int or unique_openings < 1):
                 raise ValueError('unique_openings must be positive')
-            games = (2 * unique_openings if unique_openings else 2) if games is None else games
+            if games is None:
+                games = 2 * (len(openings) if openings is not None else unique_openings or 1)
             if len(players) != 2 or type(games) is not int or games < 1:
                 raise ValueError('A match needs two engines and a positive number of games')
             if type(max_placements) is not int or max_placements < 2:

@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 
 from hexo import Game
 from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings, budget_of,
-                  export_path, import_history, model_key, presets_of, proof_turns, review, scan, six_backend)
+                  export_path, file_digest, file_identity, import_history, model_key, presets_of, proof_turns, review, scan, six_backend)
 from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
@@ -782,6 +782,27 @@ class Matches(unittest.TestCase):
         self.assertEqual(self.session.history, [])
         self.assertFalse(self.output.exists())
 
+    def test_every_explicit_opening_gets_a_pair_by_default(self):
+        openings = [[[0, 0]], [[0, 0], [1, 0], [2, 0]]]
+        self.session.start_match(['Native', 'Other'], output=self.output, openings=openings, max_placements=5)
+        wait(lambda: not self.session.match_worker.is_alive())
+        self.assertEqual(self.session.match['completed'], 4)
+        games = [json.loads(p.read_text()) for p in sorted(self.output.glob('game-*.json'))]
+        for game, opening in zip(games, [openings[0], openings[0], openings[1], openings[1]]):
+            self.assertEqual(game['history'][:len(opening)], opening)
+
+    def test_six_identity_hashes_files_in_its_working_directory(self):
+        folder = Path(self.directory.name)
+        driver, model = folder / 'driver.py', folder / 'model.onnx'
+        driver.write_text('print("test protocol driver")')
+        model.write_bytes(b'network weights')
+        self.session.entries['six:Test'] = dict(id='six:Test', name='Test', kind='six', cwd=str(folder),
+            command=[sys.executable, driver.name, model.name], presets=PRESETS['six'])
+        seat = self.session.match_seat('six:Test', 'standard')
+        for path in (driver, model):
+            self.assertEqual(seat['source']['files'][str(path.resolve())],
+                             file_digest(file_identity(path)))
+
     def test_resume_keeps_completed_games_and_pair_accounting(self):
         self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
         wait(lambda: self.session.match['completed'] == 1)
@@ -836,6 +857,50 @@ class Proofs(unittest.TestCase):
         self.assertEqual([proof_turns(p, 2, True) for p in (1, 2, 5, 6, 9, 10)], [1, 1, 2, 2, 3, 3])
         self.assertEqual([proof_turns(p, 1, True) for p in (1, 4, 5)], [1, 2, 2])
         self.assertEqual([proof_turns(p, 2, False) for p in (3, 4, 7, 8)], [1, 1, 2, 2])
+
+
+class TurnTrees(unittest.TestCase):
+    """A fixed-budget play turn searches its second stone in the tree its first stone grew."""
+
+    def setUp(self):
+        import hexnet
+        import neural_search
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.path = Path(self.folder.name)/'ema.pt'
+        hexnet.save_model(self.path, hexnet.HexNet(hexnet.HexNetConfig(
+            blocks=1, channels=8, pool_every=1, line_length=5, value_hidden=8, head_channels=4)))
+        self.trees = []
+        trees = self.trees
+
+        class Spy(neural_search.NeuralSearch):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.searched = []
+                trees.append(self)
+
+            def search(self, *args, **kwargs):
+                result = super().search(*args, **kwargs)
+                self.searched.append((list(self.history), result['completed'], int(result['visits'].sum())))
+                return result
+        patcher = unittest.mock.patch.object(neural_search, 'NeuralSearch', Spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_play_evaluation_keeps_one_tree_for_the_turn(self):
+        import hexnet
+        import neural_search
+        from play import evaluate
+        from types import SimpleNamespace
+        model = hexnet.load_model(self.path)
+        bubble = SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=16), sha256='tiny',
+                                 cache=neural_search.EvaluationCache())
+        moves = evaluate(bubble, None, [(0, 0)], 32, 0)['moves']
+        self.assertEqual(len(self.trees), 1)
+        tree = self.trees[0]
+        self.assertEqual([h for h, _, _ in tree.searched], [[(0, 0)], [(0, 0), tuple(moves[0])]])
+        self.assertGreater(tree.searched[1][2], tree.searched[1][1])
+        self.assertIsNone(tree.ptr)
 
 
 class Registry(unittest.TestCase):

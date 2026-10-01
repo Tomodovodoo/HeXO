@@ -37,8 +37,8 @@ ACTOR_WAIT_SECONDS = 120.
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
         'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'deblunder_weight',
-        'optimizer', 'proof_policy_weight', 'proof_policy_missing_only', 'future_target', 'regret_fraction', 'cheap_row_fraction',
-        'phase_export', 'phase_actors')
+        'optimizer', 'proof_policy_weight', 'proof_policy_missing_only', 'pair_policy_weight', 'future_target',
+        'regret_fraction', 'cheap_row_fraction', 'phase_export', 'phase_actors')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
