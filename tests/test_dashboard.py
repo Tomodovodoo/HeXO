@@ -92,6 +92,82 @@ class TacticalResults(unittest.TestCase):
             self.assertEqual(first['sources'], ['manual log'])
 
 
+class ExternalRatings(unittest.TestCase):
+    def test_legacy_match_tracks_current_reference_rating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            folder = run/'matches/opponent'
+            folder.mkdir(parents=True)
+            report = folder/'report.json'
+            report.write_text('{"games": []}', encoding='utf-8')
+            saved = dict(schema='hexo-external-elo-estimate-v1', calculated_at=1,
+                scale=dict(zero_checkpoint='main/000500'),
+                match=dict(local_checkpoint='main/132500', checkpoint_sha256='a'*64,
+                    report='report.json', report_sha256=hashlib.sha256(report.read_bytes()).hexdigest(), games=64),
+                opponent=dict(model_id='pulsatrix', difficulty='standard'),
+                estimate={'85k_minus_pulsatrix_elo': -200, 'pair_adjusted_delta_sd': 100, 'assumption': 'paired games'})
+            (folder/'opponent-elo-estimate.json').write_text(json.dumps(saved), encoding='utf-8')
+            reference = dict(id='main/132500', elo=1600, elo_interval=[1404, 1796], ema_sha256='a'*64)
+            league = dict(checkpoints=[dict(id='main/000500', elo=0), reference])
+            rating = dashboard.external_ratings(run, league)['pulsatrix:standard']
+            self.assertEqual(rating['elo'], 1800)
+            self.assertAlmostEqual(rating['elo_interval'][1]-1800, 1.96*math.sqrt(20000))
+            reference['elo'] = 1700
+            self.assertEqual(dashboard.external_ratings(run, league)['pulsatrix:standard']['elo'], 1900)
+            saved['calculated_at'] = '2026-09-30'
+            (folder/'opponent-elo-estimate.json').write_text(json.dumps(saved), encoding='utf-8')
+            newer = dict(saved, schema='hexo-external-elo-estimate-v2', calculated_at=1790812800,
+                sources=[dict(report='report.json', report_sha256=saved['match']['report_sha256'])],
+                estimate=dict(reference_minus_opponent_elo=-300, pair_adjusted_delta_sd=100, assumption='joint fit'))
+            # The numeric v2 file sorts before the ISO-string legacy file.
+            (folder/'a-newer-elo-estimate.json').write_text(json.dumps(newer), encoding='utf-8')
+            self.assertEqual(dashboard.external_ratings(run, league)['pulsatrix:standard']['elo'], 2000)
+            newer['calculated_at'] = '2026-09-29'
+            saved['calculated_at'] = 1790812800
+            (folder/'a-newer-elo-estimate.json').write_text(json.dumps(newer), encoding='utf-8')
+            (folder/'opponent-elo-estimate.json').write_text(json.dumps(saved), encoding='utf-8')
+            self.assertEqual(dashboard.external_ratings(run, league)['pulsatrix:standard']['elo'], 1900)
+
+    def test_calibrated_match_requires_both_unchanged_reports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            folder = run/'matches/calibration'
+            folder.mkdir(parents=True)
+            match = run/'matches/six/report.json'
+            match.parent.mkdir()
+            calibration = folder/'report.json'
+            for report in (match, calibration): report.write_text('{"games": []}', encoding='utf-8')
+            saved = dict(schema='hexo-external-elo-estimate-v2', calculated_at=1,
+                scale=dict(zero_checkpoint='main/000500'),
+                match=dict(local_checkpoint='main/132500', checkpoint_sha256='a'*64,
+                    report='../six/report.json', report_sha256=hashlib.sha256(match.read_bytes()).hexdigest(), games=12),
+                opponent=dict(model_id='six', difficulty='default', label='Six@default'),
+                calibration=dict(games=32), sources=[dict(report='report.json',
+                    report_sha256=hashlib.sha256(calibration.read_bytes()).hexdigest())],
+                estimate=dict(reference_minus_opponent_elo=-600, pair_adjusted_delta_sd=100, assumption='joint fit'))
+            path = folder/'six-elo-estimate.json'
+            path.write_text(json.dumps(saved), encoding='utf-8')
+            league = dict(checkpoints=[dict(id='main/000500', elo=0),
+                dict(id='main/132500', elo=1600, elo_interval=[1404, 1796], ema_sha256='a'*64)])
+            rating = dashboard.external_ratings(run, league)['six:default']
+            self.assertEqual((rating['label'], rating['elo'], rating['calibration_games']), ('Six@default', 2200, 32))
+            self.assertAlmostEqual(rating['elo_interval'][0], 2200-1.96*math.sqrt(20000))
+            sources = saved.pop('sources')
+            for evidence in (None, []):
+                if evidence is not None: saved['sources'] = evidence
+                path.write_text(json.dumps(saved), encoding='utf-8')
+                self.assertEqual(dashboard.external_ratings(run, league), {})
+            saved['sources'] = sources
+            path.write_text(json.dumps(saved), encoding='utf-8')
+            for report in (match, calibration):
+                original = report.read_bytes()
+                report.write_text('{"games": [1]}', encoding='utf-8')
+                self.assertEqual(dashboard.external_ratings(run, league), {})
+                report.write_bytes(original)
+            calibration.unlink()
+            self.assertEqual(dashboard.external_ratings(run, league), {})
+
+
 class EvaluationBinding(unittest.TestCase):
     def test_latest_checkpoint_identity_and_legacy_binding(self):
         with tempfile.TemporaryDirectory() as directory:
