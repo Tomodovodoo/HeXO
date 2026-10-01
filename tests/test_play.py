@@ -292,6 +292,18 @@ class Jobs(unittest.TestCase):
         wait(lambda: self.session.jobs[old].status == 'cancelled')
         self.engines.hold = False
 
+    def test_viewing_another_position_cancels_the_running_view_analysis(self):
+        self.session.configure_seat(1, 'human')
+        for move in [(0, 0), (1, 0)]:
+            self.session.play(*move)
+        self.engines.hold = True
+        first = self.session.analyse(1, force=True)
+        wait(lambda: self.session.jobs[first].status == 'running')
+        self.session.analyse(2, force=True)
+        wait(lambda: self.session.jobs[first].status == 'cancelled')
+        self.engines.release.set()
+        wait(lambda: not self.session.state()['jobs'])
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)

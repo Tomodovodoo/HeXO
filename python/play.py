@@ -239,9 +239,9 @@ def winning_line(history, result):
         local.close()
 
 
-def interruptible(call, watch):
-    """`call()` on its own thread, polling `watch(0)` meanwhile; when `watch` raises, the call is left to finish
-    alone and the exception propagates."""
+def interruptible(call, watch, abort):
+    """`call()` on its own thread, polling `watch(0)` meanwhile; when `watch` raises, `abort()` ends the call and
+    the exception propagates."""
     result = {}
     def run():
         try:
@@ -252,7 +252,11 @@ def interruptible(call, watch):
     thread.start()
     while thread.is_alive():
         thread.join(.05)
-        watch(0)
+        try:
+            watch(0)
+        except Cancelled:
+            abort()
+            raise
     if 'error' in result:
         raise result['error']
     return result['value']
@@ -280,14 +284,15 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         if local.winner >= 0:
             raise ValueError('The game has finished')
         if prover is not None and solver_nodes:
-            mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=10000), watch)
+            mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=10000), watch,
+                                 prover.abort)
             solved = searched(mine)
             if verified(mine):
                 moves, line = [list(m) for m in mine['moves']], winning_line(history, mine)
                 proof = dict(winner=player, turns=mine['proof_turns'])
             else:
                 theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=10000),
-                                       watch)
+                                       watch, prover.abort)
                 solved = solved and searched(theirs)
                 if verified(theirs):
                     threat = [list(m) for m in theirs['moves']]
@@ -364,12 +369,7 @@ class Engines:
         when the solver is not built) and the key of the weights it used (see `model_key`)."""
         bubble, (solver, build) = self.bubble(export_path(entry, checkpoint)), self.solver()
         spent = budget if solver else budget | dict(solver_nodes=0)
-        try:
-            found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch)
-        except Cancelled:
-            if solver is not None:
-                solver.abort()
-            raise
+        found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch)
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
         return found, spent, f'{bubble.sha256[:16]}:{build}'
@@ -791,8 +791,11 @@ class Session:
             if not self.analysis or not 0 <= ply <= len(self.history):
                 raise ValueError('Nothing to analyse')
             for job in self.jobs.values():
-                if job.kind == 'analyse' and job.priority == 0 and job.status == 'queued':
-                    job.cancelled, job.status = True, 'cancelled'
+                stale = job.kind == 'analyse' and job.priority == 0 and job.history != tuple(self.history[:ply])
+                if stale and job.status in ('queued', 'running'):
+                    job.cancelled = True
+                    if job.status == 'queued':
+                        job.status = 'cancelled'
             job = self.request_analysis(self.history[:ply], 0, force)
             self.lock.notify_all()
             return job.id if job else None

@@ -53,18 +53,7 @@ select,input,textarea{background:var(--bg);border:1px solid var(--line-2);border
 #board-wrap{grid-area:board;position:relative;min-width:0;min-height:0;background:var(--board);overflow:hidden;
   box-shadow:inset 0 0 0 2px color-mix(in srgb,var(--turn) 55%,transparent);transition:box-shadow .4s}
 #board{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair;display:block}
-#marks{position:absolute;inset:0;pointer-events:none}
-.mark{position:absolute;left:0;top:0;width:var(--s);height:var(--s);margin:calc(var(--s)/-2) 0 0 calc(var(--s)/-2);
-  display:grid;place-items:center;font:600 11px/1 var(--mono);color:var(--text)}
-.ring::before{content:"";position:absolute;inset:0;clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);
-  background:var(--c);-webkit-mask:linear-gradient(#000 0 0);opacity:.9}
-.ring::after{content:"";position:absolute;inset:3px;clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);background:var(--board);opacity:.92}
-.mark>.label{position:relative;z-index:1;color:var(--c)}
-.pulse{animation:pulse 1.6s ease-in-out infinite}
-@keyframes pulse{50%{transform:scale(1.12);opacity:.65}}
-.ghost{opacity:.4}
-.badge{position:absolute;right:-4px;top:-4px;width:17px;height:17px;border-radius:50%;background:var(--c);color:#0b1222;
-  display:grid;place-items:center;font:800 10px/1 system-ui;animation:pop .35s cubic-bezier(.3,1.6,.5,1) both}
+#marks{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;display:block}
 @keyframes pop{from{transform:scale(0)}}
 #pips{position:absolute;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:6px;pointer-events:none}
 #pips i{width:14px;height:16px;clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);background:var(--turn);
@@ -167,7 +156,7 @@ dialog::backdrop{background:rgba(2,6,23,.7)}dialog textarea{width:100%;height:18
   </section>
   <main id="board-wrap">
     <canvas id="board" tabindex="0" aria-label="Board"></canvas>
-    <div id="marks"></div>
+    <canvas id="marks"></canvas>
     <div id="pips"></div>
     <div id="coord"></div>
     <div id="toast" role="alert"></div>
@@ -205,7 +194,7 @@ const LABEL={win:['◆','--best'],found:['!','--best'],kept:['=','--best'],best:
   inaccuracy:['?!','--inaccuracy'],mistake:['?','--mistake'],blunder:['??','--blunder'],missed:['✗','--proof'],allowed:['⚑','--proof'],lost:['·','--dim']};
 const PRESETS=['quick','standard','strong','deep','custom'],SHORT={quick:'Q',standard:'S',strong:'St',deep:'D',custom:'⋯'};
 let S=null,view=0,cam={x:0,y:0,size:26},hover=null,drag=null,fitted=false,seenLabels=new Map(),landed=new Map(),known=0,asked=new Set();
-const canvas=$('board'),ctx=canvas.getContext('2d');
+const canvas=$('board'),ctx=canvas.getContext('2d'),overlay=$('marks'),mctx=overlay.getContext('2d');
 const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const key=(q,r)=>q+','+r,dist=(a,b,c,d)=>Math.max(Math.abs(a-c),Math.abs(b-d),Math.abs(a+b-c-d));
 const playerAt=p=>p===0?0:(Math.floor((p-1)/2)+1)%2;
@@ -256,7 +245,8 @@ function fit(){
   const size=Math.max(10,Math.min(30,canvas.clientWidth/w,(canvas.clientHeight-90)/hh));
   cam={size,x:-size*(Math.max(...xs)+Math.min(...xs))/2,y:-size*(Math.max(...ys)+Math.min(...ys))/2};
 }
-function hexPath(x,y,s){ctx.beginPath();for(let k=0;k<6;k++){const a=(60*k-30)*Math.PI/180;const px=x+s*Math.cos(a),py=y+s*Math.sin(a);k?ctx.lineTo(px,py):ctx.moveTo(px,py)}ctx.closePath()}
+const CELL=()=>cam.size-1;
+function hexPath(x,y,s,c=ctx){c.beginPath();for(let k=0;k<6;k++){const a=(60*k-30)*Math.PI/180;const px=x+s*Math.cos(a),py=y+s*Math.sin(a);k?c.lineTo(px,py):c.moveTo(px,py)}c.closePath()}
 let legalCache={id:null,set:null};
 function legalSet(stones){
   const id=stones.join(';');if(legalCache.id===id)return legalCache.set;
@@ -285,15 +275,15 @@ function paint(){
   for(let q=Math.min(...qs)-3;q<=Math.max(...qs)+3;q++)for(let r=Math.min(...rs)-2;r<=Math.max(...rs)+2;r++){
     const[x,y]=screen(q,r);if(x<-size||x>w+size||y<-size||y>h+size)continue;
     const k=key(q,r);if(occupied.has(k))continue;
-    hexPath(x,y,size-1);
+    hexPath(x,y,CELL());
     if(legal.has(k)){ctx.fillStyle='#152036';ctx.fill()}
     ctx.strokeStyle='rgba(148,163,184,'+(legal.has(k)?.16:.06)+')';ctx.stroke();
   }
   const now=performance.now();let moving=false;
   const win=S.winner>=0&&view===S.history.length?new Set(sixLine(stones).map(s=>key(...s))):new Set();
   stones.forEach(([q,r],i)=>{
-    const[x,y]=screen(q,r),k=key(q,r),t0=landed.get(k);let s=size*.9,a=1;
-    if(MOTION&&t0!==undefined){const t=(now-t0)/260;if(t<0){a=0}else if(t<1){const e=1-Math.pow(1-t,3);s*=1.35-.35*e;a=e;moving=true}else landed.delete(k)}
+    const[x,y]=screen(q,r),k=key(q,r),t0=landed.get(k);let s=CELL(),a=1;
+    if(MOTION&&t0!==undefined){const t=(now-t0)/260;if(t<0){a=0}else if(t<1){const e=1-Math.pow(1-t,3);s*=.55+.45*e;a=e;moving=true}else landed.delete(k)}
     if(!a)return;ctx.globalAlpha=a;hexPath(x,y,s);ctx.fillStyle=COLORS[playerAt(i)];ctx.fill();
     if(win.has(k)){ctx.lineWidth=3;ctx.strokeStyle='#fff';ctx.stroke();ctx.lineWidth=1}
     ctx.globalAlpha=1;
@@ -301,35 +291,51 @@ function paint(){
   if(stones.length){const[x,y]=screen(...stones.at(-1));ctx.fillStyle='rgba(2,6,23,.55)';ctx.beginPath();ctx.arc(x,y,size*.18,0,7);ctx.fill()}
   if(stones.length>1&&view===S.history.length){const prev=stones.at(-2),turnStart=playerAt(stones.length-2)===playerAt(stones.length-1);
     if(turnStart){const[x,y]=screen(...prev);ctx.fillStyle='rgba(2,6,23,.35)';ctx.beginPath();ctx.arc(x,y,size*.14,0,7);ctx.fill()}}
-  if(hover&&canPlace()&&legal.has(key(...hover))&&!occupied.has(key(...hover))){const[x,y]=screen(...hover);hexPath(x,y,size-1.5);
+  if(hover&&canPlace()&&legal.has(key(...hover))&&!occupied.has(key(...hover))){const[x,y]=screen(...hover);hexPath(x,y,CELL());
     ctx.globalAlpha=.35;ctx.fillStyle=COLORS[S.player];ctx.fill();ctx.globalAlpha=1}
-  placeMarks();
+  marks=collectMarks();drawMarks();
   if(moving)draw();
 }
 
-/* marks over the board: suggestions, proofs, review */
-function placeMarks(){
-  const box=$('marks'),marks=[],ev=S.evaluations[view],turn=selectedTurn(),s=cam.size*1.9;
-  const add=(q,r,cls,color,text,badge)=>marks.push({q,r,cls,color,text,badge});
+/* marks over the board: suggestions, proofs, review; drawn with the board's own transform */
+let marks=[],pulseFrame=0;
+function collectMarks(){
+  const out=[],ev=S.evaluations[view],turn=selectedTurn();
+  const add=(q,r,kind,color,text)=>out.push({q,r,kind,color,text});
   const done=turn&&turn.label&&view===turn.ply+turn.stones.length;
-  if(done){const[g,c]=LABEL[turn.label];
-    turn.stones.forEach((p,i)=>add(p[0],p[1],'','',null,i===turn.stones.length-1?[g,c]:null));
-    for(const p of turn.better||[])add(p[0],p[1],'ring ghost',COLORS[turn.player],'')}
+  if(done){const[g,c]=LABEL[turn.label],last=turn.stones.at(-1);
+    out.push({q:last[0],r:last[1],kind:'badge',color:css(c),text:g});
+    for(const p of turn.better||[])add(p[0],p[1],'better',COLORS[turn.player],'')}
   if(ev&&!(done&&turn.better)){
-    if(ev.line&&ev.line.length)ev.line.slice(0,12).forEach((p,i)=>add(p[0],p[1],'ring'+(i?'':' pulse'),COLORS[p[2]],i+1));
-    else ev.top.forEach((p,i)=>add(p[0],p[1],'ring'+(i?' ghost':' pulse'),COLORS[playerAt(view)],i+1));
+    if(ev.line&&ev.line.length)ev.line.slice(0,12).forEach((p,i)=>add(p[0],p[1],i?'ring':'pulse',COLORS[p[2]],i+1));
+    else ev.top.forEach((p,i)=>add(p[0],p[1],i?'ghost':'pulse',COLORS[playerAt(view)],i+1));
     for(const p of ev.threat||[])add(p[0],p[1],'ring',COLORS[1-playerAt(view)],'!');
   }
-  while(box.children.length<marks.length)box.append(el('div'));
-  [...box.children].forEach((d,i)=>{const m=marks[i];if(!m){d.style.display='none';return}
-    const[x,y]=screen(m.q,m.r);d.style.display='';d.className='mark '+m.cls;
-    d.style.setProperty('--s',s+'px');d.style.setProperty('--c',m.color);d.style.translate=`${x}px ${y}px`;
-    const inner=d.firstChild||d.appendChild(el('span'));inner.className='label';inner.style.transform=`scale(${Math.min(1,cam.size/22)})`;
-    inner.replaceChildren(m.text!=null&&m.text!==''?el('b',{},String(m.text)):'');
-    const bd=d.querySelector('.badge');
-    if(m.badge){const b=bd||d.appendChild(el('span',{class:'badge'}));b.textContent=m.badge[0];b.style.setProperty('--c',`var(${m.badge[1]})`)}
-    else if(bd)bd.remove()});
-  $('marks').style.setProperty('--board',css('--board'));
+  return out;
+}
+function drawMarks(){
+  cancelAnimationFrame(pulseFrame);
+  const ratio=devicePixelRatio||1,w=overlay.clientWidth,h=overlay.clientHeight;
+  if(overlay.width!==canvas.width||overlay.height!==canvas.height){overlay.width=canvas.width;overlay.height=canvas.height}
+  mctx.setTransform(ratio,0,0,ratio,0,0);mctx.clearRect(0,0,w,h);
+  const cell=CELL(),t=performance.now()/1600*Math.PI*2,font=Math.max(9,Math.min(14,cam.size*.5));
+  let pulsing=false;
+  for(const m of marks){
+    const[x,y]=screen(m.q,m.r);if(x<-cam.size||y<-cam.size||x>w+cam.size||y>h+cam.size)continue;
+    if(m.kind==='badge'){const bx=x+cell*.62,by=y-cell*.62,br=Math.max(7,cell*.3);
+      mctx.beginPath();mctx.arc(bx,by,br,0,7);mctx.fillStyle=m.color;mctx.fill();
+      mctx.fillStyle='#0b1222';mctx.font=`800 ${Math.round(br*1.1)}px system-ui`;mctx.textAlign='center';mctx.textBaseline='middle';
+      mctx.fillText(m.text,bx,by+.5);continue}
+    const pulse=m.kind==='pulse'&&MOTION,wave=pulse?(1-Math.cos(t))/2:0;pulsing||=pulse;
+    mctx.globalAlpha=m.kind==='ghost'?.45:1-.35*wave;
+    hexPath(x,y,cell-1,mctx);mctx.fillStyle='rgba(15,23,42,.72)';mctx.fill();
+    mctx.lineWidth=2+wave*1.5;mctx.strokeStyle=m.color;mctx.setLineDash(m.kind==='better'?[4,3]:[]);
+    hexPath(x,y,cell-1-mctx.lineWidth/2,mctx);mctx.stroke();mctx.setLineDash([]);
+    if(m.text!==''){mctx.fillStyle=m.color;mctx.font=`600 ${Math.round(font)}px ui-monospace,Consolas,monospace`;
+      mctx.textAlign='center';mctx.textBaseline='middle';mctx.fillText(String(m.text),x,y+.5)}
+    mctx.globalAlpha=1;
+  }
+  if(pulsing)pulseFrame=requestAnimationFrame(drawMarks);
 }
 
 /* interaction */

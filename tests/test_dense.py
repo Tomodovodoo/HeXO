@@ -7107,6 +7107,14 @@ class DenseBrowser(unittest.TestCase):
         with self.assertRaises(Cancelled):
             evaluate(self.bubble, prover, [(0, 0)], 4, 2048, watch)
         self.assertLess(time.time() - started, 1)
+        prover.abort.assert_called_once()
+        idle = unittest.mock.Mock(history=unittest.mock.Mock(return_value=dict(status='UNKNOWN', reason='no verified strategy')))
+        def network(n):
+            if n:
+                raise Cancelled()
+        with self.assertRaises(Cancelled):
+            evaluate(self.bubble, idle, [(0, 0)], 4, 2048, network)
+        idle.abort.assert_not_called()
 
     def test_verified_line_replays_to_a_win(self):
         from play import evaluate
