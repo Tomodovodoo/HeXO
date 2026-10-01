@@ -58,7 +58,8 @@ Import takes HTTTX or a game file; Copy HTTTX, Game file and Evaluations export.
 ## Saved evaluations
 
 Evaluations go to `play-evaluations.jsonl` in the `--dense-run` directory (else `models/`, or `--evaluations`),
-one JSON line each: position, the model (the first 16 hex digits of its SHA-256, and its name), simulations, solver nodes, value, the engine's turn, top five
+one JSON line each: position, the engine (the first 16 hex digits of the weights' SHA-256 and 8 of the
+solver build's, plus a readable name), simulations, solver nodes, value, the engine's turn, top five
 first stones, proof winner and distance in turns, winning line and time. The file is only appended to. On start
 the server copies it to `play-evaluations.jsonl.<time>.bak` and keeps the newest three copies, then indexes the
 newest 200,000 evaluations in memory by position and model; the deepest one is shown, and a saved evaluation

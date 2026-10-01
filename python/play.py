@@ -158,6 +158,12 @@ def file_digest(path, modified_ns, size):
     return digest(path)
 
 
+@functools.lru_cache(maxsize=8)
+def file_build(package, modified_ns):
+    import tactical_proof
+    return tactical_proof.build_hash(package)[:8]
+
+
 def model_key(path):
     """Evaluations are keyed by the weights they came from: the first 16 hex digits of the file's SHA-256."""
     stat = Path(path).stat()
@@ -354,13 +360,21 @@ class Engines:
             raise
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
-        return found, spent, bubble.sha256[:16]
+        return found, spent, f'{bubble.sha256[:16]}:{self.solver_build()}'
 
     def effective(self, budget):
         """`budget` as it can run here: no solver nodes when the tactical library is not built."""
+        return budget if self.solver_build() != 'none' else budget | dict(solver_nodes=0)
+
+    def solver_build(self):
+        """The first 8 hex digits of the tactical library's recorded SHA-256, or 'none' when it is not built."""
         import tactical_proof
-        built = tactical_proof.library(self.tactical_package or tactical_proof.PACKAGE).exists()
-        return budget if built else budget | dict(solver_nodes=0)
+        package = self.tactical_package or tactical_proof.PACKAGE
+        record = tactical_proof.library(package).with_name(tactical_proof.library(package).name + '.json')
+        if not record.exists():
+            return 'none'
+        stat = record.stat()
+        return file_build(str(package), stat.st_mtime_ns)
 
     def turn(self, entry, budget, history, stop=lambda: False):
         """A native or Seal turn. Their searches cannot be interrupted in process, so each kind searches in a child
@@ -607,7 +621,9 @@ class Session:
         return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget_of(entry['kind'], preset, custom))
 
     def engine_key(self, seat):
-        return model_key(export_path(self.entries[seat['engine']], seat['checkpoint']))
+        """Evaluations are keyed by the weights and the solver build that produced them."""
+        weights = model_key(export_path(self.entries[seat['engine']], seat['checkpoint']))
+        return f'{weights}:{self.engines.solver_build()}'
 
     # Reading
 

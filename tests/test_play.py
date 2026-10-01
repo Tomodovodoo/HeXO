@@ -52,7 +52,10 @@ class FakeEngines:
         watch(budget['simulations'])
         moves = legal_turn(history)
         found = dict(moves=moves, value=.5, top=[[*moves[0], .9]], proof=None, line=[], threat=[], ms=1)
-        return found, budget, model_key(export_path(entry, checkpoint))
+        return found, budget, f'{model_key(export_path(entry, checkpoint))}:none'
+
+    def solver_build(self):
+        return 'none'
 
     def effective(self, budget):
         return budget
