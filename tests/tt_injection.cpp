@@ -42,6 +42,36 @@ int main() {
     assert(b.hash()==before && b.features==features);
     b.make({1,0});auto partial=search.turns(b,false,distant);
     for(auto t:partial) assert(t.count==1);
+    // A quiet second stone can sustain a forced attack for several turns.
+    // The proof must remain valid when replayed and leave cached gains intact.
+    std::vector<Cell> opening{{0,0},{0,8},{2,8},{1,0},{2,0},{4,8},{6,8}};
+    Board open;
+    for(auto c:opening) {assert(open.legal(c));open.make(c);}
+    auto open_key=open.hash();auto open_features=open.features;
+    Search forcing(5000,16);forcing.proof_deadline=forcing.deadline;
+    CandidateGuard open_cache(open);
+    auto gains=Search::candidate_scores(open);
+    int root=forcing.prove(open,6);
+    assert(root>=0 && forcing.replay(open,root));
+    assert(open.hash()==open_key && open.features==open_features);
+    assert(Search::candidate_scores(open)==gains);
+    Board blocked;
+    auto defended_opening=opening;defended_opening[5]=forcing.proof[root].attack.cells[0];
+    for(auto c:defended_opening) {assert(blocked.legal(c));blocked.make(c);}
+    auto blocked_key=blocked.hash();
+    assert(!forcing.replay(blocked,root) && blocked.hash()==blocked_key);
+    Board counter;
+    for(Cell c:std::vector<Cell>{{0,0},{0,8},{1,8},{1,0},{2,0},{2,8},{3,8}}) {
+        assert(counter.legal(c));counter.make(c);
+    }
+    auto counter_key=counter.hash();
+    assert(!forcing.replay(counter,root) && counter.hash()==counter_key);
+    Board spare;
+    for(Cell c:std::vector<Cell>{{0,0},{-1,0},{0,5},{1,0},{2,0},{3,3},{-3,5},{3,0},{4,0}}) {
+        assert(spare.legal(c));spare.make(c);
+    }
+    std::vector<Turn> free_replies;
+    assert(!forcing.forced_replies(spare,0,free_replies));
     // Incremental second-stone ranking must equal a fresh full-board ranking,
     // including cells whose only promising line was just blocked.
     std::mt19937 rng(20261001);
