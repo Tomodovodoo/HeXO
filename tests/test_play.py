@@ -304,6 +304,17 @@ class Jobs(unittest.TestCase):
         self.engines.release.set()
         wait(lambda: not self.session.state()['jobs'])
 
+    def test_analysis_of_positions_left_behind_by_a_retry_is_cancelled(self):
+        self.session.configure_seat(1, 'human')
+        for move in [(0, 0), (1, 0), (2, 0)]:
+            self.session.play(*move)
+        self.engines.hold = True
+        old = self.session.analyse(3, force=True)
+        wait(lambda: self.session.jobs[old].status == 'running')
+        self.session.load([(0, 0), (1, 1), (2, 2)], True)
+        wait(lambda: self.session.jobs[old].status == 'cancelled')
+        self.engines.hold = False
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
@@ -441,10 +452,19 @@ class Http(unittest.TestCase):
         self.post('/new')
         state = self.post('/import', dict(text=text))
         self.assertEqual((state['history'], state['winner']), ([list(p) for p in final], 1))
+        port = self.server.server_port
+        rebound = {'Host': f'evil.example:{port}', 'Origin': f'http://evil.example:{port}'}
+        for headers in ({'Origin': 'http://example.com'}, rebound):
+            with self.assertRaises(HTTPError) as caught:
+                self.post('/new', headers=headers)
+            self.assertEqual(caught.exception.code, 403)
+            caught.exception.close()
         with self.assertRaises(HTTPError) as caught:
-            self.post('/new', headers={'Origin': 'http://example.com'})
+            urlopen(Request(self.root + '/state', headers={'Host': f'evil.example:{port}'}), timeout=5)
         self.assertEqual(caught.exception.code, 403)
         caught.exception.close()
+        local = {'Origin': f'http://localhost:{port}', 'Host': f'localhost:{port}'}
+        self.assertEqual(self.post('/new', headers=local)['history'], [])
 
 
 class Registry(unittest.TestCase):

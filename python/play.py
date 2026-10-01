@@ -690,6 +690,11 @@ class Session:
                    and j.history == tuple(self.history) for j in self.jobs.values())
         if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy:
             self.submit(Job('move', 1, self.history, side=player, seat=dict(seat)))
+        for job in self.jobs.values():
+            if job.kind == 'analyse' and job.status in ('queued', 'running') and                     job.history != tuple(self.history[:len(job.history)]):
+                job.cancelled = True
+                if job.status == 'queued':
+                    job.status = 'cancelled'
         opening = not self.history or remaining == 2
         if self.analysis and self.analysis['auto'] and winner < 0 and opening:
             self.request_analysis(self.history, 1)
@@ -988,7 +993,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def local(self):
+        """True for requests addressed to this server by its loopback name, which keeps pages on other sites out
+        even when their hostname resolves to 127.0.0.1; POSTs must also come from such a page."""
+        port = self.server.server_address[1]
+        hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
+        origin = self.headers.get('Origin')
+        return self.headers.get('Host') in hosts and (origin is None or origin in {f'http://{h}' for h in hosts})
+
     def do_GET(self):
+        if not self.local():
+            return self.respond(403, dict(error='Host rejected'))
         url, session = urlparse(self.path), self.session
         if url.path == '/':
             return self.respond(200, self.page.read_bytes(), 'text/html; charset=utf-8')
@@ -1012,8 +1027,7 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(404, dict(error='Not found'))
 
     def do_POST(self):
-        origin = self.headers.get('Origin')
-        if origin and origin != f"http://{self.headers.get('Host')}":
+        if not self.local():
             return self.respond(403, dict(error='Origin rejected'))
         session = self.session
         try:
