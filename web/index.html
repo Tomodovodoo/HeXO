@@ -434,7 +434,7 @@ function autoAnalyse(){
   const short=!ev||need&&(ev.simulations<need.simulations||ev.solver_nodes<need.solver_nodes);
   if(!short||!S.analysis||!S.analysis.auto||job||(S.winner>=0&&view===S.history.length))return;
   const a=S.analysis,tag=[a.engine,a.checkpoint,JSON.stringify(a.budget),S.history.slice(0,view).join(';')].join('|'),now=Date.now();
-  if(now-(asked.get(tag)||0)>31000){asked.set(tag,now);post('/analyse',{ply:view})}
+  if(now-(asked.get(tag)||0)>3000){asked.set(tag,now);post('/analyse',{ply:view})}
 }
 function renderGraph(){
   const g=$('graph'),W=300,H=92,n=Math.max(1,S.history.length),X=p=>p/n*W,Y=v=>(1-v)*H;
