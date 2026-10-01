@@ -1,24 +1,21 @@
 # Hi, I'm Bubble!
 
-I play [HeXO](https://github.com/HeXO-Game/HeXO), connect six on a hexagonal board with no edges. Cross opens with one stone at the origin. After that every turn is two stones, each placed within eight cells of a stone already on the board. Six in a row along any of the three axes wins on the spot, even if it is the first stone of a turn.
-
-I learned the game from scratch on one RTX 3070 Ti. This repository holds my rules engine, my search, the training loop that made me and a browser page where you can play me.
-
+I play [HeXO](https://github.com/HeXO-Game/HeXO), connect six on an infinite hexagonal board.
+I learned the game from scratch on one RTX 3070 Ti. Read further on how to play me, run other bots, handle my api, or use my training stack
 ## How I made Bubble
 
 Bubble is a hex-masked residual network with a policy head and a value head. It trains on one GPU in a loop that runs as separate processes on one run directory:
 
-- Actors play Bubble against itself with Gumbel MCTS, the AlphaZero recipe with a root search that improves the policy from a handful of simulations per stone.
-- A learner trains on those games from a replay window sized the KataGo way, and exports a checkpoint every few thousand steps. The actors switch to it at once.
+- Actors play Bubble against itself with Gumbel MCTS, AlphaZero-like using Gumbel with a root search that improves the policy from a handful of simulations per stone.
+- A learner trains on those games from a replay window sized the KataGo way, and exports a checkpoint every few thousand steps.
 - An evaluator plays every checkpoint against the champion on colour-swapped opening pairs and rates them with a posterior Bradley-Terry model. Promotion is a posterior probability, not an SPRT.
-- A tactical solver proves forced wins with certificates that an independent checker verifies. It started as the solver of [Strix](https://github.com/SootyOwl/hexo-strix) (MIT), vendored and changed in many places.
+- A tactical solver proves forced wins with absolute labels to train on. It started as the solver of [Strix](https://github.com/SootyOwl/hexo-strix) (MIT), edited and changed in many places.
 - A proof pass uses the spare CPU to re-check finished games, and a dashboard shows the run.
 
 ## Decisions that made Bubble stronger
 
 The rules make HeXO a tactical game: two stones per turn means a four with open ends is already a win. Most of what worked came from taking that seriously.
 
-- Exact tactics inside the search. Every placement in the tree is checked for an immediate win or a forced block, and the solver answers three questions at every turn start: can I force a win, can the opponent, and does my chosen move lose by force. A proven game is adjudicated and its forced line becomes training rows with exact labels.
 - Proven outcomes live on the search graph. A proof propagates up the tree with its distance, so the search plays the shortest win, resists longest when lost, and never spends simulations on a settled node. The search also shares evaluations between positions that only differ in move order.
 - Spare CPU hunts blunders. The proof pass scans finished games for forced wins that the search missed, labels those positions exactly, and feeds the worst misses back as restart positions for new games.
 - Value targets know how far the end is. A calibrated map turns the search value and the plies remaining into a win probability, blended with the outcome. Rows with an exact label get double weight and no outcome noise.
