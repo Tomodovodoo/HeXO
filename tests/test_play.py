@@ -13,12 +13,15 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import formats
 from hexo import Game
 from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings, budget_of,
-                  export_path, file_digest, file_identity, import_history, model_key, presets_of, proof_turns, review, scan, six_backend)
+                  export, export_path, file_digest, file_identity, import_history, linked_history, model_key, presets_of,
+                  proof_turns, read_game, review, scan, six_backend)
 from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
+SITE = Path(__file__).parent / 'fixtures' / 'hexo-site'
 
 
 def legal_turn(history):
@@ -69,7 +72,7 @@ class FakeEngines:
             time.sleep(.01)
         watch(budget['simulations'])
         moves = legal_turn(history)
-        found = dict(moves=moves, value=.5, top=[[*moves[0], .9]], proof=None, line=[], threat=[], ms=1)
+        found = dict(moves=moves, value=.5, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1)
         return found, budget, f'{model_key(export_path(entry, checkpoint))}:none'
 
     def solver_build(self):
@@ -147,6 +150,21 @@ class Store(unittest.TestCase):
         self.assertEqual(store.best([], 'e')['value'], .1)
         store.add([], 'e', dict(simulations=32, solver_nodes=131072), dict(value=1., moves=[], top=[], proof=dict(winner=0, turns=2)))
         self.assertEqual(store.best([], 'e')['value'], 1.)
+
+    def test_evaluations_without_move_values_are_shown_last_and_never_reused(self):
+        store = Evaluations()
+        store.add([], 'e', dict(simulations=512, solver_nodes=0), dict(value=.1, moves=[], top=[[0, 0, 1.]]))
+        self.assertIsNone(store.covering([], 'e', dict(simulations=32, solver_nodes=0)))
+        store.add([], 'e', dict(simulations=0, solver_nodes=0), dict(value=.4, moves=[], top=[[0, 0, 1.]]))
+        self.assertEqual(store.covering([], 'e', dict(simulations=0, solver_nodes=0))['value'], .4)
+        store.add([], 'e', dict(simulations=32, solver_nodes=0), dict(value=.2, moves=[], top=[[0, 0, 1., .2]]))
+        self.assertEqual(store.covering([], 'e', dict(simulations=32, solver_nodes=0))['value'], .2)
+        self.assertEqual(store.best([], 'e')['value'], .2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'evaluations.jsonl'
+            path.write_text(json.dumps(dict(position='', engine='e', simulations=1, solver_nodes=0, value=.3, moves=[],
+                                            top=[[0, 0, 1., 'x']])), encoding='utf-8')
+            self.assertIsNone(Evaluations(path).best([], 'e'))
 
     def test_index_keeps_the_newest_entries(self):
         store = Evaluations(limit=2)
@@ -447,6 +465,12 @@ class Jobs(unittest.TestCase):
         self.assertFalse(self.session.worker.is_alive())
         self.assertEqual(closed, [True])
 
+    def test_a_stone_placed_on_a_paused_game_gets_its_answer(self):
+        self.session.pause(True)
+        self.session.play(0, 0)
+        wait(lambda: len(self.history()) == 3)
+        self.assertFalse(self.session.paused)
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
@@ -584,6 +608,16 @@ class Jobs(unittest.TestCase):
         shrimp = presets_of('six', dict(quick=dict(nodes=1, args=['--visits', '32'])))
         self.assertEqual(budget_of(shrimp, 'custom', dict(nodes=9, args=['--visits', '1'])), dict(nodes=9))
         self.assertEqual(budget_of(shrimp, 'quick'), dict(nodes=1, args=['--visits', '32']))
+        lightning = {kind: presets_of(kind, None)['lightning'] for kind in PRESETS}
+        self.assertEqual(lightning, dict(bubble=dict(simulations=8, solver_nodes=2048), native=dict(ms=100),
+                                         seal=dict(ms=50), six=dict(nodes=1500), strix=dict(simulations=2)))
+        self.assertEqual([list(PRESETS[kind]) for kind in PRESETS], [['lightning', 'quick', 'standard', 'strong', 'deep', 'dangerous']] * 5)
+        self.assertEqual(presets_of('six', dict(quick=dict(nodes=1)))['lightning'], dict(nodes=1500))
+        self.assertEqual({kind: presets_of(kind, None)['dangerous'] for kind in PRESETS},
+                         dict(bubble=dict(simulations=65536, solver_nodes=4_000_000), native=dict(ms=60000),
+                              seal=dict(ms=30000), six=dict(nodes=2_000_000), strix=dict(simulations=4096)))
+        self.assertEqual(budget_of(PRESETS['bubble'], 'custom', dict(simulations=65536, solver_nodes=4_000_000)),
+                         dict(simulations=65536, solver_nodes=4_000_000))
         for spec in (dict(heavy=dict(nodes=1)), dict(quick=dict(nodes=0)), dict(quick=dict(args='--x')), [1],
                      dict(quick=dict(ms=1000))):
             with self.assertRaises(ValueError):
@@ -660,6 +694,17 @@ class Http(unittest.TestCase):
             finally:
                 self.session.close()
 
+    def test_import_loads_a_hexo_site_link(self):
+        with unittest.mock.patch('play.fetch_json', return_value=SiteImport.sandbox) as fetch:
+            state = self.post('/import', dict(text='https://hexo.did.science/sandbox/2mdyn02'))
+        fetch.assert_called_once_with('https://hexo.did.science/api/sandbox-positions/2mdyn02')
+        self.assertEqual((len(state['history']), state['paused']), (7, True))
+        state = self.post('/import', dict(text=Formats.GAME))
+        self.assertEqual((len(state['history']), state['winner']), (91, 1))
+        shown = json.loads(self.get('/export?format=rectilinear&ply=3'))
+        self.assertEqual(formats.rectilinear_loads(shown['text']), state['history'][:3])
+        self.assertEqual(json.loads(self.get('/export?format=tyto'))['text'], formats.tyto_dumps(state['history']))
+
     def test_import_export_retry_and_origin(self):
         self.post('/seat', dict(side=1, engine='human'))
         state = self.post('/import', dict(text='version[1];\n1. [1,0][2,0];'))
@@ -703,6 +748,141 @@ class Http(unittest.TestCase):
         caught.exception.close()
         local = {'Origin': f'http://localhost:{port}', 'Host': f'localhost:{port}'}
         self.assertEqual(self.post('/new', headers=local)['history'], [])
+
+
+class SiteImport(unittest.TestCase):
+    """Recorded API answers: hexo.did.science (hexo.mineking.dev serves the same API under /proxy/api) and
+    hexo.tyto.cc."""
+    game = json.loads((SITE / 'finished-game.json').read_text(encoding='utf-8'))
+    sandbox = json.loads((SITE / 'sandbox-position.json').read_text(encoding='utf-8'))
+    shared = json.loads((SITE / 'sandbox-z108lz7.json').read_text(encoding='utf-8'))
+    tyto = json.loads((SITE / 'tyto-game.json').read_text(encoding='utf-8'))
+
+    def fetched(self, url, answer):
+        asked = []
+        history = linked_history(url, lambda api, body=None: asked.append((api, body)) or answer)
+        return history, [api for api, _ in asked]
+
+    def test_games_and_sandbox_positions_become_htttx_histories(self):
+        history, asked = self.fetched('https://hexo.did.science/games/8211f449-5020-4a5a-9a93-581c5f720aac', self.game)
+        self.assertEqual(asked, ['https://hexo.did.science/api/finished-games/8211f449-5020-4a5a-9a93-581c5f720aac'])
+        self.assertEqual((len(history), history[:3]), (39, [[0, 0], [1, 2], [2, 1]]))
+        game = Game(history)
+        self.assertEqual(game.winner, 1)
+        game.close()
+        _, asked = self.fetched('https://hexo.mineking.dev/games/8211f449-5020-4a5a-9a93-581c5f720aac/', self.game)
+        self.assertEqual(asked, ['https://hexo.mineking.dev/proxy/api/finished-games/8211f449-5020-4a5a-9a93-581c5f720aac'])
+        history, asked = self.fetched('https://hexo.mineking.dev/sandbox/2MDYN02', self.sandbox)
+        self.assertEqual(asked, ['https://hexo.mineking.dev/proxy/api/sandbox-positions/2mdyn02'])
+        self.assertEqual(history, [[0, 0], [1, -1], [0, 1], [1, 0], [-1, 0], [2, 0], [-4, 0]])
+        history, asked = self.fetched('https://hexo.did.science/sandbox/z108lz7', self.shared)
+        self.assertEqual((len(history), history[:3]), (18, [[0, 0], [3, 0], [1, 2]]))
+
+    def test_tyto_analysis_and_game_links(self):
+        self.assertEqual(linked_history('https://hexo.tyto.cc/analysis#c=BAEIAw', self.offline), [[0, 0], [1, 1], [2, 2]])
+        asked = []
+        history = linked_history('https://hexo.tyto.cc/#g=ebb77124-db4c-4c42-979c-3e4d49244cec',
+                                 lambda api, body=None: asked.append((api, body)) or self.tyto)
+        self.assertEqual(asked, [('https://hexo.tyto.cc/game_htttx', dict(game_id='ebb77124-db4c-4c42-979c-3e4d49244cec'))])
+        self.assertEqual(history, import_history(self.tyto['htttx']))
+        with self.assertRaises(ValueError):
+            linked_history('https://hexo.tyto.cc/analysis', self.offline)
+
+    def test_other_text_is_left_alone_and_bad_links_are_refused(self):
+        for text in ('version[1];\n1. [1,0][2,0];', 'https://example.com/games/1', '[[0, 0]]'):
+            self.assertIsNone(linked_history(text, self.offline))
+        with self.assertRaises(ValueError):
+            linked_history('https://hexo.did.science/leaderboard', self.offline)
+        moved = json.loads(json.dumps(self.sandbox))
+        for cell in moved['gamePosition']['cells']:
+            cell['x'] += 3
+        self.assertEqual(self.fetched('https://hexo.did.science/sandbox/2mdyn02', moved)[0][:2], [[0, 0], [1, -1]])
+        swapped = json.loads(json.dumps(self.sandbox))
+        swapped['gamePosition']['cells'][1]['player'] = 'player-1'
+        with self.assertRaises(ValueError):
+            self.fetched('https://hexo.did.science/sandbox/2mdyn02', swapped)
+
+    def offline(self, url, body=None):
+        raise AssertionError(f'fetched {url}')
+
+
+class Formats(unittest.TestCase):
+    """Rectilinear notation (MineKing9534/HeXO) and Tyto analysis links (SootyOwl/hexo-strix)."""
+    GAME = ('o/xo, q @(1, 1) x A0 C2.1 o A1 B2.0 x C1.2 B4.0 o B1.0 C1.0 x D1.0 C4.1 o E4.3 B3.0 x C4.0 D3.3 o C3.2 '
+            'E3.3 x C3.1 F4.1 o D4.1 E3.2 x E3.0 F4.2 o D4.0 D4.2 x D4.3 F4.3 o F4.4 D5.1 x D5.0 F3.1 o G3.2 F3.2 x '
+            'H3.2 G3.1 o E3.1 G3.4 x F3.4 F3.0 o G3.3 H3.4 x D2.3 I3.5 o F2.5 E5.1 x F5.1 G2.5 o H3.0 K3.4 x L3.4 '
+            'G2.4 o G2.6 K3.0 x L3.0 M2.12 o L3.3 E5.0 x F4.5 N2.12 o O2.12 K2.10 x I2.8 M3.2 o M2.10 N2.10 x I3.3 '
+            'O2.10 o J3.4 K2.7 x I3.2 I3.4 o I3.0 I3.6 x K2.8 M3.3 o M3.1 M2.9 x L3.2 J3.1 o K3.2 K3.1 x K3.3 N2.11 '
+            'o L2.8 D3.1 x O2.11 I2.5 o F3.3 H3.5')
+
+    def test_a_rectilinear_game_reads_and_writes_back(self):
+        history = formats.rectilinear_loads(self.GAME)
+        game = Game(history)
+        self.assertEqual((len(history), game.winner, history[:3]), (91, 1, [[0, 0], [-1, 1], [1, 0]]))
+        game.close()
+        text, spans = formats.rectilinear_dumps(history)
+        self.assertTrue(text.startswith('x, b @(0, 0) o A0 A2 x B2.1 B5.1'))
+        self.assertEqual(formats.rectilinear_loads(text), history)
+        self.assertEqual([text[a:b] for a, b in spans[:3]], ['x', 'A0', 'A2'])
+        self.assertEqual(formats.rectilinear_dumps([[0, 0]]), ('x', [(0, 0 + 1)]))
+
+    def test_rings_follow_the_reference_parser(self):
+        _, turns = formats.bke_turns('b@(1,0): o A0 A1 x B3.1 B3.2', implicit=False)
+        self.assertEqual([(player, set(cells)) for player, cells in turns],
+                         [('o', {(1, -1), (2, -1)}), ('x', {(-1, 2), (0, 2)})])
+        for baseline in range(6):
+            for ring in range(1, 30):
+                for offset in range(6 * ring):
+                    cell = formats.ring_cell((3, -2), baseline, True, ring, offset)
+                    self.assertEqual(formats.ring_offset(cell, (3, -2), baseline), (ring, *divmod(offset, ring)))
+        history = formats.rectilinear_loads('x A0 H2.2 o A1 G2.2')
+        self.assertEqual((len(history), history[0]), (5, [0, 0]))
+        self.assertEqual(formats.rectilinear_loads('x A0 H2.2 o A1 G2.2'),
+                         formats.rectilinear_loads('o, d @(0, 0) x A0 H2.2 o A1 G2.2'))
+        self.assertEqual(formats.rectilinear_loads('c-x'), [[0, 0]])
+        self.assertEqual(formats.rectilinear_loads('oxo\r\nxx'), formats.rectilinear_loads('oxo/xx'))
+        for text in ('x7x7o7o7x', 'oxo/xx'):
+            self.assertEqual(len(formats.rectilinear_loads(text)), len(formats.drawing(text)))
+        with self.assertRaisesRegex(ValueError, 'cannot be played'):
+            formats.rectilinear_loads('x9oo')
+        self.assertEqual(len(formats.rectilinear_loads('x, o A0 A1 x B1')), 4)
+        for bad in ('xx', 'o/xo, q @(1, 1) o A0 B1', 'x(!', 'xz', 'x, o A0 x A1 A2', 'x, o A0 A1 A2'):
+            with self.assertRaises(ValueError):
+                formats.rectilinear_loads(bad)
+
+    def test_tyto_links_both_ways(self):
+        for history, code in (([(0, 0), (1, 1)], 'BAE'), ([(0, 0), (1, 1), (2, 2)], 'BAEIAw'),
+                              ([(0, 0), (1, 0), (-1, 2), (3, -1), (0, -2)], 'AgACAwQCAwQ')):
+            self.assertEqual(formats.tyto_dumps(history), formats.TYTO + code)
+            self.assertEqual(formats.tyto_loads(code), [list(p) for p in history])
+        far = formats.tyto_dumps([(0, 0), (1, 0), (2, 0), (3, -1), (70, -1)])
+        with self.assertRaises(ValueError):
+            formats.tyto_loads(far[len(formats.TYTO):])
+        for broken in ('BA', '!!!', 'BAE=', 'BAEIA'):
+            with self.assertRaises(ValueError):
+                formats.tyto_loads(broken)
+        with self.assertRaises(ValueError):
+            formats.tyto_dumps([])
+
+    def test_pasted_text_of_any_kind_is_read(self):
+        self.assertEqual(read_game('version[1];\n1. [1,0][2,0];', self.offline), [[0, 0], [1, 0], [2, 0]])
+        self.assertEqual(len(read_game(self.GAME, self.offline)), 91)
+        self.assertEqual(read_game('https://hexo.tyto.cc/analysis#c=BAE', self.offline), [[0, 0], [1, 1]])
+        with self.assertRaisesRegex(ValueError, 'Illegal'):
+            read_game('version[1];\n1. [1,0][1,0];', self.offline)
+
+    def test_exports_mark_each_stone(self):
+        history = [(0, 0), (1, 0), (-1, 2), (3, -1), (0, -2)]
+        htttx = export(history, 'htttx')
+        self.assertEqual([[htttx['text'][a:b], q, r] for a, b, q, r in htttx['spans']],
+                         [['[1,0]', 1, 0], ['[-1,2]', -1, 2], ['[3,-1]', 3, -1], ['[0,-2]', 0, -2]])
+        rectilinear = export(history, 'rectilinear')
+        self.assertEqual(formats.rectilinear_loads(rectilinear['text']), [list(p) for p in history])
+        self.assertEqual([s[2:] for s in rectilinear['spans']], [list(p) for p in history])
+        self.assertEqual(export(history, 'tyto'), dict(text=formats.TYTO + 'AgACAwQCAwQ', spans=[]))
+
+    def offline(self, url, body=None):
+        raise AssertionError(f'fetched {url}')
 
 
 class Matches(unittest.TestCase):
@@ -889,6 +1069,7 @@ class Matches(unittest.TestCase):
         seat = self.session.match_seat('bubble:2@quick', 'standard')
         self.assertEqual((seat['engine'], seat['checkpoint'], seat['device']), ('bubble:fake', 'main/000002', 'cpu'))
         self.assertEqual(seat['budget'], PRESETS['bubble']['quick'])
+        self.assertEqual(self.session.match_seat('Native@lightning', 'standard')['budget'], dict(ms=100))
         custom = self.session.match_seat('bubble:2{simulations=512,solver_nodes=0}', 'standard')
         self.assertEqual(custom['budget'], dict(simulations=512, solver_nodes=0))
         with self.assertRaisesRegex(ValueError, 'not a budget'):
@@ -968,7 +1149,10 @@ class TurnTrees(unittest.TestCase):
         model = hexnet.load_model(self.path)
         bubble = SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=16), sha256='tiny',
                                  cache=neural_search.EvaluationCache())
-        moves = evaluate(bubble, None, [(0, 0)], 32, 0)['moves']
+        found = evaluate(bubble, None, [(0, 0)], 32, 0)
+        moves = found['moves']
+        self.assertTrue(found['top'] and all(len(t) == 4 and 0 <= t[3] <= 1 for t in found['top']))
+        self.assertTrue(all(len(t) == 3 for t in evaluate(bubble, None, [(0, 0)], 0, 0)['top']))
         self.assertEqual(len(self.trees), 1)
         tree = self.trees[0]
         self.assertEqual([h for h, _, _ in tree.searched], [[(0, 0)], [(0, 0), tuple(moves[0])]])
@@ -1015,6 +1199,7 @@ class Registry(unittest.TestCase):
             self.assertEqual(list(found), ['six:Six gen-0120 · CPU', 'six:Six gen-0100 · CPU', 'six:shrimp',
                                            'strix:Strix', 'native:Native'])
             six = found['six:Six gen-0120 · CPU']
+            self.assertEqual((six['label'], six['variant'], found['six:shrimp']['label']), ('Six', 'gen-0120 · CPU', 'shrimp'))
             self.assertEqual((six['command'][1:], six['mirrored']),
                              (['--net', str(models / 'six/gen-0120.onnx'), '--cpu'], True))
             shrimp = found['six:shrimp']
@@ -1042,6 +1227,10 @@ class Registry(unittest.TestCase):
             self.assertEqual(list(found), ['bubble:alpha', 'bubble:broken', 'bubble:beta', 'bubble:gamma', 'native:Native'])
             self.assertEqual(found['bubble:alpha']['checkpoints'], ['play/000150', 'main/000200', 'main/000100'])
             self.assertEqual(found['bubble:beta']['checkpoints'], [''])
+            self.assertEqual([found[k]['label'] for k in ('bubble:alpha', 'bubble:broken', 'bubble:gamma')],
+                             ['Bubble', 'broken', 'gamma'])
+            both = scan(None, None, [root / 'elsewhere/net.pt', root / 'runs/alpha'], None)
+            self.assertEqual([e['label'] for e in both.values() if e['kind'] == 'bubble'], ['Bubble', 'alpha'])
             (root / 'models/gamma').mkdir()
             (root / 'models/gamma/ema.pt').write_bytes(b'')
             twins = [k for k in scan(root / 'models', root / 'runs', [], None) if k.startswith('bubble:gamma')]
