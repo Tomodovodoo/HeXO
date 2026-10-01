@@ -302,7 +302,7 @@ def main():
     selected.add_argument('--run', type=Path)
     selected.add_argument('--model', type=Path)
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
-    parser.add_argument('--simulations', type=int, default=128)
+    parser.add_argument('--simulations', type=int, help='Optional simulation cap for each timed turn')
     parser.add_argument('--solver-nodes', type=int, default=32768)
     parser.add_argument('--net-kernels', choices=['fused', 'reference'], default='fused')
     args = parser.parse_args()
@@ -310,7 +310,7 @@ def main():
     from timed_engine import TimedEngine
     device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
     config = dict(kind='bubble', run=str((args.run or Path('.')).resolve()), device=device,
-                  search=dict(simulations=args.simulations), net_kernels=args.net_kernels,
+                  search=dict(max_simulations=args.simulations), net_kernels=args.net_kernels,
                   solver=dict(enabled=args.solver_nodes > 0, nodes=max(1, args.solver_nodes)))
     if args.model:
         config['model'] = str(args.model.resolve())

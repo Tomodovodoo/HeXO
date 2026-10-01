@@ -105,7 +105,8 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
     side, remaining = game.player, game.remaining
     result = dict(moves=legal_turn(history), backend='dense', checkpoint=player.checkpoint,
                   player=side, win_probability=None, suggestions=[], winning_line=[], threat=None,
-                  proof_status='UNKNOWN', solver_status='off', settings=dict(player.options),
+                  proof_status='UNKNOWN', solver_status='off',
+                  settings=dict(player.options) | dict(simulations=limits.get('simulations')),
                   completed=0, evaluated=0, solver_nodes=0)
     tree = None
     solver_left = [limits['normal_ms']*.25]

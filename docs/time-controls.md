@@ -33,6 +33,8 @@ Chess UCI sends balances and increments with `go wtime ... btime ... winc ... bi
 
 The Six server honors `go movetime`, reads commands during search and returns a complete legal turn on `stop`. Full clocks use `xtime`, `otime`, `xinc`, `oinc`, or the UCI clock names with white mapped to cross. `isready` remains responsive. Coordinates retain the Six format.
 
+Timed Six search follows the clock by default. `--simulations` adds an optional cap for each complete turn.
+
 ```sh
 python python/six_engine.py serve --run runs/dense-v1 --device cuda --net-kernels fused
 ```
