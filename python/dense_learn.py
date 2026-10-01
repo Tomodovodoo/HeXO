@@ -94,7 +94,7 @@ def certified_policy_rows(out, batch, samples, rows):
         certified[i, :len(sample.actions)] = torch.from_numpy(matches.any(1))
     known = certified.any(1)
     mass = (logits.softmax(1)*certified).sum(1)
-    top1 = certified.gather(1, logits.argmax(1, keepdim=True))[:, 0].float()
+    top1 = (certified & (logits == logits.amax(1, keepdim=True))).any(1).float()
     return (torch.where(known, mass, math.nan), torch.where(known, top1, math.nan))
 
 

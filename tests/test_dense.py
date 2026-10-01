@@ -2574,6 +2574,15 @@ class ValidationSourceTests(unittest.TestCase):
         empty = dense_learn.certified_policy_summary([math.nan], [math.nan], [1])
         self.assertEqual(empty['certified_policy_rows'], 0)
         self.assertIsNone(empty['certified_policy_second_mass'])
+        # Far cells share a split logit; recognition must not depend on which tied cell comes first.
+        tied = dict(policy=torch.tensor([[.1, .6, .3]]).log(), far=torch.tensor([.7]).log())
+        far_batch = dict(cells=torch.tensor([[2, -1, -1]]), counts=torch.tensor([3]))
+        witness = [dict(proven=1, proof_action=[[101, 0]])]
+        for actions in ([[10, 0], [100, 0], [101, 0]], [[10, 0], [101, 0], [100, 0]]):
+            mass, top1 = dense_learn.certified_policy_rows(tied, far_batch,
+                [SimpleNamespace(actions=np.array(actions))], witness)
+            torch.testing.assert_close(mass, torch.tensor([.35]))
+            self.assertEqual(top1.tolist(), [1.])
         rows[0]['proof_action'] = [[999, 999]]
         with self.assertRaisesRegex(ValueError, 'not legal'):
             dense_learn.certified_policy_rows(out, batch, samples, rows)
