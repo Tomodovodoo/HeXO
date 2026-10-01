@@ -4,7 +4,7 @@
 #include <iostream>
 #include <random>
 int main() {
-    Board b;b.make({0,0});Search search(10000,2);
+    Board b;b.make({0,0});Search search(10000,2,true);
     auto before=b.hash();auto features=b.features;
     Turn distant{{Cell{8,0},Cell{16,0}},2,0};
     auto plain=search.turns(b,false);
@@ -33,11 +33,11 @@ int main() {
     assert(!threat.completions(1-threat.player).empty());
     auto defended=search.turns(threat,false,distant);
     for(auto t:defended) {Restore restore(threat);int side=threat.player;apply(threat,t);assert(threat.completions(1-side).empty());}
-    // Frozen move source is distinct from mutable score entries. A bogus exact
-    // score must never bypass search in injection mode.
-    search.inject_tt=true;search.frozen_hints=search.tt;
-    auto key=b.hash();search.frozen_hints[key&(search.tt.size()-1)]={key,8,123456,0,distant};
-    search.tt[key&(search.tt.size()-1)]={key,8,123456,0,reverse};
+    // Current-iteration hints cannot change the frozen admission set. Cached
+    // ordering scores must never substitute for a searched value.
+    search.frozen_hints=search.tt;distant.score=123456;
+    auto key=b.hash();search.frozen_hints[key&(search.tt.size()-1)]={key,distant};
+    search.tt[key&(search.tt.size()-1)]={key,reverse};
     int value=search.negamax(b,1,-mate-1,mate+1);assert(value!=123456);
     assert(b.hash()==before && b.features==features);
     b.make({1,0});auto partial=search.turns(b,false,distant);
@@ -88,5 +88,5 @@ int main() {
             }
         }
     }
-    std::cout<<"Native search checks passed; TT "<<sizeof(Entry)*(1<<16)<<" bytes\n";
+    std::cout<<"Native search checks passed\n";
 }
