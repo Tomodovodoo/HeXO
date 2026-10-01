@@ -7071,6 +7071,9 @@ class DenseBrowser(unittest.TestCase):
         self.assertIsNot(engines.bubble(path), first)
         entry = dict(kind='bubble', path=path)
         found, spent, weights = engines.evaluate(entry, '', dict(simulations=0, solver_nodes=2048), [(0, 0)], lambda n: None)
+        with unittest.mock.patch.object(engines, 'solver') as solver:
+            engines.evaluate(entry, '', dict(simulations=0, solver_nodes=0), [(0, 0)], lambda n: None)
+        solver.assert_not_called()
         self.assertEqual((spent, weights), (dict(simulations=0, solver_nodes=0), engines.bubble(path).sha256[:16] + ':none'))
 
     def test_solver_failures_do_not_count_as_checked(self):

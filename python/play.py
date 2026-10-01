@@ -382,7 +382,8 @@ class Engines:
     def evaluate(self, entry, checkpoint, budget, history, watch):
         """`evaluate` with the entry's export; returns the evaluation, the budget it really had (no solver nodes
         when the solver is not built) and the key of the weights it used (see `model_key`)."""
-        bubble, (solver, build) = self.bubble(export_path(entry, checkpoint)), self.solver()
+        bubble = self.bubble(export_path(entry, checkpoint))
+        solver, build = self.solver() if budget['solver_nodes'] else (None, 'none')
         spent = budget if solver else budget | dict(solver_nodes=0)
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch)
         if not found.pop('solved'):
