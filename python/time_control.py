@@ -37,7 +37,7 @@ class TimeControl:
 
 
 def allowance(clock=None, side=0, movetime=None, *, horizon=20, reserve_ms=10):
-    """Return normal/hard turn budgets; future increments never extend the hard clock."""
+    """Return work and inclusive hard budgets; consumers remove the response reserve once."""
     reserve_ms = milliseconds(reserve_ms, 'reserve_ms')
     if horizon < 1:
         raise ValueError('horizon must be positive')
@@ -48,7 +48,7 @@ def allowance(clock=None, side=0, movetime=None, *, horizon=20, reserve_ms=10):
     increment = milliseconds(clock.get('increment_ms', 0), 'increment_ms')
     usable = max(0, remaining-reserve_ms)
     normal = min(usable, (usable+(horizon-1)*increment)/horizon)
-    hard = min(usable, 3*normal)
+    hard = min(remaining, 3*normal+reserve_ms)
     if movetime is not None:
         hard = min(hard, milliseconds(movetime, 'movetime'))
     return dict(normal_ms=min(normal, max(0, hard-reserve_ms)), hard_ms=hard, reserve_ms=reserve_ms)

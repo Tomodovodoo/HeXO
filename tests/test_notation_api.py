@@ -344,6 +344,7 @@ class TimedClocks(unittest.TestCase):
                 self.assertEqual(restored.state, 'paused')
                 self.assertIsNone(restored.clock.running)
                 self.assertEqual(restored.snapshot()['circle_ms'], 900)
+                self.assertEqual(restored.created, match.created)
             finally:
                 match.close()
                 restored.close()
@@ -352,6 +353,9 @@ class TimedClocks(unittest.TestCase):
         from time_control import allowance
         budget = allowance(dict(cross_ms=15, circle_ms=1000, increment_ms=10000), 0)
         self.assertLessEqual(budget['hard_ms'], 15)
+        self.assertEqual(budget['hard_ms']-budget['reserve_ms'], 5)
+        budget = allowance(dict(cross_ms=15, circle_ms=1000, increment_ms=0), 0)
+        self.assertGreater(budget['hard_ms']-budget['reserve_ms'], 0)
 
     def test_native_controller_returns_a_complete_turn_by_its_allowance(self):
         from timed_engine import TimedEngine, legal_turn
@@ -377,6 +381,52 @@ class TimedClocks(unittest.TestCase):
                 self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
             finally:
                 game.close()
+
+    def test_http_opponent_failures_keep_timeout_and_illegal_results(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from timed_engine import TimedEngine
+        from timed_match import Match, play_turn
+        class Handler(BaseHTTPRequestHandler):
+            mode = 'timeout'
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(dict(stateless=dict(versions={'v1-alpha': {}}))).encode())
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                mode = self.mode
+                if mode == 'timeout':
+                    time.sleep(1)
+                self.send_response(200)
+                self.end_headers()
+                piece = dict(q='bad' if mode == 'coordinates' else 0, r=0)
+                try:
+                    self.wfile.write(json.dumps(dict(move=dict(pieces=[piece]))).encode())
+                except ConnectionError:
+                    pass
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for mode in ('timeout', 'coordinates', 'occupied'):
+                with self.subTest(mode=mode):
+                    Handler.mode = mode
+                    with TimedEngine(dict(kind='htttx', url=f'http://127.0.0.1:{server.server_port}')) as engine:
+                        match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='htttx')),
+                                           time_control='5'))
+                        try:
+                            match.start()
+                            result = play_turn(match, engine)
+                            self.assertEqual(result['result'], dict(winner='x', reason='engine_timeout' if mode == 'timeout' else 'illegal'))
+                            self.assertEqual(result['history'], [[0, 0]])
+                        finally:
+                            match.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 @unittest.skipUnless(importlib.util.find_spec('aiohttp'), 'Install the api extra')
@@ -493,6 +543,40 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
         response = await ws.receive_json(timeout=1)
         self.assertEqual((response['type'], response['request_id']), ('eval_response', 7))
         await ws.close()
+
+    async def test_restored_match_records_the_resumed_engines(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        from timed_api import create_app
+        from timed_match import Match
+        with TemporaryDirectory() as folder:
+            original = Match(dict(players=dict(cross=dict(kind='native'), circle=dict(kind='human')),
+                                  time_control='10', identities=[dict(checkpoint='old'), dict(checkpoint='human')]),
+                             directory=folder)
+            original.start()
+            original.pause()
+            root = '/matches/'+original.id
+            directory = original.directory
+            original.close()
+            class Engine:
+                identity = dict(checkpoint='new')
+                def __init__(self, config):
+                    pass
+                def close(self):
+                    pass
+            client = TestClient(TestServer(create_app(directory=folder, engine_factory=Engine)))
+            await client.start_server()
+            try:
+                response = await client.post(root+'/resume')
+                self.assertEqual(response.status, 200)
+                await client.post(root+'/pause')
+                spec = json.loads((directory/'spec.json').read_text())
+                self.assertEqual(spec['identities'][0]['checkpoint'], 'new')
+                events = [json.loads(line) for line in (directory/'events.jsonl').read_text().splitlines()]
+                change = next(event for event in events if event['type'] == 'engines')
+                self.assertEqual(change['previous_identities'][0]['checkpoint'], 'old')
+                self.assertEqual(change['identities'][0]['checkpoint'], 'new')
+            finally:
+                await client.close()
 
 
 if __name__ == '__main__':

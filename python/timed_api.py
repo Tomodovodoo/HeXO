@@ -57,6 +57,15 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
             await asyncio.to_thread(engine.close)
             raise
 
+    def identities(match, prepared):
+        with match.lock:
+            previous = match.specification.get('identities')
+            current = [engine.identity if engine else dict(checkpoint='human') for engine in prepared]
+            match.specification['identities'] = current
+            if match.directory:
+                match._write('spec.json', match.specification)
+            match.record('engines', identities=current, previous_identities=previous)
+
     async def prepare(match):
         prepared = []
         try:
@@ -65,11 +74,8 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
                 prepared.append(None if player['kind'] == 'human' else
                                 await start_engine(player))
             engines[match.id] = prepared
+            identities(match, prepared)
             with match.lock:
-                match.specification['identities'] = [engine.identity if engine else dict(checkpoint='human')
-                                                       for engine in prepared]
-                if match.directory:
-                    match._write('spec.json', match.specification)
                 match.state = 'ready'
                 match.record('ready')
         except BaseException as error:
@@ -331,18 +337,25 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
         elif command == 'resume':
             if match.id not in engines:
                 # Restoration is inert until an explicit resume request.
+                with match.lock:
+                    if match.state != 'paused':
+                        raise ValueError('Match is not paused')
+                    match.state = 'preparing'
                 prepared = []
                 try:
                     for side in ('cross', 'circle'):
                         player = match.specification['players'][side]
                         prepared.append(None if player['kind'] == 'human' else
                                         await start_engine(player))
+                    identities(match, prepared)
                 except BaseException:
                     for engine in prepared:
                         if engine:
                             await asyncio.to_thread(engine.close)
+                    match.state = 'paused'
                     raise
                 engines[match.id] = prepared
+                match.state = 'paused'
             match.resume()
         elif command == 'resign':
             match.resign(('x', 'o').index(body['side']))

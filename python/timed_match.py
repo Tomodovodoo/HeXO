@@ -33,6 +33,8 @@ class Match:
         self.cancel = threading.Event()
         self.thinking = None
         self.created = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        self.specification.setdefault('utcdatetime', self.created)
+        self.created = self.specification['utcdatetime']
         self.directory = Path(directory)/self.id if directory else None
         try:
             self.notation()
@@ -252,7 +254,8 @@ def play_turn(match, engine):
             if match.state == 'playing' and not cancellation.is_set():
                 match.tick()
                 if match.state == 'playing':
-                    match.finish(1-game.player, 'engine_timeout' if isinstance(error, TimeoutError) else 'crash')
+                    reason = 'engine_timeout' if isinstance(error, TimeoutError) else 'illegal' if isinstance(error, ValueError) else 'crash'
+                    match.finish(1-game.player, reason)
                     match.record('engine_error', error=str(error))
             return match.snapshot()
     finally:

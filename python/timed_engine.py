@@ -314,7 +314,10 @@ def _worker(connection, cancellation, config):
                         game.close()
                 connection.send((generation, 'done', result))
             except Exception as error:
-                connection.send((generation, 'error', str(error)))
+                reason = ('timeout' if isinstance(error, TimeoutError) else
+                          'illegal' if kind in ('six', 'htttx') and isinstance(error, (ValueError, KeyError, TypeError))
+                          else 'crash')
+                connection.send((generation, 'error', dict(reason=reason, message=str(error))))
     except (EOFError, BrokenPipeError):
         pass
     except Exception as error:
@@ -409,7 +412,8 @@ class TimedEngine:
                     if status in ('done', 'error'):
                         self.busy = False
                     if status == 'error':
-                        raise RuntimeError(result)
+                        error = {'timeout': TimeoutError, 'illegal': ValueError}.get(result['reason'], RuntimeError)
+                        raise error(result['message'])
                     result['moves'] = legal_turn(history, result['moves'])
                     best.update(result)
                     if publish:

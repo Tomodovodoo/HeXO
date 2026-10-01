@@ -122,6 +122,8 @@ python python/timed_match.py --run runs/dense-v1 --a main/132500 --b main/115000
 
 Each match saves its specification, append-only events, final JSON and notation. Identities include the model, source revision, settings and native-library hashes. Timeout, illegal reply and engine crash are explicit outcomes. Placement caps are censored. Results stay outside the fixed-simulation league.
 
+When a restored match reloads its engines, it refreshes their identities in the specification and records both the old and new identities in the event log.
+
 Notation records `version`, `utcdatetime`, players, control, winner and `endreason[time]` for timeout. It preserves a one-stone final turn. Its control grammar does not explicitly name units; Bubble uses seconds in text and milliseconds in JSON. Detailed clocks and finish reasons absent from notation remain in JSON. [Notation specification](https://github.com/hex-tic-tac-toe/hexagonal-tic-tac-toe-notation/blob/15bb7877ae020d661497e332adf0810d00d24e3e/README.md).
 
 ## Allocation and interruption
@@ -130,7 +132,7 @@ Controls with fractional seconds remain in JSON because notation specifies integ
 
 An external opponent must supply its own move. If it exceeds the allocated response time, the JSON result records `engine_timeout`, or `time` if the game clock expired too. The host never substitutes its legal fallback for an opponent's reply.
 
-The initial normal allowance divides remaining time and expected increments over 20 own turns. Its hard cap is at most three normal allowances and never spends future increment. Reserve 10 ms for returning the move. Fixed move-time requests use their supplied allowance inside that reserve. These are initial settings, not measured optimal values.
+The initial normal allowance divides remaining time and expected increments over 20 own turns. Its hard cap allows at most three normal work allowances plus the return reserve and never spends future increment. Reserve 10 ms for returning the move. Fixed move-time requests use their supplied allowance inside that reserve. These are initial settings, not measured optimal values.
 
 Give the first stone 60% of normal time and preserve time for the second. Root and optional leaf proofs share at most 25% of normal time. Keep a complete legal candidate before solving or inference. A persistent worker owns the model; the controller can return that candidate while a non-cancellable call finishes. Generation IDs discard late results.
 

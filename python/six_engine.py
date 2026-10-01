@@ -16,6 +16,14 @@ class ProtocolError(RuntimeError):
     pass
 
 
+class ProtocolTimeout(ProtocolError, TimeoutError):
+    pass
+
+
+class IllegalReply(ProtocolError, ValueError):
+    pass
+
+
 def serve(player, source=sys.stdin, out=sys.stdout):
     """Read commands while thinking; stop returns the latest complete legal turn."""
     from timed_engine import TimedEngine, legal_turn
@@ -180,9 +188,9 @@ class SixEngine:
         threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
         try:
             self._send('six')
-            self._expect('sixok', self.timeout)
+            self._expect('sixok', max(5., self.timeout))
             self._send('isready')
-            self._expect('readyok', self.timeout)
+            self._expect('readyok', max(5., self.timeout))
         except Exception:
             self._stop()
             raise
@@ -212,7 +220,7 @@ class SixEngine:
             except queue.Empty as error:
                 if time.monotonic() < deadline:
                     continue
-                raise ProtocolError(f'engine timed out waiting for {prefix}') from error
+                raise ProtocolTimeout(f'engine timed out waiting for {prefix}') from error
             if line is None:
                 raise ProtocolError('engine exited')
             if line.startswith('error'):
@@ -235,7 +243,7 @@ class SixEngine:
             line = self._expect('bestmove', self.timeout + 3*ms/1000)
             parts = line.split()[1:]
             if len(parts) not in (2, 4):
-                raise ProtocolError(f'unreadable bestmove: {line}')
+                raise IllegalReply(f'unreadable bestmove: {line}')
             numbers = [int(v) for v in parts]
             turn = list(zip(numbers[::2], numbers[1::2]))
             probe = Game([tuple(c[:2]) for c in game.cells])
@@ -247,9 +255,9 @@ class SixEngine:
                     if probe.winner >= 0:
                         break
                 if len(played) != len(turn):
-                    raise ProtocolError('engine sent a move after the winning stone')
+                    raise IllegalReply('engine sent a move after the winning stone')
                 if probe.winner < 0 and probe.player == game.player:
-                    raise ProtocolError('engine did not complete its turn')
+                    raise IllegalReply('engine did not complete its turn')
             finally:
                 probe.close()
             return turn
@@ -258,7 +266,8 @@ class SixEngine:
             self.game = None
             if self.cancel is None or not self.cancel.is_set():
                 self._start()
-            raise ProtocolError(str(error)) from error
+            error_class = IllegalReply if isinstance(error, ValueError) else type(error)
+            raise error_class(str(error)) from error
 
     def _stop(self):
         if self.proc is None:
