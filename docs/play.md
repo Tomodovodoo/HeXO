@@ -246,7 +246,7 @@ Import reads whatever is pasted:
 
 The server does the fetching, without accounts or tokens. These sites draw HTTTX's `(q, r)` at `(q + r, -r)`; the
 first stone moves to the origin, and in Rectilinear notation the player who moved first becomes cross. Drawn stones
-must form complete turns, since a drawing has no move order.
+must form complete turns; a drawing has no move order, so the importer looks for one that plays them legally.
 
 The clipboard button above the move list copies the shown position as HTTTX; the menu beside it shows it as HTTTX,
 Rectilinear and a Tyto analysis link, each with its own copy button. Hovering a stone's token there rings that cell

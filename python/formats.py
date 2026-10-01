@@ -159,6 +159,54 @@ def bke_turns(text, implicit):
     return origin, turns
 
 
+def wins(stone, owner, owners):
+    """True when `stone` of `owner` completes six in a row among `owners` ({cell: owner})."""
+    for dq, dr in ((1, 0), (0, 1), (1, -1)):
+        run = 1
+        for sign in (1, -1):
+            q, r = stone[0] + sign * dq, stone[1] + sign * dr
+            while owners.get((q, r)) == owner:
+                run, q, r = run + 1, q + sign * dq, r + sign * dr
+        if run >= 6:
+            return True
+    return False
+
+
+def drawn_order(cells, first, openings, may_win, budget=20000):
+    """An order of the drawn `cells` ({cell: owner}) that plays them as complete turns from one of `openings`:
+    every stone within eight cells of an earlier one, no six before the last stone (none at all unless
+    `may_win`). Searches depth first, nearest stones first, for at most `budget` placements; None when no order
+    is found."""
+    second = 'o' if first == 'x' else 'x'
+    count, left = len(cells), [budget]
+    turn = [first] + [second if (i // 2) % 2 == 0 else first for i in range(count - 1)]
+
+    def extend(placed, owners):
+        if len(placed) == count:
+            return placed
+        owner = turn[len(placed)]
+        options = sorted((c for c in cells if c not in owners and cells[c] == owner),
+                         key=lambda c: min(distance(c, p) for p in placed))
+        for stone in options:
+            if min(distance(stone, p) for p in placed) > 8:
+                break
+            left[0] -= 1
+            if left[0] < 0:
+                return None
+            if wins(stone, owner, owners) and (len(placed) + 1 < count or not may_win):
+                continue
+            found = extend(placed + [stone], owners | {stone: owner})
+            if found or left[0] < 0:
+                return found
+        return None
+
+    for opening in openings:
+        found = extend([opening], {opening: first})
+        if found or left[0] < 0:
+            return found
+    return None
+
+
 def split_turns(text):
     """The drawing and the BKE part of Rectilinear notation, split at the first comma outside a label."""
     depth, escaped = 0, False
@@ -208,12 +256,14 @@ def rectilinear_loads(text):
         raise ValueError('The drawn stones are not a sequence of complete turns')
     second = 'o' if first == 'x' else 'x'
     reading = sorted(cells, key=lambda c: (c[1], c[0]))
-    opening = origin if origin in cells and cells[origin] == first else next(c for c in reading if cells[c] == first)
-    pools = {owner: [c for c in reading if cells[c] == owner and c != opening] for owner in 'xo'}
-    stones, mover = [opening], second
-    while pools['x'] or pools['o']:
-        stones += [pools[mover].pop(0), pools[mover].pop(0)]
-        mover = first if mover == second else second
+    openings = [c for c in reading if cells[c] == first]
+    if origin in openings:
+        openings.insert(0, openings.pop(openings.index(origin)))
+    stones = drawn_order(cells, first, openings, not turns)
+    if stones is None:
+        raise ValueError('The drawn stones cannot be played as legal turns')
+    opening = stones[0]
+    mover = second if later % 2 == 0 else first
     for index, (player, moves) in enumerate(turns):
         if player != mover:
             raise ValueError(f'BKE turn by {player} where {mover} moves')
