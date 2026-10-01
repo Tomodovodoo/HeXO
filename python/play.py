@@ -635,6 +635,7 @@ class Session:
         self.lock = threading.Condition()
         self.history, self.revision, self.paused = [], 0, False
         self.instance = os.urandom(4).hex()
+        self.retries = {}
         self.jobs, self.queue, self.order = OrderedDict(), [], itertools.count()
         bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
         opponent = bubble or entries['native:Native']
@@ -730,6 +731,7 @@ class Session:
 
     def submit(self, job):
         self.jobs[job.id] = job
+        self.revision += 1
         heapq.heappush(self.queue, (job.priority, next(self.order), job))
         while len(self.jobs) > 200:
             oldest = next(iter(self.jobs))
@@ -958,14 +960,17 @@ class Session:
             raise Cancelled()
         entry = self.entries[seat['engine']]
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
-        if spent['solver_nodes'] < budget['solver_nodes']:
-            timer = threading.Timer(31, self.retry, args=(list(history),))
-            timer.daemon = True
-            timer.start()
+        if spent['solver_nodes'] < budget['solver_nodes'] and job.kind == 'analyse':
+            with self.lock:
+                tries = self.retries[tuple(history)] = self.retries.get(tuple(history), 0) + 1
+            if tries <= 3:
+                timer = threading.Timer(31, self.retry, args=(list(history),))
+                timer.daemon = True
+                timer.start()
         return self.store.add(history, weights, spent, found | dict(model=model))
 
     def retry(self, history):
-        """Analyse `history` again after a solver failure, when automatic analysis is on."""
+        """Analyse `history` again after a solver failure, when automatic analysis is on; at most three times."""
         with self.lock:
             if self.analysis and self.analysis['auto'] and tuple(history) == tuple(self.history[:len(history)]):
                 self.request_analysis(history, 1)
