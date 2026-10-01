@@ -804,6 +804,7 @@ def external_ratings(run, league):
         stat = report.stat()
         if report_digest(report, stat.st_mtime_ns, stat.st_size) != match['report_sha256']: continue
         sources = saved.get('sources', [])
+        if saved['schema'] == 'hexo-external-elo-estimate-v2' and not sources: continue
         intact = True
         for source in sources:
             evidence = (path.parent/source['report']).resolve()

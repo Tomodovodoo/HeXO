@@ -139,6 +139,13 @@ class ExternalRatings(unittest.TestCase):
             rating = dashboard.external_ratings(run, league)['six:default']
             self.assertEqual((rating['label'], rating['elo'], rating['calibration_games']), ('Six@default', 2200, 32))
             self.assertAlmostEqual(rating['elo_interval'][0], 2200-1.96*math.sqrt(20000))
+            sources = saved.pop('sources')
+            for evidence in (None, []):
+                if evidence is not None: saved['sources'] = evidence
+                path.write_text(json.dumps(saved), encoding='utf-8')
+                self.assertEqual(dashboard.external_ratings(run, league), {})
+            saved['sources'] = sources
+            path.write_text(json.dumps(saved), encoding='utf-8')
             for report in (match, calibration):
                 original = report.read_bytes()
                 report.write_text('{"games": [1]}', encoding='utf-8')
