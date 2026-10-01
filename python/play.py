@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -28,6 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 from hexo import Game
 from notation import NotationConflict, dumps, loads
+from process_tree import TreeProcess
 
 ROOT = Path(__file__).resolve().parents[1]
 PRESETS = dict(
@@ -41,7 +43,9 @@ PRESETS = dict(
 LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 1_500_000), ms=(10, 120_000), nodes=(1, 50_000_000))
 KIND_LIMITS = dict(strix=dict(simulations=(1, 16384)))
 SIX_LIBRARIES = dict(cuda=('cudart64_12.dll', 'libcudart.so.12'), cudnn=('cudnn64_9.dll', 'libcudnn.so.9'),
-                     tensorrt=('nvinfer_10.dll', 'libnvinfer.so.10'), directml=('DirectML.dll',))
+                     tensorrt=('nvinfer_10.dll', 'libnvinfer.so.10'), directml=('DirectML.dll',),
+                     cuda_build=('onnxruntime_providers_cuda.dll', 'libonnxruntime_providers_cuda.so'),
+                     tensorrt_build=('onnxruntime_providers_tensorrt.dll', 'libonnxruntime_providers_tensorrt.so'))
 
 
 def player_at(ply):
@@ -112,9 +116,9 @@ def run_checkpoints(run):
 
 def six_backend(folder):
     """The fastest backend `sixengine` in `folder` can run here, as (name, flags, PATH directories to add):
-    TensorRT when its library and CUDA's are found, then CUDA, then DirectML (the DirectML build ships
-    DirectML.dll), then the CPU. Libraries are looked for in the folder, PyTorch's and TensorRT's Python
-    packages, and PATH."""
+    TensorRT, then CUDA, when the build ships ONNX Runtime's provider for it and its libraries are found, then
+    DirectML for the DirectML build (it ships DirectML.dll), then the CPU. Libraries are looked for in the folder,
+    PyTorch's and TensorRT's Python packages, PATH and LD_LIBRARY_PATH."""
     import importlib.util
 
     def package(name, *parts):
@@ -125,12 +129,14 @@ def six_backend(folder):
     listed = os.pathsep.join(os.environ.get(name, '') for name in ('PATH', 'LD_LIBRARY_PATH'))
     dirs = [*extra, *map(Path, filter(None, listed.split(os.pathsep)))]
 
-    def found(kind):
-        return any((d / name).exists() for d in dirs for name in SIX_LIBRARIES[kind])
+    def found(kind, where=dirs):
+        return any((d / name).exists() for d in where for name in SIX_LIBRARIES[kind])
 
-    if found('cuda') and found('cudnn'):
-        return ('TensorRT', ['--trt'], extra) if found('tensorrt') else ('CUDA', [], extra)
-    if any((Path(folder) / name).exists() for name in SIX_LIBRARIES['directml']):
+    if found('cuda_build', [Path(folder)]) and found('cuda') and found('cudnn'):
+        if found('tensorrt_build', [Path(folder)]) and found('tensorrt'):
+            return 'TensorRT', ['--trt'], extra
+        return 'CUDA', [], extra
+    if found('directml', [Path(folder)]):
         return 'DirectML', [], extra
     return 'CPU', ['--cpu'], []
 
@@ -194,9 +200,10 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                 bubble(path)
         for folder in sorted(p for p in Path(models).iterdir() if p.is_dir()):
             binary = next((folder / n for n in ('sixengine.exe', 'sixengine') if (folder / n).exists()), None)
-            if binary:
-                backend, flags, libraries = six_backend(folder)
-            for network in sorted(folder.glob('gen-*.onnx'), reverse=True) if binary else ():
+            if binary is None:
+                continue
+            backend, flags, libraries = six_backend(folder)
+            for network in sorted(folder.glob('gen-*.onnx'), reverse=True):
                 add('six', f'Six {network.stem} · {backend}', command=[str(binary), '--net', str(network), *flags],
                     cwd=folder, mirrored=True, libraries=libraries)
         for path in sorted(Path(models).glob('*.json')):
@@ -426,6 +433,35 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         local.close()
 
 
+class SearchChild:
+    """A search process and its output lines. It is a TreeProcess, so ending it also ends what it started, like
+    Strix's native search; its temporary files go in a private folder, removed when it ends."""
+
+    def __init__(self, command):
+        self.folder = tempfile.TemporaryDirectory(prefix='hexo-play-', ignore_cleanup_errors=True)
+        env = os.environ | dict.fromkeys(('TMPDIR', 'TEMP', 'TMP'), self.folder.name)
+        self.process = TreeProcess(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                                   encoding='utf-8', bufsize=1)
+        self.lines = queue.Queue()
+        self.pump = threading.Thread(target=self.forward, daemon=True)
+        self.pump.start()
+
+    def forward(self):
+        for line in self.process.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def end(self):
+        """Kill the process and everything it started, reap it and remove its temporary folder."""
+        self.process.kill()
+        self.process.wait()
+        self.pump.join()
+        with contextlib.suppress(OSError):
+            self.process.stdin.close()
+        self.process.stdout.close()
+        self.folder.cleanup()
+
+
 class Engines:
     """Loaded engines, used only from the worker thread. Keeps the three most recent Bubble exports."""
 
@@ -489,34 +525,28 @@ class Engines:
             return 'none'
 
     def turn(self, entry, budget, history, stop=lambda: False):
-        """A turn from a non-Bubble engine. A Six-protocol engine is ended when `stop()` turns true. Native, Seal and
-        Strix searches cannot be interrupted in process, so each kind searches in a child process; when `stop()`
-        turns true the child is killed and a fresh one starts on the next turn. Both raise Cancelled."""
+        """A turn from a non-Bubble engine. A Six-protocol engine's search is stopped when `stop()` turns true.
+        Native, Seal and Strix searches cannot be interrupted in process, so each kind searches in a SearchChild;
+        when `stop()` turns true the child and everything it started are killed and a fresh one starts on the next
+        turn. Both raise Cancelled."""
         kind = entry['kind']
         if kind == 'six':
             return self.protocol(entry, budget, history, stop)
-        if kind not in self.children or self.children[kind][0].poll() is not None:
-            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'search', kind],
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding='utf-8',
-                                     bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            lines = queue.Queue()
-            def pump():
-                for line in child.stdout:
-                    lines.put(line)
-                lines.put(None)
-            threading.Thread(target=pump, daemon=True).start()
-            self.children[kind] = child, lines
-        child, lines = self.children[kind]
+        if kind in self.children and self.children[kind].process.poll() is not None:
+            self.children.pop(kind).end()
+        if kind not in self.children:
+            self.children[kind] = SearchChild([sys.executable, str(Path(__file__).resolve()), 'search', kind])
+        child = self.children[kind]
         request = dict(budget, history=[list(p) for p in history], model=str(entry.get('model')))
-        child.stdin.write(json.dumps(request) + '\n')
-        child.stdin.flush()
+        child.process.stdin.write(json.dumps(request) + '\n')
+        child.process.stdin.flush()
         while True:
             try:
-                line = lines.get(timeout=.05)
+                line = child.lines.get(timeout=.05)
                 break
             except queue.Empty:
                 if stop():
-                    self.end(self.children.pop(kind)[0])
+                    self.children.pop(kind).end()
                     raise Cancelled() from None
         if line is None:
             raise RuntimeError(f'{kind} search process exited')
@@ -544,8 +574,10 @@ class Engines:
         game = replay(history)
         try:
             if key not in self.external:
+                print(f"{entry['name']}: {shlex.join(command)}", flush=True)
                 self.external[key] = SixEngine(command, mirrored=entry['mirrored'], cwd=entry['cwd'],
-                                               path=entry['libraries'], cancel=cancel)
+                                               path=entry['libraries'], cancel=cancel, log=True,
+                                               startup=900)
             return self.external[key](game, budget.get('ms'), nodes=budget.get('nodes'))
         except ProtocolError:
             if cancel.is_set():
@@ -555,19 +587,11 @@ class Engines:
             done.set()
             game.close()
 
-    @staticmethod
-    def end(child):
-        """Kill a search child and reap it with its pipes."""
-        child.kill()
-        child.wait()
-        child.stdin.close()
-        child.stdout.close()
-
     def close(self):
         """Release the models and end every child process."""
         self.bubbles.clear()
-        for child, _ in self.children.values():
-            self.end(child)
+        for child in self.children.values():
+            child.end()
         self.children.clear()
         if self.prover is not None:
             self.prover.close()
@@ -1344,10 +1368,11 @@ def search_child(kind):
                         engines['seal'] = Seal()
                     moves = engines['seal'](game, request['ms'])
                 else:
-                    sys.path.insert(0, str(ROOT))
-                    from tools.strix_learned_adapter import StrixLearned
                     key = (request['model'], request['simulations'])
                     if key not in engines:
+                        if str(ROOT) not in sys.path:
+                            sys.path.insert(0, str(ROOT))
+                        from tools.strix_learned_adapter import StrixLearned
                         engines[key] = StrixLearned(request['model'], simulations=request['simulations'],
                                                     timeout_ms=min(600_000, max(5_000, 250 * request['simulations'])))
                     moves = engines[key](game, 0)

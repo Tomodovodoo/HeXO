@@ -30,16 +30,20 @@ The picker lists everything the server finds on start:
 
 Engines you build or download yourself:
 
-- Six: the release zip and a network from github.com/CixMango/Six releases, unpacked into `models/six/`.
-- Six on CUDA: `cudart64_12.dll` and `cudnn64_9.dll` (CUDA 12, cuDNN 9) on PATH or beside `sixengine.exe`; an
-  installed PyTorch with CUDA also has them, and its `torch/lib` is added to the engine's PATH.
-- Six on TensorRT: `nvinfer_10.dll` as well, for example from `pip install tensorrt` (its `tensorrt_libs` is added
-  too). The first game builds the TensorRT plan beside the network.
-- Six on DirectML: the DirectML release, which ships `DirectML.dll` next to `sixengine.exe`.
+- Six: the release zip and a network from github.com/CixMango/Six releases, unpacked into `models/six/`. The
+  release's engine is the DirectML build, which ships `DirectML.dll` next to `sixengine.exe`.
+- Six on CUDA: Six's engine built against ONNX Runtime's GPU package, with that package's DLLs (among them
+  `onnxruntime_providers_cuda.dll`) beside `sixengine.exe`, and `cudart64_12.dll` and `cudnn64_9.dll` (CUDA 12,
+  cuDNN 9) on PATH or beside it; an installed PyTorch with CUDA also has them, and its `torch/lib` is added to the
+  engine's PATH.
+- Six on TensorRT: `onnxruntime_providers_tensorrt.dll` beside the engine and `nvinfer_10.dll` as well, for example
+  from `pip install tensorrt` (its `tensorrt_libs` is added too). The first game builds the TensorRT plan beside the
+  network, which takes a few minutes.
 - Strix: `python tools/build_strix_learned.py <hexo-strix checkout>` (Rust and MinGW), and the public model
   from `https://hexo.tyto.cc/model.safetensors` next to the JSON.
-- Mantis Shrimp: build Cmiller132/hexo-bot with its `scripts/build_native.sh`, then point a `six` entry at Six's
-  `arena/drivers/shrimp_driver.py`. Its strength is `--visits`, so give each preset its own `args`, for example
+- Mantis Shrimp: build Cmiller132/hexo-bot with its `scripts/build_native.sh` into a Six checkout's `rivals/shrimp`,
+  then point a mirrored `six` entry at Six's `arena/drivers/shrimp_driver.py`, run by that build's Python. Its
+  strength is `--visits`, so give each preset its own `args`, for example
   `"presets": {"quick": {"nodes": 1, "args": ["--visits", "32"]}}`.
 - Seal: build with `-DHEXO_SEAL_SOURCE=<HexTicTacToe checkout>`.
 

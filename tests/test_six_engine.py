@@ -57,6 +57,17 @@ for raw in sys.stdin:
 '''
 
 
+STOPPABLE_ENGINE = '''import sys
+for raw in sys.stdin:
+    words = raw.split()
+    if not words: continue
+    if words[0] == 'six': print('sixok', flush=True)
+    elif words[0] == 'isready': print('readyok', flush=True)
+    elif words[0] == 'stop': print('bestmove 0 0', flush=True)
+    elif words[0] == 'quit': break
+'''
+
+
 class FakePlayer:
     checkpoint = 'main/000001'
     model_sha256 = 'abcdef1234567890'
@@ -189,9 +200,30 @@ class SixProtocolTests(unittest.TestCase):
                     started = time.monotonic()
                     with self.assertRaisesRegex(ProtocolError, 'cancelled'):
                         engine(game, 1000)
-                    self.assertLess(time.monotonic()-started, .5)
+                    self.assertLess(time.monotonic()-started, 1.5)
                     self.assertIsNotNone(child.poll())
                     self.assertIsNone(engine.proc)
+                finally:
+                    timer.join()
+                    game.close()
+
+    def test_cancel_stops_a_search_and_keeps_an_engine_that_answers_stop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder)/'engine.py'
+            script.write_text(STOPPABLE_ENGINE)
+            cancelled = threading.Event()
+            with SixEngine([sys.executable, str(script)], cancel=cancelled) as engine:
+                child = engine.proc
+                game = Game()
+                timer = threading.Timer(.05, cancelled.set)
+                timer.start()
+                try:
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(ProtocolError, 'cancelled'):
+                        engine(game, nodes=10**6)
+                    self.assertLess(time.monotonic()-started, .5)
+                    self.assertIs(engine.proc, child)
+                    self.assertIsNone(child.poll())
                 finally:
                     timer.join()
                     game.close()
