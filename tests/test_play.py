@@ -521,6 +521,12 @@ class Jobs(unittest.TestCase):
         deep = [budget for checkpoint, budget, history in self.engines.calls if not history]
         self.assertEqual(deep, budgets)
         self.assertIsNone(self.session.analyse(0))
+        self.engines.hold = True
+        self.session.load([(0, 0), (1, 0), (1, 1)], False)
+        wait(lambda: any(j['status'] == 'running' and j['ply'] == 3 and j['kind'] == 'analyse' for j in self.session.state()['jobs']))
+        self.session.configure_analysis('bubble:fake', preset='quick', auto=False)
+        wait(lambda: not [j for j in self.session.state()['jobs'] if j['kind'] == 'analyse'])
+        self.engines.release.set()
         self.session.load([(0, 0)], True)
         time.sleep(.2)
         self.assertFalse([j for j in self.session.state()['jobs'] if j['ply'] == 1 and j['kind'] == 'analyse'

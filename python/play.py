@@ -1164,15 +1164,15 @@ class Session:
     def deepen(self, winner):
         """While an engine seat plays, the game is not paused and Auto is on, evaluate the current position with the analysis
         model at each preset in turn, fastest first: the first preset not yet saved is queued at the lowest
-        priority, and `changed` queues the next when it lands. Deepening of other positions is dropped; a preset
-        that failed for this position is skipped."""
-        current = tuple(self.history)
+        priority, and `changed` queues the next when it lands. Deepening of other positions, and all of it once
+        deepening stops, is dropped; a preset that failed for this position is skipped."""
+        current, active = tuple(self.history), self.deepening(winner)
         for job in self.jobs.values():
-            if hasattr(job, 'tier') and job.status in ('queued', 'running') and job.history != current:
+            if hasattr(job, 'tier') and job.status in ('queued', 'running') and (job.history != current or not active):
                 job.cancelled = True
                 if job.status == 'queued':
                     job.status = 'cancelled'
-        if not self.deepening(winner) or any(hasattr(job, 'tier') and job.history == current and
+        if not active or any(hasattr(job, 'tier') and job.history == current and
                                              job.status in ('queued', 'running') for job in self.jobs.values()):
             return
         for tier in PRESET_NAMES:
