@@ -181,6 +181,9 @@ class LauncherTests(unittest.TestCase):
         self.launcher.prepare('auto', lambda c: None, 4, tactical=True)
         (self.run / 'config.json').write_text(json.dumps(dict(actor=dict(solver_root_nodes=0, solver_cap_nodes=512))))
         self.launcher.prepare('auto', lambda c: None, 4, tactical=False)
+        (self.run / 'league.json').write_text(json.dumps(dict(variants=[dict(settings=dict(solver_threat_nodes=135))])))
+        with self.assertRaises(RuntimeError):
+            self.launcher.prepare('auto', lambda c: None, 4, tactical=False)
 
     def test_prepare_probes_the_configured_variant(self):
         (self.run / 'config.json').write_text(json.dumps(dict(learner=dict(variant='alt'))))

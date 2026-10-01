@@ -219,8 +219,8 @@ class Launcher:
     def prepare(self, device, run_steps, actors=None, tactical=True):
         """Create the run configuration (on `device`, `auto` resolved then) and the first checkpoint when either is
         missing; `run_steps` runs a command. An existing run must agree with an explicit `device`, its phase
-        schedule may not wait for more workers than `actors` starts, and its solver budgets need the tactical
-        build (`tactical`)."""
+        schedule may not wait for more workers than `actors` starts, and solver budgets in its configuration or
+        its registered evaluation variants need the tactical build (`tactical`)."""
         config = self.config()
         if config is None:
             run_steps([sys.executable, str(PYTHON / 'dense_config.py'), '--run', str(self.run), '--device',
@@ -237,7 +237,13 @@ class Launcher:
                                    'set actor.phase_follow to true in its config.json')
             queries = ('solver_root_nodes', 'solver_finalist_nodes', 'solver_threat_nodes', 'solver_leaf_nodes',
                        'solver_deep_nodes')   # the budgets that enable queries; caps and floors only bound them
-            budgets = [(config.get(section) or {}).get(key, 0) for section in ('actor', 'evaluation') for key in queries]
+            sections = [config.get(section) or {} for section in ('actor', 'evaluation')]
+            try:
+                league = json.loads((self.run / 'league.json').read_text(encoding='utf-8'))
+                sections += [variant.get('settings') or {} for variant in league.get('variants', [])]
+            except (OSError, ValueError, AttributeError):
+                pass
+            budgets = [section.get(key, 0) for section in sections for key in queries]
             if not tactical and any(budgets):
                 raise RuntimeError(f'{self.run} uses solver budgets but the tactical solver is not built; '
                                    'run python tools/build_tactical.py or set the solver_*_nodes settings to 0')
