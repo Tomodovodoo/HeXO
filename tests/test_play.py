@@ -528,6 +528,10 @@ class Jobs(unittest.TestCase):
         for spec in (dict(heavy=dict(nodes=1)), dict(quick=dict(nodes=0)), dict(quick=dict(args='--x')), [1]):
             with self.assertRaises(ValueError):
                 presets_of('six', spec)
+        with self.assertRaises(ValueError):
+            budget_of(presets_of('strix', None), 'custom', dict(simulations=0), 'strix')
+        with self.assertRaises(ValueError):
+            presets_of('strix', dict(quick=dict(simulations=0)))
 
 
 class Http(unittest.TestCase):

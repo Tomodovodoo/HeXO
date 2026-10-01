@@ -39,6 +39,7 @@ PRESETS = dict(
     strix=dict(quick=dict(simulations=8), standard=dict(simulations=64), strong=dict(simulations=128),
                deep=dict(simulations=512)))
 LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 1_500_000), ms=(10, 120_000), nodes=(1, 50_000_000))
+KIND_LIMITS = dict(strix=dict(simulations=(1, 16384)))
 SIX_LIBRARIES = dict(cuda=('cudart64_12.dll', 'libcudart.so.12'), cudnn=('cudnn64_9.dll', 'libcudnn.so.9'),
                      tensorrt=('nvinfer_10.dll', 'libnvinfer.so.10'), directml=('DirectML.dll',))
 
@@ -121,7 +122,8 @@ def six_backend(folder):
         return Path(spec.submodule_search_locations[0], *parts) if spec and spec.submodule_search_locations else None
 
     extra = [d for d in (Path(folder), package('torch', 'lib'), package('tensorrt_libs')) if d and d.is_dir()]
-    dirs = [*extra, *map(Path, filter(None, os.environ.get('PATH', '').split(os.pathsep)))]
+    listed = os.pathsep.join(os.environ.get(name, '') for name in ('PATH', 'LD_LIBRARY_PATH'))
+    dirs = [*extra, *map(Path, filter(None, listed.split(os.pathsep)))]
 
     def found(kind):
         return any((d / name).exists() for d in dirs for name in SIX_LIBRARIES[kind])
@@ -145,7 +147,8 @@ def presets_of(kind, spec):
         for key, value in budget.items():
             if key == 'args' and kind == 'six' and isinstance(value, list) and all(isinstance(v, str) for v in value):
                 continue
-            if key not in LIMITS or type(value) is not int or not LIMITS[key][0] <= value <= LIMITS[key][1]:
+            limits = LIMITS | KIND_LIMITS.get(kind, {})
+            if key not in limits or type(value) is not int or not limits[key][0] <= value <= limits[key][1]:
                 raise ValueError(f'bad {key} in preset {name}')
         presets[name] = presets[name] | budget
     return presets
@@ -768,9 +771,10 @@ class Job:
                     error=self.error, ply=len(self.history), side=getattr(self, 'side', None))
 
 
-def budget_of(presets, preset, custom=None):
+def budget_of(presets, preset, custom=None, kind=None):
     """The budget of `preset` from an entry's `presets`, or the standard budget with `custom` values checked
-    against LIMITS (a preset's launch `args` are not custom)."""
+    against LIMITS and the `kind`'s own limits (a preset's launch `args` are not custom)."""
+    limits = LIMITS | KIND_LIMITS.get(kind, {})
     if preset != 'custom':
         if preset not in presets:
             raise ValueError('Unknown preset')
@@ -781,9 +785,9 @@ def budget_of(presets, preset, custom=None):
     for key, value in (custom or {}).items():
         if key == 'args':
             continue
-        if key not in budget or key not in LIMITS:
+        if key not in budget or key not in limits:
             raise ValueError(f'{key} is not a budget of this engine')
-        low, high = LIMITS[key]
+        low, high = limits[key]
         if type(value) is not int or not low <= value <= high:
             raise ValueError(f'{key} must be {low}..{high}')
         budget[key] = value
@@ -820,7 +824,8 @@ class Session:
                 raise ValueError('Unknown checkpoint')
         else:
             checkpoint = None
-        return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget_of(entry['presets'], preset, custom))
+        budget = budget_of(entry['presets'], preset, custom, entry['kind'])
+        return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget)
 
     def engine_key(self, seat):
         """Evaluations are keyed by the weights and the solver build that produced them ('none' for a budget
@@ -1343,7 +1348,8 @@ def search_child(kind):
                     from tools.strix_learned_adapter import StrixLearned
                     key = (request['model'], request['simulations'])
                     if key not in engines:
-                        engines[key] = StrixLearned(request['model'], simulations=request['simulations'])
+                        engines[key] = StrixLearned(request['model'], simulations=request['simulations'],
+                                                    timeout_ms=min(600_000, max(5_000, 250 * request['simulations'])))
                     moves = engines[key](game, 0)
             finally:
                 game.close()
