@@ -449,6 +449,8 @@ def main():
     if args.command in ('train', 'stop', 'status') and os.name != 'nt' and not Path('/proc').is_dir():
         sys.exit('bubble.py manages services on Windows and Linux only: it identifies them through /proc')
     launcher = Launcher(args.run)
+    if args.command == 'train' and launcher.run == (ROOT / 'runs' / 'play').resolve():
+        sys.exit('runs/play holds downloaded weights for playing; train in another run directory')
     if args.command == 'train':
         proof = tactical_built()
         if not proof:
