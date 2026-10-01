@@ -18,6 +18,8 @@ A candidate is promoted when it has the highest posterior rating and P(candidate
 
 `league.json` also records a calibration diagnostic: for every posterior verdict, the stated sd of the rating difference against how far it later moved.
 
+The dashboard also shows provisional external opponents in the scoreboard and as dashed Elo references. When a match uses different search settings from the league, compare those settings against the same checkpoint's normal evaluator settings first. Fit the calibration and opponent comparisons jointly, then translate the resulting opponent difference through that checkpoint's current league Elo. The displayed interval includes uncertainty from both comparisons and the reference checkpoint. Hash-bound `matches/*/*-elo-estimate.json` artifacts retain the match and calibration reports; changing either report invalidates the displayed estimate. Match games played at different budgets stay separate.
+
 ## Variants
 
 A variant is a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`, `search_graph`, `solver_*`), rated in the league as `<checkpoint>@<name>`:
