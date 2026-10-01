@@ -1,7 +1,8 @@
 /* "Bubble (browser)" for web/index.html: a seat and an analysis engine that run entirely in this browser.
  * The server sees a browser seat as a human seat and receives its stones through /play; like server engines a
  * browser seat waits while the game is paused, and cancelling its move pauses the game. Browser analyses are shown
- * in place of the server's for the positions they cover. Choices persist per browser (localStorage). */
+ * in place of the server's for the positions they cover. A task that failed is not retried until the position, preset
+ * or engine choice changes. Choices persist per browser (localStorage). */
 import {BubbleEngine, PRESETS} from './bubble.mjs';
 
 const ID = 'browser:bubble', LABEL = 'Bubble (browser)', ENTRY = {id: ID, kind: 'bubble', name: LABEL, label: LABEL, checkpoints: []};
@@ -10,9 +11,9 @@ const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'ren
   'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems'];
 const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, page[name]]));
 const engine = new BubbleEngine(), analyses = new Map(), hk = history => history.map(p => p.join(',')).join(';');
-let config = {seats: [null, null], analysis: null}, job = null, posting = false, loaded = 0;
+let config = {seats: [null, null], analysis: null}, job = null, failed = null, posting = false, loaded = 0;
 try { config = {...config, ...JSON.parse(localStorage.getItem(STORE))}; } catch {}
-const save = () => { try { localStorage.setItem(STORE, JSON.stringify(config)); } catch {} };
+const save = () => { failed = null; try { localStorage.setItem(STORE, JSON.stringify(config)); } catch {} };
 const state = () => typeof S === 'undefined' ? null : S;
 const viewed = () => typeof view === 'undefined' ? 0 : view;
 const closeIcon = () => typeof icon === 'function' ? icon('close') : '×';
@@ -76,7 +77,7 @@ function schedule() {
   const task = move ? {kind: 'move', side, preset, history: s.history.map(p => [...p])}
     : analyse ? {kind: 'analyse', ply: prefix.length, preset: config.analysis, history: prefix.map(p => [...p])} : null;
   const key = task && `${task.kind}|${task.preset}|${hk(task.history)}`;
-  if (job?.key === key) return;
+  if (job?.key === key || (key && key === failed)) return;
   job?.controller.abort();
   job = null;
   if (task) run(key, task);
@@ -112,7 +113,10 @@ async function run(key, task) {
       }
     }
   } catch (error) {
-    if (error.name !== 'AbortError') original.toast(error.message);
+    if (error.name !== 'AbortError') {
+      failed = key;
+      original.toast(error.message);
+    }
     if (job === current) job = null;
   }
   schedule();

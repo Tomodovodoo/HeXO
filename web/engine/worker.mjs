@@ -84,7 +84,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
     }
     const given = moves.length > 0, current = history.map(p => [...p]);
     for (let local = native.game(current); !given && local.player === player && local.winner < 0; local = native.game(current)) {
-      let action, policy, actions, stoneValue;
+      let action, policy, actions, stoneValue, values = null;
       if (simulations) {
         tree ??= new NeuralSearch(native, {seed: 1740, tactics: true, history: current});
         const stone = moves.length;
@@ -92,7 +92,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
           evaluate: leaves => network.evaluate(leaves), stop: () => cancelled.has(id),
           onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / local.remaining)})});
         check();
-        ({action, policy, actions} = result);
+        ({action, policy, actions, values} = result);
         completed += result.completed;
         stoneValue = result.proven ? result.proven : result.exact_winner >= 0 ? (result.exact_winner === local.player ? 1 : -1)
           : policy.reduce((sum, p, i) => sum + p * result.values[i], 0);
@@ -110,7 +110,8 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
       }
       if (!moves.length) {
         top = policy.map((p, i) => i).sort((a, b) => policy[b] - policy[a]).slice(0, 5)
-          .map(i => [actions[i][0], actions[i][1], Math.round(policy[i] * 1e4) / 1e4]);
+          .map(i => [actions[i][0], actions[i][1], Math.round(policy[i] * 1e4) / 1e4,
+            ...(values ? [Math.round((values[i] + 1) / 2 * 1e4) / 1e4] : [])]);
         value = (stoneValue + 1) / 2;
       }
       moves.push([action[0], action[1]]);

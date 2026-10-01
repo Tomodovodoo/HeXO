@@ -9,12 +9,13 @@ export const PRESETS = {lightning: {simulations: 8, solver_nodes: 2048}, quick: 
  * ONNX Runtime's WebAssembly backend can use threads. Resolves false when the page is already isolated or cannot be.
  */
 export async function isolate() {
-  if (globalThis.crossOriginIsolated || !navigator.serviceWorker || !isSecureContext) return false;
-  const registration = await navigator.serviceWorker.register(new URL('../coi-sw.js', import.meta.url));
-  if (registration.active && !navigator.serviceWorker.controller) { location.reload(); return true; }
-  registration.addEventListener('updatefound', () => registration.installing?.addEventListener('statechange', event => {
-    if (event.target.state === 'activated') location.reload();
-  }));
+  const workers = globalThis.navigator?.serviceWorker;
+  if (globalThis.crossOriginIsolated || !workers || !isSecureContext || workers.controller) return false;
+  const registration = await workers.register(new URL('../coi-sw.js', import.meta.url));
+  if (registration.active) { location.reload(); return true; }
+  const reload = worker => worker?.addEventListener('statechange', () => { if (worker.state === 'activated') location.reload(); });
+  reload(registration.installing || registration.waiting);
+  registration.addEventListener('updatefound', () => reload(registration.installing));
   return true;
 }
 
