@@ -131,6 +131,8 @@ def native_comparison(args):
                     side = board.player
                     engine = "candidate" if side == candidate_colour else "baseline"
                     result = engines[engine].search(history, args.ms, args.depth or 12, args.width)
+                    if args.seal_library and any(abs(q) > 55 or abs(r) > 55 for q, r in result["moves"]):
+                        result["invalid"] = "Seal coordinate range exceeded"
                     if result.get("invalid"):
                         invalid = result["invalid"]
                         searches.append({"engine": engine, "ply": len(history), **result})
@@ -420,6 +422,12 @@ if __name__ == "__main__":
         parser.error("Games must be nonnegative and even; max-stones >= 3 and depth positive")
     if args.compare_library and args.seal_library:
         parser.error("Select one opponent: compare-library or seal-library")
+    if args.seal_library and not (args.games or args.trace):
+        parser.error("Seal comparisons require --games or --trace")
+    if args.games and not (args.compare_library or args.seal_library):
+        parser.error("Paired games require --compare-library or --seal-library")
+    if args.trace and (args.games or args.compare_library):
+        parser.error("Trace admission and library comparisons are separate modes")
     if args.trace and (not max(6, args.width//2) <= args.root_seconds <= 128 or
                        not 2*args.width <= args.root_turns <= 1024):
         parser.error("Require max(6,width/2) <= root-seconds <= 128 and 2*width <= root-turns <= 1024")

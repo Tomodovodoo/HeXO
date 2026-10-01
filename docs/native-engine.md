@@ -56,7 +56,9 @@ are reported separately and counted as half a point, not as proven draws.
 Seal range exits remain in the report as invalid games; the comparison continues
 and excludes incomplete pairs from paired statistics.
 
-Without `--games`, the comparison uses saved real positions. Add `--depth 2
+With `--compare-library` and no `--games`, the comparison uses saved real
+positions. Seal comparisons require paired games or a recorded `--trace`.
+Add `--depth 2
 --ms 10000 --positions 28 --repeats 2` to compare completed work rather than a
 time budget; check identical moves, scores, nodes and depths before interpreting
 the timing difference. The same report measures complete-turn generation.
