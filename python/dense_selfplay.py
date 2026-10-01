@@ -675,7 +675,7 @@ class SelfPlayGame:
 
     def forced_line(self, proof):
         """[((q, r), proof_turns)] from the current position to the winner's six in a row along `proof`: the
-        attacker's certificate stones, a covered defender reply sampled with the game's RNG, and after an
+        attacker's certificate stones in either order, a covered defender reply sampled with the game's RNG, and after an
         unstoppable node any legal stones off the attacker's threats; the line stops early where the certificate gives no
         move."""
         history, line = [tuple(m) for m in self.moves], []
@@ -689,9 +689,10 @@ class SelfPlayGame:
                 if stones is None:
                     threats = {tuple(c) for t in node.get('threats', ()) for c in t}
                     stones = [next(tuple(m) for m in game.legal_moves() if tuple(m) not in threats)]
-                line.append((stones[0], move[1]))
-                game.play(*stones[0])
-                history.append(stones[0])
+                stone = stones[self.rng.integers(len(stones))]
+                line.append((stone, move[1]))
+                game.play(*stone)
+                history.append(stone)
         finally:
             game.close()
         return line

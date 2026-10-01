@@ -572,13 +572,14 @@ class Adjudication(unittest.TestCase):
         _, _, node, _ = proof.walk(base+first)
         covered = {tuple(sorted(map(tuple, r['action']))) for r in node['responses']}
         winner = dense_solver.mover(base)
-        lines, replies = {}, set()
+        lines, replies, orders = {}, set(), set()
         for seed in [*range(12), 3]:
             game = from_position(dense_selfplay.SelfPlayGame([model, model], s, seed), base)
             try:
                 with mock.patch.object(model.evaluator, 'evaluate', side_effect=AssertionError('No neural search needed')):
                     game.adjudicate(winner, proof)
                 self.assertEqual(game.game.winner, winner)
+                orders.add(tuple(map(tuple, game.moves[len(base):len(base)+len(first)])))
                 offset = len(base)+len(first)
                 reply = tuple(sorted(map(tuple, game.moves[offset:offset+2])))
                 self.assertIn(reply, covered)
@@ -596,6 +597,7 @@ class Adjudication(unittest.TestCase):
                 for tree in game.trees.values():
                     tree.close()
         self.assertGreater(len(replies), 1)
+        self.assertEqual(orders, {tuple(first), tuple(reversed(first))})
 
     def play(self, plies=40, **changes):
         model = tiny_model()
