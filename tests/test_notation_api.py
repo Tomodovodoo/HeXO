@@ -418,6 +418,9 @@ class TimedClocks(unittest.TestCase):
 
     def test_native_controller_returns_a_complete_turn_by_its_allowance(self):
         from timed_engine import TimedEngine, legal_turn
+        for cap in (0, -1):
+            with self.assertRaisesRegex(ValueError, 'simulation cap'):
+                TimedEngine(dict(kind='bubble', search=dict(max_simulations=cap)))
         with TimedEngine(dict(kind='native')) as engine:
             game = Game([[0, 0]])
             try:
@@ -602,6 +605,40 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
         response = await ws.receive_json(timeout=1)
         self.assertEqual((response['type'], response['request_id']), ('eval_response', 7))
         await ws.close()
+
+    async def test_interrupt_during_send_cannot_restore_old_history(self):
+        from aiohttp import web
+        from timed_engine import legal_turn
+        blocked, release = asyncio.Event(), asyncio.Event()
+        original_send = web.WebSocketResponse.send_json
+        async def delayed_send(socket, data, *args, **kwargs):
+            if data.get('request_id') == 2 and data.get('type') == 'move_response':
+                blocked.set()
+                await release.wait()
+            return await original_send(socket, data, *args, **kwargs)
+        with patch.object(web.WebSocketResponse, 'send_json', delayed_send):
+            ws = await self.client.ws_connect('/bws/v1-alpha/game')
+            try:
+                await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=1))
+                first = await ws.receive_json(timeout=1)
+                own = first['move']['pieces']
+                advanced = [[0, 0]]+[[p['q'], p['r']] for p in own]
+                previous = [dict(side='o', pieces=own),
+                            dict(side='x', pieces=[dict(q=q, r=r) for q, r in legal_turn(advanced)])]
+                await ws.send_json(dict(type='move_request', side='o', previous=previous, request_id=2))
+                await asyncio.wait_for(blocked.wait(), 1)
+                await ws.send_json(dict(type='interrupt', request_id=2))
+                await ws.send_json(dict(type='setup'))
+                await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=3))
+                self.assertEqual((await ws.receive_json(timeout=1))['request_id'], 3)
+                release.set()
+                self.assertEqual((await ws.receive_json(timeout=1))['request_id'], 2)
+                await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=4))
+                self.assertEqual((await ws.receive_json(timeout=1))['request_id'], 4)
+                self.assertEqual(self.calls[-1][0], [[0, 0]])
+            finally:
+                release.set()
+                await ws.close()
 
     async def test_restored_match_records_the_resumed_engines(self):
         from aiohttp.test_utils import TestClient, TestServer

@@ -306,6 +306,8 @@ def main():
     parser.add_argument('--solver-nodes', type=int, default=32768)
     parser.add_argument('--net-kernels', choices=['fused', 'reference'], default='fused')
     args = parser.parse_args()
+    if args.simulations is not None and args.simulations <= 0:
+        parser.error('--simulations must be positive')
     import torch
     from timed_engine import TimedEngine
     device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device

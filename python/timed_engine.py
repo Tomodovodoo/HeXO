@@ -341,6 +341,10 @@ def _worker(connection, cancellation, config):
 class TimedEngine:
     """Return a completed legal candidate by the controller deadline, including on stop."""
     def __init__(self, config, *, startup_timeout=120):
+        search = config.get('search', {})
+        cap = search.get('max_simulations', search.get('simulations'))
+        if cap is not None and (type(cap) is not int or cap <= 0):
+            raise ValueError('simulation cap must be a positive integer')
         self.external = config.get('kind') in ('six', 'htttx')
         self.config = dict(config)
         context = mp.get_context('spawn')

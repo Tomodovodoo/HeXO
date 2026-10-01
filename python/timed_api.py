@@ -202,7 +202,8 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
                     if ident is not None:
                         packet['request_id'] = ident
                     await ws.send_json(packet)
-                    history, saved = local, None
+                    if token == generation and not cancel_event.is_set():
+                        history, saved = local, None
             except Exception as error:
                 if token == generation and not cancel_event.is_set():
                     await ws.send_json(dict(type='error', error=str(error), request_id=ident))
