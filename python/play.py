@@ -582,7 +582,7 @@ class Job:
 
     def __init__(self, kind, priority, history, **fields):
         self.id, self.kind, self.priority, self.history = next(Job.ids), kind, priority, tuple(history)
-        self.status, self.done, self.total, self.error, self.cancelled = 'queued', 0, 1, None, False
+        self.status, self.done, self.total, self.error, self.cancelled, self.ended = 'queued', 0, 1, None, False, None
         self.__dict__.update(fields)
 
     def summary(self):
@@ -714,7 +714,7 @@ class Session:
                     job.cancelled, job.status = True, 'cancelled'
                 elif job.status in ('queued', 'running'):
                     return job
-                if job.status in ('failed', 'done') and not force:
+                if job.status in ('failed', 'done') and not force and time.time() - job.ended < 30:
                     return None
         if not force and self.store.covering(history, self.engine_key(settings), self.engines.effective(settings['budget'])):
             return None
@@ -772,14 +772,19 @@ class Session:
         if self.entries[engine]['kind'] != 'bubble' or type(auto) is not bool:
             raise ValueError('Analysis needs a Bubble model')
         with self.lock:
-            for job in self.jobs.values():
-                settings = {k: v for k, v in getattr(job, 'seat', {}).items() if k != 'auto'}
-                if job.kind in ('analyse', 'review') and job.status in ('queued', 'running') and settings != seat:
-                    job.cancelled = True
-                    if job.status == 'queued':
-                        job.status = 'cancelled'
             self.analysis = seat | dict(auto=auto)
+            self.stop_analysis()
             self.changed()
+
+    def stop_analysis(self):
+        """Cancel analysis and review jobs made for other analysis settings than the current ones."""
+        current = {k: v for k, v in (self.analysis or {}).items() if k != 'auto'}
+        for job in self.jobs.values():
+            settings = {k: v for k, v in getattr(job, 'seat', {}).items() if k != 'auto'}
+            if job.kind in ('analyse', 'review') and job.status in ('queued', 'running') and settings != current:
+                job.cancelled = True
+                if job.status == 'queued':
+                    job.status = 'cancelled'
 
     def analyse(self, ply, force=False):
         with self.lock:
@@ -838,6 +843,7 @@ class Session:
                 raise
             self.seats, self.analysis = seats, analysis
             self.stop_moves()
+            self.stop_analysis()
             self.changed()
 
     # Working
@@ -856,7 +862,7 @@ class Session:
             try:
                 result = self.run(job)
                 with self.lock:
-                    job.status = 'cancelled' if job.cancelled else 'done'
+                    job.status, job.ended = 'cancelled' if job.cancelled else 'done', time.time()
                     if job.kind == 'move' and not job.cancelled and list(job.history) == self.history:
                         self.history.extend(tuple(p) for p in result)
                     self.changed()

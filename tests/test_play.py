@@ -282,6 +282,16 @@ class Jobs(unittest.TestCase):
         self.engines.release.set()
         wait(lambda: len(self.history()) == 3)
 
+    def test_rescans_cancel_work_for_a_vanished_analysis_model(self):
+        self.session.configure_seat(1, 'human')
+        self.engines.hold = True
+        old = self.session.analyse(0, force=True)
+        wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']))
+        self.session.rescan_entries = lambda: {k: v for k, v in entries().items() if k != 'bubble:fake'}
+        self.session.rescan()
+        wait(lambda: self.session.jobs[old].status == 'cancelled')
+        self.engines.hold = False
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
