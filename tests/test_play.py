@@ -1,9 +1,11 @@
 """Play server: evaluation store, review labels, background jobs and the HTTP surface, with fake engines."""
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -291,6 +293,26 @@ class Jobs(unittest.TestCase):
             self.assertLess(time.time() - started, 10)
         finally:
             engines.close()
+
+    def test_solver_identity_follows_the_built_library(self):
+        import tactical_proof
+        with tempfile.TemporaryDirectory() as directory:
+            engines = Engines('cpu', tactical_package=Path(directory))
+            binary = tactical_proof.library(Path(directory))
+            binary.parent.mkdir(parents=True)
+            record = binary.with_name(binary.name + '.json')
+            record.write_text(json.dumps(dict(binary_sha256='a' * 64)))
+            self.assertEqual((engines.solver_build(), engines.solver()), ('none', (None, 'none')))
+            binary.write_bytes(b'')
+            with unittest.mock.patch.object(tactical_proof, 'IsolatedTactics') as isolated:
+                first, build = engines.solver()
+                self.assertEqual((build, engines.solver()[0]), ('aaaaaaaa', first))
+                record.write_text(json.dumps(dict(binary_sha256='b' * 64)))
+                os.utime(record, ns=(1, 1))
+                second, build = engines.solver()
+                self.assertEqual(build, 'bbbbbbbb')
+                first.abort.assert_called_once()
+                self.assertEqual(isolated.call_count, 2)
 
     def test_budgets(self):
         self.assertEqual(budget_of('bubble', 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))

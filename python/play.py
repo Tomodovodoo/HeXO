@@ -323,7 +323,7 @@ class Engines:
 
     def __init__(self, device, tactical_package=None, seal=None):
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
-        self.bubbles, self.prover = OrderedDict(), None
+        self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
         self.children = {}
 
     def bubble(self, path):
@@ -338,20 +338,26 @@ class Engines:
         return self.bubbles[key]
 
     def solver(self):
-        """The tactical solver in its own process, so a cancelled query can be ended; None when not built."""
-        if self.prover is None:
-            import tactical_proof
+        """The tactical solver in its own process, so a cancelled query can be ended, and its build; (None, 'none')
+        when not built. A rebuilt library replaces the running solver."""
+        import tactical_proof
+        build = self.solver_build()
+        if build == 'none':
+            return None, build
+        if self.prover is None or self.prover_build != build:
+            if self.prover is not None:
+                old = self.prover
+                old.abort()
+                threading.Thread(target=old.close, daemon=True).start()
             package = self.tactical_package or tactical_proof.PACKAGE
-            if not tactical_proof.library(package).exists():
-                return None
-            self.prover = tactical_proof.IsolatedTactics(package, priority='below_normal')
-        return self.prover
+            self.prover, self.prover_build = tactical_proof.IsolatedTactics(package, priority='below_normal'), build
+        return self.prover, build
 
     def evaluate(self, entry, checkpoint, budget, history, watch):
         """`evaluate` with the entry's export; returns the evaluation, the budget it really had (no solver nodes
         when the solver is not built) and the key of the weights it used (see `model_key`)."""
-        bubble, spent = self.bubble(export_path(entry, checkpoint)), self.effective(budget)
-        solver = self.solver()
+        bubble, (solver, build) = self.bubble(export_path(entry, checkpoint)), self.solver()
+        spent = budget if solver else budget | dict(solver_nodes=0)
         try:
             found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch)
         except Cancelled:
@@ -360,18 +366,20 @@ class Engines:
             raise
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
-        return found, spent, f'{bubble.sha256[:16]}:{self.solver_build()}'
+        return found, spent, f'{bubble.sha256[:16]}:{build}'
 
     def effective(self, budget):
         """`budget` as it can run here: no solver nodes when the tactical library is not built."""
         return budget if self.solver_build() != 'none' else budget | dict(solver_nodes=0)
 
     def solver_build(self):
-        """The first 8 hex digits of the tactical library's recorded SHA-256, or 'none' when it is not built."""
+        """The first 8 hex digits of the tactical library's recorded SHA-256, or 'none' when the library or its
+        record is missing."""
         import tactical_proof
         package = self.tactical_package or tactical_proof.PACKAGE
-        record = tactical_proof.library(package).with_name(tactical_proof.library(package).name + '.json')
-        if not record.exists():
+        binary = tactical_proof.library(package)
+        record = binary.with_name(binary.name + '.json')
+        if not (binary.exists() and record.exists()):
             return 'none'
         stat = record.stat()
         return file_build(str(package), stat.st_mtime_ns)
