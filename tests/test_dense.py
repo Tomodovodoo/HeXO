@@ -1724,7 +1724,7 @@ class DenseDataTests(unittest.TestCase):
             self.assertLess(recent_share, share)
             self.assertLessEqual((1-recent_share)*recent_base+recent_share, 4/20+1e-12)
             self.assertEqual(len(window.sample(np.random.default_rng(7), 256, recency=2., regret_fraction=.25)), 256)
-            self.assertEqual(window.regret_share(256, .25, recency=4.), 0.)
+            self.assertAlmostEqual(window.regret_share(256, .25, recency=4.), 0.)
             self.assertLessEqual(window.regret_distribution(4.).max(), 4/20+1e-12)
             self.assertEqual(len(window.sample(np.random.default_rng(7), 256, recency=4., regret_fraction=.25)), 256)
             self.assertAlmostEqual(window.regret_distribution(3000.).sum(), 1.)
@@ -1733,6 +1733,23 @@ class DenseDataTests(unittest.TestCase):
             path.unlink()
             window.refresh_regret()
             self.assertEqual(window.regret_rows, 0)
+
+            write_games(run/'shards'/'000002', [(moves, -1, None)]*100)
+            path.write_text(json.dumps(dict(entries=[dict(shard='000002', game=0, ply=19, regret=1.)])), encoding='utf-8')
+            window = dense_data.ReplayWindow(run, capacity_rows=3000, min_rows=3000)
+            self.assertEqual(window.regret_rows, 1)
+            W = len(window.index)
+            share = window.regret_share(256, .25)
+            self.assertGreater(share, 0.)
+            self.assertLess(256*share, 1.)
+            self.assertEqual(share, window.regret_share(16, .25))
+            probability = (1-share)/W+share*window.regret_probabilities(share)[0]
+            self.assertAlmostEqual(probability, 4/W)
+            rng = np.random.default_rng(12)
+            hits = sum(ref.shard == '000002' and ref.row['game'] == 0 and ref.row['ply'] == 19
+                       for _ in range(4096) for ref in window.sample(rng, 16, regret_fraction=.25))
+            self.assertAlmostEqual(hits/(4096*16), probability, delta=45/(4096*16))
+            self.assertGreater(hits, 85)
 
     def test_certified_loss_errors_enter_bounded_priority_without_restarts(self):
         moves, _ = random_game(np.random.default_rng(4), 20)

@@ -784,13 +784,13 @@ class ReplayWindow:
         return self.regret_distribution(recency)[self.regret_positions]
 
     def regret_count(self, batch_size, fraction, recency=0.):
-        """Number of priority draws allowed by the fourfold per-row probability cap."""
+        """Expected priority draws allowed by the fourfold per-row probability cap, including fractions."""
         if not fraction or not self.regret_rows:
             return 0
         W, K = len(self.index), self.regret_rows
         baseline = self.regret_baseline(recency).sum()
         limit = 1. if K == W or baseline == 1 else max(0., min(1., (4*K/W-baseline)/(1-baseline)))
-        return min(batch_size, int(batch_size*min(fraction, limit)+1e-12))
+        return batch_size*min(1., fraction, limit)
 
     def regret_share(self, batch_size, fraction, recency=0.):
         return self.regret_count(batch_size, fraction, recency)/batch_size
@@ -851,7 +851,8 @@ class ReplayWindow:
 
     def sample(self, rng, n, recency=0., validation=False, regret_fraction=0.):
         """n Refs drawn with replacement from the training (or validation) index; the k-th oldest of
-        W rows has weight ((k+1)/W)^recency."""
+        W rows has weight ((k+1)/W)^recency. Priority counts are stochastic, with the capped expected share,
+        so fewer than one expected priority draw per batch still samples regret rows."""
         index = self.validation if validation else self.index
         W = len(index)
         if not W:
@@ -862,9 +863,9 @@ class ReplayWindow:
             picks = rng.choice(W, n, p=p)
         else:
             picks = rng.integers(W, size=n)
-        priority = 0 if validation else self.regret_count(n, regret_fraction, recency)
+        share = 0. if validation else self.regret_share(n, regret_fraction, recency)
+        priority = rng.binomial(n, share) if share else 0
         if priority:
-            share = priority/n
             picks[:priority] = rng.choice(self.regret_positions, priority, p=self.regret_probabilities(share, recency))
         return [self.ref(*index[k]) for k in picks]
 
