@@ -7153,6 +7153,27 @@ class DenseBrowser(unittest.TestCase):
         self.assertEqual((result['proof'] or {}).get('winner'), 0)
         self.assertTrue(self.complete(history, result['moves']))
 
+    def test_dense_player_keeps_the_proven_second_stone_without_reevaluation(self):
+        from dense_player import DensePlayer
+        history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (3, 5), (4, 5),
+                   (3, 0), (-1, 1), (6, 6), (7, 7)]
+        player = DensePlayer(Path(self.temp.name), 'cpu', model=Path(self.temp.name)/'ema.pt',
+                             tactical_package=Path(self.temp.name)/'missing', net_kernels='reference')
+        player.configure(dict(search=True, simulations=16, solver=False))
+        game = Game(history)
+        try:
+            with unittest.mock.patch.object(player.evaluator, 'evaluate', wraps=player.evaluator.evaluate) as evaluate:
+                result = player.turn(game)
+            self.assertEqual(evaluate.call_count, 1)
+            self.assertEqual([tuple(cell[:2]) for cell in game.cells], history)
+            self.assertEqual(len(result['moves']), 2)
+            for move in result['moves']:
+                game.play(*move)
+            self.assertEqual(game.winner, 0)
+        finally:
+            game.close()
+            player.close()
+
     def test_engines_reload_changed_weights_and_record_the_budget_they_ran(self):
         from play import Engines
         path = Path(self.temp.name)/'ema.pt'

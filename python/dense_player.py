@@ -121,6 +121,7 @@ class DensePlayer:
             local.close()
 
     def turn(self, game, milliseconds=None, analyze=False):
+        """Keep the first stone's search continuation, with a fresh budget for each placement."""
         if milliseconds is not None:
             from threading import Event
             from timed_engine import dense_turn
@@ -135,7 +136,7 @@ class DensePlayer:
         history = [cell[:2] for cell in game.cells]
         local, moves, suggestions = Game(history), [], []
         player, start, proof, line, threat = local.player, time.perf_counter(), None, [], None
-        win_probability = None
+        win_probability = tree = None
         try:
             if self.options['solver']:
                 proof = self.solve(history)
@@ -150,12 +151,10 @@ class DensePlayer:
             while not proven and local.player == player and local.winner < 0:
                 current = [cell[:2] for cell in local.cells]
                 if self.options['search']:
-                    tree = NeuralSearch(self.evaluator, self.model_sha256, current, seed=1740,
-                                        cache=self.cache, tactics=True)
-                    try:
-                        result = tree.search(self.options['simulations'], root_samples=16, batch_size=16)
-                    finally:
-                        tree.close()
+                    if tree is None:
+                        tree = NeuralSearch(self.evaluator, self.model_sha256, current, seed=1740,
+                                            cache=self.cache, tactics=True)
+                    result = tree.search(self.options['simulations'], root_samples=16, batch_size=16)
                     action, policy, actions = result['action'], result['policy'], result['actions']
                     value = root_value(result, local.player)
                 else:
@@ -169,6 +168,8 @@ class DensePlayer:
                     win_probability = (value+1)/2
                 moves.append(action)
                 local.play(*action)
+                if tree is not None:
+                    tree.advance(action)
             return dict(moves=moves, backend='dense', checkpoint=self.checkpoint,
                         elapsed_ms=(time.perf_counter()-start)*1000, suggestions=suggestions,
                         player=player, win_probability=1. if proven else win_probability,
@@ -176,4 +177,6 @@ class DensePlayer:
                         threat_checked=analyze and self.options['solver'],
                         solver_status=proof['status'] if proof else 'off', settings=dict(self.options))
         finally:
+            if tree is not None:
+                tree.close()
             local.close()
