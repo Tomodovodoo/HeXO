@@ -2539,6 +2539,8 @@ class ValidationSourceTests(unittest.TestCase):
                              metrics['certified_policy_second_rows'])
             learner.settings = replace(learner.settings, proof_policy_weight=.25, proof_policy_missing_only=True)
             weighted = learner.validate(window)
+            self.assertAlmostEqual(weighted['policy_ce'],
+                                   weighted['policy_target_entropy']+weighted['policy_kl'], delta=1e-5)
             for key, value in metrics.items():
                 if key.startswith('certified_policy'):
                     self.assertEqual(value, weighted[key], key)
