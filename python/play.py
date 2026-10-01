@@ -10,6 +10,7 @@ import hashlib
 import heapq
 import itertools
 import json
+import math
 import os
 import queue
 import shutil
@@ -451,7 +452,7 @@ def position_text(history):
 def well_formed(record):
     """True for a dict with the fields of a saved evaluation, each of the right shape."""
     def number(v):
-        return type(v) in (int, float)
+        return type(v) in (int, float) and math.isfinite(v)
 
     def cells(v, size, third=lambda x: type(x) is int):
         """A list of [q, r] or [q, r, x] items with integer coordinates and a third value passing `third`."""
