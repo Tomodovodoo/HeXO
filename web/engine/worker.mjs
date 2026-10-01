@@ -90,7 +90,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
         const stone = moves.length;
         const result = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version,
           evaluate: leaves => network.evaluate(leaves), stop: () => cancelled.has(id),
-          onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / local.remaining)})});
+          onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining)})});
         check();
         ({action, policy, actions, values} = result);
         completed += result.completed;
@@ -102,6 +102,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
       } else {
         actions = native.legal(current);
         const [prediction] = await network.evaluate([{history: current, actions}]);
+        check();
         const maximum = Math.max(...prediction.logits), weights = Array.from(prediction.logits, l => Math.exp(l - maximum));
         const total = weights.reduce((a, b) => a + b, 0);
         policy = weights.map(w => w / total);
