@@ -368,6 +368,8 @@ class Http(unittest.TestCase):
         replay = json.loads(self.get('/replay'))
         self.assertEqual(import_history(json.dumps(replay)), state['history'])
         self.assertEqual(self.post('/retry', dict(ply=2))['history'], [[0, 0], [1, 0]])
+        self.assertEqual(self.get('/htttx'), 'version[1];\n1. [1,0];')
+        self.post('/new')
         with self.assertRaises(HTTPError) as caught:
             self.get('/htttx')
         self.assertEqual(caught.exception.code, 409)

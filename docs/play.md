@@ -1,6 +1,8 @@
 # Browser play
 
 ```sh
+python python/bubble.py play                       # the newest release, downloaded into runs/play
+python python/bubble.py play --model path/to/ema.pt
 python python/play.py --dense-run runs/bubble --device cpu
 ```
 

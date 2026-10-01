@@ -1047,6 +1047,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--dense-run', type=Path, help='a Bubble run; its champion is the default opponent')
+    parser.add_argument('--dense-model', type=Path, help='an ema.pt file; the default opponent, ahead of --dense-run')
     parser.add_argument('--models', type=Path, default=ROOT / 'models', help='folder scanned for models and engines')
     parser.add_argument('--runs', type=Path, default=ROOT / 'runs', help='folder whose runs are offered as models')
     parser.add_argument('--evaluations', type=Path,
@@ -1064,7 +1065,7 @@ def main():
         args.device = 'cuda' if cuda else 'cpu'
     from hexo import library
     seal = library.with_name(library.name.replace('hexo', 'hexo_seal'))
-    runs = [args.dense_run] if args.dense_run else []
+    runs = [path for path in (args.dense_model, args.dense_run) if path]
     find = lambda: scan(args.models, args.runs, runs, seal)
     store_path = args.evaluations or (args.dense_run or args.models) / 'play-evaluations.jsonl'
     store_path.parent.mkdir(parents=True, exist_ok=True)
