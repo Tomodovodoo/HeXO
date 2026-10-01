@@ -111,4 +111,5 @@ A final turn may hold one stone, whether it won or the turn is still open, and t
 - [Six: Bubble as a Six engine, Six as an opponent](docs/six-engine.md)
 - [GPU kernels](docs/gpu-kernels.md)
 - [Native engine, Seal adapter, tests](docs/native-engine.md)
+- [Browser engine: WebGPU, WebAssembly search and solver](docs/web-engine.md)
 - [Notation and bot API](docs/notation-api.md)

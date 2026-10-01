@@ -1,0 +1,47 @@
+{
+ "sources": {
+  "src/gumbel.cpp": "0d28ca708c6ebd3c81528f370b8732b1b7b22d1f49a94ebfc44f06dfa387e193",
+  "src/hexo.cpp": "bc3ab300e8064cdf3cda947c4482a12f9792800d6a03466466d6b51fc1c7d1fc",
+  "src/hexo.hpp": "9b4e0e117fd8ee2575607b3bd4b9f12a2865545e06a5f351c74aab0f7bca160f",
+  "src/nnue.hpp": "d9ee693837f624cbf749add0ea0d93f6981874a879ece5fadfe3d77b00689622",
+  "tools/tactical/Cargo.lock": "e70e49f6f1a247deaf603eb600ce1cdaeb0bad0151d0e3e61142835867be69df",
+  "tools/tactical/Cargo.toml": "f12a71409068c74745546be5037da8dbac549f84274e3a7ef4ebf1eb6db589b9",
+  "tools/tactical/src/check.rs": "94e5f2bc9bf4eb776b7131864afc03ec9924efb7553bc7a79ff09dc806b62cfe",
+  "tools/tactical/src/lib.rs": "255de7e4bca50312eac37f4d07f2a6a603ac8468c31a57b289cd354ca43e097c",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/Cargo.toml": "f2ff06b35462bcdb041108a1ee0597bdde2ddf55af6c4d035e9c819f9abd7c83",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/board.rs": "218dad17ee226423d99b60ee5ceabbc61877790b46cc4b5abcf10dc632754ee6",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/game.rs": "2a31479496eaae015a50618f4a7ce024ba17caab93d719ef26467b8fc552728a",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/hex.rs": "10456cb0a3c0a8d4c4df53cd201ceebc030d808596cafca83e751e8e0cd67cb6",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/legal_moves.rs": "cdaeaa1f0b69771685891836db6e64bed952729ffa92520a0fac10b063f35eff",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/lib.rs": "b3d1ad2c40927487160a23c670b47d55c365e7aece3ec03f069f90babf461ba8",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/symmetry.rs": "a8335e27b8617bcade140157fa460e8431f93c62a2478b257626765aef3a0243",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/threat.rs": "e166fc13de6c3cbee7ece66f63e9c718ad9cbadb1e1a5ab7f2636fad55cd7fe7",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/turn.rs": "904acb04aac89b917bde9a7ef3f5d0bfd93571d670a39f1dc92de66438c89fab",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/types.rs": "4ae6fc2ab542d5c29d793116f50491d72160be654537115c82753cc88ab4722b",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/win.rs": "1442e8dfbcb6afb8cca336b45d5f3c81c1a849088143f8f47eab8dfe42d9f26a",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/Cargo.toml": "4b1f584042f56b172c2e158f480717f9c61a3a8fa267206e9451188b624bd211",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/forcing.rs": "b1f8c07453849aa96e0728c06ec327506f1d1f7ebac34e938beff3e7a7ea8dbe",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/lib.rs": "84b597f5cb53c08a6dd1db12b96c349ca063580a5e45843019334755b9b3cf63",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/position.rs": "4d1b74f8629d5c660dcb00e2ed4174d49c17ce9b5b63ebb770429b190d096258",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/certificate.rs": "ec562795678d5a724d3576726b801693a2ce5d7177ac65b05efd14fce9213e00",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/dfpn.rs": "0238aa8639c1752ba410cb6f9a8c5e32864653cdd018ac3687a7f3bc3eb6f3dd",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/fixtures.rs": "fe736b32a274db7ff95964c489d683a949352271f4cfb823a3f5df93d0ba1dc8",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/hybrid.rs": "4f5f2e6c0ec0327b58f11f9db3229dfe12d4e5b98cf26456d07420cc3183d728",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/io.rs": "bd915a66ff4ced7d5b057480a4f5f6633686e49d3cecabaa5a4289fea877130c",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/kernel.rs": "3ed1d07b827da75f22a339953484d4a7d9cf032fb6b0dd2901ce2b2704fff31b",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/mod.rs": "eda77b6e0ee47ba20c36e5e28f5270f438634c6d452ef1d8e36e16bbd8d5495e",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/pdspn.rs": "547d9d257b46868799c9629318d6f495a5aaddce626b1c335971b6f60fb36dae",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/pn.rs": "ef72206cbade4b86aea09586838686b4fd34214dd65c4ed07a4060bd429cf561",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/portfolio.rs": "0812d35b9dadfdb9493327d6a2f4ee3fb57a69c6fe5b83c1f684c1f51178b7bd",
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/vct_probe.rs": "fa20d9e829fd69d94cb4bf0f0081dfe92901aee0849055b0bd0a44e4eeb5b46a"
+ },
+ "artefacts": {
+  "gumbel.mjs": "b8c55d8ea171fe79e8d3165dbb73ba18b88aa4f1ca9409b3f2985be5ebb2a16c",
+  "gumbel.wasm": "c825c5bf4d0881f2b3d6765a1b1abbb9043f218644cb476893b5ae0cc7e21ba2",
+  "tactical.wasm": "71552a10b14c98310b0faaeb6a1d7a31ff1a2ca22bc8cf844cbf05ca39c18a48"
+ },
+ "tools": {
+  "emxx": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 6.0.10 (d6c521a7f05449857c76bd99e396895583cf2083)",
+  "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)"
+ }
+}

@@ -1,0 +1,135 @@
+"""Parity of the browser engine bundle (web/engine) with the native engine and the PyTorch network."""
+import base64
+import importlib.util
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+import numpy as np
+import torch
+import export_web
+import hexcrop
+import hexnet
+import play
+import tactical_proof
+from neural_search import EvaluationCache, NeuralSearch
+
+ROOT = Path(__file__).resolve().parents[1]
+ENGINE = ROOT/'web'/'engine'
+NODE = shutil.which('node')
+BUILT = NODE is not None and (ENGINE/'gumbel.wasm').exists()
+spec = importlib.util.spec_from_file_location('build_web', ROOT/'tools'/'build_web.py')
+build_web = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_web)
+
+
+def node(job):
+    done = subprocess.run([NODE, str(ROOT/'tests'/'web'/'engine.mjs')], input=json.dumps(job), capture_output=True,
+                          text=True, encoding='utf-8')
+    if done.returncode:
+        raise RuntimeError(done.stderr)
+    return json.loads(done.stdout)
+
+
+def random_model(seed=0):
+    """A HexNet with random weights, line taps and batch-norm statistics."""
+    torch.manual_seed(seed)
+    model = hexnet.HexNet(hexnet.HexNetConfig(aux_heads=False))
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, hexnet.MaskedNorm):
+                module.running_mean.uniform_(-.5, .5)
+                module.running_var.uniform_(.5, 2)
+                module.weight.uniform_(.5, 1.5)
+                module.bias.uniform_(-.2, .2)
+            if isinstance(module, hexnet.LineConv):
+                module.weight.normal_(0, .1)
+    return model.eval()
+
+
+class Recorder:
+    """A DenseEvaluator that records every batch it answers as [{history, logits, q}]."""
+    def __init__(self, model):
+        self.inner, self.batches = hexnet.DenseEvaluator(model, 'cpu', 'test'), []
+
+    def evaluate(self, histories):
+        results = self.inner.evaluate(histories)
+        self.batches.append([dict(history=[list(map(int, p)) for p in h], logits=r['logits'].astype(float).tolist(),
+                                  q=r['q'].astype(float).tolist()) for h, r in zip(histories, results)])
+        return results
+
+
+class Export(unittest.TestCase):
+    def test_graphs_match_the_reference_path(self):
+        model = random_model()
+        with tempfile.TemporaryDirectory() as folder:
+            for name, half, tolerance in (('fp32.onnx', False, 1e-4), ('fp16.onnx', True, .1)):
+                export_web.export_onnx(model, Path(folder)/name, half)
+                worst = export_web.parity(model, Path(folder)/name, export_web.histories(every=13), half)
+                self.assertLess(max(worst.values()), tolerance, (name, worst))
+
+
+@unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
+class Bundle(unittest.TestCase):
+    def test_artefacts_match_their_sources(self):
+        record = json.loads((ENGINE/'build.json').read_text(encoding='utf-8'))
+        self.assertEqual(record['sources'], build_web.sources())
+        self.assertEqual(record['artefacts'], {name: build_web.digest(ENGINE/name) for name in record['artefacts']})
+
+    def test_encoder_matches_hexcrop(self):
+        model = random_model()
+        positions = export_web.histories(every=5)
+        samples = [hexcrop.encode(h) for h in positions]
+        answers = node(dict(kind='encode', positions=[dict(history=h, actions=s.actions.tolist()) for h, s in zip(positions, samples)]))
+        self.assertTrue(any(s.far for s in samples))
+        for sample, answer in zip(samples, answers):
+            self.assertEqual(answer['size'], sample.size)
+            self.assertEqual(answer['cells'], sample.cells.tolist())
+            self.assertEqual(answer['far'], sample.far)
+            self.assertEqual(answer['ones'], np.flatnonzero(sample.planes).tolist())
+            with torch.inference_mode():
+                expected = export_web.inputs(model, torch.from_numpy(sample.planes[None]).float())[0].numpy()
+            np.testing.assert_array_equal(np.frombuffer(base64.b64decode(answer['features']), np.float32), expected.reshape(-1))
+
+    @unittest.skipUnless(tactical_proof.library().exists(), 'needs the native tactical library')
+    def test_winning_line_matches_play(self):
+        from tests.test_tactical_proof import IMMEDIATE, OPEN_THREE
+        for history in (OPEN_THREE, IMMEDIATE):
+            result = tactical_proof.NativeTactics().history(history, nodes=100000, ms=20000)
+            self.assertEqual(result['status'], 'PROVEN_WIN')
+            self.assertEqual(node(dict(kind='line', history=history, certificate=result['certificate'])),
+                             play.winning_line(history, result))
+
+    def test_search_matches_native(self):
+        """Same seed, position, budget and evaluations: the same actions, visits and policy as the native library."""
+        model, games = random_model(1), export_web.histories(every=9)
+        tactical = list(json.loads((ROOT/'tests'/'fixtures'/'tactical_positions.json').read_text())['positions'].values())[:4]
+        cases = []
+        for history, simulations in [(h, 64) for h in games[::3]]+[(h, 128) for h in tactical]+[(games[5], 512)]:
+            recorder, steps, results = Recorder(model), [], []
+            tree = NeuralSearch(recorder, 'test', history, seed=1740, cache=EvaluationCache(), tactics=True)
+            try:
+                for _ in range(2 if len(history) % 2 else 1):
+                    result = tree.search(simulations, root_samples=16, batch_size=16)
+                    steps.append(dict(simulations=simulations, root_samples=16, batch_size=16))
+                    results.append(result)
+                    if result['action'] is None:
+                        break
+                    tree.advance(tuple(result['action']))
+            finally:
+                tree.close()
+            cases.append((dict(history=history, seed=1740, tactics=True, steps=steps, batches=recorder.batches), results))
+        answers = node(dict(kind='search', cases=[case for case, _ in cases]))
+        for (case, results), answer in zip(cases, answers):
+            self.assertEqual(len(answer), len(results))
+            for native, web in zip(results, answer):
+                self.assertEqual(web['action'], native['action'])
+                self.assertEqual(web['visits'], native['visits'].tolist())
+                self.assertEqual(web['completed'], native['completed'])
+                np.testing.assert_allclose(web['policy'], native['policy'], rtol=0, atol=1e-12)
+
+
+if __name__ == '__main__':
+    unittest.main()

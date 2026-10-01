@@ -619,6 +619,18 @@ class Http(unittest.TestCase):
         with urlopen(self.root + path, timeout=5) as response:
             return response.read().decode()
 
+    def test_engine_bundle_is_served_cross_origin_isolated(self):
+        for path, kind in (('/', 'text/html'), ('/engine/search.mjs', 'text/javascript'), ('/coi-sw.js', 'text/javascript')):
+            with urlopen(self.root + path, timeout=5) as response:
+                self.assertTrue(response.headers['Content-Type'].startswith(kind))
+                self.assertEqual(response.headers['Cross-Origin-Opener-Policy'], 'same-origin')
+                self.assertEqual(response.headers['Cross-Origin-Embedder-Policy'], 'credentialless')
+        for path in ('/engine/../../python/play.py', '/engine/%2e%2e/index.html', '/engine/missing.mjs', '/index.html'):
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(self.root + path, timeout=5)
+            self.assertEqual(caught.exception.code, 404)
+            caught.exception.close()
+
     def test_page_stays_responsive_while_an_engine_thinks(self):
         self.engines.hold = True
         self.post('/play', dict(q=0, r=0))
