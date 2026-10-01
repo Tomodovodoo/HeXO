@@ -426,7 +426,8 @@ function renderStudy(){
   $('top').replaceChildren(...top.map((t,i)=>{const d=el('div',{},el('span',{},i+1),el('span',{},t[0]+', '+t[1]),
     el('em',{style:`--c:${COLORS[side]};transform:scaleX(${t[2]/max})`}),el('span',{style:'text-align:right'},(t[2]*100).toFixed(1)));
     d.onclick=()=>{const[sx,sy]=screen(t[0],t[1]);cam.x+=canvas.clientWidth/2-sx;cam.y+=canvas.clientHeight/2-sy;draw()};return d}));
-  if(!ev&&S.analysis&&S.analysis.auto&&!job&&view<=S.history.length&&!(S.winner>=0&&view===S.history.length)){
+  const need=S.analysis&&S.analysis.budget,short=!ev||need&&(ev.simulations<need.simulations||ev.solver_nodes<need.solver_nodes);
+  if(short&&S.analysis&&S.analysis.auto&&!job&&view<=S.history.length&&!(S.winner>=0&&view===S.history.length)){
     const tag=S.revision+':'+view;if(!asked.has(tag)){asked.add(tag);post('/analyse',{ply:view})}}
   renderGraph();renderMoves();renderDetail();
 }
