@@ -411,15 +411,26 @@ def dense_manifests(folder, pattern='*/manifest.json'):
 
 
 @lru_cache(maxsize=None)
-def episode_lengths(path, modified):
+def episode_summary(path, modified):
     """Compact counts from an immutable actor shard; never retain its move histories.
 
     Keep every visited shard: an oldest-first scan larger than a bounded LRU would evict the next scan's entries.
     """
     episodes = json.loads(Path(path).read_text(encoding='utf-8'))
     return Counter((len(e['moves']), e.get('origin', 'selfplay'),
-                    'capped' if e['winner'] < 0 else 'proven' if e.get('reason') == 'proven' else 'win')
+                    'capped' if e['winner'] < 0 else 'proven' if e.get('reason') == 'proven' else 'win',
+                    e['winner'], tuple(map(tuple, e['moves'][:e['book']['ply']]))
+                    if e.get('origin') == 'book' and not e.get('opponent')
+                    and e.get('book', {}).get('suite') == dense_openings.LIVE else ())
                    for e in episodes)
+
+
+def counted_median(counts):
+    total, cumulative, middle = sum(counts.values()), 0, []
+    for value, count in sorted(counts.items()):
+        middle.extend(value for rank in ((total-1)//2, total//2) if cumulative <= rank < cumulative+count)
+        cumulative += count
+    return sum(middle)/2 if total else None
 
 
 def game_lengths(run, hours=6, start='all'):
@@ -432,7 +443,7 @@ def game_lengths(run, hours=6, start='all'):
         if origin != 'actor' or (hours and now-manifest.get('created_at', 0) > hours*3600):
             continue
         episodes = path.with_name('episodes.json')
-        for (plies, source, ending), count in episode_lengths(str(episodes), episodes.stat().st_mtime_ns).items():
+        for (plies, source, ending, _, _), count in episode_summary(str(episodes), episodes.stat().st_mtime_ns).items():
             if start == 'all' or source == start:
                 counts[plies, ending] += count
     lengths, endings = Counter(), Counter()
@@ -445,13 +456,9 @@ def game_lengths(run, hours=6, start='all'):
             for low in range(0, max(lengths, default=-1)+1, width)]
     for (plies, ending), count in counts.items():
         bins[plies//width][ending] += count
-    middle, cumulative = [], 0
-    for plies, count in sorted(lengths.items()):
-        middle.extend(plies for rank in ((games-1)//2, games//2) if cumulative <= rank < cumulative+count)
-        cumulative += count
     return dict(run=run.name, hours=hours, start=start, games=games, bins=bins, endings=endings,
                 mean=sum(plies*n for plies, n in lengths.items())/games if games else None,
-                median=sum(middle)/2 if games else None, updated_at=now)
+                median=counted_median(lengths), updated_at=now)
 
 
 def provisional(league, evaluator):
@@ -629,10 +636,11 @@ BOOK_SORTS = {'games', 'p1_win_rate', 'skew_z', 'decisive_share', 'median_plies'
 
 
 def book_rows(run):
-    """Book counters plus report lengths along canonical prefixes, cached per run revision.
+    """Evaluator and book-start self-play results along canonical prefixes, cached per run revision.
 
     Report file mtimes matter too: rewriting a report need not change its directory's mtime.
     Archives belong here because book counters retain games across protocol refreshes.
+    Only this display combines results; the evaluator's paired book statistics stay unchanged.
     """
     run = Path(run)
     config = read_json(run/'config.json', {})
@@ -645,14 +653,27 @@ def book_rows(run):
     folder = run/'evaluations'
     paths = sorted(folder.glob('*/report*.json'))
     stamp = lambda path: (path.stat().st_mtime_ns, path.stat().st_size) if path.exists() else None
-    revision = (str(book), stamp(book), stamp(folder), tuple((str(p), stamp(p)) for p in paths))
+    shards = []
+    if suite == dense_openings.LIVE:
+        for path, manifest in dense_manifests(run/'shards'):
+            origin = manifest.get('origin') or ('converted' if 'source' in manifest.get('identity', {}) else 'actor')
+            if origin == 'actor' and manifest.get('counts', {}).get('book_games', 0) > 0:
+                episodes = path.with_name('episodes.json')
+                shards.append((str(episodes), episodes.stat().st_mtime_ns))
+    revision = (str(book), stamp(book), stamp(folder), tuple((str(p), stamp(p)) for p in paths), tuple(shards))
     cached = _book_cache.get(run)
     if cached and cached[0] == revision:
         return cached[1]
     data = read_json(book, {})
     nodes, counted = data.get('nodes', []), data.get('counted')
-    lengths = {node['key']: [] for node in nodes}
+    lengths = {node['key']: Counter() for node in nodes}
     matched = {}
+    def prefixes(moves):
+        if moves not in matched:
+            matched[moves] = [key for depth in range(1, len(moves)+1)
+                              if (key := dense_openings.canonical(moves[:depth])[0]) in lengths]
+        return matched[moves]
+
     for path in paths:
         report = read_json(path, {})
         if suite != dense_openings.LIVE and report.get('settings', {}).get(
@@ -666,24 +687,36 @@ def book_rows(run):
             games = [game for pair in dense_openings.pairs_of(report)[:limit] for game in pair]
         for game in games:
             moves = tuple(map(tuple, game['opening']))
-            if moves not in matched:
-                matched[moves] = [key for depth in range(1, len(moves)+1)
-                                  if (key := dense_openings.canonical(moves[:depth])[0]) in lengths]
-            for key in matched[moves]:
-                lengths[key].append(game['plies'])
+            for key in prefixes(moves):
+                lengths[key][game['plies']] += 1
+    report_games = {key: sum(plies.values()) for key, plies in lengths.items()}
+    actor_results = Counter()
+    for path, modified in shards:
+        for (plies, _, _, winner, moves), count in episode_summary(path, modified).items():
+            if not moves:
+                continue
+            for key in prefixes(moves):
+                actor_results[key, winner] += count
+                lengths[key][plies] += count
     rows = []
     for node in nodes:
         row = {key: node.get(key) for key in ('key', 'moves', 'depth', 'status', 'reason', 'created_at',
                'retired_at', 'champion_probability', 'champion_value', 'off_policy',
                'games', 'p1_wins', 'p2_wins', 'capped', 'pairs', 'skew')}
+        actor_games = sum(actor_results[row['key'], winner] for winner in (-1, 0, 1))
+        row['games'] += actor_games
+        for field, winner in (('p1_wins', 0), ('p2_wins', 1), ('capped', -1)):
+            row[field] += actor_results[row['key'], winner]
         decisive = row['p1_wins'] + row['p2_wins']
         plies = lengths[row['key']]
+        recorded = sum(plies.values())
         row.update(decisive=decisive, p1_win_rate=row['p1_wins']/decisive if decisive else None,
                    p2_value=1-row['champion_value'] if row['champion_value'] is not None else None,
                    skew_z=(row['p1_wins']-row['p2_wins'])/math.sqrt(decisive) if decisive else None,
                    decisive_share=decisive/row['games'] if row['games'] else None,
-                   report_games=len(plies), median_plies=statistics.median(plies) if plies else None,
-                   mean_plies=statistics.fmean(plies) if plies else None,
+                   report_games=report_games[row['key']], selfplay_games=actor_games,
+                   median_plies=counted_median(plies),
+                   mean_plies=sum(p*n for p, n in plies.items())/recorded if recorded else None,
                    parents=node.get('parents', dense_openings.parents(node['moves'])))
         rows.append(row)
     _book_cache[run] = revision, rows
