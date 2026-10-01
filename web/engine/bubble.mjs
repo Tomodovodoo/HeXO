@@ -27,12 +27,15 @@ export class BubbleEngine {
     this.waits = new Map();
     this.worker = null;
     this.ready = null;
+    this.abandon = null;
     this.device = null;
   }
 
   /** Starts the worker and loads the model; `progress(fraction)` reports loading. Resolves to the chosen device. */
   load(progress = () => {}) {
-    this.ready ??= new Promise((resolve, reject) => {
+    if (this.ready) return this.ready;
+    const ready = this.ready = new Promise((resolve, reject) => {
+      this.abandon = reject;
       this.worker = new Worker(new URL('worker.mjs', import.meta.url), {type: 'module'});
       this.worker.onmessage = ({data}) => {
         if (data.type === 'ready') { this.device = data.device; resolve(data.device); return; }
@@ -48,21 +51,22 @@ export class BubbleEngine {
         if (data.type === 'result') wait.resolve(data.result);
         else wait.reject(data.type === 'cancelled' ? new DOMException('Cancelled', 'AbortError') : new Error(data.message));
       };
-      this.worker.onerror = event => reject(new Error(event.message || 'Engine worker failed'));
+      this.worker.onerror = event => this.fail(new Error(event.message || 'Engine worker failed'));
       this.worker.postMessage({type: 'load', options: this.options});
     });
-    this.ready.catch(() => { this.ready = null; this.worker?.terminate(); });
-    return this.ready;
+    ready.catch(error => { if (this.ready === ready) this.fail(error); });
+    return ready;
   }
 
   async call(message, {signal, progress = () => {}} = {}) {
     await this.load();
     const id = ++this.calls;
     return new Promise((resolve, reject) => {
-      if (signal?.aborted) { reject(new DOMException('Cancelled', 'AbortError')); return; }
+      if (signal?.aborted || !this.worker) { reject(new DOMException(signal?.aborted ? 'Cancelled' : 'Closed', 'AbortError')); return; }
+      const worker = this.worker;
       this.waits.set(id, {resolve, reject, progress});
-      signal?.addEventListener('abort', () => this.worker.postMessage({type: 'cancel', id}), {once: true});
-      this.worker.postMessage({...message, id});
+      signal?.addEventListener('abort', () => worker.postMessage({type: 'cancel', id}), {once: true});
+      worker.postMessage({...message, id});
     });
   }
 
@@ -90,9 +94,19 @@ export class BubbleEngine {
     return this.call({type: 'bench', ...options});
   }
 
+  /** Ends the worker; pending loads and calls reject with an AbortError. */
   close() {
+    this.fail(new DOMException('Closed', 'AbortError'));
+  }
+
+  /** Ends the worker and rejects the pending load and calls with `error`; the next call starts a new worker. */
+  fail(error) {
     this.worker?.terminate();
     this.worker = null;
     this.ready = null;
+    this.abandon?.(error);
+    this.abandon = null;
+    for (const wait of this.waits.values()) wait.reject(error);
+    this.waits.clear();
   }
 }
