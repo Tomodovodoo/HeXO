@@ -612,6 +612,7 @@ class Session:
         self.entries, self.engines, self.store, self.rescan_entries = entries, engines, store, rescan
         self.lock = threading.Condition()
         self.history, self.revision, self.paused = [], 0, False
+        self.instance = os.urandom(4).hex()
         self.jobs, self.queue, self.order = OrderedDict(), [], itertools.count()
         bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
         opponent = bubble or entries['native:Native']
@@ -657,8 +658,9 @@ class Session:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'line', 'threat', 'simulations', 'solver_nodes')}
             entries = [{k: v for k, v in e.items() if k != 'path'} for e in self.entries.values()]
-            return dict(revision=self.revision, history=[list(p) for p in history], **board, paused=self.paused,
-                        seats=self.seats, analysis=self.analysis, engines=entries, evaluations=evaluations,
+            return dict(instance=self.instance, revision=self.revision, history=[list(p) for p in history], **board,
+                        paused=self.paused, seats=self.seats, analysis=self.analysis, engines=entries,
+                        evaluations=evaluations,
                         review=review(history, self.lookup, board['winner']), jobs=self.job_list())
 
     def job_list(self):
@@ -670,7 +672,7 @@ class Session:
     def poll(self, since):
         with self.lock:
             if since == self.revision:
-                return dict(revision=self.revision, jobs=self.job_list())
+                return dict(instance=self.instance, revision=self.revision, jobs=self.job_list())
         return self.state()
 
     # Changing
@@ -912,7 +914,17 @@ class Session:
             raise Cancelled()
         entry = self.entries[seat['engine']]
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
+        if spent['solver_nodes'] < budget['solver_nodes']:
+            timer = threading.Timer(31, self.retry, args=(list(history),))
+            timer.daemon = True
+            timer.start()
         return self.store.add(history, weights, spent, found | dict(model=model))
+
+    def retry(self, history):
+        """Analyse `history` again after a solver failure, when automatic analysis is on."""
+        with self.lock:
+            if self.analysis and self.analysis['auto']:
+                self.request_analysis(history, 1)
 
     def run(self, job):
         seat, history = job.seat, list(job.history)
