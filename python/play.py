@@ -153,10 +153,17 @@ def export_path(entry, checkpoint):
     return entry['path'] / 'checkpoints' / checkpoint / 'ema.pt' if checkpoint else entry['path']
 
 
+def file_identity(path):
+    """Path, size and modification, change and inode stamps: a new value whenever the file is replaced."""
+    stat = Path(path).stat()
+    return str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino
+
+
 @functools.lru_cache(maxsize=256)
-def file_digest(path, modified_ns, size):
+def file_digest(identity):
+    """SHA-256 of the file `identity` (see `file_identity`) names."""
     from legacy.train import digest
-    return digest(path)
+    return digest(identity[0])
 
 
 @functools.lru_cache(maxsize=8)
@@ -171,8 +178,7 @@ def file_build(package, modified_ns):
 
 def model_key(path):
     """Evaluations are keyed by the weights they came from: the first 16 hex digits of the file's SHA-256."""
-    stat = Path(path).stat()
-    return file_digest(str(path), stat.st_mtime_ns, stat.st_size)[:16]
+    return file_digest(file_identity(path))[:16]
 
 
 class Cancelled(Exception):
@@ -349,8 +355,7 @@ class Engines:
 
     def bubble(self, path):
         """The loaded export at `path`, reloaded when the file changes."""
-        stat = Path(path).stat()
-        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        key = file_identity(path)
         if key not in self.bubbles:
             self.bubbles[key] = Bubble(path, self.device)
             while len(self.bubbles) > 3:
