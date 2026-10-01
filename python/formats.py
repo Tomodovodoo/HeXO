@@ -116,7 +116,7 @@ def drawing(text):
             index += 1
             continue
         index += 1
-        if character == ' ':
+        if character in ' \r':
             continue
         if character in '/\n':
             start = start[0] + down[0], start[1] + down[1]

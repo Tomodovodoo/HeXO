@@ -724,7 +724,7 @@ function renderPanels(){
   const pips=view===S.history.length&&S.winner<0?(S.history.length?2:1):0,used=pips?(pips-S.remaining):0;
   $('pips').replaceChildren(...Array.from({length:pips},(_,i)=>el('i',{class:i<used?'used':''})));
   $('pips').classList.toggle('held',held);
-  if($('formats').classList.contains('show')&&$('formats').dataset.sig!==view+'/'+S.history.length)openFormats();
+  if($('formats').classList.contains('show')&&$('formats').dataset.sig!==shownSig())openFormats();
   if(focused&&$(focused)&&document.activeElement!==$(focused))$(focused).focus();
 }
 function renderJobs(){
@@ -770,7 +770,7 @@ function tokens(data){
 }
 function markTokens(k){for(const t of $('formats').querySelectorAll('.tok'))t.classList.toggle('on',t.dataset.k===k)}
 async function openFormats(){
-  const box=$('formats'),sig=view+'/'+S.history.length;box.dataset.sig=sig;
+  const box=$('formats'),sig=shownSig();box.dataset.sig=sig;
   const rows=await Promise.all(FORMATS.map(async([kind,name])=>{
     let data;try{data=await exported(kind)}catch(e){data={text:'',spans:[]}}
     const copy=el('button',{class:'ib ghost','aria-label':'Copy '+name,html:icon('copy')});copy.disabled=!data.text;
@@ -778,11 +778,12 @@ async function openFormats(){
     return el('div',{class:'format'},el('div',{class:'row'},el('span',{class:'chip'},name),el('span',{class:'spacer'}),copy),
       el('div',{class:'code'},data.text?tokens(data):'—'))}));
   if(box.dataset.sig!==sig)return;
-  if(sig!==view+'/'+S.history.length)return openFormats();
+  if(sig!==shownSig())return openFormats();
   box.replaceChildren(...rows);
   const r=$('more').getBoundingClientRect();box.style.left=Math.max(8,Math.min(r.right-312,innerWidth-320))+'px';box.style.top=(r.bottom+6)+'px';
   box.classList.add('show');
 }
+function shownSig(){return S.instance+'/'+view+'/'+S.history.slice(0,view).join(';')}
 function closeFormats(){$('formats').classList.remove('show');$('formats').dataset.sig=''}
 $('more').onclick=()=>$('formats').classList.contains('show')?closeFormats():openFormats();
 addEventListener('pointerdown',e=>{if($('formats').classList.contains('show')&&!e.target.closest('#formats,#more,#board'))closeFormats()});

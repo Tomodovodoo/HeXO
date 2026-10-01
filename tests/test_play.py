@@ -840,6 +840,7 @@ class Formats(unittest.TestCase):
         self.assertEqual(formats.rectilinear_loads('x A0 H2.2 o A1 G2.2'),
                          formats.rectilinear_loads('o, d @(0, 0) x A0 H2.2 o A1 G2.2'))
         self.assertEqual(formats.rectilinear_loads('c-x'), [[0, 0]])
+        self.assertEqual(formats.rectilinear_loads('oxo\r\nxx'), formats.rectilinear_loads('oxo/xx'))
         for text in ('x7x7o7o7x', 'oxo/xx'):
             self.assertEqual(len(formats.rectilinear_loads(text)), len(formats.drawing(text)))
         with self.assertRaisesRegex(ValueError, 'cannot be played'):
