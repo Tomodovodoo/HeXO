@@ -2,6 +2,7 @@
 multi-run comparison page at / and per-run detail at /?run=<name>. Read-only except metrics/gpu.jsonl, which the
 server appends to for dense runs with a live process (dense_config layout)."""
 import argparse
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import hashlib
@@ -790,10 +791,17 @@ def external_ratings(run, league):
     """
     checkpoints = {c['id']: c for c in league.get('checkpoints', []) if not c.get('skipped')}
     zero = next(iter(checkpoints), None)
-    ratings = {}
+    ratings, timestamps = {}, {}
     for path in sorted((run/'matches').glob('*/*-elo-estimate.json')):
         saved = read_json(path, {})
         if saved.get('schema') not in ('hexo-external-elo-estimate-v1', 'hexo-external-elo-estimate-v2'): continue
+        calculated = saved['calculated_at']
+        if isinstance(calculated, str):
+            try:
+                date = datetime.fromisoformat(calculated)
+                calculated = (date if date.tzinfo else date.replace(tzinfo=timezone.utc)).timestamp()
+            except (ValueError, OverflowError, OSError): continue
+        if not finite(calculated): continue
         match, estimate, opponent = saved['match'], saved['estimate'], saved['opponent']
         reference = checkpoints.get(match['local_checkpoint'], {})
         interval = reference.get('elo_interval')
@@ -819,7 +827,8 @@ def external_ratings(run, league):
         sd = estimate.get('pair_adjusted_delta_sd')
         if not intact or not finite(delta) or not finite(sd) or sd < 0: continue
         key = f"{opponent['model_id']}:{opponent['difficulty']}"
-        if key in ratings and ratings[key]['calculated_at'] >= saved['calculated_at']: continue
+        if key in ratings and timestamps[key] >= calculated: continue
+        timestamps[key] = calculated
         elo = reference['elo']-delta
         width = 1.96*math.hypot((interval[1]-interval[0])/3.92, sd)
         ratings[key] = dict(label=opponent.get('label', f"{opponent['model_id']} {opponent['difficulty']}"),

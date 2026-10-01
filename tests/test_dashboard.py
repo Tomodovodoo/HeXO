@@ -114,6 +114,19 @@ class ExternalRatings(unittest.TestCase):
             self.assertAlmostEqual(rating['elo_interval'][1]-1800, 1.96*math.sqrt(20000))
             reference['elo'] = 1700
             self.assertEqual(dashboard.external_ratings(run, league)['pulsatrix:standard']['elo'], 1900)
+            saved['calculated_at'] = '2026-09-30'
+            (folder/'opponent-elo-estimate.json').write_text(json.dumps(saved), encoding='utf-8')
+            newer = dict(saved, schema='hexo-external-elo-estimate-v2', calculated_at=1790812800,
+                sources=[dict(report='report.json', report_sha256=saved['match']['report_sha256'])],
+                estimate=dict(reference_minus_opponent_elo=-300, pair_adjusted_delta_sd=100, assumption='joint fit'))
+            # The numeric v2 file sorts before the ISO-string legacy file.
+            (folder/'a-newer-elo-estimate.json').write_text(json.dumps(newer), encoding='utf-8')
+            self.assertEqual(dashboard.external_ratings(run, league)['pulsatrix:standard']['elo'], 2000)
+            newer['calculated_at'] = '2026-09-29'
+            saved['calculated_at'] = 1790812800
+            (folder/'a-newer-elo-estimate.json').write_text(json.dumps(newer), encoding='utf-8')
+            (folder/'opponent-elo-estimate.json').write_text(json.dumps(saved), encoding='utf-8')
+            self.assertEqual(dashboard.external_ratings(run, league)['pulsatrix:standard']['elo'], 1900)
 
     def test_calibrated_match_requires_both_unchanged_reports(self):
         with tempfile.TemporaryDirectory() as directory:
