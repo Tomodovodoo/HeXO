@@ -1406,6 +1406,10 @@ class Session:
                     if not path.exists():
                         break
                     game = json.loads(path.read_text(encoding='utf-8'))
+                    notation = path.with_suffix('.htttx')
+                    temporary = notation.with_suffix('.htttx.tmp')
+                    temporary.write_text(dumps([tuple(p) for p in game['history']]), encoding='utf-8')
+                    temporary.replace(notation)
                     winner = game['winner']
                     player = (winner if number % 2 else 1-winner) if winner is not None else None
                     if player is None:
@@ -1422,6 +1426,8 @@ class Session:
                 registry = {}
                 for seat in match['players']:
                     source = seat['source']
+                    if seat['budget'].get('solver_nodes') and source['solver_build'] != self.engines.solver_build():
+                        raise ValueError('Tactical solver build changed since the batch started')
                     if source.get('weights') and file_digest(file_identity(source['weights'])) != source['weights_sha256']:
                         raise ValueError('Checkpoint weights changed since the batch started')
                     for path, digest in source['files'].items():
@@ -1762,6 +1768,8 @@ class Session:
             started = time.monotonic()
             if self.match and self.match['active']:
                 source = self.match['players'][job.side if self.match['current'] % 2 else 1-job.side]['source']
+                if seat['budget'].get('solver_nodes') and source['solver_build'] != self.engines.solver_build():
+                    raise ValueError('Tactical solver build changed during this batch')
                 files = source['files'] | ({source['weights']: source['weights_sha256']} if source.get('weights') else {})
                 if any(file_digest(file_identity(path)) != digest for path, digest in files.items()):
                     raise ValueError('An engine or checkpoint file changed during this batch')

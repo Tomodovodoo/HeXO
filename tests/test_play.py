@@ -809,12 +809,24 @@ class Matches(unittest.TestCase):
         self.session.stop_match()
         wait(lambda: not self.session.match_worker.is_alive())
         first = (self.output / 'game-0001.json').read_bytes()
+        (self.output / 'game-0001.htttx').write_text('interrupted notation write')
         self.session.resume_match(self.output)
         wait(lambda: not self.session.match_worker.is_alive())
         self.assertEqual((self.output / 'game-0001.json').read_bytes(), first)
+        self.assertEqual(import_history((self.output / 'game-0001.htttx').read_text()), json.loads(first)['history'])
         self.assertEqual(self.session.match['completed'], 2)
         self.assertEqual(self.session.match['pentanomial'], [0, 0, 1, 0, 0])
         self.assertEqual(len(list(self.output.glob('game-*.json'))), 2)
+
+    def test_resume_rejects_a_changed_tactical_solver(self):
+        self.session.start_match(['bubble:2@quick', 'Other'], output=self.output, max_placements=3)
+        wait(lambda: self.session.match['completed'] == 1)
+        self.session.stop_match()
+        wait(lambda: not self.session.match_worker.is_alive())
+        self.engines.solver_build = lambda: 'new-build'
+        with self.assertRaisesRegex(ValueError, 'Tactical solver build changed'):
+            self.session.resume_match(self.output)
+        self.assertFalse(self.session.match['active'])
 
     def test_seat_specs_resolve_presets_checkpoint_steps_and_custom_budgets(self):
         seat = self.session.match_seat('bubble:2@quick', 'standard')
