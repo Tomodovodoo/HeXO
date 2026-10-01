@@ -966,7 +966,8 @@ class Session:
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
         if spent['solver_nodes'] < budget['solver_nodes'] and job.kind == 'analyse':
             with self.lock:
-                tries = self.retries[tuple(history)] = self.retries.get(tuple(history), 0) + 1
+                tried = (tuple(history), weights, budget['simulations'], budget['solver_nodes'])
+                tries = self.retries[tried] = self.retries.get(tried, 0) + 1
             if tries <= 3:
                 timer = threading.Timer(31, self.retry, args=(list(history),))
                 timer.daemon = True
@@ -974,7 +975,8 @@ class Session:
         return self.store.add(history, weights, spent, found | dict(model=model))
 
     def retry(self, history):
-        """Analyse `history` again after a solver failure, when automatic analysis is on; at most three times."""
+        """Analyse `history` again after a solver failure, when automatic analysis is on; at most three times for
+        one position, model, solver build and budget."""
         with self.lock:
             if self.analysis and self.analysis['auto'] and tuple(history) == tuple(self.history[:len(history)]):
                 self.request_analysis(history, 1)
