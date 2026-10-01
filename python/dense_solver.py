@@ -596,16 +596,22 @@ class Proof:
         move = self.path(history)[1]
         return [list(a) for a in move[0]] if move and move[0] else None
 
-    def reply(self, history):
-        """The defender stones still to play in the first certificate reply that extends the defender's turn in
-        progress at the end of `history`, or None (not at a covered defender turn on the certificate)."""
+    def reply(self, history, rng=None):
+        """Defender stones in a covered reply extending this turn, or None. Use the first compatible reply by
+        default; an RNG samples compatible replies for forced-line training."""
         _, move, node, played = self.walk(history)
         if move is None or move[0] or node['kind'] != 'defender_replies':
             return None
+        replies = []
         for response in node['responses']:
             action = [tuple(a) for a in response['action']]
             if set(played) <= set(action):
-                return [a for a in action if a not in played]
+                reply = [a for a in action if a not in played]
+                if rng is None:
+                    return reply
+                replies.append(reply)
+        if replies:
+            return replies[int(rng.integers(len(replies)))]
         return None
 
     def walk(self, history):
