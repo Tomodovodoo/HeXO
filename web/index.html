@@ -778,6 +778,7 @@ async function openFormats(){
     return el('div',{class:'format'},el('div',{class:'row'},el('span',{class:'chip'},name),el('span',{class:'spacer'}),copy),
       el('div',{class:'code'},data.text?tokens(data):'—'))}));
   if(box.dataset.sig!==sig)return;
+  if(sig!==view+'/'+S.history.length)return openFormats();
   box.replaceChildren(...rows);
   const r=$('more').getBoundingClientRect();box.style.left=Math.max(8,Math.min(r.right-312,innerWidth-320))+'px';box.style.top=(r.bottom+6)+'px';
   box.classList.add('show');
