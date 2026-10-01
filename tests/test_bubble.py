@@ -34,6 +34,20 @@ class FakeProcesses:
 
 
 class CommandTests(unittest.TestCase):
+    def test_match_command_submits_seats_and_shared_clock_to_the_player(self):
+        from unittest.mock import patch
+        args = ['bubble.py', 'match', 'run@123{simulations=512,solver_nodes=0}', 'Six@quick',
+                '--port', '8877', '--tc', '180+2', '--unique-openings', '16', '--a-device', 'cpu']
+        with patch.object(sys, 'argv', args), patch.object(bubble, 'ensure_player', return_value={}), \
+                patch.object(bubble, 'player_request', return_value={}) as request:
+            bubble.main()
+        port, path, body = request.call_args.args
+        self.assertEqual((port, path), (8877, '/match'))
+        self.assertEqual(body['players'][0], dict(engine='run@123{simulations=512,solver_nodes=0}', device='cpu'))
+        self.assertEqual(body['players'][1], dict(engine='Six@quick'))
+        self.assertEqual(body['clock'], dict(mode='game', tc='180+2'))
+        self.assertEqual(body['unique_openings'], 16)
+
     def test_every_service_targets_the_run(self):
         plan = bubble.commands(Path('runs/x'), actors=3, dashboard_port=9000)
         self.assertEqual(set(plan), set(bubble.SERVICES))

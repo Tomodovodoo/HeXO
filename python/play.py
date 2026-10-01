@@ -14,6 +14,8 @@ import json
 import math
 import os
 import queue
+import random
+import re
 import shlex
 import shutil
 import subprocess
@@ -30,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from hexo import Game
 from notation import NotationConflict, dumps, loads
 from process_tree import TreeProcess
+from time_control import Clock, TimeControl, duration, milliseconds
 
 ROOT = Path(__file__).resolve().parents[1]
 PRESETS = dict(
@@ -98,6 +101,71 @@ def checked_turn(history, moves):
         raise ValueError('Engine returned an incomplete turn')
     finally:
         game.close()
+
+
+def book_openings(path, mode='wide', count=None, seed=0):
+    """Freeze a read-only selection of the book's canonical openings, without replacement."""
+    if mode not in ('narrow', 'wide', 'all'):
+        raise ValueError('Opening range must be narrow, wide or all')
+    if count is not None and (type(count) is not int or count < 1):
+        raise ValueError('unique_openings must be positive')
+    if type(seed) is not int:
+        raise ValueError('Opening seed must be an integer')
+    path = Path(path)
+    raw = path.read_bytes()
+    book = json.loads(raw)
+    if book['schema'] != 'hexo-opening-book-v2':
+        raise ValueError('Choose a v2 opening book')
+    # Known-result tactical cases stay outside the ordinary comparison pool.
+    nodes = {n['key']: n for n in book['nodes'] if n['status'] == 'opening'
+             and (mode == 'all' or not n.get('off_policy'))}
+    pool = sorted(nodes.values(), key=lambda n: n['key'])
+    count = min(8, len(pool)) if count is None and mode == 'narrow' else len(pool) if count is None else count
+    if not pool or count > len(pool):
+        raise ValueError(f'{mode} has {len(pool)} unique openings; requested {count}')
+    rng = random.Random(seed)
+    if mode == 'narrow':
+        if any(n.get('champion_probability') is None for n in pool):
+            raise ValueError('Narrow selection needs recorded champion policy probabilities for this book')
+        pool.sort(key=lambda n: (-n['champion_probability'], n['key']))
+        selected = pool[:count]
+        cutoff = selected[-1]['champion_probability']
+    else:
+        selected = rng.sample(pool, count)
+        cutoff = None
+    rng.shuffle(selected)
+    from hexcrop import SYMMETRIES
+    nodes = []
+    for node in selected:
+        orientation = rng.randrange(len(SYMMETRIES))
+        transform = SYMMETRIES[orientation]
+        moves = [[int(q*transform[0, 0]+r*transform[1, 0]), int(q*transform[0, 1]+r*transform[1, 1])]
+                 for q, r in node['moves']]
+        nodes.append({k: node.get(k) for k in ('key', 'champion_probability', 'scored_by', 'off_policy')} |
+                     dict(moves=moves, symmetry=orientation))
+    return dict(book=str(path.resolve()), sha256=hashlib.sha256(raw).hexdigest(), range=mode, seed=seed,
+                eligible=len(pool), unique_openings=count, policy_cutoff=cutoff, refreshed_by=book.get('refreshed_by'),
+                nodes=nodes)
+
+
+def lock_match(directory):
+    """Hold an OS lock for the batch; a process exit releases it, including after a crash."""
+    handle = (Path(directory) / 'match.lock').open('a+b')
+    if handle.tell() == 0:
+        handle.write(b'0')
+        handle.flush()
+    handle.seek(0)
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        handle.close()
+        raise ValueError('This batch is already owned by another player') from error
+    return handle
 
 
 # Engines
@@ -387,6 +455,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     local = replay(history)
     start, player = time.perf_counter(), local.player
     moves, top, value, proof, line, threat, solved, tree = [], [], None, None, [], [], True, None
+    completed = solver_used = 0
     deadline = min(60_000, max(10_000, solver_nodes // 8))
     network = Watched(bubble.evaluator, watch)
     try:
@@ -396,6 +465,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
             mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=deadline),
                                  watch, prover.abort)
             solved = searched(mine)
+            solver_used += mine.get('nodes_used', 0)
             if verified(mine):
                 moves, line = [list(m) for m in mine['moves']], winning_line(history, mine)
                 proof = dict(winner=player, turns=mine['proof_turns'])
@@ -403,6 +473,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline),
                                        watch, prover.abort)
                 solved = solved and searched(theirs)
+                solver_used += theirs.get('nodes_used', 0)
                 if verified(theirs):
                     threat = [list(m) for m in theirs['moves']]
         given = bool(moves)
@@ -413,6 +484,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                     tree = NeuralSearch(network, bubble.sha256, current, seed=1740, cache=bubble.cache, tactics=True)
                 result = tree.search(simulations, root_samples=16, batch_size=16)
                 action, policy, actions = result['action'], result['policy'], result['actions']
+                completed += result.get('completed', 0)
                 stone_value = root_value(result, local.player)
                 proven = result.get('proven') or 0
                 if proof is None and (proven > 0 or proven < 0 and not moves):
@@ -434,7 +506,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         if proof:
             value = 1. if proof['winner'] == player else 0.
         return dict(moves=moves, value=round(value, 4), top=top, proof=proof, line=line, threat=threat,
-                    solved=solved, ms=round((time.perf_counter() - start) * 1000))
+                    solved=solved, ms=round((time.perf_counter() - start) * 1000),
+                    actual_completed=completed, actual_solver_nodes=solver_used)
     finally:
         if tree is not None:
             tree.close()
@@ -478,12 +551,14 @@ class Engines:
         self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
         self.external = {}
         self.children = {}
+        self.last_turn = {}
 
-    def bubble(self, path):
+    def bubble(self, path, device=None):
         """The loaded export at `path`, reloaded when the file changes."""
-        key = file_identity(path)
+        device = device or self.device
+        key = (device, *file_identity(path))
         if key not in self.bubbles:
-            self.bubbles[key] = Bubble(path, self.device)
+            self.bubbles[key] = Bubble(path, device)
             while len(self.bubbles) > 3:
                 self.bubbles.popitem(last=False)
         self.bubbles.move_to_end(key)
@@ -505,10 +580,10 @@ class Engines:
             self.prover, self.prover_build = tactical_proof.IsolatedTactics(package, priority='below_normal'), build
         return self.prover, build
 
-    def evaluate(self, entry, checkpoint, budget, history, watch):
+    def evaluate(self, entry, checkpoint, budget, history, watch, device=None):
         """`evaluate` with the entry's export; returns the evaluation, the budget it really had (no solver nodes
         when the solver is not built) and the key of the weights it used (see `model_key`)."""
-        bubble = self.bubble(export_path(entry, checkpoint))
+        bubble = self.bubble(export_path(entry, checkpoint), device)
         solver, build = self.solver() if budget['solver_nodes'] else (None, 'none')
         spent = budget if solver else budget | dict(solver_nodes=0)
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch)
@@ -537,6 +612,7 @@ class Engines:
         Native, Seal and Strix searches cannot be interrupted in process, so each kind searches in a SearchChild;
         when `stop()` turns true the child and everything it started are killed and a fresh one starts on the next
         turn. Both raise Cancelled."""
+        self.last_turn = {}
         kind = entry['kind']
         if kind == 'six':
             return self.protocol(entry, budget, history, stop)
@@ -563,6 +639,7 @@ class Engines:
         answer = json.loads(line)
         if 'error' in answer:
             raise RuntimeError(answer['error'])
+        self.last_turn = answer.get('measurements', {})
         return answer['moves']
 
     def protocol(self, entry, budget, history, stop):
@@ -588,7 +665,9 @@ class Engines:
                 self.external[key] = SixEngine(command, mirrored=entry['mirrored'], cwd=entry['cwd'],
                                                path=entry['libraries'], cancel=cancel, log=True,
                                                startup=900)
-            return self.external[key](game, budget.get('ms'), nodes=budget.get('nodes'))
+            moves = self.external[key](game, budget.get('ms'), nodes=budget.get('nodes'))
+            self.last_turn = dict(nodes=self.external[key].info.get('nodes'))
+            return moves
         except ProtocolError:
             if cancel.is_set():
                 raise Cancelled() from None
@@ -804,6 +883,9 @@ class Job:
         return dict(id=self.id, kind=self.kind, status=self.status, done=self.done, total=self.total,
                     error=self.error, ply=len(self.history), side=getattr(self, 'side', None))
 
+    def is_set(self):
+        return self.cancelled
+
 
 def budget_of(presets, preset, custom=None, kind=None):
     """The budget of `preset` from an entry's `presets`, or the standard budget with `custom` values checked
@@ -832,11 +914,18 @@ class Session:
     """The game, the seats, the analysis settings and the job queue. HTTP threads call the public methods; one
     worker thread runs the jobs through `engines`. `revision` grows with every change the page must redraw."""
 
-    def __init__(self, entries, engines, store, rescan=lambda: None):
+    def __init__(self, entries, engines, store, rescan=lambda: None, book=None, archive=None, study_store=None):
         self.entries, self.engines, self.store, self.rescan_entries = entries, engines, store, rescan
+        self.book = book
+        self.archive = Path(archive) if archive else None
+        self.study_store = study_store
+        self.saved_matches, self.study, self.saved_game = {}, None, None
         self.lock = threading.Condition()
         self.history, self.revision, self.paused = [], 0, False
         self.instance, self.closing = os.urandom(4).hex(), False
+        self.match, self.match_worker = None, None
+        self.match_clock, self.timed_engines = None, []
+        self.match_file = None
         self.retries = {}
         self.jobs, self.queue, self.order = OrderedDict(), [], itertools.count()
         bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
@@ -873,6 +962,12 @@ class Session:
 
     # Reading
 
+    def models(self):
+        shown = ('id', 'name', 'kind', 'presets', 'checkpoints')
+        with self.lock:
+            return [{k: e[k] for k in shown if k in e} |
+                    dict(clocks=e['kind'] in ('bubble', 'six', 'native', 'seal')) for e in self.entries.values()]
+
     def lookup(self, history):
         key = self.engine_key(self.analysis) if self.analysis else None
         return self.store.best(history, key) if key else None
@@ -893,6 +988,10 @@ class Session:
             entries = [{k: e[k] for k in shown if k in e} for e in self.entries.values()]
             return dict(instance=self.instance, revision=self.revision, history=[list(p) for p in history], **board,
                         paused=self.paused, seats=self.seats, analysis=self.analysis, engines=entries,
+                        match={k: v for k, v in self.match.items() if k not in ('results', 'openings', 'opening_selection')}
+                        if self.match else None,
+                        clock=self.match_clock.json() if self.match_clock else None,
+                        saved_game=self.saved_game,
                         evaluations=evaluations,
                         review=review(history, self.lookup, board['winner']), jobs=self.job_list())
 
@@ -905,7 +1004,8 @@ class Session:
     def poll(self, since):
         with self.lock:
             if since == self.revision:
-                return dict(instance=self.instance, revision=self.revision, jobs=self.job_list())
+                return dict(instance=self.instance, revision=self.revision, jobs=self.job_list(),
+                            **(dict(clock=self.match_clock.json()) if self.match_clock else {}))
         return self.state()
 
     # Changing
@@ -921,7 +1021,12 @@ class Session:
         seat = self.seats[player]
         busy = any(j.kind == 'move' and j.status in ('queued', 'running') and not j.cancelled
                    and j.history == tuple(self.history) for j in self.jobs.values())
-        if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy:
+        waiting = self.match and self.match['active'] and (self.match['between'] or self.match['preparing'] or
+                                                          self.match.get('outcome') or
+                                                          len(self.history) >= self.match['max_placements'])
+        if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy and not waiting:
+            if self.match_clock and self.match and self.match['active'] and self.match_clock.running is None:
+                self.match_clock.start(player)
             self.submit(Job('move', 1, self.history, side=player, seat=dict(seat)))
         for job in self.jobs.values():
             stale = job.history != tuple(self.history[:len(job.history)])
@@ -965,6 +1070,7 @@ class Session:
 
     def play(self, q, r):
         with self.lock:
+            self.match_editable()
             game = replay(self.history)
             try:
                 if game.winner >= 0 or self.seats[game.player]['engine'] != 'human':
@@ -978,6 +1084,7 @@ class Session:
     def undo(self):
         """Take back stones to the start of the latest turn a person played, or one stone without people."""
         with self.lock:
+            self.match_editable()
             if not self.history:
                 return
             people = [i for i, seat in enumerate(self.seats) if seat['engine'] == 'human']
@@ -992,7 +1099,11 @@ class Session:
         """Replace the game with `history` (validated)."""
         replay(history).close()
         with self.lock:
+            self.match_editable()
             self.history, self.paused = [tuple(map(int, p)) for p in history], paused
+            self.match = None
+            self.match_clock = None
+            self.saved_game = None
             self.stop_moves()
             self.changed()
 
@@ -1006,6 +1117,7 @@ class Session:
 
     def configure_seat(self, side, engine, checkpoint=None, preset='standard', custom=None):
         with self.lock:
+            self.match_editable()
             self.seats[side] = self.seat(engine, checkpoint, preset, custom)
             self.stop_moves(side)
             self.changed()
@@ -1072,6 +1184,9 @@ class Session:
                 job.cancelled = True
                 if job.kind == 'move':
                     self.paused = True
+                    if self.match_clock:
+                        self.pause_clock()
+                        self.save_match_position()
                 if job.status == 'queued':
                     job.status = 'cancelled'
                 self.revision += 1
@@ -1081,6 +1196,509 @@ class Session:
             self.paused = bool(paused)
             if self.paused:
                 self.stop_moves()
+                if self.match_clock:
+                    self.pause_clock()
+            if self.match:
+                self.save_match_position()
+            self.changed()
+
+    # Bot matches use the same seats, jobs and board as interactive play.
+
+    def remember_match(self, directory):
+        directory = Path(directory).resolve()
+        ident = hashlib.sha256(str(directory).encode()).hexdigest()[:16]
+        self.saved_matches[ident] = directory
+        if self.archive:
+            self.archive.mkdir(parents=True, exist_ok=True)
+            path = self.archive / f'{ident}.json'
+            temporary = path.with_suffix(f'.{os.getpid()}.tmp')
+            temporary.write_text(json.dumps(str(directory)), encoding='utf-8')
+            temporary.replace(path)
+        return ident
+
+    def match_catalogue(self):
+        if self.archive:
+            for path in self.archive.glob('*.json'):
+                self.saved_matches[path.stem] = Path(json.loads(path.read_text(encoding='utf-8')))
+        rows = []
+        for ident, directory in list(self.saved_matches.items()):
+            try:
+                match = json.loads((directory / 'summary.json').read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                continue
+            # A replay is committed before the summary. Recover only that trailing suffix,
+            # so ordinary catalogue reads do not reopen every saved game.
+            for number in range(len(match['results'])+1, match['games']+1):
+                path = directory / f'game-{number:04d}.json'
+                if not path.exists():
+                    break
+                game = json.loads(path.read_text(encoding='utf-8'))
+                winner = game['winner']
+                player = (winner if number % 2 else 1-winner) if winner is not None else None
+                if player is None:
+                    match['capped'] += 1
+                else:
+                    match['wins'][player] += 1
+                match['results'].append(dict(game=number, winner=player, reason=game['reason'],
+                    placements=len(game['history']), opening=((number-1)//2) % len(match['openings'])))
+            match['completed'] = len(match['results'])
+            rows.append(dict(id=ident, name=directory.name, **{key: match[key] for key in
+                ('games', 'completed', 'wins', 'capped', 'results')}, players=[p['name'] for p in match['players']]))
+        return sorted(rows, key=lambda row: row['name'], reverse=True)
+
+    def saved_replay(self, ident, number):
+        self.match_catalogue()
+        if ident not in self.saved_matches or type(number) is not int or number < 1:
+            raise ValueError('No such saved game')
+        directory = self.saved_matches[ident]
+        game = json.loads((directory / f'game-{number:04d}.json').read_text(encoding='utf-8'))
+        return directory, game
+
+    def open_saved_game(self, ident, number):
+        directory, game = self.saved_replay(ident, number)
+        with self.lock:
+            if self.study is None:
+                # Analysis has its own queue and CPU model; it cannot spend a live game's clock.
+                self.study = Session(dict(self.entries), Engines('cpu', getattr(self.engines, 'tactical_package', None)),
+                                     Evaluations(self.study_store), self.rescan_entries)
+            study = self.study
+        with study.lock:
+            for job in study.jobs.values():
+                if job.status in ('queued', 'running'):
+                    job.cancelled = True
+            study.entries.update(self.entries)
+            study.seats = [dict(engine='human'), dict(engine='human')]
+            if study.analysis:
+                study.analysis['auto'] = False
+            # Reuse evaluations already saved during the tournament, without editing its files.
+            path = directory / 'evaluations.jsonl'
+            if path.exists():
+                with study.store.lock, path.open(encoding='utf-8') as lines:
+                    for line in lines:
+                        try:
+                            record = json.loads(line)
+                            key = (hashlib.blake2b(record['position'].encode(), digest_size=16).digest(), record['engine'],
+                                   (record['simulations'], record['solver_nodes']))
+                            if key not in study.store.order:
+                                study.store.index(record, line.strip())
+                        except (ValueError, KeyError, TypeError):
+                            continue
+            study.load(game['history'], True)
+            study.saved_game = dict(batch=ident, name=directory.name, game=number,
+                                   players=[p['name'] for p in game['players']], winner=game['winner'], reason=game['reason'])
+        return study
+
+    def match_editable(self):
+        if self.match and self.match['active'] or self.match_worker and self.match_worker.is_alive():
+            raise ValueError('Stop the match before changing its players or position')
+
+    def match_seat(self, specification, preset):
+        specification = dict(engine=specification) if isinstance(specification, str) else dict(specification)
+        selector = specification['engine']
+        if selector.endswith('}') and '{' in selector:
+            selector, custom = selector[:-1].rsplit('{', 1)
+            specification.update(preset='custom', custom={k.strip(): int(v.strip())
+                                 for k, v in (item.split('=', 1) for item in custom.split(','))})
+        if '@' in selector:
+            selector, suffix = selector.rsplit('@', 1)
+            specification['preset' if suffix in ('quick', 'standard', 'strong', 'deep') else 'checkpoint'] = suffix
+            if '@' in selector:
+                selector, specification['checkpoint'] = selector.rsplit('@', 1)
+        if Path(selector).is_file() and Path(selector).suffix == '.pt':
+            found = scan(extra_runs=[Path(selector)])
+            entry = next(e for e in found.values() if e['kind'] == 'bubble')
+            same = next((e for e in self.entries.values() if e['kind'] == 'bubble' and e['path'] == entry['path']), None)
+            if same:
+                entry = same
+            elif entry['id'] in self.entries:
+                entry['id'] += '~' + hashlib.sha256(str(entry['path']).encode()).hexdigest()[:8]
+            self.entries[entry['id']] = entry
+            selector = entry['id']
+        name = selector.casefold()
+        matches = [e for e in self.entries.values() if name in (e['id'].casefold(), e['name'].casefold())]
+        if not matches:
+            matches = [e for e in self.entries.values() if name == e['kind']]
+        if not matches and name.startswith('bubble:') and name[7:].isdigit():
+            specification['checkpoint'] = name[7:]
+            matches = [e for e in self.entries.values() if e['kind'] == 'bubble' and
+                       any(c.rsplit('/', 1)[-1].isdigit() and int(c.rsplit('/', 1)[-1]) == int(name[7:])
+                           for c in e['checkpoints'])]
+        if len(matches) != 1:
+            choices = ', '.join(e['id'] for e in matches or self.entries.values())
+            raise ValueError(f'Choose an unambiguous engine for {specification["engine"]!r}: {choices}')
+        entry = matches[0]
+        checkpoint = specification.get('checkpoint')
+        if entry['kind'] == 'bubble' and checkpoint:
+            if checkpoint == 'champion':
+                path = Path(entry['path'])
+                checkpoint = json.loads((path / 'champion.json').read_text(encoding='utf-8'))['checkpoint']
+            elif checkpoint.isdigit():
+                found = [c for c in entry['checkpoints'] if c.rsplit('/', 1)[-1].isdigit() and
+                         int(c.rsplit('/', 1)[-1]) == int(checkpoint)]
+                if len(found) != 1:
+                    raise ValueError('Choose a full, unambiguous checkpoint id')
+                checkpoint = found[0]
+        seat = self.seat(entry['id'], checkpoint, specification.get('preset', preset),
+                         specification.get('custom'))
+        source = {k: str(v) if isinstance(v, Path) else v for k, v in entry.items()
+                  if k in ('kind', 'name', 'path', 'command', 'cwd', 'model', 'mirrored')}
+        if 'libraries' in entry:
+            source['libraries'] = list(map(str, entry['libraries']))
+        if entry['kind'] == 'bubble':
+            source['weights'] = str(export_path(entry, seat['checkpoint']).resolve())
+            source['weights_sha256'] = file_digest(file_identity(source['weights']))
+            seat['device'] = specification.get('device', getattr(self.engines, 'device', 'cpu'))
+            if seat['device'] not in ('cpu', 'cuda'):
+                raise ValueError('Bubble device must be cpu or cuda')
+        elif 'device' in specification:
+            raise ValueError('Choose the external engine backend from its catalogue entry')
+        source['device'] = seat.get('device', entry['name'].rsplit(' · ', 1)[-1] if entry['kind'] == 'six' else 'cpu')
+        from hexo import library
+        files = [library]
+        if entry['kind'] == 'bubble':
+            files += [library.with_name(library.name.replace('hexo', 'hexo_gumbel'))]
+            source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] else 'none'
+        elif entry['kind'] == 'six':
+            command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in entry['command']]
+            files += [path for path in command_files if path.is_file()]
+        elif entry['kind'] == 'strix':
+            files += [Path(entry['model'])]
+        elif entry['kind'] == 'seal':
+            files += [library.with_name(library.name.replace('hexo', 'hexo_seal'))]
+        source['files'] = {str(path.resolve()): file_digest(file_identity(path)) for path in files}
+        return seat | dict(name=entry['name'] + (f"/{seat['checkpoint']}" if seat['checkpoint'] else ''), source=source)
+
+    def start_match(self, players, games=None, preset='standard', output=None, openings=None, max_placements=512,
+                    book=None, opening_range=None, unique_openings=None, seed=0, evaluations=None, clock=None):
+        with self.lock:
+            self.match_editable()
+            board = replay(self.history)
+            try:
+                if self.history and board.winner < 0 and any(s['engine'] == 'human' for s in self.seats):
+                    raise ValueError('A human game is on this board; use a new player port or finish/reset that game')
+            finally:
+                board.close()
+            if unique_openings is not None and (type(unique_openings) is not int or unique_openings < 1):
+                raise ValueError('unique_openings must be positive')
+            if games is None:
+                games = 2 * (len(openings) if openings is not None else unique_openings or 1)
+            if len(players) != 2 or type(games) is not int or games < 1:
+                raise ValueError('A match needs two engines and a positive number of games')
+            if type(max_placements) is not int or max_placements < 2:
+                raise ValueError('max_placements must be at least 2')
+            seats = [self.match_seat(p, preset) for p in players]
+            clock = clock or dict(mode='fixed')
+            mode = clock['mode']
+            if mode not in ('fixed', 'move', 'game'):
+                raise ValueError('Clock mode must be fixed, move or game')
+            if mode == 'move':
+                clock = dict(mode=mode, ms=milliseconds(clock['ms'], 'move time', positive=True))
+            elif mode == 'game':
+                clock = dict(mode=mode, **TimeControl.parse(clock.get('tc', clock)).json())
+            if mode != 'fixed':
+                for seat in seats:
+                    self.timed_config(seat)  # Refuse unsupported adapters before starting or writing results.
+            selection = None
+            book = book or self.book
+            if openings is None and (book or opening_range or unique_openings):
+                if not book:
+                    raise ValueError('Select an opening book with --book or --dense-run')
+                count = unique_openings or (games + 1) // 2
+                if games % 2:
+                    raise ValueError('Book matches need an even game count for colour-swapped opening pairs')
+                if unique_openings and games < 2 * unique_openings:
+                    raise ValueError('Each unique book opening needs two colour-swapped games')
+                selection = book_openings(book, opening_range or 'wide', count, seed)
+                openings = [n['moves'] for n in selection['nodes']]
+            elif openings is not None and (opening_range or unique_openings):
+                raise ValueError('Choose explicit openings or a book selection, not both')
+            openings = [[[0, 0]]] if openings is None else openings
+            if not openings:
+                raise ValueError('Provide at least one opening')
+            openings = [import_history(json.dumps(h)) for h in openings]
+            for history in openings:
+                game = replay(history)
+                try:
+                    if game.winner >= 0 or len(history) >= max_placements:
+                        raise ValueError('An opening must be unfinished and shorter than max_placements')
+                    dumps([tuple(p) for p in history])
+                finally:
+                    game.close()
+            name = datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + os.urandom(3).hex()
+            directory = Path(output) if output else ROOT / 'artifacts' / 'play' / name
+            directory.mkdir(parents=True, exist_ok=False)
+            match = dict(schema='bubble-match-v1', active=True, between=False, games=games, completed=0, current=1, wins=[0, 0], capped=0,
+                         players=seats, results=[], openings=openings, max_placements=max_placements,
+                         output=str(directory.resolve()), error=None, opening_selection=selection,
+                         unique_openings=len(openings), opening_range=selection['range'] if selection else 'explicit',
+                         clock=clock, preparing=mode != 'fixed', turns=[], outcome=None, pentanomial=[0]*5, seed=seed,
+                         partial_spent_ms=0)
+            self.write_match(match)
+            self.remember_match(directory)
+            evaluation_path = Path(evaluations) if evaluations else directory / 'evaluations.jsonl'
+            evaluation_path.parent.mkdir(parents=True, exist_ok=True)
+            self.store = Evaluations(evaluation_path)
+            self.match = match
+            self.match_file = lock_match(directory)
+            self.match_clock = self.new_match_clock()
+            for job in self.jobs.values():
+                if job.status in ('queued', 'running'):
+                    job.cancelled = True
+            if self.analysis:
+                self.analysis = self.analysis | dict(auto=False)
+            self.history = [tuple(p) for p in openings[0]]
+            self.seats = [{k: v for k, v in s.items() if k not in ('name', 'source')} for s in seats]
+            self.paused = False
+            self.save_match_position()
+            self.changed()
+            self.match_worker = threading.Thread(target=self.run_match, args=(match,), daemon=True)
+            self.match_worker.start()
+
+    def write_match(self, match, name='summary.json', data=None):
+        path = Path(match['output']) / name
+        temporary = path.with_suffix(path.suffix + '.tmp')
+        temporary.write_text(json.dumps(match if data is None else data, indent=2), encoding='utf-8')
+        temporary.replace(path)
+
+    def new_match_clock(self):
+        specification = self.match['clock']
+        if specification['mode'] == 'fixed':
+            return None
+        return Clock(dict(base_ms=specification['ms']) if specification['mode'] == 'move' else specification)
+
+    def save_match_position(self):
+        if self.match:
+            self.write_match(self.match, 'current.json', dict(game=self.match['current'], history=list(self.history),
+                             seats=self.seats, turns=self.match['turns'],
+                             partial_spent_ms=self.match.get('partial_spent_ms', 0),
+                             balances=self.match_clock.remaining() if self.match_clock else None))
+
+    def pause_clock(self):
+        if self.match_clock:
+            elapsed = self.match_clock.stop()/1e6
+            self.match['partial_spent_ms'] = self.match.get('partial_spent_ms', 0) + elapsed
+
+    def resume_match(self, directory):
+        with self.lock:
+            self.match_editable()
+            if self.history and any(s['engine'] == 'human' for s in self.seats):
+                raise ValueError('Use an empty player board to resume a saved batch')
+            directory = Path(directory).resolve()
+            handle = lock_match(directory)
+            try:
+                match = json.loads((directory / 'summary.json').read_text(encoding='utf-8'))
+                if match['schema'] != 'bubble-match-v1':
+                    raise ValueError('Not a saved player batch')
+                # Completed replay files are the commits; summary/current may lag one file after a crash.
+                results, wins, capped, pairs = [], [0, 0], 0, [0]*5
+                for number in range(1, match['games']+1):
+                    path = directory / f'game-{number:04d}.json'
+                    if not path.exists():
+                        break
+                    game = json.loads(path.read_text(encoding='utf-8'))
+                    notation = path.with_suffix('.htttx')
+                    temporary = notation.with_suffix('.htttx.tmp')
+                    temporary.write_text(dumps([tuple(p) for p in game['history']]), encoding='utf-8')
+                    temporary.replace(notation)
+                    winner = game['winner']
+                    player = (winner if number % 2 else 1-winner) if winner is not None else None
+                    if player is None:
+                        capped += 1
+                    else:
+                        wins[player] += 1
+                    results.append(dict(game=number, winner=player, reason=game['reason'], placements=len(game['history']),
+                                        opening=((number-1)//2) % len(match['openings'])))
+                    if number % 2 == 0:
+                        points = sum(1 if r['winner'] == 0 else .5 if r['winner'] is None else 0 for r in results[-2:])
+                        pairs[round(points*2)] += 1
+                if len(results) >= match['games']:
+                    raise ValueError('This batch is already complete')
+                registry = {}
+                for seat in match['players']:
+                    source = seat['source']
+                    if seat['budget'].get('solver_nodes') and source['solver_build'] != self.engines.solver_build():
+                        raise ValueError('Tactical solver build changed since the batch started')
+                    if source.get('weights') and file_digest(file_identity(source['weights'])) != source['weights_sha256']:
+                        raise ValueError('Checkpoint weights changed since the batch started')
+                    for path, digest in source['files'].items():
+                        if file_digest(file_identity(path)) != digest:
+                            raise ValueError(f'Engine file changed since the batch started: {path}')
+                    entry = {k: Path(v) if k in ('path', 'model') else v for k, v in source.items()
+                             if k in ('kind', 'path', 'command', 'cwd', 'model', 'mirrored', 'libraries')}
+                    entry.update(id=seat['engine'], name=source.get('name', seat['name']), presets=PRESETS[source['kind']])
+                    if source['kind'] == 'bubble':
+                        entry['checkpoints'] = [seat['checkpoint']]
+                    registry[seat['engine']] = entry
+                number = len(results)+1
+                current_path = directory / 'current.json'
+                saved = json.loads(current_path.read_text(encoding='utf-8')) if current_path.exists() else {}
+                continuing = saved.get('game') == number
+                history = saved['history'] if continuing else match['openings'][((number-1)//2) % len(match['openings'])]
+                replay(history).close()
+                match.update(active=True, completed=len(results), current=number, results=results, wins=wins, capped=capped,
+                             pentanomial=pairs, output=str(directory), between=False, preparing=match['clock']['mode'] != 'fixed',
+                             outcome=None, error=None, turns=saved.get('turns', []) if continuing else [])
+                match['partial_spent_ms'] = saved.get('partial_spent_ms', 0) if continuing else 0
+                self.entries.update(registry)
+                self.match, self.match_file = match, handle
+                self.match_clock = self.new_match_clock()
+                if self.match_clock and continuing and saved.get('balances'):
+                    self.match_clock.balances = saved['balances']
+                self.store = Evaluations(directory / 'evaluations.jsonl')
+                self.history = list(map(tuple, history))
+                order = [0, 1] if number % 2 else [1, 0]
+                self.seats = [{k: v for k, v in match['players'][i].items() if k not in ('name', 'source')} for i in order]
+                self.stop_moves()
+                if self.analysis:
+                    self.analysis['auto'] = False
+                self.paused = False
+                self.write_match(match)
+                self.remember_match(directory)
+                self.changed()
+                self.match_worker = threading.Thread(target=self.run_match, args=(match,), daemon=True)
+                self.match_worker.start()
+            except BaseException:
+                handle.close()
+                raise
+
+    def timed_config(self, seat):
+        entry, budget = self.entries[seat['engine']], seat['budget']
+        kind = entry['kind']
+        if kind not in ('bubble', 'six', 'native', 'seal'):
+            raise ValueError(f"{entry['name']} supports fixed simulations only; its adapter cannot enforce a clock")
+        if kind == 'bubble':
+            return dict(kind=kind, model=str(export_path(entry, seat['checkpoint']).resolve()),
+                        tactical_package=str(self.engines.tactical_package) if getattr(self.engines, 'tactical_package', None) else None,
+                        device=seat['device'], search=dict(enabled=budget['simulations'] > 0,
+                        max_simulations=max(1, budget['simulations'])),
+                        solver=dict(enabled=budget['solver_nodes'] > 0, nodes=max(1, budget['solver_nodes'])))
+        if kind == 'six':
+            return dict(kind=kind, command=entry['command'] + budget.get('args', []),
+                        cwd=str(entry.get('cwd') or ROOT), path=list(map(str, entry.get('libraries', []))),
+                        mirrored=entry.get('mirrored', False), nodes=budget['nodes'])
+        return dict(kind=kind, max_ms=budget['ms'])
+
+    def run_match(self, match):
+        try:
+            if match['clock']['mode'] != 'fixed':
+                from timed_engine import TimedEngine
+                for seat in match['players']:
+                    if not match['active'] or self.closing:
+                        return
+                    engine = TimedEngine(self.timed_config(seat))
+                    self.timed_engines.append(engine)
+                    seat['source']['timed_identity'] = engine.identity
+                with self.lock:
+                    match['preparing'] = False
+                    self.write_match(match)
+                    self.changed()
+            with self.lock:
+                while match['active'] and not self.closing:
+                    game = replay(self.history)
+                    try:
+                        winner = game.winner
+                    finally:
+                        game.close()
+                    if self.match_clock and self.match_clock.expired():
+                        received = any(j.status == 'running' and getattr(j, 'received', None) is not None
+                                       and not self.match_clock.expired(j.received) for j in self.jobs.values())
+                        if not received:
+                            side = self.match_clock.running
+                            match['outcome'] = dict(winner=1-side, reason='time')
+                            self.pause_clock()
+                            match['turns'].append(dict(ply=len(self.history), side=side, stop_reason='deadline',
+                                                      clock_spent_ms=match['partial_spent_ms'], completed=None, nodes=None))
+                            self.stop_moves()
+                    if match['outcome']:
+                        winner = match['outcome']['winner']
+                    if winner < 0 and len(self.history) < match['max_placements']:
+                        self.lock.wait(timeout=.1 if self.match_clock else None)
+                        continue
+                    number = match['current']
+                    order = [0, 1] if number % 2 else [1, 0]
+                    result = dict(format='bubble-replay', version=1, game=number,
+                                  players=[match['players'][i] for i in order], history=list(self.history),
+                                  winner=winner if winner >= 0 else None, reason='win' if winner >= 0 else 'capped',
+                                  clock=match['clock'], turns=match['turns'])
+                    if match['outcome']:
+                        result.update(match['outcome'])
+                    opening_index = ((number - 1) // 2) % len(match['openings'])
+                    result['opening'] = (match['opening_selection']['nodes'][opening_index] if match['opening_selection']
+                                         else dict(moves=match['openings'][opening_index]))
+                    self.write_match(match, f'game-{number:04d}.json', result)
+                    (Path(match['output']) / f'game-{number:04d}.htttx').write_text(dumps(self.history), encoding='utf-8')
+                    if winner >= 0:
+                        match['wins'][order[winner]] += 1
+                    else:
+                        match['capped'] += 1
+                    match['results'].append(dict(game=number, winner=order[winner] if winner >= 0 else None,
+                                                 reason=result['reason'], placements=len(self.history), opening=opening_index))
+                    match['completed'] = number
+                    match['between'] = True
+                    if number % 2 == 0:
+                        points = sum(1 if r['winner'] == 0 else .5 if r['winner'] is None else 0
+                                     for r in match['results'][-2:])
+                        match['pentanomial'][round(points*2)] += 1
+                        from dense_posterior import Posterior
+                        posterior = Posterior(['A', 'B'], 'B', [('A', 'B', match['pentanomial'])], matchup_prior=0)
+                        elo, sd = posterior.difference('A', 'B', matchup=False)
+                        match['elo'] = dict(a_minus_b=elo, interval=[elo-1.96*sd, elo+1.96*sd],
+                                            pairs=sum(match['pentanomial']))
+                    self.write_match(match)
+                    print(f"Game {number}/{match['games']}: {result['reason']}; wins {match['wins']}, "
+                          f"capped {match['capped']}", flush=True)
+                    self.changed()
+                    if number == match['games']:
+                        break
+                    # Leave the finished board visible briefly; Pause also holds the next game.
+                    self.lock.wait_for(lambda: not match['active'] or self.closing, timeout=2)
+                    self.lock.wait_for(lambda: not self.paused or not match['active'] or self.closing)
+                    if not match['active'] or self.closing:
+                        break
+                    match['current'] += 1
+                    match['between'] = False
+                    match['outcome'], match['turns'] = None, []
+                    match['partial_spent_ms'] = 0
+                    self.match_clock = self.new_match_clock()
+                    self.history = [tuple(p) for p in match['openings'][(number // 2) % len(match['openings'])]]
+                    order = [0, 1] if match['current'] % 2 else [1, 0]
+                    self.seats = [{k: v for k, v in match['players'][i].items() if k not in ('name', 'source')}
+                                  for i in order]
+                    self.save_match_position()
+                    self.changed()
+        except Exception as error:
+            match['error'] = str(error)
+            print(f'Match stopped: {error}', file=sys.stderr, flush=True)
+        finally:
+            with self.lock:
+                match['active'] = False
+                self.paused = True
+                self.stop_moves()
+                if self.match_clock:
+                    self.pause_clock()
+                try:
+                    self.save_match_position()
+                    self.write_match(match)
+                except OSError as error:
+                    match['error'] = str(error)
+                    print(f'Cannot save match: {error}', file=sys.stderr, flush=True)
+                self.changed()
+            for engine in self.timed_engines:
+                engine.close()
+            self.timed_engines.clear()
+            if self.match_file:
+                self.match_file.close()
+                self.match_file = None
+
+    def stop_match(self):
+        with self.lock:
+            if self.match:
+                self.match['active'] = False
+            self.paused = True
+            self.stop_moves()
+            if self.match_clock:
+                self.pause_clock()
+            self.save_match_position()
             self.changed()
 
     def rescan(self):
@@ -1097,6 +1715,7 @@ class Session:
             entry = entries.get(seat['engine']) if seat['engine'] else None
             return entry is not None and (entry['kind'] != 'bubble' or seat['checkpoint'] in entry['checkpoints'])
         with self.lock:
+            self.match_editable()
             followed = [seat if seat['engine'] == 'human' else follow(seat) for seat in self.seats]
             analysis = follow(self.analysis) if self.analysis else None
             previous, self.entries = self.entries, entries
@@ -1124,7 +1743,11 @@ class Session:
                     job.cancelled = True
             self.lock.notify_all()
         self.worker.join(timeout)
+        if self.match_worker:
+            self.match_worker.join(timeout)
         self.engines.close()
+        if self.study:
+            self.study.close(timeout)
 
     def work(self):
         while True:
@@ -1142,6 +1765,7 @@ class Session:
             result, failure = None, None
             try:
                 result = self.run(job)
+                job.received = time.monotonic_ns()
             except Yielded:
                 with self.lock:
                     job.status = 'queued'
@@ -1156,10 +1780,29 @@ class Session:
                 if failure is not None:
                     job.status, job.error = 'failed', str(failure)
                     self.paused = self.paused or job.kind == 'move'
+                    if self.match and self.match['active'] and job.kind == 'move':
+                        self.match['error'] = str(failure)
+                        self.pause_clock()
+                        self.save_match_position()
                 else:
                     job.status = 'cancelled' if job.cancelled else 'done'
                     if job.kind == 'move' and not job.cancelled and list(job.history) == self.history:
-                        self.history.extend(tuple(p) for p in result)
+                        expired = self.match_clock and self.match_clock.expired(job.received)
+                        if self.match and self.match['active']:
+                            if expired:
+                                self.match['outcome'] = dict(winner=1-job.side, reason='time')
+                            elapsed = self.match_clock.stop(completed=not expired, at=job.received) if self.match_clock else None
+                            self.match['turns'].append(dict(ply=len(job.history), side=job.side,
+                                **getattr(job, 'measurements', {}),
+                                clock_spent_ms=elapsed/1e6+self.match['partial_spent_ms'] if elapsed is not None else None))
+                            self.match['partial_spent_ms'] = 0
+                            if self.match_clock and not expired and self.match['clock']['mode'] == 'move':
+                                self.match_clock.balances = [int(self.match['clock']['ms']*1e6)]*2
+                        if not expired:
+                            self.history.extend(tuple(p) for p in result)
+                        if self.match and self.match['active']:
+                            self.match['error'] = None
+                            self.save_match_position()
                 try:
                     self.changed()
                 except Exception as error:
@@ -1186,9 +1829,11 @@ class Session:
         else:
             saved = self.store.get(history, key, budget) if exact else self.store.covering(history, key, budget)
         if saved:
+            job.cache_hit = True
             return saved
         found, spent, weights = self.engines.evaluate(self.entries[seat['engine']], seat['checkpoint'], budget,
-                                                      history, self.watcher(job, job.kind != 'review'))
+                                                      history, self.watcher(job, job.kind != 'review'),
+                                                      **({'device': seat['device']} if 'device' in seat else {}))
         if job.cancelled:
             raise Cancelled()
         entry = self.entries[seat['engine']]
@@ -1214,11 +1859,54 @@ class Session:
         seat, history = job.seat, list(job.history)
         entry = self.entries[seat['engine']]
         if job.kind == 'move':
+            started = time.monotonic()
+            if self.match and self.match['active']:
+                source = self.match['players'][job.side if self.match['current'] % 2 else 1-job.side]['source']
+                if seat['budget'].get('solver_nodes') and source['solver_build'] != self.engines.solver_build():
+                    raise ValueError('Tactical solver build changed during this batch')
+                files = source['files'] | ({source['weights']: source['weights_sha256']} if source.get('weights') else {})
+                if any(file_digest(file_identity(path)) != digest for path, digest in files.items()):
+                    raise ValueError('An engine or checkpoint file changed during this batch')
+            if self.match and self.match['active'] and self.match_clock:
+                side = job.side if self.match['current'] % 2 else 1-job.side
+                game = replay(history)
+                try:
+                    def publish(found):
+                        job.done = found.get('completed') or found.get('nodes') or 0
+                    with self.lock:
+                        clock = self.match_clock.json() if self.match['clock']['mode'] == 'game' else None
+                        move_ms = self.match_clock.json()['cross_ms' if job.side == 0 else 'circle_ms'] if clock is None else None
+                    try:
+                        found = self.timed_engines[side].turn(game, move_ms, clock=clock, cancel=job, publish=publish)
+                    except TimeoutError:
+                        # External adapters stop before the response reserve. Let the host clock
+                        # finish that allowance, then score the timeout instead of pausing the batch.
+                        with self.lock:
+                            self.lock.wait_for(lambda: job.cancelled or self.match_clock.expired(),
+                                timeout=max(0, self.match_clock.remaining()[job.side]/1e9))
+                        if job.cancelled:
+                            raise Cancelled()
+                        job.measurements = dict(stop_reason='deadline')
+                        return []
+                    if job.cancelled:
+                        raise Cancelled()
+                    job.measurements = {k: found.get(k) for k in ('elapsed_ms', 'completed', 'evaluated', 'solver_nodes',
+                                                                  'nodes', 'stop_reason', 'allowance')}
+                    return checked_turn(history, found['moves'])
+                finally:
+                    game.close()
             if entry['kind'] == 'bubble':
                 job.total = max(1, seat['budget']['simulations']) * 2
-                moves = self.evaluation(job, seat, history, exact=True)['moves']
+                found = self.evaluation(job, seat, history, exact=True)
+                moves = found['moves']
+                cached = getattr(job, 'cache_hit', False)
+                counts = dict(completed=0 if cached else found.get('actual_completed'),
+                              solver_nodes=0 if cached else found.get('actual_solver_nodes'), cached=cached)
             else:
                 moves = self.engines.turn(entry, seat['budget'], history, lambda: job.cancelled)
+                counts = getattr(self.engines, 'last_turn', {})
+            job.measurements = dict(elapsed_ms=(time.monotonic()-started)*1000, completed=None, nodes=None,
+                                    evaluated=job.done if entry['kind'] == 'bubble' else None, stop_reason='budget') | counts
             return checked_turn(history, moves)
         if job.kind == 'analyse':
             job.total = max(1, seat['budget']['simulations']) * 2
@@ -1294,9 +1982,43 @@ class Handler(BaseHTTPRequestHandler):
         url, session = urlparse(self.path), self.session
         if url.path == '/':
             return self.respond(200, self.page.read_bytes(), 'text/html; charset=utf-8')
+        if url.path.startswith('/study/'):
+            session = session.study
+            if session is None:
+                return self.respond(404, dict(error='Choose a tournament game to analyse'))
+            url = url._replace(path=url.path[len('/study'):])
+        if url.path in ('/matches', '/matches/game'):
+            try:
+                if url.path == '/matches':
+                    return self.respond(200, dict(matches=session.match_catalogue()))
+                query = parse_qs(url.query)
+                _, game = session.saved_replay(query['batch'][0], int(query['game'][0]))
+                if query.get('format') == ['htttx']:
+                    return self.respond(200, dumps([tuple(p) for p in game['history']]), 'text/plain; charset=utf-8',
+                                        [('Content-Disposition', f'attachment; filename="game-{game["game"]:04d}.htttx"')])
+                return self.respond(200, game)
+            except (ValueError, KeyError, TypeError, OSError) as error:
+                return self.respond(400, dict(error=str(error)))
         if url.path == '/state':
             since = parse_qs(url.query).get('since', [''])[0]
             return self.respond(200, session.poll(int(since)) if since.isdigit() else session.state())
+        if url.path == '/models':
+            return self.respond(200, dict(api='bubble-player-v1', models=session.models(),
+                                          book=str(session.book) if session.book else None))
+        if url.path == '/match':
+            with session.lock:
+                return self.respond(200, dict(match=session.match, paused=session.paused))
+        if url.path == '/openings':
+            try:
+                if not session.book:
+                    raise ValueError('No opening book configured; start the player with --book or --dense-run')
+                query = parse_qs(url.query)
+                count = query.get('count', [None])[0]
+                return self.respond(200, book_openings(session.book, query.get('range', ['wide'])[0],
+                                                       int(count) if count is not None else None,
+                                                       int(query.get('seed', ['0'])[0])))
+            except (ValueError, KeyError, TypeError, OSError) as error:
+                return self.respond(400, dict(error=str(error)))
         if url.path == '/htttx':
             try:
                 return self.respond(200, dumps(list(session.history)), 'text/plain; charset=utf-8')
@@ -1309,19 +2031,46 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == '/evaluations':
             return self.respond(200, session.store.export(), 'application/x-ndjson',
                                 [('Content-Disposition', 'attachment; filename="evaluations.jsonl"')])
+        if url.path == '/match/results':
+            with session.lock:
+                if session.match:
+                    return self.respond(200, json.dumps(session.match), headers=[
+                        ('Content-Disposition', 'attachment; filename="match.json"')])
+            return self.respond(404, dict(error='No match'))
+        if url.path == '/match/replay':
+            try:
+                number = int(parse_qs(url.query).get('game', ['0'])[0])
+                with session.lock:
+                    if not session.match or not 1 <= number <= session.match['completed']:
+                        raise ValueError('No such completed game')
+                    path = Path(session.match['output']) / f'game-{number:04d}.htttx'
+                    return self.respond(200, path.read_bytes(), 'text/plain; charset=utf-8',
+                                        [('Content-Disposition', f'attachment; filename="game-{number:04d}.htttx"')])
+            except (ValueError, OSError) as error:
+                return self.respond(400, dict(error=str(error)))
         self.respond(404, dict(error='Not found'))
 
     def do_POST(self):
         if not self.local():
             return self.respond(403, dict(error='Origin rejected'))
         session = self.session
+        if self.path.startswith('/study/'):
+            session = session.study
+            if session is None:
+                return self.respond(404, dict(error='Choose a tournament game to analyse'))
+            self.path = self.path[len('/study'):]
+            if self.path.startswith('/match'):
+                return self.respond(400, dict(error='Start tournaments on the live board'))
         try:
             length = int(self.headers.get('Content-Length', 0))
             if not 0 <= length <= 1 << 20:
                 raise ValueError('Request too large')
             args = json.loads(self.rfile.read(length) or '{}')
             reply = {}
-            if self.path == '/play':
+            if self.path == '/matches/open':
+                session.open_saved_game(args['batch'], args['game'])
+                return self.respond(200, dict(url='/?study=1'))
+            elif self.path == '/play':
                 session.play(args['q'], args['r'])
             elif self.path == '/undo':
                 session.undo()
@@ -1354,10 +2103,31 @@ class Handler(BaseHTTPRequestHandler):
                 session.pause(args['paused'])
             elif self.path == '/rescan':
                 session.rescan()
+            elif self.path == '/match':
+                action = args.get('action', 'start')
+                if action == 'start':
+                    openings = ([import_history(text) for text in args['opening_texts']] if args.get('opening_texts')
+                                else args.get('openings'))
+                    session.start_match(args['players'], args.get('games'), args.get('preset', 'standard'),
+                                        args.get('output'), openings, args.get('max_placements', 512),
+                                        args.get('book'), args.get('opening_range'), args.get('unique_openings'),
+                                        args.get('seed', 0), clock=args.get('clock'))
+                elif action == 'resume' and args.get('batch'):
+                    session.resume_match(args['batch'])
+                elif action in ('pause', 'resume'):
+                    if not session.match or not session.match['active']:
+                        raise ValueError('No active batch; use resume with a saved batch directory to continue one')
+                    session.pause(action == 'pause')
+                elif action == 'stop':
+                    session.stop_match()
+                else:
+                    raise ValueError('Match action must be start, pause, resume or stop')
+            elif self.path == '/match/stop':
+                session.stop_match()
             else:
                 return self.respond(404, dict(error='Not found'))
             self.respond(200, session.state() | reply)
-        except (ValueError, KeyError, TypeError, AttributeError) as error:
+        except (ValueError, KeyError, TypeError, AttributeError, OSError) as error:
             self.respond(400, dict(error=str(error)))
 
 
@@ -1368,10 +2138,12 @@ def search_child(kind):
     for line in sys.stdin:
         try:
             request = json.loads(line)
+            measurements = {}
             game = replay(request['history'])
             try:
                 if kind == 'native':
-                    moves = game.search(request['ms'])['moves']
+                    found = game.search(request['ms'])
+                    moves, measurements = found['moves'], dict(nodes=found.get('nodes'))
                 elif kind == 'seal':
                     if 'seal' not in engines:
                         from legacy.arena import Seal
@@ -1391,7 +2163,7 @@ def search_child(kind):
                     moves = engines[key](game, 0)
             finally:
                 game.close()
-            answer = dict(moves=[list(map(int, m)) for m in moves])
+            answer = dict(moves=[list(map(int, m)) for m in moves], measurements=measurements)
         except Exception as error:
             answer = dict(error=str(error))
         print(json.dumps(answer), flush=True)
@@ -1410,7 +2182,41 @@ def main():
                         help='saved evaluations file; default play-evaluations.jsonl in the run or models folder')
     parser.add_argument('--tactical-package', type=Path, help='directory with the built tactical solver')
     parser.add_argument('--device', default='auto', help='cuda, cpu, or auto: cuda when a GPU is available')
+    parser.add_argument('--idle', action='store_true', help='start paused, without automatic analysis, for API clients')
+    parser.add_argument('--list-engines', action='store_true', help='list engine ids, names and checkpoints, then exit')
+    parser.add_argument('--match', nargs=2, metavar=('A', 'B'), help='play a batch using engine names, ids or unique kinds')
+    parser.add_argument('--games', type=int, help='games in --match; defaults to 2 per requested unique opening, else 2')
+    parser.add_argument('--preset', choices=['quick', 'standard', 'strong', 'deep'], default='standard')
+    clocks = parser.add_mutually_exclusive_group()
+    clocks.add_argument('--tc', help='shared game clock, seconds+increment, e.g. 180+2')
+    clocks.add_argument('--move', type=duration, help='shared time per complete turn, e.g. 5s')
+    for side in ('a', 'b'):
+        parser.add_argument(f'--{side}-checkpoint', help=f'checkpoint of engine {side.upper()} in --match')
+        parser.add_argument(f'--{side}-preset', choices=['quick', 'standard', 'strong', 'deep'])
+    parser.add_argument('--opening', type=Path, action='append', help='HTTTX or replay opening; repeat for paired openings')
+    parser.add_argument('--book', type=Path, help='read-only v2 opening book; defaults to openings.json in --dense-run')
+    parser.add_argument('--openings', choices=['narrow', 'wide', 'all'], help='book selection, default wide')
+    parser.add_argument('--unique-openings', type=int, help='distinct book openings; each is played with colours swapped')
+    parser.add_argument('--seed', type=int, default=0, help='repeatable book selection and ordering')
+    parser.add_argument('--max-placements', type=int, default=512, help='cap each match game after a complete turn')
+    parser.add_argument('--out', type=Path, help='new match output directory; default artifacts/play/<unique match>')
     args = parser.parse_args()
+    from hexo import library
+    seal = library.with_name(library.name.replace('hexo', 'hexo_seal'))
+    runs = [path for path in (args.dense_model, args.dense_run) if path]
+    find = lambda: scan(args.models, args.runs, runs, seal)
+    entries = find()
+    book = args.book or (args.dense_run / 'openings.json' if args.dense_run and
+                        (args.dense_run / 'openings.json').exists() else None)
+    if args.list_engines:
+        for entry in entries.values():
+            print(entry['id'])
+            if entry.get('checkpoints'):
+                print('  checkpoints: ' + ', '.join(entry['checkpoints']))
+        return
+    if args.match and args.out is None:
+        name = datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + os.urandom(3).hex()
+        args.out = ROOT / 'artifacts' / 'play' / name
     try:
         import torch
         torch.set_num_threads(2)
@@ -1419,20 +2225,40 @@ def main():
         cuda = False
     if args.device == 'auto':
         args.device = 'cuda' if cuda else 'cpu'
-    from hexo import library
-    seal = library.with_name(library.name.replace('hexo', 'hexo_seal'))
-    runs = [path for path in (args.dense_model, args.dense_run) if path]
-    find = lambda: scan(args.models, args.runs, runs, seal)
-    store_path = args.evaluations or (args.dense_run or args.models) / 'play-evaluations.jsonl'
-    store_path.parent.mkdir(parents=True, exist_ok=True)
-    Handler.session = Session(find(), Engines(args.device, args.tactical_package), Evaluations(store_path), find)
-    with Handler.session.lock:
-        Handler.session.changed()
-    print(f'Bubble is ready at http://127.0.0.1:{args.port}', flush=True)
-    try:
-        ThreadingHTTPServer(('127.0.0.1', args.port), Handler).serve_forever()
-    finally:
-        Handler.session.close()
+    store_path = args.evaluations or ((args.out / 'evaluations.jsonl') if args.match else
+                                     (args.dense_run or args.models) / 'play-evaluations.jsonl')
+    if not args.match:
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+    # Bind before starting any engine work: a busy port must not leave a hidden match running.
+    with ThreadingHTTPServer(('127.0.0.1', args.port), Handler) as server:
+        Handler.session = Session(entries, Engines(args.device, args.tactical_package),
+                                  Evaluations(None if args.match else store_path), find, book,
+                                  archive=ROOT / 'artifacts' / 'play' / 'matches',
+                                  study_store=ROOT / 'artifacts' / 'play' / f'study-{args.port}.jsonl')
+        try:
+            if args.match:
+                players = [dict(engine=name, checkpoint=getattr(args, f'{side}_checkpoint'),
+                                preset=getattr(args, f'{side}_preset') or args.preset)
+                           for side, name in zip(('a', 'b'), args.match)]
+                openings = [import_history(path.read_text(encoding='utf-8')) for path in args.opening] if args.opening else None
+                Handler.session.start_match(players, args.games, args.preset, args.out, openings, args.max_placements,
+                                            opening_range=args.openings, unique_openings=args.unique_openings, seed=args.seed,
+                                            evaluations=args.evaluations, clock=dict(mode='game', tc=args.tc) if args.tc else
+                                            dict(mode='move', ms=args.move) if args.move else None)
+                print(f'Match results: {args.out.resolve()}', flush=True)
+            else:
+                with Handler.session.lock:
+                    if args.idle:
+                        Handler.session.paused = True
+                        if Handler.session.analysis:
+                            Handler.session.analysis['auto'] = False
+                    Handler.session.changed()
+            print(f'Bubble is ready at http://127.0.0.1:{server.server_port}', flush=True)
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            Handler.session.close()
 
 
 if __name__ == '__main__':

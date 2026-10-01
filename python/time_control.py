@@ -1,6 +1,7 @@
 """Absolute/Fischer clocks and turn allowances. All public times are milliseconds."""
 from dataclasses import dataclass
 import math
+import re
 import time
 
 
@@ -8,6 +9,14 @@ def milliseconds(value, name, *, positive=False):
     if type(value) not in (int, float) or not math.isfinite(value) or value < 0 or (positive and value == 0):
         raise ValueError(f'{name} must be a finite {"positive" if positive else "nonnegative"} time')
     return float(value)
+
+
+def duration(value):
+    """CLI duration in seconds, optionally suffixed with s or ms, returned in milliseconds."""
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*(ms|s)?', str(value))
+    if not match:
+        raise ValueError('Use seconds such as 5s, or milliseconds such as 500ms')
+    return milliseconds(float(match[1]) * (1 if match[2] == 'ms' else 1000), 'duration', positive=True)
 
 
 @dataclass(frozen=True)

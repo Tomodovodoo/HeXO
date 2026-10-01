@@ -195,6 +195,7 @@ class SixEngine:
         self.env = {**os.environ, **{name: os.pathsep.join([*map(str, path), os.environ.get(name, '')])
                                      for name in loader}} if path else None
         self.game = None
+        self.info = {}
         self.proc = None
         self._start()
 
@@ -242,11 +243,18 @@ class SixEngine:
                 raise ProtocolError('engine exited')
             if line.startswith('error'):
                 raise ProtocolError(line)
+            if line.startswith('info '):
+                words = line.split()
+                for key in ('nodes', 'time'):
+                    if key in words and words.index(key)+1 < len(words):
+                        value = words[words.index(key)+1]
+                        if value.isdigit():
+                            self.info[key] = int(value)
             if line.startswith(prefix):
                 return line
 
-    def __call__(self, game, ms=None, nodes=None):
-        """The engine's turn for `game`, searched for `nodes` nodes when given, else for `ms` milliseconds."""
+    def __call__(self, game, ms=None, nodes=None, clock=None):
+        """One turn with optional node ceiling, per-turn milliseconds or full game clocks."""
         frame = mirror if self.mirrored else (lambda q, r: (q, r))
         searching = False
         try:
@@ -259,9 +267,17 @@ class SixEngine:
                 self.game = game
             moves = ' '.join('%d %d' % frame(q, r) for q, r, _ in game.cells)
             self._send('position radius 8' + (f' moves {moves}' if moves else ''))
-            self._send(f'go nodes {nodes}' if nodes else f'go movetime {ms}')
+            self.info = {}
+            options = dict(nodes=nodes) if nodes is not None else {}
+            if clock is not None:
+                options.update(xtime=max(0, int(clock['cross_ms'])), otime=max(0, int(clock['circle_ms'])),
+                               xinc=int(clock.get('increment_ms', 0)), oinc=int(clock.get('increment_ms', 0)))
+            elif ms is not None:
+                options['movetime'] = int(ms)
+            self._send('go ' + ' '.join(f'{key} {value}' for key, value in options.items()))
             searching = True
-            line = self._expect('bestmove', self.timeout + (nodes / 1000 if nodes else 3*ms/1000))
+            duration = clock['cross_ms' if game.player == 0 else 'circle_ms'] if clock else ms
+            line = self._expect('bestmove', self.timeout + (3*duration/1000 if duration is not None else nodes/1000))
             searching = False
             parts = line.split()[1:]
             if len(parts) not in (2, 4):

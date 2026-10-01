@@ -161,6 +161,9 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
             if first:
                 stage_end = min(stage_end, hard-max(.001, getattr(player, 'batch_seconds', .01)))
             available = stage_end-time.monotonic()
+            simulation_cap = limits.get('simulations')
+            if first and simulation_cap is not None and simulation_cap > 1:
+                simulation_cap = max(1, int(simulation_cap*.6))
             if available <= 0:
                 break
             current = [cell[:2] for cell in game.cells]
@@ -168,7 +171,7 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
                 rate = getattr(player, 'simulations_per_second', 200.)
                 sims = max(2, min(16384, int(rate*available)))
                 if limits.get('simulations') is not None:
-                    sims = min(sims, max(0, limits['simulations']-result['completed']))
+                    sims = min(sims, max(0, simulation_cap-result['completed']))
                     if sims < 1:
                         break
                 t0 = time.monotonic()
@@ -187,7 +190,7 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
                         extension_end-time.monotonic() > player.batch_seconds):
                     extra = max(1, min(16384, int(player.simulations_per_second*(extension_end-time.monotonic()))))
                     if limits.get('simulations') is not None:
-                        extra = min(extra, max(0, limits['simulations']-result['completed']))
+                        extra = min(extra, max(0, simulation_cap-result['completed']))
                     order = np.argsort(-searched['scores'])
                     finalists = searched['actions'][[i for i in order if np.isfinite(searched['scores'][i])][:2]]
                     if extra and len(finalists):
@@ -257,6 +260,7 @@ def _worker(connection, cancellation, config):
                                      key=lambda p: int(p.name)).relative_to(run/'checkpoints').as_posix()
                 model = run/'checkpoints'/checkpoint/'ema.pt'
             player = DensePlayer(run, config.get('device', 'cpu'), model=model,
+                                 tactical_package=Path(config['tactical_package']) if config.get('tactical_package') else None,
                                  net_kernels=config.get('net_kernels', 'fused'))
             search, solver = config.get('search', {}), config.get('solver', {})
             player.configure(dict(search=search.get('enabled', True),
@@ -272,8 +276,13 @@ def _worker(connection, cancellation, config):
                                  leaf_solver=solver.get('leaf', False) and player.options['solver'])
         elif kind == 'six':
             from six_engine import SixEngine
-            player = SixEngine(config['command'], cancel=cancellation)
+            player = SixEngine(config['command'], cancel=cancellation, mirrored=config.get('mirrored', False),
+                               cwd=config.get('cwd'), path=config.get('path', ()), startup=120)
             identity = dict(checkpoint='six', command=config['command'])
+        elif kind == 'seal':
+            from legacy.arena import Seal
+            player = Seal()
+            identity = dict(checkpoint='seal')
         elif kind == 'htttx':
             player = HTTTXEngine(config['url'])
             identity = dict(checkpoint='htttx', url=config['url'], capabilities=player.capabilities,
@@ -309,8 +318,11 @@ def _worker(connection, cancellation, config):
                 else:
                     game = Game(history)
                     try:
-                        budget = max(1, int(limits['normal_ms']))
+                        budget = max(1, int(min(limits['normal_ms'], config.get('max_ms', limits['normal_ms']))))
                         if kind == 'six':
+                            result = dict(moves=player(game, budget, nodes=config.get('nodes'), clock=limits.get('clock')),
+                                          nodes=player.info.get('nodes'))
+                        elif kind == 'seal':
                             result = dict(moves=player(game, budget))
                         elif kind == 'htttx':
                             result = dict(moves=player.turn(game, budget))
@@ -333,7 +345,7 @@ def _worker(connection, cancellation, config):
         except (EOFError, BrokenPipeError):
             pass
     finally:
-        if player:
+        if player and config.get('kind') != 'seal':
             player.close()
         connection.close()
 
@@ -376,6 +388,11 @@ class TimedEngine:
         history = [list(cell[:2]) for cell in game.cells]
         started = time.monotonic()
         limits = allowance(clock, game.player, milliseconds)
+        if clock and self.config.get('kind') == 'six':
+            # A clock-aware external engine owns its allocation, bounded by the host's remaining clock.
+            remaining = clock['cross_ms' if game.player == 0 else 'circle_ms']
+            limits['hard_ms'] = remaining if milliseconds is None else min(remaining, milliseconds)
+            limits['clock'] = dict(clock)
         deadline = started + max(0, limits['hard_ms']-limits['reserve_ms'])/1000
         best = dict(moves=legal_turn(history), backend='timed', checkpoint=self.checkpoint,
                     model_sha256=self.model_sha256, stop_reason='deadline', elapsed_ms=0,
