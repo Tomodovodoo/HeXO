@@ -5778,22 +5778,23 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator.step()
         self.export(30)
         (self.run/'learner-status.json').write_text(json.dumps(dict(stage='exporting', updated_at=time.time())))
-        now, steps, export = [0.], [], self.export
+        now, steps, slept = [0.], [], []
         def sleep(seconds):
+            if not slept:
+                self.export(40)
+            slept.append(seconds)
             now[0] += seconds
         evaluator.pacer = dense_eval.Pacer(1., clock=lambda: now[0], sleep=sleep)
         evaluator.busy_pacer = dense_eval.BusyPacer(self.run, .5, clock=lambda: now[0], sleep=sleep)
 
         class Stalled(dense_eval.Pool):
             def step(self):
-                now[0] += .2
+                now[0] += 3.
                 steps.append(now[0])
-                if len(steps) == 3:
-                    export(40)
                 return []
         with unittest.mock.patch.object(dense_eval, 'Pool', Stalled):
             self.assertTrue(evaluator.step())
-        self.assertEqual(len(steps), 4)                                     # one second after the last check
+        self.assertEqual((steps, slept), ([3.], [1.]))                      # noticed a second into a 3 s yield
         self.assertFalse(dense_eval.report_path(self.run, 'main/000030', 'main/000010').exists())
         self.assertTrue(evaluator.entry('main/000030')['skipped'])
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]

@@ -824,7 +824,8 @@ class BusyPacer:
     """Limit playing duty under fresh actor/learner activity, without banking idle credit.
 
     After at least 100 ms of charged work, wait for the evaluator's queued GPU work and then yield
-    work * (1/share - 1) seconds. This controls wall time, not a measured fraction of GPU capacity.
+    work * (1/share - 1) seconds, calling tick() before each sleep of at most a second and ending the yield
+    early once tick() returns true. This controls wall time, not a measured fraction of GPU capacity.
     """
 
     def __init__(self, run, share, clock=time.monotonic, sleep=time.sleep, now=time.time):
@@ -865,8 +866,7 @@ class BusyPacer:
         delay = (self.work+self.clock()-started)*(1/self.share-1)
         self.work = 0.
         until = self.clock()+delay
-        while self.clock() < until:
-            tick()
+        while self.clock() < until and not tick():
             self.sleep(min(1., max(0., until-self.clock())))
 
 
@@ -1192,7 +1192,7 @@ class Evaluator:
         is negative, and with nothing running the session then waits and asks want() again. Every completed
         pair is persisted at once. stop(), when supplied (a newer export, settle request, or a checkpoint
         interrupting a variant), is asked after every engine step that finishes a game and at least once a
-        second while the pool plays; once it holds, the session abandons every game in flight and every finished
+        second while the pool plays or busy pacing holds it; once it holds, the session abandons every game in flight and every finished
         half awaiting its colour partner, publishes the idle status at once and logs an 'abandon' event with
         the main lane, games_abandoned and halves_discarded.
         Status shows the session's pairing from its first pass. When auxiliary is supplied, free slots
@@ -1233,8 +1233,22 @@ class Evaluator:
                          mean_placements=added[main][1]/added[main][0] if main in added else None,
                          placements_per_second=live/max(self.pacer.clock()-start, 1e-9),
                          solver=self.solver_status(pool, [name for lane in shown for name in lane[:2]]))
+
+        def halt(now=False):
+            nonlocal checked_at, abandoned
+            if stop is not None and abandoned is None and (now or self.pacer.clock()-checked_at >= 1.):
+                checked_at = self.pacer.clock()
+                if stop():
+                    abandoned = pool.running(), sum(len(group) for groups in waiting.values() for group in groups.values())
+            return abandoned is not None
+
+        def throttle():
+            show('throttled')
+            return halt()
         while True:
-            self.busy_pacer.wait(pool.synchronize, lambda: show('throttled'))
+            self.busy_pacer.wait(pool.synchronize, throttle)
+            if abandoned:
+                break
             lanes = dict(primary)
             now = self.pacer.clock()
             if auxiliary is not None and now-gate_at >= 1.:
@@ -1309,7 +1323,9 @@ class Evaluator:
                 break
             show('playing', fresh)
             fresh = False
-            self.busy_pacer.wait(pool.synchronize, lambda: show('throttled'))
+            self.busy_pacer.wait(pool.synchronize, throttle)
+            if abandoned:
+                break
             tick = self.pacer.clock()
             results = pool.step()
             end = self.pacer.clock()
@@ -1341,11 +1357,8 @@ class Evaluator:
                     paired = True
             if paired:
                 primary = want()
-            if stop is not None and (results or self.pacer.clock()-checked_at >= 1.):
-                checked_at = self.pacer.clock()
-                if stop():
-                    abandoned = pool.running(), sum(len(group) for groups in waiting.values() for group in groups.values())
-                    break
+            if halt(bool(results)):
+                break
         if abandoned is None:
             show('playing', True)
         pool.close()
