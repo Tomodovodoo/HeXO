@@ -816,9 +816,10 @@ class Session:
             self.stop_moves()
             self.changed()
 
-    def stop_moves(self):
+    def stop_moves(self, side=None):
+        """Cancel queued and running engine moves, of one `side` or of both."""
         for job in self.jobs.values():
-            if job.kind == 'move' and job.status in ('queued', 'running'):
+            if job.kind == 'move' and job.status in ('queued', 'running') and side in (None, job.side):
                 job.cancelled = True
                 if job.status == 'queued':
                     job.status = 'cancelled'
@@ -826,7 +827,7 @@ class Session:
     def configure_seat(self, side, engine, checkpoint=None, preset='standard', custom=None):
         with self.lock:
             self.seats[side] = self.seat(engine, checkpoint, preset, custom)
-            self.stop_moves()
+            self.stop_moves(side)
             self.changed()
 
     def configure_analysis(self, engine, checkpoint=None, preset='standard', custom=None, auto=True):

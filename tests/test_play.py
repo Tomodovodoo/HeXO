@@ -361,6 +361,14 @@ class Jobs(unittest.TestCase):
             session.pause(False)
             wait(lambda: len(session.history) == 3)
 
+    def test_changing_one_seat_leaves_the_other_engine_thinking(self):
+        self.engines.hold = True
+        self.session.play(0, 0)
+        wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']))
+        self.session.configure_seat(0, 'native:Native', preset='quick')
+        self.engines.release.set()
+        wait(lambda: len(self.history()) >= 3)
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
