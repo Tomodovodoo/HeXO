@@ -260,6 +260,7 @@ def _worker(connection, cancellation, config):
                                      key=lambda p: int(p.name)).relative_to(run/'checkpoints').as_posix()
                 model = run/'checkpoints'/checkpoint/'ema.pt'
             player = DensePlayer(run, config.get('device', 'cpu'), model=model,
+                                 tactical_package=Path(config['tactical_package']) if config.get('tactical_package') else None,
                                  net_kernels=config.get('net_kernels', 'fused'))
             search, solver = config.get('search', {}), config.get('solver', {})
             player.configure(dict(search=search.get('enabled', True),

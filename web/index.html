@@ -104,6 +104,9 @@ select,input,textarea{background:var(--bg);border:1px solid var(--line-2);border
 .detail .nums{font:12px var(--mono);color:var(--muted);display:flex;gap:12px;flex-wrap:wrap}
 .empty{color:var(--dim);font-size:13px}
 #match[hidden]{display:none}
+#study-note[hidden]{display:none}#saved-games{max-height:55vh;overflow:auto}
+.saved-game{display:flex;gap:12px;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line)}
+.saved-game a,#study-note a{color:var(--o)}
 .head{display:flex;align-items:center;gap:6px}
 .head .pick{flex:1}
 .switch{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;user-select:none;padding:4px 6px;border-radius:6px}
@@ -146,12 +149,14 @@ dialog::backdrop{background:rgba(2,6,23,.7)}dialog textarea{width:100%;height:18
   <nav id="tabs"><button data-tab="game" class="on">Play</button><button data-tab="study" class="wide">Analysis</button><button data-tab="analysis" class="narrow">Analysis</button><button data-tab="review" class="narrow">Moves</button></nav>
   <section id="game" class="panel">
     <div class="brand"><svg viewBox="0 0 20 22"><path d="M10 1 19 6v10l-9 5-9-5V6z" fill="none" stroke="var(--o)" stroke-width="2"/><circle cx="10" cy="11" r="3.2" fill="var(--x)"/></svg>Bubble</div>
+    <div id="study-note" class="stack" hidden></div>
     <div class="seat" id="seat0" style="--c:var(--x)"></div>
     <div class="seat" id="seat1" style="--c:var(--o)"></div>
     <div class="row"><button id="new">New</button><button id="undo">Undo</button><button id="pause">Pause</button></div>
     <div id="match" class="stack" hidden></div>
     <div class="spacer"></div>
     <div class="stack">
+      <button id="tournaments">Tournaments</button>
       <div class="row"><button id="import">Import</button><button id="copy">Copy HTTTX</button></div>
       <div class="row"><button id="save-game">Game file</button><button id="save-evals">Evaluations</button></div>
     </div>
@@ -189,12 +194,19 @@ dialog::backdrop{background:rgba(2,6,23,.7)}dialog textarea{width:100%;height:18
   <textarea id="import-text" spellcheck="false" placeholder="version[1]; 1. [1,0][2,0];"></textarea>
   <div class="row"><button value="cancel">Cancel</button><button id="import-go" value="ok">Load</button></div>
 </form></dialog>
+<dialog id="tournament-dialog"><div class="stack">
+  <div class="head"><strong>Saved tournaments</strong><span class="spacer"></span><button id="tournament-close">Close</button></div>
+  <select id="saved-batch" aria-label="Tournament"></select>
+  <div id="saved-games"></div>
+</div></dialog>
 <script>
 'use strict';
 const $=id=>document.getElementById(id),SQ3=Math.sqrt(3),COLORS=['#fbbf24','#38bdf8'],MOTION=!matchMedia('(prefers-reduced-motion: reduce)').matches;
 const LABEL={win:['◆','--best'],found:['!','--best'],kept:['=','--best'],best:['★','--best'],good:['✓','--good'],
   inaccuracy:['?!','--inaccuracy'],mistake:['?','--mistake'],blunder:['??','--blunder'],missed:['✗','--proof'],allowed:['⚑','--proof'],lost:['·','--dim']};
 const PRESETS=['quick','standard','strong','deep','custom'],SHORT={quick:'Q',standard:'S',strong:'St',deep:'D',custom:'⋯'};
+const PAGE=new URLSearchParams(location.search),STUDY=PAGE.has('study');
+const endpoint=path=>(STUDY&&!path.startsWith('/matches')?'/study':'')+path;
 let S=null,view=0,cam={x:0,y:0,size:26},hover=null,drag=null,fitted=false,seenLabels=new Map(),landed=new Map(),asked=new Map();
 const canvas=$('board'),ctx=canvas.getContext('2d'),overlay=$('marks'),mctx=overlay.getContext('2d');
 const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
@@ -206,12 +218,12 @@ function toast(text){const t=$('toast');t.textContent=text;t.classList.add('show
 
 /* server */
 async function post(path,body={}){
-  try{const res=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  try{const res=await fetch(endpoint(path),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const data=await res.json();if(!res.ok)throw Error(data.error);accept(data);return data}
   catch(e){toast(e.message);return null}
 }
 async function poll(){
-  try{const res=await fetch('/state'+(S?'?since='+S.revision:''));accept(await res.json())}catch(e){}
+  try{const res=await fetch(endpoint('/state')+(S?'?since='+S.revision:''));if(res.ok)accept(await res.json())}catch(e){}
   setTimeout(poll,S&&S.jobs.length?350:1500);
 }
 const failures=new Set();
@@ -393,6 +405,8 @@ function seatControls(seat,kind,send,extra){
 }
 function renderSeat(side){
   const seat=S.seats[side],box=$('seat'+side),[kind,name]=engineName(seat);
+  if(S.saved_game){box.replaceChildren(el('div',{class:'seat-head'},el('i',{class:'hexdot'}),
+    el('span',{},S.saved_game.players[side])));box.classList.remove('active');return}
   const pick=el('button',{class:'pick'},el('span',{class:'kind'},kind),el('span',{},name));
   const items=[{id:'human',kind:'you',name:'Human'},...S.engines.map(e=>({id:e.id,kind:e.kind,name:e.name}))];
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,seat.engine,it=>post('/seat',{side,engine:it.id}));
@@ -484,6 +498,9 @@ function renderDetail(){
 }
 function renderPanels(){
   if(!S)return;
+  $('study-note').hidden=!STUDY;
+  if(STUDY)$('study-note').replaceChildren(el('strong',{},S.saved_game?`Analysis · Game ${S.saved_game.game}`:'Analysis board'),
+    ...(S.saved_game?[el('span',{class:'empty'},S.saved_game.name)]:[]),el('a',{href:'/'},'Live board'));
   document.documentElement.style.setProperty('--turn',S.winner>=0?COLORS[S.winner]:COLORS[playerAt(view)]);
   renderSeat(0);renderSeat(1);renderEngineHead();renderStudy();
   const engines=S.seats.some(s=>s.engine!=='human');$('pause').textContent=S.paused?'Resume':'Pause';$('pause').disabled=!engines;
@@ -502,7 +519,8 @@ function renderPanels(){
       const replay=el('select',{'aria-label':'Completed game'},Array.from({length:match.completed},(_,i)=>
         el('option',{value:i+1},`Game ${i+1}`)));replay.value=match.completed;
       const link=el('a',{href:`/match/replay?game=${replay.value}`,download:''},'HTTTX');
-      replay.onchange=()=>link.href=`/match/replay?game=${replay.value}`;box.append(el('div',{class:'row'},replay,link));
+      const open=el('button',{onclick:showTournaments},'Browse games');
+      replay.onchange=()=>link.href=`/match/replay?game=${replay.value}`;box.append(el('div',{class:'row'},replay,link),open);
     }
   }
   for(const id of ['new','undo','import','retry'])$(id).disabled=!!match?.active;
@@ -533,13 +551,37 @@ function renderJobs(){
 /* game actions */
 $('new').onclick=async()=>{if(await post('/new')){fit();draw()}};$('undo').onclick=()=>post('/undo');
 $('pause').onclick=()=>post('/pause',{paused:!S.paused});
-$('copy').onclick=async()=>{const res=await fetch('/htttx');const text=await res.text();if(!res.ok)return toast(JSON.parse(text).error);
+$('copy').onclick=async()=>{const res=await fetch(endpoint('/htttx'));const text=await res.text();if(!res.ok)return toast(JSON.parse(text).error);
   await navigator.clipboard.writeText(text);$('copy').textContent='Copied';setTimeout(()=>$('copy').textContent='Copy HTTTX',1400)};
-$('save-game').onclick=()=>location.assign('/replay');$('save-evals').onclick=()=>location.assign('/evaluations');
+$('save-game').onclick=()=>location.assign(endpoint('/replay'));$('save-evals').onclick=()=>location.assign(endpoint('/evaluations'));
 $('import').onclick=()=>{$('import-text').value='';$('import-dialog').showModal()};
 $('import-dialog').onclose=async()=>{if($('import-dialog').returnValue==='ok'&&await post('/import',{text:$('import-text').value})){view=S.history.length;fit();go(view)}};
 $('import-dialog').ondragover=e=>e.preventDefault();
 $('import-dialog').ondrop=async e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)$('import-text').value=await f.text()};
-poll();
+async function showTournaments(){
+  try{const response=await fetch('/matches'),data=await response.json();if(!response.ok)throw Error(data.error);
+    const select=$('saved-batch'),games=$('saved-games');
+    select.replaceChildren(...data.matches.map(m=>el('option',{value:m.id},`${m.name} · ${m.players.join(' vs ')} · ${m.completed}/${m.games}`)));
+    const render=()=>{const match=data.matches.find(m=>m.id===select.value);
+      games.replaceChildren(...(match?.results.length?match.results.map(r=>{
+        const query=new URLSearchParams({batch:match.id,game:r.game}),result=r.winner==null?'capped':`${match.players[r.winner]} won`;
+        return el('div',{class:'saved-game'},el('a',{href:`/?study=1&${query}`,target:'_blank',rel:'noopener'},
+          `Game ${r.game} · ${result} · ${r.placements} placements`),
+          el('a',{href:`/matches/game?${query}&format=htttx`,download:''},'HTTTX'));
+      }):[el('div',{class:'empty'},'No completed games yet.')]))};
+    select.onchange=render;render();$('tournament-dialog').showModal();
+  }catch(error){toast(error.message)}
+}
+$('tournaments').onclick=showTournaments;
+$('tournament-close').onclick=()=>$('tournament-dialog').close();
+(async()=>{
+  if(STUDY&&PAGE.has('batch')){
+    try{const response=await fetch('/matches/open',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({batch:PAGE.get('batch'),game:Number(PAGE.get('game'))})});
+      if(!response.ok)throw Error((await response.json()).error);
+    }catch(error){toast(error.message);return}
+  }
+  poll();
+})();
 </script>
 </html>

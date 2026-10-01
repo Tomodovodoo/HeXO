@@ -914,9 +914,12 @@ class Session:
     """The game, the seats, the analysis settings and the job queue. HTTP threads call the public methods; one
     worker thread runs the jobs through `engines`. `revision` grows with every change the page must redraw."""
 
-    def __init__(self, entries, engines, store, rescan=lambda: None, book=None):
+    def __init__(self, entries, engines, store, rescan=lambda: None, book=None, archive=None, study_store=None):
         self.entries, self.engines, self.store, self.rescan_entries = entries, engines, store, rescan
         self.book = book
+        self.archive = Path(archive) if archive else None
+        self.study_store = study_store
+        self.saved_matches, self.study, self.saved_game = {}, None, None
         self.lock = threading.Condition()
         self.history, self.revision, self.paused = [], 0, False
         self.instance, self.closing = os.urandom(4).hex(), False
@@ -988,6 +991,7 @@ class Session:
                         match={k: v for k, v in self.match.items() if k not in ('results', 'openings', 'opening_selection')}
                         if self.match else None,
                         clock=self.match_clock.json() if self.match_clock else None,
+                        saved_game=self.saved_game,
                         evaluations=evaluations,
                         review=review(history, self.lookup, board['winner']), jobs=self.job_list())
 
@@ -1099,6 +1103,7 @@ class Session:
             self.history, self.paused = [tuple(map(int, p)) for p in history], paused
             self.match = None
             self.match_clock = None
+            self.saved_game = None
             self.stop_moves()
             self.changed()
 
@@ -1198,6 +1203,74 @@ class Session:
             self.changed()
 
     # Bot matches use the same seats, jobs and board as interactive play.
+
+    def remember_match(self, directory):
+        directory = Path(directory).resolve()
+        ident = hashlib.sha256(str(directory).encode()).hexdigest()[:16]
+        self.saved_matches[ident] = directory
+        if self.archive:
+            self.archive.mkdir(parents=True, exist_ok=True)
+            path = self.archive / f'{ident}.json'
+            temporary = path.with_suffix(f'.{os.getpid()}.tmp')
+            temporary.write_text(json.dumps(str(directory)), encoding='utf-8')
+            temporary.replace(path)
+        return ident
+
+    def match_catalogue(self):
+        if self.archive:
+            for path in self.archive.glob('*.json'):
+                self.saved_matches[path.stem] = Path(json.loads(path.read_text(encoding='utf-8')))
+        rows = []
+        for ident, directory in list(self.saved_matches.items()):
+            try:
+                match = json.loads((directory / 'summary.json').read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                continue
+            rows.append(dict(id=ident, name=directory.name, **{key: match[key] for key in
+                ('games', 'completed', 'wins', 'capped', 'results')}, players=[p['name'] for p in match['players']]))
+        return sorted(rows, key=lambda row: row['name'], reverse=True)
+
+    def saved_replay(self, ident, number):
+        self.match_catalogue()
+        if ident not in self.saved_matches or type(number) is not int or number < 1:
+            raise ValueError('No such saved game')
+        directory = self.saved_matches[ident]
+        game = json.loads((directory / f'game-{number:04d}.json').read_text(encoding='utf-8'))
+        return directory, game
+
+    def open_saved_game(self, ident, number):
+        directory, game = self.saved_replay(ident, number)
+        with self.lock:
+            if self.study is None:
+                # Analysis has its own queue and CPU model; it cannot spend a live game's clock.
+                self.study = Session(dict(self.entries), Engines('cpu', getattr(self.engines, 'tactical_package', None)),
+                                     Evaluations(self.study_store), self.rescan_entries)
+            study = self.study
+        with study.lock:
+            for job in study.jobs.values():
+                if job.status in ('queued', 'running'):
+                    job.cancelled = True
+            study.entries.update(self.entries)
+            study.seats = [dict(engine='human'), dict(engine='human')]
+            if study.analysis:
+                study.analysis['auto'] = False
+            # Reuse evaluations already saved during the tournament, without editing its files.
+            path = directory / 'evaluations.jsonl'
+            if path.exists():
+                with study.store.lock, path.open(encoding='utf-8') as lines:
+                    for line in lines:
+                        try:
+                            record = json.loads(line)
+                            key = (hashlib.blake2b(record['position'].encode(), digest_size=16).digest(), record['engine'],
+                                   (record['simulations'], record['solver_nodes']))
+                            if key not in study.store.order:
+                                study.store.index(record, line.strip())
+                        except (ValueError, KeyError, TypeError):
+                            continue
+            study.load(game['history'], True)
+            study.saved_game = dict(batch=ident, name=directory.name, game=number,
+                                   players=[p['name'] for p in game['players']], winner=game['winner'], reason=game['reason'])
+        return study
 
     def match_editable(self):
         if self.match and self.match['active'] or self.match_worker and self.match_worker.is_alive():
@@ -1345,6 +1418,7 @@ class Session:
                          clock=clock, preparing=mode != 'fixed', turns=[], outcome=None, pentanomial=[0]*5, seed=seed,
                          partial_spent_ms=0)
             self.write_match(match)
+            self.remember_match(directory)
             evaluation_path = Path(evaluations) if evaluations else directory / 'evaluations.jsonl'
             evaluation_path.parent.mkdir(parents=True, exist_ok=True)
             self.store = Evaluations(evaluation_path)
@@ -1463,6 +1537,7 @@ class Session:
                     self.analysis['auto'] = False
                 self.paused = False
                 self.write_match(match)
+                self.remember_match(directory)
                 self.changed()
                 self.match_worker = threading.Thread(target=self.run_match, args=(match,), daemon=True)
                 self.match_worker.start()
@@ -1477,6 +1552,7 @@ class Session:
             raise ValueError(f"{entry['name']} supports fixed simulations only; its adapter cannot enforce a clock")
         if kind == 'bubble':
             return dict(kind=kind, model=str(export_path(entry, seat['checkpoint']).resolve()),
+                        tactical_package=str(self.engines.tactical_package) if getattr(self.engines, 'tactical_package', None) else None,
                         device=seat['device'], search=dict(enabled=budget['simulations'] > 0,
                         max_simulations=max(1, budget['simulations'])),
                         solver=dict(enabled=budget['solver_nodes'] > 0, nodes=max(1, budget['solver_nodes'])))
@@ -1654,6 +1730,8 @@ class Session:
         if self.match_worker:
             self.match_worker.join(timeout)
         self.engines.close()
+        if self.study:
+            self.study.close(timeout)
 
     def work(self):
         while True:
@@ -1888,6 +1966,23 @@ class Handler(BaseHTTPRequestHandler):
         url, session = urlparse(self.path), self.session
         if url.path == '/':
             return self.respond(200, self.page.read_bytes(), 'text/html; charset=utf-8')
+        if url.path.startswith('/study/'):
+            session = session.study
+            if session is None:
+                return self.respond(404, dict(error='Choose a tournament game to analyse'))
+            url = url._replace(path=url.path[len('/study'):])
+        if url.path in ('/matches', '/matches/game'):
+            try:
+                if url.path == '/matches':
+                    return self.respond(200, dict(matches=session.match_catalogue()))
+                query = parse_qs(url.query)
+                _, game = session.saved_replay(query['batch'][0], int(query['game'][0]))
+                if query.get('format') == ['htttx']:
+                    return self.respond(200, dumps([tuple(p) for p in game['history']]), 'text/plain; charset=utf-8',
+                                        [('Content-Disposition', f'attachment; filename="game-{game["game"]:04d}.htttx"')])
+                return self.respond(200, game)
+            except (ValueError, KeyError, TypeError, OSError) as error:
+                return self.respond(400, dict(error=str(error)))
         if url.path == '/state':
             since = parse_qs(url.query).get('since', [''])[0]
             return self.respond(200, session.poll(int(since)) if since.isdigit() else session.state())
@@ -1943,13 +2038,23 @@ class Handler(BaseHTTPRequestHandler):
         if not self.local():
             return self.respond(403, dict(error='Origin rejected'))
         session = self.session
+        if self.path.startswith('/study/'):
+            session = session.study
+            if session is None:
+                return self.respond(404, dict(error='Choose a tournament game to analyse'))
+            self.path = self.path[len('/study'):]
+            if self.path.startswith('/match'):
+                return self.respond(400, dict(error='Start tournaments on the live board'))
         try:
             length = int(self.headers.get('Content-Length', 0))
             if not 0 <= length <= 1 << 20:
                 raise ValueError('Request too large')
             args = json.loads(self.rfile.read(length) or '{}')
             reply = {}
-            if self.path == '/play':
+            if self.path == '/matches/open':
+                session.open_saved_game(args['batch'], args['game'])
+                return self.respond(200, dict(url='/?study=1'))
+            elif self.path == '/play':
                 session.play(args['q'], args['r'])
             elif self.path == '/undo':
                 session.undo()
@@ -2111,7 +2216,9 @@ def main():
     # Bind before starting any engine work: a busy port must not leave a hidden match running.
     with ThreadingHTTPServer(('127.0.0.1', args.port), Handler) as server:
         Handler.session = Session(entries, Engines(args.device, args.tactical_package),
-                                  Evaluations(None if args.match else store_path), find, book)
+                                  Evaluations(None if args.match else store_path), find, book,
+                                  archive=ROOT / 'artifacts' / 'play' / 'matches',
+                                  study_store=ROOT / 'artifacts' / 'play' / f'study-{args.port}.jsonl')
         try:
             if args.match:
                 players = [dict(engine=name, checkpoint=getattr(args, f'{side}_checkpoint'),

@@ -84,6 +84,16 @@ null. Complete colour pairs use the evaluator's pentanomial scoring and `dense_p
 relative Elo estimate and 95% interval. These exploratory results stay in the batch directory and do not
 change the training league or its calibrated-opponent scoreboard.
 
+The **Tournaments** button lists saved batches and every completed game's result. Click a game to open it
+in the player's analysis board in another tab, or download its HTTTX. The analysis board has its own CPU
+engine queue, move timeline, analysis controls and Review button, so browsing and analysing a saved game
+do not replace the live tournament board or spend its clock. One analysis board is shared by the player
+port. Retry creates a variation without changing the saved tournament game.
+
+The tournament catalogue also remembers custom `--out` directories and survives server restarts.
+Analysis is saved in `artifacts/play/study-<port>.jsonl`; reopening a game restores it and also reuses
+evaluations recorded during the tournament. Bookmarked game links reopen the saved game after a restart.
+
 ```sh
 python python/bubble.py match status --port 8772
 python python/bubble.py match pause --port 8772
@@ -116,6 +126,9 @@ curl -X POST http://127.0.0.1:8772/match -H "Content-Type: application/json" -d 
 | `POST /match` with `{"action":"resume","batch":"path/to/batch"}` | Load and resume a saved batch |
 | `GET /match/results` | Download the batch specification and completed results |
 | `GET /match/replay?game=1` | Download a completed game's HTTTX |
+| `GET /matches` | Saved tournaments and their completed game results |
+| `GET /matches/game?batch=<id>&game=1` | Saved replay JSON; add `&format=htttx` for notation |
+| `POST /matches/open` with `{"batch":"<id>","game":1}` | Open a saved game on the separate analysis board |
 | `GET /replay`, `GET /htttx` | Export the visible game |
 
 A player specification can also be `{"engine":"dense-v1","checkpoint":"main/150000","preset":"custom","custom":{"simulations":128,"solver_nodes":32768}}`.

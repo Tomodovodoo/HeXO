@@ -643,6 +643,17 @@ class Http(unittest.TestCase):
                 result = json.loads(self.get('/match/results'))
                 self.assertEqual((live['match']['completed'], result['capped']), (2, 2))
                 self.assertEqual(len(live['history']), 3)
+                catalogue = json.loads(self.get('/matches'))['matches']
+                ident = catalogue[0]['id']
+                self.assertEqual(catalogue[0]['completed'], 2)
+                saved = json.loads(self.get(f'/matches/game?batch={ident}&game=1'))
+                self.assertEqual(import_history(self.get(f'/matches/game?batch={ident}&game=1&format=htttx')), saved['history'])
+                with unittest.mock.patch('play.Engines', return_value=FakeEngines()):
+                    self.post('/matches/open', dict(batch=ident, game=1))
+                self.assertEqual(json.loads(self.get('/study/state'))['history'], saved['history'])
+                self.post('/study/retry', dict(ply=1))
+                self.assertEqual(json.loads(self.get('/study/state'))['history'], [[0, 0]])
+                self.assertEqual(json.loads(self.get('/state'))['history'], live['history'])
                 self.assertEqual(self.post('/match/stop')['match']['active'], False)
                 self.post('/new')
                 self.assertIsNone(json.loads(self.get('/state'))['match'])
@@ -827,6 +838,47 @@ class Matches(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Tactical solver build changed'):
             self.session.resume_match(self.output)
         self.assertFalse(self.session.match['active'])
+
+    def test_saved_games_and_analysis_survive_restart_without_changing_live_play(self):
+        self.session.archive = Path(self.directory.name) / 'archive'
+        self.session.study_store = Path(self.directory.name) / 'analysis.jsonl'
+        self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
+        wait(lambda: self.session.match['completed'] == 1)
+        self.session.pause(True)
+        ident = self.session.match_catalogue()[0]['id']
+        saved = (self.output / 'game-0001.json').read_bytes()
+        with unittest.mock.patch('play.Engines', return_value=FakeEngines()):
+            study = self.session.open_saved_game(ident, 1)
+        study.configure_analysis('bubble:fake', preset='custom', custom=dict(simulations=1, solver_nodes=0), auto=False)
+        study.analyse(1)
+        wait(lambda: study.lookup([(0, 0)]) is not None)
+        self.assertTrue(self.session.match['active'])
+        self.session.pause(False)
+        wait(lambda: not self.session.match_worker.is_alive())
+        self.assertEqual(self.session.match['completed'], 2)
+        self.session.close()
+        reopened = Session(entries(), FakeEngines(), Evaluations(), archive=self.session.archive,
+                           study_store=self.session.study_store)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.match_catalogue()[0]['completed'], 2)
+        with unittest.mock.patch('play.Engines', return_value=FakeEngines()):
+            study = reopened.open_saved_game(ident, 1)
+        self.assertIsNotNone(study.lookup([(0, 0)]))
+        self.assertEqual((self.output / 'game-0001.json').read_bytes(), saved)
+
+    def test_timed_bubble_uses_the_selected_tactical_package(self):
+        package = Path(self.directory.name) / 'solver'
+        self.engines.tactical_package = package
+        seat = self.session.match_seat('bubble:2@quick', 'standard')
+        config = self.session.timed_config(seat)
+        self.assertEqual(config['tactical_package'], str(package))
+        from timed_engine import _worker
+        with unittest.mock.patch('dense_player.DensePlayer') as player:
+            player.return_value.prover = None
+            connection = unittest.mock.Mock()
+            connection.recv.return_value = None
+            _worker(connection, threading.Event(), config)
+            self.assertEqual(player.call_args.kwargs['tactical_package'], package)
 
     def test_seat_specs_resolve_presets_checkpoint_steps_and_custom_budgets(self):
         seat = self.session.match_seat('bubble:2@quick', 'standard')
