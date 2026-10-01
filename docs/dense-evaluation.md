@@ -20,7 +20,7 @@ A candidate is promoted when it has the highest posterior rating and P(candidate
 
 ## Variants
 
-A variant is a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`, `solver_*`), rated in the league as `<checkpoint>@<name>`:
+A variant is a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`, `search_graph`, `solver_*`), rated in the league as `<checkpoint>@<name>`:
 
 ```sh
 python python/dense_eval.py variant --run R --checkpoint champion --name solver --set solver_root_nodes=135 --set solver_finalists=2 --set solver_finalist_nodes=135 --set solver_threat_nodes=135

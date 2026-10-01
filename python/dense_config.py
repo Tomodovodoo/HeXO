@@ -36,6 +36,7 @@ class ActorSettings:
     cheap_root_samples: int = 4  # leave cheap searches enough visits to descend beyond the root
     max_plies: int = 256
     tactics: bool = True         # exact win/must-block classification inside the tree
+    search_graph: bool = False   # share transposed turn contexts and proven positions (neural_search graph)
     cache_positions: int = 4096
     shard_games: int = 32
     opening_random_plies: float = 2.  # mean of an exponential; sampled from the search policy
@@ -214,6 +215,7 @@ class EvaluationSettings:
     root_samples: int = 16
     max_plies: int = 256
     tactics: bool = True
+    search_graph: bool = False    # share transposed turn contexts and proven positions (neural_search graph)
     anchor_every: int = 5         # the champion owes anchor_games more vs Seal per N checkpoints rated during its reign
     anchor_games: int = 100       # champion vs Seal, played before optional work; 0 = never
     anchor_session_games: int = 20  # most Seal anchor games before a pending trial gets its turn

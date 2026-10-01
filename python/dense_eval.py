@@ -47,17 +47,17 @@ def anchor_engine(settings):
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
 # Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
-PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'opening_suite', 'opening_book', 'seal_ms',
+PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'search_graph', 'opening_suite', 'opening_book', 'seal_ms',
             'external_engine', 'external_name',
             'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes',
             'solver_defence', 'solver_defence_candidates', 'solver_gate_cap_nodes', 'pipeline')
-PROTOCOL_DEFAULTS = dict(opening_book='', external_engine='', external_name='seal', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
+PROTOCOL_DEFAULTS = dict(opening_book='', search_graph=False, external_engine='', external_name='seal', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
                          solver_threat_nodes=0, solver_defence=False, solver_defence_candidates=8,
                          solver_gate_cap_nodes=0, pipeline=False)
 CHAMPION = 'champion'  # the symbolic base of a variant, bound to the champion when its comparison starts
 # The PROTOCOL fields of one side's search, which a variant may override; max_plies, opening_suite, seal_ms
 # and opening_book belong to the game.
-SIDE = ('sims', 'root_samples', 'tactics', 'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes',
+SIDE = ('sims', 'root_samples', 'tactics', 'search_graph', 'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes',
         'solver_threat_nodes', 'solver_defence', 'solver_defence_candidates')
 REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
 CALIBRATION_LATER = 3     # later comparisons of a decided checkpoint before `calibration` counts its verdict
@@ -73,22 +73,25 @@ class MatchGame:
     placements with argmax play (one tree per distinct model, advanced on every placement); a Seal side
     plays complete turns inline, validated with Game.legal. Ends at a win, `max_plies` placements or when the
     Engine stops it (`reason` 'span'). sims, samples and tactics are one value for both colours or a pair per
-    colour; solvers[colour] is that colour's dense_solver.Budgets (None: off). A model playing both colours shares
-    one tree, searched with colour 0's tactics."""
+    colour; solvers[colour] is that colour's dense_solver.Budgets (None: off). graphs, one value or a pair, selects
+    graph search per colour. A model playing both colours with one graph setting shares one tree, searched with the
+    first such colour's tactics."""
 
     def __init__(self, sides, opening, seed, sims, samples, tactics, max_plies, record, seal=None, seal_ms=0,
-                 solvers=(None, None), anchor=SEAL):
+                 solvers=(None, None), anchor=SEAL, graphs=False):
         self.sides, self.max_plies, self.seal, self.seal_ms, self.record = sides, max_plies, seal, seal_ms, record
         self.anchor = anchor
         self.solvers = solvers
         self.reason, self.error = None, None
         per = lambda value: tuple(value) if isinstance(value, (tuple, list)) else (value, value)
-        self.budgets, self.sample_counts, tactics = per(sims), per(samples), per(tactics)
+        self.budgets, self.sample_counts, tactics, self.graphs = per(sims), per(samples), per(tactics), per(graphs)
         self.game, self.moves = Game([tuple(m) for m in opening]), [list(m) for m in opening]
         self.trees = {}
         for colour, side in enumerate(sides):
-            if side != self.anchor and id(side) not in self.trees:
-                self.trees[id(side)] = side.tree([tuple(m) for m in opening], seed*2+colour, tactics[colour])
+            key = id(side), self.graphs[colour]
+            if side != self.anchor and key not in self.trees:
+                args = [tuple(m) for m in opening], seed*2+colour, tactics[colour]
+                self.trees[key] = side.tree(*args, graph=True) if self.graphs[colour] else side.tree(*args)
         try:
             self.seal_turns()
         except Exception as error:
@@ -110,7 +113,7 @@ class MatchGame:
 
     @property
     def tree(self):
-        return self.trees[id(self.model)]
+        return self.trees[id(self.model), self.graphs[self.game.player]]
 
     @property
     def solver(self):
@@ -216,7 +219,8 @@ def paired_games(challenger, rival, games, label, config, settings, seal, book, 
             out.append(MatchGame(players, opening, seed, [s.sims for s in search], [s.root_samples for s in search],
                                  [s.tactics for s in search], settings.max_plies,
                                  dict(record, pair=pair, seed=seed, opening=[list(m) for m in opening], challenger_color=colour),
-                                 seal, settings.seal_ms, [Budgets.of(s) for s in search], anchor_name(settings)))
+                                 seal, settings.seal_ms, [Budgets.of(s) for s in search], anchor_name(settings),
+                                 [s.search_graph for s in search]))
     return out
 
 
@@ -2243,7 +2247,7 @@ def calibrate(args):
     settings = config.evaluation
     samples = min(settings.root_samples, args.sims)
     games = [MatchGame([model, model], e['moves'], k, args.sims, samples, settings.tactics, len(e['moves'])+args.extra,
-                       dict(index=k)) for k, e in enumerate(chosen)]
+                       dict(index=k), graphs=settings.search_graph) for k, e in enumerate(chosen)]
     started = time.perf_counter()
     records = play(games, config.actor.leaf_batch)
     methods = ['masked', 'root']+[f'td{lam:g}' for lam in args.lambdas]
