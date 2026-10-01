@@ -519,7 +519,8 @@ class Jobs(unittest.TestCase):
         wait(lambda: all(self.session.store.covering([], key, budget) for budget in budgets
                          for key in [self.session.engine_key(self.session.analysis)]))
         deep = [budget for checkpoint, budget, history in self.engines.calls if not history]
-        self.assertEqual((deep, deep[-1]), (sorted(deep, key=lambda b: b['simulations']), PRESETS['bubble']['dangerous']))
+        self.assertEqual(deep, budgets)
+        self.assertIsNone(self.session.analyse(0))
         self.session.load([(0, 0)], True)
         time.sleep(.2)
         self.assertFalse([j for j in self.session.state()['jobs'] if j['ply'] == 1 and j['kind'] == 'analyse'

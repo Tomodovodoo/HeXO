@@ -1148,10 +1148,18 @@ class Session:
                 if job.status == 'queued':
                     job.status = 'cancelled'
         opening = not self.history or remaining == 2
-        if self.analysis and self.analysis['auto'] and winner < 0 and opening:
+        if self.analysis and self.analysis['auto'] and winner < 0 and opening and not self.deepening(winner):
             self.request_analysis(self.history, 1)
         self.deepen(winner)
         self.lock.notify_all()
+
+    def deepening(self, winner):
+        """True while the current position deepens (see `deepen`): Auto is on, an engine seat plays, the game is
+        neither paused, finished nor a batch. The configured analysis budget then waits for the deepening, so the
+        fast presets land first."""
+        return bool(self.analysis and self.analysis['auto'] and not self.paused and winner < 0
+                    and any(seat['engine'] != 'human' for seat in self.seats)
+                    and not (self.match and self.match['active']))
 
     def deepen(self, winner):
         """While an engine seat plays, the game is not paused and Auto is on, evaluate the current position with the analysis
@@ -1164,10 +1172,8 @@ class Session:
                 job.cancelled = True
                 if job.status == 'queued':
                     job.status = 'cancelled'
-        playing = (not self.paused and winner < 0 and any(seat['engine'] != 'human' for seat in self.seats)
-                   and not (self.match and self.match['active']))
-        if not playing or not self.analysis or not self.analysis['auto'] or any(hasattr(job, 'tier') and job.history == current and
-                                                   job.status in ('queued', 'running') for job in self.jobs.values()):
+        if not self.deepening(winner) or any(hasattr(job, 'tier') and job.history == current and
+                                             job.status in ('queued', 'running') for job in self.jobs.values()):
             return
         for tier in PRESET_NAMES:
             failed = any(getattr(job, 'tier', None) == tier and job.history == current and job.status == 'failed'
@@ -1323,7 +1329,12 @@ class Session:
                     job.cancelled = True
                     if job.status == 'queued':
                         job.status = 'cancelled'
-            job = self.request_analysis(self.history[:ply], 0, force)
+            game = replay(self.history)
+            try:
+                deepening = ply == len(self.history) and self.deepening(game.winner)
+            finally:
+                game.close()
+            job = None if deepening and not force else self.request_analysis(self.history[:ply], 0, force)
             self.lock.notify_all()
             return job.id if job else None
 
