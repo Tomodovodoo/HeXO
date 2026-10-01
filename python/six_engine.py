@@ -164,9 +164,10 @@ def serve(player, source=sys.stdin, out=sys.stdout):
 class SixEngine:
     """An external Six-protocol opponent with the call shape of legacy.arena.Seal."""
 
-    def __init__(self, command, timeout=30.):
+    def __init__(self, command, timeout=30., *, cancel=None):
         self.command = shlex.split(command) if isinstance(command, str) else list(command)
         self.timeout = timeout
+        self.cancel = cancel
         self.game = None
         self.proc = None
         self._start()
@@ -203,9 +204,14 @@ class SixEngine:
         import time
         deadline = time.monotonic() + timeout
         while True:
+            if self.cancel is not None and self.cancel.is_set():
+                raise ProtocolError('engine request cancelled')
             try:
-                line = self.lines.get(timeout=max(0, deadline - time.monotonic()))
+                wait = max(0, deadline-time.monotonic())
+                line = self.lines.get(timeout=min(.01, wait) if self.cancel is not None else wait)
             except queue.Empty as error:
+                if time.monotonic() < deadline:
+                    continue
                 raise ProtocolError(f'engine timed out waiting for {prefix}') from error
             if line is None:
                 raise ProtocolError('engine exited')
@@ -216,6 +222,8 @@ class SixEngine:
 
     def __call__(self, game, ms):
         try:
+            if self.proc is None:
+                self._start()
             if game is not self.game:
                 self._send('newgame')
                 self._send('isready')
@@ -248,7 +256,8 @@ class SixEngine:
         except (ProtocolError, ValueError) as error:
             self._stop()
             self.game = None
-            self._start()
+            if self.cancel is None or not self.cancel.is_set():
+                self._start()
             raise ProtocolError(str(error)) from error
 
     def _stop(self):

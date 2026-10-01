@@ -181,7 +181,8 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
                     extra = max(1, min(16384, int(player.simulations_per_second*(extension_end-time.monotonic()))))
                     if limits.get('simulations') is not None:
                         extra = min(extra, max(0, limits['simulations']-result['completed']))
-                    finalists = searched['actions'][np.isfinite(searched['scores'])][:2]
+                    order = np.argsort(-searched['scores'])
+                    finalists = searched['actions'][[i for i in order if np.isfinite(searched['scores'][i])][:2]]
                     if extra and len(finalists):
                         extended = tree.search(extra, root_samples=min(2, extra), batch_size=min(16, extra),
                             milliseconds=max(.001, (extension_end-time.monotonic())*1000), stop=cancel.is_set,
@@ -264,7 +265,7 @@ def _worker(connection, cancellation, config):
                                  leaf_solver=solver.get('leaf', False) and player.options['solver'])
         elif kind == 'six':
             from six_engine import SixEngine
-            player = SixEngine(config['command'])
+            player = SixEngine(config['command'], cancel=cancellation)
             identity = dict(checkpoint='six', command=config['command'])
         elif kind == 'htttx':
             player = HTTTXEngine(config['url'])
@@ -362,13 +363,19 @@ class TimedEngine:
         limits = allowance(clock, game.player, milliseconds)
         deadline = started + max(0, limits['hard_ms']-limits['reserve_ms'])/1000
         best = dict(moves=legal_turn(history), backend='timed', checkpoint=self.checkpoint,
-                    model_sha256=self.model_sha256, stop_reason='deadline', elapsed_ms=0)
-        with self.lock:
+                    model_sha256=self.model_sha256, stop_reason='deadline', elapsed_ms=0,
+                    allowance=limits)
+        if not self.lock.acquire(timeout=max(0, deadline-time.monotonic())):
+            best.update(stop_reason='busy', elapsed_ms=(time.monotonic()-started)*1000)
+            return best
+        try:
             while self.connection.poll():
                 message = self.connection.recv()
                 if len(message) == 3 and message[1] in ('done', 'error'):
                     self.busy = False
             if self.busy or time.monotonic() >= deadline:
+                best.update(stop_reason='busy' if self.busy else 'deadline',
+                            elapsed_ms=(time.monotonic()-started)*1000)
                 return best
             if not self.process.is_alive():
                 raise RuntimeError('Engine worker exited')
@@ -410,6 +417,8 @@ class TimedEngine:
             best['elapsed_ms'] = (time.monotonic()-started)*1000
             best['allowance'] = limits
             return best
+        finally:
+            self.lock.release()
 
     def close(self):
         self.cancellation.set()

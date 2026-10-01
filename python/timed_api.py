@@ -19,6 +19,8 @@ from time_control import milliseconds
 def create_app(default_config=None, *, run=None, directory=None, engine_factory=TimedEngine):
     default_config = dict(default_config or dict(kind='native'))
     matches, engines, tasks = {}, {}, set()
+    sockets = set()
+    shutting_down = asyncio.Event()
 
     @web.middleware
     async def errors(request, handler):
@@ -46,13 +48,22 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
             configured['run'] = str(Path(run).resolve())
         return configured
 
+    async def start_engine(configuration):
+        task = asyncio.create_task(asyncio.to_thread(engine_factory, configuration))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            engine = await task
+            await asyncio.to_thread(engine.close)
+            raise
+
     async def prepare(match):
         prepared = []
         try:
             for side in ('cross', 'circle'):
                 player = match.specification['players'][side]
                 prepared.append(None if player['kind'] == 'human' else
-                                await asyncio.to_thread(engine_factory, player))
+                                await start_engine(player))
             engines[match.id] = prepared
             with match.lock:
                 match.specification['identities'] = [engine.identity if engine else dict(checkpoint='human')
@@ -61,10 +72,13 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
                     match._write('spec.json', match.specification)
                 match.state = 'ready'
                 match.record('ready')
-        except Exception as error:
+        except BaseException as error:
+            engines.pop(match.id, None)
             for engine in prepared:
                 if engine:
                     await asyncio.to_thread(engine.close)
+            if isinstance(error, asyncio.CancelledError):
+                raise
             with match.lock:
                 match.state = 'failed'
                 match.record('error', error=str(error))
@@ -77,7 +91,21 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
             await asyncio.to_thread(play_turn, match, engine)
             await asyncio.sleep(0)
 
+    async def release(match):
+        playing = getattr(match, 'playing_task', None)
+        if playing and playing is not asyncio.current_task():
+            with suppress(Exception):
+                await playing
+        for engine in engines.pop(match.id, []):
+            if engine:
+                await asyncio.to_thread(engine.close)
+
     def schedule(match):
+        if match.state == 'finished':
+            releasing = getattr(match, 'release_task', None)
+            if match.id in engines and (releasing is None or releasing.done()):
+                match.release_task = spawn(release(match))
+            return
         existing = getattr(match, 'playing_task', None)
         if existing and not existing.done():
             # An abandoned turn's thread exits before a resumed request starts.
@@ -141,7 +169,8 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
     async def socket(request):
         ws = web.WebSocketResponse(max_msg_size=1_048_576, heartbeat=20)
         await ws.prepare(request)
-        engine = await asyncio.to_thread(engine_factory, default_config)
+        sockets.add(ws)
+        engine = None
         history, saved, clock, setup_history = [[0, 0]], None, None, None
         generation, last_id, pending = 0, -1, None
         cancellation = threading.Event()
@@ -157,7 +186,10 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
                 if evaluate:
                     value = result.get('win_probability')
                     evaluation = {} if value is None else dict(heuristic=(2*value-1)*(1 if game.player == 0 else -1))
-                    await ws.send_json(dict(type='eval_response', evaluation=evaluation))
+                    packet = dict(type='eval_response', evaluation=evaluation)
+                    if ident is not None:
+                        packet['request_id'] = ident
+                    await ws.send_json(packet)
                 else:
                     legal_turn(local, result['moves'])
                     packet = dict(type='move_response', move=dict(pieces=[dict(q=q, r=r) for q, r in result['moves']]))
@@ -172,6 +204,7 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
                 game.close()
 
         try:
+            engine = await start_engine(default_config)
             async for message in ws:
                 if message.type != web.WSMsgType.TEXT:
                     continue
@@ -258,12 +291,14 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
                 except (ValueError, KeyError, TypeError) as error:
                     await ws.send_json(dict(type='error', error=str(error)))
         finally:
+            sockets.discard(ws)
             generation += 1
             cancellation.set()
             if pending:
                 with suppress(Exception):
                     await pending
-            await asyncio.to_thread(engine.close)
+            if engine:
+                await asyncio.to_thread(engine.close)
         return ws
 
     async def create(request):
@@ -301,7 +336,7 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
                     for side in ('cross', 'circle'):
                         player = match.specification['players'][side]
                         prepared.append(None if player['kind'] == 'human' else
-                                        await asyncio.to_thread(engine_factory, player))
+                                        await start_engine(player))
                 except BaseException:
                     for engine in prepared:
                         if engine:
@@ -331,12 +366,13 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
         response = web.StreamResponse(headers={'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache'})
         await response.prepare(request)
         try:
-            while True:
+            while not shutting_down.is_set():
                 event = dict(type='clock', **match.tick())
                 await response.write(('data: '+json.dumps(event, allow_nan=False)+'\n\n').encode())
                 if match.state == 'finished':
                     break
-                await asyncio.sleep(.25)
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(shutting_down.wait(), .25)
         except (ConnectionError, asyncio.CancelledError):
             pass
         return response
@@ -345,6 +381,8 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
         while True:
             for match in list(matches.values()):
                 match.tick()
+                if match.state == 'finished':
+                    schedule(match)
             await asyncio.sleep(.01)
 
     async def startup(app):
@@ -352,8 +390,12 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
             for saved in Path(directory).glob('*/state.json'):
                 match = Match.restore(saved.parent)
                 matches[match.id] = match
-        app[engine_key] = await asyncio.to_thread(engine_factory, default_config)
+        app[engine_key] = await start_engine(default_config)
         app[watchdog_key] = asyncio.create_task(watchdog())
+
+    async def shutdown(app):
+        shutting_down.set()
+        await asyncio.gather(*(ws.close(code=1001, message=b'Server shutdown') for ws in list(sockets)))
 
     async def cleanup(app):
         app[watchdog_key].cancel()
@@ -374,6 +416,7 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
             match.close()
 
     app.on_startup.append(startup)
+    app.on_shutdown.append(shutdown)
     app.on_cleanup.append(cleanup)
     app.add_routes([web.get('/capabilities.json', capabilities), web.get('/models', models),
                     web.post('/bot', turn), web.post('/analyze', turn),

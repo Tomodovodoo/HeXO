@@ -206,8 +206,10 @@ class Match:
 
     def notation(self):
         metadata = dict(version='1', name=self.specification.get('name', 'Bubble timed match'),
-                        platform='Bubble', utcdatetime=self.created,
-                        timecontrol=self.clock.control.text())
+                        platform='Bubble', utcdatetime=self.created)
+        control = self.clock.control
+        if control.base_ms % 1000 == 0 and control.increment_ms % 1000 == 0:
+            metadata['timecontrol'] = control.text()
         for key, side in [('playercross', 'cross'), ('playercircle', 'circle')]:
             player = self.specification['players'][side]
             metadata[key] = str(player.get('checkpoint', player['kind']))

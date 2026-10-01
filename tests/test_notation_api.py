@@ -338,6 +338,7 @@ class TimedClocks(unittest.TestCase):
             match.submit([[1, 0]], 0, 0, partial=True)
             match.pause()
             self.assertEqual(loads(match.notation()).history, [(0, 0), (1, 0)])
+            self.assertNotIn('timecontrol', loads(match.notation()).metadata)
             restored = Match.restore(match.directory, now=lambda: 9_000_000_000)
             try:
                 self.assertEqual(restored.state, 'paused')
@@ -361,6 +362,15 @@ class TimedClocks(unittest.TestCase):
                 result = engine.turn(game, 30)
                 self.assertLess(time.monotonic()-started, .5)
                 self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+                engine.lock.acquire()
+                try:
+                    started = time.monotonic()
+                    queued = engine.turn(game, 30)
+                    self.assertLess(time.monotonic()-started, .2)
+                    self.assertEqual(queued['stop_reason'], 'busy')
+                    self.assertEqual(legal_turn([[0, 0]], queued['moves']), queued['moves'])
+                finally:
+                    engine.lock.release()
                 stopped = threading.Event()
                 stopped.set()
                 result = engine.turn(game, 1000, cancel=stopped)
@@ -376,11 +386,14 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
         from timed_api import create_app
         from timed_engine import legal_turn
         self.calls = []
+        self.engines = []
         calls = self.calls
+        engines = self.engines
         class Engine:
             identity = dict(checkpoint='fake')
             def __init__(self, config):
-                pass
+                self.closed = False
+                engines.append(self)
             def turn(self, game, milliseconds=None, *, clock=None, cancel=None, publish=None):
                 history = [list(c[:2]) for c in game.cells]
                 calls.append((history, clock))
@@ -390,7 +403,7 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
                     time.sleep(.002)
                 return dict(moves=legal_turn(history), win_probability=.6)
             def close(self):
-                pass
+                self.closed = True
         self.client = TestClient(TestServer(create_app(engine_factory=Engine)))
         await self.client.start_server()
 
@@ -446,6 +459,39 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
         response = await ws.receive_json(timeout=1)
         self.assertEqual(response['request_id'], 3)
         self.assertEqual(self.calls[-1][0], history+reply)
+        await ws.close()
+
+    async def test_server_shutdown_closes_an_open_bot_session(self):
+        ws = await self.client.ws_connect('/bws/v1-alpha/game')
+        await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=1))
+        await ws.receive_json(timeout=1)
+        await asyncio.wait_for(self.client.close(), 1)
+        self.assertTrue(all(engine.closed for engine in self.engines))
+
+    async def test_finished_match_releases_its_engines(self):
+        created = await self.client.post('/matches', json=dict(players=dict(cross=dict(kind='native'),
+            circle=dict(kind='human')), time_control='10'))
+        root = '/matches/'+(await created.json())['match_id']
+        for _ in range(50):
+            state = await (await self.client.get(root)).json()
+            if state['state'] == 'ready':
+                break
+            await asyncio.sleep(.01)
+        await self.client.post(root+'/start')
+        state = await (await self.client.post(root+'/resign', json=dict(side='o'))).json()
+        self.assertEqual(state['state'], 'finished')
+        for _ in range(50):
+            if self.engines[-1].closed:
+                break
+            await asyncio.sleep(.01)
+        self.assertTrue(self.engines[-1].closed)
+        self.assertFalse(self.engines[0].closed)
+
+    async def test_websocket_evaluation_echoes_request_id(self):
+        ws = await self.client.ws_connect('/bws/v1-alpha/game')
+        await ws.send_json(dict(type='eval_request', side='o', request_id=7))
+        response = await ws.receive_json(timeout=1)
+        self.assertEqual((response['type'], response['request_id']), ('eval_response', 7))
         await ws.close()
 
 

@@ -162,6 +162,27 @@ class SixProtocolTests(unittest.TestCase):
                 finally:
                     game.close()
 
+    def test_cancel_closes_external_search_without_restarting_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script, marker = Path(folder)/'engine.py', Path(folder)/'slow.once'
+            script.write_text(FAKE_ENGINE)
+            cancelled = threading.Event()
+            with SixEngine([sys.executable, str(script), str(marker)], cancel=cancelled) as engine:
+                child = engine.proc
+                game = Game()
+                timer = threading.Timer(.05, cancelled.set)
+                timer.start()
+                try:
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(ProtocolError, 'cancelled'):
+                        engine(game, 1000)
+                    self.assertLess(time.monotonic()-started, .5)
+                    self.assertIsNotNone(child.poll())
+                    self.assertIsNone(engine.proc)
+                finally:
+                    timer.join()
+                    game.close()
+
     def test_client_starts_each_game(self):
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder)/'engine.py'
