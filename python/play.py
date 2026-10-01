@@ -471,6 +471,12 @@ class Evaluations:
                         self.index(json.loads(line), line.strip())
                     except (ValueError, KeyError, TypeError):
                         continue
+            with open(self.path, 'rb+') as data:
+                size = data.seek(0, 2)
+                if size:
+                    data.seek(size - 1)
+                    if data.read(1) != b'\n':
+                        data.write(b'\n')
 
     @staticmethod
     def key(history):

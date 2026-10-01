@@ -99,6 +99,16 @@ class Store(unittest.TestCase):
             self.assertEqual(len(list(Path(directory).glob('evaluations.jsonl.*.bak'))), 3)
             self.assertEqual(len(path.read_text().splitlines()), 4)
 
+    def test_a_torn_last_line_does_not_swallow_the_next_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'evaluations.jsonl'
+            Evaluations(path).add([], 'e', STANDARD, dict(value=.1, moves=[]))
+            with open(path, 'a', encoding='utf-8') as out:
+                out.write('{"position": "0,0", "eng')
+            Evaluations(path).add([(0, 0)], 'e', STANDARD, dict(value=.2, moves=[]))
+            reloaded = Evaluations(path)
+            self.assertEqual((reloaded.best([], 'e')['value'], reloaded.best([(0, 0)], 'e')['value']), (.1, .2))
+
     def test_reuse_needs_every_budget_dimension(self):
         store = Evaluations()
         store.add([], 'e', dict(simulations=512, solver_nodes=0), dict(value=.1, moves=[]))
