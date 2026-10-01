@@ -387,7 +387,7 @@ class Engines:
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch)
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
-        return found, spent, f'{bubble.sha256[:16]}:{build}'
+        return found, spent, f"{bubble.sha256[:16]}:{build if spent['solver_nodes'] else 'none'}"
 
     def effective(self, budget):
         """`budget` as it can run here: no solver nodes when the tactical library is not built."""
@@ -695,13 +695,14 @@ class Session:
         return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget_of(entry['kind'], preset, custom))
 
     def engine_key(self, seat):
-        """Evaluations are keyed by the weights and the solver build that produced them; None when the weights
-        file is gone."""
+        """Evaluations are keyed by the weights and the solver build that produced them ('none' for a budget
+        without solver nodes); None when the weights file is gone."""
         try:
             weights = model_key(export_path(self.entries[seat['engine']], seat['checkpoint']))
         except (OSError, KeyError):
             return None
-        return f'{weights}:{self.engines.solver_build()}'
+        searched = self.engines.effective(seat['budget'])['solver_nodes']
+        return f"{weights}:{self.engines.solver_build() if searched else 'none'}"
 
     # Reading
 
