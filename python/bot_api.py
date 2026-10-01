@@ -1,9 +1,8 @@
 """Local HTTTX stateless v1-alpha adapter. No external registration or deployment.
 
 Spec revision: hex-tic-tac-toe/htttx-bot-api@37d2385f1016abe8b25798238a7d0c4a17a25dda.
-The published schema requires exactly two pieces even for a first-placement win,
-which contradicts its prohibition on playing after a win. Return an explicit 409
-for unrepresentable responses. Time limits are advisory; capability stays false.
+Native turn rules accept a winning first stone and the remainder of a half-turn.
+This legacy HTTP adapter has advisory limits; timed_api provides enforced clocks.
 """
 import argparse
 import hashlib
@@ -55,15 +54,15 @@ def board_game(board, *, deadline, node_limit=20000):
             raise APIError("Cells require x/o pieces and unique coordinates")
         owners[point] = 0 if cell['p'] == 'x' else 1
     if not owners:
-        raise APIError("The API's two-piece response cannot represent the one-stone origin turn", 409)
+        if board['to_move'] != 'x':
+            raise APIError('Empty board requires cross to move')
+        return Game()
     if owners.get((0, 0)) != 0:
         raise APIError("A reachable board requires cross at the origin")
     n = len(owners)
-    if n % 2 == 0:
-        raise APIError("The API has no partial-turn field and requires two response pieces", 409)
     counts = [sum(p == side for p in owners.values()) for side in (0, 1)]
-    expected = [1+2*((n-1)//4), 2*((n+1)//4)]
-    side = (1+(n-1)//2) % 2
+    expected = [sum(((i+1)//2)%2 == side for i in range(n)) for side in (0, 1)]
+    side = ((n+1)//2) % 2
     if counts != expected or board['to_move'] != ('x', 'o')[side]:
         raise APIError("Piece counts or to_move disagree with standard turn order")
     for (q, r), owner in owners.items():
@@ -122,7 +121,7 @@ class Adapter:
         return {'meta': {'name': 'Bubble', 'version': '1',
                          'evaluator': 'nnue' if self.model else 'handwritten',
                          'model_sha256': self.model_sha256,
-                         'limitations': '409 for origin, partial turns, terminal boards, and first-placement wins; '
+                         'limitations': '409 for terminal boards; time limits are advisory; '
                                         f'local board limit {MAX_CELLS}; reconstruction may return 503'},
                 'stateless': {'versions': {'v1-alpha': {'request_id': True, 'move_time_limit': False}}}}
 
@@ -154,8 +153,6 @@ class Adapter:
                     raise APIError("Configured model could not be loaded", 503) from exc
             result = game.search(ms=ms, width=self.width, depth=self.depth)
             moves = result['moves']
-            if len(moves) != 2:
-                raise APIError("The chosen first-placement win cannot satisfy the API's exactly-two-pieces schema", 409)
             for move in moves:
                 game.play(*move)
             response = {'move': {'pieces': [{'q': q, 'r': r} for q, r in moves]}}

@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 
 from hexo import Game
 
@@ -16,10 +17,73 @@ class ProtocolError(RuntimeError):
 
 
 def serve(player, source=sys.stdin, out=sys.stdout):
-    """Run one synchronous protocol session. Search time is advisory."""
-    game = Game()
-    try:
+    """Read commands while thinking; stop returns the latest complete legal turn."""
+    from timed_engine import TimedEngine, legal_turn
+    from time_control import allowance
+    lines, replies = queue.Queue(), queue.Queue()
+    def read():
         for raw in source:
+            lines.put(raw)
+        lines.put(None)
+    threading.Thread(target=read, daemon=True).start()
+    game = Game()
+    active = None
+    generation = 0
+    def finish():
+        nonlocal active
+        if active:
+            active['cancel'].set()
+            print('bestmove ' + ' '.join(f'{q} {r}' for q, r in active['best']), file=out, flush=True)
+            active = None
+    def calculate(job, milliseconds, clock):
+        local = Game(job['history'])
+        try:
+            if isinstance(player, TimedEngine):
+                result = player.turn(local, milliseconds, clock=clock, cancel=job['cancel'],
+                                     publish=lambda result: job.update(best=result['moves']))
+            else:
+                result = player.turn(local, milliseconds=milliseconds)
+            played = []
+            side = local.player
+            for q, r in result['moves'][:local.remaining]:
+                local.play(int(q), int(r))
+                played.append([int(q), int(r)])
+                if local.winner >= 0:
+                    break
+            if local.winner < 0 and local.player == side:
+                raise ValueError('player did not complete its turn')
+            replies.put((job['id'], played, None))
+        except Exception as error:
+            replies.put((job['id'], None, str(error)))
+        finally:
+            local.close()
+            job['done'].set()
+    try:
+        while True:
+            while not replies.empty():
+                ident, moves, error = replies.get()
+                if active and ident == active['id']:
+                    if error:
+                        print(f'error {error}', file=out, flush=True)
+                        active = None
+                    else:
+                        active['best'] = moves
+                        finish()
+            if active and time.monotonic() >= active['deadline']:
+                finish()
+            try:
+                raw = lines.get(timeout=.005)
+            except queue.Empty:
+                continue
+            if raw is None:
+                if active:
+                    active['done'].wait(min(.005, max(0, active['deadline']-time.monotonic())))
+                    while not replies.empty():
+                        ident, moves, error = replies.get()
+                        if active and ident == active['id'] and not error:
+                            active['best'] = moves
+                    finish()
+                return
             words = raw.strip().split()
             if not words:
                 continue
@@ -32,10 +96,12 @@ def serve(player, source=sys.stdin, out=sys.stdout):
                 elif command == 'isready':
                     print('readyok', file=out, flush=True)
                 elif command == 'newgame':
+                    finish()
                     player.set_history()
                     game.close()
                     game = Game()
                 elif command == 'position':
+                    finish()
                     if len(words) < 3 or words[1] != 'radius' or int(words[2]) != 8:
                         raise ValueError('Bubble supports radius 8')
                     if len(words) > 3 and words[3] != 'moves':
@@ -53,36 +119,45 @@ def serve(player, source=sys.stdin, out=sys.stdout):
                     game.close()
                     game = next_game
                 elif command == 'go':
+                    if active:
+                        raise ValueError('Search already running')
                     if game.winner >= 0:
                         raise ValueError('game has finished')
                     options = words[1:]
-                    if len(options) % 2 or any(options[i] not in ('movetime', 'nodes', 'depth') or
-                                                   int(options[i+1]) < 1 for i in range(0, len(options), 2)):
+                    allowed = ('movetime', 'nodes', 'depth', 'xtime', 'otime', 'xinc', 'oinc',
+                               'wtime', 'btime', 'winc', 'binc')
+                    if len(options) % 2 or any(options[i] not in allowed or
+                                                   int(options[i+1]) < 0 for i in range(0, len(options), 2)):
                         raise ValueError('bad go options')
-                    turn = player.turn(game, milliseconds=int(options[options.index('movetime')+1])
-                                       if 'movetime' in options else None)['moves']
-                    probe = Game([tuple(c[:2]) for c in game.cells])
-                    try:
-                        played = []
-                        for q, r in turn[:probe.remaining]:
-                            probe.play(int(q), int(r))
-                            played.append((q, r))
-                            if probe.winner >= 0:
-                                break
-                        if probe.winner < 0 and probe.player == game.player:
-                            raise ValueError('player did not complete its turn')
-                    finally:
-                        probe.close()
-                    print('bestmove ' + ' '.join(f'{q} {r}' for q, r in played), file=out, flush=True)
+                    values = dict(zip(options[::2], map(int, options[1::2])))
+                    milliseconds = values.get('movetime')
+                    cross, circle = values.get('xtime', values.get('wtime')), values.get('otime', values.get('btime'))
+                    clock = None
+                    if cross is not None or circle is not None:
+                        if cross is None or circle is None:
+                            raise ValueError('Both clocks are required')
+                        increment = values.get('xinc', values.get('winc', 0)) if game.player == 0 else values.get('oinc', values.get('binc', 0))
+                        clock = dict(cross_ms=cross, circle_ms=circle, increment_ms=increment)
+                    generation += 1
+                    history = [list(c[:2]) for c in game.cells]
+                    budget = allowance(clock, game.player, milliseconds)['hard_ms']
+                    active = dict(id=generation, history=history, best=legal_turn(history),
+                                  cancel=threading.Event(), done=threading.Event(),
+                                  deadline=time.monotonic()+budget/1000)
+                    threading.Thread(target=calculate, args=(active, milliseconds, clock), daemon=True).start()
+                    active['done'].wait(.001)
                 elif command == 'stop':
-                    pass  # Search runs synchronously and is already finished before the next line is read.
+                    finish()
                 elif command == 'quit':
+                    finish()
                     return
                 else:
                     raise ValueError(f'unknown command {command}')
             except Exception as error:
                 print(f'error {error}', file=out, flush=True)
     finally:
+        if active:
+            active['cancel'].set()
         game.close()
 
 
@@ -211,13 +286,17 @@ def main():
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     parser.add_argument('--simulations', type=int, default=128)
     parser.add_argument('--solver-nodes', type=int, default=32768)
+    parser.add_argument('--net-kernels', choices=['fused', 'reference'], default='fused')
     args = parser.parse_args()
     import torch
-    from play import DensePlayer
+    from timed_engine import TimedEngine
     device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
-    player = DensePlayer(args.run or Path('.'), device, model=args.model)
-    player.configure(dict(simulations=args.simulations, solver=args.solver_nodes > 0,
-                          solver_nodes=max(1, args.solver_nodes)))
+    config = dict(kind='bubble', run=str((args.run or Path('.')).resolve()), device=device,
+                  search=dict(simulations=args.simulations), net_kernels=args.net_kernels,
+                  solver=dict(enabled=args.solver_nodes > 0, nodes=max(1, args.solver_nodes)))
+    if args.model:
+        config['model'] = str(args.model.resolve())
+    player = TimedEngine(config)
     try:
         serve(player)
     finally:

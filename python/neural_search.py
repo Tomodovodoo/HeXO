@@ -127,9 +127,12 @@ class NeuralSearch:
             raise ValueError('Invalid evaluator shapes')
         checked(native.hxg_fulfill(self.ptr, request, actions, logits, q, len(q)))
 
-    def search(self, simulations=128, root_samples=None, batch_size=16, milliseconds=None):
+    def search(self, simulations=128, root_samples=None, batch_size=16, milliseconds=None,
+               *, stop=None, anytime=False, batch_seconds=0., priority=None):
         coordinator = SearchCoordinator(self.evaluator, self.model_version, self.cache)
-        return coordinator.search_many([self], simulations, root_samples, batch_size, milliseconds)[0]
+        return coordinator.search_many([self], simulations, root_samples, batch_size, milliseconds,
+                                       stop=stop, anytime=anytime, batch_seconds=batch_seconds,
+                                       priority=priority)[0]
 
     def fulfill_proof(self, request, history, certificate, milliseconds=None):
         """Verify a certificate against this pending state before exact backup."""
@@ -172,7 +175,7 @@ class NeuralSearch:
         # A won root offers only its shortest winning moves, so those are the finite scores.
         shortest = [actions[i].tolist() for i in range(n) if np.isfinite(scores[i])] if proven > 0 else []
         return dict(action=actions[selected].tolist() if selected is not None else None,
-                    actions=actions, visits=visits, values=values, policy=policy,
+                    actions=actions, visits=visits, values=values, policy=policy, scores=scores,
                     completed=native.hxg_completed(self.ptr), evaluated=evaluated, cache_hits=hits,
                     elapsed_ms=(finished-start)*1000,
                     exact_winner=winner,
@@ -189,7 +192,13 @@ class SearchCoordinator:
         self.evaluator, self.model_version = evaluator, model_version
         self.cache = cache if cache is not None else EvaluationCache()
 
-    def search_many(self, searches, simulations=128, root_samples=None, batch_size=16, milliseconds=None):
+    def search_many(self, searches, simulations=128, root_samples=None, batch_size=16, milliseconds=None,
+                    *, stop=None, anytime=False, batch_seconds=0., priority=None):
+        """Time-limited play keeps the last completed halving comparison as its fallback.
+
+        Fixed-simulation training is unchanged. The existing native hold supplies a
+        comparable candidate snapshot before the final round, without a new DLL ABI.
+        """
         self.last_stats = dict(inference_batches=0, unique_positions=0, largest_batch=0)
         searches = list(searches)
         if len({id(search) for search in searches}) != len(searches):
@@ -209,6 +218,8 @@ class SearchCoordinator:
         starts, finishes = [], [None]*len(searches)
         evaluated, hits = [0]*len(searches), [0]*len(searches)
         proof_spent = [0.]*len(searches)
+        snapshots = [None]*len(searches)
+        interrupted = [False]*len(searches)
         active = set()
         cursor = 0
         try:
@@ -216,6 +227,11 @@ class SearchCoordinator:
                 starts.append(time.perf_counter())
                 sample = max(2, int(budgets[i]**0.5)) if samples[i] is None else samples[i]
                 checked(native.hxg_begin(search.ptr, budgets[i], sample))
+                if anytime:
+                    native.hxg_hold(search.ptr, 1)
+                if priority is not None:
+                    actions = np.ascontiguousarray(priority, dtype=np.int64).reshape(-1, 2)
+                    native.hxg_priority(search.ptr, actions, len(actions))
                 game = Game(search.history)
                 try:
                     if game.winner < 0:
@@ -227,11 +243,12 @@ class SearchCoordinator:
             def finished(i):
                 now = time.perf_counter()
                 done = native.hxg_done(searches[i].ptr)
-                expired = limits[i] is not None and (now-starts[i])*1000 >= limits[i]
+                expired = (limits[i] is not None and (now-starts[i])*1000 >= limits[i]) or (stop is not None and stop())
                 if done or expired:
                     active.discard(i)
                     finishes[i] = now
                     if expired:
+                        interrupted[i] = True
                         native.hxg_cancel(searches[i].ptr)
                     return True
                 return False
@@ -247,7 +264,11 @@ class SearchCoordinator:
                         idle = 0
                     else:
                         request, history = searches[i].request()
-                        if request == -1:
+                        if request == HOLD:
+                            snapshots[i] = searches[i].result(starts[i], time.perf_counter(), evaluated[i], hits[i])
+                            native.hxg_hold(searches[i].ptr, 0)
+                            idle = 0
+                        elif request == -1:
                             idle = 0
                         elif request == 0:
                             idle += 1
@@ -286,12 +307,22 @@ class SearchCoordinator:
                 for i in list(active):
                     finished(i)
                 pending = [item for item in pending if item[0] in active]
+                if anytime and batch_seconds:
+                    for i in {item[0] for item in pending}:
+                        if limits[i] is not None and limits[i]/1000-(time.perf_counter()-starts[i]) < batch_seconds:
+                            active.discard(i)
+                            interrupted[i] = True
+                            finishes[i] = time.perf_counter()
+                            native.hxg_cancel(searches[i].ptr)
+                    pending = [item for item in pending if item[0] in active]
                 if pending:
                     grouped = OrderedDict()
                     for item in pending:
                         grouped.setdefault(item[3], []).append(item)
                     unique = list(grouped.values())
+                    batch_start = time.perf_counter()
                     predictions = self.evaluator.evaluate([items[0][2] for items in unique])
+                    batch_seconds = max(batch_seconds, time.perf_counter()-batch_start)
                     self.last_stats["inference_batches"] += 1
                     self.last_stats["unique_positions"] += len(unique)
                     self.last_stats["largest_batch"] = max(self.last_stats["largest_batch"], len(unique))
@@ -312,5 +343,18 @@ class SearchCoordinator:
         finally:
             for search in searches:
                 native.hxg_cancel(search.ptr)
-        return [search.result(starts[i], finishes[i] or time.perf_counter(), evaluated[i], hits[i])
-                for i, search in enumerate(searches)]
+        results = []
+        for i, search in enumerate(searches):
+            result = search.result(starts[i], finishes[i] or time.perf_counter(), evaluated[i], hits[i])
+            result['batch_seconds'] = batch_seconds
+            result['stable_choice'] = bool(snapshots[i] and result['action'] == snapshots[i]['action'])
+            if anytime and interrupted[i] and not result['proven']:
+                snapshot = snapshots[i]
+                result['action'] = None
+                if snapshot:
+                    eligible = {tuple(a) for a, p in zip(result['actions'], result['policy']) if p > 0}
+                    order = np.argsort(-snapshot['scores'])
+                    result['action'] = next((snapshot['actions'][j].tolist() for j in order
+                        if np.isfinite(snapshot['scores'][j]) and tuple(snapshot['actions'][j]) in eligible), None)
+            results.append(result)
+        return results

@@ -5,15 +5,16 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILD = Path(os.environ.get('HEXO_NATIVE_DIR', ROOT / 'build'))
 if os.name == "nt":
     import shutil
     compiler = shutil.which("g++")
     _dll_dir = os.add_dll_directory(str(Path(compiler).parent)) if compiler else None
-    library = ROOT / "build" / "libhexo.dll"
+    library = BUILD / "libhexo.dll"
     if not library.exists():
-        library = ROOT / "build" / "Release" / "hexo.dll"
+        library = BUILD / "Release" / "hexo.dll"
 else:
-    library = ROOT / "build" / ("libhexo.dylib" if os.uname().sysname == "Darwin" else "libhexo.so")
+    library = BUILD / ("libhexo.dylib" if os.uname().sysname == "Darwin" else "libhexo.so")
 lib = C.CDLL(str(library))
 
 

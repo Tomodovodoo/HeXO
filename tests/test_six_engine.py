@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import threading
+import time
 
 from hexo import Game
 from six_engine import ProtocolError, SixEngine, serve
@@ -72,6 +74,50 @@ class FakeModel:
 
 
 class SixProtocolTests(unittest.TestCase):
+    def test_stop_and_isready_work_during_blocked_search(self):
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        class Slow(FakePlayer):
+            def turn(self, game, milliseconds=None):
+                entered.set()
+                try:
+                    release.wait(1)
+                    return {'moves': [(1, 0), (0, 1)]}
+                finally:
+                    finished.set()
+        def commands():
+            yield 'position radius 8 moves 0 0\n'
+            yield 'go movetime 500\n'
+            entered.wait(1)
+            yield 'isready\n'
+            yield 'stop\n'
+            yield 'quit\n'
+        out = io.StringIO()
+        started = time.monotonic()
+        try:
+            serve(Slow([]), commands(), out)
+            self.assertLess(time.monotonic()-started, .4)
+            self.assertIn('readyok', out.getvalue())
+            self.assertEqual(out.getvalue().count('bestmove'), 1)
+        finally:
+            release.set()
+            finished.wait(1)
+
+    def test_go_passes_full_clocks_and_own_increment(self):
+        from timed_engine import TimedEngine
+        from timed_engine import legal_turn
+        class Player(TimedEngine):
+            checkpoint, model_sha256 = 'fake', 'abc'
+            def __init__(self):
+                self.clocks = []
+            def turn(self, game, milliseconds=None, *, clock=None, cancel=None, publish=None):
+                self.clocks.append(clock)
+                return dict(moves=legal_turn([c[:2] for c in game.cells]))
+        player, out = Player(), io.StringIO()
+        serve(player, io.StringIO('position radius 8 moves 0 0\n'
+              'go xtime 60000 otime 50000 xinc 1000 oinc 500\nquit\n'), out)
+        self.assertEqual(player.clocks, [dict(cross_ms=60000, circle_ms=50000, increment_ms=500)])
+        self.assertIn('bestmove', out.getvalue())
+
     def test_external_anchor_needs_its_own_league_id(self):
         for name in ('seal', '', 'main/000001', 'main-000001'):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'external_name'):

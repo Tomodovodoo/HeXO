@@ -58,6 +58,10 @@ With a run, the model picker lists its champion, its newest export and two more.
 
 ## Build Bubble
 
+For games with a clock, bot connections and live remaining times, see
+[timed matches and the API](docs/time-controls.md). Bubble supports Absolute and Fischer controls, shares one
+deadline across solving and both stones, and exposes HTTTX HTTP and WebSocket routes.
+
 You need Python 3.10 or newer, CMake 3.20 or newer with a C++20 compiler, and PyTorch 2.11 or newer. Install the CUDA build of PyTorch for your card from the [PyTorch selector](https://pytorch.org/get-started/locally/); `requirements/tested.txt` pins the versions this run used. With MinGW on Windows, add `-G "MinGW Makefiles"` to the configure command and keep `g++` on `PATH`.
 
 The tactical solver needs Rust and Cargo with edition 2024 support:
