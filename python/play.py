@@ -820,17 +820,16 @@ class Session:
                     job.status = 'cancelled'
 
     def configure_seat(self, side, engine, checkpoint=None, preset='standard', custom=None):
-        seat = self.seat(engine, checkpoint, preset, custom)
         with self.lock:
-            self.seats[side] = seat
+            self.seats[side] = self.seat(engine, checkpoint, preset, custom)
             self.stop_moves()
             self.changed()
 
     def configure_analysis(self, engine, checkpoint=None, preset='standard', custom=None, auto=True):
-        seat = self.seat(engine, checkpoint, preset, custom)
-        if self.entries[engine]['kind'] != 'bubble' or type(auto) is not bool:
-            raise ValueError('Analysis needs a Bubble model')
         with self.lock:
+            seat = self.seat(engine, checkpoint, preset, custom)
+            if self.entries[engine]['kind'] != 'bubble' or type(auto) is not bool:
+                raise ValueError('Analysis needs a Bubble model')
             self.analysis = seat | dict(auto=auto)
             self.stop_analysis()
             self.changed()
