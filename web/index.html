@@ -904,7 +904,7 @@ function renderTournamentForm(){
 async function startTournament(){
   const t=tournament,players=entrants.map(e=>({engine:e.engine,preset:e.preset,...(e.checkpoint?{checkpoint:e.checkpoint}:{})}));
   const body={players,games:t.games,clock:t.clock==='fixed'?{mode:'fixed'}:t.clock==='move'?{mode:'move',ms:Math.round(t.ms*1000)}:{mode:'game',tc:t.tc}};
-  if(t.openings!=='origin')Object.assign(body,{opening_range:t.openings,unique_openings:t.games/2});
+  Object.assign(body,t.openings==='origin'?{openings:[[[0,0]]]}:{opening_range:t.openings,unique_openings:t.games/2});
   if(await post('/match',{...body,replace:true})){$('tournament-dialog').close();fit();draw()}
 }
 function tournamentTab(name){for(const b of $('t-tabs').children)b.classList.toggle('on',b.dataset.t===name);

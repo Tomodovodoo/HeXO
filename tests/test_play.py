@@ -532,6 +532,15 @@ class Jobs(unittest.TestCase):
         self.assertFalse([j for j in self.session.state()['jobs'] if j['ply'] == 1 and j['kind'] == 'analyse'
                           and j['status'] == 'queued'])
 
+    def test_a_preset_without_a_solver_verdict_is_not_deepened_again(self):
+        def unsolved(entry, checkpoint, budget, history, watch, live=None):
+            found, spent, key = FakeEngines.evaluate(self.engines, entry, checkpoint, budget, history, watch)
+            return found, spent | dict(solver_nodes=0), key
+        self.engines.evaluate = unsolved
+        self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(len([c for c in self.engines.calls if not c[2]]), len(PRESETS['bubble']))
+
     def test_finished_positions_are_not_analysed(self):
         final = [(0, 0), (0, 5), (1, 5), (5, 0), (-5, 0), (2, 5), (3, 5), (0, -5), (0, -6), (4, 5), (5, 5)]
         self.session.load(final, True)

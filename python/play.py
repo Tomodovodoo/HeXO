@@ -1165,18 +1165,21 @@ class Session:
         """While an engine seat plays, the game is not paused and Auto is on, evaluate the current position with the analysis
         model at each preset in turn, fastest first: the first preset not yet saved is queued at the lowest
         priority, and `changed` queues the next when it lands. Deepening of other positions, and all of it once
-        deepening stops, is dropped; a preset that failed for this position is skipped."""
+        deepening stops, is dropped; a preset that failed for this position, or whose solver gave no verdict, is
+        skipped."""
         current, active = tuple(self.history), self.deepening(winner)
         for job in self.jobs.values():
             if hasattr(job, 'tier') and job.status in ('queued', 'running') and (job.history != current or not active):
                 job.cancelled = True
                 if job.status == 'queued':
                     job.status = 'cancelled'
-        if not active or any(hasattr(job, 'tier') and job.history == current and
-                                             job.status in ('queued', 'running') for job in self.jobs.values()):
+        busy = any(hasattr(job, 'tier') and job.history == current and job.status in ('queued', 'running')
+                   for job in self.jobs.values())
+        if not active or busy:
             return
         for tier in PRESET_NAMES:
-            failed = any(getattr(job, 'tier', None) == tier and job.history == current and job.status == 'failed'
+            failed = any(getattr(job, 'tier', None) == tier and job.history == current
+                         and (job.status == 'failed' or getattr(job, 'incomplete', False))
                          for job in self.jobs.values())
             seat = self.seat(self.analysis['engine'], self.analysis['checkpoint'], tier)
             key, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
@@ -2047,7 +2050,8 @@ class Session:
             raise Cancelled()
         entry = self.entries[seat['engine']]
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
-        if spent['solver_nodes'] < budget['solver_nodes'] and job.kind == 'analyse':
+        job.incomplete = spent['solver_nodes'] < budget['solver_nodes']
+        if job.incomplete and job.kind == 'analyse':
             with self.lock:
                 tried = (tuple(history), key, budget['simulations'], budget['solver_nodes'])
                 tries = self.retries[tried] = self.retries.get(tried, 0) + 1
