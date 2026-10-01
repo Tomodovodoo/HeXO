@@ -252,7 +252,7 @@ def play_turn(match, engine):
             if match.state == 'playing' and not cancellation.is_set():
                 match.tick()
                 if match.state == 'playing':
-                    match.finish(1-game.player, 'crash')
+                    match.finish(1-game.player, 'engine_timeout' if isinstance(error, TimeoutError) else 'crash')
                     match.record('engine_error', error=str(error))
             return match.snapshot()
     finally:

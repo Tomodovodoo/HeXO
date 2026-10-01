@@ -331,6 +331,7 @@ def _worker(connection, cancellation, config):
 class TimedEngine:
     """Return a completed legal candidate by the controller deadline, including on stop."""
     def __init__(self, config, *, startup_timeout=120):
+        self.external = config.get('kind') in ('six', 'htttx')
         self.config = dict(config)
         context = mp.get_context('spawn')
         self.connection, child = context.Pipe()
@@ -366,6 +367,8 @@ class TimedEngine:
                     model_sha256=self.model_sha256, stop_reason='deadline', elapsed_ms=0,
                     allowance=limits)
         if not self.lock.acquire(timeout=max(0, deadline-time.monotonic())):
+            if self.external:
+                raise TimeoutError('Opponent worker is busy')
             best.update(stop_reason='busy', elapsed_ms=(time.monotonic()-started)*1000)
             return best
         try:
@@ -374,6 +377,8 @@ class TimedEngine:
                 if len(message) == 3 and message[1] in ('done', 'error'):
                     self.busy = False
             if self.busy or time.monotonic() >= deadline:
+                if self.external:
+                    raise TimeoutError('Opponent did not return a move within its allowance')
                 best.update(stop_reason='busy' if self.busy else 'deadline',
                             elapsed_ms=(time.monotonic()-started)*1000)
                 return best
@@ -388,6 +393,7 @@ class TimedEngine:
                                          normal_ms=max(0, limits['normal_ms']-elapsed))
             self.connection.send((generation, history, worker_limits))
             self.busy = True
+            complete = False
             try:
                 while time.monotonic() < deadline:
                     if cancel is not None and cancel.is_set():
@@ -409,6 +415,7 @@ class TimedEngine:
                     if publish:
                         publish(dict(best))
                     if status == 'done':
+                        complete = True
                         best['stop_reason'] = 'budget'
                         break
             finally:
@@ -416,6 +423,8 @@ class TimedEngine:
                     self.cancellation.set()
             best['elapsed_ms'] = (time.monotonic()-started)*1000
             best['allowance'] = limits
+            if self.external and not complete and (cancel is None or not cancel.is_set()):
+                raise TimeoutError('Opponent did not return a move within its allowance')
             return best
         finally:
             self.lock.release()

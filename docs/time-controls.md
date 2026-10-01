@@ -128,6 +128,8 @@ Notation records `version`, `utcdatetime`, players, control, winner and `endreas
 
 Controls with fractional seconds remain in JSON because notation specifies integer controls.
 
+An external opponent must supply its own move. If it exceeds the allocated response time, the JSON result records `engine_timeout`, or `time` if the game clock expired too. The host never substitutes its legal fallback for an opponent's reply.
+
 The initial normal allowance divides remaining time and expected increments over 20 own turns. Its hard cap is at most three normal allowances and never spends future increment. Reserve 10 ms for returning the move. Fixed move-time requests use their supplied allowance inside that reserve. These are initial settings, not measured optimal values.
 
 Give the first stone 60% of normal time and preserve time for the second. Root and optional leaf proofs share at most 25% of normal time. Keep a complete legal candidate before solving or inference. A persistent worker owns the model; the controller can return that candidate while a non-cancellable call finishes. Generation IDs discard late results.

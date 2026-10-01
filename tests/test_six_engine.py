@@ -183,6 +183,24 @@ class SixProtocolTests(unittest.TestCase):
                     timer.join()
                     game.close()
 
+    def test_timed_match_does_not_invent_an_external_opponents_move(self):
+        from timed_engine import TimedEngine
+        from timed_match import Match, play_turn
+        with tempfile.TemporaryDirectory() as folder:
+            script, marker = Path(folder)/'engine.py', Path(folder)/'slow.once'
+            script.write_text(FAKE_ENGINE)
+            with TimedEngine(dict(kind='six', command=[sys.executable, str(script), str(marker)])) as engine:
+                match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='six')),
+                                   time_control='10', turn_cap_ms=30))
+                try:
+                    match.start()
+                    result = play_turn(match, engine)
+                    self.assertEqual(result['result']['winner'], 'x')
+                    self.assertIn(result['result']['reason'], ('engine_timeout', 'time'))
+                    self.assertEqual(result['history'], [[0, 0]])
+                finally:
+                    match.close()
+
     def test_client_starts_each_game(self):
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder)/'engine.py'
