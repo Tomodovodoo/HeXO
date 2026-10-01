@@ -536,6 +536,8 @@ class Engines:
         kind = entry['kind']
         if kind == 'six':
             return self.protocol(entry, budget, history, stop)
+        if kind == 'strix' and not history:
+            return [[0, 0]]   # the only legal first stone; Strix searches only once it is on the board
         if kind in self.children and self.children[kind].process.poll() is not None:
             self.children.pop(kind).end()
         if kind not in self.children:

@@ -515,6 +515,16 @@ class Jobs(unittest.TestCase):
             self.assertEqual(beat.read_text(), last)
             self.assertFalse(temporary.exists())
 
+    def test_strix_opens_at_the_origin_without_a_search(self):
+        entry = dict(id='strix:Strix', name='Strix', kind='strix', presets=presets_of('strix', None),
+                     model=Path('missing.safetensors'))
+        engines = Engines('cpu')
+        try:
+            self.assertEqual(engines.turn(entry, dict(simulations=8), []), [[0, 0]])
+            self.assertEqual(engines.children, {})
+        finally:
+            engines.close()
+
     def test_reaping_a_tree_process_ends_what_it_left_running(self):
         with tempfile.TemporaryDirectory() as folder:
             beat = Path(folder) / 'beat'
