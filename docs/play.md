@@ -21,13 +21,39 @@ The picker lists everything the server finds on start:
 - `models/<name>.json` for a model stored elsewhere: `{"name": "old", "kind": "bubble", "path": "../runs/x"}`.
 - Native, the handwritten engine, always.
 - Seal, when `build/libhexo_seal.dll` (or `.so`) is built with `-DHEXO_SEAL_SOURCE`.
+- Six: a folder in `models/` holding `sixengine.exe` and `gen-NNNN.onnx` networks shows one entry per network,
+  labelled with the backend it runs on: TensorRT, CUDA, DirectML or CPU, the first whose libraries are found.
+  Six seats search by nodes, so a preset plays the same strength on any hardware.
+- Any engine speaking the Six protocol: `models/<name>.json` with `{"name", "kind": "six", "command", "mirrored"}`,
+  `command` a list of arguments.
+  Set `"mirrored": true` for engines in Six's frame, where HTTTX `(q, r)` is `(q + r, -r)`.
+- Strix: `models/<name>.json` with `{"name", "kind": "strix", "model": "model.safetensors"}`.
 
-| Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms |
-|---|---|---|---|
-| Quick (Q) | 32 | 2,048 | 250 and 100 |
-| Standard (S) | 128 | 32,768 | 1,000 and 500 |
-| Strong (St) | 512 | 131,072 | 3,000 and 2,000 |
-| Deep (D) | 2,048 | 524,288 | 10,000 and 8,000 |
+Engines you build or download yourself:
+
+- Six: the release zip and a network from github.com/CixMango/Six releases, unpacked into `models/six/`. The
+  release's engine is the DirectML build, which ships `DirectML.dll` next to `sixengine.exe`.
+- Six on CUDA: Six's engine built against ONNX Runtime's GPU package, with that package's DLLs (among them
+  `onnxruntime_providers_cuda.dll`) beside `sixengine.exe`, and `cudart64_12.dll` and `cudnn64_9.dll` (CUDA 12,
+  cuDNN 9) on PATH or beside it; an installed PyTorch with CUDA also has them, and its `torch/lib` is added to the
+  engine's PATH.
+- Six on TensorRT: `onnxruntime_providers_tensorrt.dll` beside the engine and `nvinfer_10.dll` as well, for example
+  from `pip install tensorrt` (its `tensorrt_libs` is added too). The first game builds the TensorRT plan beside the
+  network, which takes a few minutes.
+- Strix: `python tools/build_strix_learned.py <hexo-strix checkout>` (Rust and MinGW), and the public model
+  from `https://hexo.tyto.cc/model.safetensors` next to the JSON.
+- Mantis Shrimp: build Cmiller132/hexo-bot with its `scripts/build_native.sh` into a Six checkout's `rivals/shrimp`,
+  then point a mirrored `six` entry at Six's `arena/drivers/shrimp_driver.py`, run by that build's Python. Its
+  strength is `--visits`, so give each preset its own `args`, for example
+  `"presets": {"quick": {"nodes": 1, "args": ["--visits", "32"]}}`.
+- Seal: build with `-DHEXO_SEAL_SOURCE=<HexTicTacToe checkout>`.
+
+| Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms | Six protocol nodes | Strix simulations |
+|---|---|---|---|---|---|
+| Quick (Q) | 32 | 2,048 | 250 and 100 | 6,000 | 8 |
+| Standard (S) | 128 | 32,768 | 1,000 and 500 | 30,000 | 64 |
+| Strong (St) | 512 | 131,072 | 3,000 and 2,000 | 135,000 | 128 |
+| Deep (D) | 2,048 | 524,288 | 10,000 and 8,000 | 500,000 | 512 |
 
 On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at these presets. Custom
 (`⋯`) takes any simulations from 0 (raw policy) to 16,384, solver nodes up to 1,500,000 (0 turns the solver off; the solver gets up to a minute)
@@ -82,7 +108,7 @@ Shrimp's play deck from its repository, and the official HeXO client for the sto
 | Stones | filled hex | inset hex with glow | filled hex | filled hex | filled hex, landing animation |
 | Engine runs | in the browser | browser worker (WASM, ONNX on WebGPU) or native process | Python server | inside the HTTP request | background worker thread with job ids |
 | Page while thinking | usable | usable, progress in positions per second | usable, stale reads dropped | frozen, every control disabled | usable, progress per job, cancel |
-| Engines per side | Strix versions against a human | Six levels, bot against bot | random, checkpoints, SealBot | human against Bubble or native | Bubble, native or Seal per side, found in `runs/` and `models/`, bot against bot live |
+| Engines per side | Strix versions against a human | Six levels, bot against bot | random, checkpoints, SealBot | human against Bubble or native | Bubble, native, Seal, Six, Strix or Shrimp per side, found in `runs/` and `models/`, bot against bot live |
 | Strength | Instant, Quick, Standard, Strong, Deep | levels by positions per turn (6k to 135k) or time | argmax, sample, improved policy | simulations and proof nodes lists | Quick, Standard, Strong, Deep, custom, per side |
 | Analysis | vertical eval bar, top 5 moves with scores, shaded candidates | win-chance bar, best turn as ghost stones | value, entropy, candidate table, heat maps | on click: win chance, top 5, proof, threat | continuous: eval bar, top moves, best turn, proof and threat, saved |
 | Forced wins | check on request, winning line overlay | proven scores, threat outlines | none | solver proof and threat | solver proof and threat, winning line |

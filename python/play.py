@@ -14,9 +14,11 @@ import json
 import math
 import os
 import queue
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -27,14 +29,24 @@ from urllib.parse import parse_qs, urlparse
 
 from hexo import Game
 from notation import NotationConflict, dumps, loads
+from process_tree import TreeProcess
 
 ROOT = Path(__file__).resolve().parents[1]
 PRESETS = dict(
     bubble=dict(quick=dict(simulations=32, solver_nodes=2048), standard=dict(simulations=128, solver_nodes=32768),
                 strong=dict(simulations=512, solver_nodes=131072), deep=dict(simulations=2048, solver_nodes=524288)),
     native=dict(quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000), deep=dict(ms=10000)),
-    seal=dict(quick=dict(ms=100), standard=dict(ms=500), strong=dict(ms=2000), deep=dict(ms=8000)))
-LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 1_500_000), ms=(10, 120_000))
+    seal=dict(quick=dict(ms=100), standard=dict(ms=500), strong=dict(ms=2000), deep=dict(ms=8000)),
+    six=dict(quick=dict(nodes=6000), standard=dict(nodes=30000), strong=dict(nodes=135000), deep=dict(nodes=500000)),
+    strix=dict(quick=dict(simulations=8), standard=dict(simulations=64), strong=dict(simulations=128),
+               deep=dict(simulations=512)))
+LIMITS = dict(simulations=(0, 16384), solver_nodes=(0, 1_500_000), ms=(10, 120_000), nodes=(1, 50_000_000))
+KIND_LIMITS = dict(strix=dict(simulations=(1, 16384)))
+# Each library Six's backends need, as its Windows and its POSIX file name
+SIX_LIBRARIES = dict(cuda=('cudart64_12.dll', 'libcudart.so.12'), cudnn=('cudnn64_9.dll', 'libcudnn.so.9'),
+                     tensorrt=('nvinfer_10.dll', 'libnvinfer.so.10'), directml=('DirectML.dll', None),
+                     cuda_build=('onnxruntime_providers_cuda.dll', 'libonnxruntime_providers_cuda.so'),
+                     tensorrt_build=('onnxruntime_providers_tensorrt.dll', 'libonnxruntime_providers_tensorrt.so'))
 
 
 def player_at(ply):
@@ -103,15 +115,70 @@ def run_checkpoints(run):
     return ([champion] if champion in ids else []) + [c for c in ids if c != champion]
 
 
-def scan(models=None, runs=None, extra_runs=(), seal=None):
-    """Every engine on offer, by id. Bubble runs come from `extra_runs`, the directories in `runs`, and `models`;
-    single `.pt` exports and `<name>.json` entries ({"name", "kind": "bubble", "path"}) come from `models`.
-    Entries carry `id`, `name`, `kind`, `presets`, and for Bubble `checkpoints` plus the server-only `path`. An id
-    is `kind:name`; entries sharing one get a suffix from their path, so an id never moves to another model."""
-    found, seen = [], set()
+def six_backend(folder):
+    """The fastest backend `sixengine` in `folder` can run here, as (name, flags, PATH directories to add):
+    TensorRT, then CUDA, when the build ships ONNX Runtime's provider for it and its libraries are found, then
+    DirectML for the DirectML build (it ships DirectML.dll), then the CPU. Libraries are looked for in the folder,
+    PyTorch's and TensorRT's Python packages, PATH and LD_LIBRARY_PATH."""
+    import importlib.util
 
-    def add(kind, name, **fields):
-        found.append(dict(name=name, kind=kind, presets=PRESETS[kind], **fields))
+    def package(name, *parts):
+        spec = importlib.util.find_spec(name)
+        return Path(spec.submodule_search_locations[0], *parts) if spec and spec.submodule_search_locations else None
+
+    extra = [d for d in (Path(folder), package('torch', 'lib'), package('tensorrt_libs')) if d and d.is_dir()]
+    listed = os.pathsep.join(os.environ.get(name, '') for name in ('PATH', 'LD_LIBRARY_PATH'))
+    dirs = [*extra, *map(Path, filter(None, listed.split(os.pathsep)))]
+
+    def found(kind, where=dirs):
+        name = SIX_LIBRARIES[kind][os.name != 'nt']
+        return name is not None and any((d / name).exists() for d in where)
+
+    if found('cuda_build', [Path(folder)]) and found('cuda') and found('cudnn'):
+        if found('tensorrt_build', [Path(folder)]) and found('tensorrt'):
+            return 'TensorRT', ['--trt'], extra
+        return 'CUDA', [], extra
+    if found('directml', [Path(folder)]):
+        return 'DirectML', [], extra
+    return 'CPU', ['--cpu'], []
+
+
+def presets_of(kind, spec):
+    """The presets of an engine entry: the kind's defaults, overridden per preset by `spec`. Six-protocol presets
+    may add `args`, extra command-line arguments for an engine whose strength is set at launch, like Shrimp."""
+    presets = {name: dict(budget) for name, budget in PRESETS[kind].items()}
+    if not isinstance(spec or {}, dict):
+        raise ValueError('presets must be an object')
+    for name, budget in (spec or {}).items():
+        if name not in presets or not isinstance(budget, dict):
+            raise ValueError(f'unknown preset {name}')
+        for key, value in budget.items():
+            if key == 'args' and kind == 'six' and isinstance(value, list) and all(isinstance(v, str) for v in value):
+                continue
+            limits = LIMITS | KIND_LIMITS.get(kind, {})
+            if (key not in PRESETS[kind]['standard'] or type(value) is not int
+                    or not limits[key][0] <= value <= limits[key][1]):
+                raise ValueError(f'bad {key} in preset {name}')
+        presets[name] = presets[name] | budget
+    return presets
+
+
+def scan(models=None, runs=None, extra_runs=(), seal=None):
+    """Every engine on offer, by id.
+
+    Bubble runs come from `extra_runs`, the directories in `runs`, and `models`; single `.pt` exports come from
+    `models`. A directory in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once per network,
+    on the backend `six_backend` finds. `models/<name>.json` adds one entry: {"name", "kind": "bubble", "path"},
+    {"name", "kind": "six", "command", "mirrored", "presets"} or {"name", "kind": "strix", "model"}, paths
+    relative to the file. Entries carry `id`, `name`, `kind`, `presets`, and the server-only `path` and
+    `checkpoints` (Bubble), `command`, `cwd`, `mirrored` and `libraries` (Six protocol) or `model` (Strix). An id
+    is `kind:name`; entries sharing one get a suffix from their path, command or model, so an id never moves to
+    another engine."""
+    found, seen = [], set()
+    models = models and Path(models).resolve()
+
+    def add(kind, name, presets=None, **fields):
+        found.append(dict(name=name, kind=kind, presets=presets_of(kind, presets), **fields))
 
     def bubble(path, name=None):
         path = Path(path).resolve()
@@ -135,12 +202,31 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
         for path in sorted(Path(models).rglob('*.pt')):
             if 'checkpoints' not in path.relative_to(models).parts:
                 bubble(path)
+        for folder in sorted(p for p in Path(models).iterdir() if p.is_dir()):
+            binary = folder / ('sixengine.exe' if os.name == 'nt' else 'sixengine')
+            if not binary.exists():
+                continue
+            backend, flags, libraries = six_backend(folder)
+            for network in sorted(folder.glob('gen-*.onnx'), reverse=True):
+                add('six', f'Six {network.stem} · {backend}', command=[str(binary), '--net', str(network), *flags],
+                    cwd=folder, mirrored=True, libraries=libraries)
         for path in sorted(Path(models).glob('*.json')):
             try:
                 spec = json.loads(path.read_text(encoding='utf-8'))
-                if spec.get('kind') == 'bubble':
-                    bubble(path.parent / spec['path'], spec.get('name'))
-            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                name, kind = spec.get('name') or path.stem, spec.get('kind')
+                if kind == 'bubble':
+                    bubble(path.parent / spec['path'], name)
+                elif kind == 'six':
+                    command = spec['command']
+                    if not isinstance(command, list) or not command or not all(isinstance(c, str) for c in command):
+                        raise ValueError('command must be a list of arguments')
+                    first = path.parent / command[0]
+                    command[0] = str(first) if first.exists() else command[0]
+                    add('six', name, spec.get('presets'), command=command, cwd=path.parent,
+                        mirrored=spec.get('mirrored') is True, libraries=[])
+                elif kind == 'strix':
+                    add('strix', name, spec.get('presets'), model=(path.parent / spec['model']).resolve())
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
                 continue
     add('native', 'Native')
     if seal is not None and Path(seal).exists():
@@ -148,7 +234,8 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     bases = [f"{e['kind']}:{e['name']}" for e in found]
     entries = OrderedDict()
     for base, entry in zip(bases, found):
-        suffix = hashlib.blake2b(str(entry.get('path')).encode(), digest_size=3).hexdigest()
+        identity = entry.get('path') or entry.get('command') or entry.get('model')
+        suffix = hashlib.blake2b(str(identity).encode(), digest_size=3).hexdigest()
         key = base if bases.count(base) == 1 else f'{base}~{suffix}'
         entries[key] = dict(id=key, **entry)
     return entries
@@ -352,12 +439,42 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         local.close()
 
 
+class SearchChild:
+    """A search process and its output lines. It is a TreeProcess, so ending it also ends what it started, like
+    Strix's native search; its temporary files go in a private folder, removed when it ends."""
+
+    def __init__(self, command):
+        self.folder = tempfile.TemporaryDirectory(prefix='hexo-play-', ignore_cleanup_errors=True)
+        env = os.environ | dict.fromkeys(('TMPDIR', 'TEMP', 'TMP'), self.folder.name)
+        self.process = TreeProcess(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                                   encoding='utf-8', bufsize=1)
+        self.lines = queue.Queue()
+        self.pump = threading.Thread(target=self.forward, daemon=True)
+        self.pump.start()
+
+    def forward(self):
+        for line in self.process.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def end(self):
+        """Kill the process and everything it started, reap it and remove its temporary folder."""
+        self.process.kill()
+        self.process.wait()
+        self.pump.join()
+        with contextlib.suppress(OSError):
+            self.process.stdin.close()
+        self.process.stdout.close()
+        self.folder.cleanup()
+
+
 class Engines:
     """Loaded engines, used only from the worker thread. Keeps the three most recent Bubble exports."""
 
     def __init__(self, device, tactical_package=None, seal=None):
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
         self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
+        self.external = {}
         self.children = {}
 
     def bubble(self, path):
@@ -414,31 +531,30 @@ class Engines:
             return 'none'
 
     def turn(self, entry, budget, history, stop=lambda: False):
-        """A native or Seal turn. Their searches cannot be interrupted in process, so each kind searches in a child
-        process; when `stop()` turns true the child is killed, a fresh one starts on the next turn, and this raises
-        Cancelled."""
+        """A turn from a non-Bubble engine. A Six-protocol engine's search is stopped when `stop()` turns true.
+        Native, Seal and Strix searches cannot be interrupted in process, so each kind searches in a SearchChild;
+        when `stop()` turns true the child and everything it started are killed and a fresh one starts on the next
+        turn. Both raise Cancelled."""
         kind = entry['kind']
-        if kind not in self.children or self.children[kind][0].poll() is not None:
-            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'search', kind],
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding='utf-8',
-                                     bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            lines = queue.Queue()
-            def pump():
-                for line in child.stdout:
-                    lines.put(line)
-                lines.put(None)
-            threading.Thread(target=pump, daemon=True).start()
-            self.children[kind] = child, lines
-        child, lines = self.children[kind]
-        child.stdin.write(json.dumps(dict(ms=budget['ms'], history=[list(p) for p in history])) + '\n')
-        child.stdin.flush()
+        if kind == 'six':
+            return self.protocol(entry, budget, history, stop)
+        if kind == 'strix' and not history:
+            return [[0, 0]]   # the only legal first stone; Strix searches only once it is on the board
+        if kind in self.children and self.children[kind].process.poll() is not None:
+            self.children.pop(kind).end()
+        if kind not in self.children:
+            self.children[kind] = SearchChild([sys.executable, str(Path(__file__).resolve()), 'search', kind])
+        child = self.children[kind]
+        request = dict(budget, history=[list(p) for p in history], model=str(entry.get('model')))
+        child.process.stdin.write(json.dumps(request) + '\n')
+        child.process.stdin.flush()
         while True:
             try:
-                line = lines.get(timeout=.05)
+                line = child.lines.get(timeout=.05)
                 break
             except queue.Empty:
                 if stop():
-                    self.end(self.children.pop(kind)[0])
+                    self.children.pop(kind).end()
                     raise Cancelled() from None
         if line is None:
             raise RuntimeError(f'{kind} search process exited')
@@ -447,23 +563,50 @@ class Engines:
             raise RuntimeError(answer['error'])
         return answer['moves']
 
-    @staticmethod
-    def end(child):
-        """Kill a search child and reap it with its pipes."""
-        child.kill()
-        child.wait()
-        child.stdin.close()
-        child.stdout.close()
+    def protocol(self, entry, budget, history, stop):
+        """A turn from a Six-protocol engine, kept running between turns, one process per command line."""
+        from six_engine import ProtocolError, SixEngine
+        command = [*entry['command'], *budget.get('args', ())]
+        key = (*command, entry['mirrored'])
+        cancel = self.external[key].cancel if key in self.external else threading.Event()
+        cancel.clear()
+        done = threading.Event()
+
+        def watch():
+            while not done.wait(.05):
+                if stop():
+                    cancel.set()
+                    return
+
+        threading.Thread(target=watch, daemon=True).start()
+        game = replay(history)
+        try:
+            if key not in self.external:
+                print(f"{entry['name']}: {shlex.join(command)}", flush=True)
+                self.external[key] = SixEngine(command, mirrored=entry['mirrored'], cwd=entry['cwd'],
+                                               path=entry['libraries'], cancel=cancel, log=True,
+                                               startup=900)
+            return self.external[key](game, budget.get('ms'), nodes=budget.get('nodes'))
+        except ProtocolError:
+            if cancel.is_set():
+                raise Cancelled() from None
+            raise
+        finally:
+            done.set()
+            game.close()
 
     def close(self):
         """Release the models and end every child process."""
         self.bubbles.clear()
-        for child, _ in self.children.values():
-            self.end(child)
+        for child in self.children.values():
+            child.end()
         self.children.clear()
         if self.prover is not None:
             self.prover.close()
             self.prover = None
+        for engine in self.external.values():
+            engine.close()
+        self.external.clear()
 
 
 # Saved evaluations
@@ -660,19 +803,26 @@ class Job:
                     error=self.error, ply=len(self.history), side=getattr(self, 'side', None))
 
 
-def budget_of(kind, preset, custom=None):
-    """The budget of `preset` for an engine kind, or `custom` checked against LIMITS."""
+def budget_of(presets, preset, custom=None, kind=None):
+    """The budget of `preset` from an entry's `presets`, or the standard budget with `custom` values checked
+    against LIMITS and the `kind`'s own limits (a preset's launch `args` are not custom)."""
+    limits = LIMITS | KIND_LIMITS.get(kind, {})
     if preset != 'custom':
-        if preset not in PRESETS[kind]:
+        if preset not in presets:
             raise ValueError('Unknown preset')
-        return dict(PRESETS[kind][preset])
+        return dict(presets[preset])
     if custom is not None and not isinstance(custom, dict):
         raise ValueError('A custom budget is an object of numbers')
-    budget = dict(PRESETS[kind]['standard']) | (custom or {})
-    for key, value in budget.items():
-        low, high = LIMITS[key]
-        if key not in PRESETS[kind]['standard'] or type(value) is not int or not low <= value <= high:
+    budget = dict(presets['standard'])
+    for key, value in (custom or {}).items():
+        if key == 'args':
+            continue
+        if key not in budget or key not in limits:
+            raise ValueError(f'{key} is not a budget of this engine')
+        low, high = limits[key]
+        if type(value) is not int or not low <= value <= high:
             raise ValueError(f'{key} must be {low}..{high}')
+        budget[key] = value
     return budget
 
 
@@ -706,7 +856,8 @@ class Session:
                 raise ValueError('Unknown checkpoint')
         else:
             checkpoint = None
-        return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget_of(entry['kind'], preset, custom))
+        budget = budget_of(entry['presets'], preset, custom, entry['kind'])
+        return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget)
 
     def engine_key(self, seat):
         """Evaluations are keyed by the weights and the solver build that produced them ('none' for a budget
@@ -736,7 +887,8 @@ class Session:
                 if (found := self.lookup(history[:ply])) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'line', 'threat', 'simulations', 'solver_nodes')}
-            entries = [{k: v for k, v in e.items() if k != 'path'} for e in self.entries.values()]
+            shown = ('id', 'name', 'kind', 'presets', 'checkpoints')
+            entries = [{k: e[k] for k in shown if k in e} for e in self.entries.values()]
             return dict(instance=self.instance, revision=self.revision, history=[list(p) for p in history], **board,
                         paused=self.paused, seats=self.seats, analysis=self.analysis, engines=entries,
                         evaluations=evaluations,
@@ -1208,17 +1360,33 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def search_child(kind):
-    """The child process of `Engines.turn`: one JSON line {ms, history} in, one line {moves} or {error} out."""
-    engine = None
-    if kind == 'seal':
-        from legacy.arena import Seal
-        engine = Seal()
+    """The child process of `Engines.turn`: one JSON line {history, the budget, model} in, one line {moves} or
+    {error} out. A Strix child keeps the two most recent settings loaded, one per seat."""
+    engines = OrderedDict()
     for line in sys.stdin:
         try:
             request = json.loads(line)
             game = replay(request['history'])
             try:
-                moves = game.search(request['ms'])['moves'] if kind == 'native' else engine(game, request['ms'])
+                if kind == 'native':
+                    moves = game.search(request['ms'])['moves']
+                elif kind == 'seal':
+                    if 'seal' not in engines:
+                        from legacy.arena import Seal
+                        engines['seal'] = Seal()
+                    moves = engines['seal'](game, request['ms'])
+                else:
+                    key = (request['model'], request['simulations'])
+                    if key not in engines:
+                        if str(ROOT) not in sys.path:
+                            sys.path.insert(0, str(ROOT))
+                        from tools.strix_learned_adapter import StrixLearned
+                        engines[key] = StrixLearned(request['model'], simulations=request['simulations'],
+                                                    timeout_ms=min(600_000, max(5_000, 250 * request['simulations'])))
+                        while len(engines) > 2:
+                            engines.popitem(last=False)[1].close()
+                    engines.move_to_end(key)
+                    moves = engines[key](game, 0)
             finally:
                 game.close()
             answer = dict(moves=[list(map(int, m)) for m in moves])

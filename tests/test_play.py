@@ -1,6 +1,8 @@
 """Play server: evaluation store, review labels, background jobs and the HTTP surface, with fake engines."""
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -12,8 +14,9 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from hexo import Game
-from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, Session, budget_of, export_path, import_history,
-                  model_key, proof_turns, review, scan)
+from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, budget_of,
+                  export_path, import_history, model_key, presets_of, proof_turns, review, scan, six_backend)
+from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
 
@@ -29,6 +32,19 @@ def legal_turn(history):
         return moves
     finally:
         game.close()
+
+
+SLOW_ENGINE = """import sys
+stones = False
+for raw in sys.stdin:
+    words = raw.split()
+    if not words: continue
+    if words[0] == 'six': print('sixok', flush=True)
+    elif words[0] == 'isready': print('readyok', flush=True)
+    elif words[0] == 'position': stones = len(words) > 3
+    elif words[0] == 'go' and not stones: print('bestmove 0 0', flush=True)
+    elif words[0] == 'quit': break
+"""
 
 
 def wait(condition, timeout=10):
@@ -206,6 +222,50 @@ class Jobs(unittest.TestCase):
         self.assertEqual(self.engines.calls[0][:2], ('main/000002', STANDARD))
         with self.assertRaises(ValueError):
             self.session.configure_seat(1, 'bubble:fake', 'main/000009')
+
+    def test_six_protocol_engines_play_and_end_on_cancel(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / 'engine.py'
+            script.write_text(SLOW_ENGINE)
+            entry = dict(id='six:slow', name='slow', kind='six', presets=presets_of('six', None),
+                         command=[sys.executable, str(script)], cwd=Path(folder), mirrored=True, libraries=[])
+            engines = Engines('cpu')
+            session = Session(entries() | {'six:slow': entry}, engines, Evaluations())
+            try:
+                session.configure_analysis('bubble:fake', auto=False)
+                session.configure_seat(1, 'native:Native', preset='quick')
+                session.configure_seat(0, 'six:slow')
+                self.assertEqual(json.loads(json.dumps(session.state()))['engines'][-1], dict(
+                    id='six:slow', name='slow', kind='six', presets=presets_of('six', None)))
+                wait(lambda: len(session.history) == 1)
+                session.pause(True)
+                session.load([(0, 0), (1, 0), (2, 0)], False)
+                thinking = lambda: [j['id'] for j in session.state()['jobs'] if j['status'] == 'running' and j['ply'] == 3]
+                wait(thinking)
+                started = time.time()
+                session.cancel(thinking()[0])
+                wait(lambda: not session.state()['jobs'])
+                self.assertLess(time.time() - started, 5)
+                self.assertEqual(session.history, [(0, 0), (1, 0), (2, 0)])
+                session.pause(False)
+                wait(lambda: any(j['status'] == 'running' and j['ply'] == 3 for j in session.state()['jobs']))
+            finally:
+                session.close()
+
+    def test_a_silent_engine_can_be_cancelled_during_its_handshake(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / 'engine.py'
+            script.write_text('import time\ntime.sleep(60)\n')
+            entry = dict(id='six:mute', name='mute', kind='six', presets=presets_of('six', None),
+                         command=[sys.executable, str(script)], cwd=Path(folder), mirrored=False, libraries=[])
+            engines = Engines('cpu')
+            started = time.time()
+            try:
+                with self.assertRaises(Cancelled):
+                    engines.turn(entry, dict(nodes=10), [], lambda: time.time() - started > .5)
+                self.assertLess(time.time() - started, 5)
+            finally:
+                engines.close()
 
     def test_cancel_stops_a_thinking_engine_and_pauses(self):
         self.engines.hold = True
@@ -430,6 +490,60 @@ class Jobs(unittest.TestCase):
         finally:
             engines.close()
 
+    def test_ending_a_search_child_ends_what_it_started_and_removes_its_temporary_folder(self):
+        with tempfile.TemporaryDirectory() as folder:
+            beat = Path(folder) / 'beat'
+            (Path(folder) / 'grandchild.py').write_text(
+                'import pathlib, sys, time\n'
+                'while True:\n'
+                '    pathlib.Path(sys.argv[1]).write_text(str(time.time()))\n'
+                '    time.sleep(.02)\n')
+            (Path(folder) / 'child.py').write_text(
+                'import subprocess, sys, tempfile, time\n'
+                'subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n'
+                'print(tempfile.gettempdir(), flush=True)\n'
+                'time.sleep(60)\n')
+            child = SearchChild([sys.executable, str(Path(folder) / 'child.py'), str(Path(folder) / 'grandchild.py'),
+                                 str(beat)])
+            temporary = Path(child.lines.get(timeout=10).strip())
+            self.assertTrue(temporary.is_dir())
+            wait(beat.exists)
+            child.end()
+            time.sleep(.1)
+            last = beat.read_text()
+            time.sleep(.3)
+            self.assertEqual(beat.read_text(), last)
+            self.assertFalse(temporary.exists())
+
+    def test_strix_opens_at_the_origin_without_a_search(self):
+        entry = dict(id='strix:Strix', name='Strix', kind='strix', presets=presets_of('strix', None),
+                     model=Path('missing.safetensors'))
+        engines = Engines('cpu')
+        try:
+            self.assertEqual(engines.turn(entry, dict(simulations=8), []), [[0, 0]])
+            self.assertEqual(engines.children, {})
+        finally:
+            engines.close()
+
+    def test_reaping_a_tree_process_ends_what_it_left_running(self):
+        with tempfile.TemporaryDirectory() as folder:
+            beat = Path(folder) / 'beat'
+            (Path(folder) / 'grandchild.py').write_text(
+                'import pathlib, sys, time\n'
+                'while True:\n'
+                '    pathlib.Path(sys.argv[1]).write_text(str(time.time()))\n'
+                '    time.sleep(.02)\n')
+            leader = TreeProcess([sys.executable, '-c', 'import subprocess, sys; subprocess.Popen(sys.argv[1:])',
+                                  sys.executable, str(Path(folder) / 'grandchild.py'), str(beat)],
+                                 stdout=subprocess.DEVNULL)
+            wait(beat.exists)
+            wait(lambda: leader.poll() is not None)
+            leader.wait()
+            time.sleep(.1)
+            last = beat.read_text()
+            time.sleep(.3)
+            self.assertEqual(beat.read_text(), last)
+
     def test_solver_identity_follows_the_built_library(self):
         import tactical_proof
         with tempfile.TemporaryDirectory() as directory:
@@ -455,12 +569,28 @@ class Jobs(unittest.TestCase):
                 self.assertEqual(isolated.call_count, 2)
 
     def test_budgets(self):
-        self.assertEqual(budget_of('bubble', 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
+        bubble = PRESETS['bubble']
+        self.assertEqual(budget_of(bubble, 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
         for custom in (dict(simulations=10 ** 6), dict(ms=5), dict(simulations='8')):
             with self.assertRaises(ValueError):
-                budget_of('bubble', 'custom', custom)
+                budget_of(bubble, 'custom', custom)
         with self.assertRaises(ValueError):
-            budget_of('native', 'heavy')
+            budget_of(PRESETS['native'], 'heavy')
+        self.assertEqual(presets_of('six', dict(quick=dict(args=['--visits', '8'])))['quick'],
+                         dict(nodes=6000, args=['--visits', '8']))
+        shrimp = presets_of('six', dict(quick=dict(nodes=1, args=['--visits', '32'])))
+        self.assertEqual(budget_of(shrimp, 'custom', dict(nodes=9, args=['--visits', '1'])), dict(nodes=9))
+        self.assertEqual(budget_of(shrimp, 'quick'), dict(nodes=1, args=['--visits', '32']))
+        for spec in (dict(heavy=dict(nodes=1)), dict(quick=dict(nodes=0)), dict(quick=dict(args='--x')), [1],
+                     dict(quick=dict(ms=1000))):
+            with self.assertRaises(ValueError):
+                presets_of('six', spec)
+        with self.assertRaises(ValueError):
+            budget_of(presets_of('strix', None), 'custom', dict(simulations=0), 'strix')
+        with self.assertRaises(ValueError):
+            presets_of('strix', dict(quick=dict(simulations=0)))
+        with self.assertRaises(ValueError):
+            presets_of('strix', dict(quick=dict(nodes=100)))
 
 
 class Http(unittest.TestCase):
@@ -552,6 +682,51 @@ class Proofs(unittest.TestCase):
 
 
 class Registry(unittest.TestCase):
+    def test_six_takes_the_fastest_backend_it_can_load(self):
+        library = lambda kind: SIX_LIBRARIES[kind][os.name != 'nt']
+        with tempfile.TemporaryDirectory() as directory:
+            six, libraries = Path(directory) / 'six', Path(directory) / 'gpu'
+            six.mkdir()
+            libraries.mkdir()
+            with unittest.mock.patch('importlib.util.find_spec', return_value=None), \
+                    unittest.mock.patch.dict(os.environ, dict(PATH=str(libraries))):
+                self.assertEqual(six_backend(six), ('CPU', ['--cpu'], []))
+                for kind in ('cuda', 'cudnn', 'tensorrt'):
+                    (libraries / library(kind)).write_bytes(b'')
+                self.assertEqual(six_backend(six), ('CPU', ['--cpu'], []))
+                (six / 'DirectML.dll').write_bytes(b'')
+                self.assertEqual(six_backend(six)[:2], ('DirectML', []) if os.name == 'nt' else ('CPU', ['--cpu']))
+                (six / 'DirectML.dll').unlink()
+                (six / library('cuda_build')).write_bytes(b'')
+                self.assertEqual(six_backend(six)[:2], ('CUDA', []))
+                (six / library('tensorrt_build')).write_bytes(b'')
+                self.assertEqual(six_backend(six)[:2], ('TensorRT', ['--trt']))
+                (libraries / library('tensorrt')).unlink()
+                self.assertEqual(six_backend(six)[:2], ('CUDA', []))
+
+    def test_six_folders_and_engine_entries_are_found(self):
+        with tempfile.TemporaryDirectory() as directory:
+            models = Path(directory)
+            (models / 'six').mkdir()
+            for name in ('sixengine.exe' if os.name == 'nt' else 'sixengine', 'gen-0100.onnx', 'gen-0120.onnx'):
+                (models / 'six' / name).write_bytes(b'')
+            (models / 'shrimp.json').write_text(json.dumps(dict(
+                kind='six', command=['python', 'driver.py'], presets=dict(quick=dict(nodes=1, args=['--visits', '32'])))))
+            (models / 'strix.json').write_text(json.dumps(dict(name='Strix', kind='strix', model='strix.safetensors')))
+            (models / 'broken.json').write_text(json.dumps(dict(kind='six', command=[], presets=dict(odd={}))))
+            (models / 'spaced.json').write_text(json.dumps(dict(kind='six', command='six --cpu')))
+            with unittest.mock.patch('play.six_backend', return_value=('CPU', ['--cpu'], [])):
+                found = scan(models, None, [], None)
+            self.assertEqual(list(found), ['six:Six gen-0120 · CPU', 'six:Six gen-0100 · CPU', 'six:shrimp',
+                                           'strix:Strix', 'native:Native'])
+            six = found['six:Six gen-0120 · CPU']
+            self.assertEqual((six['command'][1:], six['mirrored']),
+                             (['--net', str(models / 'six/gen-0120.onnx'), '--cpu'], True))
+            shrimp = found['six:shrimp']
+            self.assertEqual((shrimp['command'], shrimp['mirrored']), (['python', 'driver.py'], False))
+            self.assertEqual(shrimp['presets']['quick'], dict(nodes=1, args=['--visits', '32']))
+            self.assertEqual(found['strix:Strix']['presets']['deep'], dict(simulations=512))
+
     def test_runs_models_and_entries_are_found(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -10,6 +10,7 @@ import threading
 import time
 
 from hexo import Game
+from process_tree import TreeProcess
 
 
 class ProtocolError(RuntimeError):
@@ -169,28 +170,44 @@ def serve(player, source=sys.stdin, out=sys.stdout):
         game.close()
 
 
-class SixEngine:
-    """An external Six-protocol opponent with the call shape of legacy.arena.Seal."""
+def mirror(q, r):
+    """Six's and Strix's axial frame from ours and back: HTTTX (q, r) is their (q + r, -r); its own inverse."""
+    return q + r, -r
 
-    def __init__(self, command, timeout=30., *, cancel=None):
+
+class SixEngine:
+    """An external Six-protocol opponent with the call shape of legacy.arena.Seal.
+
+    A `mirrored` engine uses Six's frame, so positions and moves pass through `mirror`. `path` directories go in
+    front of PATH (and LD_LIBRARY_PATH off Windows) for the engine process, for the libraries of its GPU backend;
+    `cwd` is its working folder. With `log` the engine's stderr, where Six reports a backend it could not use, goes
+    to ours. `startup` bounds the handshake, which covers loading a network (Six on TensorRT takes a minute, and
+    minutes when it first builds its plan). The engine runs as a TreeProcess, so whatever it starts ends with it."""
+
+    def __init__(self, command, timeout=30., *, cancel=None, mirrored=False, cwd=None, path=(), log=False,
+                 startup=None):
         self.command = shlex.split(command) if isinstance(command, str) else list(command)
         self.timeout = timeout
         self.cancel = cancel
+        self.mirrored, self.cwd, self.log = mirrored, cwd, log
+        self.startup = max(5., timeout) if startup is None else startup
+        loader = ('PATH',) if os.name == 'nt' else ('PATH', 'LD_LIBRARY_PATH')
+        self.env = {**os.environ, **{name: os.pathsep.join([*map(str, path), os.environ.get(name, '')])
+                                     for name in loader}} if path else None
         self.game = None
         self.proc = None
         self._start()
 
     def _start(self):
         self.lines = queue.Queue()
-        self.proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, text=True, encoding='utf-8', bufsize=1,
-                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        self.proc = TreeProcess(self.command, cwd=self.cwd, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=None if self.log else subprocess.DEVNULL, text=True, encoding='utf-8', bufsize=1)
         threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
         try:
             self._send('six')
-            self._expect('sixok', max(5., self.timeout))
+            self._expect('sixok', self.startup)
             self._send('isready')
-            self._expect('readyok', max(5., self.timeout))
+            self._expect('readyok', self.startup)
         except Exception:
             self._stop()
             raise
@@ -228,7 +245,10 @@ class SixEngine:
             if line.startswith(prefix):
                 return line
 
-    def __call__(self, game, ms):
+    def __call__(self, game, ms=None, nodes=None):
+        """The engine's turn for `game`, searched for `nodes` nodes when given, else for `ms` milliseconds."""
+        frame = mirror if self.mirrored else (lambda q, r: (q, r))
+        searching = False
         try:
             if self.proc is None:
                 self._start()
@@ -237,15 +257,17 @@ class SixEngine:
                 self._send('isready')
                 self._expect('readyok', self.timeout)
                 self.game = game
-            moves = ' '.join(f'{q} {r}' for q, r, _ in game.cells)
+            moves = ' '.join('%d %d' % frame(q, r) for q, r, _ in game.cells)
             self._send('position radius 8' + (f' moves {moves}' if moves else ''))
-            self._send(f'go movetime {ms}')
-            line = self._expect('bestmove', self.timeout + 3*ms/1000)
+            self._send(f'go nodes {nodes}' if nodes else f'go movetime {ms}')
+            searching = True
+            line = self._expect('bestmove', self.timeout + (nodes / 1000 if nodes else 3*ms/1000))
+            searching = False
             parts = line.split()[1:]
             if len(parts) not in (2, 4):
                 raise IllegalReply(f'unreadable bestmove: {line}')
             numbers = [int(v) for v in parts]
-            turn = list(zip(numbers[::2], numbers[1::2]))
+            turn = [frame(q, r) for q, r in zip(numbers[::2], numbers[1::2])]
             probe = Game([tuple(c[:2]) for c in game.cells])
             try:
                 played = []
@@ -262,12 +284,28 @@ class SixEngine:
                 probe.close()
             return turn
         except (ProtocolError, ValueError) as error:
-            self._stop()
-            self.game = None
-            if self.cancel is None or not self.cancel.is_set():
-                self._start()
+            cancelled = self.cancel is not None and self.cancel.is_set()
+            if not (cancelled and searching and self._settle()):
+                self._stop()
+                self.game = None
+                if not cancelled:
+                    self._start()
             error_class = IllegalReply if isinstance(error, ValueError) else type(error)
             raise error_class(str(error)) from error
+
+    def _settle(self):
+        """Stop a cancelled search and read its answer, so the engine stays loaded; False when it does not answer."""
+        cancel, self.cancel = self.cancel, None
+        try:
+            self._send('stop')
+            self._expect('bestmove', .5)
+            self._send('isready')
+            self._expect('readyok', .5)
+            return True
+        except ProtocolError:
+            return False
+        finally:
+            self.cancel = cancel
 
     def _stop(self):
         if self.proc is None:
