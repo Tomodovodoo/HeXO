@@ -134,6 +134,39 @@ struct CenterTable {
         slots[hole]={};--count;
     }
 };
+struct CandidateData {
+    std::array<int,2> gain{};
+    int nearby=0,lines=0;
+    bool occupied=false;
+};
+struct CandidateCache {
+    struct Slot {Cell cell{};uint64_t hash=0;CandidateData data{};};
+    std::vector<Slot> slots;
+    size_t count=0;
+    std::array<int,2> empty_gain{};
+    static uint64_t hash(Cell c) {auto h=CellHash{}(c);return h?h:1;}
+    void reserve(size_t n) {size_t capacity=128;while(capacity*3<n*4) capacity*=2;slots.resize(capacity);}
+    const CandidateData* find(Cell c) const {
+        auto h=hash(c);size_t i=h&(slots.size()-1);
+        while(slots[i].hash) {
+            if(slots[i].hash==h && slots[i].cell==c) return &slots[i].data;
+            i=(i+1)&(slots.size()-1);
+        }
+        return nullptr;
+    }
+    CandidateData& get(Cell c) {
+        if((count+1)*4>=slots.size()*3) {
+            auto old=std::move(slots);slots=std::vector<Slot>(old.size()*2);count=0;
+            for(const auto& slot:old) if(slot.hash) get(slot.cell)=slot.data;
+        }
+        auto h=hash(c);size_t i=h&(slots.size()-1);
+        while(slots[i].hash) {
+            if(slots[i].hash==h && slots[i].cell==c) return slots[i].data;
+            i=(i+1)&(slots.size()-1);
+        }
+        slots[i]={c,h,CandidateData{empty_gain}};++count;return slots[i].data;
+    }
+};
 struct Board {
     std::unordered_map<Cell,int,CellHash> cells;
     WindowTable windows;
@@ -148,6 +181,21 @@ struct Board {
     CenterTable centers;
     std::array<int64_t,64> pool{};
     std::array<int64_t,2> stone_counts{};
+    CandidateCache* candidates=nullptr;
+    int window_gain(Counts n,int pattern,int k,int p) const {
+        int delta=adjustment[pattern+(p+1)*powers[k]]-adjustment[pattern];
+        int result=p==0?delta:-delta;
+        if(n[1-p]==0) result+=weight[n[p]+1]-weight[n[p]];
+        if(n[p]==0) result+=(weight[n[1-p]+1]-weight[n[1-p]])*3/4;
+        return result;
+    }
+    static bool promising(Counts n) { return (n[0]>=2 && !n[1]) || (n[1]>=2 && !n[0]); }
+    void candidate_nearby(Cell c,int delta) {
+        if(!candidates) return;
+        candidates->get(c).occupied=delta>0;
+        for(int q=-2;q<=2;++q) for(int r=std::max(-2,-q-2);r<=std::min(2,-q+2);++r)
+            candidates->get(c+Cell{q,r}).nearby+=delta;
+    }
     void nn_update(Cell c,int p,int delta) {
         if(!model) return;
         auto change=[&](Cell target,int axis,int digit,bool all_axes) {
@@ -249,6 +297,7 @@ struct Board {
             auto& data=windows.get(w);
             Counts& n=data.counts;
             auto& pattern=data.pattern;
+            const auto old_counts=n;const int old_pattern=pattern;
             if(pattern) --features[pattern];
             learned_score-=adjustment[pattern];
             evaluation-=value(n);
@@ -256,6 +305,12 @@ struct Board {
                 if(n[side]>=4 && n[1-side]==0) threats[side].erase(w);
             n[p]+=delta;
             pattern+=delta*(p+1)*powers[k];
+            if(candidates) for(int j=0;j<6;++j) if(j!=k && pattern/powers[j]%3==0) {
+                auto& item=candidates->get(w.start+axes[d]*j);
+                for(int side=0;side<2;++side)
+                    item.gain[side]+=window_gain(n,pattern,j,side)-window_gain(old_counts,old_pattern,j,side);
+                item.lines+=int(promising(n))-int(promising(old_counts));
+            }
             if(pattern) ++features[pattern];
             learned_score+=adjustment[pattern];
             evaluation+=value(n);
@@ -266,6 +321,7 @@ struct Board {
         }
     }
     void make(Cell c) {
+        candidate_nearby(c,1);
         history.push_back({c,player,remaining,winner});
         cells.emplace(c,player);
         stones_hash^=mix(CellHash{}(c)^mix(player+991));
@@ -280,6 +336,7 @@ struct Board {
         cells.erase(u.c);
         stones_hash^=mix(CellHash{}(u.c)^mix(u.player+991));
         player=u.player;remaining=u.remaining;winner=u.winner;
+        candidate_nearby(u.c,-1);
     }
     int score(int p) const {
         int64_t residual=0;
@@ -336,18 +393,57 @@ struct Board {
         return out;
     }
     int gain(Cell c,int p) const {
+        if(candidates) {
+            auto data=candidates->find(c);
+            return data?data->gain[p]:candidates->empty_gain[p];
+        }
         int score=0;
         for(int d=0;d<3;++d) for(int k=0;k<6;++k) {
             auto data=windows.find({c+axes[d]*(-k),d});
             Counts n=data?data->counts:Counts{0,0};
             int pattern=data?data->pattern:0;
-            int delta=adjustment[pattern+(p+1)*powers[k]]-adjustment[pattern];
-            score+=p==0?delta:-delta;
-            if(n[1-p]==0) score+=weight[n[p]+1]-weight[n[p]];
-            if(n[p]==0) score+=(weight[n[1-p]+1]-weight[n[1-p]])*3/4;
+            score+=window_gain(n,pattern,k,p);
         }
         return score;
     }
+    int placed_score(Cell c,int p) const {
+        // Exact scalar evaluation after one empty cell is filled. Candidate
+        // ranking need not update the board, feature counts or threat sets.
+        int64_t score=evaluation+learned_score;
+        for(int a=0;a<3;++a) for(int k=0;k<6;++k) {
+            auto data=windows.find({c+axes[a]*(-k),a});
+            Counts n=data?data->counts:Counts{};
+            int pattern=data?data->pattern:0;
+            score-=value(n)+adjustment[pattern];
+            ++n[p];
+            score+=value(n)+adjustment[pattern+(p+1)*powers[k]];
+        }
+        int result=int(std::clamp(score,int64_t(-500000),int64_t(500000)));
+        return p==0?result:-result;
+    }
+};
+struct CandidateGuard {
+    Board& b;CandidateCache cache;
+    explicit CandidateGuard(Board& board):b(board) {
+        if(b.model) return;
+        for(int p=0;p<2;++p) for(int k=0;k<6;++k) cache.empty_gain[p]+=3*b.window_gain({},0,k,p);
+        cache.reserve(b.cells.size()*12+128);
+        for(auto [c,p]:b.cells) {
+            cache.get(c).occupied=true;
+            for(int q=-2;q<=2;++q) for(int r=std::max(-2,-q-2);r<=std::min(2,-q+2);++r)
+                ++cache.get(c+Cell{q,r}).nearby;
+        }
+        for(const auto& slot:b.windows.slots) if(slot.hash) {
+            const auto& data=slot.data;
+            for(int j=0;j<6;++j) if(data.pattern/powers[j]%3==0) {
+                auto& item=cache.get(slot.start+axes[slot.axis]*j);
+                for(int p=0;p<2;++p) item.gain[p]+=b.window_gain(data.counts,data.pattern,j,p)-b.window_gain({},0,j,p);
+                item.lines+=int(Board::promising(data.counts));
+            }
+        }
+        b.candidates=&cache;
+    }
+    ~CandidateGuard(){b.candidates=nullptr;}
 };
 struct Restore {
     Board& b; size_t size;
@@ -361,14 +457,14 @@ struct Turn {
 void apply(Board& b,const Turn& t) { for(int i=0;i<t.count && b.winner<0;++i) b.make(t.cells[i]); }
 constexpr int mate=10000000;
 struct Timeout {};
-struct Entry { uint64_t key=0; int depth=-1,score=0,flag=0; Turn best; };
+struct Entry { uint64_t key=0; Turn best; };
 struct Search {
     Clock::time_point deadline;
     int width;
     uint64_t nodes=0;
     std::vector<Entry> tt, frozen_hints;
     bool inject_tt=false;
-    Search(int ms,int width,bool table=true):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(table?1<<16:0){}
+    Search(int ms,int width,bool inject=false):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(inject?1<<16:0),inject_tt(inject){}
     void check() const { if(Clock::now()>=deadline) throw Timeout{}; }
     Turn immediate(Board& b) {
         auto completions=b.completions(b.player,b.remaining);
@@ -380,8 +476,18 @@ struct Search {
         }
         return {};
     }
-    static std::vector<Cell> candidates(Board& b,int limit) {
-        if(b.cells.empty()) return {{0,0}};
+    using RankedCells=std::vector<std::pair<int,Cell>>;
+    static RankedCells candidate_scores(Board& b) {
+        if(b.candidates) {
+            RankedCells ranked;
+            ranked.reserve(b.candidates->count);
+            for(const auto& slot:b.candidates->slots) if(slot.hash) {
+                const auto& c=slot.cell;const auto& item=slot.data;
+                if(!item.occupied && (item.nearby || item.lines) && std::abs(c.q)<=1000000000000LL && std::abs(c.r)<=1000000000000LL)
+                    ranked.emplace_back(item.gain[b.player],c);
+            }
+            return ranked;
+        }
         std::unordered_set<Cell,CellHash> set;
         for(auto [c,_]:b.cells) {
             for(int q=-2;q<=2;++q) for(int r=std::max(-2,-q-2);r<=std::min(2,-q+2);++r)
@@ -393,7 +499,7 @@ struct Search {
             if((data.counts[0]>=2 && !data.counts[1]) || (data.counts[1]>=2 && !data.counts[0]))
                 for(auto c:b.empty(slot.key())) set.insert(c);
         }
-        std::vector<std::pair<int,Cell>> ranked;
+        RankedCells ranked;
         // Every candidate is empty and within five cells of an occupied cell.
         // Only the coordinate representation limit needs checking here.
         ranked.reserve(set.size());
@@ -405,6 +511,9 @@ struct Search {
             for(auto c:set) if(std::abs(c.q)<=1000000000000LL && std::abs(c.r)<=1000000000000LL)
                 ranked.emplace_back(b.gain(c,b.player),c);
         }
+        return ranked;
+    }
+    static std::vector<Cell> select_candidates(Board& b,RankedCells ranked,int limit) {
         const auto better=[](const auto& a,const auto& z){ return a.first!=z.first ? a.first>z.first : a.second<z.second; };
         if(int(ranked.size())>limit) {
             std::nth_element(ranked.begin(),ranked.begin()+limit,ranked.end(),better);
@@ -417,6 +526,47 @@ struct Search {
         for(int p=0;p<2;++p) for(auto& e:b.completions(p)) for(auto c:e)
             if(std::find(out.begin(),out.end(),c)==out.end() && b.legal(c)) out.push_back(c);
         return out;
+    }
+    static std::vector<Cell> candidates(Board& b,int limit) {
+        if(b.cells.empty()) return {{0,0}};
+        return select_candidates(b,candidate_scores(b),limit);
+    }
+    static bool candidate_cell(const Board& b,Cell c) {
+        for(int q=-2;q<=2;++q) for(int r=std::max(-2,-q-2);r<=std::min(2,-q+2);++r)
+            if(b.at(c+Cell{q,r})>=0) return true;
+        for(int a=0;a<3;++a) for(int k=0;k<6;++k) {
+            auto data=b.windows.find({c+axes[a]*(-k),a});
+            if(data && ((data->counts[0]>=2 && !data->counts[1]) || (data->counts[1]>=2 && !data->counts[0]))) return true;
+        }
+        return false;
+    }
+    static RankedCells following_scores(Board& b,const RankedCells& base,Cell first) {
+        if(b.candidates) return candidate_scores(b);
+        // Only the 18 windows through the first stone changed. Keep all other
+        // scalar rankings and discover only the newly reachable candidates.
+        RankedCells ranked;ranked.reserve(base.size()+48);
+        for(const auto& [score,c]:base) if(!(c==first)) {
+            auto q=c.q-first.q,r=c.r-first.r;
+            bool changed=(q==0 || r==0 || q+r==0) && std::max(std::abs(q),std::abs(r))<=5;
+            // A blocked line can stop admitting a distant empty endpoint.
+            if(changed && std::max(std::abs(q),std::abs(r))>2 && !candidate_cell(b,c)) continue;
+            ranked.emplace_back(changed?b.gain(c,b.player):score,c);
+        }
+        std::vector<Cell> added;
+        for(int q=-2;q<=2;++q) for(int r=std::max(-2,-q-2);r<=std::min(2,-q+2);++r)
+            added.push_back(first+Cell{q,r});
+        for(int a=0;a<3;++a) for(int k=0;k<6;++k) {
+            Window w{first+axes[a]*(-k),a};auto data=b.windows.find(w);
+            if(data && ((data->counts[0]>=2 && !data->counts[1]) || (data->counts[1]>=2 && !data->counts[0])))
+                for(auto c:b.empty(w)) added.push_back(c);
+        }
+        std::sort(added.begin(),added.end());added.erase(std::unique(added.begin(),added.end()),added.end());
+        for(auto c:added) {
+            if(b.at(c)>=0 || std::abs(c.q)>1000000000000LL || std::abs(c.r)>1000000000000LL) continue;
+            auto found=std::lower_bound(base.begin(),base.end(),c,[](const auto& a,Cell z){return a.second<z;});
+            if(found==base.end() || !(found->second==c)) ranked.emplace_back(b.gain(c,b.player),c);
+        }
+        return ranked;
     }
     void covers(const std::vector<std::vector<Cell>>& threats,std::vector<Cell>& selected,
                 int remaining,std::vector<std::vector<Cell>>& out) {
@@ -482,6 +632,32 @@ struct Search {
         // hint must cover every immediate threat; own wins were handled above.
         add(hint,!constraints.empty());
         const bool pinned=!result.empty();
+        RankedCells base;
+        if(!b.model && b.remaining==2) {
+            base=candidate_scores(b);
+            std::sort(base.begin(),base.end(),[](const auto& a,const auto& z){return a.second<z.second;});
+        }
+        auto follow=[&](Cell first,int limit) {
+            Restore restore(b);b.make(first);
+            auto seconds=b.model?candidates(b,limit):select_candidates(b,following_scores(b,base,first),limit);
+            if(b.model) {
+                b.undo();
+                for(auto c:seconds) add({{first,c},2,0});
+                return;
+            }
+            for(auto c:seconds) {
+                // Immediate wins were returned above. These two placements
+                // cannot make a new opponent threat; they only cover old ones.
+                // Deduplicate using the same final-position hash as add().
+                auto key=b.stones_hash^mix(CellHash{}(c)^mix(side+991))^mix(100+(1-side)*3+2)^mix(199);
+                if(!seen.insert(key).second) continue;
+                int score=b.placed_score(c,side);
+                for(const auto& threat:constraints)
+                    if(std::find(threat.begin(),threat.end(),first)==threat.end() &&
+                       std::find(threat.begin(),threat.end(),c)==threat.end()) {score=-mate;break;}
+                result.push_back({{first,c},2,score});
+            }
+        };
         if(!constraints.empty()) {
             std::vector<std::vector<Cell>> defenses;std::vector<Cell> selected;
             covers(constraints,selected,b.remaining,defenses);
@@ -491,23 +667,17 @@ struct Search {
                     Turn t; t.count=int(cover.size());std::copy(cover.begin(),cover.end(),t.cells.begin());add(t);
                     if(t.count==2) {std::swap(t.cells[0],t.cells[1]);add(t);}
                 } else {
-                    Restore restore(b);
                     if(!b.legal(cover[0])) continue;
-                    b.make(cover[0]);
-                    auto seconds=candidates(b,width);
-                    b.undo();
-                    for(auto c:seconds) add({{cover[0],c},2,0});
+                    follow(cover[0],width);
                 }
             }
             if(!result.empty()) {std::sort(result.begin()+int(pinned),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});return result;}
         }
-        auto firsts=candidates(b,width);
+        auto firsts=base.empty()?candidates(b,width):select_candidates(b,base,width);
         for(auto a:firsts) {
             if(timed) check();
             if(b.remaining==1) {add({{a,{}},1,0});continue;}
-            Restore restore(b);b.make(a);
-            auto seconds=candidates(b,std::max(6,width/2));b.undo();
-            for(auto c:seconds) add({{a,c},2,0});
+            follow(a,std::max(6,width/2));
         }
         std::stable_sort(result.begin()+int(pinned),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});
         if(int(result.size())>width*2) result.resize(width*2);
@@ -518,27 +688,13 @@ struct Search {
         if(b.winner>=0) return b.winner==b.player?mate:-mate;
         if(immediate(b).count) return mate;
         if(depth<=0) return unavoidable_loss(b)?-mate:b.score(b.player);
-        uint64_t key=b.hash();auto& entry=tt[key&(tt.size()-1)];
-        if(!inject_tt && entry.key==key && entry.depth>=depth) {
-            if(entry.flag==0) return entry.score;
-            if(entry.flag==1 && entry.score>=beta) return entry.score;
-            if(entry.flag==2 && entry.score<=alpha) return entry.score;
+        Turn hint{};
+        if(inject_tt) {
+            uint64_t key=b.hash();const auto& entry=frozen_hints[key&(frozen_hints.size()-1)];
+            if(entry.key==key) hint=entry.best;
         }
-        const auto& move_entry=inject_tt?frozen_hints[key&(frozen_hints.size()-1)]:entry;
-        const Turn hint=move_entry.key==key?move_entry.best:Turn{};
-        const int original=alpha;
-        auto moves=turns(b,true,inject_tt?hint:Turn{});
+        auto moves=turns(b,true,hint);
         if(moves.empty()) return b.score(b.player);
-        // Only reorder the selected, independently validated turns. Injecting a
-        // hash move before truncation would change this selective search tree.
-        // Keep the actual generated turn, including early first-stone wins.
-        if(!inject_tt && hint.count>=1 && hint.count<=2) {
-            auto found=std::find_if(moves.begin(),moves.end(),[&](const Turn& t) {
-                return t.count==hint.count && t.cells[0]==hint.cells[0] &&
-                    (t.count==1 || t.cells[1]==hint.cells[1]);
-            });
-            if(found!=moves.end()) std::rotate(moves.begin(),found,found+1);
-        }
         int best=-mate-1;Turn best_turn=moves.front();bool first=true;
         for(const auto& t:moves) {
             Restore restore(b);int side=b.player;apply(b,t);
@@ -553,7 +709,7 @@ struct Search {
             if(score>best) {best=score;best_turn=t;}
             alpha=std::max(alpha,score);if(alpha>=beta) break;
         }
-        entry={key,depth,best,best<=original?2:best>=beta?1:0,best_turn};
+        if(inject_tt) {uint64_t key=b.hash();tt[key&(tt.size()-1)]={key,best_turn};}
         return best;
     }
     std::vector<Turn> diversify(Board& b,std::vector<Turn> base,int seconds,int cap,bool timed=true) {
@@ -598,7 +754,7 @@ struct Search {
         return base;
     }
     HxResult run(Board& b,int max_depth,int root_seconds=0,int root_turns=0) {
-        auto start=Clock::now();Restore restore(b);HxResult output{};
+        auto start=Clock::now();CandidateGuard candidate_cache(b);Restore restore(b);HxResult output{};
         if(b.winner>=0) return output;
         Turn chosen=immediate(b);
         if(chosen.count) {chosen.score=mate;output.depth=1;}
@@ -679,7 +835,7 @@ int hx_search_tt(void* p,int ms,int depth,int width,int seconds,int cap,HxResult
     if(ms<1 || depth<1 || width<2 || width>128 ||
         ((seconds || cap) && (seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024))) return 0;
     try {
-        auto start=Clock::now();Search search(ms,width);search.inject_tt=true;
+        auto start=Clock::now();Search search(ms,width,true);
         *out=search.run(*static_cast<Board*>(p),depth,seconds,cap);
         out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;
     } catch(...) {return 0;}
