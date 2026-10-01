@@ -645,14 +645,19 @@ class Session:
         return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget_of(entry['kind'], preset, custom))
 
     def engine_key(self, seat):
-        """Evaluations are keyed by the weights and the solver build that produced them."""
-        weights = model_key(export_path(self.entries[seat['engine']], seat['checkpoint']))
+        """Evaluations are keyed by the weights and the solver build that produced them; None when the weights
+        file is gone."""
+        try:
+            weights = model_key(export_path(self.entries[seat['engine']], seat['checkpoint']))
+        except (OSError, KeyError):
+            return None
         return f'{weights}:{self.engines.solver_build()}'
 
     # Reading
 
     def lookup(self, history):
-        return self.store.best(history, self.engine_key(self.analysis)) if self.analysis else None
+        key = self.engine_key(self.analysis) if self.analysis else None
+        return self.store.best(history, key) if key else None
 
     def state(self):
         with self.lock:
@@ -700,7 +705,8 @@ class Session:
         if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy:
             self.submit(Job('move', 1, self.history, side=player, seat=dict(seat)))
         for job in self.jobs.values():
-            if job.kind == 'analyse' and job.status in ('queued', 'running') and                     job.history != tuple(self.history[:len(job.history)]):
+            stale = job.history != tuple(self.history[:len(job.history)])
+            if job.kind == 'analyse' and job.status in ('queued', 'running') and stale:
                 job.cancelled = True
                 if job.status == 'queued':
                     job.status = 'cancelled'
@@ -732,7 +738,8 @@ class Session:
                     return job
                 if job.status in ('failed', 'done') and not force and time.time() - job.ended < 30:
                     return None
-        if not force and self.store.covering(history, self.engine_key(settings), self.engines.effective(settings['budget'])):
+        key, budget = self.engine_key(settings), self.engines.effective(settings['budget'])
+        if key is None or not force and self.store.covering(history, key, budget):
             return None
         return self.submit(Job('analyse', priority, history, seat=settings, force=force))
 
@@ -884,27 +891,32 @@ class Session:
                     continue
                 job.status = 'running'
                 self.revision += 1
+            result, failure = None, None
             try:
                 result = self.run(job)
-                with self.lock:
-                    job.status, job.ended = 'cancelled' if job.cancelled else 'done', time.time()
-                    if job.kind == 'move' and not job.cancelled and list(job.history) == self.history:
-                        self.history.extend(tuple(p) for p in result)
-                    self.changed()
-            except Cancelled:
-                with self.lock:
-                    job.status = 'cancelled'
-                    self.changed()
             except Yielded:
                 with self.lock:
                     job.status = 'queued'
                     heapq.heappush(self.queue, (job.priority, next(self.order), job))
+                continue
+            except Cancelled:
+                job.cancelled = True
             except Exception as error:
-                with self.lock:
-                    job.status, job.error, job.ended = 'failed', str(error), time.time()
-                    if job.kind == 'move':
-                        self.paused = True
+                failure = error
+            with self.lock:
+                job.ended = time.time()
+                if failure is not None:
+                    job.status, job.error = 'failed', str(failure)
+                    self.paused = self.paused or job.kind == 'move'
+                else:
+                    job.status = 'cancelled' if job.cancelled else 'done'
+                    if job.kind == 'move' and not job.cancelled and list(job.history) == self.history:
+                        self.history.extend(tuple(p) for p in result)
+                try:
                     self.changed()
+                except Exception as error:
+                    self.revision += 1
+                    job.status, job.error = 'failed', f'{failure or ""} {error}'.strip()
 
     def watcher(self, job, count=True):
         """A network-batch callback that stops a cancelled job and, when `count`, adds batch sizes to its progress."""
@@ -919,7 +931,12 @@ class Session:
         """The evaluation of `history` for `seat`, saved. Unless forced, a saved one is reused: at exactly the
         seat's budget when `exact`, else at least as deep."""
         key, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
-        saved = None if force else self.store.get(history, key, budget) if exact else self.store.covering(history, key, budget)
+        if key is None:
+            raise ValueError('The model file is gone; rescan the engines')
+        if force:
+            saved = None
+        else:
+            saved = self.store.get(history, key, budget) if exact else self.store.covering(history, key, budget)
         if saved:
             return saved
         found, spent, weights = self.engines.evaluate(self.entries[seat['engine']], seat['checkpoint'], budget,

@@ -326,6 +326,22 @@ class Jobs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(len(self.engines.calls), calls)
 
+    def test_the_worker_survives_a_model_file_that_vanished(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / 'gone.pt').write_bytes(b'')
+            gone = dict(id='bubble:gone', name='gone', kind='bubble', presets=PRESETS['bubble'], checkpoints=[''],
+                        path=Path(directory) / 'gone.pt')
+            session = Session(entries() | {'bubble:gone': gone}, self.engines, Evaluations())
+            session.configure_analysis('bubble:gone', auto=True)
+            session.configure_seat(1, 'bubble:gone')
+            (Path(directory) / 'gone.pt').unlink()
+            session.play(0, 0)
+            wait(lambda: session.paused)
+            self.assertIsNone(session.state()['evaluations'].get(1))
+            session.configure_seat(1, 'native:Native', preset='quick')
+            session.pause(False)
+            wait(lambda: len(session.history) == 3)
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
