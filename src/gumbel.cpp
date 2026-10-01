@@ -10,8 +10,20 @@
 #include <unordered_map>
 namespace gumbel {
 struct Node;
-// A proven position: winner, distance, bound, the stones it holds and, for a win, a shortest winning first placement.
-struct Outcome { int winner=-1,distance=-1,stones=0;bool bound=false,witnessed=false;Cell witness; };
+// One proven edge of a position, sorted by action like the legal moves.
+struct EdgeProof { Cell action;int winner=-1,distance=-1;bool bound=false; };
+// A proven position: its mover, winner, distance and bound, the stones it holds and the edge proofs gathered from its
+// expanded nodes (for a win its winning moves, for a loss each move's resistance).
+struct Outcome {
+ int player=0,winner=-1,distance=-1,stones=0;bool bound=false;std::vector<EdgeProof> edges;
+ bool witnessed()const {return winner==player && std::any_of(edges.begin(),edges.end(),[&](const EdgeProof& e){return e.winner==winner;});}
+};
+// Tightens a proof (winner, distance, bound) to a new one when that is new, contradicts it, or is tighter; true when
+// it changed.
+inline bool tighten(int winner,int distance,bool bound,int& w,int& d,bool& b) {
+ if(w>=0 && w==winner && (distance>d || (distance==d && (bound || !b))))return false;
+ w=winner;d=distance;b=bound;return true;
+}
 // 128-bit order-independent keys: `position` (stones by colour, mover, remaining placements) decides the game value;
 // `context` adds the network's turn inputs (the stone placed earlier in this turn, the opponent's previous turn), the
 // same identity as dense_selfplay.position_key.
@@ -82,9 +94,7 @@ struct Tree {
    const double before=p->q;const int winner=p->exact_winner,distance=p->distance;const bool bound=p->bound;
    if(c->exact_winner>=0){
     bool changed=false;
-    for(auto& e:p->edges)if(e.child.get()==c && (e.exact_winner!=c->exact_winner || e.distance!=c->distance+1 || e.bound!=c->bound)){
-     e.exact_winner=c->exact_winner;e.distance=c->distance+1;e.bound=c->bound;changed=true;
-    }
+    for(auto& e:p->edges)if(e.child.get()==c)changed|=tighten(c->exact_winner,c->distance+1,c->bound,e.exact_winner,e.distance,e.bound);
     if(changed){settle(*p);learn(*p);}
    }
    refresh(*p);
@@ -95,32 +105,40 @@ struct Tree {
  // A new or better outcome also reaches the live nodes of the same position in other turn contexts.
  void learn(const Node& node) {
   if(!graph || node.exact_winner<0)return;
-  Outcome outcome{node.exact_winner,node.distance,node.stones,node.bound};
-  if(node.exact_winner==node.player)for(auto& e:node.edges)if(e.eligible && e.exact_winner==node.player){outcome.witnessed=true;outcome.witness=e.action;break;}
-  auto [o,added]=outcomes.try_emplace(node.position,outcome);
-  const auto& old=o->second;
-  const bool better=old.winner==node.exact_winner && (node.distance<old.distance || (node.distance==old.distance && ((!node.bound && old.bound)
-   || (outcome.witnessed && !old.witnessed))));
-  if(added || better)o->second=outcome;
-  // Peers take any improvement: a better outcome, or a new edge proof of an expanded node under an unchanged one.
-  if(!added && !better && !node.expanded)return;
-  if(auto list=positions.find(node.position);list!=positions.end())for(auto& w:std::vector(list->second))if(auto n=w.lock())if(n.get()!=&node)share(node,o->second,*n);
+  Outcome outcome{node.player,node.exact_winner,node.distance,node.stones,node.bound};
+  if(node.expanded)for(auto& e:node.edges)if(e.exact_winner>=0)outcome.edges.push_back({e.action,e.exact_winner,e.distance,e.bound});
+  if(!record(node.position,outcome))return;
+  // Peers take any improvement: a better outcome, or new edge proofs under an unchanged one.
+  if(auto list=positions.find(node.position);list!=positions.end())for(auto& w:std::vector(list->second))if(auto n=w.lock())if(n.get()!=&node)share(node,outcomes[node.position],*n);
+ }
+ // Merges `outcome` into the table entry of `position`: a tighter verdict and any new or tighter edge proof; true when
+ // the entry changed.
+ bool record(const Key& position,const Outcome& outcome) {
+  auto [o,added]=outcomes.try_emplace(position,outcome);
+  if(added)return true;
+  auto& old=o->second;bool changed=false;
+  if(old.winner!=outcome.winner){old=outcome;return true;}
+  changed|=tighten(outcome.winner,outcome.distance,outcome.bound,old.winner,old.distance,old.bound);
+  std::vector<EdgeProof> merged;merged.reserve(old.edges.size()+outcome.edges.size());
+  auto i=old.edges.cbegin();auto j=outcome.edges.cbegin();
+  while(i!=old.edges.cend() || j!=outcome.edges.cend()){
+   if(j==outcome.edges.cend() || (i!=old.edges.cend() && i->action<j->action)){merged.push_back(*i++);continue;}
+   if(i==old.edges.cend() || j->action<i->action){merged.push_back(*j++);changed=true;continue;}
+   EdgeProof e=*i++;changed|=tighten(j->winner,j->distance,j->bound,e.winner,e.distance,e.bound);++j;merged.push_back(e);
+  }
+  old.edges=std::move(merged);
+  return changed;
  }
  // Installs a proven outcome on a node of its position: an unexpanded node takes the verdict; an expanded node takes
- // the witness as a winning edge, or for a loss every unproven edge as a bounded loss, and is settled. True when
- // anything improved.
+ // its edge proofs and, for a loss, every still unproven edge as a bounded loss, and is settled. True when anything
+ // improved.
  bool apply(const Outcome& o,Node& into) {
-  auto improves=[&](int winner,int distance,bool bound,int w,int d,bool b){return w!=winner || d>distance || (d==distance && b && !bound);};
-  if(!into.expanded){
-   if(into.exact_winner>=0 && !improves(o.winner,o.distance,o.bound,into.exact_winner,into.distance,into.bound))return false;
-   into.exact_winner=o.winner;into.distance=o.distance;into.bound=o.bound;return true;
-  }
-  bool changed=false;
+  if(!into.expanded)return tighten(o.winner,o.distance,o.bound,into.exact_winner,into.distance,into.bound);
+  bool changed=false;auto j=o.edges.begin();
   for(auto& e:into.edges){
-   if(o.winner==into.player?!(o.witnessed && e.action==o.witness):e.exact_winner>=0)continue;
-   if(e.exact_winner<0 || improves(o.winner,o.distance,o.winner==into.player?o.bound:true,e.exact_winner,e.distance,e.bound)){
-    e.exact_winner=o.winner;e.distance=o.distance;e.bound=o.winner==into.player?o.bound:true;changed=true;
-   }
+   while(j!=o.edges.end() && j->action<e.action)++j;
+   if(j!=o.edges.end() && j->action==e.action)changed|=tighten(j->winner,j->distance,j->bound,e.exact_winner,e.distance,e.bound);
+   else if(o.winner!=into.player && e.exact_winner<0){e.exact_winner=o.winner;e.distance=o.distance;e.bound=true;changed=true;}
   }
   if(changed)settle(into);
   return changed;
@@ -132,9 +150,7 @@ struct Tree {
   if(from.edges.size()!=into.edges.size())return false;
   for(size_t i=0;i<from.edges.size();++i){
    auto& f=from.edges[i];auto& e=into.edges[i];
-   if(f.exact_winner>=0 && f.action==e.action && (e.exact_winner!=f.exact_winner || e.distance>f.distance || (e.distance==f.distance && e.bound && !f.bound))){
-    e.exact_winner=f.exact_winner;e.distance=f.distance;e.bound=f.bound;changed=true;
-   }
+   if(f.exact_winner>=0 && f.action==e.action)changed|=tighten(f.exact_winner,f.distance,f.bound,e.exact_winner,e.distance,e.bound);
   }
   return changed;
  }
@@ -244,7 +260,7 @@ struct Tree {
   for(auto i=path.edges.rbegin();i!=path.edges.rend();++i){
    auto& [node,index]=*i;auto& edge=node->edges[index];
    if(child->player!=node->player)value=-value;
-   if(child->exact_winner>=0 && (edge.exact_winner!=child->exact_winner || edge.distance!=child->distance+1 || edge.bound!=child->bound)){edge.exact_winner=child->exact_winner;edge.distance=child->distance+1;edge.bound=child->bound;settle(*node);}
+   if(child->exact_winner>=0 && tighten(child->exact_winner,child->distance+1,child->bound,edge.exact_winner,edge.distance,edge.bound))settle(*node);
    ++edge.visits;--edge.pending;
    if(edge.exact_winner>=0){value=edge.exact_winner==node->player?1:-1;edge.sum=value*edge.visits;}
    else edge.sum+=value;
@@ -319,11 +335,11 @@ struct Tree {
   if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges){edge.exact_winner=node.exact_winner;edge.distance=node.distance;edge.bound=true;}
   if(tactics)classify(path,node);
   if(graph){
-   // A live expanded peer of the position hands over its edge proofs (exact resistances included); a shared win's
-   // witness covers the case where no peer holds them.
+   // A live expanded peer of the position hands over its edge proofs; the shared outcome keeps them when no peer
+   // is alive (a win's witnesses, a loss's per-move resistances).
    if(auto list=positions.find(node.position);list!=positions.end())
     for(auto& w:std::vector(list->second))if(auto peer=w.lock())if(peer.get()!=&node && peer->expanded && copy(*peer,node))settle(node);
-   if(auto o=outcomes.find(node.position);o!=outcomes.end() && o->second.winner==node.player)apply(o->second,node);
+   if(auto o=outcomes.find(node.position);o!=outcomes.end())apply(o->second,node);
   }
   // A certificate adds its witness as a winning edge; settle keeps any shorter tactical win found by classify.
   if(exact>=0){for(auto& edge:node.edges)if(edge.action==witness && (edge.exact_winner!=exact || edge.distance>distance)){edge.exact_winner=exact;edge.distance=distance;edge.bound=true;}settle(node);}
@@ -352,11 +368,11 @@ struct Tree {
     auto [p,c]=keys(position);
     if(auto existing=nodes[c].lock()){
      existing->parents.push_back(node->weak_from_this());
-     const Outcome o{player,distance-1,int(position.cells.size()),true,true,Cell{moves[2],moves[3]}};
-     if(apply(o,*existing))refresh(*existing);
-     // The outcome keeps the witness even while the node is unexpanded; peers take it too.
-     auto& kept=outcomes[p];if(kept.winner!=player || o.distance<kept.distance || !kept.witnessed)kept=o;
-     for(auto& w:std::vector(positions[p]))if(auto peer=w.lock())if(peer!=existing)share(*existing,o,*peer);
+     const Outcome o{player,player,distance-1,int(position.cells.size()),true,{EdgeProof{Cell{moves[2],moves[3]},player,distance-1,true}}};
+     // The outcome keeps the witness even while the node is unexpanded; its parents and peers take the proof.
+     if(apply(o,*existing)){refresh(*existing);propagate(*existing,nullptr);}
+     record(p,o);
+     for(auto& w:std::vector(positions[p]))if(auto peer=w.lock())if(peer!=existing)share(*existing,outcomes[p],*peer);
      for(auto& e:node->edges)if(e.action==witness){e.child=existing;break;}
      return;
     }
@@ -385,7 +401,7 @@ struct Tree {
   // exact root (only an expanded exact root stops the search); otherwise immediate tactical choices are
   // reconstructed on the actual board, and general certificates retain their two-placement child.
   auto shared=graph?outcomes.find(root->position):outcomes.end();
-  const bool witnessed=shared!=outcomes.end() && shared->second.winner==root->player && shared->second.witnessed;
+  const bool witnessed=shared!=outcomes.end() && shared->second.player==root->player && shared->second.witnessed();
   if((winner==root->player || root->exact_winner==root->player) && !root->expanded && board.winner<0 && !witnessed){
    root->exact_winner=-1;
    if(tactics){Path path;capture(path);if(!path.own.empty()){root->expanded=true;root->remaining=path.remaining;for(auto c:path.legal){Edge e;e.action=c;e.prior=1./path.legal.size();root->edges.push_back(std::move(e));}classify(path,*root);}}

@@ -73,16 +73,16 @@ int main(){
  // same-distance bound on an unexpanded one.
  {gumbel::Tree t(0);t.graph=true;gumbel::Node n;n.player=0;n.expanded=true;
   for(int i=0;i<2;++i){gumbel::Edge e;e.action={i,1};n.edges.push_back(std::move(e));}
-  gumbel::Outcome won{0,5,3,true,true,{1,1}};
+  gumbel::Outcome won{0,0,5,3,true,{{{1,1},0,5,true}}};
   assert(t.apply(won,n) && n.exact_winner==0 && n.distance==5 && !n.edges[0].eligible && n.edges[1].eligible);
   gumbel::Node u;u.player=1;u.exact_winner=0;u.distance=4;u.bound=true;
-  assert(t.apply(gumbel::Outcome{0,4,3,false},u) && !u.bound && !t.apply(gumbel::Outcome{0,6,3,false},u));}
+  assert(t.apply(gumbel::Outcome{1,0,4,3,false},u) && !u.bound && !t.apply(gumbel::Outcome{1,0,6,3,false},u));}
  // Advancing into another context of a position proven won with a witness keeps the verdict; the root still expands
  // on the first request, which installs the witness as its only eligible move.
  {gumbel::Tree u(0);u.graph=true;
   for(auto c:std::vector<Cell>{{0,0},{1,0},{3,0},{0,1},{0,2},{4,0}})u.advance(c);
   u.board.make({2,0});auto position=gumbel::keys(u.board).first;u.board.undo();
-  u.outcomes[position]=gumbel::Outcome{0,3,7,true,true,{5,0}};u.advance({2,0});
+  u.outcomes[position]=gumbel::Outcome{0,0,3,7,true,{{{5,0},0,3,true}}};u.advance({2,0});
   assert(!u.root->expanded && u.root->exact_winner==0);
   u.begin(8,4);int id=u.request();assert(id>0 && u.requests.at(id).edges.empty());
   auto& legal=u.requests.at(id).legal;std::vector<int64_t> a;for(auto c:legal){a.push_back(c.q);a.push_back(c.r);}
@@ -116,12 +116,21 @@ int main(){
   peer->expanded=true;peer->remaining=2;
   for(size_t i=0;i<legal.size();++i){gumbel::Edge e;e.action=legal[i];e.exact_winner=1;e.distance=i==0?9:3;peer->edges.push_back(std::move(e));}
   t.settle(*peer);t.learn(*peer);assert(peer->exact_winner==1 && peer->distance==9 && !peer->bound);
-  gumbel::Tree u(0);u.graph=true;u.outcomes=t.outcomes;u.positions=t.positions;
-  for(auto c:std::vector<Cell>{{0,0},{1,0},{3,0},{0,1},{0,2},{2,0},{4,0}})u.advance(c);
-  assert(u.root->exact_winner==1 && !u.root->expanded);
-  u.begin(4,2);int id=u.request();auto& l=u.requests.at(id).legal;std::vector<int64_t> a;for(auto c:l){a.push_back(c.q);a.push_back(c.r);}
-  std::vector<double> z(l.size());u.fulfill(id,a.data(),z.data(),z.data(),int(l.size()));
-  assert(u.root->distance==9 && !u.root->bound && u.root->edges[0].eligible && !u.root->edges[1].eligible);}
+  // With the peer alive, and after it is gone (the shared outcome keeps the per-move resistances).
+  for(bool alive:{true,false}){
+   gumbel::Tree u(0);u.graph=true;u.outcomes=t.outcomes;if(alive)u.positions=t.positions;
+   for(auto c:std::vector<Cell>{{0,0},{1,0},{3,0},{0,1},{0,2},{2,0},{4,0}})u.advance(c);
+   assert(u.root->exact_winner==1 && !u.root->expanded);
+   u.begin(4,2);int id=u.request();auto& l=u.requests.at(id).legal;std::vector<int64_t> a;for(auto c:l){a.push_back(c.q);a.push_back(c.r);}
+   std::vector<double> z(l.size());u.fulfill(id,a.data(),z.data(),z.data(),int(l.size()));
+   assert(u.root->distance==9 && !u.root->bound && u.root->edges[0].eligible && !u.root->edges[1].eligible);
+  }}
+ // A longer proof from a shared child never loosens a tighter proof already on an incoming edge.
+ {gumbel::Tree t(0);t.graph=true;auto p=std::make_shared<gumbel::Node>(),c=std::make_shared<gumbel::Node>();
+  p->player=0;c->player=1;p->expanded=c->expanded=true;
+  gumbel::Edge e;e.child=c;e.exact_winner=0;e.distance=3;e.bound=true;p->edges.push_back(std::move(e));c->parents.push_back(p);
+  c->exact_winner=0;c->distance=9;t.propagate(*c,nullptr);
+  assert(p->edges[0].distance==3 && p->edges[0].bound);}
  // MCGS backup: a node's value is recomputed from its edges' visits and its children's current values; a playout
  // reusing a transposed child's value leaves that child unchanged.
  {gumbel::Tree t(0);t.graph=true;gumbel::Node r;r.player=0;r.expanded=true;r.value=.2;
