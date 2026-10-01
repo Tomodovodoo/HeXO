@@ -91,10 +91,14 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
 
     async def play(match):
         while match.tick()['state'] == 'playing':
-            engine = engines[match.id][match.game.player]
+            with match.lock:
+                engine = engines[match.id][match.game.player]
+                cancellation = match.cancel
             if engine is None:
                 return
             await asyncio.to_thread(play_turn, match, engine)
+            if cancellation.is_set():
+                return
             await asyncio.sleep(0)
 
     async def release(match):

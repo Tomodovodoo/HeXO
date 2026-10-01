@@ -599,6 +599,66 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.engines[-1].closed)
         self.assertFalse(self.engines[0].closed)
 
+    async def test_resumed_match_waits_for_abandoned_worker(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from aiohttp.test_utils import TestClient, TestServer
+        from timed_api import create_app
+        arrived, release = threading.Event(), threading.Event()
+        class Handler(BaseHTTPRequestHandler):
+            calls = 0
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(dict(stateless=dict(versions={'v1-alpha': {}}))).encode())
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                Handler.calls += 1
+                if Handler.calls == 1:
+                    arrived.set()
+                    release.wait(.4)
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    self.wfile.write(json.dumps(dict(move=dict(pieces=[dict(q=1, r=0), dict(q=2, r=0)]))).encode())
+                except ConnectionError:
+                    pass
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = TestClient(TestServer(create_app()))
+        await client.start_server()
+        try:
+            created = await client.post('/matches', json=dict(players=dict(cross=dict(kind='human'),
+                circle=dict(kind='htttx', url=f'http://127.0.0.1:{server.server_port}')), time_control='10'))
+            root = '/matches/'+(await created.json())['match_id']
+            for _ in range(100):
+                state = await (await client.get(root)).json()
+                if state['state'] == 'ready':
+                    break
+                await asyncio.sleep(.01)
+            self.assertEqual(state['state'], 'ready')
+            await client.post(root+'/start')
+            self.assertTrue(await asyncio.to_thread(arrived.wait, 1))
+            self.assertEqual((await client.post(root+'/pause')).status, 200)
+            self.assertEqual((await client.post(root+'/resume')).status, 200)
+            await asyncio.sleep(.03)
+            release.set()
+            for _ in range(100):
+                state = await (await client.get(root)).json()
+                if state['result'] or len(state['history']) == 3:
+                    break
+                await asyncio.sleep(.01)
+            self.assertIsNone(state['result'])
+            self.assertEqual(state['history'], [[0, 0], [1, 0], [2, 0]])
+        finally:
+            release.set()
+            await client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     async def test_websocket_evaluation_echoes_request_id(self):
         ws = await self.client.ws_connect('/bws/v1-alpha/game')
         await ws.send_json(dict(type='eval_request', side='o', request_id=7))

@@ -386,10 +386,19 @@ class TimedEngine:
             best.update(stop_reason='busy', elapsed_ms=(time.monotonic()-started)*1000)
             return best
         try:
-            while self.connection.poll():
-                message = self.connection.recv()
-                if len(message) == 3 and message[1] in ('done', 'error'):
-                    self.busy = False
+            def drain():
+                while self.connection.poll():
+                    message = self.connection.recv()
+                    if len(message) == 3 and message[1] in ('done', 'error'):
+                        self.busy = False
+            drain()
+            while self.busy and time.monotonic() < deadline:
+                if cancel is not None and cancel.is_set():
+                    break
+                if not self.process.is_alive():
+                    raise RuntimeError('Engine worker exited')
+                self.connection.poll(min(.005, max(0, deadline-time.monotonic())))
+                drain()
             if self.busy or time.monotonic() >= deadline:
                 if self.external:
                     raise TimeoutError('Opponent did not return a move within its allowance')
