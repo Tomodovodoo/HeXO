@@ -229,6 +229,9 @@ class Launcher:
             phase_actors = (config.get('learner') or {}).get('phase_actors', 0)
             if actors is not None and phase_actors > actors:
                 raise RuntimeError(f'{self.run} phases wait for {phase_actors} actors; pass --actors {phase_actors} or more')
+            if phase_actors > 0 and not (config.get('actor') or {}).get('phase_follow', False):
+                raise RuntimeError(f'{self.run} phases wait for actors that never acknowledge them; '
+                                   'set actor.phase_follow to true in its config.json')
         # Play-only installs (variant `play`, weights without optimizer state) never count as a learner checkpoint.
         exports = (self.run / 'checkpoints' / self.variant()).glob('*/ema.pt')
         learner_files = ('model.pt', 'optimizer.pt', 'manifest.json')

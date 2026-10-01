@@ -163,6 +163,10 @@ class LauncherTests(unittest.TestCase):
             self.launcher.prepare('cpu', calls.append, 4)
         with self.assertRaises(RuntimeError):
             self.launcher.prepare('auto', calls.append, 4)
+        with self.assertRaises(RuntimeError):
+            self.launcher.prepare('auto', calls.append, 6)
+        (self.run / 'config.json').write_text(json.dumps(dict(device='cuda', learner=dict(phase_actors=6),
+                                                              actor=dict(phase_follow=True))))
         self.launcher.prepare('auto', calls.append, 6)
         self.assertEqual([Path(c[1]).name for c in calls], ['dense_learn.py'])
 
