@@ -229,6 +229,10 @@ For inaccuracies and worse the board outlines the engine's turn and the panel li
 step one stone, ↑ and ↓ one turn, Home and End, F fits the board. Retry plays on from the shown position.
 Changing the analysis engine, checkpoint or strength evaluates the shown position again at once.
 
+Each cell has fixed places for its marks, so none hides another: a candidate or line stone fills the cell with its
+rank in the middle, a threat is a badge at the lower left, a review glyph a badge at the upper right, the last stone
+a dot, and the hovered cell a ring. Candidate rows carry the same threat badge.
+
 Import reads whatever is pasted:
 
 | Pasted | Read as |

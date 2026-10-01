@@ -159,11 +159,13 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 @keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
 .proof{font:700 12px var(--mono);height:14px;margin-top:-6px;display:flex;justify-content:space-between}
 .top{display:grid;gap:2px;min-height:130px;align-content:start}
-.top div{display:grid;grid-template-columns:16px 64px 1fr 40px 38px;gap:8px;align-items:center;font:12px var(--mono);color:var(--muted);
+.top div{display:grid;grid-template-columns:16px 78px 1fr 40px 38px;gap:8px;align-items:center;font:12px var(--mono);color:var(--muted);
   padding:3px 6px;border-radius:7px;cursor:pointer;transition:background .15s;animation:rise .3s var(--ease) both}
 .top div:hover{background:var(--raise)}
 .top div:first-child{color:var(--text)}
 .top .rank{color:var(--dim)}
+.top .cell{display:flex;align-items:center;gap:5px;white-space:nowrap}
+.threat{display:inline-grid;place-items:center;width:13px;height:13px;border-radius:50%;background:var(--t);color:#0b1222;font:800 9px/1 system-ui;font-style:normal}
 .top em{height:6px;border-radius:3px;background:linear-gradient(90deg,color-mix(in srgb,var(--c) 55%,transparent),var(--c));transform-origin:left;transition:transform .4s var(--ease);font-style:normal}
 .top .p{text-align:right}
 .top .v{text-align:center;border-radius:5px;padding:1px 0;font-weight:700;color:var(--c);background:color-mix(in srgb,var(--c) 12%,transparent)}
@@ -442,46 +444,53 @@ function paint(){
   if(moving)draw();
 }
 
-/* marks over the board: suggestions, proofs, review; ghost stones in the mover's colour */
+/* marks over the board, one slot each so none hides another: the body (a ghost stone with its rank) fills the
+   cell, a threat is a badge at the lower left, a review glyph a badge at the upper right, the hovered cell a ring */
 let marks=[],pulseFrame=0;
 function collectMarks(){
-  const out=[],ev=S.evaluations[view],turn=selectedTurn();
-  const add=(q,r,kind,color,text,weight=1)=>out.push({q,r,kind,color,text,weight});
+  const cells=new Map(),ev=S.evaluations[view],turn=selectedTurn();
+  const at=(q,r)=>{const k=key(q,r);if(!cells.has(k))cells.set(k,{q,r});return cells.get(k)};
+  const body=(q,r,kind,color,text,weight=1)=>{const c=at(q,r);if(!c.body)c.body={kind,color,text,weight}};
   const done=turn&&turn.label&&view===turn.ply+turn.stones.length;
-  if(done){const[g,c]=LABEL[turn.label],last=turn.stones.at(-1);
-    out.push({q:last[0],r:last[1],kind:'badge',color:css(c),text:g});
-    for(const p of turn.better||[])add(p[0],p[1],'better',COLORS[turn.player],'')}
+  if(done){const[g,c]=LABEL[turn.label],last=turn.stones.at(-1);at(last[0],last[1]).badge={color:css(c),text:g};
+    for(const p of turn.better||[])body(p[0],p[1],'better',COLORS[turn.player],'')}
   if(ev&&!(done&&turn.better)){
-    if(ev.line&&ev.line.length)ev.line.slice(0,12).forEach((p,i)=>add(p[0],p[1],i?'ghost':'pulse',COLORS[p[2]],i+1));
+    if(ev.line&&ev.line.length)ev.line.slice(0,12).forEach((p,i)=>body(p[0],p[1],i?'ghost':'pulse',COLORS[p[2]],i+1));
     else{const max=Math.max(...ev.top.map(t=>t[2]),.001);
-      ev.top.forEach((p,i)=>add(p[0],p[1],i?'ghost':'pulse',COLORS[playerAt(view)],i+1,.35+.65*p[2]/max))}
-    for(const p of ev.threat||[])add(p[0],p[1],'threat',COLORS[1-playerAt(view)],'!');
+      ev.top.forEach((p,i)=>body(p[0],p[1],i?'ghost':'pulse',COLORS[playerAt(view)],i+1,.35+.65*p[2]/max))}
   }
-  if(hot)add(hot[0],hot[1],'hot',COLORS[playerAt(view)],'');
-  return out;
+  for(const p of ev?.threat||[])at(p[0],p[1]).threat=COLORS[1-playerAt(view)];
+  if(hot)at(hot[0],hot[1]).hot=true;
+  return[...cells.values()];
+}
+function cornerBadge(x,y,color,text,size){
+  mctx.beginPath();mctx.arc(x,y,size,0,7);mctx.fillStyle=color;mctx.fill();mctx.lineWidth=2;mctx.strokeStyle='#0b1222';mctx.stroke();
+  mctx.fillStyle='#0b1222';mctx.font=`800 ${Math.round(size*1.1)}px system-ui`;mctx.textAlign='center';mctx.textBaseline='middle';
+  mctx.fillText(text,x,y+.5);
 }
 function drawMarks(){
   cancelAnimationFrame(pulseFrame);
   const ratio=devicePixelRatio||1,w=overlay.clientWidth,h=overlay.clientHeight;
   if(overlay.width!==canvas.width||overlay.height!==canvas.height){overlay.width=canvas.width;overlay.height=canvas.height}
   mctx.setTransform(ratio,0,0,ratio,0,0);mctx.clearRect(0,0,w,h);
-  const cell=CELL(),t=performance.now()/1600*Math.PI*2,font=Math.max(9,Math.min(15,cam.size*.52));
+  const cell=CELL(),t=performance.now()/1600*Math.PI*2,font=Math.max(9,Math.min(15,cam.size*.52)),badge=Math.max(6,cell*.27);
   let pulsing=false;
   for(const m of marks){
     const[x,y]=screen(m.q,m.r);if(x<-cam.size||y<-cam.size||x>w+cam.size||y>h+cam.size)continue;
-    if(m.kind==='badge'){const bx=x+cell*.62,by=y-cell*.62,br=Math.max(7,cell*.3);
-      mctx.beginPath();mctx.arc(bx,by,br,0,7);mctx.fillStyle=m.color;mctx.fill();mctx.lineWidth=2;mctx.strokeStyle='#0b1222';mctx.stroke();
-      mctx.fillStyle='#0b1222';mctx.font=`800 ${Math.round(br*1.1)}px system-ui`;mctx.textAlign='center';mctx.textBaseline='middle';
-      mctx.fillText(m.text,bx,by+.5);continue}
-    if(m.kind==='hot'){hexPath(x,y,cell+1,mctx);mctx.lineWidth=2;mctx.strokeStyle='#fff';mctx.globalAlpha=.8;mctx.stroke();mctx.globalAlpha=1;continue}
-    const pulse=m.kind==='pulse'&&MOTION,wave=pulse?(1-Math.cos(t))/2:0;pulsing||=pulse;
-    const strength=m.kind==='pulse'?.38+.14*wave:m.kind==='threat'?.25:.08+.16*m.weight;
-    hexPath(x,y,cell,mctx);mctx.globalAlpha=strength;mctx.fillStyle=m.color;mctx.fill();
-    mctx.globalAlpha=m.kind==='ghost'?.3+.4*m.weight:.9;mctx.lineWidth=1.5;mctx.strokeStyle=m.color;
-    mctx.setLineDash(m.kind==='better'||m.kind==='threat'?[4,3]:[]);hexPath(x,y,cell-1.5,mctx);mctx.stroke();mctx.setLineDash([]);
-    if(m.text!==''){mctx.globalAlpha=1;mctx.fillStyle=m.kind==='pulse'?'#fff':m.color;mctx.font=`700 ${Math.round(font)}px ui-monospace,Consolas,monospace`;
-      mctx.textAlign='center';mctx.textBaseline='middle';mctx.fillText(String(m.text),x,y+.5)}
-    mctx.globalAlpha=1;
+    const b=m.body||(m.threat?{kind:'threat',color:m.threat,text:'',weight:1}:null);
+    if(b){
+      const pulse=b.kind==='pulse'&&MOTION,wave=pulse?(1-Math.cos(t))/2:0;pulsing||=pulse;
+      hexPath(x,y,cell,mctx);mctx.globalAlpha=b.kind==='pulse'?.38+.14*wave:b.kind==='threat'?.2:.08+.16*b.weight;
+      mctx.fillStyle=b.color;mctx.fill();
+      mctx.globalAlpha=b.kind==='ghost'?.3+.4*b.weight:.9;mctx.lineWidth=1.5;mctx.strokeStyle=b.color;
+      mctx.setLineDash(b.kind==='better'||b.kind==='threat'?[4,3]:[]);hexPath(x,y,cell-1.5,mctx);mctx.stroke();mctx.setLineDash([]);
+      if(b.text!==''){mctx.globalAlpha=1;mctx.fillStyle=b.kind==='pulse'?'#fff':b.color;mctx.font=`700 ${Math.round(font)}px ui-monospace,Consolas,monospace`;
+        mctx.textAlign='center';mctx.textBaseline='middle';mctx.fillText(String(b.text),x,y+.5)}
+      mctx.globalAlpha=1;
+    }
+    if(m.threat)cornerBadge(x-cell*.62,y+cell*.62,m.threat,'!',badge);
+    if(m.badge)cornerBadge(x+cell*.62,y-cell*.62,m.badge.color,m.badge.text,Math.max(7,cell*.3));
+    if(m.hot){hexPath(x,y,cell+1,mctx);mctx.lineWidth=2;mctx.strokeStyle='#fff';mctx.globalAlpha=.8;mctx.stroke();mctx.globalAlpha=1}
   }
   if(pulsing)pulseFrame=requestAnimationFrame(drawMarks);
 }
@@ -609,7 +618,7 @@ function renderEngineHead(){
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,a.engine,it=>sendAnalysis({engine:it.id,checkpoint:null,preset:'standard',custom:undefined}));
   const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,'aria-label':'Automatic analysis',tabindex:0},el('i'));
   auto.onclick=()=>sendAnalysis({auto:!a.auto});
-  const again=el('button',{class:'ib',id:'again','aria-label':'Analyse again'});
+  const again=el('button',{class:'ib',id:'again','aria-label':'Analyse again'});setIcon(again,S.jobs.some(j=>j.kind==='analyse')?'close':'again');
   head.replaceChildren(el('div',{class:'head'},pick,auto,configButton('analysis',a),again),...seatControls(a,sendAnalysis,'analysis',null));
   head.style.setProperty('--c',COLORS[playerAt(view)]);
 }
@@ -623,9 +632,10 @@ function renderStudy(){
   $('xv').textContent=ev?pct(x):'';$('ov').textContent=ev?pct(1-x):'';
   const proof=ev&&ev.proof;$('xproof').textContent=proof&&proof.winner===0?'X +'+proof.turns:'';$('oproof').textContent=proof&&proof.winner===1?'O +'+proof.turns:'';
   $('xproof').style.color=COLORS[0];$('oproof').style.color=COLORS[1];
-  const top=ev?ev.top:[],max=Math.max(...top.map(t=>t[2]),.001),sig=JSON.stringify([view,top]);
+  const top=ev?ev.top:[],max=Math.max(...top.map(t=>t[2]),.001),sig=JSON.stringify([view,top,ev&&ev.threat]);
   if(renderStudy.sig!==sig){renderStudy.sig=sig;
-    $('top').replaceChildren(...top.map((t,i)=>{const d=el('div',{style:`--c:${COLORS[side]};animation-delay:${i*30}ms`},el('span',{class:'rank'},i+1),el('span',{},t[0]+', '+t[1]),
+    $('top').replaceChildren(...top.map((t,i)=>{const d=el('div',{style:`--c:${COLORS[side]};animation-delay:${i*30}ms`},el('span',{class:'rank'},i+1),el('span',{class:'cell'},t[0]+', '+t[1],
+      (ev.threat||[]).some(p=>p[0]===t[0]&&p[1]===t[1])?el('i',{class:'threat',style:`--t:${COLORS[1-side]}`},'!'):null),
       el('em',{style:`transform:scaleX(${t[2]/max})`}),el('span',{class:'p'},(t[2]*100).toFixed(1)),
       t.length>3?el('span',{class:'v'},pct(t[3])):el('span'));
       d.onclick=()=>{const[sx,sy]=screen(t[0],t[1]);cam.x+=canvas.clientWidth/2-sx;cam.y+=canvas.clientHeight/2-sy;draw()};
