@@ -254,7 +254,9 @@ def rectilinear_dumps(history):
 
 
 def tyto_dumps(history):
-    """The Tyto analysis link of `history`."""
+    """The Tyto analysis link of `history`; ValueError for an empty board, which the link cannot hold."""
+    if not history:
+        raise ValueError('A Tyto link needs a stone')
     data = bytearray()
     for q, r in history[1:]:
         for value in to_site(q, r):
@@ -269,6 +271,8 @@ def tyto_dumps(history):
 def tyto_loads(code):
     """The HTTTX history of the code after `#c=` in a Tyto analysis link; ValueError for a broken one."""
     code = re.sub(r'\s+', '', code.replace('%20', ''))
+    if not re.fullmatch(r'[A-Za-z0-9_-]*', code) or len(code) % 4 == 1:
+        raise ValueError('Not a Tyto analysis link')
     try:
         data = base64.urlsafe_b64decode(code + '=' * (-len(code) % 4))
     except ValueError as error:

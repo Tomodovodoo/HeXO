@@ -845,8 +845,11 @@ class Formats(unittest.TestCase):
         far = formats.tyto_dumps([(0, 0), (1, 0), (2, 0), (3, -1), (70, -1)])
         with self.assertRaises(ValueError):
             formats.tyto_loads(far[len(formats.TYTO):])
+        for broken in ('BA', '!!!', 'BAE=', 'BAEIA'):
+            with self.assertRaises(ValueError):
+                formats.tyto_loads(broken)
         with self.assertRaises(ValueError):
-            formats.tyto_loads('BA')
+            formats.tyto_dumps([])
 
     def test_pasted_text_of_any_kind_is_read(self):
         self.assertEqual(read_game('version[1];\n1. [1,0][2,0];', self.offline), [[0, 0], [1, 0], [2, 0]])
