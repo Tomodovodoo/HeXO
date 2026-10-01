@@ -3350,6 +3350,34 @@ class EvaluatorSearchTests(unittest.TestCase):
         finally:
             game.game.close()
 
+    def test_match_search_choice_is_per_colour_and_preserves_proofs(self):
+        model = dense_selfplay.Model(self.model, 'tiny', 'test', 'cpu', 16, 0)
+        game = dense_eval.MatchGame([model, model], [(0, 0)], 1, 2, 2, False, 16, {},
+                                    choices=('gumbel', 'policy'))
+        try:
+            for proven, selected in ((0, 0), (0, 0), (0, 1), (-1, 1), (1, 1)):
+                actions = np.asarray(game.game.legal_moves()[:3])
+                result = dict(action=actions[1], actions=actions, policy=np.array([.8, .15, .05]),
+                              scores=np.array([-np.inf, 1., -np.inf]), proven=proven)
+                self.assertTrue(game.searched(result))
+                self.assertEqual(game.moves[-1], actions[selected].tolist())
+        finally:
+            game.finish()
+
+        config = dense_config.RunConfig(device='cpu')
+        settings = config.evaluation
+        book = dense_eval.dense_openings.Book(Path.cwd(), settings)
+        games = dense_eval.paired_games(model, model, 2, 'choices', config, settings, None, book,
+                                       sides=(replace(settings, search_choice='policy'), settings))
+        try:
+            for game in games:
+                colour = game.record['challenger_color']
+                self.assertEqual(game.choices[colour], 'policy')
+                self.assertEqual(game.choices[1-colour], 'gumbel')
+        finally:
+            for game in games:
+                game.finish()
+
     def test_evaluator_matches_model_including_far_cells(self):
         histories = [POSITIONS[10], [], line_history(31), line_history(6)]
         results = self.evaluator.evaluate(histories)
@@ -5927,6 +5955,14 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(dense_eval.split_id('main/032500'), ('main/032500', None))
         self.assertEqual(dense_eval.parse_settings(['sims=20', 'tactics=false', 'solver-root-nodes=135']),
                          dict(sims=20, tactics=False, solver_root_nodes=135))
+        self.assertEqual(dense_eval.parse_settings(['search-choice=policy']), dict(search_choice='policy'))
+        base = dense_config.EvaluationSettings()
+        old = asdict(base); old.pop('search_choice')
+        self.assertTrue(dense_eval.same_protocol(dict(settings=old), base))
+        policy = dense_eval.side_settings(base, dict(search_choice='policy'))
+        self.assertFalse(dense_eval.same_protocol(dict(settings=old), policy))
+        with self.assertRaises(ValueError):
+            dense_eval.side_settings(base, dict(search_choice='unknown'))
         for bad in (['max_plies=10'], ['sims'], [], ['tactics=maybe'], ['sims=0']):
             with self.assertRaises(ValueError):
                 dense_eval.parse_settings(bad)

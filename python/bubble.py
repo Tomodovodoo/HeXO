@@ -566,7 +566,7 @@ def main():
     match.add_argument('--openings', choices=['narrow', 'wide', 'all'])
     match.add_argument('--opening', type=Path, action='append', help='custom HTTTX or replay opening, repeatable')
     match.add_argument('--seed', type=int, default=0)
-    match.add_argument('--preset', choices=['quick', 'standard', 'strong', 'deep'], default='standard')
+    match.add_argument('--preset', choices=['lightning', 'quick', 'standard', 'strong', 'deep', 'dangerous'], default='standard')
     from time_control import duration
     clocks = match.add_mutually_exclusive_group()
     clocks.add_argument('--tc', help='shared game clock in seconds+increment, e.g. 180+2')

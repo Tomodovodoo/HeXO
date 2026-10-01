@@ -1,0 +1,262 @@
+{
+ "id": "8211f449-5020-4a5a-9a93-581c5f720aac",
+ "players": [
+  {
+   "playerId": "ydr5tx",
+   "displayName": "Cross"
+  },
+  {
+   "playerId": "96nx7o",
+   "displayName": "Circle"
+  }
+ ],
+ "playerTiles": {
+  "ydr5tx": {
+   "colorIndex": 0
+  },
+  "96nx7o": {
+   "colorIndex": 1
+  }
+ },
+ "moveCount": 39,
+ "gameResult": {
+  "winningPlayerId": "96nx7o",
+  "reason": "six-in-a-row"
+ },
+ "moves": [
+  {
+   "moveNumber": 2,
+   "playerId": "ydr5tx",
+   "x": 0,
+   "y": 0
+  },
+  {
+   "moveNumber": 3,
+   "playerId": "96nx7o",
+   "x": 3,
+   "y": -2
+  },
+  {
+   "moveNumber": 4,
+   "playerId": "96nx7o",
+   "x": 3,
+   "y": -1
+  },
+  {
+   "moveNumber": 5,
+   "playerId": "ydr5tx",
+   "x": 3,
+   "y": 0
+  },
+  {
+   "moveNumber": 6,
+   "playerId": "ydr5tx",
+   "x": 2,
+   "y": 0
+  },
+  {
+   "moveNumber": 7,
+   "playerId": "96nx7o",
+   "x": 1,
+   "y": 0
+  },
+  {
+   "moveNumber": 8,
+   "playerId": "96nx7o",
+   "x": 5,
+   "y": -5
+  },
+  {
+   "moveNumber": 9,
+   "playerId": "ydr5tx",
+   "x": 2,
+   "y": -1
+  },
+  {
+   "moveNumber": 10,
+   "playerId": "ydr5tx",
+   "x": 2,
+   "y": 1
+  },
+  {
+   "moveNumber": 11,
+   "playerId": "96nx7o",
+   "x": 2,
+   "y": 2
+  },
+  {
+   "moveNumber": 12,
+   "playerId": "96nx7o",
+   "x": 5,
+   "y": -2
+  },
+  {
+   "moveNumber": 13,
+   "playerId": "ydr5tx",
+   "x": 2,
+   "y": -2
+  },
+  {
+   "moveNumber": 14,
+   "playerId": "ydr5tx",
+   "x": 1,
+   "y": -1
+  },
+  {
+   "moveNumber": 15,
+   "playerId": "96nx7o",
+   "x": 2,
+   "y": -3
+  },
+  {
+   "moveNumber": 16,
+   "playerId": "96nx7o",
+   "x": -1,
+   "y": 1
+  },
+  {
+   "moveNumber": 17,
+   "playerId": "ydr5tx",
+   "x": 0,
+   "y": -1
+  },
+  {
+   "moveNumber": 18,
+   "playerId": "ydr5tx",
+   "x": 0,
+   "y": 1
+  },
+  {
+   "moveNumber": 19,
+   "playerId": "96nx7o",
+   "x": 0,
+   "y": -3
+  },
+  {
+   "moveNumber": 20,
+   "playerId": "96nx7o",
+   "x": 6,
+   "y": -5
+  },
+  {
+   "moveNumber": 21,
+   "playerId": "ydr5tx",
+   "x": 0,
+   "y": 3
+  },
+  {
+   "moveNumber": 22,
+   "playerId": "ydr5tx",
+   "x": 1,
+   "y": 2
+  },
+  {
+   "moveNumber": 23,
+   "playerId": "96nx7o",
+   "x": -1,
+   "y": 4
+  },
+  {
+   "moveNumber": 24,
+   "playerId": "96nx7o",
+   "x": 0,
+   "y": 2
+  },
+  {
+   "moveNumber": 25,
+   "playerId": "ydr5tx",
+   "x": 3,
+   "y": 1
+  },
+  {
+   "moveNumber": 26,
+   "playerId": "ydr5tx",
+   "x": 4,
+   "y": 1
+  },
+  {
+   "moveNumber": 27,
+   "playerId": "96nx7o",
+   "x": 5,
+   "y": 1
+  },
+  {
+   "moveNumber": 28,
+   "playerId": "96nx7o",
+   "x": 7,
+   "y": -5
+  },
+  {
+   "moveNumber": 29,
+   "playerId": "ydr5tx",
+   "x": 8,
+   "y": -5
+  },
+  {
+   "moveNumber": 30,
+   "playerId": "ydr5tx",
+   "x": 6,
+   "y": -6
+  },
+  {
+   "moveNumber": 31,
+   "playerId": "96nx7o",
+   "x": 5,
+   "y": -3
+  },
+  {
+   "moveNumber": 32,
+   "playerId": "96nx7o",
+   "x": 5,
+   "y": -4
+  },
+  {
+   "moveNumber": 33,
+   "playerId": "ydr5tx",
+   "x": 5,
+   "y": -1
+  },
+  {
+   "moveNumber": 34,
+   "playerId": "ydr5tx",
+   "x": 5,
+   "y": -6
+  },
+  {
+   "moveNumber": 35,
+   "playerId": "96nx7o",
+   "x": 3,
+   "y": -3
+  },
+  {
+   "moveNumber": 36,
+   "playerId": "96nx7o",
+   "x": 4,
+   "y": -3
+  },
+  {
+   "moveNumber": 37,
+   "playerId": "ydr5tx",
+   "x": 4,
+   "y": -6
+  },
+  {
+   "moveNumber": 38,
+   "playerId": "ydr5tx",
+   "x": 7,
+   "y": -6
+  },
+  {
+   "moveNumber": 39,
+   "playerId": "96nx7o",
+   "x": 6,
+   "y": -3
+  },
+  {
+   "moveNumber": 40,
+   "playerId": "96nx7o",
+   "x": 7,
+   "y": -3
+  }
+ ]
+}

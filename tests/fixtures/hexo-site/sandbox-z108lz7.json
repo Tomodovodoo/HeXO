@@ -1,0 +1,119 @@
+{
+ "id": "z108lz7",
+ "name": "test",
+ "gamePosition": {
+  "cells": [
+   {
+    "x": 0,
+    "y": 0,
+    "player": "player-1",
+    "moveId": 1
+   },
+   {
+    "x": 3,
+    "y": 0,
+    "player": "player-2",
+    "moveId": 2
+   },
+   {
+    "x": 3,
+    "y": -2,
+    "player": "player-2",
+    "moveId": 3
+   },
+   {
+    "x": -2,
+    "y": -3,
+    "player": "player-1",
+    "moveId": 4
+   },
+   {
+    "x": -5,
+    "y": 1,
+    "player": "player-1",
+    "moveId": 5
+   },
+   {
+    "x": -3,
+    "y": 5,
+    "player": "player-2",
+    "moveId": 6
+   },
+   {
+    "x": 4,
+    "y": 5,
+    "player": "player-2",
+    "moveId": 7
+   },
+   {
+    "x": 8,
+    "y": -1,
+    "player": "player-1",
+    "moveId": 8
+   },
+   {
+    "x": 7,
+    "y": -4,
+    "player": "player-1",
+    "moveId": 9
+   },
+   {
+    "x": 2,
+    "y": -5,
+    "player": "player-2",
+    "moveId": 10
+   },
+   {
+    "x": 0,
+    "y": -3,
+    "player": "player-2",
+    "moveId": 11
+   },
+   {
+    "x": 4,
+    "y": 3,
+    "player": "player-1",
+    "moveId": 12
+   },
+   {
+    "x": 7,
+    "y": -1,
+    "player": "player-1",
+    "moveId": 13
+   },
+   {
+    "x": 4,
+    "y": -3,
+    "player": "player-2",
+    "moveId": 14
+   },
+   {
+    "x": -2,
+    "y": -1,
+    "player": "player-2",
+    "moveId": 15
+   },
+   {
+    "x": -3,
+    "y": 2,
+    "player": "player-1",
+    "moveId": 16
+   },
+   {
+    "x": -1,
+    "y": 4,
+    "player": "player-1",
+    "moveId": 17
+   },
+   {
+    "x": 5,
+    "y": 3,
+    "player": "player-2",
+    "moveId": 18
+   }
+  ],
+  "currentTurnPlayer": "player-2",
+  "placementsRemaining": 1
+ },
+ "originalPositionId": null
+}

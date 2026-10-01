@@ -30,6 +30,7 @@ py-modules = [
   "dense_solver",
   "export_web",
   "forcing_material",
+  "formats",
   "hexcrop",
   "hexnet",
   "hexnet_graphs",
