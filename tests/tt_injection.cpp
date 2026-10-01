@@ -70,6 +70,20 @@ int main() {
                 assert(cached==fresh);
             };
             check_cache();
+            if(step==10 && trial<4) {
+                auto key=position.hash();auto features=position.features;
+                Search cached_search(10000,4);
+                int cached_value=cached_search.negamax(position,2,-mate-1,mate+1);
+                assert(position.hash()==key && position.features==features);
+                check_cache();
+                position.candidates=nullptr;
+                Search fresh_search(10000,4);
+                int fresh_value=fresh_search.negamax(position,2,-mate-1,mate+1);
+                position.candidates=&cache.cache;
+                assert(cached_value==fresh_value && cached_search.nodes==fresh_search.nodes);
+                assert(position.hash()==key && position.features==features);
+                check_cache();
+            }
             for(auto first:Search::candidates(position,4)) {
                 Restore restore(position);position.make(first);
                 if(position.winner>=0) continue;
@@ -87,6 +101,19 @@ int main() {
                 }
             }
         }
+    }
+    for(int sign:{-1,1}) {
+        Board boundary;
+        for(int i=0;i<12;++i) boundary.make({int64_t(sign)*i*8,0});
+        auto fresh=Search::candidate_scores(boundary);
+        auto by_cell=[](const auto& a,const auto& z){return a.second<z.second;};
+        std::sort(fresh.begin(),fresh.end(),by_cell);
+        CandidateGuard cache(boundary);
+        auto key=boundary.hash();auto features=boundary.features;
+        Search search(10000,4);search.negamax(boundary,2,-mate-1,mate+1);
+        auto cached=Search::candidate_scores(boundary);
+        std::sort(cached.begin(),cached.end(),by_cell);
+        assert(cached==fresh && boundary.hash()==key && boundary.features==features);
     }
     std::cout<<"Native search checks passed\n";
 }

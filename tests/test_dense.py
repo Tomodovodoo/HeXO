@@ -4838,7 +4838,7 @@ class PacerTests(unittest.TestCase):
         pacer.wait(lambda: ticks.append(now[0]))
         # 25 s of credit + 10 s accrued while playing - 40 s played: 5 s of debt repaid at a quarter per second.
         self.assertAlmostEqual(sum(slept), 20.)
-        self.assertLessEqual(max(slept), 10.)
+        self.assertLessEqual(max(slept), 1.)
         self.assertEqual(len(ticks), len(slept))
         self.assertAlmostEqual(pacer.used(), 40/60)
         now[0] = 1000.
@@ -5646,8 +5646,8 @@ class EvaluatorLoopTests(unittest.TestCase):
             self.assertTrue(evaluator.step())
         report = json.loads(dense_eval.report_path(self.run, candidate, 'main/000010').read_text())
         verdict = evaluator.entry(candidate)['verdict']
-        self.assertEqual((verdict['decision'], len(report['games'])), ('superseded', 8))
-        self.assertEqual(running, list(range(8, 0, -1)))
+        self.assertEqual((verdict['decision'], len(report['games'])), ('superseded', 2))
+        self.assertEqual(running, [8, 7])                                   # abandoned once its first pair is complete
         self.assertFalse(dense_eval.settle_path(self.run, candidate).exists())
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertIn('settled on request', next(e for e in events if e['kind'] == 'decision')['message'])
@@ -5760,8 +5760,9 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(evaluator.step())
         self.assertTrue(dense_eval.report_path(self.run, 'main/000040', 'main/000010').exists())
 
-    def test_supersession_drains_the_pool_and_counts_its_games(self):
-        """A newer export stops new games; the games in flight finish and count, none is discarded."""
+    def test_supersession_abandons_the_games_in_flight(self):
+        """A newer export ends the session after the step that reveals it: the games in flight and the half whose
+        colour partner still ran are discarded, only the complete pair stays in the report."""
         evaluator = self.start(sprt_max_games=40, pool_games=8)
         self.export(10)
         evaluator.step()
@@ -5769,22 +5770,74 @@ class EvaluatorLoopTests(unittest.TestCase):
         running = []
         def export(pool, steps):
             running.append(pool.running())
-            if steps == 1 and not (self.run/'checkpoints'/'main'/'000040').exists():
+            if steps == 3:
                 self.export(40)
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=export)):
             self.assertTrue(evaluator.step())
         report = json.loads(dense_eval.report_path(self.run, 'main/000030', 'main/000010').read_text())
-        started = evaluator.next['main/000030', 'main/000010']
-        self.assertEqual((report['metrics']['sprt']['decision'], len(report['games'])), ('superseded', 2*started))
-        self.assertEqual(sorted({g['pair'] for g in report['games']}), list(range(started)))
-        self.assertEqual(started, 4)
-        self.assertEqual(running, list(range(8, 0, -1)))
+        self.assertEqual((report['metrics']['sprt']['decision'], len(report['games'])), ('superseded', 2))
+        self.assertEqual({g['pair'] for g in report['games']}, {0})
+        self.assertEqual(running, [8, 7, 8])
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        abandon = [e for e in events if e['kind'] == 'abandon']
+        self.assertEqual([(e['candidate'], e['opponent'], e['games_abandoned'], e['halves_discarded']) for e in abandon],
+                         [('main/000030', 'main/000010', 7, 1)])
         entry = self.league()['checkpoints'][-1]
         self.assertEqual((entry['id'], entry.get('superseded'), self.league()['champion']), ('main/000030', True, 'main/000010'))
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1)):
             self.assertTrue(evaluator.step())
         report = json.loads(dense_eval.report_path(self.run, 'main/000040', 'main/000010').read_text())
         self.assertEqual((report['metrics']['sprt']['decision'], len(report['games'])), ('max-games', 40))
+
+    def test_supersession_is_noticed_while_busy_pacing_holds_a_pool_that_finishes_nothing(self):
+        evaluator = self.start(sprt_max_games=40, pool_games=4, busy_share=.5)
+        self.export(10)
+        evaluator.step()
+        self.export(30)
+        (self.run/'learner-status.json').write_text(json.dumps(dict(stage='exporting', updated_at=time.time())))
+        now, steps, slept = [0.], [], []
+        def sleep(seconds):
+            if not slept:
+                self.export(40)
+            slept.append(seconds)
+            now[0] += seconds
+        evaluator.pacer = dense_eval.Pacer(1., clock=lambda: now[0], sleep=sleep)
+        evaluator.busy_pacer = dense_eval.BusyPacer(self.run, .5, clock=lambda: now[0], sleep=sleep)
+
+        class Stalled(dense_eval.Pool):
+            def step(self):
+                now[0] += 3.
+                steps.append(now[0])
+                return []
+        with unittest.mock.patch.object(dense_eval, 'Pool', Stalled):
+            self.assertTrue(evaluator.step())
+        self.assertEqual((steps, slept), ([3.], [1.]))                      # noticed a second into a 3 s yield
+        self.assertFalse(dense_eval.report_path(self.run, 'main/000030', 'main/000010').exists())
+        self.assertTrue(evaluator.entry('main/000030')['skipped'])
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([(e['candidate'], e['games_abandoned'], e['halves_discarded']) for e in events if e['kind'] == 'abandon'],
+                         [('main/000030', 4, 0)])
+
+    def test_supersession_is_noticed_while_the_share_pacer_holds_an_empty_pool(self):
+        evaluator = self.start(sprt_max_games=40, pool_games=4)
+        self.export(10)
+        evaluator.step()
+        self.export(30)
+        now, slept = [0.], []
+        def sleep(seconds):
+            if not slept:
+                self.export(40)
+            slept.append(seconds)
+            now[0] += seconds
+        evaluator.pacer = dense_eval.Pacer(.5, clock=lambda: now[0], sleep=sleep)
+        evaluator.pacer.credit = -100.
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
+            self.assertTrue(evaluator.step())
+        self.assertEqual(slept, [1.])
+        self.assertTrue(evaluator.entry('main/000030')['skipped'])
+        events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        self.assertEqual([(e['candidate'], e['games_abandoned'], e['halves_discarded']) for e in events if e['kind'] == 'abandon'],
+                         [('main/000030', 0, 0)])
 
     def test_the_pool_refills_as_games_finish(self):
         """Games stream one at a time: a finished game's slot is refilled before the next step, and the status
@@ -5815,30 +5868,29 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(all(s[0] >= 5 for s in seen[:13]))                 # kept full until the budget runs out
         self.assertEqual(len(evaluator.games('main/000020', 'main/000010')), 20)
 
-    def test_status_refreshes_posterior_while_games_drain(self):
+    def test_status_leaves_a_superseded_pairing_at_once(self):
         evaluator = self.start(decision='posterior', sprt_max_games=20, pool_games=6)
         self.export(10)
         evaluator.step()
         self.export(20)
+        status = lambda: json.loads((self.run/'evaluator-status.json').read_text())
+        log, abandoning = dense_eval.log_event, []
+        def logged(run, source, kind, message, **fields):
+            if kind == 'abandon':
+                abandoning.append(status())
+            return log(run, source, kind, message, **fields)
 
         def supersede(pool, steps):
-            if steps == 1:
+            if steps == 3:
                 self.export(30)
-            if steps == 5:
-                raise Crash
-
-        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=supersede)), \
-                unittest.mock.patch.object(dense_eval, 'STATUS_SECONDS', 0.), self.assertRaises(Crash):
-            evaluator.step()
-        status = json.loads((self.run/'evaluator-status.json').read_text())
-        candidate, champion = 'main/000020', 'main/000010'
-        current = evaluator.verdict(candidate, champion)
-        self.assertEqual(status['decision']['direct']['games'], status['tally']['games'])
-        self.assertEqual(status['decision']['direct']['games'], 4)
-        self.assertAlmostEqual(status['decision']['p_better'], current['p_better'])
-        self.assertAlmostEqual(status['decision']['delta'], current['delta'])
-        self.assertAlmostEqual(status['decision']['delta_sd'], current['delta_sd'])
-        self.assertAlmostEqual(status['decision']['direct']['effective_pairs'], current['direct']['effective_pairs'])
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=supersede)), \
+                unittest.mock.patch.object(dense_eval, 'log_event', logged):
+            self.assertTrue(evaluator.step())
+        self.assertEqual([(s['stage'], s['comparison'], s['pool'], s['tally']) for s in abandoning], [('idle', None, [], None)])
+        playing = []
+        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(hook=lambda pool, steps: playing.append(status()))):
+            self.assertTrue(evaluator.step())
+        self.assertEqual((playing[0]['stage'], playing[0]['comparison']['candidate']), ('playing', 'main/000030'))
 
     def test_status_refreshes_when_only_evidence_finishes(self):
         evaluator = self.start(decision='posterior', opening_suite='standard-v1', pool_games=4, sprt_max_games=20)
@@ -5886,8 +5938,7 @@ class EvaluatorLoopTests(unittest.TestCase):
             self.assertTrue(evaluator.step())
         report = json.loads(dense_eval.report_path(self.run, 'main/000030', 'main/000010').read_text())
         test, n = report['metrics']['sprt'], len(report['games'])
-        self.assertEqual((test['decision'], test['settled']['promote'], n % 2), ('superseded', True, 0))
-        self.assertGreater(n, 16)
+        self.assertEqual((test['decision'], test['settled']['promote'], n), ('superseded', True, 16))
         league = self.league()
         self.assertEqual((league['champion'], league['checkpoints'][-1].get('superseded')), ('main/000030', True))
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
@@ -6459,7 +6510,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual((len(report['games']), report['metrics']['sprt']['decision']), (4, 'H1'))   # the pair in flight drains
         self.assertEqual(self.league()['champion'], 'main/000020')
 
-    def test_sprt_bound_crossed_during_request_drain_stays_the_decision(self):
+    def test_sprt_bound_crossed_by_the_pair_before_a_request_stays_the_decision(self):
         evaluator = self.start(sprt_max_games=12, pool_games=6)
         self.export(10)
         evaluator.step()
@@ -6468,13 +6519,13 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.export(20)
 
         def request(pool, steps):
-            if steps == 3:
+            if steps == 4:
                 dense_eval.request_settle(self.run, 'main/000020')
 
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=request)):
             self.assertTrue(evaluator.step())
         report = json.loads(dense_eval.report_path(self.run, 'main/000020', 'main/000010').read_text())
-        self.assertEqual((len(report['games']), report['metrics']['sprt']['decision']), (8, 'H1'))
+        self.assertEqual((len(report['games']), report['metrics']['sprt']['decision']), (4, 'H1'))
         self.assertEqual(self.league()['champion'], 'main/000020')
 
     def test_an_idle_sprt_rematch_keeps_the_bound_it_crossed(self):
@@ -6737,23 +6788,31 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(len(evaluator.direct(candidate, base)), 20)
         self.assertEqual(len(evaluator.games(candidate, base)), 14)
 
-    def test_pipeline_variant_refill_yields_before_a_color_pair_finishes(self):
-        evaluator = self.start(decision='posterior', pipeline=True, sprt_max_games=40, sprt_min_games=40, pool_games=6)
-        self.export(10)
-        evaluator.step()
-        base = 'main/000010'
-        dense_eval.register(self.run, base, 'x', dict(sims=1))
-        seen = []
-        def arrived(pool, steps):
-            seen.append(pool.running())
-            if steps == 2:
-                self.export(20)
-        with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=arrived,
-                order=lambda r: r['challenger_color'])):
-            self.assertTrue(evaluator.step())
-        self.assertEqual(seen, [6, 5, 4, 3, 2, 1])
-        self.assertEqual(len(evaluator.games(base+'@x', base)), 6)
-        self.assertNotIn('verdict', evaluator.variants()[0])
+    def test_a_checkpoint_abandons_a_variant_trial_and_its_unpaired_halves(self):
+        root = self.run
+        for pipeline in (False, True):
+            with self.subTest(pipeline=pipeline):
+                self.run = root/str(pipeline)
+                evaluator = self.start(decision='posterior', pipeline=pipeline, sprt_max_games=40, sprt_min_games=40, pool_games=6)
+                self.export(10)
+                evaluator.step()
+                base = 'main/000010'
+                dense_eval.register(self.run, base, 'x', dict(sims=1))
+                seen = []
+                def arrived(pool, steps):
+                    seen.append(pool.running())
+                    if steps == 2:
+                        self.export(20)
+                with unittest.mock.patch.object(dense_eval, 'Pool', scripted(winner=lambda r: -1, hook=arrived,
+                        order=lambda r: r['challenger_color'])):
+                    self.assertTrue(evaluator.step())
+                self.assertEqual(seen, [6, 5])
+                self.assertEqual(evaluator.games(base+'@x', base), [])
+                self.assertNotIn('verdict', evaluator.variants()[0])
+                events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+                self.assertEqual([(e['candidate'], e['comparison'], e['games_abandoned'], e['halves_discarded'])
+                                  for e in events if e['kind'] == 'abandon'], [(base+'@x', 'variant', 4, 2)])
+        self.run = root
 
     def test_games_finished_on_creation_occupy_the_pool(self):
         pool = dense_eval.Pool(64)
