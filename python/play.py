@@ -10,7 +10,11 @@ import hashlib
 import heapq
 import itertools
 import json
+import os
+import queue
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -85,8 +89,10 @@ def run_checkpoints(run):
     exports = sorted((p for p in Path(run).glob('checkpoints/*/*/ema.pt') if p.parent.name.isdigit()),
                      key=lambda p: (int(p.parent.name), p.parent.parent.name), reverse=True)
     ids = [p.parent.relative_to(Path(run) / 'checkpoints').as_posix() for p in exports]
-    champion_file = Path(run) / 'champion.json'
-    champion = json.loads(champion_file.read_text(encoding='utf-8')).get('checkpoint') if champion_file.exists() else None
+    try:
+        champion = json.loads((Path(run) / 'champion.json').read_text(encoding='utf-8')).get('checkpoint')
+    except (OSError, ValueError, AttributeError):
+        champion = None
     return ([champion] if champion in ids else []) + [c for c in ids if c != champion]
 
 
@@ -311,8 +317,8 @@ class Engines:
 
     def __init__(self, device, tactical_package=None, seal=None):
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
-        self.bubbles, self.prover, self.seal = OrderedDict(), None, None
-        self.locks = dict(native=threading.Lock(), seal=threading.Lock())
+        self.bubbles, self.prover = OrderedDict(), None
+        self.children = {}
 
     def bubble(self, path):
         """The loaded export at `path`, reloaded when the file changes."""
@@ -357,37 +363,45 @@ class Engines:
         return budget if built else budget | dict(solver_nodes=0)
 
     def turn(self, entry, budget, history, stop=lambda: False):
-        """A native or Seal turn, searched on its own thread. Their searches cannot be interrupted, so when `stop()`
-        turns true this raises Cancelled and leaves the search to finish alone; a lock per kind keeps it from
-        overlapping the next search of the same kind."""
-        kind, result = entry['kind'], {}
-        def search():
-            with self.locks[kind]:
-                game = replay(history)
-                try:
-                    if kind == 'native':
-                        result['moves'] = game.search(budget['ms'])['moves']
-                    else:
-                        if self.seal is None:
-                            from legacy.arena import Seal
-                            self.seal = Seal()
-                        result['moves'] = self.seal(game, budget['ms'])
-                except Exception as error:
-                    result['error'] = error
-                finally:
-                    game.close()
-        thread = threading.Thread(target=search, daemon=True)
-        thread.start()
-        while thread.is_alive():
-            thread.join(.05)
-            if stop():
-                raise Cancelled()
-        if 'error' in result:
-            raise result['error']
-        return result['moves']
+        """A native or Seal turn. Their searches cannot be interrupted in process, so each kind searches in a child
+        process; when `stop()` turns true the child is killed, a fresh one starts on the next turn, and this raises
+        Cancelled."""
+        kind = entry['kind']
+        if kind not in self.children or self.children[kind][0].poll() is not None:
+            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'search', kind],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding='utf-8',
+                                     bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            lines = queue.Queue()
+            def pump():
+                for line in child.stdout:
+                    lines.put(line)
+                lines.put(None)
+            threading.Thread(target=pump, daemon=True).start()
+            self.children[kind] = child, lines
+        child, lines = self.children[kind]
+        child.stdin.write(json.dumps(dict(ms=budget['ms'], history=[list(p) for p in history])) + '\n')
+        child.stdin.flush()
+        while True:
+            try:
+                line = lines.get(timeout=.05)
+                break
+            except queue.Empty:
+                if stop():
+                    child.kill()
+                    child.stdin.close()
+                    del self.children[kind]
+                    raise Cancelled() from None
+        if line is None:
+            raise RuntimeError(f'{kind} search process exited')
+        answer = json.loads(line)
+        if 'error' in answer:
+            raise RuntimeError(answer['error'])
+        return answer['moves']
 
     def close(self):
         self.bubbles.clear()
+        for child, _ in self.children.values():
+            child.kill()
 
 
 # Saved evaluations
@@ -983,7 +997,29 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(400, dict(error=str(error)))
 
 
+def search_child(kind):
+    """The child process of `Engines.turn`: one JSON line {ms, history} in, one line {moves} or {error} out."""
+    engine = None
+    if kind == 'seal':
+        from legacy.arena import Seal
+        engine = Seal()
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            game = replay(request['history'])
+            try:
+                moves = game.search(request['ms'])['moves'] if kind == 'native' else engine(game, request['ms'])
+            finally:
+                game.close()
+            answer = dict(moves=[list(map(int, m)) for m in moves])
+        except Exception as error:
+            answer = dict(error=str(error))
+        print(json.dumps(answer), flush=True)
+
+
 def main():
+    if sys.argv[1:2] == ['search']:
+        return search_child(sys.argv[2])
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--dense-run', type=Path, help='a Bubble run; its champion is the default opponent')

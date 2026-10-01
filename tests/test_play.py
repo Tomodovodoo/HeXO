@@ -277,13 +277,17 @@ class Jobs(unittest.TestCase):
         state = self.session.state()
         self.assertEqual((state['seats'][1], state['analysis']['engine']), (dict(engine='human'), 'bubble:fake~2'))
 
-    def test_native_searches_are_abandoned_on_cancel(self):
+    def test_cancelled_native_searches_end_and_the_next_starts_at_once(self):
         engines = Engines('cpu')
-        started = time.time()
-        with self.assertRaises(Cancelled):
-            engines.turn(entries()['native:Native'], dict(ms=3000), [(0, 0)], lambda: time.time() - started > .2)
-        self.assertLess(time.time() - started, 1)
-        self.assertEqual(len(engines.turn(entries()['native:Native'], dict(ms=50), [(0, 0)])), 2)
+        try:
+            self.assertEqual(len(engines.turn(entries()['native:Native'], dict(ms=50), [(0, 0)])), 2)
+            started = time.time()
+            with self.assertRaises(Cancelled):
+                engines.turn(entries()['native:Native'], dict(ms=20000), [(0, 0)], lambda: time.time() - started > .2)
+            self.assertEqual(len(engines.turn(entries()['native:Native'], dict(ms=50), [(0, 0)])), 2)
+            self.assertLess(time.time() - started, 10)
+        finally:
+            engines.close()
 
     def test_budgets(self):
         self.assertEqual(budget_of('bubble', 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
@@ -371,13 +375,16 @@ class Registry(unittest.TestCase):
                 (root / 'runs/alpha/checkpoints' / checkpoint).mkdir(parents=True)
                 (root / 'runs/alpha/checkpoints' / checkpoint / 'ema.pt').write_bytes(b'')
             (root / 'runs/alpha/champion.json').write_text(json.dumps(dict(checkpoint='play/000150')))
+            (root / 'runs/broken/checkpoints/main/000001').mkdir(parents=True)
+            (root / 'runs/broken/checkpoints/main/000001/ema.pt').write_bytes(b'')
+            (root / 'runs/broken/champion.json').write_text('{"checkpoint": ')
             (root / 'models/beta').mkdir(parents=True)
             (root / 'models/beta/ema.pt').write_bytes(b'')
             (root / 'elsewhere').mkdir()
             (root / 'elsewhere/net.pt').write_bytes(b'')
             (root / 'models/gamma.json').write_text(json.dumps(dict(name='gamma', kind='bubble', path='../elsewhere/net.pt')))
             found = scan(root / 'models', root / 'runs', [root / 'runs/alpha'], root / 'missing.dll')
-            self.assertEqual(list(found), ['bubble:alpha', 'bubble:beta', 'bubble:gamma', 'native:Native'])
+            self.assertEqual(list(found), ['bubble:alpha', 'bubble:broken', 'bubble:beta', 'bubble:gamma', 'native:Native'])
             self.assertEqual(found['bubble:alpha']['checkpoints'], ['play/000150', 'main/000200', 'main/000100'])
             self.assertEqual(found['bubble:beta']['checkpoints'], [''])
             (root / 'models/gamma').mkdir()
