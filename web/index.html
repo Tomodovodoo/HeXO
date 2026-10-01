@@ -219,6 +219,7 @@ function active(jobs){
 }
 function accept(data){
   if(S&&data.instance===S.instance&&data.revision<S.revision)return;
+  if(S&&!('history' in data)&&data.instance!==S.instance){S.revision=-1;return}
   data.jobs=active(data.jobs);
   if('history' in data){
     const live=!S||view>=S.history.length,before=S?S.history.length:null;

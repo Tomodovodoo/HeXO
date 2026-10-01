@@ -315,6 +315,17 @@ class Jobs(unittest.TestCase):
         wait(lambda: self.session.jobs[old].status == 'cancelled')
         self.engines.hold = False
 
+    def test_solver_retries_skip_positions_from_another_game(self):
+        self.session.configure_seat(1, 'human')
+        self.session.configure_analysis('bubble:fake', auto=True)
+        self.session.play(0, 0)
+        wait(lambda: not self.session.state()['jobs'])
+        calls = len(self.engines.calls)
+        self.session.retry([(0, 0), (5, 5)])
+        self.session.retry([(0, 0)])
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(len(self.engines.calls), calls)
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)

@@ -928,7 +928,7 @@ class Session:
     def retry(self, history):
         """Analyse `history` again after a solver failure, when automatic analysis is on."""
         with self.lock:
-            if self.analysis and self.analysis['auto']:
+            if self.analysis and self.analysis['auto'] and tuple(history) == tuple(self.history[:len(history)]):
                 self.request_analysis(history, 1)
 
     def run(self, job):
