@@ -830,6 +830,11 @@ class Formats(unittest.TestCase):
         _, turns = formats.bke_turns('b@(1,0): o A0 A1 x B3.1 B3.2', implicit=False)
         self.assertEqual([(player, set(cells)) for player, cells in turns],
                          [('o', {(1, -1), (2, -1)}), ('x', {(-1, 2), (0, 2)})])
+        for baseline in range(6):
+            for ring in range(1, 30):
+                for offset in range(6 * ring):
+                    cell = formats.ring_cell((3, -2), baseline, True, ring, offset)
+                    self.assertEqual(formats.ring_offset(cell, (3, -2), baseline), (ring, *divmod(offset, ring)))
         history = formats.rectilinear_loads('x A0 H2.2 o A1 G2.2')
         self.assertEqual((len(history), history[0]), (5, [0, 0]))
         self.assertEqual(formats.rectilinear_loads('x A0 H2.2 o A1 G2.2'),

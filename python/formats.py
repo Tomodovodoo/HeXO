@@ -75,10 +75,13 @@ def ring_cell(origin, baseline, clockwise, ring, offset):
 def ring_offset(cell, origin, baseline):
     """(ring, sector, step) of `cell` around `origin`, clockwise from the `baseline` direction."""
     ring = distance(cell, origin)
+    q, r = origin[0] + DIRECTIONS[baseline][1][0] * ring, origin[1] + DIRECTIONS[baseline][1][1] * ring
     for sector in range(6):
-        for step in range(ring):
-            if ring_cell(origin, baseline, True, ring, sector * ring + step) == tuple(cell):
-                return ring, sector, step
+        dq, dr = ring_side(baseline, sector)
+        step = max(abs(cell[0] - q), abs(cell[1] - r))
+        if step < ring and (cell[0] - q, cell[1] - r) == (dq * step, dr * step):
+            return ring, sector, step
+        q, r = q + dq * ring, r + dr * ring
     raise ValueError(f'{cell} is not on ring {ring} of {origin}')
 
 
