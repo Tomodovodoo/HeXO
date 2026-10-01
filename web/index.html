@@ -433,7 +433,7 @@ function autoAnalyse(){
   const ev=S.evaluations[view],need=S.analysis&&S.analysis.budget,job=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);
   const short=!ev||need&&(ev.simulations<need.simulations||ev.solver_nodes<need.solver_nodes);
   if(!short||!S.analysis||!S.analysis.auto||job||(S.winner>=0&&view===S.history.length))return;
-  const tag=S.history.slice(0,view).join(';'),now=Date.now();
+  const a=S.analysis,tag=[a.engine,a.checkpoint,JSON.stringify(a.budget),S.history.slice(0,view).join(';')].join('|'),now=Date.now();
   if(now-(asked.get(tag)||0)>31000){asked.set(tag,now);post('/analyse',{ply:view})}
 }
 function renderGraph(){

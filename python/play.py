@@ -889,8 +889,10 @@ class Session:
             return job.id
 
     def review_again(self, history, seat, tries):
+        """Queue the review of `history` again when the analysis settings, Auto aside, are still `seat`'s."""
+        without = lambda settings: {k: v for k, v in (settings or {}).items() if k != 'auto'}
         with self.lock:
-            if self.analysis == seat:
+            if without(self.analysis) == without(seat):
                 with contextlib.suppress(ValueError):
                     self.review_game(history, tries)
 
