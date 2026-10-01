@@ -56,6 +56,11 @@ def review_plies(history):
         game.close()
 
 
+def without_auto(settings):
+    """Analysis settings without the Auto switch, which does not change what an evaluation is."""
+    return {k: v for k, v in (settings or {}).items() if k != 'auto'}
+
+
 def replay(history):
     """A native game with `history` played; raises ValueError on an illegal stone."""
     game = Game()
@@ -892,7 +897,7 @@ class Session:
             if not self.analysis or tuple(history) != tuple(self.history[:len(history)]):
                 raise ValueError('Review needs a Bubble model and a position of this game')
             for job in self.jobs.values():
-                same = job.history == tuple(history) and job.seat == self.analysis
+                same = job.history == tuple(history) and without_auto(job.seat) == without_auto(self.analysis)
                 if job.kind == 'review' and job.status in ('queued', 'running') and same:
                     return job.id
             job = self.submit(Job('review', 2, history, seat=dict(self.analysis), tries=tries))
@@ -901,9 +906,8 @@ class Session:
 
     def review_again(self, history, seat, tries):
         """Queue the review of `history` again when the analysis settings, Auto aside, are still `seat`'s."""
-        without = lambda settings: {k: v for k, v in (settings or {}).items() if k != 'auto'}
         with self.lock:
-            if without(self.analysis) == without(seat):
+            if without_auto(self.analysis) == without_auto(seat):
                 with contextlib.suppress(ValueError):
                     self.review_game(history, tries)
 
@@ -1065,7 +1069,7 @@ class Session:
         if job.kind == 'analyse':
             job.total = max(1, seat['budget']['simulations']) * 2
             return self.evaluation(job, seat, history, job.force)
-        incomplete = False
+        incomplete, identity = False, self.engine_key(seat)
         for index, ply in enumerate(review_plies(history)):
             if job.cancelled:
                 raise Cancelled()
@@ -1077,8 +1081,10 @@ class Session:
             job.done = index + 1
             with self.lock:
                 self.revision += 1
-        if incomplete and job.tries < 3:
-            timer = threading.Timer(31, self.review_again, args=(list(history), dict(seat), job.tries + 1))
+        changed = self.engine_key(seat) != identity
+        if changed or incomplete and job.tries < 3:
+            timer = threading.Timer(1 if changed else 31, self.review_again,
+                                    args=(list(history), dict(seat), job.tries + (not changed)))
             timer.daemon = True
             timer.start()
         return None
