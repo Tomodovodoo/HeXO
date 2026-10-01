@@ -1,4 +1,5 @@
 """Native neural tree checks independent of trained model quality."""
+import importlib.util
 import unittest
 import numpy as np
 from hexo import Game
@@ -16,6 +17,7 @@ class Uniform:
         return out
 
 class NeuralTree(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec('torch'), 'Timed Bubble turns require torch')
     def test_timed_turn_reserves_simulations_for_both_stones(self):
         import threading
         from types import SimpleNamespace
