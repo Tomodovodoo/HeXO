@@ -863,7 +863,7 @@ class Learner:
         """Per-row EMA losses over `refs` under symmetries drawn from a fixed seed: float arrays with one entry per
         ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
         finished (1. when winner >= 0, else 0.), value_bce, value (its target), outcome_bce, outcome (the hard
-        outcome; .5 for capped games), policy_ce (against the improved policy; nan on rows without a policy
+        outcome; .5 for capped games), policy_weight, policy_ce (against the improved policy; nan on rows without a policy
         target), policy_target_entropy, policy_kl, policy_top1, policy_top2, policy_argmax_mass (nan without a
         policy target), policy_pair_top1 (pair_policy_rows; nan without a policy target or a pair target), searched
         (searched_value at the row), proven (the row's `proven`), proof_action (1 with a witness)
@@ -890,14 +890,14 @@ class Learner:
                     policy = [torch.where(b['policy_weight'] > 0, x, math.nan).tolist()
                               for x in (*policy_validation_rows(out, b), pair)]
                     losses += zip(bce[0].tolist(), b['value'].tolist(), bce[1].tolist(), b['outcome'].tolist(),
-                                  *policy, *(x.tolist() for x in certified))
+                                  b['policy_weight'].tolist(), *policy, *(x.tolist() for x in certified))
                 for i, loss in zip(order, losses):
                     ref = chunk[i]
                     e, t = ref.episode, ref.row['ply']
                     rows.append((t, len(e['moves'])-t, float(e['winner'] >= 0), *loss, searched_value(e, t),
                                  float(ref.row.get('proven', 0)), float(bool(ref.row.get('proof_action'))),
                                  targets[i].get('deblundered', 0.), ref.row['remaining']))
-        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_ce',
+        keys = ('ply', 'remaining', 'finished', 'value_bce', 'value', 'outcome_bce', 'outcome', 'policy_weight', 'policy_ce',
                 'policy_target_entropy', 'policy_kl', 'policy_top1', 'policy_top2', 'policy_argmax_mass',
                 'policy_pair_top1', 'certified_policy_mass', 'certified_policy_top1',
                 'searched', 'proven', 'proof_action', 'deblundered', 'placements')
@@ -942,7 +942,7 @@ class Learner:
             out[f'{source}_policy_ce_proof'] = float(r['policy_ce'][proof].mean()) if proof.any() else None
             out[f'{source}_policy_ce_proof_rows'] = int(proof.sum())
             p = np.isfinite(r['policy_ce'])
-            out.update({f'{source}_{k}': v for k, v in policy_summary(p, r['placements'], *(r[k] for k in (
+            out.update({f'{source}_{k}': v for k, v in policy_summary(r['policy_weight'], r['placements'], *(r[k] for k in (
                 'policy_target_entropy', 'policy_kl', 'policy_top1', 'policy_top2', 'policy_argmax_mass',
                 'policy_pair_top1'))).items()})
             out.update({f'{source}_{k}': v for k, v in outcome_split(r['outcome_bce'], r['finished'] > 0, r['proven'] != 0).items()})

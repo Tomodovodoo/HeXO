@@ -2606,6 +2606,7 @@ class ValidationSourceTests(unittest.TestCase):
                 if key.startswith('certified_policy'):
                     self.assertEqual(value, weighted[key], key)
             refs = [window.ref('1000000000001', ply) for ply in (11, 12)]
+            self.assertEqual(learner.row_losses(window, refs)['policy_weight'].tolist(), [.25, .25])
             learner.settings = replace(learner.settings, proof_policy_weight=0.)
             per_row = learner.row_losses(window, refs)
             self.assertTrue(np.isnan(per_row['policy_ce']).all())
