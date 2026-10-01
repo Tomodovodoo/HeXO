@@ -764,8 +764,8 @@ class Learner:
 
     def validate(self, window):
         """EMA weighted_means (eval mode) over VALIDATION_ROWS held-out rows drawn with a fixed sampling seed, by
-        head, plus outcome_split and certified winning-move recognition on the same rows, including rows
-        without a policy training target; None without held-out rows."""
+        head, plus policy-weighted entropy, KL and top-1, outcome_split and certified winning-move recognition
+        on the same rows, including rows without a policy training target; None without held-out rows."""
         if not window.validation:
             return None
         self.ema.eval()
@@ -790,13 +790,13 @@ class Learner:
                 rows.append(np.stack([bce.numpy(), b['outcome'].numpy() != .5, b['exact'].numpy() > 0]))
                 mask = b['policy_weight'] > 0
                 if mask.any():
-                    policy_rows.append(torch.stack(policy_validation_rows(out, b)[1:])[:, mask].numpy())
+                    policy_rows.append(torch.stack([b['policy_weight'], *policy_validation_rows(out, b)[1:]])[:, mask].numpy())
                 if s.deblunder_weight:
                     value_bce = torch.nn.functional.binary_cross_entropy_with_logits(logit, b['value'], reduction='none')
                     deblundered.append(np.stack([value_bce.numpy(), b['deblundered'].numpy()]))
-        policy = np.concatenate(policy_rows, 1) if policy_rows else np.empty((3, 0))
+        policy = np.concatenate(policy_rows, 1) if policy_rows else np.empty((4, 0))
         extra = dict(zip(('policy_target_entropy', 'policy_kl', 'policy_top1'),
-                         (float(x.mean()) if x.size else None for x in policy)))
+                         (float(np.average(x, weights=policy[0])) if x.size else None for x in policy[1:])))
         result = (dict(zip(self.heads, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1)) | extra
                   | certified_policy_summary(*np.concatenate(certified_rows, 1)))
         if s.deblunder_weight:
