@@ -28,6 +28,8 @@ bind('hxg_policy', C.c_int, ptr, ptr)
 bind('hxg_completed', C.c_int, ptr)
 bind('hxg_done', C.c_int, ptr)
 bind('hxg_tactics', C.c_int, ptr, C.c_int)
+bind('hxg_graph', C.c_int, ptr, C.c_int)
+bind('hxg_census', C.c_int, ptr, ptr)
 bind('hxg_exact', C.c_int, ptr)
 bind('hxg_distance', C.c_int, ptr)
 bind('hxg_prove', C.c_int, ptr, C.c_int, ints, C.c_int, C.c_int, C.c_int, ints, C.c_int, C.c_int)
@@ -71,7 +73,7 @@ class EvaluationCache:
 
 class NeuralSearch:
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None,
-                 tactics=False, proof_solver=None, proof_ms=100):
+                 tactics=False, proof_solver=None, proof_ms=100, graph=False):
         if not model_version:
             raise ValueError('A model version is required')
         self.evaluator, self.model_version = evaluator, model_version
@@ -82,6 +84,7 @@ class NeuralSearch:
         self.history = []
         self.proof_solver, self.proof_ms = proof_solver, proof_ms
         checked(native.hxg_tactics(self.ptr, int(tactics)))
+        checked(native.hxg_graph(self.ptr, int(graph)))
         try:
             for point in history:
                 self.advance(point)
@@ -148,6 +151,12 @@ class NeuralSearch:
         finally:
             game.close()
         return True
+
+    def census(self):
+        """{nodes, expanded, exact, duplicates} reachable from the root (native hxg_census)."""
+        out = np.zeros(4, np.int64)
+        native.hxg_census(self.ptr, out.ctypes.data)
+        return dict(zip(('nodes', 'expanded', 'exact', 'duplicates'), map(int, out)))
 
     def result(self, start, finished, evaluated, hits):
         n = native.hxg_stats(self.ptr, None, None, None, None)

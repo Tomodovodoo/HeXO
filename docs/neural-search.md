@@ -20,6 +20,8 @@ Values are stored from the mover's view and flip sign only when the mover change
 
 `advance(action)` keeps the played move's subtree, with its visits, values and proofs, and frees the rest. In self-play both colours share one tree per model, so the opponent's search deepens the tree the next turn reads. Reused visits act as priors: the halving schedule restarts and the Gumbel noise is redrawn at every search.
 
+`NeuralSearch(..., graph=True)` (actor and evaluation setting `search_graph`, off by default) turns the tree into a transposition graph with Monte-Carlo graph search backups, shared proofs by position and `census()` diagnostics; see [search-outcomes.md](search-outcomes.md).
+
 `milliseconds` is a cooperative cap checked between batches. `action` is `None` only when no simulation started.
 
 ## Many games, one evaluator

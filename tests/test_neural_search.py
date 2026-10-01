@@ -261,6 +261,38 @@ class NeuralTree(unittest.TestCase):
         self.assertEqual((result['proven'], result['proof_plies']), (-1, 3))
         self.assertEqual(result['actions'][np.flatnonzero(result['policy'])].tolist(), [[5,0]])
         self.assertEqual(result['action'], [5,0])
+    def test_graph_search_shares_both_orders_of_a_turn(self):
+        # The prior favours the same two cells for either stone, so the tree expands the turn twice.
+        history = [(0,0),(1,2),(2,1)]
+        favoured = [(-1,-1),(-2,1)]
+        class Favour(Uniform):
+            def evaluate(self, histories):
+                predictions = super().evaluate(histories)
+                for prediction in predictions:
+                    for cell in favoured:
+                        prediction['logits'][(prediction['actions'] == cell).all(axis=1)] = 10.
+                return predictions
+        found = {}
+        for graph in (False, True):
+            search = NeuralSearch(Favour(), 'orders', history, 3, tactics=True, graph=graph)
+            self.addCleanup(search.close)
+            found[graph] = search.search(24, root_samples=2, batch_size=1), search.census()
+        (tree, tree_census), (shared, graph_census) = found[False], found[True]
+        self.assertGreater(tree_census['duplicates'], 0)
+        self.assertEqual(graph_census['duplicates'], 0)
+        expansions = lambda r: r['evaluated']+r['cache_hits']   # the tree's repeated turn is a cache hit
+        self.assertLess(expansions(shared), expansions(tree))
+        self.assertEqual(shared['completed'], 24)
+        self.assertAlmostEqual(float(shared['policy'].sum()), 1.)
+
+    def test_graph_search_proves_what_the_tree_proves(self):
+        # Exact results do not depend on sharing: the proven-loss and proven-win roots of the tactics test.
+        for history, winner in (([[0,0],[1,5],[3,3],[-2,2],[-1,1],[2,4],[0,6],[1,-1]], 1),
+                                ([[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]], 0)):
+            search = NeuralSearch(Uniform(), 'graph-exact', history, tactics=True, graph=True)
+            self.addCleanup(search.close)
+            result = search.search(8)
+            self.assertEqual((result['exact_winner'], result['completed']), (winner, 0))
 
     def test_a_longer_certificate_keeps_the_shorter_tactical_win(self):
         # Player 0 completes six with one stone; a (stub-verified) certificate names a slower turn elsewhere.

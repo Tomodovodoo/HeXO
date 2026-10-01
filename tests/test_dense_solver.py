@@ -415,6 +415,57 @@ class LostRoots(unittest.TestCase):
         self.assertEqual(len(episode['moves']), len(self.HISTORY)+2)
 
 
+class GraphSearch(unittest.TestCase):
+    """The opt-in graph search through actors and evaluation games."""
+
+    def test_selfplay_with_graph_search_writes_ordinary_rows(self):
+        model = tiny_model()
+        s = settings(full_fraction=1., search_graph=True, max_plies=10, opening_random_plies=0.)
+        game = dense_selfplay.SelfPlayGame([model, model], s, 3)
+        self.assertTrue(all(t.census()['nodes'] >= 1 for t in game.trees.values()))
+        run([game])
+        episode, rows = game.episode()
+        self.assertEqual(len(rows), len(episode['moves']))
+        self.assertTrue(all(abs(float(r['policy'].sum())-1) < 1e-5 for r in rows if r['policy'] is not None))
+
+    def test_graph_selfplay_repeats_with_the_same_seed(self):
+        s = settings(full_fraction=1., search_graph=True, max_plies=12, opening_random_plies=0.)
+        played = []
+        for _ in range(2):
+            game = dense_selfplay.SelfPlayGame([tiny_model()]*2, s, 9)
+            run([game])
+            episode, rows = game.episode()
+            played.append((episode['moves'], [r['policy'].tolist() for r in rows if r['policy'] is not None]))
+        self.assertEqual(played[0], played[1])
+
+    def test_a_graph_variant_searches_only_its_own_side(self):
+        config = dense_config.RunConfig()
+        overrides = dense_eval.parse_settings(['search_graph=true'])
+        self.assertEqual(overrides, dict(search_graph=True))
+        sides = (dense_eval.side_settings(config.evaluation, overrides), config.evaluation)
+        model = tiny_model()
+        with tempfile.TemporaryDirectory() as run:
+            book = dense_openings.Book(run, config.evaluation)
+        for game in dense_eval.paired_games(model, model, 2, 'test', config, config.evaluation, None, book, sides=sides):
+            colour = game.record['challenger_color']
+            self.assertEqual((game.graphs[colour], game.graphs[1-colour]), (True, False))
+            self.assertEqual(len(game.trees), 2)
+            game.finish()
+
+    def test_book_lines_search_with_the_evaluation_graph_setting(self):
+        calls = []
+        model = type('Model', (), dict(tree=lambda self, *args, graph=False: calls.append(args+(graph,))))()
+        dense_openings.Line(model, [(0, 0)], 3, 4, 4, True, 1., 0, graph=True)
+        self.assertEqual(calls, [([(0, 0)], 0, True, True)])
+
+    def test_one_model_with_two_graph_settings_keeps_two_trees(self):
+        model = tiny_model()
+        game = dense_eval.MatchGame([model, model], [(0, 0)], 1, 8, 4, True, 5, {}, graphs=(False, True))
+        self.assertEqual(len(game.trees), 2)
+        run([game])
+        self.assertEqual(len(game.moves), 5)
+
+
 class Proofs(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
