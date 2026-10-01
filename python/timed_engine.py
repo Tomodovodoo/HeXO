@@ -7,6 +7,7 @@ import json
 import hashlib
 import subprocess
 from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 from hexo import Game, library
 from time_control import allowance
@@ -32,8 +33,13 @@ class HTTTXEngine:
                     time_limit=ms/1000, request_id=self.request_id)
         request = Request(self.url+'/'+self.root.strip('/')+'/turn', data=json.dumps(body).encode(),
                           headers={'Content-Type': 'application/json'})
-        with urlopen(request, timeout=max(.001, ms/1000)) as response:
-            result = json.loads(response.read(1_048_577))
+        try:
+            with urlopen(request, timeout=max(.001, ms/1000)) as response:
+                result = json.loads(response.read(1_048_577))
+        except URLError as error:
+            if isinstance(error.reason, TimeoutError) or getattr(error, 'code', None) == 408:
+                raise TimeoutError(str(error)) from error
+            raise
         if self.capabilities['stateless']['versions']['v1-alpha'].get('request_id') and result.get('request_id') != self.request_id:
             raise ValueError('Opponent returned a different request_id')
         return [list(_coord(cell)) for cell in result['move']['pieces']]

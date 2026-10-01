@@ -308,7 +308,7 @@ class TimedClocks(unittest.TestCase):
         from timed_match import Match
         clock = [0]
         match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='human')),
-                           time_control=dict(base_ms=1000, increment_ms=200)), now=lambda: clock[0])
+                           time_control=dict(base_ms=1000, increment_ms=200), turn_cap_ms=1000), now=lambda: clock[0])
         self.addCleanup(match.close)
         match.start()
         clock[0] = 100_000_000
@@ -326,6 +326,65 @@ class TimedClocks(unittest.TestCase):
         state = match.submit([[0, 1], [0, 2]], state['turn_id'], state['revision'])
         self.assertEqual(state['result'], dict(winner='o', reason='time'))
         self.assertEqual(len(state['history']), 3)
+        self.assertEqual(state['turn_cap_remaining_ms'], 0)
+        self.assertEqual(match.turn_spent_ns, 1_000_000_000)
+
+    def test_winning_turn_retains_its_elapsed_time(self):
+        from timed_match import Match
+        clock = [0]
+        history = [[0, 0], [0, 3], [1, 3], [1, 0], [2, 0], [3, 3],
+                   [4, 3], [3, 0], [4, 0], [5, 3], [6, 3]]
+        match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='human')),
+                           history=history, time_control='1', turn_cap_ms=100), now=lambda: clock[0])
+        self.addCleanup(match.close)
+        match.start()
+        clock[0] = 50_000_000
+        result = match.submit([[5, 0]], 0, 0)
+        self.assertEqual(result['result'], dict(winner='x', reason='win'))
+        self.assertEqual((match.turn_spent_ns, result['turn_cap_remaining_ms']), (50_000_000, 50))
+
+    def test_receipt_before_deadline_is_atomic_with_watchdog(self):
+        from timed_match import Match, play_turn
+        clock = [0]
+        received, release, armed, watchdog_started = (threading.Event() for _ in range(4))
+        reply_thread = None
+        def now():
+            captured = clock[0]
+            if threading.current_thread() is reply_thread and armed.is_set() and not received.is_set():
+                received.set()
+                release.wait(1)
+            return captured
+        class Engine:
+            def turn(self, *_args, **_kwargs):
+                armed.set()
+                return dict(moves=[[1, 0], [2, 0]])
+        match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='native')),
+                           time_control='1'), now=now)
+        self.addCleanup(match.close)
+        match.start()
+        clock[0] = 900_000_000
+        reply_thread = threading.Thread(target=play_turn, args=(match, Engine()))
+        reply_thread.start()
+        watchdog = None
+        try:
+            self.assertTrue(received.wait(1))
+            clock[0] = 1_100_000_000
+            def tick():
+                watchdog_started.set()
+                match.tick()
+            watchdog = threading.Thread(target=tick)
+            watchdog.start()
+            self.assertTrue(watchdog_started.wait(1))
+            time.sleep(.02)
+        finally:
+            release.set()
+            reply_thread.join(1)
+            if watchdog:
+                watchdog.join(1)
+        self.assertFalse(reply_thread.is_alive())
+        self.assertEqual(match.snapshot()['history'], [[0, 0], [1, 0], [2, 0]])
+        self.assertIsNone(match.result)
+        self.assertEqual(match.snapshot()['circle_ms'], 100)
 
     def test_restore_is_paused_and_half_turn_round_trips(self):
         from timed_match import Match
@@ -399,7 +458,7 @@ class TimedClocks(unittest.TestCase):
                 mode = self.mode
                 if mode == 'timeout':
                     time.sleep(1)
-                self.send_response(200)
+                self.send_response(408 if mode == 'http_timeout' else 200)
                 self.end_headers()
                 piece = dict(q='bad' if mode == 'coordinates' else 0, r=0)
                 try:
@@ -410,7 +469,7 @@ class TimedClocks(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            for mode in ('timeout', 'coordinates', 'occupied'):
+            for mode in ('timeout', 'http_timeout', 'coordinates', 'occupied'):
                 with self.subTest(mode=mode):
                     Handler.mode = mode
                     with TimedEngine(dict(kind='htttx', url=f'http://127.0.0.1:{server.server_port}')) as engine:
@@ -419,7 +478,7 @@ class TimedClocks(unittest.TestCase):
                         try:
                             match.start()
                             result = play_turn(match, engine)
-                            self.assertEqual(result['result'], dict(winner='x', reason='engine_timeout' if mode == 'timeout' else 'illegal'))
+                            self.assertEqual(result['result'], dict(winner='x', reason='engine_timeout' if mode in ('timeout', 'http_timeout') else 'illegal'))
                             self.assertEqual(result['history'], [[0, 0]])
                         finally:
                             match.close()

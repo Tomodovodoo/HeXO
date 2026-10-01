@@ -108,7 +108,7 @@ class Match:
             self.record('start')
 
     def finish(self, winner, reason):
-        self.clock.stop()
+        self.turn_spent_ns += self.clock.stop()
         self.cancel.set()
         self.state = 'finished'
         self.result = dict(winner=None if winner is None else ('x', 'o')[winner], reason=reason)
@@ -161,6 +161,8 @@ class Match:
                 self.revision += 1
             completed = self.game.player != side or self.game.winner >= 0
             elapsed = self.clock.stop(completed=True, at=received) if completed else None
+            if completed:
+                self.turn_spent_ns += elapsed
             self.record('turn' if completed else 'placement', pieces=pieces, elapsed_ns=elapsed,
                         clock_before=before)
             if self.game.winner >= 0:
@@ -228,11 +230,12 @@ class Match:
 
 
 def play_turn(match, engine):
-    state = match.tick()
+    with match.lock:
+        state = match.tick()
+        cancellation = match.cancel
     if state['state'] != 'playing':
         return state
     game = Game(state['history'])
-    cancellation = match.cancel
     try:
         def publish(result):
             with match.lock:
@@ -240,8 +243,8 @@ def play_turn(match, engine):
                     match.thinking = result
         result = engine.turn(game, clock=state, cancel=cancellation, publish=publish,
                              milliseconds=state['turn_cap_remaining_ms'])
-        received = match.clock.now()
         with match.lock:
+            received = match.clock.now()
             if cancellation.is_set() or match.state != 'playing':
                 return match.snapshot()
             try:

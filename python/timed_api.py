@@ -360,8 +360,8 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
         elif command == 'resign':
             match.resign(('x', 'o').index(body['side']))
         elif command in ('turn', 'place'):
-            received = match.clock.now()
             with match.lock:
+                received = match.clock.now()
                 if match.specification['players'][('cross', 'circle')[match.game.player]]['kind'] != 'human':
                     raise ValueError('This side is controlled by an engine')
                 pieces = body['pieces'] if command == 'turn' else [[body['q'], body['r']]]
