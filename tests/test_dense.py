@@ -1212,6 +1212,12 @@ class DenseConfigTests(unittest.TestCase):
         for weight in (-1., float('nan'), float('inf')):
             with self.assertRaises(ValueError):
                 replace(base, proof_policy_weight=weight)
+            with self.assertRaises(ValueError):
+                replace(base, pair_policy_weight=weight)
+        self.assertEqual(base.pair_policy_weight, 0.)
+        self.assertIn('pair_policy_weight', dense_learn.KEEP)
+        paired = dense_config.override(base, parser.parse_args(['--pair-policy-weight', '1']))
+        self.assertEqual(dense_data.target_options(paired)['pair_policy_weight'], 1.)
         self.assertEqual((base.value_target, base.outcome_lambda, base.outcome_weight, base.calibration_games, base.validation_rows,
                           base.validation_quota), ('outcome', .98, 0., 4000, 8192, 128))
         self.assertEqual(base.future_target, 'legacy')
@@ -1899,6 +1905,42 @@ class DenseDataTests(unittest.TestCase):
             out = subprocess.run([sys.executable, str(Path(tmp)/'main.py')], cwd=ROOT, capture_output=True, text=True, check=True,
                                  env={**os.environ, 'PYTHONPATH': str(ROOT/'python')}).stdout
         self.assertEqual(out.split(), ['4', '3'])
+
+    def test_pair_policy_mixes_the_second_stone_into_the_first(self):
+        actions = np.array([[0, 0], [0, 1], [1, 0]])
+        policy = np.array([.5, .5, 0.], np.float32)
+        second = np.array([[0, 1], [1, 0], [2, 2]])
+        mixed = dense_data.pair_policy(policy, actions, second, np.array([.2, .4, .4], np.float32), 1.)
+        np.testing.assert_allclose(mixed, [.25, .25+1/6, 1/3], rtol=1e-6)
+        self.assertIs(dense_data.pair_policy(policy, actions, [[3, 3]], np.array([1.], np.float32), 1.), policy)
+
+    def test_pair_policy_targets_only_first_stones_with_a_searched_second_stone(self):
+        with tempfile.TemporaryDirectory() as run:
+            write_games(Path(run)/'shards'/'000001', [(winning_game(), 0, None)])
+            window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0., cheap_row_fraction=0.)
+            refs = [window.ref('000001', i) for i in range(12)]
+            ordinary = window.policy
+            def policy(ref):
+                return np.empty(0, np.float32) if ref.row['ply'] == 4 else ordinary(ref)
+            with unittest.mock.patch.object(window, 'policy', side_effect=policy):
+                samples, base = dense_data.examples(window, refs, np.random.default_rng(0))
+                _, paired = dense_data.examples(window, refs, np.random.default_rng(0), pair_policy_weight=1.)
+            moves = winning_game()
+            changed = []
+            for t, (s, before, after) in enumerate(zip(samples, base, paired)):
+                for key in before:
+                    if key != 'policy':
+                        np.testing.assert_array_equal(before[key], after[key])
+                if np.array_equal(before['policy'], after['policy']):
+                    continue
+                changed.append(t)
+                self.assertEqual(s.remaining, 2)
+                self.assertAlmostEqual(float(after['policy'].sum()), 1., places=5)
+                second = dict(zip(map(tuple, legal(moves[:t+1]).tolist()), ordinary(refs[t+1])))
+                second = np.array([second.get(tuple(a), 0.) for a in s.actions.tolist()])
+                self.assertEqual(second[(s.actions == moves[t]).all(1)].sum(), 0.)
+                np.testing.assert_allclose(after['policy'], (before['policy']+second/second.sum())/2, atol=1e-6)
+            self.assertEqual(changed, [t for t in range(11) if samples[t].remaining == 2 and t not in (3, 4)])
 
     def test_examples_and_collate(self):
         rng = np.random.default_rng(6)
@@ -3489,6 +3531,24 @@ class EngineTests(unittest.TestCase):
         slot.settings = replace(slot.settings, full_fraction=1.)
         dense_selfplay.SelfPlayGame.plan(slot)
         self.assertEqual((slot.budget, slot.samples), (64, 16))
+
+    def test_full_turns_search_both_stones_of_a_turn_alike(self):
+        draws = iter(np.tile([.1, .9], 50))
+        slot = SimpleNamespace(settings=dense_config.ActorSettings(full_fraction=.5, full_turns=True), moves=[],
+                               forced_plies=0, rng=SimpleNamespace(random=lambda: next(draws)))
+        kinds = []
+        for ply in range(9):
+            slot.moves = [[0, 0]]*ply
+            dense_selfplay.SelfPlayGame.plan(slot)
+            kinds.append(slot.is_full)
+        self.assertEqual(kinds, [True, False, False, True, True, False, False, True, True])
+        slot.moves, slot.forced_plies, slot.is_full = [[0, 0]]*4, 4, True
+        dense_selfplay.SelfPlayGame.plan(slot)
+        self.assertFalse(slot.is_full)
+        slot.settings = replace(slot.settings, full_turns=False)
+        slot.moves, slot.forced_plies = [[0, 0]]*2, 0
+        dense_selfplay.SelfPlayGame.plan(slot)
+        self.assertTrue(slot.is_full)
 
     def test_leaf_proof_skips_inference_and_records_exact_value(self):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]

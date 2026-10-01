@@ -17,7 +17,7 @@ The games hit their placement cap, so their outcomes stay masked and the search 
 
 ## Rows
 
-An actor writes one row per placement. A full-search row (the `full_fraction` of placements, 128 simulations in the live run) carries the improved search policy as its policy target and a value target. A cheap-search row (12 simulations) carries a value target at weight `cheap_value_weight` (0.25) and no policy target; `--cheap-row-fraction f` keeps a hash-chosen share `f` of them, and `f = 0` is KataGo's choice of not training on them at all. Rows with an exact label, from a proof or a forced line, are always kept at value weight `proven_value_weight` (2) and their outcome loss is masked.
+An actor writes one row per placement. A full-search row (the `full_fraction` of placements, 128 simulations in the live run) carries the improved search policy as its policy target and a value target. A cheap-search row (12 simulations) carries a value target at weight `cheap_value_weight` (0.25) and no policy target; `--cheap-row-fraction f` keeps a hash-chosen share `f` of them, and `f = 0` is KataGo's choice of not training on them at all. Each placement draws its kind independently, so both stones of a turn are full searches in only `full_fraction` squared of turns; the actor flag `--full-turns` lets a turn's second stone repeat its first stone's draw, which keeps the full share and makes every full first stone a pair that `--pair-policy-weight` can use. Rows with an exact label, from a proof or a forced line, are always kept at value weight `proven_value_weight` (2) and their outcome loss is masked.
 
 Actors also store the network's own value prediction for each root, before search. The proof pass uses it to find positions where the network was wrong although the solver knew better.
 
@@ -38,6 +38,7 @@ Capped games always use TD over root values. `--bootstrap-full-only` restricts e
 The policy target is the root search's improved policy over every eligible legal move. Unvisited moves receive a mixed value estimate. Three sources add to it:
 
 - `--proof-policy-weight w` mixes the certificate's winning stones into winning rows, `(search + w * proof) / (1 + w)`; with `--proof-policy-missing-only` it only fills rows that have no search policy, such as solver roots and forced-line rows.
+- `--pair-policy-weight w` mixes the same turn's second-stone search policy into a first stone's target, `(search + w * second) / (1 + w)`, where it exists. A turn's two stones reach the same position in either order, so the complement the second search found is also a good first stone, and the first-stone prior should rank both stones of a good pair near the top. Cells that only became legal after the first stone are dropped and the rest renormalised. Second stones and rows without both searches keep their targets. `w = 1` gives the played pair equal weight when both searches are sharp.
 - `--regret-fraction f` draws a share `f` of each batch from the proof pass's regret buffer, positions where the network's value was furthest from a proven result.
 - `--future-target masked` adds a three-class occupancy head (empty, own, opponent) at 20 placements ahead, weight `--future-weight` (0.5). The default `legacy` keeps the older occupancy targets at 6 and 20 placements. Switching keeps the shared weights and optimizer state.
 

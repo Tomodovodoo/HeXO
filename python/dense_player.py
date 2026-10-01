@@ -133,7 +133,7 @@ class DensePlayer:
         if game.winner >= 0:
             raise ValueError('This game has finished')
         history = [cell[:2] for cell in game.cells]
-        local, moves, suggestions = Game(history), [], []
+        local, moves, suggestions, tree = Game(history), [], [], None
         player, start, proof, line, threat = local.player, time.perf_counter(), None, [], None
         win_probability = None
         try:
@@ -150,12 +150,12 @@ class DensePlayer:
             while not proven and local.player == player and local.winner < 0:
                 current = [cell[:2] for cell in local.cells]
                 if self.options['search']:
-                    tree = NeuralSearch(self.evaluator, self.model_sha256, current, seed=1740,
-                                        cache=self.cache, tactics=True)
-                    try:
-                        result = tree.search(self.options['simulations'], root_samples=16, batch_size=16)
-                    finally:
-                        tree.close()
+                    if tree is None:
+                        tree = NeuralSearch(self.evaluator, self.model_sha256, current, seed=1740,
+                                            cache=self.cache, tactics=True)
+                    else:
+                        tree.advance(tuple(moves[-1]))
+                    result = tree.search(self.options['simulations'], root_samples=16, batch_size=16)
                     action, policy, actions = result['action'], result['policy'], result['actions']
                     value = root_value(result, local.player)
                 else:
@@ -176,4 +176,6 @@ class DensePlayer:
                         threat_checked=analyze and self.options['solver'],
                         solver_status=proof['status'] if proof else 'off', settings=dict(self.options))
         finally:
+            if tree is not None:
+                tree.close()
             local.close()
