@@ -209,7 +209,7 @@ class BubblePlayer:
         from play import Bubble, Engines
         path = Path(path).resolve()
         self.bubble, self.simulations, self.solver_nodes = Bubble(path, device), simulations, solver_nodes
-        self.prover = Engines(device).solver() if solver_nodes else None
+        self.prover = Engines(device).solver()[0] if solver_nodes else None
         self.model_sha256 = self.bubble.sha256
         in_run = path.name == 'ema.pt' and path.parent.parent.parent.name == 'checkpoints'
         self.checkpoint = f'{path.parent.parent.name}/{path.parent.name}' if in_run else path.stem

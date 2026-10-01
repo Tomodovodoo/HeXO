@@ -206,8 +206,10 @@ def verified(result):
 
 
 def searched(result):
-    """True when a solver query spent its budget: it proved a win or found none; False when it failed to run."""
-    return verified(result) or result.get('reason') == 'no verified strategy'
+    """True when a solver query ran to a verdict (a proof, or a reason in `dense_solver.VERDICTS`); False when it
+    failed to run (worker starting or restarting, deadline, crash)."""
+    from dense_solver import VERDICTS
+    return verified(result) or result.get('reason') in VERDICTS
 
 
 def winning_line(history, result):

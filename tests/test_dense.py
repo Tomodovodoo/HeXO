@@ -7076,9 +7076,19 @@ class DenseBrowser(unittest.TestCase):
     def test_solver_failures_do_not_count_as_checked(self):
         from play import evaluate
         for result, solved in ((dict(status='UNKNOWN', reason='tactical worker starting'), False),
-                               (dict(status='UNKNOWN', reason='no verified strategy'), True)):
+                               (dict(status='UNKNOWN', reason='no verified strategy'), True),
+                               (dict(status='UNKNOWN', reason='defender counterwin'), True)):
             prover = unittest.mock.Mock(history=unittest.mock.Mock(return_value=result))
             self.assertEqual(evaluate(self.bubble, prover, [(0, 0)], 0, 2048)['solved'], solved)
+
+    def test_six_protocol_player_plays_a_turn(self):
+        from six_engine import BubblePlayer
+        player = BubblePlayer(Path(self.temp.name)/'ema.pt', 'cpu', 4, 2048)
+        game = Game([(0, 0)])
+        try:
+            self.assertTrue(self.complete([(0, 0)], player.turn(game)['moves']))
+        finally:
+            game.close()
 
     def test_cancelling_stops_the_search(self):
         from play import Cancelled, evaluate
