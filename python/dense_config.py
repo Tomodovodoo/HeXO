@@ -220,6 +220,7 @@ class EvaluationSettings:
     max_plies: int = 256
     tactics: bool = True
     search_graph: bool = False    # share transposed turn contexts and proven positions (neural_search graph)
+    search_choice: str = 'gumbel'  # final move: Gumbel score or highest improved search policy ('policy')
     anchor_every: int = 5         # the champion owes anchor_games more vs Seal per N checkpoints rated during its reign
     anchor_games: int = 100       # champion vs Seal, played before optional work; 0 = never
     anchor_session_games: int = 20  # most Seal anchor games before a pending trial gets its turn
@@ -286,6 +287,8 @@ class EvaluationSettings:
     solver_gate_cap_nodes: int = 0  # 0 keeps fixed budgets flat; otherwise gate scales toward this cap at weight 3
 
     def __post_init__(self):
+        if self.search_choice not in ('gumbel', 'policy'):
+            raise ValueError('search_choice must be gumbel or policy')
         name = self.external_name
         if self.external_engine and (not name or name == 'seal' or name.rpartition('-')[2].isdigit() or
                                      not name[0].isalpha() or

@@ -22,13 +22,24 @@ The dashboard also shows provisional external opponents in the scoreboard and as
 
 ## Variants
 
-A variant is a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`, `search_graph`, `solver_*`), rated in the league as `<checkpoint>@<name>`:
+A variant is a rated checkpoint's weights with overridden per-side settings (`sims`, `root_samples`, `tactics`, `search_graph`, `search_choice`, `solver_*`), rated in the league as `<checkpoint>@<name>`:
 
 ```sh
 python python/dense_eval.py variant --run R --checkpoint champion --name solver --set solver_root_nodes=135 --set solver_finalists=2 --set solver_finalist_nodes=135 --set solver_threat_nodes=135
 ```
 
 The evaluator decides it against its own checkpoint with the promotion rule. Variants never become champion and never reach the actors; they are how a search setting earns its place before it is switched on for the run.
+
+To test selecting the highest improved search policy instead of the final Gumbel score:
+
+```sh
+python python/dense_eval.py variant --run R --checkpoint champion --name policy --set search_choice=policy
+```
+
+`search_choice` defaults to `gumbel`. `policy` changes only the final move at an unproven root; internal search,
+simulation budgets and policy targets stay the same. It can choose an eligible move removed in an earlier
+halving round. Proven roots retain shortest wins and longest resistance. `--eval-search-choice policy` sets it
+for both model sides of ordinary matches. Historical reports without this field used `gumbel`.
 
 ## Opening book
 
