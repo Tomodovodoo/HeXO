@@ -483,10 +483,13 @@ class Evaluations:
         return hashlib.blake2b(position_text(history).encode(), digest_size=16).digest()
 
     def index(self, record, line):
-        """Index one record; ValueError when it lacks a text position and engine or integer budgets."""
+        """Index one record; ValueError when it lacks a text position and engine, integer budgets, a numeric value
+        or the lists of moves and top stones."""
         if not (isinstance(record, dict) and isinstance(record.get('position'), str)
                 and isinstance(record.get('engine'), str)
-                and all(type(record.get(k)) is int for k in ('simulations', 'solver_nodes'))):
+                and all(type(record.get(k)) is int for k in ('simulations', 'solver_nodes'))
+                and type(record.get('value')) in (int, float)
+                and all(isinstance(record.get(k), list) for k in ('moves', 'top'))):
             raise ValueError('Not an evaluation record')
         position = hashlib.blake2b(record['position'].encode(), digest_size=16).digest()
         budget = (record['simulations'], record['solver_nodes'])
@@ -546,9 +549,9 @@ def review(history, lookup, winner=-1):
 
     `lookup(prefix)` returns the evaluation of a position (fields of `evaluate`) or None. A turn is judged on the
     mover's win probability before and after it; the first label that applies wins: win (made six), lost (the
-    opponent already had a proven win), kept or missed (the mover had one and kept or lost it), allowed (handed the
-    opponent one), found (proved one), best (the engine's own turn), then the loss bands good (< 0.05),
-    inaccuracy (< 0.10), mistake (< 0.20) and blunder. Turns lacking an evaluation get label None. For
+    opponent already had a proven win), kept or missed (the mover had one and kept it, or played the proven turn,
+    or lost it), allowed (handed the opponent one), found (proved one), best (the engine's own turn), then the
+    loss bands good (< 0.05), inaccuracy (< 0.10), mistake (< 0.20) and blunder. Turns lacking an evaluation get label None. For
     inaccuracy and worse, missed and allowed, `better` is the engine's turn and `line` its continuation."""
     turns = []
     starts = turn_starts(len(history))
@@ -569,15 +572,16 @@ def review(history, lookup, winner=-1):
         had = (before.get('proof') or {}).get('winner')
         has = (after.get('proof') or {}).get('winner')
         loss = turn['before'] - turn['after']
+        played_best = bool(before['moves']) and sorted(map(tuple, before['moves'])) == sorted(map(tuple, stones))
         if had == 1 - me:
             label = 'lost'
         elif had == me:
-            label = 'kept' if has == me else 'missed'
+            label = 'kept' if has == me or played_best else 'missed'
         elif has == 1 - me:
             label = 'allowed'
         elif has == me:
             label = 'found'
-        elif before['moves'] and sorted(map(tuple, before['moves'])) == sorted(map(tuple, stones)):
+        elif played_best:
             label = 'best'
         else:
             label = 'good' if loss < .05 else 'inaccuracy' if loss < .1 else 'mistake' if loss < .2 else 'blunder'

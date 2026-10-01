@@ -84,10 +84,10 @@ class Store(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'evaluations.jsonl'
             store = Evaluations(path)
-            store.add([(0, 0)], 'run/a', dict(simulations=32, solver_nodes=2048), dict(value=.4, moves=[]))
-            store.add([(0, 0)], 'run/a', dict(simulations=512, solver_nodes=2048), dict(value=.6, moves=[]))
-            store.add([(0, 0)], 'run/b', dict(simulations=32, solver_nodes=2048), dict(value=.9, moves=[]))
-            store.add([(0, 0)], 'run/a', dict(simulations=32, solver_nodes=2048), dict(value=.3, moves=[]))
+            store.add([(0, 0)], 'run/a', dict(simulations=32, solver_nodes=2048), dict(value=.4, moves=[], top=[]))
+            store.add([(0, 0)], 'run/a', dict(simulations=512, solver_nodes=2048), dict(value=.6, moves=[], top=[]))
+            store.add([(0, 0)], 'run/b', dict(simulations=32, solver_nodes=2048), dict(value=.9, moves=[], top=[]))
+            store.add([(0, 0)], 'run/a', dict(simulations=32, solver_nodes=2048), dict(value=.3, moves=[], top=[]))
             self.assertEqual(len(path.read_text().splitlines()), 4)
             self.assertEqual(store.best([(0, 0)], 'run/a')['value'], .6)
             self.assertEqual(store.get([(0, 0)], 'run/a', dict(simulations=32, solver_nodes=2048))['value'], .3)
@@ -102,29 +102,29 @@ class Store(unittest.TestCase):
     def test_a_torn_last_line_does_not_swallow_the_next_record(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'evaluations.jsonl'
-            Evaluations(path).add([], 'e', STANDARD, dict(value=.1, moves=[]))
+            Evaluations(path).add([], 'e', STANDARD, dict(value=.1, moves=[], top=[]))
             with open(path, 'a', encoding='utf-8') as out:
                 out.write('[1]\n{"position": 5, "engine": "e", "simulations": 1, "solver_nodes": 1}\n')
                 out.write('{"position": "0,0", "eng')
-            Evaluations(path).add([(0, 0)], 'e', STANDARD, dict(value=.2, moves=[]))
+            Evaluations(path).add([(0, 0)], 'e', STANDARD, dict(value=.2, moves=[], top=[]))
             reloaded = Evaluations(path)
             self.assertEqual((reloaded.best([], 'e')['value'], reloaded.best([(0, 0)], 'e')['value']), (.1, .2))
 
     def test_reuse_needs_every_budget_dimension(self):
         store = Evaluations()
-        store.add([], 'e', dict(simulations=512, solver_nodes=0), dict(value=.1, moves=[]))
+        store.add([], 'e', dict(simulations=512, solver_nodes=0), dict(value=.1, moves=[], top=[]))
         self.assertIsNone(store.covering([], 'e', STANDARD))
-        store.add([], 'e', dict(simulations=128, solver_nodes=131072), dict(value=.2, moves=[]))
+        store.add([], 'e', dict(simulations=128, solver_nodes=131072), dict(value=.2, moves=[], top=[]))
         self.assertEqual(store.covering([], 'e', STANDARD)['value'], .2)
         self.assertEqual(store.covering([], 'e', dict(simulations=64, solver_nodes=0))['value'], .1)
         self.assertEqual(store.best([], 'e')['value'], .1)
-        store.add([], 'e', dict(simulations=32, solver_nodes=131072), dict(value=1., moves=[], proof=dict(winner=0, turns=2)))
+        store.add([], 'e', dict(simulations=32, solver_nodes=131072), dict(value=1., moves=[], top=[], proof=dict(winner=0, turns=2)))
         self.assertEqual(store.best([], 'e')['value'], 1.)
 
     def test_index_keeps_the_newest_entries(self):
         store = Evaluations(limit=2)
         for n in range(3):
-            store.add([(0, 0)] if n == 0 else [(0, 0), (n, 0)], 'e', STANDARD, dict(value=n / 10, moves=[]))
+            store.add([(0, 0)] if n == 0 else [(0, 0), (n, 0)], 'e', STANDARD, dict(value=n / 10, moves=[], top=[]))
         self.assertIsNone(store.best([(0, 0)], 'e'))
         self.assertEqual(store.best([(0, 0), (2, 0)], 'e')['value'], .2)
 
@@ -160,6 +160,9 @@ class Review(unittest.TestCase):
     def test_proof_labels(self):
         win = lambda side: dict(winner=side, turns=2)
         base = {(): evaluation(.5, [(0, 0)])}
+        kept = self.labels(base | {(0,): evaluation(.5, [(1, 0), (1, 1)], win(1), [(1, 0, 1)]),
+                                   (0, 1, 2): evaluation(.5, [], None)})
+        self.assertEqual(kept[1]['label'], 'kept')
         cases = [(win(0), None, 'lost'), (win(1), win(0), 'missed'), (win(1), win(1), 'kept'),
                  (None, win(0), 'allowed'), (None, win(1), 'found')]
         for before, after, label in cases:
