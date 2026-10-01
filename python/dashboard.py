@@ -793,24 +793,39 @@ def external_ratings(run, league):
     ratings = {}
     for path in sorted((run/'matches').glob('*/*-elo-estimate.json')):
         saved = read_json(path, {})
-        if saved.get('schema') != 'hexo-external-elo-estimate-v1': continue
+        if saved.get('schema') not in ('hexo-external-elo-estimate-v1', 'hexo-external-elo-estimate-v2'): continue
         match, estimate, opponent = saved['match'], saved['estimate'], saved['opponent']
         reference = checkpoints.get(match['local_checkpoint'], {})
         interval = reference.get('elo_interval')
         if saved['scale']['zero_checkpoint'] != zero or reference.get('ema_sha256') != match['checkpoint_sha256'] \
                 or not finite(reference.get('elo')) or not interval or not all(finite(v) for v in interval): continue
-        report = path.parent/match['report']
-        if not report.is_file(): continue
+        report = (path.parent/match['report']).resolve()
+        if not report.is_relative_to(run.resolve()) or not report.is_file(): continue
         stat = report.stat()
         if report_digest(report, stat.st_mtime_ns, stat.st_size) != match['report_sha256']: continue
+        sources = saved.get('sources', [])
+        intact = True
+        for source in sources:
+            evidence = (path.parent/source['report']).resolve()
+            if not evidence.is_relative_to(run.resolve()) or not evidence.is_file():
+                intact = False
+                break
+            stat = evidence.stat()
+            if report_digest(evidence, stat.st_mtime_ns, stat.st_size) != source['report_sha256']:
+                intact = False
+                break
+        delta = estimate.get('reference_minus_opponent_elo', estimate.get('85k_minus_pulsatrix_elo'))
+        sd = estimate.get('pair_adjusted_delta_sd')
+        if not intact or not finite(delta) or not finite(sd) or sd < 0: continue
         key = f"{opponent['model_id']}:{opponent['difficulty']}"
         if key in ratings and ratings[key]['calculated_at'] >= saved['calculated_at']: continue
-        elo = reference['elo']-estimate['85k_minus_pulsatrix_elo']
-        width = 1.96*math.hypot((interval[1]-interval[0])/3.92, estimate['pair_adjusted_delta_sd'])
+        elo = reference['elo']-delta
+        width = 1.96*math.hypot((interval[1]-interval[0])/3.92, sd)
         ratings[key] = dict(label=opponent.get('label', f"{opponent['model_id']} {opponent['difficulty']}"),
                             elo=elo, elo_interval=[elo-width, elo+width], provisional=True, games=match['games'],
                             reference=match['local_checkpoint'], note=saved.get('display_note', estimate['assumption']),
-                            source=str(path.relative_to(run)), calculated_at=saved['calculated_at'])
+                            source=str(path.relative_to(run)), calculated_at=saved['calculated_at'],
+                            calibration_games=saved.get('calibration', {}).get('games', 0))
     return ratings
 
 
