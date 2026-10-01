@@ -154,7 +154,8 @@ def presets_of(kind, spec):
             if key == 'args' and kind == 'six' and isinstance(value, list) and all(isinstance(v, str) for v in value):
                 continue
             limits = LIMITS | KIND_LIMITS.get(kind, {})
-            if key not in limits or type(value) is not int or not limits[key][0] <= value <= limits[key][1]:
+            if (key not in PRESETS[kind]['standard'] or type(value) is not int
+                    or not limits[key][0] <= value <= limits[key][1]):
                 raise ValueError(f'bad {key} in preset {name}')
         presets[name] = presets[name] | budget
     return presets

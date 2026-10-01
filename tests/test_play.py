@@ -571,13 +571,16 @@ class Jobs(unittest.TestCase):
         shrimp = presets_of('six', dict(quick=dict(nodes=1, args=['--visits', '32'])))
         self.assertEqual(budget_of(shrimp, 'custom', dict(nodes=9, args=['--visits', '1'])), dict(nodes=9))
         self.assertEqual(budget_of(shrimp, 'quick'), dict(nodes=1, args=['--visits', '32']))
-        for spec in (dict(heavy=dict(nodes=1)), dict(quick=dict(nodes=0)), dict(quick=dict(args='--x')), [1]):
+        for spec in (dict(heavy=dict(nodes=1)), dict(quick=dict(nodes=0)), dict(quick=dict(args='--x')), [1],
+                     dict(quick=dict(ms=1000))):
             with self.assertRaises(ValueError):
                 presets_of('six', spec)
         with self.assertRaises(ValueError):
             budget_of(presets_of('strix', None), 'custom', dict(simulations=0), 'strix')
         with self.assertRaises(ValueError):
             presets_of('strix', dict(quick=dict(simulations=0)))
+        with self.assertRaises(ValueError):
+            presets_of('strix', dict(quick=dict(nodes=100)))
 
 
 class Http(unittest.TestCase):

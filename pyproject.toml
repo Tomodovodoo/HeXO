@@ -37,6 +37,7 @@ py-modules = [
   "neural_search",
   "notation",
   "play",
+  "process_tree",
   "proof",
   "tactical_proof",
   "time_control",
