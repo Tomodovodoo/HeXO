@@ -1226,6 +1226,22 @@ class Session:
                 match = json.loads((directory / 'summary.json').read_text(encoding='utf-8'))
             except FileNotFoundError:
                 continue
+            # A replay is committed before the summary. Recover only that trailing suffix,
+            # so ordinary catalogue reads do not reopen every saved game.
+            for number in range(len(match['results'])+1, match['games']+1):
+                path = directory / f'game-{number:04d}.json'
+                if not path.exists():
+                    break
+                game = json.loads(path.read_text(encoding='utf-8'))
+                winner = game['winner']
+                player = (winner if number % 2 else 1-winner) if winner is not None else None
+                if player is None:
+                    match['capped'] += 1
+                else:
+                    match['wins'][player] += 1
+                match['results'].append(dict(game=number, winner=player, reason=game['reason'],
+                    placements=len(game['history']), opening=((number-1)//2) % len(match['openings'])))
+            match['completed'] = len(match['results'])
             rows.append(dict(id=ident, name=directory.name, **{key: match[key] for key in
                 ('games', 'completed', 'wins', 'capped', 'results')}, players=[p['name'] for p in match['players']]))
         return sorted(rows, key=lambda row: row['name'], reverse=True)

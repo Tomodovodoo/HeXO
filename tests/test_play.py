@@ -731,6 +731,11 @@ class Matches(unittest.TestCase):
         self.assertEqual(first['players'], second['players'][::-1])
         self.assertEqual(import_history((self.output / 'game-0002.htttx').read_text()), second['history'])
         self.assertTrue(self.session.paused)
+        stale = summary | dict(completed=1, wins=[0, 1], results=summary['results'][:1])
+        (self.output / 'summary.json').write_text(json.dumps(stale))
+        recovered = self.session.match_catalogue()[0]
+        self.assertEqual((recovered['completed'], recovered['wins']), (2, [1, 1]))
+        self.assertEqual([r['game'] for r in recovered['results']], [1, 2])
 
     def test_pause_holds_the_next_game_and_settings_cannot_change_mid_match(self):
         self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
