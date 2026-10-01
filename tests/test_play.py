@@ -15,9 +15,9 @@ from urllib.request import Request, urlopen
 
 import formats
 from hexo import Game
-from play import (command_of, Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings, budget_of,
-                  export, export_path, file_digest, file_identity, import_history, linked_history, model_key, presets_of,
-                  proof_turns, read_game, review, scan, six_backend)
+from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings,
+                  budget_of, command_of, export, export_path, file_digest, file_identity, import_history, linked_history,
+                  model_key, move_row, pair_elo, presets_of, proof_turns, read_game, review, scan, six_backend)
 from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
@@ -65,7 +65,7 @@ class FakeEngines:
     def __init__(self):
         self.calls, self.turns, self.hold, self.release = [], [], False, threading.Event()
 
-    def evaluate(self, entry, checkpoint, budget, history, watch):
+    def evaluate(self, entry, checkpoint, budget, history, watch, live=None):
         self.calls.append((checkpoint, dict(budget), [tuple(p) for p in history]))
         while self.hold and not self.release.is_set():
             watch(1)
@@ -166,6 +166,10 @@ class Store(unittest.TestCase):
             path.write_text(json.dumps(dict(position='', engine='e', simulations=1, solver_nodes=0, value=.3, moves=[],
                                             top=[[0, 0, 1., 'x']])), encoding='utf-8')
             self.assertIsNone(Evaluations(path).best([], 'e'))
+
+    def test_rows_mark_stones_the_search_proved(self):
+        self.assertEqual([move_row([1, 2], .5, v)[3:] for v in (1., -1., .2)], [[1., 1], [0., -1], [.6, 0]])
+        self.assertEqual(move_row([1, 2], .5), [1, 2, .5])
 
     def test_index_keeps_the_newest_entries(self):
         store = Evaluations(limit=2)
@@ -463,7 +467,7 @@ class Jobs(unittest.TestCase):
         self.session.analyse(0, force=True)
         wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']))
         self.session.close()
-        self.assertFalse(self.session.worker.is_alive())
+        self.assertFalse(any(worker.is_alive() for worker in self.session.workers))
         self.assertEqual(closed, [True])
 
     def test_a_stone_placed_on_a_paused_game_gets_its_answer(self):
@@ -509,6 +513,36 @@ class Jobs(unittest.TestCase):
         self.assertEqual([c[2] for c in started], ['gen-2.onnx', 'gen-1.onnx', 'gen-0.onnx'])
         self.assertEqual([c[2] for c in closed], ['gen-1.onnx'])
 
+    def test_analysis_deepens_through_every_preset_while_an_engine_plays(self):
+        self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
+        budgets = [PRESETS['bubble'][name] for name in PRESETS['bubble']]
+        wait(lambda: all(self.session.store.covering([], key, budget) for budget in budgets
+                         for key in [self.session.engine_key(self.session.analysis)]))
+        deep = [budget for checkpoint, budget, history in self.engines.calls if not history]
+        self.assertEqual((deep, deep[-1]), (sorted(deep, key=lambda b: b['simulations']), PRESETS['bubble']['dangerous']))
+        self.session.load([(0, 0)], True)
+        time.sleep(.2)
+        self.assertFalse([j for j in self.session.state()['jobs'] if j['ply'] == 1 and j['kind'] == 'analyse'
+                          and j['status'] == 'queued'])
+
+    def test_finished_positions_are_not_analysed(self):
+        final = [(0, 0), (0, 5), (1, 5), (5, 0), (-5, 0), (2, 5), (3, 5), (0, -5), (0, -6), (4, 5), (5, 5)]
+        self.session.load(final, True)
+        self.assertIsNone(self.session.analyse(len(final)))
+        self.session.configure_analysis('bubble:fake', preset='deep', auto=True)
+        time.sleep(.2)
+        self.assertFalse([j for j in self.session.state()['jobs'] if j['ply'] == len(final)])
+
+    def test_review_uses_the_review_budget_whatever_the_slider_says(self):
+        self.session.configure_seat(1, 'human')
+        self.session.load([(0, 0), (1, 0), (2, 0)], True)
+        self.session.configure_analysis('bubble:fake', preset='deep', auto=False)
+        self.session.review_game()
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual({tuple(b.items()) for _, b, _ in self.engines.calls}, {tuple(STANDARD.items())})
+        state = self.session.state()
+        self.assertEqual((state['review_preset'], [t['label'] is not None for t in state['review']]), ('standard', [True, True]))
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
@@ -520,7 +554,7 @@ class Jobs(unittest.TestCase):
         self.assertEqual(self.history(), [])
 
     def test_failures_reach_the_page_and_rescans_drop_vanished_engines(self):
-        def broken(*args):
+        def broken(*args, **options):
             raise RuntimeError('weights unreadable')
         self.engines.evaluate = broken
         self.session.analyse(0)
@@ -1037,6 +1071,30 @@ class Matches(unittest.TestCase):
             self.assertEqual(seat['source']['files'][str(path.resolve())],
                              file_digest(file_identity(path)))
 
+    def test_book_openings_start_engine_games(self):
+        path = Path(self.directory.name) / 'book.json'
+        nodes = [dict(key=str(i), status='opening', moves=[[0, 0], [i, 0], [i, 1]], off_policy=i == 2) for i in (1, 2)]
+        path.write_text(json.dumps(dict(schema='hexo-opening-book-v2', nodes=nodes)))
+        self.session.book = None
+        with self.assertRaises(ValueError):
+            self.session.use_book(True)
+        self.session.book = path
+        self.session.pause(True)
+        self.session.configure_seat(0, 'native:Native')
+        self.session.configure_seat(1, 'native:Other')
+        self.session.use_book(True)
+        self.assertEqual(sorted(abs(q) + abs(r) + abs(q + r) for q, r in self.session.history[:3]), [0, 2, 4])
+        self.session.configure_seat(1, 'human')
+        self.session.new_game()
+        self.assertEqual((self.session.history, self.session.state()['book']), ([], dict(available=True, enabled=True)))
+
+    def test_saved_tournaments_report_an_elo_from_complete_pairs(self):
+        self.assertIsNone(pair_elo([dict(game=1, winner=0)]))
+        elo = pair_elo([dict(game=1, winner=0), dict(game=2, winner=0), dict(game=3, winner=None), dict(game=4, winner=1)])
+        self.assertEqual(elo['pairs'], 2)
+        self.assertGreater(elo['a_minus_b'], 0)
+        self.assertLess(elo['interval'][0], elo['a_minus_b'])
+
     def test_six_networks_are_checkpoints_of_one_entry(self):
         folder = Path(self.directory.name)
         for name in ('sixengine.exe', 'gen-0001.onnx', 'gen-0002.onnx'):
@@ -1205,9 +1263,12 @@ class TurnTrees(unittest.TestCase):
         model = hexnet.load_model(self.path)
         bubble = SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=16), sha256='tiny',
                                  cache=neural_search.EvaluationCache())
-        found = evaluate(bubble, None, [(0, 0)], 32, 0)
+        seen = []
+        found = evaluate(bubble, None, [(0, 0)], 32, 0, live=seen.append)
         moves = found['moves']
-        self.assertTrue(found['top'] and all(len(t) == 4 and 0 <= t[3] <= 1 for t in found['top']))
+        self.assertTrue(seen and all(len(g['top']) <= 5 and 0 <= g['value'] <= 1 and g['top'][0][2] >= g['top'][-1][2]
+                                     for g in seen))
+        self.assertTrue(found['top'] and all(len(t) == 5 and 0 <= t[3] <= 1 and t[4] in (-1, 0, 1) for t in found['top']))
         self.assertTrue(all(len(t) == 3 for t in evaluate(bubble, None, [(0, 0)], 0, 0)['top']))
         self.assertEqual(len(self.trees), 1)
         tree = self.trees[0]
