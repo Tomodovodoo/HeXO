@@ -133,7 +133,7 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                 spec = json.loads(path.read_text(encoding='utf-8'))
                 if spec.get('kind') == 'bubble':
                     bubble(path.parent / spec['path'], spec.get('name'))
-            except (OSError, ValueError, KeyError, TypeError):
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 continue
     add('native', 'Native')
     if seal is not None and Path(seal).exists():

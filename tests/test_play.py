@@ -527,6 +527,7 @@ class Registry(unittest.TestCase):
             (root / 'elsewhere').mkdir()
             (root / 'elsewhere/net.pt').write_bytes(b'')
             (root / 'models/gamma.json').write_text(json.dumps(dict(name='gamma', kind='bubble', path='../elsewhere/net.pt')))
+            (root / 'models/list.json').write_text('[1, 2]')
             found = scan(root / 'models', root / 'runs', [root / 'runs/alpha'], root / 'missing.dll')
             self.assertEqual(list(found), ['bubble:alpha', 'bubble:broken', 'bubble:beta', 'bubble:gamma', 'native:Native'])
             self.assertEqual(found['bubble:alpha']['checkpoints'], ['play/000150', 'main/000200', 'main/000100'])
