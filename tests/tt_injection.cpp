@@ -2,6 +2,7 @@
 #include "../src/hexo.cpp"
 #include <cassert>
 #include <iostream>
+#include <random>
 int main() {
     Board b;b.make({0,0});Search search(10000,2);
     auto before=b.hash();auto features=b.features;
@@ -41,5 +42,51 @@ int main() {
     assert(b.hash()==before && b.features==features);
     b.make({1,0});auto partial=search.turns(b,false,distant);
     for(auto t:partial) assert(t.count==1);
-    std::cout<<"TT admission, legality, deduplication, mandatory cover, phase, frozen hints and score isolation passed\n";
+    // Incremental second-stone ranking must equal a fresh full-board ranking,
+    // including cells whose only promising line was just blocked.
+    std::mt19937 rng(20261001);
+    for(int trial=0;trial<12;++trial) {
+        Board position;
+        for(int step=0;step<25 && position.winner<0;++step) {
+            auto legal=position.legal_moves();
+            position.make(legal[rng()%legal.size()]);
+            if(position.winner>=0 || position.remaining!=2) continue;
+            if(trial&1) {
+                for(int i=1;i<729;++i) position.adjustment[i]=(i*19)%101-50;
+                position.learned_score=0;
+                for(int i=1;i<729;++i) position.learned_score+=int64_t(position.features[i])*position.adjustment[i];
+            }
+            auto base=Search::candidate_scores(position);
+            auto by_cell=[](const auto& a,const auto& z){return a.second<z.second;};
+            std::sort(base.begin(),base.end(),by_cell);
+            CandidateGuard cache(position);
+            auto check_cache=[&]() {
+                auto cached=Search::candidate_scores(position);
+                position.candidates=nullptr;
+                auto fresh=Search::candidate_scores(position);
+                position.candidates=&cache.cache;
+                std::sort(cached.begin(),cached.end(),by_cell);
+                std::sort(fresh.begin(),fresh.end(),by_cell);
+                assert(cached==fresh);
+            };
+            check_cache();
+            for(auto first:Search::candidates(position,4)) {
+                Restore restore(position);position.make(first);
+                if(position.winner>=0) continue;
+                check_cache();
+                auto fresh=Search::candidate_scores(position);
+                auto incremental=Search::following_scores(position,base,first);
+                std::sort(fresh.begin(),fresh.end(),by_cell);
+                std::sort(incremental.begin(),incremental.end(),by_cell);
+                assert(fresh==incremental);
+                for(auto second:Search::candidates(position,4)) {
+                    auto scalar=position.placed_score(second,position.player);
+                    int side=position.player;Restore undo(position);position.make(second);
+                    assert(scalar==position.score(side));
+                    if(position.winner<0) check_cache();
+                }
+            }
+        }
+    }
+    std::cout<<"Native search checks passed; TT "<<sizeof(Entry)*(1<<16)<<" bytes\n";
 }
