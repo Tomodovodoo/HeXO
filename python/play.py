@@ -483,6 +483,11 @@ class Evaluations:
         return hashlib.blake2b(position_text(history).encode(), digest_size=16).digest()
 
     def index(self, record, line):
+        """Index one record; ValueError when it lacks a text position and engine or integer budgets."""
+        if not (isinstance(record, dict) and isinstance(record.get('position'), str)
+                and isinstance(record.get('engine'), str)
+                and all(type(record.get(k)) is int for k in ('simulations', 'solver_nodes'))):
+            raise ValueError('Not an evaluation record')
         position = hashlib.blake2b(record['position'].encode(), digest_size=16).digest()
         budget = (record['simulations'], record['solver_nodes'])
         full = (position, record['engine'], budget)
@@ -611,6 +616,8 @@ def budget_of(kind, preset, custom=None):
         if preset not in PRESETS[kind]:
             raise ValueError('Unknown preset')
         return dict(PRESETS[kind][preset])
+    if custom is not None and not isinstance(custom, dict):
+        raise ValueError('A custom budget is an object of numbers')
     budget = dict(PRESETS[kind]['standard']) | (custom or {})
     for key, value in budget.items():
         low, high = LIMITS[key]
@@ -1104,7 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 return self.respond(404, dict(error='Not found'))
             self.respond(200, session.state() | reply)
-        except (ValueError, KeyError, TypeError) as error:
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
             self.respond(400, dict(error=str(error)))
 
 

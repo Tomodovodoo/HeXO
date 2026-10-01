@@ -104,6 +104,7 @@ class Store(unittest.TestCase):
             path = Path(directory) / 'evaluations.jsonl'
             Evaluations(path).add([], 'e', STANDARD, dict(value=.1, moves=[]))
             with open(path, 'a', encoding='utf-8') as out:
+                out.write('[1]\n{"position": 5, "engine": "e", "simulations": 1, "solver_nodes": 1}\n')
                 out.write('{"position": "0,0", "eng')
             Evaluations(path).add([(0, 0)], 'e', STANDARD, dict(value=.2, moves=[]))
             reloaded = Evaluations(path)
@@ -475,7 +476,8 @@ class Http(unittest.TestCase):
             self.get('/htttx')
         self.assertEqual(caught.exception.code, 409)
         caught.exception.close()
-        for path, body in (('/play', dict(q=40, r=0)), ('/import', dict(text='1. [9,9]')), ('/retry', dict(ply=9))):
+        for path, body in (('/play', dict(q=40, r=0)), ('/import', dict(text='1. [9,9]')), ('/retry', dict(ply=9)),
+                           ('/seat', [1]), ('/seat', dict(side=1, engine='native:Native', preset='custom', custom=[]))):
             with self.assertRaises(HTTPError) as caught:
                 self.post(path, body)
             self.assertEqual(caught.exception.code, 400)
