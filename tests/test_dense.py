@@ -7011,6 +7011,13 @@ class DenseBrowser(unittest.TestCase):
         found, spent, weights = engines.evaluate(entry, '', dict(simulations=0, solver_nodes=2048), [(0, 0)], lambda n: None)
         self.assertEqual((spent, weights), (dict(simulations=0, solver_nodes=0), engines.bubble(path).sha256[:16]))
 
+    def test_solver_failures_do_not_count_as_checked(self):
+        from play import evaluate
+        for result, solved in ((dict(status='UNKNOWN', reason='tactical worker starting'), False),
+                               (dict(status='UNKNOWN', reason='no verified strategy'), True)):
+            prover = unittest.mock.Mock(history=unittest.mock.Mock(return_value=result))
+            self.assertEqual(evaluate(self.bubble, prover, [(0, 0)], 0, 2048)['solved'], solved)
+
     def test_cancelling_stops_the_search(self):
         from play import Cancelled, evaluate
         def watch(n):

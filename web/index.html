@@ -498,7 +498,7 @@ $('copy').onclick=async()=>{const res=await fetch('/htttx');const text=await res
   await navigator.clipboard.writeText(text);$('copy').textContent='Copied';setTimeout(()=>$('copy').textContent='Copy HTTTX',1400)};
 $('save-game').onclick=()=>location.assign('/replay');$('save-evals').onclick=()=>location.assign('/evaluations');
 $('import').onclick=()=>{$('import-text').value='';$('import-dialog').showModal()};
-$('import-dialog').onclose=async()=>{if($('import-dialog').returnValue==='ok'&&await post('/import',{text:$('import-text').value})){view=0;fit();go(1e9)}};
+$('import-dialog').onclose=async()=>{if($('import-dialog').returnValue==='ok'&&await post('/import',{text:$('import-text').value})){view=S.history.length;fit();go(view)}};
 $('import-dialog').ondragover=e=>e.preventDefault();
 $('import-dialog').ondrop=async e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)$('import-text').value=await f.text()};
 poll();

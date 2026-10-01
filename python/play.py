@@ -162,6 +162,10 @@ class Cancelled(Exception):
     """The job was cancelled while the engine was working."""
 
 
+class Yielded(Exception):
+    """A review stepped aside for more urgent jobs; it goes back in the queue."""
+
+
 class Watched:
     """A network evaluator that reports each batch to `watch`, which may raise Cancelled."""
 
@@ -187,6 +191,11 @@ class Bubble:
 
 def verified(result):
     return result.get('status') == 'PROVEN_WIN' and result.get('native_verified')
+
+
+def searched(result):
+    """True when a solver query spent its budget: it proved a win or found none; False when it failed to run."""
+    return verified(result) or result.get('reason') == 'no verified strategy'
 
 
 def winning_line(history, result):
@@ -237,7 +246,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
     stones as [q, r, probability]), `proof` (None or {winner, turns}: the solver proved a win for the side to move,
     or the search proved the position exact), `line` (a winning line as [q, r, player] when the solver proved it)
-    and `threat` (the stones of a forced win the opponent would have if it moved now).
+    and `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a
+    solver query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
     `simulations` 0 plays the raw policy; `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
     before each network batch of n positions and may raise Cancelled."""
     import numpy as np
@@ -246,23 +256,25 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     history = [tuple(map(int, p)) for p in history]
     local = replay(history)
     start, player = time.perf_counter(), local.player
-    moves, top, value, proof, line, threat = [], [], None, None, [], []
+    moves, top, value, proof, line, threat, solved = [], [], None, None, [], [], True
     network = Watched(bubble.evaluator, watch)
     try:
         if local.winner >= 0:
             raise ValueError('The game has finished')
         if prover is not None and solver_nodes:
             mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=10000), watch)
+            solved = searched(mine)
             if verified(mine):
                 moves, line = [list(m) for m in mine['moves']], winning_line(history, mine)
                 proof = dict(winner=player, turns=mine['proof_turns'])
             else:
                 theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=10000),
                                        watch)
+                solved = solved and searched(theirs)
                 if verified(theirs):
                     threat = [list(m) for m in theirs['moves']]
-        solved = bool(moves)
-        while not solved and local.player == player and local.winner < 0:
+        given = bool(moves)
+        while not given and local.player == player and local.winner < 0:
             current = [tuple(cell[:2]) for cell in local.cells]
             if simulations:
                 tree = NeuralSearch(network, bubble.sha256, current, seed=1740, cache=bubble.cache, tactics=True)
@@ -289,7 +301,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         if proof:
             value = 1. if proof['winner'] == player else 0.
         return dict(moves=moves, value=round(value, 4), top=top, proof=proof, line=line, threat=threat,
-                    ms=round((time.perf_counter() - start) * 1000))
+                    solved=solved, ms=round((time.perf_counter() - start) * 1000))
     finally:
         local.close()
 
@@ -334,6 +346,8 @@ class Engines:
             if solver is not None:
                 solver.abort()
             raise
+        if not found.pop('solved'):
+            spent = spent | dict(solver_nodes=0)
         return found, spent, bubble.sha256[:16]
 
     def effective(self, budget):
@@ -656,7 +670,7 @@ class Session:
                     job.cancelled, job.status = True, 'cancelled'
                 elif job.status in ('queued', 'running'):
                     return job
-                if job.status == 'failed' and not force:
+                if job.status in ('failed', 'done') and not force:
                     return None
         if not force and self.store.covering(history, self.engine_key(settings), self.engines.effective(settings['budget'])):
             return None
@@ -798,6 +812,10 @@ class Session:
                 with self.lock:
                     job.status = 'cancelled'
                     self.changed()
+            except Yielded:
+                with self.lock:
+                    job.status = 'queued'
+                    heapq.heappush(self.queue, (job.priority, next(self.order), job))
             except Exception as error:
                 with self.lock:
                     job.status, job.error, job.ended = 'failed', str(error), time.time()
@@ -842,11 +860,14 @@ class Session:
         if job.kind == 'analyse':
             job.total = max(1, seat['budget']['simulations']) * 2
             return self.evaluation(job, seat, history, job.force)
-        for ply in review_plies(history):
+        for index, ply in enumerate(review_plies(history)):
             if job.cancelled:
                 raise Cancelled()
+            with self.lock:
+                if self.queue and self.queue[0][0] < job.priority:
+                    raise Yielded()
             self.evaluation(job, seat, history[:ply])
-            job.done += 1
+            job.done = index + 1
             with self.lock:
                 self.revision += 1
         return None

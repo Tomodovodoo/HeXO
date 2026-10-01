@@ -243,6 +243,18 @@ class Jobs(unittest.TestCase):
         self.assertIsNotNone(self.session.state()['evaluations'].get(0))
         self.assertEqual(len(self.engines.calls), 2)
 
+    def test_review_steps_aside_for_the_viewed_position(self):
+        self.session.configure_seat(1, 'human')
+        for move in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]:
+            self.session.play(*move)
+        self.engines.hold = True
+        self.session.review_game()
+        wait(lambda: len(self.engines.calls) == 1)
+        self.session.analyse(3)
+        self.engines.release.set()
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual([len(call[2]) for call in self.engines.calls], [0, 3, 1, 5])
+
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
