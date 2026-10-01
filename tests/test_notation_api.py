@@ -346,20 +346,14 @@ class TimedClocks(unittest.TestCase):
     def test_receipt_before_deadline_is_atomic_with_watchdog(self):
         from timed_match import Match, play_turn
         clock = [0]
-        received, release, armed, watchdog_started = (threading.Event() for _ in range(4))
-        reply_thread = None
-        def now():
-            captured = clock[0]
-            if threading.current_thread() is reply_thread and armed.is_set() and not received.is_set():
-                received.set()
-                release.wait(1)
-            return captured
+        thinking, release, watchdog_started = (threading.Event() for _ in range(3))
         class Engine:
             def turn(self, *_args, **_kwargs):
-                armed.set()
+                thinking.set()
+                release.wait(1)
                 return dict(moves=[[1, 0], [2, 0]])
         match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='native')),
-                           time_control='1'), now=now)
+                           time_control='1'), now=lambda: clock[0])
         self.addCleanup(match.close)
         match.start()
         clock[0] = 900_000_000
@@ -367,15 +361,20 @@ class TimedClocks(unittest.TestCase):
         reply_thread.start()
         watchdog = None
         try:
-            self.assertTrue(received.wait(1))
-            clock[0] = 1_100_000_000
-            def tick():
-                watchdog_started.set()
-                match.tick()
-            watchdog = threading.Thread(target=tick)
-            watchdog.start()
-            self.assertTrue(watchdog_started.wait(1))
-            time.sleep(.02)
+            self.assertTrue(thinking.wait(1))
+            with match.lock:
+                def tick():
+                    watchdog_started.set()
+                    match.tick()
+                watchdog = threading.Thread(target=tick)
+                watchdog.start()
+                self.assertTrue(watchdog_started.wait(1))
+                release.set()
+                until = time.monotonic()+1
+                while match.receipt[2][0] is None and time.monotonic() < until:
+                    time.sleep(.001)
+                self.assertEqual(match.receipt[2][0], 900_000_000)
+                clock[0] = 1_100_000_000
         finally:
             release.set()
             reply_thread.join(1)
@@ -689,8 +688,12 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(blocked.wait(), 1)
                 await ws.send_json(dict(type='interrupt', request_id=2))
                 await ws.send_json(dict(type='setup'))
+                await ws.send_json(dict(type='config', **{'x-bubble-clock': dict(version=1,
+                    cross_ms=2000, circle_ms=2000, increment_ms=100)}))
                 await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=3))
                 self.assertEqual((await ws.receive_json(timeout=1))['request_id'], 3)
+                self.assertEqual(self.calls[-1][1]['increment_ms'], 100)
+                self.assertGreater(self.calls[-1][1]['circle_ms'], 1900)
                 release.set()
                 self.assertEqual((await ws.receive_json(timeout=1))['request_id'], 2)
                 await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=4))

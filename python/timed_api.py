@@ -230,7 +230,7 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
                         if saved is not None:
                             history, saved = saved, None
                     elif kind == 'config':
-                        if pending and not pending.done():
+                        if pending and not pending.done() and not cancellation.is_set():
                             raise ValueError('Configuration requires an idle session')
                         if 'x-bubble-clock' in packet:
                             clock = dict(packet['x-bubble-clock'])

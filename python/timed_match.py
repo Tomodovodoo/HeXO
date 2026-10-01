@@ -31,6 +31,7 @@ class Match:
         self.turn_spent_ns = 0
         self.lock = threading.RLock()
         self.cancel = threading.Event()
+        self.receipt = None
         self.thinking = None
         self.created = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         self.specification.setdefault('utcdatetime', self.created)
@@ -95,6 +96,7 @@ class Match:
         match.created = match.specification.get('utcdatetime', datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'))
         match.directory = path
         match.lock, match.cancel = threading.RLock(), threading.Event()
+        match.receipt = None
         match.thinking = None
         return match
 
@@ -120,7 +122,11 @@ class Match:
     def tick(self):
         with self.lock:
             if self.state == 'playing' and self.expired():
-                self.finish(1-self.game.player, 'time')
+                receipt = self.receipt
+                # An on-time reply may be waiting to acquire this lock for submission.
+                if not (receipt and receipt[:2] == (self.turn_id, self.revision)
+                        and receipt[2][0] is not None and not self.expired(receipt[2][0])):
+                    self.finish(1-self.game.player, 'time')
             return self.snapshot()
 
     def expired(self, at=None):
@@ -232,9 +238,11 @@ class Match:
 def play_turn(match, engine):
     with match.lock:
         state = match.tick()
+        if state['state'] != 'playing':
+            return state
         cancellation = match.cancel
-    if state['state'] != 'playing':
-        return state
+        receipt = (state['turn_id'], state['revision'], [None])
+        match.receipt = receipt
     game = Game(state['history'])
     try:
         def publish(result):
@@ -243,8 +251,8 @@ def play_turn(match, engine):
                     match.thinking = result
         result = engine.turn(game, clock=state, cancel=cancellation, publish=publish,
                              milliseconds=state['turn_cap_remaining_ms'])
+        received = receipt[2][0] = match.clock.now()
         with match.lock:
-            received = match.clock.now()
             if cancellation.is_set() or match.state != 'playing':
                 return match.snapshot()
             try:
@@ -262,6 +270,9 @@ def play_turn(match, engine):
                     match.record('engine_error', error=str(error))
             return match.snapshot()
     finally:
+        with match.lock:
+            if match.receipt is receipt:
+                match.receipt = None
         game.close()
 
 
