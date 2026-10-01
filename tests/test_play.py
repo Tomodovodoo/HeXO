@@ -321,9 +321,10 @@ class Jobs(unittest.TestCase):
             self.session.play(*move)
         self.engines.hold = True
         old = self.session.analyse(3, force=True)
+        review = self.session.review_game()
         wait(lambda: self.session.jobs[old].status == 'running')
         self.session.load([(0, 0), (1, 1), (2, 2)], True)
-        wait(lambda: self.session.jobs[old].status == 'cancelled')
+        wait(lambda: self.session.jobs[old].status == self.session.jobs[review].status == 'cancelled')
         self.engines.hold = False
 
     def test_solver_retries_skip_positions_from_another_game(self):

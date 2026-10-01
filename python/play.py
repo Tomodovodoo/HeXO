@@ -720,7 +720,7 @@ class Session:
             self.submit(Job('move', 1, self.history, side=player, seat=dict(seat)))
         for job in self.jobs.values():
             stale = job.history != tuple(self.history[:len(job.history)])
-            if job.kind == 'analyse' and job.status in ('queued', 'running') and stale:
+            if job.kind in ('analyse', 'review') and job.status in ('queued', 'running') and stale:
                 job.cancelled = True
                 if job.status == 'queued':
                     job.status = 'cancelled'
