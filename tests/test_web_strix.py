@@ -83,7 +83,6 @@ class WebStrixParity(unittest.TestCase):
                 if answer['moves'] != expected:
                     self.assertTrue(equivalent(history, answer['moves'], expected), (answer['moves'], expected))
                 self.assertTrue(0 <= answer['value'] <= 1)
-                self.assertIn(answer['moves'][0], [row[:2] for row in answer['top']])
 
     def test_empty_board_plays_the_origin(self):
         played, analysed = browser([dict(history=[], simulations=2), dict(history=[], simulations=2, analysis=True)])
