@@ -704,6 +704,46 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('aiohttp'), 'API extra not installed')
 class ArenaNative(unittest.IsolatedAsyncioTestCase):
+    async def test_gateway_errors_retry_account_and_presence(self):
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        from arena_bot import NativeArena
+        calls = dict(account=0, presence=0)
+        connected, release = asyncio.Event(), asyncio.Event()
+
+        async def account(request):
+            if request.method == 'GET':
+                calls['account'] += 1
+                if calls['account'] == 1:
+                    return web.Response(status=502)
+            return web.json_response(dict(name='local'))
+
+        async def presence(request):
+            calls['presence'] += 1
+            if calls['presence'] == 1:
+                return web.Response(status=502)
+            response = web.StreamResponse()
+            await response.prepare(request)
+            await response.write(b'\n')
+            connected.set()
+            await release.wait()
+            return response
+
+        app = web.Application()
+        app.router.add_route('*', '/api/bot/account', account)
+        app.router.add_get('/api/bot/stream', presence)
+        async with TestServer(app) as server:
+            bot = NativeArena(str(server.make_url('/')), 'private')
+            task = asyncio.create_task(bot.run())
+            try:
+                await asyncio.wait_for(connected.wait(), 4)
+                self.assertFalse(task.done())
+                self.assertEqual(calls, dict(account=2, presence=2))
+            finally:
+                release.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     async def test_finished_game_cleanup_does_not_delay_the_next_game(self):
         from arena_bot import NativeArena
         started = {game_id: asyncio.Event() for game_id in ('old', 'next')}
