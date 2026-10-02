@@ -1790,6 +1790,14 @@ class DenseDataTests(unittest.TestCase):
             weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
                        for k, w in zip(window.regret_positions, window.regret_weights)}
             self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 8: .5, 10: .1})
+            (run/'shards'/'000001'/dense_data.SIDECAR).write_text(
+                json.dumps(dict(game=0, plies=[7, 13]))+'\n', encoding='utf-8')
+            window.refresh()
+            self.assertEqual(window.ref('000001', 13).row['proven'], 1)
+            for reader in (window, dense_data.ReplayWindow(run, capacity_rows=1000)):
+                weights = {reader.ref(*reader.index[k]).row['ply']: round(float(w), 6)
+                           for k, w in zip(reader.regret_positions, reader.regret_weights)}
+                self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 7: .1, 8: .5, 10: .1, 13: 1.})
 
     def test_certified_value_priority_excludes_validation_and_legacy_predictions(self):
         moves, _ = random_game(np.random.default_rng(4), 12)
