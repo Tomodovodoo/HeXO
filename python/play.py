@@ -51,6 +51,7 @@ PRESETS = dict(
     strix=dict(lightning=dict(simulations=2), quick=dict(simulations=8), standard=dict(simulations=64),
                strong=dict(simulations=128), deep=dict(simulations=512), dangerous=dict(simulations=4096)))
 PRESET_NAMES = list(PRESETS['bubble'])
+REVIEW_PRESET = 'standard'
 LIMITS = dict(simulations=(0, 65536), solver_nodes=(0, 4_000_000), ms=(10, 120_000), nodes=(1, 50_000_000))
 KIND_LIMITS = dict(strix=dict(simulations=(1, 16384)))
 HEXO_SITES = {'hexo.did.science': 'https://hexo.did.science/api',
@@ -80,11 +81,6 @@ def review_plies(history):
         return turn_starts(len(history)) + ([len(history)] if game.winner < 0 else [])
     finally:
         game.close()
-
-
-def without_auto(settings):
-    """Analysis settings without the Auto switch, which does not change what an evaluation is."""
-    return {k: v for k, v in (settings or {}).items() if k != 'auto'}
 
 
 def replay(history):
@@ -460,17 +456,39 @@ def interruptible(call, watch, abort):
     return result['value']
 
 
-def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None):
+def move_row(action, probability, value=None):
+    """A `top` row: [q, r, probability], then, from a search, the mover's win probability after the stone and
+    1 or -1 when the search proved that stone wins or loses (an exact child has value exactly +-1), else 0."""
+    row = [*map(int, action), round(float(probability), 4)]
+    if value is None:
+        return row
+    return row + [round((float(value) + 1) / 2, 4), 1 if value >= 1 else -1 if value <= -1 else 0]
+
+
+def glimpse(tree):
+    """The root of a search under way, or None before it has statistics: `top` (five first stones as in
+    `evaluate`), `value` (win probability of the side to move under the current policy) and `completed`."""
+    import numpy as np
+    stats = tree.result(0, 0, 0, 0)
+    policy, values, actions = stats['policy'], stats['values'], stats['actions']
+    if not len(actions) or not policy.sum() > 0:
+        return None
+    policy = policy / policy.sum()
+    top = [move_row(actions[i], policy[i], values[i]) for i in np.argsort(-policy)[:5]]
+    return dict(top=top, value=round((float(policy @ values) + 1) / 2, 4), completed=int(stats['completed']))
+
+
+def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None, live=None):
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
-    stones as [q, r, probability, win probability of the side to move after that stone; absent for the raw
-    policy]), `proof` (None or
+    stones as `move_row`s), `proof` (None or
     {winner, turns}: the solver proved a win for the side to move, or the search proved the position exact),
     `line` (a winning line as [q, r, player] when the solver proved it) and `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a
     solver query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
     `simulations` 0 plays the raw policy; `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
-    before each network batch of n positions and may raise Cancelled."""
+    before each network batch of n positions and may raise Cancelled; `live(glimpse)` receives the search of the
+    first stone as it goes, a few times a second."""
     import numpy as np
     from dense_selfplay import root_value
     from neural_search import NeuralSearch
@@ -480,7 +498,16 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     moves, top, value, proof, line, threat, solved, tree = [], [], None, None, [], [], True, None
     completed = solver_used = 0
     deadline = min(60_000, max(10_000, solver_nodes // 8))
-    network = Watched(bubble.evaluator, watch)
+    shown = [0.]
+
+    def observe(n):
+        watch(n)
+        if live and tree is not None and not moves and time.monotonic() >= shown[0]:
+            shown[0] = time.monotonic() + .3
+            if (seen := glimpse(tree)) is not None:
+                live(seen)
+
+    network = Watched(bubble.evaluator, observe)
     try:
         if local.winner >= 0:
             raise ValueError('The game has finished')
@@ -522,8 +549,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 values = None
                 action, stone_value = actions[policy.argmax()].tolist(), float(result['q'][0])
             if not moves:
-                top = [[*map(int, actions[i]), round(float(policy[i]), 4),
-                        *([] if values is None else [round((float(values[i]) + 1) / 2, 4)])]
+                top = [move_row(actions[i], policy[i], None if values is None else values[i])
                        for i in np.argsort(-policy)[:5]]
                 value = (stone_value + 1) / 2
             moves.append([int(action[0]), int(action[1])])
@@ -607,13 +633,13 @@ class Engines:
             self.prover, self.prover_build = tactical_proof.IsolatedTactics(package, priority='below_normal'), build
         return self.prover, build
 
-    def evaluate(self, entry, checkpoint, budget, history, watch, device=None):
+    def evaluate(self, entry, checkpoint, budget, history, watch, device=None, live=None):
         """`evaluate` with the entry's export; returns the evaluation, the budget it really had (no solver nodes
         when the solver is not built) and the key of the weights it used (see `model_key`)."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
         solver, build = self.solver() if budget['solver_nodes'] else (None, 'none')
         spent = budget if solver else budget | dict(solver_nodes=0)
-        found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch)
+        found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live)
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
         return found, spent, f"{bubble.sha256[:16]}:{build if spent['solver_nodes'] else 'none'}"
@@ -749,7 +775,7 @@ def well_formed(record):
             and all(type(record.get(k)) is int for k in ('simulations', 'solver_nodes'))
             and number(record.get('value')) and cells(record.get('moves'), 2)
             and isinstance(record.get('top'), list)
-            and all(isinstance(c, list) and len(c) in (3, 4) and cells([c[:3]], 3, number) and all(map(number, c[3:]))
+            and all(isinstance(c, list) and 3 <= len(c) <= 5 and cells([c[:3]], 3, number) and all(map(number, c[3:]))
                     for c in record['top'])
             and cells(record.get('line', []), 3) and cells(record.get('threat', []), 2)
             and (proof is None or isinstance(proof, dict) and proof.get('winner') in (0, 1)
@@ -917,6 +943,26 @@ def review(history, lookup, winner=-1):
 # Session and jobs
 
 
+def pair_elo(results):
+    """A's Elo over B from the colour-swapped pairs among `results` (game, winner 0 for A, 1 for B, None for a
+    capped game): {a_minus_b, interval (95%), pairs}, or None before the first complete pair."""
+    pairs = [0] * 5
+    ordered = sorted(results, key=lambda r: r['game'])
+    for first, second in zip(ordered[::2], ordered[1::2]):
+        points = sum(1 if r['winner'] == 0 else .5 if r['winner'] is None else 0 for r in (first, second))
+        pairs[round(points * 2)] += 1
+    if not sum(pairs):
+        return None
+    from dense_posterior import Posterior
+    elo, sd = Posterior(['A', 'B'], 'B', [('A', 'B', pairs)], matchup_prior=0).difference('A', 'B', matchup=False)
+    return dict(a_minus_b=elo, interval=[elo - 1.96 * sd, elo + 1.96 * sd], pairs=sum(pairs))
+
+
+def lane(job):
+    """The worker that runs `job`: moves on one, analysis and review on the other."""
+    return 'move' if job.kind == 'move' else 'analysis'
+
+
 class Job:
     """One unit of engine work. `kind` is move, analyse or review; progress is `done` of `total`."""
     ids = itertools.count(1)
@@ -928,7 +974,8 @@ class Job:
 
     def summary(self):
         return dict(id=self.id, kind=self.kind, status=self.status, done=self.done, total=self.total,
-                    error=self.error, ply=len(self.history), side=getattr(self, 'side', None))
+                    error=self.error, ply=len(self.history), side=getattr(self, 'side', None),
+                    live=getattr(self, 'live', None))
 
     def is_set(self):
         return self.cancelled
@@ -958,16 +1005,20 @@ def budget_of(presets, preset, custom=None, kind=None):
 
 
 class Session:
-    """The game, the seats, the analysis settings and the job queue. HTTP threads call the public methods; one
-    worker thread runs the jobs through `engines`. `revision` grows with every change the page must redraw."""
+    """The game, the seats, the analysis settings and the job queues. HTTP threads call the public methods; two
+    worker threads run the jobs: engine moves through `engines`, analysis and review through `analysis_engines`
+    (`engines` when not given), so analysis keeps up while engines play. `revision` grows with every change the
+    page must redraw."""
 
-    def __init__(self, entries, engines, store, rescan=lambda: None, book=None, archive=None, study_store=None):
+    def __init__(self, entries, engines, store, rescan=lambda: None, book=None, archive=None, study_store=None,
+                 analysis_engines=None):
         self.entries, self.engines, self.store, self.rescan_entries = entries, engines, store, rescan
+        self.analysis_engines = analysis_engines or engines
         self.book = book
         self.archive = Path(archive) if archive else None
         self.study_store = study_store
         self.saved_matches, self.study, self.saved_game = {}, None, None
-        self.models_folder = None
+        self.models_folder, self.opening_book = None, False
         self.lock = threading.Condition()
         self.history, self.revision, self.paused = [], 0, False
         self.instance, self.closing = os.urandom(4).hex(), False
@@ -975,13 +1026,14 @@ class Session:
         self.match_clock, self.timed_engines = None, []
         self.match_file = None
         self.retries = {}
-        self.jobs, self.queue, self.order = OrderedDict(), [], itertools.count()
+        self.jobs, self.queues, self.order = OrderedDict(), dict(move=[], analysis=[]), itertools.count()
         bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
         opponent = bubble or entries['native:Native']
         self.seats = [dict(engine='human'), self.seat(opponent['id'], None, 'standard')]
         self.analysis = self.seat(bubble['id'], None, 'standard') | dict(auto=True) if bubble else None
-        self.worker = threading.Thread(target=self.work, daemon=True)
-        self.worker.start()
+        self.workers = [threading.Thread(target=self.work, args=(lane,), daemon=True) for lane in self.queues]
+        for worker in self.workers:
+            worker.start()
 
     def seat(self, engine, checkpoint, preset, custom=None):
         if engine == 'human':
@@ -1019,6 +1071,17 @@ class Session:
         key = self.engine_key(self.analysis) if self.analysis else None
         return self.store.best(history, key) if key else None
 
+    def review_seat(self):
+        """The analysis model at REVIEW_PRESET: reviews always use it, so every verdict compares evaluations made
+        with one budget."""
+        return self.seat(self.analysis['engine'], self.analysis['checkpoint'], REVIEW_PRESET) if self.analysis else None
+
+    def review_lookup(self, history):
+        """The evaluation of `history` at exactly the review budget, or None."""
+        seat = self.review_seat()
+        key = self.engine_key(seat) if seat else None
+        return self.store.get(history, key, self.engines.effective(seat['budget'])) if key else None
+
     def state(self):
         with self.lock:
             history, game = list(self.history), replay(self.history)
@@ -1038,13 +1101,17 @@ class Session:
                         if self.match else None,
                         clock=self.match_clock.json() if self.match_clock else None,
                         saved_game=self.saved_game, models_folder=self.models_folder,
+                        book=dict(available=bool(self.book), enabled=self.opening_book),
                         evaluations=evaluations,
-                        review=review(history, self.lookup, board['winner']), jobs=self.job_list())
+                        review=review(history, self.review_lookup, board['winner']), review_preset=REVIEW_PRESET,
+                        jobs=self.job_list())
 
     def job_list(self):
-        """Queued and running jobs, then jobs that failed in the last ten seconds with their `error`."""
-        now = time.time()
-        return [job.summary() for job in self.jobs.values()
+        """Queued and running jobs, then jobs that failed in the last ten seconds with their `error`; a job's live
+        search is shown only while its position is still on the board."""
+        now, current = time.time(), tuple(self.history)
+        return [job.summary() | ({} if job.history == current[:len(job.history)] else dict(live=None))
+                for job in self.jobs.values()
                 if job.status in ('queued', 'running') or job.status == 'failed' and now - job.ended < 10]
 
     def poll(self, since):
@@ -1081,14 +1148,49 @@ class Session:
                 if job.status == 'queued':
                     job.status = 'cancelled'
         opening = not self.history or remaining == 2
-        if self.analysis and self.analysis['auto'] and winner < 0 and opening:
+        if self.analysis and self.analysis['auto'] and winner < 0 and opening and not self.deepening(winner):
             self.request_analysis(self.history, 1)
+        self.deepen(winner)
         self.lock.notify_all()
+
+    def deepening(self, winner):
+        """True while the current position deepens (see `deepen`): Auto is on, an engine seat plays, the game is
+        neither paused, finished nor a batch. The configured analysis budget then waits for the deepening, so the
+        fast presets land first."""
+        return bool(self.analysis and self.analysis['auto'] and not self.paused and winner < 0
+                    and any(seat['engine'] != 'human' for seat in self.seats)
+                    and not (self.match and self.match['active']))
+
+    def deepen(self, winner):
+        """While an engine seat plays, the game is not paused and Auto is on, evaluate the current position with the analysis
+        model at each preset in turn, fastest first: the first preset not yet saved is queued at the lowest
+        priority, and `changed` queues the next when it lands. Deepening of other positions, and all of it once
+        deepening stops, is dropped; a preset that failed for this position, or whose solver gave no verdict, is
+        skipped."""
+        current, active = tuple(self.history), self.deepening(winner)
+        for job in self.jobs.values():
+            if hasattr(job, 'tier') and job.status in ('queued', 'running') and (job.history != current or not active):
+                job.cancelled = True
+                if job.status == 'queued':
+                    job.status = 'cancelled'
+        busy = any(hasattr(job, 'tier') and job.history == current and job.status in ('queued', 'running')
+                   for job in self.jobs.values())
+        if not active or busy:
+            return
+        for tier in PRESET_NAMES:
+            failed = any(getattr(job, 'tier', None) == tier and job.history == current
+                         and (job.status == 'failed' or getattr(job, 'incomplete', False))
+                         for job in self.jobs.values())
+            seat = self.seat(self.analysis['engine'], self.analysis['checkpoint'], tier)
+            key, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
+            if key and not failed and not self.store.covering(current, key, budget):
+                self.submit(Job('analyse', 3, current, seat=seat, force=False, tier=tier))
+                return
 
     def submit(self, job):
         self.jobs[job.id] = job
         self.revision += 1
-        heapq.heappush(self.queue, (job.priority, next(self.order), job))
+        heapq.heappush(self.queues[lane(job)], (job.priority, next(self.order), job))
         while len(self.jobs) > 200:
             oldest = next(iter(self.jobs))
             if self.jobs[oldest].status in ('queued', 'running'):
@@ -1101,6 +1203,12 @@ class Session:
         """Queue an evaluation of `history` by the analysis engine unless it is saved or already queued at the same
         or a more urgent `priority` (lower runs first)."""
         settings = dict(self.analysis)
+        game = replay(history)
+        try:
+            if game.winner >= 0:
+                return None
+        finally:
+            game.close()
         for job in self.jobs.values():
             if job.kind == 'analyse' and job.history == tuple(history) and job.seat == settings:
                 if job.status == 'queued' and job.priority > priority:
@@ -1148,6 +1256,26 @@ class Session:
             self.stop_moves()
             self.changed()
 
+    def new_game(self):
+        """Start again: from a random in-policy opening of the book, in a random orientation, when the book is on
+        and both seats are engines."""
+        history = []
+        if self.opening_book and self.book and all(seat['engine'] != 'human' for seat in self.seats):
+            history = book_openings(self.book, 'wide', 1, random.randrange(1 << 30))['nodes'][0]['moves']
+        self.load(history, False)
+
+    def use_book(self, enabled):
+        """Turn book openings for engine games on or off; an empty board starts from one at once."""
+        if type(enabled) is not bool:
+            raise ValueError('enabled must be true or false')
+        if enabled and not self.book:
+            raise ValueError('No opening book; start the player with --dense-run or --book')
+        with self.lock:
+            self.opening_book = enabled
+            self.revision += 1
+            if enabled and not self.history:
+                self.new_game()
+
     def load(self, history, paused):
         """Replace the game with `history` (validated)."""
         replay(history).close()
@@ -1185,11 +1313,16 @@ class Session:
             self.changed()
 
     def stop_analysis(self):
-        """Cancel analysis and review jobs made for other analysis settings than the current ones."""
+        """Cancel analysis jobs made for other analysis settings than the current ones, and review and deepening
+        jobs made for another analysis model."""
         current = {k: v for k, v in (self.analysis or {}).items() if k != 'auto'}
         for job in self.jobs.values():
             settings = {k: v for k, v in getattr(job, 'seat', {}).items() if k != 'auto'}
-            if job.kind in ('analyse', 'review') and job.status in ('queued', 'running') and settings != current:
+            if job.kind == 'review' or hasattr(job, 'tier'):
+                stale = (settings.get('engine'), settings.get('checkpoint')) != (current.get('engine'), current.get('checkpoint'))
+            else:
+                stale = settings != current
+            if job.kind in ('analyse', 'review') and job.status in ('queued', 'running') and stale:
                 job.cancelled = True
                 if job.status == 'queued':
                     job.status = 'cancelled'
@@ -1204,7 +1337,12 @@ class Session:
                     job.cancelled = True
                     if job.status == 'queued':
                         job.status = 'cancelled'
-            job = self.request_analysis(self.history[:ply], 0, force)
+            game = replay(self.history)
+            try:
+                deepening = ply == len(self.history) and self.deepening(game.winner)
+            finally:
+                game.close()
+            job = None if deepening and not force else self.request_analysis(self.history[:ply], 0, force)
             self.lock.notify_all()
             return job.id if job else None
 
@@ -1215,18 +1353,19 @@ class Session:
             history = self.history if history is None else history
             if not self.analysis or tuple(history) != tuple(self.history[:len(history)]):
                 raise ValueError('Review needs a Bubble model and a position of this game')
+            seat = self.review_seat()
             for job in self.jobs.values():
-                same = job.history == tuple(history) and without_auto(job.seat) == without_auto(self.analysis)
-                if job.kind == 'review' and job.status in ('queued', 'running') and same:
+                if job.kind == 'review' and job.status in ('queued', 'running') and job.history == tuple(history) \
+                        and job.seat == seat:
                     return job.id
-            job = self.submit(Job('review', 2, history, seat=dict(self.analysis), tries=tries))
+            job = self.submit(Job('review', 2, history, seat=seat, tries=tries))
             job.total = len(review_plies(history))
             return job.id
 
     def review_again(self, history, seat, tries):
-        """Queue the review of `history` again when the analysis settings, Auto aside, are still `seat`'s."""
+        """Queue the review of `history` again when the review settings are still `seat`."""
         with self.lock:
-            if without_auto(self.analysis) == without_auto(seat):
+            if self.review_seat() == seat:
                 with contextlib.suppress(ValueError):
                     self.review_game(history, tries)
 
@@ -1296,7 +1435,8 @@ class Session:
                     placements=len(game['history']), opening=((number-1)//2) % len(match['openings'])))
             match['completed'] = len(match['results'])
             rows.append(dict(id=ident, name=directory.name, **{key: match[key] for key in
-                ('games', 'completed', 'wins', 'capped', 'results')}, players=[p['name'] for p in match['players']]))
+                ('games', 'completed', 'wins', 'capped', 'results')}, players=[p['name'] for p in match['players']],
+                elo=pair_elo(match['results']), clock=match.get('clock'), opening_range=match.get('opening_range')))
         return sorted(rows, key=lambda row: row['name'], reverse=True)
 
     def saved_replay(self, ident, number):
@@ -1312,8 +1452,9 @@ class Session:
         with self.lock:
             if self.study is None:
                 # Analysis has its own queue and CPU model; it cannot spend a live game's clock.
-                self.study = Session(dict(self.entries), Engines('cpu', getattr(self.engines, 'tactical_package', None)),
-                                     Evaluations(self.study_store), self.rescan_entries)
+                package = getattr(self.engines, 'tactical_package', None)
+                self.study = Session(dict(self.entries), Engines('cpu', package), Evaluations(self.study_store),
+                                     self.rescan_entries, analysis_engines=Engines('cpu', package))
             study = self.study
         with study.lock:
             for job in study.jobs.values():
@@ -1426,12 +1567,14 @@ class Session:
         return seat | dict(name=entry['name'] + (f"/{seat['checkpoint']}" if seat['checkpoint'] else ''), source=source)
 
     def start_match(self, players, games=None, preset='standard', output=None, openings=None, max_placements=512,
-                    book=None, opening_range=None, unique_openings=None, seed=0, evaluations=None, clock=None):
+                    book=None, opening_range=None, unique_openings=None, seed=0, evaluations=None, clock=None,
+                    replace=False):
+        """Start a batch on this board; an unfinished game against a person is refused unless `replace`."""
         with self.lock:
             self.match_editable()
             board = replay(self.history)
             try:
-                if self.history and board.winner < 0 and any(s['engine'] == 'human' for s in self.seats):
+                if self.history and board.winner < 0 and any(s['engine'] == 'human' for s in self.seats) and not replace:
                     raise ValueError('A human game is on this board; use a new player port or finish/reset that game')
             finally:
                 board.close()
@@ -1799,21 +1942,29 @@ class Session:
                 if job.status in ('queued', 'running'):
                     job.cancelled = True
             self.lock.notify_all()
-        self.worker.join(timeout)
+        for worker in self.workers:
+            worker.join(timeout)
         if self.match_worker:
             self.match_worker.join(timeout)
         self.engines.close()
+        if self.analysis_engines is not self.engines:
+            self.analysis_engines.close()
         if self.study:
             self.study.close(timeout)
 
-    def work(self):
+    def lane_engines(self, job):
+        return self.engines if lane(job) == 'move' else self.analysis_engines
+
+    def work(self, name):
+        """Run the jobs of one lane, most urgent first."""
+        queue = self.queues[name]
         while True:
             with self.lock:
-                while not self.queue and not self.closing:
+                while not queue and not self.closing:
                     self.lock.wait()
                 if self.closing:
                     return
-                job = heapq.heappop(self.queue)[2]
+                job = heapq.heappop(queue)[2]
                 if job.cancelled:
                     job.status = 'cancelled'
                     continue
@@ -1826,7 +1977,7 @@ class Session:
             except Yielded:
                 with self.lock:
                     job.status = 'queued'
-                    heapq.heappush(self.queue, (job.priority, next(self.order), job))
+                    heapq.heappush(queue, (job.priority, next(self.order), job))
                 continue
             except Cancelled:
                 job.cancelled = True
@@ -1867,8 +2018,16 @@ class Session:
                     job.status, job.error = 'failed', f'{failure or ""} {error}'.strip()
 
     def watcher(self, job, count=True):
-        """A network-batch callback that stops a cancelled job and, when `count`, adds batch sizes to its progress."""
+        """A network-batch callback that stops a cancelled job and, when `count`, adds batch sizes to its progress.
+        A deepening job steps aside for more urgent analysis and slows down while an engine seat searches."""
         def watch(n):
+            if hasattr(job, 'tier'):
+                with self.lock:
+                    if self.queues['analysis'] and self.queues['analysis'][0][0] < job.priority:
+                        job.cancelled = True
+                    busy = any(j.kind == 'move' and j.status == 'running' for j in self.jobs.values())
+                if busy:
+                    time.sleep(.03)
             if job.cancelled:
                 raise Cancelled()
             if count:
@@ -1888,14 +2047,16 @@ class Session:
         if saved:
             job.cache_hit = True
             return saved
-        found, spent, weights = self.engines.evaluate(self.entries[seat['engine']], seat['checkpoint'], budget,
-                                                      history, self.watcher(job, job.kind != 'review'),
-                                                      **({'device': seat['device']} if 'device' in seat else {}))
+        live = (lambda seen: setattr(job, 'live', seen)) if job.kind != 'review' else None
+        found, spent, weights = self.lane_engines(job).evaluate(
+            self.entries[seat['engine']], seat['checkpoint'], budget, history, self.watcher(job, job.kind != 'review'),
+            live=live, **({'device': seat['device']} if 'device' in seat else {}))
         if job.cancelled:
             raise Cancelled()
         entry = self.entries[seat['engine']]
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
-        if spent['solver_nodes'] < budget['solver_nodes'] and job.kind == 'analyse':
+        job.incomplete = spent['solver_nodes'] < budget['solver_nodes']
+        if job.incomplete and job.kind == 'analyse':
             with self.lock:
                 tried = (tuple(history), key, budget['simulations'], budget['solver_nodes'])
                 tries = self.retries[tried] = self.retries.get(tried, 0) + 1
@@ -1973,9 +2134,9 @@ class Session:
             if job.cancelled:
                 raise Cancelled()
             with self.lock:
-                if self.queue and self.queue[0][0] < job.priority:
+                if self.queues['analysis'] and self.queues['analysis'][0][0] < job.priority:
                     raise Yielded()
-            record = self.evaluation(job, seat, history[:ply])
+            record = self.evaluation(job, seat, history[:ply], exact=True)
             incomplete |= record['solver_nodes'] < self.engines.effective(seat['budget'])['solver_nodes']
             job.done = index + 1
             with self.lock:
@@ -2253,7 +2414,9 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/undo':
                 session.undo(args.get('people'))
             elif self.path == '/new':
-                session.load([], False)
+                session.new_game()
+            elif self.path == '/book':
+                session.use_book(args['enabled'])
             elif self.path == '/retry':
                 ply = args['ply']
                 if type(ply) is not int or not 0 <= ply <= len(session.history):
@@ -2289,7 +2452,8 @@ class Handler(BaseHTTPRequestHandler):
                     session.start_match(args['players'], args.get('games'), args.get('preset', 'standard'),
                                         args.get('output'), openings, args.get('max_placements', 512),
                                         args.get('book'), args.get('opening_range'), args.get('unique_openings'),
-                                        args.get('seed', 0), clock=args.get('clock'))
+                                        args.get('seed', 0), clock=args.get('clock'),
+                                        replace=args.get('replace') is True)
                 elif action == 'resume' and args.get('batch'):
                     session.resume_match(args['batch'])
                 elif action in ('pause', 'resume'):
@@ -2412,7 +2576,8 @@ def main():
         Handler.session = Session(entries, Engines(args.device, args.tactical_package),
                                   Evaluations(None if args.match else store_path), find, book,
                                   archive=ROOT / 'artifacts' / 'play' / 'matches',
-                                  study_store=ROOT / 'artifacts' / 'play' / f'study-{args.port}.jsonl')
+                                  study_store=ROOT / 'artifacts' / 'play' / f'study-{args.port}.jsonl',
+                                  analysis_engines=Engines(args.device, args.tactical_package))
         Handler.session.models_folder = str(args.models.resolve())
         try:
             if args.match:

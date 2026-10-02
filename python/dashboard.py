@@ -874,7 +874,8 @@ HEADS = ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', '
 SOURCES = ('converted', 'fresh', 'newest')  # dense_data.SOURCES
 SOURCE_METRICS = tuple(f'{s}_{k}{h}' for s in SOURCES for k in ('', 'train_', 'gap_')
                        for h in ('policy_ce', 'value_bce', 'future_bce', 'future_masked_ce'))
-POLICY_METRICS = ('policy_kl', 'policy_target_entropy', 'policy_top1')
+POLICY_METRICS = ('policy_kl', 'policy_target_entropy')+tuple(
+    f'policy{s}_{k}' for s in ('', '_first', '_second') for k in ('top1', 'top2', 'argmax_mass'))+('policy_pair_top1',)
 POLICY_VALIDATION_METRICS = POLICY_METRICS+tuple(f'{s}_{h}' for s in SOURCES for h in POLICY_METRICS)
 CURVE_SOURCES = ('fresh', 'newest')  # dense_learn.CURVE_SOURCES
 CURVE_SCALARS = tuple(f'{s}_{k}' for s in CURVE_SOURCES
