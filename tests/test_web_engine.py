@@ -72,6 +72,72 @@ class Export(unittest.TestCase):
                 self.assertLess(max(worst.values()), tolerance, (name, worst))
 
 
+def page(job):
+    done = subprocess.run([NODE, str(ROOT/'tests'/'web'/'book.mjs')], input=json.dumps(job), capture_output=True,
+                          text=True, encoding='utf-8')
+    if done.returncode:
+        raise RuntimeError(done.stderr)
+    return json.loads(done.stdout)
+
+
+@unittest.skipUnless(NODE, 'needs node')
+class PlayPage(unittest.TestCase):
+    """The opening-book default follows the seats as the page shows them until the person touches the switch."""
+    def follow(self, steps, enabled=True, available=True, stored=None):
+        return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored))
+
+    def books(self, answer):
+        return [body['enabled'] for path, body in answer['requests'] if path == '/book']
+
+    def test_engines_turn_the_book_on(self):
+        answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False)
+        self.assertEqual(self.books(answer), [True])
+        self.assertTrue(answer['enabled'])
+
+    def test_people_turn_the_book_off(self):
+        answer = self.follow([['/seat', dict(side=1, engine='human')]])
+        self.assertEqual(self.books(answer), [False])
+        self.assertIsNone(answer['stored'])
+
+    def test_mixed_seats_take_the_server_default(self):
+        answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=0, engine='six')]])
+        self.assertEqual(self.books(answer), [False, True])
+        self.assertEqual(self.books(self.follow([['/seat', dict(side=1, engine='native')]])), [])
+
+    def test_a_browser_seat_counts_as_an_engine(self):
+        answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=1, engine='browser:bubble')],
+                              ['/seat', dict(side=0, engine='browser:bubble')]])
+        self.assertEqual(self.books(answer), [False, True])
+        self.assertTrue(answer['enabled'])
+
+    def test_a_touched_switch_stays(self):
+        answer = self.follow([['/book', dict(enabled=False)], ['/seat', dict(side=0, engine='native')],
+                              ['/book', dict(enabled=True, mode='wide')], ['/seat', dict(side=0, engine='human')],
+                              ['/seat', dict(side=1, engine='human')]])
+        self.assertEqual(self.books(answer), [False, True])
+        self.assertEqual(answer['stored'], '1')
+        answer = self.follow([['/seat', dict(side=1, engine='human')]], stored='1')
+        self.assertEqual(self.books(answer), [])
+
+    def test_without_a_book_nothing_is_sent(self):
+        self.assertEqual(self.books(self.follow([['/seat', dict(side=1, engine='human')]], available=False)), [])
+
+    def test_the_serverless_page_never_asks_for_the_book(self):
+        requests = page(dict(kind='offline', steps=[['/seat', dict(side=1, engine='human')], ['/seat', dict(side=0, engine='human')],
+                                                    ['/play', dict(q=0, r=0)]]))
+        self.assertEqual(requests, ['/seat', '/seat', '/play'])
+
+    def test_the_human_seat_is_labelled_human(self):
+        sources = {name: (ROOT/'web'/name).read_text(encoding='utf-8') for name in ('index.html', 'engine/seat.mjs')}
+        self.assertIn(".kind[data-k=human]", sources['index.html'])
+        self.assertIn("return['human',null]", sources['index.html'])
+        self.assertIn("kind:'human',label:null", sources['index.html'])
+        self.assertIn("kind: 'human', label: null", sources['engine/seat.mjs'])
+        for text in sources.values():
+            self.assertNotIn("'you'", text)
+            self.assertNotIn('data-k=you', text)
+
+
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 class Bundle(unittest.TestCase):
     def test_artefacts_match_their_sources(self):

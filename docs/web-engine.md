@@ -38,6 +38,7 @@ to the site's path, adds the cross-origin isolation headers after one reload.
 | `web/engine/tactical.mjs`, `solver-worker.mjs` | Solver with a WASI shim, in a worker that a cancel terminates |
 | `web/engine/proof.mjs` | Certificate walk for the winning line |
 | `web/engine/seat.mjs` | Play page hook: the browser seat and analysis engine |
+| `web/engine/book.mjs` | Play page hook: the opening-book default that follows the seats |
 | `web/engine/offline.mjs` | The play server's game requests answered in the page, for static hosting |
 | `web/coi-sw.js` | Cross-origin isolation on static hosts (`isolate()`), for WebAssembly threads |
 

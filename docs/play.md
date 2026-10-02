@@ -180,13 +180,16 @@ Strength is a slider from Faster to Smarter with six stops: a spark, an open hex
 stack and the hazard sign; arrow keys move it one stop. The sliders button beside it opens the custom budget.
 
 When the run has an opening book (`openings.json` in `--dense-run`, or `--book`), the seats card offers Opening
-book, on by default, and its set: narrow (the openings above the policy cutoff, as for batches), on-policy (every
-active opening) or all (with the imported off-policy ones). New then starts from one of them in a random
+book, on when the player starts, and its set: narrow (the openings above the policy cutoff, as for batches),
+on-policy (every active opening) or all (with the imported off-policy ones). New then starts from one of them in a random
 orientation, shown as played stones; the move list names the set. Between engines the opening is drawn uniformly.
 Against a person it prefers lines that person has not played on that side: walking the book's tree, each step
 picks among branches that still hold an unplayed opening, so a branch counts as played only once all of its
 openings have been; when all have, one of the least played is picked. What was played is kept per side in
 `play-openings.jsonl` beside the saved evaluations, appended like them.
+
+Until the switch or its set is changed in this browser session, each seat change sets the book from the seats
+as the page shows them: off when both are Human, on otherwise (a Bubble (browser) seat is an engine).
 
 | Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms | Six protocol nodes | Strix simulations |
 |---|---|---|---|---|---|

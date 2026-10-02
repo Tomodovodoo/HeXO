@@ -184,7 +184,7 @@ function install() {
     const send = change => { config.seats[side] = change.preset; save(); page.renderPanels(); };
     const pick = box.querySelector('.pick');
     if (pick) {
-      const items = [{id: 'human', ids: ['human'], kind: 'you', label: null}, ...original.pickItems(() => true)];
+      const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...original.pickItems(() => true)];
       pick.onclick = () => original.openMenu(pick, items, ID, it => page.post('/seat', {side, engine: it.id}));
     }
     box.append(original.el('div', {class: 'more'}, original.el('div', {}, original.strength({preset: config.seats[side]}, send, 'seat' + side, null))));
