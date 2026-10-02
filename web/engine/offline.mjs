@@ -1,6 +1,6 @@
 /* The play server's game state for a page served without it (a static host such as GitHub Pages): answers the
  * page's /state and game requests from this browser, with the rules of gumbel.wasm. Both seats are people to it;
- * seat.mjs plays Bubble (browser) on them. Requests for server-only features answer 501. */
+ * seat.mjs plays the browser engines on them. Requests for server-only features answer 501. */
 import createModule from './gumbel.mjs';
 import {Native} from './search.mjs';
 
