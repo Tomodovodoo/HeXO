@@ -85,7 +85,7 @@ def gated_nodes(history, attacker, nodes, gate):
 
 def unknown_result(reason, start, attacker, build_hash=None):
     """An UNKNOWN result with every documented field; `build_hash` is None when no library answered."""
-    return dict(status=UNKNOWN, native_verified=False, moves=[], certificate=None, proof_turns=None,
+    return dict(status=UNKNOWN, native_verified=False, moves=[], certificate=None, proof_turns=None, shortest=False,
                 nodes_used=0, attacker=attacker, build_hash=build_hash, reason=reason,
                 elapsed_ms=(time.perf_counter()-start)*1000)
 
@@ -108,7 +108,9 @@ class NativeTactics:
     Every result carries `status`, `moves` (the verified first turn), `certificate`,
     `nodes_used` (search work charged against the budget), `budget` and `gate_score`
     (module contract), `proof_turns` (most attacker turns on any certificate path, the
-    completing turn included; None unless PROVEN_WIN), `attacker` and `build_hash`
+    completing turn included; None unless PROVEN_WIN), `shortest` (True when `shortest=True`
+    asked for the fewest attacker turns and the solver proved no shorter forcing win exists),
+    `attacker` and `build_hash`
     (SHA-256 of the loaded library). Verification accepts at most
     min(200000, max(50000, 8*budget)) certificate nodes and visits.
     """
@@ -132,7 +134,7 @@ class NativeTactics:
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None, gate=None, table_mb=0):
+                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False):
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         start = time.perf_counter()
         nodes, score = gated_nodes(history, attacker, nodes, gate)
@@ -150,6 +152,8 @@ class NativeTactics:
                 request['certificate'] = certificate
             if root_moves is not None:
                 request['root_moves'] = root_moves
+            if shortest:
+                request['shortest'] = True
             payload = json.dumps(request, separators=(',', ':')).encode()
             if len(payload) > REQUEST_LIMIT:
                 return unknown('request size limit')
@@ -245,7 +249,7 @@ class IsolatedTactics:
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None, gate=None, table_mb=0):
+                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False):
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         start = time.perf_counter()
         hard = start+(ms+self.grace_ms)/1000
@@ -277,7 +281,7 @@ class IsolatedTactics:
                 return unknown('deadline')
             request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
                            attacker=attacker, certificate=certificate, root_moves=root_moves, gate=gate,
-                           table_mb=table_mb)
+                           table_mb=table_mb, shortest=shortest)
             payload = json.dumps(request, separators=(',', ':'))
             if len(payload) > REQUEST_LIMIT:
                 return unknown('request size limit')
