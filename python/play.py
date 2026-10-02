@@ -394,7 +394,7 @@ def engine_identity(entry):
     executable (Strix)."""
     identity = str(entry.get('path') or entry.get('command') or entry.get('library') or
                    (entry.get('model'), entry.get('engine')))
-    return identity + (f"@q{entry['q_range_floor']:g}" if entry.get('q_range_floor') else '')
+    return identity + (f"@q{entry['q_range_floor']!r}" if entry.get('q_range_floor') else '')
 
 
 def command_of(entry, checkpoint):
@@ -440,7 +440,7 @@ def model_key(path):
 
 def search_key(weights, entry):
     """The model key `weights` of a Bubble entry's evaluations, marked with its Q range floor when it has one."""
-    return weights + (f"~q{entry['q_range_floor']:g}" if entry.get('q_range_floor') else '')
+    return weights + (f"~q{entry['q_range_floor']!r}" if entry.get('q_range_floor') else '')
 
 
 class Cancelled(Exception):

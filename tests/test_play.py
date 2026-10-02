@@ -1662,6 +1662,7 @@ class Registry(unittest.TestCase):
         self.assertNotIn('q_range_floor', found['bubble:alpha'])
         self.assertEqual(found['bubble:flat']['q_range_floor'], .5)
         self.assertEqual([play.search_key('ab', e) for e in (found['bubble:alpha'], found['bubble:flat'])], ['ab', 'ab~q0.5'])
+        self.assertNotEqual(*(play.search_key('ab', dict(q_range_floor=x)) for x in (.5000001, .5000002)))
         bubble = unittest.mock.Mock(sha256='ab'*32)
         with unittest.mock.patch('neural_search.NeuralSearch') as tree:
             turn = play.TurnSearch(bubble, None, [(0, 0)], 8, play.solve(None, [(0, 0)], 0), q_range_floor=.5)
