@@ -42,8 +42,8 @@ It refuses a different revision, unexpected tracked changes, and untracked
 files in the compiled dependency tree, including automatically discovered
 `build.rs` files. The only source
 patch changes the unused `inference_subprocess` module gate from `not(wasm32)`
-to `unix`. Upstream otherwise tries to compile Unix file-descriptor and `fcntl`
-calls on Windows. Search, graph construction, model arithmetic and rules are
+to `target_os = "linux"`. Upstream otherwise tries to compile Linux pipe and `fcntl`
+calls on Windows and macOS. Search, graph construction, model arithmetic and rules are
 unchanged. `build-local.toml` contains local dependency paths and is ignored;
 Cargo.lock pins the other dependencies. The generated `build-provenance.json`
 records the source revision, original/patched module hashes and executable

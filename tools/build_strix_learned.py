@@ -1,4 +1,4 @@
-"""Build pinned Strix with its unused Unix-only subprocess module gated on Unix."""
+"""Build pinned Strix with its unused Linux-only subprocess module gated on Linux."""
 import argparse
 import hashlib
 import json
@@ -24,7 +24,7 @@ def main():
     relative = "hexo-rs/hexo-mcts/src/lib.rs"
     pristine = subprocess.check_output(["git", "-C", str(source), "show", f"{REVISION}:{relative}"])
     old = b'#[cfg(not(target_arch = "wasm32"))]\npub mod inference_subprocess;'
-    new = b'#[cfg(unix)]\npub mod inference_subprocess;'
+    new = b'#[cfg(target_os = "linux")]\npub mod inference_subprocess;'
     if pristine.count(old) != 1:
         raise ValueError("unexpected upstream module gate")
     patched = pristine.replace(old, new)
@@ -53,7 +53,7 @@ def main():
         executable = executable.with_suffix(".exe")
     report = dict(upstream=URL, revision=REVISION, patch_file=relative,
         pristine_sha256=hashlib.sha256(pristine).hexdigest(), patched_sha256=hashlib.sha256(patched).hexdigest(),
-        patch="cfg(not(wasm32)) -> cfg(unix) for unused inference_subprocess module",
+        patch="cfg(not(wasm32)) -> cfg(target_os = \"linux\") for unused inference_subprocess module",
         executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
         wrapper_sha256={name: hashlib.sha256((package/name).read_bytes()).hexdigest()
                         for name in ("Cargo.toml", "Cargo.lock", "src/main.rs")},

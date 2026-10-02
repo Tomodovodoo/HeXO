@@ -32,6 +32,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import formats
+from engine_setup import Setups
 from hexo import Game
 from notation import NotationConflict, dumps, loads
 from process_tree import TreeProcess
@@ -242,14 +243,18 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     """Every engine on offer, by id.
 
     Bubble runs come from `extra_runs`, the directories in `runs`, and `models`; single `.pt` exports come from
-    `models`. A directory in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once, on the
-    backend `six_backend` finds, labelled with that backend; its networks are its `checkpoints`, newest first. `models/<name>.json` adds one entry: {"name", "kind": "bubble", "path"},
-    {"name", "kind": "six", "command", "mirrored", "presets"} or {"name", "kind": "strix", "model"}, paths
-    relative to the file. Entries carry `id`, `name`, `kind`, `presets`, `label` (the name the page shows; the
-    first run in `extra_runs` is labelled Bubble), `checkpoints` (Bubble checkpoints or Six networks), and the
-    server-only `path` (Bubble), `command`, `cwd`, `mirrored`, `libraries` and, for a Six folder, `networks`
-    ({name: path}) and `backend` (Six protocol, see `command_of`) or `model` (Strix). An id is `kind:name`;
-    entries sharing one get a suffix from their path, command or model, so an id never moves to another engine."""
+    `models`, except inside folders an engine setup made (they hold `setup.json`, see engine_setup). A directory
+    in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once, on the backend `six_backend` finds,
+    labelled with that backend; its networks are its `checkpoints`, newest first. `models/<name>.json` adds one
+    entry: {"name", "kind": "bubble", "path"}, {"name", "kind": "six", "command", "mirrored", "presets", optional
+    "files" a match also hashes; a command starting with "python" runs on this server's Python},
+    {"name", "kind": "strix", "model", optional "engine"} or {"name", "kind": "seal", "library"}, paths relative
+    to the file. `seal`, the library built with -DHEXO_SEAL_SOURCE, adds Seal when it exists. Entries carry `id`,
+    `name`, `kind`, `presets`, `label` (the name the page shows; the first run in `extra_runs` is labelled
+    Bubble), `checkpoints` (Bubble checkpoints or Six networks), and the server-only `path` (Bubble), `command`,
+    `cwd`, `mirrored`, `libraries`, `files` and, for a Six folder, `networks` ({name: path}) and `backend` (Six protocol,
+    see `command_of`), `model` and `engine` (Strix) or `library` (Seal). An id is `kind:name`;
+    entries sharing one get a suffix from `engine_identity`, so an id never moves to another engine."""
     found, seen = [], set()
     models = models and Path(models).resolve()
 
@@ -276,8 +281,9 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                 if child.is_dir():
                     bubble(child)
     if models and Path(models).is_dir():
+        installed = {folder for folder in Path(models).iterdir() if (folder / 'setup.json').is_file()} | {models / '.setup'}
         for path in sorted(Path(models).rglob('*.pt')):
-            if 'checkpoints' not in path.relative_to(models).parts:
+            if 'checkpoints' not in path.relative_to(models).parts and not installed & set(path.parents):
                 bubble(path)
         for folder in sorted(p for p in Path(models).iterdir() if p.is_dir()):
             binary = folder / ('sixengine.exe' if os.name == 'nt' else 'sixengine')
@@ -299,24 +305,33 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                     if not isinstance(command, list) or not command or not all(isinstance(c, str) for c in command):
                         raise ValueError('command must be a list of arguments')
                     first = path.parent / command[0]
-                    command[0] = str(first) if first.exists() else command[0]
+                    command[0] = sys.executable if command[0] == 'python' else str(first) if first.exists() else command[0]
                     add('six', name, spec.get('presets'), command=command, cwd=path.parent,
-                        mirrored=spec.get('mirrored') is True, libraries=[])
+                        mirrored=spec.get('mirrored') is True, libraries=[],
+                        files=[(path.parent / file).resolve() for file in spec.get('files', [])])
                 elif kind == 'strix':
-                    add('strix', name, spec.get('presets'), model=(path.parent / spec['model']).resolve())
+                    engine = {'engine': (path.parent / spec['engine']).resolve()} if 'engine' in spec else {}
+                    add('strix', name, spec.get('presets'), model=(path.parent / spec['model']).resolve(), **engine)
+                elif kind == 'seal' and (path.parent / spec['library']).is_file():
+                    add('seal', name, spec.get('presets'), library=(path.parent / spec['library']).resolve())
             except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
                 continue
     add('native', 'Native')
     if seal is not None and Path(seal).exists():
-        add('seal', 'Seal')
+        add('seal', 'Seal', library=Path(seal))
     bases = [f"{e['kind']}:{e['name']}" for e in found]
     entries = OrderedDict()
     for base, entry in zip(bases, found):
-        identity = entry.get('path') or entry.get('command') or entry.get('model')
-        suffix = hashlib.blake2b(str(identity).encode(), digest_size=3).hexdigest()
+        suffix = hashlib.blake2b(engine_identity(entry).encode(), digest_size=3).hexdigest()
         key = base if bases.count(base) == 1 else f'{base}~{suffix}'
         entries[key] = dict(id=key, **entry)
     return entries
+
+
+def engine_identity(entry):
+    """What makes an entry its engine: its path, command or library, or its model and executable (Strix)."""
+    return str(entry.get('path') or entry.get('command') or entry.get('library') or
+               (entry.get('model'), entry.get('engine')))
 
 
 def command_of(entry, checkpoint):
@@ -677,7 +692,8 @@ class Engines:
         if kind not in self.children:
             self.children[kind] = SearchChild([sys.executable, str(Path(__file__).resolve()), 'search', kind])
         child = self.children[kind]
-        request = dict(budget, history=[list(p) for p in history], model=str(entry.get('model')))
+        request = dict(budget, history=[list(p) for p in history], model=str(entry.get('model')),
+                       **{key: str(entry[key]) for key in ('engine', 'library') if entry.get(key)})
         child.process.stdin.write(json.dumps(request) + '\n')
         child.process.stdin.flush()
         while True:
@@ -1019,7 +1035,7 @@ class Session:
         self.study_store = study_store
         self.saved_matches, self.study, self.saved_game = {}, None, None
         self.models_folder, self.opening_book = None, False
-        self.lock = threading.Condition()
+        self.lock, self.rescanning = threading.Condition(), threading.Lock()
         self.history, self.revision, self.paused = [], 0, False
         self.instance, self.closing = os.urandom(4).hex(), False
         self.match, self.match_worker = None, None
@@ -1536,7 +1552,7 @@ class Session:
         seat = self.seat(entry['id'], checkpoint, specification.get('preset', preset),
                          specification.get('custom'))
         source = {k: str(v) if isinstance(v, Path) else v for k, v in entry.items()
-                  if k in ('kind', 'name', 'path', 'cwd', 'model', 'mirrored')}
+                  if k in ('kind', 'name', 'path', 'cwd', 'model', 'engine', 'library', 'mirrored')}
         if entry['kind'] == 'six':
             source['command'] = command_of(entry, seat['checkpoint'])
         if 'libraries' in entry:
@@ -1558,11 +1574,11 @@ class Session:
             source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] else 'none'
         elif entry['kind'] == 'six':
             command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in source['command']]
-            files += [path for path in command_files if path.is_file()]
+            files += [path for path in command_files if path.is_file()] + list(entry.get('files', []))
         elif entry['kind'] == 'strix':
-            files += [Path(entry['model'])]
+            files += [Path(entry['model']), *([Path(entry['engine'])] if entry.get('engine') else [])]
         elif entry['kind'] == 'seal':
-            files += [library.with_name(library.name.replace('hexo', 'hexo_seal'))]
+            files += [Path(entry['library'])]
         source['files'] = {str(path.resolve()): file_digest(file_identity(path)) for path in files}
         return seat | dict(name=entry['name'] + (f"/{seat['checkpoint']}" if seat['checkpoint'] else ''), source=source)
 
@@ -1723,8 +1739,9 @@ class Session:
                     for path, digest in source['files'].items():
                         if file_digest(file_identity(path)) != digest:
                             raise ValueError(f'Engine file changed since the batch started: {path}')
-                    entry = {k: Path(v) if k in ('path', 'model') else v for k, v in source.items()
-                             if k in ('kind', 'path', 'command', 'cwd', 'model', 'mirrored', 'libraries')}
+                    entry = {k: Path(v) if k in ('path', 'model', 'engine', 'library') else v for k, v in source.items()
+                             if k in ('kind', 'path', 'command', 'cwd', 'model', 'engine', 'library', 'mirrored',
+                                      'libraries')}
                     entry.update(id=seat['engine'], name=source.get('name', seat['name']), presets=PRESETS[source['kind']])
                     if seat['checkpoint'] is not None:
                         entry['checkpoints'] = [seat['checkpoint']]
@@ -1776,7 +1793,7 @@ class Session:
             return dict(kind=kind, command=command_of(entry, seat['checkpoint']) + budget.get('args', []),
                         cwd=str(entry.get('cwd') or ROOT), path=list(map(str, entry.get('libraries', []))),
                         mirrored=entry.get('mirrored', False), nodes=budget['nodes'])
-        return dict(kind=kind, max_ms=budget['ms'])
+        return dict(kind=kind, max_ms=budget['ms'], **({'library': str(entry['library'])} if entry.get('library') else {}))
 
     def run_match(self, match):
         try:
@@ -1904,33 +1921,34 @@ class Session:
     def rescan(self):
         """Replace the engine list. A seat follows its engine, matched by kind and path, to its id in the new list;
         a seat whose engine or checkpoint is gone becomes a person, and analysis falls back to the first Bubble
-        model."""
-        entries = self.rescan_entries()
-        identity = lambda e: (e['kind'], str(e.get('path') or e.get('command') or e.get('model')))
-        def follow(seat):
-            old = self.entries.get(seat['engine'])
-            moved = next((e['id'] for e in entries.values() if old and identity(e) == identity(old)), None)
-            return seat | dict(engine=moved)
-        def valid(seat):
-            entry = entries.get(seat['engine']) if seat['engine'] else None
-            return entry is not None and (not entry.get('checkpoints') or seat['checkpoint'] in entry['checkpoints'])
-        with self.lock:
-            self.match_editable()
-            followed = [seat if seat['engine'] == 'human' else follow(seat) for seat in self.seats]
-            analysis = follow(self.analysis) if self.analysis else None
-            previous, self.entries = self.entries, entries
-            try:
-                seats = [seat if seat['engine'] == 'human' or valid(seat) else dict(engine='human') for seat in followed]
-                if analysis is None or not valid(analysis):
-                    bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
-                    analysis = self.seat(bubble['id'], None, 'standard') | dict(auto=True) if bubble else None
-            except Exception:
-                self.entries = previous
-                raise
-            self.seats, self.analysis = seats, analysis
-            self.stop_moves()
-            self.stop_analysis()
-            self.changed()
+        model. Rescans run one at a time, so an older scan never replaces a newer one."""
+        with self.rescanning:
+            entries = self.rescan_entries()
+            identity = lambda e: (e['kind'], engine_identity(e))
+            def follow(seat):
+                old = self.entries.get(seat['engine'])
+                moved = next((e['id'] for e in entries.values() if old and identity(e) == identity(old)), None)
+                return seat | dict(engine=moved)
+            def valid(seat):
+                entry = entries.get(seat['engine']) if seat['engine'] else None
+                return entry is not None and (not entry.get('checkpoints') or seat['checkpoint'] in entry['checkpoints'])
+            with self.lock:
+                self.match_editable()
+                followed = [seat if seat['engine'] == 'human' else follow(seat) for seat in self.seats]
+                analysis = follow(self.analysis) if self.analysis else None
+                previous, self.entries = self.entries, entries
+                try:
+                    seats = [seat if seat['engine'] == 'human' or valid(seat) else dict(engine='human') for seat in followed]
+                    if analysis is None or not valid(analysis):
+                        bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
+                        analysis = self.seat(bubble['id'], None, 'standard') | dict(auto=True) if bubble else None
+                except Exception:
+                    self.entries = previous
+                    raise
+                self.seats, self.analysis = seats, analysis
+                self.stop_moves()
+                self.stop_analysis()
+                self.changed()
 
     # Working
 
@@ -2271,6 +2289,7 @@ ISOLATION = (('Cross-Origin-Opener-Policy', 'same-origin'), ('Cross-Origin-Embed
 
 class Handler(BaseHTTPRequestHandler):
     session = None
+    setups = None
     page = ROOT / 'web' / 'index.html'
 
     def log_message(self, *args):
@@ -2313,6 +2332,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, self.page.read_bytes(), 'text/html; charset=utf-8', ISOLATION)
         if url.path.startswith('/engine/') or url.path == '/coi-sw.js':
             return self.static(url.path)
+        if url.path == '/setup' and self.setups:
+            return self.respond(200, dict(engines=self.setups.catalogue()))
         if url.path.startswith('/study/'):
             session = session.study
             if session is None:
@@ -2444,6 +2465,9 @@ class Handler(BaseHTTPRequestHandler):
                 session.pause(args['paused'])
             elif self.path == '/rescan':
                 session.rescan()
+            elif self.path == '/setup' and self.setups:
+                self.setups.start(args['engine'])
+                return self.respond(200, dict(engines=self.setups.catalogue()))
             elif self.path == '/match':
                 action = args.get('action', 'start')
                 if action == 'start':
@@ -2487,18 +2511,19 @@ def search_child(kind):
                     found = game.search(request['ms'])
                     moves, measurements = found['moves'], dict(nodes=found.get('nodes'))
                 elif kind == 'seal':
-                    if 'seal' not in engines:
+                    if request.get('library') not in engines:
                         from legacy.arena import Seal
-                        engines['seal'] = Seal()
-                    moves = engines['seal'](game, request['ms'])
+                        engines[request.get('library')] = Seal(request.get('library'))
+                    moves = engines[request.get('library')](game, request['ms'])
                 else:
-                    key = (request['model'], request['simulations'])
+                    key = (request['model'], request['simulations'], request.get('engine'))
                     if key not in engines:
                         if str(ROOT) not in sys.path:
                             sys.path.insert(0, str(ROOT))
                         from tools.strix_learned_adapter import StrixLearned
                         engines[key] = StrixLearned(request['model'], simulations=request['simulations'],
-                                                    timeout_ms=min(600_000, max(5_000, 250 * request['simulations'])))
+                                                    timeout_ms=min(600_000, max(5_000, 250 * request['simulations'])),
+                                                    executable=request.get('engine'))
                         while len(engines) > 2:
                             engines.popitem(last=False)[1].close()
                     engines.move_to_end(key)
@@ -2579,6 +2604,7 @@ def main():
                                   study_store=ROOT / 'artifacts' / 'play' / f'study-{args.port}.jsonl',
                                   analysis_engines=Engines(args.device, args.tactical_package))
         Handler.session.models_folder = str(args.models.resolve())
+        Handler.setups = Setups(args.models, Handler.session.rescan, lambda: Handler.session.entries)
         try:
             if args.match:
                 players = [dict(engine=name, checkpoint=getattr(args, f'{side}_checkpoint'),

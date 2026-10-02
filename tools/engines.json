@@ -1,0 +1,150 @@
+{
+  "release": {
+    "repository": "Tomodovodoo/HeXO",
+    "tag": "engines-v1",
+    "files": {}
+  },
+  "six": {
+    "name": "Six",
+    "kind": "six",
+    "repository": "CixMango/Six",
+    "licence": "MIT",
+    "assets": {
+      "windows-x64": "-windows-x64.zip",
+      "linux-x64": "-linux-x64.tar.gz",
+      "macos-arm64": "-macos-arm64.zip"
+    }
+  },
+  "strix": {
+    "name": "Strix",
+    "kind": "strix",
+    "repository": "SootyOwl/hexo-strix",
+    "revision": "5a771e572553a8bd8e010112b2ce65f16e5afa1b",
+    "licence": "MIT; the model's licence is not stated, so it is downloaded from its site and never republished",
+    "executable": "hexo-strix-learned",
+    "model": {
+      "url": "https://hexo.tyto.cc/model.safetensors",
+      "sha256": "aec92391c66050e737d9b769757248b520ffc1bf44fa039db7c8abd3ef720185",
+      "size": 2810120
+    }
+  },
+  "shrimp": {
+    "name": "Shrimp",
+    "kind": "six",
+    "repository": "Cmiller132/hexo-bot",
+    "revision": "6251fc6d9072cb6b26ae6830e3c28d0c0666f502",
+    "licence": "MIT (hexo-bot and Six)",
+    "crates": [
+      "hexo_engine",
+      "shrimp"
+    ],
+    "sources": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "packages/hexo_engine/",
+      "packages/hexo_utils/",
+      "packages/shrimp/",
+      "packages/hexfield_eq/"
+    ],
+    "files": [
+      {
+        "path": "arena/six_rules.py",
+        "sha256": "15064498bbf6e0d0fef1ffc18dbdd06a03b711909558a326a4f689d97e7971b8",
+        "url": "https://raw.githubusercontent.com/CixMango/Six/fbc7087f570d0df21e591db4b9e44d2f4e49deb1/arena/six_rules.py"
+      },
+      {
+        "path": "arena/drivers/sixdriver.py",
+        "sha256": "aa206cabc5968d3e7c5fe764137a6e8535dc1d6755114cd25f0d3750d32dad36",
+        "url": "https://raw.githubusercontent.com/CixMango/Six/fbc7087f570d0df21e591db4b9e44d2f4e49deb1/arena/drivers/sixdriver.py"
+      },
+      {
+        "path": "arena/drivers/shrimp_driver.py",
+        "sha256": "e9ff43d9412a2c0cb385265324678f9a664b7844ab1e6aeb1d56dca7a7386c0d",
+        "url": "https://raw.githubusercontent.com/CixMango/Six/fbc7087f570d0df21e591db4b9e44d2f4e49deb1/arena/drivers/shrimp_driver.py"
+      },
+      {
+        "path": "rivals/shrimp/models/shrimp_main7_infer.pt",
+        "sha256": "680eebd4381ad59511674b21d80ae8222cc1338ba4de3301eb2942ba6b96304f",
+        "url": "https://media.githubusercontent.com/media/Cmiller132/hexo-bot/6251fc6d9072cb6b26ae6830e3c28d0c0666f502/models/shrimp_main7_infer.pt"
+      },
+      {
+        "path": "rivals/shrimp/hexo-bot/apps/showcase/profiles/shrimp_main_7.toml",
+        "sha256": "2e3ea6308cb03cc25de1e5b686331cebae67d94416d603f431a70018ac78e62d",
+        "url": "https://raw.githubusercontent.com/Cmiller132/hexo-bot/6251fc6d9072cb6b26ae6830e3c28d0c0666f502/apps/showcase/profiles/shrimp_main_7.toml"
+      }
+    ],
+    "presets": {
+      "lightning": {
+        "nodes": 1,
+        "args": [
+          "--visits",
+          "16"
+        ]
+      },
+      "quick": {
+        "nodes": 1,
+        "args": [
+          "--visits",
+          "32"
+        ]
+      },
+      "standard": {
+        "nodes": 1,
+        "args": [
+          "--visits",
+          "128"
+        ]
+      },
+      "strong": {
+        "nodes": 1,
+        "args": [
+          "--visits",
+          "512"
+        ]
+      },
+      "deep": {
+        "nodes": 1,
+        "args": [
+          "--visits",
+          "1024"
+        ]
+      },
+      "dangerous": {
+        "nodes": 1,
+        "args": [
+          "--visits",
+          "4096"
+        ]
+      }
+    }
+  },
+  "seal": {
+    "name": "Seal",
+    "kind": "seal",
+    "repository": "Ramora0/HexTicTacToe",
+    "revision": "3474edb5a9cdb12004c70aac69a631a45a3cb9e0",
+    "licence": "none, so it is built on this machine and never republished",
+    "files": [
+      {
+        "path": "cpp/engine.h",
+        "sha256": "9e2adaecc25a0580835d64996b559711cf02c34e05077e7c4926ccf6f90ba177",
+        "url": "https://raw.githubusercontent.com/Ramora0/HexTicTacToe/3474edb5a9cdb12004c70aac69a631a45a3cb9e0/cpp/engine.h"
+      },
+      {
+        "path": "cpp/types.h",
+        "sha256": "70e6cdcb03ef407a504fb04fb49f9a5608cec9230e036a4039e3df94b31e9fb6",
+        "url": "https://raw.githubusercontent.com/Ramora0/HexTicTacToe/3474edb5a9cdb12004c70aac69a631a45a3cb9e0/cpp/types.h"
+      },
+      {
+        "path": "cpp/pattern_data.h",
+        "sha256": "2819d28d6bce7baaacbd42c00cd8c5a21e171a95327245efe3f29eda79f434bd",
+        "url": "https://raw.githubusercontent.com/Ramora0/HexTicTacToe/3474edb5a9cdb12004c70aac69a631a45a3cb9e0/cpp/pattern_data.h"
+      },
+      {
+        "path": "cpp/ankerl_unordered_dense.h",
+        "sha256": "930f11abf8ba4f476eb56a28bb71897472a3ab7510be809bf00e07e2f73ff2e0",
+        "url": "https://raw.githubusercontent.com/Ramora0/HexTicTacToe/3474edb5a9cdb12004c70aac69a631a45a3cb9e0/cpp/ankerl_unordered_dense.h"
+      }
+    ]
+  }
+}
