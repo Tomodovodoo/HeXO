@@ -3,11 +3,13 @@
 // {kind: 'search', cases: [{history, seed, tactics, steps: [{simulations, root_samples, batch_size}], batches}]}
 //   replays the recorded evaluations batch by batch -> [[{action, policy, visits, completed}] per step]
 // {kind: 'line', history, certificate} -> winning line
+// {kind: 'offline', requests: [[path, body]]} -> [[status, history or error]] from an OfflineSession
 import {readFileSync} from 'node:fs';
 import {encode, features} from '../../web/engine/encode.mjs';
 import {Native, NeuralSearch, EvaluationCache} from '../../web/engine/search.mjs';
 import {winningLine} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
+import {OfflineSession} from '../../web/engine/offline.mjs';
 
 const job = JSON.parse(readFileSync(0, 'utf8'));
 const native = new Native(await createModule());
@@ -48,5 +50,11 @@ if (job.kind === 'encode') {
   for (const item of job.cases) answer.push(await search(item));
 } else if (job.kind === 'line') {
   answer = winningLine(native, job.history, job.certificate);
+} else if (job.kind === 'offline') {
+  const session = new OfflineSession(native, {engine: 'browser:bubble'});
+  answer = job.requests.map(([path, body]) => {
+    const [status, data] = session.answer(path, body);
+    return [status, status === 200 ? data.history : data.error];
+  });
 }
 process.stdout.write(JSON.stringify(answer));

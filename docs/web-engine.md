@@ -16,6 +16,15 @@ python -m unittest tests.test_web_engine tests.test_web_tactical
 `rustup target add wasm32-wasip1`; `web/engine/build.json` binds the committed artefacts to their sources and the
 tests fail when they are stale. `ort` and `model` write ignored files; a static deployment runs all three.
 
+## GitHub Pages
+
+`.github/workflows/pages.yml` builds the bundle on every push to `main` (ONNX Runtime, and the model exported from the
+newest release) and publishes `web/` as the site, so the play page opens at <https://tomodovodoo.github.io/HeXO/>.
+It runs once the repository is public and Settings > Pages > Build and deployment > Source is set to GitHub Actions.
+Without a play server the page answers its own game requests (`web/engine/offline.mjs`): Bubble (browser) holds seat O
+and the analysis, server-only controls (review, tournaments, import and export) are hidden, and `web/coi-sw.js`, scoped
+to the site's path, adds the cross-origin isolation headers after one reload.
+
 ## Layout
 
 | File | Role |
@@ -29,6 +38,7 @@ tests fail when they are stale. `ort` and `model` write ignored files; a static 
 | `web/engine/tactical.mjs`, `solver-worker.mjs` | Solver with a WASI shim, in a worker that a cancel terminates |
 | `web/engine/proof.mjs` | Certificate walk for the winning line |
 | `web/engine/seat.mjs` | Play page hook: the browser seat and analysis engine |
+| `web/engine/offline.mjs` | The play server's game requests answered in the page, for static hosting |
 | `web/coi-sw.js` | Cross-origin isolation on static hosts (`isolate()`), for WebAssembly threads |
 
 ## Device choice

@@ -4,7 +4,8 @@
  * turns to the people's last turn. Browser analyses are shown in place of the server's for the positions they cover.
  * A task that failed is not retried until the position, preset or engine choice changes. Choices persist per browser
  * (localStorage). */
-import {BubbleEngine, PRESETS} from './bubble.mjs';
+import {BubbleEngine, PRESETS, isolate} from './bubble.mjs';
+import {OfflineSession} from './offline.mjs';
 
 const ID = 'browser:bubble', LABEL = 'Bubble (browser)', ENTRY = {id: ID, kind: 'bubble', name: LABEL, label: LABEL, checkpoints: []};
 const STORE = 'bubble-browser';
@@ -13,7 +14,8 @@ const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'ren
 const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, page[name]]));
 const engine = new BubbleEngine(), analyses = new Map(), hk = history => history.map(p => p.join(',')).join(';');
 let config = {seats: [null, null], analysis: null}, job = null, failed = null, posting = false, loaded = 0;
-try { config = {...config, ...JSON.parse(localStorage.getItem(STORE))}; } catch {}
+let fresh = true;
+try { const saved = localStorage.getItem(STORE); fresh = saved === null; config = {...config, ...JSON.parse(saved)}; } catch {}
 const save = () => { failed = null; try { localStorage.setItem(STORE, JSON.stringify(config)); } catch {} };
 const state = () => typeof S === 'undefined' ? null : S;
 const viewed = () => typeof view === 'undefined' ? 0 : view;
@@ -97,7 +99,8 @@ async function run(key, task) {
       posting = true;
       try {
         for (const [q, r] of result.moves) {
-          if (state().paused || hk(state().history) !== hk(task.history) || !(await original.post('/play', {q, r}))) break;
+          if (state().paused || config.seats[task.side] !== task.preset || hk(state().history) !== hk(task.history)
+              || !(await original.post('/play', {q, r}))) break;
           task.history.push([q, r]);
         }
       } finally {
@@ -136,6 +139,10 @@ function install() {
     if (path === '/seat' && body.engine !== undefined) {
       config.seats[body.side] = body.engine === ID ? config.seats[body.side] || 'standard' : null;
       save();
+      if (job?.kind === 'move' && job.side === body.side && !config.seats[body.side]) {
+        job.controller.abort();
+        job = null;
+      }
       if (body.engine === ID) return original.post('/seat', {side: body.side, engine: 'human'});
     }
     if (path === '/analysis' && body.engine !== undefined) {
@@ -194,5 +201,36 @@ function install() {
   }
 }
 
-if (HOOKS.every(name => typeof original[name] === 'function')) install();
-else console.warn('Bubble (browser) needs the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));
+/**
+ * Without a play server (a static host) the page's server requests are answered by an OfflineSession, server-only
+ * controls are hidden, Bubble (browser) takes seat O and analysis, and the page asks for cross-origin isolation.
+ * Resolves true when it took over (or is reloading for isolation).
+ */
+async function serverless() {
+  try {
+    const response = await fetch('/state', {cache: 'no-store'});
+    if (response.ok && (response.headers.get('Content-Type') || '').includes('json')) return false;
+  } catch {}
+  if (await isolate()) return true;
+  const session = await OfflineSession.create({engine: ID, preset: 'quick', budget: PRESETS.quick});
+  const server = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+    if (url.origin !== location.origin || !OfflineSession.handles(url.pathname)) return server(input, init);
+    const [status, data] = session.answer(url.pathname, init?.body ? JSON.parse(init.body) : {});
+    return Promise.resolve(new Response(JSON.stringify(data), {status, headers: {'Content-Type': 'application/json'}}));
+  };
+  if (fresh) config.seats = [null, 'standard'];
+  config.analysis ??= 'quick';
+  save();
+  document.head.append(original.el('style', {}, ['#review-go', '#copy', '#more', '#import', '[aria-label="Tournaments"]']
+    .map(selector => `.serverless ${selector}`).join(',') + '{display:none!important}'));
+  document.documentElement.classList.add('serverless');
+  page.accept(session.state());
+  return true;
+}
+
+if (HOOKS.every(name => typeof original[name] === 'function')) {
+  install();
+  serverless();
+} else console.warn('Bubble (browser) needs the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));

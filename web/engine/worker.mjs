@@ -31,6 +31,14 @@ function send(id) {
   if (!solver) {
     solver = new Worker(new URL('solver-worker.mjs', import.meta.url), {type: 'module'});
     solver.onmessage = ({data}) => { solverWaits.get(data.id)?.resolve(data.result); solverWaits.delete(data.id); };
+    solver.onerror = event => {
+      solver.terminate();
+      solver = null;
+      for (const wait of solverWaits.values()) {
+        wait.resolve({status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: 0, reason: `solver worker failed: ${event.message || 'error'}`});
+      }
+      solverWaits.clear();
+    };
   }
   const {history, options} = solverWaits.get(id);
   solver.postMessage({id, history, options});
