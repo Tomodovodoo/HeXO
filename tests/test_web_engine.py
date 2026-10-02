@@ -91,7 +91,7 @@ class PlayPage(unittest.TestCase):
 
     def test_engines_turn_the_book_on(self):
         answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False)
-        self.assertEqual(self.books(answer), [True])
+        self.assertEqual(answer['requests'], [['/book', dict(enabled=True)], ['/seat', dict(side=0, engine='native')]])
         self.assertTrue(answer['enabled'])
 
     def test_people_turn_the_book_off(self):

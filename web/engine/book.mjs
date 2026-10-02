@@ -11,21 +11,22 @@ export function bookDefault(humans) {
 
 /**
  * Wraps `page.post`. A /book request through it marks the switch touched for the session (`storage`, sessionStorage
- * in the page) when it is sent. /seat requests that name an engine run one at a time, each followed, while untouched,
- * by the /book request that applies `bookDefault` to the seats then shown, so the book follows the last seats.
- * `state()` is the page's current state, `human(seat)` whether the page shows that seat object as Human.
+ * in the page) when it is sent. /seat requests that name an engine run one at a time; while untouched, each is
+ * preceded by the /book request that applies `bookDefault` to the seats it leaves (a request for 'human' makes that
+ * seat Human, any other engine makes it an engine), so the book is set before an engine seat can move and follows the
+ * last seats. `state()` is the page's current state, `human(seat)` whether the page shows that seat object as Human.
  */
 export function followSeats(page, state, human, storage) {
   const post = page.post;
   let touched = false, queue = Promise.resolve();
   try { touched = storage?.getItem(KEY) === '1'; } catch {}
   const follow = async body => {
-    const data = await post('/seat', body), s = state();
-    if (data && !touched && s?.book?.available) {
-      const enabled = bookDefault(s.seats.map(human));
+    const s = state();
+    if (!touched && s?.book?.available) {
+      const enabled = bookDefault(s.seats.map((seat, side) => side === body.side ? body.engine === 'human' : human(seat)));
       if (enabled !== s.book.enabled) await post('/book', {enabled});
     }
-    return data;
+    return post('/seat', body);
   };
   page.post = (path, body = {}) => {
     if (path === '/book') {
