@@ -1412,6 +1412,12 @@ class TurnTrees(unittest.TestCase):
         self.assertLess(first.searched[-1][2], 128 + 16)
         engines.kept_trees(bubble, [(0, 0), (1, 0)])
         self.assertIsNone(first.ptr)
+        trees = engines.kept_trees(bubble, [(0, 0)], 'abc')
+        tree, missing = trees([(0, 0)], 32, bubble.evaluator)
+        tree.search(10, root_samples=16, batch_size=16)
+        self.assertEqual(trees([(0, 0)], 32, bubble.evaluator), (tree, 32 - int(tree.result(0, 0, 0, 0)['visits'].sum())))
+        engines.kept_trees(bubble, [(0, 0)], 'def')
+        self.assertIsNone(tree.ptr)
 
     def test_rows_put_proven_wins_first_and_proven_losses_last(self):
         import numpy as np

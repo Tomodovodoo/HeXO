@@ -817,7 +817,7 @@ class Engines:
         spent = budget if solver else budget | dict(solver_nodes=0)
         trees = solved = None
         if keep:
-            trees, kept = self.kept_trees(bubble, history), self.kept
+            trees, kept = self.kept_trees(bubble, history, build), self.kept
             proven = kept['solved'] if kept['solved'] and kept['solved']['proof'] else None
             solved = proven or solve(solver, history, spent['solver_nodes'], watch)
             kept['solved'] = solved
@@ -827,30 +827,30 @@ class Engines:
             spent = spent | dict(solver_nodes=0)
         return found, spent, f"{bubble.sha256[:16]}:{build if spent['solver_nodes'] else 'none'}" + (':kept' if keep else '')
 
-    def kept_trees(self, bubble, history):
+    def kept_trees(self, bubble, history, build='none'):
         """A `TurnSearch` tree source that keeps one tree per position of `history`'s turn for the next kept
-        evaluation of the same position and model, and runs only the simulations a tree has not had yet; the
-        trees of any other position or model are dropped."""
+        evaluation of the same position, model and solver `build`, and runs only the simulations its root has not
+        had yet (an interrupted search counts what it finished); the trees of anything else are dropped."""
         from neural_search import NeuralSearch
-        key = (bubble.sha256, position_text(history))
+        key = (bubble.sha256, position_text(history), build)
         if self.kept is None or self.kept['key'] != key:
             self.drop_kept()
             self.kept = dict(key=key, trees={}, solved=None)
         kept = self.kept
 
         def trees(cells, simulations, network):
-            entry = kept['trees'].get(position_text(cells))
-            if entry is None:
-                entry = kept['trees'][position_text(cells)] = [
-                    NeuralSearch(network, bubble.sha256, cells, seed=1740, cache=bubble.cache, tactics=True), 0]
-            entry[0].evaluator = network
-            missing, entry[1] = simulations - entry[1], max(entry[1], simulations)
-            return entry[0], max(1, missing)
+            tree = kept['trees'].get(position_text(cells))
+            if tree is None:
+                tree = kept['trees'][position_text(cells)] = NeuralSearch(network, bubble.sha256, cells, seed=1740,
+                                                                         cache=bubble.cache, tactics=True)
+            tree.evaluator = network
+            visits = int(tree.result(0, 0, 0, 0)['visits'].sum())
+            return tree, max(1, simulations - visits)
         return trees
 
     def drop_kept(self):
         if self.kept is not None:
-            for tree, _ in self.kept['trees'].values():
+            for tree in self.kept['trees'].values():
                 tree.close()
         self.kept = None
 
