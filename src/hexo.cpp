@@ -629,12 +629,13 @@ struct Search {
         std::array<Cell,2> selected{};
         return !cover_exists(threats,selected,0,b.remaining);
     }
-    std::vector<Turn> turns(Board& b,bool timed=true,Turn hint={},bool forcing=false,const Cell* first_only=nullptr) {
+    std::vector<Turn> turns(Board& b,bool timed=true,Turn hint={},bool forcing=false,const Cell* first_only=nullptr,std::unordered_set<uint64_t>* seen_turns=nullptr) {
         Turn win=immediate(b); if(win.count) {win.score=mate;return {win};}
         int side=b.player;
         auto constraints=b.completions(1-side);
         std::vector<Turn> result;
-        std::unordered_set<uint64_t> seen;
+        std::unordered_set<uint64_t> local_seen;
+        auto& seen=seen_turns?*seen_turns:local_seen;
         auto add=[&](Turn t,bool mandatory=false) {
             if(t.count<1 || t.count>2 || t.count>b.remaining) return;
             CandidatePause pause(b);Restore restore(b);
@@ -662,7 +663,8 @@ struct Search {
         }
         auto follow=[&](Cell first,int limit) {
             Restore restore(b);b.make(first);
-            if(forcing) {
+            // A mandatory first-stone block can leave the attack to the second.
+            if(forcing && constraints.empty()) {
                 bool attack=false;
                 for(int a=0;a<3;++a) for(int j=0;j<6;++j) {
                     auto data=b.windows.find({first+axes[a]*(-j),a});
@@ -767,12 +769,14 @@ struct Search {
         if(!depth) return -1;
         const auto mark=proof.size();
         const bool constrained=!b.completions(1-attacker).empty();
+        // Reversing a pair in another first-stone batch is the same attack.
+        std::unordered_set<uint64_t> generated;
         auto ranked=candidate_scores(b);
         // Continuous attacks need offensive candidates: cancel the defensive
         // three-quarter term shared by the two cached scalar rankings.
         for(auto& [score,c]:ranked) score=4*score-3*b.gain(c,1-attacker);
         auto firsts=constrained?std::vector<Cell>{{}}:select_candidates(b,std::move(ranked),width);
-        for(auto first:firsts) for(const auto& attack:turns(b,true,{},true,constrained?nullptr:&first)) {
+        for(auto first:firsts) for(const auto& attack:turns(b,true,{},true,constrained?nullptr:&first,&generated)) {
             if(Clock::now()>=proof_deadline) throw Timeout{};
             Restore restore(b);apply(b,attack);
             std::vector<Turn> replies;
