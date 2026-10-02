@@ -791,15 +791,21 @@ struct Search {
     }
     int probe(Board& b,int depth) {
         const auto mark=proof.size();const int limit=proof_limit;
-        if(depth>3) {
+        if(depth>1) {
             const auto end=proof_deadline,now=Clock::now();
             proof_deadline=now+(end-now)/2;
-            proof_limit=std::min(limit,192);proof_nodes=0;
             int found=-1;
-            try {found=prove(b,3);} catch(const Timeout&) {}
+            // Find short continuations before longer alternatives can consume
+            // the budget, including after the opponent follows a known proof.
+            for(int d=1;d<std::min(4,depth);++d) {
+                proof_limit=std::min(limit,64*d);proof_nodes=0;
+                try {found=prove(b,d);} catch(const Timeout&) {}
+                if(found>=0) break;
+                proof.resize(mark);
+                if(Clock::now()>=proof_deadline) break;
+            }
             proof_limit=limit;proof_deadline=end;
             if(found>=0) return found;
-            proof.resize(mark);
             if(Clock::now()>=proof_deadline) return -1;
         }
         proof_nodes=0;

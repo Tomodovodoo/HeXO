@@ -74,7 +74,8 @@ int main() {
     assert(!forcing.forced_replies(spare,0,free_replies));
     // Development losses: an attack hidden below defensive first-stone
     // rankings, and a winning continuation with no unblocked three-stone line.
-    // Both strategies were checked separately by the raw-board Python verifier.
+    // Short continuations must also survive the proof work limit. All strategies
+    // were checked separately by the raw-board Python verifier.
     for(const auto& history:std::vector<std::vector<Cell>>{
         {
             {0,0},{1,1},{-1,2},{-1,1},{3,-3},{1,-1},{1,0},{1,-3},{2,-3},{4,-3},
@@ -92,6 +93,11 @@ int main() {
             {4,-6},{3,3},{4,2},{1,5},{7,-1},{6,-5},{-6,6},{-8,8},{7,-6},{-6,4},
             {-6,7},{-6,2},{-6,8},{-8,6},{-1,-6},{-9,7},{-1,-8},{2,6},{7,-5},{2,5},
             {8,-5}
+        },
+        {
+            {0,0},{-2,-2},{-2,1},{-2,2},{-1,1},{2,-2},{-4,4},{-1,2},{-1,0},{-1,-2},
+            {0,-2},{1,-2},{1,2},{-4,2},{-4,-2},{1,0},{-3,-2},{-4,0},{-4,1},{-4,-1},
+            {-4,3},{-2,-1},{-3,0},{-5,2},{0,-3}
         }
     }) {
         Board position;
