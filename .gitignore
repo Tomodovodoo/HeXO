@@ -15,3 +15,5 @@ web/engine/model/
 web/engine/six/networks/
 web/engine/shrimp/model/
 web/engine/seal/
+web/engine/strix/*.safetensors
+web/engine/strix/networks.json

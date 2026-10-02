@@ -46,6 +46,8 @@ to the site's path, adds the cross-origin isolation headers after one reload.
 | `web/engine/shrimp/` | `shrimp.wasm` (built from `tools/shrimp_web`), `search.mjs` (the driver's turn), `network.mjs` (the graph's inputs) |
 | `web/engine/seal.mjs`, `seal-worker.mjs` | Seal (browser): page API and worker; `seal/` holds its build |
 | `web/engine/six.mjs`, `six-worker.mjs`, `six/search.mjs` | Six (browser): page API and seat entry, worker, and Six's search driving its network |
+| `web/engine/strix.mjs`, `strix-worker.mjs` | Strix (browser): page API and worker |
+| `web/engine/strix/` | `strix.wasm` and its loader `core.mjs`, built from `tools/strix_web`; the network when built |
 | `web/engine/offline.mjs` | The play server's game requests answered in the page, for static hosting |
 | `web/coi-sw.js` | Cross-origin isolation on static hosts (`isolate()`), for WebAssembly threads |
 
@@ -249,3 +251,35 @@ Speed on the RTX 3070 Ti (otherwise idle) in the Claude desktop browser pane, We
 quick 22 s, standard 102 s. The search itself and its threat solver run on one thread in the worker, so turns slow
 down as the tree grows. On WebAssembly a position costs about 0.4 s on one thread, so without WebGPU only lightning
 is practical.
+
+## Strix (browser)
+
+Strix ([SootyOwl/hexo-strix](https://github.com/SootyOwl/hexo-strix) at `5a771e5`) with the network hexo.tyto.cc
+lists as `pulsatrix-10-best` also runs in the page as **Strix (browser)**, for a seat or the analysis, with the
+server's presets in simulations per placement (lightning 2, quick 8, standard 64, strong 128, deep 512, dangerous
+4,096). hexo.tyto.cc runs Strix the same way: the Rust network (`hexo-infer`) and Gumbel search (`hexo-mcts`)
+compiled to WebAssembly in a worker that a cancel terminates. Here `tools/strix_web` wraps the same calls as the
+server's wrapper `tools/strix_learned` (4 root actions, `c_visit` 50, `c_scale` 1, no Gumbel noise, the same request
+and Strix's mirrored frame) as a `wasm32-wasip1` library with SIMD, run through the WASI shim of `tactical.mjs`.
+`build_web.py strix` builds `web/engine/strix/strix.wasm` (676 KB) and records it in `build.json`; `build_web.py wasm`
+builds it with the rest.
+
+The network is not committed. `python tools/build_web.py strix-network` downloads the file pinned in
+`tools/engines.json` (2.8 MB, checked against its SHA-256) into `web/engine/strix/` with `networks.json`; without
+that file the page does not offer Strix. The worker keeps `strix.wasm` and the network in the Cache API under their
+digests. Its licence is unstated: hexo.tyto.cc serves it publicly, and neither the site nor the repository grants
+permission to redistribute it. The Pages workflow therefore fetches it only when the repository variable
+`PUBLISH_STRIX_NETWORK` is `true`. The engine code is MIT (`web/engine/strix/LICENSE-hexo-strix.txt`); the Rust
+crates it links (serde, serde_json, rand, safetensors, rayon, rustc-hash) are MIT or Apache 2.0.
+
+A search runs on one thread. On the Ryzen 9 5900X under node 24, from a 19-stone position, a turn takes 1.0 s at
+lightning, 3.0 s at quick, 23 s at standard, 44 s at strong and 178 s at deep, against 0.8, 1.9, 10.7, 19.3 and 76 s
+for the server wrapper, which evaluates a batch on all cores. From a 5-stone position standard takes 6 s.
+
+Parity (`tests/test_web_strix.py`, against `tools/strix_learned_adapter.py`): the wasm build plays the server's turn in
+all 156 recorded positions at 8 simulations, and in 40 of 46 at 64. The network's outputs differ from the native
+build's in the last bits of a float (about 1e-9; the network calls `exp` and `tanh`, which the two math libraries
+round differently), and that decides near-equal choices: five of the six differences are the position after the
+origin, where the browser plays the mirror image of the server's turn, and one is a different stone in an 8-stone
+position. The 19-stone timing position above also got a different second stone at 128. The test checks exact turns
+on positions without such ties, and the origin position up to its symmetry.

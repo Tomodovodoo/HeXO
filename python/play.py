@@ -2649,7 +2649,8 @@ def export(history, kind):
 
 
 STATIC_TYPES = {'.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json',
-                '.onnx': 'application/octet-stream', '.html': 'text/html; charset=utf-8'}
+                '.onnx': 'application/octet-stream', '.safetensors': 'application/octet-stream',
+                '.html': 'text/html; charset=utf-8'}
 # Cross-origin isolation (SharedArrayBuffer for the browser engine's threads) without blocking credentialless subresources
 ISOLATION = (('Cross-Origin-Opener-Policy', 'same-origin'), ('Cross-Origin-Embedder-Policy', 'credentialless'))
 
