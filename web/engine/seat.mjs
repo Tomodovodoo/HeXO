@@ -15,6 +15,7 @@ import {BubbleEngine, PRESETS, isolate} from './bubble.mjs';
 import {OfflineSession} from './offline.mjs';
 import {native} from './native.mjs';
 import {shrimp} from './shrimp.mjs';
+import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
@@ -22,7 +23,7 @@ const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bu
   engine: new BubbleEngine(),
   record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
     solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE})};
-const ENGINES = new Map([bubble, native, shrimp, six].filter(Boolean).map(e => [e.entry.id, e]));
+const ENGINES = new Map([bubble, native, shrimp, seal, six].filter(Boolean).map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
   'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems'];

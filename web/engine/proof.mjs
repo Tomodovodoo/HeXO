@@ -1,85 +1,70 @@
-/* Walking a verified solver certificate: python/dense_solver.py Proof.walk and python/play.py winning_line. */
+/* Rows of a browser analysis record: the candidate rows (python/play.py top_rows) and the principal variation of a
+ * verified solver certificate (python/play.py principal_variation). */
 
-const same = (a, b) => a[0] === b[0] && a[1] === b[1];
-const has = (list, point) => list.some(p => same(p, point));
-const sorted = cells => cells.map(p => [...p]).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-
-export class Proof {
-  /** A certificate of a forced win for the side to move at `base` ([[q, r], ...]). */
-  constructor(base, certificate) {
-    this.base = base;
-    this.nodes = certificate.nodes;
-    this.root = certificate.root;
-    this.depth = new Map();
-    this.replies = new Map();
-    this.nodes.forEach((node, i) => {
-      if (node.kind === 'defender_replies') this.replies.set(i, new Map(node.responses.map(r => [JSON.stringify(sorted(r.action)), r.child])));
-    });
-  }
-  turns(index) {
-    if (!this.depth.has(index)) {
-      const node = this.nodes[index];
-      this.depth.set(index, node.kind === 'attacker_move' ? 1 + this.turns(node.child)
-        : this.replies.has(index) ? Math.max(...[...this.replies.get(index).values()].map(c => this.turns(c))) : 1);
+/** Most attacker turns on any path of `certificate` from each node, the completing turn included. */
+function depths(certificate) {
+  const memo = new Map();
+  const turns = index => {
+    if (!memo.has(index)) {
+      const node = certificate.nodes[index];
+      memo.set(index, node.kind === 'attacker_move' ? 1 + turns(node.child)
+        : node.kind === 'defender_replies' ? Math.max(...node.responses.map(r => turns(r.child))) : 1);
     }
-    return this.depth.get(index);
-  }
-  /** [move, node, played]: move is [stones still to play this attacker turn, turns] or null off the certificate. */
-  walk(history) {
-    let i = this.base.length;
-    if (history.length < i || this.base.some((p, j) => !same(p, history[j]))) return [null, null, []];
-    let index = this.root;
-    for (;;) {
-      let node = this.nodes[index], turns = this.turns(index);
-      if (node.kind === 'defender_replies' || node.kind === 'unstoppable') {
-        const reply = history.slice(i, i + 2);
-        if (reply.length < 2) return [[[], turns], node, reply];
-        i += 2;
-        if (node.kind === 'unstoppable') {
-          const threat = node.threats.find(t => !t.some(c => has(reply, c)));
-          if (!threat) return [null, null, []];
-          node = {kind: 'immediate_win', action: threat};
-          turns = 1;
-        } else {
-          index = this.replies.get(index).get(JSON.stringify(sorted(reply)));
-          if (index === undefined) return [null, null, []];
-          continue;
-        }
-      }
-      const action = node.action, played = history.slice(i, i + action.length);
-      if (played.length < action.length) {
-        if (!played.every(p => has(action, p))) return [null, null, []];
-        return [[action.filter(a => !has(played, a)), turns], node, played];
-      }
-      if (!played.every(p => has(action, p)) || node.kind === 'immediate_win') return [null, null, []];
-      index = node.child;
-      i += action.length;
-    }
-  }
-  /** Defender stones of the first covered reply extending this turn, or null. */
-  reply(history) {
-    const [move, node, played] = this.walk(history);
-    if (!move || move[0].length || node.kind !== 'defender_replies') return null;
-    for (const response of node.responses) {
-      if (played.every(p => has(response.action, p))) return response.action.filter(a => !has(played, a));
-    }
-    return null;
-  }
+    return memo.get(index);
+  };
+  return turns;
 }
 
-/** One legal continuation of `certificate` from `history` as [q, r, player] stones (play.winning_line). */
-export function winningLine(native, history, certificate) {
-  const proof = new Proof(history, certificate), current = history.map(p => [...p]), line = [];
-  for (let state = native.game(current); state.winner < 0; state = native.game(current)) {
-    const move = proof.walk(current)[0];
-    if (!move) break;
-    const actions = move[0].length ? move[0] : proof.reply(current) || native.legal(current).slice(0, state.remaining);
-    for (const action of actions) {
-      const player = native.game(current).player;
-      line.push([action[0], action[1], player]);
-      current.push([action[0], action[1]]);
-      if (native.game(current).winner >= 0) break;
+/**
+ * The principal variation of a verified certificate for the side to move at `history` (play.principal_variation):
+ * {pv: [[q, r, player], ...] up to the winning stone, plies: placements to it}. The attacker takes the certificate's
+ * primary choice, the defender the covered reply lasting the most attacker turns (the first of equals); at an
+ * unstoppable fork the defender's two stones are left out (counted in `plies`) and the shortest threat completes.
+ */
+export function principalVariation(native, history, certificate) {
+  const turns = depths(certificate), current = history.map(p => [...p]), pv = [];
+  const attacker = native.game(current).player;
+  let plies = 0, index = certificate.root;
+  while (native.game(current).winner < 0) {
+    const node = certificate.nodes[index];
+    if (node.kind === 'unstoppable') {
+      if (node.threats?.length) {
+        const threat = node.threats.reduce((a, b) => b.length < a.length ? b : a);
+        for (const [q, r] of threat) pv.push([q, r, attacker]);
+        plies += 2 + threat.length;
+      }
+      break;
     }
+    let action;
+    if (node.kind === 'defender_replies') {
+      const reply = node.responses.reduce((a, b) => turns(b.child) > turns(a.child) ? b : a);
+      [action, index] = [reply.action, reply.child];
+    } else [action, index] = [node.action, node.child];
+    for (const [q, r] of action) {
+      const state = native.game(current);
+      if (state.winner >= 0) break;
+      pv.push([q, r, state.player]);
+      current.push([q, r]);
+      plies++;
+    }
+    if (index === undefined) break;
   }
-  return line;
+  return {pv, plies};
+}
+
+/** A `top` row as python/play.py move_row: [q, r, probability], then from a search the mover's win probability after
+ * the stone and 1 or -1 when the search proved that it wins or loses, else 0. */
+function moveRow([q, r], probability, value) {
+  const row = [q, r, Math.round(probability * 1e4) / 1e4];
+  return value === undefined ? row : [...row, Math.round((value + 1) / 2 * 1e4) / 1e4, value >= 1 ? 1 : value <= -1 ? -1 : 0];
+}
+
+/** The five `top` rows as python/play.py top_rows (without `won`): `lead` first, then proven wins, the others by
+ * policy and proven losses last; a stone below a policy share of 0.00005 only when the search proved it wins. */
+export function topRows(actions, policy, values, lead) {
+  const rank = i => !values ? 1 : values[i] >= 1 ? 0 : values[i] <= -1 ? 2 : 1;
+  const first = actions.findIndex(a => a[0] === lead[0] && a[1] === lead[1]);
+  const order = Array.from(policy, (p, i) => i).filter(i => i !== first && (policy[i] >= .00005 || rank(i) === 0))
+    .sort((a, b) => rank(a) - rank(b) || policy[b] - policy[a]);
+  return (first >= 0 ? [first, ...order] : order).slice(0, 5).map(i => moveRow(actions[i], policy[i], values?.[i]));
 }

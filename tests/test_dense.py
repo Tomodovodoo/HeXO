@@ -7622,10 +7622,10 @@ class DenseBrowser(unittest.TestCase):
                       certificate=dict(root=0, nodes=[dict(kind='immediate_win', action=[[4, 0], [5, 0]])]))
         prover = unittest.mock.Mock(history=unittest.mock.Mock(return_value=result))
         found = evaluate(self.bubble, prover, history, 4, 2048)
-        self.assertEqual((found['value'], found['proof'], found['moves']), (1., dict(winner=0, turns=1), [[4, 0], [5, 0]]))
+        self.assertEqual((found['value'], found['proof'], found['moves']), (1., dict(winner=0, turns=1, plies=2), [[4, 0], [5, 0]]))
         game = Game(history)
         try:
-            for q, r, player in found['line']:
+            for q, r, player in found['pv']:
                 self.assertEqual(player, 0)
                 game.play(q, r)
             self.assertEqual(game.winner, 0)
