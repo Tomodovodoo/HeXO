@@ -17,6 +17,41 @@ class NativeRules(unittest.TestCase):
         self.addCleanup(game.close)
         return game
 
+    def test_benchmark_records_only_executed_placements(self):
+        import contextlib
+        import io
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from hexo import library
+        from tests.benchmark import native_comparison
+
+        history = [(0,0),(1,0),(0,-8),(-1,0),(-2,0),(-2,-8),(-4,-8),
+                   (-3,0),(-4,0),(-6,-8),(-8,-8)]
+        args = SimpleNamespace(seed=1, games=2, book="selected-book", opening_range="wide",
+                               compare_library=None, seal_library=library, ms=100, depth=1,
+                               width=16, max_stones=301, output=None)
+        for wins_first in (True, False):
+            submitted = [(-5,0) if wins_first else (-2,1), (56,0)]
+            engine = Mock(path=Path(library))
+            engine.search.side_effect = [dict(moves=submitted.copy()) for _ in range(2)]
+            with patch("tests.benchmark.NativeLibrary", return_value=engine), \
+                 patch("tests.benchmark.SealLibrary", return_value=engine), \
+                 patch("play.book_openings", return_value={"nodes": [{"moves": history}]}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                report = native_comparison(args)
+            self.assertEqual(report["summary"]["invalid_pairs"], 0 if wins_first else 1)
+            if wins_first:
+                self.assertEqual((report["summary"]["wins"], report["summary"]["losses"]), (1, 1))
+            else:
+                self.assertIsNone(report["summary"]["score"])
+            for game in report["games"]:
+                self.assertEqual(game["winner"], 0 if wins_first else -1)
+                self.assertEqual(game["invalid"], None if wins_first else "Seal coordinate range exceeded")
+                self.assertEqual(game["history"], history + submitted[:1])
+                self.assertEqual(game["searches"][0]["moves"], submitted[:1])
+                self.assertEqual(game["searches"][0]["submitted_moves"], submitted)
+
     def test_tt_injection_preserves_board_and_returns_complete_legal_turn(self):
         from legacy.curriculum import opening_for
         for seed in range(12):
