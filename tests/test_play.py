@@ -1414,6 +1414,25 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(found['pv'], [[*m, 1] for m in found['moves']])
         self.assertGreater(found['proof']['plies'], 0)
 
+    def test_a_proof_found_at_the_second_stone_counts_the_first(self):
+        import numpy as np
+        from play import TurnSearch, solve
+        actions = np.array([[1, 0], [2, 0]])
+        results = iter([dict(action=[1, 0], policy=np.array([.6, .4]), actions=actions, values=np.array([.1, .2]),
+                             proven=0, exact_winner=-1, proof_plies=0),
+                        dict(action=[2, 0], policy=np.array([0., 1.]), actions=actions, values=np.array([0., 1.]),
+                             proven=1, exact_winner=1, proof_plies=5)])
+        turn = TurnSearch(None, None, [(0, 0)], 1, solve(None, [(0, 0)], 0), trees=lambda *a: (None, 1))
+        try:
+            turn.take(next(results))
+            turn.take(next(results))
+            found = turn.record()
+        finally:
+            turn.close()
+        self.assertEqual((found['proof']['winner'], found['proof']['plies']), (1, 6))
+        self.assertEqual(found['later'][0]['proof']['plies'], 5)
+        self.assertEqual(found['pv'], [[1, 0, 1], [2, 0, 1]])
+
     def test_a_proven_second_stone_keeps_its_proof(self):
         from play import evaluate
         history = [(0, 0), (1, 2), (2, 2), (-2, 0), (-3, 0), (3, 2), (4, 2), (0, -3), (0, -4)]

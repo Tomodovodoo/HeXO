@@ -672,7 +672,7 @@ class TurnSearch:
                          turns=proof_turns(result['proof_plies'], self.local.remaining, proven > 0),
                          plies=int(result['proof_plies'])) if proven else None
             if self.proof is None and (proven > 0 or proven < 0 and not self.moves):
-                self.proof = exact
+                self.proof = dict(exact, plies=exact['plies'] + self.played)
         if not self.given:
             self.moves.append([int(action[0]), int(action[1])])
         stone = self.moves[self.played]

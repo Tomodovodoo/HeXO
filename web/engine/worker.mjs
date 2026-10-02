@@ -122,7 +122,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
           : policy.reduce((sum, p, i) => sum + p * result.values[i], 0);
         if (proof === null && (result.proven > 0 || (result.proven < 0 && !moves.length))) {
           proof = {winner: result.proven > 0 ? player : 1 - player, turns: proofTurns(result.proof_plies, local.remaining, result.proven > 0),
-            plies: result.proof_plies};
+            plies: result.proof_plies + moves.length};
         }
       } else {
         actions = native.legal(current);
