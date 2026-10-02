@@ -174,7 +174,7 @@ export class BrowserSession extends OfflineSession {
     if (signature === this.gameSignature) return null;
     this.gameSignature = signature; game.saved_at = new Date().toISOString();
     const summary = {id: this.gameId, name: game.created_at.slice(0, 19).replace('T', ' '), games: 1, completed: 1,
-      players: players.map(p => p.name), wins: winner < 0 ? [0, 0] : [winner === 0 ? 1 : 0, winner === 1 ? 1 : 0], capped: 0,
+      players: players.map(p => p.name), player_specs: players, created_at: game.created_at, wins: winner < 0 ? [0, 0] : [winner === 0 ? 1 : 0, winner === 1 ? 1 : 0], capped: 0,
       results: [{game: 1, winner: game.winner, reason: game.reason, placements: this.history.length, id: game.id}], single: true, kind: 'freeplay'};
     return {game, summary};
   }
@@ -383,7 +383,11 @@ export class BrowserSession extends OfflineSession {
   }
   async catalogue() {
     await this.saving;
-    return (await this.storage.all('matches')).sort((a, b) => b.name.localeCompare(a.name)).map(m => ({...m, players: m.players.map(p => typeof p === 'string' ? p : p.name)}));
+    return Promise.all((await this.storage.all('matches')).sort((a, b) => b.name.localeCompare(a.name)).map(async m => {
+      const game = m.single && !m.player_specs ? await this.storage.get('games', m.id) : null;
+      return {...m, player_specs: m.player_specs || game?.players || m.players, created_at: m.created_at || game?.created_at,
+        players: m.players.map(p => typeof p === 'string' ? p : p.name)};
+    }));
   }
   async savedReplay(id, game) {
     await this.saving;

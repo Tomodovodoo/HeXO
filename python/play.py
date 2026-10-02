@@ -1779,6 +1779,7 @@ class Session:
         if signature == self.freeplay_signature:
             return
         summary = dict(output=str(self.freeplay_directory), single=True, kind='freeplay', games=1, completed=1,
+                       created_at=datetime.fromtimestamp(self.freeplay_directory.stat().st_ctime).astimezone().isoformat(),
                        players=players, wins=[int(winner == 0), int(winner == 1)], capped=0,
                        results=[dict(game=1, winner=winner, reason=record['reason'], placements=len(self.history))])
         self.write_match(summary, 'game-0001.json', record)
@@ -1818,7 +1819,8 @@ class Session:
             rows.append(dict(id=ident, name=directory.name, **{key: match[key] for key in
                 ('games', 'completed', 'wins', 'capped', 'results')}, players=[p['name'] for p in match['players']],
                 elo=pair_elo(match['results']), clock=match.get('clock'), opening_range=match.get('opening_range'),
-                single=match.get('single', False), kind=match.get('kind', 'match')))
+                single=match.get('single', False), kind=match.get('kind', 'match'),
+                player_specs=match['players'], created_at=match.get('created_at')))
         return sorted(rows, key=lambda row: row['name'], reverse=True)
 
     def saved_replay(self, ident, number):

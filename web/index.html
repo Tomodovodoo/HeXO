@@ -138,7 +138,8 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 #seats .divider{height:1px;background:var(--line);margin:2px 6px}
 #match{display:grid;gap:6px;padding:4px 6px;font-size:12px;color:var(--muted)}
 #match[hidden]{display:none}
-.score{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px;font:600 13px var(--mono);color:var(--text)}
+.score{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:8px;font:600 13px var(--mono);color:var(--text)}
+.score span{overflow-wrap:anywhere}
 .score span:last-child{text-align:right}.score em{font-style:normal;color:var(--dim);font-size:11px}
 .progress{height:4px;border-radius:2px;background:var(--line);overflow:hidden}.progress i{display:block;height:100%;background:var(--text);transition:width .4s}
 /* study */
@@ -261,12 +262,12 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .tok{border-radius:3px;cursor:default;transition:background .12s,color .12s}
 .tok[data-p="0"]{color:color-mix(in srgb,var(--x) 80%,var(--text))}.tok[data-p="1"]{color:color-mix(in srgb,var(--o) 80%,var(--text))}
 .tok:hover,.tok.on{background:var(--text);color:var(--bg)}
-dialog{background:var(--panel);color:var(--text);border:1px solid var(--line-2);border-radius:14px;padding:16px;width:min(560px,92vw);
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--line-2);border-radius:14px;padding:16px;width:min(560px,92vw);max-height:calc(100dvh - 32px);
   box-shadow:0 24px 60px rgba(0,0,0,.6)}
 dialog[open]{animation:drop .18s var(--ease)}
 dialog::backdrop{background:rgba(2,6,23,.72);backdrop-filter:blur(2px)}
 dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog textarea::placeholder{color:var(--dim)}
-.dialog-head{display:flex;align-items:center;gap:10px;font-weight:700}
+.dialog-head{display:flex;align-items:center;gap:10px;font-weight:700;flex-wrap:wrap}
 #saved-batch{width:100%}
 #t-new[hidden],#t-results[hidden],#saved-batch[hidden]{display:none}
 .tabs{display:inline-flex;gap:2px;padding:2px;border-radius:9px;background:var(--bg);border:1px solid var(--line);margin-left:8px}
@@ -284,15 +285,17 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 .book .chips{display:inline-flex;gap:2px;padding:2px;border-radius:7px;background:var(--bg);border:1px solid var(--line)}
 .book .chips button{border:0;background:transparent;color:var(--dim);font:600 10px system-ui;letter-spacing:.04em;padding:2px 7px;border-radius:5px;cursor:pointer}
 .book .chips button.on{background:var(--raise-2);color:var(--text)}.book:not(.on) .chips{opacity:.45}
-#saved-games{max-height:55vh;overflow:auto;display:grid;gap:4px;scrollbar-width:thin;scrollbar-color:var(--line-2) transparent}
-.saved-game{display:grid;grid-template-columns:44px minmax(0,1fr) auto 32px auto 32px;align-items:center;gap:10px;padding:6px 6px 6px 10px;border-radius:9px;
+#saved-games{max-height:45dvh;overflow-y:auto;display:grid;gap:4px;scrollbar-width:thin;scrollbar-color:var(--line-2) transparent}
+.saved-game{display:grid;grid-template-columns:28px minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px 6px 8px 10px;border-radius:9px;
   background:var(--raise);border:1px solid var(--line);color:inherit;text-decoration:none;transition:border-color .15s,background .15s}
 .saved-game:hover{border-color:var(--line-2);background:var(--raise-2)}
 .saved-game .no{font:700 12px var(--mono);color:var(--dim)}
+.saved-game .details{min-width:0;display:grid;gap:4px}
 .saved-game .who{display:flex;align-items:center;gap:8px;min-width:0;font-weight:600}
-.saved-game .who span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.saved-game .len{font:12px var(--mono);color:var(--muted);display:flex;align-items:center;gap:6px}
-.saved-game .len::before{content:"";width:9px;height:10px;background:var(--dim);clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%)}
+.saved-game .who span{overflow-wrap:anywhere}
+.saved-game .meta{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.saved-game .downloads{display:flex;align-items:center;gap:4px}
+.saved-game .downloads .btn{padding:5px 8px;font-size:11px}
 .chip{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 6px;border-radius:5px;background:rgba(148,163,184,.1);color:var(--muted)}
 .medal{width:10px;height:10px;border-radius:50%;background:var(--best);flex:none;box-shadow:0 0 0 3px color-mix(in srgb,var(--best) 20%,transparent)}
 /* medium and narrow */
@@ -313,6 +316,7 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
   #seats{padding:4px}.card-head{display:none}#seats.open .card-head{display:flex}.seat-head .pick{padding:3px 6px}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+@media (max-width:420px){#t-tabs{order:3;width:100%;margin-left:0}.saved-game .downloads{grid-column:2 / 4;justify-self:end}}
 </style>
 <div id="app" data-tab="analysis">
   <nav id="tabs"><button data-tab="analysis" class="on">Analysis</button><button data-tab="review">Moves</button></nav>
@@ -863,11 +867,11 @@ function renderMatch(){
   const resume=el('button',{class:'ib','aria-label':'Resume match',html:icon('play'),onclick:()=>post('/match',{action:'resume',batch:match.id||match.output})});
   const browse=el('button',{class:'ib','aria-label':'Games',html:icon('open'),onclick:()=>showTournaments('results','tournaments')});
   box.replaceChildren(el('div',{class:'divider'}),
-    el('div',{class:'score'},el('span',{},match.players[0].name.split('/')[0]),el('span',{},`${match.wins[0]} – ${match.wins[1]}`),el('span',{},match.players[1].name.split('/')[0])),
+    el('div',{class:'score'},el('span',{},'A · '+playerLabel(match.players[0])),el('span',{},`${match.wins[0]} – ${match.wins[1]}`),el('span',{},'B · '+playerLabel(match.players[1]))),
     el('div',{class:'progress'},el('i',{style:`width:${match.completed/match.games*100}%`})),
     el('div',{class:'row'},el('span',{},`${done?match.games:match.current} / ${match.games}`),
       ...(match.capped?[el('span',{class:'chip'},'= '+match.capped)]:[]),
-      ...(match.elo?[el('span',{},`${Math.round(match.elo.a_minus_b)} ± ${Math.round((match.elo.interval[1]-match.elo.interval[0])/2)}`)]:[]),
+      ...(showElo(match)?[el('span',{},`${Math.round(match.elo.a_minus_b)} ± ${Math.round((match.elo.interval[1]-match.elo.interval[0])/2)}`)]:[]),
       el('span',{class:'spacer'}),browse,results,...(!match.active&&!done?[resume]:[]),stop),
     ...(match.error?[el('div',{style:'color:var(--blunder)'},match.error)]:[]));
 }
@@ -988,6 +992,10 @@ $('import-dialog').ondrop=async e=>{e.preventDefault();const f=e.dataTransfer.fi
 $('import-file').onchange=async e=>{const f=e.target.files[0];if(f)$('import-text').value=await f.text()};
 const entrants=[{engine:null,checkpoint:null,preset:'quick'},{engine:null,checkpoint:null,preset:'quick'}],tournament={games:8,openings:'wide',clock:'fixed',ms:5,tc:'180+2',max_placements:512};
 let savedKind='freeplay';
+function playerLabel(spec){if(typeof spec==='string')return spec;return spec.name+(spec.preset?' · '+spec.preset:'')+(spec.checkpoint?' · '+spec.checkpoint:'')}
+function savedPlayers(match){return match.player_specs||match.players}
+function showElo(match){return match.elo?.pairs>=20&&(match.elo.interval[1]-match.elo.interval[0])/2<=200}
+function savedDate(match){if(match.created_at)return new Date(match.created_at).toLocaleString();const m=match.name.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);return m?`${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`:match.name}
 function entrantRow(i){
   const spec=entrants[i],engines=S.engines.filter(e=>!e.id.startsWith('browser:'));if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
   const entry=entryOf(spec.engine);if(entry&&!(entry.checkpoints||[]).includes(spec.checkpoint))spec.checkpoint=entry.checkpoints?.[0]??null;
@@ -1034,20 +1042,22 @@ async function showTournaments(tab,kind){
     const render=()=>{const match=data.matches.find(m=>m.id===select.value);
       $('t-summary').replaceChildren(...(match?[el('div',{class:'summary'},el('span',{},match.single?'Freeplay':`${match.wins[0]} – ${match.wins[1]}`),
         ...(match.capped?[el('span',{class:'chip'},'= '+match.capped)]:[]),
-        ...(match.elo?[el('span',{class:'elo'},`${match.elo.a_minus_b>=0?'+':''}${Math.round(match.elo.a_minus_b)} ± ${Math.round((match.elo.interval[1]-match.elo.interval[0])/2)} Elo${match.elo.method?' (estimate)':''}`)]:[]),
+        ...(showElo(match)?[el('span',{class:'elo'},`${match.elo.a_minus_b>=0?'+':''}${Math.round(match.elo.a_minus_b)} ± ${Math.round((match.elo.interval[1]-match.elo.interval[0])/2)} Elo${match.elo.method?' (estimate)':''}`)]:[]),
         ...(!match.single&&match.completed<match.games?[el('button',{class:'btn',onclick:async()=>{if(await post('/match',{action:'resume',batch:match.id}))$('tournament-dialog').close()}},'Resume')]:[]),
         ...(globalThis.browserPlay?[el('button',{class:'ib ghost','aria-label':'Delete saved games',html:icon('close'),onclick:async()=>{if(confirm('Delete these saved games from this browser?')){await post('/matches/delete',{batch:match.id});showTournaments('results')}}})]:[]))]:[]));
       games.replaceChildren(...(match?.results.length?match.results.map(r=>{
         const query=new URLSearchParams({batch:match.id,game:r.game}),href=`/?study=1&${query}`;
-        const who=r.winner==null?el('span',{class:'chip'},r.reason==='saved'?'unfinished':'capped'):[el('i',{class:'medal'}),el('span',{},match.players[r.winner])];
-        return el('div',{class:'saved-game'},el('span',{class:'no'},'#'+r.game),el('span',{class:'who'},who),el('span',{class:'len'},r.placements),
-          el('a',{class:'ib ghost',href,target:'_blank',rel:'noopener','aria-label':'Analyse',html:icon('open')}),
+        const players=savedPlayers(match),side=match.single||r.game%2?r.winner:1-r.winner;
+        const who=match.single?players.map((p,i)=>`P${i+1} ${playerLabel(p)}`).join(' vs '):r.winner==null?players.map((p,i)=>`${'AB'[i]} ${playerLabel(p)}`).join(' vs '):`${'AB'[r.winner]} · ${playerLabel(players[r.winner])} · P${side+1} won`;
+        return el('div',{class:'saved-game'},el('span',{class:'no'},'#'+r.game),el('div',{class:'details'},el('span',{class:'who'},r.winner!=null&&!match.single?el('i',{class:'medal'}):null,el('span',{},who)),
+          el('div',{class:'meta'},r.winner==null?el('span',{class:'chip'},r.reason==='saved'?'unfinished':'capped'):match.single?el('span',{},`P${r.winner+1} won`):null,`${r.placements} stones`,el('time',{},savedDate(match)))),
+          el('div',{class:'downloads'},el('a',{class:'ib ghost',href,target:'_blank',rel:'noopener','aria-label':'Analyse',html:icon('open')}),
           el('a',{class:'btn',href:`/matches/game?${query}`,download:'game.json','aria-label':'Download game file'},'JSON'),
-          ...(r.placements?[el('a',{class:'ib ghost',href:`/matches/game?${query}&format=htttx`,download:'','aria-label':'HTTTX',html:icon('download')})]:[]));
+          ...(r.placements?[el('a',{class:'ib ghost',href:`/matches/game?${query}&format=htttx`,download:'','aria-label':'HTTTX',html:icon('download')})]:[])));
       }):[el('div',{class:'empty'},savedKind==='freeplay'?'No saved freeplay games.':'No saved tournament games.')]))};
     const filter=()=>{const rows=data.matches.filter(m=>!!m.single===(savedKind==='freeplay'));
       for(const b of $('saved-tabs').children)b.classList.toggle('on',b.dataset.kind===savedKind);
-      select.replaceChildren(...rows.map(m=>el('option',{value:m.id},`${m.players.join(' vs ')}${m.single?'':` · ${m.completed}/${m.games}`} · ${m.name}`)));
+      select.replaceChildren(...rows.map(m=>el('option',{value:m.id},`${savedPlayers(m).map((p,i)=>`${m.single?'P'+(i+1):'AB'[i]} ${playerLabel(p)}`).join(' vs ')}${m.single?'':` · ${m.completed}/${m.games}`} · ${savedDate(m)}`)));
       select.hidden=!rows.length;render()};
     $('saved-tabs').onclick=e=>{const b=e.target.closest('button');if(b){savedKind=b.dataset.kind;filter()}};
     select.onchange=render;filter();tournamentTab(tab||'results');
