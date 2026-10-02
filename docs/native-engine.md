@@ -53,6 +53,13 @@ attack the mover has no time to develop. These are positional estimates, not
 proofs. The tactical prover and the public `Game.turns` and `Game.evaluation`
 APIs keep their previous feature/table scores.
 
+At the search horizon, if defending consumes both stones, Native scores the best
+complete defensive reply before evaluating the position. It updates only the
+affected window scores in temporary scalars. Final-layer move ranking and beta
+cutoffs use these corrected values. This evaluates the defender's
+counterplay at the horizon without extending the search tree.
+The resulting position still receives a heuristic score.
+
 ```python
 from hexo import Game
 

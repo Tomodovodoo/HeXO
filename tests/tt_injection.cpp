@@ -152,6 +152,14 @@ int main() {
         if(played.winner>=0) break;
         std::vector<Turn> replies;
         assert(continuation.forced_replies(played,plan.attacker,replies));
+        if(!replies.empty()) {
+            const int defender=played.player;int expected=-mate;
+            for(const auto& reply:replies) {
+                Restore restore(played);apply(played,reply);
+                expected=std::max(expected,played.score(defender));
+            }
+            assert(continuation.leaf_value(played)==expected);
+        }
         // With no covering pair, any legal defense leaves an immediate win.
         auto defense=replies.empty()?continuation.turns(played,false).front():replies.back();
         if(defense.count==2) std::swap(defense.cells[0],defense.cells[1]);
@@ -172,7 +180,7 @@ int main() {
         Search leaf(10000,16);
         if(position.winner<0 && !leaf.immediate(position).count) {
             const int side=position.player;int exact=-mate-1;
-            auto moves=leaf.turns(position,false);
+            auto moves=leaf.turns(position,false,{},false,nullptr,nullptr,mate+1,true);
             for(const auto& move:moves) {
                 Restore restore(position);apply(position,move);
                 int value=position.winner==side?mate:
@@ -299,12 +307,23 @@ int main() {
                 Search leaf(10000,16);
                 if(position.winner<0 && !leaf.immediate(position).count) {
                     const int side=position.player;int exact=-mate-1;
-                    auto moves=leaf.turns(position,false);
+                    auto moves=leaf.turns(position,false,{},false,nullptr,nullptr,mate+1,true);
                     for(const auto& move:moves) {
                         Restore restore(position);apply(position,move);
                         int value=position.winner==side?mate:
                             leaf.immediate(position).count?-mate:
                             leaf.unavoidable_loss(position)?mate:position.score(side);
+                        if(position.winner<0 && std::abs(value)<mate) {
+                            std::vector<Turn> replies;
+                            if(leaf.forced_replies(position,side,replies) && !replies.empty()) {
+                                int response=-mate;
+                                for(const auto& reply:replies) {
+                                    Restore defense(position);apply(position,reply);
+                                    response=std::max(response,position.score(1-side));
+                                }
+                                value=-response;
+                            }
+                        }
                         assert(!move.leaf_score_exact || value==move.score);
                         exact=std::max(exact,value);
                     }
@@ -345,8 +364,12 @@ int main() {
                 assert(fresh==incremental);
                 for(auto second:Search::candidates(position,4)) {
                     auto scalar=position.placed_score(second,position.player);
-                    int side=position.player;Restore undo(position);position.make(second);
-                    assert(scalar==position.score(side));
+                    int side=position.player;
+                    position.undo();
+                    auto pair_score=position.covered_score({first,second},side);
+                    position.make(first);
+                    Restore undo(position);position.make(second);
+                    assert(scalar==position.score(side) && pair_score==position.score(side));
                     if(position.winner<0) check_cache();
                 }
             }
