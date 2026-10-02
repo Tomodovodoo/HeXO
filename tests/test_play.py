@@ -1381,6 +1381,13 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual([(step['history'], step['moves'], len(step['top'])) for step in found['later']],
                          [([(0, 0), (1, 0)], [[2, 0]], 5)])
 
+    def test_a_proven_second_stone_keeps_its_proof(self):
+        from play import evaluate
+        history = [(0, 0), (1, 2), (2, 2), (-2, 0), (-3, 0), (3, 2), (4, 2), (0, -3), (0, -4)]
+        found = evaluate(self.bubble(), None, history, 64, 0)
+        later = found['later'][0]
+        self.assertEqual((later['proof']['winner'], later['value']), (1, 1.))
+
     def test_pooled_evaluations_match_single_ones(self):
         from play import evaluate, evaluate_many
         histories = [[(0, 0)], [(0, 0), (1, 0), (1, 1)], [(0, 0), (1, 0)]]

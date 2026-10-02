@@ -635,23 +635,25 @@ class TurnSearch:
             actions, values = found['actions'], None
             policy = np.exp(found['logits'] - found['logits'].max())
             policy /= policy.sum()
-            action, stone_value = actions[policy.argmax()].tolist(), float(found['q'][0])
+            action, stone_value, exact = actions[policy.argmax()].tolist(), float(found['q'][0]), None
         else:
             action, policy, actions, values = result['action'], result['policy'], result['actions'], result['values']
             self.completed += result.get('completed', 0)
             stone_value = root_value(result, self.local.player)
             proven = result.get('proven') or 0
+            exact = dict(winner=self.player if proven > 0 else 1 - self.player,
+                         turns=proof_turns(result['proof_plies'], self.local.remaining, proven > 0)) if proven else None
             if self.proof is None and (proven > 0 or proven < 0 and not self.moves):
-                self.proof = dict(winner=self.player if proven > 0 else 1 - self.player,
-                                  turns=proof_turns(result['proof_plies'], self.local.remaining, proven > 0))
+                self.proof = exact
         rows = top_rows(actions, policy, values)
         if not self.given:
             self.moves.append([int(action[0]), int(action[1])])
         if not self.played:
             self.top, self.value = rows, (stone_value + 1) / 2
         else:
+            value = (1. if exact['winner'] == self.player else 0.) if exact else (stone_value + 1) / 2
             self.later.append(dict(history=[tuple(cell[:2]) for cell in self.local.cells], moves=[self.moves[self.played]],
-                                   value=round((stone_value + 1) / 2, 4), top=rows, proof=None, line=[], threat=[]))
+                                   value=round(value, 4), top=rows, proof=exact, line=[], threat=[]))
         self.local.play(*self.moves[self.played])
         self.played += 1
 
