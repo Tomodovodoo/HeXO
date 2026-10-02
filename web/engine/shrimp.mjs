@@ -107,5 +107,5 @@ export function record(result, history, preset) {
     simulations: PRESETS[preset].visits, solver_nodes: 0, ms: result.ms, engine: ID};
 }
 
-export const shrimp = {entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
+export const shrimp = {entry: {id: ID, kind: 'six', badge: 'shrimp', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
   engine: new ShrimpEngine(), record};
