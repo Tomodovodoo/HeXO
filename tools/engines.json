@@ -20,7 +20,7 @@
     "kind": "strix",
     "repository": "SootyOwl/hexo-strix",
     "revision": "5a771e572553a8bd8e010112b2ce65f16e5afa1b",
-    "licence": "MIT; the model's licence is not stated, so it is downloaded from its site and never republished",
+    "licence": "MIT; the model's licence is not stated and its author allows this use; it is downloaded from its site",
     "executable": "hexo-strix-learned",
     "model": {
       "url": "https://hexo.tyto.cc/model.safetensors",
