@@ -280,7 +280,7 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                 if child.is_dir():
                     bubble(child)
     if models and Path(models).is_dir():
-        installed = {folder for folder in Path(models).iterdir() if (folder / 'setup.json').is_file()}
+        installed = {folder for folder in Path(models).iterdir() if (folder / 'setup.json').is_file()} | {models / '.setup'}
         for path in sorted(Path(models).rglob('*.pt')):
             if 'checkpoints' not in path.relative_to(models).parts and not installed & set(path.parents):
                 bubble(path)

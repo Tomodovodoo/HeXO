@@ -204,6 +204,10 @@ class Recipes(unittest.TestCase):
         self.assertTrue(shrimp['mirrored'])
         self.assertEqual(shrimp['presets']['strong'], dict(nodes=1, args=['--visits', '512']))
         self.assertFalse(any(e['kind'] == 'bubble' for e in entries.values()))
+        unfinished = self.models / '.setup' / 'shrimp' / 'shrimp' / 'rivals' / 'shrimp' / 'models' / 'weights.pt'
+        unfinished.parent.mkdir(parents=True)
+        unfinished.write_bytes(b'weights')
+        self.assertFalse(any(e['kind'] == 'bubble' for e in scan(self.models).values()))
 
     def test_shrimp_refuses_a_python_without_pytorch(self):
         with unittest.mock.patch('engine_setup.importlib.util.find_spec', return_value=None):

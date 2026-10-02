@@ -80,12 +80,14 @@ def compiler(which=shutil.which):
 
 
 def run(command, cwd=None, env=None):
-    """Run a build command at low priority with two build jobs; a failure raises SetupError with its last line."""
+    """Run a build command at low priority with two build jobs; a failure prints its output to stderr and raises
+    SetupError with its last line."""
     flags = subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW if WINDOWS else 0
     environment = os.environ | dict(CARGO_BUILD_JOBS='2') | (env or {})
     done = subprocess.run(list(map(str, command)), cwd=cwd, env=environment, capture_output=True, text=True,
                           errors='replace', creationflags=flags)
     if done.returncode:
+        print(done.stdout, done.stderr, sep='\n', file=sys.stderr, flush=True)
         lines = (done.stderr or done.stdout).strip().splitlines()
         raise SetupError(lines[-1] if lines else f'{Path(str(command[0])).name} failed')
     return done.stdout
