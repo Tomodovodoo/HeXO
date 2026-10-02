@@ -91,6 +91,26 @@ struct WindowTable {
 constexpr int powers[]={1,3,9,27,81,243};
 constexpr int weight[]={0,1,12,150,2400,24000,1000000};
 int value(Counts c) { return c[1]==0 ? weight[c[0]] : c[0]==0 ? -weight[c[1]] : 0; }
+struct Pressure {
+    int64_t raw=0;
+    std::array<Cell,2> common{};
+    int shared=0,windows=0;
+    void add(Window w,Counts n,unsigned gaps) {
+        if(n[0] && n[1]) return;
+        int count=std::max(n[0],n[1]);
+        if(count<4 || count>=6) return;
+        raw+=weight[count];
+        std::array<Cell,2> empty{};int size=0;
+        for(;gaps;gaps&=gaps-1) empty[size++]=w.start+axes[w.axis]*int(std::countr_zero(gaps));
+        if(!windows++) {common=empty;shared=size;return;}
+        int keep=0;
+        for(int i=0;i<shared;++i) for(int j=0;j<size;++j)
+            if(common[i]==empty[j]) {common[keep++]=common[i];break;}
+        shared=keep;
+    }
+    int blocks() const {return windows?(shared?1:2):0;}
+    int64_t excess() const {return raw-weight[4]*blocks();}
+};
 struct Undo { Cell c; int player,remaining,winner; };
 struct Center {
     std::array<int32_t,3> codes{};
@@ -175,6 +195,7 @@ struct Board {
     std::vector<Undo> history;
     int player=0,remaining=1,winner=-1;
     int64_t evaluation=0;
+    std::array<int,2> threes{};
     int64_t learned_score=0;
     std::array<int32_t,729> features{},adjustment{};
     uint64_t stones_hash=0;
@@ -305,6 +326,7 @@ struct Board {
             if(pattern) --features[pattern];
             learned_score-=adjustment[pattern];
             evaluation-=value(n);
+            for(int side=0;side<2;++side) if(n[side]==3 && !n[1-side]) --threes[side];
             for(int side=0;side<2;++side)
                 if(n[side]>=4 && n[1-side]==0) threats[side].erase(w);
             n[p]+=delta;
@@ -329,6 +351,7 @@ struct Board {
             if(pattern) ++features[pattern];
             learned_score+=adjustment[pattern];
             evaluation+=value(n);
+            for(int side=0;side<2;++side) if(n[side]==3 && !n[1-side]) ++threes[side];
             for(int side=0;side<2;++side)
                 if(n[side]>=4 && n[1-side]==0) threats[side].insert(w);
             if(n[p]>=6) winner=p;
@@ -353,8 +376,29 @@ struct Board {
         player=u.player;remaining=u.remaining;winner=u.winner;
         candidate_nearby(u.c,-1);
     }
-    int score(int p) const {
+    std::array<Pressure,2> pressure(const Cell* changed=nullptr) const {
+        std::array<Pressure,2> result;
+        for(int p=0;p<2;++p) for(auto w:threats[p]) {
+            if(changed) {
+                const auto q=changed->q-w.start.q,r=changed->r-w.start.r;
+                const auto along=w.axis==1?r:q;
+                if((w.axis==0?r==0:w.axis==1?q==0:q+r==0) && along>=0 && along<6) continue;
+            }
+            const auto* data=windows.find(w);
+            result[p].add(w,data->counts,data->empty);
+        }
+        return result;
+    }
+    static int initiative(int mover,int remaining,const std::array<Pressure,2>& attack,const std::array<int,2>& setups) {
+        const int free=std::max(0,remaining-attack[1-mover].blocks());
+        return std::min(free,setups[mover])*(weight[4]-weight[3])*(mover==0?1:-1);
+    }
+    int score(int p,bool normalize=true) const {
         int64_t residual=0;
+        if(!model && normalize) {
+            auto attack=pressure();
+            residual=attack[1].excess()-attack[0].excess()+initiative(player,remaining,attack,threes);
+        }
         if(model) residual=int64_t(std::clamp(model->value(inputs())*6000.0f,-1000000.0f,1000000.0f))*(player==0?1:-1);
         auto v=std::clamp<int64_t>(evaluation+learned_score+residual,-500000,500000);
         return int(p==0?v:-v);
@@ -433,19 +477,26 @@ struct Board {
         }
         return score;
     }
-    int placed_score(Cell c,int p,int* threats=nullptr) const {
+    int placed_score(Cell c,int p,int* threats=nullptr,bool normalize=true) const {
         // Exact scalar evaluation after one empty cell is filled. Candidate
         // ranking need not update the board, feature counts or threat sets.
         int64_t score=evaluation+learned_score;
+        auto attack=normalize?pressure(&c):std::array<Pressure,2>{};
+        auto setups=threes;
         for(int a=0;a<3;++a) for(int k=0;k<6;++k) {
             auto data=windows.find({c+axes[a]*(-k),a});
             Counts n=data?data->counts:Counts{};
             int pattern=data?data->pattern:0;
             score-=value(n)+adjustment[pattern];
+            for(int side=0;side<2;++side) if(n[side]==3 && !n[1-side]) --setups[side];
             ++n[p];
+            for(int side=0;side<2;++side) if(n[side]==3 && !n[1-side]) ++setups[side];
             if(threats && n[p]==4 && !n[1-p]) ++*threats;
             score+=value(n)+adjustment[pattern+(p+1)*powers[k]];
+            if(normalize && !n[1-p]) attack[p].add({c+axes[a]*(-k),a},n,(data?data->empty:63)&~(1u<<k));
         }
+        if(!model && normalize) score+=attack[1].excess()-attack[0].excess()+
+            initiative(remaining==1?1-player:player,remaining==1?2:remaining-1,attack,setups);
         int result=int(std::clamp(score,int64_t(-500000),int64_t(500000)));
         return p==0?result:-result;
     }
@@ -513,6 +564,7 @@ struct Search {
     std::vector<ForcingLine> proof;
     Clock::time_point proof_deadline;
     int proof_nodes=0,proof_limit=512;
+    bool positional_proposals=true;
     Clock::duration proof_screen;
     Search(int ms,int width,bool inject=false):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(inject?1<<16:0),inject_tt(inject),proof_screen(std::chrono::milliseconds(ms)/50){}
     void check() const { if(Clock::now()>=deadline) throw Timeout{}; }
@@ -674,7 +726,7 @@ struct Search {
             if(b.winner<0 && b.player==side) return;
             if(mandatory && b.winner<0 && !b.completions(1-side).empty()) return;
             if(!seen.insert(b.hash()).second) return;
-            t.score=b.winner==side?mate:b.score(side);
+            t.score=b.winner==side?mate:b.score(side,!forcing && positional_proposals);
             // Every immediate opponent completion must be covered.
             if(b.winner<0 && !b.completions(1-side).empty()) t.score=-mate;
             t.leaf_score_exact=t.score>-mate && t.score<mate && b.threats[side].size()<3;
@@ -742,7 +794,7 @@ struct Search {
                 auto key=b.stones_hash^mix(CellHash{}(c)^mix(side+991))^mix(100+(1-side)*3+2)^mix(199);
                 if(!seen.insert(key).second) continue;
                 int threats=int(b.threats[side].size());
-                int score=b.placed_score(c,side,&threats);
+                int score=b.placed_score(c,side,&threats,!forcing && positional_proposals);
                 for(const auto& threat:constraints)
                     if(std::find(threat.begin(),threat.end(),first)==threat.end() &&
                        std::find(threat.begin(),threat.end(),c)==threat.end()) {score=-mate;break;}
@@ -826,7 +878,7 @@ struct Search {
                 for(auto& reply:replies) {
                     if(Clock::now()>=proof_deadline) throw Timeout{};
                     CandidatePause pause(b);Restore order(b);b.make(reply.cells[0]);
-                    reply.score=reply.count==2?b.placed_score(reply.cells[1],defender):b.score(defender);
+                    reply.score=reply.count==2?b.placed_score(reply.cells[1],defender,nullptr,false):b.score(defender,false);
                 }
                 std::stable_sort(replies.begin(),replies.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});
             }
@@ -952,7 +1004,7 @@ struct Search {
         for(auto& reply:replies) {
             check();if(Clock::now()>=proof_deadline) throw Timeout{};
             CandidatePause pause(b);Restore order(b);const int defender=b.player;
-            b.make(reply.cells[0]);reply.score=b.placed_score(reply.cells[1],defender);
+            b.make(reply.cells[0]);reply.score=b.placed_score(reply.cells[1],defender,nullptr,false);
         }
         std::stable_sort(replies.begin(),replies.end(),[&](const Turn& a,const Turn& z){sorting();return a.score>z.score;});
         ForcingLine line{attack,{}};std::vector<int> strategies;
@@ -1081,7 +1133,7 @@ struct Search {
                 b.make(t.cells[i]);if(b.winner>=0) {t.count=i+1;break;}
             }
             if(!valid || (b.winner<0 && b.player==side) || !seen.insert(b.hash()).second) continue;
-            t.score=b.winner==side?mate:b.score(side);
+            t.score=b.winner==side?mate:b.score(side,positional_proposals);
             if(b.winner<0 && !b.completions(1-side).empty()) t.score=-mate;
             base.push_back(t);
         }
@@ -1229,7 +1281,9 @@ int hx_search_tt(void* p,int ms,int depth,int width,int seconds,int cap,HxResult
 int hx_turns(void* p,int width,int seconds,int cap,HxTurn* out,int capacity) {
     if(width<2 || width>128 || ((seconds || cap) && (seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024))) return -1;
     auto& b=*static_cast<Board*>(p);if(b.winner>=0) return 0;
-    Search search(1,width,false);auto turns=search.turns(b,false);
+    // Proof callers use the original feature/table ordering, as hx_evaluate does.
+    Search search(1,width,false);search.positional_proposals=false;
+    auto turns=search.turns(b,false);
     if(seconds) turns=search.diversify(b,std::move(turns),seconds,cap,false);
     if(out) for(int i=0;i<std::min(capacity,int(turns.size()));++i) {
         const auto& t=turns[i];out[i]={t.cells[0].q,t.cells[0].r,t.cells[1].q,t.cells[1].r,t.count,t.score};
@@ -1237,7 +1291,8 @@ int hx_turns(void* p,int width,int seconds,int cap,HxTurn* out,int capacity) {
     return int(turns.size());
 }
 uint64_t hx_hash(void* p){return static_cast<Board*>(p)->hash();}
-int hx_evaluate(void* p){auto& b=*static_cast<Board*>(p);return b.score(b.player);}
+// Keep the feature/table evaluation API stable; search adds positional terms.
+int hx_evaluate(void* p){auto& b=*static_cast<Board*>(p);return b.score(b.player,false);}
 int hx_features(void* p,int32_t* out,int cap){auto& b=*static_cast<Board*>(p);for(int i=0;i<std::min(cap,729);++i)out[i]=b.features[i];return 729;}
 int hx_load_table(void* p,const int32_t* weights,int count){
     if(count!=729 || weights[0]!=0) return 0;

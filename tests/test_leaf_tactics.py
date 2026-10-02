@@ -63,11 +63,18 @@ class LeafTactics(unittest.TestCase):
         side = game.player
         result = game.search(1000, depth=1, width=16)
         self.assertLess(abs(result["score"]), 10000000)
-        for point in result["moves"]:
+        # Keep this shared-cover position fixed when positional preferences change.
+        for point in [(3,0),(-1,0)]:
+            game.play(*point)
             reference.play(*point)
         threats = reference.completions(side)
         self.assertGreaterEqual(len(threats), 3)
         self.assertTrue(has_cover(threats, reference.remaining))
+        result = game.search(1000, depth=1, width=16)
+        self.assertLess(abs(result["score"]), 10000000)
+        for point in result["moves"]:
+            reference.play(*point)
+        self.assertFalse(reference.completions(side))
 
     def test_one_block_leaves_the_free_placement_unresolved(self):
         game, reference = self.position([(0,0),(-1,0),(0,5),(1,0),(2,0),(3,3),(-3,5)])

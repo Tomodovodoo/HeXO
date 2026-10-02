@@ -20,6 +20,15 @@ the existing root proof time budget, and retained proof storage stays capped at
 No weights, model, external solver or new dependency is required.
 The optional NNUE search keeps its existing candidate evaluation.
 
+Native values immediate pressure by the placements needed to block it. Several
+four- or five-stone windows that share a blocking cell count as one obligation;
+otherwise the heuristic counts two. Search checks unavoidable wins separately.
+The score also rewards the mover's three-stone setups, limited by the placements
+left after mandatory defence. This accounts for initiative without rewarding an
+attack the mover has no time to develop. These are positional estimates, not
+proofs. The tactical prover and the public `Game.turns` and `Game.evaluation`
+APIs keep their previous feature/table scores.
+
 ```python
 from hexo import Game
 
