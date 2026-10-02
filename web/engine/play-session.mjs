@@ -378,6 +378,7 @@ export class BrowserSession extends OfflineSession {
     if (!this.match || this.match.completed >= this.match.games) throw Error('No unfinished match');
     for (const p of this.match.players) if (p.version && this.entries.get(p.engine)?.version !== p.version) throw Error('This match used a different engine version. Start a new match.');
     if (this.match.pending_game) this.beginMatchGame();
+    this.seats = copy(this.match.current % 2 ? this.match.players : [...this.match.players].reverse());
     this.jobs = this.jobs.filter(j => j.status !== 'failed'); this.match.error = null; this.match.active = true; this.paused = false;
   }
   async finishMatch(winner, reason) {

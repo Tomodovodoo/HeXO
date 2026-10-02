@@ -140,12 +140,16 @@ if (job.kind === 'encode') {
   await until(() => s.history.length === 3 && s.running?.history.length === 3);
   await s.request('/match',{action:'stop'},'POST'); await s.idle; await s.saving;
   const id=s.match.id, before={history:structuredClone(s.history),clock:s.clockNow(),timings:structuredClone(s.match.timings)};
+  s.apply('/seat',{side:0,engine:'human'}); s.apply('/seat',{side:1,engine:'human'});
+  await s.request('/match',{action:'resume'},'POST'); await until(()=>!!s.running);
+  const sameBatchSeats=s.seats.map(s=>s.engine);
+  await s.request('/match',{action:'stop'},'POST'); await s.idle;
   s.apply('/seat',{side:0,engine:'human'}); s.apply('/seat',{side:1,engine:'human'}); s.apply('/book',{enabled:true});
   await s.request('/new',{},'POST'); const bookStart=s.book.opening;
   await s.request('/import',{text:JSON.stringify({history:[[0,0]]})},'POST'); const imported=s.book.opening;
   await s.request('/match',{action:'resume',batch:id},'POST');
   await until(() => !!s.running); await s.request('/match',{action:'stop'},'POST'); await s.idle;
-  answer={before,after:{history:s.history,clock:s.clockNow(),timings:s.match.timings},bookStart,imported,auto:s.analysis.auto};
+  answer={before,after:{history:s.history,clock:s.clockNow(),timings:s.match.timings},bookStart,imported,auto:s.analysis.auto,sameBatchSeats};
 } else if (job.kind === 'lifecycle') {
   const entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', presets: {standard: {simulations: 1, solver_nodes: 0}}};
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -165,13 +169,19 @@ if (job.kind === 'encode') {
   answer.paused_save = [];
   for (const path of ['/pause', '/cancel']) {
     const paused = new BrowserSession(native); let commit;
-    paused.registerEngine(entry,{turn:async history=>({moves:job.history.slice(history.length,history.length+(history.length?2:1)),value:.5})});
+    const adapter={turn:async history=>({moves:job.history.slice(history.length,history.length+(history.length?2:1)),value:.5})};
+    paused.registerEngine(entry,adapter); paused.registerEngine({...entry,id:'other',name:'Other'},adapter);
     const commitSession = paused.storage.saveSession.bind(paused.storage);
     paused.storage.saveSession = async (...args) => { if(args[3]?.length) await new Promise(resolve=>{commit=resolve;}); return commitSession(...args); };
-    await paused.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,openings:[job.history.slice(0,-1)]});
+    await paused.startMatch({players:[{engine:'test'},{engine:'other'}],games:2,openings:[job.history.slice(0,-1)]});
     await until(()=>!!commit);
     await paused.request(path,path==='/pause'?{paused:true}:{id:paused.running.id},'POST'); commit(); await paused.idle;
-    answer.paused_save.push({paused:paused.paused,completed:paused.match.completed,pending:paused.match.pending_game,current:paused.match.current});
+    const result={paused:paused.paused,completed:paused.match.completed,pending:paused.match.pending_game,current:paused.match.current};
+    paused.storage.saveSession=commitSession;
+    await paused.request('/match',{action:'stop'},'POST');
+    paused.apply('/seat',{side:0,engine:'human'}); paused.apply('/seat',{side:1,engine:'human'});
+    await paused.request('/match',{action:'resume'},'POST'); await until(()=>!paused.match.active);
+    result.resumedSeats=paused.seats.map(s=>s.engine); answer.paused_save.push(result);
   }
   const id = s.match.id;
   await s.request('/matches/delete', {batch: id}, 'POST');

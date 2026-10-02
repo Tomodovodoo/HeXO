@@ -214,7 +214,7 @@ class Bundle(unittest.TestCase):
         result = node(dict(kind='lifecycle', history=history))
         self.assertEqual(result['stopped_save'], dict(paused=True, active=False, completed=1))
         self.assertEqual(result['resumed'], dict(wins=[1, 1], completed=2))
-        self.assertEqual(result['paused_save'], [dict(paused=True, completed=1, pending=True, current=2)]*2)
+        self.assertEqual(result['paused_save'], [dict(paused=True, completed=1, pending=True, current=2, resumedSeats=['other', 'test'])]*2)
         self.assertIsNone(result['deleted']['current'])
         self.assertTrue(all(m['single'] for m in result['deleted']['catalogue']))
         self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]]))
@@ -264,6 +264,7 @@ class Bundle(unittest.TestCase):
         self.assertIsNotNone(result['bookStart'])
         self.assertIsNone(result['imported'])
         self.assertFalse(result['auto'])
+        self.assertEqual(result['sameBatchSeats'], ['test', 'test'])
 
     def test_search_matches_native(self):
         """Same seed, position, budget, Q range floor and evaluations: the same actions, visits and policy as the native
