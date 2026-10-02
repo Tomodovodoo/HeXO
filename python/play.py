@@ -32,6 +32,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import formats
+from engine_setup import Setups
 from hexo import Game
 from notation import NotationConflict, dumps, loads
 from process_tree import TreeProcess
@@ -246,14 +247,18 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     """Every engine on offer, by id.
 
     Bubble runs come from `extra_runs`, the directories in `runs`, and `models`; single `.pt` exports come from
-    `models`. A directory in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once, on the
-    backend `six_backend` finds, labelled with that backend; its networks are its `checkpoints`, newest first. `models/<name>.json` adds one entry: {"name", "kind": "bubble", "path"},
-    {"name", "kind": "six", "command", "mirrored", "presets"} or {"name", "kind": "strix", "model"}, paths
-    relative to the file. Entries carry `id`, `name`, `kind`, `presets`, `label` (the name the page shows; the
-    first run in `extra_runs` is labelled Bubble), `checkpoints` (Bubble checkpoints or Six networks), and the
-    server-only `path` (Bubble), `command`, `cwd`, `mirrored`, `libraries` and, for a Six folder, `networks`
-    ({name: path}) and `backend` (Six protocol, see `command_of`) or `model` (Strix). An id is `kind:name`;
-    entries sharing one get a suffix from their path, command or model, so an id never moves to another engine."""
+    `models`, except inside folders an engine setup made (they hold `setup.json`, see engine_setup). A directory
+    in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once, on the backend `six_backend` finds,
+    labelled with that backend; its networks are its `checkpoints`, newest first. `models/<name>.json` adds one
+    entry: {"name", "kind": "bubble", "path"}, {"name", "kind": "six", "command", "mirrored", "presets"},
+    {"name", "kind": "strix", "model", optional "engine"} or {"name", "kind": "seal", "library"}, paths relative
+    to the file. `seal`, the library built with -DHEXO_SEAL_SOURCE, adds Seal when it exists. Entries carry `id`,
+    `name`, `kind`, `presets`, `label` (the name the page shows; the first run in `extra_runs` is labelled
+    Bubble), `checkpoints` (Bubble checkpoints or Six networks), and the server-only `path` (Bubble), `command`,
+    `cwd`, `mirrored`, `libraries` and, for a Six folder, `networks` ({name: path}) and `backend` (Six protocol,
+    see `command_of`), `model` and `engine` (Strix) or `library` (Seal). An id is `kind:name`;
+    entries sharing one get a suffix from their path, command, model or library, so an id never moves to another
+    engine."""
     found, seen = [], set()
     models = models and Path(models).resolve()
 
@@ -280,8 +285,9 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                 if child.is_dir():
                     bubble(child)
     if models and Path(models).is_dir():
+        installed = {folder for folder in Path(models).iterdir() if (folder / 'setup.json').is_file()}
         for path in sorted(Path(models).rglob('*.pt')):
-            if 'checkpoints' not in path.relative_to(models).parts:
+            if 'checkpoints' not in path.relative_to(models).parts and not installed & set(path.parents):
                 bubble(path)
         for folder in sorted(p for p in Path(models).iterdir() if p.is_dir()):
             binary = folder / ('sixengine.exe' if os.name == 'nt' else 'sixengine')
@@ -307,16 +313,19 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                     add('six', name, spec.get('presets'), command=command, cwd=path.parent,
                         mirrored=spec.get('mirrored') is True, libraries=[])
                 elif kind == 'strix':
-                    add('strix', name, spec.get('presets'), model=(path.parent / spec['model']).resolve())
+                    engine = {'engine': (path.parent / spec['engine']).resolve()} if 'engine' in spec else {}
+                    add('strix', name, spec.get('presets'), model=(path.parent / spec['model']).resolve(), **engine)
+                elif kind == 'seal' and (path.parent / spec['library']).is_file():
+                    add('seal', name, spec.get('presets'), library=(path.parent / spec['library']).resolve())
             except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
                 continue
     add('native', 'Native')
     if seal is not None and Path(seal).exists():
-        add('seal', 'Seal')
+        add('seal', 'Seal', library=Path(seal))
     bases = [f"{e['kind']}:{e['name']}" for e in found]
     entries = OrderedDict()
     for base, entry in zip(bases, found):
-        identity = entry.get('path') or entry.get('command') or entry.get('model')
+        identity = entry.get('path') or entry.get('command') or entry.get('model') or entry.get('library')
         suffix = hashlib.blake2b(str(identity).encode(), digest_size=3).hexdigest()
         key = base if bases.count(base) == 1 else f'{base}~{suffix}'
         entries[key] = dict(id=key, **entry)
@@ -651,7 +660,8 @@ class Engines:
         if kind not in self.children:
             self.children[kind] = SearchChild([sys.executable, str(Path(__file__).resolve()), 'search', kind])
         child = self.children[kind]
-        request = dict(budget, history=[list(p) for p in history], model=str(entry.get('model')))
+        request = dict(budget, history=[list(p) for p in history], model=str(entry.get('model')),
+                       **{key: str(entry[key]) for key in ('engine', 'library') if entry.get(key)})
         child.process.stdin.write(json.dumps(request) + '\n')
         child.process.stdin.flush()
         while True:
@@ -1390,7 +1400,7 @@ class Session:
         seat = self.seat(entry['id'], checkpoint, specification.get('preset', preset),
                          specification.get('custom'))
         source = {k: str(v) if isinstance(v, Path) else v for k, v in entry.items()
-                  if k in ('kind', 'name', 'path', 'cwd', 'model', 'mirrored')}
+                  if k in ('kind', 'name', 'path', 'cwd', 'model', 'engine', 'library', 'mirrored')}
         if entry['kind'] == 'six':
             source['command'] = command_of(entry, seat['checkpoint'])
         if 'libraries' in entry:
@@ -1414,9 +1424,9 @@ class Session:
             command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in source['command']]
             files += [path for path in command_files if path.is_file()]
         elif entry['kind'] == 'strix':
-            files += [Path(entry['model'])]
+            files += [Path(entry['model']), *([Path(entry['engine'])] if entry.get('engine') else [])]
         elif entry['kind'] == 'seal':
-            files += [library.with_name(library.name.replace('hexo', 'hexo_seal'))]
+            files += [Path(entry['library'])]
         source['files'] = {str(path.resolve()): file_digest(file_identity(path)) for path in files}
         return seat | dict(name=entry['name'] + (f"/{seat['checkpoint']}" if seat['checkpoint'] else ''), source=source)
 
@@ -1758,7 +1768,7 @@ class Session:
         a seat whose engine or checkpoint is gone becomes a person, and analysis falls back to the first Bubble
         model."""
         entries = self.rescan_entries()
-        identity = lambda e: (e['kind'], str(e.get('path') or e.get('command') or e.get('model')))
+        identity = lambda e: (e['kind'], str(e.get('path') or e.get('command') or e.get('model') or e.get('library')))
         def follow(seat):
             old = self.entries.get(seat['engine'])
             moved = next((e['id'] for e in entries.values() if old and identity(e) == identity(old)), None)
@@ -2099,6 +2109,7 @@ def export(history, kind):
 
 class Handler(BaseHTTPRequestHandler):
     session = None
+    setups = None
     page = ROOT / 'web' / 'index.html'
 
     def log_message(self, *args):
@@ -2129,6 +2140,8 @@ class Handler(BaseHTTPRequestHandler):
         url, session = urlparse(self.path), self.session
         if url.path == '/':
             return self.respond(200, self.page.read_bytes(), 'text/html; charset=utf-8')
+        if url.path == '/setup' and self.setups:
+            return self.respond(200, dict(engines=self.setups.catalogue()))
         if url.path.startswith('/study/'):
             session = session.study
             if session is None:
@@ -2258,6 +2271,9 @@ class Handler(BaseHTTPRequestHandler):
                 session.pause(args['paused'])
             elif self.path == '/rescan':
                 session.rescan()
+            elif self.path == '/setup' and self.setups:
+                self.setups.start(args['engine'])
+                return self.respond(200, dict(engines=self.setups.catalogue()))
             elif self.path == '/match':
                 action = args.get('action', 'start')
                 if action == 'start':
@@ -2300,18 +2316,19 @@ def search_child(kind):
                     found = game.search(request['ms'])
                     moves, measurements = found['moves'], dict(nodes=found.get('nodes'))
                 elif kind == 'seal':
-                    if 'seal' not in engines:
+                    if request.get('library') not in engines:
                         from legacy.arena import Seal
-                        engines['seal'] = Seal()
-                    moves = engines['seal'](game, request['ms'])
+                        engines[request.get('library')] = Seal(request.get('library'))
+                    moves = engines[request.get('library')](game, request['ms'])
                 else:
-                    key = (request['model'], request['simulations'])
+                    key = (request['model'], request['simulations'], request.get('engine'))
                     if key not in engines:
                         if str(ROOT) not in sys.path:
                             sys.path.insert(0, str(ROOT))
                         from tools.strix_learned_adapter import StrixLearned
                         engines[key] = StrixLearned(request['model'], simulations=request['simulations'],
-                                                    timeout_ms=min(600_000, max(5_000, 250 * request['simulations'])))
+                                                    timeout_ms=min(600_000, max(5_000, 250 * request['simulations'])),
+                                                    executable=request.get('engine'))
                         while len(engines) > 2:
                             engines.popitem(last=False)[1].close()
                     engines.move_to_end(key)
@@ -2391,6 +2408,7 @@ def main():
                                   archive=ROOT / 'artifacts' / 'play' / 'matches',
                                   study_store=ROOT / 'artifacts' / 'play' / f'study-{args.port}.jsonl')
         Handler.session.models_folder = str(args.models.resolve())
+        Handler.setups = Setups(args.models, Handler.session.rescan, lambda: Handler.session.entries)
         try:
             if args.match:
                 players = [dict(engine=name, checkpoint=getattr(args, f'{side}_checkpoint'),
