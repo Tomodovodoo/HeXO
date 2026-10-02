@@ -477,39 +477,48 @@ def searched(result):
 def principal_variation(history, certificate):
     """The principal variation of a verified certificate for the side to move at `history`, as (stones, plies).
 
-    `stones` are [q, r, player] up to the winning stone: at each attacker turn the certificate's primary choice
-    (its fewest worst-case attacker turns), at each defender turn the covered reply whose subtree lasts the most
-    attacker turns, the first of equals. At an unstoppable fork every reply loses at once, so the defender's two
-    stones are left out and the attacker completes the shortest of the certificate's threats. `plies` counts the
-    placements up to the winning stone, those two left-out stones included."""
+    `stones` are [q, r, player, ply] up to the winning stone, `ply` counting placements from 1: at each attacker
+    turn the certificate's primary choice (its fewest worst-case attacker turns), at each defender turn the covered
+    reply whose subtree lasts the most attacker turns, among equals the one whose stones lie nearest the attacker's
+    last stone (least summed hex distance), then the first listed. At an unstoppable fork every reply loses at once,
+    so the defender's two stones are left out, their plies skipped, and the attacker completes the shortest of the
+    certificate's threats. `plies` counts the placements up to the winning stone, those two left-out stones
+    included, so it is the last stone's `ply`."""
     from dense_solver import Proof
     proof = Proof([tuple(map(int, p)) for p in history], certificate)
     local, stones, plies, index = replay(history), [], 0, proof.root
     try:
         attacker = local.player
+        near = lambda reply: sum(hex_distance(cell, stones[-1]) for cell in reply['action'])
         while local.winner < 0:
             node = proof.nodes[index]
             if node['kind'] == 'unstoppable':
                 if node.get('threats'):
                     threat = min(node['threats'], key=len)
-                    stones += [[int(q), int(r), attacker] for q, r in threat]
+                    stones += [[int(q), int(r), attacker, plies + 3 + i] for i, (q, r) in enumerate(threat)]
                     plies += 2 + len(threat)
                 break
             if node['kind'] == 'defender_replies':
-                reply = max(node['responses'], key=lambda r: proof.turns(r['child']))
+                reply = min(node['responses'], key=lambda r: (-proof.turns(r['child']), near(r)))
                 action, index = reply['action'], reply['child']
             else:
                 action, index = node['action'], node.get('child')
             for q, r in action:
                 if local.winner < 0:
-                    stones.append([int(q), int(r), local.player])
-                    local.play(int(q), int(r))
                     plies += 1
+                    stones.append([int(q), int(r), local.player, plies])
+                    local.play(int(q), int(r))
             if index is None:
                 break
         return stones, plies
     finally:
         local.close()
+
+
+def hex_distance(a, b):
+    """Steps between hex cells `a` and `b` ([q, r] axial)."""
+    dq, dr = a[0] - b[0], a[1] - b[1]
+    return max(abs(dq), abs(dr), abs(dq + dr))
 
 
 def proof_turns(plies, remaining, mover_wins):
@@ -683,7 +692,8 @@ class TurnSearch:
             if self.given:
                 exact = dict(self.proof, plies=self.proof['plies'] - self.played)
             value = (1. if exact['winner'] == self.player else 0.) if exact else (stone_value + 1) / 2
-            pv = self.pv[self.played:] if self.given else [[*stone, self.player]] if exact else []
+            pv = ([[q, r, side, ply - self.played] for q, r, side, ply in self.pv[self.played:]] if self.given else
+                  [[*stone, self.player, 1]] if exact else [])
             self.later.append(dict(history=[tuple(cell[:2]) for cell in self.local.cells], moves=[stone],
                                    value=round(value, 4), top=rows, proof=exact, pv=pv, threat=[]))
         self.local.play(*self.moves[self.played])
@@ -691,7 +701,7 @@ class TurnSearch:
 
     def record(self):
         value = (1. if self.proof['winner'] == self.player else 0.) if self.proof else self.value
-        pv = self.pv or ([[*m, self.player] for m in self.moves] if self.proof else [])
+        pv = self.pv or ([[*m, self.player, i + 1] for i, m in enumerate(self.moves)] if self.proof else [])
         return dict(moves=self.moves, value=round(value, 4), top=self.top, proof=self.proof, pv=pv,
                     threat=self.threat, solved=self.solved, ms=round((time.perf_counter() - self.start) * 1000),
                     actual_completed=self.completed, actual_solver_nodes=self.solver_used, later=self.later)
@@ -709,8 +719,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
     stones as `move_row`s, the turn's first stone first), `proof` (None or {winner, turns, plies}: the solver proved
     a win for the side to move, or the search proved the position exact; `plies` placements to the winning stone),
-    `pv` (the principal variation as [q, r, player]: the solver's, see `principal_variation`, else on a search proof
-    the turn's own stones; [] when unproven) and
+    `pv` (the principal variation as [q, r, player, ply]: the solver's, see `principal_variation`, else on a search
+    proof the turn's own stones; [] when unproven) and
     `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a solver
     query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
     `simulations` 0 plays the raw policy; `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
@@ -1061,9 +1071,11 @@ def well_formed(record):
         return type(v) in (int, float) and math.isfinite(v)
 
     def cells(v, size, third=lambda x: type(x) is int):
-        """A list of [q, r] or [q, r, x] items with integer coordinates and a third value passing `third`."""
+        """A list of [q, r], [q, r, x] or [q, r, x, n] items with integer coordinates, a third value passing `third`
+        and an integer fourth."""
         return isinstance(v, list) and all(isinstance(c, list) and len(c) == size and type(c[0]) is int
-                                           and type(c[1]) is int and (size == 2 or third(c[2])) for c in v)
+                                           and type(c[1]) is int and (size == 2 or third(c[2]))
+                                           and (size < 4 or type(c[3]) is int) for c in v)
 
     if not isinstance(record, dict):
         return False
@@ -1074,7 +1086,7 @@ def well_formed(record):
             and isinstance(record.get('top'), list)
             and all(isinstance(c, list) and 3 <= len(c) <= 5 and cells([c[:3]], 3, number) and all(map(number, c[3:]))
                     for c in record['top'])
-            and cells(record.get('pv', []), 3) and cells(record.get('threat', []), 2)
+            and (cells(record.get('pv', []), 3) or cells(record.get('pv', []), 4)) and cells(record.get('threat', []), 2)
             and (proof is None or isinstance(proof, dict) and proof.get('winner') in (0, 1)
                  and type(proof.get('turns')) is int))
 

@@ -143,7 +143,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
       tree?.advance(action);
     }
     if (proof) value = proof.winner === player ? 1 : 0;
-    if (proof && !pv.length) pv = moves.map(([q, r]) => [q, r, player]);
+    if (proof && !pv.length) pv = moves.map(([q, r], i) => [q, r, player, i + 1]);
     return {moves, value: Math.round(value * 1e4) / 1e4, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
       actual_completed: completed, actual_solver_nodes: solverUsed};
   } finally {

@@ -91,13 +91,15 @@ class Overlay(unittest.TestCase):
             self.assertAlmostEqual(got, want)
 
     def test_proven_positions_show_only_the_numbered_line_and_its_six(self):
-        pv = [[-1, 1, 1], [-2, 2, 1], [9, 9, 0], [9, 10, 0], [5, 0, 1], [6, 0, 1]]
+        pv = [[-1, 1, 1, 1], [-2, 2, 1, 2], [9, 9, 0, 3], [9, 10, 0, 4], [5, 0, 1, 7], [6, 0, 1, 8]]
         top = [[-1, 1, 1, 1, 1], [-20, 5, 0, .99, 0]]
-        live, old = self.overlay(dict(top=top, proof=dict(winner=1, turns=2, plies=8), pv=pv),
-                                 dict(top=top, proof=dict(winner=1, turns=2)))
+        live, old, unnumbered = self.overlay(dict(top=top, proof=dict(winner=1, turns=2, plies=8), pv=pv),
+                                             dict(top=top, proof=dict(winner=1, turns=2)),
+                                             dict(top=top, proof=dict(winner=1, turns=2), pv=[p[:3] for p in pv]))
         self.assertEqual(live['candidates'], [])
         self.assertEqual([(p['q'], p['r'], p['n'], p['player']) for p in live['plies']],
-                         [(*p[:2], i + 1, p[2]) for i, p in enumerate(pv)])
+                         [(q, r, n, player) for q, r, player, n in pv])
+        self.assertEqual([p['n'] for p in unnumbered['plies']], [1, 2, 3, 4, 5, 6])
         self.assertEqual(len({(p['q'], p['r']) for p in live['plies']}), len(pv))
         self.assertEqual(live['plies'][0]['fade'], 1)
         self.assertAlmostEqual(live['plies'][-1]['fade'], .45)
