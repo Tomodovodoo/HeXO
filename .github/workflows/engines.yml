@@ -56,7 +56,9 @@ jobs:
           path: dist
           merge-multiple: true
       - run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
-      - run: gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "Engines ${TAG#engines-v}" --notes "Prebuilt Strix and Shrimp for the play page's one-click engine setup. Pin with: python tools/build_engines.py pin $TAG"
+      - run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "Engines ${TAG#engines-v}" \
+            --notes "Prebuilt Strix and Shrimp for the play page's one-click engine setup. Pin with: python tools/build_engines.py pin $TAG"
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
