@@ -11,7 +11,7 @@ Bubble is a hex-masked residual network with a policy head and a value head. Tra
 - Actors play Bubble against itself with Gumbel MCTS. A small root search improves the policy from a few dozen simulations per stone.
 - A learner trains on those games from a replay window sized the KataGo way and exports a checkpoint every few thousand steps.
 - An evaluator plays every checkpoint against the champion on colour-swapped opening pairs and rates them with a Bradley-Terry model over paired results.
-- A tactical solver proves forced wins and losses. The search uses the proofs to play the shortest win and the longest defence, and proven positions become exact training labels. The solver started as the one in [Strix](https://github.com/SootyOwl/hexo-strix) (MIT) and has been changed in many places.
+- A tactical solver proves forced wins. The search uses the proofs to play the shortest win and the longest defence, a position whose every move is proven lost counts as lost, and proven positions become exact training labels. The solver started as the one in [Strix](https://github.com/SootyOwl/hexo-strix) (MIT) and has been changed in many places.
 - A proof pass uses spare CPU to re-check finished games for missed forced wins, labels those positions and feeds the worst misses back as starting positions.
 - A dashboard shows the run.
 
