@@ -1163,6 +1163,7 @@ class DenseConfigTests(unittest.TestCase):
     def test_round_trip_and_no_overwrite(self):
         config = dense_config.RunConfig(created_at=12.5, seed=3, device='cpu',
                                         model=dense_config.ModelSettings(blocks=2, aux_heads=False),
+                                        actor=dense_config.ActorSettings(search_choice='policy'),
                                         learner=dense_config.LearnerSettings(lr=1e-3, recency=.5))
         with tempfile.TemporaryDirectory() as tmp:
             dense_config.save(tmp, config)
@@ -1186,6 +1187,11 @@ class DenseConfigTests(unittest.TestCase):
         self.assertEqual((got.tactics, got.full_fraction, got.full_sims), (False, .5, 32))
         self.assertIsInstance(got.full_fraction, float)
         self.assertTrue(dense_config.override(got, parser.parse_args(['--tactics'])).tactics)
+        policy_args = parser.parse_args(['--search-choice', 'policy'])
+        self.assertEqual(dense_config.override(base, policy_args).search_choice, 'policy')
+        self.assertEqual(dense_selfplay.actor_flags(policy_args), ['--search-choice', 'policy'])
+        with self.assertRaisesRegex(ValueError, 'search_choice must be gumbel or policy'):
+            dense_config.override(base, parser.parse_args(['--search-choice', 'unknown']))
         self.assertEqual(dense_selfplay.actor_flags(parser.parse_args(['--historical-weighting', 'uniform'])),
                          ['--historical-weighting', 'uniform'])
         prefixed = argparse.ArgumentParser()
@@ -3657,6 +3663,28 @@ class EngineTests(unittest.TestCase):
         slot.settings = replace(slot.settings, full_fraction=1.)
         dense_selfplay.SelfPlayGame.plan(slot)
         self.assertEqual((slot.budget, slot.samples), (64, 16))
+
+    def test_actor_search_choice_plays_policy_or_gumbel_move(self):
+        model = unittest.mock.Mock()
+        for choice, proven, opening, expected in (('policy', 0, False, 0), ('gumbel', 0, False, 1),
+                                                   ('policy', 1, False, 1), ('policy', 0, True, 0)):
+            with self.subTest(choice=choice, proven=proven, opening=opening):
+                settings = dense_config.ActorSettings(search_choice=choice, full_fraction=1.,
+                                                      opening_random_plies=0., max_plies=2)
+                slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, [[0, 0]]))
+                try:
+                    slot.random_plies = 2 if opening else 0
+                    actions = np.asarray(slot.game.legal_moves()[:3], np.int64)
+                    policy = np.array([1., 0., 0.]) if opening else np.array([.8, .15, .05])
+                    result = dict(action=actions[1], actions=actions, policy=policy, values=np.zeros(3),
+                                  completed=1, exact_winner=-1, proven=proven, proof_turns=[], solver_nodes=0,
+                                  solver_budget=0)
+                    self.assertFalse(slot.searched(result))
+                    self.assertEqual(slot.moves[-1], actions[expected].tolist())
+                    np.testing.assert_array_equal(slot.rows[0]['policy'], policy.astype(np.float32))
+                    self.assertEqual(slot.values[-1], float(proven))
+                finally:
+                    slot.game.close()
 
     def test_full_turns_search_both_stones_of_a_turn_alike(self):
         draws = iter(np.tile([.1, .9], 50))
