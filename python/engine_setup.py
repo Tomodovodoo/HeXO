@@ -6,6 +6,7 @@ A setup downloads an engine, checks every file against its SHA-256, lays it out 
 Engines that need compiling are built here when the toolchain is present and otherwise come from the release named
 in the manifest, whose file hashes are checked in. Nothing here needs the training modules.
 """
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -137,15 +138,16 @@ class Job:
 
 
 class Setups:
-    """Setup jobs for the engines in `manifest`, one thread each. `rescan` refreshes the registry; `entries`
-    returns its current entries, which decide what counts as installed."""
+    """Setup jobs for the engines in `manifest`, one thread each. `rescan` refreshes the registry; jobs call it one
+    at a time after their install, so the last rescan sees every finished one. `entries` returns the registry's
+    current entries, which decide what counts as installed."""
 
     def __init__(self, models, rescan=lambda: None, entries=lambda: {}, manifest=MANIFEST, opener=urlopen,
                  which=shutil.which, cargo=cargo):
         self.models, self.rescan, self.entries = Path(models).resolve(), rescan, entries
         self.manifest = json.loads(Path(manifest).read_text(encoding='utf-8'))
         self.opener, self.which, self.cargo = opener, which, cargo
-        self.jobs, self.threads, self.lock = {}, {}, threading.Lock()
+        self.jobs, self.threads, self.lock, self.rescanning = {}, {}, threading.Lock(), threading.Lock()
 
     def catalogue(self):
         """Every known engine as {engine, name, kind, installed, job}: `installed` is the id of the registry entry
@@ -186,10 +188,8 @@ class Setups:
             return
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        try:
+        with self.rescanning, contextlib.suppress(ValueError):
             self.rescan()
-        except ValueError:
-            pass
         job.state = 'done'
 
     # Steps shared by the recipes

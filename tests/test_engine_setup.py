@@ -243,6 +243,32 @@ class Recipes(unittest.TestCase):
             self.setups({}).place(staged, 'seal', dict(name='Seal'))
         self.assertEqual((self.models / 'strix' / 'mine.txt').read_text(), 'keep')
 
+    def test_setups_finishing_together_rescan_one_at_a_time(self):
+        inside, overlaps = [], []
+
+        def rescan():
+            overlaps.append(bool(inside))
+            inside.append(1)
+            threading.Event().wait(.2)
+            inside.pop()
+        path = Path(self.folder.name) / 'engines.json'
+        path.write_text(json.dumps(self.manifest), encoding='utf-8')
+        setups = Setups(self.models, rescan, dict, path, Web({}), lambda name: None, lambda: None)
+        with unittest.mock.patch.object(Setups, 'seal', lambda self, job, work: None), \
+                unittest.mock.patch.object(Setups, 'six', lambda self, job, work: None):
+            setups.start('seal')
+            setups.start('six')
+            self.assertEqual((setups.wait('seal', 5).state, setups.wait('six', 5).state), ('done', 'done'))
+        self.assertEqual(overlaps, [False, False])
+
+    def test_strix_entries_differ_by_executable(self):
+        for name in ('a', 'b'):
+            (self.models / f'{name}.json').write_text(json.dumps(dict(name='Strix', kind='strix', model='m.safetensors',
+                                                                      engine=f'{name}.exe')))
+        strix = [e for e in scan(self.models).values() if e['kind'] == 'strix']
+        self.assertEqual(len({e['id'] for e in strix}), 2)
+        self.assertEqual({e['engine'].name for e in strix}, {'a.exe', 'b.exe'})
+
     def test_a_second_start_joins_the_running_setup(self):
         gate = threading.Event()
         setups = self.setups({})

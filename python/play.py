@@ -257,8 +257,7 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     Bubble), `checkpoints` (Bubble checkpoints or Six networks), and the server-only `path` (Bubble), `command`,
     `cwd`, `mirrored`, `libraries` and, for a Six folder, `networks` ({name: path}) and `backend` (Six protocol,
     see `command_of`), `model` and `engine` (Strix) or `library` (Seal). An id is `kind:name`;
-    entries sharing one get a suffix from their path, command, model or library, so an id never moves to another
-    engine."""
+    entries sharing one get a suffix from `engine_identity`, so an id never moves to another engine."""
     found, seen = [], set()
     models = models and Path(models).resolve()
 
@@ -325,11 +324,16 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     bases = [f"{e['kind']}:{e['name']}" for e in found]
     entries = OrderedDict()
     for base, entry in zip(bases, found):
-        identity = entry.get('path') or entry.get('command') or entry.get('model') or entry.get('library')
-        suffix = hashlib.blake2b(str(identity).encode(), digest_size=3).hexdigest()
+        suffix = hashlib.blake2b(engine_identity(entry).encode(), digest_size=3).hexdigest()
         key = base if bases.count(base) == 1 else f'{base}~{suffix}'
         entries[key] = dict(id=key, **entry)
     return entries
+
+
+def engine_identity(entry):
+    """What makes an entry its engine: its path, command or library, or its model and executable (Strix)."""
+    return str(entry.get('path') or entry.get('command') or entry.get('library') or
+               (entry.get('model'), entry.get('engine')))
 
 
 def command_of(entry, checkpoint):
@@ -1768,7 +1772,7 @@ class Session:
         a seat whose engine or checkpoint is gone becomes a person, and analysis falls back to the first Bubble
         model."""
         entries = self.rescan_entries()
-        identity = lambda e: (e['kind'], str(e.get('path') or e.get('command') or e.get('model') or e.get('library')))
+        identity = lambda e: (e['kind'], engine_identity(e))
         def follow(seat):
             old = self.entries.get(seat['engine'])
             moved = next((e['id'] for e in entries.values() if old and identity(e) == identity(old)), None)
