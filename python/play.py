@@ -1584,18 +1584,23 @@ class Session:
             self.paused = False
             self.changed()
 
-    def undo(self, people=None):
-        """Take back stones to the start of the latest turn a person played, or one stone without people. `people`
-        (sides) overrides the human seats, for a page that plays a seat itself (the browser engine)."""
-        if people is not None and (not isinstance(people, list) or any(side not in (0, 1) or type(side) is not int
-                                                                        for side in people)):
+    def people(self, people=None):
+        """The sides people play: `people` (a list of sides) when given, for a page that plays a seat itself (the
+        browser engines), otherwise the human seats."""
+        if people is None:
+            return [i for i, seat in enumerate(self.seats) if seat['engine'] == 'human']
+        if not isinstance(people, list) or any(side not in (0, 1) or type(side) is not int for side in people):
             raise ValueError('People must be a list of sides')
+        return people
+
+    def undo(self, people=None):
+        """Take back stones to the start of the latest turn a person played (`people` as for `people`), or one
+        stone without people."""
         with self.lock:
+            people = self.people(people)
             self.match_editable()
             if not self.history:
                 return
-            if people is None:
-                people = [i for i, seat in enumerate(self.seats) if seat['engine'] == 'human']
             self.fork_freeplay()
             self.history.pop()
             while people and self.history and not (player_at(len(self.history)) in people
@@ -1604,15 +1609,16 @@ class Session:
             self.stop_moves()
             self.changed()
 
-    def new_game(self):
+    def new_game(self, people=None):
         """Start again; with the book on, from one of its openings (`book_mode`: narrow, wide or all, as for
-        batches) in a random orientation, shown as played stones. Against a person the opening comes from
-        `pick_opening` over what that person has played on that side (`Coverage`), otherwise uniformly."""
+        batches) in a random orientation, shown as played stones. Against a person (`people` as for `people`) the
+        opening comes from `pick_opening` over what that person has played on that side (`Coverage`), otherwise
+        uniformly."""
         history, opening, played = [], None, None
+        people = self.people(people)
         if self.opening_book and self.book:
             rng = random.Random()
             selection = book_openings(self.book, self.book_mode, None, rng.randrange(1 << 30))
-            people = [side for side, seat in enumerate(self.seats) if seat['engine'] == 'human']
             if len(people) == 1:
                 book = selection['sha256'][:16]
                 node = pick_opening(selection['nodes'], lambda key: self.coverage.count(book, key, people[0]), rng)
@@ -1627,8 +1633,9 @@ class Session:
             if played:
                 self.coverage.add(*played)
 
-    def use_book(self, enabled, mode=None):
-        """Turn book openings on or off and choose the book (`BOOKS`); an empty board starts from one at once."""
+    def use_book(self, enabled, mode=None, people=None):
+        """Turn book openings on or off and choose the book (`BOOKS`); an empty board starts from one at once
+        (`new_game` with `people`)."""
         if type(enabled) is not bool or mode not in (None, *BOOKS):
             raise ValueError('enabled must be true or false and the book narrow, wide or all')
         if enabled and not self.book:
@@ -1637,7 +1644,7 @@ class Session:
             self.opening_book, self.book_mode = enabled, mode or self.book_mode
             self.revision += 1
             if enabled and not self.history:
-                self.new_game()
+                self.new_game(people)
 
     def load(self, history, paused, saved_game=None):
         """Replace the game with `history` (validated)."""
@@ -2877,9 +2884,9 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/undo':
                 session.undo(args.get('people'))
             elif self.path == '/new':
-                session.new_game()
+                session.new_game(args.get('people'))
             elif self.path == '/book':
-                session.use_book(args['enabled'], args.get('mode'))
+                session.use_book(args['enabled'], args.get('mode'), args.get('people'))
             elif self.path == '/retry':
                 ply = args['ply']
                 if type(ply) is not int or not 0 <= ply <= len(session.history):

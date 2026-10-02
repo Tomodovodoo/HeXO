@@ -27,7 +27,7 @@ const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bu
 const ENGINES = new Map([bubble, native, shrimp, seal, six, strix].filter(Boolean).map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
-  'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems'];
+  'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems', 'isHuman'];
 const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, page[name]]));
 const analyses = new Map(), loads = new Map(), hk = history => history.map(p => p.join(',')).join(';');
 /** Each seat and the analysis: null, or {engine: an ENGINES id, preset, checkpoint}. */
@@ -227,8 +227,8 @@ function install() {
       }
       return Promise.resolve(s);
     }
-    if (path === '/undo' && s && config.seats.some(Boolean)) {
-      return original.post('/undo', {people: [0, 1].filter(side => s.seats[side].engine === 'human' && !config.seats[side])});
+    if (['/undo', '/new', '/book'].includes(path) && s && config.seats.some(Boolean)) {
+      return original.post(path, {...body, people: [0, 1].filter(side => s.seats[side].engine === 'human' && !config.seats[side])});
     }
     return original.post(path, body);
   };
@@ -239,6 +239,10 @@ function install() {
     const {entry} = ENGINES.get(choice.engine);
     return [entry.badge || entry.kind, entry.label];
   };
+  page.isHuman = seat => {
+    const s = state(), side = s ? s.seats.indexOf(seat) : -1;
+    return original.isHuman(seat) && !(side >= 0 && config.seats[side]);
+  };
   page.canPlace = () => original.canPlace() && !config.seats[state().player];
   page.renderSeat = side => {
     original.renderSeat(side);
@@ -247,7 +251,7 @@ function install() {
     const send = change => { config.seats[side] = {...config.seats[side], ...change}; save(); page.renderPanels(); };
     const pick = box.querySelector('.pick');
     if (pick) {
-      const items = [{id: 'human', ids: ['human'], kind: 'you', label: null}, ...original.pickItems(() => true)];
+      const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...original.pickItems(() => true)];
       pick.onclick = () => original.openMenu(pick, items, config.seats[side].engine, it => page.post('/seat', {side, engine: it.id}));
     }
     box.append(original.el('div', {class: 'more'}, original.el('div', {}, ...controls(config.seats[side], send, 'seat' + side))));

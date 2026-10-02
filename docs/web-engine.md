@@ -48,6 +48,7 @@ to the site's path, adds the cross-origin isolation headers after one reload.
 | `web/engine/six.mjs`, `six-worker.mjs`, `six/search.mjs` | Six (browser): page API and seat entry, worker, and Six's search driving its network |
 | `web/engine/strix.mjs`, `strix-worker.mjs` | Strix (browser): page API and worker |
 | `web/engine/strix/` | `strix.wasm` and its loader `core.mjs`, built from `tools/strix_web`; the network when built |
+| `web/engine/book.mjs` | Play page hook: the opening-book default that follows the seats |
 | `web/engine/offline.mjs` | The play server's game requests answered in the page, for static hosting |
 | `web/coi-sw.js` | Cross-origin isolation on static hosts (`isolate()`), for WebAssembly threads |
 
