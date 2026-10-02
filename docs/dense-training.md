@@ -19,7 +19,7 @@ The games hit their placement cap, so their outcomes stay masked and the search 
 
 An actor writes one row per placement. A full-search row (the `full_fraction` of placements, 128 simulations in the live run) carries the improved search policy as its policy target and a value target. A cheap-search row (12 simulations) carries a value target at weight `cheap_value_weight` (0.25) and no policy target; `--cheap-row-fraction f` keeps a hash-chosen share `f` of them, and `f = 0` is KataGo's choice of not training on them at all. Each placement draws its kind independently, so both stones of a turn are full searches in only `full_fraction` squared of turns; the actor flag `--full-turns` lets a turn's second stone repeat its first stone's draw, which keeps the full share and makes every full first stone a pair that `--pair-policy-weight` can use. Rows with an exact label, from a proof or a forced line, are always kept at value weight `proven_value_weight` (2) and their outcome loss is masked.
 
-Actors also store the network's own value prediction for each root, before search. The proof pass uses it to find positions where the network was wrong although the solver knew better.
+Actors also store the network's own value prediction for each root, before search. Completed games batch any missing predictions, including trained solver continuation rows. The existing bounded regret sampler prioritizes exact rows whose predictions disagree with their proven result, so these continuations can receive extra value and proof-policy training. Older rows without predictions keep their ordinary sampling weight. The proof pass also uses these predictions to find positions where the network was wrong although the solver knew better.
 
 ## Value targets
 

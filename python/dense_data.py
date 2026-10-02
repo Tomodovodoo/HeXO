@@ -580,13 +580,13 @@ class ReplayWindow:
         self.refresh_regret()
 
     def exact_errors(self, name, episodes, rows, labels):
-        """Cached actor-value errors after native and sidecar labels, skipping unpredicted forced lines."""
+        """Cached actor-value errors after native and sidecar labels, including predicted proof lines."""
         errors = {}
         for i, row in enumerate(rows):
             proven = row.get('proven', 0)
             if not proven and labels and (row['game'], row['ply']) in labels:
                 proven = 1
-            if proven not in (-1, 1) or row.get('line'):
+            if proven not in (-1, 1):
                 continue
             predictions = episodes[row['game']].get('network_values')
             value = predictions[row['ply']] if predictions is not None else None

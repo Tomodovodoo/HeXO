@@ -775,8 +775,8 @@ def record_network_values(slots):
     """Fill missing predictions on trained rows and the tactical opening before saving a completed game.
 
     Root predictions are saved during search independently of cache eviction. Missing rows share an extra
-    batch per model here, including roots proved later by the offline pass. Forced prefixes and generated
-    proof lines stay null. Predictions that cannot be encoded also stay null. Return submission sizes for
+    batch per model here, including generated proof lines and roots proved later by the offline pass. Forced
+    prefixes stay null. Predictions that cannot be encoded also stay null. Return submission sizes for
     actor metrics. The tactical opening also records an untrained opponent's head for reporting only.
     Search values and played moves are already fixed.
     """
@@ -785,7 +785,7 @@ def record_network_values(slots):
         for row in slot.rows:
             ply = row['ply']
             tactical = slot.book is not None and slot.book.get('tactical') is not None and ply == slot.book['ply']
-            if row.get('line') or (slot.values[ply] is None and not tactical) or slot.network_values[ply] is not None:
+            if (slot.values[ply] is None and not tactical) or slot.network_values[ply] is not None:
                 continue
             history = np.asarray(slot.moves[:ply], np.int64).reshape(-1, 2)
             model, key = slot.sides[row['player']], position_key(history)
