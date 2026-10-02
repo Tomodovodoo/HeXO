@@ -17,6 +17,64 @@ class Uniform:
         return out
 
 class NeuralTree(unittest.TestCase):
+    def test_puct_initial_value_uses_policy_weighted_action_values(self):
+        from puct_search import PUCTSearch
+        search = PUCTSearch(Uniform(), 'puct-weighted', [(0, 0)])
+        self.addCleanup(search.close)
+        search.begin(1)
+        request = search.request()
+        prediction = search.evaluator.evaluate([request[0].history])[0]
+        count = len(prediction['actions'])
+        prediction['logits'][0] = np.log(9*(count-1))
+        prediction['q'][:] = -1.
+        prediction['q'][0] = 1.
+        search.fulfill(request, prediction)
+        self.assertAlmostEqual(search.root.value, .8)
+
+    def test_puct_backup_keeps_sign_within_turn_and_flips_between_turns(self):
+        from puct_search import PUCTSearch, search_many
+        class Positive(Uniform):
+            def evaluate(self, histories):
+                return [dict(p, q=np.full(len(p['actions']), .8)) for p in super().evaluate(histories)]
+        search = PUCTSearch(Positive(), 'puct-sign', [(0, 0)], cache=EvaluationCache(64))
+        self.addCleanup(search.close)
+        result = search_many([search], 1)[0]
+        chosen = int(np.argmax(result['visits']))
+        self.assertAlmostEqual(result['values'][chosen], .8)
+        search.advance(result['action'])
+        self.assertEqual(search.game.remaining, 1)
+        result = search_many([search], 1)[0]
+        chosen = int(np.argmax(result['visits']))
+        self.assertAlmostEqual(result['values'][chosen], -.8)
+        self.assertFalse(search.root.parents)
+
+    def test_puct_unresolved_reply_prevents_loss_and_winning_reply_proves_node(self):
+        from puct_search import Node
+        root, loss, win = Node((), 1), Node((), 1, 0), Node((), 1, 1)
+        root.expanded, root.eligible = True, np.ones(2, bool)
+        root.children[0] = loss
+        root.settle()
+        self.assertEqual(root.winner, -1)
+        self.assertFalse(root.eligible[0])
+        root.children[1] = win
+        root.settle()
+        self.assertEqual(root.winner, 1)
+        np.testing.assert_array_equal(root.eligible, [False, True])
+
+    def test_puct_native_tactics_and_retained_complement(self):
+        from puct_search import PUCTSearch, search_many
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        search = PUCTSearch(Uniform(), 'puct-tactics', history, cache=EvaluationCache(64), tactics=True, graph=True)
+        self.addCleanup(search.close)
+        result = search_many([search], 8)[0]
+        self.assertEqual(result['proven'], 1)
+        search.advance(result['action'])
+        if search.game.winner < 0:
+            result = search_many([search], 8)[0]
+            self.assertEqual(result['proven'], 1)
+            search.advance(result['action'])
+        self.assertEqual(search.game.winner, 0)
+
     @unittest.skipUnless(importlib.util.find_spec('torch'), 'Timed Bubble turns require torch')
     def test_timed_turn_reserves_simulations_for_both_stones(self):
         import threading
