@@ -55,8 +55,41 @@ struct WindowTable {
     };
     std::vector<Slot> slots=std::vector<Slot>(128);
     size_t count=0;
+    std::vector<WindowData> dense;
+    std::vector<uint64_t> dense_used;
+    static int dense_index(Window w) {
+        if(w.start.q < -32 || w.start.q>=32 || w.start.r < -32 || w.start.r>=32) return -1;
+        return int((w.axis*64+w.start.q+32)*64+w.start.r+32);
+    }
+    struct View {
+        const WindowTable& table;
+        struct Iterator {
+            const WindowTable* table;size_t index;
+            void skip() {
+                const auto n=table->dense.size();
+                if(index<n) {
+                    size_t word=index/64;auto bits=table->dense_used[word]&(~uint64_t(0)<<(index%64));
+                    while(!bits && ++word<table->dense_used.size()) bits=table->dense_used[word];
+                    index=bits?word*64+std::countr_zero(bits):n;
+                }
+                while(index>=n && index<n+table->slots.size() && !table->slots[index-n].hash) ++index;
+            }
+            Slot operator*() const {
+                if(index>=table->dense.size()) return table->slots[index-table->dense.size()];
+                auto a=index/(64*64),q=(index/64)%64,r=index%64;
+                return {Cell{int64_t(q)-32,int64_t(r)-32},1,table->dense[index],uint8_t(a)};
+            }
+            Iterator& operator++(){++index;skip();return *this;}
+            bool operator!=(const Iterator& other) const{return index!=other.index;}
+        };
+        Iterator begin() const {Iterator it{&table,0};it.skip();return it;}
+        Iterator end() const {return {&table,table.dense.size()+table.slots.size()};}
+    };
+    View all() const {return {*this};}
     static uint64_t hash(Window w) { auto h=WindowHash{}(w);return h?h:1; }
     const WindowData* find(Window w) const {
+        const int index=dense.empty()?-1:dense_index(w);
+        if(index>=0) return dense[index].pattern?&dense[index]:nullptr;
         auto h=hash(w);size_t i=h&(slots.size()-1);
         while(slots[i].hash) {
             if(slots[i].hash==h && slots[i].key()==w) return &slots[i].data;
@@ -65,6 +98,8 @@ struct WindowTable {
         return nullptr;
     }
     WindowData& get(Window w) {
+        const int index=dense.empty()?-1:dense_index(w);
+        if(index>=0) {dense_used[index/64]|=uint64_t(1)<<(index%64);return dense[index];}
         if((count+1)*4>=slots.size()*3) {
             auto old=std::move(slots);slots=std::vector<Slot>(old.size()*2);count=0;
             for(const auto& s:old) if(s.hash) get(s.key())=s.data;
@@ -77,6 +112,8 @@ struct WindowTable {
         slots[i]={w.start,h,{},uint8_t(w.axis)};++count;return slots[i].data;
     }
     void erase(Window w) {
+        const int index=dense.empty()?-1:dense_index(w);
+        if(index>=0) {dense_used[index/64]&=~(uint64_t(1)<<(index%64));dense[index]={};return;}
         auto h=hash(w);const size_t mask=slots.size()-1;size_t hole=h&mask;
         while(slots[hole].hash!=h || !(slots[hole].key()==w)) hole=(hole+1)&mask;
         for(size_t next=(hole+1)&mask;slots[next].hash;next=(next+1)&mask) {
@@ -86,6 +123,27 @@ struct WindowTable {
             }
         }
         slots[hole]={};--count;
+    }
+};
+// Search restores the board before this guard reinstates the original sparse
+// layout. Only current line counts are stored; no search values survive.
+struct DenseWindows {
+    WindowTable& table;
+    std::vector<WindowTable::Slot> saved;
+    size_t count=0;
+    bool enabled=false;
+    DenseWindows(WindowTable& table,bool use):table(table),enabled(use && table.dense.empty()) {
+        if(!enabled) return;
+        WindowTable next;
+        next.dense.resize(3*64*64);next.dense_used.resize(3*64);
+        for(const auto& slot:table.slots) if(slot.hash) next.get(slot.key())=slot.data;
+        saved=std::move(table.slots);count=table.count;
+        table.slots=std::move(next.slots);table.count=next.count;
+        table.dense=std::move(next.dense);table.dense_used=std::move(next.dense_used);
+    }
+    ~DenseWindows() {
+        if(!enabled) return;
+        table.dense.clear();table.dense_used.clear();table.slots=std::move(saved);table.count=count;
     }
 };
 constexpr int powers[]={1,3,9,27,81,243};
@@ -633,7 +691,7 @@ struct CandidateGuard {
             for(int q=-2;q<=2;++q) for(int r=std::max(-2,-q-2);r<=std::min(2,-q+2);++r)
                 ++cache.get(c+Cell{q,r}).nearby;
         }
-        for(const auto& slot:b.windows.slots) if(slot.hash) {
+        for(const auto& slot:b.windows.all()) if(slot.hash) {
             const auto& data=slot.data;
             for(unsigned gaps=data.empty;gaps;gaps&=gaps-1) {
                 int j=std::countr_zero(gaps);
@@ -723,7 +781,7 @@ struct Search {
                 if(b.at(c+Cell{q,r})<0) set.insert(c+Cell{q,r});
         }
         // Include every empty cell of a promising line, even far from the last move.
-        for(const auto& slot:b.windows.slots) if(slot.hash) {
+        for(const auto& slot:b.windows.all()) if(slot.hash) {
             const auto& data=slot.data;
             if((data.counts[0]>=2 && !data.counts[1]) || (data.counts[1]>=2 && !data.counts[0]))
                 for(auto c:b.empty(slot.key())) set.insert(c);
@@ -1069,7 +1127,7 @@ struct Search {
         // played cell, blocking an attacking completion, or creating a defending
         // completion. Three defending stones plus the extra stone can win in two.
         size_t support_slots=0;
-        if(support) for(const auto& slot:b.windows.slots) {
+        if(support) for(const auto& slot:b.windows.all()) {
             if(!(++support_slots&255)) {check();if(Clock::now()>=proof_deadline) throw Timeout{};}
             if(!slot.hash) continue;
             auto n=slot.data.counts;
@@ -1184,7 +1242,7 @@ struct Search {
     bool forcing_material(const Board& b,int player) const {
         // Two placements can turn two stones into a forcing four. Requiring
         // three stones can discard a previously proven winning continuation.
-        for(const auto& slot:b.windows.slots)
+        for(const auto& slot:b.windows.all())
             if(slot.hash && !slot.data.counts[1-player] && slot.data.counts[player]>=2) return true;
         return false;
     }
@@ -1294,7 +1352,7 @@ struct Search {
         return base;
     }
     HxResult run(Board& b,int max_depth,int root_seconds=0,int root_turns=0,WinningPlan* plan=nullptr) {
-        auto start=Clock::now();CandidateGuard candidate_cache(b);Restore restore(b);HxResult output{};
+        auto start=Clock::now();CandidateGuard candidate_cache(b);DenseWindows dense_windows(b.windows,!b.model);Restore restore(b);HxResult output{};
         if(b.winner>=0) return output;
         Turn chosen=immediate(b);
         if(chosen.count) {chosen.score=mate;output.depth=1;}
