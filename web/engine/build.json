@@ -1,7 +1,7 @@
 {
  "sources": {
   "src/gumbel.cpp": "5c934f129ec0a5e3ef689b324df29055e2d3c341a8b832df87da1d588c10aefe",
-  "src/hexo.cpp": "bed15e16f6ce0e704e53b49c5eec01398fc1b4ba51ab6cdb9d4464ae021420ca",
+  "src/hexo.cpp": "93fa7def5fa3196473c9218ea58ecbe6ef796402e674a5a51f4fe8e678d4fe06",
   "src/hexo.hpp": "aa4459c649f17ecc209a892f1522952e4a259385a82d15a48c689f5a975cb520",
   "src/nnue.hpp": "38e657c7fe31028565ff971e34742be42e4c82031ac51f70d558828cfc6e4a54",
   "tools/tactical/Cargo.lock": "56319088ab2d82c5dd7becbd5420e692b77fb581b0991d7159ce94df08236ade",
@@ -64,10 +64,10 @@
  },
  "artefacts": {
   "gumbel.mjs": "850e06d732526665636e3b12b72f5e48bb2011668fb86b5bba8c95ce8b33bec9",
-  "gumbel.wasm": "3705735bfc71307e4706edae6ad49b24fa14c424bcc77cb56242f451c4d68f5d",
+  "gumbel.wasm": "5f6ebf84983a252412aa8d3ddc7e8b4b7673aa09add271658a15fe003a1b73a0",
   "tactical.wasm": "4f38302a4e9b37181ac285135a8c49b2064c64e5d6e02b2e149c32073dbad8f9",
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
-  "native/native.wasm": "3005b8b61b84323d7092047bd21a7e00617b0a02522b0f9e8893c16a2a3e8c4f",
+  "native/native.wasm": "1bcd1d85021001f1afe9a9f62749dc606c7b210ae648ecc15f72fd2b95320dcd",
   "shrimp/shrimp.wasm": "caeed68606deaee3be330278c8e8c294c05c83e1045169ef203b7e537b1a47d4"
  },
  "tools": {

@@ -5,6 +5,54 @@
 #include <random>
 #include <set>
 int main() {
+    // The temporary line array must agree with sparse storage through updates,
+    // undo and deadline exits, including lines that cross its coordinate limit.
+    {
+        Board sparse,dense;
+        const std::vector<Cell> initial{{0,0},{31,31},{32,32},{-32,-32},{-33,-33},{1000,1000},{-1000,-1000}};
+        for(auto c:initial) {sparse.make(c);dense.make(c);}
+        const auto hash=dense.hash();const auto features=dense.features;
+        {
+            DenseWindows guard(dense.windows,true);
+            Restore restore_dense(dense),restore_sparse(sparse);
+            auto same=[&] {
+                assert(dense.hash()==sparse.hash() && dense.features==sparse.features &&
+                       dense.evaluation==sparse.evaluation && dense.threes==sparse.threes);
+                size_t a=0,z=0;
+                for(auto slot:dense.windows.all()) {
+                    ++a;auto other=sparse.windows.find(slot.key());
+                    assert(other && other->counts==slot.data.counts &&
+                           other->pattern==slot.data.pattern && other->empty==slot.data.empty);
+                }
+                for(auto slot:sparse.windows.all()) {
+                    ++z;auto other=dense.windows.find(slot.key());
+                    assert(other && other->counts==slot.data.counts &&
+                           other->pattern==slot.data.pattern && other->empty==slot.data.empty);
+                }
+                assert(a==z);
+            };
+            std::mt19937 random(20261002);
+            for(int i=0;i<600;++i) {
+                if(i%3==2 && dense.history.size()>initial.size()) {dense.undo();sparse.undo();}
+                else {
+                    Cell c;
+                    do {c={int(random()%90)-45,int(random()%90)-45};} while(dense.at(c)>=0);
+                    dense.make(c);sparse.make(c);
+                }
+                if(i%17==0) same();
+            }
+            while(dense.history.size()>initial.size()) {dense.undo();sparse.undo();}
+            same();
+        }
+        Search timed(1,16);timed.run(dense,12);
+        assert(dense.hash()==hash && dense.features==features &&
+               dense.windows.dense.empty() && dense.windows.dense_used.empty());
+        for(auto slot:sparse.windows.all()) {
+            auto other=dense.windows.find(slot.key());
+            assert(other && other->counts==slot.data.counts &&
+                   other->pattern==slot.data.pattern && other->empty==slot.data.empty);
+        }
+    }
     // Filler generation must allow cancellation during dense scans and sparse
     // neighborhood generation/sorting, without changing the legal set or board.
     for(int span:{128,264}) {
