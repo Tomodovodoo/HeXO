@@ -107,7 +107,9 @@ def publish(run, state):
         path = run/'checkpoints'/checkpoint/'ema.pt'
         if hashlib.sha256(path.read_bytes()).hexdigest() != sha:
             raise ValueError('Target run checkpoint weights differ from the comparison')
-    ids = {'gumbel': state['checkpoint'], **{m: state['checkpoint']+'@'+state['names'][m] for m in ('puct', 'policy')}}
+    plain = state.get('plain_mode', 'gumbel')
+    variants = [m for m in MODES if m != plain]
+    ids = {m: state['checkpoint'] if m == plain else state['checkpoint']+'@'+state['names'][m] for m in MODES}
     reports, paths = [], []
     for a, b in itertools.combinations(MODES, 2):
         records = [dict(g, candidate=ids[a], opponent=ids[b]) for g in state['results']
@@ -138,7 +140,7 @@ def publish(run, state):
             write_json(path, report)
     league = json.loads((run/'league.json').read_text(encoding='utf-8'))
     known = {v['id'] for v in league.get('variants', [])} | set(dense_eval.requests(run))
-    for mode in ('puct', 'policy'):
+    for mode in variants:
         cid = ids[mode]
         if cid in known:
             continue
@@ -202,7 +204,8 @@ def main():
                          ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip(),
                      cases=json.loads(args.panel.read_text(encoding='utf-8'))['cases'],
                      openings=[book.draw(s) for s in seeds], seeds=seeds, book_digest=book.digest(),
-                     names={m: f'{m}-{args.sims}-{batch_id[:8]}' for m in ('policy', 'puct')}, results=[], models={},
+                     plain_mode='policy', names={m: f'{m}-{args.sims}-{batch_id[:8]}' for m in ('gumbel', 'puct')},
+                     results=[], models={},
                      native=native_hashes, source_files=source_hashes,
                      external_solver=False, graph=True, tactics=True, device=args.device, complete=False)
     starts = [c['history'] for c in state['cases']] + state['openings']
@@ -253,7 +256,7 @@ def main():
                     model, evaluator = models[checkpoint]
                     trees = [tree for _, tree in group]
                     results = search_many(trees, args.sims) if puct else SearchCoordinator(
-                        evaluator, model.sha, model.cache).search_many(trees, args.sims, args.root_samples, 32)
+                        evaluator, model.sha, model.cache).search_many(trees, args.sims, args.root_samples, 32, choice='gumbel')
                     for (match, _), result in zip(group, results):
                         match.play(result)
                 finished = [m for m in active if m.game.winner >= 0 or len(m.history) >= args.max_plies]

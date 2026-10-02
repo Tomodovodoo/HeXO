@@ -30,16 +30,18 @@ python python/dense_eval.py variant --run R --checkpoint champion --name solver 
 
 The evaluator decides it against its own checkpoint with the promotion rule. Variants never become champion and never reach the actors; they are how a search setting earns its place before it is switched on for the run.
 
-To test selecting the highest improved search policy instead of the final Gumbel score:
+Plain Bubble selects the highest improved search policy. To compare the final Gumbel choice:
 
 ```sh
-python python/dense_eval.py variant --run R --checkpoint champion --name policy --set search_choice=policy
+python python/dense_eval.py variant --run R --checkpoint champion --name gumbel --set search_choice=gumbel
 ```
 
-`search_choice` defaults to `gumbel`. `policy` changes only the final move at an unproven root; internal search,
+`search_choice` defaults to `policy`. This changes only the final move at an unproven root; internal search,
 simulation budgets and policy targets stay the same. It can choose an eligible move removed in an earlier
 halving round. Proven roots retain shortest wins and longest resistance. `--eval-search-choice policy` sets it
-for both model sides of ordinary matches. Historical reports without this field used `gumbel`.
+for both model sides of ordinary matches, including runs whose saved configuration used Gumbel.
+Fixed-budget and timed play use the same policy choice by default. Training actors retain Gumbel exploration.
+Historical reports without this field used `gumbel`; completed `@policy` benchmarks keep their original names.
 
 ## Fixed search comparisons
 

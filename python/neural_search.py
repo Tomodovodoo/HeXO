@@ -128,11 +128,11 @@ class NeuralSearch:
         checked(native.hxg_fulfill(self.ptr, request, actions, logits, q, len(q)))
 
     def search(self, simulations=128, root_samples=None, batch_size=16, milliseconds=None,
-               *, stop=None, anytime=False, batch_seconds=0., priority=None):
+               *, stop=None, anytime=False, batch_seconds=0., priority=None, choice='policy'):
         coordinator = SearchCoordinator(self.evaluator, self.model_version, self.cache)
         return coordinator.search_many([self], simulations, root_samples, batch_size, milliseconds,
                                        stop=stop, anytime=anytime, batch_seconds=batch_seconds,
-                                       priority=priority)[0]
+                                       priority=priority, choice=choice)[0]
 
     def fulfill_proof(self, request, history, certificate, milliseconds=None):
         """Verify a certificate against this pending state before exact backup."""
@@ -161,7 +161,7 @@ class NeuralSearch:
         native.hxg_census(self.ptr, out.ctypes.data)
         return dict(zip(('nodes', 'expanded', 'exact', 'duplicates'), map(int, out)))
 
-    def result(self, start, finished, evaluated, hits):
+    def result(self, start, finished, evaluated, hits, *, choice='gumbel'):
         n = native.hxg_stats(self.ptr, None, None, None, None)
         actions = np.empty((n, 2), np.int64)
         visits = np.empty(n, np.int32)
@@ -172,6 +172,8 @@ class NeuralSearch:
         selected = int(np.argmax(scores)) if n and np.isfinite(scores).any() else None
         winner = native.hxg_exact(self.ptr)
         proven = 0 if winner < 0 else 1 if winner == ((len(self.history)+1)//2)%2 else -1
+        if choice == 'policy' and not proven and n and policy.max() > 0:
+            selected = int(np.argmax(policy))
         # A won root offers only its shortest winning moves, so those are the finite scores.
         shortest = [actions[i].tolist() for i in range(n) if np.isfinite(scores[i])] if proven > 0 else []
         return dict(action=actions[selected].tolist() if selected is not None else None,
@@ -193,12 +195,15 @@ class SearchCoordinator:
         self.cache = cache if cache is not None else EvaluationCache()
 
     def search_many(self, searches, simulations=128, root_samples=None, batch_size=16, milliseconds=None,
-                    *, stop=None, anytime=False, batch_seconds=0., priority=None):
+                    *, stop=None, anytime=False, batch_seconds=0., priority=None, choice='policy'):
         """Time-limited play keeps the last completed halving comparison as its fallback.
 
-        Fixed-simulation training is unchanged. The existing native hold supplies a
-        comparable candidate snapshot before the final round, without a new DLL ABI.
+        Play chooses the highest improved policy by default; choice='gumbel' uses the
+        final Gumbel score. Actors call result() directly and retain Gumbel exploration.
+        The native hold supplies a comparable snapshot before the final round.
         """
+        if choice not in ('policy', 'gumbel'):
+            raise ValueError('choice must be policy or gumbel')
         self.last_stats = dict(inference_batches=0, unique_positions=0, largest_batch=0)
         searches = list(searches)
         if len({id(search) for search in searches}) != len(searches):
@@ -265,7 +270,7 @@ class SearchCoordinator:
                     else:
                         request, history = searches[i].request()
                         if request == HOLD:
-                            snapshots[i] = searches[i].result(starts[i], time.perf_counter(), evaluated[i], hits[i])
+                            snapshots[i] = searches[i].result(starts[i], time.perf_counter(), evaluated[i], hits[i], choice=choice)
                             native.hxg_hold(searches[i].ptr, 0)
                             idle = 0
                         elif request == -1:
@@ -345,7 +350,7 @@ class SearchCoordinator:
                 native.hxg_cancel(search.ptr)
         results = []
         for i, search in enumerate(searches):
-            result = search.result(starts[i], finishes[i] or time.perf_counter(), evaluated[i], hits[i])
+            result = search.result(starts[i], finishes[i] or time.perf_counter(), evaluated[i], hits[i], choice=choice)
             result['batch_seconds'] = batch_seconds
             result['stable_choice'] = bool(snapshots[i] and result['action'] == snapshots[i]['action'])
             if anytime and interrupted[i] and not result['proven']:
@@ -353,8 +358,10 @@ class SearchCoordinator:
                 result['action'] = None
                 if snapshot:
                     eligible = {tuple(a) for a, p in zip(result['actions'], result['policy']) if p > 0}
-                    order = np.argsort(-snapshot['scores'])
+                    ranking = snapshot['policy'] if choice == 'policy' else snapshot['scores']
+                    order = np.argsort(-ranking)
                     result['action'] = next((snapshot['actions'][j].tolist() for j in order
-                        if np.isfinite(snapshot['scores'][j]) and tuple(snapshot['actions'][j]) in eligible), None)
+                        if (snapshot['policy'][j] > 0 if choice == 'policy' else np.isfinite(snapshot['scores'][j]))
+                        and tuple(snapshot['actions'][j]) in eligible), None)
             results.append(result)
         return results
