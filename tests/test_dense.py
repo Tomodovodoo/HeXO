@@ -1751,15 +1751,18 @@ class DenseDataTests(unittest.TestCase):
             self.assertAlmostEqual(hits/(4096*16), probability, delta=45/(4096*16))
             self.assertGreater(hits, 85)
 
-    def test_certified_loss_errors_enter_bounded_priority_without_restarts(self):
+    def test_certified_value_errors_enter_bounded_priority_without_restarts(self):
         moves, _ = random_game(np.random.default_rng(4), 20)
         episode, rows = episode_rows(moves, -1, [-1.]*20)
         episode['network_values'] = [-1.]*20
-        for ply, value in ((0, .8), (1, -.8), (3, 0.), (4, -.9), (5, -.8), (6, None), (7, .8)):
+        for ply, value in ((0, .8), (1, -.8), (3, 0.), (4, -.9), (5, -.8), (6, None), (7, .8),
+                           (8, 0.), (9, .9), (10, .8), (11, None), (12, -.8)):
             episode['network_values'][ply] = value
         for ply in (0, 3, 4, 5, 6):
             rows[ply]['proven'] = -1
-        rows[1]['proven'] = 1
+        for ply in (1, 8, 9, 10, 11, 12):
+            rows[ply]['proven'] = 1
+        rows[12]['line'] = True
         rows[3]['policy'] = None
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
@@ -1767,10 +1770,11 @@ class DenseDataTests(unittest.TestCase):
             window = dense_data.ReplayWindow(run, capacity_rows=1000)
             weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
                        for k, w in zip(window.regret_positions, window.regret_weights)}
-            self.assertEqual(weights, {0: .9, 3: .5, 5: .1})
+            self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 8: .5, 10: .1})
             self.assertFalse((run/'restarts.json').exists())
-            targets = dense_data.examples(window, [window.ref('000001', 3)], np.random.default_rng(0))[1]
+            targets = dense_data.examples(window, [window.ref('000001', i) for i in (3, 1)], np.random.default_rng(0))[1]
             self.assertEqual((targets[0]['value'], targets[0]['exact']), (0., 1.))
+            self.assertEqual((targets[1]['value'], targets[1]['exact']), (1., 1.))
             ordinary = window.sample(np.random.default_rng(19), 256)
             disabled = window.sample(np.random.default_rng(19), 256, regret_fraction=0.)
             self.assertEqual([(r.shard, r.index) for r in ordinary], [(r.shard, r.index) for r in disabled])
@@ -1778,19 +1782,28 @@ class DenseDataTests(unittest.TestCase):
             probability = np.full(len(window.index), (1-share)/len(window.index))
             probability[window.regret_positions] += share*window.regret_probabilities(share)
             self.assertLessEqual(probability.max(), 4/len(window.index)+1e-12)
-            window.set_regret({('000001', 0, 1): .7, ('000001', 0, 3): .2})
+            window.set_regret({('000001', 0, 1): .7, ('000001', 0, 2): .7, ('000001', 0, 3): .2})
             weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
                        for k, w in zip(window.regret_positions, window.regret_weights)}
-            self.assertEqual(weights, {0: .9, 1: .7, 3: .5, 5: .1})
+            self.assertEqual(weights, {0: .9, 1: .9, 2: .7, 3: .5, 5: .1, 8: .5, 10: .1})
             window.set_regret({})
             weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
                        for k, w in zip(window.regret_positions, window.regret_weights)}
-            self.assertEqual(weights, {0: .9, 3: .5, 5: .1})
+            self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 8: .5, 10: .1})
+            (run/'shards'/'000001'/dense_data.SIDECAR).write_text(
+                json.dumps(dict(game=0, plies=[7, 13]))+'\n', encoding='utf-8')
+            window.refresh()
+            self.assertEqual(window.ref('000001', 13).row['proven'], 1)
+            for reader in (window, dense_data.ReplayWindow(run, capacity_rows=1000)):
+                weights = {reader.ref(*reader.index[k]).row['ply']: round(float(w), 6)
+                           for k, w in zip(reader.regret_positions, reader.regret_weights)}
+                self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 7: .1, 8: .5, 10: .1, 13: 1.})
 
-    def test_certified_loss_priority_excludes_validation_and_legacy_predictions(self):
+    def test_certified_value_priority_excludes_validation_and_legacy_predictions(self):
         moves, _ = random_game(np.random.default_rng(4), 12)
         episode, rows = episode_rows(moves, -1, [-1.]*12)
         rows[0]['proven'] = -1
+        rows[1]['proven'] = 1
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
             dense_data.write_shard(run/'shards'/'000001', dict(actor_sha256='a'*64), [episode], rows)
@@ -1803,15 +1816,16 @@ class DenseDataTests(unittest.TestCase):
             self.assertEqual(len(refs), 64)
             self.assertFalse(len(held.index))
 
-    def test_certified_loss_priority_rejects_invalid_network_predictions(self):
+    def test_certified_value_priority_rejects_invalid_network_predictions(self):
         moves, _ = random_game(np.random.default_rng(4), 12)
         episode, rows = episode_rows(moves, -1, [-1.]*12)
         episode['network_values'] = [1.2]*12
-        rows[0]['proven'] = -1
-        with tempfile.TemporaryDirectory() as tmp:
-            dense_data.write_shard(Path(tmp)/'shards'/'000001', dict(actor_sha256='a'*64), [episode], rows)
-            with self.assertRaisesRegex(ValueError, 'Invalid network value'):
-                dense_data.ReplayWindow(tmp, capacity_rows=1000)
+        for proven in (-1, 1):
+            with self.subTest(proven=proven), tempfile.TemporaryDirectory() as tmp:
+                rows[0]['proven'] = proven
+                dense_data.write_shard(Path(tmp)/'shards'/'000001', dict(actor_sha256='a'*64), [episode], rows)
+                with self.assertRaisesRegex(ValueError, 'Invalid network value'):
+                    dense_data.ReplayWindow(tmp, capacity_rows=1000)
 
     def test_regret_cap_at_feasibility_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:

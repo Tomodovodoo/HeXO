@@ -539,8 +539,8 @@ class ReplayWindow:
     agrees; full-search and exact rows are always retained (`retained`). The training index holds retained rows
     only (regret priority draws included), the validation index every held-out row. At fraction 1 every row is
     retained and nothing is filtered.
-    Priority also includes searched, certified losses whose saved network prediction has error at least 0.1.
-    Those errors are cached when a shard loads and share the existing regret sampler and fourfold exposure cap;
+    Priority also includes certified results whose saved network prediction has error at least 0.1.
+    Those errors are cached when a shard loads or gains proof labels and share the existing regret sampler and fourfold exposure cap;
     computing them needs no inference or solver calls and creates no actor restart entries.
     Counts: `total_rows` is the pacing count, the retained trained rows (see `trained`) of all shards, held-out
     rows included; `rows` the window's trained rows (retained or not); `retained_rows` the training index and
@@ -575,28 +575,35 @@ class ReplayWindow:
         self.policy_dir = self.run_dir/'cache'/'policies' if policy_dir is None else Path(policy_dir)
         self.manifests = {}; self.shards = {}; self.values = OrderedDict()
         self.unlabelled = set(); self.deblunders = {}
-        self.regret_mtime = None; self.regret_entries = {}; self.loss_regret = {}
+        self.regret_mtime = None; self.regret_entries = {}; self.exact_regret = {}
         self.refresh()
         self.refresh_regret()
 
-    def load(self, name):
-        path = self.run_dir/'shards'/name
-        episodes, rows = read_shard(path, policies=False)
-        losses = {}
+    def exact_errors(self, name, episodes, rows, labels):
+        """Cached actor-value errors after native and sidecar labels, skipping unpredicted forced lines."""
+        errors = {}
         for i, row in enumerate(rows):
-            if row.get('proven') != -1 or row.get('line'):
+            proven = row.get('proven', 0)
+            if not proven and labels and (row['game'], row['ply']) in labels:
+                proven = 1
+            if proven not in (-1, 1) or row.get('line'):
                 continue
             predictions = episodes[row['game']].get('network_values')
             value = predictions[row['ply']] if predictions is not None else None
             if value is not None:
-                regret = (1+value)/2
+                regret = (1-proven*value)/2
                 if not 0 <= regret <= 1:
                     raise ValueError(f'Invalid network value at {name}/{row["game"]}/{row["ply"]}')
-                if value >= -.8:
-                    losses[i] = regret
-        self.loss_regret[name] = losses
-        offsets = load_offsets(path, len(rows))
+                if proven*value <= .8:
+                    errors[i] = regret
+        return errors
+
+    def load(self, name):
+        path = self.run_dir/'shards'/name
+        episodes, rows = read_shard(path, policies=False)
         labels, self.deblunders[name] = proof_annotations(path)
+        self.exact_regret[name] = self.exact_errors(name, episodes, rows, labels)
+        offsets = load_offsets(path, len(rows))
         if labels is None:
             self.unlabelled.add(name)
         game = np.array([r['game'] for r in rows], np.int32); ply = np.array([r['ply'] for r in rows], np.int32)
@@ -642,7 +649,7 @@ class ReplayWindow:
         for name in set(self.shards) - {n for n, _ in admitted}:
             del self.shards[name]; self.unlabelled.discard(name)
             del self.deblunders[name]
-            del self.loss_regret[name]
+            del self.exact_regret[name]
             for key in [k for k in self.values if k[0] == name]:
                 del self.values[key]
         self.prune({n for n, _ in admitted})
@@ -653,6 +660,8 @@ class ReplayWindow:
                 labels, self.deblunders[name] = proof_annotations(self.run_dir/'shards'/name)
                 if labels is not None:
                     label(self.shards[name], labels); self.unlabelled.discard(name)
+                    episodes, rows = read_shard(self.run_dir/'shards'/name, policies=False)
+                    self.exact_regret[name] = self.exact_errors(name, episodes, rows, labels)
         self.admitted = admitted[::-1]; self.full_rows = have; self.proven_rows = 0
         parts = ([], []), ([], [])    # (shard ids, rows) of the training and validation index
         self.starts = {}; candidates = 0; loss_positions = {}; train_offset = 0
@@ -666,7 +675,7 @@ class ReplayWindow:
             train = i[~held]; candidates += len(train)
             if self.cheap_row_fraction < 1:
                 train = train[retained(self.seed, name, full, (s.proven != 0) | (s.known_result != 0), self.cheap_row_fraction)[train]]
-            for row, regret in self.loss_regret[name].items():
+            for row, regret in self.exact_regret[name].items():
                 position = int(np.searchsorted(train, row))
                 if position < len(train) and train[position] == row:
                     loss_positions[train_offset+position] = regret
@@ -743,7 +752,7 @@ class ReplayWindow:
             self.set_regret(entries)
 
     def set_regret(self, entries):
-        """Use a captured restart buffer alongside the certified loss errors."""
+        """Use a captured restart buffer alongside the certified value errors."""
         if entries != self.regret_entries:
             self.regret_entries = entries
             self.refresh()
