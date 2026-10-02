@@ -854,11 +854,12 @@ class Engines:
         self.kept = None
 
     def solvers(self, count):
-        """Up to `count` tactical workers of the current build: the solver and helpers kept for pooled work."""
+        """Up to `count` tactical workers of one build, and that build: the solver and helpers kept for pooled
+        work; ([], 'none') when the solver is not built."""
         import tactical_proof
         prover, build = self.solver()
         if prover is None:
-            return []
+            return [], 'none'
         if any(helper_build != build for _, helper_build in self.helpers):
             for helper, _ in self.helpers:
                 helper.abort()
@@ -867,14 +868,13 @@ class Engines:
         package = self.tactical_package or tactical_proof.PACKAGE
         while len(self.helpers) < count - 1:
             self.helpers.append((tactical_proof.IsolatedTactics(package, priority='below_normal'), build))
-        return [prover, *(helper for helper, _ in self.helpers[:count - 1])]
+        return [prover, *(helper for helper, _ in self.helpers[:count - 1])], build
 
     def evaluate_many(self, entry, checkpoint, budget, histories, watch, device=None):
         """`evaluate_many` of `histories` with the entry's export, its solver queries spread over REVIEW_SOLVERS
         workers; returns (evaluation, budget it really had, key of the weights) per position as `evaluate` does."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
-        provers = self.solvers(REVIEW_SOLVERS) if budget['solver_nodes'] else []
-        build = self.solver_build() if provers else 'none'
+        provers, build = self.solvers(REVIEW_SOLVERS) if budget['solver_nodes'] else ([], 'none')
         spent = budget if provers else budget | dict(solver_nodes=0)
         found = evaluate_many(bubble, provers, histories, spent['simulations'], spent['solver_nodes'], watch,
                               REVIEW_BATCH['cuda' if str(device or self.device).startswith('cuda') else 'cpu'])
