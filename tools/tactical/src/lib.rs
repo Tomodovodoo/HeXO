@@ -165,7 +165,8 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
     if let Some(cert)=cert {
         match check::verify(&req.history,ply,&cert,deadline,check_nodes(req.nodes)) {
             Ok((moves,turns))=>{
-                if !cache_hit && fresh {
+                // A shortening cut short by the time cap is not a function of the key, so it is not kept.
+                if !cache_hit && fresh && (exact || !req.shortest) {
                     let mut guard=cache.lock().map_err(|_|"cache lock")?;
                     if guard.len()>=128 {guard.clear();}
                     guard.insert(key,(cert.clone(),meter.spent().min(req.nodes),probe_verdict,exact));
