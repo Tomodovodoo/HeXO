@@ -29,6 +29,7 @@ bind('hxg_completed', C.c_int, ptr)
 bind('hxg_done', C.c_int, ptr)
 bind('hxg_tactics', C.c_int, ptr, C.c_int)
 bind('hxg_graph', C.c_int, ptr, C.c_int)
+bind('hxg_q_range_floor', C.c_int, ptr, C.c_double)
 bind('hxg_census', C.c_int, ptr, ptr)
 bind('hxg_exact', C.c_int, ptr)
 bind('hxg_distance', C.c_int, ptr)
@@ -72,8 +73,10 @@ class EvaluationCache:
             self.entries.popitem(last=False)
 
 class NeuralSearch:
+    """One native tree. `q_range_floor` is the least Q range of the completed-Q rescale (0 keeps mctx's
+    min-max rescale); it applies to every search and policy target of the tree."""
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None,
-                 tactics=False, proof_solver=None, proof_ms=100, graph=False):
+                 tactics=False, proof_solver=None, proof_ms=100, graph=False, q_range_floor=0.):
         if not model_version:
             raise ValueError('A model version is required')
         self.evaluator, self.model_version = evaluator, model_version
@@ -86,6 +89,7 @@ class NeuralSearch:
         checked(native.hxg_tactics(self.ptr, int(tactics)))
         checked(native.hxg_graph(self.ptr, int(graph)))
         try:
+            checked(native.hxg_q_range_floor(self.ptr, q_range_floor))
             for point in history:
                 self.advance(point)
         except Exception:
@@ -128,11 +132,11 @@ class NeuralSearch:
         checked(native.hxg_fulfill(self.ptr, request, actions, logits, q, len(q)))
 
     def search(self, simulations=128, root_samples=None, batch_size=16, milliseconds=None,
-               *, stop=None, anytime=False, batch_seconds=0., priority=None, choice='policy'):
+               *, stop=None, anytime=False, batch_seconds=0., priority=None, choice='policy', q_range_floor=None):
         coordinator = SearchCoordinator(self.evaluator, self.model_version, self.cache)
         return coordinator.search_many([self], simulations, root_samples, batch_size, milliseconds,
                                        stop=stop, anytime=anytime, batch_seconds=batch_seconds,
-                                       priority=priority, choice=choice)[0]
+                                       priority=priority, choice=choice, q_range_floor=q_range_floor)[0]
 
     def fulfill_proof(self, request, history, certificate, milliseconds=None):
         """Verify a certificate against this pending state before exact backup."""
@@ -195,8 +199,11 @@ class SearchCoordinator:
         self.cache = cache if cache is not None else EvaluationCache()
 
     def search_many(self, searches, simulations=128, root_samples=None, batch_size=16, milliseconds=None,
-                    *, stop=None, anytime=False, batch_seconds=0., priority=None, choice='policy'):
+                    *, stop=None, anytime=False, batch_seconds=0., priority=None, choice='policy', q_range_floor=None):
         """Time-limited play keeps the last completed halving comparison as its fallback.
+
+        `q_range_floor`, when given, becomes every tree's floor (NeuralSearch) from this search on; None keeps
+        each tree's own.
 
         Play chooses the highest improved policy by default; choice='gumbel' uses the
         final Gumbel score. Actors call result() directly and retain Gumbel exploration.
@@ -230,6 +237,8 @@ class SearchCoordinator:
         try:
             for i, search in enumerate(searches):
                 starts.append(time.perf_counter())
+                if q_range_floor is not None:
+                    checked(native.hxg_q_range_floor(search.ptr, q_range_floor))
                 sample = max(2, int(budgets[i]**0.5)) if samples[i] is None else samples[i]
                 checked(native.hxg_begin(search.ptr, budgets[i], sample))
                 if anytime:

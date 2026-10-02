@@ -150,7 +150,8 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
         else:
             tree = NeuralSearch(player.evaluator, player.model_sha256, history, seed=1740,
                                 cache=player.cache, tactics=True,
-                                proof_solver=proof_budget if limits.get('leaf_solver') else None)
+                                proof_solver=proof_budget if limits.get('leaf_solver') else None,
+                                q_range_floor=limits.get('q_range_floor', 0.))
         player._timed_tree = tree
         tree.proof_solver = proof_budget if limits.get('leaf_solver') else None
         while game.player == side and game.winner < 0 and not stopped():
@@ -273,6 +274,7 @@ def _worker(connection, cancellation, config):
             identity = dict(checkpoint=player.checkpoint, model_sha256=player.model_sha256)
             search_limits = dict(simulations=search.get('max_simulations', search.get('simulations')),
                                  root_samples=search.get('root_samples', 16),
+                                 q_range_floor=search.get('q_range_floor', 0.),
                                  leaf_solver=solver.get('leaf', False) and player.options['solver'])
         elif kind == 'six':
             from six_engine import SixEngine

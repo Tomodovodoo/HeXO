@@ -1423,7 +1423,7 @@ class TurnTrees(unittest.TestCase):
 
     def test_a_turn_the_solver_gave_still_ranks_each_of_its_positions(self):
         from play import evaluate
-        pv = [[1, 0, 1], [2, 0, 1], [2, 3, 0], [3, 3, 0], [3, 0, 1], [4, 0, 1]]
+        pv = [[1, 0, 1, 1], [2, 0, 1, 2], [2, 3, 0, 3], [3, 3, 0, 4], [3, 0, 1, 5], [4, 0, 1, 6]]
         given = dict(moves=[[1, 0], [2, 0]], pv=pv, proof=dict(winner=1, turns=2, plies=6), threat=[], solved=True,
                      used=0)
         found = evaluate(self.bubble(), None, [(0, 0)], 16, 0, solved=given)
@@ -1432,7 +1432,8 @@ class TurnTrees(unittest.TestCase):
         [step] = found['later']
         self.assertEqual((step['history'], step['moves'], step['top'][0][:2], step['top'][0][3:]),
                          ([(0, 0), (1, 0)], [[2, 0]], [2, 0], [1., 1]))
-        self.assertEqual((step['pv'], step['proof'], step['value']), (pv[1:], dict(winner=1, turns=2, plies=5), 1.))
+        self.assertEqual((step['pv'], step['proof'], step['value']),
+                         ([[*p[:3], p[3] - 1] for p in pv[1:]], dict(winner=1, turns=2, plies=5), 1.))
 
     def test_the_first_row_is_the_stone_played(self):
         from play import evaluate
@@ -1448,7 +1449,7 @@ class TurnTrees(unittest.TestCase):
         history = [(0, 0), (1, 2), (2, 2), (-2, 0), (-3, 0), (3, 2), (4, 2), (0, -3), (0, -4)]
         found = evaluate(self.bubble(), None, history, 64, 0)
         self.assertEqual(found['proof']['winner'], 1)
-        self.assertEqual(found['pv'], [[*m, 1] for m in found['moves']])
+        self.assertEqual(found['pv'], [[*m, 1, i + 1] for i, m in enumerate(found['moves'])])
         self.assertGreater(found['proof']['plies'], 0)
 
     def test_a_proof_found_at_the_second_stone_counts_the_first(self):
@@ -1468,7 +1469,7 @@ class TurnTrees(unittest.TestCase):
             turn.close()
         self.assertEqual((found['proof']['winner'], found['proof']['plies']), (1, 6))
         self.assertEqual(found['later'][0]['proof']['plies'], 5)
-        self.assertEqual(found['pv'], [[1, 0, 1], [2, 0, 1]])
+        self.assertEqual(found['pv'], [[1, 0, 1, 1], [2, 0, 1, 2]])
 
     def test_a_proven_second_stone_keeps_its_proof(self):
         from play import evaluate
@@ -1545,29 +1546,37 @@ class TurnTrees(unittest.TestCase):
 
 class PrincipalVariation(unittest.TestCase):
     """`principal_variation` and the solver step of an evaluation."""
-    # Side 1 to move at [(0, 0)]: its two stones, then defender covers lasting one or two more attacker turns, then
-    # an unstoppable fork whose defender stones do not matter.
+    # Side 1 to move at [(0, 0)]: its two stones, then defender covers lasting one or two more attacker turns (of the
+    # two longest, the far one listed first), then an unstoppable fork whose defender stones do not matter.
     CERTIFICATE = dict(root=0, nodes=[
         dict(kind='attacker_move', action=[[1, 0], [2, 0]], child=1,
              alternatives=[dict(action=[[0, 1], [0, 2]], child=2)]),
         dict(kind='defender_replies', responses=[dict(action=[[1, 2], [2, 2]], child=2),
-                                                 dict(action=[[2, 3], [3, 3]], child=3),
-                                                 dict(action=[[-5, 5], [-6, 6]], child=3)]),
+                                                 dict(action=[[-5, 5], [-6, 6]], child=3),
+                                                 dict(action=[[2, 3], [3, 3]], child=3)]),
         dict(kind='immediate_win', action=[[3, 0], [4, 0]]),
         dict(kind='attacker_move', action=[[3, 0], [4, 0]], child=4),
         dict(kind='unstoppable', threats=[[[5, 0], [6, 0]], [[-1, 0]]])])
 
-    def test_shortest_attack_longest_defence_and_no_filler(self):
+    def test_shortest_attack_nearest_longest_defence_and_no_filler(self):
         from play import principal_variation
         pv, plies = principal_variation([(0, 0)], self.CERTIFICATE)
-        self.assertEqual(pv, [[1, 0, 1], [2, 0, 1], [2, 3, 0], [3, 3, 0], [3, 0, 1], [4, 0, 1], [-1, 0, 1]])
+        self.assertEqual(pv, [[1, 0, 1, 1], [2, 0, 1, 2], [2, 3, 0, 3], [3, 3, 0, 4], [3, 0, 1, 5], [4, 0, 1, 6],
+                              [-1, 0, 1, 9]])
         self.assertEqual(plies, 9)
+
+    def test_the_winning_turn_keeps_its_ply_numbers_after_left_out_stones(self):
+        from play import principal_variation
+        certificate = dict(root=0, nodes=[dict(kind='attacker_move', action=[[1, 0], [2, 0]], child=1),
+                                          dict(kind='unstoppable', threats=[[[3, 0], [4, 0]]])])
+        self.assertEqual(principal_variation([(0, 0)], certificate),
+                         ([[1, 0, 1, 1], [2, 0, 1, 2], [3, 0, 1, 5], [4, 0, 1, 6]], 6))
 
     def test_an_immediate_win_ends_at_the_winning_stone(self):
         from play import principal_variation
         history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (2, 5), (3, 5), (3, 0), (-1, 3), (5, 5), (6, 5)]
         certificate = dict(root=0, nodes=[dict(kind='immediate_win', action=[[4, 0], [5, 0]])])
-        self.assertEqual(principal_variation(history, certificate), ([[4, 0, 0], [5, 0, 0]], 2))
+        self.assertEqual(principal_variation(history, certificate), ([[4, 0, 0, 1], [5, 0, 0, 2]], 2))
 
     def test_solve_asks_for_the_shortest_win_and_keeps_its_line(self):
         from play import solve
@@ -1577,7 +1586,7 @@ class PrincipalVariation(unittest.TestCase):
         found = solve(prover, [(0, 0)], 4096)
         self.assertTrue(prover.history.call_args.kwargs['shortest'])
         self.assertEqual((found['moves'], found['proof']), ([[1, 0], [2, 0]], dict(winner=1, turns=3, plies=9)))
-        self.assertEqual(found['pv'][:2], [[1, 0, 1], [2, 0, 1]])
+        self.assertEqual(found['pv'][:2], [[1, 0, 1, 1], [2, 0, 1, 2]])
 
     def test_a_late_win_shows_the_shortest_line(self):
         import tactical_proof
@@ -1589,13 +1598,14 @@ class PrincipalVariation(unittest.TestCase):
         prover.abort = lambda: None
         found = solve(prover, LATE_WIN, 32768)
         self.assertEqual((found['moves'], found['proof']), ([[-1, -11], [-1, -10]], dict(winner=0, turns=4, plies=14)))
-        self.assertEqual((found['pv'][:2], len(found['pv'])), ([[-1, -11, 0], [-1, -10, 0]], 12))
+        self.assertEqual((found['pv'][:2], len(found['pv'])), ([[-1, -11, 0, 1], [-1, -10, 0, 2]], 12))
+        self.assertEqual([p[3] for p in found['pv'][-2:]], [13, 14])
         game = Game([tuple(p) for p in LATE_WIN] + [tuple(p[:2]) for p in found['pv'][:-2]])
         try:
             self.assertEqual((game.winner, game.player), (-1, 1))
             for q, r in [m for m in game.legal_moves() if list(m) not in [p[:2] for p in found['pv']]][-2:]:
                 game.play(q, r)
-            for q, r, _ in found['pv'][-2:]:
+            for q, r, _, _ in found['pv'][-2:]:
                 game.play(q, r)
             self.assertEqual(game.winner, 0)
         finally:
@@ -1686,6 +1696,29 @@ class Registry(unittest.TestCase):
             triple = scan(root / 'models', root / 'runs', [], None)
             self.assertTrue(set(twins) < set(triple))
             self.assertEqual({triple[k]['path'] for k in twins}, {found['bubble:gamma']['path'], root / 'models/gamma/ema.pt'})
+
+    def test_a_bubble_entry_carries_its_q_range_floor_to_its_searches(self):
+        import play
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'runs/alpha/checkpoints/main/000100').mkdir(parents=True)
+            (root / 'runs/alpha/checkpoints/main/000100/ema.pt').write_bytes(b'')
+            (root / 'models').mkdir()
+            for name, floor in (('flat', .5), ('wrong', 3), ('alpha', 0)):
+                spec = dict(name=name, kind='bubble', path='../runs/alpha', q_range_floor=floor)
+                (root / f'models/{name}.json').write_text(json.dumps(spec))
+            found = scan(root / 'models', root / 'runs', [], None)
+        self.assertEqual(list(found), ['bubble:alpha', 'bubble:flat', 'native:Native'])
+        self.assertNotIn('q_range_floor', found['bubble:alpha'])
+        self.assertEqual(found['bubble:flat']['q_range_floor'], .5)
+        self.assertEqual([play.search_key('ab', e) for e in (found['bubble:alpha'], found['bubble:flat'])], ['ab', 'ab~q0.5'])
+        self.assertNotEqual(*(play.search_key('ab', dict(q_range_floor=x)) for x in (.5000001, .5000002)))
+        bubble = unittest.mock.Mock(sha256='ab'*32)
+        with unittest.mock.patch('neural_search.NeuralSearch') as tree:
+            turn = play.TurnSearch(bubble, None, [(0, 0)], 8, play.solve(None, [(0, 0)], 0), q_range_floor=.5)
+            turn.advanced([(0, 0)], 8, None)
+            turn.close()
+        self.assertEqual(tree.call_args.kwargs['q_range_floor'], .5)
 
 
 if __name__ == '__main__':
