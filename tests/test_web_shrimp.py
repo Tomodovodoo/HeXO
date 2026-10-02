@@ -72,6 +72,16 @@ class Export(unittest.TestCase):
         self.assertEqual((settings['gumbel_root'], settings['tss_enabled'], settings['moves_left_utility']), (1, 1, 1))
 
 
+@unittest.skipUnless(NODE, 'needs node')
+class Presets(unittest.TestCase):
+    def test_presets_are_the_server_entrys(self):
+        script = "import {PRESETS} from './web/engine/shrimp.mjs'; console.log(JSON.stringify(PRESETS))"
+        done = subprocess.run([NODE, '--input-type=module', '-e', script], cwd=ROOT, capture_output=True, text=True, check=True)
+        browser = {name: preset['visits'] for name, preset in json.loads(done.stdout).items()}
+        server = json.loads((ROOT/'tools'/'engines.json').read_text(encoding='utf-8'))['shrimp']['presets']
+        self.assertEqual(browser, {name: int(preset['args'][preset['args'].index('--visits') + 1]) for name, preset in server.items()})
+
+
 class Recorder:
     """The driver's evaluator, recording each row it answers by the sha1 of its int32 coordinates and float32
     features: {value, moves_left, logits of its legal cells} and the row itself."""
