@@ -235,7 +235,7 @@ function install() {
     const head = document.getElementById('engine-head'), s = state();
     if (!config.analysis || !head || !s?.analysis) return;
     const {entry} = ENGINES.get(config.analysis.engine);
-    const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.kind, entry.label));
+    const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.badge || entry.kind, entry.label));
     const items = original.pickItems(analysable);
     pick.onclick = () => original.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: 'standard', auto: true}));
     const send = change => { config.analysis = {...config.analysis, preset: change.preset}; save(); page.renderPanels(); };
