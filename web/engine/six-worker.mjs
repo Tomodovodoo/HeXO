@@ -11,7 +11,8 @@ const BASE = new URL('./', import.meta.url), WIN = 1000000;
 /** A one-node graph (Identity on one float) whose session starts the runtime before any network is chosen. */
 const START = Uint8Array.from(atob('CAgSADo7ChAKAXgSAXkiCElkZW50aXR5EgVzdGFydFoPCgF4EgoKCAgBEgQKAggBYg8KAXkSCgoICAESBAoCCAFCBAoAEBE='), c => c.charCodeAt(0));
 const cancelled = new Set();
-let ort = null, device = null, manifest = null, search = null, current = null, running = null, queue = Promise.resolve();
+let ort = null, device = null, settings = {}, manifest = null, search = null, current = null, running = null;
+let queue = Promise.resolve();
 
 class Cancelled extends Error {}
 
@@ -29,15 +30,38 @@ async function runtime(provider, threads, report) {
   return module;
 }
 
+/** Starts ONNX Runtime on `device.provider` with a one-node session and a new search, holding no network. */
+async function start(report = () => {}) {
+  ort = await runtime(device.provider, settings.threads, report);
+  const session = await ort.InferenceSession.create(START, {executionProviders: [device.provider], logSeverityLevel: 3});
+  await session.release();
+  search = await SixSearch.create(ort);
+  current = null;
+}
+
+/** Moves to WebAssembly after WebGPU failed with `error`, unless WebGPU was asked for; otherwise throws `error`. */
+async function fallback(error) {
+  if (device.provider !== 'webgpu' || settings.prefer) throw error;
+  device = {provider: 'wasm', adapter: '', fallback: String(error.message || error)};
+  await start();
+}
+
 /** Searches with network `name` (a manifest entry) from the next turn on; `report(fraction)` follows its download.
- * Only the network in use is held. */
+ * Only the network in use is held. A graph that WebGPU cannot run moves the engine to WebAssembly. */
 async function use(name, report = () => {}) {
   if (current?.name === name) return;
   const entry = manifest.networks.find(n => n.name === name);
   if (!entry) throw new Error(`Six has no network ${name}`);
   const bytes = await cached(new URL(`six/networks/${entry.file}`, BASE).href, entry.sha256, report);
-  const session = await ort.InferenceSession.create(new Uint8Array(bytes), {executionProviders: [device.provider],
+  const create = () => ort.InferenceSession.create(new Uint8Array(bytes), {executionProviders: [device.provider],
     graphOptimizationLevel: 'all', logSeverityLevel: 3});
+  let session;
+  try {
+    session = await create();
+  } catch (error) {
+    await fallback(error);
+    session = await create();
+  }
   const old = current;
   current = {name, session};
   search.use(session);
@@ -45,23 +69,13 @@ async function use(name, report = () => {}) {
 }
 
 async function load(options = {}) {
+  settings = options;
   manifest = await (await fetch(new URL('six/networks/manifest.json', BASE), {cache: 'no-cache'})).json();
-  const report = fraction => postMessage({type: 'progress', fraction: .95 * fraction});
-  const start = async () => {
-    ort = await runtime(device.provider, options.threads, report);
-    const session = await ort.InferenceSession.create(START, {executionProviders: [device.provider], logSeverityLevel: 3});
-    await session.release();
-    search ??= await SixSearch.create(ort);
-    current = null;
-  };
   device = await probe(options.prefer);
   try {
-    await start();
+    await start(fraction => postMessage({type: 'progress', fraction: .95 * fraction}));
   } catch (error) {
-    if (device.provider !== 'webgpu' || options.prefer) throw error;
-    device = {provider: 'wasm', adapter: '', fallback: String(error.message || error)};
-    search = null;
-    await start();
+    await fallback(error);
   }
   postMessage({type: 'progress', fraction: 1});
   return {provider: device.provider, adapter: device.adapter, fallback: device.fallback, threads: ort.env.wasm.numThreads,
@@ -73,6 +87,7 @@ async function load(options = {}) {
  * solver proved a win, whose distance Six does not report, so there is no `proof`) and the positions searched. The
  * network (the newest when null) is fetched on its first turn; progress follows that download, then the search. */
 async function turn({id, history, nodes, network}) {
+  if (cancelled.has(id)) throw new Cancelled();
   await use(network ?? manifest.networks[0].name, fraction => postMessage({type: 'progress', id, fraction}));
   if (cancelled.has(id)) throw new Cancelled();
   const start = performance.now(), player = history.length === 0 ? 0 : ((history.length - 1 >> 1) + 1) % 2;
