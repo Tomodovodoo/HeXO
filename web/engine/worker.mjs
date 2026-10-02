@@ -8,7 +8,7 @@
 import createModule from './gumbel.mjs';
 import {Native, NeuralSearch, EvaluationCache} from './search.mjs';
 import {Network, probe} from './network.mjs';
-import {winningLine} from './proof.mjs';
+import {principalVariation, topRows} from './proof.mjs';
 
 const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 'defender counterwin',
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
@@ -79,30 +79,25 @@ function proofTurns(plies, remaining, moverWins) {
   return Math.ceil((plies - remaining) / 4);
 }
 
-/** A `top` row as python/play.py move_row: [q, r, probability], then from a search the mover's win probability after
- * the stone and 1 or -1 when the search proved that it wins or loses, else 0. */
-function moveRow([q, r], probability, value) {
-  const row = [q, r, Math.round(probability * 1e4) / 1e4];
-  return value === undefined ? row : [...row, Math.round((value + 1) / 2 * 1e4) / 1e4, value >= 1 ? 1 : value <= -1 ? -1 : 0];
-}
-
-/** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, line, threat, solved, ms). */
+/** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms). */
 async function turn({id, history, simulations, solverNodes, batchSize = 16, choice = 'policy'}) {
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
-  let moves = [], top = [], value = null, proof = null, line = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null;
+  let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null;
   const deadline = Math.min(60000, Math.max(10000, Math.floor(solverNodes / 8)));
   try {
     if (solverNodes) {
-      const mine = await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: deadline});
+      const mine = await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: deadline, shortest: true});
       check();
       solved = searched(mine);
       solverUsed += mine.nodes_used || 0;
       if (verified(mine)) {
         moves = mine.moves.map(m => [...m]);
-        line = winningLine(native, history, mine.certificate);
-        proof = {winner: player, turns: mine.proof_turns};
+        const found = principalVariation(native, history, mine.certificate);
+        pv = found.pv;
+        proof = {winner: player, turns: mine.proof_turns, plies: found.plies};
+        top = [[...moves[0], 1, 1, 1]];
       } else {
         const theirs = await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: deadline});
         check();
@@ -126,7 +121,8 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
         stoneValue = result.proven ? result.proven : result.exact_winner >= 0 ? (result.exact_winner === local.player ? 1 : -1)
           : policy.reduce((sum, p, i) => sum + p * result.values[i], 0);
         if (proof === null && (result.proven > 0 || (result.proven < 0 && !moves.length))) {
-          proof = {winner: result.proven > 0 ? player : 1 - player, turns: proofTurns(result.proof_plies, local.remaining, result.proven > 0)};
+          proof = {winner: result.proven > 0 ? player : 1 - player, turns: proofTurns(result.proof_plies, local.remaining, result.proven > 0),
+            plies: result.proof_plies + moves.length};
         }
       } else {
         actions = native.legal(current);
@@ -139,8 +135,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
         stoneValue = prediction.q[0];
       }
       if (!moves.length) {
-        top = policy.map((p, i) => i).sort((a, b) => policy[b] - policy[a]).slice(0, 5)
-          .map(i => moveRow(actions[i], policy[i], values?.[i]));
+        top = topRows(actions, policy, values, action);
         value = (stoneValue + 1) / 2;
       }
       moves.push([action[0], action[1]]);
@@ -148,7 +143,8 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
       tree?.advance(action);
     }
     if (proof) value = proof.winner === player ? 1 : 0;
-    return {moves, value: Math.round(value * 1e4) / 1e4, top, proof, line, threat, solved, ms: Math.round(performance.now() - start),
+    if (proof && !pv.length) pv = moves.map(([q, r]) => [q, r, player]);
+    return {moves, value: Math.round(value * 1e4) / 1e4, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
       actual_completed: completed, actual_solver_nodes: solverUsed};
   } finally {
     tree?.close();

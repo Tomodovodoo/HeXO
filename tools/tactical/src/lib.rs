@@ -9,7 +9,7 @@ use std::time::{Duration,Instant};
 use hexo_engine::types::Player;
 use hexo_solver::forcing::Meter;
 use hexo_solver::prover::{self,Ctl,DriverKind,ProverConfig};
-use hexo_solver::prover::io::{Position,PosConfig};
+use hexo_solver::prover::io::{Position,PosConfig,Verdict};
 use hexo_solver::prover::certificate::{ProofCertificate,ProofNode,ProofResponse};
 use serde::Deserialize;
 use serde_json::{json,Value};
@@ -20,12 +20,12 @@ const NODES_PER_TT_MB:u64=2048;
 /// Certificate size and checker visits scale with search work, up to 200,000.
 fn check_nodes(nodes:u64)->usize {(nodes.saturating_mul(8)).clamp(50_000,200_000) as usize}
 // Exact state keys, never Zobrist hashes. Rules/scope are fixed by this library version.
-// The budgets (and the IDTT depth when IDTT runs) are part of the key: a search is a
-// function of position and budgets. Searches with resident state are keyed apart, so a
+// The budgets (and the IDTT depth when IDTT runs) and the shortest flag are part of the key: a search is a
+// function of position, budgets and that flag. Searches with resident state are keyed apart, so a
 // cold (table_mb 0) query never replays a result that depended on earlier queries. A hit replays the search's certificate, work and
 // IDTT verdict, so it is indistinguishable from a fresh search except for `cache_hit`.
-type Key=(Vec<((i32,i32),u8)>,u8,u8,u64,u64,u8,bool);
-type Solved=(ProofCertificate,u64,Option<String>);
+type Key=(Vec<((i32,i32),u8)>,u8,u8,u64,u64,u8,bool,bool);
+type Solved=(ProofCertificate,u64,Option<String>,bool);
 static CACHE:OnceLock<Mutex<BTreeMap<Key,Solved>>>=OnceLock::new();
 /// Whose forced win is asked: the side to move, or its opponent given a fresh
 /// two-placement turn on the current stones (a flipped-turn threat query).
@@ -41,6 +41,9 @@ struct Request {
     #[serde(default)] root_moves:Option<Vec<(i32,i32)>>,
     /// Resident search state of this worker thread in megabytes (dfpn::set_resident); 0 = none.
     #[serde(default)] table_mb:u64,
+    /// After a found proof, spend the rest of `nodes` tightening it to the fewest attacker turns
+    /// (guided PDS-PN threshold probes); `shortest` in the response says whether that minimum is exact.
+    #[serde(default)] shortest:bool,
 }
 fn position(board:&check::Board,side:u8,remaining:u8)->Position {
     Position{stones:board.iter().map(|(&p,&s)|(p,if s==0{Player::P1}else{Player::P2})).collect(),
@@ -80,6 +83,18 @@ fn complete_candidate(board:&check::Board,start:usize,moves:&[(i32,i32)],req:&Re
     }
     cert.nodes[1]=ProofNode::DefenderReplies{responses};Ok(cert)
 }
+/// The certificate re-proved at the fewest attacker turns the remaining nodes and half the remaining time can
+/// establish, and whether that count is the exact minimum over the solver's forcing width; None when the
+/// probes returned no certificate. The caller verifies it.
+fn shorten(pos:&Position,cert:&ProofCertificate,req:&Request,ctl:&Ctl,meter:&Meter)->Option<(ProofCertificate,bool)> {
+    let left=req.nodes.saturating_sub(meter.spent());
+    let deadline=ctl.deadline.map(|d|{let now=Instant::now();now+d.saturating_duration_since(now)/2});
+    let ctl=Ctl{deadline,..ctl.clone()};
+    let cfg=ProverConfig{driver:DriverKind::PdspnShortest,wide:true,node_budget:left,
+        tt_mb:(left/NODES_PER_TT_MB).clamp(1,16) as usize,pn2_nodes:1000,..Default::default()};
+    let found=prover::guided_pdspn_shortest(pos,cert,&cfg,&ctl).ok()?;
+    Some((found.certificate?,found.verdict==Verdict::Win))
+}
 /// One query. `nodes` bounds the total search work (IDTT nodes plus PDS-PN level-1
 /// nodes and level-2 expansions), so with `table_mb` 0 the verdict and certificate are a
 /// function of (position, attacker, nodes, idtt_nodes, build); a resident table
@@ -95,8 +110,9 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
     let board=check::replay(&req.history)?;
     let ply=if req.attacker==Attacker::Opponent {check::flip(req.history.len())} else {req.history.len()};
     let (side,remaining)=check::phase(ply);
+    let fresh=req.certificate.is_none() && req.root_moves.is_none();
     let key=(board.iter().map(|(&p,&s)|(p,s)).collect(),side,remaining,req.nodes,req.idtt_nodes,
-        if req.idtt_nodes>0 {req.depth} else {0},req.table_mb>0);
+        if req.idtt_nodes>0 {req.depth} else {0},req.table_mb>0,req.shortest && fresh);
     let scope=json!({"rules":{"win_length":6,"placement_radius":8,"match_move_cap":null},
         "defenses":"all legal two-stone covers including complete free-second frontier; quiet defender nodes unsupported",
         "attacks":"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN","checker_version":3,
@@ -109,12 +125,13 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
     let mut cache_hit=false;
     let mut probe_verdict=None;
     let mut cached_nodes=None;
+    let mut exact=false;
     let cert=if let Some(cert)=req.certificate.clone() {Some(cert)} else if let Some(moves)=&req.root_moves {
         Some(complete_candidate(&board,ply,moves,&req,&ctl,&meter)?)
     } else {
         let saved=cache.lock().map_err(|_|"cache lock")?.get(&key).cloned();
-        if let Some((cert,used,verdict))=saved {
-            cache_hit=true;cached_nodes=Some(used);probe_verdict=verdict;Some(cert)
+        if let Some((cert,used,verdict,minimal))=saved {
+            cache_hit=true;cached_nodes=Some(used);probe_verdict=verdict;exact=minimal;Some(cert)
         } else {
             let pos=position(&board,side,remaining);
             let cfg=ProverConfig{driver:DriverKind::Pdspn,wide:true,depth_cap:req.depth,
@@ -128,23 +145,34 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
                 probe_verdict=Some(format!("{:?}",probe.verdict));
             }
             // Only PDS-PN emits an all-defense DAG. An IDTT PV is never enough.
-            if ctl.expired() {None} else {prover::pdspn::solve(&pos,&cfg,&ctl).certificate}
+            let found=if ctl.expired() {None} else {prover::pdspn::solve(&pos,&cfg,&ctl).certificate};
+            match found {
+                Some(cert) if req.shortest =>
+                    match shorten(&pos,&cert,&req,&ctl,&meter) {
+                        Some((tight,minimal)) if check::verify(&req.history,ply,&tight,deadline,check_nodes(req.nodes)).is_ok() =>
+                            {exact=minimal;Some(tight)}
+                        _=>Some(cert),
+                    },
+                found=>found,
+            }
         }
     };
     let mut response=json!({"status":"UNKNOWN","native_verified":false,"moves":[],"certificate":null,
         "revision":REVISION,"scope":scope,"cache_hit":cache_hit,"idtt_verdict":probe_verdict.clone(),
         "attacker":if req.attacker==Attacker::Opponent {"opponent"} else {"mover"},
-        "reason":"no verified strategy","nodes_used":cached_nodes.unwrap_or(meter.spent().min(req.nodes)),"proof_turns":null,"elapsed_ms":0.0});
+        "reason":"no verified strategy","nodes_used":cached_nodes.unwrap_or(meter.spent().min(req.nodes)),"proof_turns":null,"elapsed_ms":0.0,
+        "shortest":false});
     if let Some(cert)=cert {
         match check::verify(&req.history,ply,&cert,deadline,check_nodes(req.nodes)) {
             Ok((moves,turns))=>{
-                if !cache_hit && req.certificate.is_none() && req.root_moves.is_none() {
+                // A shortening cut short by the time cap is not a function of the key, so it is not kept.
+                if !cache_hit && fresh && (exact || !req.shortest) {
                     let mut guard=cache.lock().map_err(|_|"cache lock")?;
                     if guard.len()>=128 {guard.clear();}
-                    guard.insert(key,(cert.clone(),meter.spent().min(req.nodes),probe_verdict));
+                    guard.insert(key,(cert.clone(),meter.spent().min(req.nodes),probe_verdict,exact));
                 }
                 response["status"]=json!("PROVEN_WIN");response["native_verified"]=json!(true);
-                response["moves"]=json!(moves);response["proof_turns"]=json!(turns);
+                response["moves"]=json!(moves);response["proof_turns"]=json!(turns);response["shortest"]=json!(exact);
                 response["certificate"]=serde_json::to_value(cert).map_err(|e|e.to_string())?;
                 response["reason"]=json!("independent raw-board strategy verification");
             }
