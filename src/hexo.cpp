@@ -2,6 +2,7 @@
 #include "nnue.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -40,7 +41,7 @@ struct WindowHash {
     }
 };
 using Counts = std::array<uint8_t,2>;
-struct WindowData { Counts counts{}; uint16_t pattern=0; };
+struct WindowData { Counts counts{}; uint16_t pattern=0; uint8_t empty=63; };
 // Search repeatedly creates and removes the same six-cell windows. An open
 // table avoids a heap allocation on every make/undo and keeps probes contiguous.
 // Backshift deletion leaves no tombstones to accumulate during long searches.
@@ -308,12 +309,14 @@ struct Board {
                 if(n[side]>=4 && n[1-side]==0) threats[side].erase(w);
             n[p]+=delta;
             pattern+=delta*(p+1)*powers[k];
+            data.empty^=uint8_t(1<<k);
             if(candidates && n[0]+n[1]<6 && old_counts[0]+old_counts[1]<6) {
                 const std::array<int,2> gain_delta={count_gain(n,0)-count_gain(old_counts,0),
                                                    count_gain(n,1)-count_gain(old_counts,1)};
                 const int pattern_delta=adjustment[old_pattern]-adjustment[pattern];
                 const int line_delta=int(promising(n))-int(promising(old_counts));
-                for(int j=0;j<6;++j) if(j!=k && pattern/powers[j]%3==0) {
+                for(unsigned gaps=data.empty & ~(1u<<k);gaps;gaps&=gaps-1) {
+                    int j=std::countr_zero(gaps);
                     auto& item=candidates->get(w.start+axes[d]*j);
                     for(int side=0;side<2;++side) {
                         int change=adjustment[pattern+(side+1)*powers[j]]-
@@ -390,8 +393,9 @@ struct Board {
     }
     std::vector<Cell> empty(Window w) const {
         std::vector<Cell> result;
-        for(int i=0;i<6;++i) { auto c=w.start+axes[w.axis]*i; if(at(c)<0) result.push_back(c); }
-        std::sort(result.begin(),result.end());
+        auto data=windows.find(w);
+        for(unsigned gaps=data?data->empty:63;gaps;gaps&=gaps-1)
+            result.push_back(w.start+axes[w.axis]*int(std::countr_zero(gaps)));
         return result;
     }
     std::vector<std::vector<Cell>> completions(int p,int stones=2) const {
@@ -448,7 +452,8 @@ struct CandidateGuard {
         }
         for(const auto& slot:b.windows.slots) if(slot.hash) {
             const auto& data=slot.data;
-            for(int j=0;j<6;++j) if(data.pattern/powers[j]%3==0) {
+            for(unsigned gaps=data.empty;gaps;gaps&=gaps-1) {
+                int j=std::countr_zero(gaps);
                 auto& item=cache.get(slot.start+axes[slot.axis]*j);
                 for(int p=0;p<2;++p) item.gain[p]+=b.window_gain(data.counts,data.pattern,j,p)-b.window_gain({},0,j,p);
                 item.lines+=int(Board::promising(data.counts));
@@ -670,9 +675,12 @@ struct Search {
         if(cut) return result;
         const bool pinned=!result.empty();
         RankedCells base;
-        if(!b.model && b.remaining==2) {
+        // Cached following scores do not use base. Only the fallback needs
+        // coordinate order; selecting first placements sorts by gain itself.
+        if(!b.model && b.remaining==2 && (!b.candidates || (constraints.empty() && !first_only))) {
             base=candidate_scores(b);
-            std::sort(base.begin(),base.end(),[](const auto& a,const auto& z){return a.second<z.second;});
+            if(!b.candidates)
+                std::sort(base.begin(),base.end(),[](const auto& a,const auto& z){return a.second<z.second;});
         }
         auto follow=[&](Cell first,int limit) {
             Restore restore(b);b.make(first);
@@ -748,7 +756,7 @@ struct Search {
             }
             if(!result.empty()) {std::sort(result.begin()+int(pinned),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});return result;}
         }
-        auto firsts=first_only?std::vector<Cell>{*first_only}:base.empty()?candidates(b,width):select_candidates(b,base,width);
+        auto firsts=first_only?std::vector<Cell>{*first_only}:base.empty()?candidates(b,width):select_candidates(b,b.candidates?std::move(base):base,width);
         for(auto a:firsts) {
             if(timed) check();
             if(b.remaining==1) {add({{a,{}},1,0});if(cut) return result;continue;}

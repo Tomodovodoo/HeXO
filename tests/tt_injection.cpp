@@ -220,6 +220,15 @@ int main() {
             std::sort(base.begin(),base.end(),by_cell);
             CandidateGuard cache(position);
             auto check_cache=[&]() {
+                for(const auto& slot:position.windows.slots) if(slot.hash) {
+                    unsigned gaps=0;std::vector<Cell> empty;
+                    for(int k=0;k<6;++k) {
+                        Cell cell=slot.start+axes[slot.axis]*k;
+                        if(position.at(cell)<0) {gaps|=1u<<k;empty.push_back(cell);}
+                    }
+                    assert(slot.data.empty==gaps && position.empty(slot.key())==empty);
+                    assert(std::is_sorted(empty.begin(),empty.end()));
+                }
                 auto cached=Search::candidate_scores(position);
                 position.candidates=nullptr;
                 auto fresh=Search::candidate_scores(position);
