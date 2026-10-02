@@ -320,7 +320,7 @@ export class BrowserSession extends OfflineSession {
         }
       } else if (job.kind === 'review') { job.cursor++; job.done = job.cursor; }
     } catch (error) {
-      if (error.name !== 'AbortError') { job.status = 'failed'; job.error = error.message; if (job.kind === 'move') this.paused = true; if (this.match) this.match.error = error.message; }
+      if (error.name !== 'AbortError') { job.status = 'failed'; job.error = error.message; if (job.kind === 'move') { this.freezeClock(); this.paused = true; } if (this.match) this.match.error = error.message; }
     } finally {
       clearTimeout(timer); this.running = null;
       if (job.status !== 'failed' && (job.kind !== 'review' || job.cursor >= job.plies.length || job.controller.signal.aborted)) this.jobs = this.jobs.filter(j => j !== job);

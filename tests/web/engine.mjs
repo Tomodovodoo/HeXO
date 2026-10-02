@@ -118,12 +118,13 @@ if (job.kind === 'encode') {
   const study = new BrowserSession(native); study.storage = s.storage; study.id = 'study'; await study.openGame(id, 1); study.registerEngine(entry, adapter);
   await study.request('/play', {q: 1, r: 0}, 'POST');
   const reopened = new BrowserSession(native); reopened.storage = s.storage; await reopened.restore(); reopened.registerEngine(entry, adapter); await reopened.saving;
+  for (let i = 0; i < 40; i++) await reopened.persist();
   const imported = new BrowserSession(native); imported.registerEngine(entry, adapter); imported.analysis = imported.spec({engine: 'test'});
   await imported.request('/import', {text: JSON.stringify((await s.request('/replay'))[1])}, 'POST');
   const label = imported.state().review[0].label;
   imported.registerEngine({...entry, version: 'v2'}, adapter);
   answer = {calls, history: reopened.history, simulations: reopened.state().evaluations[1].simulations, catalogue: await s.catalogue(), preserved: JSON.stringify(await s.savedReplay(id, 1)) === original,
-    variation: (await study.savedReplay(study.gameId, 1)).history, imported_label: label, changed_version: imported.state().evaluations};
+    variation: (await study.savedReplay(study.gameId, 1)).history, imported_label: label, changed_version: imported.state().evaluations, restored_identity: reopened.gameId === id};
 } else if (job.kind === 'resume') {
   const s = new BrowserSession(native), wait = ms => new Promise(r => setTimeout(r, ms));
   const until = async condition => { for (let i = 0; !condition(); i++) { if (i > 3000) throw Error('Move did not start'); await wait(1); } };
@@ -190,5 +191,11 @@ if (job.kind === 'encode') {
   await capped.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,max_placements:0});
   await until(() => !capped.match.active);
   answer.uncapped = {completed:capped.match.completed,capped:capped.match.capped,wins:capped.match.wins};
+  const failed = new BrowserSession(native);
+  failed.registerEngine(entry, {turn: async () => { throw Error('Engine failed'); }});
+  await failed.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,clock:{mode:'game',tc:'180+2'}});
+  await until(() => !failed.running);
+  const frozen = failed.clockNow(); await wait(25);
+  answer.failure_clock_frozen = failed.paused && !('started' in failed.clock) && JSON.stringify(frozen) === JSON.stringify(failed.clockNow());
 }
 process.stdout.write(JSON.stringify(answer));

@@ -219,16 +219,20 @@ class Bundle(unittest.TestCase):
         self.assertEqual((result['capped']['completed'], result['capped']['capped']), (2, 2))
         self.assertTrue(all(r['placements'] == 3 and r['reason'] == 'capped' for r in result['capped']['results']))
         self.assertEqual(result['uncapped'], dict(completed=2, capped=0, wins=[1, 1]))
+        self.assertTrue(result['failure_clock_frozen'])
 
     def test_freeplay_updates_until_new_game(self):
-        requests = [['/play', dict(q=0, r=0)], ['/play', dict(q=1, r=0)], ['/new', {}],
-                    ['/play', dict(q=0, r=0)], ['/state', {}]]
+        win = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
+        requests = [['/play', dict(q=0, r=0)], ['/play', dict(q=1, r=0)]] + [['/storage/save', {}]]*20 + [['/new', {}]]
+        requests += [['/play', dict(q=q, r=r)] for q, r in win] + [['/storage/save', {}]]*20 + [['/state', {}]]
         answers = node(dict(kind='play', history=[], requests=requests))
         self.assertTrue(all(a['status'] == 200 for a in answers[:-1]))
         saved = answers[-1]
         self.assertEqual(len(saved['catalogue']), 2)
         self.assertTrue(all(m['kind'] == 'freeplay' for m in saved['catalogue']))
-        self.assertCountEqual([g['history'] for g in saved['backup']['games']], [[[0, 0], [1, 0]], [[0, 0]]])
+        self.assertCountEqual([g['history'] for g in saved['backup']['games']], [[[0, 0], [1, 0]], win])
+        finished = next(g for g in saved['backup']['games'] if g['history'] == win)
+        self.assertEqual((finished['winner'], finished['reason']), (0, 'six'))
 
     def test_browser_freeplay_deepens_restores_and_keeps_original_study(self):
         result = node(dict(kind='freeplay'))
@@ -240,6 +244,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['variation'], [[0, 0], [1, 0]])
         self.assertEqual(result['imported_label'], 'best')
         self.assertEqual(result['changed_version'], {})
+        self.assertTrue(result['restored_identity'])
 
     def test_browser_resumes_partial_match_after_switching_boards_and_clears_import_opening(self):
         result = node(dict(kind='resume'))

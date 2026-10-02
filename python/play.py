@@ -2021,7 +2021,8 @@ class Session:
             self.remember_match(directory)
             evaluation_path = Path(evaluations) if evaluations else directory / 'evaluations.jsonl'
             evaluation_path.parent.mkdir(parents=True, exist_ok=True)
-            self.save_freeplay()
+            if self.freeplay_directory or self.history:
+                self.save_freeplay()
             self.store = Evaluations(evaluation_path)
             self.match = match
             self.match_file = lock_match(directory)

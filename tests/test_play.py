@@ -1037,6 +1037,7 @@ class Matches(unittest.TestCase):
         self.output = Path(self.directory.name) / 'match'
 
     def test_real_winners_are_counted_for_the_right_bot_after_swapping(self):
+        self.session.archive = Path(self.directory.name) / 'archive'
         opening = [(0, 0), (0, 5), (1, 5), (5, 0), (-5, 0), (2, 5), (3, 5), (0, -5), (0, -6),
                    (4, 5), (-2, 5), (0, -7), (0, -8)]
         self.engines.turn = lambda *args: [[5, 5]]
@@ -1055,6 +1056,8 @@ class Matches(unittest.TestCase):
         recovered = self.session.match_catalogue()[0]
         self.assertEqual((recovered['completed'], recovered['wins']), (2, [1, 1]))
         self.assertEqual([r['game'] for r in recovered['results']], [1, 2])
+        self.assertEqual(len(self.session.match_catalogue()), 1)
+        self.assertFalse(recovered['single'])
 
     def test_pause_holds_the_next_game_and_settings_cannot_change_mid_match(self):
         self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
