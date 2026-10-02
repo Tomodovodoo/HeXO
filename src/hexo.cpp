@@ -784,7 +784,9 @@ struct Search {
             ForcingLine line{attack,{}};bool won=true;
             for(const auto& defense:replies) {
                 Restore reply(b);apply(b,defense);
-                int child=prove(b,depth-1);
+                // Recheck a winning continuation against this defense before searching it again.
+                int child=line.replies.empty()?-1:line.replies.back().second;
+                if(child<0 || !replay(b,child)) child=prove(b,depth-1);
                 if(child<0) {won=false;break;}
                 line.replies.emplace_back(defense,child);
             }
