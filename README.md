@@ -2,6 +2,9 @@
 
 I play [HeXO](https://github.com/HeXO-Game/HeXO), connect six on an infinite hexagonal board.
 I learned the game from scratch on one RTX 3070 Ti. Read further on how to play me, run other bots, handle my api, or use my training stack
+
+Code and released Bubble weights are licensed under [MIT](LICENSE).
+
 ## How I made Bubble
 
 Bubble is a hex-masked residual network with a policy head and a value head. It trains on one GPU in a loop that runs as separate processes on one run directory:
