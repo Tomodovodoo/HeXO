@@ -957,7 +957,7 @@ function tokens(data){
 function markTokens(k){for(const t of $('notation-text').querySelectorAll('.tok'))t.classList.toggle('on',t.dataset.k===k)}
 async function showNotation(kind,quiet){
   const box=$('notation'),sig=shownSig();shownNotation=kind;box.dataset.sig=sig;renderFormats();
-  let data={text:'',spans:[]};if(view)try{data=await exported(kind)}catch(e){if(!quiet)toast(e.message)}
+  let data={text:'',spans:[]};if(view||kind==='game')try{data=await exported(kind)}catch(e){if(!quiet)toast(e.message)}
   if(shownNotation!==kind||box.dataset.sig!==sig)return;
   if(sig!==shownSig())return showNotation(kind,true);
   $('notation-name').textContent=kind==='game'?'Game file':FORMATS.find(([k])=>k===kind)[1];

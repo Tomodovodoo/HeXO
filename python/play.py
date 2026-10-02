@@ -2438,7 +2438,7 @@ class Session:
             return self.evaluation(job, seat, history, job.force)
         identity, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
         plies = review_plies(history)
-        missing = [p for p in plies if not self.store.get(history[:p], identity, budget)]
+        missing = [p for p in dict.fromkeys(plies) if not self.store.get(history[:p], identity, budget)]
         job.done = len(plies) - len(missing)
         for start in range(0, len(missing), REVIEW_CHUNK):
             if job.cancelled:

@@ -572,6 +572,12 @@ class Jobs(unittest.TestCase):
         time.sleep(.2)
         self.assertFalse([j for j in self.session.state()['jobs'] if j['ply'] == len(final)])
 
+    def test_reviewing_an_empty_board_evaluates_it_once(self):
+        self.session.configure_seat(1, 'human')
+        self.session.review_game()
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual([len(call[2]) for call in self.engines.calls], [0])
+
     def test_review_uses_the_review_budget_whatever_the_slider_says(self):
         self.session.configure_seat(1, 'human')
         self.session.load([(0, 0), (1, 0), (2, 0)], True)
