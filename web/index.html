@@ -46,7 +46,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .kind{--k:var(--muted);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--k);flex:none;
   border:1px solid color-mix(in srgb,var(--k) 35%,transparent);border-radius:5px;padding:1px 6px;background:color-mix(in srgb,var(--k) 10%,transparent)}
 .kind[data-k=you]{--k:#e2e8f0}.kind[data-k=bubble]{--k:#2dd4bf}.kind[data-k=six]{--k:#a78bfa}.kind[data-k=strix]{--k:#fb7185}
-.kind[data-k=native]{--k:#94a3b8}.kind[data-k=seal]{--k:#a3e635}
+.kind[data-k=native]{--k:#94a3b8}.kind[data-k=seal]{--k:#a3e635}.kind[data-k=shrimp]{--k:#fb923c}
 .pick{flex:1;min-width:0;display:flex;align-items:center;gap:8px;text-align:left;padding:5px 8px;cursor:pointer;
   border:1px solid transparent;border-radius:8px;background:transparent;transition:background .15s,border-color .15s}
 .pick:hover,.pick.on{background:var(--raise-2);border-color:var(--line-2)}
@@ -631,12 +631,13 @@ new ResizeObserver(draw).observe(canvas);
 $('tabs').onclick=e=>{const b=e.target.closest('button');if(!b)return;$('app').dataset.tab=b.dataset.tab;
   for(const x of $('tabs').children)x.classList.toggle('on',x===b);draw()};
 
-/* engine picker: an entry shows its kind, and its label when that differs from the kind */
+/* engine picker: an entry shows its badge (which bot it is; `kind` is how the server runs it), and its label when that
+   differs from the badge */
 let menuFor=null,pinned=false;
 function badge(kind,label){return[el('span',{class:'kind','data-k':kind},kind),label&&label.toLowerCase()!==kind?el('span',{class:'name'},label):null]}
 function entryOf(id){return S.engines.find(x=>x.id===id)}
-function shown(seat){if(seat.engine==='human')return['you',null];const e=entryOf(seat.engine);return e?[e.kind,e.label||e.name]:['?',seat.engine]}
-function pickItems(filter){return S.engines.filter(filter).map(e=>({id:e.id,ids:[e.id],kind:e.kind,label:e.label||e.name}))}
+function shown(seat){if(seat.engine==='human')return['you',null];const e=entryOf(seat.engine);return e?[e.badge||e.kind,e.label||e.name]:['?',seat.engine]}
+function pickItems(filter){return S.engines.filter(filter).map(e=>({id:e.id,ids:[e.id],kind:e.badge||e.kind,label:e.label||e.name}))}
 function openMenu(anchor,items,current,choose){
   const m=$('menu');menuFor=anchor;anchor.classList.add('on');$('seats').classList.toggle('open',!!anchor.closest('#seats'));
   const rows=items.map(it=>{const b=el('button',{class:it.ids.includes(current)?'on':''},...badge(it.kind,it.label));
@@ -671,9 +672,9 @@ function paintSetups(){
   setupShown??=new Set(setupList.filter(s=>!s.installed||s.job?.state==='running').map(s=>s.engine));
   box.replaceChildren(...setupList.filter(s=>setupShown.has(s.engine)).map(s=>{
     const state=s.job?.state;
-    if(s.installed&&state!=='running'){const b=el('button',{},...badge(s.kind,s.name));
+    if(s.installed&&state!=='running'){const b=el('button',{},...badge(s.badge,s.name));
       b.onclick=()=>{closeMenu();setupChoose({id:s.installed,ids:[s.installed]})};return b}
-    const b=el('button',{class:'setup'+(state?' '+state:'')+(state==='running'&&s.job.busy?' busy':''),'aria-label':'Download '+s.name},...badge(s.kind,s.name),setupRing(s.job));
+    const b=el('button',{class:'setup'+(state?' '+state:'')+(state==='running'&&s.job.busy?' busy':''),'aria-label':'Download '+s.name},...badge(s.badge,s.name),setupRing(s.job));
     b.onclick=async()=>{if(state==='running')return;setupSeen.set(s.engine,'running');
       await fetch('/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({engine:s.engine})}).catch(()=>{});refreshSetups()};
     return b}));
@@ -1016,7 +1017,7 @@ function savedGameRow(match,r){
 function entrantRow(i){
   const spec=entrants[i],engines=S.engines.filter(e=>globalThis.browserPlay||!e.id.startsWith('browser:'));if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
   const entry=entryOf(spec.engine);if(entry&&!(entry.checkpoints||[]).includes(spec.checkpoint))spec.checkpoint=entry.checkpoints?.[0]??null;
-  const pick=el('select',{'aria-label':'Engine'},engines.map(e=>el('option',{value:e.id},e.kind+(e.label&&e.label.toLowerCase()!==e.kind?' · '+e.label:''))));
+  const pick=el('select',{'aria-label':'Engine'},engines.map(e=>{const b=e.badge||e.kind;return el('option',{value:e.id},b+(e.label&&e.label.toLowerCase()!==b?' · '+e.label:''))}));
   pick.value=spec.engine;pick.onchange=()=>{spec.engine=pick.value;spec.checkpoint=null;renderTournamentForm()};
   const parts=[pick];
   if(entry?.checkpoints?.length>1){const cp=el('select',{'aria-label':'Checkpoint'},entry.checkpoints.map(c=>el('option',{value:c},c)));

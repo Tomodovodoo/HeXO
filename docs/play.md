@@ -156,7 +156,7 @@ once it is registered. A failure shows its error for a few seconds and the butto
 
 | Engine | Source, licence | One click |
 |---|---|---|
-| Six | newest release of CixMango/Six, MIT | downloads the release archive for Windows, Linux or macOS (arm64), checks it against the SHA-256 GitHub publishes for it, and keeps only the engine folder and the network, as `models/six/` |
+| Six | newest release of CixMango/Six, MIT | downloads the release archive for Windows, Linux or macOS (arm64), checks it against the SHA-256 GitHub publishes for it, and keeps only the engine folder and the network, as `models/six/`. Also runs in the browser as Six (browser), with no download ([web-engine.md](web-engine.md#six-browser)) |
 | Strix | SootyOwl/hexo-strix at `5a771e5`, MIT; the model is the one hexo.tyto.cc lists as `pulsatrix-10-best`, licence unstated | builds the wrapper with `tools/build_strix_learned.py` when cargo and git are found, else downloads it from the `engines-v1` release; downloads the model from hexo.tyto.cc and checks its pinned SHA-256; writes `models/strix/` and `models/strix.json` |
 | Shrimp | Cmiller132/hexo-bot at `6251fc6` (main_7, epoch 18), MIT, run by Six's Shrimp driver | downloads the driver, the weights and the search profile, each at a pinned SHA-256; builds `hexo_engine` and `shrimp` with maturin when cargo is found, else downloads the release's wheels for this Python; writes `models/shrimp/` and `models/shrimp.json`, which run the driver with the server's Python and its PyTorch on two CPU threads. Needs Python 3.11 or newer with PyTorch and NumPy. The page also runs it with no server, as Shrimp (browser) |
 | Seal | Ramora0/HexTicTacToe at `3474edb`, no licence | downloads four pinned headers and compiles `tools/seal_adapter.cpp` with g++ or clang++. It has no licence, so the engines release does not carry it and it needs a C++ compiler; the Pages site serves it compiled to WebAssembly ([browser engine](web-engine.md#seal)) |
@@ -222,7 +222,7 @@ its folder name. Seal also appears when `build/libhexo_seal.dll` (or `.so`) is b
 {"name": "Strix", "kind": "strix", "model": "strix/model.safetensors", "engine": "strix/hexo-strix-learned.exe"}
 {"name": "Seal", "kind": "seal", "library": "seal/hexo_seal.dll"}
 {"name": "old", "kind": "bubble", "path": "../runs/old"}
-{"name": "Shrimp", "kind": "six", "mirrored": true, "command": ["python", "shrimp/launch.py", "--threads", "2"],
+{"name": "Shrimp", "kind": "six", "badge": "shrimp", "mirrored": true, "command": ["python", "shrimp/launch.py", "--threads", "2"],
  "presets": {"quick": {"nodes": 1, "args": ["--visits", "32"]}, "deep": {"nodes": 1, "args": ["--visits", "1024"]}}}
 ```
 
@@ -230,6 +230,10 @@ its folder name. Seal also appears when `build/libhexo_seal.dll` (or `.so`) is b
 `"mirrored": true` is for engines in Six's frame, where HTTTX `(q, r)` is `(q + r, -r)`. `presets` overrides a
 preset's budget; `args` are extra arguments for engines whose strength is set at launch, and `files` lists further
 files a match records the hashes of. Strix's `engine` defaults to `tools/strix_learned/target/release`.
+`kind` is how the server runs an engine; the picker's badge says which bot it is. A Six-protocol entry for a bot
+other than Six names it in `badge` (a lowercase word, `six` when left out): Shrimp's setup writes `"badge": "shrimp"`,
+and a Strix behind Six's protocol would say `"strix"`. `--match` also takes a unique badge. A Shrimp installed before
+badges existed shows its download button again; setting it up once more writes the badge.
 
 Six picks the fastest backend whose libraries it finds: TensorRT, CUDA, DirectML, CPU. The release's engine is the
 DirectML build, which ships `DirectML.dll`. A CUDA build needs ONNX Runtime's GPU DLLs (among them

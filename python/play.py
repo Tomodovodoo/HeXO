@@ -60,7 +60,7 @@ LIMITS = dict(simulations=(0, 65536), solver_nodes=(0, 4_000_000), ms=(10, 120_0
 KIND_LIMITS = dict(strix=dict(simulations=(1, 16384)))
 HEXO_SITES = {'hexo.did.science': 'https://hexo.did.science/api',
               'hexo.mineking.dev': 'https://hexo.mineking.dev/proxy/api'}
-SHOWN = ('id', 'name', 'label', 'kind', 'presets', 'checkpoints')
+SHOWN = ('id', 'name', 'label', 'kind', 'badge', 'presets', 'checkpoints')
 # Each library Six's backends need, as its Windows and its POSIX file name
 SIX_LIBRARIES = dict(cuda=('cudart64_12.dll', 'libcudart.so.12'), cudnn=('cudnn64_9.dll', 'libcudnn.so.9'),
                      tensorrt=('nvinfer_10.dll', 'libnvinfer.so.10'), directml=('DirectML.dll', None),
@@ -304,10 +304,11 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once, on the backend `six_backend` finds,
     labelled with that backend; its networks are its `checkpoints`, newest first. `models/<name>.json` adds one
     entry: {"name", "kind": "bubble", "path"}, {"name", "kind": "six", "command", "mirrored", "presets", optional
-    "files" a match also hashes; a command starting with "python" runs on this server's Python},
+    "files" a match also hashes and "badge"; a command starting with "python" runs on this server's Python},
     {"name", "kind": "strix", "model", optional "engine"} or {"name", "kind": "seal", "library"}, paths relative
     to the file. `seal`, the library built with -DHEXO_SEAL_SOURCE, adds Seal when it exists. Entries carry `id`,
-    `name`, `kind`, `presets`, `label` (the name the page shows; the first run in `extra_runs` is labelled
+    `name`, `kind` (how the server runs it), `badge` (which bot it is, as the page shows it: the kind unless a Six
+    protocol entry names another bot, like Shrimp), `presets`, `label` (the name the page shows; the first run in `extra_runs` is labelled
     Bubble), `checkpoints` (Bubble checkpoints or Six networks), and the server-only `path` (Bubble), `command`,
     `cwd`, `mirrored`, `libraries`, `files` and, for a Six folder, `networks` ({name: path}) and `backend` (Six protocol,
     see `command_of`), `model` and `engine` (Strix) or `library` (Seal). An id is `kind:name`;
@@ -315,8 +316,9 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     found, seen = [], set()
     models = models and Path(models).resolve()
 
-    def add(kind, name, presets=None, label=None, **fields):
-        found.append(dict(name=name, label=label or name, kind=kind, presets=presets_of(kind, presets), **fields))
+    def add(kind, name, presets=None, label=None, badge=None, **fields):
+        found.append(dict(name=name, label=label or name, kind=kind, badge=badge or kind, presets=presets_of(kind, presets),
+                          **fields))
 
     def bubble(path, name=None, label=None):
         path = Path(path).resolve()
@@ -363,7 +365,10 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                         raise ValueError('command must be a list of arguments')
                     first = path.parent / command[0]
                     command[0] = sys.executable if command[0] == 'python' else str(first) if first.exists() else command[0]
-                    add('six', name, spec.get('presets'), command=command, cwd=path.parent,
+                    badge = spec.get('badge', 'six')
+                    if not isinstance(badge, str) or not re.fullmatch(r'[a-z][a-z0-9-]*', badge):
+                        raise ValueError('badge must be a lowercase word')
+                    add('six', name, spec.get('presets'), badge=badge, command=command, cwd=path.parent,
                         mirrored=spec.get('mirrored') is True, libraries=[],
                         files=[(path.parent / file).resolve() for file in spec.get('files', [])])
                 elif kind == 'strix':
@@ -1896,7 +1901,7 @@ class Session:
         matches = [e for e in self.entries.values()
                    if name in (e['id'].casefold(), e['name'].casefold(), e.get('label', '').casefold())]
         if not matches:
-            matches = [e for e in self.entries.values() if name == e['kind']]
+            matches = [e for e in self.entries.values() if name in (e['kind'], e.get('badge'))]
         if not matches and name.startswith('bubble:') and name[7:].isdigit():
             specification['checkpoint'] = name[7:]
             matches = [e for e in self.entries.values() if e['kind'] == 'bubble' and
@@ -1920,7 +1925,7 @@ class Session:
         seat = self.seat(entry['id'], checkpoint, specification.get('preset', preset),
                          specification.get('custom'))
         source = {k: str(v) if isinstance(v, Path) else v for k, v in entry.items()
-                  if k in ('kind', 'name', 'path', 'cwd', 'model', 'engine', 'library', 'mirrored')}
+                  if k in ('kind', 'badge', 'name', 'path', 'cwd', 'model', 'engine', 'library', 'mirrored')}
         if entry['kind'] == 'six':
             source['command'] = command_of(entry, seat['checkpoint'])
         if 'libraries' in entry:
@@ -2113,7 +2118,8 @@ class Session:
                     entry = {k: Path(v) if k in ('path', 'model', 'engine', 'library') else v for k, v in source.items()
                              if k in ('kind', 'path', 'command', 'cwd', 'model', 'engine', 'library', 'mirrored',
                                       'libraries')}
-                    entry.update(id=seat['engine'], name=source.get('name', seat['name']), presets=PRESETS[source['kind']])
+                    entry.update(id=seat['engine'], name=source.get('name', seat['name']), presets=PRESETS[source['kind']],
+                                 badge=source.get('badge', source['kind']))
                     if seat['checkpoint'] is not None:
                         entry['checkpoints'] = [seat['checkpoint']]
                     registry[seat['engine']] = entry
