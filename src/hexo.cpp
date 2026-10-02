@@ -813,6 +813,9 @@ struct Search {
                         int score=b.winner==side?mate:-negamax(b,depth-1,-mate-1,-best);
                         t.score=score;
                         if(score>best) {best=score;iteration=t;}
+                        // No remaining root can beat mate. Finish this iteration
+                        // before a later timeout can discard the winning move.
+                        if(best>=mate) break;
                     }
                     chosen=iteration;chosen.score=best;output.depth=depth;
                     std::stable_sort(roots.begin(),roots.end(),[](auto a,auto z){return a.score>z.score;});
