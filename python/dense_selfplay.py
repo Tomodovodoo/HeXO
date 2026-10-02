@@ -639,6 +639,8 @@ class SelfPlayGame:
         for tree in self.trees.values():
             tree.advance((q, r))
         self.moves.append([q, r])
+        if result.get('proven') == 1:
+            self.label(ply, 1, result['proof_turns'], row.get('proof_action') or [[q, r]])
         if game.winner >= 0:
             return False
         if self.settings.adjudicate_proven and result.get('proven'):
@@ -733,19 +735,33 @@ class SelfPlayGame:
 
     def label(self, ply, proven, turns, proof_action=None):
         """Record a proof's verdict (+1 / -1: the side to move wins / loses) on the row of `ply` unless it has one;
-        1 when set."""
+        return the number of newly labelled rows. A winning second-stone row also proves its preceding
+        same-player first-stone row, with the played first stone and winning continuations as policy targets
+        and one additional placement on its win bound."""
         index = ply-(len(self.moves)-len(self.rows))
         row = self.rows[index] if 0 <= index < len(self.rows) else None
         if row is None:
             return 0
         if proof_action and proven > 0 and row.get('proven', 0) >= 0:
             row.setdefault('proof_action', proof_action)
-        if row.get('proven'):
-            return 0
-        row.update(proven=proven, proof_turns=turns)
-        if 'remaining' in row:
-            row['proof_plies'] = dense_solver.proof_plies(row['remaining'], turns, proven > 0)
-        return 1
+        labelled = 0
+        if not row.get('proven'):
+            row.update(proven=proven, proof_turns=turns)
+            if 'remaining' in row:
+                row['proof_plies'] = dense_solver.proof_plies(row['remaining'], turns, proven > 0)
+            labelled = 1
+        if row.get('proven') == 1 and row.get('remaining') == 1 and index > 0:
+            first = self.rows[index-1]
+            if first.get('remaining') == 2 and first['player'] == row['player'] and first['ply'] == ply-1:
+                action = [self.moves[ply-1], *row['proof_action']] if row.get('proof_action') else None
+                added = self.label(ply-1, 1, turns, action)
+                if added:
+                    if row.get('proof_plies', 0) > 0:
+                        first['proof_plies'] = row['proof_plies']+1
+                    else:
+                        first.pop('proof_plies', None)
+                labelled += added
+        return labelled
 
     def episode(self):
         """(episode, rows without `game`) after closing the native objects."""

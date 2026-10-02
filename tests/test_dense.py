@@ -3560,6 +3560,30 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_second_stone_proof_labels_the_searched_first_stone(self):
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        model = unittest.mock.Mock()
+        settings = replace(dense_config.ActorSettings(), full_fraction=0., opening_random_plies=0.,
+                           adjudicate_proven=True, proven_line_rows=False)
+        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+        def result(action, proven):
+            actions = np.asarray(slot.game.legal_moves(), np.int64)
+            return dict(actions=actions, action=action, policy=np.ones(len(actions))/len(actions),
+                        values=np.zeros(len(actions)), exact_winner=0 if proven else -1, proven=proven,
+                        proof_turns=0, proof_plies=1 if proven else 0, solver_nodes=0, solver_budget=0,
+                        proof_action=[[5,0],[-1,0]] if proven else [])
+        try:
+            self.assertTrue(slot.searched(result([4,0], 0)))
+            self.assertEqual(slot.rows[0].get('proven', 0), 0)
+            self.assertFalse(slot.searched(result([5,0], 1)))
+            first, second = slot.rows
+            self.assertEqual((first['proven'], second['proven']), (1, 1))
+            self.assertEqual((first['proof_plies'], second['proof_plies']), (2, 1))
+            self.assertEqual(first['proof_action'], [[4,0],[5,0],[-1,0]])
+            self.assertEqual(slot.game.winner, 0)
+        finally:
+            slot.game.close()
+
     def test_native_exact_root_stops_early_and_supplies_actor_labels_with_and_without_plan(self):
         import dense_solver
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]

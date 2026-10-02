@@ -1283,6 +1283,29 @@ class Determinism(unittest.TestCase):
 
 
 class ProvenTargets(unittest.TestCase):
+    def test_delayed_second_stone_win_labels_its_first_stone_once(self):
+        slot = object.__new__(dense_selfplay.SelfPlayGame)
+        slot.moves = [[0,0],[0,1],[1,1]]
+        slot.rows = [dict(ply=1, player=1, remaining=2),
+                     dict(ply=2, player=1, remaining=1, proven=1, proof_turns=0, proof_plies=9)]
+        self.assertEqual(slot.label(2, 1, 0, [[2,1]]), 1)
+        self.assertEqual(slot.rows[0]['proven'], 1)
+        self.assertEqual(slot.rows[0]['proof_action'], [[0,1],[2,1]])
+        self.assertEqual(slot.rows[0]['proof_plies'], 10)
+        self.assertEqual(slot.label(2, 1, 0, [[2,1]]), 0)
+        self.assertEqual(slot.rows[0]['proof_plies'], 10)
+
+    def test_exact_losses_and_opponent_turn_wins_do_not_label_the_preceding_row(self):
+        slot = object.__new__(dense_selfplay.SelfPlayGame)
+        slot.moves = [[0,0],[0,1],[1,1],[1,0]]
+        slot.rows = [dict(ply=1, player=1, remaining=2),
+                     dict(ply=2, player=1, remaining=1), dict(ply=3, player=0, remaining=2)]
+        self.assertEqual(slot.label(2, -1, 2), 1)
+        self.assertNotIn('proven', slot.rows[0])
+        self.assertEqual(slot.label(3, 1, 2, [[2,0],[3,0]]), 1)
+        self.assertEqual(slot.rows[1]['proven'], -1)
+        self.assertNotIn('proven', slot.rows[0])
+
     def test_policy_mix_and_legacy_rows(self):
         moves = winning_game()
         episode, rows = episode_rows(moves, 0, [0.]*len(moves))
