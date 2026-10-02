@@ -164,9 +164,10 @@ whether each is installed (the id of its entry) and the last setup's progress; `
 
 The prebuilt Strix and Shrimp files come from this repository's `engines-v<N>` release.
 `gh workflow run engines.yml -f tag=engines-v1` builds them on Windows and Linux (Shrimp's wheels for Python 3.11 to
-3.14) and creates the release with a `SHA256SUMS` file; `python tools/build_engines.py pin engines-v1` then copies those
-hashes into `tools/engines.json`, and every download is checked against them. `python tools/build_engines.py build
---out dist` builds the same files on one machine.
+3.14) and creates the release with a `SHA256SUMS` file. Downloads are checked against the hashes pinned in
+`tools/engines.json`, or against the release's `SHA256SUMS` while none are pinned; `python tools/build_engines.py pin
+engines-v1` copies those hashes into the manifest. `python tools/build_engines.py build --out dist` builds the same
+files on one machine.
 
 Kraken (Ramora0/KrakenBot) is not offered: its code has no licence and its weights are not public. Neither is
 MantisNet (Cmiller132/Hexo-Shrimp-Bot), which has no licence and no weights.

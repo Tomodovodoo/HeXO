@@ -44,7 +44,8 @@ def build(out, all_pythons):
         archive = work / 'source.zip'
         archive.write_bytes(get(engine_setup.source_url(spec['shrimp'])))
         source = engine_setup.source_tree(archive, work / 'src', spec['shrimp']['sources'])
-        engine_setup.build_wheels(source, out, spec['shrimp']['crates'], None if all_pythons else [sys.executable])
+        engine_setup.build_wheels(source, out, spec['shrimp']['crates'], toolchain,
+                                  None if all_pythons else [sys.executable])
     for path in sorted(out.iterdir()):
         print(hashlib.sha256(path.read_bytes()).hexdigest(), path.name)
 
@@ -53,8 +54,8 @@ def pin(tag):
     """Write the file hashes of release `tag`, from its SHA256SUMS, into tools/engines.json."""
     spec = manifest()
     release = spec['release']
-    sums = get(f"https://github.com/{release['repository']}/releases/download/{tag}/SHA256SUMS").decode()
-    files = {name.lstrip('*'): digest for digest, name in (line.split(maxsplit=1) for line in sums.splitlines() if line)}
+    files = engine_setup.parse_sums(
+        get(f"https://github.com/{release['repository']}/releases/download/{tag}/SHA256SUMS").decode())
     spec['release'] = release | dict(tag=tag, files=dict(sorted(files.items())))
     engine_setup.MANIFEST.write_text(json.dumps(spec, indent=2) + '\n', encoding='utf-8')
     print(f'{len(files)} files of {tag} pinned in {engine_setup.MANIFEST}')

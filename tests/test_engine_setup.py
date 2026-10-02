@@ -11,7 +11,7 @@ import unittest.mock
 import zipfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import engine_setup
@@ -45,7 +45,7 @@ def archive(name, members):
 
 
 class Web:
-    """Answers requests from `files` ({url: bytes}) the way urlopen does and records them; others are 404."""
+    """Answers requests from `files` ({url: bytes}) the way urlopen does and records them; others fail."""
 
     def __init__(self, files):
         self.files, self.asked = files, []
@@ -53,7 +53,7 @@ class Web:
     def __call__(self, request, timeout=None):
         self.asked.append(request.full_url)
         if request.full_url not in self.files:
-            raise HTTPError(request.full_url, 404, 'Not Found', {}, None)
+            raise URLError(f'{request.full_url} not found')
         response = io.BytesIO(self.files[request.full_url])
         response.headers = {'Content-Length': str(len(self.files[request.full_url]))}
         return response
@@ -139,11 +139,27 @@ class Recipes(unittest.TestCase):
         strix = next(e for e in scan(self.models).values() if e['kind'] == 'strix')
         self.assertEqual((strix['model'].read_bytes(), strix['engine'].read_bytes()), (model, executable))
 
+    def test_an_unpinned_release_is_checked_against_its_own_sums(self):
+        executable, model = b'strix executable', b'strix model'
+        name = f"hexo-strix-learned-{system()}{'.exe' if WINDOWS else ''}"
+        self.manifest['strix']['model'] |= dict(url='https://example.test/model', sha256=sha(model), size=len(model))
+        release = 'https://github.com/Tomodovodoo/HeXO/releases/download/engines-v1/'
+        sums = f'{sha(executable)}  {name}\n{"0" * 64}  other-file\n'.encode()
+        job = self.finish(self.setups({release + 'SHA256SUMS': sums, release + name: executable,
+                                       'https://example.test/model': model}), 'strix')
+        self.assertEqual(job.state, 'done', job.error)
+        job = self.finish(self.setups({release + 'SHA256SUMS': sums, release + name: b'tampered',
+                                       'https://example.test/model': model}), 'strix')
+        self.assertIn('SHA-256', job.error)
+
     def test_without_a_toolchain_or_a_published_build_the_setup_says_so(self):
         job = self.finish(self.setups({}), 'strix')
         self.assertEqual(job.state, 'failed')
         self.assertIn('No published build', job.error)
         self.assertFalse((self.models / 'strix.json').exists())
+        with unittest.mock.patch('engine_setup.build_strix', side_effect=OSError('linker missing')):
+            job = self.finish(self.setups({}, which=lambda name: name, cargo=lambda: 'cargo'), 'strix')
+        self.assertEqual(job.error, 'linker missing')
 
     def test_a_failed_local_build_falls_back_to_the_published_one(self):
         executable, model = b'published', b'model'

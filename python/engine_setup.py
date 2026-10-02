@@ -90,24 +90,32 @@ def run(command, cwd=None, env=None):
     return done.stdout
 
 
+def with_cargo(cargo_path):
+    """The environment change that puts `cargo_path`'s folder first on PATH."""
+    return dict(PATH=str(Path(cargo_path).parent) + os.pathsep + os.environ.get('PATH', ''))
+
+
 def build_strix(work, cargo_path):
     """Build the pinned Strix wrapper with tools/build_strix_learned.py from a clone in `work`; returns the
     executable, with its build-provenance.json beside it."""
-    run([sys.executable, ROOT / 'tools' / 'build_strix_learned.py', Path(work) / 'hexo-strix', '--cargo', cargo_path])
+    run([sys.executable, ROOT / 'tools' / 'build_strix_learned.py', Path(work) / 'hexo-strix', '--cargo', cargo_path],
+        env=with_cargo(cargo_path))
     return ROOT / 'tools' / 'strix_learned' / 'target' / 'release' / ('hexo-strix-learned.exe' if WINDOWS else
                                                                        'hexo-strix-learned')
 
 
-def build_wheels(source, out, crates, interpreters=None):
-    """Build `crates` of the hexo-bot checkout `source` into wheels in `out` with maturin, for `interpreters`
-    (paths), or every interpreter maturin finds when None; returns the wheel paths."""
+def build_wheels(source, out, crates, cargo_path, interpreters=None):
+    """Build `crates` of the hexo-bot checkout `source` into wheels in `out` with maturin and `cargo_path`, for
+    `interpreters` (paths), or every interpreter maturin finds when None; returns the wheel paths."""
     tools = Path(out) / '.maturin'
     run([sys.executable, '-m', 'pip', 'install', '--quiet', '--target', tools, 'maturin>=1.7,<2'])
-    maturin = next(tools.glob('bin/maturin*'))
+    maturin = next((path for folder in ('bin', 'Scripts') for path in sorted((tools / folder).glob('maturin*'))), None)
+    if maturin is None:
+        raise SetupError('maturin did not install')
     chosen = ['--find-interpreter'] if interpreters is None else [x for i in interpreters for x in ('-i', i)]
     for crate in crates:
         run([maturin, 'build', '--release', *chosen, '-m', Path(source) / 'packages' / crate / 'Cargo.toml',
-             '--out', out], env=dict(CARGO_TARGET_DIR=str(Path(out) / '.target')))
+             '--out', out], env=with_cargo(cargo_path) | dict(CARGO_TARGET_DIR=str(Path(out) / '.target')))
     shutil.rmtree(tools)
     shutil.rmtree(Path(out) / '.target')
     return sorted(Path(out).glob('*.whl'))
@@ -210,15 +218,28 @@ class Setups:
                          timeout=30) as response:
             return json.loads(response.read())
 
-    def published(self, job, fits, path):
-        """Download the one file of the pinned engines release that `fits(name)` accepts, checked against its
-        hash in the manifest, to `path`."""
+    def release_files(self):
+        """The engines release's files and their SHA-256s: the ones pinned in the manifest, or, while none are
+        pinned, the release's own SHA256SUMS; empty when neither is there."""
         release = self.manifest['release']
-        names = [name for name in release['files'] if fits(name)]
+        if release['files']:
+            return release['files']
+        url = f"https://github.com/{release['repository']}/releases/download/{release['tag']}/SHA256SUMS"
+        try:
+            with self.opener(Request(url, headers={'User-Agent': 'bubble'}), timeout=30) as response:
+                return parse_sums(response.read().decode())
+        except (OSError, ValueError):
+            return {}
+
+    def published(self, job, fits, path, failure=None):
+        """Download the one file of the engines release that `fits(name)` accepts to `path`, checked against its
+        hash from `release_files`. Without one, raise `failure`, the local build's error, if there was one."""
+        release, files = self.manifest['release'], self.release_files()
+        names = [name for name in files if fits(name)]
         if not names:
-            raise SetupError(f'No published build for {system()}; install the build tools to build it here')
+            raise failure or SetupError(f'No published build for {system()}; install the build tools to build it here')
         url = f"https://github.com/{release['repository']}/releases/download/{release['tag']}/{names[0]}"
-        return self.download(job, url, path, release['files'][names[0]])
+        return self.download(job, url, path, files[names[0]])
 
     def place(self, staged, name, entry=None):
         """Move the folder `staged` to `<models>/<name>`, replacing an earlier setup there but never other
@@ -268,14 +289,13 @@ class Setups:
         staged = work / 'strix'
         staged.mkdir()
         name = spec['executable'] + ('.exe' if WINDOWS else '')
-        built, toolchain = None, self.cargo()
-        if toolchain and self.which('git'):
+        built = failure = None
+        if (toolchain := self.cargo()) and self.which('git'):
             job.busy = True
             try:
                 built = build_strix(work, toolchain)
-            except SetupError:
-                if not any(n.startswith(spec['executable'] + '-') for n in self.manifest['release']['files']):
-                    raise
+            except Exception as error:
+                failure = error
         if built:
             shutil.copy2(built, staged / name)
             if (built.parent / 'build-provenance.json').is_file():
@@ -283,7 +303,7 @@ class Setups:
             job.advance()
         else:
             self.published(job, lambda n: n == f"{spec['executable']}-{system()}{'.exe' if WINDOWS else ''}",
-                           staged / name)
+                           staged / name, failure)
             (staged / name).chmod((staged / name).stat().st_mode | 0o111)
         model = spec['model']
         self.download(job, model['url'], staged / 'model.safetensors', model['sha256'], model['size'])
@@ -300,21 +320,18 @@ class Setups:
         staged = work / 'shrimp'
         for file in spec['files']:
             self.download(job, file['url'], staged / file['path'], file['sha256'])
-        wheels, toolchain = [], self.cargo()
-        if toolchain:
+        wheels, failure = [], None
+        if toolchain := self.cargo():
             try:
                 source = self.source(job, spec, work)
                 job.busy = True
-                wheels = build_wheels(source, work / 'wheels', spec['crates'], [sys.executable])
-            except SetupError:
-                if not any(wheel_fits(n, c) for n in self.manifest['release']['files'] for c in spec['crates']):
-                    raise
-                wheels = []
+                wheels = build_wheels(source, work / 'built', spec['crates'], toolchain, [sys.executable])
+                job.advance()
+            except Exception as error:
+                wheels, failure = [], error
         if not wheels:
-            wheels = [self.published(job, lambda n, c=crate: wheel_fits(n, c), work / 'wheels' / f'{crate}.whl')
-                      for crate in spec['crates']]
-        else:
-            job.advance()
+            wheels = [self.published(job, lambda n, c=crate: wheel_fits(n, c), work / 'wheels' / f'{crate}.whl',
+                                     failure) for crate in spec['crates']]
         job.busy = True
         for wheel in wheels:
             with zipfile.ZipFile(wheel) as archive:
@@ -346,6 +363,12 @@ class Setups:
         job.advance()
         self.place(staged, 'seal', dict(name=spec['name'], kind='seal', library=f'seal/{library}'))
         job.advance()
+
+
+def parse_sums(text):
+    """{file name: SHA-256} from `sha256sum` output."""
+    return {name.lstrip('*'): digest for digest, name in (line.split(maxsplit=1) for line in text.splitlines()
+                                                          if line.strip())}
 
 
 def source_url(spec):
