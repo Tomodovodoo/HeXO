@@ -366,14 +366,20 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 <dialog id="import-dialog"><form method="dialog" class="stack">
   <div class="dialog-head">Import<span class="spacer"></span><button class="ib ghost" value="cancel" aria-label="Close" id="import-close"></button></div>
   <textarea id="import-text" spellcheck="false" placeholder="version[1]; 1. [1,0][2,0];&#10;x, d @(0, 0) o A0 A1&#10;https://hexo.did.science/games/…&#10;https://hexo.tyto.cc/analysis#c=…"></textarea>
+  <label class="hint">Choose a game or backup file <input id="import-file" type="file" accept=".htttx,.json,.txt"></label>
   <div class="row"><span class="spacer"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" id="import-go" value="ok">Load</button></div>
 </form></dialog>
 <dialog id="tournament-dialog"><div class="stack">
-  <div class="dialog-head">Tournaments<span class="tabs" id="t-tabs"><button data-t="new">New</button><button data-t="results">Results</button></span>
+  <div class="dialog-head">Games<span class="tabs" id="t-tabs"><button data-t="results">Saved games</button><button data-t="new">New match</button></span>
     <span class="spacer"></span><button class="ib ghost" id="tournament-close" aria-label="Close"></button></div>
   <div class="stack" id="t-new"></div>
   <div class="stack" id="t-results">
-    <select id="saved-batch" aria-label="Tournament"></select>
+    <select id="saved-batch" aria-label="Saved games"></select>
+    <div class="row" id="browser-library" hidden>
+      <a class="btn" href="/storage/backup" download="hexo-browser-save.json">Download backup</a>
+      <button class="btn" id="restore-local">Import backup</button>
+    </div>
+    <span class="hint" id="browser-storage"></span>
     <div id="t-summary"></div>
     <div id="saved-games"></div>
   </div>
@@ -386,6 +392,7 @@ const LABEL={win:['◆','--best'],found:['!','--best'],kept:['=','--best'],best:
 const STOPS=['lightning','quick','standard','strong','deep','dangerous'],configured=new Set();
 const FIELDS={simulations:'Search',solver_nodes:'Solver',nodes:'Positions',ms:'ms'};
 const PAGE=new URLSearchParams(location.search),STUDY=PAGE.has('study');
+globalThis.playReady=new Promise(resolve=>{globalThis.resolvePlayReady=resolve});
 const endpoint=path=>(STUDY&&!path.startsWith('/matches')?'/study':'')+path;
 let S=null,view=0,cam={x:0,y:0,size:26},hover=null,hot=null,drag=null,fitted=false,seenLabels=new Map(),landed=new Map(),asked=new Map();
 const canvas=$('board'),ctx=canvas.getContext('2d'),overlay=$('marks'),mctx=overlay.getContext('2d');
@@ -716,7 +723,7 @@ function renderCard(){
   const logo=el('span',{html:'<svg class="logo" viewBox="0 0 20 22"><path d="M10 1 19 6v10l-9 5-9-5V6z" fill="none" stroke="var(--o)" stroke-width="2"/><circle cx="10" cy="11" r="3.2" fill="var(--x)"/></svg>'});
   const title=S.saved_game?`Game ${S.saved_game.game}`:'Bubble';
   const extra=STUDY?el('a',{class:'ib ghost',href:'/','aria-label':'Live board',html:icon('home')}):
-    el('button',{class:'ib ghost','aria-label':'Tournaments',html:icon('trophy'),onclick:e=>{e.stopPropagation();showTournaments()}});
+    el('button',{class:'ib ghost','aria-label':'Games',html:icon('open'),onclick:e=>{e.stopPropagation();showTournaments()}});
   head.replaceChildren(logo,el('span',{},title),el('span',{class:'spacer'}),extra);
   head.onclick=e=>{if(!e.target.closest('a,button')){pinned=!pinned;$('seats').classList.toggle('open',pinned)}};
 }
@@ -775,8 +782,9 @@ function renderStudy(){
   renderGraph();renderMoves();renderDetail();
 }
 function autoAnalyse(){
+  if(S.importing)return;
   const ev=S.evaluations[view],need=S.analysis&&S.analysis.budget,job=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);
-  const short=!ev||need&&(ev.simulations<need.simulations||ev.solver_nodes<need.solver_nodes);
+  const short=!ev||need&&Object.entries(need).some(([k,v])=>typeof v==='number'&&(ev.budget?.[k]??ev[k]??0)<v);
   if(!short||!S.analysis||!S.analysis.auto||job||finished())return;
   const a=S.analysis,tag=[a.engine,a.checkpoint,JSON.stringify(a.budget),S.history.slice(0,view).join(';')].join('|'),now=Date.now();
   if(now-(asked.get(tag)||0)>3000){asked.set(tag,now);post('/analyse',{ply:view})}
@@ -846,6 +854,7 @@ function renderMatch(){
   const done=match.completed===match.games;
   const stop=el('button',{class:'ib','aria-label':'Stop match',html:icon('stop'),onclick:()=>post('/match',{action:'stop'})});stop.disabled=!match.active;
   const results=el('a',{class:'ib','aria-label':'Results',href:'/match/results',download:'match.json',html:icon('download')});
+  const resume=el('button',{class:'ib','aria-label':'Resume match',html:icon('play'),onclick:()=>post('/match',{action:'resume',batch:match.id||match.output})});
   const browse=el('button',{class:'ib','aria-label':'Games',html:icon('open'),onclick:()=>showTournaments('results')});
   box.replaceChildren(el('div',{class:'divider'}),
     el('div',{class:'score'},el('span',{},match.players[0].name.split('/')[0]),el('span',{},`${match.wins[0]} – ${match.wins[1]}`),el('span',{},match.players[1].name.split('/')[0])),
@@ -853,7 +862,7 @@ function renderMatch(){
     el('div',{class:'row'},el('span',{},`${done?match.games:match.current} / ${match.games}`),
       ...(match.capped?[el('span',{class:'chip'},'= '+match.capped)]:[]),
       ...(match.elo?[el('span',{},`${Math.round(match.elo.a_minus_b)} ± ${Math.round((match.elo.interval[1]-match.elo.interval[0])/2)}`)]:[]),
-      el('span',{class:'spacer'}),browse,results,stop),
+      el('span',{class:'spacer'}),browse,results,...(!match.active&&!done?[resume]:[]),stop),
     ...(match.error?[el('div',{style:'color:var(--blunder)'},match.error)]:[]));
 }
 function renderPanels(){
@@ -970,6 +979,7 @@ $('import').onclick=()=>{$('import-text').value='';$('import-dialog').showModal(
 $('import-dialog').onclose=async()=>{if($('import-dialog').returnValue==='ok'&&await post('/import',{text:$('import-text').value})){view=S.history.length;fit();go(view)}};
 $('import-dialog').ondragover=e=>e.preventDefault();
 $('import-dialog').ondrop=async e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)$('import-text').value=await f.text()};
+$('import-file').onchange=async e=>{const f=e.target.files[0];if(f)$('import-text').value=await f.text()};
 const entrants=[{engine:null,checkpoint:null,preset:'quick'},{engine:null,checkpoint:null,preset:'quick'}],tournament={games:8,openings:'wide',clock:'fixed',ms:5,tc:'180+2'};
 function entrantRow(i){
   const spec=entrants[i],engines=S.engines;if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
@@ -1009,26 +1019,33 @@ $('t-tabs').onclick=e=>{const b=e.target.closest('button');if(b)tournamentTab(b.
 async function showTournaments(tab){
   try{const response=await fetch('/matches'),data=await response.json();if(!response.ok)throw Error(data.error);
     const select=$('saved-batch'),games=$('saved-games');
-    select.replaceChildren(...data.matches.map(m=>el('option',{value:m.id},`${m.players.join(' vs ')} · ${m.completed}/${m.games} · ${m.name}`)));
+    select.replaceChildren(...data.matches.map(m=>el('option',{value:m.id},`${m.single?'Freeplay · ':''}${m.players.join(' vs ')}${m.single?'':` · ${m.completed}/${m.games}`} · ${m.name}`)));
     select.hidden=!data.matches.length;
+    $('browser-library').hidden=!globalThis.browserPlay;
     const render=()=>{const match=data.matches.find(m=>m.id===select.value);
-      $('t-summary').replaceChildren(...(match?[el('div',{class:'summary'},el('span',{},`${match.wins[0]} – ${match.wins[1]}`),
+      $('t-summary').replaceChildren(...(match?[el('div',{class:'summary'},el('span',{},match.single?'Freeplay':`${match.wins[0]} – ${match.wins[1]}`),
         ...(match.capped?[el('span',{class:'chip'},'= '+match.capped)]:[]),
-        ...(match.elo?[el('span',{class:'elo'},`${match.elo.a_minus_b>=0?'+':''}${Math.round(match.elo.a_minus_b)} ± ${Math.round((match.elo.interval[1]-match.elo.interval[0])/2)} Elo`)]:[]))]:[]));
+        ...(match.elo?[el('span',{class:'elo'},`${match.elo.a_minus_b>=0?'+':''}${Math.round(match.elo.a_minus_b)} ± ${Math.round((match.elo.interval[1]-match.elo.interval[0])/2)} Elo${match.elo.method?' (estimate)':''}`)]:[]),
+        ...(!match.single&&match.completed<match.games?[el('button',{class:'btn',onclick:async()=>{if(await post('/match',{action:'resume',batch:match.id}))$('tournament-dialog').close()}},'Resume')]:[]),
+        ...(globalThis.browserPlay?[el('button',{class:'ib ghost','aria-label':'Delete saved games',html:icon('close'),onclick:async()=>{if(confirm('Delete these saved games from this browser?')){await post('/matches/delete',{batch:match.id});showTournaments('results')}}})]:[]))]:[]));
       games.replaceChildren(...(match?.results.length?match.results.map(r=>{
         const query=new URLSearchParams({batch:match.id,game:r.game}),href=`/?study=1&${query}`;
-        const who=r.winner==null?el('span',{class:'chip'},'capped'):[el('i',{class:'medal'}),el('span',{},match.players[r.winner])];
+        const who=r.winner==null?el('span',{class:'chip'},r.reason==='saved'?'unfinished':'capped'):[el('i',{class:'medal'}),el('span',{},match.players[r.winner])];
         return el('div',{class:'saved-game'},el('span',{class:'no'},'#'+r.game),el('span',{class:'who'},who),el('span',{class:'len'},r.placements),
           el('a',{class:'ib ghost',href,target:'_blank',rel:'noopener','aria-label':'Analyse',html:icon('open')}),
-          el('a',{class:'ib ghost',href:`/matches/game?${query}&format=htttx`,download:'','aria-label':'HTTTX',html:icon('download')}));
+          el('a',{class:'btn',href:`/matches/game?${query}`,download:'game.json','aria-label':'Download game file'},'JSON'),
+          ...(r.placements?[el('a',{class:'ib ghost',href:`/matches/game?${query}&format=htttx`,download:'','aria-label':'HTTTX',html:icon('download')})]:[]));
       }):[el('div',{class:'empty'},'—')]))};
-    select.onchange=render;render();tournamentTab(tab||(S.match?.active||!data.matches.length?'new':'results'));
+    select.onchange=render;render();tournamentTab(tab||'results');
+    if(!globalThis.browserPlay)$('browser-storage').textContent='Freeplay games save automatically on this computer.';
     if(!$('tournament-dialog').open)$('tournament-dialog').showModal();
   }catch(error){toast(error.message)}
 }
 $('tournament-close').onclick=()=>$('tournament-dialog').close();
+$('restore-local').onclick=()=>{$('tournament-dialog').close();$('import-text').value='';$('import-dialog').showModal()};
 (async()=>{
-  if(STUDY&&PAGE.has('batch')){
+  await globalThis.playReady;
+  if(STUDY&&PAGE.has('batch')&&!globalThis.browserPlay){
     try{const response=await fetch('/matches/open',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({batch:PAGE.get('batch'),game:Number(PAGE.get('game'))})});
       if(!response.ok)throw Error((await response.json()).error);

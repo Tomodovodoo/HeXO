@@ -1250,11 +1250,43 @@ class Matches(unittest.TestCase):
         reopened = Session(entries(), FakeEngines(), Evaluations(), archive=self.session.archive,
                            study_store=self.session.study_store)
         self.addCleanup(reopened.close)
-        self.assertEqual(reopened.match_catalogue()[0]['completed'], 2)
+        self.assertEqual(next(m for m in reopened.match_catalogue() if m['id'] == ident)['completed'], 2)
         with unittest.mock.patch('play.Engines', return_value=FakeEngines()):
             study = reopened.open_saved_game(ident, 1)
         self.assertIsNotNone(study.lookup([(0, 0)]))
         self.assertEqual((self.output / 'game-0001.json').read_bytes(), saved)
+
+    def test_freeplay_autosaves_moves_new_games_and_analysis_and_preserves_studies(self):
+        self.session.configure_seat(1, 'human')
+        self.session.archive = Path(self.directory.name) / 'archive'
+        with self.session.lock:
+            self.session.changed()
+        first = self.session.match_catalogue()[0]['id']
+        self.session.play(0, 0)
+        self.session.play(1, 0)
+        directory, game = self.session.saved_replay(first, 1)
+        self.assertEqual(game['history'], [[0, 0], [1, 0]])
+        self.assertEqual(game['reason'], 'saved')
+        self.session.configure_analysis('bubble:fake', preset='custom', custom=dict(simulations=1, solver_nodes=0), auto=False)
+        self.session.analyse(1)
+        wait(lambda: self.session.lookup([(0, 0)]) is not None and
+             '"value":0.5' in (directory / 'evaluations.jsonl').read_text())
+        original = (directory / 'game-0001.json').read_bytes()
+        evaluations = (directory / 'evaluations.jsonl').read_bytes()
+        self.session.configure_analysis('bubble:fake', checkpoint='main/000001', auto=False)
+        self.assertEqual((directory / 'evaluations.jsonl').read_bytes(), evaluations)
+        self.session.new_game()
+        self.assertEqual(len(self.session.match_catalogue()), 2)
+        reopened = Session(entries(), FakeEngines(), Evaluations(), archive=self.session.archive, save_initial=False)
+        self.addCleanup(reopened.close)
+        with unittest.mock.patch('play.Engines', return_value=FakeEngines()):
+            study = reopened.open_saved_game(first, 1)
+        self.assertIsNotNone(study.lookup([(0, 0)]))
+        self.assertEqual(len(reopened.match_catalogue()), 2)
+        study.play(2, 0)
+        self.assertEqual(len(reopened.match_catalogue()), 3)
+        self.assertEqual((directory / 'game-0001.json').read_bytes(), original)
+        self.assertTrue(all(m['kind'] == 'freeplay' for m in reopened.match_catalogue()))
 
     def test_timed_bubble_uses_the_selected_tactical_package(self):
         package = Path(self.directory.name) / 'solver'
@@ -1327,6 +1359,8 @@ class TurnTrees(unittest.TestCase):
     def setUp(self):
         import hexnet
         import neural_search
+        import torch
+        torch.manual_seed(1)
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
         self.path = Path(self.folder.name)/'ema.pt'
@@ -1359,7 +1393,7 @@ class TurnTrees(unittest.TestCase):
                                  cache=neural_search.EvaluationCache())
         seen = []
         # A stopped clock: the first glimpse with statistics is shown at once and the throttle holds back the rest.
-        with unittest.mock.patch('play.time', SimpleNamespace(monotonic=lambda: 0., perf_counter=time.perf_counter)):
+        with unittest.mock.patch('play.time', SimpleNamespace(**(vars(time) | dict(monotonic=lambda: 0.)))):
             found = evaluate(bubble, None, [(0, 0)], 32, 0, live=seen.append)
         moves = found['moves']
         self.assertEqual(len(seen), 1)

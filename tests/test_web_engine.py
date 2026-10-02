@@ -120,6 +120,72 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answers[6][1], [])
         self.assertEqual([a[2] for a in answers[-2:]], [True, False])
 
+    def test_browser_notations_preserve_a_single_stone_final_turn(self):
+        history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
+        histories = [history[:1], history[:6], history]
+        for original, formats in zip(histories, node(dict(kind='notation', histories=histories))):
+            for name, data in formats.items():
+                self.assertEqual(data['history'], original)
+                expected = play.export(original, name)
+                self.assertEqual(data['text'], expected['text'])
+
+    def test_browser_book_has_unique_legal_starts_and_separate_policy_ranges(self):
+        book = json.loads((ENGINE/'openings.json').read_text())
+        counts = {m: len(book['nodes']) if m == 'all' else 8 if m == 'narrow' else sum(not n['off_policy'] for n in book['nodes'])
+                  for m in ('narrow', 'wide', 'all')}
+        for row in node(dict(kind='book')):
+            self.assertEqual(row['count'], counts[row['mode']])
+            self.assertEqual(row['unique'], row['count'])
+            if row['mode'] != 'all':
+                self.assertEqual(row['off_policy'], 0)
+
+    def test_browser_review_and_paired_tournament_are_saved(self):
+        history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
+        requests = [['/import', dict(text=json.dumps(dict(history=history)))], ['/review', {}], ['/state', {}],
+                    ['/storage/save', {}], ['/match', dict(players=[dict(engine='browser:test')]*2, games=2, clock=dict(mode='fixed'))],
+                    ['/state', {}]]
+        answers = node(dict(kind='play', history=history, requests=requests))
+        self.assertTrue(all(a['status'] == 200 for a in answers[:-1]))
+        self.assertEqual(answers[2]['data']['review'][-1]['label'], 'win')
+        self.assertEqual(answers[5]['data']['match']['wins'], [1, 1])
+        self.assertEqual(answers[5]['data']['match']['completed'], 2)
+        games = answers[-1]['backup']['games']
+        self.assertEqual(len(games), 4)
+        self.assertEqual(sum(g['history'] == history for g in games), 3)
+        self.assertTrue(any(g['history'] == [] for g in games))
+
+    def test_browser_stop_import_and_delete_survive_pending_jobs(self):
+        history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
+        result = node(dict(kind='lifecycle', history=history))
+        self.assertEqual(result['stopped_save'], dict(paused=True, active=False, completed=1))
+        self.assertEqual(result['resumed'], dict(wins=[1, 1], completed=2))
+        self.assertIsNone(result['deleted']['current'])
+        self.assertTrue(all(m['single'] for m in result['deleted']['catalogue']))
+        self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]]))
+        self.assertEqual(result['stopped_timeout'], dict(paused=True, active=False, completed=0))
+        self.assertEqual(result['forked_clock'], dict(match=None, clock=None))
+
+    def test_freeplay_updates_until_new_game(self):
+        requests = [['/play', dict(q=0, r=0)], ['/play', dict(q=1, r=0)], ['/new', {}],
+                    ['/play', dict(q=0, r=0)], ['/state', {}]]
+        answers = node(dict(kind='play', history=[], requests=requests))
+        self.assertTrue(all(a['status'] == 200 for a in answers[:-1]))
+        saved = answers[-1]
+        self.assertEqual(len(saved['catalogue']), 2)
+        self.assertTrue(all(m['kind'] == 'freeplay' for m in saved['catalogue']))
+        self.assertCountEqual([g['history'] for g in saved['backup']['games']], [[[0, 0], [1, 0]], [[0, 0]]])
+
+    def test_browser_freeplay_deepens_restores_and_keeps_original_study(self):
+        result = node(dict(kind='freeplay'))
+        self.assertEqual([n for ply, n in result['calls'] if ply == 1], [1, 2, 4])
+        self.assertEqual(result['history'], [[0, 0]])
+        self.assertEqual(result['simulations'], 4)
+        self.assertEqual(len(result['catalogue']), 2)
+        self.assertTrue(result['preserved'])
+        self.assertEqual(result['variation'], [[0, 0], [1, 0]])
+        self.assertEqual(result['imported_label'], 'best')
+        self.assertEqual(result['changed_version'], {})
+
     def test_search_matches_native(self):
         """Same seed, position, budget and evaluations: the same actions, visits and policy as the native library."""
         model, games = random_model(1), export_web.histories(every=9)
