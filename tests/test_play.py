@@ -1647,6 +1647,28 @@ class Registry(unittest.TestCase):
             self.assertTrue(set(twins) < set(triple))
             self.assertEqual({triple[k]['path'] for k in twins}, {found['bubble:gamma']['path'], root / 'models/gamma/ema.pt'})
 
+    def test_a_bubble_entry_carries_its_q_range_floor_to_its_searches(self):
+        import play
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'runs/alpha/checkpoints/main/000100').mkdir(parents=True)
+            (root / 'runs/alpha/checkpoints/main/000100/ema.pt').write_bytes(b'')
+            (root / 'models').mkdir()
+            for name, floor in (('flat', .5), ('wrong', 3), ('alpha', 0)):
+                spec = dict(name=name, kind='bubble', path='../runs/alpha', q_range_floor=floor)
+                (root / f'models/{name}.json').write_text(json.dumps(spec))
+            found = scan(root / 'models', root / 'runs', [], None)
+        self.assertEqual(list(found), ['bubble:alpha', 'bubble:flat', 'native:Native'])
+        self.assertNotIn('q_range_floor', found['bubble:alpha'])
+        self.assertEqual(found['bubble:flat']['q_range_floor'], .5)
+        self.assertEqual([play.search_key('ab', e) for e in (found['bubble:alpha'], found['bubble:flat'])], ['ab', 'ab~q0.5'])
+        bubble = unittest.mock.Mock(sha256='ab'*32)
+        with unittest.mock.patch('neural_search.NeuralSearch') as tree:
+            turn = play.TurnSearch(bubble, None, [(0, 0)], 8, play.solve(None, [(0, 0)], 0), q_range_floor=.5)
+            turn.advanced([(0, 0)], 8, None)
+            turn.close()
+        self.assertEqual(tree.call_args.kwargs['q_range_floor'], .5)
+
 
 if __name__ == '__main__':
     unittest.main()

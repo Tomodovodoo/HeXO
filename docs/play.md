@@ -222,6 +222,7 @@ its folder name. Seal also appears when `build/libhexo_seal.dll` (or `.so`) is b
 {"name": "Strix", "kind": "strix", "model": "strix/model.safetensors", "engine": "strix/hexo-strix-learned.exe"}
 {"name": "Seal", "kind": "seal", "library": "seal/hexo_seal.dll"}
 {"name": "old", "kind": "bubble", "path": "../runs/old"}
+{"name": "old-flat", "kind": "bubble", "path": "../runs/old", "q_range_floor": 0.5}
 {"name": "Shrimp", "kind": "six", "mirrored": true, "command": ["python", "shrimp/launch.py", "--threads", "2"],
  "presets": {"quick": {"nodes": 1, "args": ["--visits", "32"]}, "deep": {"nodes": 1, "args": ["--visits", "1024"]}}}
 ```
@@ -229,7 +230,9 @@ its folder name. Seal also appears when `build/libhexo_seal.dll` (or `.so`) is b
 `command` is a list of arguments, run in the models folder; a first argument `python` is the server's own Python.
 `"mirrored": true` is for engines in Six's frame, where HTTTX `(q, r)` is `(q + r, -r)`. `presets` overrides a
 preset's budget; `args` are extra arguments for engines whose strength is set at launch, and `files` lists further
-files a match records the hashes of. Strix's `engine` defaults to `tools/strix_learned/target/release`.
+files a match records the hashes of. Strix's `engine` defaults to `tools/strix_learned/target/release`. A Bubble
+entry's `q_range_floor` (0 to 2) is its searches' Q range floor ([neural-search.md](neural-search.md)), saved under
+its own evaluation key.
 
 Six picks the fastest backend whose libraries it finds: TensorRT, CUDA, DirectML, CPU. The release's engine is the
 DirectML build, which ships `DirectML.dll`. A CUDA build needs ONNX Runtime's GPU DLLs (among them

@@ -22,6 +22,8 @@ Values are stored from the mover's view and flip sign only when the mover change
 
 `NeuralSearch(..., graph=True)` (actor and evaluation setting `search_graph`, off by default) turns the tree into a transposition graph with Monte-Carlo graph search backups, shared proofs by position and `census()` diagnostics; see [search-outcomes.md](search-outcomes.md).
 
+`NeuralSearch(..., q_range_floor=x)` (actor and evaluation setting `q_range_floor`, 0 by default, or a `q_range_floor` field in a Bubble entry's `models/<name>.json` for the play page) rescales the completed Q by at least x instead of its own min-max range, so a root whose moves differ by less than x keeps a flatter target. Without it a spread made of estimation noise gets the same confident target as a real gap: on checkpoint 200000, in the half of 40 positions whose Q spread was below the median of 0.24 (value scale -1 to 1), two independent searches chose different top target moves 25 percent of the time at 128 simulations and 35 percent at 256. A floor of 0.5 raised top-move agreement over all 40 positions from 0.80 to 0.875 at 128 simulations and from 0.825 to 1.00 at 256, still moved the target's top move away from the prior's in 28 percent of them, and picked solver-certified winning moves as often as the plain rescale.
+
 `milliseconds` is a cooperative cap checked between batches. `action` is `None` only when no simulation started.
 
 ## Many games, one evaluator

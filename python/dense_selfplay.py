@@ -214,8 +214,9 @@ class Model:
         self.evaluator = Evaluator(net, device, sha, max_batch, cuda_graphs=cuda_graphs)
         self.cache = EvaluationCache(cache_positions)
 
-    def tree(self, history, seed, tactics, graph=False):
-        return NeuralSearch(self.evaluator, self.sha, history, seed, self.cache, tactics, graph=graph)
+    def tree(self, history, seed, tactics, graph=False, q_range_floor=0.):
+        return NeuralSearch(self.evaluator, self.sha, history, seed, self.cache, tactics, graph=graph,
+                            q_range_floor=q_range_floor)
 
 
 def load(run, config, initial=None, source=None):
@@ -573,7 +574,8 @@ class SelfPlayGame:
         self.forced_plies = len(forced)
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) \
             if settings.opening_random_plies > 0 and restart is None and book is None else 0
-        self.trees = {model: model.tree([tuple(m) for m in forced], seed+k, settings.tactics, settings.search_graph)
+        self.trees = {model: model.tree([tuple(m) for m in forced], seed+k, settings.tactics, settings.search_graph,
+                                        settings.q_range_floor)
                       for k, model in enumerate(dict.fromkeys(sides))}
         self.game, self.moves, self.rows = Game(forced), forced, []
         self.values, self.full = [None]*len(forced), [False]*len(forced)

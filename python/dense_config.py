@@ -39,6 +39,7 @@ class ActorSettings:
     tactics: bool = True         # exact win/must-block classification inside the tree
     search_graph: bool = False   # share transposed turn contexts and proven positions (neural_search graph)
     search_choice: str = 'gumbel'  # final move: Gumbel score or highest improved search policy ('policy')
+    q_range_floor: float = 0.    # least Q range of the completed-Q rescale, 0 to 2 (neural_search); 0 keeps mctx's
     cache_positions: int = 4096
     shard_games: int = 32
     opening_random_plies: float = 2.  # mean of an exponential; sampled from the search policy
@@ -105,6 +106,8 @@ class ActorSettings:
     def __post_init__(self):
         if self.search_choice not in ('gumbel', 'policy'):
             raise ValueError('search_choice must be gumbel or policy')
+        if not 0 <= self.q_range_floor <= 2:
+            raise ValueError('q_range_floor must lie in [0, 2]')
         if self.cheap_root_samples < 1 or self.solver_leaf_nodes < 0:
             raise ValueError('cheap_root_samples must be positive and solver_leaf_nodes nonnegative')
         if self.net_kernels not in ('reference', 'fused'):
@@ -224,6 +227,7 @@ class EvaluationSettings:
     tactics: bool = True
     search_graph: bool = False    # share transposed turn contexts and proven positions (neural_search graph)
     search_choice: str = 'policy'  # final move: highest improved search policy or Gumbel score
+    q_range_floor: float = 0.     # least Q range of the completed-Q rescale, 0 to 2 (neural_search); 0 keeps mctx's
     anchor_every: int = 5         # the champion owes anchor_games more vs Seal per N checkpoints rated during its reign
     anchor_games: int = 100       # champion vs Seal, played before optional work; 0 = never
     anchor_session_games: int = 20  # most Seal anchor games before a pending trial gets its turn
@@ -292,6 +296,8 @@ class EvaluationSettings:
     def __post_init__(self):
         if self.search_choice not in ('gumbel', 'policy'):
             raise ValueError('search_choice must be gumbel or policy')
+        if not 0 <= self.q_range_floor <= 2:
+            raise ValueError('q_range_floor must lie in [0, 2]')
         name = self.external_name
         if self.external_engine and (not name or name == 'seal' or name.rpartition('-')[2].isdigit() or
                                      not name[0].isalpha() or

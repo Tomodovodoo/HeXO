@@ -1,6 +1,6 @@
 {
  "sources": {
-  "src/gumbel.cpp": "38ba3e8ecf6512434148d8fedb59fe3975394af59f2f9f677bed2211ba4762cd",
+  "src/gumbel.cpp": "5c934f129ec0a5e3ef689b324df29055e2d3c341a8b832df87da1d588c10aefe",
   "src/hexo.cpp": "bed15e16f6ce0e704e53b49c5eec01398fc1b4ba51ab6cdb9d4464ae021420ca",
   "src/hexo.hpp": "aa4459c649f17ecc209a892f1522952e4a259385a82d15a48c689f5a975cb520",
   "src/nnue.hpp": "38e657c7fe31028565ff971e34742be42e4c82031ac51f70d558828cfc6e4a54",
@@ -63,8 +63,8 @@
   "tools/shrimp_web/vendor/hexo-bot/packages/shrimp/rust/src/tree.rs": "f7328e5f7929db9c42efedcfd0ae99e97da918aeae8c248f4fdd5beba201e865"
  },
  "artefacts": {
-  "gumbel.mjs": "5bace107d54c423e2d5282b60d838d78013b76b0fe29a9b274d14ae996887d5e",
-  "gumbel.wasm": "0c4fb99d79fd78bd3613063a930a6fb18f22f59b841f5a3509b1d5962f49f77f",
+  "gumbel.mjs": "850e06d732526665636e3b12b72f5e48bb2011668fb86b5bba8c95ce8b33bec9",
+  "gumbel.wasm": "3705735bfc71307e4706edae6ad49b24fa14c424bcc77cb56242f451c4d68f5d",
   "tactical.wasm": "4f38302a4e9b37181ac285135a8c49b2064c64e5d6e02b2e149c32073dbad8f9",
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
   "native/native.wasm": "3005b8b61b84323d7092047bd21a7e00617b0a02522b0f9e8893c16a2a3e8c4f",

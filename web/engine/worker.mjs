@@ -1,6 +1,7 @@
 /* Bubble in a Web Worker: network (network.mjs), native search (gumbel.wasm) and the tactical solver (solver-worker.mjs).
- * In: {type: 'load', options} | {type: 'turn', id, history, simulations, solverNodes, batchSize} | {type: 'cancel', id}
- *     | {type: 'bench', id, batches, sizes, repeats} | {type: 'search', id, history, simulations, batchSize}
+ * In: {type: 'load', options} | {type: 'turn', id, history, simulations, solverNodes, batchSize, qRangeFloor}
+ *     | {type: 'cancel', id} | {type: 'bench', id, batches, sizes, repeats}
+ *     | {type: 'search', id, history, simulations, batchSize, qRangeFloor}
  *     | {type: 'evaluate', id, histories}.
  * Out: {type: 'progress', id?, fraction} | {type: 'ready', device} | {type: 'result', id, result} | {type: 'cancelled', id}
  *     | {type: 'error', id?, message}.
@@ -80,7 +81,7 @@ function proofTurns(plies, remaining, moverWins) {
 }
 
 /** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms). */
-async function turn({id, history, simulations, solverNodes, batchSize = 16, choice = 'policy'}) {
+async function turn({id, history, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0}) {
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
@@ -110,7 +111,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
     for (let local = native.game(current); !given && local.player === player && local.winner < 0; local = native.game(current)) {
       let action, policy, actions, stoneValue, values = null;
       if (simulations) {
-        tree ??= new NeuralSearch(native, {seed: 1740, tactics: true, history: current});
+        tree ??= new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current});
         const stone = moves.length;
         const result = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
           evaluate: leaves => network.evaluate(leaves), stop: () => cancelled.has(id),
@@ -203,7 +204,7 @@ onmessage = async ({data}) => {
       postMessage({type: 'result', id: data.id, result: predictions.map((p, i) => ({actions: leaves[i].actions, logits: Array.from(p.logits), q: Array.from(p.q)}))});
     }
     else if (data.type === 'search') {
-      const tree = new NeuralSearch(native, {seed: 1740, tactics: true, history: data.history});
+      const tree = new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor: data.qRangeFloor ?? 0, history: data.history});
       try {
         const result = await tree.search({simulations: data.simulations, rootSamples: 16, batchSize: data.batchSize ?? 16,
           choice: data.choice ?? 'policy',
