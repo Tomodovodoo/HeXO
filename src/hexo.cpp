@@ -90,7 +90,21 @@ struct WindowTable {
 };
 constexpr int powers[]={1,3,9,27,81,243};
 constexpr int weight[]={0,1,12,150,2400,24000,1000000};
-int value(Counts c) { return c[1]==0 ? weight[c[0]] : c[0]==0 ? -weight[c[1]] : 0; }
+struct CountScore { int value=0;std::array<int,2> gain{};bool promising=false; };
+constexpr auto count_scores=[] {
+    std::array<CountScore,64> result{};
+    for(int a=0;a<=6;++a) for(int b=0;b<=6;++b) {
+        auto& out=result[a+8*b];
+        out.value=b==0?weight[a]:a==0?-weight[b]:0;
+        out.promising=(a>=2 && b==0) || (b>=2 && a==0);
+        if(a+b>=6) continue;
+        if(!b) {out.gain[0]+=weight[a+1]-weight[a];out.gain[1]+=(weight[a+1]-weight[a])*3/4;}
+        if(!a) {out.gain[1]+=weight[b+1]-weight[b];out.gain[0]+=(weight[b+1]-weight[b])*3/4;}
+    }
+    return result;
+}();
+const CountScore& count_score(Counts n) {return count_scores[n[0]+8*n[1]];}
+int value(Counts c) { return count_score(c).value; }
 struct Pressure {
     int64_t raw=0;
     std::array<Cell,2> common{};
@@ -169,6 +183,7 @@ struct CandidateCache {
     std::unordered_map<Cell,uint32_t,CellHash> outside;
     size_t count=0;
     std::array<int,2> empty_gain{};
+    bool adjusted=false;
     static int index(Cell c) {
         if(c.q < -64 || c.q>=64 || c.r < -64 || c.r>=64) return -1;
         return int((c.q+64)*128+c.r+64);
@@ -205,16 +220,13 @@ struct Board {
     std::array<int64_t,2> stone_counts{};
     CandidateCache* candidates=nullptr;
     static int count_gain(Counts n,int p) {
-        int result=0;
-        if(n[1-p]==0) result+=weight[n[p]+1]-weight[n[p]];
-        if(n[p]==0) result+=(weight[n[1-p]+1]-weight[n[1-p]])*3/4;
-        return result;
+        return count_score(n).gain[p];
     }
     int window_gain(Counts n,int pattern,int k,int p) const {
         int delta=adjustment[pattern+(p+1)*powers[k]]-adjustment[pattern];
         return count_gain(n,p)+(p==0?delta:-delta);
     }
-    static bool promising(Counts n) { return (n[0]>=2 && !n[1]) || (n[1]>=2 && !n[0]); }
+    static bool promising(Counts n) { return count_score(n).promising; }
     void candidate_nearby(Cell c,int delta) {
         if(!candidates) return;
         candidates->get(c).occupied=delta>0;
@@ -337,15 +349,24 @@ struct Board {
                                                    count_gain(n,1)-count_gain(old_counts,1)};
                 const int pattern_delta=adjustment[old_pattern]-adjustment[pattern];
                 const int line_delta=int(promising(n))-int(promising(old_counts));
-                for(unsigned gaps=data.empty & ~(1u<<k);gaps;gaps&=gaps-1) {
-                    int j=std::countr_zero(gaps);
-                    auto& item=candidates->get(w.start+axes[d]*j);
-                    for(int side=0;side<2;++side) {
-                        int change=adjustment[pattern+(side+1)*powers[j]]-
-                                   adjustment[old_pattern+(side+1)*powers[j]]+pattern_delta;
-                        item.gain[side]+=gain_delta[side]+(side==0?change:-change);
+                if(candidates->adjusted) {
+                    for(unsigned gaps=data.empty & ~(1u<<k);gaps;gaps&=gaps-1) {
+                        int j=std::countr_zero(gaps);
+                        auto& item=candidates->get(w.start+axes[d]*j);
+                        for(int side=0;side<2;++side) {
+                            int change=adjustment[pattern+(side+1)*powers[j]]-
+                                       adjustment[old_pattern+(side+1)*powers[j]]+pattern_delta;
+                            item.gain[side]+=gain_delta[side]+(side==0?change:-change);
+                        }
+                        item.lines+=line_delta;
                     }
-                    item.lines+=line_delta;
+                } else if(gain_delta[0] || gain_delta[1] || line_delta) {
+                    for(unsigned gaps=data.empty & ~(1u<<k);gaps;gaps&=gaps-1) {
+                        const int j=std::countr_zero(gaps);
+                        auto& item=candidates->get(w.start+axes[d]*j);
+                        item.gain[0]+=gain_delta[0];item.gain[1]+=gain_delta[1];
+                        item.lines+=line_delta;
+                    }
                 }
             }
             if(pattern) ++features[pattern];
@@ -505,6 +526,7 @@ struct CandidateGuard {
     Board& b;CandidateCache cache;
     explicit CandidateGuard(Board& board):b(board) {
         if(b.model) return;
+        cache.adjusted=std::any_of(b.adjustment.begin(),b.adjustment.end(),[](int n){return n!=0;});
         for(int p=0;p<2;++p) for(int k=0;k<6;++k) cache.empty_gain[p]+=3*b.window_gain({},0,k,p);
         cache.reserve(b.cells.size()*12+128);
         for(auto [c,p]:b.cells) {
@@ -617,11 +639,9 @@ struct Search {
     }
     static std::vector<Cell> select_candidates(Board& b,RankedCells ranked,int limit) {
         const auto better=[](const auto& a,const auto& z){ return a.first!=z.first ? a.first>z.first : a.second<z.second; };
-        if(int(ranked.size())>limit) {
-            std::nth_element(ranked.begin(),ranked.begin()+limit,ranked.end(),better);
-            ranked.resize(limit);
-        }
-        std::sort(ranked.begin(),ranked.end(),better);
+        const auto count=std::min(ranked.size(),size_t(limit));
+        std::partial_sort(ranked.begin(),ranked.begin()+count,ranked.end(),better);
+        ranked.resize(count);
         std::vector<Cell> out;
         for(int i=0;i<std::min(limit,int(ranked.size()));++i) out.push_back(ranked[i].second);
         // Tactical cells cannot be removed by ordinary move ordering.
