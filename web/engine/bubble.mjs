@@ -44,7 +44,8 @@ export class BubbleEngine {
   /**
    * Starts the worker and loads the model; `progress(fraction)` reports loading. Resolves to the chosen device. When
    * the thread count was left to the loader and the runtime has not come up READY_MS after the downloads finished
-   * (its thread workers never start on some hosts), the worker is replaced by one running on a single thread.
+   * (its thread workers never start on some hosts), the worker is replaced by one running on a single thread; a
+   * further download (the WebAssembly runtime after a failed WebGPU start) suspends that watchdog.
    */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
@@ -64,15 +65,15 @@ export class BubbleEngine {
       let timer = null;
       const threaded = this.options.threads === null && defaultThreads({isolated: Boolean(globalThis.crossOriginIsolated),
         cores: navigator.hardwareConcurrency || 2}) > 1;   // a single-threaded start has nothing to fall back to
-      const stall = () => {
+      const stall = armed => {   // the worker reports below .95 while downloading, at .95 while the runtime starts
         clearTimeout(timer);
-        if (threaded) timer = setTimeout(() => { if (this.worker === worker) { worker.terminate(); reject(STALLED); } }, READY_MS);
+        if (armed && threaded) timer = setTimeout(() => { if (this.worker === worker) { worker.terminate(); reject(STALLED); } }, READY_MS);
       };
       this.abandon = reject;
       worker.onmessage = ({data}) => {
         if (data.type === 'ready') { clearTimeout(timer); this.device = data.device; resolve(data.device); return; }
         if (data.id === undefined) {
-          if (data.type === 'progress') { progress(data.fraction); if (data.fraction >= .95) stall(); }
+          if (data.type === 'progress') { progress(data.fraction); stall(data.fraction >= .95); }
           else if (data.type === 'error') { clearTimeout(timer); reject(new Error(data.message)); }
           return;
         }
