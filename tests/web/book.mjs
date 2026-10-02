@@ -1,6 +1,7 @@
 // Node runner for tests/test_web_engine.py: reads one JSON job from stdin, writes one JSON answer to stdout.
-// {kind: 'follow', enabled, available, stored, steps: [[path, body]]} -> {requests: [[path, body]], enabled, stored}
+// {kind: 'follow', enabled, available, stored, steps: [[path, body]], together} -> {requests: [[path, body]], enabled, stored}
 //   drives web/engine/book.mjs on a stand-in play server whose page plays 'browser:bubble' seats itself, as seat.mjs does
+//   and answers /book later than /seat; `together` sends every step at once instead of one after another
 // {kind: 'offline', steps: [[path, body]]} -> [path] of every request an OfflineSession answered
 import {readFileSync} from 'node:fs';
 import {followSeats} from '../../web/engine/book.mjs';
@@ -20,7 +21,10 @@ if (job.kind === 'follow') {
       const mine = body.engine === 'browser:bubble';
       mine ? browser.add(body.side) : browser.delete(body.side);
       state = {...state, seats: state.seats.map((seat, side) => side === body.side ? {engine: mine ? 'human' : body.engine} : seat)};
-    } else if (path === '/book') state = {...state, book: {...state.book, enabled: body.enabled}};
+    } else if (path === '/book') {
+      await new Promise(done => setTimeout(done, 20));
+      state = {...state, book: {...state.book, enabled: body.enabled}};
+    }
     return state;
   }};
 } else {
@@ -35,5 +39,6 @@ if (job.kind === 'follow') {
   }};
 }
 followSeats(page, () => state, human, storage);
-for (const [path, body] of job.steps) await page.post(path, body);
+if (job.together) await Promise.all(job.steps.map(([path, body]) => page.post(path, body)));
+else for (const [path, body] of job.steps) await page.post(path, body);
 process.stdout.write(JSON.stringify(job.kind === 'follow' ? {requests, enabled: state.book.enabled, stored: stored.get('book-touched') ?? null} : requests));

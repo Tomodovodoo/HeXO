@@ -83,8 +83,8 @@ def page(job):
 @unittest.skipUnless(NODE, 'needs node')
 class PlayPage(unittest.TestCase):
     """The opening-book default follows the seats as the page shows them until the person touches the switch."""
-    def follow(self, steps, enabled=True, available=True, stored=None):
-        return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored))
+    def follow(self, steps, enabled=True, available=True, stored=None, together=False):
+        return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored, together=together))
 
     def books(self, answer):
         return [body['enabled'] for path, body in answer['requests'] if path == '/book']
@@ -107,6 +107,11 @@ class PlayPage(unittest.TestCase):
     def test_a_browser_seat_counts_as_an_engine(self):
         answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=1, engine='browser:bubble')],
                               ['/seat', dict(side=0, engine='browser:bubble')]])
+        self.assertEqual(self.books(answer), [False, True])
+        self.assertTrue(answer['enabled'])
+
+    def test_quick_seat_changes_end_on_the_last_seats(self):
+        answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=0, engine='native')]], together=True)
         self.assertEqual(self.books(answer), [False, True])
         self.assertTrue(answer['enabled'])
 
