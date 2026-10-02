@@ -65,6 +65,13 @@ function proofTurns(plies, remaining, moverWins) {
   return Math.ceil((plies - remaining) / 4);
 }
 
+/** A `top` row as python/play.py move_row: [q, r, probability], then from a search the mover's win probability after
+ * the stone and 1 or -1 when the search proved that it wins or loses, else 0. */
+function moveRow([q, r], probability, value) {
+  const row = [q, r, Math.round(probability * 1e4) / 1e4];
+  return value === undefined ? row : [...row, Math.round((value + 1) / 2 * 1e4) / 1e4, value >= 1 ? 1 : value <= -1 ? -1 : 0];
+}
+
 /** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, line, threat, solved, ms). */
 async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
@@ -119,8 +126,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
       }
       if (!moves.length) {
         top = policy.map((p, i) => i).sort((a, b) => policy[b] - policy[a]).slice(0, 5)
-          .map(i => [actions[i][0], actions[i][1], Math.round(policy[i] * 1e4) / 1e4,
-            ...(values ? [Math.round((values[i] + 1) / 2 * 1e4) / 1e4] : [])]);
+          .map(i => moveRow(actions[i], policy[i], values?.[i]));
         value = (stoneValue + 1) / 2;
       }
       moves.push([action[0], action[1]]);
