@@ -199,7 +199,7 @@ python -m unittest tests.test_web_seal
 `build_web.py seal` downloads Seal's four headers at the revision pinned in `tools/engines.json`, checks each
 against its SHA-256 and compiles them with `tools/seal_adapter.cpp`, the server's adapter, using the same em++ flags
 as `gumbel.wasm`. The headers are never committed; the Pages workflow installs emsdk 6.0.10 and builds Seal on every
-deployment. HexTicTacToe has no licence file; this site serves the compiled Seal regardless.
+deployment. HexTicTacToe has no licence file; its author allows this use, so the site serves the compiled Seal.
 
 The wasm is 115 KB and its glue 10 KB. The worker fetches `seal/manifest.json`, then the wasm from the Cache API
 under its SHA-256, and calls `seal_move` exactly as the server does; Seal's clock is `performance.now()` in the

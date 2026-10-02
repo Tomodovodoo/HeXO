@@ -12,9 +12,9 @@
  * entry lists any, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
  * evaluation record the analysis panel shows for that turn. */
 import {BubbleEngine, PRESETS, isolate} from './bubble.mjs';
-import {OfflineSession} from './offline.mjs';
 import {native} from './native.mjs';
 import {shrimp} from './shrimp.mjs';
+import {mountPlay} from './browser-play.mjs';
 import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 import {strix} from './strix.mjs';
@@ -282,8 +282,7 @@ function install() {
 }
 
 /**
- * Without a play server (a static host) the page's server requests are answered by an OfflineSession, server-only
- * controls are hidden, Bubble (browser) takes seat O and analysis, and the page asks for cross-origin isolation.
+ * Without a play server (a static host), mount the browser Play session and ask for cross-origin isolation.
  * Resolves true when it took over (or is reloading for isolation).
  */
 async function serverless() {
@@ -292,25 +291,16 @@ async function serverless() {
     if (response.ok && (response.headers.get('Content-Type') || '').includes('json')) return false;
   } catch {}
   if (await isolate()) return true;
-  const session = await OfflineSession.create({engine: BUBBLE, preset: 'quick', budget: PRESETS.quick});
-  const server = globalThis.fetch;
-  globalThis.fetch = (input, init) => {
-    const url = new URL(typeof input === 'string' ? input : input.url, location.href);
-    if (url.origin !== location.origin || !OfflineSession.handles(url.pathname)) return server(input, init);
-    const [status, data] = session.answer(url.pathname, init?.body ? JSON.parse(init.body) : {});
-    return Promise.resolve(new Response(JSON.stringify(data), {status, headers: {'Content-Type': 'application/json'}}));
-  };
-  if (fresh) config.seats = [null, {engine: BUBBLE, preset: 'standard'}];
-  config.analysis ??= {engine: BUBBLE, preset: 'quick'};
-  save();
-  document.head.append(original.el('style', {}, ['#review-go', '#copy', '#more', '#import', '[aria-label="Tournaments"]']
-    .map(selector => `.serverless ${selector}`).join(',') + '{display:none!important}'));
-  document.documentElement.classList.add('serverless');
-  page.accept(session.state());
+  Object.assign(page, original);
+  const [manifest, build] = await Promise.all(['model/manifest.json', 'build.json'].map(async path => (await fetch(new URL(path, import.meta.url), {cache:'no-cache'})).json()));
+  bubble.entry.version = [manifest.model_version, build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
+  native.entry.version = build.artefacts['native/native.wasm'];
+  for (const {entry} of ENGINES.values()) entry.version ||= JSON.stringify(build.artefacts);
+  await mountPlay(ENGINES, config);
   return true;
 }
 
 if (HOOKS.every(name => typeof original[name] === 'function')) {
   install();
-  serverless();
+  serverless().then(active=>{if(!active||page.browserPlay)page.resolvePlayReady?.()}).catch(error=>{original.toast(error.message)});
 } else console.warn('The browser engines need the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));
