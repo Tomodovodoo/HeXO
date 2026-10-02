@@ -134,7 +134,7 @@ class PUCTSearch:
         node.actions = result['actions']
         node.prior = np.exp(prediction['logits']-np.max(prediction['logits']))
         node.prior /= node.prior.sum()
-        node.value = float(np.mean(prediction['q']))
+        node.value = float(np.dot(node.prior, prediction['q']))
         node.visits = np.zeros(len(node.actions), np.int64)
         node.sums = np.zeros(len(node.actions))
         node.eligible = result['policy'] > 0

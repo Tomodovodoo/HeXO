@@ -17,6 +17,20 @@ class Uniform:
         return out
 
 class NeuralTree(unittest.TestCase):
+    def test_puct_initial_value_uses_policy_weighted_action_values(self):
+        from puct_search import PUCTSearch
+        search = PUCTSearch(Uniform(), 'puct-weighted', [(0, 0)], cache=EvaluationCache(64))
+        self.addCleanup(search.close)
+        search.begin(1)
+        request = search.request()
+        prediction = search.evaluator.evaluate([request[0].history])[0]
+        count = len(prediction['actions'])
+        prediction['logits'][0] = np.log(9*(count-1))
+        prediction['q'][:] = -1.
+        prediction['q'][0] = 1.
+        search.fulfill(request, prediction)
+        self.assertAlmostEqual(search.root.value, .8)
+
     def test_puct_backup_keeps_sign_within_turn_and_flips_between_turns(self):
         from puct_search import PUCTSearch, search_many
         class Positive(Uniform):

@@ -5320,6 +5320,12 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(evaluator.step())
         self.assertIsNotNone(evaluator.entry('main/000030'))
         self.assertFalse(any('@' in cid for cid in evaluator.models))
+        with unittest.mock.patch.object(sys, 'argv', argv[:-1]+['cuda']), self.assertRaisesRegex(ValueError, 'device differs'):
+            compare_search_modes.main()
+        weights = self.run/'checkpoints/main/000010/ema.pt'
+        weights.write_bytes(weights.read_bytes()+b'changed')
+        with self.assertRaisesRegex(ValueError, 'checkpoint weights differ'):
+            compare_search_modes.publish(self.run, state)
 
     def setUp(self):
         self.threads = torch.get_num_threads()

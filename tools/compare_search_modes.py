@@ -30,8 +30,8 @@ import dense_eval
 import dense_openings
 import dense_selfplay
 import hexnet
-from hexo import Game
-from neural_search import NeuralSearch, SearchCoordinator
+from hexo import Game, library
+from neural_search import NeuralSearch, SearchCoordinator, native
 from puct_search import PUCTSearch, search_many
 from legacy.train import write_json
 
@@ -101,6 +101,10 @@ def jobs(state):
 
 def publish(run, state):
     """Import archived reports and rating-only variants through the evaluator's existing request directory."""
+    for checkpoint, sha in state['models'].items():
+        path = run/'checkpoints'/checkpoint/'ema.pt'
+        if hashlib.sha256(path.read_bytes()).hexdigest() != sha:
+            raise ValueError('Target run checkpoint weights differ from the comparison')
     ids = {'gumbel': state['checkpoint'], **{m: state['checkpoint']+'@'+state['names'][m] for m in ('puct', 'policy')}}
     reports = []
     for a, b in itertools.combinations(MODES, 2):
@@ -172,7 +176,7 @@ def main():
         raise ValueError('games must be a positive colour-balanced pair count')
     if args.out.exists():
         state = json.loads(args.out.read_text(encoding='utf-8'))
-        for key in ('checkpoint', 'opponent', 'games', 'sims', 'root_samples', 'max_plies', 'cpuct'):
+        for key in ('checkpoint', 'opponent', 'games', 'sims', 'root_samples', 'max_plies', 'cpuct', 'device'):
             if state[key] != getattr(args, key):
                 raise ValueError(f'{key} differs from the saved batch')
     else:
@@ -187,7 +191,8 @@ def main():
                      cases=json.loads(args.panel.read_text(encoding='utf-8'))['cases'],
                      openings=[book.draw(s) for s in seeds], seeds=seeds, book_digest=book.digest(),
                      names={m: f'{m}-{args.sims}-{batch_id[:8]}' for m in ('policy', 'puct')}, results=[], models={},
-                     native={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'build').glob('*.dll')},
+                     native={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                             for p in (library, Path(native._name))},
                      external_solver=False, graph=True, tactics=True, device=args.device, complete=False)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         write_json(args.out, state)

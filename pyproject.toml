@@ -36,6 +36,7 @@ py-modules = [
   "hexnet_kernels",
   "hexo",
   "neural_search",
+  "puct_search",
   "notation",
   "play",
   "process_tree",
