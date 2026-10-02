@@ -37,7 +37,8 @@ to the site's path, adds the cross-origin isolation headers after one reload.
 | `web/engine/search.mjs` | `hxg_*` driver: the `neural_search` loop, evaluation cache, root statistics |
 | `web/engine/tactical.mjs`, `solver-worker.mjs` | Solver with a WASI shim, in a worker that a cancel terminates |
 | `web/engine/proof.mjs` | Certificate walk for the winning line |
-| `web/engine/seat.mjs` | Play page hook: the browser seat and analysis engine |
+| `web/engine/engines.mjs` | The browser engines the page offers, and the interface each one implements |
+| `web/engine/seat.mjs` | Play page hook: browser seats and the browser analysis engine, for every engine in `engines.mjs` |
 | `web/engine/offline.mjs` | The play server's game requests answered in the page, for static hosting |
 | `web/coi-sw.js` | Cross-origin isolation on static hosts (`isolate()`), for WebAssembly threads |
 

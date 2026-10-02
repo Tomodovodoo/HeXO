@@ -1,7 +1,11 @@
 """Build the browser engine bundle in web/engine.
 
-wasm   src/gumbel.cpp -> gumbel.mjs + gumbel.wasm (em++ on PATH, or --emxx), tools/tactical -> tactical.wasm
-       (cargo with the wasm32-wasip1 target); build.json binds them to their sources (committed).
+wasm   src/gumbel.cpp -> gumbel.mjs + gumbel.wasm (em++ on PATH, or --emxx), tools/tactical -> tactical.wasm and
+       tools/strix_web -> strix/strix.wasm (cargo with the wasm32-wasip1 target); build.json binds them to their
+       sources (committed).
+strix  only tools/strix_web -> strix/strix.wasm, refreshing its entries in build.json.
+strix-network  the Strix network pinned in tools/engines.json (hexo.tyto.cc's pulsatrix-10-best, licence unstated)
+       into strix/ with strix/networks.json (ignored). Without it the page does not offer Strix (browser).
 ort    onnxruntime-web from the npm registry, checked against its published integrity, into ort/ (ignored).
 model  --checkpoint ema.pt, or --release TAG (or 'latest') from the GitHub releases, exported by export_web into
        model/ (ignored).
@@ -11,6 +15,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -22,6 +27,8 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT/'web'/'engine'
 TACTICAL = ROOT/'tools'/'tactical'
+STRIX = ROOT/'tools'/'strix_web'
+STRIX_NETWORK = 'pulsatrix-10-best'
 ORT_VERSION = '1.30.0'
 ORT_INTEGRITY = 'sha512-q0y+JrrtukXSzsBWEMccVfqX25LRmosXHF+CaRJmg8pZClzcV7svNc4rKY3jL02Vb7QmRMDs1SigqR4CXAfKYQ=='
 ORT_FILES = ('ort.webgpu.min.mjs', 'ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.asyncify.wasm',
@@ -30,6 +37,7 @@ GUMBEL_EXPORTS = ('malloc', 'free', 'hxg_new', 'hxg_free', 'hxg_error', 'hxg_beg
                   'hxg_legal', 'hxg_fulfill', 'hxg_cancel', 'hxg_advance', 'hxg_stats', 'hxg_policy', 'hxg_completed',
                   'hxg_done', 'hxg_tactics', 'hxg_graph', 'hxg_exact', 'hxg_distance', 'hxg_census',
                   'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_moves')
+ARTEFACTS = ('gumbel.mjs', 'gumbel.wasm', 'tactical.wasm', 'strix/strix.wasm')
 GUMBEL_FLAGS = ['-std=c++20', '-O3', '-fwasm-exceptions', '-msimd128', '-sMODULARIZE', '-sEXPORT_ES6',
                 '-sENVIRONMENT=web,worker,node', '-sALLOW_MEMORY_GROWTH', '-sMAXIMUM_MEMORY=4GB', '-sFILESYSTEM=0',
                 '-sEXPORTED_RUNTIME_METHODS=HEAP32,HEAPF64,HEAPU8,UTF8ToString']
@@ -44,7 +52,27 @@ def sources():
     """{relative path: sha256} of every source the wasm artefacts are built from."""
     paths = [ROOT/'src'/name for name in ('gumbel.cpp', 'hexo.cpp', 'hexo.hpp', 'nnue.hpp')]
     paths += sorted(p for p in TACTICAL.rglob('*') if p.suffix in ('.rs', '.toml', '.lock') and 'target' not in p.parts)
+    paths += [STRIX/'Cargo.toml', STRIX/'Cargo.lock', STRIX/'src'/'lib.rs']
     return {p.relative_to(ROOT).as_posix(): digest(p) for p in paths}
+
+
+def cargo_wasm(cargo, manifest, crate, out, rustflags=''):
+    """Builds `crate` of `manifest` for wasm32-wasip1 (release, locked) into `out`."""
+    with tempfile.TemporaryDirectory() as target:
+        command = [cargo, 'build', '--release', '--locked', '--lib', '--target', 'wasm32-wasip1',
+                   '--manifest-path', str(manifest), '--target-dir', target]
+        subprocess.run(command, check=True, env={**os.environ, 'RUSTFLAGS': rustflags})
+        shutil.copyfile(Path(target)/'wasm32-wasip1'/'release'/f'{crate}.wasm', out)
+
+
+def build_strix(cargo):
+    """strix/strix.wasm with SIMD (every current browser has it); returns the sources it was built from."""
+    before = sources()
+    (ENGINE/'strix').mkdir(exist_ok=True)
+    cargo_wasm(cargo, STRIX/'Cargo.toml', 'hexo_strix_web', ENGINE/'strix'/'strix.wasm', '-C target-feature=+simd128')
+    if sources() != before:
+        raise ValueError('Sources changed during the build')
+    return before
 
 
 def build_wasm(emxx, cargo):
@@ -53,18 +81,38 @@ def build_wasm(emxx, cargo):
     gumbel = [emxx, str(ROOT/'src'/'gumbel.cpp'), '-I', str(ROOT/'src'), *GUMBEL_FLAGS,
               f'-sEXPORTED_FUNCTIONS={exports}', '-o', str(ENGINE/'gumbel.mjs')]
     subprocess.run(gumbel, check=True)
-    with tempfile.TemporaryDirectory() as target:
-        tactical = [cargo, 'build', '--release', '--locked', '--lib', '--target', 'wasm32-wasip1',
-                    '--manifest-path', str(TACTICAL/'Cargo.toml'), '--target-dir', target]
-        subprocess.run(tactical, check=True)
-        shutil.copyfile(Path(target)/'wasm32-wasip1'/'release'/'hexo_tactical.wasm', ENGINE/'tactical.wasm')
-    if sources() != before:
+    cargo_wasm(cargo, TACTICAL/'Cargo.toml', 'hexo_tactical', ENGINE/'tactical.wasm')
+    if build_strix(cargo) != before:
         raise ValueError('Sources changed during the build')
     tools = dict(emxx=subprocess.check_output([emxx, '--version'], text=True).splitlines()[0],
                  cargo=subprocess.check_output([cargo, '--version'], text=True).strip())
-    record = dict(sources=before, artefacts={name: digest(ENGINE/name) for name in ('gumbel.mjs', 'gumbel.wasm', 'tactical.wasm')},
-                  tools=tools)
+    record = dict(sources=before, artefacts={name: digest(ENGINE/name) for name in ARTEFACTS}, tools=tools)
     (ENGINE/'build.json').write_text(json.dumps(record, indent=1)+'\n', encoding='utf-8')
+
+
+def refresh_strix(cargo):
+    """Rebuilds only strix/strix.wasm and rewrites its source and artefact entries in build.json."""
+    built = build_strix(cargo)
+    record = json.loads((ENGINE/'build.json').read_text(encoding='utf-8'))
+    strix = STRIX.relative_to(ROOT).as_posix()+'/'
+    record['sources'] = {**{k: v for k, v in record['sources'].items() if not k.startswith(strix)},
+                         **{k: v for k, v in built.items() if k.startswith(strix)}}
+    record['artefacts']['strix/strix.wasm'] = digest(ENGINE/'strix'/'strix.wasm')
+    record['tools']['cargo'] = subprocess.check_output([cargo, '--version'], text=True).strip()
+    (ENGINE/'build.json').write_text(json.dumps(record, indent=1)+'\n', encoding='utf-8')
+
+
+def build_strix_network():
+    """The Strix network pinned in tools/engines.json into strix/<id>.safetensors and strix/networks.json."""
+    model = json.loads((ROOT/'tools'/'engines.json').read_text(encoding='utf-8'))['strix']['model']
+    data = fetch(model['url'])
+    if len(data) != model['size'] or hashlib.sha256(data).hexdigest() != model['sha256']:
+        raise ValueError(f"{model['url']} does not match the SHA-256 pinned in tools/engines.json")
+    out = ENGINE/'strix'
+    (out/f'{STRIX_NETWORK}.safetensors').write_bytes(data)
+    networks = [dict(id=STRIX_NETWORK, file=f'{STRIX_NETWORK}.safetensors', sha256=model['sha256'], size=model['size'],
+                     source=model['url'], licence='unstated')]
+    (out/'networks.json').write_text(json.dumps(dict(networks=networks), indent=1)+'\n', encoding='utf-8')
 
 
 def fetch(url):
@@ -98,7 +146,7 @@ def build_model(checkpoint, release):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('parts', nargs='+', choices=('wasm', 'ort', 'model'))
+    parser.add_argument('parts', nargs='+', choices=('wasm', 'strix', 'strix-network', 'ort', 'model'))
     parser.add_argument('--emxx', default=shutil.which('em++') or 'em++')
     parser.add_argument('--cargo', default='cargo')
     parser.add_argument('--checkpoint', type=Path)
@@ -106,6 +154,10 @@ def main():
     args = parser.parse_args()
     if 'wasm' in args.parts:
         build_wasm(args.emxx, args.cargo)
+    elif 'strix' in args.parts:
+        refresh_strix(args.cargo)
+    if 'strix-network' in args.parts:
+        build_strix_network()
     if 'ort' in args.parts:
         build_ort()
     if 'model' in args.parts:

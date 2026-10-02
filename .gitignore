@@ -12,3 +12,5 @@ target/
 models/
 web/engine/ort/
 web/engine/model/
+web/engine/strix/*.safetensors
+web/engine/strix/networks.json

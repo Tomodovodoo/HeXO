@@ -7,9 +7,11 @@
 const MAX_NODES = 10000000, MAX_TABLE_MB = 256, REQUEST_LIMIT = 64 * 1024 * 1024;
 const ENOSYS = 52, EINVAL = 28;
 
-class Exit extends Error {}
+/** Thrown by the shim's proc_exit. */
+export class Exit extends Error {}
 
-function wasi(state) {
+/** The WASI preview1 calls a wasm32-wasip1 library uses, over `state.memory`; stderr goes to console.error. */
+export function wasi(state) {
   const view = () => new DataView(state.memory.buffer);
   const zeroSizes = (count, size) => { view().setUint32(count, 0, true); view().setUint32(size, 0, true); return 0; };
   return {
@@ -36,12 +38,13 @@ function wasi(state) {
     environ_sizes_get: zeroSizes,
     args_get: () => 0,
     args_sizes_get: zeroSizes,
-    proc_exit(code) { throw new Exit(`tactical module exited with ${code}`); },
+    proc_exit(code) { throw new Exit(`wasm module exited with ${code}`); },
     sched_yield: () => 0,
   };
 }
 
-async function compile(source) {
+/** [WebAssembly.Module, SHA-256 hex of its bytes or null] from a URL string (file: in node), Response, bytes or Module. */
+export async function compile(source) {
   if (source instanceof WebAssembly.Module) return [source, null];
   let bytes;
   if (typeof source === 'string') {
