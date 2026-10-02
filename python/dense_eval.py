@@ -47,17 +47,17 @@ def anchor_engine(settings):
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
 # Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
-PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'search_graph', 'search_choice', 'opening_suite', 'opening_book', 'seal_ms',
+PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'search_graph', 'search_choice', 'q_range_floor', 'opening_suite', 'opening_book', 'seal_ms',
             'external_engine', 'external_name',
             'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes',
             'solver_defence', 'solver_defence_candidates', 'solver_gate_cap_nodes', 'pipeline')
-PROTOCOL_DEFAULTS = dict(opening_book='', search_graph=False, search_choice='gumbel', external_engine='', external_name='seal', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
+PROTOCOL_DEFAULTS = dict(opening_book='', search_graph=False, search_choice='gumbel', q_range_floor=0., external_engine='', external_name='seal', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
                          solver_threat_nodes=0, solver_defence=False, solver_defence_candidates=8,
                          solver_gate_cap_nodes=0, pipeline=False)
 CHAMPION = 'champion'  # the symbolic base of a variant, bound to the champion when its comparison starts
 # The PROTOCOL fields of one side's search, which a variant may override; max_plies, opening_suite, seal_ms
 # and opening_book belong to the game.
-SIDE = ('sims', 'root_samples', 'tactics', 'search_graph', 'search_choice', 'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes',
+SIDE = ('sims', 'root_samples', 'tactics', 'search_graph', 'search_choice', 'q_range_floor', 'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes',
         'solver_threat_nodes', 'solver_defence', 'solver_defence_candidates')
 REMATCH_SPRT_LIMIT = 2    # a continued champion SPRT stops at this many times sprt_max_games
 CALIBRATION_LATER = 3     # later comparisons of a decided checkpoint before `calibration` counts its verdict
@@ -76,24 +76,28 @@ class MatchGame:
     colour; solvers[colour] is that colour's dense_solver.Budgets (None: off). graphs, one value or a pair, selects
     graph search per colour. A model playing both colours with one graph setting shares one tree, searched with the
     first such colour's tactics. choices, one value or a pair, selects the final move per colour; 'policy'
-    takes the largest improved policy at unproven roots. Exact roots keep their shortest win or longest resistance."""
+    takes the largest improved policy at unproven roots. Exact roots keep their shortest win or longest resistance.
+    floors, one value or a pair, is each colour's q_range_floor (neural_search); colours share a tree only when
+    their graph and floor settings agree."""
 
     def __init__(self, sides, opening, seed, sims, samples, tactics, max_plies, record, seal=None, seal_ms=0,
-                 solvers=(None, None), anchor=SEAL, graphs=False, choices='policy'):
+                 solvers=(None, None), anchor=SEAL, graphs=False, choices='policy', floors=0.):
         self.sides, self.max_plies, self.seal, self.seal_ms, self.record = sides, max_plies, seal, seal_ms, record
         self.anchor = anchor
         self.solvers = solvers
         self.reason, self.error = None, None
         per = lambda value: tuple(value) if isinstance(value, (tuple, list)) else (value, value)
         self.budgets, self.sample_counts, tactics, self.graphs = per(sims), per(samples), per(tactics), per(graphs)
-        self.choices = per(choices)
+        self.choices, self.floors = per(choices), per(floors)
         self.game, self.moves = Game([tuple(m) for m in opening]), [list(m) for m in opening]
         self.trees = {}
         for colour, side in enumerate(sides):
-            key = id(side), self.graphs[colour]
+            key = id(side), self.graphs[colour], self.floors[colour]
             if side != self.anchor and key not in self.trees:
                 args = [tuple(m) for m in opening], seed*2+colour, tactics[colour]
-                self.trees[key] = side.tree(*args, graph=True) if self.graphs[colour] else side.tree(*args)
+                options = {k: v for k, v in dict(graph=self.graphs[colour], q_range_floor=self.floors[colour]).items()
+                           if v}
+                self.trees[key] = side.tree(*args, **options)
         try:
             self.seal_turns()
         except Exception as error:
@@ -115,7 +119,7 @@ class MatchGame:
 
     @property
     def tree(self):
-        return self.trees[id(self.model), self.graphs[self.game.player]]
+        return self.trees[id(self.model), self.graphs[self.game.player], self.floors[self.game.player]]
 
     @property
     def solver(self):
@@ -225,7 +229,8 @@ def paired_games(challenger, rival, games, label, config, settings, seal, book, 
                                  [s.tactics for s in search], settings.max_plies,
                                  dict(record, pair=pair, seed=seed, opening=[list(m) for m in opening], challenger_color=colour),
                                  seal, settings.seal_ms, [Budgets.of(s) for s in search], anchor_name(settings),
-                                 [s.search_graph for s in search], choices=[s.search_choice for s in search]))
+                                 [s.search_graph for s in search], choices=[s.search_choice for s in search],
+                                 floors=[s.q_range_floor for s in search]))
     return out
 
 
@@ -2289,7 +2294,8 @@ def calibrate(args):
     settings = config.evaluation
     samples = min(settings.root_samples, args.sims)
     games = [MatchGame([model, model], e['moves'], k, args.sims, samples, settings.tactics, len(e['moves'])+args.extra,
-                       dict(index=k), graphs=settings.search_graph, choices=settings.search_choice) for k, e in enumerate(chosen)]
+                       dict(index=k), graphs=settings.search_graph, choices=settings.search_choice,
+                       floors=settings.q_range_floor) for k, e in enumerate(chosen)]
     started = time.perf_counter()
     records = play(games, config.actor.leaf_batch)
     methods = ['masked', 'root']+[f'td{lam:g}' for lam in args.lambdas]
