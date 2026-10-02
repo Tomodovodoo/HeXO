@@ -15,14 +15,12 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import engine_setup
-from engine_setup import MANIFEST, SetupError, Setups, python_tag, six_member, system, unpack, wheel_fits
+from engine_setup import MANIFEST, SetupError, Setups, interpreter_tags, six_member, system, unpack, wheel_fits
 from play import Evaluations, Handler, Session, scan
 from tests.test_play import FakeEngines, entries
 
 WINDOWS = os.name == 'nt'
 SIX_BINARY = 'sixengine.exe' if WINDOWS else 'sixengine'
-WHEEL_PLATFORM = {'windows-x64': 'win_amd64', 'linux-x64': 'manylinux_2_34_x86_64',
-                  'linux-arm64': 'manylinux_2_34_aarch64', 'macos-arm64': 'macosx_11_0_arm64'}.get(system(), 'none')
 
 
 def sha(data):
@@ -191,7 +189,7 @@ class Recipes(unittest.TestCase):
         self.manifest['shrimp']['files'] = files
         release = {}
         for crate in self.manifest['shrimp']['crates']:
-            name = f'{crate}-0.1.0-{python_tag()}-{python_tag()}-{WHEEL_PLATFORM}.whl'
+            name = f'{crate}-0.1.0-{interpreter_tags()[0]}.whl'
             web[f'https://github.com/Tomodovodoo/HeXO/releases/download/engines-v1/{name}'] = data = \
                 archive('x.zip', {f'{crate}/__init__.py': b'', f'{crate}-0.1.0.dist-info/WHEEL': b''})
             release[name] = sha(data)
@@ -351,15 +349,17 @@ class Pieces(unittest.TestCase):
                              ['Cargo.toml', 'packages/shrimp/lib.rs'])
             self.assertFalse(path.exists())
 
-    def test_wheels_match_python_and_platform(self):
-        self.assertTrue(wheel_fits('shrimp-0.1.0-cp314-cp314-win_amd64.whl', 'shrimp', 'cp314', 'windows-x64'))
-        self.assertTrue(wheel_fits('hexo_engine-0.1.0-cp312-cp312-manylinux_2_34_x86_64.whl', 'hexo_engine', 'cp312',
-                                   'linux-x64'))
-        self.assertFalse(wheel_fits('hexo_engine-0.1.0-cp312-cp312-win_amd64.whl', 'shrimp', 'cp312', 'windows-x64'))
-        self.assertFalse(wheel_fits('shrimp-0.1.0-cp313-cp313-win_amd64.whl', 'shrimp', 'cp314', 'windows-x64'))
-        self.assertFalse(wheel_fits('shrimp-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl', 'shrimp', 'cp314',
-                                    'windows-x64'))
-        self.assertFalse(wheel_fits('hexo-strix-learned-linux-x64', 'shrimp', 'cp314', 'linux-x64'))
+    def test_wheels_match_the_interpreters_tags(self):
+        windows = ['cp314-cp314-win_amd64']
+        linux = ['cp312-cp312-manylinux_2_31_x86_64', 'cp312-cp312-manylinux_2_17_x86_64', 'cp312-abi3-linux_x86_64']
+        self.assertTrue(wheel_fits('shrimp-0.1.0-cp314-cp314-win_amd64.whl', 'shrimp', windows))
+        self.assertFalse(wheel_fits('hexo_engine-0.1.0-cp314-cp314-win_amd64.whl', 'shrimp', windows))
+        self.assertFalse(wheel_fits('shrimp-0.1.0-cp313-cp313-win_amd64.whl', 'shrimp', windows))
+        self.assertTrue(wheel_fits('shrimp-0.1.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl', 'shrimp',
+                                   linux))
+        self.assertFalse(wheel_fits('shrimp-0.1.0-cp312-cp312-manylinux_2_34_x86_64.whl', 'shrimp', linux))
+        self.assertFalse(wheel_fits('hexo-strix-learned-linux-x64', 'shrimp', linux))
+        self.assertTrue(wheel_fits(f'shrimp-0.1.0-{interpreter_tags()[0]}.whl', 'shrimp'))
 
     def test_job_progress_counts_steps_and_bytes(self):
         job = engine_setup.Job(4)

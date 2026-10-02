@@ -41,8 +41,6 @@ INSTALLED = dict(six=lambda e: e['kind'] == 'six' and bool(e.get('networks')),
                  strix=lambda e: e['kind'] == 'strix',
                  shrimp=lambda e: e['kind'] == 'six' and 'shrimp' in e['name'].lower(),
                  seal=lambda e: e['kind'] == 'seal')
-WHEEL_PLATFORMS = {'windows-x64': ('win', 'amd64'), 'linux-x64': ('linux', 'x86_64'),
-                   'linux-arm64': ('linux', 'aarch64'), 'macos-arm64': ('macosx', 'arm64')}
 
 
 class SetupError(RuntimeError):
@@ -56,18 +54,24 @@ def system():
     return f"{name}-{dict(amd64='x64', x86_64='x64', aarch64='arm64').get(machine, machine)}"
 
 
-def python_tag():
-    return f'cp{sys.version_info.major}{sys.version_info.minor}'
+def interpreter_tags():
+    """The wheel tags this interpreter accepts, as 'python-abi-platform' strings, most specific first."""
+    try:
+        from packaging.tags import sys_tags
+    except ImportError:
+        from pip._vendor.packaging.tags import sys_tags
+    return [str(tag) for tag in sys_tags()]
 
 
-def wheel_fits(name, crate, tag=None, where=None):
-    """True when the wheel file `name` is `crate`'s for CPython `tag` on platform `where` (this machine's by
-    default)."""
+def wheel_fits(name, crate, tags=None):
+    """True when the wheel file `name` is `crate`'s and one of its tags is in `tags` (this interpreter's by
+    default); compressed tag sets like manylinux_2_17_x86_64.manylinux2014_x86_64 count each member."""
     parts = name.removesuffix('.whl').split('-')
-    if not name.endswith('.whl') or len(parts) < 5 or parts[0] != crate or parts[-3] != (tag or python_tag()):
+    if not name.endswith('.whl') or len(parts) < 5 or parts[0] != crate:
         return False
-    family, arch = WHEEL_PLATFORMS.get(where or system(), ('-', '-'))
-    return family in parts[-1] and parts[-1].endswith(arch)
+    accepted = set(interpreter_tags() if tags is None else tags)
+    return any(f'{python}-{abi}-{where}' in accepted for python in parts[-3].split('.')
+               for abi in parts[-2].split('.') for where in parts[-1].split('.'))
 
 
 def cargo():
