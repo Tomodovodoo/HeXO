@@ -60,6 +60,7 @@ export class BrowserSession extends OfflineSession {
     this.bookData = null; this.book = {enabled: false, mode: 'wide', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false;
   }
   registerEngine(entry, adapter) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
@@ -124,16 +125,23 @@ export class BrowserSession extends OfflineSession {
     return {id: this.id, history: copy(this.history), seats: copy(this.seats), analysis: copy(this.analysis), paused: this.paused,
       book: copy(this.book), match: copy(this.match), saved_game: copy(this.saved_game), clock: this.clockNow(), gameId: this.gameId, gameCreated: this.gameCreated, records: copy(this.records)};
   }
-  persist() {
-    if (this.importing) return this.saving;
+  storageConflict() {
+    this.conflicted = true; this.paused = true; this.freezeClock(); this.cancelJobs();
+    if (this.match) this.match.active = false;
+    this.gameSignature = null; this.storageError = 'This game changed in another tab. Reload to continue.'; this.revision++; this.onchange(this.state());
+  }
+  persist(games = []) {
+    if (this.importing || this.initializing || this.conflicted) return this.saving;
+    this.dirty = true;
     if (this.match && !this.match.pending_game && this.match.completed < this.match.games) {
       this.match.position = {game: this.match.current, history: copy(this.history), records: copy(this.records), clock: this.clockNow(), opening: copy(this.book.opening)};
     }
     const snapshot = this.snapshot(), freeplay = this.freeplay();
     this.saving = this.saving.then(async () => {
-      await this.storage.put('sessions', snapshot);
-      if (snapshot.match) await this.storage.put('matches', snapshot.match);
-      if (freeplay) { await this.storage.put('games', freeplay.game); await this.storage.put('matches', freeplay.summary); }
+      if (this.conflicted) return;
+      snapshot._write_token = uid();
+      if (!await this.storage.saveSession(snapshot, freeplay, this.storageToken, games)) this.storageConflict();
+      else this.storageToken = snapshot._write_token;
     }).catch(error => { this.gameSignature = null; this.storageError = `Could not save in this browser: ${error.message}`; this.onchange(this.state()); });
     return this.saving;
   }
@@ -142,6 +150,7 @@ export class BrowserSession extends OfflineSession {
     this.cache.clear(); this.index.clear();
     for (const r of evaluations) this.indexRecord(r);
     this.coverage = coverage?.counts || {};
+    this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false;
     if (saved) {
       this.native.game(saved.history); Object.assign(this, {...saved, paused: true});
       if (this.match) this.match.active = false;
@@ -154,7 +163,7 @@ export class BrowserSession extends OfflineSession {
     for (const job of this.jobs) if (predicate(job)) job.controller.abort();
     this.jobs = this.jobs.filter(j => !j.controller.signal.aborted);
   }
-  editable() { if (this.match?.active) throw Error('Stop the match before changing its players or position'); }
+  editable() { if (this.conflicted) throw Error(this.storageError); if (this.match?.active) throw Error('Stop the match before changing its players or position'); }
   load(history, paused = false, opening = null) {
     this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.paused = paused; this.saved_game = null;
     this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
@@ -180,6 +189,7 @@ export class BrowserSession extends OfflineSession {
   }
   async saveGame() { await this.persist(); }
   apply(path, body) {
+    if (this.conflicted && path !== '/state') throw Error(this.storageError);
     if (['/new', '/undo', '/retry', '/seat'].includes(path)) this.editable();
     if (path === '/play') {
       const point = [body.q, body.r];
@@ -244,7 +254,9 @@ export class BrowserSession extends OfflineSession {
     const record = {...result, id: this.cacheKey(history, spec), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
     this.indexRecord(record); await this.storage.put('evaluations', record);
-    if (position(this.history.slice(0, history.length)) === position(history)) this.records.push(record);
+    if (position(this.history.slice(0, history.length)) === position(history)) {
+      this.records = this.records.filter(r => r.id !== record.id); this.records.push(record);
+    }
     return record;
   }
   indexRecord(record) {
@@ -269,7 +281,7 @@ export class BrowserSession extends OfflineSession {
   }
   freezeClock() { this.clock = this.clockNow(); if (this.clock) { delete this.clock.started; delete this.clock.side; } }
   async pump() {
-    if (this.running || this.importing) return;
+    if (this.running || this.importing || this.conflicted) return;
     const state = this.native.game(this.history), seat = this.seats[state.player];
     if (!this.paused && state.winner < 0 && this.adapters.has(seat.engine) && !this.jobs.some(j => j.kind === 'move')) this.enqueue('move', this.history, seat, {side: state.player});
     const job = this.jobs.find(j => j.status === 'queued' && j.kind === 'move') || this.jobs.find(j => j.status === 'queued' && j.kind === 'analyse' && !j.tier)
@@ -326,12 +338,12 @@ export class BrowserSession extends OfflineSession {
       if (job.status !== 'failed' && (job.kind !== 'review' || job.cursor >= job.plies.length || job.controller.signal.aborted)) this.jobs = this.jobs.filter(j => j !== job);
       else if (job.status !== 'failed') job.status = 'queued';
       this.changed(); await this.saving;
-      if (!this.importing && this.match && !this.match.active) await this.storage.put('matches', copy(this.match)).catch(error => { this.storageError = error.message; });
       settled();
       queueMicrotask(() => this.pump());
     }
   }
   async startMatch(body) {
+    if (this.conflicted) throw Error(this.storageError);
     if (this.match?.active) throw Error('Stop the current match first');
     if (!Array.isArray(body.players) || body.players.length !== 2 || !Number.isInteger(body.games) || body.games < 2 || body.games > 10000 || body.games % 2) throw Error('Choose two engines and an even number of games');
     const max_placements = body.max_placements ?? 512;
@@ -353,7 +365,7 @@ export class BrowserSession extends OfflineSession {
     if (this.analysis) this.analysis.auto = false;
     this.match = {id: uid(), name: new Date().toISOString().slice(0, 19).replace('T', ' '), active: true, players, games: body.games,
       completed: 0, current: 1, wins: [0, 0], capped: 0, results: [], openings, opening_range: mode, seed, clock, timings: [], elo: null, max_placements};
-    this.beginMatchGame(); await this.storage.put('matches', copy(this.match)); this.changed(); this.pump();
+    this.beginMatchGame(); this.changed(); await this.saving; this.pump();
   }
   beginMatchGame() {
     const match = this.match, number = match.completed + 1;
@@ -372,14 +384,13 @@ export class BrowserSession extends OfflineSession {
     const m = this.match, game = m.current, aWinner = winner == null ? null : game % 2 ? winner : 1 - winner, id = `${m.id}:${game}`;
     const record = {id, format: 'bubble-replay', version: 1, game, history: copy(this.history), players: copy(this.seats), winner, reason,
       evaluations: this.state().evaluations, records: copy(this.records), timings: copy(m.timings), opening: copy(this.book.opening), saved_at: new Date().toISOString()};
-    await this.storage.put('games', record);
     m.results.push({id, game, winner: aWinner, reason, placements: this.history.length, opening: Math.floor((game - 1) / 2)});
     if (winner == null) m.capped++; else m.wins[aWinner]++;
     m.completed++; m.elo = pairElo(m.results);
     if (m.completed >= m.games) { m.active = false; if (this.match === m) { this.paused = true; this.clock = null; } }
-    else if (this.match === m && m.active) this.beginMatchGame();
     else { m.pending_game = true; m.current = m.completed + 1; }
-    await this.storage.put('matches', copy(m));
+    await this.persist([record]);
+    if (!this.conflicted && !this.paused && this.match === m && m.active && m.completed < m.games) this.beginMatchGame();
   }
   async catalogue() {
     await this.saving;
@@ -405,7 +416,14 @@ export class BrowserSession extends OfflineSession {
   }
   async request(input, body = {}, method = 'GET') {
     const url = new URL(input, 'https://play.invalid'), path = url.pathname.replace(/^\/study/, ''), q = url.searchParams;
+    const interrupt = path === '/cancel' || path === '/pause' && body.paused || path === '/match' && ['pause', 'stop'].includes(body.action);
     try {
+      if (method !== 'GET' && !interrupt && !['/state', '/export', '/replay', '/evaluations', '/storage/backup'].includes(path)) {
+        await this.saving;
+        const known = this.storageToken, stored = (await this.storage.get('sessions', this.id))?._write_token ?? null;
+        if (stored !== known && stored !== this.storageToken) this.storageConflict();
+        if (this.conflicted) throw Error(this.storageError);
+      }
       let data, type = 'application/json';
       if (path === '/state' && method === 'GET' && q.has('since') && +q.get('since') === this.revision) {
         const state = this.state(); data = {instance: state.instance, revision: state.revision, jobs: state.jobs, clock: state.clock};
@@ -464,15 +482,14 @@ export class BrowserSession extends OfflineSession {
         } else if (body.action === 'pause' || body.action === 'stop') {
           this.freezeClock(); this.cancelJobs(); this.paused = true; if (this.match) this.match.active = false;
         } else throw Error('Unknown match action');
-        if (this.match) await this.storage.put('matches', copy(this.match));
         this.changed(); this.pump(); data = this.state();
       } else {
         if (path === '/new') await this.saveGame();
         const [status, value] = this.answer(path, body);
         if (path === '/play' && this.native.game(this.history).winner >= 0) await this.saveGame();
-        await this.saving; return [status, value, type];
+        if (!interrupt) await this.saving; return [status, value, type];
       }
-      await this.saving; return [200, data, type];
+      if (!interrupt) await this.saving; return [200, data, type];
     } catch (error) { return [400, {error: error.message}, 'application/json']; }
   }
 }

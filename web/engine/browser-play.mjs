@@ -11,12 +11,13 @@ export async function mountPlay(engines, legacy) {
   catch (error) { globalThis.toast(`Browser storage is unavailable: ${error.message}`); storage = new PlayStorage(null); }
   const id = study ? `study:${params.get('batch')}:${params.get('game')}` : 'live';
   const session = await BrowserSession.create({engine: entry.id, preset: 'quick', budget: entry.presets.quick, auto: true}, {storage, id, book});
+  session.initializing = true;
   const first = !await storage.get('sessions', id);
   if (first && study && params.has('batch')) await session.openGame(params.get('batch'), +params.get('game'));
   for (const {entry, engine, record} of engines.values()) session.registerEngine(entry, {
     ready: f => engine.load(f),
     turn: async (history, budget, options) => {
-      const result = await engine.turn(history, budget, options), preset = options.preset === 'custom' ? 'standard' : options.preset;
+      const result = await engine.turn(history, {...budget, ...(options.checkpoint ? {checkpoint: options.checkpoint} : {})}, options), preset = options.preset === 'custom' ? 'standard' : options.preset;
       return record ? {...record(result, history, preset), ...result} : result;
     }
   });
@@ -75,10 +76,12 @@ export async function mountPlay(engines, legacy) {
       if (link.target === '_blank') window.open(target.href, '_blank', 'noopener'); else location.href = target.href;
     }
   });
-  const leave = () => { session.freezeClock(); session.cancelJobs(); if (session.match) session.match.active = false; session.paused = true; session.persist(); };
+  const leave = () => { session.freezeClock(); session.cancelJobs(); if (session.match) session.match.active = false; session.paused = true; if (session.dirty) session.persist(); };
   addEventListener('pagehide', leave);
   const hint = document.getElementById('browser-storage');
   if (hint) hint.textContent = storage.db ? 'Games and analysis are saved in this browser.' : 'Browser storage is unavailable. Download your games before leaving.';
-  session.persist(); globalThis.accept(session.state()); session.pump();
+  session.initializing = false;
+  if (first) session.persist();
+  globalThis.accept(session.state()); session.pump();
   return session;
 }

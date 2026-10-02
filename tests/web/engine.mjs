@@ -152,15 +152,26 @@ if (job.kind === 'encode') {
   const s = new BrowserSession(native);
   s.registerEngine(entry, {turn: async history => ({moves: job.history.slice(history.length, history.length + (history.length ? 2 : 1)), value: .5, top: []})});
   let release, saving = false;
-  const put = s.storage.put.bind(s.storage);
-  s.storage.put = async (name, value) => { if (name === 'games' && value.game === 1) { saving = true; await new Promise(resolve => { release = resolve; }); } return put(name, value); };
+  const save = s.storage.saveSession.bind(s.storage);
+  s.storage.saveSession = async (...args) => { if (args[3]?.some(game => game.game === 1)) { saving = true; await new Promise(resolve => { release = resolve; }); } return save(...args); };
   await s.startMatch({players: [{engine: 'test'}, {engine: 'test'}], games: 2, clock: {mode: 'fixed'}});
   await until(() => saving);
   await s.request('/match', {action: 'stop'}, 'POST'); release(); await s.idle;
   answer = {stopped_save: {paused: s.paused, active: s.match.active, completed: s.match.completed}};
-  s.storage.put = put;
+  s.storage.saveSession = save;
   await s.request('/match', {action: 'resume'}, 'POST'); await until(() => !s.match.active);
   answer.resumed = {wins: s.match.wins, completed: s.match.completed};
+  answer.paused_save = [];
+  for (const path of ['/pause', '/cancel']) {
+    const paused = new BrowserSession(native); let commit;
+    paused.registerEngine(entry,{turn:async history=>({moves:job.history.slice(history.length,history.length+(history.length?2:1)),value:.5})});
+    const commitSession = paused.storage.saveSession.bind(paused.storage);
+    paused.storage.saveSession = async (...args) => { if(args[3]?.length) await new Promise(resolve=>{commit=resolve;}); return commitSession(...args); };
+    await paused.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,openings:[job.history.slice(0,-1)]});
+    await until(()=>!!commit);
+    await paused.request(path,path==='/pause'?{paused:true}:{id:paused.running.id},'POST'); commit(); await paused.idle;
+    answer.paused_save.push({paused:paused.paused,completed:paused.match.completed,pending:paused.match.pending_game,current:paused.match.current});
+  }
   const id = s.match.id;
   await s.request('/matches/delete', {batch: id}, 'POST');
   s.analysis = s.spec({engine: 'test'}); s.apply('/analyse', {ply: 1}); await until(() => !s.running && !s.jobs.some(j => j.status === 'queued'));
@@ -197,5 +208,29 @@ if (job.kind === 'encode') {
   await until(() => !failed.running);
   const frozen = failed.clockNow(); await wait(25);
   answer.failure_clock_frozen = failed.paused && !('started' in failed.clock) && JSON.stringify(frozen) === JSON.stringify(failed.clockNow());
+  const writer = new BrowserSession(native);
+  writer.registerEngine(entry, {turn:async()=>null});
+  await writer.request('/play',{q:0,r:0},'POST'); await writer.saving;
+  const stale = new BrowserSession(native); stale.storage = writer.storage; stale.initializing = true;
+  await stale.restore(); stale.registerEngine(entry,{turn:async()=>null}); stale.initializing = false;
+  await writer.request('/play',{q:1,r:0},'POST'); await writer.saving;
+  await stale.persist();
+  const restored = new BrowserSession(native); restored.storage = writer.storage; await restored.restore();
+  answer.stale_tab = {conflicted:stale.conflicted,history:restored.history,archive:(await writer.savedReplay(writer.gameId,1)).history,
+    games:(await writer.catalogue()).length,identity:restored.gameId===writer.gameId,mutation_status:(await stale.request('/play',{q:0,r:1},'POST'))[0]};
+  const older = new BrowserSession(native); let late;
+  older.registerEngine(entry, {turn: () => new Promise(resolve => { late = resolve; })});
+  await older.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,openings:[job.history.slice(0,-1)]});
+  await until(() => !!late); await older.saving;
+  const owner = new BrowserSession(native); owner.storage = older.storage; owner.initializing = true; await owner.restore();
+  owner.registerEngine(entry, {turn: (history,budget,options) => new Promise((resolve,reject) => {
+    options.signal.addEventListener('abort',()=>reject(new DOMException('Cancelled','AbortError')),{once:true});
+  })}); owner.initializing = false;
+  await owner.request('/match',{action:'resume'},'POST'); await owner.saving;
+  late({moves:job.history.slice(-1),value:1}); await older.idle; await older.saving;
+  answer.stale_match = {conflicted:older.conflicted,session_completed:(await owner.storage.get('sessions','live')).match.completed,
+    archive_completed:(await owner.storage.get('matches',owner.match.id)).completed,
+    archived_games:(await owner.storage.all('games')).filter(g=>g.game).length};
+  await owner.request('/match',{action:'stop'},'POST'); await owner.idle;
 }
 process.stdout.write(JSON.stringify(answer));

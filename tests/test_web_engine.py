@@ -192,24 +192,27 @@ class Bundle(unittest.TestCase):
 
     def test_browser_review_and_paired_tournament_are_saved(self):
         history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
-        requests = [['/import', dict(text=json.dumps(dict(history=history)))], ['/review', {}], ['/state', {}],
+        requests = [['/import', dict(text=json.dumps(dict(history=history)))], ['/review', {}], ['/review', {}], ['/state', {}],
                     ['/storage/save', {}], ['/match', dict(players=[dict(engine='browser:test')]*2, games=2, clock=dict(mode='fixed'))],
                     ['/state', {}]]
         answers = node(dict(kind='play', history=history, requests=requests))
         self.assertTrue(all(a['status'] == 200 for a in answers[:-1]))
-        self.assertEqual(answers[2]['data']['review'][-1]['label'], 'win')
-        self.assertEqual(answers[5]['data']['match']['wins'], [1, 1])
-        self.assertEqual(answers[5]['data']['match']['completed'], 2)
+        self.assertEqual(answers[3]['data']['review'][-1]['label'], 'win')
+        self.assertEqual(answers[6]['data']['match']['wins'], [1, 1])
+        self.assertEqual(answers[6]['data']['match']['completed'], 2)
         games = answers[-1]['backup']['games']
         self.assertEqual(len(games), 4)
         self.assertEqual(sum(g['history'] == history for g in games), 3)
         self.assertTrue(any(g['history'] == [] for g in games))
+        for game in games:
+            self.assertEqual(len(game['records']), len({r['id'] for r in game['records']}))
 
     def test_browser_stop_import_and_delete_survive_pending_jobs(self):
         history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
         result = node(dict(kind='lifecycle', history=history))
         self.assertEqual(result['stopped_save'], dict(paused=True, active=False, completed=1))
         self.assertEqual(result['resumed'], dict(wins=[1, 1], completed=2))
+        self.assertEqual(result['paused_save'], [dict(paused=True, completed=1, pending=True, current=2)]*2)
         self.assertIsNone(result['deleted']['current'])
         self.assertTrue(all(m['single'] for m in result['deleted']['catalogue']))
         self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]]))
@@ -220,6 +223,9 @@ class Bundle(unittest.TestCase):
         self.assertTrue(all(r['placements'] == 3 and r['reason'] == 'capped' for r in result['capped']['results']))
         self.assertEqual(result['uncapped'], dict(completed=2, capped=0, wins=[1, 1]))
         self.assertTrue(result['failure_clock_frozen'])
+        self.assertEqual(result['stale_tab'], dict(conflicted=True, history=[[0, 0], [1, 0]], archive=[[0, 0], [1, 0]],
+                                                 games=1, identity=True, mutation_status=400))
+        self.assertEqual(result['stale_match'], dict(conflicted=True, session_completed=0, archive_completed=0, archived_games=0))
 
     def test_freeplay_updates_until_new_game(self):
         win = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]

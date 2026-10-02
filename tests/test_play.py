@@ -1265,6 +1265,7 @@ class Matches(unittest.TestCase):
         with self.session.lock:
             self.session.changed()
         first = self.session.match_catalogue()[0]['id']
+        created = self.session.match_catalogue()[0]['created_at']
         self.session.play(0, 0)
         self.session.play(1, 0)
         directory, game = self.session.saved_replay(first, 1)
@@ -1275,6 +1276,7 @@ class Matches(unittest.TestCase):
         wait(lambda: self.session.lookup([(0, 0)]) is not None and
              '"value":0.5' in (directory / 'evaluations.jsonl').read_text())
         original = (directory / 'game-0001.json').read_bytes()
+        self.assertEqual(self.session.match_catalogue()[0]['created_at'], created)
         evaluations = (directory / 'evaluations.jsonl').read_bytes()
         self.session.configure_analysis('bubble:fake', checkpoint='main/000001', auto=False)
         self.assertEqual((directory / 'evaluations.jsonl').read_bytes(), evaluations)

@@ -1321,6 +1321,7 @@ class Session:
         self.study_store = study_store
         self.saved_matches, self.study, self.saved_game = {}, None, None
         self.freeplay_directory, self.freeplay_signature = None, None
+        self.freeplay_created = None
         self.freeplay_records = {}
         self.models_folder, self.opening_book, self.book_mode, self.opening = None, bool(book), 'narrow', None
         self.coverage = Coverage(Path(store.path).with_name('play-openings.jsonl') if store.path else None)
@@ -1758,6 +1759,7 @@ class Session:
             name = datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-freeplay-' + os.urandom(3).hex()
             self.freeplay_directory = self.archive / name
             self.freeplay_directory.mkdir(parents=True, exist_ok=False)
+            self.freeplay_created = datetime.now().astimezone().isoformat()
             self.remember_match(self.freeplay_directory)
         players = [seat | dict(name=self.entries.get(seat['engine'], {}).get('name', 'Human')) for seat in self.seats]
         game = replay(self.history)
@@ -1784,7 +1786,7 @@ class Session:
         if signature == self.freeplay_signature:
             return
         summary = dict(output=str(self.freeplay_directory), single=True, kind='freeplay', games=1, completed=1,
-                       created_at=datetime.fromtimestamp(self.freeplay_directory.stat().st_ctime).astimezone().isoformat(),
+                       created_at=self.freeplay_created,
                        players=players, wins=[int(winner == 0), int(winner == 1)], capped=0,
                        results=[dict(game=1, winner=winner, reason=record['reason'], placements=len(self.history))])
         self.write_match(summary, 'game-0001.json', record)
