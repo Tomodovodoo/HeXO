@@ -5,8 +5,8 @@
 //   play server, unless `resumes` is false, as in the static page's session);
 //   `together` sends every step at once instead of one after another
 // {kind: 'offline', steps: [[path, body]]} -> [path] of every request an OfflineSession answered
-// {kind: 'static', steps: [[path, body]]} -> {requests: [path], enabled, paused} from the static page's BrowserSession,
-//   which starts paused with Human against an engine and the book on
+// {kind: 'static', steps: [[path, body]]} -> {requests: [path], enabled, paused, stones} from the static page's BrowserSession,
+//   which starts paused with Human against an engine (one that keeps thinking) and the book on
 import {readFileSync} from 'node:fs';
 import {followSeats} from '../../web/engine/book.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
@@ -33,13 +33,14 @@ if (job.kind === 'follow') {
       await new Promise(done => setTimeout(done, 20));
       state = {...state, book: {...state.book, enabled: body.enabled}, paused: state.paused && !(body.enabled && job.resumes !== false)};
     } else if (path === '/pause') state = {...state, paused: body.paused};
+    else if (path === '/new') state = {...state, paused: false};
     return state;
   }};
 } else if (job.kind === 'static') {
   const session = new BrowserSession(new Native(await createModule()));
   session.bookData = new OpeningBook(JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url))));
   const entry = {id: 'browser:test', name: 'Test', kind: 'bubble', version: 'v1', checkpoints: [], presets: {standard: {simulations: 1, solver_nodes: 0}}};
-  session.registerEngine(entry, {turn: async () => ({moves: [[0, 0]], value: .5, top: [], proof: null, line: []})});
+  session.registerEngine(entry, {turn: () => new Promise(() => {})});
   session.seats = [{engine: 'human'}, session.spec({engine: entry.id, preset: 'standard'})];
   session.book.enabled = true;
   session.paused = true;
@@ -64,5 +65,5 @@ if (job.kind === 'follow') {
 followSeats(page, () => state, human, storage);
 if (job.together) await Promise.all(job.steps.map(([path, body]) => page.post(path, body)));
 else for (const [path, body] of job.steps) await page.post(path, body);
-process.stdout.write(JSON.stringify(job.kind === 'static' ? {requests, enabled: state.book.enabled, paused: state.paused}
+process.stdout.write(JSON.stringify(job.kind === 'static' ? {requests, enabled: state.book.enabled, paused: state.paused, stones: state.history.length}
   : job.kind === 'follow' ? {requests, enabled: state.book.enabled, paused: state.paused, stored: stored.get('book-touched') ?? null} : requests));

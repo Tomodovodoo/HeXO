@@ -97,7 +97,7 @@ class PlayPage(unittest.TestCase):
         self.assertTrue(answer['enabled'])
         self.assertFalse(answer['paused'])
         answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False, resumes=False)
-        self.assertEqual(answer['requests'][-1], ['/pause', dict(paused=False)])
+        self.assertEqual(answer['requests'][-1], ['/new', {}])
         self.assertTrue(answer['enabled'])
         self.assertFalse(answer['paused'])
 
@@ -140,12 +140,13 @@ class PlayPage(unittest.TestCase):
                                                     ['/play', dict(q=0, r=0)]]))
         self.assertEqual(requests, ['/seat', '/seat', '/play'])
 
-    def test_the_static_page_session_follows_the_seats_and_resumes(self):
+    def test_the_static_page_session_starts_the_opening_for_new_seats(self):
         answer = page(dict(kind='static', steps=[['/seat', dict(side=1, engine='human')], ['/pause', dict(paused=False)],
                                                  ['/seat', dict(side=0, engine='browser:test')]]))
-        self.assertEqual(answer['requests'], ['/seat', '/book', '/pause', '/pause', '/seat', '/book', '/pause'])
+        self.assertEqual(answer['requests'], ['/seat', '/book', '/pause', '/pause', '/seat', '/book', '/new'])
         self.assertTrue(answer['enabled'])
         self.assertFalse(answer['paused'])
+        self.assertGreater(answer['stones'], 0)
 
     def test_the_human_seat_is_labelled_human(self):
         sources = {name: (ROOT/'web'/name).read_text(encoding='utf-8') for name in ('index.html', 'engine/seat.mjs')}
