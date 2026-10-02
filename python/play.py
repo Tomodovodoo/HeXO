@@ -1343,13 +1343,16 @@ class Session:
     page must redraw."""
 
     def __init__(self, entries, engines, store, rescan=lambda: None, book=None, archive=None, study_store=None,
-                 analysis_engines=None):
+                 analysis_engines=None, save_initial=True):
         self.entries, self.engines, self.store, self.rescan_entries = entries, engines, store, rescan
         self.analysis_engines = analysis_engines or engines
         self.book = book
         self.archive = Path(archive) if archive else None
         self.study_store = study_store
         self.saved_matches, self.study, self.saved_game = {}, None, None
+        self.freeplay_directory, self.freeplay_signature = None, None
+        self.freeplay_created = None
+        self.freeplay_records = {}
         self.models_folder, self.opening_book, self.book_mode, self.opening = None, bool(book), 'narrow', None
         self.coverage = Coverage(Path(store.path).with_name('play-openings.jsonl') if store.path else None)
         self.lock, self.rescanning = threading.Condition(), threading.Lock()
@@ -1364,6 +1367,8 @@ class Session:
         opponent = bubble or entries['native:Native']
         self.seats = [dict(engine='human'), self.seat(opponent['id'], None, 'standard')]
         self.analysis = self.seat(bubble['id'], None, 'standard') | dict(auto=True) if bubble else None
+        if save_initial:
+            self.save_freeplay()
         self.workers = [threading.Thread(target=self.work, args=(lane,), daemon=True) for lane in self.queues]
         for worker in self.workers:
             worker.start()
@@ -1476,7 +1481,7 @@ class Session:
                    and j.history == tuple(self.history) for j in self.jobs.values())
         waiting = self.match and self.match['active'] and (self.match['between'] or self.match['preparing'] or
                                                           self.match.get('outcome') or
-                                                          len(self.history) >= self.match['max_placements'])
+                                                          self.match['max_placements'] and len(self.history) >= self.match['max_placements'])
         if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy and not waiting:
             if self.match_clock and self.match and self.match['active'] and self.match_clock.running is None:
                 self.match_clock.start(player)
@@ -1491,6 +1496,7 @@ class Session:
         if self.analysis and self.analysis['auto'] and winner < 0 and opening and not self.deepening(winner):
             self.request_analysis(self.history, 1)
         self.deepen(winner)
+        self.save_freeplay()
         self.lock.notify_all()
 
     def deepening(self, winner):
@@ -1573,6 +1579,7 @@ class Session:
                 game.play(q, r)
             finally:
                 game.close()
+            self.fork_freeplay()
             self.history.append((q, r))
             self.paused = False
             self.changed()
@@ -1589,6 +1596,7 @@ class Session:
                 return
             if people is None:
                 people = [i for i, seat in enumerate(self.seats) if seat['engine'] == 'human']
+            self.fork_freeplay()
             self.history.pop()
             while people and self.history and not (player_at(len(self.history)) in people
                                                    and len(self.history) in turn_starts(len(self.history) + 1)):
@@ -1615,6 +1623,7 @@ class Session:
         with self.lock:
             self.load(history, False)
             self.opening = opening
+            self.save_freeplay()
             if played:
                 self.coverage.add(*played)
 
@@ -1630,15 +1639,19 @@ class Session:
             if enabled and not self.history:
                 self.new_game()
 
-    def load(self, history, paused):
+    def load(self, history, paused, saved_game=None):
         """Replace the game with `history` (validated)."""
         replay(history).close()
         with self.lock:
             self.match_editable()
+            if saved_game is None or self.freeplay_directory is not None:
+                self.save_freeplay()
+            self.freeplay_directory, self.freeplay_signature = None, None
+            self.freeplay_records = {}
             self.history, self.paused, self.opening = [tuple(map(int, p)) for p in history], paused, None
             self.match = None
             self.match_clock = None
-            self.saved_game = None
+            self.saved_game = saved_game
             self.stop_moves()
             self.changed()
 
@@ -1762,6 +1775,59 @@ class Session:
             temporary.replace(path)
         return ident
 
+    def fork_freeplay(self):
+        if self.saved_game or self.match:
+            self.saved_game, self.match = None, None
+            self.match_clock = None
+            self.freeplay_directory, self.freeplay_signature = None, None
+            self.freeplay_records = {}
+
+    def save_freeplay(self):
+        """Update the current freeplay archive. Call with the session lock held after a change."""
+        if not self.archive or self.match or self.saved_game:
+            return
+        if self.freeplay_directory is None:
+            name = datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-freeplay-' + os.urandom(3).hex()
+            self.freeplay_directory = self.archive / name
+            self.freeplay_directory.mkdir(parents=True, exist_ok=False)
+            self.freeplay_created = datetime.now().astimezone().isoformat()
+            self.remember_match(self.freeplay_directory)
+        players = [seat | dict(name=self.entries.get(seat['engine'], {}).get('name', 'Human')) for seat in self.seats]
+        game = replay(self.history)
+        try:
+            winner = game.winner if game.winner >= 0 else None
+        finally:
+            game.close()
+        keys = set()
+        for seat in [*self.seats, self.analysis]:
+            key = self.engine_key(seat) if seat and seat['engine'] != 'human' else None
+            if key:
+                bare = key.split(':')[0] + ':none'
+                keys.update((key, key + ':kept', bare, bare + ':kept'))
+        with self.store.lock:
+            for ply in range(len(self.history) + 1):
+                position = self.store.key(self.history[:ply])
+                for key in sorted(keys):
+                    for budget in sorted(self.store.by_position.get((position, key), ())):
+                        self.freeplay_records[(position, key, budget)] = self.store.order[(position, key, budget)]
+        records = list(self.freeplay_records.values())
+        record = dict(format='bubble-replay', version=1, game=1, history=list(self.history), players=players,
+                      winner=winner, reason='six' if winner is not None else 'saved', opening=self.opening)
+        signature = json.dumps(record) + '\n'.join(records)
+        if signature == self.freeplay_signature:
+            return
+        summary = dict(output=str(self.freeplay_directory), single=True, kind='freeplay', games=1, completed=1,
+                       created_at=self.freeplay_created,
+                       players=players, wins=[int(winner == 0), int(winner == 1)], capped=0,
+                       results=[dict(game=1, winner=winner, reason=record['reason'], placements=len(self.history))])
+        self.write_match(summary, 'game-0001.json', record)
+        path = self.freeplay_directory / 'evaluations.jsonl'
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(''.join(line + '\n' for line in records), encoding='utf-8')
+        temporary.replace(path)
+        self.write_match(summary)
+        self.freeplay_signature = signature
+
     def match_catalogue(self):
         if self.archive:
             for path in self.archive.glob('*.json'):
@@ -1790,7 +1856,9 @@ class Session:
             match['completed'] = len(match['results'])
             rows.append(dict(id=ident, name=directory.name, **{key: match[key] for key in
                 ('games', 'completed', 'wins', 'capped', 'results')}, players=[p['name'] for p in match['players']],
-                elo=pair_elo(match['results']), clock=match.get('clock'), opening_range=match.get('opening_range')))
+                elo=pair_elo(match['results']), clock=match.get('clock'), opening_range=match.get('opening_range'),
+                single=match.get('single', False), kind=match.get('kind', 'match'),
+                player_specs=match['players'], created_at=match.get('created_at')))
         return sorted(rows, key=lambda row: row['name'], reverse=True)
 
     def saved_replay(self, ident, number):
@@ -1808,7 +1876,8 @@ class Session:
                 # Analysis has its own queue and CPU model; it cannot spend a live game's clock.
                 package = getattr(self.engines, 'tactical_package', None)
                 self.study = Session(dict(self.entries), Engines('cpu', package), Evaluations(self.study_store),
-                                     self.rescan_entries, analysis_engines=Engines('cpu', package))
+                                     self.rescan_entries, archive=self.archive, analysis_engines=Engines('cpu', package),
+                                     save_initial=False)
             study = self.study
         with study.lock:
             for job in study.jobs.values():
@@ -1818,7 +1887,7 @@ class Session:
             study.seats = [dict(engine='human'), dict(engine='human')]
             if study.analysis:
                 study.analysis['auto'] = False
-            # Reuse evaluations already saved during the tournament, without editing its files.
+            # Reuse the game's evaluations without editing its files.
             path = directory / 'evaluations.jsonl'
             if path.exists():
                 with study.store.lock, path.open(encoding='utf-8') as lines:
@@ -1831,9 +1900,8 @@ class Session:
                                 study.store.index(record, line.strip())
                         except (ValueError, KeyError, TypeError):
                             continue
-            study.load(game['history'], True)
-            study.saved_game = dict(batch=ident, name=directory.name, game=number,
-                                   players=[p['name'] for p in game['players']], winner=game['winner'], reason=game['reason'])
+            study.load(game['history'], True, saved_game=dict(batch=ident, name=directory.name, game=number,
+                       players=[p['name'] for p in game['players']], winner=game['winner'], reason=game['reason']))
         return study
 
     def match_editable(self):
@@ -1939,8 +2007,8 @@ class Session:
                 games = 2 * (len(openings) if openings is not None else unique_openings or 1)
             if len(players) != 2 or type(games) is not int or games < 1:
                 raise ValueError('A match needs two engines and a positive number of games')
-            if type(max_placements) is not int or max_placements < 2:
-                raise ValueError('max_placements must be at least 2')
+            if type(max_placements) is not int or max_placements < 0 or max_placements == 1:
+                raise ValueError('max_placements must be at least 2, or 0 for uncapped')
             seats = [self.match_seat(p, preset) for p in players]
             clock = clock or dict(mode='fixed')
             mode = clock['mode']
@@ -1974,7 +2042,7 @@ class Session:
             for history in openings:
                 game = replay(history)
                 try:
-                    if game.winner >= 0 or len(history) >= max_placements:
+                    if game.winner >= 0 or max_placements and len(history) >= max_placements:
                         raise ValueError('An opening must be unfinished and shorter than max_placements')
                     dumps([tuple(p) for p in history])
                 finally:
@@ -1992,6 +2060,8 @@ class Session:
             self.remember_match(directory)
             evaluation_path = Path(evaluations) if evaluations else directory / 'evaluations.jsonl'
             evaluation_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.freeplay_directory or self.history:
+                self.save_freeplay()
             self.store = Evaluations(evaluation_path)
             self.match = match
             self.match_file = lock_match(directory)
@@ -2038,7 +2108,8 @@ class Session:
             self.match_editable()
             if self.history and any(s['engine'] == 'human' for s in self.seats):
                 raise ValueError('Use an empty player board to resume a saved batch')
-            directory = Path(directory).resolve()
+            self.match_catalogue()
+            directory = Path(self.saved_matches.get(str(directory), directory)).resolve()
             handle = lock_match(directory)
             try:
                 match = json.loads((directory / 'summary.json').read_text(encoding='utf-8'))
@@ -2168,7 +2239,7 @@ class Session:
                             self.stop_moves()
                     if match['outcome']:
                         winner = match['outcome']['winner']
-                    if winner < 0 and len(self.history) < match['max_placements']:
+                    if winner < 0 and (not match['max_placements'] or len(self.history) < match['max_placements']):
                         self.lock.wait(timeout=.1 if self.match_clock else None)
                         continue
                     number = match['current']
@@ -2295,6 +2366,7 @@ class Session:
     def close(self, timeout=30):
         """Cancel every job, wait for the worker to stop, then close the engines."""
         with self.lock:
+            self.save_freeplay()
             self.closing = True
             for job in self.jobs.values():
                 if job.status in ('queued', 'running'):
@@ -2365,6 +2437,8 @@ class Session:
                             if self.match_clock and not expired and self.match['clock']['mode'] == 'move':
                                 self.match_clock.balances = [int(self.match['clock']['ms']*1e6)]*2
                         if not expired:
+                            if not (self.match and self.match['active']):
+                                self.fork_freeplay()
                             self.history.extend(tuple(p) for p in result)
                         if self.match and self.match['active']:
                             self.match['error'] = None
@@ -2705,7 +2779,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path.startswith('/study/'):
             session = session.study
             if session is None:
-                return self.respond(404, dict(error='Choose a tournament game to analyse'))
+                return self.respond(404, dict(error='Choose a saved game to analyse'))
             url = url._replace(path=url.path[len('/study'):])
         if url.path in ('/matches', '/matches/game'):
             try:
@@ -2970,7 +3044,7 @@ def main():
                                   Evaluations(None if args.match else store_path), find, book,
                                   archive=ROOT / 'artifacts' / 'play' / 'matches',
                                   study_store=ROOT / 'artifacts' / 'play' / f'study-{args.port}.jsonl',
-                                  analysis_engines=Engines(args.device, args.tactical_package))
+                                  analysis_engines=Engines(args.device, args.tactical_package), save_initial=not args.match)
         Handler.session.models_folder = str(args.models.resolve())
         Handler.setups = Setups(args.models, Handler.session.rescan, lambda: Handler.session.entries)
         try:

@@ -173,6 +173,99 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answers[6][1], [])
         self.assertEqual([a[2] for a in answers[-2:]], [True, False])
 
+    def test_browser_notations_preserve_a_single_stone_final_turn(self):
+        history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
+        histories = [history[:1], history[:6], history]
+        for original, formats in zip(histories, node(dict(kind='notation', histories=histories))):
+            for name, data in formats.items():
+                self.assertEqual(data['history'], original)
+                expected = play.export(original, name)
+                self.assertEqual(data['text'], expected['text'])
+
+    def test_browser_book_has_unique_legal_starts_and_separate_policy_ranges(self):
+        book = json.loads((ENGINE/'openings.json').read_text())
+        counts = {m: len(book['nodes']) if m == 'all' else 8 if m == 'narrow' else sum(not n['off_policy'] for n in book['nodes'])
+                  for m in ('narrow', 'wide', 'all')}
+        for row in node(dict(kind='book')):
+            self.assertEqual(row['count'], counts[row['mode']])
+            self.assertEqual(row['unique'], row['count'])
+            if row['mode'] != 'all':
+                self.assertEqual(row['off_policy'], 0)
+
+    def test_browser_review_and_paired_tournament_are_saved(self):
+        history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
+        requests = [['/import', dict(text=json.dumps(dict(history=history)))], ['/review', {}], ['/review', {}], ['/state', {}],
+                    ['/storage/save', {}], ['/match', dict(players=[dict(engine='browser:test')]*2, games=2, clock=dict(mode='fixed'))],
+                    ['/state', {}]]
+        answers = node(dict(kind='play', history=history, requests=requests))
+        self.assertTrue(all(a['status'] == 200 for a in answers[:-1]))
+        self.assertEqual(answers[3]['data']['review'][-1]['label'], 'win')
+        self.assertEqual(answers[6]['data']['match']['wins'], [1, 1])
+        self.assertEqual(answers[6]['data']['match']['completed'], 2)
+        games = answers[-1]['backup']['games']
+        self.assertEqual(len(games), 4)
+        self.assertEqual(sum(g['history'] == history for g in games), 3)
+        self.assertTrue(any(g['history'] == [] for g in games))
+        for game in games:
+            self.assertEqual(len(game['records']), len({r['id'] for r in game['records']}))
+
+    def test_browser_stop_import_and_delete_survive_pending_jobs(self):
+        history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
+        result = node(dict(kind='lifecycle', history=history))
+        self.assertEqual(result['stopped_save'], dict(paused=True, active=False, completed=1))
+        self.assertEqual(result['resumed'], dict(wins=[1, 1], completed=2))
+        self.assertEqual(result['paused_save'], [dict(paused=True, completed=1, pending=True, current=2, resumedSeats=['other', 'test'])]*2)
+        self.assertIsNone(result['deleted']['current'])
+        self.assertTrue(all(m['single'] for m in result['deleted']['catalogue']))
+        self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]]))
+        self.assertEqual(result['stopped_timeout'], dict(paused=True, active=False, completed=0))
+        self.assertEqual(result['forked_clock'], dict(match=None, clock=None))
+        self.assertEqual(result['finished_opening_status'], 400)
+        self.assertEqual((result['capped']['completed'], result['capped']['capped']), (2, 2))
+        self.assertTrue(all(r['placements'] == 3 and r['reason'] == 'capped' for r in result['capped']['results']))
+        self.assertEqual(result['uncapped'], dict(completed=2, capped=0, wins=[1, 1]))
+        self.assertTrue(result['failure_clock_frozen'])
+        self.assertEqual(result['stale_tab'], dict(conflicted=True, history=[[0, 0], [1, 0]], archive=[[0, 0], [1, 0]],
+                                                 games=1, identity=True, mutation_status=400))
+        self.assertEqual(result['stale_match'], dict(conflicted=True, session_completed=0, archive_completed=0, archived_games=0))
+
+    def test_freeplay_updates_until_new_game(self):
+        win = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
+        requests = [['/play', dict(q=0, r=0)], ['/play', dict(q=1, r=0)]] + [['/storage/save', {}]]*20 + [['/new', {}]]
+        requests += [['/play', dict(q=q, r=r)] for q, r in win] + [['/storage/save', {}]]*20 + [['/state', {}]]
+        answers = node(dict(kind='play', history=[], requests=requests))
+        self.assertTrue(all(a['status'] == 200 for a in answers[:-1]))
+        saved = answers[-1]
+        self.assertEqual(len(saved['catalogue']), 2)
+        self.assertTrue(all(m['kind'] == 'freeplay' for m in saved['catalogue']))
+        self.assertCountEqual([g['history'] for g in saved['backup']['games']], [[[0, 0], [1, 0]], win])
+        finished = next(g for g in saved['backup']['games'] if g['history'] == win)
+        self.assertEqual((finished['winner'], finished['reason']), (0, 'six'))
+
+    def test_browser_freeplay_deepens_restores_and_keeps_original_study(self):
+        result = node(dict(kind='freeplay'))
+        self.assertEqual([n for ply, n in result['calls'] if ply == 1], [1, 2, 4])
+        self.assertEqual(result['history'], [[0, 0]])
+        self.assertEqual(result['simulations'], 4)
+        self.assertEqual(len(result['catalogue']), 2)
+        self.assertTrue(result['preserved'])
+        self.assertEqual(result['variation'], [[0, 0], [1, 0]])
+        self.assertEqual(result['imported_label'], 'best')
+        self.assertEqual(result['changed_version'], {})
+        self.assertTrue(result['restored_identity'])
+
+    def test_browser_resumes_partial_match_after_switching_boards_and_clears_import_opening(self):
+        result = node(dict(kind='resume'))
+        self.assertEqual(result['before']['history'], [[0, 0], [0, 2], [1, 2]])
+        self.assertEqual(result['after']['history'], result['before']['history'])
+        self.assertEqual(result['after']['timings'], result['before']['timings'])
+        self.assertEqual(result['after']['clock']['circle_ms'], result['before']['clock']['circle_ms'])
+        self.assertGreater(result['after']['clock']['circle_ms'], 180000)
+        self.assertIsNotNone(result['bookStart'])
+        self.assertIsNone(result['imported'])
+        self.assertFalse(result['auto'])
+        self.assertEqual(result['sameBatchSeats'], ['test', 'test'])
+
     def test_search_matches_native(self):
         """Same seed, position, budget, Q range floor and evaluations: the same actions, visits and policy as the native
         library."""
