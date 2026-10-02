@@ -5307,6 +5307,16 @@ class EvaluatorLoopTests(unittest.TestCase):
         with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'shorter than max_plies'):
             compare_search_modes.main()
         self.assertFalse(output.exists())
+        panel.write_text(json.dumps(dict(cases=[dict(history=[[0, 0], [0, 0]])])))
+        with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'Illegal placement'):
+            compare_search_modes.main()
+        self.assertFalse(output.exists())
+        panel.write_text(json.dumps(dict(cases=[dict(history=winning_game())])))
+        terminal_args = list(argv)
+        terminal_args[terminal_args.index('--max-plies')+1] = '16'
+        with unittest.mock.patch.object(sys, 'argv', terminal_args), self.assertRaisesRegex(ValueError, 'nonterminal'):
+            compare_search_modes.main()
+        self.assertFalse(output.exists())
         panel.write_text(json.dumps(dict(cases=[dict(history=[[0, 0]])])))
         with unittest.mock.patch.object(sys, 'argv', argv), unittest.mock.patch('builtins.print'), \
                 unittest.mock.patch.object(compare_search_modes.Evaluator, 'evaluate', evaluate):

@@ -205,9 +205,16 @@ def main():
                      names={m: f'{m}-{args.sims}-{batch_id[:8]}' for m in ('policy', 'puct')}, results=[], models={},
                      native=native_hashes, source_files=source_hashes,
                      external_solver=False, graph=True, tactics=True, device=args.device, complete=False)
-    if any(len(history) >= state['max_plies'] for history in
-           [c['history'] for c in state['cases']] + state['openings']):
+    starts = [c['history'] for c in state['cases']] + state['openings']
+    if any(len(history) >= state['max_plies'] for history in starts):
         raise ValueError('Starting positions must be shorter than max_plies')
+    for history in starts:
+        game = Game(history)
+        try:
+            if game.winner >= 0:
+                raise ValueError('Starting positions must be nonterminal')
+        finally:
+            game.close()
     if not args.out.exists():
         args.out.parent.mkdir(parents=True, exist_ok=True)
         write_json(args.out, state)
