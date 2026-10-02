@@ -793,50 +793,6 @@ struct Search {
         }
         return -1;
     }
-    int prove_ordered(Board& b,int depth) {
-        if(++proof_nodes>proof_limit || Clock::now()>=proof_deadline) throw Timeout{};
-        ++nodes;const int attacker=b.player;
-        auto win=immediate(b);
-        if(win.count) {proof.push_back({win,{}});return int(proof.size())-1;}
-        if(!depth) return -1;
-        const auto mark=proof.size();
-        struct Attack {Turn move;std::vector<Turn> replies;int score;};
-        std::vector<Attack> attacks;
-        const bool constrained=!b.completions(1-attacker).empty();
-        std::unordered_set<uint64_t> generated;
-        auto ranked=candidate_scores(b);
-        for(auto& [score,c]:ranked) score=4*score-3*b.gain(c,1-attacker);
-        auto firsts=constrained?std::vector<Cell>{{}}:select_candidates(b,std::move(ranked),width);
-        for(auto first:firsts) for(const auto& attack:turns(b,true,{},true,constrained?nullptr:&first,&generated)) {
-            if(Clock::now()>=proof_deadline) throw Timeout{};
-            CandidatePause pause(b);Restore restore(b);apply(b,attack);
-            std::vector<Turn> replies;
-            if(b.winner!=attacker && !forced_replies(b,attacker,replies)) continue;
-            if(replies.empty()) {proof.push_back({attack,{}});return int(proof.size())-1;}
-            if(depth==1) continue;
-            // Prefer attacks whose position survives the strongest forced reply.
-            int score=mate;
-            for(const auto& defense:replies) {
-                Restore reply(b);apply(b,defense);score=std::min(score,b.score(attacker));
-            }
-            attacks.push_back({attack,std::move(replies),score});
-        }
-        std::stable_sort(attacks.begin(),attacks.end(),[](const auto& a,const auto& z){return a.score>z.score;});
-        for(const auto& attack:attacks) {
-            if(Clock::now()>=proof_deadline) throw Timeout{};
-            Restore restore(b);apply(b,attack.move);
-            ForcingLine line{attack.move,{}};bool won=true;
-            for(const auto& defense:attack.replies) {
-                Restore reply(b);apply(b,defense);
-                int child=prove_ordered(b,depth-1);
-                if(child<0) {won=false;break;}
-                line.replies.emplace_back(defense,child);
-            }
-            if(won) {proof.push_back(std::move(line));return int(proof.size())-1;}
-            proof.resize(mark);
-        }
-        return -1;
-    }
     int probe(Board& b,int depth) {
         const auto mark=proof.size();const int limit=proof_limit;
         if(depth>1) {
@@ -857,7 +813,7 @@ struct Search {
             if(Clock::now()>=proof_deadline) return -1;
         }
         proof_nodes=0;
-        return prove_ordered(b,depth);
+        return prove(b,depth);
     }
     bool replay(Board& b,int index) {
         if(Clock::now()>=proof_deadline) throw Timeout{};
@@ -993,8 +949,6 @@ struct Search {
                 if(!roots.empty()) chosen=roots.front();
                 if(root_seconds) roots=diversify(b,std::move(roots),root_seconds,root_turns);
                 const auto allowance=deadline-start;
-                auto refutation_left=allowance*3/10;
-                std::vector<Turn> probed;
                 if(!b.model) {
                     proof_deadline=std::min(deadline,Clock::now()+allowance*3/10);proof_nodes=0;
                     int own=-1;
@@ -1004,47 +958,52 @@ struct Search {
                         roots.clear();max_depth=0;
                     } else proof.clear();
                 }
-                for(int depth=1;depth<=max_depth;++depth) {
+                // Spend the counterproof allowance on the final searched choice.
+                const auto turn_deadline=deadline;
+                if(!b.model && forcing_material(b,1-b.player)) deadline-=allowance*3/10;
+                try {for(int depth=1;depth<=max_depth;++depth) {
                     // Freeze admission for the whole iteration, including PVS
                     // re-searches. Scores from a different admitted tree cannot
                     // provide bounds; only previous-iteration moves are reused.
                     if(inject_tt) frozen_hints=tt;
                     int best=-mate-1;Turn iteration=chosen;
-                    for(auto& t:roots) {
+                    // A timed-out iteration must not change fallback ordering.
+                    auto iteration_roots=roots;
+                    for(auto& t:iteration_roots) {
                         check();CandidatePause pause(b,depth==1);Restore branch(b);int side=b.player;apply(b,t);
                         int score=b.winner==side?mate:-negamax(b,depth-1,-mate-1,-best);
                         t.score=score;
                         if(score>best) {best=score;iteration=t;}
                         if(best>=mate) break;
                     }
+                    roots.swap(iteration_roots);
                     chosen=iteration;chosen.score=best;output.depth=depth;
                     std::stable_sort(roots.begin(),roots.end(),[](auto a,auto z){return a.score>z.score;});
-                    while(!b.model && refutation_left>Clock::duration::zero() &&
-                          std::none_of(probed.begin(),probed.end(),[&](const Turn& t){return t.count==chosen.count && t.cells==chosen.cells;})) {
-                        const auto probe_start=Clock::now();const auto mark=proof.size();
-                        const auto query=chosen;probed.push_back(query);int enemy=-1;
-                        {
-                            Restore restore(b);apply(b,query);proof_nodes=0;
-                            proof_deadline=std::min(deadline,probe_start+std::min(refutation_left,allowance/5));
-                            try {if(b.winner<0 && forcing_material(b,b.player)) enemy=probe(b,std::min(6,max_depth/2));} catch(const Timeout&) {}
-                        }
-                        if(enemy<0) {proof.resize(mark);refutation_left-=Clock::now()-probe_start;break;}
-                        proof_deadline=std::min(deadline,probe_start+refutation_left);
-                        std::vector<bool> refuted(roots.size());
-                        for(size_t i=0;i<roots.size();++i) {
-                            if(roots[i].count==query.count && roots[i].cells==query.cells) refuted[i]=true;
-                            else try {
-                                Restore restore(b);apply(b,roots[i]);
-                                if(b.winner<0) refuted[i]=replay(b,enemy);
-                            } catch(const Timeout&) {break;}
-                        }
-                        refutation_left-=Clock::now()-probe_start;
-                        if(!std::count(refuted.begin(),refuted.end(),false)) {chosen.score=best=-mate;break;}
-                        size_t j=0;
-                        for(size_t i=0;i<roots.size();++i) if(!refuted[i]) roots[j++]=roots[i];
-                        roots.resize(j);chosen=roots.front();best=chosen.score;
-                    }
                     if(best>=mate || best<=-mate) break;
+                }} catch(const Timeout&) {}
+                deadline=turn_deadline;
+                while(!b.model && !roots.empty() && Clock::now()<deadline) {
+                    const auto mark=proof.size();
+                    const auto query=chosen;int enemy=-1;
+                    {
+                        Restore restore(b);apply(b,query);proof_nodes=0;
+                        proof_deadline=deadline;
+                        try {if(b.winner<0 && forcing_material(b,b.player)) enemy=probe(b,std::min(6,max_depth/2));} catch(const Timeout&) {}
+                    }
+                    if(enemy<0) {proof.resize(mark);break;}
+                    proof_deadline=deadline;
+                    std::vector<bool> refuted(roots.size());
+                    for(size_t i=0;i<roots.size();++i) {
+                        if(roots[i].count==query.count && roots[i].cells==query.cells) refuted[i]=true;
+                        else try {
+                            Restore restore(b);apply(b,roots[i]);
+                            if(b.winner<0) refuted[i]=replay(b,enemy);
+                        } catch(const Timeout&) {break;}
+                    }
+                    if(!std::count(refuted.begin(),refuted.end(),false)) {chosen.score=-mate;break;}
+                    size_t j=0;
+                    for(size_t i=0;i<roots.size();++i) if(!refuted[i]) roots[j++]=roots[i];
+                    roots.resize(j);chosen=roots.front();
                 }
             } catch(const Timeout&) {}
         }
