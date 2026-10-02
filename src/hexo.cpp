@@ -418,7 +418,7 @@ struct Board {
         }
         return score;
     }
-    int placed_score(Cell c,int p) const {
+    int placed_score(Cell c,int p,int* threats=nullptr) const {
         // Exact scalar evaluation after one empty cell is filled. Candidate
         // ranking need not update the board, feature counts or threat sets.
         int64_t score=evaluation+learned_score;
@@ -428,6 +428,7 @@ struct Board {
             int pattern=data?data->pattern:0;
             score-=value(n)+adjustment[pattern];
             ++n[p];
+            if(threats && n[p]==4 && !n[1-p]) ++*threats;
             score+=value(n)+adjustment[pattern+(p+1)*powers[k]];
         }
         int result=int(std::clamp(score,int64_t(-500000),int64_t(500000)));
@@ -472,6 +473,7 @@ struct Restore {
 struct Turn {
     std::array<Cell,2> cells{};
     int count=0,score=0;
+    bool leaf_score_exact=false;
 };
 void apply(Board& b,const Turn& t) { for(int i=0;i<t.count && b.winner<0;++i) b.make(t.cells[i]); }
 constexpr int mate=10000000;
@@ -637,11 +639,11 @@ struct Search {
         std::array<Cell,2> selected{};
         return !cover_exists(threats,selected,0,b.remaining);
     }
-    std::vector<Turn> turns(Board& b,bool timed=true,Turn hint={},bool forcing=false,const Cell* first_only=nullptr,std::unordered_set<uint64_t>* seen_turns=nullptr) {
+    std::vector<Turn> turns(Board& b,bool timed=true,Turn hint={},bool forcing=false,const Cell* first_only=nullptr,std::unordered_set<uint64_t>* seen_turns=nullptr,int cutoff=mate+1) {
         Turn win=immediate(b); if(win.count) {win.score=mate;return {win};}
         int side=b.player;
         auto constraints=b.completions(1-side);
-        std::vector<Turn> result;
+        std::vector<Turn> result;bool cut=false;
         std::unordered_set<uint64_t> local_seen;
         auto& seen=seen_turns?*seen_turns:local_seen;
         auto add=[&](Turn t,bool mandatory=false) {
@@ -658,11 +660,14 @@ struct Search {
             t.score=b.winner==side?mate:b.score(side);
             // Every immediate opponent completion must be covered.
             if(b.winner<0 && !b.completions(1-side).empty()) t.score=-mate;
+            t.leaf_score_exact=t.score>-mate && t.score<mate && b.threats[side].size()<3;
             result.push_back(t);
+            if(t.score>=cutoff) {result={t};cut=true;}
         };
         // Validate both placements in order before reserving a slot. A defensive
         // hint must cover every immediate threat; own wins were handled above.
         add(hint,!constraints.empty());
+        if(cut) return result;
         const bool pinned=!result.empty();
         RankedCells base;
         if(!b.model && b.remaining==2) {
@@ -716,12 +721,15 @@ struct Search {
                 // Deduplicate using the same final-position hash as add().
                 auto key=b.stones_hash^mix(CellHash{}(c)^mix(side+991))^mix(100+(1-side)*3+2)^mix(199);
                 if(!seen.insert(key).second) continue;
-                int score=b.placed_score(c,side);
+                int threats=int(b.threats[side].size());
+                int score=b.placed_score(c,side,&threats);
                 for(const auto& threat:constraints)
                     if(std::find(threat.begin(),threat.end(),first)==threat.end() &&
                        std::find(threat.begin(),threat.end(),c)==threat.end()) {score=-mate;break;}
                 if(forcing && score>-mate && std::binary_search(prepare.begin(),prepare.end(),c)) score+=500000;
-                result.push_back({{first,c},2,score});
+                Turn t{{first,c},2,score,!forcing && score>-mate && threats<3};
+                result.push_back(t);
+                if(score>=cutoff) {result={t};cut=true;return;}
             }
         };
         if(!constraints.empty()) {
@@ -736,14 +744,16 @@ struct Search {
                     if(!b.legal(cover[0])) continue;
                     follow(cover[0],width);
                 }
+                if(cut) return result;
             }
             if(!result.empty()) {std::sort(result.begin()+int(pinned),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});return result;}
         }
         auto firsts=first_only?std::vector<Cell>{*first_only}:base.empty()?candidates(b,width):select_candidates(b,base,width);
         for(auto a:firsts) {
             if(timed) check();
-            if(b.remaining==1) {add({{a,{}},1,0});continue;}
+            if(b.remaining==1) {add({{a,{}},1,0});if(cut) return result;continue;}
             follow(a,std::max(6,width/2));
+            if(cut) return result;
         }
         std::stable_sort(result.begin()+int(pinned),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});
         if(!forcing && int(result.size())>width*2) result.resize(width*2);
@@ -903,17 +913,30 @@ struct Search {
             uint64_t key=b.hash();const auto& entry=frozen_hints[key&(frozen_hints.size()-1)];
             if(entry.key==key) hint=entry.best;
         }
-        auto moves=turns(b,true,hint);
+        const bool leaf=!b.model && !inject_tt && depth==1;
+        auto moves=turns(b,true,hint,false,nullptr,nullptr,leaf?beta:mate+1);
+        // At the final layer, static move scores are lower bounds: an
+        // unavoidable attack can only raise them to mate. The admitted list
+        // retains the highest static scores, so any generated cutoff proves
+        // that an admitted move also reaches beta, without generating the rest.
+        if(leaf && !moves.empty() && moves.front().score>=beta) {++nodes;return moves.front().score;}
         if(moves.empty()) return b.score(b.player);
         int best=-mate-1;Turn best_turn=moves.front();bool first=true;
         for(const auto& t:moves) {
-            CandidatePause pause(b,depth==1);Restore restore(b);int side=b.player;apply(b,t);
             int score;
-            if(b.winner==side) score=mate;
-            else if(first) score=-negamax(b,depth-1,-beta,-alpha);
-            else {
-                score=-negamax(b,depth-1,-alpha-1,-alpha);
-                if(score>alpha && score<beta) score=-negamax(b,depth-1,-beta,-alpha);
+            if(!b.model && depth==1 && t.leaf_score_exact) {
+                // The opponent has no immediate win, and two threatening
+                // windows can always be covered by two stones. Generation scored
+                // this leaf; only possible multi-threat wins need a full check.
+                ++nodes;check();score=t.score;
+            } else {
+                CandidatePause pause(b,depth==1);Restore restore(b);int side=b.player;apply(b,t);
+                if(b.winner==side) score=mate;
+                else if(first) score=-negamax(b,depth-1,-beta,-alpha);
+                else {
+                    score=-negamax(b,depth-1,-alpha-1,-alpha);
+                    if(score>alpha && score<beta) score=-negamax(b,depth-1,-beta,-alpha);
+                }
             }
             first=false;
             if(score>best) {best=score;best_turn=t;}
@@ -1016,8 +1039,12 @@ struct Search {
                     if(inject_tt) frozen_hints=tt;
                     int best=-mate-1;Turn iteration=chosen;
                     for(auto& t:roots) {
-                        check();CandidatePause pause(b,depth==1);Restore branch(b);int side=b.player;apply(b,t);
-                        int score=b.winner==side?mate:-negamax(b,depth-1,-mate-1,-best);
+                        check();int score;
+                        if(!b.model && depth==1 && t.leaf_score_exact) {++nodes;score=t.score;}
+                        else {
+                            CandidatePause pause(b,depth==1);Restore branch(b);int side=b.player;apply(b,t);
+                            score=b.winner==side?mate:-negamax(b,depth-1,-mate-1,-best);
+                        }
                         t.score=score;
                         if(score>best) {best=score;iteration=t;}
                         if(best>=mate) break;

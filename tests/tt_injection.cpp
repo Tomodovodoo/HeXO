@@ -116,6 +116,31 @@ int main() {
     }
     std::vector<Turn> free_replies;
     assert(!forcing.forced_replies(spare,0,free_replies));
+    for(auto* source:{&b,&threat,&open,&blocked,&counter,&spare}) {
+        auto& position=*source;
+        const auto original_key=position.hash();const auto original_features=position.features;
+        Search leaf(10000,16);
+        if(position.winner<0 && !leaf.immediate(position).count) {
+            const int side=position.player;int exact=-mate-1;
+            auto moves=leaf.turns(position,false);
+            for(const auto& move:moves) {
+                Restore restore(position);apply(position,move);
+                int value=position.winner==side?mate:
+                    leaf.immediate(position).count?-mate:
+                    leaf.unavoidable_loss(position)?mate:position.score(side);
+                assert(!move.leaf_score_exact || value==move.score);
+                exact=std::max(exact,value);
+            }
+            for(const auto& bounds:std::vector<std::pair<int,int>>{
+                {-mate-1,mate+1},{exact-1,exact},{exact,exact+1},{-1,0},{0,1},{-2400,2400}}) {
+                const auto [alpha,beta]=bounds;Search bounded(10000,16);
+                int result=bounded.negamax(position,1,alpha,beta);
+                assert(exact>=beta ? result>=beta && result<=exact :
+                       exact<=alpha ? result<=alpha && result>=exact : result==exact);
+                assert(position.hash()==original_key && position.features==original_features);
+            }
+        }
+    }
     // Development losses: an attack hidden below defensive first-stone
     // rankings, and a winning continuation with no unblocked three-stone line.
     // Short continuations must also survive the proof work limit. All strategies
@@ -204,6 +229,30 @@ int main() {
                 assert(cached==fresh);
             };
             check_cache();
+            if(step%5==0) {
+                const auto original_key=position.hash();const auto original_features=position.features;
+                Search leaf(10000,16);
+                if(position.winner<0 && !leaf.immediate(position).count) {
+                    const int side=position.player;int exact=-mate-1;
+                    auto moves=leaf.turns(position,false);
+                    for(const auto& move:moves) {
+                        Restore restore(position);apply(position,move);
+                        int value=position.winner==side?mate:
+                            leaf.immediate(position).count?-mate:
+                            leaf.unavoidable_loss(position)?mate:position.score(side);
+                        assert(!move.leaf_score_exact || value==move.score);
+                        exact=std::max(exact,value);
+                    }
+                    for(const auto& bounds:std::vector<std::pair<int,int>>{
+                        {-mate-1,mate+1},{exact-1,exact},{exact,exact+1},{-1,0},{0,1},{-2400,2400}}) {
+                        const auto [alpha,beta]=bounds;Search bounded(10000,16);
+                        int result=bounded.negamax(position,1,alpha,beta);
+                        assert(exact>=beta ? result>=beta && result<=exact :
+                               exact<=alpha ? result<=alpha && result>=exact : result==exact);
+                        assert(position.hash()==original_key && position.features==original_features);
+                    }
+                }
+            }
             if(step==10 && trial<4) {
                 auto key=position.hash();auto features=position.features;
                 Search cached_search(10000,4);
