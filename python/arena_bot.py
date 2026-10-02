@@ -84,8 +84,14 @@ class NativeArena:
         incoming = asyncio.create_task(socket.receive())
 
         async def respond(packet):
-            confirmed, reply, result = await asyncio.get_running_loop().run_in_executor(
+            computation = asyncio.get_running_loop().run_in_executor(
                 worker, answer, history, packet, self.ms, self.width, self.depth)
+            try:
+                confirmed, reply, result = await asyncio.shield(computation)
+            finally:
+                # Cancelling an asyncio wait cannot stop Native. Finish its bounded
+                # work before redialling, then receive the server's updated clock.
+                await asyncio.gather(computation, return_exceptions=True)
             await socket.send_json(reply)
             print(f'Game {game_id}: ply {len(confirmed)}, '
                   f'{result["elapsed_ms"]:.1f} ms, depth {result["depth"]}', flush=True)

@@ -704,6 +704,54 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('aiohttp'), 'API extra not installed')
 class ArenaNative(unittest.IsolatedAsyncioTestCase):
+    async def test_dropped_socket_drains_native_before_requesting_a_new_clock(self):
+        import aiohttp
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        from arena_bot import NativeArena, answer
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        dials, replies = [], []
+
+        def delayed_answer(*args):
+            if not started.is_set():
+                started.set()
+                if not release.wait(4):
+                    raise TimeoutError('Test did not release Native')
+                result = answer(*args)
+                finished.set()
+                return result
+            return answer(*args)
+
+        async def session(request):
+            dials.append(finished.is_set())
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            await ws.send_json(dict(type='setup', board=dict(cells=[dict(q=0, r=0, p='x')])))
+            await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=len(dials),
+                                    move_time_limit=5 if len(dials) == 1 else .2))
+            if len(dials) == 1:
+                self.assertTrue(await asyncio.to_thread(started.wait, 3))
+                asyncio.get_running_loop().call_later(1.2, release.set)
+                await ws.close(code=1011)
+            else:
+                replies.append(await ws.receive_json(timeout=3))
+                await ws.close()
+            return ws
+
+        app = web.Application()
+        app.router.add_get('/engine', session)
+        async with TestServer(app) as server, aiohttp.ClientSession() as client:
+            bot = NativeArena(str(server.make_url('/')), 'private', ms=20, width=8, depth=1)
+            bot.http = client
+            with patch('arena_bot.answer', side_effect=delayed_answer):
+                try:
+                    await asyncio.wait_for(bot.play(dict(gameId='redial',
+                        engine=dict(socketUrl='/engine', token='game-only'))), 6)
+                finally:
+                    release.set()
+        self.assertEqual(dials, [False, True])
+        self.assertEqual([reply['request_id'] for reply in replies], [2])
+
     async def test_confirmed_turns_replay_without_duplicating_our_move(self):
         from arena_bot import answer
         first = dict(type='move_request', side='o', previous=[], request_id=17, move_time_limit=5)
