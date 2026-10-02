@@ -5271,6 +5271,100 @@ def scripted(winner=lambda record: record['challenger_color'], hook=lambda pool,
 class EvaluatorLoopTests(unittest.TestCase):
     """Evaluator.step on a CPU run of TINY checkpoints with two-sim, eight-ply games."""
 
+    def test_imported_benchmark_variant_is_rated_but_never_scheduled(self):
+        evaluator = self.start()
+        benchmark = dict(id='main/000010@puct', checkpoint='main/000010', settings=dict(search_choice='puct'),
+                         benchmark_only=True, elo=100., elo_interval=[90., 110.], matches=[])
+        ordinary = dict(id='main/000010@policy', checkpoint='main/000010', settings=dict(search_choice='policy'))
+        evaluator.league['variants'] = [benchmark, ordinary]
+        self.assertEqual(evaluator.variants(), [ordinary])
+        self.assertIsNone(evaluator.entry(benchmark['id']))
+        self.assertIs(evaluator.entry(ordinary['id']), ordinary)
+        self.assertIn(benchmark, evaluator.league['variants'])
+
+    def test_pinned_search_comparison_survives_export_and_publishes_history(self):
+        from tools import compare_search_modes
+        evaluator = self.start()
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        book = dense_eval.dense_openings.Book(self.run, evaluator.settings, suite='book')
+        book.data['nodes'][0]['status'] = 'opening'
+        (self.run/'openings.json').write_text(json.dumps(book.data))
+        panel, output = self.run/'panel.json', self.run/'comparison.json'
+        panel.write_text(json.dumps(dict(cases=[dict(history=[[0, 0]])])))
+        original = compare_search_modes.Evaluator.evaluate
+        exported = []
+        def evaluate(adapter, histories):
+            if not exported:
+                self.export(30)
+                exported.append(30)
+            return original(adapter, histories)
+        argv = ['compare_search_modes.py', '--run', str(self.run), '--checkpoint', 'main/000010',
+                '--opponent', 'main/000020', '--panel', str(panel), '--out', str(output),
+                '--games', '2', '--sims', '2', '--root-samples', '2', '--max-plies', '8', '--device', 'cpu']
+        panel.write_text(json.dumps(dict(cases=[dict(history=[[i, 0] for i in range(8)])])))
+        with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'shorter than max_plies'):
+            compare_search_modes.main()
+        self.assertFalse(output.exists())
+        panel.write_text(json.dumps(dict(cases=[dict(history=[[0, 0], [0, 0]])])))
+        with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'Illegal placement'):
+            compare_search_modes.main()
+        self.assertFalse(output.exists())
+        panel.write_text(json.dumps(dict(cases=[dict(history=winning_game())])))
+        terminal_args = list(argv)
+        terminal_args[terminal_args.index('--max-plies')+1] = '16'
+        with unittest.mock.patch.object(sys, 'argv', terminal_args), self.assertRaisesRegex(ValueError, 'nonterminal'):
+            compare_search_modes.main()
+        self.assertFalse(output.exists())
+        panel.write_text(json.dumps(dict(cases=[dict(history=[[0, 0]])])))
+        with unittest.mock.patch.object(sys, 'argv', argv), unittest.mock.patch('builtins.print'), \
+                unittest.mock.patch.object(compare_search_modes.Evaluator, 'evaluate', evaluate):
+            compare_search_modes.main()
+        state = json.loads(output.read_text())
+        self.assertTrue(state['complete'])
+        self.assertEqual(len(state['results']), 9)
+        self.assertEqual({g['sides'][g['challenger_color']][0] for g in state['results']}, {'main/000010'})
+        too_long = dict(state, cases=[dict(history=[[i, 0] for i in range(state['max_plies'])])])
+        output.write_text(json.dumps(too_long))
+        with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'shorter than max_plies'):
+            compare_search_modes.main()
+        output.write_text(json.dumps(state))
+        # A sweep distinguishes the two orientations of the one-sided paired test.
+        for game in state['results']:
+            if game['kind'] == 'match':
+                game['winner'] = game['challenger_color']
+        partial = dict(state, results=[g for g in state['results']
+                                      if g.get('a') != 'puct' or g.get('b') != 'policy'])
+        with self.assertRaisesRegex(ValueError, 'all three complete'):
+            compare_search_modes.publish(self.run, partial)
+        self.assertEqual(dense_eval.load_reports(self.run), [])
+        self.assertFalse(dense_eval.requests(self.run))
+        compare_search_modes.publish(self.run, state)
+        dense_eval.write_league(self.run, evaluator.league, evaluator.config)
+        variants = self.league()['variants']
+        self.assertEqual(len(variants), 2)
+        self.assertTrue(all(v['elo'] is not None and len(v['matches']) == 2 for v in variants))
+        puct = next(v for v in variants if v['settings']['search_choice'] == 'puct')
+        self.assertEqual(next(m for m in puct['matches'] if m['opponent'] == 'main/000010')['opening_pair_p'], 1.)
+        self.assertLess(next(m for m in puct['matches'] if m['opponent'] != 'main/000010')['opening_pair_p'], 1.)
+        self.assertEqual(evaluator.variants(), [])
+        self.assertEqual(len(dense_eval.load_reports(self.run)), 3)
+        self.assertTrue(evaluator.step())
+        self.assertIsNotNone(evaluator.entry('main/000030'))
+        self.assertFalse(any('@' in cid for cid in evaluator.models))
+        with unittest.mock.patch.object(sys, 'argv', argv[:-1]+['cuda']), self.assertRaisesRegex(ValueError, 'device differs'):
+            compare_search_modes.main()
+        wrapper = next(name for name in state['source_files'] if name == 'python/hexo.py')
+        state['source_files'][wrapper] = 'changed'
+        output.write_text(json.dumps(state))
+        with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'Python search source differs'):
+            compare_search_modes.main()
+        weights = self.run/'checkpoints/main/000010/ema.pt'
+        weights.write_bytes(weights.read_bytes()+b'changed')
+        with self.assertRaisesRegex(ValueError, 'checkpoint weights differ'):
+            compare_search_modes.publish(self.run, state)
+
     def setUp(self):
         self.threads = torch.get_num_threads()
         torch.set_num_threads(2)

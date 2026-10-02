@@ -477,12 +477,16 @@ void apply(Board& b,const Turn& t) { for(int i=0;i<t.count && b.winner<0;++i) b.
 constexpr int mate=10000000;
 struct Timeout {};
 struct Entry { uint64_t key=0; Turn best; };
+struct ForcingLine { Turn attack; std::vector<std::pair<Turn,int>> replies; };
 struct Search {
     Clock::time_point deadline;
     int width;
     uint64_t nodes=0;
     std::vector<Entry> tt, frozen_hints;
     bool inject_tt=false;
+    std::vector<ForcingLine> proof;
+    Clock::time_point proof_deadline;
+    int proof_nodes=0,proof_limit=512;
     Search(int ms,int width,bool inject=false):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(inject?1<<16:0),inject_tt(inject){}
     void check() const { if(Clock::now()>=deadline) throw Timeout{}; }
     Turn immediate(Board& b) {
@@ -625,7 +629,7 @@ struct Search {
         std::array<Cell,2> selected{};
         return !cover_exists(threats,selected,0,b.remaining);
     }
-    std::vector<Turn> turns(Board& b,bool timed=true,Turn hint={}) {
+    std::vector<Turn> turns(Board& b,bool timed=true,Turn hint={},bool forcing=false,const Cell* first_only=nullptr) {
         Turn win=immediate(b); if(win.count) {win.score=mate;return {win};}
         int side=b.player;
         auto constraints=b.completions(1-side);
@@ -658,13 +662,45 @@ struct Search {
         }
         auto follow=[&](Cell first,int limit) {
             Restore restore(b);b.make(first);
+            if(forcing) {
+                bool attack=false;
+                for(int a=0;a<3;++a) for(int j=0;j<6;++j) {
+                    auto data=b.windows.find({first+axes[a]*(-j),a});
+                    if(data && data->counts[side]>=3 && !data->counts[1-side]) attack=true;
+                }
+                if(!attack) return;
+            }
             auto seconds=b.model?candidates(b,limit):select_candidates(b,following_scores(b,base,first),limit);
             if(b.model) {
                 b.undo();
                 for(auto c:seconds) add({{first,c},2,0});
                 return;
             }
+            std::vector<Cell> prepare;
+            if(forcing && constraints.empty()) for(auto w:b.threats[side]) {
+                auto q=first.q-w.start.q,r=first.r-w.start.r;
+                auto along=w.axis==1?r:q;
+                if((w.axis==0?r!=0:w.axis==1?q!=0:q+r!=0) || along<0 || along>5) continue;
+                for(int j=0;j<6;++j) {
+                    Cell stone=w.start+axes[w.axis]*j;
+                    if(b.at(stone)!=side) continue;
+                    for(auto d:axes) for(int sign:{-1,1}) {
+                        Cell c=stone+d*sign;auto x=c.q-first.q,y=c.r-first.r;
+                        if((w.axis==0?y==0:w.axis==1?x==0:x+y==0) || b.at(c)>=0 ||
+                           std::abs(c.q)>1000000000000LL || std::abs(c.r)>1000000000000LL) continue;
+                        prepare.push_back(c);
+                    }
+                }
+            }
+            std::sort(prepare.begin(),prepare.end());prepare.erase(std::unique(prepare.begin(),prepare.end()),prepare.end());
+            for(auto c:prepare) if(std::find(seconds.begin(),seconds.end(),c)==seconds.end()) seconds.push_back(c);
             for(auto c:seconds) {
+                if(forcing) {
+                    if(timed && Clock::now()>=proof_deadline) throw Timeout{};
+                    CandidatePause pause(b);Restore second(b);b.make(c);
+                    std::vector<Turn> replies;
+                    if(b.winner!=side && !forced_replies(b,side,replies)) continue;
+                }
                 // Immediate wins were returned above. These two placements
                 // cannot make a new opponent threat; they only cover old ones.
                 // Deduplicate using the same final-position hash as add().
@@ -674,6 +710,7 @@ struct Search {
                 for(const auto& threat:constraints)
                     if(std::find(threat.begin(),threat.end(),first)==threat.end() &&
                        std::find(threat.begin(),threat.end(),c)==threat.end()) {score=-mate;break;}
+                if(forcing && score>-mate && std::binary_search(prepare.begin(),prepare.end(),c)) score+=500000;
                 result.push_back({{first,c},2,score});
             }
         };
@@ -692,15 +729,120 @@ struct Search {
             }
             if(!result.empty()) {std::sort(result.begin()+int(pinned),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});return result;}
         }
-        auto firsts=base.empty()?candidates(b,width):select_candidates(b,base,width);
+        auto firsts=first_only?std::vector<Cell>{*first_only}:base.empty()?candidates(b,width):select_candidates(b,base,width);
         for(auto a:firsts) {
             if(timed) check();
             if(b.remaining==1) {add({{a,{}},1,0});continue;}
             follow(a,std::max(6,width/2));
         }
         std::stable_sort(result.begin()+int(pinned),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});
-        if(int(result.size())>width*2) result.resize(width*2);
+        if(!forcing && int(result.size())>width*2) result.resize(width*2);
         return result;
+    }
+    bool forced_replies(Board& b,int attacker,std::vector<Turn>& out) {
+        if(immediate(b).count) return false;
+        auto threats=b.completions(attacker);
+        std::erase_if(threats,[&](const auto& e) {
+            return !std::all_of(e.begin(),e.end(),[&](Cell c){return b.legal(c);});
+        });
+        if(threats.empty()) return false;
+        std::vector<std::vector<Cell>> defenses;std::vector<Cell> selected;
+        covers(threats,selected,b.remaining,defenses);
+        for(auto& defense:defenses) {
+            if(int(defense.size())<b.remaining) return false;
+            std::sort(defense.begin(),defense.end());
+        }
+        std::sort(defenses.begin(),defenses.end());
+        defenses.erase(std::unique(defenses.begin(),defenses.end()),defenses.end());
+        for(const auto& d:defenses) {
+            Turn t;t.count=int(d.size());std::copy(d.begin(),d.end(),t.cells.begin());out.push_back(t);
+        }
+        return true;
+    }
+    int prove(Board& b,int depth) {
+        if(++proof_nodes>proof_limit || Clock::now()>=proof_deadline) throw Timeout{};
+        ++nodes;const int attacker=b.player;
+        auto win=immediate(b);
+        if(win.count) {proof.push_back({win,{}});return int(proof.size())-1;}
+        if(!depth) return -1;
+        const auto mark=proof.size();
+        const bool constrained=!b.completions(1-attacker).empty();
+        auto ranked=candidate_scores(b);
+        // Continuous attacks need offensive candidates: cancel the defensive
+        // three-quarter term shared by the two cached scalar rankings.
+        for(auto& [score,c]:ranked) score=4*score-3*b.gain(c,1-attacker);
+        auto firsts=constrained?std::vector<Cell>{{}}:select_candidates(b,std::move(ranked),width);
+        for(auto first:firsts) for(const auto& attack:turns(b,true,{},true,constrained?nullptr:&first)) {
+            if(Clock::now()>=proof_deadline) throw Timeout{};
+            Restore restore(b);apply(b,attack);
+            std::vector<Turn> replies;
+            if(b.winner!=attacker && !forced_replies(b,attacker,replies)) continue;
+            ForcingLine line{attack,{}};bool won=true;
+            for(const auto& defense:replies) {
+                Restore reply(b);apply(b,defense);
+                int child=prove(b,depth-1);
+                if(child<0) {won=false;break;}
+                line.replies.emplace_back(defense,child);
+            }
+            if(won) {proof.push_back(std::move(line));return int(proof.size())-1;}
+            proof.resize(mark);
+        }
+        return -1;
+    }
+    int probe(Board& b,int depth) {
+        const auto mark=proof.size();const int limit=proof_limit;
+        if(depth>1) {
+            const auto end=proof_deadline,now=Clock::now();
+            proof_deadline=now+(end-now)/2;
+            int found=-1;
+            // Find short continuations before longer alternatives can consume
+            // the budget, including after the opponent follows a known proof.
+            for(int d=1;d<std::min(4,depth);++d) {
+                proof_limit=std::min(limit,64*d);proof_nodes=0;
+                try {found=prove(b,d);} catch(const Timeout&) {}
+                if(found>=0) break;
+                proof.resize(mark);
+                if(Clock::now()>=proof_deadline) break;
+            }
+            proof_limit=limit;proof_deadline=end;
+            if(found>=0) return found;
+            if(Clock::now()>=proof_deadline) return -1;
+        }
+        proof_nodes=0;
+        return prove(b,depth);
+    }
+    bool replay(Board& b,int index) {
+        if(Clock::now()>=proof_deadline) throw Timeout{};
+        check();++nodes;const int attacker=b.player;
+        struct RestoreCache {
+            Board& b;CandidateCache* cache;
+            ~RestoreCache(){b.candidates=cache;}
+        } restore_cache{b,b.candidates};
+        b.candidates=nullptr;
+        const auto& line=proof[index];Restore restore(b);
+        for(int j=0;j<line.attack.count;++j) {
+            if(!b.legal(line.attack.cells[j])) return false;
+            b.make(line.attack.cells[j]);if(b.winner>=0) return b.winner==attacker;
+        }
+        if(b.player==attacker) return false;
+        std::vector<Turn> replies;
+        if(!forced_replies(b,attacker,replies)) return false;
+        for(const auto& defense:replies) {
+            auto found=std::find_if(line.replies.begin(),line.replies.end(),[&](const auto& r) {
+                return defense.count==r.first.count && defense.cells==r.first.cells;
+            });
+            if(found==line.replies.end()) return false;
+            Restore reply(b);apply(b,defense);
+            if(!replay(b,found->second)) return false;
+        }
+        return true;
+    }
+    bool forcing_material(const Board& b,int player) const {
+        // Two placements can turn two stones into a forcing four. Requiring
+        // three stones can discard a previously proven winning continuation.
+        for(const auto& slot:b.windows.slots)
+            if(slot.hash && !slot.data.counts[1-player] && slot.data.counts[player]>=2) return true;
+        return false;
     }
     int negamax(Board& b,int depth,int alpha,int beta) {
         ++nodes;check();
@@ -802,6 +944,18 @@ struct Search {
                 auto roots=turns(b);
                 if(!roots.empty()) chosen=roots.front();
                 if(root_seconds) roots=diversify(b,std::move(roots),root_seconds,root_turns);
+                const auto allowance=deadline-start;
+                auto refutation_left=allowance*3/10;
+                std::vector<Turn> probed;
+                if(!b.model) {
+                    proof_deadline=std::min(deadline,Clock::now()+allowance*3/10);proof_nodes=0;
+                    int own=-1;
+                    try {if(forcing_material(b,b.player)) own=probe(b,std::min(6,max_depth/2));} catch(const Timeout&) {}
+                    if(own>=0) {
+                        chosen=proof[own].attack;chosen.score=mate;output.depth=1;
+                        roots.clear();max_depth=0;
+                    } else proof.clear();
+                }
                 for(int depth=1;depth<=max_depth;++depth) {
                     // Freeze admission for the whole iteration, including PVS
                     // re-searches. Scores from a different admitted tree cannot
@@ -813,12 +967,35 @@ struct Search {
                         int score=b.winner==side?mate:-negamax(b,depth-1,-mate-1,-best);
                         t.score=score;
                         if(score>best) {best=score;iteration=t;}
-                        // No remaining root can beat mate. Finish this iteration
-                        // before a later timeout can discard the winning move.
                         if(best>=mate) break;
                     }
                     chosen=iteration;chosen.score=best;output.depth=depth;
                     std::stable_sort(roots.begin(),roots.end(),[](auto a,auto z){return a.score>z.score;});
+                    while(!b.model && refutation_left>Clock::duration::zero() &&
+                          std::none_of(probed.begin(),probed.end(),[&](const Turn& t){return t.count==chosen.count && t.cells==chosen.cells;})) {
+                        const auto probe_start=Clock::now();const auto mark=proof.size();
+                        const auto query=chosen;probed.push_back(query);int enemy=-1;
+                        {
+                            Restore restore(b);apply(b,query);proof_nodes=0;
+                            proof_deadline=std::min(deadline,probe_start+std::min(refutation_left,allowance/5));
+                            try {if(b.winner<0 && forcing_material(b,b.player)) enemy=probe(b,std::min(6,max_depth/2));} catch(const Timeout&) {}
+                        }
+                        if(enemy<0) {proof.resize(mark);refutation_left-=Clock::now()-probe_start;break;}
+                        proof_deadline=std::min(deadline,probe_start+refutation_left);
+                        std::vector<bool> refuted(roots.size());
+                        for(size_t i=0;i<roots.size();++i) {
+                            if(roots[i].count==query.count && roots[i].cells==query.cells) refuted[i]=true;
+                            else try {
+                                Restore restore(b);apply(b,roots[i]);
+                                if(b.winner<0) refuted[i]=replay(b,enemy);
+                            } catch(const Timeout&) {break;}
+                        }
+                        refutation_left-=Clock::now()-probe_start;
+                        if(!std::count(refuted.begin(),refuted.end(),false)) {chosen.score=best=-mate;break;}
+                        size_t j=0;
+                        for(size_t i=0;i<roots.size();++i) if(!refuted[i]) roots[j++]=roots[i];
+                        roots.resize(j);chosen=roots.front();best=chosen.score;
+                    }
                     if(best>=mate || best<=-mate) break;
                 }
             } catch(const Timeout&) {}

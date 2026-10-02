@@ -42,6 +42,74 @@ int main() {
     assert(b.hash()==before && b.features==features);
     b.make({1,0});auto partial=search.turns(b,false,distant);
     for(auto t:partial) assert(t.count==1);
+    // A quiet second stone can sustain a forced attack for several turns.
+    // The proof must remain valid when replayed and leave cached gains intact.
+    std::vector<Cell> opening{{0,0},{0,8},{2,8},{1,0},{2,0},{4,8},{6,8}};
+    Board open;
+    for(auto c:opening) {assert(open.legal(c));open.make(c);}
+    auto open_key=open.hash();auto open_features=open.features;
+    Search forcing(5000,16);forcing.proof_deadline=forcing.deadline;
+    CandidateGuard open_cache(open);
+    auto gains=Search::candidate_scores(open);
+    int root=forcing.prove(open,6);
+    assert(root>=0 && forcing.replay(open,root));
+    assert(open.hash()==open_key && open.features==open_features);
+    assert(Search::candidate_scores(open)==gains);
+    Board blocked;
+    auto defended_opening=opening;defended_opening[5]=forcing.proof[root].attack.cells[0];
+    for(auto c:defended_opening) {assert(blocked.legal(c));blocked.make(c);}
+    auto blocked_key=blocked.hash();
+    assert(!forcing.replay(blocked,root) && blocked.hash()==blocked_key);
+    Board counter;
+    for(Cell c:std::vector<Cell>{{0,0},{0,8},{1,8},{1,0},{2,0},{2,8},{3,8}}) {
+        assert(counter.legal(c));counter.make(c);
+    }
+    auto counter_key=counter.hash();
+    assert(!forcing.replay(counter,root) && counter.hash()==counter_key);
+    Board spare;
+    for(Cell c:std::vector<Cell>{{0,0},{-1,0},{0,5},{1,0},{2,0},{3,3},{-3,5},{3,0},{4,0}}) {
+        assert(spare.legal(c));spare.make(c);
+    }
+    std::vector<Turn> free_replies;
+    assert(!forcing.forced_replies(spare,0,free_replies));
+    // Development losses: an attack hidden below defensive first-stone
+    // rankings, and a winning continuation with no unblocked three-stone line.
+    // Short continuations must also survive the proof work limit. All strategies
+    // were checked separately by the raw-board Python verifier.
+    for(const auto& history:std::vector<std::vector<Cell>>{
+        {
+            {0,0},{1,1},{-1,2},{-1,1},{3,-3},{1,-1},{1,0},{1,-3},{2,-3},{4,-3},
+            {0,2},{-2,2},{0,-3},{1,2},{-1,-3},{1,3},{-3,3},{-4,4},{2,1},{-2,4},
+            {-2,3}
+        },
+        {
+            {0,0},{1,0},{0,2},{1,-3},{-1,-1},{-1,2},{0,1},{2,-1},{1,-1},{-2,2},
+            {-3,2},{-4,2},{2,2},{-3,4},{-3,1},{-4,5},{-3,3},{-1,1},{-2,1},{-4,1},
+            {2,1},{-2,-1},{-2,0},{-2,-3},{-2,3},{-4,3},{-1,0},{-6,5},{0,-1},{3,-1},
+            {2,0},{0,-3},{-1,-3},{-3,-3},{3,-3},{-5,5},{-7,5},{-9,5},{-3,5},{-1,3},
+            {0,-2},{0,-4},{0,3},{3,-5},{-3,-2},{2,-4},{0,4},{0,6},{4,-2},{1,-4},
+            {3,-4},{-1,-4},{4,-4},{-1,4},{-2,4},{-4,4},{2,4},{3,0},{4,0},{3,-2},
+            {6,0},{1,-2},{-5,0},{0,-5},{-1,-5},{1,-6},{-1,-2},{4,-5},{4,-3},{2,-5},
+            {4,-6},{3,3},{4,2},{1,5},{7,-1},{6,-5},{-6,6},{-8,8},{7,-6},{-6,4},
+            {-6,7},{-6,2},{-6,8},{-8,6},{-1,-6},{-9,7},{-1,-8},{2,6},{7,-5},{2,5},
+            {8,-5}
+        },
+        {
+            {0,0},{-2,-2},{-2,1},{-2,2},{-1,1},{2,-2},{-4,4},{-1,2},{-1,0},{-1,-2},
+            {0,-2},{1,-2},{1,2},{-4,2},{-4,-2},{1,0},{-3,-2},{-4,0},{-4,1},{-4,-1},
+            {-4,3},{-2,-1},{-3,0},{-5,2},{0,-3}
+        }
+    }) {
+        Board position;
+        for(auto c:history) {assert(position.legal(c));position.make(c);}
+        const auto key=position.hash();const auto features=position.features;
+        Search continuation(5000,16);
+        auto result=continuation.run(position,12);
+        assert(result.score==mate && !continuation.proof.empty());
+        continuation.proof_deadline=continuation.deadline;
+        assert(continuation.replay(position,int(continuation.proof.size())-1));
+        assert(position.hash()==key && position.features==features && position.history.size()==history.size());
+    }
     // Incremental second-stone ranking must equal a fresh full-board ranking,
     // including cells whose only promising line was just blocked.
     std::mt19937 rng(20261001);

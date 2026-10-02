@@ -1407,8 +1407,12 @@ class Evaluator:
             path.unlink()
 
     def variants(self):
-        """The league's variant entries (league contract), in registration order."""
-        return self.league.setdefault('variants', [])
+        """Automatically playable variants, in registration order.
+
+        Imported fixed-size benchmarks remain in league.json for ratings and
+        checkpoint history. Their separate workers own their games.
+        """
+        return [v for v in self.league.setdefault('variants', []) if not v.get('benchmark_only')]
 
     def entry(self, cid):
         """The league entry of checkpoint or variant cid, or None."""
@@ -1707,7 +1711,7 @@ class Evaluator:
                 continue
             if self.entry(f'{champion}@{entry["name"]}'):
                 if entry.get('base') == CHAMPION:
-                    self.variants().remove(entry)
+                    self.league['variants'].remove(entry)
                     request = requests(self.run).get(entry.get('registered_as', entry['id']))
                     if request:
                         request.unlink()
