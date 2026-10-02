@@ -637,6 +637,7 @@ let menuFor=null,pinned=false;
 function badge(kind,label){return[el('span',{class:'kind','data-k':kind},kind),label&&label.toLowerCase()!==kind?el('span',{class:'name'},label):null]}
 function entryOf(id){return S.engines.find(x=>x.id===id)}
 function shown(seat){if(seat.engine==='human')return['human',null];const e=entryOf(seat.engine);return e?[e.badge||e.kind,e.label||e.name]:['?',seat.engine]}
+function isHuman(seat){return seat.engine==='human'}
 function pickItems(filter){return S.engines.filter(filter).map(e=>({id:e.id,ids:[e.id],kind:e.badge||e.kind,label:e.label||e.name}))}
 function openMenu(anchor,items,current,choose){
   const m=$('menu');menuFor=anchor;anchor.classList.add('on');$('seats').classList.toggle('open',!!anchor.closest('#seats'));
@@ -1099,6 +1100,6 @@ $('restore-local').onclick=()=>{$('tournament-dialog').close();$('import-text').
 import {followSeats} from './engine/book.mjs';
 let storage=null;try{storage=sessionStorage}catch(e){}
 await globalThis.playReady;
-followSeats(globalThis,()=>S,seat=>shown(seat)[0]==='human',storage);
+followSeats(globalThis,()=>S,seat=>isHuman(seat),storage);
 </script>
 </html>

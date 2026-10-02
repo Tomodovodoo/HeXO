@@ -190,8 +190,8 @@ openings have been; when all have, one of the least played is picked. What was p
 `play-openings.jsonl` beside the saved evaluations, appended like them. A browser seat is a human seat to the
 server, so the page names the sides people play (`people`) when it asks for a new game or the book.
 
-Until the switch or its set is changed in this browser session, each seat change sets the book from the seats
-as the page shows them: off when both are Human, on otherwise (a Bubble (browser) seat is an engine).
+Until the switch or its set is changed in this browser session, each seat change sets the book from who plays
+the seats: off when both are Human, on otherwise (a seat a browser engine plays is an engine).
 
 | Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms | Six protocol nodes | Strix simulations |
 |---|---|---|---|---|---|

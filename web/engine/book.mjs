@@ -1,5 +1,5 @@
 /* Opening-book default for web/index.html: until the person changes the opening-book switch or its set in this
- * browser session, each seat change sets the book from the seats as the page shows them (a Bubble (browser) seat is
+ * browser session, each seat change sets the book from who plays the seats (a seat a browser engine plays is
  * an engine). The switch is applied through the same /book request it sends. */
 const KEY = 'book-touched';
 
@@ -16,7 +16,8 @@ export function bookDefault(humans) {
  * that turns the book on for an empty board, the game is paused during the seat change, so no engine moves before
  * the book starts the opening for the new seats. A session whose /book request leaves the game paused on an empty
  * board (the static page's) gets a /new request, which starts the opening and resumes play.
- * `state()` is the page's current state, `human(seat)` whether the page shows that seat object as Human.
+ * `state()` is the page's current state, `human(seat)` whether a person plays that seat object (a seat the page
+ * plays itself is an engine, whatever its badge).
  */
 export function followSeats(page, state, human, storage) {
   const post = page.post;

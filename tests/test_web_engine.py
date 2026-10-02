@@ -154,6 +154,8 @@ class PlayPage(unittest.TestCase):
         self.assertIn("return['human',null]", sources['index.html'])
         self.assertIn("kind:'human',label:null", sources['index.html'])
         self.assertIn("kind: 'human', label: null", sources['engine/seat.mjs'])
+        self.assertIn("followSeats(globalThis,()=>S,seat=>isHuman(seat),storage)", sources['index.html'])
+        self.assertIn("page.isHuman = seat =>", sources['engine/seat.mjs'])
         for text in sources.values():
             self.assertNotIn("'you'", text)
             self.assertNotIn('data-k=you', text)
