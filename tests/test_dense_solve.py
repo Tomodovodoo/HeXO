@@ -534,20 +534,39 @@ class RestartActorTests(unittest.TestCase):
         self.assertEqual([game.network_values[ply] for game in games], [None, None])
         self.assertTrue(all(any(row.get('line') for row in game.rows) for game in games))
         before = [game.moves.copy() for game in games]
-        expected = model.evaluator.evaluate([np.asarray(history, np.int64)])[0][2][0]
+        histories = {dense_selfplay.position_key(h): h for game in games for row in game.rows
+                     if game.values[row['ply']] is not None
+                     for h in [np.asarray(game.moves[:row['ply']], np.int64).reshape(-1, 2)]}
+        expected = dict(zip(histories, (p[2][0] for p in model.evaluator.evaluate(list(histories.values())))))
         model.cache.capacity = 256
         with unittest.mock.patch.object(model.evaluator, 'evaluate', wraps=model.evaluator.evaluate) as evaluate:
-            self.assertEqual(dense_selfplay.record_network_values(games), [1])
+            self.assertEqual(dense_selfplay.record_network_values(games), [len(histories)])
             self.assertEqual(evaluate.call_count, 1)
-            self.assertEqual([game.network_values[ply] for game in games], [expected, expected])
             self.assertEqual([game.moves for game in games], before)
             self.assertEqual([game.values[ply] for game in games], [1., 1.])
-            self.assertTrue(all(game.network_values[row['ply']] is None
-                                for game in games for row in game.rows if row.get('line')))
             for game in games:
-                game.network_values[ply] = None
+                self.assertTrue(all(v is None for v in game.network_values[:ply]))
+                for row in game.rows:
+                    h = np.asarray(game.moves[:row['ply']], np.int64).reshape(-1, 2)
+                    self.assertEqual(game.network_values[row['ply']], expected[dense_selfplay.position_key(h)])
+                    game.network_values[row['ply']] = None
             self.assertEqual(dense_selfplay.record_network_values(games), [])
             self.assertEqual(evaluate.call_count, 1)
+        episodes, rows = [], []
+        for game in games:
+            episode, items = game.episode()
+            rows.extend(dict(row, game=len(episodes)) for row in items)
+            episodes.append(episode)
+        dense_data.write_shard(self.run/'shards'/'1000000000003', dict(actor_sha256='a'*64), episodes, rows)
+        window = dense_data.ReplayWindow(self.run, capacity_rows=1000)
+        priorities = {(ref.row['game'], ref.row['ply']): w
+                      for k, w in zip(window.regret_positions, window.regret_weights)
+                      for ref in [window.ref(*window.index[k])] if ref.shard == '1000000000003'}
+        lines = [row for row in rows if row.get('line')]
+        self.assertTrue(lines)
+        for row in lines:
+            value = episodes[row['game']]['network_values'][row['ply']]
+            self.assertAlmostEqual(priorities[row['game'], row['ply']], (1-row['proven']*value)/2)
 
     def test_network_restart_gets_a_prediction_without_a_new_proof(self):
         model = tiny_model()
