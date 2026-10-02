@@ -1,7 +1,8 @@
 """Build the browser engine bundle in web/engine.
 
-wasm   src/gumbel.cpp -> gumbel.mjs + gumbel.wasm (em++ on PATH, or --emxx), tools/tactical -> tactical.wasm
-       (cargo with the wasm32-wasip1 target); build.json binds them to their sources (committed).
+wasm   src/gumbel.cpp -> gumbel.mjs + gumbel.wasm and src/hexo.cpp -> native/native.mjs + native/native.wasm (em++ on
+       PATH, or --emxx), tools/tactical -> tactical.wasm (cargo with the wasm32-wasip1 target); build.json binds them
+       to their sources (committed).
 ort    onnxruntime-web from the npm registry, checked against its published integrity, into ort/ (ignored).
 model  --checkpoint ema.pt, or --release TAG (or 'latest') from the GitHub releases, exported by export_web into
        model/ (ignored).
@@ -33,9 +34,11 @@ GUMBEL_EXPORTS = ('malloc', 'free', 'hxg_new', 'hxg_free', 'hxg_error', 'hxg_beg
                   'hxg_legal', 'hxg_fulfill', 'hxg_cancel', 'hxg_advance', 'hxg_stats', 'hxg_policy', 'hxg_completed',
                   'hxg_done', 'hxg_tactics', 'hxg_graph', 'hxg_exact', 'hxg_distance', 'hxg_census',
                   'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_moves')
-GUMBEL_FLAGS = ['-std=c++20', '-O3', '-fwasm-exceptions', '-msimd128', '-sMODULARIZE', '-sEXPORT_ES6',
+NATIVE_EXPORTS = ('malloc', 'free', 'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_search')
+WASM_FLAGS = ['-std=c++20', '-O3', '-fwasm-exceptions', '-msimd128', '-sMODULARIZE', '-sEXPORT_ES6',
                 '-sENVIRONMENT=web,worker,node', '-sALLOW_MEMORY_GROWTH', '-sMAXIMUM_MEMORY=4GB', '-sFILESYSTEM=0',
                 '-sEXPORTED_RUNTIME_METHODS=HEAP32,HEAPF64,HEAPU8,UTF8ToString']
+ARTEFACTS = ('gumbel.mjs', 'gumbel.wasm', 'tactical.wasm', 'native/native.mjs', 'native/native.wasm')
 
 
 def digest(path):
@@ -52,10 +55,9 @@ def sources():
 
 def build_wasm(emxx, cargo):
     before = sources()
-    exports = ','.join('_'+name for name in GUMBEL_EXPORTS)
-    gumbel = [emxx, str(ROOT/'src'/'gumbel.cpp'), '-I', str(ROOT/'src'), *GUMBEL_FLAGS,
-              f'-sEXPORTED_FUNCTIONS={exports}', '-o', str(ENGINE/'gumbel.mjs')]
-    subprocess.run(gumbel, check=True)
+    for source, exports, out in (('gumbel.cpp', GUMBEL_EXPORTS, 'gumbel.mjs'), ('hexo.cpp', NATIVE_EXPORTS, 'native/native.mjs')):
+        subprocess.run([emxx, str(ROOT/'src'/source), '-I', str(ROOT/'src'), *WASM_FLAGS,
+                        f"-sEXPORTED_FUNCTIONS={','.join('_'+name for name in exports)}", '-o', str(ENGINE/out)], check=True)
     with tempfile.TemporaryDirectory() as target:
         tactical = [cargo, 'build', '--release', '--locked', '--lib', '--target', 'wasm32-wasip1',
                     '--manifest-path', str(TACTICAL/'Cargo.toml'), '--target-dir', target]
@@ -65,8 +67,7 @@ def build_wasm(emxx, cargo):
         raise ValueError('Sources changed during the build')
     tools = dict(emxx=subprocess.check_output([emxx, '--version'], text=True).splitlines()[0],
                  cargo=subprocess.check_output([cargo, '--version'], text=True).strip())
-    record = dict(sources=before, artefacts={name: digest(ENGINE/name) for name in ('gumbel.mjs', 'gumbel.wasm', 'tactical.wasm')},
-                  tools=tools)
+    record = dict(sources=before, artefacts={name: digest(ENGINE/name) for name in ARTEFACTS}, tools=tools)
     (ENGINE/'build.json').write_text(json.dumps(record, indent=1)+'\n', encoding='utf-8')
 
 

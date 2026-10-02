@@ -123,3 +123,16 @@ export class SealEngine {
     this.fail(new DOMException('Closed', 'AbortError'));
   }
 }
+
+const ID = 'browser:seal', LABEL = 'Seal (browser)';
+
+/** The evaluation record of Seal's turn `result` at `history`: its first stone as the only candidate and both stones
+ * as the line. seal_move returns no score, so the record has no value. */
+export function record(result, history, preset) {
+  const player = playerAt(history.length);
+  return {moves: result.moves, value: null, top: result.moves.slice(0, 1).map(([q, r]) => [q, r, 1]),
+    line: result.moves.map(([q, r]) => [q, r, player]), threat: [], proof: null, ms: PRESETS[preset].ms, engine: ID};
+}
+
+export const seal = {entry: {id: ID, kind: 'seal', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
+  engine: new SealEngine(), record};

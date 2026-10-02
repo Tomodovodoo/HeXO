@@ -1,60 +1,65 @@
-/* Browser engines for web/index.html: seats and analysis engines that run entirely in this browser, one entry per
- * engine in ENGINES. The server sees a browser seat as a human seat and receives its stones through /play; like
- * server engines a browser seat waits while the game is paused, cancelling its move pauses the game, and Undo steps
- * back over its turns to the people's last turn. Browser analyses are shown in place of the server's for the
- * positions they cover. A task that failed is not retried until the position, preset or engine choice changes.
- * Choices persist per browser (localStorage). */
-import {BubbleEngine, PRESETS as BUBBLE, isolate} from './bubble.mjs';
-import {SealEngine, PRESETS as SEAL} from './seal.mjs';
+/* Browser engines for web/index.html: seats and analysis engines that run entirely in this browser.
+ * The server sees a browser seat as a human seat and receives its stones through /play; like server engines a
+ * browser seat waits while the game is paused, cancelling its move pauses the game, and Undo steps back over its
+ * turns to the people's last turn. Browser analyses are shown in place of the server's for the positions they cover.
+ * A task that failed is not retried until the position, preset or engine choice changes. Choices persist per browser
+ * (localStorage).
+ *
+ * ENGINES lists them. Each is {entry, engine, record}: `entry` is its picker entry ({id, kind, name, label,
+ * checkpoints, presets}, with `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
+ * while it downloads) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
+ * preset's budget, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
+ * evaluation record the analysis panel shows for that turn. */
+import {BubbleEngine, PRESETS, isolate} from './bubble.mjs';
 import {OfflineSession} from './offline.mjs';
+import {native} from './native.mjs';
+import {seal} from './seal.mjs';
 
-/**
- * Each engine has `load(progress)` and `turn(history, budget, {signal, progress})`, which resolves to a turn with
- * `moves` and rejects with an AbortError when `signal` aborts; `record(result, budget)` is that turn as the server's
- * evaluation record ({value, top, line, proof, threat} and the budget it spent).
- */
-const ENGINES = [
-  {id: 'browser:bubble', kind: 'bubble', label: 'Bubble (browser)', presets: BUBBLE, engine: new BubbleEngine(),
-    record: (result, {simulations, solver_nodes}) => ({...result, simulations, solver_nodes: result.solved ? solver_nodes : 0})},
-  {id: 'browser:seal', kind: 'seal', label: 'Seal (browser)', presets: SEAL, engine: new SealEngine(),
-    record: ({moves}, {ms}) => ({moves, value: null, top: moves.map(([q, r]) => [q, r, 1]), line: [], proof: null, threat: [], ms})},
-];
-const BY_ID = new Map(ENGINES.map(e => [e.id, e]));
-const ENTRIES = ENGINES.map(({id, kind, label, presets}) => ({id, kind, name: label, label, checkpoints: [], presets, browser: true}));
-const STORE = 'browser-engines', BUBBLE_STORE = 'bubble-browser';
+const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
+const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: [], presets: PRESETS, analysis: true},
+  engine: new BubbleEngine(),
+  record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
+    solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE})};
+const ENGINES = new Map([bubble, native, seal].map(e => [e.entry.id, e]));
+const STORE = 'browser-engines';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
   'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems'];
 const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, page[name]]));
-const analyses = new Map(), hk = history => history.map(p => p.join(',')).join(';');
-/* seats[side] and analysis are null or {engine: an ENGINES id, preset} */
-let config = {seats: [null, null], analysis: null}, job = null, failed = null, posting = false, fresh = true;
+const analyses = new Map(), loads = new Map(), hk = history => history.map(p => p.join(',')).join(';');
+/** Each seat and the analysis: null, or {engine: an ENGINES id, preset}. */
+let config = {seats: [null, null], analysis: null}, job = null, failed = null, posting = false;
+let fresh = true;
 try {
-  /* choices saved before Seal joined (key BUBBLE_STORE) hold Bubble preset names */
-  const bubble = preset => typeof preset === 'string' ? {engine: 'browser:bubble', preset} : null;
-  const earlier = JSON.parse(localStorage.getItem(BUBBLE_STORE));
-  const saved = JSON.parse(localStorage.getItem(STORE))
-    ?? (earlier && {seats: [0, 1].map(side => bubble(earlier.seats?.[side])), analysis: bubble(earlier.analysis)});
+  const saved = localStorage.getItem(STORE), known = choice => ENGINES.has(choice?.engine) ? choice : null;
   fresh = saved === null;
-  const valid = choice => BY_ID.get(choice?.engine)?.presets[choice.preset] ? choice : null;
-  if (saved) config = {seats: [0, 1].map(side => valid(saved.seats?.[side])), analysis: valid(saved.analysis)};
-  localStorage.removeItem(BUBBLE_STORE);
-  if (earlier) localStorage.setItem(STORE, JSON.stringify(config));
+  const stored = {...config, ...JSON.parse(saved)};
+  config = {seats: stored.seats.map(known), analysis: known(stored.analysis)};
 } catch {}
 const save = () => { failed = null; try { localStorage.setItem(STORE, JSON.stringify(config)); } catch {} };
 const state = () => typeof S === 'undefined' ? null : S;
 const viewed = () => typeof view === 'undefined' ? 0 : view;
 const closeIcon = () => typeof icon === 'function' ? icon('close') : '×';
-const label = choice => BY_ID.get(choice.engine).label;
-/** `choice` moved to engine `id`: the same preset on the same engine, else standard. */
-const choose = (choice, id) => ({engine: id, preset: choice?.engine === id ? choice.preset : 'standard'});
+const pickEngine = (id, current) => ({engine: id, preset: current?.engine === id ? current.preset : 'standard'});
+const analysable = e => e.kind === 'bubble' || e.analysis;
 const analysisKey = (choice, history) => `${choice.engine}|${choice.preset}|${hk(history)}`;
 
-/** Adds the browser entries to a state's engines and drops browser seats the server has given another engine. */
+/**
+ * Adds the browser entries to a state's engines and drops browser seats the server has given another engine. A server
+ * without an analysis engine (no Bubble model) gets the browser's: Native (browser) at quick unless another was chosen.
+ */
 function adopt(data) {
-  if (data.engines) for (const entry of ENTRIES) if (!data.engines.some(e => e.id === entry.id)) data.engines.push(entry);
+  if (data.engines) for (const {entry} of ENGINES.values()) if (!data.engines.some(e => e.id === entry.id)) data.engines.push(entry);
   if (data.seats && data.seats.some((seat, side) => config.seats[side] && seat.engine !== 'human')) {
     config.seats = config.seats.map((choice, side) => data.seats[side].engine === 'human' ? choice : null);
     save();
+  }
+  if (data.analysis === null) {
+    if (!config.analysis) {
+      config.analysis = {engine: native.entry.id, preset: 'quick'};
+      save();
+    }
+    const {engine, preset} = config.analysis;
+    data.analysis = {engine, checkpoint: null, preset, budget: ENGINES.get(engine).entry.presets[preset], auto: false};
   }
 }
 
@@ -77,7 +82,7 @@ function bar(element, fraction) {
 function progress() {
   const s = state();
   if (!s) return;
-  const fraction = () => job.loading ?? job.fraction;
+  const fraction = () => job.loading ? loads.get(job.engine) ?? 0 : job.fraction;
   for (const side of [0, 1]) {
     if (!config.seats[side]) continue;
     const active = job?.kind === 'move' && job.side === side, cancel = document.getElementById('cancel' + side);
@@ -100,14 +105,13 @@ function progress() {
 function schedule() {
   const s = state();
   if (!s || posting) return;
-  const side = s.player, choice = config.seats[side];
-  const move = s.winner < 0 && choice && !s.paused && !s.match?.active && s.seats[side].engine === 'human';
+  const side = s.player, seat = config.seats[side], a = config.analysis;
+  const move = s.winner < 0 && seat && !s.paused && !s.match?.active && s.seats[side].engine === 'human';
   const prefix = s.history.slice(0, viewed());
-  const analyse = config.analysis && !(s.winner >= 0 && prefix.length === s.history.length)
-    && !analyses.has(analysisKey(config.analysis, prefix));
-  const task = move ? {kind: 'move', side, choice, history: s.history.map(p => [...p])}
-    : analyse ? {kind: 'analyse', ply: prefix.length, choice: config.analysis, history: prefix.map(p => [...p])} : null;
-  const key = task && `${task.kind}|${analysisKey(task.choice, task.history)}`;
+  const analyse = a && !(s.winner >= 0 && prefix.length === s.history.length) && !analyses.has(analysisKey(a, prefix));
+  const task = move ? {kind: 'move', side, ...seat, history: s.history.map(p => [...p])}
+    : analyse ? {kind: 'analyse', ply: prefix.length, ...a, history: prefix.map(p => [...p])} : null;
+  const key = task && `${task.kind}|${task.engine}|${task.preset}|${hk(task.history)}`;
   if (job?.key === key || (key && key === failed)) return;
   job?.controller.abort();
   job = null;
@@ -116,12 +120,13 @@ function schedule() {
 }
 
 async function run(key, task) {
-  const controller = new AbortController(), current = job = {...task, key, controller, fraction: 0, loading: 0};
-  const {engine, presets, record} = BY_ID.get(task.choice.engine), budget = presets[task.choice.preset];
+  const controller = new AbortController(), current = job = {...task, key, controller, fraction: 0};
+  const {engine, entry, record} = ENGINES.get(task.engine);
   try {
-    await engine.load(f => { current.loading = f; progress(); });
-    current.loading = null;
-    const result = await engine.turn(task.history, budget, {signal: controller.signal,
+    current.loading = true;
+    await engine.load(f => { loads.set(task.engine, f); progress(); });
+    current.loading = false;
+    const result = await engine.turn(task.history, entry.presets[task.preset], {signal: controller.signal,
       progress: f => { current.fraction = f; progress(); }});
     if (job !== current) return;
     job = null;
@@ -129,7 +134,8 @@ async function run(key, task) {
       posting = true;
       try {
         for (const [q, r] of result.moves) {
-          if (state().paused || config.seats[task.side] !== task.choice || hk(state().history) !== hk(task.history)) break;
+          const seat = config.seats[task.side];
+          if (state().paused || seat?.engine !== task.engine || seat.preset !== task.preset || hk(state().history) !== hk(task.history)) break;
           if (!(await original.post('/play', {q, r}))) {
             failed = key;
             break;
@@ -140,8 +146,8 @@ async function run(key, task) {
         posting = false;
       }
     } else {
-      const evaluation = {...record(result, budget), engine: task.choice.engine};
-      analyses.set(analysisKey(task.choice, task.history), evaluation);
+      const evaluation = record(result, task.history, task.preset);
+      analyses.set(analysisKey(task, task.history), evaluation);
       const s = state();
       if (s && hk(s.history.slice(0, task.history.length)) === hk(task.history)) {
         s.evaluations[task.history.length] = evaluation;
@@ -169,18 +175,20 @@ function install() {
   page.post = (path, body = {}) => {
     const s = state();
     if (path === '/seat' && body.engine !== undefined) {
-      config.seats[body.side] = BY_ID.has(body.engine) ? choose(config.seats[body.side], body.engine) : null;
+      const browser = ENGINES.has(body.engine);
+      config.seats[body.side] = browser ? pickEngine(body.engine, config.seats[body.side]) : null;
       save();
-      if (job?.kind === 'move' && job.side === body.side && job.choice !== config.seats[body.side]) {
+      if (job?.kind === 'move' && job.side === body.side && job.engine !== config.seats[body.side]?.engine) {
         job.controller.abort();
         job = null;
       }
-      if (BY_ID.has(body.engine)) return original.post('/seat', {side: body.side, engine: 'human'});
+      if (browser) return original.post('/seat', {side: body.side, engine: 'human'});
     }
     if (path === '/analysis' && body.engine !== undefined) {
-      config.analysis = BY_ID.has(body.engine) ? choose(config.analysis, body.engine) : null;
+      const browser = ENGINES.has(body.engine);
+      config.analysis = browser ? pickEngine(body.engine, config.analysis) : null;
       save();
-      if (BY_ID.has(body.engine)) {
+      if (browser) {
         if (s?.analysis?.auto) return original.post('/analysis', {...body, engine: s.analysis.engine, auto: false});
         page.renderPanels();
         return Promise.resolve(s);
@@ -202,33 +210,35 @@ function install() {
   };
   page.shown = seat => {
     const s = state(), side = s ? s.seats.indexOf(seat) : -1;
-    if (side >= 0 && seat.engine === 'human' && config.seats[side]) return [BY_ID.get(config.seats[side].engine).kind, label(config.seats[side])];
-    if (s && seat === s.analysis && config.analysis) return [BY_ID.get(config.analysis.engine).kind, label(config.analysis)];
-    return original.shown(seat);
+    const choice = side >= 0 && seat.engine === 'human' ? config.seats[side] : s && seat === s.analysis ? config.analysis : null;
+    if (!choice) return original.shown(seat);
+    const {entry} = ENGINES.get(choice.engine);
+    return [entry.kind, entry.label];
   };
   page.canPlace = () => original.canPlace() && !config.seats[state().player];
   page.renderSeat = side => {
     original.renderSeat(side);
-    const box = document.getElementById('seat' + side), s = state(), choice = config.seats[side];
-    if (!choice || !box || s.saved_game) return;
-    const send = change => { config.seats[side] = {...choice, preset: change.preset}; save(); page.renderPanels(); };
+    const box = document.getElementById('seat' + side), s = state();
+    if (!config.seats[side] || !box || s.saved_game) return;
+    const send = change => { config.seats[side] = {...config.seats[side], preset: change.preset}; save(); page.renderPanels(); };
     const pick = box.querySelector('.pick');
     if (pick) {
       const items = [{id: 'human', ids: ['human'], kind: 'you', label: null}, ...original.pickItems(() => true)];
-      pick.onclick = () => original.openMenu(pick, items, choice.engine, it => page.post('/seat', {side, engine: it.id}));
+      pick.onclick = () => original.openMenu(pick, items, config.seats[side].engine, it => page.post('/seat', {side, engine: it.id}));
     }
-    box.append(original.el('div', {class: 'more'}, original.el('div', {}, original.strength({preset: choice.preset}, send, 'seat' + side, null))));
+    box.append(original.el('div', {class: 'more'}, original.el('div', {}, original.strength(config.seats[side], send, 'seat' + side, null))));
     progress();
   };
   page.renderEngineHead = () => {
     original.renderEngineHead();
-    const head = document.getElementById('engine-head'), s = state(), choice = config.analysis;
-    if (!choice || !head || !s?.analysis) return;
-    const pick = original.el('button', {class: 'pick'}, ...original.badge(BY_ID.get(choice.engine).kind, label(choice)));
-    const items = original.pickItems(e => e.kind === 'bubble' || e.browser);
-    pick.onclick = () => original.openMenu(pick, items, choice.engine, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: 'standard', auto: true}));
-    const send = change => { config.analysis = {...choice, preset: change.preset}; save(); page.renderPanels(); };
-    head.replaceChildren(original.el('div', {class: 'head'}, pick), original.strength({preset: choice.preset}, send, 'analysis', null));
+    const head = document.getElementById('engine-head'), s = state();
+    if (!config.analysis || !head || !s?.analysis) return;
+    const {entry} = ENGINES.get(config.analysis.engine);
+    const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.kind, entry.label));
+    const items = original.pickItems(analysable);
+    pick.onclick = () => original.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: 'standard', auto: true}));
+    const send = change => { config.analysis = {...config.analysis, preset: change.preset}; save(); page.renderPanels(); };
+    head.replaceChildren(original.el('div', {class: 'head'}, pick), original.strength(config.analysis, send, 'analysis', null));
   };
   page.renderPanels = () => {
     original.renderPanels();
@@ -249,8 +259,8 @@ function install() {
 
 /**
  * Without a play server (a static host) the page's server requests are answered by an OfflineSession, server-only
- * controls are hidden, Bubble (browser) takes seat O and analysis on a first visit, and the page asks for
- * cross-origin isolation. Resolves true when it took over (or is reloading for isolation).
+ * controls are hidden, Bubble (browser) takes seat O and analysis, and the page asks for cross-origin isolation.
+ * Resolves true when it took over (or is reloading for isolation).
  */
 async function serverless() {
   try {
@@ -258,7 +268,7 @@ async function serverless() {
     if (response.ok && (response.headers.get('Content-Type') || '').includes('json')) return false;
   } catch {}
   if (await isolate()) return true;
-  const session = await OfflineSession.create({engine: 'browser:bubble', preset: 'quick', budget: BUBBLE.quick});
+  const session = await OfflineSession.create({engine: BUBBLE, preset: 'quick', budget: PRESETS.quick});
   const server = globalThis.fetch;
   globalThis.fetch = (input, init) => {
     const url = new URL(typeof input === 'string' ? input : input.url, location.href);
@@ -266,8 +276,8 @@ async function serverless() {
     const [status, data] = session.answer(url.pathname, init?.body ? JSON.parse(init.body) : {});
     return Promise.resolve(new Response(JSON.stringify(data), {status, headers: {'Content-Type': 'application/json'}}));
   };
-  if (fresh) config.seats = [null, {engine: 'browser:bubble', preset: 'standard'}];
-  config.analysis ??= {engine: 'browser:bubble', preset: 'quick'};
+  if (fresh) config.seats = [null, {engine: BUBBLE, preset: 'standard'}];
+  config.analysis ??= {engine: BUBBLE, preset: 'quick'};
   save();
   document.head.append(original.el('style', {}, ['#review-go', '#copy', '#more', '#import', '[aria-label="Tournaments"]']
     .map(selector => `.serverless ${selector}`).join(',') + '{display:none!important}'));
@@ -279,4 +289,4 @@ async function serverless() {
 if (HOOKS.every(name => typeof original[name] === 'function')) {
   install();
   serverless();
-} else console.warn('Browser engines need the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));
+} else console.warn('The browser engines need the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));

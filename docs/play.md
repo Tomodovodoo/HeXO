@@ -148,7 +148,8 @@ The API is loopback-only. Each player port holds one visible game; use a separat
 
 ## Engines
 
-Native always plays. The engine picker also lists every engine below; one that is not installed yet has a download
+Native always plays, and Native (browser) runs the same engine as WebAssembly in the page
+(docs/web-engine.md). The engine picker also lists every engine below; one that is not installed yet has a download
 button. Click it and the server installs the engine into the models folder (`models/` in the checkout, or the folder
 given with `--models`). The row fills as files download, turns while something compiles, and becomes the engine
 once it is registered. A failure shows its error for a few seconds and the button comes back.
