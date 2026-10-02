@@ -84,12 +84,10 @@ class WebStrixParity(unittest.TestCase):
                     self.assertTrue(equivalent(history, answer['moves'], expected), (answer['moves'], expected))
                 self.assertTrue(0 <= answer['value'] <= 1)
 
-    def test_empty_board_plays_the_origin(self):
-        played, analysed = browser([dict(history=[], simulations=2), dict(history=[], simulations=2, analysis=True)])
-        after, = browser([dict(history=[[0, 0]], simulations=2)])
-        self.assertEqual((played['moves'], played['value']), ([[0, 0]], None))
-        self.assertEqual(analysed['moves'], [[0, 0]])
-        self.assertAlmostEqual(analysed['value'], 1-after['value'], places=4)
+    def test_empty_board_plays_the_origin_unsearched(self):
+        empty, = browser([dict(history=[], simulations=4096)])
+        self.assertEqual((empty['moves'], empty['simulations'], empty['eval_states']), ([[0, 0]], 0, 1))
+        self.assertTrue(0 <= empty['value'] <= 1)
 
 
 if __name__ == '__main__':

@@ -1,4 +1,4 @@
-// Strix (web/engine/strix/strix.wasm) with the network at argv[2]: one JSON request {history, simulations, analysis}
+// Strix (web/engine/strix/strix.wasm) with the network at argv[2]: one JSON request {history, simulations}
 // per stdin line, one JSON turn per stdout line.
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
@@ -8,6 +8,6 @@ const strix = await loadStrix(await readFile(new URL('../../web/engine/strix/str
 strix.load(await readFile(process.argv[2]));
 for await (const line of createInterface({ input: process.stdin })) {
   if (!line.trim()) continue;
-  const { history, simulations, analysis } = JSON.parse(line);
-  process.stdout.write(JSON.stringify(strix.turn(history, simulations, { analysis })) + '\n');
+  const { history, simulations } = JSON.parse(line);
+  process.stdout.write(JSON.stringify(strix.turn(history, simulations)) + '\n');
 }

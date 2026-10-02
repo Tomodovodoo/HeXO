@@ -1,8 +1,8 @@
 """Build the browser engine bundle in web/engine.
 
-wasm   src/gumbel.cpp -> gumbel.mjs + gumbel.wasm (em++ on PATH, or --emxx), tools/tactical -> tactical.wasm and
-       tools/strix_web -> strix/strix.wasm (cargo with the wasm32-wasip1 target); build.json binds them to their
-       sources (committed).
+wasm   src/gumbel.cpp -> gumbel.mjs + gumbel.wasm and src/hexo.cpp -> native/native.mjs + native/native.wasm (em++ on
+       PATH, or --emxx), tools/tactical -> tactical.wasm and tools/strix_web -> strix/strix.wasm (cargo with the
+       wasm32-wasip1 target); build.json binds them to their sources (committed).
 strix  only tools/strix_web -> strix/strix.wasm, refreshing its entries in build.json.
 strix-network  the Strix network pinned in tools/engines.json (hexo.tyto.cc's pulsatrix-10-best, licence unstated)
        into strix/ with strix/networks.json (ignored). Without it the page does not offer Strix (browser).
@@ -37,10 +37,11 @@ GUMBEL_EXPORTS = ('malloc', 'free', 'hxg_new', 'hxg_free', 'hxg_error', 'hxg_beg
                   'hxg_legal', 'hxg_fulfill', 'hxg_cancel', 'hxg_advance', 'hxg_stats', 'hxg_policy', 'hxg_completed',
                   'hxg_done', 'hxg_tactics', 'hxg_graph', 'hxg_exact', 'hxg_distance', 'hxg_census',
                   'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_moves')
-ARTEFACTS = ('gumbel.mjs', 'gumbel.wasm', 'tactical.wasm', 'strix/strix.wasm')
-GUMBEL_FLAGS = ['-std=c++20', '-O3', '-fwasm-exceptions', '-msimd128', '-sMODULARIZE', '-sEXPORT_ES6',
+NATIVE_EXPORTS = ('malloc', 'free', 'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_search')
+WASM_FLAGS = ['-std=c++20', '-O3', '-fwasm-exceptions', '-msimd128', '-sMODULARIZE', '-sEXPORT_ES6',
                 '-sENVIRONMENT=web,worker,node', '-sALLOW_MEMORY_GROWTH', '-sMAXIMUM_MEMORY=4GB', '-sFILESYSTEM=0',
                 '-sEXPORTED_RUNTIME_METHODS=HEAP32,HEAPF64,HEAPU8,UTF8ToString']
+ARTEFACTS = ('gumbel.mjs', 'gumbel.wasm', 'tactical.wasm', 'native/native.mjs', 'native/native.wasm', 'strix/strix.wasm')
 
 
 def digest(path):
@@ -77,10 +78,9 @@ def build_strix(cargo):
 
 def build_wasm(emxx, cargo):
     before = sources()
-    exports = ','.join('_'+name for name in GUMBEL_EXPORTS)
-    gumbel = [emxx, str(ROOT/'src'/'gumbel.cpp'), '-I', str(ROOT/'src'), *GUMBEL_FLAGS,
-              f'-sEXPORTED_FUNCTIONS={exports}', '-o', str(ENGINE/'gumbel.mjs')]
-    subprocess.run(gumbel, check=True)
+    for source, exports, out in (('gumbel.cpp', GUMBEL_EXPORTS, 'gumbel.mjs'), ('hexo.cpp', NATIVE_EXPORTS, 'native/native.mjs')):
+        subprocess.run([emxx, str(ROOT/'src'/source), '-I', str(ROOT/'src'), *WASM_FLAGS,
+                        f"-sEXPORTED_FUNCTIONS={','.join('_'+name for name in exports)}", '-o', str(ENGINE/out)], check=True)
     cargo_wasm(cargo, TACTICAL/'Cargo.toml', 'hexo_tactical', ENGINE/'tactical.wasm')
     if build_strix(cargo) != before:
         raise ValueError('Sources changed during the build')

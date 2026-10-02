@@ -7,8 +7,9 @@
 //! NUL-terminated JSON string that the caller releases with `strix_free_text`. A turn searches each
 //! placement exactly as `tools/strix_learned/src/main.rs` does and adds, for the first placement,
 //! `top` (up to five `[q, r, improved policy, mover win probability]`) and `value` (the mover's win
-//! probability under the improved policy). `hexo_strix.progress(fraction)` is called after every
-//! network batch.
+//! probability under the improved policy). `strix_value(ptr, len)` takes the same request and returns
+//! `{"status":"OK","value"}`, the network's win probability for the mover without search.
+//! `hexo_strix.progress(fraction)` is called after every network batch.
 use std::ffi::{CString, c_char};
 use std::sync::Mutex;
 use hexo_engine::{GameConfig, GameState};
@@ -40,14 +41,15 @@ struct Request {
 fn player(p: u8) -> Result<Player,String> {
     match p {0=>Ok(Player::P1),1=>Ok(Player::P2),_=>Err("invalid player".into())}
 }
-fn search(model: &InferModel, req: Request) -> Result<Value,String> {
+/// The position of `req` after the checks of `tools/strix_learned`, and the side to move.
+fn position(req: &Request) -> Result<(GameState,Player),String> {
     if !(1..=2).contains(&req.remaining) || !(1..=100000).contains(&req.simulations)
         || !(1..=1024).contains(&req.actions) || req.stones.len()>800 {
         return Err("invalid phase/search budget/stone count".into());
     }
     let mut cells=Vec::new();
     let mut seen=std::collections::HashSet::new();
-    for (q,r,p) in req.stones {
+    for &(q,r,p) in &req.stones {
         if q.unsigned_abs()>1000000 || r.unsigned_abs()>1000000 || !seen.insert((q,r)) {
             return Err("invalid or duplicate coordinates".into());
         }
@@ -55,9 +57,18 @@ fn search(model: &InferModel, req: Request) -> Result<Value,String> {
     }
     if !cells.contains(&((0,0),Player::P1)) {return Err("P1 origin required".into());}
     let side=player(req.player)?;
-    let mut game=GameState::from_state(&cells,side,req.remaining,
+    let game=GameState::from_state(&cells,side,req.remaining,
         GameConfig{win_length:6,placement_radius:8,max_moves:u32::MAX});
     if game.has_winner().is_some() {return Err("terminal input".into());}
+    Ok((game,side))
+}
+fn value(model: &InferModel, req: Request) -> Result<Value,String> {
+    let (game,_)=position(&req)?;
+    let (_,values)=model.eval_states(std::slice::from_ref(&game));
+    Ok(json!({"status":"OK","value":(values[0]+1.0)/2.0,"revision":REVISION}))
+}
+fn search(model: &InferModel, req: Request) -> Result<Value,String> {
+    let (mut game,side)=position(&req)?;
     let config=MCTSConfig{n_simulations:req.simulations,m_actions:req.actions,c_visit:50,
         c_scale:1.0,disable_gumbel_noise:true,..Default::default()};
     let mut rng=rand_chacha::ChaCha8Rng::seed_from_u64(req.seed);
@@ -144,14 +155,22 @@ pub unsafe extern "C" fn strix_load(bytes: *const u8, len: usize) -> *mut c_char
         Err(error) => failure(error.to_string()),
     })
 }
-/// One turn for the request JSON in `bytes[..len]` with the loaded model.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn strix_turn(bytes: *const u8, len: usize) -> *mut c_char {
+fn answer(bytes: *const u8, len: usize, run: fn(&InferModel,Request)->Result<Value,String>) -> *mut c_char {
     let bytes=unsafe {std::slice::from_raw_parts(bytes,len)};
     let guard=MODEL.lock().unwrap();
     let result=match guard.as_ref() {
         None => Err("load model first".to_string()),
-        Some(model) => serde_json::from_slice(bytes).map_err(|e|e.to_string()).and_then(|req|search(model,req)),
+        Some(model) => serde_json::from_slice(bytes).map_err(|e|e.to_string()).and_then(|req|run(model,req)),
     };
     text(result.unwrap_or_else(failure))
+}
+/// One turn for the request JSON in `bytes[..len]` with the loaded model.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strix_turn(bytes: *const u8, len: usize) -> *mut c_char {
+    answer(bytes,len,search)
+}
+/// The network's value for the request JSON in `bytes[..len]`, without search.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strix_value(bytes: *const u8, len: usize) -> *mut c_char {
+    answer(bytes,len,value)
 }

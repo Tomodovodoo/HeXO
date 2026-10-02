@@ -63,24 +63,28 @@ export async function loadStrix(source, {progress = () => {}} = {}) {
     return result;
   }
 
+  const round = x => Math.round(x * 1e4) / 1e4;
+  const ask = (name, history, simulations) => {
+    const answer = guarded(name, new TextEncoder().encode(JSON.stringify(request(history, simulations))));
+    if (answer.status !== 'OK') throw new Error(`Strix: ${answer.error}`);
+    return answer;
+  };
+
   /**
    * Strix's turn after `history` ([[q, r], ...], HTTTX) at `simulations` per placement: {moves, value (the mover's win
-   * probability), top ([q, r, policy, mover's win probability, 0] for up to five first stones), eval_states, root_visits}.
-   * The empty board's only stone is the origin: without `analysis` it is returned unsearched (value null), with it the
-   * value is the complement of the search after the origin.
+   * probability), top ([q, r, policy, mover's win probability, 0] for up to five first stones), simulations,
+   * eval_states, root_visits}. The empty board's only stone is the origin, played without search (simulations 0) and
+   * valued by the network's evaluation of the position after it.
    */
-  function turn(history, simulations, {analysis = false} = {}) {
+  function turn(history, simulations) {
     if (!history.length) {
-      if (!analysis) return {moves: [[0, 0]], value: null, top: [[0, 0, 1, null, 0]], eval_states: 0, root_visits: []};
-      const after = turn([[0, 0]], simulations), value = Math.round((1 - after.value) * 1e4) / 1e4;
-      return {...after, moves: [[0, 0]], value, top: [[0, 0, 1, value, 0]]};
+      const value = round(1 - ask('strix_value', [[0, 0]], 1).value);
+      return {moves: [[0, 0]], value, top: [[0, 0, 1, value, 0]], simulations: 0, eval_states: 1, root_visits: []};
     }
-    const answer = guarded('strix_turn', new TextEncoder().encode(JSON.stringify(request(history, simulations))));
-    if (answer.status !== 'OK') throw new Error(`Strix: ${answer.error}`);
-    const round = x => Math.round(x * 1e4) / 1e4;
+    const answer = ask('strix_turn', history, simulations);
     return {moves: answer.moves.map(mirror), value: round(answer.value),
       top: answer.top.map(([q, r, p, v]) => [...mirror([q, r]), round(p), round(v), 0]),
-      eval_states: answer.eval_states, root_visits: answer.root_visits};
+      simulations, eval_states: answer.eval_states, root_visits: answer.root_visits};
   }
 
   return {load, turn, build_hash: buildHash};
