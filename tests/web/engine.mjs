@@ -22,6 +22,7 @@ async function search(item) {
   try {
     for (const step of item.steps) {
       const result = await tree.search({simulations: step.simulations, rootSamples: step.root_samples, batchSize: step.batch_size, cache,
+        ...(step.choice ? {choice: step.choice} : {}),
         evaluate: async leaves => {
           const batch = batches.shift();
           if (!batch || batch.length !== leaves.length) throw new Error('Batch shape differs from the native run');
