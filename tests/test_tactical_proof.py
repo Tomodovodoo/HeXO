@@ -56,6 +56,9 @@ class NativeStrategy(unittest.TestCase):
             self.assertEqual(rejected['status'], 'UNKNOWN', mutation)
             self.assertFalse(rejected['native_verified'])
             with self.assertRaises(ValueError): independent_verify(cert, OPEN_THREE)
+            if mutation == 'cycle':
+                with self.assertRaises(VerificationTimeout):
+                    independent_verify(cert, OPEN_THREE, deadline_seconds=0)
         with self.assertRaises(VerificationTimeout):
             independent_verify(result['certificate'], OPEN_THREE, deadline_seconds=0)
 

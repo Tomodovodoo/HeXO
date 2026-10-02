@@ -445,13 +445,16 @@ def independent_verify(certificate, history, attacker='mover', deadline_seconds=
     `attacker` is the query's attacker: 'opponent' checks the certificate on the
     flipped-turn position. Returns PROVEN_WIN, raises ValueError for an invalid
     certificate and proof.VerificationTimeout when the check takes longer than
-    `deadline_seconds`. This checker allows up to 200,000 visits, the native
+    `deadline_seconds`, including certificate conversion. This checker allows up to 200,000 visits, the native
     ceiling; native acceptance also depends on the query's node budget.
     """
-    from proof import verify
+    from proof import verify, VerificationTimeout
+    deadline = time.perf_counter()+deadline_seconds
     work = 0
     def expand(index, stack):
         nonlocal work
+        if time.perf_counter() >= deadline:
+            raise VerificationTimeout('Certificate conversion deadline')
         work += 1
         if (type(index) is not int or not 0 <= index < len(certificate['nodes']) or
                 index in stack or len(stack) >= 128 or work > 200000):
@@ -477,7 +480,7 @@ def independent_verify(certificate, history, attacker='mover', deadline_seconds=
     start = n+1+n % 2 if flipped else n
     converted = dict(version=1, history=[list(p) for p in history], attacker=((start+1)//2) % 2 if start else 0,
                      flipped=flipped, tree=expand(certificate['root'], set()))
-    return verify(converted, history, deadline=time.perf_counter()+deadline_seconds)
+    return verify(converted, history, deadline=deadline)
 
 
 if __name__ == '__main__' and sys.argv[1:2] == ['serve']:
