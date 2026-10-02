@@ -63,8 +63,10 @@ export class OfflineSession {
         if (people.includes(playerAt(n)) && (n === 0 || n % 2 === 1)) break;
         this.history.pop();
       }
-    } else if (path === '/new') this.history = [];
-    else if (path === '/retry' && Number.isInteger(body.ply)) this.history = this.history.slice(0, Math.max(0, body.ply));
+    } else if (path === '/new' || (path === '/retry' && Number.isInteger(body.ply))) {
+      this.history = path === '/new' ? [] : this.history.slice(0, Math.max(0, body.ply));
+      this.paused = false;
+    }
     else if (path === '/pause') this.paused = Boolean(body.paused);
     else if (path === '/analysis' && body.preset) this.analysis = {...this.analysis, preset: body.preset};
     if (path !== '/state' && path !== '/analyse' && path !== '/cancel') this.revision++;

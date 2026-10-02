@@ -107,11 +107,13 @@ class Bundle(unittest.TestCase):
         stones = [[0, 0], [1, 0], [2, 0], [3, 0]]
         answers = node(dict(kind='offline', requests=[*[['/play', dict(q=q, r=r)] for q, r in stones], ['/play', dict(q=0, r=0)],
                                                       ['/undo', dict(people=[0])], ['/undo', dict(people=[0])],
-                                                      ['/review', {}], ['/state', {}]]))
-        self.assertEqual([a[0] for a in answers], [200, 200, 200, 200, 400, 200, 200, 501, 200])
+                                                      ['/review', {}], ['/state', {}], ['/pause', dict(paused=True)],
+                                                      ['/new', {}]]))
+        self.assertEqual([a[0] for a in answers], [200, 200, 200, 200, 400, 200, 200, 501, 200, 200, 200])
         self.assertEqual(answers[3][1], stones)
         self.assertEqual(answers[5][1], stones[:3])
         self.assertEqual(answers[6][1], [])
+        self.assertEqual([a[2] for a in answers[-2:]], [True, False])
 
     def test_search_matches_native(self):
         """Same seed, position, budget and evaluations: the same actions, visits and policy as the native library."""

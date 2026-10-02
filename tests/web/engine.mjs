@@ -3,7 +3,7 @@
 // {kind: 'search', cases: [{history, seed, tactics, steps: [{simulations, root_samples, batch_size}], batches}]}
 //   replays the recorded evaluations batch by batch -> [[{action, policy, visits, completed}] per step]
 // {kind: 'line', history, certificate} -> winning line
-// {kind: 'offline', requests: [[path, body]]} -> [[status, history or error]] from an OfflineSession
+// {kind: 'offline', requests: [[path, body]]} -> [[status, history or error, paused]] from an OfflineSession
 import {readFileSync} from 'node:fs';
 import {encode, features} from '../../web/engine/encode.mjs';
 import {Native, NeuralSearch, EvaluationCache} from '../../web/engine/search.mjs';
@@ -54,7 +54,7 @@ if (job.kind === 'encode') {
   const session = new OfflineSession(native, {engine: 'browser:bubble'});
   answer = job.requests.map(([path, body]) => {
     const [status, data] = session.answer(path, body);
-    return [status, status === 200 ? data.history : data.error];
+    return [status, status === 200 ? data.history : data.error, status === 200 && data.paused];
   });
 }
 process.stdout.write(JSON.stringify(answer));
