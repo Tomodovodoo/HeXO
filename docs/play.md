@@ -91,7 +91,11 @@ null. Complete colour pairs use the evaluator's pentanomial scoring and `dense_p
 relative Elo estimate and 95% interval. These exploratory results stay in the batch directory and do not
 change the training league or its calibrated-opponent scoreboard.
 
-The **Tournaments** button lists saved batches and every completed game's result. Click a game to open it
+The trophy button opens Tournaments. New starts a batch on this board between two engines (A and B, each with
+its checkpoint and strength), for a number of games, from the origin or from narrow, wide or all book openings
+(each played twice with colours swapped), on the seats' fixed budgets, a time per turn or a game clock; an
+unfinished game against a person is cleared first. Results lists saved batches with the score, the Elo of A over B
+with its 95% interval from complete colour pairs, and every completed game's result. Click a game to open it
 in the player's analysis board in another tab, or download its HTTTX. The analysis board has its own CPU
 engine queue, move timeline, analysis controls and Review button, so browsing and analysing a saved game
 do not replace the live tournament board or spend its clock. One analysis board is shared by the player
@@ -127,7 +131,7 @@ curl -X POST http://127.0.0.1:8772/match -H "Content-Type: application/json" -d 
 | `GET /state` | Engines, current board, jobs, match progress and score |
 | `GET /models` | Player catalogue, checkpoints, budgets and clock support |
 | `GET /openings?range=narrow&count=16&seed=0` | Preview the exact selected opening set, read-only |
-| `POST /match` | Start with `players`, `games` or `unique_openings`, `opening_range`, `seed`, and optional `book` or `output` |
+| `POST /match` | Start with `players`, `games` or `unique_openings`, `opening_range`, `seed`, and optional `book`, `output` or `replace` (clear an unfinished game against a person) |
 | `GET /match` | Match specification, score, completed results and paused state |
 | `POST /match` with `{"action":"pause"}`, `resume` or `stop` | Control the current batch |
 | `POST /match` with `{"action":"resume","batch":"path/to/batch"}` | Load and resume a saved batch |
@@ -172,8 +176,12 @@ files on one machine.
 Kraken (Ramora0/KrakenBot) is not offered: its code has no licence and its weights are not public. Neither is
 MantisNet (Cmiller132/Hexo-Shrimp-Bot), which has no licence and no weights.
 
-Strength is a slider from Faster to Smarter with six stops, marked by growing hexagons and a hazard sign for the
-last; arrow keys move it one stop. The sliders button beside it opens the custom budget.
+Strength is a slider from Faster to Smarter with six stops: a spark, an open hexagon, a filled one, one in a ring, a
+stack and the hazard sign; arrow keys move it one stop. The sliders button beside it opens the custom budget.
+
+When both seats are engines and the run has an opening book (`openings.json` in `--dense-run`, or `--book`), the
+seats card offers Opening book: New then starts from a random in-policy book opening in a random orientation, shown
+as played stones.
 
 | Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms | Six protocol nodes | Strix simulations |
 |---|---|---|---|---|---|
@@ -226,10 +234,19 @@ the two most recently used networks stay running. Six searches by nodes, so a pr
 
 ## Analysis and review
 
-The analysis engine is a Bubble checkpoint with its own preset. With Auto on it evaluates every position where a
-turn starts, plus any position you step to. Engine moves by the same checkpoint count as evaluations, so a game
-against Bubble costs nothing extra on Bubble's turns. Review evaluates whatever is missing and labels each turn
-from the mover's win probability before and after it:
+The analysis engine is a Bubble checkpoint with its own preset. Analysis and review run on their own worker and
+model, beside the one that plays engine moves, so they keep up during play. With Auto on it evaluates every
+position where a turn starts, plus any position you step to; while an engine seat plays it also deepens the current
+position through every preset, Lightning first, showing each as it lands and starting again when the position
+changes. That deepening runs last in the queue, gives way to any other analysis and slows down while an engine
+seat searches. A position without a saved evaluation shows the search of the engine or analysis working on it as
+it goes. The slider rings the stop of the evaluation shown. Engine moves by the same checkpoint count as
+evaluations, so a game against Bubble costs nothing extra on Bubble's turns.
+
+Review always evaluates at Standard (128 simulations per stone, 32,768 solver nodes), whatever the slider says,
+and labels each turn only from evaluations at exactly that budget, so a verdict never compares a deep evaluation
+with a shallow one; the Review button carries the Standard mark. It labels each turn from the mover's win
+probability before and after it:
 
 | Label | Meaning |
 |---|---|
@@ -267,9 +284,11 @@ The server does the fetching, without accounts or tokens. These sites draw HTTTX
 first stone moves to the origin, and in Rectilinear notation the player who moved first becomes cross. Drawn stones
 must form complete turns; a drawing has no move order, so the importer looks for one that plays them legally.
 
-The clipboard button above the move list copies the shown position as HTTTX; the menu beside it shows it as HTTTX,
-Rectilinear and a Tyto analysis link, each with its own copy button. Hovering a stone's token there rings that cell
-on the board, and hovering a stone on the board marks its tokens. `GET /export?format=htttx|rectilinear|tyto&ply=N`
+Above the move list sit Import, one chip per format (HTTTX, Rectilinear, Tyto link: a click copies the shown
+position, the arrow opens its text below the row), Game (downloads the replay file) and Review. Hovering a stone's
+token in the text rings that cell on the board, and hovering a stone on the board marks its tokens. In the move
+list the stone of the shown position is outlined within its turn and the later one dimmed; hovering a stone rings
+it on the board. `GET /export?format=htttx|rectilinear|tyto&ply=N`
 returns the same text with each stone's span.
 
 ## Saved evaluations

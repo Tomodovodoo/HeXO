@@ -1946,9 +1946,11 @@ class DenseDataTests(unittest.TestCase):
             changed = []
             for t, (s, before, after) in enumerate(zip(samples, base, paired)):
                 for key in before:
-                    if key != 'policy':
+                    if key not in ('policy', 'paired'):
                         np.testing.assert_array_equal(before[key], after[key])
-                if np.array_equal(before['policy'], after['policy']):
+                self.assertFalse(before['paired'])
+                self.assertEqual(after['paired'], not np.array_equal(before['policy'], after['policy']))
+                if not after['paired']:
                     continue
                 changed.append(t)
                 self.assertEqual(s.remaining, 2)
@@ -1958,6 +1960,9 @@ class DenseDataTests(unittest.TestCase):
                 self.assertEqual(second[(s.actions == moves[t]).all(1)].sum(), 0.)
                 np.testing.assert_allclose(after['policy'], (before['policy']+second/second.sum())/2, atol=1e-6)
             self.assertEqual(changed, [t for t in range(11) if samples[t].remaining == 2 and t not in (3, 4)])
+            with unittest.mock.patch.object(dense_data, 'pair_policy', side_effect=lambda policy, *_: policy):
+                _, unmixed = dense_data.examples(window, refs, np.random.default_rng(0), pair_policy_weight=1.)
+            self.assertFalse(any(target['paired'] for target in unmixed))
 
     def test_examples_and_collate(self):
         rng = np.random.default_rng(6)
@@ -2604,6 +2609,7 @@ class ValidationSourceTests(unittest.TestCase):
                 if key.startswith('certified_policy'):
                     self.assertEqual(value, weighted[key], key)
             refs = [window.ref('1000000000001', ply) for ply in (11, 12)]
+            self.assertEqual(learner.row_losses(window, refs)['policy_weight'].tolist(), [.25, .25])
             learner.settings = replace(learner.settings, proof_policy_weight=0.)
             per_row = learner.row_losses(window, refs)
             self.assertTrue(np.isnan(per_row['policy_ce']).all())
@@ -2830,9 +2836,10 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual(dense_learn.Learner(run, config.learner, config).step, 0)
             fields = dense_learn.validation_fields(manifest['metrics'])
             self.assertEqual(fields['next_ce'], aggregate['opponent_ce'])
-            for key in ('policy_kl', 'policy_target_entropy', 'policy_top1'):
+            for key in dashboard.POLICY_METRICS:
                 self.assertEqual(fields[key], aggregate[key])
                 self.assertEqual(fields[f'fresh_{key}'], v[f'fresh_{key}'])
+            self.assertEqual(aggregate['policy_pair_rows'], 0)
             dense_config.append_metrics(run, 'learner-main', step=10, validation=True, **fields)
             points = dashboard.series(run, dict(created_at=0.), 'main', 'validation_newest_gap_policy_ce')['points']
             self.assertEqual(points, [[10, v['newest_gap_policy_ce']]])
@@ -2847,18 +2854,76 @@ class ValidationSourceTests(unittest.TestCase):
             losses = learner.train_step(dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0))))
             self.assertTrue(math.isnan(losses[2]) and math.isnan(losses[5]) and torch.isfinite(losses[:2]).all())
 
+    def test_pair_policy_validation_counts_first_stones_with_a_searched_partner(self):
+        torch.set_num_threads(2)
+        torch.manual_seed(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'000001', 1, 'old', 'converted', policy_every=1)
+            source_shard(run/'shards'/'1000000000001', 2, 'x', checkpoint='main/000010', policy_every=1)
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=.5,
+                                                                                 pair_policy_weight=.5))
+            learner = dense_learn.Learner(run, config.learner, config)
+            window = dense_data.ReplayWindow(run, 1000, 10, validation_fraction=.5)
+            window.refresh()
+            sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=6)
+            metrics, sources = learner.validate(window), learner.validate_sources(sets)
+            self.assertGreater(metrics['policy_pair_rows'], 0)
+            self.assertLessEqual(metrics['policy_pair_rows'], metrics['policy_first_rows'])
+            self.assertEqual(metrics['policy_rows'], metrics['policy_first_rows']+metrics['policy_second_rows'])
+            for key in ('policy_top1', 'policy_top2', 'policy_argmax_mass', 'policy_pair_top1'):
+                self.assertTrue(0 <= metrics[key] <= 1, key)
+            self.assertGreaterEqual(metrics['policy_top2'], metrics['policy_top1'])
+            self.assertGreater(sum(sources[f'{source}_policy_pair_rows'] for source in dense_data.SOURCES), 0)
+
     def test_policy_validation_rows_on_synthetic_panel(self):
-        out = dict(policy=torch.tensor([[3., 1.], [3., 0.], [0., 1.], [0., 1.], [0., 3.]]),
-                   far=torch.tensor([0., 0., 4., 4., 0.]))
-        batch = dict(cells=torch.tensor([[0, 1, -1], [0, 1, -1], [1, -1, -1], [0, -1, -1], [0, 1, -1]]),
-                     counts=torch.tensor([3, 3, 2, 3, 2]),
+        out = dict(policy=torch.tensor([[3., 1.], [3., 0.], [0., 1.], [0., 1.], [0., 3.], [0., 1.], [0., 3.]]),
+                   far=torch.tensor([0., 0., 4., 4., 0., 4., 0.]))
+        batch = dict(cells=torch.tensor([[0, 1, -1], [0, 1, -1], [1, -1, -1], [0, -1, -1], [0, 1, -1], [0, 1, -1],
+                                         [0, 1, -1]]),
+                     counts=torch.tensor([3, 3, 2, 3, 2, 3, 3]),
                      mask=torch.tensor([[True, True, True], [True, True, True], [True, True, False],
-                                        [True, True, True], [True, True, False]]),
-                     policy=torch.tensor([.8, .2, 0., .1, .8, .1, .2, .8, .1, .1, .8, .5, .5]))
-        ce, entropy, kl, top1 = dense_learn.policy_validation_rows(out, batch)
+                                        [True, True, True], [True, True, False], [True, True, True],
+                                        [True, True, True]]),
+                     policy=torch.tensor([.8, .2, 0., .1, .8, .1, .2, .8, .1, .1, .8, .5, .5, 1., 0., 0., .6, .4, 0.]))
+        ce, entropy, kl, top1, top2, mass = dense_learn.policy_validation_rows(out, batch)
         np.testing.assert_allclose(ce.numpy(), entropy.numpy()+kl.numpy(), rtol=0, atol=1e-7)
-        self.assertEqual(top1.tolist(), [1., 0., 1., 1., 1.])
-        self.assertAlmostEqual(float(top1.mean()), 4/5)
+        self.assertEqual(top1.tolist(), [1., 0., 1., 1., 1., 0., 0.])
+        self.assertAlmostEqual(float(top1.mean()), 4/7)
+        # Row 1 ties the second mass, row 3 ties two far cells for the net argmax and row 5 has no second move.
+        self.assertEqual(top2.tolist(), [1., 1., 1., 1., 1., 0., 1.])
+        np.testing.assert_allclose(mass.numpy(), [.8, .1, .8, .45, .5, 0., .4], rtol=0, atol=1e-6)
+        single = dict(cells=torch.tensor([[0]]), counts=torch.tensor([1]), mask=torch.tensor([[True]]),
+                      policy=torch.tensor([1.]))
+        self.assertEqual([x.tolist() for x in dense_learn.policy_validation_rows(
+            dict(policy=torch.tensor([[1., 0.]]), far=torch.tensor([0.])), single)[3:]], [[1.], [1.], [1.]])
+
+    def test_pair_policy_rows_score_either_played_stone(self):
+        out = dict(policy=torch.tensor([[3., 1.], [3., 1.], [0., 1.], [1., 0.]]), far=torch.tensor([0., 0., 4., 4.]))
+        batch = dict(cells=torch.tensor([[0, 1, -1], [0, 1, -1], [0, 1, -1], [0, -1, -1]]),
+                     counts=torch.tensor([3, 3, 3, 3]))
+        actions = np.array([[10, 0], [11, 0], [12, 0]])
+        samples = [SimpleNamespace(actions=actions)]*4
+        pairs = [np.array([[11, 0], [10, 0]]), np.array([[11, 0], [99, 99]]), None, np.array([[10, 0], [9, 0]])]
+        pair = dense_learn.pair_policy_rows(out, batch, samples, pairs)
+        torch.testing.assert_close(pair, torch.tensor([1., 0., math.nan, 0.]), equal_nan=True)
+        pairs[3] = np.array([[9, 0], [12, 0]])
+        self.assertEqual(dense_learn.pair_policy_rows(out, batch, samples, pairs)[3].item(), 1.)
+
+    def test_policy_summary_splits_stones_and_pairs(self):
+        summary = dense_learn.policy_summary([2, 1, 1, 0], [2, 1, 2, 2], [1., 2., 3., 9.], [.1, .2, .3, 9.],
+                                             [1, 0, 0, 1], [1, 1, 0, 1], [.5, .4, .2, .9], [1, math.nan, 0, 1])
+        expected = dict(policy_target_entropy=7/4, policy_kl=.7/4, policy_rows=3, policy_top1=.5, policy_top2=.75,
+                        policy_argmax_mass=1.6/4, policy_first_rows=2, policy_first_top1=2/3, policy_first_top2=2/3,
+                        policy_first_argmax_mass=.4, policy_second_rows=1, policy_second_top1=0.,
+                        policy_second_top2=1., policy_second_argmax_mass=.4, policy_pair_top1=2/3, policy_pair_rows=2)
+        self.assertEqual(summary.keys(), expected.keys())
+        for key, value in expected.items():
+            self.assertAlmostEqual(summary[key], value, msg=key)
+        empty = dense_learn.policy_summary([0.], [2], [1.], [1.], [1.], [1.], [1.], [1.])
+        self.assertEqual((empty['policy_rows'], empty['policy_first_top2'], empty['policy_pair_top1'],
+                          empty['policy_pair_rows']), (0, None, None, 0))
 
     def test_remaining_curve_on_outcomes_decided_in_the_last_ten_plies(self):
         """Games whose outcome is fixed only in their last 10 plies: a predictor that knows it there and says 0.5
