@@ -91,8 +91,10 @@ class PlayPage(unittest.TestCase):
 
     def test_engines_turn_the_book_on(self):
         answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False)
-        self.assertEqual(answer['requests'], [['/book', dict(enabled=True)], ['/seat', dict(side=0, engine='native')]])
+        self.assertEqual(answer['requests'], [['/pause', dict(paused=True)], ['/seat', dict(side=0, engine='native')],
+                                              ['/book', dict(enabled=True)]])
         self.assertTrue(answer['enabled'])
+        self.assertFalse(answer['paused'])
 
     def test_people_turn_the_book_off(self):
         answer = self.follow([['/seat', dict(side=1, engine='human')]])
@@ -121,6 +123,7 @@ class PlayPage(unittest.TestCase):
                               ['/seat', dict(side=1, engine='human')]])
         self.assertEqual(self.books(answer), [False, True])
         self.assertEqual(answer['stored'], '1')
+        self.assertFalse(answer['paused'])
         answer = self.follow([['/seat', dict(side=1, engine='human')]], stored='1')
         self.assertEqual(self.books(answer), [])
 

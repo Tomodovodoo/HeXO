@@ -11,22 +11,29 @@ export function bookDefault(humans) {
 
 /**
  * Wraps `page.post`. A /book request through it marks the switch touched for the session (`storage`, sessionStorage
- * in the page) when it is sent. /seat requests that name an engine run one at a time; while untouched, each is
- * preceded by the /book request that applies `bookDefault` to the seats it leaves (a request for 'human' makes that
- * seat Human, any other engine makes it an engine), so the book is set before an engine seat can move and follows the
- * last seats. `state()` is the page's current state, `human(seat)` whether the page shows that seat object as Human.
+ * in the page) when it is sent. /seat requests that name an engine run one at a time; while untouched, each is followed
+ * by the /book request that applies `bookDefault` to the seats then shown, so the book follows the last seats. When
+ * that turns the book on for an empty board, the game is paused during the seat change, so no engine moves before
+ * the book starts the opening for the new seats (which resumes the game).
+ * `state()` is the page's current state, `human(seat)` whether the page shows that seat object as Human.
  */
 export function followSeats(page, state, human, storage) {
   const post = page.post;
   let touched = false, queue = Promise.resolve();
   try { touched = storage?.getItem(KEY) === '1'; } catch {}
   const follow = async body => {
-    const s = state();
-    if (!touched && s?.book?.available) {
-      const enabled = bookDefault(s.seats.map((seat, side) => side === body.side ? body.engine === 'human' : human(seat)));
-      if (enabled !== s.book.enabled) await post('/book', {enabled});
+    const before = state();
+    const hold = !touched && before?.book?.available && !before.book.enabled && !before.paused && !before.history.length
+      && body.engine !== 'human';
+    if (hold) await post('/pause', {paused: true});
+    const data = await post('/seat', body), s = state();
+    let started = false;
+    if (data && !touched && s?.book?.available) {
+      const enabled = bookDefault(s.seats.map(human));
+      if (enabled !== s.book.enabled) started = Boolean(await post('/book', {enabled})) && enabled;
     }
-    return post('/seat', body);
+    if (hold && !started) await post('/pause', {paused: false});
+    return data;
   };
   page.post = (path, body = {}) => {
     if (path === '/book') {
