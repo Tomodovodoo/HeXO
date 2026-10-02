@@ -6,7 +6,6 @@ A setup downloads an engine, checks every file against its SHA-256, lays it out 
 Engines that need compiling are built here when the toolchain is present and otherwise come from the release named
 in the manifest, whose file hashes are checked in. Nothing here needs the training modules.
 """
-import contextlib
 import hashlib
 import importlib.util
 import json
@@ -18,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 import zipfile
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -134,20 +134,21 @@ class Job:
 
     def json(self):
         progress = 1.0 if self.state == 'done' else min(1.0, (self.step + self.fraction) / max(1, self.steps))
-        return dict(state=self.state, progress=round(progress, 4), busy=self.busy, error=self.error)
+        return dict(state=self.state, progress=round(progress, 4), busy=self.busy and self.state == 'running',
+                    error=self.error)
 
 
 class Setups:
-    """Setup jobs for the engines in `manifest`, one thread each. `rescan` refreshes the registry; jobs call it one
-    at a time after their install, so the last rescan sees every finished one. `entries` returns the registry's
-    current entries, which decide what counts as installed."""
+    """Setup jobs for the engines in `manifest`, one thread each. `rescan` refreshes the registry after an install;
+    while it refuses with ValueError, as during a match, the job keeps running and tries again every `retry`
+    seconds. `entries` returns the registry's current entries, which decide what counts as installed."""
 
     def __init__(self, models, rescan=lambda: None, entries=lambda: {}, manifest=MANIFEST, opener=urlopen,
                  which=shutil.which, cargo=cargo):
         self.models, self.rescan, self.entries = Path(models).resolve(), rescan, entries
         self.manifest = json.loads(Path(manifest).read_text(encoding='utf-8'))
         self.opener, self.which, self.cargo = opener, which, cargo
-        self.jobs, self.threads, self.lock, self.rescanning = {}, {}, threading.Lock(), threading.Lock()
+        self.jobs, self.threads, self.lock, self.retry = {}, {}, threading.Lock(), 5
 
     def catalogue(self):
         """Every known engine as {engine, name, kind, installed, job}: `installed` is the id of the registry entry
@@ -188,8 +189,13 @@ class Setups:
             return
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        with self.rescanning, contextlib.suppress(ValueError):
-            self.rescan()
+        job.busy = True
+        while True:
+            try:
+                self.rescan()
+                break
+            except ValueError:
+                time.sleep(self.retry)
         job.state = 'done'
 
     # Steps shared by the recipes

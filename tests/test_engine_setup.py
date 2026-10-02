@@ -16,7 +16,8 @@ from urllib.request import Request, urlopen
 
 import engine_setup
 from engine_setup import MANIFEST, SetupError, Setups, python_tag, six_member, system, unpack, wheel_fits
-from play import Handler, scan
+from play import Evaluations, Handler, Session, scan
+from tests.test_play import FakeEngines, entries
 
 WINDOWS = os.name == 'nt'
 SIX_BINARY = 'sixengine.exe' if WINDOWS else 'sixengine'
@@ -243,22 +244,41 @@ class Recipes(unittest.TestCase):
             self.setups({}).place(staged, 'seal', dict(name='Seal'))
         self.assertEqual((self.models / 'strix' / 'mine.txt').read_text(), 'keep')
 
-    def test_setups_finishing_together_rescan_one_at_a_time(self):
-        inside, overlaps = [], []
+    def test_a_setup_waits_for_the_match_to_end_before_it_is_done(self):
+        refusals = [ValueError('Stop the match before changing its players or position')] * 2
 
         def rescan():
+            if refusals:
+                raise refusals.pop()
+            self.rescans += 1
+        path = Path(self.folder.name) / 'engines.json'
+        path.write_text(json.dumps(self.manifest), encoding='utf-8')
+        setups = Setups(self.models, rescan, dict, path, Web({}), lambda name: None, lambda: None)
+        setups.retry = .05
+        with unittest.mock.patch.object(Setups, 'seal', lambda self, job, work: None):
+            job = setups.start('seal')
+            self.assertEqual(setups.wait('seal', 5).state, 'done')
+        self.assertEqual((refusals, self.rescans), ([], 1))
+        self.assertFalse(job.json()['busy'])
+
+    def test_rescans_run_one_at_a_time(self):
+        inside, overlaps = [], []
+
+        def scan_slowly():
             overlaps.append(bool(inside))
             inside.append(1)
             threading.Event().wait(.2)
             inside.pop()
-        path = Path(self.folder.name) / 'engines.json'
-        path.write_text(json.dumps(self.manifest), encoding='utf-8')
-        setups = Setups(self.models, rescan, dict, path, Web({}), lambda name: None, lambda: None)
-        with unittest.mock.patch.object(Setups, 'seal', lambda self, job, work: None), \
-                unittest.mock.patch.object(Setups, 'six', lambda self, job, work: None):
-            setups.start('seal')
-            setups.start('six')
-            self.assertEqual((setups.wait('seal', 5).state, setups.wait('six', 5).state), ('done', 'done'))
+            return entries()
+        session = Session(entries(), FakeEngines(), Evaluations(), scan_slowly)
+        try:
+            threads = [threading.Thread(target=session.rescan) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+        finally:
+            session.close()
         self.assertEqual(overlaps, [False, False])
 
     def test_strix_entries_differ_by_executable(self):

@@ -1033,7 +1033,7 @@ class Session:
         self.study_store = study_store
         self.saved_matches, self.study, self.saved_game = {}, None, None
         self.models_folder, self.opening_book = None, False
-        self.lock = threading.Condition()
+        self.lock, self.rescanning = threading.Condition(), threading.Lock()
         self.history, self.revision, self.paused = [], 0, False
         self.instance, self.closing = os.urandom(4).hex(), False
         self.match, self.match_worker = None, None
@@ -1913,33 +1913,34 @@ class Session:
     def rescan(self):
         """Replace the engine list. A seat follows its engine, matched by kind and path, to its id in the new list;
         a seat whose engine or checkpoint is gone becomes a person, and analysis falls back to the first Bubble
-        model."""
-        entries = self.rescan_entries()
-        identity = lambda e: (e['kind'], engine_identity(e))
-        def follow(seat):
-            old = self.entries.get(seat['engine'])
-            moved = next((e['id'] for e in entries.values() if old and identity(e) == identity(old)), None)
-            return seat | dict(engine=moved)
-        def valid(seat):
-            entry = entries.get(seat['engine']) if seat['engine'] else None
-            return entry is not None and (not entry.get('checkpoints') or seat['checkpoint'] in entry['checkpoints'])
-        with self.lock:
-            self.match_editable()
-            followed = [seat if seat['engine'] == 'human' else follow(seat) for seat in self.seats]
-            analysis = follow(self.analysis) if self.analysis else None
-            previous, self.entries = self.entries, entries
-            try:
-                seats = [seat if seat['engine'] == 'human' or valid(seat) else dict(engine='human') for seat in followed]
-                if analysis is None or not valid(analysis):
-                    bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
-                    analysis = self.seat(bubble['id'], None, 'standard') | dict(auto=True) if bubble else None
-            except Exception:
-                self.entries = previous
-                raise
-            self.seats, self.analysis = seats, analysis
-            self.stop_moves()
-            self.stop_analysis()
-            self.changed()
+        model. Rescans run one at a time, so an older scan never replaces a newer one."""
+        with self.rescanning:
+            entries = self.rescan_entries()
+            identity = lambda e: (e['kind'], engine_identity(e))
+            def follow(seat):
+                old = self.entries.get(seat['engine'])
+                moved = next((e['id'] for e in entries.values() if old and identity(e) == identity(old)), None)
+                return seat | dict(engine=moved)
+            def valid(seat):
+                entry = entries.get(seat['engine']) if seat['engine'] else None
+                return entry is not None and (not entry.get('checkpoints') or seat['checkpoint'] in entry['checkpoints'])
+            with self.lock:
+                self.match_editable()
+                followed = [seat if seat['engine'] == 'human' else follow(seat) for seat in self.seats]
+                analysis = follow(self.analysis) if self.analysis else None
+                previous, self.entries = self.entries, entries
+                try:
+                    seats = [seat if seat['engine'] == 'human' or valid(seat) else dict(engine='human') for seat in followed]
+                    if analysis is None or not valid(analysis):
+                        bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
+                        analysis = self.seat(bubble['id'], None, 'standard') | dict(auto=True) if bubble else None
+                except Exception:
+                    self.entries = previous
+                    raise
+                self.seats, self.analysis = seats, analysis
+                self.stop_moves()
+                self.stop_analysis()
+                self.changed()
 
     # Working
 
