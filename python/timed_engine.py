@@ -281,7 +281,7 @@ def _worker(connection, cancellation, config):
             identity = dict(checkpoint='six', command=config['command'])
         elif kind == 'seal':
             from legacy.arena import Seal
-            player = Seal()
+            player = Seal(config.get('library'))
             identity = dict(checkpoint='seal')
         elif kind == 'htttx':
             player = HTTTXEngine(config['url'])

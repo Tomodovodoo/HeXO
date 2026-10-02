@@ -281,6 +281,18 @@ class Recipes(unittest.TestCase):
             session.close()
         self.assertEqual(overlaps, [False, False])
 
+    def test_a_clocked_seal_seat_names_its_library(self):
+        library = self.models / 'seal' / 'hexo_seal.dll'
+        library.parent.mkdir()
+        library.write_bytes(b'library')
+        (self.models / 'seal.json').write_text(json.dumps(dict(name='Seal', kind='seal', library='seal/hexo_seal.dll')))
+        session = Session(scan(self.models), FakeEngines(), Evaluations())
+        try:
+            config = session.timed_config(dict(engine='seal:Seal', budget=dict(ms=100)))
+        finally:
+            session.close()
+        self.assertEqual(config, dict(kind='seal', max_ms=100, library=str(library.resolve())))
+
     def test_strix_entries_differ_by_executable(self):
         for name in ('a', 'b'):
             (self.models / f'{name}.json').write_text(json.dumps(dict(name='Strix', kind='strix', model='m.safetensors',

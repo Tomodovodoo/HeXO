@@ -1732,8 +1732,9 @@ class Session:
                     for path, digest in source['files'].items():
                         if file_digest(file_identity(path)) != digest:
                             raise ValueError(f'Engine file changed since the batch started: {path}')
-                    entry = {k: Path(v) if k in ('path', 'model') else v for k, v in source.items()
-                             if k in ('kind', 'path', 'command', 'cwd', 'model', 'mirrored', 'libraries')}
+                    entry = {k: Path(v) if k in ('path', 'model', 'engine', 'library') else v for k, v in source.items()
+                             if k in ('kind', 'path', 'command', 'cwd', 'model', 'engine', 'library', 'mirrored',
+                                      'libraries')}
                     entry.update(id=seat['engine'], name=source.get('name', seat['name']), presets=PRESETS[source['kind']])
                     if seat['checkpoint'] is not None:
                         entry['checkpoints'] = [seat['checkpoint']]
@@ -1785,7 +1786,7 @@ class Session:
             return dict(kind=kind, command=command_of(entry, seat['checkpoint']) + budget.get('args', []),
                         cwd=str(entry.get('cwd') or ROOT), path=list(map(str, entry.get('libraries', []))),
                         mirrored=entry.get('mirrored', False), nodes=budget['nodes'])
-        return dict(kind=kind, max_ms=budget['ms'])
+        return dict(kind=kind, max_ms=budget['ms'], **({'library': str(entry['library'])} if entry.get('library') else {}))
 
     def run_match(self, match):
         try:
