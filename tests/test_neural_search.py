@@ -17,6 +17,34 @@ class Uniform:
         return out
 
 class NeuralTree(unittest.TestCase):
+    def test_play_defaults_to_policy_and_actor_result_retains_gumbel(self):
+        search = NeuralSearch(Uniform(), 'choice-default', [(0, 0)], seed=0)
+        self.addCleanup(search.close)
+        result = search.search(32, root_samples=4, batch_size=4)
+        policy_action = result['actions'][result['policy'].argmax()].tolist()
+        self.assertEqual(result['action'], policy_action)
+        self.assertFalse(np.isfinite(result['scores'][result['policy'].argmax()]))
+        actor = search.result(0, 0, 0, 0)
+        self.assertEqual(actor['action'], actor['actions'][actor['scores'].argmax()].tolist())
+        self.assertNotEqual(actor['action'], result['action'])
+        with self.assertRaisesRegex(ValueError, 'choice must be'):
+            search.search(32, choice='invalid')
+
+    def test_explicit_gumbel_and_timed_fallback_keep_the_selected_mode(self):
+        from unittest.mock import patch
+        for choice in ('policy', 'gumbel'):
+            search = NeuralSearch(Uniform(), 'timed-choice', [(0, 0)], seed=0)
+            self.addCleanup(search.close)
+            result = search.search(32, root_samples=4, batch_size=4, choice=choice)
+            ranking = result['policy'] if choice == 'policy' else result['scores']
+            self.assertEqual(result['action'], result['actions'][ranking.argmax()].tolist())
+            with patch.object(search, 'result', wraps=search.result) as snapshot:
+                result = search.search(32, root_samples=4, batch_size=1, anytime=True,
+                                       stop=lambda: snapshot.call_count > 0, choice=choice)
+            ranking = result['policy'] if choice == 'policy' else result['scores']
+            self.assertEqual(result['action'], result['actions'][ranking.argmax()].tolist())
+            self.assertLess(result['completed'], 32)
+
     def test_puct_initial_value_uses_policy_weighted_action_values(self):
         from puct_search import PUCTSearch
         search = PUCTSearch(Uniform(), 'puct-weighted', [(0, 0)])
@@ -421,7 +449,7 @@ class NeuralTree(unittest.TestCase):
             game = Game(search.history)
             self.assertEqual(game.remaining, remaining)
             game.close()
-            result = search.search(32, root_samples=4)
+            result = search.search(32, root_samples=4, choice='gumbel')
             self.assertGreaterEqual(result['visits'].sum(), 32)
             search.advance(result['action'])
             retained = native.hxg_stats(search.ptr, None, None, None, None)
@@ -429,8 +457,8 @@ class NeuralTree(unittest.TestCase):
 
     def test_new_budget_after_reuse_and_batch_equivalence(self):
         one, many = self.searcher([(0, 0)]), self.searcher([(0, 0)])
-        a = one.search(32, root_samples=4, batch_size=1)
-        b = many.search(32, root_samples=4, batch_size=8)
+        a = one.search(32, root_samples=4, batch_size=1, choice='gumbel')
+        b = many.search(32, root_samples=4, batch_size=8, choice='gumbel')
         np.testing.assert_array_equal(a['visits'], b['visits'])
         self.assertEqual(a['action'], b['action'])
         one.advance(a['action'])

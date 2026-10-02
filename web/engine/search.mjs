@@ -136,8 +136,9 @@ export class NeuralSearch {
    * then the partial search). Resolves to the result fields of NeuralSearch.result.
    */
   async search({simulations = 128, rootSamples = null, batchSize = 16, evaluate, cache = new EvaluationCache(), version = 'web',
-    stop = () => false, onBatch = () => {}} = {}) {
+    stop = () => false, onBatch = () => {}, choice = 'policy'} = {}) {
     if (batchSize < 1 || simulations < 1) throw new Error('Positive search budgets required');
+    if (choice !== 'policy' && choice !== 'gumbel') throw new Error('choice must be policy or gumbel');
     const start = performance.now(), stats = {evaluated: 0, hits: 0, batches: 0, largest: 0, network_ms: 0};
     const sample = rootSamples ?? Math.max(2, Math.floor(Math.sqrt(simulations)));
     this.n.checked(this.m._hxg_begin(this.ptr, simulations, sample));
@@ -196,11 +197,11 @@ export class NeuralSearch {
     } finally {
       if (this.ptr) this.m._hxg_cancel(this.ptr);
     }
-    return {...this.result(), evaluated: stats.evaluated, cache_hits: stats.hits, inference_batches: stats.batches,
+    return {...this.result(choice), evaluated: stats.evaluated, cache_hits: stats.hits, inference_batches: stats.batches,
       largest_batch: stats.largest, network_ms: stats.network_ms, stopped, elapsed_ms: performance.now() - start};
   }
   /** Root statistics as NeuralSearch.result: action, actions, visits, values, policy, scores, exact fields. */
-  result() {
+  result(choice = 'gumbel') {
     const m = this.m, n = m._hxg_stats(this.ptr, 0, 0, 0, 0);
     const a = this.n.alloc(16 * n), v = this.n.alloc(4 * n), q = this.n.alloc(8 * n), s = this.n.alloc(8 * n), p = this.n.alloc(8 * n);
     try {
@@ -213,6 +214,10 @@ export class NeuralSearch {
       scores.forEach((score, i) => { if (Number.isFinite(score) && (selected < 0 || score > scores[selected])) selected = i; });
       const winner = m._hxg_exact(this.ptr), mover = ((this.history.length + 1) >> 1) % 2;
       const proven = winner < 0 ? 0 : winner === mover ? 1 : -1;
+      if (choice === 'policy' && !proven && policy.some(p => p > 0)) {
+        selected = 0;
+        policy.forEach((p, i) => { if (p > policy[selected]) selected = i; });
+      }
       return {action: selected >= 0 ? actions[selected] : null, actions, visits, values, policy, scores,
         completed: m._hxg_completed(this.ptr), exact_winner: winner, proven,
         proof_plies: proven ? m._hxg_distance(this.ptr) : 0,

@@ -79,7 +79,7 @@ class MatchGame:
     takes the largest improved policy at unproven roots. Exact roots keep their shortest win or longest resistance."""
 
     def __init__(self, sides, opening, seed, sims, samples, tactics, max_plies, record, seal=None, seal_ms=0,
-                 solvers=(None, None), anchor=SEAL, graphs=False, choices='gumbel'):
+                 solvers=(None, None), anchor=SEAL, graphs=False, choices='policy'):
         self.sides, self.max_plies, self.seal, self.seal_ms, self.record = sides, max_plies, seal, seal_ms, record
         self.anchor = anchor
         self.solvers = solvers

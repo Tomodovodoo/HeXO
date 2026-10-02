@@ -87,7 +87,7 @@ function moveRow([q, r], probability, value) {
 }
 
 /** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, line, threat, solved, ms). */
-async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
+async function turn({id, history, simulations, solverNodes, batchSize = 16, choice = 'policy'}) {
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
@@ -117,7 +117,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16}) {
       if (simulations) {
         tree ??= new NeuralSearch(native, {seed: 1740, tactics: true, history: current});
         const stone = moves.length;
-        const result = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version,
+        const result = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
           evaluate: leaves => network.evaluate(leaves), stop: () => cancelled.has(id),
           onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining)})});
         check();
@@ -210,6 +210,7 @@ onmessage = async ({data}) => {
       const tree = new NeuralSearch(native, {seed: 1740, tactics: true, history: data.history});
       try {
         const result = await tree.search({simulations: data.simulations, rootSamples: 16, batchSize: data.batchSize ?? 16,
+          choice: data.choice ?? 'policy',
           cache: new EvaluationCache(4096), version: network.version, evaluate: leaves => network.evaluate(leaves),
           stop: () => cancelled.has(data.id)});
         if (result.stopped) throw new Cancelled();

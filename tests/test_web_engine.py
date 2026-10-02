@@ -125,13 +125,16 @@ class Bundle(unittest.TestCase):
         model, games = random_model(1), export_web.histories(every=9)
         tactical = list(json.loads((ROOT/'tests'/'fixtures'/'tactical_positions.json').read_text())['positions'].values())[:4]
         cases = []
-        for history, simulations in [(h, 64) for h in games[::3]]+[(h, 128) for h in tactical]+[(games[5], 512)]:
+        positions = [(h, 64, None) for h in games[::3]]+[(h, 128, None) for h in tactical]+[(games[5], 512, None)]
+        positions += [(games[5], 64, 'gumbel'), (tactical[0], 128, 'gumbel')]
+        for history, simulations, choice in positions:
             recorder, steps, results = Recorder(model), [], []
             tree = NeuralSearch(recorder, 'test', history, seed=1740, cache=EvaluationCache(), tactics=True)
             try:
                 for _ in range(2 if len(history) % 2 else 1):
-                    result = tree.search(simulations, root_samples=16, batch_size=16)
-                    steps.append(dict(simulations=simulations, root_samples=16, batch_size=16))
+                    option = dict(choice=choice) if choice else {}
+                    result = tree.search(simulations, root_samples=16, batch_size=16, **option)
+                    steps.append(dict(simulations=simulations, root_samples=16, batch_size=16, **option))
                     results.append(result)
                     if result['action'] is None:
                         break

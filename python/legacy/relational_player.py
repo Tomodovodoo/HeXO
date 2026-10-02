@@ -118,7 +118,7 @@ class RelationalPlayer:
                     action, detail = self._reactive(local)
                 else:
                     result = self.tree.search(simulations=self.simulations, root_samples=self.root_samples,
-                                              batch_size=self.batch_size, milliseconds=remaining/local.remaining)
+                                              batch_size=self.batch_size, milliseconds=remaining/local.remaining, choice='gumbel')
                     action = result['action']
                     if action is None:
                         raise TimeoutError('Gumbel deadline produced no completed neural action; no fallback')

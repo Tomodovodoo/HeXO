@@ -1168,12 +1168,16 @@ class DenseConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             dense_config.save(tmp, config)
             self.assertEqual(dense_config.load(tmp), config)
+            self.assertEqual(dense_config.load(tmp).evaluation.search_choice, 'policy')
             with self.assertRaises(FileExistsError):
                 dense_config.save(tmp, replace(config, seed=4))
             self.assertEqual(dense_config.load(tmp).seed, 3)
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ['config.json'])
         with self.assertRaises(ValueError):
             dense_config.from_dict(dict(asdict(config), schema='other'))
+        historical = asdict(config)
+        historical['evaluation'].pop('search_choice')
+        self.assertEqual(dense_config.from_dict(historical).evaluation.search_choice, 'gumbel')
         # ModelSettings and HexNetConfig must stay field-for-field identical.
         self.assertEqual(asdict(dense_config.ModelSettings()), asdict(hexnet.HexNetConfig()))
 
@@ -3470,12 +3474,12 @@ class EvaluatorSearchTests(unittest.TestCase):
         settings = config.evaluation
         book = dense_eval.dense_openings.Book(Path.cwd(), settings)
         games = dense_eval.paired_games(model, model, 2, 'choices', config, settings, None, book,
-                                       sides=(replace(settings, search_choice='policy'), settings))
+                                       sides=(replace(settings, search_choice='gumbel'), settings))
         try:
             for game in games:
                 colour = game.record['challenger_color']
-                self.assertEqual(game.choices[colour], 'policy')
-                self.assertEqual(game.choices[1-colour], 'gumbel')
+                self.assertEqual(game.choices[colour], 'gumbel')
+                self.assertEqual(game.choices[1-colour], 'policy')
         finally:
             for game in games:
                 game.finish()
@@ -5365,6 +5369,7 @@ class EvaluatorLoopTests(unittest.TestCase):
             compare_search_modes.main()
         state = json.loads(output.read_text())
         self.assertTrue(state['complete'])
+        self.assertEqual(state['plain_mode'], 'policy')
         self.assertEqual(len(state['results']), 9)
         self.assertEqual({g['sides'][g['challenger_color']][0] for g in state['results']}, {'main/000010'})
         too_long = dict(state, cases=[dict(history=[[i, 0] for i in range(state['max_plies'])])])
@@ -5388,8 +5393,10 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(len(variants), 2)
         self.assertTrue(all(v['elo'] is not None and len(v['matches']) == 2 for v in variants))
         puct = next(v for v in variants if v['settings']['search_choice'] == 'puct')
-        self.assertEqual(next(m for m in puct['matches'] if m['opponent'] == 'main/000010')['opening_pair_p'], 1.)
-        self.assertLess(next(m for m in puct['matches'] if m['opponent'] != 'main/000010')['opening_pair_p'], 1.)
+        gumbel = next(v for v in variants if v['settings']['search_choice'] == 'gumbel')
+        self.assertTrue(gumbel['name'].startswith('gumbel-'))
+        self.assertEqual(next(m for m in puct['matches'] if m['opponent'] == gumbel['id'])['opening_pair_p'], 1.)
+        self.assertLess(next(m for m in puct['matches'] if m['opponent'] == 'main/000010')['opening_pair_p'], 1.)
         self.assertEqual(evaluator.variants(), [])
         self.assertEqual(len(dense_eval.load_reports(self.run)), 3)
         self.assertTrue(evaluator.step())
@@ -5402,6 +5409,13 @@ class EvaluatorLoopTests(unittest.TestCase):
         output.write_text(json.dumps(state))
         with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'Python search source differs'):
             compare_search_modes.main()
+        historical = dict(state, id=state['id']+'-historical', names=dict(policy='policy-old', puct='puct-old'))
+        historical.pop('plain_mode')
+        compare_search_modes.publish(self.run, historical)
+        archived = [r for r in dense_eval.load_reports(self.run) if r['id'].startswith(historical['id'])]
+        self.assertEqual(len(archived), 3)
+        self.assertTrue(all(r['settings']['search_choice'] == 'gumbel' for r in archived))
+        self.assertTrue(any('main/000010@policy-old' in (r['candidate'], r['opponent']) for r in archived))
         weights = self.run/'checkpoints/main/000010/ema.pt'
         weights.write_bytes(weights.read_bytes()+b'changed')
         with self.assertRaisesRegex(ValueError, 'checkpoint weights differ'):
@@ -6227,9 +6241,9 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(dense_eval.parse_settings(['search-choice=policy']), dict(search_choice='policy'))
         base = dense_config.EvaluationSettings()
         old = asdict(base); old.pop('search_choice')
-        self.assertTrue(dense_eval.same_protocol(dict(settings=old), base))
-        policy = dense_eval.side_settings(base, dict(search_choice='policy'))
-        self.assertFalse(dense_eval.same_protocol(dict(settings=old), policy))
+        self.assertFalse(dense_eval.same_protocol(dict(settings=old), base))
+        gumbel = dense_eval.side_settings(base, dict(search_choice='gumbel'))
+        self.assertTrue(dense_eval.same_protocol(dict(settings=old), gumbel))
         with self.assertRaises(ValueError):
             dense_eval.side_settings(base, dict(search_choice='unknown'))
         for bad in (['max_plies=10'], ['sims'], [], ['tactics=maybe'], ['sims=0']):

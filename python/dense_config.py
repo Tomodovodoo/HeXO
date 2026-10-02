@@ -223,7 +223,7 @@ class EvaluationSettings:
     max_plies: int = 256
     tactics: bool = True
     search_graph: bool = False    # share transposed turn contexts and proven positions (neural_search graph)
-    search_choice: str = 'gumbel'  # final move: Gumbel score or highest improved search policy ('policy')
+    search_choice: str = 'policy'  # final move: highest improved search policy or Gumbel score
     anchor_every: int = 5         # the champion owes anchor_games more vs Seal per N checkpoints rated during its reign
     anchor_games: int = 100       # champion vs Seal, played before optional work; 0 = never
     anchor_session_games: int = 20  # most Seal anchor games before a pending trial gets its turn
@@ -343,6 +343,8 @@ def from_dict(data):
 
 def section(name, values):
     """The SECTIONS[name] settings of dict `values`, without its RETIRED keys."""
+    if name == 'evaluation' and 'search_choice' not in values:
+        values = dict(values, search_choice='gumbel')
     return SECTIONS[name](**{k: v for k, v in values.items() if k not in RETIRED.get(name, ())})
 
 
