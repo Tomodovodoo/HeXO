@@ -84,7 +84,7 @@ def build_seal(emxx):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
         SEAL.mkdir(exist_ok=True)
-        subprocess.run([emxx, str(ROOT/'tools'/'seal_adapter.cpp'), '-I', str(Path(folder)/'cpp'), *GUMBEL_FLAGS,
+        subprocess.run([emxx, str(ROOT/'tools'/'seal_adapter.cpp'), '-I', str(Path(folder)/'cpp'), *WASM_FLAGS,
                         '-sEXPORTED_FUNCTIONS=_malloc,_free,_seal_move', '-o', str(SEAL/'engine.mjs')], check=True)
     manifest = dict(revision=spec['revision'], sha256=hashlib.sha256((SEAL/'engine.wasm').read_bytes()).hexdigest())
     (SEAL/'manifest.json').write_text(json.dumps(manifest)+'\n', encoding='utf-8')
