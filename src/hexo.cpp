@@ -885,7 +885,10 @@ struct Search {
         // An extra defender stone can alter this strategy only by occupying a
         // played cell, blocking an attacking completion, or creating a defending
         // completion. Three defending stones plus the extra stone can win in two.
-        if(support) for(const auto& slot:b.windows.slots) if(slot.hash) {
+        size_t support_slots=0;
+        if(support) for(const auto& slot:b.windows.slots) {
+            if(!(++support_slots&255)) {check();if(Clock::now()>=proof_deadline) throw Timeout{};}
+            if(!slot.hash) continue;
             auto n=slot.data.counts;
             if((!n[1-attacker] && n[attacker]>=4) || (!n[attacker] && n[1-attacker]>=3))
                 for(auto c:b.empty(slot.key())) support->insert(c);
