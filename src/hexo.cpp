@@ -140,31 +140,31 @@ struct CandidateData {
     bool occupied=false;
 };
 struct CandidateCache {
-    struct Slot {Cell cell{};uint64_t hash=0;CandidateData data{};};
+    struct Slot {Cell cell{};CandidateData data{};};
     std::vector<Slot> slots;
+    // Compact records avoid scanning empty buckets. The coordinate index is
+    // only a fast lookup; distant cells use the same records through outside.
+    std::vector<uint32_t> lookup;
+    std::unordered_map<Cell,uint32_t,CellHash> outside;
     size_t count=0;
     std::array<int,2> empty_gain{};
-    static uint64_t hash(Cell c) {auto h=CellHash{}(c);return h?h:1;}
-    void reserve(size_t n) {size_t capacity=128;while(capacity*3<n*4) capacity*=2;slots.resize(capacity);}
+    static int index(Cell c) {
+        if(c.q < -64 || c.q>=64 || c.r < -64 || c.r>=64) return -1;
+        return int((c.q+64)*128+c.r+64);
+    }
+    void reserve(size_t n) {slots.reserve(n);lookup.resize(128*128);}
     const CandidateData* find(Cell c) const {
-        auto h=hash(c);size_t i=h&(slots.size()-1);
-        while(slots[i].hash) {
-            if(slots[i].hash==h && slots[i].cell==c) return &slots[i].data;
-            i=(i+1)&(slots.size()-1);
-        }
-        return nullptr;
+        const int i=index(c);
+        uint32_t id=0;
+        if(i>=0) id=lookup[i];
+        else {auto found=outside.find(c);if(found!=outside.end()) id=found->second;}
+        return id?&slots[id-1].data:nullptr;
     }
     CandidateData& get(Cell c) {
-        if((count+1)*4>=slots.size()*3) {
-            auto old=std::move(slots);slots=std::vector<Slot>(old.size()*2);count=0;
-            for(const auto& slot:old) if(slot.hash) get(slot.cell)=slot.data;
-        }
-        auto h=hash(c);size_t i=h&(slots.size()-1);
-        while(slots[i].hash) {
-            if(slots[i].hash==h && slots[i].cell==c) return slots[i].data;
-            i=(i+1)&(slots.size()-1);
-        }
-        slots[i]={c,h,CandidateData{empty_gain}};++count;return slots[i].data;
+        const int i=index(c);
+        auto& id=i>=0?lookup[i]:outside[c];
+        if(!id) {slots.push_back({c,CandidateData{empty_gain}});id=uint32_t(++count);}
+        return slots[id-1].data;
     }
 };
 struct Board {
@@ -182,12 +182,15 @@ struct Board {
     std::array<int64_t,64> pool{};
     std::array<int64_t,2> stone_counts{};
     CandidateCache* candidates=nullptr;
-    int window_gain(Counts n,int pattern,int k,int p) const {
-        int delta=adjustment[pattern+(p+1)*powers[k]]-adjustment[pattern];
-        int result=p==0?delta:-delta;
+    static int count_gain(Counts n,int p) {
+        int result=0;
         if(n[1-p]==0) result+=weight[n[p]+1]-weight[n[p]];
         if(n[p]==0) result+=(weight[n[1-p]+1]-weight[n[1-p]])*3/4;
         return result;
+    }
+    int window_gain(Counts n,int pattern,int k,int p) const {
+        int delta=adjustment[pattern+(p+1)*powers[k]]-adjustment[pattern];
+        return count_gain(n,p)+(p==0?delta:-delta);
     }
     static bool promising(Counts n) { return (n[0]>=2 && !n[1]) || (n[1]>=2 && !n[0]); }
     void candidate_nearby(Cell c,int delta) {
@@ -305,11 +308,20 @@ struct Board {
                 if(n[side]>=4 && n[1-side]==0) threats[side].erase(w);
             n[p]+=delta;
             pattern+=delta*(p+1)*powers[k];
-            if(candidates) for(int j=0;j<6;++j) if(j!=k && pattern/powers[j]%3==0) {
-                auto& item=candidates->get(w.start+axes[d]*j);
-                for(int side=0;side<2;++side)
-                    item.gain[side]+=window_gain(n,pattern,j,side)-window_gain(old_counts,old_pattern,j,side);
-                item.lines+=int(promising(n))-int(promising(old_counts));
+            if(candidates && n[0]+n[1]<6 && old_counts[0]+old_counts[1]<6) {
+                const std::array<int,2> gain_delta={count_gain(n,0)-count_gain(old_counts,0),
+                                                   count_gain(n,1)-count_gain(old_counts,1)};
+                const int pattern_delta=adjustment[old_pattern]-adjustment[pattern];
+                const int line_delta=int(promising(n))-int(promising(old_counts));
+                for(int j=0;j<6;++j) if(j!=k && pattern/powers[j]%3==0) {
+                    auto& item=candidates->get(w.start+axes[d]*j);
+                    for(int side=0;side<2;++side) {
+                        int change=adjustment[pattern+(side+1)*powers[j]]-
+                                   adjustment[old_pattern+(side+1)*powers[j]]+pattern_delta;
+                        item.gain[side]+=gain_delta[side]+(side==0?change:-change);
+                    }
+                    item.lines+=line_delta;
+                }
             }
             if(pattern) ++features[pattern];
             learned_score+=adjustment[pattern];
@@ -488,7 +500,7 @@ struct Search {
         if(b.candidates) {
             RankedCells ranked;
             ranked.reserve(b.candidates->count);
-            for(const auto& slot:b.candidates->slots) if(slot.hash) {
+            for(const auto& slot:b.candidates->slots) {
                 const auto& c=slot.cell;const auto& item=slot.data;
                 if(!item.occupied && (item.nearby || item.lines) && std::abs(c.q)<=1000000000000LL && std::abs(c.r)<=1000000000000LL)
                     ranked.emplace_back(item.gain[b.player],c);
