@@ -333,6 +333,13 @@ class Recipes(unittest.TestCase):
         self.assertEqual(len({e['id'] for e in strix}), 2)
         self.assertEqual({e['engine'].name for e in strix}, {'a.exe', 'b.exe'})
 
+    def test_six_is_offered_only_where_it_publishes_a_build(self):
+        setups = self.setups({})
+        with unittest.mock.patch('engine_setup.system', return_value='linux-arm64'):
+            self.assertEqual([e['engine'] for e in setups.catalogue()], ['strix', 'shrimp', 'seal'])
+        with unittest.mock.patch('engine_setup.system', return_value='macos-arm64'):
+            self.assertEqual([e['engine'] for e in setups.catalogue()], ['six', 'strix', 'shrimp', 'seal'])
+
     def test_read_only_leftovers_of_an_earlier_setup_are_cleared(self):
         leftover = self.models / '.setup' / 'seal' / 'clone' / '.git' / 'pack'
         leftover.parent.mkdir(parents=True)

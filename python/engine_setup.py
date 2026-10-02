@@ -176,14 +176,15 @@ class Setups:
         self.jobs, self.threads, self.lock, self.retry = {}, {}, threading.Lock(), 5
 
     def catalogue(self):
-        """Every known engine as {engine, name, kind, installed, job}: `installed` is the id of the registry entry
-        that provides it, else None, and `job` the last setup's progress. A setup turns done once the registry
-        has been rescanned."""
+        """Every engine that can be set up on this system as {engine, name, kind, installed, job}: `installed` is
+        the id of the registry entry that provides it, else None, and `job` the last setup's progress. A setup
+        turns done once the registry has been rescanned. Six is left out where it publishes no build."""
         entries = list(self.entries().values())
+        offered = [key for key in INSTALLED if key != 'six' or system() in self.manifest['six']['assets']]
         with self.lock:
             return [dict(engine=key, name=self.manifest[key]['name'], kind=self.manifest[key]['kind'],
                          installed=next((e['id'] for e in entries if INSTALLED[key](e)), None),
-                         job=self.jobs[key].json() if key in self.jobs else None) for key in INSTALLED]
+                         job=self.jobs[key].json() if key in self.jobs else None) for key in offered]
 
     def start(self, engine):
         """Start setting up `engine` unless its setup is already running."""
