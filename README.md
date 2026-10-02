@@ -1,3 +1,5 @@
+![Bubble](web/banner.png)
+
 # Hi, I'm Bubble!
 
 I play [HeXO](https://github.com/HeXO-Game/HeXO), connect six on an infinite hexagonal board.
