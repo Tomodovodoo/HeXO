@@ -270,15 +270,21 @@ int main() {
             std::sort(base.begin(),base.end(),by_cell);
             CandidateGuard cache(position);
             auto check_cache=[&]() {
+                std::array<int,2> threes{};
                 for(const auto& slot:position.windows.slots) if(slot.hash) {
                     unsigned gaps=0;std::vector<Cell> empty;
+                    std::array<int,2> counts{};
                     for(int k=0;k<6;++k) {
                         Cell cell=slot.start+axes[slot.axis]*k;
-                        if(position.at(cell)<0) {gaps|=1u<<k;empty.push_back(cell);}
+                        int owner=position.at(cell);
+                        if(owner<0) {gaps|=1u<<k;empty.push_back(cell);}
+                        else ++counts[owner];
                     }
+                    for(int p=0;p<2;++p) if(counts[p]==3 && !counts[1-p]) ++threes[p];
                     assert(slot.data.empty==gaps && position.empty(slot.key())==empty);
                     assert(std::is_sorted(empty.begin(),empty.end()));
                 }
+                assert(threes==position.threes);
                 auto cached=Search::candidate_scores(position);
                 position.candidates=nullptr;
                 auto fresh=Search::candidate_scores(position);
@@ -327,7 +333,9 @@ int main() {
                 check_cache();
             }
             for(auto first:Search::candidates(position,4)) {
+                int side=position.player;auto scalar=position.placed_score(first,side);
                 Restore restore(position);position.make(first);
+                assert(scalar==position.score(side));
                 if(position.winner>=0) continue;
                 check_cache();
                 auto fresh=Search::candidate_scores(position);
