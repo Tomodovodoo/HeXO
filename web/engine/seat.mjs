@@ -12,6 +12,7 @@
  * evaluation record the analysis panel shows for that turn. */
 import {BubbleEngine, PRESETS, isolate} from './bubble.mjs';
 import {OfflineSession} from './offline.mjs';
+import {native} from './native.mjs';
 import {shrimp} from './shrimp.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
@@ -19,7 +20,7 @@ const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bu
   engine: new BubbleEngine(),
   record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
     solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE})};
-const ENGINES = new Map([bubble, shrimp].map(e => [e.entry.id, e]));
+const ENGINES = new Map([bubble, native, shrimp].map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
   'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems'];
@@ -42,12 +43,23 @@ const pickEngine = (id, current) => ({engine: id, preset: current?.engine === id
 const analysable = e => e.kind === 'bubble' || e.analysis;
 const analysisKey = (choice, history) => `${choice.engine}|${choice.preset}|${hk(history)}`;
 
-/** Adds the browser entries to a state's engines and drops browser seats the server has given another engine. */
+/**
+ * Adds the browser entries to a state's engines and drops browser seats the server has given another engine. A server
+ * without an analysis engine (no Bubble model) gets the browser's: Native (browser) at quick unless another was chosen.
+ */
 function adopt(data) {
   if (data.engines) for (const {entry} of ENGINES.values()) if (!data.engines.some(e => e.id === entry.id)) data.engines.push(entry);
   if (data.seats && data.seats.some((seat, side) => config.seats[side] && seat.engine !== 'human')) {
     config.seats = config.seats.map((choice, side) => data.seats[side].engine === 'human' ? choice : null);
     save();
+  }
+  if (data.analysis === null) {
+    if (!config.analysis) {
+      config.analysis = {engine: native.entry.id, preset: 'quick'};
+      save();
+    }
+    const {engine, preset} = config.analysis;
+    data.analysis = {engine, checkpoint: null, preset, budget: ENGINES.get(engine).entry.presets[preset], auto: false};
   }
 }
 
