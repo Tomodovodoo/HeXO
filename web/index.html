@@ -734,7 +734,7 @@ function renderEngineHead(){
   const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},'Auto analysis',el('i'));
   auto.onclick=()=>sendAnalysis({auto:!a.auto});
   const again=el('button',{class:'ib',id:'again','aria-label':'Analyse again'});setIcon(again,S.jobs.some(j=>j.kind==='analyse')?'close':'again');
-  const ev=S.evaluations[view],landed=ev?STOPS.findIndex(p=>entryOf(a.engine)?.presets[p]?.simulations===ev.simulations):-1;
+  const ev=S.evaluations[view],landed=ev?STOPS.findIndex(p=>entryOf(a.engine)?.presets?.[p]?.simulations===ev.simulations):-1;
   head.replaceChildren(el('div',{class:'head'},pick,auto,again),...seatControls(a,sendAnalysis,'analysis',configButton('analysis',a),landed));
   head.style.setProperty('--c',COLORS[playerAt(view)]);
 }

@@ -7,7 +7,7 @@
 import {BubbleEngine, PRESETS, isolate} from './bubble.mjs';
 import {OfflineSession} from './offline.mjs';
 
-const ID = 'browser:bubble', LABEL = 'Bubble (browser)', ENTRY = {id: ID, kind: 'bubble', name: LABEL, label: LABEL, checkpoints: []};
+const ID = 'browser:bubble', LABEL = 'Bubble (browser)', ENTRY = {id: ID, kind: 'bubble', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS};
 const STORE = 'bubble-browser';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
   'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems'];
