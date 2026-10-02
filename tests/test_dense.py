@@ -1780,7 +1780,7 @@ class DenseDataTests(unittest.TestCase):
             window = dense_data.ReplayWindow(run, capacity_rows=1000)
             weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
                        for k, w in zip(window.regret_positions, window.regret_weights)}
-            self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 8: .5, 10: .1})
+            self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 8: .5, 10: .1, 12: .9})
             self.assertFalse((run/'restarts.json').exists())
             targets = dense_data.examples(window, [window.ref('000001', i) for i in (3, 1)], np.random.default_rng(0))[1]
             self.assertEqual((targets[0]['value'], targets[0]['exact']), (0., 1.))
@@ -1795,11 +1795,11 @@ class DenseDataTests(unittest.TestCase):
             window.set_regret({('000001', 0, 1): .7, ('000001', 0, 2): .7, ('000001', 0, 3): .2})
             weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
                        for k, w in zip(window.regret_positions, window.regret_weights)}
-            self.assertEqual(weights, {0: .9, 1: .9, 2: .7, 3: .5, 5: .1, 8: .5, 10: .1})
+            self.assertEqual(weights, {0: .9, 1: .9, 2: .7, 3: .5, 5: .1, 8: .5, 10: .1, 12: .9})
             window.set_regret({})
             weights = {window.ref(*window.index[k]).row['ply']: round(float(w), 6)
                        for k, w in zip(window.regret_positions, window.regret_weights)}
-            self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 8: .5, 10: .1})
+            self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 8: .5, 10: .1, 12: .9})
             (run/'shards'/'000001'/dense_data.SIDECAR).write_text(
                 json.dumps(dict(game=0, plies=[7, 13]))+'\n', encoding='utf-8')
             window.refresh()
@@ -1807,12 +1807,13 @@ class DenseDataTests(unittest.TestCase):
             for reader in (window, dense_data.ReplayWindow(run, capacity_rows=1000)):
                 weights = {reader.ref(*reader.index[k]).row['ply']: round(float(w), 6)
                            for k, w in zip(reader.regret_positions, reader.regret_weights)}
-                self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 7: .1, 8: .5, 10: .1, 13: 1.})
+                self.assertEqual(weights, {0: .9, 1: .9, 3: .5, 5: .1, 7: .1, 8: .5, 10: .1, 12: .9, 13: 1.})
 
     def test_certified_value_priority_excludes_validation_and_legacy_predictions(self):
         moves, _ = random_game(np.random.default_rng(4), 12)
         episode, rows = episode_rows(moves, -1, [-1.]*12)
         rows[0]['proven'] = -1
+        rows[0]['line'] = True
         rows[1]['proven'] = 1
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
