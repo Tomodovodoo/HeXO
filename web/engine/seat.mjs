@@ -227,8 +227,8 @@ function install() {
       }
       return Promise.resolve(s);
     }
-    if (path === '/undo' && s && config.seats.some(Boolean)) {
-      return original.post('/undo', {people: [0, 1].filter(side => s.seats[side].engine === 'human' && !config.seats[side])});
+    if (['/undo', '/new', '/book'].includes(path) && s && config.seats.some(Boolean)) {
+      return original.post(path, {...body, people: [0, 1].filter(side => s.seats[side].engine === 'human' && !config.seats[side])});
     }
     return original.post(path, body);
   };

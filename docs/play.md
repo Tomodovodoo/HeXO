@@ -187,7 +187,8 @@ orientation, shown as played stones; the move list names the set. Between engine
 Against a person it prefers lines that person has not played on that side: walking the book's tree, each step
 picks among branches that still hold an unplayed opening, so a branch counts as played only once all of its
 openings have been; when all have, one of the least played is picked. What was played is kept per side in
-`play-openings.jsonl` beside the saved evaluations, appended like them.
+`play-openings.jsonl` beside the saved evaluations, appended like them. A browser seat is a human seat to the
+server, so the page names the sides people play (`people`) when it asks for a new game or the book.
 
 Until the switch or its set is changed in this browser session, each seat change sets the book from the seats
 as the page shows them: off when both are Human, on otherwise (a Bubble (browser) seat is an engine).

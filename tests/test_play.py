@@ -1166,6 +1166,22 @@ class Matches(unittest.TestCase):
         self.session.new_game()
         self.assertEqual((self.session.history, self.session.state()['book']['opening']), ([], None))
 
+    def test_a_page_names_the_people_for_book_openings(self):
+        path = Path(self.directory.name) / 'book.json'
+        nodes = [dict(key=f'0,0|{i},0 {i},1', status='opening', moves=[[0, 0], [i, 0], [i, 1]]) for i in (1, 2)]
+        path.write_text(json.dumps(dict(schema='hexo-opening-book-v2', nodes=nodes)))
+        self.session.book = path
+        self.session.pause(True)
+        self.session.configure_seat(0, 'human')
+        self.session.configure_seat(1, 'human')
+        self.session.use_book(False)
+        self.session.use_book(True, 'wide', [1])
+        self.assertEqual([side for (_, _, side), n in self.session.coverage.counts.items() if n], [1])
+        self.session.new_game(people=[])
+        self.assertEqual(sum(self.session.coverage.counts.values()), 1)
+        with self.assertRaises(ValueError):
+            self.session.new_game(people=[2])
+
     def test_openings_are_picked_by_unplayed_branch(self):
         nodes = [dict(key=k) for k in ('0,0|a', '0,0|b x', '0,0|b y')]
         counts = {'0,0|a': 0, '0,0|b x': 1, '0,0|b y': 0}
