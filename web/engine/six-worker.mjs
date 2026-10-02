@@ -8,6 +8,8 @@ import {cached, probe, defaultThreads} from './network.mjs';
 import {SixSearch} from './six/search.mjs';
 
 const BASE = new URL('./', import.meta.url), WIN = 1000000;
+/** A one-node graph (Identity on one float) whose session starts the runtime before any network is chosen. */
+const START = Uint8Array.from(atob('CAgSADo7ChAKAXgSAXkiCElkZW50aXR5EgVzdGFydFoPCgF4EgoKCAgBEgQKAggBYg8KAXkSCgoICAESBAoCCAFCBAoAEBE='), c => c.charCodeAt(0));
 const cancelled = new Set();
 let ort = null, device = null, manifest = null, search = null, current = null, running = null, queue = Promise.resolve();
 
@@ -27,7 +29,8 @@ async function runtime(provider, threads, report) {
   return module;
 }
 
-/** Searches with network `name` (a manifest entry) from the next turn on; `report(fraction)` follows its download. */
+/** Searches with network `name` (a manifest entry) from the next turn on; `report(fraction)` follows its download.
+ * Only the network in use is held. */
 async function use(name, report = () => {}) {
   if (current?.name === name) return;
   const entry = manifest.networks.find(n => n.name === name);
@@ -43,12 +46,13 @@ async function use(name, report = () => {}) {
 
 async function load(options = {}) {
   manifest = await (await fetch(new URL('six/networks/manifest.json', BASE), {cache: 'no-cache'})).json();
-  const shares = [0, 0], report = i => f => { shares[i] = f; postMessage({type: 'progress', fraction: .95 * (.3 * shares[0] + .7 * shares[1])}); };
+  const report = fraction => postMessage({type: 'progress', fraction: .95 * fraction});
   const start = async () => {
-    ort = await runtime(device.provider, options.threads, report(0));
+    ort = await runtime(device.provider, options.threads, report);
+    const session = await ort.InferenceSession.create(START, {executionProviders: [device.provider], logSeverityLevel: 3});
+    await session.release();
     search ??= await SixSearch.create(ort);
     current = null;
-    await use(manifest.networks[0].name, report(1));
   };
   device = await probe(options.prefer);
   try {
@@ -65,9 +69,10 @@ async function load(options = {}) {
 }
 
 /** Six's turn at `history` within `nodes` new positions, with the fields of python/play.py evaluate: its stones as
- * `moves` and as `top` rows, the mover's win probability from its score, and a proof when it found a forced win. */
+ * `moves` and as `top` rows, the mover's win probability from its score, and a proof when it found a forced win. The
+ * network (the newest when null) is fetched on its first turn; progress follows that download, then the search. */
 async function turn({id, history, nodes, network}) {
-  await use(network ?? manifest.networks[0].name);
+  await use(network ?? manifest.networks[0].name, fraction => postMessage({type: 'progress', id, fraction}));
   if (cancelled.has(id)) throw new Cancelled();
   const start = performance.now(), player = history.length === 0 ? 0 : ((history.length - 1 >> 1) + 1) % 2;
   running = id;
