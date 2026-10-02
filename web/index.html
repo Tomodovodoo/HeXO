@@ -736,7 +736,7 @@ function renderCard(){
   const head=$('card-head');
   const logo=el('span',{html:'<svg class="logo" viewBox="0 0 20 22"><path d="M10 1 19 6v10l-9 5-9-5V6z" fill="none" stroke="var(--o)" stroke-width="2"/><circle cx="10" cy="11" r="3.2" fill="var(--x)"/></svg>'});
   const title=S.saved_game?`Game ${S.saved_game.game}`:'Bubble';
-  const extra=STUDY?el('a',{class:'ib ghost',href:'/','aria-label':'Live board',html:icon('home')}):
+  const extra=STUDY?el('a',{class:'ib ghost',href:globalThis.browserPlay?'./':'/','aria-label':'Live board',html:icon('home')}):
     el('button',{class:'btn games-button','aria-label':'Games',onclick:e=>{e.stopPropagation();showTournaments()}},el('span',{html:icon('trophy')}),'Games');
   head.replaceChildren(logo,el('span',{},title),el('span',{class:'spacer'}),extra);
   head.onclick=e=>{if(!e.target.closest('a,button')){pinned=!pinned;$('seats').classList.toggle('open',pinned)}};
@@ -1005,7 +1005,7 @@ function savedDate(match){if(match.created_at)return new Date(match.created_at).
 function savedDay(match){return match.created_at?new Date(match.created_at).toLocaleDateString():savedDate(match).split(' ')[0]}
 async function deleteSaved(match){if(confirm(`Delete this ${match.single?'game':'tournament'} from this browser?`)){await post('/matches/delete',{batch:match.id});showTournaments('results')}}
 function savedGameRow(match,r){
-  const query=new URLSearchParams({batch:match.id,game:r.game}),href=`/?study=1&${query}`;
+  const query=new URLSearchParams({batch:match.id,game:r.game}),href=`${globalThis.browserPlay?'':'/'}?study=1&${query}`;
   const players=savedPlayers(match),side=match.single||r.game%2?r.winner:1-r.winner;
   const who=match.single?players.map((p,i)=>`P${i+1} ${playerLabel(p)}`).join(' vs '):r.winner==null?players.map((p,i)=>`${'AB'[i]} ${playerLabel(p)}`).join(' vs '):`${'AB'[r.winner]} · ${playerLabel(players[r.winner])} · P${side+1} won`;
   return el('div',{class:'saved-game'+(match.single?' freeplay':'')},match.single?null:el('span',{class:'no'},'#'+r.game),el('div',{class:'details'},el('span',{class:'who'},r.winner!=null&&!match.single?el('i',{class:'medal'}):null,el('span',{},who)),
