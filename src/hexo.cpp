@@ -793,6 +793,50 @@ struct Search {
         }
         return -1;
     }
+    int prove_ordered(Board& b,int depth) {
+        if(++proof_nodes>proof_limit || Clock::now()>=proof_deadline) throw Timeout{};
+        ++nodes;const int attacker=b.player;
+        auto win=immediate(b);
+        if(win.count) {proof.push_back({win,{}});return int(proof.size())-1;}
+        if(!depth) return -1;
+        const auto mark=proof.size();
+        struct Attack {Turn move;std::vector<Turn> replies;int score;};
+        std::vector<Attack> attacks;
+        const bool constrained=!b.completions(1-attacker).empty();
+        std::unordered_set<uint64_t> generated;
+        auto ranked=candidate_scores(b);
+        for(auto& [score,c]:ranked) score=4*score-3*b.gain(c,1-attacker);
+        auto firsts=constrained?std::vector<Cell>{{}}:select_candidates(b,std::move(ranked),width);
+        for(auto first:firsts) for(const auto& attack:turns(b,true,{},true,constrained?nullptr:&first,&generated)) {
+            if(Clock::now()>=proof_deadline) throw Timeout{};
+            CandidatePause pause(b);Restore restore(b);apply(b,attack);
+            std::vector<Turn> replies;
+            if(b.winner!=attacker && !forced_replies(b,attacker,replies)) continue;
+            if(replies.empty()) {proof.push_back({attack,{}});return int(proof.size())-1;}
+            if(depth==1) continue;
+            // Prefer attacks whose position survives the strongest forced reply.
+            int score=mate;
+            for(const auto& defense:replies) {
+                Restore reply(b);apply(b,defense);score=std::min(score,b.score(attacker));
+            }
+            attacks.push_back({attack,std::move(replies),score});
+        }
+        std::stable_sort(attacks.begin(),attacks.end(),[](const auto& a,const auto& z){return a.score>z.score;});
+        for(const auto& attack:attacks) {
+            if(Clock::now()>=proof_deadline) throw Timeout{};
+            Restore restore(b);apply(b,attack.move);
+            ForcingLine line{attack.move,{}};bool won=true;
+            for(const auto& defense:attack.replies) {
+                Restore reply(b);apply(b,defense);
+                int child=prove_ordered(b,depth-1);
+                if(child<0) {won=false;break;}
+                line.replies.emplace_back(defense,child);
+            }
+            if(won) {proof.push_back(std::move(line));return int(proof.size())-1;}
+            proof.resize(mark);
+        }
+        return -1;
+    }
     int probe(Board& b,int depth) {
         const auto mark=proof.size();const int limit=proof_limit;
         if(depth>1) {
@@ -813,7 +857,7 @@ struct Search {
             if(Clock::now()>=proof_deadline) return -1;
         }
         proof_nodes=0;
-        return prove(b,depth);
+        return prove_ordered(b,depth);
     }
     bool replay(Board& b,int index) {
         if(Clock::now()>=proof_deadline) throw Timeout{};
