@@ -174,15 +174,17 @@ class Bundle(unittest.TestCase):
         self.assertEqual([a[2] for a in answers[-2:]], [True, False])
 
     def test_search_matches_native(self):
-        """Same seed, position, budget and evaluations: the same actions, visits and policy as the native library."""
+        """Same seed, position, budget, Q range floor and evaluations: the same actions, visits and policy as the native
+        library."""
         model, games = random_model(1), export_web.histories(every=9)
         tactical = list(json.loads((ROOT/'tests'/'fixtures'/'tactical_positions.json').read_text())['positions'].values())[:4]
         cases = []
-        positions = [(h, 64, None) for h in games[::3]]+[(h, 128, None) for h in tactical]+[(games[5], 512, None)]
-        positions += [(games[5], 64, 'gumbel'), (tactical[0], 128, 'gumbel')]
-        for history, simulations, choice in positions:
+        positions = [(h, 64, None, 0.) for h in games[::3]]+[(h, 128, None, 0.) for h in tactical]+[(games[5], 512, None, 0.)]
+        positions += [(games[5], 64, 'gumbel', 0.), (tactical[0], 128, 'gumbel', 0.), (games[5], 128, None, .5)]
+        for history, simulations, choice, floor in positions:
             recorder, steps, results = Recorder(model), [], []
-            tree = NeuralSearch(recorder, 'test', history, seed=1740, cache=EvaluationCache(), tactics=True)
+            tree = NeuralSearch(recorder, 'test', history, seed=1740, cache=EvaluationCache(), tactics=True,
+                                q_range_floor=floor)
             try:
                 for _ in range(2 if len(history) % 2 else 1):
                     option = dict(choice=choice) if choice else {}
@@ -194,7 +196,8 @@ class Bundle(unittest.TestCase):
                     tree.advance(tuple(result['action']))
             finally:
                 tree.close()
-            cases.append((dict(history=history, seed=1740, tactics=True, steps=steps, batches=recorder.batches), results))
+            cases.append((dict(history=history, seed=1740, tactics=True, q_range_floor=floor, steps=steps,
+                               batches=recorder.batches), results))
         answers = node(dict(kind='search', cases=[case for case, _ in cases]))
         for (case, results), answer in zip(cases, answers):
             self.assertEqual(len(answer), len(results))

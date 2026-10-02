@@ -303,8 +303,9 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     `models`, except inside folders an engine setup made (they hold `setup.json`, see engine_setup). A directory
     in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once, on the backend `six_backend` finds,
     labelled with that backend; its networks are its `checkpoints`, newest first. `models/<name>.json` adds one
-    entry: {"name", "kind": "bubble", "path"}, {"name", "kind": "six", "command", "mirrored", "presets", optional
-    "files" a match also hashes and "badge"; a command starting with "python" runs on this server's Python},
+    entry: {"name", "kind": "bubble", "path", optional "q_range_floor" (0 to 2, the searches' neural_search floor)},
+    {"name", "kind": "six", "command", "mirrored", "presets", optional "files" a match also hashes and
+    "badge"; a command starting with "python" runs on this server's Python},
     {"name", "kind": "strix", "model", optional "engine"} or {"name", "kind": "seal", "library"}, paths relative
     to the file. `seal`, the library built with -DHEXO_SEAL_SOURCE, adds Seal when it exists. Entries carry `id`,
     `name`, `kind` (how the server runs it), `badge` (which bot it is, as the page shows it: the kind unless a Six
@@ -320,17 +321,20 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
         found.append(dict(name=name, label=label or name, kind=kind, badge=badge or kind, presets=presets_of(kind, presets),
                           **fields))
 
-    def bubble(path, name=None, label=None):
+    def bubble(path, name=None, label=None, q_range_floor=0.):
         path = Path(path).resolve()
-        if path in seen:
+        if type(q_range_floor) not in (int, float) or not 0 <= q_range_floor <= 2:
+            raise ValueError('q_range_floor must lie in [0, 2]')
+        if (path, q_range_floor) in seen:
             return
-        seen.add(path)
+        seen.add((path, q_range_floor))
+        floor = dict(q_range_floor=float(q_range_floor)) if q_range_floor else {}
         if path.is_dir():
             if checkpoints := run_checkpoints(path):
-                add('bubble', name or path.name, label=label, checkpoints=checkpoints, path=path)
+                add('bubble', name or path.name, label=label, checkpoints=checkpoints, path=path, **floor)
         elif path.suffix == '.pt' and path.exists():
             add('bubble', name or (path.parent.name if path.stem == 'ema' else path.stem), label=label,
-                checkpoints=[''], path=path)
+                checkpoints=[''], path=path, **floor)
 
     for index, run in enumerate(extra_runs):
         bubble(run, label=None if index else 'Bubble')
@@ -358,7 +362,7 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                 spec = json.loads(path.read_text(encoding='utf-8'))
                 name, kind = spec.get('name') or path.stem, spec.get('kind')
                 if kind == 'bubble':
-                    bubble(path.parent / spec['path'], name)
+                    bubble(path.parent / spec['path'], name, q_range_floor=spec.get('q_range_floor', 0.))
                 elif kind == 'six':
                     command = spec['command']
                     if not isinstance(command, list) or not command or not all(isinstance(c, str) for c in command):
@@ -391,9 +395,11 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
 
 
 def engine_identity(entry):
-    """What makes an entry its engine: its path, command or library, or its model and executable (Strix)."""
-    return str(entry.get('path') or entry.get('command') or entry.get('library') or
-               (entry.get('model'), entry.get('engine')))
+    """What makes an entry its engine: its path (and a Bubble's Q range floor), command or library, or its model and
+    executable (Strix)."""
+    identity = str(entry.get('path') or entry.get('command') or entry.get('library') or
+                   (entry.get('model'), entry.get('engine')))
+    return identity + (f"@q{entry['q_range_floor']!r}" if entry.get('q_range_floor') else '')
 
 
 def command_of(entry, checkpoint):
@@ -435,6 +441,11 @@ def file_build(package, record, binary):
 def model_key(path):
     """Evaluations are keyed by the weights they came from: the first 16 hex digits of the file's SHA-256."""
     return file_digest(file_identity(path))[:16]
+
+
+def search_key(weights, entry):
+    """The model key `weights` of a Bubble entry's evaluations, marked with its Q range floor when it has one."""
+    return weights + (f"~q{entry['q_range_floor']!r}" if entry.get('q_range_floor') else '')
 
 
 class Cancelled(Exception):
@@ -636,8 +647,8 @@ class TurnSearch:
     `trees(history, simulations, network)` gives the tree and the simulations to run for a stone; by default one
     tree is advanced through the turn, each stone searched afresh with `simulations`."""
 
-    def __init__(self, bubble, network, history, simulations, solved, trees=None):
-        self.bubble, self.network, self.simulations = bubble, network, simulations
+    def __init__(self, bubble, network, history, simulations, solved, trees=None, q_range_floor=0.):
+        self.bubble, self.network, self.simulations, self.q_range_floor = bubble, network, simulations, q_range_floor
         self.history = [tuple(map(int, p)) for p in history]
         self.local = replay(self.history)
         if self.local.winner >= 0:
@@ -654,7 +665,7 @@ class TurnSearch:
         from neural_search import NeuralSearch
         if self.tree is None:
             self.tree = NeuralSearch(network, self.bubble.sha256, history, seed=1740, cache=self.bubble.cache,
-                                     tactics=True)
+                                     tactics=True, q_range_floor=self.q_range_floor)
         else:
             self.tree.advance(history[-1])
         return self.tree, simulations
@@ -718,7 +729,7 @@ class TurnSearch:
 
 
 def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None, live=None, trees=None,
-             solved=None):
+             solved=None, q_range_floor=0.):
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
@@ -731,7 +742,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     `simulations` 0 plays the raw policy; `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
     before each network batch of n positions and may raise Cancelled; `live(glimpse)` receives the search of the
     first stone as it goes, a few times a second. `trees` is `TurnSearch`'s tree source; `solved`, when given, is
-    the solver's view (see `solve`) and no query is made."""
+    the solver's view (see `solve`) and no query is made. `q_range_floor` is the fresh trees' neural_search floor."""
     turn, shown = None, [0.]
 
     def observe(n):
@@ -747,7 +758,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     if finished:
         raise ValueError('The game has finished')
     turn = TurnSearch(bubble, Watched(bubble.evaluator, observe), history, simulations,
-                      solved or solve(prover, history, solver_nodes, watch), trees)
+                      solved or solve(prover, history, solver_nodes, watch), trees, q_range_floor)
     try:
         while (asked := turn.request()) is not None:
             tree, count = asked
@@ -759,7 +770,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         turn.close()
 
 
-def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, batch_size=64):
+def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, batch_size=64,
+                  q_range_floor=0.):
     """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
     position per prover in `provers` at a time, each distinct position solved once; then fresh trees, one per
     position, search together so their leaves share network batches of up to `batch_size`, stone by stone. Each
@@ -788,7 +800,8 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
     turns = []
     try:
         for k, history in zip(keys, histories):
-            turns.append(TurnSearch(bubble, network, history, simulations, solved.get(k) or solve(None, history, 0)))
+            turns.append(TurnSearch(bubble, network, history, simulations, solved.get(k) or solve(None, history, 0),
+                                    q_range_floor=q_range_floor))
         coordinator = SearchCoordinator(network, bubble.sha256, bubble.cache)
         while asked := [(turn, request) for turn in turns if (request := turn.request()) is not None]:
             if not simulations:
@@ -883,22 +896,24 @@ class Engines:
         spent = budget if solver else budget | dict(solver_nodes=0)
         trees = solved = None
         if keep:
-            trees, kept = self.kept_trees(bubble, history, build), self.kept
+            trees, kept = self.kept_trees(bubble, history, build, entry.get('q_range_floor', 0.)), self.kept
             proven = kept['solved'] if kept['solved'] and kept['solved']['proof'] else None
             solved = proven or solve(solver, history, spent['solver_nodes'], watch)
             kept['solved'] = solved
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
-                         solved)
+                         solved, entry.get('q_range_floor', 0.))
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
-        return found, spent, f"{bubble.sha256[:16]}:{build if spent['solver_nodes'] else 'none'}" + (':kept' if keep else '')
+        weights = search_key(bubble.sha256[:16], entry)
+        return found, spent, f"{weights}:{build if spent['solver_nodes'] else 'none'}" + (':kept' if keep else '')
 
-    def kept_trees(self, bubble, history, build='none'):
+    def kept_trees(self, bubble, history, build='none', q_range_floor=0.):
         """A `TurnSearch` tree source that keeps one tree per position of `history`'s turn for the next kept
-        evaluation of the same position, model and solver `build`, and runs only the simulations its root has not
-        had yet (an interrupted search counts what it finished); the trees of anything else are dropped."""
+        evaluation of the same position, model, solver `build` and `q_range_floor`, and runs only the simulations
+        its root has not had yet (an interrupted search counts what it finished); the trees of anything else are
+        dropped."""
         from neural_search import NeuralSearch
-        key = (bubble.sha256, position_text(history), build)
+        key = (bubble.sha256, position_text(history), build, q_range_floor)
         if self.kept is None or self.kept['key'] != key:
             self.drop_kept()
             self.kept = dict(key=key, trees={}, solved=None)
@@ -908,7 +923,8 @@ class Engines:
             tree = kept['trees'].get(position_text(cells))
             if tree is None:
                 tree = kept['trees'][position_text(cells)] = NeuralSearch(network, bubble.sha256, cells, seed=1740,
-                                                                         cache=bubble.cache, tactics=True)
+                                                                         cache=bubble.cache, tactics=True,
+                                                                         q_range_floor=q_range_floor)
             tree.evaluator = network
             visits = int(tree.result(0, 0, 0, 0)['visits'].sum())
             return tree, max(1, simulations - visits)
@@ -944,11 +960,13 @@ class Engines:
         provers, build = self.solvers(REVIEW_SOLVERS) if budget['solver_nodes'] else ([], 'none')
         spent = budget if provers else budget | dict(solver_nodes=0)
         found = evaluate_many(bubble, provers, histories, spent['simulations'], spent['solver_nodes'], watch,
-                              REVIEW_BATCH['cuda' if str(device or self.device).startswith('cuda') else 'cpu'])
+                              REVIEW_BATCH['cuda' if str(device or self.device).startswith('cuda') else 'cpu'],
+                              entry.get('q_range_floor', 0.))
         out = []
         for record in found:
             used = spent if record.pop('solved') else spent | dict(solver_nodes=0)
-            out.append((record, used, f"{bubble.sha256[:16]}:{build if used['solver_nodes'] else 'none'}"))
+            weights = search_key(bubble.sha256[:16], entry)
+            out.append((record, used, f"{weights}:{build if used['solver_nodes'] else 'none'}"))
         return out
 
     def effective(self, budget):
@@ -1369,7 +1387,8 @@ class Session:
         """Evaluations are keyed by the weights and the solver build that produced them ('none' for a budget
         without solver nodes); None when the weights file is gone."""
         try:
-            weights = model_key(export_path(self.entries[seat['engine']], seat['checkpoint']))
+            entry = self.entries[seat['engine']]
+            weights = search_key(model_key(export_path(entry, seat['checkpoint'])), entry)
         except (OSError, KeyError):
             return None
         searched = self.engines.effective(seat['budget'])['solver_nodes']
@@ -1836,7 +1855,8 @@ class Session:
         if Path(selector).is_file() and Path(selector).suffix == '.pt':
             found = scan(extra_runs=[Path(selector)])
             entry = next(e for e in found.values() if e['kind'] == 'bubble')
-            same = next((e for e in self.entries.values() if e['kind'] == 'bubble' and e['path'] == entry['path']), None)
+            same = next((e for e in self.entries.values() if e['kind'] == 'bubble' and e['path'] == entry['path']
+                         and not e.get('q_range_floor')), None)
             if same:
                 entry = same
             elif entry['id'] in self.entries:
@@ -1871,7 +1891,7 @@ class Session:
         seat = self.seat(entry['id'], checkpoint, specification.get('preset', preset),
                          specification.get('custom'))
         source = {k: str(v) if isinstance(v, Path) else v for k, v in entry.items()
-                  if k in ('kind', 'badge', 'name', 'path', 'cwd', 'model', 'engine', 'library', 'mirrored')}
+                  if k in ('kind', 'badge', 'name', 'path', 'cwd', 'model', 'engine', 'library', 'mirrored', 'q_range_floor')}
         if entry['kind'] == 'six':
             source['command'] = command_of(entry, seat['checkpoint'])
         if 'libraries' in entry:
@@ -2107,7 +2127,7 @@ class Session:
             return dict(kind=kind, model=str(export_path(entry, seat['checkpoint']).resolve()),
                         tactical_package=str(self.engines.tactical_package) if getattr(self.engines, 'tactical_package', None) else None,
                         device=seat['device'], search=dict(enabled=budget['simulations'] > 0,
-                        max_simulations=max(1, budget['simulations'])),
+                        max_simulations=max(1, budget['simulations']), q_range_floor=entry.get('q_range_floor', 0.)),
                         solver=dict(enabled=budget['solver_nodes'] > 0, nodes=max(1, budget['solver_nodes'])))
         if kind == 'six':
             return dict(kind=kind, command=command_of(entry, seat['checkpoint']) + budget.get('args', []),

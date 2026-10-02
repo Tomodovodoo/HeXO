@@ -16,7 +16,43 @@ class Uniform:
             game.close()
         return out
 
+class Spread(Uniform):
+    """Uniform logits. Below the root [(0, 0)] every position values the root mover's first stone (q, r) at
+    scale * sin(7.3q + 3.1r) for that mover, so the root's Q spread is about 2 * scale."""
+    def __init__(self, scale):
+        self.scale = scale
+
+    def evaluate(self, histories):
+        out = []
+        for h, p in zip(histories, super().evaluate(histories)):
+            value = self.scale*np.sin(7.3*h[1][0]+3.1*h[1][1]) if len(h) > 1 else 0.
+            out.append(dict(p, q=np.full(len(p['actions']), value if (len(h)+1)//2 % 2 == 1 else -value)))
+        return out
+
 class NeuralTree(unittest.TestCase):
+    def test_q_range_floor_flattens_only_small_spreads(self):
+        def entropy(p):
+            return float(-(p[p > 0]*np.log(p[p > 0])).sum())
+        for scale in (.9, .05):
+            search = NeuralSearch(Spread(scale), 'q-range-floor', [(0, 0)], seed=3)
+            self.addCleanup(search.close)
+            plain = search.search(64, root_samples=8, batch_size=8)
+            values = plain['values'][plain['visits'] > 0]
+            native.hxg_q_range_floor(search.ptr, .5)
+            floored = search.result(0, 0, 0, 0)['policy']
+            if scale > .5:
+                self.assertGreater(values.max()-values.min(), .5)
+                np.testing.assert_array_equal(floored, plain['policy'])
+            else:
+                self.assertGreater(entropy(floored), entropy(plain['policy'])+.1)
+        with self.assertRaisesRegex(ValueError, 'Invalid Q range floor'):
+            NeuralSearch(Uniform(), 'q-range-floor', q_range_floor=-1.)
+        built, given = (NeuralSearch(Spread(.05), 'q-range-floor', [(0, 0)], seed=3, q_range_floor=floor) for floor in (.5, 0.))
+        self.addCleanup(built.close)
+        self.addCleanup(given.close)
+        np.testing.assert_array_equal(built.search(64, root_samples=8, batch_size=8)['policy'],
+                                      given.search(64, root_samples=8, batch_size=8, q_range_floor=.5)['policy'])
+
     def test_play_defaults_to_policy_and_actor_result_retains_gumbel(self):
         search = NeuralSearch(Uniform(), 'choice-default', [(0, 0)], seed=0)
         self.addCleanup(search.close)

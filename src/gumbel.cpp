@@ -55,6 +55,7 @@ struct Tree {
  // Root actions sampled first in the opening phase of the current search; ordering only (set_priority).
  std::vector<Cell> priority;
  std::map<Cell,double> defence;
+ double range_floor=0;  // least Q range of the completed-Q rescale (transformed)
  double bonus(const Edge& e)const {auto i=defence.find(e.action);return i==defence.end()?0:i->second;}
  explicit Tree(uint64_t seed):rng(seed){}
  bool done()const {return requests.empty() && (board.winner>=0 || (root->expanded && root->exact_winner>=0) || completed>=budget);}
@@ -164,6 +165,7 @@ struct Tree {
  }
  // Completed Q (mctx mixed value, min-max rescale, (50 + max visits) * 0.1) over the eligible edges only: proven
  // losses and the non-winning edges of a won node set neither the mixed value, the visit scale nor the range.
+ // The rescale divides by max(1e-8, range_floor, hi - lo), so a spread below range_floor is not stretched to the full scale.
  // Entries of ineligible edges are returned on the same scale but every caller discards them.
  std::vector<double> transformed(Node& node) {
   double weighted=0,mass=0;int total=0,maximum=0;
@@ -172,7 +174,7 @@ struct Tree {
   std::vector<double> q;
   for(auto& e:node.edges){q.push_back(known(e)?value(node,e):mixed);if(e.eligible){lo=std::min(lo,q.back());hi=std::max(hi,q.back());}}
   if(lo>hi)lo=hi=0;
-  double range=std::max(1e-8,hi-lo);
+  double range=std::max(std::max(1e-8,range_floor),hi-lo);
   for(auto& x:q)x=(x-lo)/range*(50+maximum)*0.1;
   return q;
  }
@@ -421,6 +423,9 @@ HX_API int hxg_graph(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(p)
  t.graph=enabled!=0;t.nodes.clear();t.outcomes.clear();t.positions.clear();
  if(t.graph){auto [position,context]=gumbel::keys(t.board);t.root->position=position;t.root->stones=int(t.board.cells.size());t.nodes[context]=t.root;t.positions[position].push_back(t.root);}
  return 1;}
+// Sets the least Q range of the completed-Q rescale (0, the default, keeps 1e-8) for every later search and target;
+// 0 with no change when `floor` is negative or not finite.
+HX_API int hxg_q_range_floor(void* p,double floor){if(!std::isfinite(floor) || floor<0){gumbel::error="Invalid Q range floor";return 0;}static_cast<gumbel::Tree*>(p)->range_floor=floor;return 1;}
 // Diagnostic census of the structure reachable from the root: out = {nodes, expanded, exact, expanded nodes whose turn
 // context was already expanded elsewhere (tree duplicates; 0 in a graph)}.
 HX_API int hxg_census(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);

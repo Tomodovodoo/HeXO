@@ -34,19 +34,20 @@ export class BubbleEngine extends EngineWorker {
   }
 
   /**
-   * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes} (a PRESETS entry): the fields
-   * of python/play.py evaluate. Aborting `signal` cancels it (rejects with an AbortError).
+   * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor} (a
+   * PRESETS entry): the fields of python/play.py evaluate. Aborting `signal` cancels it (rejects with an AbortError).
    */
   turn(history, budget, options = {}) {
     return this.call({type: 'turn', history, simulations: budget.simulations, solverNodes: budget.solver_nodes,
-      batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy'}, options);
+      batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0}, options);
   }
 
   /** One search of `simulations` from `history` (no solver): action, completed, elapsed_ms, evaluated, batches, policy.
-   * Aborting `options.signal` cancels it (rejects with an AbortError). */
+   * `options.qRangeFloor` is the tree's Q range floor (0 by default). Aborting `options.signal` cancels it (rejects
+   * with an AbortError). */
   search(history, simulations, options = {}) {
     return this.call({type: 'search', history, simulations, batchSize: options.batchSize ?? 16,
-      choice: options.choice ?? 'policy'}, options);
+      choice: options.choice ?? 'policy', qRangeFloor: options.qRangeFloor ?? 0}, options);
   }
 
   /** Network predictions [{actions, logits, q}] for each history, as hexnet.DenseEvaluator gives them (q broadcast). */

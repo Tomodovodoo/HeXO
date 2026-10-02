@@ -222,6 +222,7 @@ its folder name. Seal also appears when `build/libhexo_seal.dll` (or `.so`) is b
 {"name": "Strix", "kind": "strix", "model": "strix/model.safetensors", "engine": "strix/hexo-strix-learned.exe"}
 {"name": "Seal", "kind": "seal", "library": "seal/hexo_seal.dll"}
 {"name": "old", "kind": "bubble", "path": "../runs/old"}
+{"name": "old-flat", "kind": "bubble", "path": "../runs/old", "q_range_floor": 0.5}
 {"name": "Shrimp", "kind": "six", "badge": "shrimp", "mirrored": true, "command": ["python", "shrimp/launch.py", "--threads", "2"],
  "presets": {"quick": {"nodes": 1, "args": ["--visits", "32"]}, "deep": {"nodes": 1, "args": ["--visits", "1024"]}}}
 ```
@@ -233,7 +234,9 @@ files a match records the hashes of. Strix's `engine` defaults to `tools/strix_l
 `kind` is how the server runs an engine; the picker's badge says which bot it is. A Six-protocol entry for a bot
 other than Six names it in `badge` (a lowercase word, `six` when left out): Shrimp's setup writes `"badge": "shrimp"`,
 and a Strix behind Six's protocol would say `"strix"`. `--match` also takes a unique badge. A Shrimp installed before
-badges existed shows its download button again; setting it up once more writes the badge.
+badges existed shows its download button again; setting it up once more writes the badge. A Bubble entry's
+`q_range_floor` (0 to 2) is its searches' Q range floor ([neural-search.md](neural-search.md)), saved under its
+own evaluation key.
 
 Six picks the fastest backend whose libraries it finds: TensorRT, CUDA, DirectML, CPU. The release's engine is the
 DirectML build, which ships `DirectML.dll`. A CUDA build needs ONNX Runtime's GPU DLLs (among them

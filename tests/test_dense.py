@@ -1196,6 +1196,15 @@ class DenseConfigTests(unittest.TestCase):
         self.assertEqual(dense_selfplay.actor_flags(policy_args), ['--search-choice', 'policy'])
         with self.assertRaisesRegex(ValueError, 'search_choice must be gumbel or policy'):
             dense_config.override(base, parser.parse_args(['--search-choice', 'unknown']))
+        floor_args = parser.parse_args(['--q-range-floor', '0.5'])
+        self.assertEqual(dense_config.override(base, floor_args).q_range_floor, .5)
+        self.assertEqual(dense_selfplay.actor_flags(floor_args), ['--q-range-floor', '0.5'])
+        for settings in (dense_config.ActorSettings, dense_config.EvaluationSettings):
+            self.assertEqual(settings().q_range_floor, 0.)
+            self.assertEqual(settings(q_range_floor=2.).q_range_floor, 2.)
+            for bad in (-.1, 2.5, float('nan')):
+                with self.assertRaisesRegex(ValueError, r'q_range_floor must lie in \[0, 2\]'):
+                    settings(q_range_floor=bad)
         self.assertEqual(dense_selfplay.actor_flags(parser.parse_args(['--historical-weighting', 'uniform'])),
                          ['--historical-weighting', 'uniform'])
         prefixed = argparse.ArgumentParser()
@@ -6240,6 +6249,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(dense_eval.parse_settings(['sims=20', 'tactics=false', 'solver-root-nodes=135']),
                          dict(sims=20, tactics=False, solver_root_nodes=135))
         self.assertEqual(dense_eval.parse_settings(['search-choice=policy']), dict(search_choice='policy'))
+        self.assertEqual(dense_eval.parse_settings(['q_range_floor=0.5']), dict(q_range_floor=.5))
         base = dense_config.EvaluationSettings()
         old = asdict(base); old.pop('search_choice')
         self.assertFalse(dense_eval.same_protocol(dict(settings=old), base))
@@ -6247,6 +6257,11 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(dense_eval.same_protocol(dict(settings=old), gumbel))
         with self.assertRaises(ValueError):
             dense_eval.side_settings(base, dict(search_choice='unknown'))
+        old = asdict(base); old.pop('q_range_floor')
+        self.assertTrue(dense_eval.same_protocol(dict(settings=old), base))
+        self.assertFalse(dense_eval.same_protocol(dict(settings=old), dense_eval.side_settings(base, dict(q_range_floor=.5))))
+        with self.assertRaises(ValueError):
+            dense_eval.side_settings(base, dict(q_range_floor=3.))
         for bad in (['max_plies=10'], ['sims'], [], ['tactics=maybe'], ['sims=0']):
             with self.assertRaises(ValueError):
                 dense_eval.parse_settings(bad)
@@ -6280,6 +6295,12 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertEqual(evaluator.side('main/000020@solver').solver_threat_nodes, 135)
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([e['candidate'] for e in events if e['kind'] == 'variant'], ['main/000020@solver'])
+        argv = ['dense_eval.py', 'variant', '--run', str(self.run), '--checkpoint', 'champion', '--name', 'qfloor',
+                '--set', 'q_range_floor=0.5']
+        with unittest.mock.patch.object(sys, 'argv', argv), unittest.mock.patch('builtins.print'):
+            dense_eval.main()
+        floor = json.loads(dense_eval.requests(self.run)['champion@qfloor'].read_text())
+        self.assertEqual((floor['id'], floor['base'], floor['settings']), ('champion@qfloor', 'champion', dict(q_range_floor=.5)))
 
     def test_pool_games_give_each_side_its_settings(self):
         evaluator = self.start(decision='posterior', sims=4, root_samples=4)
