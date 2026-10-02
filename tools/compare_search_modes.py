@@ -36,9 +36,8 @@ from puct_search import PUCTSearch, search_many
 from legacy.train import paired_metrics, write_json
 
 MODES = ('gumbel', 'puct', 'policy')
-SOURCE_FILES = ('python/puct_search.py', 'python/neural_search.py', 'python/dense_selfplay.py',
-                'python/hexnet.py', 'python/hexcrop.py', 'python/hexnet_kernels.py',
-                'python/hexnet_graphs.py', 'tools/compare_search_modes.py')
+SOURCE_FILES = tuple(p.relative_to(ROOT).as_posix() for p in sorted((ROOT/'python').rglob('*.py'))) + (
+    'tools/compare_search_modes.py',)
 
 
 class Evaluator:
@@ -186,7 +185,7 @@ def main():
         for key in ('checkpoint', 'opponent', 'games', 'sims', 'root_samples', 'max_plies', 'cpuct', 'device'):
             if state[key] != getattr(args, key):
                 raise ValueError(f'{key} differs from the saved batch')
-        if any(state['native'].get(name) != sha for name, sha in native_hashes.items()):
+        if not args.publish and any(state['native'].get(name) != sha for name, sha in native_hashes.items()):
             raise ValueError('Native library differs from the saved batch')
         if not args.publish and state.get('source_files') != source_hashes:
             raise ValueError('Python search source differs from the saved batch; resume its original implementation')

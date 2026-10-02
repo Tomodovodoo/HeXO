@@ -5329,7 +5329,8 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertFalse(any('@' in cid for cid in evaluator.models))
         with unittest.mock.patch.object(sys, 'argv', argv[:-1]+['cuda']), self.assertRaisesRegex(ValueError, 'device differs'):
             compare_search_modes.main()
-        state['source_files']['python/puct_search.py'] = 'changed'
+        wrapper = next(name for name in state['source_files'] if name == 'python/hexo.py')
+        state['source_files'][wrapper] = 'changed'
         output.write_text(json.dumps(state))
         with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'Python search source differs'):
             compare_search_modes.main()
