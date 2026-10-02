@@ -115,6 +115,26 @@ if (job.kind === 'encode') {
   imported.registerEngine({...entry, version: 'v2'}, adapter);
   answer = {calls, history: reopened.history, simulations: reopened.state().evaluations[1].simulations, catalogue: await s.catalogue(), preserved: JSON.stringify(await s.savedReplay(id, 1)) === original,
     variation: (await study.savedReplay(study.gameId, 1)).history, imported_label: label, changed_version: imported.state().evaluations};
+} else if (job.kind === 'resume') {
+  const s = new BrowserSession(native), wait = ms => new Promise(r => setTimeout(r, ms));
+  const until = async condition => { for (let i = 0; !condition(); i++) { if (i > 3000) throw Error('Move did not start'); await wait(1); } };
+  s.bookData = new OpeningBook(JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url))));
+  s.registerEngine({id:'test', name:'Test', kind:'bubble', version:'v1', presets:{standard:{simulations:1,solver_nodes:0}}}, {
+    turn: (history, budget, options) => history.length === 1 ? Promise.resolve({moves:[[0,2],[1,2]],value:.5}) : new Promise((resolve,reject) => {
+      options.signal.addEventListener('abort', () => reject(new DOMException('Cancelled','AbortError')), {once:true});
+    })
+  });
+  s.analysis=s.spec({engine:'test',auto:true});
+  await s.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,clock:{mode:'game',tc:'180+2'}});
+  await until(() => s.history.length === 3 && s.running?.history.length === 3);
+  await s.request('/match',{action:'stop'},'POST'); await s.idle; await s.saving;
+  const id=s.match.id, before={history:structuredClone(s.history),clock:s.clockNow(),timings:structuredClone(s.match.timings)};
+  s.apply('/seat',{side:0,engine:'human'}); s.apply('/seat',{side:1,engine:'human'}); s.apply('/book',{enabled:true});
+  await s.request('/new',{},'POST'); const bookStart=s.book.opening;
+  await s.request('/import',{text:JSON.stringify({history:[[0,0]]})},'POST'); const imported=s.book.opening;
+  await s.request('/match',{action:'resume',batch:id},'POST');
+  await until(() => !!s.running); await s.request('/match',{action:'stop'},'POST'); await s.idle;
+  answer={before,after:{history:s.history,clock:s.clockNow(),timings:s.match.timings},bookStart,imported,auto:s.analysis.auto};
 } else if (job.kind === 'lifecycle') {
   const entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', presets: {standard: {simulations: 1, solver_nodes: 0}}};
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -150,6 +170,7 @@ if (job.kind === 'encode') {
   await u.startMatch({players: [{engine: 'test'}, {engine: 'test'}], games: 2, clock: {mode: 'move', ms: 5}});
   await until(() => expired); await u.request('/match', {action: 'stop'}, 'POST'); await u.idle;
   answer.stopped_timeout = {paused: u.paused, active: u.match.active, completed: u.match.completed};
+  answer.finished_opening_status=(await s.request('/match',{players:[{engine:'test'},{engine:'test'}],games:2,openings:[job.history]},'POST'))[0];
   s.match = {active: false}; s.clock = {cross_ms: 0, circle_ms: 0}; s.apply('/undo', {});
   answer.forked_clock = {match: s.match, clock: s.clock};
 }

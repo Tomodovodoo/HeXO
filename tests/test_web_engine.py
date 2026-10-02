@@ -164,6 +164,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]]))
         self.assertEqual(result['stopped_timeout'], dict(paused=True, active=False, completed=0))
         self.assertEqual(result['forked_clock'], dict(match=None, clock=None))
+        self.assertEqual(result['finished_opening_status'], 400)
 
     def test_freeplay_updates_until_new_game(self):
         requests = [['/play', dict(q=0, r=0)], ['/play', dict(q=1, r=0)], ['/new', {}],
@@ -185,6 +186,17 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['variation'], [[0, 0], [1, 0]])
         self.assertEqual(result['imported_label'], 'best')
         self.assertEqual(result['changed_version'], {})
+
+    def test_browser_resumes_partial_match_after_switching_boards_and_clears_import_opening(self):
+        result = node(dict(kind='resume'))
+        self.assertEqual(result['before']['history'], [[0, 0], [0, 2], [1, 2]])
+        self.assertEqual(result['after']['history'], result['before']['history'])
+        self.assertEqual(result['after']['timings'], result['before']['timings'])
+        self.assertEqual(result['after']['clock']['circle_ms'], result['before']['clock']['circle_ms'])
+        self.assertGreater(result['after']['clock']['circle_ms'], 180000)
+        self.assertIsNotNone(result['bookStart'])
+        self.assertIsNone(result['imported'])
+        self.assertFalse(result['auto'])
 
     def test_search_matches_native(self):
         """Same seed, position, budget and evaluations: the same actions, visits and policy as the native library."""
