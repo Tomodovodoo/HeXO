@@ -4,12 +4,14 @@
 //   replays the recorded evaluations batch by batch -> [[{action, policy, visits, completed}] per step]
 // {kind: 'line', history, certificate} -> winning line
 // {kind: 'offline', requests: [[path, body]]} -> [[status, history or error, paused]] from an OfflineSession
+// {kind: 'threads', contexts: [{inWorker, isolated, cores}]} -> the WebAssembly thread count the loader would pick
 import {readFileSync} from 'node:fs';
 import {encode, features} from '../../web/engine/encode.mjs';
 import {Native, NeuralSearch, EvaluationCache} from '../../web/engine/search.mjs';
 import {winningLine} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
+import {defaultThreads} from '../../web/engine/network.mjs';
 
 const job = JSON.parse(readFileSync(0, 'utf8'));
 const native = new Native(await createModule());
@@ -50,6 +52,8 @@ if (job.kind === 'encode') {
   for (const item of job.cases) answer.push(await search(item));
 } else if (job.kind === 'line') {
   answer = winningLine(native, job.history, job.certificate);
+} else if (job.kind === 'threads') {
+  answer = job.contexts.map(defaultThreads);
 } else if (job.kind === 'offline') {
   const session = new OfflineSession(native, {engine: 'browser:bubble'});
   answer = job.requests.map(([path, body]) => {
