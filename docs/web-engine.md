@@ -37,7 +37,9 @@ to the site's path, adds the cross-origin isolation headers after one reload.
 | `web/engine/search.mjs` | `hxg_*` driver: the `neural_search` loop, evaluation cache, root statistics |
 | `web/engine/tactical.mjs`, `solver-worker.mjs` | Solver with a WASI shim, in a worker that a cancel terminates |
 | `web/engine/proof.mjs` | Certificate walk for the winning line |
-| `web/engine/seat.mjs` | Play page hook: the browser seat and analysis engine |
+| `web/engine/seat.mjs` | Play page hook: the browser engines (`ENGINES`) as seats and analysis |
+| `web/engine/native.mjs`, `native-worker.mjs` | Native (browser): page API and worker |
+| `web/engine/native/` | `native.wasm` and its loader, built from `src/hexo.cpp`; `search.mjs` runs a turn |
 | `web/engine/offline.mjs` | The play server's game requests answered in the page, for static hosting |
 | `web/coi-sw.js` | Cross-origin isolation on static hosts (`isolate()`), for WebAssembly threads |
 
@@ -94,3 +96,30 @@ makes the WebGPU and CUDA columns noisy (WebGPU deep took 11 to 18 s across runs
 a one-operator graph already takes 6 ms, so a batch costs mostly dispatch and time slicing, not arithmetic. Graph
 capture saved 15% at batch 16 and is not used. WebAssembly with one thread is what a page without cross-origin
 isolation gets.
+
+## Native (browser)
+
+Native, the handwritten engine in `src/hexo.cpp`, also runs in the page. Pick **Native (browser)** for a seat or
+the analysis. `build_web.py wasm` compiles `hexo.cpp` with the same em++ flags as `gumbel.wasm` into
+`web/engine/native/native.wasm` (204 KB) and its loader `native.mjs` (10 KB). `build.json` records both. A worker
+(`native-worker.mjs`) keeps the module between turns, as the server keeps its search child, so a proven winning plan
+carries over to the next turn. The worker fetches `native.wasm` once and keeps it in the Cache API under the digest
+`build.json` records for it.
+
+A turn is `hx_search` with the server's settings: depth 12, width 16, and the preset's milliseconds (lightning 100,
+quick 250, standard 1,000, strong 3,000, deep 10,000, dangerous 60,000). The C++ clock is `performance.now()` in
+the worker. The search cannot stop part way inside the module, so cancelling a move ends the worker and the next
+turn starts a fresh one. The server kills its search child the same way. As analysis, Native shows its turn as the
+top move and the line. The bar shows the mover's odds as logistic(score / 1000), and 1 or 0 once the search proves a
+win or a loss. The score is a heuristic, not a probability.
+
+Parity (`tests/test_web_native.py`): with the deadline out of reach, the wasm build and the native library pick the
+same turn with the same score and completed depth in 169 depth-bounded searches (depth 2, 3 and 4) of 75 recorded
+positions. Node counts differ in 4 of them, by at most 1.2%. `std::sort` orders equal-scored turns differently in
+libc++ (Emscripten) and libstdc++ (MinGW); with two `std::sort` calls in `turns()` replaced by `std::stable_sort`
+the counts match as well. In Chrome 152 on the Ryzen 9 5900X the browser searches 78,000 nodes per second from a 7-stone
+position, against 106,000 for the server library. At 100, 1,000 and 3,000 ms both reached the same depth and chose
+the same turn.
+
+What the bundle contains: `src/hexo.cpp` (this repository, MIT), Emscripten's runtime and loader (MIT or NCSA),
+and libc++ and libc++abi (Apache 2.0 with LLVM exception).
