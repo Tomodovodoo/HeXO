@@ -59,7 +59,7 @@ export class SealEngine {
     this.calls = 0;
   }
 
-  /** Starts the worker and loads the wasm (Cache API, keyed by its SHA-256); `progress(fraction)` reports the download. */
+  /** Starts the worker and loads the wasm (Cache API, keyed by its SHA-256); `progress(1)` once it is loaded. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
     const worker = this.worker = new Worker(new URL('seal-worker.mjs', import.meta.url), {type: 'module'});
