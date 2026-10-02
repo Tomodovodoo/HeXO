@@ -5310,6 +5310,11 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(state['complete'])
         self.assertEqual(len(state['results']), 9)
         self.assertEqual({g['sides'][g['challenger_color']][0] for g in state['results']}, {'main/000010'})
+        too_long = dict(state, cases=[dict(history=[[i, 0] for i in range(state['max_plies'])])])
+        output.write_text(json.dumps(too_long))
+        with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'shorter than max_plies'):
+            compare_search_modes.main()
+        output.write_text(json.dumps(state))
         # A sweep distinguishes the two orientations of the one-sided paired test.
         for game in state['results']:
             if game['kind'] == 'match':

@@ -207,6 +207,9 @@ def main():
                      external_solver=False, graph=True, tactics=True, device=args.device, complete=False)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         write_json(args.out, state)
+    if any(len(history) >= state['max_plies'] for history in
+           [c['history'] for c in state['cases']] + state['openings']):
+        raise ValueError('Starting positions must be shorter than max_plies')
     if args.publish:
         print(json.dumps(dict(imported=publish(args.run, state)), indent=2))
         return
