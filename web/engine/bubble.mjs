@@ -11,7 +11,13 @@ export const PRESETS = {lightning: {simulations: 8, solver_nodes: 2048}, quick: 
 export async function isolate() {
   const workers = globalThis.navigator?.serviceWorker, script = new URL('../coi-sw.js', import.meta.url).href;
   if (globalThis.crossOriginIsolated || !workers || !isSecureContext || workers.controller?.scriptURL === script) return false;
-  const registration = await workers.register(script);
+  let registration;
+  try {
+    registration = await workers.register(script);
+  } catch (error) {   // a host that refuses service workers still gets the engine, without WASM threads
+    console.warn('Bubble (browser): no cross-origin isolation,', error.message);
+    return false;
+  }
   if (registration.active?.scriptURL === script) { location.reload(); return true; }
   const reload = worker => worker?.addEventListener('statechange', () => { if (worker.state === 'activated') location.reload(); });
   reload(registration.installing || registration.waiting);
