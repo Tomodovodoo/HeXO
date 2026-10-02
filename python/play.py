@@ -573,8 +573,8 @@ def solve(prover, history, solver_nodes, watch=lambda n: None):
 
 class TurnSearch:
     """One evaluation under way (see `evaluate`): the solver's findings, then a search per stone of the turn until
-    the turn is complete. When the solver already gave the turn, one search still ranks the first stones. The
-    searches of later stones are kept in `later` as evaluations of the positions inside the turn, without solver
+    the turn is complete. When the solver already gave the turn, its stones are played and each position of the turn
+    is still searched, for its rows. The searches of later stones are kept in `later` as evaluations of the positions inside the turn, without solver
     checks. `request()` names the tree and simulations of the next search, None when the turn is
     complete, (None, 0) for the raw policy; `take(result)` applies that search's result, None for the raw policy.
     `trees(history, simulations, network)` gives the tree and the simulations to run for a stone; by default one
@@ -591,7 +591,7 @@ class TurnSearch:
         self.moves, self.line, self.proof = list(solved['moves']), solved['line'], solved['proof']
         self.threat, self.solved, self.solver_used = solved['threat'], solved['solved'], solved['used']
         self.given, self.top, self.value, self.completed, self.tree = bool(self.moves), [], None, 0, None
-        self.later = []
+        self.later, self.played = [], 0
         self.trees = trees or self.advanced
 
     def advanced(self, history, simulations, network):
@@ -604,7 +604,7 @@ class TurnSearch:
         return self.tree, simulations
 
     def request(self):
-        if (self.given and self.top) or self.local.player != self.player or self.local.winner >= 0:
+        if self.local.player != self.player or self.local.winner >= 0 or self.given and self.played >= len(self.moves):
             return None
         if not self.simulations:
             return None, 0
@@ -630,16 +630,15 @@ class TurnSearch:
                 self.proof = dict(winner=self.player if proven > 0 else 1 - self.player,
                                   turns=proof_turns(result['proof_plies'], self.local.remaining, proven > 0))
         rows = top_rows(actions, policy, values)
-        if self.given:
-            self.top, self.value = rows, (stone_value + 1) / 2
-            return
-        if not self.moves:
+        if not self.given:
+            self.moves.append([int(action[0]), int(action[1])])
+        if not self.played:
             self.top, self.value = rows, (stone_value + 1) / 2
         else:
-            self.later.append(dict(history=[tuple(cell[:2]) for cell in self.local.cells], moves=[list(map(int, action))],
+            self.later.append(dict(history=[tuple(cell[:2]) for cell in self.local.cells], moves=[self.moves[self.played]],
                                    value=round((stone_value + 1) / 2, 4), top=rows, proof=None, line=[], threat=[]))
-        self.moves.append([int(action[0]), int(action[1])])
-        self.local.play(*self.moves[-1])
+        self.local.play(*self.moves[self.played])
+        self.played += 1
 
     def record(self):
         value = (1. if self.proof['winner'] == self.player else 0.) if self.proof else self.value

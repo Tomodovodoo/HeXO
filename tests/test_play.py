@@ -1373,6 +1373,14 @@ class TurnTrees(unittest.TestCase):
         return SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=64), sha256='tiny',
                                cache=neural_search.EvaluationCache())
 
+    def test_a_turn_the_solver_gave_still_ranks_each_of_its_positions(self):
+        from play import evaluate
+        given = dict(moves=[[1, 0], [2, 0]], line=[], proof=dict(winner=1, turns=1), threat=[], solved=True, used=0)
+        found = evaluate(self.bubble(), None, [(0, 0)], 16, 0, solved=given)
+        self.assertEqual((found['moves'], found['value'], len(found['top'])), ([[1, 0], [2, 0]], 1., 5))
+        self.assertEqual([(step['history'], step['moves'], len(step['top'])) for step in found['later']],
+                         [([(0, 0), (1, 0)], [[2, 0]], 5)])
+
     def test_pooled_evaluations_match_single_ones(self):
         from play import evaluate, evaluate_many
         histories = [[(0, 0)], [(0, 0), (1, 0), (1, 1)], [(0, 0), (1, 0)]]
