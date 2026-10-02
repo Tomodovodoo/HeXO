@@ -119,7 +119,7 @@ def publish(run, state):
             raise ValueError('Publish requires all three complete head-to-head batches')
         settings = dense_config.EvaluationSettings(sims=state['sims'], root_samples=state['root_samples'],
                                                    max_plies=state['max_plies'], tactics=True, search_graph=True,
-                                                   opening_suite='book', opening_book=state['book_digest'])
+                                                   search_choice=plain, opening_suite='book', opening_book=state['book_digest'])
         overrides = {ids[m]: dict(search_choice=m) for m in (a, b)}
         report = dense_eval.make_report(ids[a], ids[b], records,
             {cid: state['models'][state['checkpoint']] for cid in ids.values()}, settings, overrides,

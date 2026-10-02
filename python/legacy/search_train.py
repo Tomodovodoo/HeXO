@@ -267,7 +267,7 @@ def play_games(checkpoints, assignments, openings, args, seed, progress, *, trai
             groups=[[e for e in live if assignments[e['id']][e['game'].player]==j] for j in range(len(evaluators))]
             for j,group in enumerate(groups):
                 if not group:continue
-                results=coordinators[j].search_many([e['trees'][j] for e in group],args.simulations,args.root_samples,args.leaf_batch)
+                results=coordinators[j].search_many([e['trees'][j] for e in group],args.simulations,args.root_samples,args.leaf_batch,choice='gumbel')
                 for e,result in zip(group,results,strict=True):
                     g=e['game'];actions=result['actions'];policy=result['policy']
                     if result['completed']!=args.simulations or result['action'] is None:

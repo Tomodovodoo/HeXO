@@ -343,6 +343,8 @@ def from_dict(data):
 
 def section(name, values):
     """The SECTIONS[name] settings of dict `values`, without its RETIRED keys."""
+    if name == 'evaluation' and 'search_choice' not in values:
+        values = dict(values, search_choice='gumbel')
     return SECTIONS[name](**{k: v for k, v in values.items() if k not in RETIRED.get(name, ())})
 
 

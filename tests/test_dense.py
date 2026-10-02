@@ -1168,12 +1168,16 @@ class DenseConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             dense_config.save(tmp, config)
             self.assertEqual(dense_config.load(tmp), config)
+            self.assertEqual(dense_config.load(tmp).evaluation.search_choice, 'policy')
             with self.assertRaises(FileExistsError):
                 dense_config.save(tmp, replace(config, seed=4))
             self.assertEqual(dense_config.load(tmp).seed, 3)
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ['config.json'])
         with self.assertRaises(ValueError):
             dense_config.from_dict(dict(asdict(config), schema='other'))
+        historical = asdict(config)
+        historical['evaluation'].pop('search_choice')
+        self.assertEqual(dense_config.from_dict(historical).evaluation.search_choice, 'gumbel')
         # ModelSettings and HexNetConfig must stay field-for-field identical.
         self.assertEqual(asdict(dense_config.ModelSettings()), asdict(hexnet.HexNetConfig()))
 
@@ -5405,6 +5409,13 @@ class EvaluatorLoopTests(unittest.TestCase):
         output.write_text(json.dumps(state))
         with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'Python search source differs'):
             compare_search_modes.main()
+        historical = dict(state, id=state['id']+'-historical', names=dict(policy='policy-old', puct='puct-old'))
+        historical.pop('plain_mode')
+        compare_search_modes.publish(self.run, historical)
+        archived = [r for r in dense_eval.load_reports(self.run) if r['id'].startswith(historical['id'])]
+        self.assertEqual(len(archived), 3)
+        self.assertTrue(all(r['settings']['search_choice'] == 'gumbel' for r in archived))
+        self.assertTrue(any('main/000010@policy-old' in (r['candidate'], r['opponent']) for r in archived))
         weights = self.run/'checkpoints/main/000010/ema.pt'
         weights.write_bytes(weights.read_bytes()+b'changed')
         with self.assertRaisesRegex(ValueError, 'checkpoint weights differ'):
