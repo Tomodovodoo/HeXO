@@ -704,6 +704,37 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('aiohttp'), 'API extra not installed')
 class ArenaNative(unittest.IsolatedAsyncioTestCase):
+    async def test_finished_game_cleanup_does_not_delay_the_next_game(self):
+        from arena_bot import NativeArena
+        started = {game_id: asyncio.Event() for game_id in ('old', 'next')}
+        draining, release = asyncio.Event(), asyncio.Event()
+
+        async def play(event):
+            started[event['gameId']].set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                draining.set()
+                await release.wait()
+
+        bot = NativeArena('http://localhost', 'private')
+        first = dict(type='gameStart', gameId='old', side='o', opponent=dict(name='local'))
+        with patch.object(bot, 'play', side_effect=play):
+            try:
+                await bot.event(first)
+                await asyncio.wait_for(started['old'].wait(), 1)
+                await asyncio.wait_for(bot.event(dict(type='gameFinish', gameId='old',
+                    reason='resign', winner='o')), .2)
+                await asyncio.wait_for(draining.wait(), 1)
+                await bot.event(dict(first, gameId='next'))
+                await asyncio.wait_for(started['next'].wait(), 1)
+                self.assertFalse(release.is_set())
+            finally:
+                release.set()
+                for game_id in list(bot.games):
+                    await bot.finish(game_id)
+                await asyncio.gather(*bot.cleanups, return_exceptions=True)
+
     async def test_dropped_socket_drains_native_before_requesting_a_new_clock(self):
         import aiohttp
         from aiohttp import web

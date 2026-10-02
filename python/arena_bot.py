@@ -55,6 +55,7 @@ class NativeArena:
         self.ms, self.width, self.depth = ms, width, depth
         self.games = {}
         self.challenges = set()
+        self.cleanups = set()
         self.presence = None
 
     async def call(self, method, path, body=None):
@@ -184,7 +185,9 @@ class NativeArena:
         elif kind == 'gameFinish':
             print(f'Game {event["gameId"]} finished: {event["reason"]}, '
                   f'winner {event["winner"]}', flush=True)
-            await self.finish(event['gameId'])
+            cleanup = asyncio.create_task(self.finish(event['gameId']))
+            self.cleanups.add(cleanup)
+            cleanup.add_done_callback(self.cleanups.discard)
         elif kind == 'challenge':
             task = asyncio.create_task(self.accept(event['challenge']))
             self.challenges.add(task)
@@ -246,6 +249,7 @@ class NativeArena:
                 await asyncio.gather(*self.challenges, return_exceptions=True)
                 for game_id in list(self.games):
                     await self.finish(game_id)
+                await asyncio.gather(*self.cleanups, return_exceptions=True)
 
 
 def main():
