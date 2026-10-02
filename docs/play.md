@@ -148,50 +148,33 @@ The API is loopback-only. Each player port holds one visible game; use a separat
 
 ## Engines
 
-Native always plays. Everything else comes from the models folder: `models/` in the checkout, or the folder given
-with `--models` (the picker shows its path when it holds no models). Put files there, then press the rescan button
-at the bottom of the picker, or restart the server.
+Native always plays. The engine picker also lists every engine below; one that is not installed yet has a download
+button. Click it and the server installs the engine into the models folder (`models/` in the checkout, or the folder
+given with `--models`). The row fills as files download, turns while something compiles, and becomes the engine
+once it is registered. A failure shows its error for a few seconds and the button comes back.
 
-| Engine | What goes in the models folder | Picker |
+| Engine | Source, licence | One click |
 |---|---|---|
-| Bubble | a run folder with `checkpoints/<variant>/<step>/ema.pt` (champion first), or any `.pt` export, for example `models/old/ema.pt` | the folder or file name; checkpoints in the select |
-| Six | a folder, for example `models/six/`, with `sixengine.exe` (`sixengine` on Linux) and `gen-NNNN.onnx` networks | Six with its backend; networks in the select, newest first |
-| Strix | `strix.json` and the model file beside it | the JSON's name |
-| Shrimp, or any engine speaking the Six protocol | `shrimp.json` | the JSON's name |
+| Six | newest release of CixMango/Six, MIT | downloads the release archive for Windows, Linux or macOS (arm64), checks it against the SHA-256 GitHub publishes for it, and keeps only the engine folder and the network, as `models/six/` |
+| Strix | SootyOwl/hexo-strix at `5a771e5`, MIT; the model is the one hexo.tyto.cc lists as `pulsatrix-10-best`, licence unstated | builds the wrapper with `tools/build_strix_learned.py` when cargo and git are found, else downloads it from the `engines-v1` release; downloads the model from hexo.tyto.cc and checks its pinned SHA-256; writes `models/strix/` and `models/strix.json` |
+| Shrimp | Cmiller132/hexo-bot at `6251fc6` (main_7, epoch 18), MIT, run by Six's Shrimp driver | downloads the driver, the weights and the search profile, each at a pinned SHA-256; builds `hexo_engine` and `shrimp` with maturin when cargo is found, else downloads the release's wheels for this Python; writes `models/shrimp/` and `models/shrimp.json`, which run the driver with the server's Python and its PyTorch on two CPU threads. Needs Python 3.11 or newer with PyTorch and NumPy |
+| Seal | Ramora0/HexTicTacToe at `3474edb`, no licence | downloads four pinned headers and compiles `tools/seal_adapter.cpp` with g++ or clang++. Without a licence it is never republished, so it needs a C++ compiler |
 
-The run given with `--dense-run` or `--model` is shown as Bubble; `runs/` (or `--runs`) adds every other run under
-its folder name. Seal appears when `build/libhexo_seal.dll` (or `.so`) is built with `-DHEXO_SEAL_SOURCE`.
+Pinned revisions, URLs and hashes live in `tools/engines.json`. A setup works in `models/.setup/<engine>` and moves
+the finished folder into place with a `setup.json` marker; it replaces only folders and entries that an earlier setup
+made. `.pt` files inside such folders are never offered as Bubble models. Over HTTP, `GET /setup` lists the engines,
+whether each is installed (the id of its entry) and the last setup's progress; `POST /setup` with
+`{"engine": "six"}` starts one.
 
-A JSON entry names one engine, with paths relative to the JSON file:
+The prebuilt Strix and Shrimp files come from this repository's `engines-v<N>` release.
+`gh workflow run engines.yml -f tag=engines-v1` builds them for Windows x64, Linux x64 and arm64, and macOS arm64 (Shrimp's wheels for Python 3.11 to
+3.14) and creates the release with a `SHA256SUMS` file. Downloads are checked against the hashes pinned in
+`tools/engines.json`, or against the release's `SHA256SUMS` while none are pinned; `python tools/build_engines.py pin
+engines-v1` copies those hashes into the manifest. `python tools/build_engines.py build --out dist` builds the same
+files on one machine.
 
-```json
-{"name": "Strix", "kind": "strix", "model": "strix.safetensors"}
-{"name": "old", "kind": "bubble", "path": "../runs/old"}
-{"name": "Shrimp", "kind": "six", "mirrored": true,
- "command": ["six-checkout/rivals/shrimp/.venv/Scripts/python.exe", "six-checkout/arena/drivers/shrimp_driver.py"],
- "presets": {"quick": {"nodes": 1, "args": ["--visits", "32"]}, "deep": {"nodes": 1, "args": ["--visits", "800"]}}}
-```
-
-`command` is a list of arguments. `"mirrored": true` is for engines in Six's frame, where HTTTX `(q, r)` is
-`(q + r, -r)`. `presets` overrides a preset's budget; `args` are extra arguments for engines whose strength is set
-at launch.
-
-Getting the files:
-
-- Six: the release zip and a network from github.com/CixMango/Six releases, unpacked into `models/six/`. The
-  release's engine is the DirectML build, which ships `DirectML.dll` next to `sixengine.exe`. A CUDA build needs ONNX
-  Runtime's GPU DLLs (among them `onnxruntime_providers_cuda.dll`) beside `sixengine.exe`, and `cudart64_12.dll` and
-  `cudnn64_9.dll` on PATH, beside it, or in an installed PyTorch's `torch/lib`. TensorRT adds
-  `onnxruntime_providers_tensorrt.dll` beside the engine and `nvinfer_10.dll`, for example from `pip install tensorrt`;
-  the first game builds the plan beside the network, which takes a few minutes. A running Six keeps its process
-across presets; choosing another network starts one for it, and the two most recently used networks stay running. The fastest backend whose libraries
-  are found wins: TensorRT, CUDA, DirectML, CPU. Six searches by nodes, so a preset plays the same on any hardware.
-- Strix: `python tools/build_strix_learned.py <hexo-strix checkout>` (Rust and MinGW) builds the engine into
-  `tools/strix_learned/target/release`; the public model is `https://hexo.tyto.cc/model.safetensors`.
-- Shrimp: clone CixMango/Six into `models/six-checkout` and build Cmiller132/hexo-bot with its
-  `scripts/build_native.sh` into its `rivals/shrimp`; the entry above runs Six's Shrimp driver with that build's
-  Python. Engines run in the models folder, so relative arguments resolve there.
-- Seal: build with `-DHEXO_SEAL_SOURCE=<HexTicTacToe checkout>`.
+Kraken (Ramora0/KrakenBot) is not offered: its code has no licence and its weights are not public. Neither is
+MantisNet (Cmiller132/Hexo-Shrimp-Bot), which has no licence and no weights.
 
 Strength is a slider from Faster to Smarter with six stops: a spark, an open hexagon, a filled one, one in a ring, a
 stack and the hazard sign; arrow keys move it one stop. The sliders button beside it opens the custom budget.
@@ -219,6 +202,41 @@ Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows 
 the engine reports no progress) and its cancel button. The custom budget shows the engine's own fields: Search
 (simulations, 0 plays the raw policy, up to 65,536) and Solver (nodes, 0 turns it off, up to 4,000,000; the solver
 gets up to a minute) for Bubble, Positions for Six, Search for Strix, and 10 to 120,000 ms for Native and Seal.
+
+### By hand
+
+The models folder is scanned at start and by the rescan button at the bottom of the picker:
+
+| Engine | What goes in the models folder | Picker |
+|---|---|---|
+| Bubble | a run folder with `checkpoints/<variant>/<step>/ema.pt` (champion first), or any `.pt` export, for example `models/old/ema.pt` | the folder or file name; checkpoints in the select |
+| Six | a folder with `sixengine.exe` (`sixengine` on Linux) and `gen-NNNN.onnx` networks | Six with its backend; networks in the select, newest first |
+| Strix, Seal, Shrimp or any engine speaking the Six protocol | a JSON entry | the JSON's name |
+
+The run given with `--dense-run` or `--model` is shown as Bubble; `runs/` (or `--runs`) adds every other run under
+its folder name. Seal also appears when `build/libhexo_seal.dll` (or `.so`) is built with
+`-DHEXO_SEAL_SOURCE=<HexTicTacToe checkout>`. A JSON entry names one engine, with paths relative to the JSON file:
+
+```json
+{"name": "Strix", "kind": "strix", "model": "strix/model.safetensors", "engine": "strix/hexo-strix-learned.exe"}
+{"name": "Seal", "kind": "seal", "library": "seal/hexo_seal.dll"}
+{"name": "old", "kind": "bubble", "path": "../runs/old"}
+{"name": "Shrimp", "kind": "six", "mirrored": true, "command": ["python", "shrimp/launch.py", "--threads", "2"],
+ "presets": {"quick": {"nodes": 1, "args": ["--visits", "32"]}, "deep": {"nodes": 1, "args": ["--visits", "1024"]}}}
+```
+
+`command` is a list of arguments, run in the models folder; a first argument `python` is the server's own Python.
+`"mirrored": true` is for engines in Six's frame, where HTTTX `(q, r)` is `(q + r, -r)`. `presets` overrides a
+preset's budget; `args` are extra arguments for engines whose strength is set at launch, and `files` lists further
+files a match records the hashes of. Strix's `engine` defaults to `tools/strix_learned/target/release`.
+
+Six picks the fastest backend whose libraries it finds: TensorRT, CUDA, DirectML, CPU. The release's engine is the
+DirectML build, which ships `DirectML.dll`. A CUDA build needs ONNX Runtime's GPU DLLs (among them
+`onnxruntime_providers_cuda.dll`) beside `sixengine.exe`, and `cudart64_12.dll` and `cudnn64_9.dll` on PATH, beside it,
+or in an installed PyTorch's `torch/lib`. TensorRT adds `onnxruntime_providers_tensorrt.dll` beside the engine and
+`nvinfer_10.dll`, for example from `pip install tensorrt`; the first game builds the plan beside the network, which
+takes a few minutes. A running Six keeps its process across presets; choosing another network starts one for it, and
+the two most recently used networks stay running. Six searches by nodes, so a preset plays the same on any hardware.
 
 ## Analysis and review
 

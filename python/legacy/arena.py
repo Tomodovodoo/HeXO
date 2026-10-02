@@ -13,9 +13,8 @@ from hexo import Game, ROOT, library
 
 
 class Seal:
-    def __init__(self):
-        adapter = library.with_name(library.name.replace("hexo", "hexo_seal"))
-        self.lib = C.CDLL(str(adapter))
+    def __init__(self, adapter=None):
+        self.lib = C.CDLL(str(adapter or library.with_name(library.name.replace("hexo", "hexo_seal"))))
         self.fn = self.lib.seal_move
         self.fn.argtypes = [C.POINTER(C.c_int), C.c_int, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_int)]
         self.fn.restype = C.c_int

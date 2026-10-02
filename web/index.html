@@ -252,6 +252,12 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 #menu .hint{display:flex;align-items:center;gap:8px;padding:8px;border-top:1px solid var(--line);margin-top:4px;font-size:12px;color:var(--muted)}
 #menu .hint .ib{width:28px;height:28px;padding:0;justify-content:center}
 #menu .hint code{font:11px var(--mono);color:var(--text);word-break:break-all}
+#menu .setup>span:not(.get){opacity:.55}
+#menu .get{margin-left:auto;display:grid;place-items:center;width:18px;height:18px;color:var(--muted)}
+#menu .get svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}
+#menu .get .rest{opacity:.25}#menu .get .arc{transform:rotate(-90deg);transform-origin:center;transition:stroke-dasharray .3s}
+#menu .setup.running .get{color:var(--x)}#menu .setup.busy .get svg{animation:turn 1.2s linear infinite}
+#menu .setup.failed .get{color:#f87171}@keyframes turn{to{transform:rotate(360deg)}}
 .tok{border-radius:3px;cursor:default;transition:background .12s,color .12s}
 .tok[data-p="0"]{color:color-mix(in srgb,var(--x) 80%,var(--text))}.tok[data-p="1"]{color:color-mix(in srgb,var(--o) 80%,var(--text))}
 .tok:hover,.tok.on{background:var(--text);color:var(--bg)}
@@ -617,13 +623,41 @@ function openMenu(anchor,items,current,choose){
     b.onclick=()=>{closeMenu();if(!it.ids.includes(current))choose(it)};return b});
   const models=!S.engines.some(e=>['bubble','six','strix'].includes(e.kind));
   const rescan=el('button',{class:'ib ghost','aria-label':'Rescan',html:icon('rescan'),onclick:async()=>{closeMenu();await post('/rescan')}});
-  m.replaceChildren(...rows,el('div',{class:'hint'},models?el('span',{class:'spacer'},'Add models to ',el('code',{},S.models_folder||'models/')):el('span',{class:'spacer'}),rescan));
+  m.replaceChildren(...rows,...(anchor.closest('#seats')&&!STUDY?setupRows(choose):[]),el('div',{class:'hint'},models?el('span',{class:'spacer'},'Add models to ',el('code',{},S.models_folder||'models/')):el('span',{class:'spacer'}),rescan));
   const r=anchor.getBoundingClientRect();m.style.left=Math.min(r.left,innerWidth-260)+'px';m.style.width=Math.max(240,r.width)+'px';
   m.classList.add('show');const below=innerHeight-r.bottom;m.style.top=(below>260?r.bottom+4:Math.max(8,r.top-4-m.offsetHeight))+'px';
 }
 function closeMenu(){$('menu').classList.remove('show');if(menuFor)menuFor.classList.remove('on');menuFor=null;$('seats').classList.toggle('open',pinned)}
 addEventListener('pointerdown',e=>{if(menuFor&&!e.target.closest('#menu')&&e.target.closest('.pick')!==menuFor)closeMenu()});
 addEventListener('keydown',e=>{if(e.key==='Escape')closeMenu()});
+
+/* engine setup: known engines that are not installed get a download button; the row shows the setup's progress
+   and turns into the engine once it is registered */
+let setupList=[],setupShown=null,setupChoose=null,setupTimer=0;const setupSeen=new Map();
+function setupRows(choose){setupChoose=choose;setupShown=null;refreshSetups();return[el('div',{id:'setups'})]}
+async function refreshSetups(){
+  clearTimeout(setupTimer);
+  try{const res=await fetch('/setup');if(res.ok)setupList=(await res.json()).engines}catch(e){}
+  for(const s of setupList){const state=s.job?.state;if(state==='failed'&&setupSeen.get(s.engine)==='running')toast(s.job.error);setupSeen.set(s.engine,state)}
+  paintSetups();
+  if(setupList.some(s=>s.job?.state==='running'))setupTimer=setTimeout(refreshSetups,500);
+}
+function setupRing(job){
+  if(job?.state!=='running')return el('span',{class:'get',html:icon('download')});
+  return el('span',{class:'get',html:`<svg viewBox="0 0 16 16"><circle class="rest" cx="8" cy="8" r="6"/><circle class="arc" cx="8" cy="8" r="6" pathLength="100" stroke-dasharray="${Math.max(4,job.progress*100).toFixed(1)} 100"/></svg>`});
+}
+function paintSetups(){
+  const box=$('setups');if(!box)return;
+  setupShown??=new Set(setupList.filter(s=>!s.installed||s.job?.state==='running').map(s=>s.engine));
+  box.replaceChildren(...setupList.filter(s=>setupShown.has(s.engine)).map(s=>{
+    const state=s.job?.state;
+    if(s.installed&&state!=='running'){const b=el('button',{},...badge(s.kind,s.name));
+      b.onclick=()=>{closeMenu();setupChoose({id:s.installed,ids:[s.installed]})};return b}
+    const b=el('button',{class:'setup'+(state?' '+state:'')+(state==='running'&&s.job.busy?' busy':''),'aria-label':'Download '+s.name},...badge(s.kind,s.name),setupRing(s.job));
+    b.onclick=async()=>{if(state==='running')return;setupSeen.set(s.engine,'running');
+      await fetch('/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({engine:s.engine})}).catch(()=>{});refreshSetups()};
+    return b}));
+}
 
 /* panels */
 function configButton(id,seat){
