@@ -1268,8 +1268,8 @@ class Session:
         with self.lock:
             self.opening_book = enabled
             self.revision += 1
-        if enabled and not self.history:
-            self.new_game()
+            if enabled and not self.history:
+                self.new_game()
 
     def load(self, history, paused):
         """Replace the game with `history` (validated)."""
