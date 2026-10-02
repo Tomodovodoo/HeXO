@@ -13,6 +13,8 @@ on:
       - 'tools/tactical/**'
       - 'tools/shrimp_web/**'
       - 'tools/build_web.py'
+      - 'tools/seal_adapter.cpp'
+      - 'tools/engines.json'
       - 'tests/test_web_*.py'
       - 'tests/web/**'
       - 'requirements/**'
@@ -29,10 +31,19 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - run: |
+          git clone --quiet https://github.com/Ramora0/HexTicTacToe.git "$RUNNER_TEMP/seal"
+          git -C "$RUNNER_TEMP/seal" checkout --quiet 3474edb5a9cdb12004c70aac69a631a45a3cb9e0
+      - run: |
+          git clone --quiet https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          git -C "$RUNNER_TEMP/emsdk" checkout --quiet a2b92777574c2feda07994cd4f1079a3dfc151f8
+          "$RUNNER_TEMP/emsdk/emsdk" install 6.0.10
+          "$RUNNER_TEMP/emsdk/emsdk" activate 6.0.10
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DHEXO_SEAL_SOURCE="$RUNNER_TEMP/seal"
       - run: cmake --build build --parallel 2
       - run: python tools/build_tactical.py
+      - run: python tools/build_web.py seal --emxx "$RUNNER_TEMP/emsdk/upstream/emscripten/em++"
       - run: python -m pip install numpy==2.4.3 -r requirements/web.txt
       - run: python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install --no-deps -e .
-      - run: python -m unittest tests.test_web_engine tests.test_web_tactical tests.test_web_shrimp -v
+      - run: python -m unittest tests.test_web_engine tests.test_web_tactical tests.test_web_shrimp tests.test_web_seal -v

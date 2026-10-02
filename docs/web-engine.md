@@ -42,6 +42,7 @@ to the site's path, adds the cross-origin isolation headers after one reload.
 | `web/engine/native/` | `native.wasm` and its loader, built from `src/hexo.cpp`; `search.mjs` runs a turn |
 | `web/engine/shrimp.mjs`, `shrimp-worker.mjs` | Shrimp (browser): page API and worker |
 | `web/engine/shrimp/` | `shrimp.wasm` (built from `tools/shrimp_web`), `search.mjs` (the driver's turn), `network.mjs` (the graph's inputs) |
+| `web/engine/seal.mjs`, `seal-worker.mjs` | Seal (browser): page API and worker; `seal/` holds its build |
 | `web/engine/strix.mjs`, `strix-worker.mjs` | Strix (browser): page API and worker |
 | `web/engine/strix/` | `strix.wasm` and its loader `core.mjs`, built from `tools/strix_web`; the network when built |
 | `web/engine/offline.mjs` | The play server's game requests answered in the page, for static hosting |
@@ -179,6 +180,41 @@ WebAssembly is not measured; as with Bubble, a stalled start falls back to one t
 What the bundle contains: hexo-bot's Rust and the weights (MIT, Colton Miller), the crates they use (ahash, half,
 serde, thiserror; MIT or Apache 2.0) and ONNX Runtime Web (MIT). Mantis Shrimp (Cmiller132/Hexo-Shrimp-Bot) is not
 included: it has no licence and no published weights.
+
+## Seal
+
+Seal is the alpha-beta bot by Ramora0 ([HexTicTacToe](https://github.com/Ramora0/HexTicTacToe), revision `3474edb`),
+the community's reference bot. **Seal (browser)** in the picker plays a seat or the analysis with the server's
+presets: lightning 50, quick 100, standard 500, strong 2000, deep 8000 and dangerous 30000 ms per turn.
+
+```sh
+python tools/build_web.py seal --emxx path/to/em++   # seal/engine.mjs, engine.wasm, manifest.json (ignored)
+python -m unittest tests.test_web_seal
+```
+
+`build_web.py seal` downloads Seal's four headers at the revision pinned in `tools/engines.json`, checks each
+against its SHA-256 and compiles them with `tools/seal_adapter.cpp`, the server's adapter, using the same em++ flags
+as `gumbel.wasm`. The headers are never committed; the Pages workflow installs emsdk 6.0.10 and builds Seal on every
+deployment. HexTicTacToe has no licence file; this site serves the compiled Seal regardless.
+
+The wasm is 115 KB and its glue 10 KB. The worker fetches `seal/manifest.json`, then the wasm from the Cache API
+under its SHA-256, and calls `seal_move` exactly as the server does; Seal's clock is `performance.now()` in the
+worker. The search blocks the worker, so a cancel terminates it and the next turn starts a new one, which loses
+Seal's transposition table. The page cuts the answer to the stones left in the turn and stops at a winning stone,
+as `play.checked_turn` does. As analysis, Seal shows its first stone as the top move and both stones as the line.
+`seal_move` returns no score, so the evaluation bar stays empty.
+
+Seal searches to a clock and adds one random far candidate at the root, so the same position can get different
+turns. `tests/test_web_seal.py` compares turns at 1000 ms on 11 recorded positions where the server library gave
+one answer over repeated runs at 300 and 1500 ms; of 32 recorded positions, every one of the 16 with a stable
+server answer got the same turn in the browser build. `.github/workflows/web.yml` builds the native library and the
+wasm and runs the test. On the Ryzen 9 5900X in node 24 the wasm searches 70 to 90% of the native library's nodes
+per second (525,000 against 662,000 a second on a three-stone position at 2 s) and reaches the same depth or one
+less.
+
+What the bundle contains: Seal's `engine.h`, `types.h` and `pattern_data.h` (no licence), ankerl's
+`unordered_dense.h` as vendored in HexTicTacToe (MIT), `tools/seal_adapter.cpp` (this repository, MIT),
+Emscripten's runtime and loader (MIT or NCSA), and libc++ and libc++abi (Apache 2.0 with LLVM exception).
 
 ## Strix (browser)
 
