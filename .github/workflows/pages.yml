@@ -28,7 +28,12 @@ jobs:
       - run: gh release download --repo "$GITHUB_REPOSITORY" --pattern ema.pt --dir "$RUNNER_TEMP/release"
         env:
           GH_TOKEN: ${{ github.token }}
-      - run: python tools/build_web.py ort model shrimp --checkpoint "$RUNNER_TEMP/release/ema.pt"
+      - run: |
+          git clone --quiet https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          git -C "$RUNNER_TEMP/emsdk" checkout --quiet a2b92777574c2feda07994cd4f1079a3dfc151f8
+          "$RUNNER_TEMP/emsdk/emsdk" install 6.0.10
+          "$RUNNER_TEMP/emsdk/emsdk" activate 6.0.10
+      - run: python tools/build_web.py ort model shrimp seal --checkpoint "$RUNNER_TEMP/release/ema.pt" --emxx "$RUNNER_TEMP/emsdk/upstream/emscripten/em++"
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
         with:

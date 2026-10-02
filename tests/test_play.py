@@ -199,8 +199,8 @@ class Store(unittest.TestCase):
         self.assertEqual(store.best([(0, 0), (2, 0)], 'e')['value'], .2)
 
 
-def evaluation(value, moves=(), proof=None, line=()):
-    return dict(value=value, moves=[list(m) for m in moves], proof=proof, line=[list(p) for p in line])
+def evaluation(value, moves=(), proof=None, pv=()):
+    return dict(value=value, moves=[list(m) for m in moves], proof=proof, pv=[list(p) for p in pv])
 
 
 class Review(unittest.TestCase):
@@ -1327,9 +1327,11 @@ class TurnTrees(unittest.TestCase):
     def setUp(self):
         import hexnet
         import neural_search
+        import torch
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
         self.path = Path(self.folder.name)/'ema.pt'
+        torch.manual_seed(0)
         hexnet.save_model(self.path, hexnet.HexNet(hexnet.HexNetConfig(
             blocks=1, channels=8, pool_every=1, line_length=5, value_hidden=8, head_channels=4)))
         self.trees = []
@@ -1384,11 +1386,52 @@ class TurnTrees(unittest.TestCase):
 
     def test_a_turn_the_solver_gave_still_ranks_each_of_its_positions(self):
         from play import evaluate
-        given = dict(moves=[[1, 0], [2, 0]], line=[], proof=dict(winner=1, turns=1), threat=[], solved=True, used=0)
+        pv = [[1, 0, 1], [2, 0, 1], [2, 3, 0], [3, 3, 0], [3, 0, 1], [4, 0, 1]]
+        given = dict(moves=[[1, 0], [2, 0]], pv=pv, proof=dict(winner=1, turns=2, plies=6), threat=[], solved=True,
+                     used=0)
         found = evaluate(self.bubble(), None, [(0, 0)], 16, 0, solved=given)
-        self.assertEqual((found['moves'], found['value'], len(found['top'])), ([[1, 0], [2, 0]], 1., 5))
-        self.assertEqual([(step['history'], step['moves'], len(step['top'])) for step in found['later']],
-                         [([(0, 0), (1, 0)], [[2, 0]], 5)])
+        self.assertEqual((found['moves'], found['value'], found['pv']), ([[1, 0], [2, 0]], 1., pv))
+        self.assertEqual((found['top'][0][:2], found['top'][0][3:]), ([1, 0], [1., 1]))
+        [step] = found['later']
+        self.assertEqual((step['history'], step['moves'], step['top'][0][:2], step['top'][0][3:]),
+                         ([(0, 0), (1, 0)], [[2, 0]], [2, 0], [1., 1]))
+        self.assertEqual((step['pv'], step['proof'], step['value']), (pv[1:], dict(winner=1, turns=2, plies=5), 1.))
+
+    def test_the_first_row_is_the_stone_played(self):
+        from play import evaluate
+        for simulations in (0, 16):
+            found = evaluate(self.bubble(), None, [(0, 0)], simulations, 0)
+            self.assertEqual(found['top'][0][:2], found['moves'][0])
+            for step in found['later']:
+                self.assertEqual(step['top'][0][:2], step['moves'][0])
+            self.assertEqual(found['pv'], [])
+
+    def test_a_search_proof_shows_its_own_turn(self):
+        from play import evaluate
+        history = [(0, 0), (1, 2), (2, 2), (-2, 0), (-3, 0), (3, 2), (4, 2), (0, -3), (0, -4)]
+        found = evaluate(self.bubble(), None, history, 64, 0)
+        self.assertEqual(found['proof']['winner'], 1)
+        self.assertEqual(found['pv'], [[*m, 1] for m in found['moves']])
+        self.assertGreater(found['proof']['plies'], 0)
+
+    def test_a_proof_found_at_the_second_stone_counts_the_first(self):
+        import numpy as np
+        from play import TurnSearch, solve
+        actions = np.array([[1, 0], [2, 0]])
+        results = iter([dict(action=[1, 0], policy=np.array([.6, .4]), actions=actions, values=np.array([.1, .2]),
+                             proven=0, exact_winner=-1, proof_plies=0),
+                        dict(action=[2, 0], policy=np.array([0., 1.]), actions=actions, values=np.array([0., 1.]),
+                             proven=1, exact_winner=1, proof_plies=5)])
+        turn = TurnSearch(None, None, [(0, 0)], 1, solve(None, [(0, 0)], 0), trees=lambda *a: (None, 1))
+        try:
+            turn.take(next(results))
+            turn.take(next(results))
+            found = turn.record()
+        finally:
+            turn.close()
+        self.assertEqual((found['proof']['winner'], found['proof']['plies']), (1, 6))
+        self.assertEqual(found['later'][0]['proof']['plies'], 5)
+        self.assertEqual(found['pv'], [[1, 0, 1], [2, 0, 1]])
 
     def test_a_proven_second_stone_keeps_its_proof(self):
         from play import evaluate
@@ -1449,6 +1492,78 @@ class TurnTrees(unittest.TestCase):
         rows = top_rows(np.array([[1, 0], [2, 0], [3, 0], [4, 0]]), np.array([.4, .3, .2, .1]), np.array([-1., .2, 1., .1]))
         self.assertEqual([r[:2] for r in rows], [[3, 0], [2, 0], [4, 0], [1, 0]])
 
+    def test_rows_lead_with_the_stone_played_and_skip_untried_stones(self):
+        import numpy as np
+        from play import top_rows
+        actions = np.array([[-20, 5], [-20, 6], [1, 0], [2, 0], [3, 0]])
+        policy, values = np.array([0., 0., .7, .3, 0.]), np.array([.99, .99, .6, .5, 1.])
+        self.assertEqual([r[:2] for r in top_rows(actions, policy, values)], [[3, 0], [1, 0], [2, 0]])
+        self.assertEqual([r[:2] for r in top_rows(actions, policy, values, lead=[2, 0])], [[2, 0], [3, 0], [1, 0]])
+        self.assertEqual([r[:2] for r in top_rows(actions, policy)], [[1, 0], [2, 0]])
+        self.assertEqual(top_rows(actions, policy, values, lead=[2, 0], won=True)[0], [2, 0, .3, 1., 1])
+        self.assertEqual(top_rows(actions, policy, None, lead=[9, 9], won=True)[0], [9, 9, 0., 1., 1])
+        self.assertEqual(len(top_rows(actions, policy, values, count=2, lead=[9, 9], won=True)), 2)
+        self.assertEqual(len(top_rows(actions, policy, values, count=3, lead=[2, 0], won=True)), 3)
+
+
+class PrincipalVariation(unittest.TestCase):
+    """`principal_variation` and the solver step of an evaluation."""
+    # Side 1 to move at [(0, 0)]: its two stones, then defender covers lasting one or two more attacker turns, then
+    # an unstoppable fork whose defender stones do not matter.
+    CERTIFICATE = dict(root=0, nodes=[
+        dict(kind='attacker_move', action=[[1, 0], [2, 0]], child=1,
+             alternatives=[dict(action=[[0, 1], [0, 2]], child=2)]),
+        dict(kind='defender_replies', responses=[dict(action=[[1, 2], [2, 2]], child=2),
+                                                 dict(action=[[2, 3], [3, 3]], child=3),
+                                                 dict(action=[[-5, 5], [-6, 6]], child=3)]),
+        dict(kind='immediate_win', action=[[3, 0], [4, 0]]),
+        dict(kind='attacker_move', action=[[3, 0], [4, 0]], child=4),
+        dict(kind='unstoppable', threats=[[[5, 0], [6, 0]], [[-1, 0]]])])
+
+    def test_shortest_attack_longest_defence_and_no_filler(self):
+        from play import principal_variation
+        pv, plies = principal_variation([(0, 0)], self.CERTIFICATE)
+        self.assertEqual(pv, [[1, 0, 1], [2, 0, 1], [2, 3, 0], [3, 3, 0], [3, 0, 1], [4, 0, 1], [-1, 0, 1]])
+        self.assertEqual(plies, 9)
+
+    def test_an_immediate_win_ends_at_the_winning_stone(self):
+        from play import principal_variation
+        history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (2, 5), (3, 5), (3, 0), (-1, 3), (5, 5), (6, 5)]
+        certificate = dict(root=0, nodes=[dict(kind='immediate_win', action=[[4, 0], [5, 0]])])
+        self.assertEqual(principal_variation(history, certificate), ([[4, 0, 0], [5, 0, 0]], 2))
+
+    def test_solve_asks_for_the_shortest_win_and_keeps_its_line(self):
+        from play import solve
+        result = dict(status='PROVEN_WIN', native_verified=True, moves=[[1, 0], [2, 0]], proof_turns=3,
+                      certificate=self.CERTIFICATE, nodes_used=7)
+        prover = unittest.mock.Mock(history=unittest.mock.Mock(return_value=result))
+        found = solve(prover, [(0, 0)], 4096)
+        self.assertTrue(prover.history.call_args.kwargs['shortest'])
+        self.assertEqual((found['moves'], found['proof']), ([[1, 0], [2, 0]], dict(winner=1, turns=3, plies=9)))
+        self.assertEqual(found['pv'][:2], [[1, 0, 1], [2, 0, 1]])
+
+    def test_a_late_win_shows_the_shortest_line(self):
+        import tactical_proof
+        from play import solve
+        from tests.test_tactical_proof import LATE_WIN
+        if not tactical_proof.library().exists():
+            self.skipTest('needs the native tactical library')
+        prover = tactical_proof.NativeTactics()
+        prover.abort = lambda: None
+        found = solve(prover, LATE_WIN, 32768)
+        self.assertEqual((found['moves'], found['proof']), ([[-1, -11], [-1, -10]], dict(winner=0, turns=4, plies=14)))
+        self.assertEqual((found['pv'][:2], len(found['pv'])), ([[-1, -11, 0], [-1, -10, 0]], 12))
+        game = Game([tuple(p) for p in LATE_WIN] + [tuple(p[:2]) for p in found['pv'][:-2]])
+        try:
+            self.assertEqual((game.winner, game.player), (-1, 1))
+            for q, r in [m for m in game.legal_moves() if list(m) not in [p[:2] for p in found['pv']]][-2:]:
+                game.play(q, r)
+            for q, r, _ in found['pv'][-2:]:
+                game.play(q, r)
+            self.assertEqual(game.winner, 0)
+        finally:
+            game.close()
+
 
 class Registry(unittest.TestCase):
     def test_six_takes_the_fastest_backend_it_can_load(self):
@@ -1480,7 +1595,8 @@ class Registry(unittest.TestCase):
             for name in ('sixengine.exe' if os.name == 'nt' else 'sixengine', 'gen-0100.onnx', 'gen-0120.onnx'):
                 (models / 'six' / name).write_bytes(b'')
             (models / 'shrimp.json').write_text(json.dumps(dict(
-                kind='six', command=['python', 'driver.py'], presets=dict(quick=dict(nodes=1, args=['--visits', '32'])))))
+                kind='six', badge='shrimp', command=['python', 'driver.py'], presets=dict(quick=dict(nodes=1, args=['--visits', '32'])))))
+            (models / 'loud.json').write_text(json.dumps(dict(kind='six', badge='Shrimp!', command=['python', 'driver.py'])))
             (models / 'strix.json').write_text(json.dumps(dict(name='Strix', kind='strix', model='strix.safetensors')))
             (models / 'broken.json').write_text(json.dumps(dict(kind='six', command=[], presets=dict(odd={}))))
             (models / 'spaced.json').write_text(json.dumps(dict(kind='six', command='six --cpu')))
@@ -1497,6 +1613,8 @@ class Registry(unittest.TestCase):
             self.assertEqual((shrimp['command'], shrimp['mirrored']), ([sys.executable, 'driver.py'], False))
             self.assertEqual(shrimp['presets']['quick'], dict(nodes=1, args=['--visits', '32']))
             self.assertEqual(found['strix:Strix']['presets']['deep'], dict(simulations=512))
+            self.assertEqual({key: e['badge'] for key, e in found.items()},
+                             {'six:Six · CPU': 'six', 'six:shrimp': 'shrimp', 'strix:Strix': 'strix', 'native:Native': 'native'})
 
     def test_runs_models_and_entries_are_found(self):
         with tempfile.TemporaryDirectory() as directory:

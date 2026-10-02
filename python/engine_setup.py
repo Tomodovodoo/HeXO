@@ -42,7 +42,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 INSTALLED = dict(six=lambda e: e['kind'] == 'six' and bool(e.get('networks')),
                  strix=lambda e: e['kind'] == 'strix',
-                 shrimp=lambda e: e['kind'] == 'six' and 'shrimp' in e['name'].lower(),
+                 shrimp=lambda e: e['kind'] == 'six' and e['badge'] == 'shrimp',
                  seal=lambda e: e['kind'] == 'seal')
 
 
@@ -173,13 +173,14 @@ class Setups:
         self.jobs, self.threads, self.lock, self.retry = {}, {}, threading.Lock(), 5
 
     def catalogue(self):
-        """Every engine that can be set up on this system as {engine, name, kind, installed, job}: `installed` is
+        """Every engine that can be set up on this system as {engine, name, kind, badge, installed, job}: `installed` is
         the id of the registry entry that provides it, else None, and `job` the last setup's progress. A setup
         turns done once the registry has been rescanned. Six is left out where it publishes no build."""
         entries = list(self.entries().values())
         offered = [key for key in INSTALLED if key != 'six' or system() in self.manifest['six']['assets']]
         with self.lock:
             return [dict(engine=key, name=self.manifest[key]['name'], kind=self.manifest[key]['kind'],
+                         badge=self.manifest[key].get('badge', self.manifest[key]['kind']),
                          installed=next((e['id'] for e in entries if INSTALLED[key](e)), None),
                          job=self.jobs[key].json() if key in self.jobs else None) for key in offered]
 
@@ -374,7 +375,7 @@ class Setups:
         payload = [f"shrimp/{file['path']}" for file in spec['files']] + sorted(
             f'shrimp/{path.relative_to(staged).as_posix()}' for path in (staged / 'site').rglob('*')
             if path.suffix in ('.pyd', '.so'))
-        self.place(staged, 'shrimp', dict(name=spec['name'], kind='six', mirrored=True, presets=spec['presets'],
+        self.place(staged, 'shrimp', dict(name=spec['name'], kind='six', badge=spec['badge'], mirrored=True, presets=spec['presets'],
                                           command=['python', 'shrimp/launch.py', '--threads', '2'],
                                           files=payload))
         job.advance()
@@ -384,8 +385,8 @@ class Setups:
         return source_tree(self.download(job, source_url(spec), work / 'source.zip'), work / 'src', spec['sources'])
 
     def seal(self, job, work):
-        """Seal's pinned headers compiled with tools/seal_adapter.cpp. Seal has no licence, so it is never
-        republished and needs a C++ compiler here."""
+        """Seal's pinned headers compiled with tools/seal_adapter.cpp. Seal has no licence and is not in the engines
+        release, so it needs a C++ compiler here."""
         spec = self.manifest['seal']
         found = compiler(self.which)
         if found is None:
