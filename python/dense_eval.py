@@ -782,7 +782,8 @@ class Pacer:
     """Ceiling on the evaluator's playing share of wall time, a token bucket: credit accrues at `share` per
     wall second, capped at `share * window` while not playing (a new pacer starts full), playing spends
     `weight` per second, and wait(tick) sleeps while credit is negative, calling tick()
-    before each sleep of at most 10 s; share 1 with weight 1 never waits. used() is the weighted playing
+    before each sleep of at most a second and returning early once tick() returns true; share 1 with weight 1
+    never waits. used() is the weighted playing
     share of the last `window` seconds (of the pacer's lifetime while shorter)."""
 
     def __init__(self, share, window=PACE_WINDOW, clock=time.monotonic, sleep=time.sleep):
@@ -814,9 +815,8 @@ class Pacer:
 
     def wait(self, tick=lambda: None):
         self.refill(self.clock())
-        while self.credit < -1e-6:
-            tick()
-            self.sleep(min(10., -self.credit/self.share))
+        while self.credit < -1e-6 and not tick():
+            self.sleep(min(1., -self.credit/self.share))
             self.refill(self.clock())
 
 
@@ -824,7 +824,8 @@ class BusyPacer:
     """Limit playing duty under fresh actor/learner activity, without banking idle credit.
 
     After at least 100 ms of charged work, wait for the evaluator's queued GPU work and then yield
-    work * (1/share - 1) seconds. This controls wall time, not a measured fraction of GPU capacity.
+    work * (1/share - 1) seconds, calling tick() before each sleep of at most a second and ending the yield
+    early once tick() returns true. This controls wall time, not a measured fraction of GPU capacity.
     """
 
     def __init__(self, run, share, clock=time.monotonic, sleep=time.sleep, now=time.time):
@@ -865,8 +866,7 @@ class BusyPacer:
         delay = (self.work+self.clock()-started)*(1/self.share-1)
         self.work = 0.
         until = self.clock()+delay
-        while self.clock() < until:
-            tick()
+        while self.clock() < until and not tick():
             self.sleep(min(1., max(0., until-self.clock())))
 
 
@@ -875,7 +875,8 @@ class Pool:
     Games belong to lanes (any hashable pairing key); add(lane, games) starts them at once, step() advances the
     engine once and returns [(lane, record)] of the games that finished, so a finished game's slot can be refilled
     before the next step. running() counts games in flight (`running`); moves() is the
-    placements played after their openings by the games in flight. close() stops the engine's solver."""
+    placements played after their openings by the games in flight. close() stops the engine's solver and
+    releases the games still in flight, which are discarded."""
 
     def __init__(self, leaf_batch, schedule=None):
         self.engine, self.games, self.ready = Engine(leaf_batch, schedule=schedule), {}, []
@@ -888,6 +889,9 @@ class Pool:
 
     def close(self):
         self.engine.close()
+        for _, game in self.games.values():
+            game.finish()
+        self.games.clear()
 
     def synchronize(self):
         """Finish queued GPU work without collecting predictions or advancing any game."""
@@ -1186,20 +1190,22 @@ class Evaluator:
         only complete pairs enter a verdict. The Pacer is charged for
         engine steps and for starting games (Seal plays its first turns then); no game starts while its credit
         is negative, and with nothing running the session then waits and asks want() again. Every completed
-        pair is persisted at once. stop(), when supplied, stops new games after the next finished game (a
-        newer export, settle request, or a checkpoint interrupting a variant); games in flight drain normally.
-        When auxiliary is supplied, free slots
+        pair is persisted at once. stop(), when supplied (a newer export, settle request, or a checkpoint
+        interrupting a variant), is asked after every engine step that finishes a game and at least once a
+        second while the session plays or either pacer holds it; once it holds, the session abandons every game in flight and every finished
+        half awaiting its colour partner, publishes the idle status at once and logs an 'abandon' event with
+        the main lane, games_abandoned and halves_discarded.
+        Status shows the session's pairing from its first pass. When auxiliary is supplied, free slots
         may launch independent idle lanes up to two poolfuls per session; admissions stop for higher-priority work,
         but every launched colour pair still drains and is persisted."""
         pool, waiting, added, failed = Pool(self.config.actor.leaf_batch, Schedule.of(self.settings)), {}, {}, {}
         placed, completed, shown_completed = 0, 0, 0
-        gate_at, gate_open, miss, miss_at = -float('inf'), False, None, 0.
+        gate_at, gate_open, miss, miss_at, checked_at = -float('inf'), False, None, 0., -float('inf')
         start, wall = self.pacer.clock(), time.time()
         primary, extra, extra_started = want(), {}, 0
         used_pairs = {(x, y) for a, b, _ in primary for x, y in ((a, b), (b, a))}
         lanes = dict(primary)
-        stopping = False
-        shown = dict(lanes)
+        shown, fresh, abandoned = dict(lanes), True, None
 
         def show(stage, force=False):
             nonlocal shown_completed
@@ -1227,13 +1233,27 @@ class Evaluator:
                          mean_placements=added[main][1]/added[main][0] if main in added else None,
                          placements_per_second=live/max(self.pacer.clock()-start, 1e-9),
                          solver=self.solver_status(pool, [name for lane in shown for name in lane[:2]]))
+
+        def halt(now=False):
+            nonlocal checked_at, abandoned
+            if stop is not None and abandoned is None and (now or self.pacer.clock()-checked_at >= 1.):
+                checked_at = self.pacer.clock()
+                if stop():
+                    abandoned = pool.running(), sum(len(group) for groups in waiting.values() for group in groups.values())
+            return abandoned is not None
+
+        def throttle(force=False):
+            show('throttled', force)
+            return halt()
         while True:
-            self.busy_pacer.wait(pool.synchronize, lambda: show('throttled'))
+            self.busy_pacer.wait(pool.synchronize, throttle)
+            if abandoned:
+                break
             lanes = dict(primary)
             now = self.pacer.clock()
-            if auxiliary is not None and not stopping and now-gate_at >= 1.:
+            if auxiliary is not None and now-gate_at >= 1.:
                 gate_open, gate_at = self.pipeline_ready(), now
-            may_refill = auxiliary is not None and not stopping and gate_open
+            may_refill = auxiliary is not None and gate_open
             if may_refill and extra_started < 2*self.settings.pool_games:
                 lanes.update({lane: even(min(self.settings.pool_games, target-len(self.games(*lane[:2]))))
                               for lane, target in extra.items() if len(self.games(*lane[:2])) < target
@@ -1297,12 +1317,17 @@ class Evaluator:
                 self.busy_pacer.played(tick, end)
             if not pool.running():
                 if lanes and not ready:
-                    self.pacer.wait(lambda: show('throttled', True))
+                    self.pacer.wait(lambda: throttle(True))
+                    if abandoned:
+                        break
                     primary = want()  # the wait may have outlasted the pairing (a newer checkpoint)
                     continue
                 break
-            show('playing')
-            self.busy_pacer.wait(pool.synchronize, lambda: show('throttled'))
+            show('playing', fresh)
+            fresh = False
+            self.busy_pacer.wait(pool.synchronize, throttle)
+            if abandoned:
+                break
             tick = self.pacer.clock()
             results = pool.step()
             end = self.pacer.clock()
@@ -1310,9 +1335,6 @@ class Evaluator:
             self.busy_pacer.played(tick, end)
             paired = False
             for lane, record in results:
-                if stop is not None and not stopping and stop():
-                    stopping = True
-                    primary = {}
                 moves = record['plies']-len(record['opening'])
                 placed += moves
                 group = waiting.setdefault(lane, {}).setdefault(record['pair'], [])
@@ -1336,10 +1358,18 @@ class Evaluator:
                         count[1] += sum(game['plies']-len(game['opening']) for game in group)
                     paired = True
             if paired:
-                wanted = want()
-                primary = {} if stopping else wanted
-        show('playing', True)
+                primary = want()
+            if halt(bool(results)):
+                break
+        if abandoned is None:
+            show('playing', True)
         pool.close()
+        if abandoned is not None:
+            self.publish(True, stage='idle', comparison=None, pool=[], tally=None)
+            a, b, kind = next(iter(shown))
+            log_event(self.run, 'evaluator', 'abandon', f'{a} vs {b} ({kind}): abandoned {abandoned[0]} games in flight and '
+                      f'{abandoned[1]} halves awaiting their colour partner', candidate=a, opponent=b, comparison=kind,
+                      games_abandoned=abandoned[0], halves_discarded=abandoned[1])
         seconds = self.pacer.clock()-start
         for (a, b, kind), (games, moves) in added.items():
             records = self.games(a, b)
@@ -1592,9 +1622,10 @@ class Evaluator:
 
     def decide(self, cid, champion):
         """Posterior mode: a session whose lanes (`lanes`) follow the verdict after every completed colour pair
-        until `verdict` decides, sprt_max_games direct games are complete or a newer checkpoint of cid's variant
-        exists; the games in flight then finish and count (play resumes when they leave the verdict undecided)
-        and the final verdict settles it: superseded, cid is
+        until `verdict` decides or sprt_max_games direct games are complete, after which the games in flight
+        finish and count (play resumes when they leave the verdict undecided), or until a newer checkpoint of
+        cid's variant exists or a settle request names cid, which abandons the games in flight (`session`).
+        The final verdict settles it: superseded, cid is
         promoted when p_better >= promote_confidence (settled true), readiness aside. Returns ({opponent: report of
         cid against it}, verdict with decision 'promote', 'reject', 'max-games' or 'superseded'), or ({}, None)
         without a game in its report against the champion. The verdict (`public`) is published as status decision, stored as the direct
@@ -1694,8 +1725,9 @@ class Evaluator:
     def trial(self, entry):
         """Decide the pending variant `entry` against its checkpoint (module contract): a session like `decide`'s
         whose lanes (`lanes`, kind 'variant') follow the verdict after every completed colour pair until it
-        decides ('better' or 'worse'), sprt_max_games direct games are complete, or a checkpoint awaits rating;
-        the games in flight then finish and count (play resumes when they leave the verdict undecided). Stopped
+        decides ('better' or 'worse') or sprt_max_games direct games are complete, after which the games in
+        flight finish and count (play resumes when they leave the verdict undecided), or until a checkpoint
+        awaits rating, which abandons the games in flight (`session`). Stopped
         for a waiting checkpoint the variant stays pending and resumes on a later step; otherwise the final
         verdict (`public`, decision 'better', 'worse' or 'max-games', with candidate and opponent) is stored as
         the entry's verdict and the direct report's metrics.posterior, published as status decision and logged
@@ -1721,7 +1753,7 @@ class Evaluator:
             self.publish(decision=dict(public(verdict), candidate=cid, opponent=base, next=[list(l[:2]) for l in lanes]))
             return lanes
         while True:
-            added = self.session(want, s.sprt_max_games, stop=self.backlog if s.pipeline else None,
+            added = self.session(want, s.sprt_max_games, stop=self.backlog,
                                  budget=lambda: {(cid, base): s.sprt_max_games-len(self.direct(cid, base))})
             if 'bound_at' not in entry and report_path(self.run, cid, base).exists():
                 entry['bound_at'] = time.time()
@@ -1789,9 +1821,10 @@ class Evaluator:
         write_league(self.run, self.league, self.config, self.settings.fill_top)
 
     def sequential(self, cid, champion):
-        """SPRT mode: a session of cid vs the champion until the SPRT decides, sprt_max_games games are complete
-        or a newer checkpoint of cid's variant exists (the games in flight finish and count; a bound crossed
-        before them stays the decision). Returns ({champion:
+        """SPRT mode: a session of cid vs the champion until the SPRT decides or sprt_max_games games are
+        complete (the games in flight finish and count; a bound crossed before them stays the decision), or
+        until a newer checkpoint of cid's variant exists or a settle request names cid, which abandons the games
+        in flight (`session`). Returns ({champion:
         report}, metrics.sprt) with decision 'H1', 'H0', 'max-games' or 'superseded', settled as the module
         contract states ('settle' event: promoted when the posterior p_better of `verdict` is at least
         promote_confidence), or ({}, None) without a game. The status decision is the posterior `verdict` of

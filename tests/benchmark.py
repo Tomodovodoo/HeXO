@@ -113,14 +113,22 @@ def native_comparison(args):
     rng = random.Random(args.seed)
     if args.games:
         games = []
+        selection = None
+        if args.book:
+            from play import book_openings
+            selection = book_openings(args.book, args.opening_range, args.games // 2, args.seed)
+            report["opening_selection"] = selection
         # Independent of either engine's preferences; include near and dispersed
         # openings. Both colours get exactly the same opening in each pair.
         for index in range(args.games):
             if index % 2 == 0:
-                radius = (2, 4, 8)[(index//2) % 3]
-                cells = [(q, r) for q in range(-radius, radius+1) for r in range(-radius, radius+1)
-                         if 0 < max(abs(q), abs(r), abs(q+r)) <= radius]
-                opening = [(0, 0), *rng.sample(cells, 2)]
+                if selection:
+                    opening = selection["nodes"][index // 2]["moves"]
+                else:
+                    radius = (2, 4, 8)[(index//2) % 3]
+                    cells = [(q, r) for q in range(-radius, radius+1) for r in range(-radius, radius+1)
+                             if 0 < max(abs(q), abs(r), abs(q+r)) <= radius]
+                    opening = [(0, 0), *rng.sample(cells, 2)]
             history = list(opening)
             board = Game(history)
             searches = []
@@ -131,20 +139,29 @@ def native_comparison(args):
                     side = board.player
                     engine = "candidate" if side == candidate_colour else "baseline"
                     result = engines[engine].search(history, args.ms, args.depth or 12, args.width)
-                    if args.seal_library and any(abs(q) > 55 or abs(r) > 55 for q, r in result["moves"]):
-                        result["invalid"] = "Seal coordinate range exceeded"
                     if result.get("invalid"):
                         invalid = result["invalid"]
                         searches.append({"engine": engine, "ply": len(history), **result})
                         break
                     if not result["moves"]:
                         raise RuntimeError("Nonterminal search returned no move")
+                    executed = 0
                     for move in result["moves"]:
+                        if args.seal_library and any(abs(c) > 55 for c in move):
+                            invalid = result["invalid"] = "Seal coordinate range exceeded"
+                            break
                         board.play(*move)
                         history.append(move)
+                        executed += 1
+                        if board.winner >= 0:
+                            break
+                    if executed < len(result["moves"]):
+                        result = {**result, "submitted_moves": result["moves"], "moves": result["moves"][:executed]}
+                    searches.append({"engine": engine, "ply": len(history), **result})
+                    if invalid:
+                        break
                     if board.winner < 0 and board.player == side:
                         raise RuntimeError("Search returned an incomplete turn")
-                    searches.append({"engine": engine, "ply": len(history), **result})
                 score = None if invalid else (0.5 if board.winner < 0 else float(board.winner == candidate_colour))
                 games.append({"index": index, "opening": opening, "candidate_colour": candidate_colour,
                               "winner": board.winner, "score": score, "invalid": invalid,
@@ -411,6 +428,8 @@ if __name__ == "__main__":
     parser.add_argument("--output")
     parser.add_argument("--compare-library", help="Independent pre-change Native DLL/shared library")
     parser.add_argument("--games", type=int, default=0, help="Even number of paired Native comparison games")
+    parser.add_argument("--book", help="Read-only v2 opening book, selected through the player's book selector")
+    parser.add_argument("--opening-range", choices=("narrow", "wide", "all"), default="wide")
     parser.add_argument("--max-stones", type=int, default=301)
     parser.add_argument("--depth", type=int, help="Fixed completed turn depth (comparison only)")
     args = parser.parse_args()
@@ -426,6 +445,8 @@ if __name__ == "__main__":
         parser.error("Seal comparisons require --games or --trace")
     if args.games and not (args.compare_library or args.seal_library):
         parser.error("Paired games require --compare-library or --seal-library")
+    if args.book and not args.games:
+        parser.error("Opening books require paired --games")
     if args.trace and (args.games or args.compare_library):
         parser.error("Trace admission and library comparisons are separate modes")
     if args.trace and (not max(6, args.width//2) <= args.root_seconds <= 128 or

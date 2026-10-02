@@ -13,12 +13,15 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import formats
 from hexo import Game
-from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings, budget_of,
-                  export_path, file_digest, file_identity, import_history, model_key, presets_of, proof_turns, review, scan, six_backend)
+from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings,
+                  budget_of, command_of, export, export_path, file_digest, file_identity, import_history, linked_history,
+                  model_key, move_row, pair_elo, presets_of, proof_turns, read_game, review, scan, six_backend)
 from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
+SITE = Path(__file__).parent / 'fixtures' / 'hexo-site'
 
 
 def legal_turn(history):
@@ -60,16 +63,16 @@ class FakeEngines:
     """Plays the first legal cells; `hold` makes evaluations wait until cancelled or released."""
 
     def __init__(self):
-        self.calls, self.hold, self.release = [], False, threading.Event()
+        self.calls, self.turns, self.hold, self.release = [], [], False, threading.Event()
 
-    def evaluate(self, entry, checkpoint, budget, history, watch):
+    def evaluate(self, entry, checkpoint, budget, history, watch, live=None):
         self.calls.append((checkpoint, dict(budget), [tuple(p) for p in history]))
         while self.hold and not self.release.is_set():
             watch(1)
             time.sleep(.01)
         watch(budget['simulations'])
         moves = legal_turn(history)
-        found = dict(moves=moves, value=.5, top=[[*moves[0], .9]], proof=None, line=[], threat=[], ms=1)
+        found = dict(moves=moves, value=.5, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1)
         return found, budget, f'{model_key(export_path(entry, checkpoint))}:none'
 
     def solver_build(self):
@@ -78,7 +81,8 @@ class FakeEngines:
     def effective(self, budget):
         return budget
 
-    def turn(self, entry, budget, history, stop):
+    def turn(self, entry, budget, history, stop, checkpoint=None):
+        self.turns.append((entry['id'], checkpoint, dict(budget)))
         return legal_turn(history)
 
     def close(self):
@@ -147,6 +151,25 @@ class Store(unittest.TestCase):
         self.assertEqual(store.best([], 'e')['value'], .1)
         store.add([], 'e', dict(simulations=32, solver_nodes=131072), dict(value=1., moves=[], top=[], proof=dict(winner=0, turns=2)))
         self.assertEqual(store.best([], 'e')['value'], 1.)
+
+    def test_evaluations_without_move_values_are_shown_last_and_never_reused(self):
+        store = Evaluations()
+        store.add([], 'e', dict(simulations=512, solver_nodes=0), dict(value=.1, moves=[], top=[[0, 0, 1.]]))
+        self.assertIsNone(store.covering([], 'e', dict(simulations=32, solver_nodes=0)))
+        store.add([], 'e', dict(simulations=0, solver_nodes=0), dict(value=.4, moves=[], top=[[0, 0, 1.]]))
+        self.assertEqual(store.covering([], 'e', dict(simulations=0, solver_nodes=0))['value'], .4)
+        store.add([], 'e', dict(simulations=32, solver_nodes=0), dict(value=.2, moves=[], top=[[0, 0, 1., .2]]))
+        self.assertEqual(store.covering([], 'e', dict(simulations=32, solver_nodes=0))['value'], .2)
+        self.assertEqual(store.best([], 'e')['value'], .2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'evaluations.jsonl'
+            path.write_text(json.dumps(dict(position='', engine='e', simulations=1, solver_nodes=0, value=.3, moves=[],
+                                            top=[[0, 0, 1., 'x']])), encoding='utf-8')
+            self.assertIsNone(Evaluations(path).best([], 'e'))
+
+    def test_rows_mark_stones_the_search_proved(self):
+        self.assertEqual([move_row([1, 2], .5, v)[3:] for v in (1., -1., .2)], [[1., 1], [0., -1], [.6, 0]])
+        self.assertEqual(move_row([1, 2], .5), [1, 2, .5])
 
     def test_index_keeps_the_newest_entries(self):
         store = Evaluations(limit=2)
@@ -444,8 +467,97 @@ class Jobs(unittest.TestCase):
         self.session.analyse(0, force=True)
         wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']))
         self.session.close()
-        self.assertFalse(self.session.worker.is_alive())
+        self.assertFalse(any(worker.is_alive() for worker in self.session.workers))
         self.assertEqual(closed, [True])
+
+    def test_a_stone_placed_on_a_paused_game_gets_its_answer(self):
+        self.session.pause(True)
+        self.session.play(0, 0)
+        wait(lambda: len(self.history()) == 3)
+        self.assertFalse(self.session.paused)
+
+    def test_six_seats_play_the_chosen_network(self):
+        six = dict(id='six:Six · CPU', name='Six · CPU', label='CPU', kind='six', presets=PRESETS['six'],
+                   checkpoints=['gen-2', 'gen-1'], networks={'gen-2': Path('gen-2.onnx'), 'gen-1': Path('gen-1.onnx')},
+                   command=['sixengine', '--cpu'], cwd=Path('.'), mirrored=True, libraries=[])
+        self.session.entries[six['id']] = six
+        self.session.configure_seat(1, six['id'], preset='quick')
+        self.assertEqual(self.session.seats[1]['checkpoint'], 'gen-2')
+        self.session.configure_seat(1, six['id'], 'gen-1', 'lightning')
+        self.session.play(0, 0)
+        wait(lambda: len(self.history()) == 3)
+        self.assertEqual(self.engines.turns[-1], (six['id'], 'gen-1', dict(nodes=1500)))
+        with self.assertRaises(ValueError):
+            self.session.configure_seat(1, six['id'], 'gen-3')
+
+    def test_a_six_process_lives_across_presets_and_two_networks(self):
+        started, closed = [], []
+
+        class Fake:
+            def __init__(self, command, **options):
+                self.command, self.cancel, self.info = command, options['cancel'], {}
+                started.append(command)
+
+            def __call__(self, game, ms, nodes=None):
+                return legal_turn([tuple(cell[:2]) for cell in game.cells])
+
+            def close(self):
+                closed.append(self.command)
+
+        six = dict(kind='six', name='Six', command=['sixengine', '--cpu'], cwd=Path('.'), mirrored=True, libraries=[],
+                   networks={f'gen-{n}': Path(f'gen-{n}.onnx') for n in range(3)})
+        engines = Engines('cpu')
+        with unittest.mock.patch('six_engine.SixEngine', Fake):
+            for network, nodes in (('gen-2', 30000), ('gen-2', 6000), ('gen-1', 6000), ('gen-2', 6000), ('gen-0', 6000)):
+                engines.turn(six, dict(nodes=nodes), [], checkpoint=network)
+        self.assertEqual([c[2] for c in started], ['gen-2.onnx', 'gen-1.onnx', 'gen-0.onnx'])
+        self.assertEqual([c[2] for c in closed], ['gen-1.onnx'])
+
+    def test_analysis_deepens_through_every_preset_while_an_engine_plays(self):
+        self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
+        budgets = [PRESETS['bubble'][name] for name in PRESETS['bubble']]
+        wait(lambda: all(self.session.store.covering([], key, budget) for budget in budgets
+                         for key in [self.session.engine_key(self.session.analysis)]))
+        deep = [budget for checkpoint, budget, history in self.engines.calls if not history]
+        self.assertEqual(deep, budgets)
+        self.assertIsNone(self.session.analyse(0))
+        self.engines.hold = True
+        self.session.load([(0, 0), (1, 0), (1, 1)], False)
+        wait(lambda: any(j['status'] == 'running' and j['ply'] == 3 and j['kind'] == 'analyse' for j in self.session.state()['jobs']))
+        self.session.configure_analysis('bubble:fake', preset='quick', auto=False)
+        wait(lambda: not [j for j in self.session.state()['jobs'] if j['kind'] == 'analyse'])
+        self.engines.release.set()
+        self.session.load([(0, 0)], True)
+        time.sleep(.2)
+        self.assertFalse([j for j in self.session.state()['jobs'] if j['ply'] == 1 and j['kind'] == 'analyse'
+                          and j['status'] == 'queued'])
+
+    def test_a_preset_without_a_solver_verdict_is_not_deepened_again(self):
+        def unsolved(entry, checkpoint, budget, history, watch, live=None):
+            found, spent, key = FakeEngines.evaluate(self.engines, entry, checkpoint, budget, history, watch)
+            return found, spent | dict(solver_nodes=0), key
+        self.engines.evaluate = unsolved
+        self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(len([c for c in self.engines.calls if not c[2]]), len(PRESETS['bubble']))
+
+    def test_finished_positions_are_not_analysed(self):
+        final = [(0, 0), (0, 5), (1, 5), (5, 0), (-5, 0), (2, 5), (3, 5), (0, -5), (0, -6), (4, 5), (5, 5)]
+        self.session.load(final, True)
+        self.assertIsNone(self.session.analyse(len(final)))
+        self.session.configure_analysis('bubble:fake', preset='deep', auto=True)
+        time.sleep(.2)
+        self.assertFalse([j for j in self.session.state()['jobs'] if j['ply'] == len(final)])
+
+    def test_review_uses_the_review_budget_whatever_the_slider_says(self):
+        self.session.configure_seat(1, 'human')
+        self.session.load([(0, 0), (1, 0), (2, 0)], True)
+        self.session.configure_analysis('bubble:fake', preset='deep', auto=False)
+        self.session.review_game()
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual({tuple(b.items()) for _, b, _ in self.engines.calls}, {tuple(STANDARD.items())})
+        state = self.session.state()
+        self.assertEqual((state['review_preset'], [t['label'] is not None for t in state['review']]), ('standard', [True, True]))
 
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
@@ -457,8 +569,18 @@ class Jobs(unittest.TestCase):
         self.session.undo()
         self.assertEqual(self.history(), [])
 
+    def test_undo_skips_a_seat_the_page_plays(self):
+        self.session.configure_seat(1, 'human')
+        self.session.play(0, 0)
+        self.session.play(1, 0)
+        self.session.play(2, 0)
+        self.session.undo([0])
+        self.assertEqual(self.history(), [])
+        with self.assertRaises(ValueError):
+            self.session.undo([2])
+
     def test_failures_reach_the_page_and_rescans_drop_vanished_engines(self):
-        def broken(*args):
+        def broken(*args, **options):
             raise RuntimeError('weights unreadable')
         self.engines.evaluate = broken
         self.session.analyse(0)
@@ -584,6 +706,16 @@ class Jobs(unittest.TestCase):
         shrimp = presets_of('six', dict(quick=dict(nodes=1, args=['--visits', '32'])))
         self.assertEqual(budget_of(shrimp, 'custom', dict(nodes=9, args=['--visits', '1'])), dict(nodes=9))
         self.assertEqual(budget_of(shrimp, 'quick'), dict(nodes=1, args=['--visits', '32']))
+        lightning = {kind: presets_of(kind, None)['lightning'] for kind in PRESETS}
+        self.assertEqual(lightning, dict(bubble=dict(simulations=8, solver_nodes=2048), native=dict(ms=100),
+                                         seal=dict(ms=50), six=dict(nodes=1500), strix=dict(simulations=2)))
+        self.assertEqual([list(PRESETS[kind]) for kind in PRESETS], [['lightning', 'quick', 'standard', 'strong', 'deep', 'dangerous']] * 5)
+        self.assertEqual(presets_of('six', dict(quick=dict(nodes=1)))['lightning'], dict(nodes=1500))
+        self.assertEqual({kind: presets_of(kind, None)['dangerous'] for kind in PRESETS},
+                         dict(bubble=dict(simulations=65536, solver_nodes=4_000_000), native=dict(ms=60000),
+                              seal=dict(ms=30000), six=dict(nodes=2_000_000), strix=dict(simulations=4096)))
+        self.assertEqual(budget_of(PRESETS['bubble'], 'custom', dict(simulations=65536, solver_nodes=4_000_000)),
+                         dict(simulations=65536, solver_nodes=4_000_000))
         for spec in (dict(heavy=dict(nodes=1)), dict(quick=dict(nodes=0)), dict(quick=dict(args='--x')), [1],
                      dict(quick=dict(ms=1000))):
             with self.assertRaises(ValueError):
@@ -618,6 +750,18 @@ class Http(unittest.TestCase):
     def get(self, path):
         with urlopen(self.root + path, timeout=5) as response:
             return response.read().decode()
+
+    def test_engine_bundle_is_served_cross_origin_isolated(self):
+        for path, kind in (('/', 'text/html'), ('/engine/search.mjs', 'text/javascript'), ('/coi-sw.js', 'text/javascript')):
+            with urlopen(self.root + path, timeout=5) as response:
+                self.assertTrue(response.headers['Content-Type'].startswith(kind))
+                self.assertEqual(response.headers['Cross-Origin-Opener-Policy'], 'same-origin')
+                self.assertEqual(response.headers['Cross-Origin-Embedder-Policy'], 'credentialless')
+        for path in ('/engine/../../python/play.py', '/engine/%2e%2e/index.html', '/engine/missing.mjs', '/index.html'):
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(self.root + path, timeout=5)
+            self.assertEqual(caught.exception.code, 404)
+            caught.exception.close()
 
     def test_page_stays_responsive_while_an_engine_thinks(self):
         self.engines.hold = True
@@ -659,6 +803,17 @@ class Http(unittest.TestCase):
                 self.assertIsNone(json.loads(self.get('/state'))['match'])
             finally:
                 self.session.close()
+
+    def test_import_loads_a_hexo_site_link(self):
+        with unittest.mock.patch('play.fetch_json', return_value=SiteImport.sandbox) as fetch:
+            state = self.post('/import', dict(text='https://hexo.did.science/sandbox/2mdyn02'))
+        fetch.assert_called_once_with('https://hexo.did.science/api/sandbox-positions/2mdyn02')
+        self.assertEqual((len(state['history']), state['paused']), (7, True))
+        state = self.post('/import', dict(text=Formats.GAME))
+        self.assertEqual((len(state['history']), state['winner']), (91, 1))
+        shown = json.loads(self.get('/export?format=rectilinear&ply=3'))
+        self.assertEqual(formats.rectilinear_loads(shown['text']), state['history'][:3])
+        self.assertEqual(json.loads(self.get('/export?format=tyto'))['text'], formats.tyto_dumps(state['history']))
 
     def test_import_export_retry_and_origin(self):
         self.post('/seat', dict(side=1, engine='human'))
@@ -703,6 +858,141 @@ class Http(unittest.TestCase):
         caught.exception.close()
         local = {'Origin': f'http://localhost:{port}', 'Host': f'localhost:{port}'}
         self.assertEqual(self.post('/new', headers=local)['history'], [])
+
+
+class SiteImport(unittest.TestCase):
+    """Recorded API answers: hexo.did.science (hexo.mineking.dev serves the same API under /proxy/api) and
+    hexo.tyto.cc."""
+    game = json.loads((SITE / 'finished-game.json').read_text(encoding='utf-8'))
+    sandbox = json.loads((SITE / 'sandbox-position.json').read_text(encoding='utf-8'))
+    shared = json.loads((SITE / 'sandbox-z108lz7.json').read_text(encoding='utf-8'))
+    tyto = json.loads((SITE / 'tyto-game.json').read_text(encoding='utf-8'))
+
+    def fetched(self, url, answer):
+        asked = []
+        history = linked_history(url, lambda api, body=None: asked.append((api, body)) or answer)
+        return history, [api for api, _ in asked]
+
+    def test_games_and_sandbox_positions_become_htttx_histories(self):
+        history, asked = self.fetched('https://hexo.did.science/games/8211f449-5020-4a5a-9a93-581c5f720aac', self.game)
+        self.assertEqual(asked, ['https://hexo.did.science/api/finished-games/8211f449-5020-4a5a-9a93-581c5f720aac'])
+        self.assertEqual((len(history), history[:3]), (39, [[0, 0], [1, 2], [2, 1]]))
+        game = Game(history)
+        self.assertEqual(game.winner, 1)
+        game.close()
+        _, asked = self.fetched('https://hexo.mineking.dev/games/8211f449-5020-4a5a-9a93-581c5f720aac/', self.game)
+        self.assertEqual(asked, ['https://hexo.mineking.dev/proxy/api/finished-games/8211f449-5020-4a5a-9a93-581c5f720aac'])
+        history, asked = self.fetched('https://hexo.mineking.dev/sandbox/2MDYN02', self.sandbox)
+        self.assertEqual(asked, ['https://hexo.mineking.dev/proxy/api/sandbox-positions/2mdyn02'])
+        self.assertEqual(history, [[0, 0], [1, -1], [0, 1], [1, 0], [-1, 0], [2, 0], [-4, 0]])
+        history, asked = self.fetched('https://hexo.did.science/sandbox/z108lz7', self.shared)
+        self.assertEqual((len(history), history[:3]), (18, [[0, 0], [3, 0], [1, 2]]))
+
+    def test_tyto_analysis_and_game_links(self):
+        self.assertEqual(linked_history('https://hexo.tyto.cc/analysis#c=BAEIAw', self.offline), [[0, 0], [1, 1], [2, 2]])
+        asked = []
+        history = linked_history('https://hexo.tyto.cc/#g=ebb77124-db4c-4c42-979c-3e4d49244cec',
+                                 lambda api, body=None: asked.append((api, body)) or self.tyto)
+        self.assertEqual(asked, [('https://hexo.tyto.cc/game_htttx', dict(game_id='ebb77124-db4c-4c42-979c-3e4d49244cec'))])
+        self.assertEqual(history, import_history(self.tyto['htttx']))
+        with self.assertRaises(ValueError):
+            linked_history('https://hexo.tyto.cc/analysis', self.offline)
+
+    def test_other_text_is_left_alone_and_bad_links_are_refused(self):
+        for text in ('version[1];\n1. [1,0][2,0];', 'https://example.com/games/1', '[[0, 0]]'):
+            self.assertIsNone(linked_history(text, self.offline))
+        with self.assertRaises(ValueError):
+            linked_history('https://hexo.did.science/leaderboard', self.offline)
+        moved = json.loads(json.dumps(self.sandbox))
+        for cell in moved['gamePosition']['cells']:
+            cell['x'] += 3
+        self.assertEqual(self.fetched('https://hexo.did.science/sandbox/2mdyn02', moved)[0][:2], [[0, 0], [1, -1]])
+        swapped = json.loads(json.dumps(self.sandbox))
+        swapped['gamePosition']['cells'][1]['player'] = 'player-1'
+        with self.assertRaises(ValueError):
+            self.fetched('https://hexo.did.science/sandbox/2mdyn02', swapped)
+
+    def offline(self, url, body=None):
+        raise AssertionError(f'fetched {url}')
+
+
+class Formats(unittest.TestCase):
+    """Rectilinear notation (MineKing9534/HeXO) and Tyto analysis links (SootyOwl/hexo-strix)."""
+    GAME = ('o/xo, q @(1, 1) x A0 C2.1 o A1 B2.0 x C1.2 B4.0 o B1.0 C1.0 x D1.0 C4.1 o E4.3 B3.0 x C4.0 D3.3 o C3.2 '
+            'E3.3 x C3.1 F4.1 o D4.1 E3.2 x E3.0 F4.2 o D4.0 D4.2 x D4.3 F4.3 o F4.4 D5.1 x D5.0 F3.1 o G3.2 F3.2 x '
+            'H3.2 G3.1 o E3.1 G3.4 x F3.4 F3.0 o G3.3 H3.4 x D2.3 I3.5 o F2.5 E5.1 x F5.1 G2.5 o H3.0 K3.4 x L3.4 '
+            'G2.4 o G2.6 K3.0 x L3.0 M2.12 o L3.3 E5.0 x F4.5 N2.12 o O2.12 K2.10 x I2.8 M3.2 o M2.10 N2.10 x I3.3 '
+            'O2.10 o J3.4 K2.7 x I3.2 I3.4 o I3.0 I3.6 x K2.8 M3.3 o M3.1 M2.9 x L3.2 J3.1 o K3.2 K3.1 x K3.3 N2.11 '
+            'o L2.8 D3.1 x O2.11 I2.5 o F3.3 H3.5')
+
+    def test_a_rectilinear_game_reads_and_writes_back(self):
+        history = formats.rectilinear_loads(self.GAME)
+        game = Game(history)
+        self.assertEqual((len(history), game.winner, history[:3]), (91, 1, [[0, 0], [-1, 1], [1, 0]]))
+        game.close()
+        text, spans = formats.rectilinear_dumps(history)
+        self.assertTrue(text.startswith('x, b @(0, 0) o A0 A2 x B2.1 B5.1'))
+        self.assertEqual(formats.rectilinear_loads(text), history)
+        self.assertEqual([text[a:b] for a, b in spans[:3]], ['x', 'A0', 'A2'])
+        self.assertEqual(formats.rectilinear_dumps([[0, 0]]), ('x', [(0, 0 + 1)]))
+
+    def test_rings_follow_the_reference_parser(self):
+        _, turns = formats.bke_turns('b@(1,0): o A0 A1 x B3.1 B3.2', implicit=False)
+        self.assertEqual([(player, set(cells)) for player, cells in turns],
+                         [('o', {(1, -1), (2, -1)}), ('x', {(-1, 2), (0, 2)})])
+        for baseline in range(6):
+            for ring in range(1, 30):
+                for offset in range(6 * ring):
+                    cell = formats.ring_cell((3, -2), baseline, True, ring, offset)
+                    self.assertEqual(formats.ring_offset(cell, (3, -2), baseline), (ring, *divmod(offset, ring)))
+        history = formats.rectilinear_loads('x A0 H2.2 o A1 G2.2')
+        self.assertEqual((len(history), history[0]), (5, [0, 0]))
+        self.assertEqual(formats.rectilinear_loads('x A0 H2.2 o A1 G2.2'),
+                         formats.rectilinear_loads('o, d @(0, 0) x A0 H2.2 o A1 G2.2'))
+        self.assertEqual(formats.rectilinear_loads('c-x'), [[0, 0]])
+        self.assertEqual(formats.rectilinear_loads('oxo\r\nxx'), formats.rectilinear_loads('oxo/xx'))
+        for text in ('x7x7o7o7x', 'oxo/xx'):
+            self.assertEqual(len(formats.rectilinear_loads(text)), len(formats.drawing(text)))
+        with self.assertRaisesRegex(ValueError, 'cannot be played'):
+            formats.rectilinear_loads('x9oo')
+        self.assertEqual(len(formats.rectilinear_loads('x, o A0 A1 x B1')), 4)
+        for bad in ('xx', 'o/xo, q @(1, 1) o A0 B1', 'x(!', 'xz', 'x, o A0 x A1 A2', 'x, o A0 A1 A2'):
+            with self.assertRaises(ValueError):
+                formats.rectilinear_loads(bad)
+
+    def test_tyto_links_both_ways(self):
+        for history, code in (([(0, 0), (1, 1)], 'BAE'), ([(0, 0), (1, 1), (2, 2)], 'BAEIAw'),
+                              ([(0, 0), (1, 0), (-1, 2), (3, -1), (0, -2)], 'AgACAwQCAwQ')):
+            self.assertEqual(formats.tyto_dumps(history), formats.TYTO + code)
+            self.assertEqual(formats.tyto_loads(code), [list(p) for p in history])
+        far = formats.tyto_dumps([(0, 0), (1, 0), (2, 0), (3, -1), (70, -1)])
+        with self.assertRaises(ValueError):
+            formats.tyto_loads(far[len(formats.TYTO):])
+        for broken in ('BA', '!!!', 'BAE=', 'BAEIA'):
+            with self.assertRaises(ValueError):
+                formats.tyto_loads(broken)
+        with self.assertRaises(ValueError):
+            formats.tyto_dumps([])
+
+    def test_pasted_text_of_any_kind_is_read(self):
+        self.assertEqual(read_game('version[1];\n1. [1,0][2,0];', self.offline), [[0, 0], [1, 0], [2, 0]])
+        self.assertEqual(len(read_game(self.GAME, self.offline)), 91)
+        self.assertEqual(read_game('https://hexo.tyto.cc/analysis#c=BAE', self.offline), [[0, 0], [1, 1]])
+        with self.assertRaisesRegex(ValueError, 'Illegal'):
+            read_game('version[1];\n1. [1,0][1,0];', self.offline)
+
+    def test_exports_mark_each_stone(self):
+        history = [(0, 0), (1, 0), (-1, 2), (3, -1), (0, -2)]
+        htttx = export(history, 'htttx')
+        self.assertEqual([[htttx['text'][a:b], q, r] for a, b, q, r in htttx['spans']],
+                         [['[1,0]', 1, 0], ['[-1,2]', -1, 2], ['[3,-1]', 3, -1], ['[0,-2]', 0, -2]])
+        rectilinear = export(history, 'rectilinear')
+        self.assertEqual(formats.rectilinear_loads(rectilinear['text']), [list(p) for p in history])
+        self.assertEqual([s[2:] for s in rectilinear['spans']], [list(p) for p in history])
+        self.assertEqual(export(history, 'tyto'), dict(text=formats.TYTO + 'AgACAwQCAwQ', spans=[]))
+
+    def offline(self, url, body=None):
+        raise AssertionError(f'fetched {url}')
 
 
 class Matches(unittest.TestCase):
@@ -819,6 +1109,48 @@ class Matches(unittest.TestCase):
             self.assertEqual(seat['source']['files'][str(path.resolve())],
                              file_digest(file_identity(path)))
 
+    def test_book_openings_start_engine_games(self):
+        path = Path(self.directory.name) / 'book.json'
+        nodes = [dict(key=str(i), status='opening', moves=[[0, 0], [i, 0], [i, 1]], off_policy=i == 2) for i in (1, 2)]
+        path.write_text(json.dumps(dict(schema='hexo-opening-book-v2', nodes=nodes)))
+        self.session.book = None
+        with self.assertRaises(ValueError):
+            self.session.use_book(True)
+        self.session.book = path
+        self.session.pause(True)
+        self.session.configure_seat(0, 'native:Native')
+        self.session.configure_seat(1, 'native:Other')
+        self.session.use_book(True)
+        self.assertEqual(sorted(abs(q) + abs(r) + abs(q + r) for q, r in self.session.history[:3]), [0, 2, 4])
+        self.session.configure_seat(1, 'human')
+        self.session.new_game()
+        self.assertEqual((self.session.history, self.session.state()['book']), ([], dict(available=True, enabled=True)))
+
+    def test_saved_tournaments_report_an_elo_from_complete_pairs(self):
+        self.assertIsNone(pair_elo([dict(game=1, winner=0)]))
+        elo = pair_elo([dict(game=1, winner=0), dict(game=2, winner=0), dict(game=3, winner=None), dict(game=4, winner=1)])
+        self.assertEqual(elo['pairs'], 2)
+        self.assertGreater(elo['a_minus_b'], 0)
+        self.assertLess(elo['interval'][0], elo['a_minus_b'])
+
+    def test_six_networks_are_checkpoints_of_one_entry(self):
+        folder = Path(self.directory.name)
+        for name in ('sixengine.exe', 'gen-0001.onnx', 'gen-0002.onnx'):
+            (folder / name).write_bytes(name.encode())
+        self.session.entries['six:Six · CPU'] = dict(
+            id='six:Six · CPU', name='Six · CPU', label='CPU', kind='six', presets=PRESETS['six'],
+            checkpoints=['gen-0002', 'gen-0001'], backend='CPU', cwd=folder, mirrored=True, libraries=[],
+            networks={n: folder / f'{n}.onnx' for n in ('gen-0002', 'gen-0001')},
+            command=[str(folder / 'sixengine.exe'), '--cpu'])
+        seat = self.session.match_seat('six@gen-0001', 'quick')
+        self.assertEqual((seat['checkpoint'], seat['name'], seat['source']['device']), ('gen-0001', 'Six · CPU/gen-0001', 'CPU'))
+        self.assertEqual(seat['source']['command'], [str(folder / 'sixengine.exe'), '--net', str(folder / 'gen-0001.onnx'), '--cpu'])
+        self.assertIn(str((folder / 'gen-0001.onnx').resolve()), seat['source']['files'])
+        self.assertNotIn(str((folder / 'gen-0002.onnx').resolve()), seat['source']['files'])
+        self.assertEqual(self.session.match_seat('Six', 'quick')['checkpoint'], 'gen-0002')
+        with self.assertRaises(ValueError):
+            self.session.match_seat('Six@gen-0009', 'quick')
+
     def test_resume_keeps_completed_games_and_pair_accounting(self):
         self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
         wait(lambda: self.session.match['completed'] == 1)
@@ -889,6 +1221,7 @@ class Matches(unittest.TestCase):
         seat = self.session.match_seat('bubble:2@quick', 'standard')
         self.assertEqual((seat['engine'], seat['checkpoint'], seat['device']), ('bubble:fake', 'main/000002', 'cpu'))
         self.assertEqual(seat['budget'], PRESETS['bubble']['quick'])
+        self.assertEqual(self.session.match_seat('Native@lightning', 'standard')['budget'], dict(ms=100))
         custom = self.session.match_seat('bubble:2{simulations=512,solver_nodes=0}', 'standard')
         self.assertEqual(custom['budget'], dict(simulations=512, solver_nodes=0))
         with self.assertRaisesRegex(ValueError, 'not a budget'):
@@ -916,6 +1249,9 @@ class Matches(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'human game'):
             self.session.start_match(['Native', 'Other'], output=self.output)
         self.assertEqual(self.session.history, [(0, 0)])
+        self.session.start_match(['Native', 'Other'], games=2, output=self.output, max_placements=3, replace=True)
+        wait(lambda: not self.session.match_worker.is_alive())
+        self.assertEqual(self.session.match['completed'], 2)
 
     def test_simulations_only_adapter_refuses_a_clock_before_start(self):
         self.session.entries['strix:Strix'] = dict(id='strix:Strix', name='Strix', kind='strix',
@@ -968,7 +1304,13 @@ class TurnTrees(unittest.TestCase):
         model = hexnet.load_model(self.path)
         bubble = SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=16), sha256='tiny',
                                  cache=neural_search.EvaluationCache())
-        moves = evaluate(bubble, None, [(0, 0)], 32, 0)['moves']
+        seen = []
+        found = evaluate(bubble, None, [(0, 0)], 32, 0, live=seen.append)
+        moves = found['moves']
+        self.assertTrue(seen and all(len(g['top']) <= 5 and 0 <= g['value'] <= 1 and g['top'][0][2] >= g['top'][-1][2]
+                                     for g in seen))
+        self.assertTrue(found['top'] and all(len(t) == 5 and 0 <= t[3] <= 1 and t[4] in (-1, 0, 1) for t in found['top']))
+        self.assertTrue(all(len(t) == 3 for t in evaluate(bubble, None, [(0, 0)], 0, 0)['top']))
         self.assertEqual(len(self.trees), 1)
         tree = self.trees[0]
         self.assertEqual([h for h, _, _ in tree.searched], [[(0, 0)], [(0, 0), tuple(moves[0])]])
@@ -1012,11 +1354,13 @@ class Registry(unittest.TestCase):
             (models / 'spaced.json').write_text(json.dumps(dict(kind='six', command='six --cpu')))
             with unittest.mock.patch('play.six_backend', return_value=('CPU', ['--cpu'], [])):
                 found = scan(models, None, [], None)
-            self.assertEqual(list(found), ['six:Six gen-0120 · CPU', 'six:Six gen-0100 · CPU', 'six:shrimp',
-                                           'strix:Strix', 'native:Native'])
-            six = found['six:Six gen-0120 · CPU']
-            self.assertEqual((six['command'][1:], six['mirrored']),
-                             (['--net', str(models / 'six/gen-0120.onnx'), '--cpu'], True))
+            self.assertEqual(list(found), ['six:Six · CPU', 'six:shrimp', 'strix:Strix', 'native:Native'])
+            six = found['six:Six · CPU']
+            self.assertEqual((six['label'], six['checkpoints'], found['six:shrimp']['label']),
+                             ('CPU', ['gen-0120', 'gen-0100'], 'shrimp'))
+            self.assertEqual((command_of(six, 'gen-0100')[1:], six['mirrored']),
+                             (['--net', str(models / 'six/gen-0100.onnx'), '--cpu'], True))
+            self.assertEqual(command_of(found['six:shrimp'], None), ['python', 'driver.py'])
             shrimp = found['six:shrimp']
             self.assertEqual((shrimp['command'], shrimp['mirrored']), (['python', 'driver.py'], False))
             self.assertEqual(shrimp['presets']['quick'], dict(nodes=1, args=['--visits', '32']))
@@ -1042,6 +1386,10 @@ class Registry(unittest.TestCase):
             self.assertEqual(list(found), ['bubble:alpha', 'bubble:broken', 'bubble:beta', 'bubble:gamma', 'native:Native'])
             self.assertEqual(found['bubble:alpha']['checkpoints'], ['play/000150', 'main/000200', 'main/000100'])
             self.assertEqual(found['bubble:beta']['checkpoints'], [''])
+            self.assertEqual([found[k]['label'] for k in ('bubble:alpha', 'bubble:broken', 'bubble:gamma')],
+                             ['Bubble', 'broken', 'gamma'])
+            both = scan(None, None, [root / 'elsewhere/net.pt', root / 'runs/alpha'], None)
+            self.assertEqual([e['label'] for e in both.values() if e['kind'] == 'bubble'], ['Bubble', 'alpha'])
             (root / 'models/gamma').mkdir()
             (root / 'models/gamma/ema.pt').write_bytes(b'')
             twins = [k for k in scan(root / 'models', root / 'runs', [], None) if k.startswith('bubble:gamma')]

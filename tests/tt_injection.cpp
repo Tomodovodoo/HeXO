@@ -72,6 +72,38 @@ int main() {
     }
     std::vector<Turn> free_replies;
     assert(!forcing.forced_replies(spare,0,free_replies));
+    // Development losses: an attack hidden below defensive first-stone
+    // rankings, and a winning continuation with no unblocked three-stone line.
+    // Both strategies were checked separately by the raw-board Python verifier.
+    for(const auto& history:std::vector<std::vector<Cell>>{
+        {
+            {0,0},{1,1},{-1,2},{-1,1},{3,-3},{1,-1},{1,0},{1,-3},{2,-3},{4,-3},
+            {0,2},{-2,2},{0,-3},{1,2},{-1,-3},{1,3},{-3,3},{-4,4},{2,1},{-2,4},
+            {-2,3}
+        },
+        {
+            {0,0},{1,0},{0,2},{1,-3},{-1,-1},{-1,2},{0,1},{2,-1},{1,-1},{-2,2},
+            {-3,2},{-4,2},{2,2},{-3,4},{-3,1},{-4,5},{-3,3},{-1,1},{-2,1},{-4,1},
+            {2,1},{-2,-1},{-2,0},{-2,-3},{-2,3},{-4,3},{-1,0},{-6,5},{0,-1},{3,-1},
+            {2,0},{0,-3},{-1,-3},{-3,-3},{3,-3},{-5,5},{-7,5},{-9,5},{-3,5},{-1,3},
+            {0,-2},{0,-4},{0,3},{3,-5},{-3,-2},{2,-4},{0,4},{0,6},{4,-2},{1,-4},
+            {3,-4},{-1,-4},{4,-4},{-1,4},{-2,4},{-4,4},{2,4},{3,0},{4,0},{3,-2},
+            {6,0},{1,-2},{-5,0},{0,-5},{-1,-5},{1,-6},{-1,-2},{4,-5},{4,-3},{2,-5},
+            {4,-6},{3,3},{4,2},{1,5},{7,-1},{6,-5},{-6,6},{-8,8},{7,-6},{-6,4},
+            {-6,7},{-6,2},{-6,8},{-8,6},{-1,-6},{-9,7},{-1,-8},{2,6},{7,-5},{2,5},
+            {8,-5}
+        }
+    }) {
+        Board position;
+        for(auto c:history) {assert(position.legal(c));position.make(c);}
+        const auto key=position.hash();const auto features=position.features;
+        Search continuation(5000,16);
+        auto result=continuation.run(position,12);
+        assert(result.score==mate && !continuation.proof.empty());
+        continuation.proof_deadline=continuation.deadline;
+        assert(continuation.replay(position,int(continuation.proof.size())-1));
+        assert(position.hash()==key && position.features==features && position.history.size()==history.size());
+    }
     // Incremental second-stone ranking must equal a fresh full-board ranking,
     // including cells whose only promising line was just blocked.
     std::mt19937 rng(20261001);
@@ -100,6 +132,20 @@ int main() {
                 assert(cached==fresh);
             };
             check_cache();
+            if(step==10 && trial<4) {
+                auto key=position.hash();auto features=position.features;
+                Search cached_search(10000,4);
+                int cached_value=cached_search.negamax(position,2,-mate-1,mate+1);
+                assert(position.hash()==key && position.features==features);
+                check_cache();
+                position.candidates=nullptr;
+                Search fresh_search(10000,4);
+                int fresh_value=fresh_search.negamax(position,2,-mate-1,mate+1);
+                position.candidates=&cache.cache;
+                assert(cached_value==fresh_value && cached_search.nodes==fresh_search.nodes);
+                assert(position.hash()==key && position.features==features);
+                check_cache();
+            }
             for(auto first:Search::candidates(position,4)) {
                 Restore restore(position);position.make(first);
                 if(position.winner>=0) continue;
@@ -117,6 +163,19 @@ int main() {
                 }
             }
         }
+    }
+    for(int sign:{-1,1}) {
+        Board boundary;
+        for(int i=0;i<12;++i) boundary.make({int64_t(sign)*i*8,0});
+        auto fresh=Search::candidate_scores(boundary);
+        auto by_cell=[](const auto& a,const auto& z){return a.second<z.second;};
+        std::sort(fresh.begin(),fresh.end(),by_cell);
+        CandidateGuard cache(boundary);
+        auto key=boundary.hash();auto features=boundary.features;
+        Search search(10000,4);search.negamax(boundary,2,-mate-1,mate+1);
+        auto cached=Search::candidate_scores(boundary);
+        std::sort(cached.begin(),cached.end(),by_cell);
+        assert(cached==fresh && boundary.hash()==key && boundary.features==features);
     }
     std::cout<<"Native search checks passed\n";
 }

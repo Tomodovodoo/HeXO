@@ -8,8 +8,14 @@ python python/play.py --dense-run runs/bubble --device cpu
 
 Open <http://127.0.0.1:8765>. Either side is a person or an engine, so a person can play Bubble, Bubble can
 play another checkpoint, and two engines play each other live while the page stays usable. Engine work runs on one
-background thread as jobs; the page polls `/state` and every job can be cancelled. Cancelling an engine's move
-pauses the game until Resume.
+background thread as jobs; the page polls `/state` and every job can be cancelled. Cancelling an engine's move,
+an engine failure and an import pause the game: the engine to move shows a pause mark and the play button pulses.
+Placing a stone or pressing play resumes it.
+
+The board fills the page. The top-left card holds both seats; hover it, or click its header, to choose engines,
+checkpoints and strength. New, Undo and Pause sit at the bottom right, the move stepper at the bottom centre. The
+right panel holds the analysis engine, the evaluation bar, the candidate stones (policy share, then the mover's win
+chance after that stone), Import, Copy HTTTX, Review and the move list.
 
 ## Watch a bot match
 
@@ -28,7 +34,8 @@ ends the batch. Position edits and player changes become available again after s
 `python python/bubble.py models --port 8772` lists the same catalogue as the browser picker. Match names are
 case-insensitive catalogue names, exact ids, unique engine kinds, or paths to `.pt` exports. Use
 `dense-v1@main/150000`, `dense-v1@150000` or `dense-v1@champion` for checkpoints. `bubble:150000` also works
-when that step identifies one available Bubble run. Ambiguous names are rejected.
+when that step identifies one available Bubble run. A Six folder's network is its checkpoint: `Six@gen-0455`, the
+newest by default. Ambiguous names are rejected.
 
 A seat combines an engine, preset or custom budget, and a device. For example:
 
@@ -36,7 +43,7 @@ A seat combines an engine, preset or custom budget, and a device. For example:
 python python/bubble.py match "dense-v1@150000{simulations=512,solver_nodes=131072}" "Six@standard" --port 8772 --unique-openings 16 --a-device cpu
 ```
 
-`@quick`, `@standard`, `@strong` and `@deep` use the UI's presets; `--preset` supplies the default for both seats.
+`@lightning`, `@quick`, `@standard`, `@strong`, `@deep` and `@dangerous` use the UI's presets; `--preset` supplies the default for both seats.
 Custom keys are the engine's own: Bubble has `simulations` and `solver_nodes`, Six has `nodes` (positions),
 Strix/Pulsatrix has `simulations`, and Native/Seal has `ms`. Unknown keys are rejected. `--a-device` and
 `--b-device` choose CPU or CUDA for a Bubble seat. Six uses the backend in its catalogue entry.
@@ -84,7 +91,11 @@ null. Complete colour pairs use the evaluator's pentanomial scoring and `dense_p
 relative Elo estimate and 95% interval. These exploratory results stay in the batch directory and do not
 change the training league or its calibrated-opponent scoreboard.
 
-The **Tournaments** button lists saved batches and every completed game's result. Click a game to open it
+The trophy button opens Tournaments. New starts a batch on this board between two engines (A and B, each with
+its checkpoint and strength), for a number of games, from the origin or from narrow, wide or all book openings
+(each played twice with colours swapped), on the seats' fixed budgets, a time per turn or a game clock; an
+unfinished game against a person is cleared first. Results lists saved batches with the score, the Elo of A over B
+with its 95% interval from complete colour pairs, and every completed game's result. Click a game to open it
 in the player's analysis board in another tab, or download its HTTTX. The analysis board has its own CPU
 engine queue, move timeline, analysis controls and Review button, so browsing and analysing a saved game
 do not replace the live tournament board or spend its clock. One analysis board is shared by the player
@@ -120,7 +131,7 @@ curl -X POST http://127.0.0.1:8772/match -H "Content-Type: application/json" -d 
 | `GET /state` | Engines, current board, jobs, match progress and score |
 | `GET /models` | Player catalogue, checkpoints, budgets and clock support |
 | `GET /openings?range=narrow&count=16&seed=0` | Preview the exact selected opening set, read-only |
-| `POST /match` | Start with `players`, `games` or `unique_openings`, `opening_range`, `seed`, and optional `book` or `output` |
+| `POST /match` | Start with `players`, `games` or `unique_openings`, `opening_range`, `seed`, and optional `book`, `output` or `replace` (clear an unfinished game against a person) |
 | `GET /match` | Match specification, score, completed results and paused state |
 | `POST /match` with `{"action":"pause"}`, `resume` or `stop` | Control the current batch |
 | `POST /match` with `{"action":"resume","batch":"path/to/batch"}` | Load and resume a saved batch |
@@ -137,58 +148,88 @@ The API is loopback-only. Each player port holds one visible game; use a separat
 
 ## Engines
 
-The picker lists everything the server finds on start:
+Native always plays. Everything else comes from the models folder: `models/` in the checkout, or the folder given
+with `--models` (the picker shows its path when it holds no models). Put files there, then press the rescan button
+at the bottom of the picker, or restart the server.
 
-- Bubble runs: every directory in `runs/` (or `--runs`) and `models/` (or `--models`) with
-  `checkpoints/<variant>/<step>/ema.pt`, plus `--dense-run`. The champion comes first, then the newest.
-- Bubble exports: any other `.pt` file under `models/`.
-- `models/<name>.json` for a model stored elsewhere: `{"name": "old", "kind": "bubble", "path": "../runs/x"}`.
-- Native, the handwritten engine, always.
-- Seal, when `build/libhexo_seal.dll` (or `.so`) is built with `-DHEXO_SEAL_SOURCE`.
-- Six: a folder in `models/` holding `sixengine.exe` and `gen-NNNN.onnx` networks shows one entry per network,
-  labelled with the backend it runs on: TensorRT, CUDA, DirectML or CPU, the first whose libraries are found.
-  Six seats search by nodes, so a preset plays the same strength on any hardware.
-- Any engine speaking the Six protocol: `models/<name>.json` with `{"name", "kind": "six", "command", "mirrored"}`,
-  `command` a list of arguments.
-  Set `"mirrored": true` for engines in Six's frame, where HTTTX `(q, r)` is `(q + r, -r)`.
-- Strix: `models/<name>.json` with `{"name", "kind": "strix", "model": "model.safetensors"}`.
+| Engine | What goes in the models folder | Picker |
+|---|---|---|
+| Bubble | a run folder with `checkpoints/<variant>/<step>/ema.pt` (champion first), or any `.pt` export, for example `models/old/ema.pt` | the folder or file name; checkpoints in the select |
+| Six | a folder, for example `models/six/`, with `sixengine.exe` (`sixengine` on Linux) and `gen-NNNN.onnx` networks | Six with its backend; networks in the select, newest first |
+| Strix | `strix.json` and the model file beside it | the JSON's name |
+| Shrimp, or any engine speaking the Six protocol | `shrimp.json` | the JSON's name |
 
-Engines you build or download yourself:
+The run given with `--dense-run` or `--model` is shown as Bubble; `runs/` (or `--runs`) adds every other run under
+its folder name. Seal appears when `build/libhexo_seal.dll` (or `.so`) is built with `-DHEXO_SEAL_SOURCE`.
+
+A JSON entry names one engine, with paths relative to the JSON file:
+
+```json
+{"name": "Strix", "kind": "strix", "model": "strix.safetensors"}
+{"name": "old", "kind": "bubble", "path": "../runs/old"}
+{"name": "Shrimp", "kind": "six", "mirrored": true,
+ "command": ["six-checkout/rivals/shrimp/.venv/Scripts/python.exe", "six-checkout/arena/drivers/shrimp_driver.py"],
+ "presets": {"quick": {"nodes": 1, "args": ["--visits", "32"]}, "deep": {"nodes": 1, "args": ["--visits", "800"]}}}
+```
+
+`command` is a list of arguments. `"mirrored": true` is for engines in Six's frame, where HTTTX `(q, r)` is
+`(q + r, -r)`. `presets` overrides a preset's budget; `args` are extra arguments for engines whose strength is set
+at launch.
+
+Getting the files:
 
 - Six: the release zip and a network from github.com/CixMango/Six releases, unpacked into `models/six/`. The
-  release's engine is the DirectML build, which ships `DirectML.dll` next to `sixengine.exe`.
-- Six on CUDA: Six's engine built against ONNX Runtime's GPU package, with that package's DLLs (among them
-  `onnxruntime_providers_cuda.dll`) beside `sixengine.exe`, and `cudart64_12.dll` and `cudnn64_9.dll` (CUDA 12,
-  cuDNN 9) on PATH or beside it; an installed PyTorch with CUDA also has them, and its `torch/lib` is added to the
-  engine's PATH.
-- Six on TensorRT: `onnxruntime_providers_tensorrt.dll` beside the engine and `nvinfer_10.dll` as well, for example
-  from `pip install tensorrt` (its `tensorrt_libs` is added too). The first game builds the TensorRT plan beside the
-  network, which takes a few minutes.
-- Strix: `python tools/build_strix_learned.py <hexo-strix checkout>` (Rust and MinGW), and the public model
-  from `https://hexo.tyto.cc/model.safetensors` next to the JSON.
-- Mantis Shrimp: build Cmiller132/hexo-bot with its `scripts/build_native.sh` into a Six checkout's `rivals/shrimp`,
-  then point a mirrored `six` entry at Six's `arena/drivers/shrimp_driver.py`, run by that build's Python. Its
-  strength is `--visits`, so give each preset its own `args`, for example
-  `"presets": {"quick": {"nodes": 1, "args": ["--visits", "32"]}}`.
+  release's engine is the DirectML build, which ships `DirectML.dll` next to `sixengine.exe`. A CUDA build needs ONNX
+  Runtime's GPU DLLs (among them `onnxruntime_providers_cuda.dll`) beside `sixengine.exe`, and `cudart64_12.dll` and
+  `cudnn64_9.dll` on PATH, beside it, or in an installed PyTorch's `torch/lib`. TensorRT adds
+  `onnxruntime_providers_tensorrt.dll` beside the engine and `nvinfer_10.dll`, for example from `pip install tensorrt`;
+  the first game builds the plan beside the network, which takes a few minutes. A running Six keeps its process
+across presets; choosing another network starts one for it, and the two most recently used networks stay running. The fastest backend whose libraries
+  are found wins: TensorRT, CUDA, DirectML, CPU. Six searches by nodes, so a preset plays the same on any hardware.
+- Strix: `python tools/build_strix_learned.py <hexo-strix checkout>` (Rust and MinGW) builds the engine into
+  `tools/strix_learned/target/release`; the public model is `https://hexo.tyto.cc/model.safetensors`.
+- Shrimp: clone CixMango/Six into `models/six-checkout` and build Cmiller132/hexo-bot with its
+  `scripts/build_native.sh` into its `rivals/shrimp`; the entry above runs Six's Shrimp driver with that build's
+  Python. Engines run in the models folder, so relative arguments resolve there.
 - Seal: build with `-DHEXO_SEAL_SOURCE=<HexTicTacToe checkout>`.
+
+Strength is a slider from Faster to Smarter with six stops: a spark, an open hexagon, a filled one, one in a ring, a
+stack and the hazard sign; arrow keys move it one stop. The sliders button beside it opens the custom budget.
+
+When both seats are engines and the run has an opening book (`openings.json` in `--dense-run`, or `--book`), the
+seats card offers Opening book: New then starts from a random in-policy book opening in a random orientation, shown
+as played stones.
 
 | Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms | Six protocol nodes | Strix simulations |
 |---|---|---|---|---|---|
-| Quick (Q) | 32 | 2,048 | 250 and 100 | 6,000 | 8 |
-| Standard (S) | 128 | 32,768 | 1,000 and 500 | 30,000 | 64 |
-| Strong (St) | 512 | 131,072 | 3,000 and 2,000 | 135,000 | 128 |
-| Deep (D) | 2,048 | 524,288 | 10,000 and 8,000 | 500,000 | 512 |
+| Lightning | 8 | 2,048 | 100 and 50 | 1,500 | 2 |
+| Quick | 32 | 2,048 | 250 and 100 | 6,000 | 8 |
+| Standard | 128 | 32,768 | 1,000 and 500 | 30,000 | 64 |
+| Strong | 512 | 131,072 | 3,000 and 2,000 | 135,000 | 128 |
+| Deep | 2,048 | 524,288 | 10,000 and 8,000 | 500,000 | 512 |
+| Dangerous | 65,536 | 4,000,000 | 60,000 and 30,000 | 2,000,000 | 4,096 |
 
-On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at these presets. Custom
-(`⋯`) takes any simulations from 0 (raw policy) to 16,384, solver nodes up to 1,500,000 (0 turns the solver off; the solver gets up to a minute)
-and 10 to 120,000 ms.
+On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at Quick to Deep;
+Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows a progress line (a moving one when
+the engine reports no progress) and its cancel button. The custom budget shows the engine's own fields: Search
+(simulations, 0 plays the raw policy, up to 65,536) and Solver (nodes, 0 turns it off, up to 4,000,000; the solver
+gets up to a minute) for Bubble, Positions for Six, Search for Strix, and 10 to 120,000 ms for Native and Seal.
 
 ## Analysis and review
 
-The analysis engine is a Bubble checkpoint with its own preset. With Auto on it evaluates every position where a
-turn starts, plus any position you step to. Engine moves by the same checkpoint count as evaluations, so a game
-against Bubble costs nothing extra on Bubble's turns. Review evaluates whatever is missing and labels each turn
-from the mover's win probability before and after it:
+The analysis engine is a Bubble checkpoint with its own preset. Analysis and review run on their own worker and
+model, beside the one that plays engine moves, so they keep up during play. With Auto on it evaluates every
+position where a turn starts, plus any position you step to; while an engine seat plays it also deepens the current
+position through every preset, Lightning first, showing each as it lands and starting again when the position
+changes. That deepening runs last in the queue, gives way to any other analysis and slows down while an engine
+seat searches. A position without a saved evaluation shows the search of the engine or analysis working on it as
+it goes. The slider rings the stop of the evaluation shown. Engine moves by the same checkpoint count as
+evaluations, so a game against Bubble costs nothing extra on Bubble's turns.
+
+Review always evaluates at Standard (128 simulations per stone, 32,768 solver nodes), whatever the slider says,
+and labels each turn only from evaluations at exactly that budget, so a verdict never compares a deep evaluation
+with a shallow one; the Review button carries the Standard mark. It labels each turn from the mover's win
+probability before and after it:
 
 | Label | Meaning |
 |---|---|
@@ -205,7 +246,33 @@ from the mover's win probability before and after it:
 
 For inaccuracies and worse the board outlines the engine's turn and the panel lists its line. Keys: ← and →
 step one stone, ↑ and ↓ one turn, Home and End, F fits the board. Retry plays on from the shown position.
-Import takes HTTTX or a game file; Copy HTTTX, Game file and Evaluations export.
+Changing the analysis engine, checkpoint or strength evaluates the shown position again at once.
+
+Each cell has fixed places for its marks, so none hides another: a candidate or line stone fills the cell with its
+rank in the middle, a threat is a badge at the lower left, a review glyph a badge at the upper right, the last stone
+a dot, and the hovered cell a ring. Candidate rows carry the same threat badge.
+
+Import reads whatever is pasted:
+
+| Pasted | Read as |
+|---|---|
+| `version[1]; 1. [1,0][2,0];` | HTTTX, or a replay file or JSON list of `[q, r]` |
+| `x, d @(0, 0) o A0 A1 x B2 B3` | Rectilinear notation (MineKing9534/HeXO): drawn stones, then BKE turns |
+| `https://hexo.tyto.cc/analysis#c=BAE` | a Tyto analysis link, decoded on the spot |
+| `https://hexo.tyto.cc/#g=<id>` | a Tyto game, from the site's `POST /game_htttx` |
+| `https://hexo.did.science/games/<id>`, `/account/games/<id>`, `/sandbox/<id>` | a finished game or saved sandbox position, from `/api/finished-games/<id>` or `/api/sandbox-positions/<id>` |
+| `https://hexo.mineking.dev/games/<id>`, `/sandbox/<id>` | the same, from the API mirror under `/proxy/api` |
+
+The server does the fetching, without accounts or tokens. These sites draw HTTTX's `(q, r)` at `(q + r, -r)`; the
+first stone moves to the origin, and in Rectilinear notation the player who moved first becomes cross. Drawn stones
+must form complete turns; a drawing has no move order, so the importer looks for one that plays them legally.
+
+Above the move list sit Import, one chip per format (HTTTX, Rectilinear, Tyto link: a click copies the shown
+position, the arrow opens its text below the row), Game (downloads the replay file) and Review. Hovering a stone's
+token in the text rings that cell on the board, and hovering a stone on the board marks its tokens. In the move
+list the stone of the shown position is outlined within its turn and the later one dimmed; hovering a stone rings
+it on the board. `GET /export?format=htttx|rectilinear|tyto&ply=N`
+returns the same text with each stone's span.
 
 ## Saved evaluations
 
@@ -241,7 +308,7 @@ Shrimp's play deck from its repository, and the official HeXO client for the sto
 | Value graph | timeline with label dots | win-chance graph | per-ply trace charts | list of saved win chances | graph with label marks, click to jump |
 | Stepping | timeline, arrows | arrows, Home, End | arrows, Shift for 10, Home, End | none, undo only | arrows, Home, End, click on list or graph |
 | Retry from here | play any empty hex in analysis | yes | no | no | yes |
-| Import | HTTTX, sandbox link | HTTTX, HeXO links, position string, replay file | none | none | HTTTX, replay file |
+| Import | HTTTX, sandbox link | HTTTX, HeXO links, position string, replay file | none | none | HTTTX, replay file, HeXO game and sandbox links |
 | Export | HTTTX | HTTTX, position string, replay file | none | HTTTX | HTTTX, replay file |
 | Saved evaluations | none across visits | none across visits | none | JSON file, whole file rewritten on each save | append-only JSON lines per run, indexed in memory by position and settings, deepest shown |
 | 1366x768 | panel covers part of the board, nested scrolling | board shrinks to a strip, page scrolls | three fixed columns | sidebar scrolls | fixed three-column grid, no page scroll |

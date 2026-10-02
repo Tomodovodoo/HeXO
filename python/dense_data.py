@@ -784,13 +784,13 @@ class ReplayWindow:
         return self.regret_distribution(recency)[self.regret_positions]
 
     def regret_count(self, batch_size, fraction, recency=0.):
-        """Number of priority draws allowed by the fourfold per-row probability cap."""
+        """Expected priority draws allowed by the fourfold per-row probability cap, including fractions."""
         if not fraction or not self.regret_rows:
             return 0
         W, K = len(self.index), self.regret_rows
         baseline = self.regret_baseline(recency).sum()
         limit = 1. if K == W or baseline == 1 else max(0., min(1., (4*K/W-baseline)/(1-baseline)))
-        return min(batch_size, int(batch_size*min(fraction, limit)+1e-12))
+        return batch_size*min(1., fraction, limit)
 
     def regret_share(self, batch_size, fraction, recency=0.):
         return self.regret_count(batch_size, fraction, recency)/batch_size
@@ -851,7 +851,8 @@ class ReplayWindow:
 
     def sample(self, rng, n, recency=0., validation=False, regret_fraction=0.):
         """n Refs drawn with replacement from the training (or validation) index; the k-th oldest of
-        W rows has weight ((k+1)/W)^recency."""
+        W rows has weight ((k+1)/W)^recency. Priority counts are stochastic, with the capped expected share,
+        so fewer than one expected priority draw per batch still samples regret rows."""
         index = self.validation if validation else self.index
         W = len(index)
         if not W:
@@ -862,9 +863,9 @@ class ReplayWindow:
             picks = rng.choice(W, n, p=p)
         else:
             picks = rng.integers(W, size=n)
-        priority = 0 if validation else self.regret_count(n, regret_fraction, recency)
+        share = 0. if validation else self.regret_share(n, regret_fraction, recency)
+        priority = rng.binomial(n, share) if share else 0
         if priority:
-            share = priority/n
             picks[:priority] = rng.choice(self.regret_positions, priority, p=self.regret_probabilities(share, recency))
         return [self.ref(*index[k]) for k in picks]
 
@@ -1126,6 +1127,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         policy is empty. Losing rows and rows without a witness keep their original policy. With
         pair_policy_weight > 0, a first stone whose search policy and second stone's search policy both exist
         first takes pair_policy(policy, ..., pair_policy_weight);
+      paired: whether that step mixed second-stone mass into the policy (not collated);
       value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam, calibration) at the ply;
         weight 1 for finished games, `bootstrap_weight` for capped games with root values, 0 otherwise, times
         `cheap_value_weight` for cheap-search rows; a row with a nonzero `proven` instead gets the proven value
@@ -1173,8 +1175,10 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
             if len(next_actions) != len(next_policy) or legal_digest(next_actions) != nref.row['legal_sha256']:
                 raise ValueError(f'Next-ply legal list disagrees with row: {nref.shard}/{nref.index}')
         policy_weight = float(len(policy) > 0)
+        paired = False
         if pair_policy_weight > 0 and s.remaining == 2 and len(policy) and len(next_policy):
-            policy = pair_policy(policy, s.actions, next_actions, next_policy, pair_policy_weight)
+            mixed = pair_policy(policy, s.actions, next_actions, next_policy, pair_policy_weight)
+            paired, policy = mixed is not policy, mixed
         if (proof_policy_weight > 0 and proven > 0 and ref.row.get('proof_action')
                 and (not proof_policy_missing_only or not len(policy))):
             action = np.asarray(ref.row['proof_action'], np.int64).reshape(-1, 2)
@@ -1221,7 +1225,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
             if p.sum() > 0:
                 following = (cells, p/p.sum(), 1.)
         samples.append(s)
-        out.append(dict(policy=policy, policy_weight=policy_weight,
+        out.append(dict(policy=policy, policy_weight=policy_weight, paired=paired,
                         value=float(fixed > 0) if fixed else .5 if values[t] is None else values[t],
                         value_weight=proven_weight if fixed else value_weight,
                         outcome=float(me == e['winner']) if e['winner'] >= 0 else .5,
