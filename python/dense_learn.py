@@ -474,16 +474,22 @@ def head_losses(model, batch, device, memory_format):
 
 def batch_losses(model, batch, coefficients, device, memory_format, train):
     """Head losses [len(HEADS)] of a collated {S: bucket} batch; with `train`, backpropagates the combined loss
-    bucket by bucket (each bucket's head mean scaled by its share of that head's batch weight)."""
+    bucket by bucket (each bucket's head mean scaled by its share of that head's batch weight).
+    CUDA transfers use pinned host tensors and keep only the current padded bucket on device."""
     totals = torch.stack([sum(b[k].sum() for b in batch.values()) for k in WEIGHTS]).to(device).clamp_min(1e-8)
     logged = torch.zeros(len(HEADS), device=device)
     for bucket in batch.values():
+        bucket = pad(bucket, QUANTUM)
+        if device.type == 'cuda':
+            bucket = {k: (v.pin_memory() if v.device.type == 'cpu' else v).to(device, non_blocking=True)
+                      for k, v in bucket.items()}
         with torch.set_grad_enabled(train):
-            losses, weights = head_losses(model, pad(bucket, QUANTUM), device, memory_format)
+            losses, weights = head_losses(model, bucket, device, memory_format)
             share = losses*weights/totals
             if train:
                 (share*coefficients).sum().backward()
         logged += share.detach()
+        del bucket
     return logged
 
 

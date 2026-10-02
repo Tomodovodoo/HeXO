@@ -24,6 +24,48 @@ the existing root proof time budget, and retained proof storage stays capped at
 No weights, model, external solver or new dependency is required.
 The optional NNUE search keeps its existing candidate evaluation.
 
+## Optional GCC profile build
+
+The default build remains portable. `HEXO_NATIVE_CPU=ON` targets the build
+machine's x86 CPU, and `HEXO_NATIVE_PGO` enables GCC's two-stage profile build.
+These options apply only to `hexo`. Profiling counts executed code paths; it
+does not fit an evaluator or add anything to the search's runtime storage.
+
+Use a separate build directory and keep the source, compiler, CPU option and
+build directory unchanged between the two stages. For example, in PowerShell
+with GCC and CMake on `PATH`, starting with an ordinary `build/libhexo.dll`:
+
+```powershell
+cmake -S . -B build/native-fast -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DHEXO_NATIVE_CPU=ON -DHEXO_NATIVE_PGO=GENERATE
+cmake --build build/native-fast --target hexo --parallel 2
+$env:HEXO_NATIVE_DIR = (Resolve-Path build/native-fast).Path
+$env:PYTHONPATH = "python;."
+python -m tests.benchmark --compare-library build/libhexo.dll --positions 58 --repeats 1 --depth 5 --ms 200 --output artifacts/native-profile-workload.json
+cmake -S . -B build/native-fast -DHEXO_NATIVE_PGO=USE
+cmake --build build/native-fast --target hexo --parallel 2
+```
+
+Let the workload process exit normally so GCC writes its `.gcda` files. The
+default profile directory is `build/native-fast/native-profile`; override it
+with `HEXO_NATIVE_PROFILE_DIR`. The optimized build rejects missing profiles;
+GCC also rejects profiles whose control flow no longer matches the source.
+Collect new profiles after changing the source or compiler options. On other
+GCC platforms, use the local CMake generator and library filename.
+
+`HEXO_NATIVE_DIR` then selects this build for the player, API client or benchmark.
+A CPU-tuned library requires a compatible CPU. GCC 15.2 on Windows is built
+with a 128-bit vector preference because unrestricted host tuning produced a
+misaligned stack store during Native's prover in our tests.
+
+On a Ryzen 9 5900X with GCC 15.2, a profile from 58 real game positions made
+16 separate fixed-depth searches **1.33 times as fast**, with identical moves,
+scores, depths and node counts. At 100 ms per turn, the resulting Native scored
+**86 wins, 41 losses and one capped game against Seal** across 64 new openings
+with swapped colours: 67.6%, paired 95% interval 55.4–77.8%. The ordinary build
+scored 79–49 on the same openings, interleaved with the optimized build. This
+establishes a win over Seal in that test; the smaller difference between Native
+builds is not conclusive. Workload profiles and CPU load affect the gain.
+
 ## Play on HeXO Arena
 
 Native can play through the [HeXO Bot API](https://github.com/TimmyBurn2/Hexo-Bot-Api).
