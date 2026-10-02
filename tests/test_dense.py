@@ -5303,6 +5303,11 @@ class EvaluatorLoopTests(unittest.TestCase):
         argv = ['compare_search_modes.py', '--run', str(self.run), '--checkpoint', 'main/000010',
                 '--opponent', 'main/000020', '--panel', str(panel), '--out', str(output),
                 '--games', '2', '--sims', '2', '--root-samples', '2', '--max-plies', '8', '--device', 'cpu']
+        panel.write_text(json.dumps(dict(cases=[dict(history=[[i, 0] for i in range(8)])])))
+        with unittest.mock.patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'shorter than max_plies'):
+            compare_search_modes.main()
+        self.assertFalse(output.exists())
+        panel.write_text(json.dumps(dict(cases=[dict(history=[[0, 0]])])))
         with unittest.mock.patch.object(sys, 'argv', argv), unittest.mock.patch('builtins.print'), \
                 unittest.mock.patch.object(compare_search_modes.Evaluator, 'evaluate', evaluate):
             compare_search_modes.main()
