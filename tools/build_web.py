@@ -1,12 +1,14 @@
 """Build the browser engine bundle in web/engine.
 
 wasm   src/gumbel.cpp -> gumbel.mjs + gumbel.wasm and src/hexo.cpp -> native/native.mjs + native/native.wasm (em++ on
-       PATH, or --emxx), tools/tactical -> tactical.wasm (cargo with the wasm32-wasip1 target), tools/six ->
-       six/six.mjs + six/six.wasm (Six's network search, built as Six builds it for its site); build.json binds them
-       to their sources (committed).
+       PATH, or --emxx), tools/tactical -> tactical.wasm and tools/shrimp_web -> shrimp/shrimp.wasm (cargo with the
+       wasm32-wasip1 target), tools/six -> six/six.mjs + six/six.wasm (Six's network search, built as Six builds it
+       for its site); build.json binds them to their sources (committed).
 ort    onnxruntime-web from the npm registry, checked against its published integrity, into ort/ (ignored).
 model  --checkpoint ema.pt, or --release TAG (or 'latest') from the GitHub releases, exported by export_web into
        model/ (ignored).
+shrimp Shrimp's main_7 weights, --shrimp-weights or downloaded from hexo-bot at their pinned SHA-256, exported by
+       tools/shrimp_web/export.py into shrimp/model/ (ignored).
 six    Six's networks (CixMango/Six, MIT): the pinned release's from its archive (or --six-archive, that file saved
        locally), older generations from its 'networks' release, each checked against its pinned SHA-256 and rewritten
        for WebGPU, into six/networks/ (ignored).
@@ -14,6 +16,7 @@ six    Six's networks (CixMango/Six, MIT): the pinned release's from its archive
 import argparse
 import base64
 import hashlib
+import importlib.util
 import io
 import json
 from pathlib import Path
@@ -28,6 +31,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT/'web'/'engine'
 TACTICAL = ROOT/'tools'/'tactical'
+SHRIMP = ROOT/'tools'/'shrimp_web'
 SIX = ROOT/'tools'/'six'
 ORT_VERSION = '1.30.0'
 ORT_INTEGRITY = 'sha512-q0y+JrrtukXSzsBWEMccVfqX25LRmosXHF+CaRJmg8pZClzcV7svNc4rKY3jL02Vb7QmRMDs1SigqR4CXAfKYQ=='
@@ -41,8 +45,8 @@ NATIVE_EXPORTS = ('malloc', 'free', 'hx_new', 'hx_free', 'hx_play', 'hx_winner',
 WASM_FLAGS = ['-std=c++20', '-O3', '-fwasm-exceptions', '-msimd128', '-sMODULARIZE', '-sEXPORT_ES6',
                 '-sENVIRONMENT=web,worker,node', '-sALLOW_MEMORY_GROWTH', '-sMAXIMUM_MEMORY=4GB', '-sFILESYSTEM=0',
                 '-sEXPORTED_RUNTIME_METHODS=HEAP32,HEAPF64,HEAPU8,UTF8ToString']
-ARTEFACTS = ('gumbel.mjs', 'gumbel.wasm', 'tactical.wasm', 'native/native.mjs', 'native/native.wasm', 'six/six.mjs',
-             'six/six.wasm')
+ARTEFACTS = ('gumbel.mjs', 'gumbel.wasm', 'tactical.wasm', 'native/native.mjs', 'native/native.wasm', 'shrimp/shrimp.wasm',
+             'six/six.mjs', 'six/six.wasm')
 SIX_RELEASE = 'v1.3.3'
 SIX_ARCHIVE = ('Six-1.3.3-macos-arm64.zip', '167b4ce038844377bb704c24b9470abe4c4016389e0d15290b975574114d4f69')
 SIX_NETWORKS = {'gen-0455': 'a934a8b171cd9a715fcd54ffc3e192c24901f0a7d40caa4216ea9fbc0b074687',
@@ -68,6 +72,8 @@ def sources():
     """{relative path: sha256} of every source the wasm artefacts are built from."""
     paths = [ROOT/'src'/name for name in ('gumbel.cpp', 'hexo.cpp', 'hexo.hpp', 'nnue.hpp')]
     paths += sorted(p for p in TACTICAL.rglob('*') if p.suffix in ('.rs', '.toml', '.lock') and 'target' not in p.parts)
+    paths += sorted(p for p in SHRIMP.rglob('*') if (p.suffix in ('.rs', '.lock') or p.name == 'Cargo.toml')
+                    and 'target' not in p.parts)
     paths += sorted(p for p in SIX.rglob('*') if p.suffix in ('.cpp', '.hpp'))
     return {p.relative_to(ROOT).as_posix(): digest(p) for p in paths}
 
@@ -86,6 +92,10 @@ def build_wasm(emxx, cargo):
                     '--manifest-path', str(TACTICAL/'Cargo.toml'), '--target-dir', target]
         subprocess.run(tactical, check=True)
         shutil.copyfile(Path(target)/'wasm32-wasip1'/'release'/'hexo_tactical.wasm', ENGINE/'tactical.wasm')
+        shrimp = [cargo, 'build', '--release', '--locked', '--lib', '--target', 'wasm32-wasip1',
+                  '--manifest-path', str(SHRIMP/'Cargo.toml'), '--target-dir', target]
+        subprocess.run(shrimp, check=True)
+        shutil.copyfile(Path(target)/'wasm32-wasip1'/'release'/'shrimp_web.wasm', ENGINE/'shrimp'/'shrimp.wasm')
     if sources() != before:
         raise ValueError('Sources changed during the build')
     tools = dict(emxx=subprocess.check_output([emxx, '--version'], text=True).splitlines()[0],
@@ -204,13 +214,26 @@ def build_model(checkpoint, release):
         export_web.export(checkpoint, ENGINE/'model')
 
 
+def build_shrimp(weights):
+    """Export Shrimp's network into shrimp/model/ from `weights`, or from the pinned download when None."""
+    spec = importlib.util.spec_from_file_location('shrimp_export', SHRIMP/'export.py')
+    export = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(export)
+    with tempfile.TemporaryDirectory() as folder:
+        if weights is None:
+            weights = Path(folder)/'shrimp_main7_infer.pt'
+            weights.write_bytes(fetch(export.WEIGHTS['url']))
+        export.export(weights, ENGINE/'shrimp'/'model')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('parts', nargs='+', choices=('wasm', 'ort', 'model', 'six'))
+    parser.add_argument('parts', nargs='+', choices=('wasm', 'ort', 'model', 'shrimp', 'six'))
     parser.add_argument('--emxx', default=shutil.which('em++') or 'em++')
     parser.add_argument('--cargo', default='cargo')
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--release', default='latest')
+    parser.add_argument('--shrimp-weights', type=Path)
     parser.add_argument('--six-archive', type=Path)
     args = parser.parse_args()
     if 'wasm' in args.parts:
@@ -219,6 +242,8 @@ def main():
         build_ort()
     if 'model' in args.parts:
         build_model(args.checkpoint, args.release)
+    if 'shrimp' in args.parts:
+        build_shrimp(args.shrimp_weights)
     if 'six' in args.parts:
         build_six(args.six_archive)
 

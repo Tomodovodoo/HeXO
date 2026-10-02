@@ -28,7 +28,7 @@ jobs:
       - run: gh release download --repo "$GITHUB_REPOSITORY" --pattern ema.pt --dir "$RUNNER_TEMP/release"
         env:
           GH_TOKEN: ${{ github.token }}
-      - run: python tools/build_web.py ort model six --checkpoint "$RUNNER_TEMP/release/ema.pt"
+      - run: python tools/build_web.py ort model shrimp six --checkpoint "$RUNNER_TEMP/release/ema.pt"
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
         with:
