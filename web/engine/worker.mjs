@@ -183,6 +183,7 @@ onmessage = async ({data}) => {
     else if (data.type === 'evaluate') {
       const leaves = data.histories.map(history => ({history, actions: native.legal(history)}));
       const predictions = await network.evaluate(leaves);
+      if (cancelled.has(data.id)) throw new Cancelled();
       postMessage({type: 'result', id: data.id, result: predictions.map((p, i) => ({actions: leaves[i].actions, logits: Array.from(p.logits), q: Array.from(p.q)}))});
     }
     else if (data.type === 'search') {

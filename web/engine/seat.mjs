@@ -99,8 +99,11 @@ async function run(key, task) {
       posting = true;
       try {
         for (const [q, r] of result.moves) {
-          if (state().paused || config.seats[task.side] !== task.preset || hk(state().history) !== hk(task.history)
-              || !(await original.post('/play', {q, r}))) break;
+          if (state().paused || config.seats[task.side] !== task.preset || hk(state().history) !== hk(task.history)) break;
+          if (!(await original.post('/play', {q, r}))) {
+            failed = key;
+            break;
+          }
           task.history.push([q, r]);
         }
       } finally {
