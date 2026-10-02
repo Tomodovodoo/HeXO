@@ -65,6 +65,7 @@ def from_position(game, opening):
         for tree in game.trees.values():
             tree.advance((q, r))
         game.moves.append([q, r])
+        game.network_values.append(None)
     game.random_plies = 0
     return game
 
@@ -566,7 +567,7 @@ class Adjudication(unittest.TestCase):
         base = [tuple(m) for m in FIXTURE['positions']['1790600287230040:25:213']]
         result = NativeTactics().history(base, nodes=5000)
         self.assertTrue(result['native_verified'])
-        s = settings(proven_line_rows=True, max_plies=len(base)+40)
+        s = settings(full_fraction=1., adjudicate_proven=True, proven_line_rows=True, max_plies=len(base)+40)
         proof = Proof(base, result['certificate'])
         first = [tuple(c) for c in result['moves']]
         _, _, node, _ = proof.walk(base+first)
@@ -577,11 +578,18 @@ class Adjudication(unittest.TestCase):
         for seed in [*range(12), 3]:
             game = from_position(dense_selfplay.SelfPlayGame([model, model], s, seed), base)
             try:
+                actions = hexcrop.legal_array(game.game, np.asarray(base, np.int64))
+                policy = (actions == np.asarray(first[0])).all(1).astype(np.float32)
+                search = dict(action=list(first[0]), actions=actions, policy=policy, completed=0,
+                              exact_winner=winner, proven=1, proof_turns=result['proof_turns'],
+                              proof_plies=dense_solver.proof_plies(2, result['proof_turns']),
+                              proof_action=[list(a) for a in first], proof=proof, solver_nodes=0, solver_budget=0)
                 with mock.patch.object(model.evaluator, 'evaluate', side_effect=AssertionError('No neural search needed')):
                     with mock.patch.object(dense_selfplay, 'independent_verify', wraps=dense_selfplay.independent_verify) as verifier:
-                        game.adjudicate(winner, proof)
+                        self.assertFalse(game.searched(search))
                     checked += verifier.call_count
                 self.assertEqual(game.game.winner, winner)
+                np.testing.assert_array_equal(game.rows[0]['policy'], policy)
                 orders.add(tuple(map(tuple, game.moves[len(base):len(base)+len(first)])))
                 offset = len(base)+len(first)
                 reply = tuple(sorted(map(tuple, game.moves[offset:offset+2])))
@@ -589,7 +597,8 @@ class Adjudication(unittest.TestCase):
                 replies.add(reply)
                 for row in game.rows:
                     self.assertEqual(row['proven'], 1 if row['player'] == winner else -1)
-                    self.assertIsNone(row['policy'])
+                    if row.get('line'):
+                        self.assertIsNone(row['policy'])
                     if row['player'] == winner:
                         self.assertIn(game.moves[row['ply']], row['proof_action'])
                         varied_actions += row['proof_action'] != proof.action(game.moves[:row['ply']])
