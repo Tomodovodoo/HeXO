@@ -15,6 +15,7 @@ dynamic = ["optional-dependencies"]
 package-dir = {"" = "python", "tools" = "tools", "tests" = "tests"}
 packages = ["legacy", "tools", "tests"]
 py-modules = [
+  "arena_bot",
   "bot_api",
   "bubble",
   "dashboard",

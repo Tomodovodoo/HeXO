@@ -702,5 +702,72 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
                 await client.close()
 
 
+@unittest.skipUnless(importlib.util.find_spec('aiohttp'), 'API extra not installed')
+class ArenaNative(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmed_turns_replay_without_duplicating_our_move(self):
+        from arena_bot import answer
+        first = dict(type='move_request', side='o', previous=[], request_id=17, move_time_limit=5)
+        history, response, _ = answer([[0, 0]], first, 20, 8, 1)
+        self.assertEqual(history, [[0, 0]])
+        self.assertEqual(response['request_id'], 17)
+        own = response['move']['pieces']
+        game = Game([(0, 0), *[(p['q'], p['r']) for p in own]])
+        try:
+            opponent = game.search(ms=20, depth=1, width=8)['moves']
+        finally:
+            game.close()
+        packet = dict(first, request_id=18, previous=[dict(side='o', pieces=own),
+                      dict(side='x', pieces=[dict(q=q, r=r) for q, r in opponent])])
+        confirmed, reply, _ = answer(history, packet, 20, 8, 1)
+        self.assertEqual(confirmed, [[0, 0], *[[p['q'], p['r']] for p in own], *map(list, opponent)])
+        self.assertEqual(reply['request_id'], 18)
+        self.assertEqual(answer([[0, 0]], packet, 20, 8, 1)[:2], (confirmed, reply))
+
+    async def test_first_stone_win_and_allowance(self):
+        from arena_bot import answer
+        history = interleave([[(q, 0) for q in range(6)], [(2*q, 6) for q in range(6)]])[:-1]
+        packet = dict(side='x', previous=[], request_id=3, move_time_limit=.2)
+        with patch.object(Game, 'search', autospec=True, side_effect=Game.search) as search:
+            confirmed, reply, _ = answer(history, packet, 100, 8, 2)
+        self.assertEqual(confirmed, list(map(list, history)))
+        self.assertEqual(len(reply['move']['pieces']), 1)
+        self.assertEqual(search.call_args.kwargs['ms'], 50)
+
+    async def test_socket_uses_game_token_and_plays_native(self):
+        import aiohttp
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        from arena_bot import NativeArena
+        received = []
+
+        async def session(request):
+            self.assertNotIn('Authorization', request.headers)
+            self.assertEqual(request.query['token'], 'game-only')
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            await ws.send_json(dict(type='setup', board=dict(cells=[dict(q=0, r=0, p='x')])))
+            await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=9,
+                                    move_time_limit=5))
+            received.append(await ws.receive_json(timeout=3))
+            await ws.close()
+            return ws
+
+        app = web.Application()
+        app.router.add_get('/engine', session)
+        async with TestServer(app) as server, aiohttp.ClientSession() as client:
+            bot = NativeArena(str(server.make_url('/')), 'private-bot-token', ms=20, width=8, depth=1)
+            bot.http = client
+            await asyncio.wait_for(bot.play(dict(gameId='local', engine=dict(socketUrl='/engine',
+                                                                            token='game-only'))), 5)
+        self.assertEqual(received[0]['request_id'], 9)
+        game = Game([(0, 0)])
+        try:
+            for p in received[0]['move']['pieces']:
+                game.play(p['q'], p['r'])
+            self.assertEqual(game.player, 0)
+        finally:
+            game.close()
+
+
 if __name__ == '__main__':
     unittest.main()

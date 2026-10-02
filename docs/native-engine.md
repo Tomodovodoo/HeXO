@@ -20,6 +20,26 @@ the existing root proof time budget, and retained proof storage stays capped at
 No weights, model, external solver or new dependency is required.
 The optional NNUE search keeps its existing candidate evaluation.
 
+## Play on HeXO Arena
+
+Native can play through the [HeXO Bot API](https://github.com/TimmyBurn2/Hexo-Bot-Api).
+The engine runs on your computer; the site hosts the games and their live boards.
+Build Native as above and install the existing API extra with
+`python -m pip install -e ".[api]"`, then run:
+
+```sh
+python python/arena_bot.py https://hexo.seeligto.de --ms 100
+```
+
+Enter the bot token at the hidden prompt, or supply it in `HEXO_TOKEN`.
+The client declares its supported clocks, opens its presence stream, accepts
+challenges and plays games started from its bot page. It uses CPU only, with
+100 ms per complete turn by default, leaving time for transport when the server
+supplies a smaller allowance. `--width` and `--depth` set Native's search limits.
+Each game's worker retains Native's proven continuations. Keep the client running
+to stay online; Ctrl+C disconnects it. `HEXO_NATIVE_DIR` selects a particular build.
+The client prints game IDs and results; the site keeps the games for viewing.
+
 Native values immediate pressure by the placements needed to block it. Several
 four- or five-stone windows that share a blocking cell count as one obligation;
 otherwise the heuristic counts two. Search checks unavoidable wins separately.
