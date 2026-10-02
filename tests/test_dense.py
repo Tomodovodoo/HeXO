@@ -1960,6 +1960,9 @@ class DenseDataTests(unittest.TestCase):
                 self.assertEqual(second[(s.actions == moves[t]).all(1)].sum(), 0.)
                 np.testing.assert_allclose(after['policy'], (before['policy']+second/second.sum())/2, atol=1e-6)
             self.assertEqual(changed, [t for t in range(11) if samples[t].remaining == 2 and t not in (3, 4)])
+            with unittest.mock.patch.object(dense_data, 'pair_policy', side_effect=lambda policy, *_: policy):
+                _, unmixed = dense_data.examples(window, refs, np.random.default_rng(0), pair_policy_weight=1.)
+            self.assertFalse(any(target['paired'] for target in unmixed))
 
     def test_examples_and_collate(self):
         rng = np.random.default_rng(6)
