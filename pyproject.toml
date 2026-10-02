@@ -29,6 +29,7 @@ py-modules = [
   "dense_solve",
   "dense_solver",
   "engine_setup",
+  "export_web",
   "forcing_material",
   "formats",
   "hexcrop",
@@ -56,3 +57,4 @@ tools = ["engines.json", "seal_adapter.cpp", "strix_learned/Cargo.toml", "strix_
 [tool.setuptools.dynamic.optional-dependencies]
 learning = {file = ["requirements/learning.txt"]}
 api = {file = ["requirements/api.txt"]}
+web = {file = ["requirements/web.txt"]}

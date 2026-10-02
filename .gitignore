@@ -10,3 +10,5 @@ target/
 .pytest_cache/
 *.egg-info/
 models/
+web/engine/ort/
+web/engine/model/
