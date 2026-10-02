@@ -1237,13 +1237,18 @@ class Session:
             self.paused = False
             self.changed()
 
-    def undo(self):
-        """Take back stones to the start of the latest turn a person played, or one stone without people."""
+    def undo(self, people=None):
+        """Take back stones to the start of the latest turn a person played, or one stone without people. `people`
+        (sides) overrides the human seats, for a page that plays a seat itself (the browser engine)."""
+        if people is not None and (not isinstance(people, list) or any(side not in (0, 1) or type(side) is not int
+                                                                        for side in people)):
+            raise ValueError('People must be a list of sides')
         with self.lock:
             self.match_editable()
             if not self.history:
                 return
-            people = [i for i, seat in enumerate(self.seats) if seat['engine'] == 'human']
+            if people is None:
+                people = [i for i, seat in enumerate(self.seats) if seat['engine'] == 'human']
             self.history.pop()
             while people and self.history and not (player_at(len(self.history)) in people
                                                    and len(self.history) in turn_starts(len(self.history) + 1)):
@@ -2258,6 +2263,12 @@ def export(history, kind):
     raise ValueError('Format must be htttx, rectilinear or tyto')
 
 
+STATIC_TYPES = {'.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json',
+                '.onnx': 'application/octet-stream', '.html': 'text/html; charset=utf-8'}
+# Cross-origin isolation (SharedArrayBuffer for the browser engine's threads) without blocking credentialless subresources
+ISOLATION = (('Cross-Origin-Opener-Policy', 'same-origin'), ('Cross-Origin-Embedder-Policy', 'credentialless'))
+
+
 class Handler(BaseHTTPRequestHandler):
     session = None
     page = ROOT / 'web' / 'index.html'
@@ -2276,6 +2287,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def static(self, path):
+        """A file of the browser engine bundle (web/engine) or web/coi-sw.js, with the cross-origin isolation headers
+        that let its WebAssembly use threads."""
+        web = self.page.parent.resolve()
+        target = (web / path.lstrip('/')).resolve()
+        inside = target == web / 'coi-sw.js' or (web / 'engine') in target.parents
+        if not inside or target.suffix not in STATIC_TYPES or not target.is_file():
+            return self.respond(404, dict(error='Not found'))
+        return self.respond(200, target.read_bytes(), STATIC_TYPES[target.suffix], ISOLATION)
+
     def local(self):
         """True for requests addressed to this server by its loopback name, which keeps pages on other sites out
         even when their hostname resolves to 127.0.0.1; POSTs must also come from such a page."""
@@ -2289,7 +2310,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(403, dict(error='Host rejected'))
         url, session = urlparse(self.path), self.session
         if url.path == '/':
-            return self.respond(200, self.page.read_bytes(), 'text/html; charset=utf-8')
+            return self.respond(200, self.page.read_bytes(), 'text/html; charset=utf-8', ISOLATION)
+        if url.path.startswith('/engine/') or url.path == '/coi-sw.js':
+            return self.static(url.path)
         if url.path.startswith('/study/'):
             session = session.study
             if session is None:
@@ -2389,7 +2412,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/play':
                 session.play(args['q'], args['r'])
             elif self.path == '/undo':
-                session.undo()
+                session.undo(args.get('people'))
             elif self.path == '/new':
                 session.new_game()
             elif self.path == '/book':

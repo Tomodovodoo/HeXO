@@ -2,7 +2,9 @@ mod check;
 use std::collections::BTreeMap;
 use std::ffi::{CStr,CString,c_char};
 use std::sync::{Arc,Mutex,OnceLock};
-use std::sync::{mpsc,atomic::{AtomicBool,Ordering}};
+use std::sync::atomic::{AtomicBool,Ordering};
+#[cfg(not(target_family="wasm"))]
+use std::sync::mpsc;
 use std::time::{Duration,Instant};
 use hexo_engine::types::Player;
 use hexo_solver::forcing::Meter;
@@ -162,10 +164,17 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
 // Upstream certificate reconstruction has no cancellation hook. A single native
 // worker contains that overrun; callers stop waiting at their absolute deadline.
 // No queue of abandoned work and no per-request process/thread creation.
+#[cfg(not(target_family="wasm"))]
 type Work=(Request,Instant,mpsc::Sender<Result<Value,String>>);
+#[cfg(not(target_family="wasm"))]
 static WORKER:OnceLock<mpsc::SyncSender<Work>>=OnceLock::new();
 static BUSY:AtomicBool=AtomicBool::new(false);
 static LAST_WORK:OnceLock<Mutex<Value>>=OnceLock::new();
+#[cfg(target_family="wasm")]
+fn dispatch(req:Request,start:Instant)->Result<Value,String> {
+    if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
+    run(req,start)
+}
 #[cfg(windows)]
 fn thread_cpu_ms()->Option<f64> {
     #[repr(C)] struct FileTime {low:u32,high:u32}
@@ -179,8 +188,9 @@ fn thread_cpu_ms()->Option<f64> {
     if unsafe{GetThreadTimes(GetCurrentThread(),&mut c,&mut e,&mut k,&mut u)}==0 {return None;}
     Some((((k.high as u64)<<32|k.low as u64)+((u.high as u64)<<32|u.low as u64)) as f64/10000.0)
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows,target_family="wasm")))]
 fn thread_cpu_ms()->Option<f64> {None}
+#[cfg(not(target_family="wasm"))]
 fn dispatch(req:Request,start:Instant)->Result<Value,String> {
     if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
     let deadline=start+Duration::from_millis(req.ms as u64);
@@ -239,6 +249,12 @@ pub unsafe extern "C" fn hexo_tactical_query(input:*const c_char)->*mut c_char {
         .lock().map(|stats|stats.clone()).unwrap_or(Value::Null);
     value["equal_compute_clock"]=json!(false);
     CString::new(value.to_string()).unwrap().into_raw()
+}
+/// A request buffer of `len` spaces plus a NUL: the caller writes exactly `len` non-NUL bytes and
+/// releases it with hexo_tactical_free.
+#[unsafe(no_mangle)]
+pub extern "C" fn hexo_tactical_alloc(len:usize)->*mut c_char {
+    CString::new(vec![b' ';len]).unwrap().into_raw()
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hexo_tactical_free(value:*mut c_char) {

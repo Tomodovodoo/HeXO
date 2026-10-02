@@ -187,14 +187,14 @@ struct Bounds {
 
 /// Hard entry caps for the per-search caches. The search retains every distinct
 /// node for the run's lifetime, so an unbounded very-long run climbs past tens
-/// of GiB — and on wasm32 the allocator aborts at the 4 GiB ceiling, surfacing
-/// as an unhelpful "unreachable executed" runtime trap in the browser. Caps keep
-/// the worst case in the hundreds of MiB; reaching one drops the map wholesale
-/// (verdicts are position truths, so a cold cache only forces recomputes).
-const TT_CAP: usize = if cfg!(target_arch = "wasm32") { 1 << 21 } else { 1 << 23 };
-const GENCACHE_CAP: usize = if cfg!(target_arch = "wasm32") { 1 << 17 } else { 1 << 19 };
-const COMPS_CAP: usize = if cfg!(target_arch = "wasm32") { 1 << 18 } else { 1 << 20 };
-const WINNING_MOVES_CAP: usize = if cfg!(target_arch = "wasm32") { 1 << 17 } else { 1 << 19 };
+/// of GiB. Caps keep the worst case in the hundreds of MiB; reaching one drops
+/// the map wholesale (verdicts are position truths, so a cold cache only forces
+/// recomputes). They are the same on every target, so wasm32 builds reach the
+/// same verdicts with the same work as native ones.
+const TT_CAP: usize = 1 << 23;
+const GENCACHE_CAP: usize = 1 << 19;
+const COMPS_CAP: usize = 1 << 20;
+const WINNING_MOVES_CAP: usize = 1 << 19;
 
 const WIN_AXES: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
 
@@ -313,8 +313,7 @@ impl CellSet2 {
 }
 
 /// Mutable board for make/unmake search — dense grid + stone list. Nodes are
-/// NOT cloned per-search-node; the only clone is a single per-leaf copy for
-/// PDS-PN's disposable level-2 context (`KernelCtx::isolated`). Cells outside
+/// NOT cloned per-search-node. Cells outside
 /// the grid are empty by construction (the grid always covers every stone with
 /// `GRID_PAD` slack).
 #[derive(Clone)]

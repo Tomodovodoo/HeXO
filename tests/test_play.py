@@ -569,6 +569,16 @@ class Jobs(unittest.TestCase):
         self.session.undo()
         self.assertEqual(self.history(), [])
 
+    def test_undo_skips_a_seat_the_page_plays(self):
+        self.session.configure_seat(1, 'human')
+        self.session.play(0, 0)
+        self.session.play(1, 0)
+        self.session.play(2, 0)
+        self.session.undo([0])
+        self.assertEqual(self.history(), [])
+        with self.assertRaises(ValueError):
+            self.session.undo([2])
+
     def test_failures_reach_the_page_and_rescans_drop_vanished_engines(self):
         def broken(*args, **options):
             raise RuntimeError('weights unreadable')
@@ -740,6 +750,18 @@ class Http(unittest.TestCase):
     def get(self, path):
         with urlopen(self.root + path, timeout=5) as response:
             return response.read().decode()
+
+    def test_engine_bundle_is_served_cross_origin_isolated(self):
+        for path, kind in (('/', 'text/html'), ('/engine/search.mjs', 'text/javascript'), ('/coi-sw.js', 'text/javascript')):
+            with urlopen(self.root + path, timeout=5) as response:
+                self.assertTrue(response.headers['Content-Type'].startswith(kind))
+                self.assertEqual(response.headers['Cross-Origin-Opener-Policy'], 'same-origin')
+                self.assertEqual(response.headers['Cross-Origin-Embedder-Policy'], 'credentialless')
+        for path in ('/engine/../../python/play.py', '/engine/%2e%2e/index.html', '/engine/missing.mjs', '/index.html'):
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(self.root + path, timeout=5)
+            self.assertEqual(caught.exception.code, 404)
+            caught.exception.close()
 
     def test_page_stays_responsive_while_an_engine_thinks(self):
         self.engines.hold = True
