@@ -1529,7 +1529,7 @@ class Session:
         """Start again; with the book on, from one of its openings (`book_mode`: narrow, wide or all, as for
         batches) in a random orientation, shown as played stones. Against a person the opening comes from
         `pick_opening` over what that person has played on that side (`Coverage`), otherwise uniformly."""
-        history, opening = [], None
+        history, opening, played = [], None, None
         if self.opening_book and self.book:
             rng = random.Random()
             selection = book_openings(self.book, self.book_mode, None, rng.randrange(1 << 30))
@@ -1537,13 +1537,15 @@ class Session:
             if len(people) == 1:
                 book = selection['sha256'][:16]
                 node = pick_opening(selection['nodes'], lambda key: self.coverage.count(book, key, people[0]), rng)
-                self.coverage.add(book, node['key'], people[0])
+                played = (book, node['key'], people[0])
             else:
                 node = rng.choice(selection['nodes'])
             history, opening = node['moves'], dict(mode=self.book_mode, key=node['key'])
         with self.lock:
             self.load(history, False)
             self.opening = opening
+            if played:
+                self.coverage.add(*played)
 
     def use_book(self, enabled, mode=None):
         """Turn book openings on or off and choose the book (`BOOKS`); an empty board starts from one at once."""
