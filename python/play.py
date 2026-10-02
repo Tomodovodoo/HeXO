@@ -479,25 +479,40 @@ def searched(result):
     return verified(result) or result.get('reason') in VERDICTS
 
 
-def winning_line(history, result):
-    """One legal continuation of a verified strategy as [q, r, player] stones, choosing its first covered reply."""
+def principal_variation(history, certificate):
+    """The principal variation of a verified certificate for the side to move at `history`, as (stones, plies).
+
+    `stones` are [q, r, player] up to the winning stone: at each attacker turn the certificate's primary choice
+    (its fewest worst-case attacker turns), at each defender turn the covered reply whose subtree lasts the most
+    attacker turns, the first of equals. At an unstoppable fork every reply loses at once, so the defender's two
+    stones are left out and the attacker completes the shortest of the certificate's threats. `plies` counts the
+    placements up to the winning stone, those two left-out stones included."""
     from dense_solver import Proof
-    certificate = result.get('certificate') or json.loads(result['certificate_json'])
-    proof = Proof([tuple(p) for p in history], certificate)
-    local, line = replay(history), []
+    proof = Proof([tuple(map(int, p)) for p in history], certificate)
+    local, stones, plies, index = replay(history), [], 0, proof.root
     try:
+        attacker = local.player
         while local.winner < 0:
-            current = [cell[:2] for cell in local.cells]
-            move = proof.path(current)[1]
-            if move is None:
+            node = proof.nodes[index]
+            if node['kind'] == 'unstoppable':
+                if node.get('threats'):
+                    threat = min(node['threats'], key=len)
+                    stones += [[int(q), int(r), attacker] for q, r in threat]
+                    plies += 2 + len(threat)
                 break
-            actions = move[0] or proof.reply(current) or local.legal_moves()[:local.remaining]
-            for action in actions:
-                line.append([*action, local.player])
-                local.play(*action)
-                if local.winner >= 0:
-                    break
-        return line
+            if node['kind'] == 'defender_replies':
+                reply = max(node['responses'], key=lambda r: proof.turns(r['child']))
+                action, index = reply['action'], reply['child']
+            else:
+                action, index = node['action'], node.get('child')
+            for q, r in action:
+                if local.winner < 0:
+                    stones.append([int(q), int(r), local.player])
+                    local.play(int(q), int(r))
+                    plies += 1
+            if index is None:
+                break
+        return stones, plies
     finally:
         local.close()
 
@@ -542,13 +557,22 @@ def move_row(action, probability, value=None):
     return row + [round((float(value) + 1) / 2, 4), 1 if value >= 1 else -1 if value <= -1 else 0]
 
 
-def top_rows(actions, policy, values=None, count=5):
-    """The `count` `move_row`s to show: stones the search proved to win first, stones it proved to lose last,
-    otherwise by policy."""
+def top_rows(actions, policy, values=None, count=5, lead=None, won=False):
+    """The `count` `move_row`s to show: `lead` (the stone played) first, then stones the search proved to win,
+    the others by policy and stones it proved to lose last. A stone below a policy share of 0.00005 is left out
+    unless the search proved it wins: its value is only the search's fill-in for a stone it never tried. With
+    `won` the solver proved `lead` wins, and its row says so whatever the search found."""
     import numpy as np
+    policy = np.asarray(policy, dtype=float)
     rank = np.zeros(len(policy)) if values is None else np.where(values >= 1, 0, np.where(values <= -1, 2, 1))
-    order = np.lexsort((-np.asarray(policy), rank))[:count]
-    return [move_row(actions[i], policy[i], None if values is None else values[i]) for i in order]
+    shown = (policy >= .00005) | (rank == 0) if values is not None else policy >= .00005
+    first = [i for i, a in enumerate(actions) if lead is not None and list(map(int, a)) == list(map(int, lead))]
+    order = first + [i for i in np.lexsort((-policy, rank)) if shown[i] and i not in first]
+    rows = [move_row(actions[i], policy[i], None if values is None else values[i]) for i in order[:count]]
+    if won:
+        row = rows[0] if first else move_row(lead, 0.)
+        rows = [row[:3] + [1., 1]] + (rows[1:] if first else rows[:count - 1])
+    return rows
 
 
 def glimpse(tree):
@@ -565,10 +589,11 @@ def glimpse(tree):
 
 
 def solve(prover, history, solver_nodes, watch=lambda n: None):
-    """What the solver knows of `history` for `evaluate`: `moves` and `line` of a proven win for the side to move,
-    `proof` ({winner, turns} or None), `threat` (the stones of the opponent's forced win if it moved now), `solved`
+    """What the solver knows of `history` for `evaluate`: `moves` and `pv` (see `principal_variation`) of a proven
+    win for the side to move, its certificate tightened to the fewest attacker turns the budget allows, `proof`
+    ({winner, turns, plies} or None), `threat` (the stones of the opponent's forced win if it moved now), `solved`
     (False when a query failed to run) and `used` (nodes spent). `solver_nodes` 0 or no `prover` asks nothing."""
-    found = dict(moves=[], line=[], proof=None, threat=[], solved=True, used=0)
+    found = dict(moves=[], pv=[], proof=None, threat=[], solved=True, used=0)
     if prover is None or not solver_nodes:
         return found
     history = [tuple(map(int, p)) for p in history]
@@ -576,12 +601,13 @@ def solve(prover, history, solver_nodes, watch=lambda n: None):
     player = game.player
     game.close()
     deadline = min(60_000, max(10_000, solver_nodes // 8))
-    mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=deadline),
-                         watch, prover.abort)
+    mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=deadline,
+                                                shortest=True), watch, prover.abort)
     found.update(solved=searched(mine), used=mine.get('nodes_used', 0))
     if verified(mine):
-        found.update(moves=[list(m) for m in mine['moves']], line=winning_line(history, mine),
-                     proof=dict(winner=player, turns=mine['proof_turns']))
+        pv, plies = principal_variation(history, mine.get('certificate') or json.loads(mine['certificate_json']))
+        found.update(moves=[list(m) for m in mine['moves']], pv=pv,
+                     proof=dict(winner=player, turns=mine['proof_turns'], plies=plies))
         return found
     theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline),
                            watch, prover.abort)
@@ -594,8 +620,9 @@ def solve(prover, history, solver_nodes, watch=lambda n: None):
 class TurnSearch:
     """One evaluation under way (see `evaluate`): the solver's findings, then a search per stone of the turn until
     the turn is complete. When the solver already gave the turn, its stones are played and each position of the turn
-    is still searched, for its rows. The searches of later stones are kept in `later` as evaluations of the positions inside the turn, without solver
-    checks. `request()` names the tree and simulations of the next search, None when the turn is
+    is still searched, for its rows. The searches of later stones are kept in `later` as evaluations of the positions
+    inside the turn, without solver checks of their own; on a solver-proven turn they carry the rest of its `pv`.
+    Without a solver proof, a position the search proves has the turn's own stones as its `pv`. `request()` names the tree and simulations of the next search, None when the turn is
     complete, (None, 0) for the raw policy; `take(result)` applies that search's result, None for the raw policy.
     `trees(history, simulations, network)` gives the tree and the simulations to run for a stone; by default one
     tree is advanced through the turn, each stone searched afresh with `simulations`."""
@@ -608,7 +635,7 @@ class TurnSearch:
             self.local.close()
             raise ValueError('The game has finished')
         self.player, self.start = self.local.player, time.perf_counter()
-        self.moves, self.line, self.proof = list(solved['moves']), solved['line'], solved['proof']
+        self.moves, self.pv, self.proof = list(solved['moves']), solved['pv'], solved['proof']
         self.threat, self.solved, self.solver_used = solved['threat'], solved['solved'], solved['used']
         self.given, self.top, self.value, self.completed, self.tree = bool(self.moves), [], None, 0, None
         self.later, self.played = [], 0
@@ -647,24 +674,30 @@ class TurnSearch:
             stone_value = root_value(result, self.local.player)
             proven = result.get('proven') or 0
             exact = dict(winner=self.player if proven > 0 else 1 - self.player,
-                         turns=proof_turns(result['proof_plies'], self.local.remaining, proven > 0)) if proven else None
+                         turns=proof_turns(result['proof_plies'], self.local.remaining, proven > 0),
+                         plies=int(result['proof_plies'])) if proven else None
             if self.proof is None and (proven > 0 or proven < 0 and not self.moves):
-                self.proof = exact
-        rows = top_rows(actions, policy, values)
+                self.proof = dict(exact, plies=exact['plies'] + self.played)
         if not self.given:
             self.moves.append([int(action[0]), int(action[1])])
+        stone = self.moves[self.played]
+        rows = top_rows(actions, policy, values, lead=stone, won=self.given)
         if not self.played:
             self.top, self.value = rows, (stone_value + 1) / 2
         else:
+            if self.given:
+                exact = dict(self.proof, plies=self.proof['plies'] - self.played)
             value = (1. if exact['winner'] == self.player else 0.) if exact else (stone_value + 1) / 2
-            self.later.append(dict(history=[tuple(cell[:2]) for cell in self.local.cells], moves=[self.moves[self.played]],
-                                   value=round(value, 4), top=rows, proof=exact, line=[], threat=[]))
+            pv = self.pv[self.played:] if self.given else [[*stone, self.player]] if exact else []
+            self.later.append(dict(history=[tuple(cell[:2]) for cell in self.local.cells], moves=[stone],
+                                   value=round(value, 4), top=rows, proof=exact, pv=pv, threat=[]))
         self.local.play(*self.moves[self.played])
         self.played += 1
 
     def record(self):
         value = (1. if self.proof['winner'] == self.player else 0.) if self.proof else self.value
-        return dict(moves=self.moves, value=round(value, 4), top=self.top, proof=self.proof, line=self.line,
+        pv = self.pv or ([[*m, self.player] for m in self.moves] if self.proof else [])
+        return dict(moves=self.moves, value=round(value, 4), top=self.top, proof=self.proof, pv=pv,
                     threat=self.threat, solved=self.solved, ms=round((time.perf_counter() - self.start) * 1000),
                     actual_completed=self.completed, actual_solver_nodes=self.solver_used, later=self.later)
 
@@ -679,8 +712,10 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
-    stones as `move_row`s), `proof` (None or {winner, turns}: the solver proved a win for the side to move, or the
-    search proved the position exact), `line` (a winning line as [q, r, player] when the solver proved it) and
+    stones as `move_row`s, the turn's first stone first), `proof` (None or {winner, turns, plies}: the solver proved
+    a win for the side to move, or the search proved the position exact; `plies` placements to the winning stone),
+    `pv` (the principal variation as [q, r, player]: the solver's, see `principal_variation`, else on a search proof
+    the turn's own stones; [] when unproven) and
     `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a solver
     query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
     `simulations` 0 plays the raw policy; `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
@@ -1044,7 +1079,7 @@ def well_formed(record):
             and isinstance(record.get('top'), list)
             and all(isinstance(c, list) and 3 <= len(c) <= 5 and cells([c[:3]], 3, number) and all(map(number, c[3:]))
                     for c in record['top'])
-            and cells(record.get('line', []), 3) and cells(record.get('threat', []), 2)
+            and cells(record.get('pv', []), 3) and cells(record.get('threat', []), 2)
             and (proof is None or isinstance(proof, dict) and proof.get('winner') in (0, 1)
                  and type(proof.get('turns')) is int))
 
@@ -1198,8 +1233,8 @@ def review(history, lookup, winner=-1):
         turn['label'] = label
         if label in ('inaccuracy', 'mistake', 'blunder', 'missed', 'allowed') and before['moves']:
             turn['better'] = before['moves']
-            if before.get('line'):
-                turn['line'] = before['line']
+            if before.get('pv'):
+                turn['line'] = before['pv']
             else:
                 reply = lookup([*history[:s], *map(tuple, before['moves'])])
                 turn['line'] = [[*p, me] for p in before['moves']] + \
@@ -1366,7 +1401,7 @@ class Session:
             for ply in range(len(history) + 1):
                 if (found := self.lookup(history[:ply])) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
-                                        ('value', 'moves', 'top', 'proof', 'line', 'threat', 'simulations', 'solver_nodes')}
+                                        ('value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes')}
             entries = [{k: e[k] for k in SHOWN if k in e} for e in self.entries.values()]
             return dict(instance=self.instance, revision=self.revision, history=[list(p) for p in history], **board,
                         paused=self.paused, seats=self.seats, analysis=self.analysis, engines=entries,

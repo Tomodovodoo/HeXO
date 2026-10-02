@@ -124,7 +124,7 @@
     "kind": "seal",
     "repository": "Ramora0/HexTicTacToe",
     "revision": "3474edb5a9cdb12004c70aac69a631a45a3cb9e0",
-    "licence": "none, so it is built on this machine and never republished",
+    "licence": "none; the setup builds it on this machine, the engines release does not carry it, and the Pages site serves it compiled to WebAssembly",
     "files": [
       {
         "path": "cpp/engine.h",

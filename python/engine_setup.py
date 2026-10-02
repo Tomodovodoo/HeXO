@@ -385,8 +385,8 @@ class Setups:
         return source_tree(self.download(job, source_url(spec), work / 'source.zip'), work / 'src', spec['sources'])
 
     def seal(self, job, work):
-        """Seal's pinned headers compiled with tools/seal_adapter.cpp. Seal has no licence, so it is never
-        republished and needs a C++ compiler here."""
+        """Seal's pinned headers compiled with tools/seal_adapter.cpp. Seal has no licence and is not in the engines
+        release, so it needs a C++ compiler here."""
         spec = self.manifest['seal']
         found = compiler(self.which)
         if found is None:
