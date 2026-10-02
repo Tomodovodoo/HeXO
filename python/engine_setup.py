@@ -33,8 +33,9 @@ import sys
 from pathlib import Path
 
 here = Path(__file__).resolve().parent
-sys.path.insert(0, str(here / 'site'))
-sys.argv[0] = str(here / 'arena' / 'drivers' / 'shrimp_driver.py')
+drivers = here / 'arena' / 'drivers'
+sys.path[:0] = [str(drivers), str(here / 'site')]
+sys.argv[0] = str(drivers / 'shrimp_driver.py')
 runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 INSTALLED = dict(six=lambda e: e['kind'] == 'six' and bool(e.get('networks')),

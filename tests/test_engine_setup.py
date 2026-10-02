@@ -3,6 +3,8 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -213,6 +215,20 @@ class Recipes(unittest.TestCase):
         unfinished.parent.mkdir(parents=True)
         unfinished.write_bytes(b'weights')
         self.assertFalse(any(e['kind'] == 'bubble' for e in scan(self.models).values()))
+
+    def test_the_shrimp_launcher_runs_the_driver_as_a_script_with_its_modules(self):
+        root = Path(self.folder.name) / 'shrimp'
+        (root / 'arena' / 'drivers').mkdir(parents=True)
+        (root / 'site').mkdir()
+        (root / 'launch.py').write_text(engine_setup.SHRIMP_LAUNCHER, encoding='utf-8')
+        (root / 'arena' / 'drivers' / 'sixdriver.py').write_text('NAME = "six"\n', encoding='utf-8')
+        (root / 'site' / 'shrimp.py').write_text('NAME = "shrimp"\n', encoding='utf-8')
+        (root / 'arena' / 'drivers' / 'shrimp_driver.py').write_text(
+            'import sys\nimport shrimp, sixdriver\nif __name__ == "__main__":\n'
+            '    print(shrimp.NAME, sixdriver.NAME, *sys.argv[1:])\n', encoding='utf-8')
+        done = subprocess.run([sys.executable, '-S', 'launch.py', '--visits', '8'], cwd=root, capture_output=True,
+                              text=True, timeout=30)
+        self.assertEqual((done.stdout.split(), done.stderr), (['shrimp', 'six', '--visits', '8'], ''))
 
     def test_shrimp_refuses_a_python_without_pytorch(self):
         with unittest.mock.patch('engine_setup.importlib.util.find_spec', return_value=None):
