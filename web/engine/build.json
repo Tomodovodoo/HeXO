@@ -33,12 +33,29 @@
   "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/pdspn.rs": "dd07077e7b38118dfa4cf84f7fa5f022630415f52209747b0351cdd65465eba9",
   "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/pn.rs": "77ce381085fe36b988e381c2ef3ef527e3d6d6928643c5e2514757f98202a3d6",
   "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/prover/portfolio.rs": "037c2aadf037e0c0510e208445a6adef5f0cbdcff5ca6ddf9f1532b50a2237c4",
-  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/vct_probe.rs": "5944616fcd204346807ad8fbd859088974e8cc851c5fbf5b3ff07a9165dc7c58"
+  "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-solver/src/vct_probe.rs": "5944616fcd204346807ad8fbd859088974e8cc851c5fbf5b3ff07a9165dc7c58",
+  "tools/six/src/board.cpp": "52ff691091fe41a3478e3a97dad310ac2bba78aa49a49430271905df1d48e049",
+  "tools/six/src/board.hpp": "b611c1c481d3853f633cff46878324cf0f21c14204ebc338b78bc6761923d791",
+  "tools/six/src/evaluator.hpp": "1f1883b041831a9356282ed270403dfbe7c2592d2eb758020c6ab615c5ac8d65",
+  "tools/six/src/mcts.cpp": "4d927f67bd2bfc5659152cad68b201f710dfb04376c35322adb8904f178fd541",
+  "tools/six/src/mcts.hpp": "e34b67ae8d96215a7c24094b168736a36a1ecc09449808e07ca781ac0a412a87",
+  "tools/six/src/nnue.hpp": "66b7eb621f8442bdb327e34981856edb8cece51733f08ea364becb508eaf9028",
+  "tools/six/src/planes.cpp": "41c05f0aaeb55fccdb56ed48ee2667192ad256a07e4aba716938afa997c699b3",
+  "tools/six/src/planes.hpp": "05d00dacc800acc003a2b029ccb7e5bb2c25f66d982db66a314a72ac028e17ce",
+  "tools/six/src/search.cpp": "c4eb0e273a479101b16cc640539911c71ccee3219c26445cd324b8b00d5883c8",
+  "tools/six/src/search.hpp": "57799181483342d4dd4a3a098cd2a64ce2d9346f28fadf55b80e4a75156bf4a8",
+  "tools/six/src/tactics.cpp": "a6c5f1d62284871fbaf94dfc5cd732b49bf899c5d2d9f4b17c2a59fcb7d5112c",
+  "tools/six/src/tactics.hpp": "9f6ee6f61f3e4e8faa077d8b1c81008409d6b693f5209381dccfece40fda5090",
+  "tools/six/src/threats.cpp": "480a09c55d6977ee0acd7386f3a0263c73c9529066fab2e42be19e605431634e",
+  "tools/six/src/threats.hpp": "4d966ee9d8e770ccb29320e50e6662ec50f892bb066e18996741fb877c7ac99a",
+  "tools/six/web_bot.cpp": "2956ab9f5eb5a0ff8dff83210eac4a1a28a7ee5668f5a344c8463bb1b55afdd5"
  },
  "artefacts": {
   "gumbel.mjs": "5bace107d54c423e2d5282b60d838d78013b76b0fe29a9b274d14ae996887d5e",
   "gumbel.wasm": "f59bfe3d17643cef7c0accf050745adccb30945404b8b21a02a5ea7d52eff970",
-  "tactical.wasm": "b46d01c1fc0be6ba015d2623d0ce77670fd39372e02209667e0c44fc51405972"
+  "tactical.wasm": "b46d01c1fc0be6ba015d2623d0ce77670fd39372e02209667e0c44fc51405972",
+  "six/six.mjs": "a67e8469a4ef4648eb083a6a0c2db86afdc882384fb4105a847f64f8fa0a984b",
+  "six/six.wasm": "c4cfb2c9788f97982e6aa03ded399ee88ee35d8f11f9899101031b0067face9e"
  },
  "tools": {
   "emxx": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 6.0.10 (d6c521a7f05449857c76bd99e396895583cf2083)",
