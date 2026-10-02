@@ -10,7 +10,7 @@ implementation or a replacement for the production native scheduler.
 """
 import numpy as np
 from hexo import Game
-from neural_search import NeuralSearch, checked, native
+from neural_search import EvaluationCache, NeuralSearch, checked, native
 
 
 class Node:
@@ -52,7 +52,8 @@ class PUCTSearch:
                  tactics=False, graph=False, cpuct=1.5):
         if cpuct <= 0:
             raise ValueError('cpuct must be positive')
-        self.evaluator, self.model_version, self.cache = evaluator, model_version, cache
+        self.evaluator, self.model_version = evaluator, model_version
+        self.cache = cache if cache is not None else EvaluationCache()
         self.history = [tuple(map(int, m)) for m in history]
         self.game = Game(self.history)
         self.tactics, self.graph, self.cpuct = tactics, graph, cpuct

@@ -48,6 +48,9 @@ Gumbel policy. It plays each mode on the supplied hard positions against a fixed
 head-to-head pairings, with half the games in each colour. Checkpoint paths, openings and seeds are saved
 in `--out`; a newer export cannot interrupt the batch. Completed games survive a restart. Use the same
 command to resume; only unfinished games replay.
+Resuming requires the same device, native libraries and relevant Python implementation files
+(SHA-256 after newline normalization). Publication checks the target run's checkpoint hashes;
+it can use the current publication code without changing the games' recorded source identity.
 
 ```sh
 python tools/compare_search_modes.py --run R --checkpoint main/170000 --opponent main/155000 \

@@ -19,7 +19,7 @@ class Uniform:
 class NeuralTree(unittest.TestCase):
     def test_puct_initial_value_uses_policy_weighted_action_values(self):
         from puct_search import PUCTSearch
-        search = PUCTSearch(Uniform(), 'puct-weighted', [(0, 0)], cache=EvaluationCache(64))
+        search = PUCTSearch(Uniform(), 'puct-weighted', [(0, 0)])
         self.addCleanup(search.close)
         search.begin(1)
         request = search.request()

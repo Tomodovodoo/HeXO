@@ -36,6 +36,9 @@ from puct_search import PUCTSearch, search_many
 from legacy.train import paired_metrics, write_json
 
 MODES = ('gumbel', 'puct', 'policy')
+SOURCE_FILES = ('python/puct_search.py', 'python/neural_search.py', 'python/dense_selfplay.py',
+                'python/hexnet.py', 'python/hexcrop.py', 'python/hexnet_kernels.py',
+                'python/hexnet_graphs.py', 'tools/compare_search_modes.py')
 
 
 class Evaluator:
@@ -121,7 +124,7 @@ def publish(run, state):
             {cid: state['models'][state['checkpoint']] for cid in ids.values()}, settings, overrides,
             report_id=state['id']+'-'+a+'-'+b)
         report.update(benchmark_only=True, search_modes=dict(a=a, b=b), cpuct=state['cpuct'],
-                      source_head=state['source_head'], native=state['native'], complete=True)
+                      source_head=state['source_head'], source_files=state['source_files'], native=state['native'], complete=True)
         path = dense_eval.report_path(run, ids[a], ids[b]).with_name('report-search-'+state['id']+'.json')
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
@@ -176,6 +179,8 @@ def main():
         raise ValueError('games must be a positive colour-balanced pair count')
     native_hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                      for p in (library, Path(native._name))}
+    source_hashes = {name: hashlib.sha256((ROOT/name).read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+                     for name in SOURCE_FILES}
     if args.out.exists():
         state = json.loads(args.out.read_text(encoding='utf-8'))
         for key in ('checkpoint', 'opponent', 'games', 'sims', 'root_samples', 'max_plies', 'cpuct', 'device'):
@@ -183,6 +188,8 @@ def main():
                 raise ValueError(f'{key} differs from the saved batch')
         if any(state['native'].get(name) != sha for name, sha in native_hashes.items()):
             raise ValueError('Native library differs from the saved batch')
+        if not args.publish and state.get('source_files') != source_hashes:
+            raise ValueError('Python search source differs from the saved batch; resume its original implementation')
     else:
         batch_id = uuid.uuid4().hex
         config = dense_config.load(args.run)
@@ -195,7 +202,7 @@ def main():
                      cases=json.loads(args.panel.read_text(encoding='utf-8'))['cases'],
                      openings=[book.draw(s) for s in seeds], seeds=seeds, book_digest=book.digest(),
                      names={m: f'{m}-{args.sims}-{batch_id[:8]}' for m in ('policy', 'puct')}, results=[], models={},
-                     native=native_hashes,
+                     native=native_hashes, source_files=source_hashes,
                      external_solver=False, graph=True, tactics=True, device=args.device, complete=False)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         write_json(args.out, state)
