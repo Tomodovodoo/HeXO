@@ -38,6 +38,7 @@ class ActorSettings:
     max_plies: int = 256
     tactics: bool = True         # exact win/must-block classification inside the tree
     search_graph: bool = False   # share transposed turn contexts and proven positions (neural_search graph)
+    search_choice: str = 'gumbel'  # final move: Gumbel score or highest improved search policy ('policy')
     cache_positions: int = 4096
     shard_games: int = 32
     opening_random_plies: float = 2.  # mean of an exponential; sampled from the search policy
@@ -102,6 +103,8 @@ class ActorSettings:
     cuda_graphs: bool = False  # reuse bounded CUDA graphs for frozen fused actor models
 
     def __post_init__(self):
+        if self.search_choice not in ('gumbel', 'policy'):
+            raise ValueError('search_choice must be gumbel or policy')
         if self.cheap_root_samples < 1 or self.solver_leaf_nodes < 0:
             raise ValueError('cheap_root_samples must be positive and solver_leaf_nodes nonnegative')
         if self.net_kernels not in ('reference', 'fused'):

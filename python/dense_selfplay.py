@@ -625,6 +625,8 @@ class SelfPlayGame:
             action = actions[self.rng.choice(len(policy), p=policy/policy.sum())].tolist()
         else:
             action = result['action']
+            if self.settings.search_choice == 'policy' and not result.get('proven'):
+                action = actions[np.argmax(policy)]
         if (self.settings.adjudicate_proven and self.settings.proven_line_rows and result.get('proven', 0) > 0
                 and result.get('proof') is not None and game.remaining == 2):
             stones = result['proof'].action(self.moves)
