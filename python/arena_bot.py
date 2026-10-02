@@ -13,6 +13,8 @@ import aiohttp
 
 from hexo import Game, library
 
+RETRYABLE = (429, 500, 502, 503, 504)
+
 
 def answer(history, packet, ms, width, depth):
     """Apply confirmed turns only; our suggestion arrives in a later previous."""
@@ -67,7 +69,7 @@ class NativeArena:
                 if response.status < 300:
                     return await response.json()
                 delay = retry_delay(response.headers)
-                if response.status not in (429, 503) or attempt == 2:
+                if response.status not in RETRYABLE or attempt == 2:
                     raise Refused(response.status, delay)
             await asyncio.sleep(delay)
 
@@ -160,7 +162,7 @@ class NativeArena:
                         if self.presence is not None:
                             self.presence.close()
                         return
-                    if error.status not in (429, 503):
+                    if error.status not in RETRYABLE:
                         raise Refused(error.status) from None
                     delay = max(delay, retry_delay(error.headers))
                 except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError):
@@ -236,7 +238,7 @@ class NativeArena:
                                 if line.strip():
                                     await self.event(json.loads(line))
                     except Refused as error:
-                        if error.status not in (429, 503):
+                        if error.status not in RETRYABLE:
                             raise
                         delay = max(delay, error.retry)
                     except (aiohttp.ClientError, asyncio.TimeoutError):
