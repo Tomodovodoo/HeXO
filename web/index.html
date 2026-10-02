@@ -869,7 +869,7 @@ function renderMatch(){
   const done=match.completed===match.games;
   const stop=el('button',{class:'ib','aria-label':'Stop match',html:icon('stop'),onclick:()=>post('/match',{action:'stop'})});stop.disabled=!match.active;
   const results=el('a',{class:'ib','aria-label':'Results',href:'/match/results',download:'match.json',html:icon('download')});
-  const resume=el('button',{class:'ib','aria-label':'Resume match',html:icon('play'),onclick:()=>post('/match',{action:'resume',batch:match.id||match.output})});
+  const resume=el('button',{class:'ib','aria-label':'Resume match',html:icon('play'),onclick:()=>resumeTournament(match.id||match.output)});
   const browse=el('button',{class:'ib','aria-label':'Games',html:icon('trophy'),onclick:()=>showTournaments('results','tournaments')});
   box.replaceChildren(el('div',{class:'divider'}),
     el('div',{class:'score'},el('span',{},'A · '+playerLabel(match.players[0])),el('span',{},`${match.wins[0]} – ${match.wins[1]}`),el('span',{},'B · '+playerLabel(match.players[1]))),
@@ -928,8 +928,9 @@ function renderJobs(){
 }
 
 /* game actions */
-$('new').onclick=async()=>{if(await post('/new')){fit();go(S.history.length)}};$('undo').onclick=()=>post('/undo');
-$('pause').onclick=()=>post('/pause',{paused:!S.paused});
+function showLivePosition(){view=S.history.length;fit();go(view)}
+$('new').onclick=async()=>{if(await post('/new'))showLivePosition()};$('undo').onclick=()=>post('/undo');
+$('pause').onclick=async()=>{const paused=!S.paused;if(await post('/pause',{paused})&&!paused)showLivePosition()};
 const FORMATS=[['htttx','HTTTX'],['rectilinear','Rectilinear'],['tyto','Tyto']];
 let shownNotation=null;
 async function exported(kind){
@@ -991,7 +992,7 @@ function hideNotation(){shownNotation=null;$('notation').classList.remove('show'
   if($('exports').classList.contains('show'))renderFormats()}
 function shownSig(){return S.instance+'/'+view+'/'+S.history.slice(0,view).join(';')}
 $('import').onclick=()=>{$('import-text').value='';$('import-dialog').showModal()};
-$('import-dialog').onclose=async()=>{if($('import-dialog').returnValue==='ok'&&await post('/import',{text:$('import-text').value})){view=S.history.length;fit();go(view)}};
+$('import-dialog').onclose=async()=>{if($('import-dialog').returnValue==='ok'&&await post('/import',{text:$('import-text').value}))showLivePosition()};
 $('import-dialog').ondragover=e=>e.preventDefault();
 $('import-dialog').ondrop=async e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)$('import-text').value=await f.text()};
 $('import-file').onchange=async e=>{const f=e.target.files[0];if(f)$('import-text').value=await f.text()};
@@ -1047,8 +1048,9 @@ async function startTournament(){
   if($('t-amount')){if(t.clock==='move')t.ms=Number($('t-amount').value);else t.tc=$('t-amount').value}
   const body={players,games:t.games,max_placements:t.max_placements,clock:t.clock==='fixed'?{mode:'fixed'}:t.clock==='move'?{mode:'move',ms:Math.round(t.ms*1000)}:{mode:'game',tc:t.tc}};
   Object.assign(body,t.openings==='origin'?{openings:[[[0,0]]]}:{opening_range:t.openings,unique_openings:t.games/2});
-  if(await post('/match',{...body,replace:true})){savedKind='tournaments';$('tournament-dialog').close();fit();go(S.history.length)}
+  if(await post('/match',{...body,replace:true})){savedKind='tournaments';$('tournament-dialog').close();showLivePosition()}
 }
+async function resumeTournament(batch){if(await post('/match',{action:'resume',batch})){$('tournament-dialog').close();showLivePosition()}}
 function tournamentTab(name){for(const b of $('t-tabs').children)b.classList.toggle('on',b.dataset.t===name);
   $('t-new').hidden=name!=='new';$('t-results').hidden=name!=='results';if(name==='new')renderTournamentForm()}
 $('t-tabs').onclick=e=>{const b=e.target.closest('button');if(b)tournamentTab(b.dataset.t)};
@@ -1061,7 +1063,7 @@ async function showTournaments(tab,kind){
       $('t-summary').replaceChildren(...(match&&!match.single?[el('div',{class:'summary'},el('span',{},`${match.wins[0]} – ${match.wins[1]}`),
         ...(match.capped?[el('span',{class:'chip'},'= '+match.capped)]:[]),
         ...(showElo(match)?[el('span',{class:'elo'},`${match.elo.a_minus_b>=0?'+':''}${Math.round(match.elo.a_minus_b)} ± ${Math.round((match.elo.interval[1]-match.elo.interval[0])/2)} Elo${match.elo.method?' (estimate)':''}`)]:[]),
-        ...(match.completed<match.games?[el('button',{class:'btn',onclick:async()=>{if(await post('/match',{action:'resume',batch:match.id}))$('tournament-dialog').close()}},'Resume')]:[]))]:[]));
+        ...(match.completed<match.games?[el('button',{class:'btn',onclick:()=>resumeTournament(match.id)},'Resume')]:[]))]:[]));
       $('saved-actions').replaceChildren(...(match&&globalThis.browserPlay?[el('span',{class:'spacer'}),el('button',{class:'btn',onclick:()=>deleteSaved(match)},'Delete tournament')]:[]));
       const items=[];
       if(savedKind==='freeplay'){
