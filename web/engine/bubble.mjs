@@ -25,6 +25,10 @@ export async function isolate() {
   return true;
 }
 
+import {defaultThreads} from './network.mjs';
+
+const READY_MS = 20000, STALLED = Symbol('stalled');
+
 export class BubbleEngine {
   /** `model` is the manifest URL relative to web/engine; `prefer` 'wasm', 'webgpu-fp32' or 'webgpu-fp16' narrows the device choice. */
   constructor({model = 'model/manifest.json', prefer = null, threads = null} = {}) {
@@ -37,17 +41,40 @@ export class BubbleEngine {
     this.device = null;
   }
 
-  /** Starts the worker and loads the model; `progress(fraction)` reports loading. Resolves to the chosen device. */
+  /**
+   * Starts the worker and loads the model; `progress(fraction)` reports loading. Resolves to the chosen device. When
+   * the thread count was left to the loader and the runtime has not come up READY_MS after the downloads finished
+   * (its thread workers never start on some hosts), the worker is replaced by one running on a single thread; a
+   * further download (the WebAssembly runtime after a failed WebGPU start) suspends that watchdog.
+   */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
-    const ready = this.ready = new Promise((resolve, reject) => {
+    const ready = this.ready = this.start(progress).catch(error => {
+      if (error !== STALLED) throw error;
+      console.warn('Bubble (browser): the runtime did not start with its thread workers; retrying on one thread');
+      this.options = {...this.options, threads: 1};
+      return this.start(progress);
+    });
+    ready.catch(error => { if (this.ready === ready) this.fail(error); });
+    return ready;
+  }
+
+  start(progress) {
+    return new Promise((resolve, reject) => {
+      const worker = this.worker = new Worker(new URL('worker.mjs', import.meta.url), {type: 'module'});
+      let timer = null;
+      const threaded = this.options.threads === null && defaultThreads({isolated: Boolean(globalThis.crossOriginIsolated),
+        cores: navigator.hardwareConcurrency || 2}) > 1;   // a single-threaded start has nothing to fall back to
+      const stall = armed => {   // the worker reports below .95 while downloading, at .95 while the runtime starts
+        clearTimeout(timer);
+        if (armed && threaded) timer = setTimeout(() => { if (this.worker === worker) { worker.terminate(); reject(STALLED); } }, READY_MS);
+      };
       this.abandon = reject;
-      this.worker = new Worker(new URL('worker.mjs', import.meta.url), {type: 'module'});
-      this.worker.onmessage = ({data}) => {
-        if (data.type === 'ready') { this.device = data.device; resolve(data.device); return; }
+      worker.onmessage = ({data}) => {
+        if (data.type === 'ready') { clearTimeout(timer); this.device = data.device; resolve(data.device); return; }
         if (data.id === undefined) {
-          if (data.type === 'progress') progress(data.fraction);
-          else if (data.type === 'error') reject(new Error(data.message));
+          if (data.type === 'progress') { progress(data.fraction); stall(data.fraction >= .95); }
+          else if (data.type === 'error') { clearTimeout(timer); reject(new Error(data.message)); }
           return;
         }
         const wait = this.waits.get(data.id);
@@ -57,11 +84,9 @@ export class BubbleEngine {
         if (data.type === 'result') wait.resolve(data.result);
         else wait.reject(data.type === 'cancelled' ? new DOMException('Cancelled', 'AbortError') : new Error(data.message));
       };
-      this.worker.onerror = event => this.fail(new Error(event.message || 'Engine worker failed'));
-      this.worker.postMessage({type: 'load', options: this.options});
+      worker.onerror = event => { clearTimeout(timer); this.fail(new Error(event.message || 'Engine worker failed')); };
+      worker.postMessage({type: 'load', options: this.options});
     });
-    ready.catch(error => { if (this.ready === ready) this.fail(error); });
-    return ready;
   }
 
   async call(message, {signal, progress = () => {}} = {}) {

@@ -355,6 +355,11 @@ order. Bubble had it the other way round.
 
 ## Bubble in the browser
 
+On an isolated page ONNX Runtime runs on the cores but one WebAssembly threads, at most 8. On hosts where the
+runtime's thread workers never come up (the Claude desktop browser pane is one), the engine notices the stalled
+start 20 s after the downloads finish and replaces its worker with one running on a single thread.
+`new BubbleEngine({threads})` fixes the count instead.
+
 Feasibility of a static page that runs Bubble with no install: HexNet on WebGPU through ONNX Runtime Web, the search
 and the solver in WebAssembly. Measured on CPU on 2026-10-01 with `main/122500`; GPU speeds are estimates.
 

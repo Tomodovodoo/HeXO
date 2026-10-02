@@ -74,6 +74,11 @@ function toHalf(values) {
   return out;
 }
 
+/** ONNX Runtime's WebAssembly thread count: on an isolated page the cores but one, at most 8; otherwise one. */
+export function defaultThreads({isolated, cores}) {
+  return isolated ? Math.max(1, Math.min(8, cores - 1)) : 1;
+}
+
 export class Network {
   /**
    * Loads ONNX Runtime and the model from `base` (the web/engine URL): `model` is the manifest URL, `device` a probe()
@@ -96,7 +101,8 @@ export class Network {
       })]);
     ort.env.wasm.wasmPaths = {mjs: new URL(`${runtime}.mjs`, ortBase).href};
     ort.env.wasm.wasmBinary = wasmBinary;
-    ort.env.wasm.numThreads = threads ?? (globalThis.crossOriginIsolated ? Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 2) - 1)) : 1);
+    ort.env.wasm.numThreads = threads ?? defaultThreads({isolated: Boolean(globalThis.crossOriginIsolated),
+      cores: navigator.hardwareConcurrency || 2});
     ort.env.wasm.proxy = false;
     ort.env.logLevel = 'error';
     const networks = [];
