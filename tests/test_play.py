@@ -1358,10 +1358,13 @@ class TurnTrees(unittest.TestCase):
         bubble = SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=16), sha256='tiny',
                                  cache=neural_search.EvaluationCache())
         seen = []
-        found = evaluate(bubble, None, [(0, 0)], 32, 0, live=seen.append)
+        # A stopped clock: the first glimpse with statistics is shown at once and the throttle holds back the rest.
+        with unittest.mock.patch('play.time', SimpleNamespace(monotonic=lambda: 0., perf_counter=time.perf_counter)):
+            found = evaluate(bubble, None, [(0, 0)], 32, 0, live=seen.append)
         moves = found['moves']
-        self.assertTrue(seen and all(len(g['top']) <= 5 and 0 <= g['value'] <= 1 and g['top'][0][2] >= g['top'][-1][2]
-                                     for g in seen))
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(all(len(g['top']) <= 5 and 0 <= g['value'] <= 1 and g['top'][0][2] >= g['top'][-1][2]
+                            for g in seen))
         self.assertTrue(found['top'] and all(len(t) == 5 and 0 <= t[3] <= 1 and t[4] in (-1, 0, 1) for t in found['top']))
         self.assertTrue(all(len(t) == 3 for t in evaluate(bubble, None, [(0, 0)], 0, 0)['top']))
         self.assertEqual(len(self.trees), 1)
