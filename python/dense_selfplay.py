@@ -556,7 +556,8 @@ class SelfPlayGame:
     `network_values` stores uncorrected predictions for trained searched plies; record_network_values
     fills missing predictions before the worker saves a completed episode.
     With adjudicate_proven a proven search (+1: the side to move wins, -1: every legal move loses) plays its
-    move and ends the game there (`adjudicate`)."""
+    move and ends the game there (`adjudicate`). With proven_line_rows, an applicable two-stone winning
+    certificate may start with either legal stone so its continuation teaches both conditional complements."""
 
     def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None):
         self.sides, self.settings, self.seed, self.reason, self.adjudicated = sides, settings, seed, None, None
@@ -624,6 +625,11 @@ class SelfPlayGame:
             action = actions[self.rng.choice(len(policy), p=policy/policy.sum())].tolist()
         else:
             action = result['action']
+        if (self.settings.adjudicate_proven and self.settings.proven_line_rows and result.get('proven', 0) > 0
+                and result.get('proof') is not None and game.remaining == 2):
+            stones = result['proof'].action(self.moves)
+            if stones and len(stones) == 2 and (actions[:, None, :] == np.asarray(stones)[None, :, :]).all(2).any(0).all():
+                action = stones[int(self.rng.integers(2))]
         q, r = int(action[0]), int(action[1])
         game.play(q, r)
         for tree in self.trees.values():
