@@ -480,7 +480,7 @@ struct Entry { uint64_t key=0; Turn best; };
 struct ForcingLine { Turn attack; std::vector<std::pair<Turn,int>> replies; };
 struct WinningPlan {
     int attacker=-1;
-    std::vector<Cell> history;
+    std::vector<std::pair<Cell,int>> position;
     std::vector<ForcingLine> proof;
 };
 // The player reconstructs its Board for each request in a persistent worker.
@@ -845,6 +845,7 @@ struct Search {
         } restore_cache{b,b.candidates};
         b.candidates=nullptr;
         const auto& line=proof[index];Restore restore(b);
+        if(line.attack.count>b.remaining) return false;
         for(int j=0;j<line.attack.count;++j) {
             if(!b.legal(line.attack.cells[j])) return false;
             b.make(line.attack.cells[j]);if(b.winner>=0) return b.winner==attacker;
@@ -863,39 +864,25 @@ struct Search {
         return true;
     }
     int resume(Board& b,const WinningPlan& plan) {
-        if(plan.proof.empty() || plan.attacker!=b.player || plan.history.size()>b.history.size()) return -1;
-        for(size_t i=0;i<plan.history.size();++i) if(!(plan.history[i]==b.history[i].c)) return -1;
-        int index=int(plan.proof.size())-1;size_t ply=plan.history.size();
-        while(ply<b.history.size()) {
-            if(Clock::now()>=proof_deadline) throw Timeout{};
-            const auto& line=plan.proof[index];
-            if(ply+line.attack.count>b.history.size()) return -1;
-            for(int j=0;j<line.attack.count;++j) if(!(line.attack.cells[j]==b.history[ply+j].c)) return -1;
-            ply+=line.attack.count;
-            auto found=std::find_if(line.replies.begin(),line.replies.end(),[&](const auto& reply) {
-                const auto& defense=reply.first;
-                if(ply+defense.count>b.history.size()) return false;
-                auto cells=defense.cells;
-                for(int j=0;j<defense.count;++j) cells[j]=b.history[ply+j].c;
-                if(defense.count==2 && cells[1]<cells[0]) std::swap(cells[0],cells[1]);
-                return cells==defense.cells;
-            });
-            if(found==line.replies.end()) return -1;
-            ply+=found->first.count;index=found->second;
+        if(plan.proof.empty() || plan.attacker!=b.player || plan.position.size()>b.cells.size()) return -1;
+        for(const auto& [cell,player]:plan.position) if(b.at(cell)!=player) return -1;
+        // Stateless callers can reconstruct a different placement order.
+        // Recheck the stored strategies on the actual board instead of
+        // inferring a chronology from its stones.
+        proof=plan.proof;
+        for(int index=int(proof.size())-1;index>=0;--index) if(replay(b,index)) {
+            // Children precede their parents, so this prefix keeps their indices.
+            proof.resize(index+1);return index;
         }
-        // Proof children precede their parents. Copying this prefix preserves
-        // their indices and discards the already played part of the strategy.
-        proof.assign(plan.proof.begin(),plan.proof.begin()+index+1);
-        if(replay(b,index)) return index;
         proof.clear();return -1;
     }
     void remember(const Board& b,int root,WinningPlan& plan) const {
-        size_t bytes=b.history.size()*sizeof(Cell)+(root+1)*sizeof(ForcingLine);
+        size_t bytes=b.history.size()*sizeof(std::pair<Cell,int>)+(root+1)*sizeof(ForcingLine);
         for(int i=0;i<=root;++i) bytes+=proof[i].replies.size()*sizeof(std::pair<Turn,int>);
         if(bytes>256*1024) return;
         WinningPlan next;next.attacker=b.player;
-        next.history.reserve(b.history.size());
-        for(const auto& step:b.history) next.history.push_back(step.c);
+        next.position.reserve(b.history.size());
+        for(const auto& step:b.history) next.position.emplace_back(step.c,step.player);
         next.proof.assign(proof.begin(),proof.begin()+root+1);
         plan=std::move(next);
     }

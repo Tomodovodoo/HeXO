@@ -81,14 +81,16 @@ int main() {
     auto counter_key=counter.hash();
     assert(!forcing.replay(counter,root) && counter.hash()==counter_key);
     // A fresh Board and Search on every request must still finish a proven
-    // win, including when the defender reverses its two placements.
+    // win, even when stateless reconstruction changes earlier placement order.
     WinningPlan plan;forcing.remember(open,root,plan);
     Board played;
     for(auto c:opening) played.make(c);
     int resumed_turns=0;
     for(int turn=0;turn<8 && played.winner<0;++turn) {
         Board position;
-        for(const auto& step:played.history) position.make(step.c);
+        auto order=played.history;
+        if(turn%2==0) std::swap(order[3],order[4]);
+        for(const auto& step:order) {assert(position.legal(step.c));position.make(step.c);}
         const auto key=position.hash();const auto features=position.features;
         Search continuation(5000,16);
         auto result=continuation.run(position,1,0,0,&plan);
