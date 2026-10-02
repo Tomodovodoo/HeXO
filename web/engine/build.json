@@ -38,7 +38,9 @@
  "artefacts": {
   "gumbel.mjs": "5bace107d54c423e2d5282b60d838d78013b76b0fe29a9b274d14ae996887d5e",
   "gumbel.wasm": "0c4fb99d79fd78bd3613063a930a6fb18f22f59b841f5a3509b1d5962f49f77f",
-  "tactical.wasm": "b46d01c1fc0be6ba015d2623d0ce77670fd39372e02209667e0c44fc51405972"
+  "tactical.wasm": "b46d01c1fc0be6ba015d2623d0ce77670fd39372e02209667e0c44fc51405972",
+  "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
+  "native/native.wasm": "3005b8b61b84323d7092047bd21a7e00617b0a02522b0f9e8893c16a2a3e8c4f"
  },
  "tools": {
   "emxx": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 6.0.10 (d6c521a7f05449857c76bd99e396895583cf2083)",

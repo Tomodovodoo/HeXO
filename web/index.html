@@ -729,7 +729,7 @@ function renderEngineHead(){
   const head=$('engine-head'),a=S.analysis;
   if(!a){head.replaceChildren();return}
   const [kind,label]=shown(a),pick=el('button',{class:'pick'},...badge(kind,label));
-  const items=pickItems(e=>e.kind==='bubble');
+  const items=pickItems(e=>e.kind==='bubble'||e.analysis);
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,a.engine,it=>sendAnalysis({engine:it.id,checkpoint:null,preset:'standard',custom:undefined}));
   const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},'Auto analysis',el('i'));
   auto.onclick=()=>sendAnalysis({auto:!a.auto});
