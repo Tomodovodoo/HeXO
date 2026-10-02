@@ -10,6 +10,10 @@ for every proposed pair. The candidate cache lasts for one search. Ordinary
 Native search uses no transposition table. The experimental Python
 `tt_injection=True` option keeps its separate previous-iteration move hints;
 it is off by default and never caches score bounds.
+The existing line-count arithmetic is precomputed into 1 KiB of immutable
+constants. Without optional pattern adjustments, candidate updates skip that
+adjustment arithmetic and windows whose gains did not change. Candidate selection
+sorts only the retained cells, preserving their scores and tie order.
 The root prover can also cover an attack that leaves the defender a free second
 stone. It first finds a strategy against the mandatory block and records which
 empty cells can affect its moves or threats. Fillers outside that set share the
