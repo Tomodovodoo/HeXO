@@ -97,7 +97,7 @@ export async function loadTactical(source) {
   }
 
   function history(history, { nodes = 2500, ms = 1000, idtt_nodes = 0, depth = 8, attacker = 'mover',
-                               certificate, root_moves, table_mb = 0 } = {}) {
+                               certificate, root_moves, table_mb = 0, shortest = false } = {}) {
     checkBudgets(ms, nodes, idtt_nodes, depth, attacker, table_mb);
     const start = performance.now();
     const unknown = reason => ({
@@ -109,6 +109,7 @@ export async function loadTactical(source) {
     const request = { history, ms: remaining, nodes, idtt_nodes, depth, attacker, table_mb };
     if (certificate != null) request.certificate = certificate;
     if (root_moves != null) request.root_moves = root_moves;
+    if (shortest) request.shortest = true;
     if (JSON.stringify(request).length > REQUEST_LIMIT) return unknown('request size limit');
     const result = { ...unknown('native error'), ...query(request) };
     if (performance.now() - start >= ms) Object.assign(result, unknown('deadline'), { nodes_used: result.nodes_used });

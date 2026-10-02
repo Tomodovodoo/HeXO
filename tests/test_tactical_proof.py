@@ -17,6 +17,13 @@ IMMEDIATE = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]]
 ONE_TURN = [[0,0],[1,2],[2,2],[0,-2],[-2,0],[3,2],[4,2]]
 TWO_TURN = [[0,0],[1,2],[2,2],[0,-3],[-3,0],[3,2],[8,0],[-3,3],[3,-3],[8,1],[8,2]]
 NO_THREAT = [[0,0],[1,2],[3,-1]]
+# Side 0 to move with a forced win in four turns; the first certificate PDS-PN finds takes five.
+LATE_WIN = [[0,0],[1,-2],[-1,-1],[2,-1],[0,-2],[0,-3],[1,-4],[1,-3],[2,-5],[-4,0],[-1,0],[-3,0],[-1,1],[-4,-1],
+            [-4,-2],[-3,-1],[-4,-3],[2,-2],[-3,1],[-2,3],[-4,3],[-3,3],[-6,1],[-2,4],[-5,0],[-2,5],[-7,1],[-2,1],
+            [-8,1],[-5,-1],[-6,0],[-9,3],[-3,-3],[-6,-1],[-6,-2],[-6,3],[-6,-3],[-7,-2],[-7,-1],[-9,-1],[-5,-3],
+            [-7,-3],[-1,-3],[-7,0],[-5,-2],[-3,4],[-8,3],[-3,5],[-1,-5],[0,2],[-3,-4],[-7,6],[0,-8],[-6,5],[1,-8],
+            [-2,-7],[-10,5],[-9,5],[-2,-6],[-1,-9],[-11,4],[-12,5],[0,-7],[2,-9],[-10,2],[3,-4],[4,-5],[2,-3],
+            [-2,-1],[-2,0],[-6,4],[-1,-8],[-4,2],[0,-4],[1,-9],[0,-9],[1,-10],[-3,-6],[3,-12]]
 FIXTURE = json.loads((Path(__file__).with_name('fixtures')/'tactical_positions.json').read_text(encoding='utf-8'))
 DETERMINISM_NODES = 540
 
@@ -61,6 +68,16 @@ class NativeStrategy(unittest.TestCase):
                     independent_verify(cert, OPEN_THREE, deadline_seconds=0)
         with self.assertRaises(VerificationTimeout):
             independent_verify(result['certificate'], OPEN_THREE, deadline_seconds=0)
+
+    def test_shortest_tightens_the_certificate_to_the_fewest_turns(self):
+        loose = self.engine.history(LATE_WIN, nodes=32768, ms=20000)
+        self.assertEqual((loose['status'], loose['proof_turns'], loose['shortest']), ('PROVEN_WIN', 5, False))
+        tight = self.engine.history(LATE_WIN, nodes=32768, ms=20000, shortest=True)
+        self.assertEqual((tight['status'], tight['proof_turns'], tight['shortest'], tight['moves']),
+                         ('PROVEN_WIN', 4, True, [[-1, -11], [-1, -10]]))
+        self.assertEqual(independent_verify(tight['certificate'], LATE_WIN), 'PROVEN_WIN')
+        again = self.engine.history(LATE_WIN, nodes=32768, ms=20000, shortest=True)
+        self.assertEqual((again['cache_hit'], again['shortest'], again['certificate']), (True, True, tight['certificate']))
 
     def test_certificate_cap_tracks_granted_budget(self):
         cert = dict(version=1, width='wide', root=0,
@@ -213,6 +230,14 @@ class FlippedTurnThreats(unittest.TestCase):
             recheck = self.engine.history(history, attacker='opponent', certificate=result['certificate'])
             self.assertEqual(recheck['status'], 'PROVEN_WIN')
             self.assertEqual(self.engine.history(history, certificate=result['certificate'])['status'], 'UNKNOWN')
+
+    def test_isolated_worker_passes_shortest(self):
+        tactics = IsolatedTactics()
+        try:
+            result = tactics.history(LATE_WIN, nodes=32768, ms=20000, shortest=True)
+            self.assertEqual((result['status'], result['proof_turns'], result['shortest']), ('PROVEN_WIN', 4, True))
+        finally:
+            tactics.close()
 
     def test_no_threat(self):
         result = self.engine.history(NO_THREAT, nodes=100000, attacker='opponent')
