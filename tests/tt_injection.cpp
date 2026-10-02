@@ -55,6 +55,20 @@ int main() {
     assert(root>=0 && forcing.replay(open,root));
     assert(open.hash()==open_key && open.features==open_features);
     assert(Search::candidate_scores(open)==gains);
+    // Lazy first-stone batches must preserve every distinct attack, while
+    // spending the proof budget only once on each resulting position.
+    std::unordered_set<uint64_t> independent,shared,returned;
+    size_t independent_count=0,shared_count=0;
+    for(auto first:Search::candidates(open,16)) {
+        for(const auto& t:forcing.turns(open,false,{},true,&first)) {
+            Restore restore(open);apply(open,t);independent.insert(open.hash());++independent_count;
+        }
+        for(const auto& t:forcing.turns(open,false,{},true,&first,&shared)) {
+            Restore restore(open);apply(open,t);assert(returned.insert(open.hash()).second);++shared_count;
+        }
+    }
+    assert(independent_count>shared_count && independent==returned && shared==returned);
+    assert(open.hash()==open_key && Search::candidate_scores(open)==gains);
     Board blocked;
     auto defended_opening=opening;defended_opening[5]=forcing.proof[root].attack.cells[0];
     for(auto c:defended_opening) {assert(blocked.legal(c));blocked.make(c);}
@@ -75,7 +89,8 @@ int main() {
     // Development losses: an attack hidden below defensive first-stone
     // rankings, and a winning continuation with no unblocked three-stone line.
     // Short continuations must also survive the proof work limit. All strategies
-    // were checked separately by the raw-board Python verifier.
+    // were checked separately by the raw-board Python verifier. The final
+    // position needs a blocking first stone and an attacking second stone.
     for(const auto& history:std::vector<std::vector<Cell>>{
         {
             {0,0},{1,1},{-1,2},{-1,1},{3,-3},{1,-1},{1,0},{1,-3},{2,-3},{4,-3},
@@ -98,6 +113,10 @@ int main() {
             {0,0},{-2,-2},{-2,1},{-2,2},{-1,1},{2,-2},{-4,4},{-1,2},{-1,0},{-1,-2},
             {0,-2},{1,-2},{1,2},{-4,2},{-4,-2},{1,0},{-3,-2},{-4,0},{-4,1},{-4,-1},
             {-4,3},{-2,-1},{-3,0},{-5,2},{0,-3}
+        },
+        {
+            {0,0},{-2,-2},{-2,1},{0,1},{0,2},{0,-1},{-2,-1},{-2,2},{0,5},{0,3},
+            {-1,2},{-3,3},{-5,5},{-1,1},{-1,-1},{-1,0},{-4,4}
         }
     }) {
         Board position;
