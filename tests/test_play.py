@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import random
 import tempfile
 import threading
 import time
@@ -17,7 +18,7 @@ import formats
 from hexo import Game
 from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings,
                   budget_of, command_of, export, export_path, file_digest, file_identity, import_history, linked_history,
-                  model_key, move_row, pair_elo, presets_of, proof_turns, read_game, review, scan, six_backend)
+                  model_key, move_row, pair_elo, pick_opening, position_text, presets_of, proof_turns, read_game, review, scan, six_backend)
 from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
@@ -65,7 +66,7 @@ class FakeEngines:
     def __init__(self):
         self.calls, self.turns, self.hold, self.release = [], [], False, threading.Event()
 
-    def evaluate(self, entry, checkpoint, budget, history, watch, live=None):
+    def evaluate(self, entry, checkpoint, budget, history, watch, live=None, keep=False):
         self.calls.append((checkpoint, dict(budget), [tuple(p) for p in history]))
         while self.hold and not self.release.is_set():
             watch(1)
@@ -73,7 +74,10 @@ class FakeEngines:
         watch(budget['simulations'])
         moves = legal_turn(history)
         found = dict(moves=moves, value=.5, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1)
-        return found, budget, f'{model_key(export_path(entry, checkpoint))}:none'
+        return found, budget, f'{model_key(export_path(entry, checkpoint))}:none' + (':kept' if keep else '')
+
+    def evaluate_many(self, entry, checkpoint, budget, histories, watch):
+        return [self.evaluate(entry, checkpoint, budget, history, watch) for history in histories]
 
     def solver_build(self):
         return 'none'
@@ -170,6 +174,22 @@ class Store(unittest.TestCase):
     def test_rows_mark_stones_the_search_proved(self):
         self.assertEqual([move_row([1, 2], .5, v)[3:] for v in (1., -1., .2)], [[1., 1], [0., -1], [.6, 0]])
         self.assertEqual(move_row([1, 2], .5), [1, 2, .5])
+
+    def test_turn_evaluations_kept_trees_and_review_stay_apart(self):
+        session = Session(entries(), FakeEngines(), Evaluations())
+        self.addCleanup(session.close)
+        session.configure_analysis('bubble:fake', preset='standard', auto=False)
+        key = session.engine_key(session.analysis)
+        later = dict(history=[(0, 0), (1, 0)], moves=[[1, 1]], value=.3, top=[[1, 1, 1., .3, 0]], proof=None, line=[],
+                     threat=[])
+        found = dict(moves=[[1, 0], [1, 1]], value=.6, top=[[1, 0, 1., .6, 0]], proof=None, line=[], threat=[], later=[later])
+        session.save([(0, 0)], key, STANDARD, found, 'fake')
+        self.assertEqual(session.lookup([(0, 0), (1, 0)])['value'], .3)
+        self.assertIsNone(session.review_lookup([(0, 0), (1, 0)]))
+        session.store.add([(0, 0), (1, 0), (1, 1)], key + ':kept', STANDARD, dict(value=.9, moves=[], top=[]))
+        self.assertEqual(session.lookup([(0, 0), (1, 0), (1, 1)])['value'], .9)
+        self.assertIsNone(session.review_lookup([(0, 0), (1, 0), (1, 1)]))
+        self.assertEqual(session.review_lookup([(0, 0)])['value'], .6)
 
     def test_index_keeps_the_newest_entries(self):
         store = Evaluations(limit=2)
@@ -362,6 +382,9 @@ class Jobs(unittest.TestCase):
         for move in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]:
             self.session.play(*move)
         self.engines.hold = True
+        patcher = unittest.mock.patch('play.REVIEW_CHUNK', 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.session.review_game()
         wait(lambda: len(self.engines.calls) == 1)
         self.session.analyse(3)
@@ -517,7 +540,7 @@ class Jobs(unittest.TestCase):
         self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
         budgets = [PRESETS['bubble'][name] for name in PRESETS['bubble']]
         wait(lambda: all(self.session.store.covering([], key, budget) for budget in budgets
-                         for key in [self.session.engine_key(self.session.analysis)]))
+                         for key in [self.session.engine_key(self.session.analysis) + ':kept']))
         deep = [budget for checkpoint, budget, history in self.engines.calls if not history]
         self.assertEqual(deep, budgets)
         self.assertIsNone(self.session.analyse(0))
@@ -533,8 +556,8 @@ class Jobs(unittest.TestCase):
                           and j['status'] == 'queued'])
 
     def test_a_preset_without_a_solver_verdict_is_not_deepened_again(self):
-        def unsolved(entry, checkpoint, budget, history, watch, live=None):
-            found, spent, key = FakeEngines.evaluate(self.engines, entry, checkpoint, budget, history, watch)
+        def unsolved(entry, checkpoint, budget, history, watch, live=None, keep=False):
+            found, spent, key = FakeEngines.evaluate(self.engines, entry, checkpoint, budget, history, watch, keep=keep)
             return found, spent | dict(solver_nodes=0), key
         self.engines.evaluate = unsolved
         self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
@@ -548,6 +571,12 @@ class Jobs(unittest.TestCase):
         self.session.configure_analysis('bubble:fake', preset='deep', auto=True)
         time.sleep(.2)
         self.assertFalse([j for j in self.session.state()['jobs'] if j['ply'] == len(final)])
+
+    def test_reviewing_an_empty_board_evaluates_it_once(self):
+        self.session.configure_seat(1, 'human')
+        self.session.review_game()
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual([len(call[2]) for call in self.engines.calls], [0])
 
     def test_review_uses_the_review_budget_whatever_the_slider_says(self):
         self.session.configure_seat(1, 'human')
@@ -1109,9 +1138,10 @@ class Matches(unittest.TestCase):
             self.assertEqual(seat['source']['files'][str(path.resolve())],
                              file_digest(file_identity(path)))
 
-    def test_book_openings_start_engine_games(self):
+    def test_book_openings_start_games_and_cover_lines_against_a_person(self):
         path = Path(self.directory.name) / 'book.json'
-        nodes = [dict(key=str(i), status='opening', moves=[[0, 0], [i, 0], [i, 1]], off_policy=i == 2) for i in (1, 2)]
+        nodes = [dict(key=f'0,0|{i},0 {i},1', status='opening', moves=[[0, 0], [i, 0], [i, 1]], off_policy=i == 3)
+                 for i in (1, 2, 3)]
         path.write_text(json.dumps(dict(schema='hexo-opening-book-v2', nodes=nodes)))
         self.session.book = None
         with self.assertRaises(ValueError):
@@ -1120,11 +1150,34 @@ class Matches(unittest.TestCase):
         self.session.pause(True)
         self.session.configure_seat(0, 'native:Native')
         self.session.configure_seat(1, 'native:Other')
-        self.session.use_book(True)
-        self.assertEqual(sorted(abs(q) + abs(r) + abs(q + r) for q, r in self.session.history[:3]), [0, 2, 4])
-        self.session.configure_seat(1, 'human')
+        self.session.use_book(True, 'wide')
+        opening = self.session.state()['book']['opening']
+        i = int(opening['key'][4])
+        self.assertEqual((opening['mode'], sorted(abs(q) + abs(r) + abs(q + r) for q, r in self.session.history[:3])),
+                         ('wide', [0, 2 * i, 2 * i + 2]))
+        self.session.configure_seat(0, 'human')
+        keys = []
+        for _ in range(3):
+            self.session.new_game()
+            keys.append(self.session.state()['book']['opening']['key'])
+        self.assertEqual(set(keys[:2]), {'0,0|1,0 1,1', '0,0|2,0 2,1'})
+        self.assertEqual(sum(self.session.coverage.counts.values()), 3)
+        self.session.use_book(False)
         self.session.new_game()
-        self.assertEqual((self.session.history, self.session.state()['book']), ([], dict(available=True, enabled=True)))
+        self.assertEqual((self.session.history, self.session.state()['book']['opening']), ([], None))
+
+    def test_openings_are_picked_by_unplayed_branch(self):
+        nodes = [dict(key=k) for k in ('0,0|a', '0,0|b x', '0,0|b y')]
+        counts = {'0,0|a': 0, '0,0|b x': 1, '0,0|b y': 0}
+        picks = {pick_opening(nodes, counts.get, random.Random(seed))['key'] for seed in range(40)}
+        self.assertEqual(picks, {'0,0|a', '0,0|b y'})
+        played = dict.fromkeys(counts, 0)
+        for seed in range(3):
+            node = pick_opening(nodes, played.get, random.Random(seed))
+            played[node['key']] += 1
+        self.assertEqual(set(played.values()), {1})
+        played['0,0|a'] = 2
+        self.assertNotEqual(pick_opening(nodes, played.get, random.Random(5))['key'], '0,0|a')
 
     def test_saved_tournaments_report_an_elo_from_complete_pairs(self):
         self.assertIsNone(pair_elo([dict(game=1, winner=0)]))
@@ -1319,6 +1372,82 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual([h for h, _, _ in tree.searched], [[(0, 0)], [(0, 0), tuple(moves[0])]])
         self.assertGreater(tree.searched[1][2], tree.searched[1][1])
         self.assertIsNone(tree.ptr)
+        self.assertEqual([len(step['history']) for step in found['later']], [2])
+
+    def bubble(self):
+        import hexnet
+        import neural_search
+        from types import SimpleNamespace
+        model = hexnet.load_model(self.path)
+        return SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=64), sha256='tiny',
+                               cache=neural_search.EvaluationCache())
+
+    def test_a_turn_the_solver_gave_still_ranks_each_of_its_positions(self):
+        from play import evaluate
+        given = dict(moves=[[1, 0], [2, 0]], line=[], proof=dict(winner=1, turns=1), threat=[], solved=True, used=0)
+        found = evaluate(self.bubble(), None, [(0, 0)], 16, 0, solved=given)
+        self.assertEqual((found['moves'], found['value'], len(found['top'])), ([[1, 0], [2, 0]], 1., 5))
+        self.assertEqual([(step['history'], step['moves'], len(step['top'])) for step in found['later']],
+                         [([(0, 0), (1, 0)], [[2, 0]], 5)])
+
+    def test_a_proven_second_stone_keeps_its_proof(self):
+        from play import evaluate
+        history = [(0, 0), (1, 2), (2, 2), (-2, 0), (-3, 0), (3, 2), (4, 2), (0, -3), (0, -4)]
+        found = evaluate(self.bubble(), None, history, 64, 0)
+        later = found['later'][0]
+        self.assertEqual((later['proof']['winner'], later['value']), (1, 1.))
+
+    def test_pooled_evaluations_match_single_ones(self):
+        from play import evaluate, evaluate_many
+        histories = [[(0, 0)], [(0, 0), (1, 0), (1, 1)], [(0, 0), (1, 0)]]
+        pooled = evaluate_many(self.bubble(), [], histories, 16, 0, batch_size=64)
+        for history, found in zip(histories, pooled):
+            alone = evaluate(self.bubble(), None, history, 16, 0)
+            self.assertEqual((found['moves'], [t[:2] for t in found['top']]), (alone['moves'], [t[:2] for t in alone['top']]))
+            self.assertAlmostEqual(found['value'], alone['value'], places=3)
+
+    def test_a_pooled_review_asks_the_solver_once_per_position(self):
+        from dense_solver import VERDICTS
+        from play import evaluate_many
+        asked = []
+
+        class Prover:
+            def history(self, history, **options):
+                asked.append((position_text(history), options['attacker']))
+                return dict(status='UNKNOWN', reason=next(iter(VERDICTS)), nodes_used=1)
+
+            def abort(self):
+                pass
+        histories = [[(0, 0)], [(0, 0), (1, 0), (1, 1)], [(0, 0)]]
+        found = evaluate_many(self.bubble(), [Prover(), Prover()], histories, 0, 64)
+        self.assertEqual(sorted(asked), sorted((position_text(h), side) for h in histories[:2] for side in ('mover', 'opponent')))
+        self.assertTrue(all(f['solved'] for f in found))
+
+    def test_kept_trees_run_only_the_simulations_they_lack(self):
+        from play import evaluate
+        engines, bubble, history = Engines('cpu'), self.bubble(), [(0, 0)]
+        self.addCleanup(engines.close)
+        for tier in (8, 32, 128):
+            evaluate(bubble, None, history, tier, 0, trees=engines.kept_trees(bubble, history))
+        first = self.trees[0]
+        self.assertEqual([h for h, _, _ in first.searched], [[(0, 0)]] * 3)
+        self.assertEqual(sum(1 for t in self.trees if t.history == [(0, 0)]), 1)
+        self.assertGreaterEqual(first.searched[-1][2], 128)
+        self.assertLess(first.searched[-1][2], 128 + 16)
+        engines.kept_trees(bubble, [(0, 0), (1, 0)])
+        self.assertIsNone(first.ptr)
+        trees = engines.kept_trees(bubble, [(0, 0)], 'abc')
+        tree, missing = trees([(0, 0)], 32, bubble.evaluator)
+        tree.search(10, root_samples=16, batch_size=16)
+        self.assertEqual(trees([(0, 0)], 32, bubble.evaluator), (tree, 32 - int(tree.result(0, 0, 0, 0)['visits'].sum())))
+        engines.kept_trees(bubble, [(0, 0)], 'def')
+        self.assertIsNone(tree.ptr)
+
+    def test_rows_put_proven_wins_first_and_proven_losses_last(self):
+        import numpy as np
+        from play import top_rows
+        rows = top_rows(np.array([[1, 0], [2, 0], [3, 0], [4, 0]]), np.array([.4, .3, .2, .1]), np.array([-1., .2, 1., .1]))
+        self.assertEqual([r[:2] for r in rows], [[3, 0], [2, 0], [4, 0], [1, 0]])
 
 
 class Registry(unittest.TestCase):

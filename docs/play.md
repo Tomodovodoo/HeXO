@@ -179,9 +179,14 @@ MantisNet (Cmiller132/Hexo-Shrimp-Bot), which has no licence and no weights.
 Strength is a slider from Faster to Smarter with six stops: a spark, an open hexagon, a filled one, one in a ring, a
 stack and the hazard sign; arrow keys move it one stop. The sliders button beside it opens the custom budget.
 
-When both seats are engines and the run has an opening book (`openings.json` in `--dense-run`, or `--book`), the
-seats card offers Opening book: New then starts from a random in-policy book opening in a random orientation, shown
-as played stones.
+When the run has an opening book (`openings.json` in `--dense-run`, or `--book`), the seats card offers Opening
+book, on by default, and its set: narrow (the openings above the policy cutoff, as for batches), on-policy (every
+active opening) or all (with the imported off-policy ones). New then starts from one of them in a random
+orientation, shown as played stones; the move list names the set. Between engines the opening is drawn uniformly.
+Against a person it prefers lines that person has not played on that side: walking the book's tree, each step
+picks among branches that still hold an unplayed opening, so a branch counts as played only once all of its
+openings have been; when all have, one of the least played is picked. What was played is kept per side in
+`play-openings.jsonl` beside the saved evaluations, appended like them.
 
 | Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms | Six protocol nodes | Strix simulations |
 |---|---|---|---|---|---|
@@ -240,14 +245,21 @@ model, beside the one that plays engine moves, so they keep up during play. With
 position where a turn starts, plus any position you step to; while an engine seat plays it also deepens the current
 position through every preset, Lightning first, showing each as it lands and starting again when the position
 changes. That deepening runs last in the queue, gives way to any other analysis and slows down while an engine
-seat searches. A position without a saved evaluation shows the search of the engine or analysis working on it as
-it goes. The slider rings the stop of the evaluation shown. Engine moves by the same checkpoint count as
+seat searches. Each preset continues the search trees of the one before on the same position, adding only the
+simulations they lack, and keeps a solver proof it already has; these evaluations are saved apart from fresh ones
+(their engine key ends in `:kept`), shown like them, and never used by review. A position without a saved
+evaluation shows the search of the engine or analysis working on it as it goes. The search of a turn's second
+stone is saved as the evaluation of the position after its first stone, so every placement has rows. The slider
+rings the stop of the evaluation shown. Engine moves by the same checkpoint count as
 evaluations, so a game against Bubble costs nothing extra on Bubble's turns.
 
 Review always evaluates at Standard (128 simulations per stone, 32,768 solver nodes), whatever the slider says,
 and labels each turn only from evaluations at exactly that budget, so a verdict never compares a deep evaluation
-with a shallow one; the Review button carries the Standard mark. It labels each turn from the mover's win
-probability before and after it:
+with a shallow one; the Review button carries the Standard mark. It evaluates the missing positions in pooled
+steps: fresh trees, one per position, search together so their leaves share network batches (64 on CPU, 256 on
+CUDA), and the solver queries run on four tactical workers at once, each distinct position solved once. Between
+steps it gives way to more urgent analysis, and it slows down while an engine seat searches. It labels each turn
+from the mover's win probability before and after it:
 
 | Label | Meaning |
 |---|---|
@@ -266,9 +278,13 @@ For inaccuracies and worse the board outlines the engine's turn and the panel li
 step one stone, ↑ and ↓ one turn, Home and End, F fits the board. Retry plays on from the shown position.
 Changing the analysis engine, checkpoint or strength evaluates the shown position again at once.
 
-Each cell has fixed places for its marks, so none hides another: a candidate or line stone fills the cell with its
-rank in the middle, a threat is a badge at the lower left, a review glyph a badge at the upper right, the last stone
-a dot, and the hovered cell a ring. Candidate rows carry the same threat badge.
+Each cell has fixed places for its marks, so none hides another. A candidate is a ring with its rank and, below,
+the mover's win chance after it: rank 1 green, the others blue to red by how far they fall behind it. A proven line
+is drawn as translucent stones in each player's colour numbered from the shown position; on a candidate's cell
+its number moves to a badge at the lower right. A threat is a badge at the lower left, a stone the search proved
+wins or loses a check or cross at the upper left, a review glyph a badge at the upper right, and the hovered cell
+a white ring. Proven positions still list candidates, proven wins first and proven losses last. The proof shows
+as the winner's colour and the placements of its line above the rows. Candidate rows carry the same badges.
 
 Import reads whatever is pasted:
 
@@ -285,8 +301,9 @@ The server does the fetching, without accounts or tokens. These sites draw HTTTX
 first stone moves to the origin, and in Rectilinear notation the player who moved first becomes cross. Drawn stones
 must form complete turns; a drawing has no move order, so the importer looks for one that plays them legally.
 
-Above the move list sit Import, one chip per format (HTTTX, Rectilinear, Tyto link: a click copies the shown
-position, the arrow opens its text below the row), Game (downloads the replay file) and Review. Hovering a stone's
+Above the move list sit Import, the copy button (HTTTX of the shown position) with its format arrow, and Review.
+The arrow opens HTTTX, Rectilinear, Tyto link and Game file: a click on a name copies it (or downloads the replay
+file), and the chevron beside it opens its full text in a panel, with its own copy button. Hovering a stone's
 token in the text rings that cell on the board, and hovering a stone on the board marks its tokens. In the move
 list the stone of the shown position is outlined within its turn and the later one dimmed; hovering a stone rings
 it on the board. `GET /export?format=htttx|rectilinear|tyto&ply=N`
