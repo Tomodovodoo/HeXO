@@ -67,8 +67,8 @@ export class SixSearch {
   }
 
   /**
-   * The rest of the turn at `history` ([[q, r], ...]) within `nodes` new positions: {moves, score, stopped}, with
-   * `score` 1000 times the mover's value or 1000000 for a proven win. `progress(nodes)` reports the search a few
+   * The rest of the turn at `history` ([[q, r], ...]) within `nodes` new positions: {moves, score, nodes, stopped},
+   * with `score` 1000 times the mover's value or 1000000 for a proven win and `nodes` the positions searched. `progress(nodes)` reports the search a few
    * times a second. After stop() the turn ends early with `stopped` set, and the next turn starts a new tree.
    */
   async turn(history, nodes, progress = null) {
@@ -90,7 +90,8 @@ export class SixSearch {
     const stopped = this.stopped;
     if (stopped) this.forget();
     else this.played = [...history.map(p => [...p]), ...moves];
-    return {moves, score: this.module.ccall('six_score', 'number', [], []), stopped};
+    return {moves, score: this.module.ccall('six_score', 'number', [], []), nodes: this.module.ccall('six_nodes', 'number', [], []),
+      stopped};
   }
 
   /** Ends the running turn early. */

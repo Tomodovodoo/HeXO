@@ -56,7 +56,7 @@ SIX_NETWORKS = {'gen-0455': 'a934a8b171cd9a715fcd54ffc3e192c24901f0a7d40caa4216e
                 'gen-0100': 'a666b400170354d98e507cf3471d655531cf6b20a87c50e475e8b07e5982903a'}
 SIX_CROP_CELLS = 25*25
 SIX_SOURCES = ('board.cpp', 'tactics.cpp', 'search.cpp', 'threats.cpp', 'planes.cpp', 'mcts.cpp')
-SIX_EXPORTS = ('six_turn', 'six_stop', 'six_score', 'six_new_game', 'six_set_option', 'six_crop_cells', 'six_plane_count',
+SIX_EXPORTS = ('six_turn', 'six_stop', 'six_score', 'six_nodes', 'six_new_game', 'six_set_option', 'six_crop_cells', 'six_plane_count',
                'six_crop', 'malloc', 'free')
 SIX_FLAGS = ['-std=c++20', '-O3', '-msimd128', '-fexceptions', '-sASYNCIFY', '-sASYNCIFY_STACK_SIZE=65536',
              '-sSTACK_SIZE=1048576', '-sMODULARIZE', '-sEXPORT_ES6', '-sENVIRONMENT=web,worker,node', '-sALLOW_MEMORY_GROWTH',

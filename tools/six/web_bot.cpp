@@ -1,5 +1,6 @@
 // The network search compiled to WebAssembly, for playing HexBot Net in a browser with nothing installed.
-// CixMango/Six engine/web/web_bot.cpp (MIT, see LICENSE) with two additions for HeXO: six_stop and six_score.
+// CixMango/Six engine/web/web_bot.cpp (MIT, see LICENSE) with three additions for HeXO: six_stop, six_score and
+// six_nodes.
 // The search is the engine's own MCTS; each batch of positions goes out to JavaScript, which runs the network with
 // ONNX Runtime Web (WebGPU when the browser has it, WASM otherwise) and writes the outputs back.
 //
@@ -43,6 +44,7 @@ JsEvaluator evaluator;
 std::unique_ptr<six::Mcts> mcts;
 std::string reply;
 int score = 0;
+double searched = 0;
 
 }  // namespace
 
@@ -72,6 +74,7 @@ EMSCRIPTEN_KEEPALIVE const char* six_turn(const char* moves, int radius, int mov
       if (info.progress) jsProgress(static_cast<double>(info.nodes), info.timeMs);
     });
     score = result.score;
+    searched = static_cast<double>(result.nodes);
     std::ostringstream out;
     for (std::size_t i = 0; i < result.stones.size(); ++i) out << (i ? " " : "") << result.stones[i].q << ' ' << result.stones[i].r;
     reply = out.str();
@@ -109,6 +112,9 @@ EMSCRIPTEN_KEEPALIVE void six_stop() {
 
 /** The score of the last six_turn for the side that moved: 1000 x its value, or 1000000 for a proven forced win. */
 EMSCRIPTEN_KEEPALIVE int six_score() { return score; }
+
+/** The positions the last six_turn searched (0 when tactics decided the turn before the search). */
+EMSCRIPTEN_KEEPALIVE double six_nodes() { return searched; }
 
 /** Forgets the previous game, so a new one doesn't try to continue its tree. */
 EMSCRIPTEN_KEEPALIVE void six_new_game() {

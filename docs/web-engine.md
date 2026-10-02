@@ -186,8 +186,10 @@ included: it has no licence and no published weights.
 **Six (browser)** is CixMango/Six's own browser build, as its site playsix.cixmango.workers.dev runs it: Six's MCTS
 and threat solver (`tools/six`, its `engine/src` and `engine/web/web_bot.cpp` at `fbc7087`, MIT) compiled to
 WebAssembly with Six's flags (`web/engine/six/six.wasm`, 435 kB, committed through `build.json`), with each batch of
-positions sent out to ONNX Runtime Web. HeXO adds two exports to `web_bot.cpp`: `six_stop`, so a cancel ends a turn
-at its next batch, and `six_score`. Both seats and the analysis panel can use it; the presets give it the server's
+positions sent out to ONNX Runtime Web. HeXO adds three exports to `web_bot.cpp`: `six_stop`, so a cancel ends a
+turn at its next batch, `six_score` and `six_nodes`. Both seats and the analysis panel can use it. As analysis it
+shows its turn: the first stone as the top move, both stones as the line, the win chance from its score (100% when
+its threat solver proves a win, whose distance Six does not report) and the positions searched; the presets give it the server's
 Six protocol nodes (lightning 1,500 to dangerous 2,000,000) and the network select lists the site's networks, newest
 first. It plays like the server's Six (`python/six_engine.py` driving `sixengine`): Six's default search settings,
 radius 8, mirrored coordinates, `go nodes N` with no time limit, and the tree kept while the game continues.

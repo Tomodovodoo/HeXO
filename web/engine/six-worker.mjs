@@ -69,7 +69,8 @@ async function load(options = {}) {
 }
 
 /** Six's turn at `history` within `nodes` new positions, with the fields of python/play.py evaluate: its stones as
- * `moves` and as `top` rows, the mover's win probability from its score, and a proof when it found a forced win. The
+ * `moves` and `line`, the first as the one `top` row, the mover's win probability from its score (1 when its threat
+ * solver proved a win, whose distance Six does not report, so there is no `proof`) and the positions searched. The
  * network (the newest when null) is fetched on its first turn; progress follows that download, then the search. */
 async function turn({id, history, nodes, network}) {
   await use(network ?? manifest.networks[0].name, fraction => postMessage({type: 'progress', id, fraction}));
@@ -83,10 +84,11 @@ async function turn({id, history, nodes, network}) {
     running = null;
   }
   if (result.stopped) throw new Cancelled();
-  const won = result.score >= WIN - 1000, value = won ? 1 : Math.round((Math.max(-1, Math.min(1, result.score / 1000)) + 1) / 2 * 1e4) / 1e4;
-  return {moves: result.moves, value, top: result.moves.map(([q, r]) => [q, r, 1, value, won ? 1 : 0]),
-    proof: won ? {winner: player, turns: Math.max(1, WIN - result.score)} : null, line: [], threat: [], solved: false,
-    ms: Math.round(performance.now() - start), network: current.name, nodes};
+  const won = result.score === WIN, value = won ? 1 : Math.round((Math.max(-1, Math.min(1, result.score / 1000)) + 1) / 2 * 1e4) / 1e4;
+  const [first] = result.moves;
+  return {moves: result.moves, value, top: first ? [[first[0], first[1], 1, value, won ? 1 : 0]] : [],
+    line: result.moves.map(([q, r]) => [q, r, player]), proof: null, threat: [], solved: false,
+    ms: Math.round(performance.now() - start), network: current.name, nodes: result.nodes};
 }
 
 onmessage = ({data}) => {

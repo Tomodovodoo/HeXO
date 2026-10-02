@@ -75,7 +75,7 @@
   "tools/six/src/tactics.hpp": "9f6ee6f61f3e4e8faa077d8b1c81008409d6b693f5209381dccfece40fda5090",
   "tools/six/src/threats.cpp": "480a09c55d6977ee0acd7386f3a0263c73c9529066fab2e42be19e605431634e",
   "tools/six/src/threats.hpp": "4d966ee9d8e770ccb29320e50e6662ec50f892bb066e18996741fb877c7ac99a",
-  "tools/six/web_bot.cpp": "2956ab9f5eb5a0ff8dff83210eac4a1a28a7ee5668f5a344c8463bb1b55afdd5"
+  "tools/six/web_bot.cpp": "e3103d32e572ce82133729d6ef1ee2f7e90354026f6e32ed6aab21eb97202b60"
  },
  "artefacts": {
   "gumbel.mjs": "5bace107d54c423e2d5282b60d838d78013b76b0fe29a9b274d14ae996887d5e",
@@ -84,8 +84,8 @@
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
   "native/native.wasm": "3005b8b61b84323d7092047bd21a7e00617b0a02522b0f9e8893c16a2a3e8c4f",
   "shrimp/shrimp.wasm": "caeed68606deaee3be330278c8e8c294c05c83e1045169ef203b7e537b1a47d4",
-  "six/six.mjs": "a67e8469a4ef4648eb083a6a0c2db86afdc882384fb4105a847f64f8fa0a984b",
-  "six/six.wasm": "c4cfb2c9788f97982e6aa03ded399ee88ee35d8f11f9899101031b0067face9e"
+  "six/six.mjs": "70f1820dbd41982fa3a62827b075a3236b4637d80214bd735e72b7cba43ecc22",
+  "six/six.wasm": "e548d33d3574fa0d4cf174cf0afbb0ce35ef9d198e03d475e44bbdc2bb36d8c2"
  },
  "tools": {
   "emxx": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 6.0.10 (d6c521a7f05449857c76bd99e396895583cf2083)",
