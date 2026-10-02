@@ -139,20 +139,29 @@ def native_comparison(args):
                     side = board.player
                     engine = "candidate" if side == candidate_colour else "baseline"
                     result = engines[engine].search(history, args.ms, args.depth or 12, args.width)
-                    if args.seal_library and any(abs(q) > 55 or abs(r) > 55 for q, r in result["moves"]):
-                        result["invalid"] = "Seal coordinate range exceeded"
                     if result.get("invalid"):
                         invalid = result["invalid"]
                         searches.append({"engine": engine, "ply": len(history), **result})
                         break
                     if not result["moves"]:
                         raise RuntimeError("Nonterminal search returned no move")
+                    executed = 0
                     for move in result["moves"]:
+                        if args.seal_library and any(abs(c) > 55 for c in move):
+                            invalid = result["invalid"] = "Seal coordinate range exceeded"
+                            break
                         board.play(*move)
                         history.append(move)
+                        executed += 1
+                        if board.winner >= 0:
+                            break
+                    if executed < len(result["moves"]):
+                        result = {**result, "submitted_moves": result["moves"], "moves": result["moves"][:executed]}
+                    searches.append({"engine": engine, "ply": len(history), **result})
+                    if invalid:
+                        break
                     if board.winner < 0 and board.player == side:
                         raise RuntimeError("Search returned an incomplete turn")
-                    searches.append({"engine": engine, "ply": len(history), **result})
                 score = None if invalid else (0.5 if board.winner < 0 else float(board.winner == candidate_colour))
                 games.append({"index": index, "opening": opening, "candidate_colour": candidate_colour,
                               "winner": board.winner, "score": score, "invalid": invalid,
