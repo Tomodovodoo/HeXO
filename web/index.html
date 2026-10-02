@@ -908,7 +908,9 @@ $('new').onclick=async()=>{if(await post('/new')){fit();draw()}};$('undo').oncli
 $('pause').onclick=()=>post('/pause',{paused:!S.paused});
 const FORMATS=[['htttx','HTTTX'],['rectilinear','Rectilinear'],['tyto','Tyto']];
 let shownNotation=null;
-async function exported(kind){const res=await fetch(endpoint(`/export?format=${kind}&ply=${view}`)),data=await res.json();if(!res.ok)throw Error(data.error);return data}
+async function exported(kind){
+  if(kind==='game'){const res=await fetch(endpoint('/replay'));if(!res.ok)throw Error((await res.json()).error);return{text:await res.text(),spans:[]}}
+  const res=await fetch(endpoint(`/export?format=${kind}&ply=${view}`)),data=await res.json();if(!res.ok)throw Error(data.error);return data}
 async function copyFormat(kind,button){
   try{await navigator.clipboard.writeText((await exported(kind)).text);button.classList.add('done');
     clearTimeout(button.t);button.t=setTimeout(()=>button.classList.remove('done'),1200)}catch(e){toast(e.message)}
@@ -919,12 +921,22 @@ function renderFormats(){
     const side=el('button',{class:'side','aria-label':'Show '+name,html:icon('side')}),go=el('button',{class:'go','aria-label':'Copy '+name},name);
     side.onclick=()=>shownNotation===kind?hideNotation():showNotation(kind);go.onclick=()=>copyFormat(kind,go);
     return el('div',{class:'export'+(shownNotation===kind?' on':''),'data-kind':kind},side,go)}),
-    el('div',{class:'export'},el('span'),el('a',{class:'go',href:endpoint('/replay'),download:'game.json'},el('span',{html:icon('download')}),'Game file')));
+    gameRow());
+}
+function gameRow(){
+  const side=el('button',{class:'side','aria-label':'Show game file',html:icon('side')});
+  side.onclick=()=>shownNotation==='game'?hideNotation():showNotation('game');
+  return el('div',{class:'export'+(shownNotation==='game'?' on':'')},side,
+    el('a',{class:'go',href:endpoint('/replay'),download:'game.json'},el('span',{html:icon('download')}),'Game file'));
 }
 function placeExports(){
   const r=$('export-more').getBoundingClientRect(),box=$('exports'),panel=$('notation');
   box.style.left=Math.max(8,Math.min(r.right-200,innerWidth-208))+'px';box.style.top=Math.max(8,r.top-box.offsetHeight-6)+'px';
-  const b=box.getBoundingClientRect();panel.style.left=Math.max(8,b.left-panel.offsetWidth-6)+'px';
+  const b=box.getBoundingClientRect();
+  if(innerWidth<600){panel.style.left='8px';panel.style.width=(innerWidth-16)+'px';
+    panel.style.maxHeight=Math.max(120,b.top-14)+'px';panel.style.top=Math.max(8,b.top-panel.offsetHeight-6)+'px';return}
+  panel.style.width=panel.style.maxHeight='';
+  panel.style.left=Math.max(8,b.left-panel.offsetWidth-6)+'px';
   panel.style.top=Math.max(8,Math.min(b.top,innerHeight-panel.offsetHeight-8))+'px';
 }
 function openExports(){renderFormats();$('exports').classList.add('show');$('export-more').classList.add('on');placeExports()}
@@ -948,7 +960,7 @@ async function showNotation(kind,quiet){
   let data={text:'',spans:[]};if(view)try{data=await exported(kind)}catch(e){if(!quiet)toast(e.message)}
   if(shownNotation!==kind||box.dataset.sig!==sig)return;
   if(sig!==shownSig())return showNotation(kind,true);
-  $('notation-name').textContent=FORMATS.find(([k])=>k===kind)[1];
+  $('notation-name').textContent=kind==='game'?'Game file':FORMATS.find(([k])=>k===kind)[1];
   $('notation-text').replaceChildren(...(data.text?tokens(data):['—']));box.classList.add('show');placeExports();
 }
 function hideNotation(){shownNotation=null;$('notation').classList.remove('show');$('notation').dataset.sig='';
