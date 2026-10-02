@@ -316,6 +316,7 @@ export class BrowserSession extends OfflineSession {
           this.match.timings.push({ply: history.length, side: job.side, engine: job.spec.engine, elapsed_ms: elapsed});
           const winner = this.native.game(this.history).winner;
           if (winner >= 0) await this.finishMatch(winner, 'six');
+          else if (this.match.max_placements && this.history.length >= this.match.max_placements) await this.finishMatch(null, 'capped');
         }
       } else if (job.kind === 'review') { job.cursor++; job.done = job.cursor; }
     } catch (error) {
@@ -333,11 +334,13 @@ export class BrowserSession extends OfflineSession {
   async startMatch(body) {
     if (this.match?.active) throw Error('Stop the current match first');
     if (!Array.isArray(body.players) || body.players.length !== 2 || !Number.isInteger(body.games) || body.games < 2 || body.games > 10000 || body.games % 2) throw Error('Choose two engines and an even number of games');
+    const max_placements = body.max_placements ?? 512;
+    if (!Number.isSafeInteger(max_placements) || max_placements < 0 || max_placements === 1) throw Error('Stone limit must be at least 2, or 0 for uncapped');
     const players = body.players.map(p => { const s = this.spec(p), entry = this.entries.get(s.engine); return {...s, name: entry.name, version: entry.version}; });
     const seed = body.seed ?? Math.floor(Math.random() * 4294967296), mode = body.opening_range || 'origin';
     const openings = mode === 'origin' ? (body.openings || [[[0, 0]]]).map(moves => ({moves})) : this.bookData?.select(mode, body.unique_openings || body.games / 2, seed);
     if (!openings?.length) throw Error('No opening book is available');
-    openings.forEach(n => { if (this.native.game(n.moves).winner >= 0) throw Error('Match openings must be unfinished positions'); });
+    openings.forEach(n => { if (this.native.game(n.moves).winner >= 0 || max_placements && n.moves.length >= max_placements) throw Error('Match openings must be unfinished and shorter than the stone limit'); });
     const clock = {...body.clock || {mode: 'fixed'}};
     if (!['fixed', 'move', 'game'].includes(clock.mode)) throw Error('Unknown clock mode');
     if (clock.mode === 'move' && (!Number.isInteger(clock.ms) || clock.ms < 1)) throw Error('Seconds per turn must be positive');
@@ -349,7 +352,7 @@ export class BrowserSession extends OfflineSession {
     await this.saveGame(); this.cancelJobs();
     if (this.analysis) this.analysis.auto = false;
     this.match = {id: uid(), name: new Date().toISOString().slice(0, 19).replace('T', ' '), active: true, players, games: body.games,
-      completed: 0, current: 1, wins: [0, 0], capped: 0, results: [], openings, opening_range: mode, seed, clock, timings: [], elo: null};
+      completed: 0, current: 1, wins: [0, 0], capped: 0, results: [], openings, opening_range: mode, seed, clock, timings: [], elo: null, max_placements};
     this.beginMatchGame(); await this.storage.put('matches', copy(this.match)); this.changed(); this.pump();
   }
   beginMatchGame() {

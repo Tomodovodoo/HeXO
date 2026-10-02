@@ -165,6 +165,9 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['stopped_timeout'], dict(paused=True, active=False, completed=0))
         self.assertEqual(result['forked_clock'], dict(match=None, clock=None))
         self.assertEqual(result['finished_opening_status'], 400)
+        self.assertEqual((result['capped']['completed'], result['capped']['capped']), (2, 2))
+        self.assertTrue(all(r['placements'] == 3 and r['reason'] == 'capped' for r in result['capped']['results']))
+        self.assertEqual(result['uncapped'], dict(completed=2, capped=0, wins=[1, 1]))
 
     def test_freeplay_updates_until_new_game(self):
         requests = [['/play', dict(q=0, r=0)], ['/play', dict(q=1, r=0)], ['/new', {}],

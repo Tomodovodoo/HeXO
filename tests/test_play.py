@@ -1040,7 +1040,7 @@ class Matches(unittest.TestCase):
         opening = [(0, 0), (0, 5), (1, 5), (5, 0), (-5, 0), (2, 5), (3, 5), (0, -5), (0, -6),
                    (4, 5), (-2, 5), (0, -7), (0, -8)]
         self.engines.turn = lambda *args: [[5, 5]]
-        self.session.start_match(['Native', 'Other'], output=self.output, openings=[opening])
+        self.session.start_match(['Native', 'Other'], output=self.output, openings=[opening], max_placements=0)
         wait(lambda: not self.session.match_worker.is_alive())
         summary = json.loads((self.output / 'summary.json').read_text())
         self.assertEqual((summary['completed'], summary['wins'], summary['capped']), (2, [1, 1], 0))
@@ -1110,7 +1110,7 @@ class Matches(unittest.TestCase):
     def test_bad_match_specifications_do_not_change_the_board_or_start_jobs(self):
         for players, kwargs in [(['fake', 'Native'], {}), (['Native', 'Other'], dict(games=0)),
                                 (['Native', 'Other'], dict(unique_openings=2, games=2)),
-                                (['Native', 'Other'], dict(max_placements=0))]:
+                                (['Native', 'Other'], dict(max_placements=1))]:
             with self.assertRaises(ValueError):
                 self.session.start_match(players, output=self.output, **kwargs)
         self.assertIsNone(self.session.match)

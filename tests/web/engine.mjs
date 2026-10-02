@@ -173,5 +173,13 @@ if (job.kind === 'encode') {
   answer.finished_opening_status=(await s.request('/match',{players:[{engine:'test'},{engine:'test'}],games:2,openings:[job.history]},'POST'))[0];
   s.match = {active: false}; s.clock = {cross_ms: 0, circle_ms: 0}; s.apply('/undo', {});
   answer.forked_clock = {match: s.match, clock: s.clock};
+  const capped = new BrowserSession(native);
+  capped.registerEngine(entry, {turn: async history => ({moves: job.history.slice(history.length, history.length + (history.length ? 2 : 1)), value: .5})});
+  await capped.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,max_placements:3});
+  await until(() => !capped.match.active);
+  answer.capped = {completed:capped.match.completed,capped:capped.match.capped,results:capped.match.results};
+  await capped.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,max_placements:0});
+  await until(() => !capped.match.active);
+  answer.uncapped = {completed:capped.match.completed,capped:capped.match.capped,wins:capped.match.wins};
 }
 process.stdout.write(JSON.stringify(answer));

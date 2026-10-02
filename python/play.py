@@ -1409,7 +1409,7 @@ class Session:
                    and j.history == tuple(self.history) for j in self.jobs.values())
         waiting = self.match and self.match['active'] and (self.match['between'] or self.match['preparing'] or
                                                           self.match.get('outcome') or
-                                                          len(self.history) >= self.match['max_placements'])
+                                                          self.match['max_placements'] and len(self.history) >= self.match['max_placements'])
         if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy and not waiting:
             if self.match_clock and self.match and self.match['active'] and self.match_clock.running is None:
                 self.match_clock.start(player)
@@ -1931,8 +1931,8 @@ class Session:
                 games = 2 * (len(openings) if openings is not None else unique_openings or 1)
             if len(players) != 2 or type(games) is not int or games < 1:
                 raise ValueError('A match needs two engines and a positive number of games')
-            if type(max_placements) is not int or max_placements < 2:
-                raise ValueError('max_placements must be at least 2')
+            if type(max_placements) is not int or max_placements < 0 or max_placements == 1:
+                raise ValueError('max_placements must be at least 2, or 0 for uncapped')
             seats = [self.match_seat(p, preset) for p in players]
             clock = clock or dict(mode='fixed')
             mode = clock['mode']
@@ -1966,7 +1966,7 @@ class Session:
             for history in openings:
                 game = replay(history)
                 try:
-                    if game.winner >= 0 or len(history) >= max_placements:
+                    if game.winner >= 0 or max_placements and len(history) >= max_placements:
                         raise ValueError('An opening must be unfinished and shorter than max_placements')
                     dumps([tuple(p) for p in history])
                 finally:
@@ -2161,7 +2161,7 @@ class Session:
                             self.stop_moves()
                     if match['outcome']:
                         winner = match['outcome']['winner']
-                    if winner < 0 and len(self.history) < match['max_placements']:
+                    if winner < 0 and (not match['max_placements'] or len(self.history) < match['max_placements']):
                         self.lock.wait(timeout=.1 if self.match_clock else None)
                         continue
                     number = match['current']

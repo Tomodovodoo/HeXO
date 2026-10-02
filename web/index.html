@@ -285,7 +285,7 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 .book .chips button{border:0;background:transparent;color:var(--dim);font:600 10px system-ui;letter-spacing:.04em;padding:2px 7px;border-radius:5px;cursor:pointer}
 .book .chips button.on{background:var(--raise-2);color:var(--text)}.book:not(.on) .chips{opacity:.45}
 #saved-games{max-height:55vh;overflow:auto;display:grid;gap:4px;scrollbar-width:thin;scrollbar-color:var(--line-2) transparent}
-.saved-game{display:grid;grid-template-columns:44px 1fr auto 32px 32px;align-items:center;gap:10px;padding:6px 6px 6px 10px;border-radius:9px;
+.saved-game{display:grid;grid-template-columns:44px minmax(0,1fr) auto 32px auto 32px;align-items:center;gap:10px;padding:6px 6px 6px 10px;border-radius:9px;
   background:var(--raise);border:1px solid var(--line);color:inherit;text-decoration:none;transition:border-color .15s,background .15s}
 .saved-game:hover{border-color:var(--line-2);background:var(--raise-2)}
 .saved-game .no{font:700 12px var(--mono);color:var(--dim)}
@@ -611,7 +611,7 @@ canvas.onwheel=e=>{e.preventDefault();const b=canvas.getBoundingClientRect(),mx=
 function go(p){if(!S)return;view=Math.max(0,Math.min(S.history.length,p));renderPanels();draw()}
 $('first').onclick=()=>go(0);$('prev').onclick=()=>go(view-1);$('next').onclick=()=>go(view+1);$('last').onclick=()=>go(1e9);
 $('retry').onclick=()=>post('/retry',{ply:view});
-addEventListener('keydown',e=>{if(e.target.closest('input,textarea,select,dialog'))return;
+addEventListener('keydown',e=>{if(e.defaultPrevented||e.target.closest('input,textarea,select,dialog'))return;
   const k={ArrowLeft:()=>go(view-1),ArrowRight:()=>go(view+1),Home:()=>go(0),End:()=>go(1e9),
     ArrowUp:()=>go(turnEdge(-1)),ArrowDown:()=>go(turnEdge(1)),f:()=>{fit();draw()}}[e.key];if(k){e.preventDefault();k()}});
 function turnEdge(d){const ends=[0,...S.review.map(t=>t.ply+t.stones.length)];return d<0?Math.max(0,...ends.filter(p=>p<view)):Math.min(S.history.length,...ends.filter(p=>p>view))}
@@ -914,7 +914,7 @@ function renderJobs(){
 }
 
 /* game actions */
-$('new').onclick=async()=>{if(await post('/new')){fit();draw()}};$('undo').onclick=()=>post('/undo');
+$('new').onclick=async()=>{if(await post('/new')){fit();go(S.history.length)}};$('undo').onclick=()=>post('/undo');
 $('pause').onclick=()=>post('/pause',{paused:!S.paused});
 const FORMATS=[['htttx','HTTTX'],['rectilinear','Rectilinear'],['tyto','Tyto']];
 let shownNotation=null;
@@ -981,7 +981,7 @@ $('import-dialog').onclose=async()=>{if($('import-dialog').returnValue==='ok'&&a
 $('import-dialog').ondragover=e=>e.preventDefault();
 $('import-dialog').ondrop=async e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)$('import-text').value=await f.text()};
 $('import-file').onchange=async e=>{const f=e.target.files[0];if(f)$('import-text').value=await f.text()};
-const entrants=[{engine:null,checkpoint:null,preset:'quick'},{engine:null,checkpoint:null,preset:'quick'}],tournament={games:8,openings:'wide',clock:'fixed',ms:5,tc:'180+2'};
+const entrants=[{engine:null,checkpoint:null,preset:'quick'},{engine:null,checkpoint:null,preset:'quick'}],tournament={games:8,openings:'wide',clock:'fixed',ms:5,tc:'180+2',max_placements:512};
 let savedKind='freeplay';
 function entrantRow(i){
   const spec=entrants[i],engines=S.engines;if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
@@ -1000,6 +1000,7 @@ function renderTournamentForm(){
   const games=el('input',{id:'t-games',type:'number',inputmode:'numeric',min:2,step:2,value:t.games,'aria-label':'Games'});games.oninput=()=>t.games=Math.max(2,2*Math.round(Number(games.value)/2));
   const openings=el('select',{id:'t-openings','aria-label':'Openings'},['origin',...(book?['narrow','wide','all']:[])].map(o=>el('option',{value:o},o)));
   openings.value=t.openings;openings.onchange=()=>t.openings=openings.value;
+  const limit=el('input',{id:'t-limit',type:'number',inputmode:'numeric',min:0,step:1,value:t.max_placements,'aria-label':'Stone limit'});limit.oninput=()=>t.max_placements=Number(limit.value);
   const clock=el('select',{id:'t-clock','aria-label':'Clock'},[['fixed','budget'],['move','per turn'],['game','game clock']].map(([v,n])=>el('option',{value:v},n)));
   clock.value=t.clock;clock.onchange=()=>{t.clock=clock.value;renderTournamentForm()};
   const amount=t.clock==='move'?el('input',{id:'t-amount',type:'number',inputmode:'numeric',min:1,value:t.ms,'aria-label':'Seconds per turn'}):
@@ -1007,15 +1008,15 @@ function renderTournamentForm(){
   if(amount)amount.oninput=()=>t.clock==='move'?t.ms=Number(amount.value):t.tc=amount.value;
   const start=el('button',{class:'btn primary'},'Start');start.onclick=startTournament;
   $('t-new').replaceChildren(entrantRow(0),entrantRow(1),el('div',{class:'form-grid'},
-    'Games',games,'Openings',openings,'Clock',el('span',{class:'row'},clock,amount)),el('div',{class:'row'},el('span',{class:'spacer'}),start));
+    'Games',games,'Openings',openings,'Stone limit',el('span',{class:'row'},limit,el('span',{class:'hint'},'0 = uncapped')),'Clock',el('span',{class:'row'},clock,amount)),el('div',{class:'row'},el('span',{class:'spacer'}),start));
 }
 async function startTournament(){
   const t=tournament,players=entrants.map(e=>({engine:e.engine,preset:e.preset,...(e.checkpoint?{checkpoint:e.checkpoint}:{})}));
-  t.games=Math.max(2,2*Math.round(Number($('t-games').value)/2));t.openings=$('t-openings').value;t.clock=$('t-clock').value;
+  t.games=Math.max(2,2*Math.round(Number($('t-games').value)/2));t.openings=$('t-openings').value;t.clock=$('t-clock').value;t.max_placements=Number($('t-limit').value);
   if($('t-amount')){if(t.clock==='move')t.ms=Number($('t-amount').value);else t.tc=$('t-amount').value}
-  const body={players,games:t.games,clock:t.clock==='fixed'?{mode:'fixed'}:t.clock==='move'?{mode:'move',ms:Math.round(t.ms*1000)}:{mode:'game',tc:t.tc}};
+  const body={players,games:t.games,max_placements:t.max_placements,clock:t.clock==='fixed'?{mode:'fixed'}:t.clock==='move'?{mode:'move',ms:Math.round(t.ms*1000)}:{mode:'game',tc:t.tc}};
   Object.assign(body,t.openings==='origin'?{openings:[[[0,0]]]}:{opening_range:t.openings,unique_openings:t.games/2});
-  if(await post('/match',{...body,replace:true})){savedKind='tournaments';$('tournament-dialog').close();fit();draw()}
+  if(await post('/match',{...body,replace:true})){savedKind='tournaments';$('tournament-dialog').close();fit();go(S.history.length)}
 }
 function tournamentTab(name){for(const b of $('t-tabs').children)b.classList.toggle('on',b.dataset.t===name);
   $('t-new').hidden=name!=='new';$('t-results').hidden=name!=='results';if(name==='new')renderTournamentForm()}
