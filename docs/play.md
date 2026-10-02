@@ -148,14 +148,15 @@ The API is loopback-only. Each player port holds one visible game; use a separat
 
 ## Engines
 
-Native always plays. The engine picker also lists every engine below; one that is not installed yet has a download
+Native always plays, and Native (browser) runs the same engine as WebAssembly in the page
+(docs/web-engine.md). The engine picker also lists every engine below; one that is not installed yet has a download
 button. Click it and the server installs the engine into the models folder (`models/` in the checkout, or the folder
 given with `--models`). The row fills as files download, turns while something compiles, and becomes the engine
 once it is registered. A failure shows its error for a few seconds and the button comes back.
 
 | Engine | Source, licence | One click |
 |---|---|---|
-| Six | newest release of CixMango/Six, MIT | downloads the release archive for Windows, Linux or macOS (arm64), checks it against the SHA-256 GitHub publishes for it, and keeps only the engine folder and the network, as `models/six/`. Also runs in the browser as Six (browser), with no download ([web-engine.md](web-engine.md#six)) |
+| Six | newest release of CixMango/Six, MIT | downloads the release archive for Windows, Linux or macOS (arm64), checks it against the SHA-256 GitHub publishes for it, and keeps only the engine folder and the network, as `models/six/`. Also runs in the browser as Six (browser), with no download ([web-engine.md](web-engine.md#six-browser)) |
 | Strix | SootyOwl/hexo-strix at `5a771e5`, MIT; the model is the one hexo.tyto.cc lists as `pulsatrix-10-best`, licence unstated | builds the wrapper with `tools/build_strix_learned.py` when cargo and git are found, else downloads it from the `engines-v1` release; downloads the model from hexo.tyto.cc and checks its pinned SHA-256; writes `models/strix/` and `models/strix.json` |
 | Shrimp | Cmiller132/hexo-bot at `6251fc6` (main_7, epoch 18), MIT, run by Six's Shrimp driver | downloads the driver, the weights and the search profile, each at a pinned SHA-256; builds `hexo_engine` and `shrimp` with maturin when cargo is found, else downloads the release's wheels for this Python; writes `models/shrimp/` and `models/shrimp.json`, which run the driver with the server's Python and its PyTorch on two CPU threads. Needs Python 3.11 or newer with PyTorch and NumPy |
 | Seal | Ramora0/HexTicTacToe at `3474edb`, no licence | downloads four pinned headers and compiles `tools/seal_adapter.cpp` with g++ or clang++. Without a licence it is never republished, so it needs a C++ compiler |

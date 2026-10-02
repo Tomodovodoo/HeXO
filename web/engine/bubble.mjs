@@ -59,17 +59,3 @@ export class BubbleEngine extends EngineWorker {
     return this.call({type: 'bench', ...options});
   }
 }
-
-/** Bubble (browser) for seat.mjs's engine list. */
-export function browserEngine() {
-  const engine = new BubbleEngine(), label = 'Bubble (browser)';
-  return {
-    entry: {id: 'browser:bubble', kind: 'bubble', name: label, label, checkpoints: [], presets: PRESETS},
-    get device() { return engine.device; },
-    load: progress => engine.load(progress),
-    async turn(history, {preset}, options) {
-      const result = await engine.turn(history, PRESETS[preset], options), {simulations, solver_nodes} = PRESETS[preset];
-      return {...result, simulations, solver_nodes: result.solved ? solver_nodes : 0};
-    },
-  };
-}
