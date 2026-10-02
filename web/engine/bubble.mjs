@@ -25,6 +25,8 @@ export async function isolate() {
   return true;
 }
 
+import {defaultThreads} from './network.mjs';
+
 const READY_MS = 20000, STALLED = Symbol('stalled');
 
 export class BubbleEngine {
@@ -60,9 +62,11 @@ export class BubbleEngine {
     return new Promise((resolve, reject) => {
       const worker = this.worker = new Worker(new URL('worker.mjs', import.meta.url), {type: 'module'});
       let timer = null;
+      const threaded = this.options.threads === null && defaultThreads({isolated: Boolean(globalThis.crossOriginIsolated),
+        cores: navigator.hardwareConcurrency || 2}) > 1;   // a single-threaded start has nothing to fall back to
       const stall = () => {
         clearTimeout(timer);
-        if (this.options.threads === null) timer = setTimeout(() => { if (this.worker === worker) { worker.terminate(); reject(STALLED); } }, READY_MS);
+        if (threaded) timer = setTimeout(() => { if (this.worker === worker) { worker.terminate(); reject(STALLED); } }, READY_MS);
       };
       this.abandon = reject;
       worker.onmessage = ({data}) => {
