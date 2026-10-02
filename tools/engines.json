@@ -31,6 +31,7 @@
   "shrimp": {
     "name": "Shrimp",
     "kind": "six",
+    "badge": "shrimp",
     "repository": "Cmiller132/hexo-bot",
     "revision": "6251fc6d9072cb6b26ae6830e3c28d0c0666f502",
     "licence": "MIT (hexo-bot and Six)",

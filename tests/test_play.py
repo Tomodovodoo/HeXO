@@ -1480,7 +1480,8 @@ class Registry(unittest.TestCase):
             for name in ('sixengine.exe' if os.name == 'nt' else 'sixengine', 'gen-0100.onnx', 'gen-0120.onnx'):
                 (models / 'six' / name).write_bytes(b'')
             (models / 'shrimp.json').write_text(json.dumps(dict(
-                kind='six', command=['python', 'driver.py'], presets=dict(quick=dict(nodes=1, args=['--visits', '32'])))))
+                kind='six', badge='shrimp', command=['python', 'driver.py'], presets=dict(quick=dict(nodes=1, args=['--visits', '32'])))))
+            (models / 'loud.json').write_text(json.dumps(dict(kind='six', badge='Shrimp!', command=['python', 'driver.py'])))
             (models / 'strix.json').write_text(json.dumps(dict(name='Strix', kind='strix', model='strix.safetensors')))
             (models / 'broken.json').write_text(json.dumps(dict(kind='six', command=[], presets=dict(odd={}))))
             (models / 'spaced.json').write_text(json.dumps(dict(kind='six', command='six --cpu')))
@@ -1497,6 +1498,8 @@ class Registry(unittest.TestCase):
             self.assertEqual((shrimp['command'], shrimp['mirrored']), ([sys.executable, 'driver.py'], False))
             self.assertEqual(shrimp['presets']['quick'], dict(nodes=1, args=['--visits', '32']))
             self.assertEqual(found['strix:Strix']['presets']['deep'], dict(simulations=512))
+            self.assertEqual({key: e['badge'] for key, e in found.items()},
+                             {'six:Six · CPU': 'six', 'six:shrimp': 'shrimp', 'strix:Strix': 'strix', 'native:Native': 'native'})
 
     def test_runs_models_and_entries_are_found(self):
         with tempfile.TemporaryDirectory() as directory:

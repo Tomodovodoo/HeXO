@@ -6,7 +6,7 @@
  * (localStorage).
  *
  * ENGINES lists them. Each is {entry, engine, record}: `entry` is its picker entry ({id, kind, name, label,
- * checkpoints, presets}, with `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
+ * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
  * while it downloads) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
  * preset's budget, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
  * evaluation record the analysis panel shows for that turn. */
@@ -213,7 +213,7 @@ function install() {
     const choice = side >= 0 && seat.engine === 'human' ? config.seats[side] : s && seat === s.analysis ? config.analysis : null;
     if (!choice) return original.shown(seat);
     const {entry} = ENGINES.get(choice.engine);
-    return [entry.kind, entry.label];
+    return [entry.badge || entry.kind, entry.label];
   };
   page.canPlace = () => original.canPlace() && !config.seats[state().player];
   page.renderSeat = side => {
