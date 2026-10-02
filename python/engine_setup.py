@@ -22,8 +22,10 @@ import zipfile
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-ROOT = Path(__file__).resolve().parents[1]
-MANIFEST = ROOT / 'tools' / 'engines.json'
+HERE = Path(__file__).resolve().parent
+TOOLS = next((d for d in (HERE.parent / 'tools', HERE / 'tools') if (d / 'engines.json').is_file()),
+             HERE.parent / 'tools')
+MANIFEST = TOOLS / 'engines.json'
 CHUNK = 1 << 20
 WINDOWS = os.name == 'nt'
 SHRIMP_LAUNCHER = '''import runpy
@@ -101,10 +103,10 @@ def with_cargo(cargo_path):
 def build_strix(work, cargo_path):
     """Build the pinned Strix wrapper with tools/build_strix_learned.py from a clone in `work`; returns the
     executable, with its build-provenance.json beside it."""
-    run([sys.executable, ROOT / 'tools' / 'build_strix_learned.py', Path(work) / 'hexo-strix', '--cargo', cargo_path],
+    run([sys.executable, TOOLS / 'build_strix_learned.py', Path(work) / 'hexo-strix', '--cargo', cargo_path],
         env=with_cargo(cargo_path))
-    return ROOT / 'tools' / 'strix_learned' / 'target' / 'release' / ('hexo-strix-learned.exe' if WINDOWS else
-                                                                       'hexo-strix-learned')
+    return TOOLS / 'strix_learned' / 'target' / 'release' / ('hexo-strix-learned.exe' if WINDOWS else
+                                                             'hexo-strix-learned')
 
 
 def build_wheels(source, out, crates, cargo_path, interpreters=None):
@@ -281,7 +283,9 @@ class Setups:
         asset = next((a for a in release['assets'] if a['name'].endswith(spec['assets'][system()])), None)
         if asset is None:
             raise SetupError(f"Six {release['tag_name']} has no {spec['assets'][system()]}")
-        digest = (asset.get('digest') or '').removeprefix('sha256:') or None
+        digest = (asset.get('digest') or '').removeprefix('sha256:')
+        if not re.fullmatch(r'[0-9a-f]{64}', digest):
+            raise SetupError(f"Six {release['tag_name']} publishes no SHA-256 for {asset['name']}")
         archive = self.download(job, asset['browser_download_url'], work / asset['name'], digest, asset['size'])
         job.busy = True
         staged = work / 'six'
@@ -369,7 +373,7 @@ class Setups:
         staged = work / 'seal'
         staged.mkdir()
         library = 'hexo_seal.dll' if WINDOWS else 'libhexo_seal.so'
-        run([found, '-std=c++20', '-O3', '-shared', '-I', work / 'source' / 'cpp', ROOT / 'tools' / 'seal_adapter.cpp',
+        run([found, '-std=c++20', '-O3', '-shared', '-I', work / 'source' / 'cpp', TOOLS / 'seal_adapter.cpp',
              '-o', staged / library, *(['-static-libgcc', '-static-libstdc++'] if WINDOWS else ['-fPIC'])])
         job.advance()
         self.place(staged, 'seal', dict(name=spec['name'], kind='seal', library=f'seal/{library}'))

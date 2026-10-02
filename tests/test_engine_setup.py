@@ -122,6 +122,13 @@ class Recipes(unittest.TestCase):
         self.assertEqual(list(self.models.iterdir()), [self.models / '.setup'])
         self.assertEqual(list((self.models / '.setup').iterdir()), [])
         self.assertEqual(self.rescans, 0)
+        release = self.six_release()
+        api = 'https://api.github.com/repos/CixMango/Six/releases/latest'
+        listed = json.loads(release[api])
+        listed['assets'][0]['digest'] = None
+        job = self.finish(self.setups(release | {api: json.dumps(listed).encode()}), 'six')
+        self.assertIn('no SHA-256', job.error)
+        self.assertNotIn('https://example.test/six-archive', self.web.asked)
 
     def test_strix_comes_from_the_pinned_release_without_a_toolchain(self):
         executable, model = b'strix executable', b'strix model'
