@@ -85,7 +85,7 @@ def gated_nodes(history, attacker, nodes, gate):
 
 def unknown_result(reason, start, attacker, build_hash=None):
     """An UNKNOWN result with every documented field; `build_hash` is None when no library answered."""
-    return dict(status=UNKNOWN, native_verified=False, moves=[], certificate=None, proof_turns=None,
+    return dict(status=UNKNOWN, native_verified=False, moves=[], certificate=None, proof_turns=None, shortest=False,
                 nodes_used=0, attacker=attacker, build_hash=build_hash, reason=reason,
                 elapsed_ms=(time.perf_counter()-start)*1000)
 

@@ -78,6 +78,8 @@ class NativeStrategy(unittest.TestCase):
         self.assertEqual(independent_verify(tight['certificate'], LATE_WIN), 'PROVEN_WIN')
         again = self.engine.history(LATE_WIN, nodes=32768, ms=20000, shortest=True)
         self.assertEqual((again['cache_hit'], again['shortest'], again['certificate']), (True, True, tight['certificate']))
+        refused = self.engine.history(LATE_WIN * 2000, nodes=32768, ms=20000, shortest=True)
+        self.assertEqual((refused['status'], refused['shortest']), ('UNKNOWN', False))
 
     def test_certificate_cap_tracks_granted_budget(self):
         cert = dict(version=1, width='wide', root=0,

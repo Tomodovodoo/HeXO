@@ -101,7 +101,7 @@ export async function loadTactical(source) {
     checkBudgets(ms, nodes, idtt_nodes, depth, attacker, table_mb);
     const start = performance.now();
     const unknown = reason => ({
-      status: 'UNKNOWN', native_verified: false, moves: [], certificate: null, proof_turns: null, nodes_used: 0,
+      status: 'UNKNOWN', native_verified: false, moves: [], certificate: null, proof_turns: null, shortest: false, nodes_used: 0,
       attacker, build_hash: buildHash, reason, elapsed_ms: performance.now() - start, budget: nodes, gate_score: null,
     });
     const remaining = Math.floor(ms - (performance.now() - start));
