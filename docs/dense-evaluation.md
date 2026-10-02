@@ -41,6 +41,31 @@ simulation budgets and policy targets stay the same. It can choose an eligible m
 halving round. Proven roots retain shortest wins and longest resistance. `--eval-search-choice policy` sets it
 for both model sides of ordinary matches. Historical reports without this field used `gumbel`.
 
+## Fixed search comparisons
+
+`tools/compare_search_modes.py` compares Gumbel, most-visited PUCT, and choosing the highest improved
+Gumbel policy. It plays each mode on the supplied hard positions against a fixed opponent, then all three
+head-to-head pairings, with half the games in each colour. Checkpoint paths, openings and seeds are saved
+in `--out`; a newer export cannot interrupt the batch. Completed games survive a restart. Use the same
+command to resume; only unfinished games replay.
+
+```sh
+python tools/compare_search_modes.py --run R --checkpoint main/170000 --opponent main/155000 \
+  --panel heldout-proven.json --out search-comparison.json --games 64 --sims 64
+```
+
+All modes use native immediate tactics and retain search across both placements. The external solver is off.
+PUCT is a Python comparison backend: all legal moves can be selected, exploration coefficient defaults to 1.5,
+unvisited Q uses the node value, no root noise, and the final move is most visited. It shares nodes by the full
+network turn context; edge Q remains a running mean. Gumbel retains its native graph backup and root sample
+count. This is an algorithm comparison at equal simulations, not an equal-time comparison or Six's exact tuning.
+
+After all batches finish, run the command again with `--publish`. It imports archived reports and submits
+`benchmark_only` variants through the evaluator's registration directory. The evaluator must first load this
+support. Those variants appear in checkpoint history and the league, but are excluded from automatic games,
+promotion and actor selection. Only the evaluator writes `league.json`. The Gumbel baseline is the checkpoint
+itself; benchmark ratings compare solver-free play and should be read alongside their recorded settings.
+
 ## Opening book
 
 `python/dense_openings.py` keeps `openings.json`, a DAG of symmetry-reduced positions. Each completed pair is recorded on every node its opening passed through. The live book holds `book_size` (512) openings of 3 to `book_plies` (5) placements, each the shortest plausible unused prefix of a line sampled from the champion's own searches. At every champion change and every `book_refresh_hours` (6) the champion re-scores the book and retires openings that are implausible (policy below `book_min_prob`), skewed toward one colour beyond `book_max_skew` Elo, short and skewed, or nested inside a child; retired openings are replaced. A refresh that changes the openings starts comparisons afresh.

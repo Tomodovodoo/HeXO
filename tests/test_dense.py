@@ -5271,6 +5271,56 @@ def scripted(winner=lambda record: record['challenger_color'], hook=lambda pool,
 class EvaluatorLoopTests(unittest.TestCase):
     """Evaluator.step on a CPU run of TINY checkpoints with two-sim, eight-ply games."""
 
+    def test_imported_benchmark_variant_is_rated_but_never_scheduled(self):
+        evaluator = self.start()
+        benchmark = dict(id='main/000010@puct', checkpoint='main/000010', settings=dict(search_choice='puct'),
+                         benchmark_only=True, elo=100., elo_interval=[90., 110.], matches=[])
+        ordinary = dict(id='main/000010@policy', checkpoint='main/000010', settings=dict(search_choice='policy'))
+        evaluator.league['variants'] = [benchmark, ordinary]
+        self.assertEqual(evaluator.variants(), [ordinary])
+        self.assertIsNone(evaluator.entry(benchmark['id']))
+        self.assertIs(evaluator.entry(ordinary['id']), ordinary)
+        self.assertIn(benchmark, evaluator.league['variants'])
+
+    def test_pinned_search_comparison_survives_export_and_publishes_history(self):
+        from tools import compare_search_modes
+        evaluator = self.start()
+        self.export(10)
+        evaluator.step()
+        self.export(20)
+        book = dense_eval.dense_openings.Book(self.run, evaluator.settings, suite='book')
+        book.data['nodes'][0]['status'] = 'opening'
+        (self.run/'openings.json').write_text(json.dumps(book.data))
+        panel, output = self.run/'panel.json', self.run/'comparison.json'
+        panel.write_text(json.dumps(dict(cases=[dict(history=[[0, 0]])])))
+        original = compare_search_modes.Evaluator.evaluate
+        exported = []
+        def evaluate(adapter, histories):
+            if not exported:
+                self.export(30)
+                exported.append(30)
+            return original(adapter, histories)
+        argv = ['compare_search_modes.py', '--run', str(self.run), '--checkpoint', 'main/000010',
+                '--opponent', 'main/000020', '--panel', str(panel), '--out', str(output),
+                '--games', '2', '--sims', '2', '--root-samples', '2', '--max-plies', '8', '--device', 'cpu']
+        with unittest.mock.patch.object(sys, 'argv', argv), unittest.mock.patch('builtins.print'), \
+                unittest.mock.patch.object(compare_search_modes.Evaluator, 'evaluate', evaluate):
+            compare_search_modes.main()
+        state = json.loads(output.read_text())
+        self.assertTrue(state['complete'])
+        self.assertEqual(len(state['results']), 9)
+        self.assertEqual({g['sides'][g['challenger_color']][0] for g in state['results']}, {'main/000010'})
+        compare_search_modes.publish(self.run, state)
+        dense_eval.write_league(self.run, evaluator.league, evaluator.config)
+        variants = self.league()['variants']
+        self.assertEqual(len(variants), 2)
+        self.assertTrue(all(v['elo'] is not None and len(v['matches']) == 2 for v in variants))
+        self.assertEqual(evaluator.variants(), [])
+        self.assertEqual(len(dense_eval.load_reports(self.run)), 3)
+        self.assertTrue(evaluator.step())
+        self.assertIsNotNone(evaluator.entry('main/000030'))
+        self.assertFalse(any('@' in cid for cid in evaluator.models))
+
     def setUp(self):
         self.threads = torch.get_num_threads()
         torch.set_num_threads(2)
