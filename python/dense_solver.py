@@ -226,7 +226,8 @@ def decode(result):
 class Pool:
     """Worker threads, each owning one IsolatedTactics child at `priority`, serving queries earliest deadline first.
     `reserved` is the expected milliseconds of the work queued or running (the capacity ledger); `rate` the
-    RATE_QUANTILE of the nodes per ms of recent queries that searched at least RATE_NODES nodes, at most RATE."""
+    RATE_QUANTILE of the nodes per ms of recent queries that searched at least RATE_NODES nodes, at most RATE.
+    close() ends the running queries at once (`IsolatedTactics.abort`) and leaves the queued ones unanswered."""
 
     def __init__(self, workers, priority):
         self.engines = [IsolatedTactics(priority=priority) for _ in range(workers)]
@@ -275,6 +276,8 @@ class Pool:
         with self.condition:
             self.stopped = True
             self.condition.notify_all()
+        for engine in self.engines:
+            engine.abort()
         for thread in self.threads:
             thread.join()
         for engine in self.engines:
