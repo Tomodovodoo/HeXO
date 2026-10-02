@@ -289,6 +289,7 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 .saved-game{display:grid;grid-template-columns:28px minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px 6px 8px 10px;border-radius:9px;
   background:var(--raise);border:1px solid var(--line);color:inherit;text-decoration:none;transition:border-color .15s,background .15s}
 .saved-game:hover{border-color:var(--line-2);background:var(--raise-2)}
+.saved-game.freeplay{grid-template-columns:minmax(0,1fr) auto}
 .saved-game .no{font:700 12px var(--mono);color:var(--dim)}
 .saved-game .details{min-width:0;display:grid;gap:4px}
 .saved-game .who{display:flex;align-items:center;gap:8px;min-width:0;font-weight:600}
@@ -316,7 +317,7 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
   #seats{padding:4px}.card-head{display:none}#seats.open .card-head{display:flex}.seat-head .pick{padding:3px 6px}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
-@media (max-width:420px){#t-tabs{order:3;width:100%;margin-left:0}.saved-game .downloads{grid-column:2 / 4;justify-self:end}}
+@media (max-width:420px){#t-tabs{order:3;width:100%;margin-left:0}.saved-game .downloads{grid-column:2 / 4;justify-self:end}.saved-game.freeplay .downloads{grid-column:1 / 3}}
 </style>
 <div id="app" data-tab="analysis">
   <nav id="tabs"><button data-tab="analysis" class="on">Analysis</button><button data-tab="review">Moves</button></nav>
@@ -997,7 +998,7 @@ function savedPlayers(match){return match.player_specs||match.players}
 function showElo(match){return match.elo?.pairs>=20&&(match.elo.interval[1]-match.elo.interval[0])/2<=200}
 function savedDate(match){if(match.created_at)return new Date(match.created_at).toLocaleString();const m=match.name.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);return m?`${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`:match.name}
 function entrantRow(i){
-  const spec=entrants[i],engines=S.engines.filter(e=>!e.id.startsWith('browser:'));if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
+  const spec=entrants[i],engines=S.engines.filter(e=>globalThis.browserPlay||!e.id.startsWith('browser:'));if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
   const entry=entryOf(spec.engine);if(entry&&!(entry.checkpoints||[]).includes(spec.checkpoint))spec.checkpoint=entry.checkpoints?.[0]??null;
   const pick=el('select',{'aria-label':'Engine'},engines.map(e=>el('option',{value:e.id},e.kind+(e.label&&e.label.toLowerCase()!==e.kind?' · '+e.label:''))));
   pick.value=spec.engine;pick.onchange=()=>{spec.engine=pick.value;spec.checkpoint=null;renderTournamentForm()};
@@ -1049,8 +1050,8 @@ async function showTournaments(tab,kind){
         const query=new URLSearchParams({batch:match.id,game:r.game}),href=`/?study=1&${query}`;
         const players=savedPlayers(match),side=match.single||r.game%2?r.winner:1-r.winner;
         const who=match.single?players.map((p,i)=>`P${i+1} ${playerLabel(p)}`).join(' vs '):r.winner==null?players.map((p,i)=>`${'AB'[i]} ${playerLabel(p)}`).join(' vs '):`${'AB'[r.winner]} · ${playerLabel(players[r.winner])} · P${side+1} won`;
-        return el('div',{class:'saved-game'},el('span',{class:'no'},'#'+r.game),el('div',{class:'details'},el('span',{class:'who'},r.winner!=null&&!match.single?el('i',{class:'medal'}):null,el('span',{},who)),
-          el('div',{class:'meta'},r.winner==null?el('span',{class:'chip'},r.reason==='saved'?'unfinished':'capped'):match.single?el('span',{},`P${r.winner+1} won`):null,`${r.placements} stones`,el('time',{},savedDate(match)))),
+        return el('div',{class:'saved-game'+(match.single?' freeplay':'')},match.single?null:el('span',{class:'no'},'#'+r.game),el('div',{class:'details'},el('span',{class:'who'},r.winner!=null&&!match.single?el('i',{class:'medal'}):null,el('span',{},who)),
+          el('div',{class:'meta'},r.winner==null?el('span',{},r.reason==='saved'?'In progress':'Capped'):match.single?el('span',{},`P${r.winner+1} won`):null,`${r.placements} stones`,el('time',{},savedDate(match)))),
           el('div',{class:'downloads'},el('a',{class:'ib ghost',href,target:'_blank',rel:'noopener','aria-label':'Analyse',html:icon('open')}),
           el('a',{class:'btn',href:`/matches/game?${query}`,download:'game.json','aria-label':'Download game file'},'JSON'),
           ...(r.placements?[el('a',{class:'ib ghost',href:`/matches/game?${query}&format=htttx`,download:'','aria-label':'HTTTX',html:icon('download')})]:[])));
