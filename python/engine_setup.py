@@ -196,6 +196,9 @@ class Setups:
                 break
             except ValueError:
                 time.sleep(self.retry)
+            except Exception as error:
+                job.state, job.error = 'failed', str(error) or type(error).__name__
+                return
         job.state = 'done'
 
     # Steps shared by the recipes

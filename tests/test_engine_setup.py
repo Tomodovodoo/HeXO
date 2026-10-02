@@ -260,6 +260,10 @@ class Recipes(unittest.TestCase):
             self.assertEqual(setups.wait('seal', 5).state, 'done')
         self.assertEqual((refusals, self.rescans), ([], 1))
         self.assertFalse(job.json()['busy'])
+        refusals.append(PermissionError('models folder locked'))
+        with unittest.mock.patch.object(Setups, 'seal', lambda self, job, work: None):
+            setups.start('seal')
+            self.assertEqual(setups.wait('seal', 5).json()['error'], 'models folder locked')
 
     def test_rescans_run_one_at_a_time(self):
         inside, overlaps = [], []
