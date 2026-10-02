@@ -6,6 +6,7 @@ A setup downloads an engine, checks every file against its SHA-256, lays it out 
 Engines that need compiling are built here when the toolchain is present and otherwise come from the release named
 in the manifest, whose file hashes are checked in. Nothing here needs the training modules.
 """
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -13,6 +14,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -100,17 +102,31 @@ def run(command, cwd=None, env=None):
     return done.stdout
 
 
+def remove(path):
+    """Delete the folder `path` if it exists, read-only files too, such as a git clone's objects."""
+    def writable(function, name, _):
+        os.chmod(name, stat.S_IWRITE)
+        function(name)
+    if Path(path).exists():
+        shutil.rmtree(path, **{'onexc' if sys.version_info >= (3, 12) else 'onerror': writable})
+
+
 def with_cargo(cargo_path):
     """The environment change that puts `cargo_path`'s folder first on PATH."""
     return dict(PATH=str(Path(cargo_path).parent) + os.pathsep + os.environ.get('PATH', ''))
 
 
 def build_strix(work, cargo_path):
-    """Build the pinned Strix wrapper with tools/build_strix_learned.py from a clone in `work`; returns the
-    executable, with its build-provenance.json beside it."""
-    run([sys.executable, TOOLS / 'build_strix_learned.py', Path(work) / 'hexo-strix', '--cargo', cargo_path],
+    """Build the pinned Strix wrapper with tools/build_strix_learned.py, both copied into `work` so nothing is
+    written beside the installed tools, from a clone in `work`; returns the executable, with its
+    build-provenance.json beside it."""
+    tools = Path(work) / 'tools'
+    shutil.copytree(TOOLS / 'strix_learned', tools / 'strix_learned',
+                    ignore=shutil.ignore_patterns('target', 'build-local.toml'))
+    shutil.copy2(TOOLS / 'build_strix_learned.py', tools)
+    run([sys.executable, tools / 'build_strix_learned.py', Path(work) / 'hexo-strix', '--cargo', cargo_path],
         env=with_cargo(cargo_path))
-    return TOOLS / 'strix_learned' / 'target' / 'release' / ('hexo-strix-learned.exe' if WINDOWS else
+    return tools / 'strix_learned' / 'target' / 'release' / ('hexo-strix-learned.exe' if WINDOWS else
                                                              'hexo-strix-learned')
 
 
@@ -126,8 +142,8 @@ def build_wheels(source, out, crates, cargo_path, interpreters=None):
     for crate in crates:
         run([maturin, 'build', '--release', *chosen, '-m', Path(source) / 'packages' / crate / 'Cargo.toml',
              '--out', out], env=with_cargo(cargo_path) | dict(CARGO_TARGET_DIR=str(Path(out) / '.target')))
-    shutil.rmtree(tools)
-    shutil.rmtree(Path(out) / '.target')
+    remove(tools)
+    remove(Path(out) / '.target')
     return sorted(Path(out).glob('*.whl'))
 
 
@@ -190,14 +206,15 @@ class Setups:
     def work(self, engine, job):
         work = self.models / '.setup' / engine
         try:
-            shutil.rmtree(work, ignore_errors=True)
+            remove(work)
             work.mkdir(parents=True)
             getattr(self, engine)(job, work)
         except Exception as error:
             job.state, job.error = 'failed', str(error) or type(error).__name__
             return
         finally:
-            shutil.rmtree(work, ignore_errors=True)
+            with contextlib.suppress(OSError):
+                remove(work)
         job.busy = True
         while True:
             try:
@@ -268,8 +285,7 @@ class Setups:
         if entry and entry_path.exists() and 'setup' not in json.loads(entry_path.read_text(encoding='utf-8')):
             raise SetupError(f'{entry_path} already exists')
         (Path(staged) / 'setup.json').write_text(json.dumps(dict(engine=name)), encoding='utf-8')
-        if target.exists():
-            shutil.rmtree(target)
+        remove(target)
         os.replace(staged, target)
         if entry:
             temporary = entry_path.with_suffix('.json.tmp')
@@ -357,8 +373,12 @@ class Setups:
             with zipfile.ZipFile(wheel) as archive:
                 archive.extractall(staged / 'site')
         (staged / 'launch.py').write_text(SHRIMP_LAUNCHER, encoding='utf-8')
+        payload = [f"shrimp/{file['path']}" for file in spec['files']] + sorted(
+            f'shrimp/{path.relative_to(staged).as_posix()}' for path in (staged / 'site').rglob('*')
+            if path.suffix in ('.pyd', '.so'))
         self.place(staged, 'shrimp', dict(name=spec['name'], kind='six', mirrored=True, presets=spec['presets'],
-                                          command=[sys.executable, 'shrimp/launch.py', '--threads', '2']))
+                                          command=[sys.executable, 'shrimp/launch.py', '--threads', '2'],
+                                          files=payload))
         job.advance()
 
     def source(self, job, spec, work):

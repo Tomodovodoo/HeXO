@@ -246,12 +246,13 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     `models`, except inside folders an engine setup made (they hold `setup.json`, see engine_setup). A directory
     in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once, on the backend `six_backend` finds,
     labelled with that backend; its networks are its `checkpoints`, newest first. `models/<name>.json` adds one
-    entry: {"name", "kind": "bubble", "path"}, {"name", "kind": "six", "command", "mirrored", "presets"},
+    entry: {"name", "kind": "bubble", "path"}, {"name", "kind": "six", "command", "mirrored", "presets", optional
+    "files" a match also hashes},
     {"name", "kind": "strix", "model", optional "engine"} or {"name", "kind": "seal", "library"}, paths relative
     to the file. `seal`, the library built with -DHEXO_SEAL_SOURCE, adds Seal when it exists. Entries carry `id`,
     `name`, `kind`, `presets`, `label` (the name the page shows; the first run in `extra_runs` is labelled
     Bubble), `checkpoints` (Bubble checkpoints or Six networks), and the server-only `path` (Bubble), `command`,
-    `cwd`, `mirrored`, `libraries` and, for a Six folder, `networks` ({name: path}) and `backend` (Six protocol,
+    `cwd`, `mirrored`, `libraries`, `files` and, for a Six folder, `networks` ({name: path}) and `backend` (Six protocol,
     see `command_of`), `model` and `engine` (Strix) or `library` (Seal). An id is `kind:name`;
     entries sharing one get a suffix from `engine_identity`, so an id never moves to another engine."""
     found, seen = [], set()
@@ -306,7 +307,8 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                     first = path.parent / command[0]
                     command[0] = str(first) if first.exists() else command[0]
                     add('six', name, spec.get('presets'), command=command, cwd=path.parent,
-                        mirrored=spec.get('mirrored') is True, libraries=[])
+                        mirrored=spec.get('mirrored') is True, libraries=[],
+                        files=[(path.parent / file).resolve() for file in spec.get('files', [])])
                 elif kind == 'strix':
                     engine = {'engine': (path.parent / spec['engine']).resolve()} if 'engine' in spec else {}
                     add('strix', name, spec.get('presets'), model=(path.parent / spec['model']).resolve(), **engine)
@@ -1572,7 +1574,7 @@ class Session:
             source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] else 'none'
         elif entry['kind'] == 'six':
             command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in source['command']]
-            files += [path for path in command_files if path.is_file()]
+            files += [path for path in command_files if path.is_file()] + list(entry.get('files', []))
         elif entry['kind'] == 'strix':
             files += [Path(entry['model']), *([Path(entry['engine'])] if entry.get('engine') else [])]
         elif entry['kind'] == 'seal':

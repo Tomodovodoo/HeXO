@@ -210,6 +210,8 @@ class Recipes(unittest.TestCase):
         self.assertEqual(shrimp['command'][1:], ['shrimp/launch.py', '--threads', '2'])
         self.assertTrue(shrimp['mirrored'])
         self.assertEqual(shrimp['presets']['strong'], dict(nodes=1, args=['--visits', '512']))
+        self.assertIn((folder / 'rivals/shrimp/models/shrimp_main7_infer.pt').resolve(), shrimp['files'])
+        self.assertEqual(len(shrimp['files']), len(self.manifest['shrimp']['files']))
         self.assertFalse(any(e['kind'] == 'bubble' for e in entries.values()))
         unfinished = self.models / '.setup' / 'shrimp' / 'shrimp' / 'rivals' / 'shrimp' / 'models' / 'weights.pt'
         unfinished.parent.mkdir(parents=True)
@@ -329,6 +331,17 @@ class Recipes(unittest.TestCase):
         strix = [e for e in scan(self.models).values() if e['kind'] == 'strix']
         self.assertEqual(len({e['id'] for e in strix}), 2)
         self.assertEqual({e['engine'].name for e in strix}, {'a.exe', 'b.exe'})
+
+    def test_read_only_leftovers_of_an_earlier_setup_are_cleared(self):
+        leftover = self.models / '.setup' / 'seal' / 'clone' / '.git' / 'pack'
+        leftover.parent.mkdir(parents=True)
+        leftover.write_bytes(b'pack')
+        leftover.chmod(0o444)
+        with unittest.mock.patch.object(Setups, 'seal', lambda self, job, work: None):
+            setups = self.setups({})
+            setups.start('seal')
+            self.assertEqual(setups.wait('seal', 5).json()['error'], None)
+        self.assertFalse((self.models / '.setup' / 'seal').exists())
 
     def test_a_second_start_joins_the_running_setup(self):
         gate = threading.Event()
