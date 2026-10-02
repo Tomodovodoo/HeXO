@@ -184,7 +184,9 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .part{display:flex;flex-direction:column;gap:var(--gap);min-height:0}#analysis{flex:none}#review{flex:1}
 .part>*,.panel>*{flex:none}
 .toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
-.toolbar #review-go{margin-left:auto;display:flex;align-items:center;gap:6px}
+.toolbar #review-go{margin-left:auto;display:flex;align-items:center;gap:6px;flex:none;white-space:nowrap}
+.fmt{flex:none}
+#accuracy{flex-wrap:wrap;row-gap:4px}
 .toolbar #review-go svg{width:14px;height:14px}
 #formats{display:contents}
 .fmt{display:inline-flex;align-items:stretch;border:1px solid var(--line-2);border-radius:8px;overflow:hidden;background:linear-gradient(180deg,var(--raise-2),var(--raise));height:32px}
