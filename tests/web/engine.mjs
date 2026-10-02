@@ -4,7 +4,7 @@
 //   replays the recorded evaluations batch by batch -> [[{action, policy, visits, completed}] per step]
 // {kind: 'line', history, certificate} -> winning line
 // {kind: 'offline', requests: [[path, body]]} -> [[status, history or error, paused]] from an OfflineSession
-// {kind: 'threads', contexts: [{inWorker, isolated, cores}]} -> the WebAssembly thread count the loader would pick
+// {kind: 'threads', contexts: [{isolated, cores}]} -> the WebAssembly thread count the loader would pick
 import {readFileSync} from 'node:fs';
 import {encode, features} from '../../web/engine/encode.mjs';
 import {Native, NeuralSearch, EvaluationCache} from '../../web/engine/search.mjs';

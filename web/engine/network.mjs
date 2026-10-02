@@ -74,13 +74,9 @@ function toHalf(values) {
   return out;
 }
 
-/**
- * ONNX Runtime's WebAssembly thread count: one inside a worker, where the runtime's own thread workers never come up
- * (the engine runs there, and WebGPU does the heavy work anyway); on an isolated page, the cores but one, at most 8.
- */
-export function defaultThreads({inWorker, isolated, cores}) {
-  if (inWorker || !isolated) return 1;
-  return Math.max(1, Math.min(8, cores - 1));
+/** ONNX Runtime's WebAssembly thread count: on an isolated page the cores but one, at most 8; otherwise one. */
+export function defaultThreads({isolated, cores}) {
+  return isolated ? Math.max(1, Math.min(8, cores - 1)) : 1;
 }
 
 export class Network {
@@ -105,8 +101,8 @@ export class Network {
       })]);
     ort.env.wasm.wasmPaths = {mjs: new URL(`${runtime}.mjs`, ortBase).href};
     ort.env.wasm.wasmBinary = wasmBinary;
-    ort.env.wasm.numThreads = threads ?? defaultThreads({inWorker: typeof WorkerGlobalScope !== 'undefined',
-      isolated: Boolean(globalThis.crossOriginIsolated), cores: navigator.hardwareConcurrency || 2});
+    ort.env.wasm.numThreads = threads ?? defaultThreads({isolated: Boolean(globalThis.crossOriginIsolated),
+      cores: navigator.hardwareConcurrency || 2});
     ort.env.wasm.proxy = false;
     ort.env.logLevel = 'error';
     const networks = [];

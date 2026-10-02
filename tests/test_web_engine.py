@@ -103,10 +103,10 @@ class Bundle(unittest.TestCase):
             self.assertEqual(node(dict(kind='line', history=history, certificate=result['certificate'])),
                              play.winning_line(history, result))
 
-    def test_worker_loads_single_threaded(self):
-        contexts = [dict(inWorker=True, isolated=True, cores=24), dict(inWorker=False, isolated=True, cores=24),
-                    dict(inWorker=False, isolated=False, cores=24), dict(inWorker=False, isolated=True, cores=2)]
-        self.assertEqual(node(dict(kind='threads', contexts=contexts)), [1, 8, 1, 1])
+    def test_thread_count_follows_isolation_and_cores(self):
+        contexts = [dict(isolated=True, cores=24), dict(isolated=False, cores=24), dict(isolated=True, cores=2),
+                    dict(isolated=True, cores=5)]
+        self.assertEqual(node(dict(kind='threads', contexts=contexts)), [8, 1, 1, 4])
 
     def test_offline_session_plays_and_undoes_like_the_server(self):
         stones = [[0, 0], [1, 0], [2, 0], [3, 0]]
