@@ -5,7 +5,7 @@ import createModule from './gumbel.mjs';
 import {Native} from './search.mjs';
 
 const GAME = new Set(['/state', '/play', '/undo', '/new', '/seat', '/analysis', '/analyse', '/pause', '/retry', '/cancel']);
-const SERVER = ['/review', '/rescan', '/import', '/export', '/match', '/matches', '/htttx', '/replay', '/evaluations', '/models'];
+const SERVER = ['/review', '/rescan', '/import', '/export', '/match', '/matches', '/htttx', '/replay', '/evaluations', '/models', '/book'];
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 
 export class OfflineSession {
@@ -26,7 +26,8 @@ export class OfflineSession {
     const {winner, player, remaining} = this.native.game(this.history);
     return {instance: 'offline', revision: this.revision, history: this.history.map(p => [...p]), player, remaining, winner,
       paused: this.paused, seats: [{engine: 'human'}, {engine: 'human'}], analysis: this.analysis, engines: [], match: null,
-      clock: null, saved_game: null, models_folder: null, evaluations: {}, review: [], jobs: []};
+      clock: null, saved_game: null, models_folder: null, book: {available: false, enabled: false}, evaluations: {}, review: [],
+      review_preset: 'standard', jobs: []};
   }
 
   /** Whether `path` (absolute, as the page requests it) is a play server request. */
