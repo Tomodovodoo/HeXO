@@ -122,6 +122,7 @@ stays empty.
 Seal searches to a clock and adds one random far candidate at the root, so the same position can get different
 turns. `tests/test_web_seal.py` compares turns at 1000 ms on 12 recorded positions where the server library gave
 one answer over repeated runs at 300 and 1500 ms; of 32 recorded positions, every one of the 16 with a stable
-server answer got the same turn in the browser build. On the Ryzen 9 5900X in node 24 the wasm searches 70 to 90%
+server answer got the same turn in the browser build. `.github/workflows/web.yml` builds the native library and the
+wasm and runs the test. On the Ryzen 9 5900X in node 24 the wasm searches 70 to 90%
 of the native library's nodes per second (525,000 against 662,000 a second on a three-stone position at 2 s) and reaches the
 same depth or one less.
