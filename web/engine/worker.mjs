@@ -18,43 +18,57 @@ const cancelled = new Set(), solverWaits = new Map();
 
 class Cancelled extends Error {}
 
-/** The solver's answer to one query of turn `owner`; queries run one at a time in the solver worker. */
+const GRACE_MS = 500;
+const unknown = reason => ({status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: 0, reason});
+
+/**
+ * The solver's answer to one query of turn `owner`; queries run one at a time in the solver worker. A query still
+ * unanswered GRACE_MS after its `ms` (its own deadline, as IsolatedTactics' hard deadline) answers UNKNOWN and the
+ * solver worker is replaced, since certificate reconstruction cannot be interrupted inside it.
+ */
 function solve(owner, history, options) {
   return new Promise((resolve, reject) => {
     const id = ++solverCalls;
-    solverWaits.set(id, {owner, history, options, resolve, reject});
+    const timer = setTimeout(() => { settle(id, unknown('deadline')); replace(); }, options.ms + GRACE_MS);
+    solverWaits.set(id, {owner, history, options, resolve, reject, timer});
     send(id);
   });
+}
+
+function settle(id, result) {
+  const wait = solverWaits.get(id);
+  if (!wait) return;
+  clearTimeout(wait.timer);
+  solverWaits.delete(id);
+  result instanceof Error ? wait.reject(result) : wait.resolve(result);
 }
 
 function send(id) {
   if (!solver) {
     solver = new Worker(new URL('solver-worker.mjs', import.meta.url), {type: 'module'});
-    solver.onmessage = ({data}) => { solverWaits.get(data.id)?.resolve(data.result); solverWaits.delete(data.id); };
+    solver.onmessage = ({data}) => settle(data.id, data.result);
     solver.onerror = event => {
-      solver.terminate();
-      solver = null;
-      for (const wait of solverWaits.values()) {
-        wait.resolve({status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: 0, reason: `solver worker failed: ${event.message || 'error'}`});
-      }
-      solverWaits.clear();
+      for (const id of [...solverWaits.keys()]) settle(id, unknown(`solver worker failed: ${event.message || 'error'}`));
+      replace();
     };
   }
   const {history, options} = solverWaits.get(id);
   solver.postMessage({id, history, options});
 }
 
-/** Ends the solver queries of turn `owner`: the solver worker is replaced and other turns' queries are resent. */
-function stopSolver(owner) {
-  if (![...solverWaits.values()].some(wait => wait.owner === owner)) return;
-  solver.terminate();
+/** A new solver worker for the queries still waiting. */
+function replace() {
+  solver?.terminate();
   solver = null;
-  for (const [id, wait] of solverWaits) {
-    if (wait.owner !== owner) continue;
-    wait.reject(new Cancelled());
-    solverWaits.delete(id);
-  }
   for (const id of solverWaits.keys()) send(id);
+}
+
+/** Ends the solver queries of turn `owner` and replaces the solver worker when it was working for that turn. */
+function stopSolver(owner) {
+  const ids = [...solverWaits].filter(([, wait]) => wait.owner === owner).map(([id]) => id);
+  if (!ids.length) return;
+  for (const id of ids) settle(id, new Cancelled());
+  replace();
 }
 
 const verified = r => r.status === 'PROVEN_WIN' && r.native_verified;

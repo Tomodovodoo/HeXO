@@ -157,7 +157,15 @@ function install() {
         return Promise.resolve(s);
       }
     }
-    if (path === '/analyse' && config.analysis) return Promise.resolve(s);
+    if (path === '/analyse' && config.analysis) {
+      if (body.force && s) {
+        const ply = Number.isInteger(body.ply) ? body.ply : viewed();
+        analyses.delete(`${config.analysis}|${hk(s.history.slice(0, ply))}`);
+        failed = null;
+        schedule();
+      }
+      return Promise.resolve(s);
+    }
     if (path === '/undo' && s && config.seats.some(Boolean)) {
       return original.post('/undo', {people: [0, 1].filter(side => s.seats[side].engine === 'human' && !config.seats[side])});
     }
@@ -174,6 +182,11 @@ function install() {
     const box = document.getElementById('seat' + side), s = state();
     if (!config.seats[side] || !box || s.saved_game) return;
     const send = change => { config.seats[side] = change.preset; save(); page.renderPanels(); };
+    const pick = box.querySelector('.pick');
+    if (pick) {
+      const items = [{id: 'human', ids: ['human'], kind: 'you', label: null}, ...original.pickItems(() => true)];
+      pick.onclick = () => original.openMenu(pick, items, ID, it => page.post('/seat', {side, engine: it.id}));
+    }
     box.append(original.el('div', {class: 'more'}, original.el('div', {}, original.strength({preset: config.seats[side]}, send, 'seat' + side, null))));
     progress();
   };
