@@ -107,13 +107,14 @@ export class BubbleEngine {
    */
   turn(history, budget, options = {}) {
     return this.call({type: 'turn', history, simulations: budget.simulations, solverNodes: budget.solver_nodes,
-      batchSize: budget.batch_size ?? 16}, options);
+      batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy'}, options);
   }
 
   /** One search of `simulations` from `history` (no solver): action, completed, elapsed_ms, evaluated, batches, policy.
    * Aborting `options.signal` cancels it (rejects with an AbortError). */
   search(history, simulations, options = {}) {
-    return this.call({type: 'search', history, simulations, batchSize: options.batchSize ?? 16}, options);
+    return this.call({type: 'search', history, simulations, batchSize: options.batchSize ?? 16,
+      choice: options.choice ?? 'policy'}, options);
   }
 
   /** Network predictions [{actions, logits, q}] for each history, as hexnet.DenseEvaluator gives them (q broadcast). */
