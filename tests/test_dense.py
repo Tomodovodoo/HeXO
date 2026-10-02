@@ -5310,11 +5310,18 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(state['complete'])
         self.assertEqual(len(state['results']), 9)
         self.assertEqual({g['sides'][g['challenger_color']][0] for g in state['results']}, {'main/000010'})
+        # A sweep distinguishes the two orientations of the one-sided paired test.
+        for game in state['results']:
+            if game['kind'] == 'match':
+                game['winner'] = game['challenger_color']
         compare_search_modes.publish(self.run, state)
         dense_eval.write_league(self.run, evaluator.league, evaluator.config)
         variants = self.league()['variants']
         self.assertEqual(len(variants), 2)
         self.assertTrue(all(v['elo'] is not None and len(v['matches']) == 2 for v in variants))
+        puct = next(v for v in variants if v['settings']['search_choice'] == 'puct')
+        self.assertEqual(next(m for m in puct['matches'] if m['opponent'] == 'main/000010')['opening_pair_p'], 1.)
+        self.assertLess(next(m for m in puct['matches'] if m['opponent'] != 'main/000010')['opening_pair_p'], 1.)
         self.assertEqual(evaluator.variants(), [])
         self.assertEqual(len(dense_eval.load_reports(self.run)), 3)
         self.assertTrue(evaluator.step())
