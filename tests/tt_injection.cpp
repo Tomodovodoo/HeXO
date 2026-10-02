@@ -5,6 +5,22 @@
 #include <random>
 #include <set>
 int main() {
+    // Filler generation must allow cancellation during dense scans and sparse
+    // neighborhood generation/sorting, without changing the legal set or board.
+    for(int span:{128,264}) {
+        Board spread;
+        for(int i=0;i<=span;++i) spread.make({8*i,0});
+        for(int i=1;i<=span;++i) spread.make({8*span,8*i});
+        const auto hash=spread.hash();const auto features=spread.features;
+        const auto expected=spread.legal_moves();int checks=0;
+        assert(spread.legal_moves([&]{++checks;})==expected && checks>1000);
+        for(int stop:{1,checks/2,checks-1}) {
+            int seen=0;bool cancelled=false;
+            try {spread.legal_moves([&]{if(++seen==stop) throw Timeout{};});}
+            catch(const Timeout&) {cancelled=true;}
+            assert(cancelled && seen==stop && spread.hash()==hash && spread.features==features);
+        }
+    }
     Board b;b.make({0,0});Search search(10000,2,true);
     auto before=b.hash();auto features=b.features;
     Turn distant{{Cell{8,0},Cell{16,0}},2,0};
