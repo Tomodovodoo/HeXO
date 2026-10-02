@@ -207,7 +207,8 @@ class Recipes(unittest.TestCase):
         self.assertIn('shrimp_driver.py', (folder / 'launch.py').read_text(encoding='utf-8'))
         entries = scan(self.models)
         shrimp = entries['six:Shrimp']
-        self.assertEqual(shrimp['command'][1:], ['shrimp/launch.py', '--threads', '2'])
+        self.assertEqual(shrimp['command'], [sys.executable, 'shrimp/launch.py', '--threads', '2'])
+        self.assertEqual(json.loads((self.models / 'shrimp.json').read_text(encoding='utf-8'))['command'][0], 'python')
         self.assertTrue(shrimp['mirrored'])
         self.assertEqual(shrimp['presets']['strong'], dict(nodes=1, args=['--visits', '512']))
         self.assertIn((folder / 'rivals/shrimp/models/shrimp_main7_infer.pt').resolve(), shrimp['files'])

@@ -1360,9 +1360,9 @@ class Registry(unittest.TestCase):
                              ('CPU', ['gen-0120', 'gen-0100'], 'shrimp'))
             self.assertEqual((command_of(six, 'gen-0100')[1:], six['mirrored']),
                              (['--net', str(models / 'six/gen-0100.onnx'), '--cpu'], True))
-            self.assertEqual(command_of(found['six:shrimp'], None), ['python', 'driver.py'])
+            self.assertEqual(command_of(found['six:shrimp'], None), [sys.executable, 'driver.py'])
             shrimp = found['six:shrimp']
-            self.assertEqual((shrimp['command'], shrimp['mirrored']), (['python', 'driver.py'], False))
+            self.assertEqual((shrimp['command'], shrimp['mirrored']), ([sys.executable, 'driver.py'], False))
             self.assertEqual(shrimp['presets']['quick'], dict(nodes=1, args=['--visits', '32']))
             self.assertEqual(found['strix:Strix']['presets']['deep'], dict(simulations=512))
 

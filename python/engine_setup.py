@@ -377,7 +377,7 @@ class Setups:
             f'shrimp/{path.relative_to(staged).as_posix()}' for path in (staged / 'site').rglob('*')
             if path.suffix in ('.pyd', '.so'))
         self.place(staged, 'shrimp', dict(name=spec['name'], kind='six', mirrored=True, presets=spec['presets'],
-                                          command=[sys.executable, 'shrimp/launch.py', '--threads', '2'],
+                                          command=['python', 'shrimp/launch.py', '--threads', '2'],
                                           files=payload))
         job.advance()
 

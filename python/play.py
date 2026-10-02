@@ -247,7 +247,7 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     in `models` holding `sixengine` and `gen-*.onnx` networks offers Six once, on the backend `six_backend` finds,
     labelled with that backend; its networks are its `checkpoints`, newest first. `models/<name>.json` adds one
     entry: {"name", "kind": "bubble", "path"}, {"name", "kind": "six", "command", "mirrored", "presets", optional
-    "files" a match also hashes},
+    "files" a match also hashes; a command starting with "python" runs on this server's Python},
     {"name", "kind": "strix", "model", optional "engine"} or {"name", "kind": "seal", "library"}, paths relative
     to the file. `seal`, the library built with -DHEXO_SEAL_SOURCE, adds Seal when it exists. Entries carry `id`,
     `name`, `kind`, `presets`, `label` (the name the page shows; the first run in `extra_runs` is labelled
@@ -305,7 +305,7 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                     if not isinstance(command, list) or not command or not all(isinstance(c, str) for c in command):
                         raise ValueError('command must be a list of arguments')
                     first = path.parent / command[0]
-                    command[0] = str(first) if first.exists() else command[0]
+                    command[0] = sys.executable if command[0] == 'python' else str(first) if first.exists() else command[0]
                     add('six', name, spec.get('presets'), command=command, cwd=path.parent,
                         mirrored=spec.get('mirrored') is True, libraries=[],
                         files=[(path.parent / file).resolve() for file in spec.get('files', [])])
