@@ -222,19 +222,9 @@ impl<'a> Dfpn<'a> {
             };
             self.pn.set_max_nodes(budget);
         }
-        // WASM has a 4 GiB linear-address ceiling. PN²'s disposable level-2 tree
-        // must therefore include its kernel memos: otherwise hundreds of leaves
-        // retain gigabytes even after their PN arenas are cleared. Native keeps
-        // the shared memo cache for speed (and has a much larger address space).
-        // The isolated board has identical Zobrist/node keys, so its result is
-        // directly reusable by level 1.
+        // Every target shares the kernel memos with level 1, so the work meter and
+        // the verdict are the same on wasm32 as on native builds.
         self.pn.set_hints(self.hints.clone());
-        #[cfg(target_arch = "wasm32")]
-        let (pn, dn) = {
-            let mut leaf_k = self.k.isolated();
-            self.pn.search_at(&mut leaf_k, node, remaining)
-        };
-        #[cfg(not(target_arch = "wasm32"))]
         let (pn, dn) = self.pn.search_at(&mut self.k, node, remaining);
         self.leaf_solves += 1;
         if pn == 0 {

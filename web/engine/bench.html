@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bubble engine bench</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f7f7f5; --fg: #1d1d1b; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #e8e8e4; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 13px/1.5 ui-monospace, monospace; }
+  progress { width: 100%; }
+  pre { white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body>
+<progress id="load" max="1" value="0"></progress>
+<pre id="out"></pre>
+<script type="module">
+import {BubbleEngine, PRESETS, isolate} from './bubble.mjs';
+
+const query = new URLSearchParams(location.search), out = document.getElementById('out');
+const log = value => { out.textContent += (typeof value === 'string' ? value : JSON.stringify(value)) + '\n'; };
+if (query.has('isolate') && await isolate()) await new Promise(() => {});
+const engine = new BubbleEngine({prefer: query.get('prefer'), threads: query.has('threads') ? Number(query.get('threads')) : null});
+const report = {device: await engine.load(f => { document.getElementById('load').value = f; })};
+log(report.device);
+const position = [[0, 0], [1, 0], [0, 1], [2, -1], [-1, 2], [3, -2], [1, 1], [-2, 3], [2, 0]];
+report.forward = await engine.bench({batches: [1, 16, 64], sizes: [24, 32], repeats: Number(query.get('repeats') || 20)});
+log(report.forward);
+report.search = {};
+for (const name of (query.get('presets') || 'lightning,quick,standard,strong,deep').split(',')) {
+  const runs = [];
+  for (let i = 0; i < Number(query.get('runs') || 3); i++) runs.push(await engine.search(position, PRESETS[name].simulations));
+  const ms = runs.map(r => r.elapsed_ms).sort((a, b) => a - b)[runs.length >> 1];
+  report.search[name] = {simulations: PRESETS[name].simulations, completed: runs[0].completed, ms: Math.round(ms),
+    placements_per_s: Math.round(runs[0].completed / ms * 1000), evaluated: runs[0].evaluated, batches: runs[0].batches, network_ms: Math.round(runs[0].network_ms), action: runs[0].action};
+  log({[name]: report.search[name]});
+}
+if (query.has('turn')) {
+  report.turn = await engine.turn(position, PRESETS[query.get('turn')]);
+  log(report.turn);
+}
+window.report = report;
+document.title = 'done';
+</script>
+</body>
+</html>
