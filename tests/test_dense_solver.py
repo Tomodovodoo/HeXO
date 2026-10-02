@@ -604,6 +604,24 @@ class Adjudication(unittest.TestCase):
         self.assertEqual(orders, {tuple(first), tuple(reversed(first))})
         self.assertGreater(checked, 0)
         self.assertGreater(varied_actions, 0)
+        game = from_position(dense_selfplay.SelfPlayGame([model, model], s, 3), base)
+        original_turns = Proof.turns
+        try:
+            # The existing alternatives have equal depths. Advertise a valid looser descendant bound.
+            with mock.patch.object(Proof, 'turns', lambda p, i: original_turns(p, i)+int(i == p.root and len(p.base) > len(base))):
+                with mock.patch.object(dense_solver, 'Proof', wraps=Proof) as adopted:
+                    game.adjudicate(winner, proof)
+            extra = adopted.call_count-1
+            self.assertGreater(extra, 0)
+            self.assertEqual(game.game.winner, winner)
+            for row in game.rows[:4]:
+                turns = proof.path(game.moves[:row['ply']])[1][1]
+                self.assertEqual(row['proof_turns'], turns+extra)
+                self.assertEqual(row['proof_plies'], dense_solver.proof_plies(row['remaining'], turns+extra, row['proven'] > 0))
+        finally:
+            game.game.close()
+            for tree in game.trees.values():
+                tree.close()
         for error in (ValueError('unverified alternative'), dense_selfplay.VerificationTimeout('expired')):
             game = from_position(dense_selfplay.SelfPlayGame([model, model], s, 3), base)
             try:

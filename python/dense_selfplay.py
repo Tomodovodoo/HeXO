@@ -703,8 +703,12 @@ class SelfPlayGame:
                         except (ValueError, VerificationTimeout):
                             verified = False
                         if verified:
+                            previous_turns = move[1]
                             proof = dense_solver.Proof(history, certificate)
                             _, move, node, played = proof.walk(history)
+                            extra = max(0, move[1]-previous_turns)
+                            if extra:
+                                line = [(stone, turns+extra, action) for stone, turns, action in line]
                 stones = move[0] or proof.reply(history, self.rng)
                 if stones is None:
                     threats = {tuple(c) for t in node.get('threats', ()) for c in t}
