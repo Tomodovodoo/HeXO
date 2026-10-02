@@ -21,7 +21,7 @@ const ENGINES = [
 ];
 const BY_ID = new Map(ENGINES.map(e => [e.id, e]));
 const ENTRIES = ENGINES.map(({id, kind, label, presets}) => ({id, kind, name: label, label, checkpoints: [], presets, browser: true}));
-const STORE = 'browser-engines';
+const STORE = 'browser-engines', BUBBLE_STORE = 'bubble-browser';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
   'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems'];
 const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, page[name]]));
@@ -29,10 +29,16 @@ const analyses = new Map(), hk = history => history.map(p => p.join(',')).join('
 /* seats[side] and analysis are null or {engine: an ENGINES id, preset} */
 let config = {seats: [null, null], analysis: null}, job = null, failed = null, posting = false, fresh = true;
 try {
-  const saved = JSON.parse(localStorage.getItem(STORE));
+  /* choices saved before Seal joined (key BUBBLE_STORE) hold Bubble preset names */
+  const bubble = preset => typeof preset === 'string' ? {engine: 'browser:bubble', preset} : null;
+  const earlier = JSON.parse(localStorage.getItem(BUBBLE_STORE));
+  const saved = JSON.parse(localStorage.getItem(STORE))
+    ?? (earlier && {seats: [0, 1].map(side => bubble(earlier.seats?.[side])), analysis: bubble(earlier.analysis)});
   fresh = saved === null;
   const valid = choice => BY_ID.get(choice?.engine)?.presets[choice.preset] ? choice : null;
   if (saved) config = {seats: [0, 1].map(side => valid(saved.seats?.[side])), analysis: valid(saved.analysis)};
+  localStorage.removeItem(BUBBLE_STORE);
+  if (earlier) localStorage.setItem(STORE, JSON.stringify(config));
 } catch {}
 const save = () => { failed = null; try { localStorage.setItem(STORE, JSON.stringify(config)); } catch {} };
 const state = () => typeof S === 'undefined' ? null : S;
