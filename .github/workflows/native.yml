@@ -31,3 +31,11 @@ jobs:
       - run: ./build/tt_injection
       - run: c++ -std=c++20 -O2 tests/gumbel.cpp -o build/gumbel_test
       - run: ./build/gumbel_test
+      - name: Check GCC profile build
+        run: |
+          cmake -S . -B build/pgo -DCMAKE_BUILD_TYPE=Release -DHEXO_NATIVE_CPU=ON -DHEXO_NATIVE_PGO=GENERATE
+          cmake --build build/pgo --target hexo --parallel 2
+          HEXO_NATIVE_DIR=build/pgo python -m unittest tests.test_engine.NativeRules tests.test_leaf_tactics -v
+          cmake -S . -B build/pgo -DHEXO_NATIVE_PGO=USE
+          cmake --build build/pgo --target hexo --parallel 2
+          HEXO_NATIVE_DIR=build/pgo python -m unittest tests.test_engine.NativeRules tests.test_leaf_tactics -v
