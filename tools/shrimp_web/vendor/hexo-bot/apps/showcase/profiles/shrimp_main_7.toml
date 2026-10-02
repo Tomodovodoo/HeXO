@@ -1,0 +1,62 @@
+# shrimp_main_7 as-trained search profile (Gumbel era, 1024 selfplay visits).
+#
+# The search-relevant sections of configs/shrimp_main_7.toml, value for
+# value. A bots.toml entry with search_profile = "shrimp_main_7" gets the
+# same search as an entry with no search_profile under the default
+# SHOWCASE_SEARCH_CONFIG (configs/shrimp_main_7.toml); this file exists so a
+# catalogue can name every checkpoint's profile explicitly. Keep it in sync
+# with the training config if that changes.
+
+[model.config.selfplay]
+search_visits = 1024
+pcr_full_proportion = 0.33
+pcr_fast_visits = 192
+pcr_fast_temperature = 0.0
+active_games = 192
+c_puct = 1.5
+virtual_batch_size = 48
+flush_target = 1024
+active_root_limit = 192
+fpu_reduction = 0.2
+root_fpu_reduction = 0.2
+lcb_z = 1.6
+nucleus_f64 = true
+new_child_fpu = true
+lazy_widening = false
+clean_root_prior_cache = true
+widening_policy_mass = 0.95
+widening_max_children = 96
+widening_min_children = 2
+policy_init_fraction = 0.25
+policy_init_avg_plies = 4.0
+policy_init_max_plies = 8
+policy_init_temperature = 1.4
+temperature = 1.0
+temperature_floor = 0.15
+temperature_halflife_plies = 10.0
+root_policy_temperature = 1.1
+root_policy_temperature_early = 1.15
+root_policy_temperature_halflife = 19.0
+ml_two_sided = false
+ml_final_pick_band = 0.08
+max_game_plies = 256
+tss_enabled = true
+cache_max_states = 262144
+
+gumbel_root_enabled = true
+gumbel_sequential_halving = true
+gumbel_nonroot_select = true
+gumbel_target_enabled = true
+gumbel_c_visit = 50.0
+gumbel_c_scale = 1.0
+gumbel_target_c_scale = 0.35
+gumbel_m = 32
+gumbel_draw_temperature = 1.5
+gumbel_target_min_visits = 1
+gumbel_play_prune = true
+export_root_prior_logits = true
+
+[model.config.multi_stage_eval]
+eval_virtual_batch_size = 32
+opening_plies = 8
+opening_temperature = 1.0
