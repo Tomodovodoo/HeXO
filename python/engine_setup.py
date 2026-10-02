@@ -59,10 +59,7 @@ def system():
 
 def interpreter_tags():
     """The wheel tags this interpreter accepts, as 'python-abi-platform' strings, most specific first."""
-    try:
-        from packaging.tags import sys_tags
-    except ImportError:
-        from pip._vendor.packaging.tags import sys_tags
+    from packaging.tags import sys_tags
     return [str(tag) for tag in sys_tags()]
 
 
