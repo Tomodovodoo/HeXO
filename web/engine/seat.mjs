@@ -42,12 +42,23 @@ const pickEngine = (id, current) => ({engine: id, preset: current?.engine === id
 const analysable = e => e.kind === 'bubble' || e.analysis;
 const analysisKey = (choice, history) => `${choice.engine}|${choice.preset}|${hk(history)}`;
 
-/** Adds the browser entries to a state's engines and drops browser seats the server has given another engine. */
+/**
+ * Adds the browser entries to a state's engines and drops browser seats the server has given another engine. A server
+ * without an analysis engine (no Bubble model) gets the browser's: Native (browser) at quick unless another was chosen.
+ */
 function adopt(data) {
   if (data.engines) for (const {entry} of ENGINES.values()) if (!data.engines.some(e => e.id === entry.id)) data.engines.push(entry);
   if (data.seats && data.seats.some((seat, side) => config.seats[side] && seat.engine !== 'human')) {
     config.seats = config.seats.map((choice, side) => data.seats[side].engine === 'human' ? choice : null);
     save();
+  }
+  if (data.analysis === null) {
+    if (!config.analysis) {
+      config.analysis = {engine: native.entry.id, preset: 'quick'};
+      save();
+    }
+    const {engine, preset} = config.analysis;
+    data.analysis = {engine, checkpoint: null, preset, budget: ENGINES.get(engine).entry.presets[preset], auto: false};
   }
 }
 

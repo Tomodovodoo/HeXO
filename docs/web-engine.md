@@ -110,7 +110,7 @@ A turn is `hx_search` with the server's settings: depth 12, width 16, and the pr
 quick 250, standard 1,000, strong 3,000, deep 10,000, dangerous 60,000). The C++ clock is `performance.now()` in
 the worker. The search cannot stop part way inside the module, so cancelling a move ends the worker and the next
 turn starts a fresh one. The server kills its search child the same way. As analysis, Native shows its turn as the
-top move and the line. The bar shows the mover's odds as logistic(score / 1000), and 1 or 0 once the search proves a
+top move and the line. It is the analysis engine when the play server has none (no Bubble model). The bar shows the mover's odds as logistic(score / 1000), and 1 or 0 once the search proves a
 win or a loss. The score is a heuristic, not a probability.
 
 Parity (`tests/test_web_native.py`): with the deadline out of reach, the wasm build and the native library pick the
