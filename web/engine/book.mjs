@@ -14,7 +14,7 @@ export function bookDefault(humans) {
  * in the page) when it is sent. /seat requests that name an engine run one at a time; while untouched, each is followed
  * by the /book request that applies `bookDefault` to the seats then shown, so the book follows the last seats. When
  * that turns the book on for an empty board, the game is paused during the seat change, so no engine moves before
- * the book starts the opening for the new seats (which resumes the game).
+ * the book starts the opening for the new seats; it is resumed if the book request left it paused.
  * `state()` is the page's current state, `human(seat)` whether the page shows that seat object as Human.
  */
 export function followSeats(page, state, human, storage) {
@@ -27,12 +27,11 @@ export function followSeats(page, state, human, storage) {
       && body.engine !== 'human';
     if (hold) await post('/pause', {paused: true});
     const data = await post('/seat', body), s = state();
-    let started = false;
     if (data && !touched && s?.book?.available) {
       const enabled = bookDefault(s.seats.map(human));
-      if (enabled !== s.book.enabled) started = Boolean(await post('/book', {enabled})) && enabled;
+      if (enabled !== s.book.enabled) await post('/book', {enabled});
     }
-    if (hold && !started) await post('/pause', {paused: false});
+    if (hold && state()?.paused) await post('/pause', {paused: false});
     return data;
   };
   page.post = (path, body = {}) => {

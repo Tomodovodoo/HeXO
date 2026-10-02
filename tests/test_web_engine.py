@@ -83,8 +83,9 @@ def page(job):
 @unittest.skipUnless(NODE, 'needs node')
 class PlayPage(unittest.TestCase):
     """The opening-book default follows the seats as the page shows them until the person touches the switch."""
-    def follow(self, steps, enabled=True, available=True, stored=None, together=False):
-        return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored, together=together))
+    def follow(self, steps, enabled=True, available=True, stored=None, together=False, resumes=True):
+        return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored, together=together,
+                         resumes=resumes))
 
     def books(self, answer):
         return [body['enabled'] for path, body in answer['requests'] if path == '/book']
@@ -93,6 +94,10 @@ class PlayPage(unittest.TestCase):
         answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False)
         self.assertEqual(answer['requests'], [['/pause', dict(paused=True)], ['/seat', dict(side=0, engine='native')],
                                               ['/book', dict(enabled=True)]])
+        self.assertTrue(answer['enabled'])
+        self.assertFalse(answer['paused'])
+        answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False, resumes=False)
+        self.assertEqual(answer['requests'][-1], ['/pause', dict(paused=False)])
         self.assertTrue(answer['enabled'])
         self.assertFalse(answer['paused'])
 
@@ -134,6 +139,13 @@ class PlayPage(unittest.TestCase):
         requests = page(dict(kind='offline', steps=[['/seat', dict(side=1, engine='human')], ['/seat', dict(side=0, engine='human')],
                                                     ['/play', dict(q=0, r=0)]]))
         self.assertEqual(requests, ['/seat', '/seat', '/play'])
+
+    def test_the_static_page_session_follows_the_seats_and_resumes(self):
+        answer = page(dict(kind='static', steps=[['/seat', dict(side=1, engine='human')], ['/pause', dict(paused=False)],
+                                                 ['/seat', dict(side=0, engine='browser:test')]]))
+        self.assertEqual(answer['requests'], ['/seat', '/book', '/pause', '/pause', '/seat', '/book', '/pause'])
+        self.assertTrue(answer['enabled'])
+        self.assertFalse(answer['paused'])
 
     def test_the_human_seat_is_labelled_human(self):
         sources = {name: (ROOT/'web'/name).read_text(encoding='utf-8') for name in ('index.html', 'engine/seat.mjs')}

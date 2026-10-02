@@ -1098,6 +1098,7 @@ $('restore-local').onclick=()=>{$('tournament-dialog').close();$('import-text').
 <script type="module">
 import {followSeats} from './engine/book.mjs';
 let storage=null;try{storage=sessionStorage}catch(e){}
+await globalThis.playReady;
 followSeats(globalThis,()=>S,seat=>shown(seat)[0]==='human',storage);
 </script>
 </html>
