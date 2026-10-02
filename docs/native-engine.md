@@ -2,7 +2,7 @@
 
 `src/hexo.cpp` is the rules engine every other part uses, exposed to Python through `python/hexo.py` as `Game`. The board is a sparse axial grid with 64-bit coordinates and no edge. Each placement updates the counts of the 18 six-cell windows it touches, which is what the one-turn tactics read: immediate wins, and the covers that block every opponent completion.
 
-`Game.search(ms)` is the handwritten player: iterative deepening over complete turns with principal variation search, a window evaluator and an optional learned pattern table. It is what `python python/play.py` and the bot API serve when no checkpoint is given. It does not prove anything; its scores are never used as certificates.
+`Game.search(ms)` is the handwritten player: iterative deepening over complete turns with principal variation search, a window evaluator and an optional learned pattern table. It is what `python python/play.py` and the bot API serve when no checkpoint is given. Its bounded tactical search proves continuous-threat wins and retains their winning continuations between turns. Ordinary heuristic scores are not certificates.
 
 Native updates candidate scores only along the lines changed by a placement. It
 ranks the second stone from an exact evaluation delta, avoiding a full make/unmake
@@ -10,6 +10,13 @@ for every proposed pair. The candidate cache lasts for one search. Ordinary
 Native search uses no transposition table. The experimental Python
 `tt_injection=True` option keeps its separate previous-iteration move hints;
 it is off by default and never caches score bounds.
+The root prover can also cover an attack that leaves the defender a free second
+stone. It first finds a strategy against the mandatory block and records which
+empty cells can affect its moves or threats. Fillers outside that set share the
+strategy; every remaining legal filler is checked separately. These probes share
+the existing root proof time budget, and retained proof storage stays capped at
+256 KiB.
+
 No weights, model, external solver or new dependency is required.
 The optional NNUE search keeps its existing candidate evaluation.
 
