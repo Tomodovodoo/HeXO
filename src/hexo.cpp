@@ -105,6 +105,28 @@ constexpr auto count_scores=[] {
 }();
 const CountScore& count_score(Counts n) {return count_scores[n[0]+8*n[1]];}
 int value(Counts c) { return count_score(c).value; }
+// Native's candidate cache stores the exact change from placing either colour.
+// Keep this separate from the count scores used by the shared board operations.
+struct PlacementScore {
+    std::array<int,2> scalar{};
+    std::array<int,4> setups{};
+};
+constexpr auto placement_scores=[] {
+    std::array<PlacementScore,64> result{};
+    for(int a=0;a<=5;++a) for(int b=0;b<6-a;++b) {
+        auto& out=result[a+8*b];const int before[2]={a,b};
+        const int value=b==0?weight[a]:a==0?-weight[b]:0;
+        for(int p=0;p<2;++p) {
+            int next[2]={a,b};++next[p];
+            const int after=next[1]==0?weight[next[0]]:next[0]==0?-weight[next[1]]:0;
+            out.scalar[p]=(after-value)*(p==0?1:-1);
+            for(int side=0;side<2;++side)
+                out.setups[2*p+side]=int(next[side]==3 && !next[1-side])-int(before[side]==3 && !before[1-side]);
+        }
+    }
+    return result;
+}();
+const PlacementScore& placement_score(Counts n) {return placement_scores[n[0]+8*n[1]];}
 struct Pressure {
     int64_t raw=0;
     std::array<Cell,2> common{};
@@ -171,7 +193,11 @@ struct CenterTable {
 };
 struct CandidateData {
     std::array<int,2> gain{};
+    // An empty board contributes one point in each of 18 windows.
+    std::array<int,2> scalar{18,18};
+    std::array<uint32_t,2> attack{}; // Six containing windows per axis.
     int nearby=0,lines=0;
+    std::array<int8_t,4> setups{}; // At most 18 windows change per placement.
     bool occupied=false;
 };
 struct CandidateCache {
@@ -361,11 +387,21 @@ struct Board {
                         item.lines+=line_delta;
                     }
                 } else if(gain_delta[0] || gain_delta[1] || line_delta) {
+                    const auto& before=placement_score(old_counts);const auto& after=placement_score(n);
+                    const std::array<int,2> scalar_delta={after.scalar[0]-before.scalar[0],after.scalar[1]-before.scalar[1]};
+                    const std::array<int,4> setup_delta={after.setups[0]-before.setups[0],after.setups[1]-before.setups[1],after.setups[2]-before.setups[2],after.setups[3]-before.setups[3]};
+                    const std::array<bool,2> attacking={n[0]>=3 && !n[1],n[1]>=3 && !n[0]};
                     for(unsigned gaps=data.empty & ~(1u<<k);gaps;gaps&=gaps-1) {
                         const int j=std::countr_zero(gaps);
                         auto& item=candidates->get(w.start+axes[d]*j);
                         item.gain[0]+=gain_delta[0];item.gain[1]+=gain_delta[1];
                         item.lines+=line_delta;
+                        const auto bit=uint32_t(1)<<(d*6+j);
+                        for(int p=0;p<2;++p) {
+                            item.scalar[p]+=scalar_delta[p];
+                            item.attack[p]=(item.attack[p]&~bit)|(attacking[p]?bit:0);
+                        }
+                        for(int j=0;j<4;++j) item.setups[j]+=setup_delta[j];
                     }
                 }
             }
@@ -540,6 +576,29 @@ struct Board {
     int placed_score(Cell c,int p,int* threats=nullptr,bool normalize=true,Pressure* resulting=nullptr) const {
         // Exact scalar evaluation after one empty cell is filled. Candidate
         // ranking need not update the board, feature counts or threat sets.
+        if(candidates && !candidates->adjusted) {
+            // Ordinary and proof ranking use the same scalar changes. Only
+            // windows with at least three own stones can create new pressure.
+            const auto* item=candidates->find(c);
+            if(item) {
+                int64_t total=evaluation+(p==0?item->scalar[p]:-item->scalar[p]);
+                auto setups=threes;
+                for(int side=0;side<2;++side) setups[side]+=item->setups[2*p+side];
+                auto attack=normalize?pressure(&c):std::array<Pressure,2>{};
+                for(unsigned bits=item->attack[p];bits;bits&=bits-1) {
+                    int index=std::countr_zero(bits),axis=index/6,k=index%6;
+                    Window w{c+axes[axis]*(-k),axis};
+                    const auto* data=windows.find(w);auto n=data->counts;++n[p];
+                    if(threats && n[p]==4) ++*threats;
+                    if(normalize) attack[p].add(w,n,data->empty&~(1u<<k));
+                }
+                if(resulting) *resulting=attack[p];
+                if(normalize) total+=attack[1].excess()-attack[0].excess()+
+                    initiative(remaining==1?1-player:player,remaining==1?2:remaining-1,attack,setups);
+                int result=int(std::clamp(total,int64_t(-500000),int64_t(500000)));
+                return p==0?result:-result;
+            }
+        }
         int64_t score=evaluation+learned_score;
         auto attack=normalize?pressure(&c):std::array<Pressure,2>{};
         auto setups=threes;
@@ -581,6 +640,12 @@ struct CandidateGuard {
                 auto& item=cache.get(slot.start+axes[slot.axis]*j);
                 for(int p=0;p<2;++p) item.gain[p]+=b.window_gain(data.counts,data.pattern,j,p)-b.window_gain({},0,j,p);
                 item.lines+=int(Board::promising(data.counts));
+                const auto& score=placement_score(data.counts);
+                for(int p=0;p<2;++p) {
+                    item.scalar[p]+=score.scalar[p]-1;
+                    if(data.counts[p]>=3 && !data.counts[1-p]) item.attack[p]|=uint32_t(1)<<(slot.axis*6+j);
+                }
+                for(int k=0;k<4;++k) item.setups[k]+=score.setups[k];
             }
         }
         b.candidates=&cache;

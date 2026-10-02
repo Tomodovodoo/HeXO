@@ -1,0 +1,17 @@
+[package]
+name = "hexo_utils"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "hexo_utils"
+path = "rust/src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+python = ["dep:pyo3"]
+
+[dependencies]
+hexo_engine.workspace = true
+pyo3 = { workspace = true, optional = true }
