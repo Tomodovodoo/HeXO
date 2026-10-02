@@ -752,7 +752,7 @@ function finished(){return S.winner>=0&&view===S.history.length}
 function renderAnalysis(){
   const ev=shownEval(view),side=playerAt(view),bar=$('evalbar'),job=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view);
   const over=finished(),near=ev?view:Math.max(-1,...Object.keys(S.evaluations).map(Number).filter(p=>p<view)),seen=over?null:ev||S.evaluations[near];
-  const x=over?(S.winner===0?1:0):seen?(playerAt(ev?view:near)===0?seen.value:1-seen.value):null;
+  const x=over?(S.winner===0?1:0):seen?.value!=null?(playerAt(ev?view:near)===0?seen.value:1-seen.value):null;
   bar.classList.toggle('idle',x==null);bar.classList.toggle('stale',!over&&!!seen&&!ev);bar.classList.toggle('pending',!!job&&!over);
   bar.classList.toggle('live',!!ev?.live);
   if(x!=null)bar.firstChild.style.transform=`scaleX(${x})`;
@@ -788,13 +788,13 @@ function autoAnalyse(){
 }
 function renderGraph(){
   const g=$('graph'),W=300,H=84,n=Math.max(1,S.history.length),X=p=>p/n*W,Y=v=>(1-v)*H;
-  const pts=Object.entries(S.evaluations).map(([p,e])=>[+p,playerAt(+p)===0?e.value:1-e.value]).sort((a,b)=>a[0]-b[0]);
+  const pts=Object.entries(S.evaluations).filter(([p,e])=>e.value!=null).map(([p,e])=>[+p,playerAt(+p)===0?e.value:1-e.value]).sort((a,b)=>a[0]-b[0]);
   g.classList.toggle('empty',pts.length<2);
   g.setAttribute('viewBox',`0 0 ${W} ${H}`);
   const line=pts.map(([p,v],i)=>(i?'L':'M')+X(p).toFixed(1)+' '+Y(v).toFixed(1)).join('');
   const area=pts.length?line+`L${X(pts.at(-1)[0])} ${H/2}L${X(pts[0][0])} ${H/2}Z`:'';
   const dots=S.review.filter(t=>t.label&&['inaccuracy','mistake','blunder','missed','allowed'].includes(t.label)).map(t=>{
-    const p=t.ply+t.stones.length,e=S.evaluations[p];if(!e)return'';const v=playerAt(p)===0?e.value:1-e.value;
+    const p=t.ply+t.stones.length,e=S.evaluations[p];if(e?.value==null)return'';const v=playerAt(p)===0?e.value:1-e.value;
     return`<circle cx="${X(p)}" cy="${Y(v)}" r="3.2" fill="var(${LABEL[t.label][1]})" stroke="#0b1222" stroke-width="1"/>`}).join('');
   g.innerHTML=`<defs><clipPath id="up"><rect width="${W}" height="${H/2}"/></clipPath><clipPath id="dn"><rect y="${H/2}" width="${W}" height="${H/2}"/></clipPath></defs>
     <rect width="${W}" height="${H}" fill="var(--bg)"/><line x1="0" x2="${W}" y1="${H/2}" y2="${H/2}" stroke="var(--line-2)"/>
@@ -977,7 +977,7 @@ $('import-dialog').ondragover=e=>e.preventDefault();
 $('import-dialog').ondrop=async e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)$('import-text').value=await f.text()};
 const entrants=[{engine:null,checkpoint:null,preset:'quick'},{engine:null,checkpoint:null,preset:'quick'}],tournament={games:8,openings:'wide',clock:'fixed',ms:5,tc:'180+2'};
 function entrantRow(i){
-  const spec=entrants[i],engines=S.engines;if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
+  const spec=entrants[i],engines=S.engines.filter(e=>!e.id.startsWith('browser:'));if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
   const entry=entryOf(spec.engine);if(entry&&!(entry.checkpoints||[]).includes(spec.checkpoint))spec.checkpoint=entry.checkpoints?.[0]??null;
   const pick=el('select',{'aria-label':'Engine'},engines.map(e=>el('option',{value:e.id},e.kind+(e.label&&e.label.toLowerCase()!==e.kind?' · '+e.label:''))));
   pick.value=spec.engine;pick.onchange=()=>{spec.engine=pick.value;spec.checkpoint=null;renderTournamentForm()};
