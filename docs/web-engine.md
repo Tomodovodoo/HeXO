@@ -40,6 +40,8 @@ to the site's path, adds the cross-origin isolation headers after one reload.
 | `web/engine/seat.mjs` | Play page hook: the browser engines (`ENGINES`) as seats and analysis |
 | `web/engine/native.mjs`, `native-worker.mjs` | Native (browser): page API and worker |
 | `web/engine/native/` | `native.wasm` and its loader, built from `src/hexo.cpp`; `search.mjs` runs a turn |
+| `web/engine/shrimp.mjs`, `shrimp-worker.mjs` | Shrimp (browser): page API and worker |
+| `web/engine/shrimp/` | `shrimp.wasm` (built from `tools/shrimp_web`), `search.mjs` (the driver's turn), `network.mjs` (the graph's inputs) |
 | `web/engine/strix.mjs`, `strix-worker.mjs` | Strix (browser): page API and worker |
 | `web/engine/strix/` | `strix.wasm` and its loader `core.mjs`, built from `tools/strix_web`; the network when built |
 | `web/engine/offline.mjs` | The play server's game requests answered in the page, for static hosting |
@@ -125,6 +127,58 @@ the same turn.
 
 What the bundle contains: `src/hexo.cpp` (this repository, MIT), Emscripten's runtime and loader (MIT or NCSA),
 and libc++ and libc++abi (Apache 2.0 with LLVM exception).
+
+## Shrimp (browser)
+
+Shrimp is Cmiller132/hexo-bot's main_7 network (epoch 18, 8.1M parameters) with hexo-bot's own Gumbel search, as
+the server runs it through Six's Shrimp driver. Pick **Shrimp (browser)** for a seat or the analysis. Its presets are
+the server entry's visits per stone: lightning 16, quick 32, standard 128, strong 512, deep 1,024, dangerous 4,096.
+
+What runs where:
+
+- The search is hexo-bot's Rust, compiled to `web/engine/shrimp/shrimp.wasm` (380 KB) from `tools/shrimp_web`. The
+  tree, the threat-space search, the featurizer and the evaluation cache are hexo-bot's files at `6251fc6`, vendored
+  unchanged under `tools/shrimp_web/vendor/hexo-bot`. `src/search.rs` is the driver's `ShrimpMctsSession.search`
+  with the evaluator call turned into a pause: `sh_step` returns when leaves need the network and `sh_fulfill`
+  takes the answers. Selection, early stop, LCB and the tactical guard are hexo-bot's functions.
+- `shrimp/search.mjs` plays a turn the way the driver does: the history mirrored into Six's frame, the first stone
+  moved to the origin, one search per stone with seed 5003 + ply, the second stone reusing the first one's tree, and a
+  new game key per turn. The server sends `newgame` before every turn and runs one driver process per preset, so the
+  worker keeps one game counter per preset; a cancelled turn resets it, as the server restarts the driver.
+- The network is `shrimp-fp32.onnx` (29 MB) under ONNX Runtime Web, WebGPU when the device has it, else WebAssembly.
+  `tools/shrimp_web/export.py` writes it from the pinned weights: the evaluator's CPU forward with the moves-left
+  head and the value decode. The page builds the inputs (`shrimp/network.mjs`): node features, the hex
+  convolution's gather rows and each attention pair's bias row, so the graph has no integer arithmetic left for the
+  WebGPU provider to hand back to the CPU. With the pair index computed in the graph, a batch took 1.2 s on WebGPU
+  whatever its size; built in the page it takes 46 ms for 16 positions.
+
+`build_web.py shrimp` downloads the weights from hexo-bot's Git LFS at their pinned SHA-256 (or takes
+`--shrimp-weights`) and exports them into `web/engine/shrimp/model/` (ignored) with a manifest holding the search
+profile from the pinned `shrimp_main_7.toml` and the graph's parity. The Pages workflow runs it.
+
+Parity (`tests/test_web_shrimp.py`, which needs the server's Shrimp installed in `models/`): on 10 turns from
+openings, the tactical fixtures and recorded middle games, at 16 to 64 visits, the browser search fed the driver's
+own network answers plays the driver's stones with bit-identical root values and visit counts. The exported graph
+under ONNX Runtime Web (WebAssembly, in node) plays the driver's stones on the first 6 of those turns. On the
+driver's rows the graph's logits are within 1e-4 of PyTorch's; on synthetic rows the export reports 7.6e-6 for
+the policy, 0 for the value and 1.9e-5 for the moves left.
+
+Seconds per two-stone turn from a 9-stone position, Chrome in the Claude desktop pane on the RTX 3070 Ti and Ryzen 9
+5900X, the GPU shared with the training run. The server is the driver with PyTorch on two CPU threads.
+
+| Preset | WebGPU | WebAssembly, 1 thread | Server CPU |
+|---|---|---|---|
+| lightning 16 | 0.2 | 5.0 | 1.8 |
+| quick 32 | 0.3 | 11.3 | 4.7 |
+| standard 128 | 1.0 | | 16.5 |
+| strong 512 | 3.5 | | 61 |
+
+WebGPU and WebAssembly chose the same stones. The pane does not start ONNX Runtime's thread workers, so threaded
+WebAssembly is not measured; as with Bubble, a stalled start falls back to one thread after 20 s.
+
+What the bundle contains: hexo-bot's Rust and the weights (MIT, Colton Miller), the crates they use (ahash, half,
+serde, thiserror; MIT or Apache 2.0) and ONNX Runtime Web (MIT). Mantis Shrimp (Cmiller132/Hexo-Shrimp-Bot) is not
+included: it has no licence and no published weights.
 
 ## Strix (browser)
 

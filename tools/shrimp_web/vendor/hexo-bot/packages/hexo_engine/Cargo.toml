@@ -1,0 +1,22 @@
+[package]
+name = "hexo_engine"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "hexo_engine"
+path = "rust/src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+python = ["dep:pyo3"]
+
+[dependencies]
+ahash.workspace = true
+pyo3 = { workspace = true, optional = true }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
