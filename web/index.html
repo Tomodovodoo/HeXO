@@ -729,7 +729,7 @@ function renderEngineHead(){
   const head=$('engine-head'),a=S.analysis;
   if(!a){head.replaceChildren();return}
   const [kind,label]=shown(a),pick=el('button',{class:'pick'},...badge(kind,label));
-  const items=pickItems(e=>e.kind==='bubble');
+  const items=pickItems(e=>e.kind==='bubble'||e.browser);
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,a.engine,it=>sendAnalysis({engine:it.id,checkpoint:null,preset:'standard',custom:undefined}));
   const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},'Auto analysis',el('i'));
   auto.onclick=()=>sendAnalysis({auto:!a.auto});
@@ -747,7 +747,7 @@ function finished(){return S.winner>=0&&view===S.history.length}
 function renderAnalysis(){
   const ev=shownEval(view),side=playerAt(view),bar=$('evalbar'),job=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view);
   const over=finished(),near=ev?view:Math.max(-1,...Object.keys(S.evaluations).map(Number).filter(p=>p<view)),seen=over?null:ev||S.evaluations[near];
-  const x=over?(S.winner===0?1:0):seen?(playerAt(ev?view:near)===0?seen.value:1-seen.value):null;
+  const x=over?(S.winner===0?1:0):seen?.value!=null?(playerAt(ev?view:near)===0?seen.value:1-seen.value):null;
   bar.classList.toggle('idle',x==null);bar.classList.toggle('stale',!over&&!!seen&&!ev);bar.classList.toggle('pending',!!job&&!over);
   bar.classList.toggle('live',!!ev?.live);
   if(x!=null)bar.firstChild.style.transform=`scaleX(${x})`;
@@ -783,13 +783,13 @@ function autoAnalyse(){
 }
 function renderGraph(){
   const g=$('graph'),W=300,H=84,n=Math.max(1,S.history.length),X=p=>p/n*W,Y=v=>(1-v)*H;
-  const pts=Object.entries(S.evaluations).map(([p,e])=>[+p,playerAt(+p)===0?e.value:1-e.value]).sort((a,b)=>a[0]-b[0]);
+  const pts=Object.entries(S.evaluations).filter(([p,e])=>e.value!=null).map(([p,e])=>[+p,playerAt(+p)===0?e.value:1-e.value]).sort((a,b)=>a[0]-b[0]);
   g.classList.toggle('empty',pts.length<2);
   g.setAttribute('viewBox',`0 0 ${W} ${H}`);
   const line=pts.map(([p,v],i)=>(i?'L':'M')+X(p).toFixed(1)+' '+Y(v).toFixed(1)).join('');
   const area=pts.length?line+`L${X(pts.at(-1)[0])} ${H/2}L${X(pts[0][0])} ${H/2}Z`:'';
   const dots=S.review.filter(t=>t.label&&['inaccuracy','mistake','blunder','missed','allowed'].includes(t.label)).map(t=>{
-    const p=t.ply+t.stones.length,e=S.evaluations[p];if(!e)return'';const v=playerAt(p)===0?e.value:1-e.value;
+    const p=t.ply+t.stones.length,e=S.evaluations[p];if(e?.value==null)return'';const v=playerAt(p)===0?e.value:1-e.value;
     return`<circle cx="${X(p)}" cy="${Y(v)}" r="3.2" fill="var(${LABEL[t.label][1]})" stroke="#0b1222" stroke-width="1"/>`}).join('');
   g.innerHTML=`<defs><clipPath id="up"><rect width="${W}" height="${H/2}"/></clipPath><clipPath id="dn"><rect y="${H/2}" width="${W}" height="${H/2}"/></clipPath></defs>
     <rect width="${W}" height="${H}" fill="var(--bg)"/><line x1="0" x2="${W}" y1="${H/2}" y2="${H/2}" stroke="var(--line-2)"/>

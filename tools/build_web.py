@@ -5,6 +5,8 @@ wasm   src/gumbel.cpp -> gumbel.mjs + gumbel.wasm (em++ on PATH, or --emxx), too
 ort    onnxruntime-web from the npm registry, checked against its published integrity, into ort/ (ignored).
 model  --checkpoint ema.pt, or --release TAG (or 'latest') from the GitHub releases, exported by export_web into
        model/ (ignored).
+seal   Seal's headers at the revision pinned in tools/engines.json, each checked against its SHA-256, with
+       tools/seal_adapter.cpp -> seal/engine.mjs + engine.wasm and seal/manifest.json (ignored).
 """
 import argparse
 import base64
@@ -22,6 +24,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT/'web'/'engine'
 TACTICAL = ROOT/'tools'/'tactical'
+SEAL = ENGINE/'seal'
 ORT_VERSION = '1.30.0'
 ORT_INTEGRITY = 'sha512-q0y+JrrtukXSzsBWEMccVfqX25LRmosXHF+CaRJmg8pZClzcV7svNc4rKY3jL02Vb7QmRMDs1SigqR4CXAfKYQ=='
 ORT_FILES = ('ort.webgpu.min.mjs', 'ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.asyncify.wasm',
@@ -67,6 +70,25 @@ def build_wasm(emxx, cargo):
     (ENGINE/'build.json').write_text(json.dumps(record, indent=1)+'\n', encoding='utf-8')
 
 
+def build_seal(emxx):
+    """Compile tools/seal_adapter.cpp against Seal's pinned headers into seal/; seal/manifest.json names Seal's
+    revision and the wasm's SHA-256, which the browser caches it under."""
+    spec = json.loads((ROOT/'tools'/'engines.json').read_text(encoding='utf-8'))['seal']
+    with tempfile.TemporaryDirectory() as folder:
+        for file in spec['files']:
+            data = fetch(file['url'])
+            if hashlib.sha256(data).hexdigest() != file['sha256']:
+                raise ValueError(f"Seal's {file['path']} does not match its pinned SHA-256")
+            target = Path(folder)/file['path']
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        SEAL.mkdir(exist_ok=True)
+        subprocess.run([emxx, str(ROOT/'tools'/'seal_adapter.cpp'), '-I', str(Path(folder)/'cpp'), *GUMBEL_FLAGS,
+                        '-sEXPORTED_FUNCTIONS=_malloc,_free,_seal_move', '-o', str(SEAL/'engine.mjs')], check=True)
+    manifest = dict(revision=spec['revision'], sha256=hashlib.sha256((SEAL/'engine.wasm').read_bytes()).hexdigest())
+    (SEAL/'manifest.json').write_text(json.dumps(manifest)+'\n', encoding='utf-8')
+
+
 def fetch(url):
     with urlopen(Request(url, headers={'User-Agent': 'hexo-build-web'})) as response:
         return response.read()
@@ -98,7 +120,7 @@ def build_model(checkpoint, release):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('parts', nargs='+', choices=('wasm', 'ort', 'model'))
+    parser.add_argument('parts', nargs='+', choices=('wasm', 'ort', 'model', 'seal'))
     parser.add_argument('--emxx', default=shutil.which('em++') or 'em++')
     parser.add_argument('--cargo', default='cargo')
     parser.add_argument('--checkpoint', type=Path)
@@ -110,6 +132,8 @@ def main():
         build_ort()
     if 'model' in args.parts:
         build_model(args.checkpoint, args.release)
+    if 'seal' in args.parts:
+        build_seal(args.emxx)
 
 
 if __name__ == '__main__':

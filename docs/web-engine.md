@@ -37,7 +37,8 @@ to the site's path, adds the cross-origin isolation headers after one reload.
 | `web/engine/search.mjs` | `hxg_*` driver: the `neural_search` loop, evaluation cache, root statistics |
 | `web/engine/tactical.mjs`, `solver-worker.mjs` | Solver with a WASI shim, in a worker that a cancel terminates |
 | `web/engine/proof.mjs` | Certificate walk for the winning line |
-| `web/engine/seat.mjs` | Play page hook: the browser seat and analysis engine |
+| `web/engine/seat.mjs` | Play page hook: the browser engines (`ENGINES`) as seats and analysis engines |
+| `web/engine/seal.mjs`, `seal-worker.mjs` | Seal's page API and its worker, which a cancel terminates |
 | `web/engine/offline.mjs` | The play server's game requests answered in the page, for static hosting |
 | `web/coi-sw.js` | Cross-origin isolation on static hosts (`isolate()`), for WebAssembly threads |
 
@@ -94,3 +95,33 @@ makes the WebGPU and CUDA columns noisy (WebGPU deep took 11 to 18 s across runs
 a one-operator graph already takes 6 ms, so a batch costs mostly dispatch and time slicing, not arithmetic. Graph
 capture saved 15% at batch 16 and is not used. WebAssembly with one thread is what a page without cross-origin
 isolation gets.
+
+## Seal
+
+Seal is the alpha-beta bot by Ramora0 ([HexTicTacToe](https://github.com/Ramora0/HexTicTacToe), revision `3474edb`),
+the community's reference bot. **Seal (browser)** in the picker plays a seat or the analysis with the server's
+presets: lightning 50, quick 100, standard 500, strong 2000, deep 8000 and dangerous 30000 ms per turn.
+
+```sh
+python tools/build_web.py seal --emxx path/to/em++   # seal/engine.mjs, engine.wasm, manifest.json (ignored)
+python -m unittest tests.test_web_seal
+```
+
+`build_web.py seal` downloads Seal's four headers at the revision pinned in `tools/engines.json`, checks each
+against its SHA-256 and compiles them with `tools/seal_adapter.cpp`, the server's adapter, using the same em++ flags
+as `gumbel.wasm`. The headers are never committed; the Pages workflow installs emsdk 6.0.10 and builds Seal on every
+deployment. HexTicTacToe has no licence file; this site serves the compiled Seal regardless.
+
+The wasm is 115 KB and its glue 10 KB. The worker fetches `seal/manifest.json`, then the wasm from the Cache API
+under its SHA-256, and calls `seal_move` exactly as the server does; Seal's clock is `performance.now()` in the
+worker. The search blocks the worker, so a cancel terminates it and the next turn starts a new one, which loses
+Seal's transposition table. The page cuts the answer to the stones left in the turn and stops at a winning stone,
+as `play.checked_turn` does. As an analysis engine Seal reports its turn without a value, so the evaluation bar
+stays empty.
+
+Seal searches to a clock and adds one random far candidate at the root, so the same position can get different
+turns. `tests/test_web_seal.py` compares turns at 1000 ms on 12 recorded positions where the server library gave
+one answer over repeated runs at 300 and 1500 ms; of 32 recorded positions, every one of the 16 with a stable
+server answer got the same turn in the browser build. On the Ryzen 9 5900X in node 24 the wasm searches 70 to 90%
+of the native library's nodes per second (525,000 against 662,000 a second on a three-stone position at 2 s) and reaches the
+same depth or one less.
