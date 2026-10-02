@@ -496,7 +496,9 @@ def player_client(args):
     catalogue = ensure_player(args, start=bool(resume) or action not in controls)
     if args.command == 'models':
         for model in catalogue['models']:
-            print(f"{model['id']}  [{model['kind']}; {'clocks supported' if model['clocks'] else 'fixed budget only'}]")
+            badge = model.get('badge', model['kind'])   # a running player from before badges lists none
+            kind = badge if badge == model['kind'] else f"{badge}, {model['kind']} protocol"
+            print(f"{model['id']}  [{kind}; {'clocks supported' if model['clocks'] else 'fixed budget only'}]")
             if model.get('checkpoints'):
                 print('  ' + ', '.join(model['checkpoints']))
         return
