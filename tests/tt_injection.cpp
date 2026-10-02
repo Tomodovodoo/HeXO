@@ -3,7 +3,24 @@
 #include <cassert>
 #include <iostream>
 #include <random>
+#include <set>
 int main() {
+    // Filler generation must allow cancellation during dense scans and sparse
+    // neighborhood generation/sorting, without changing the legal set or board.
+    for(int span:{128,264}) {
+        Board spread;
+        for(int i=0;i<=span;++i) spread.make({8*i,0});
+        for(int i=1;i<=span;++i) spread.make({8*span,8*i});
+        const auto hash=spread.hash();const auto features=spread.features;
+        const auto expected=spread.legal_moves();int checks=0;
+        assert(spread.legal_moves([&]{++checks;})==expected && checks>1000);
+        for(int stop:{1,checks/2,checks-1}) {
+            int seen=0;bool cancelled=false;
+            try {spread.legal_moves([&]{if(++seen==stop) throw Timeout{};});}
+            catch(const Timeout&) {cancelled=true;}
+            assert(cancelled && seen==stop && spread.hash()==hash && spread.features==features);
+        }
+    }
     Board b;b.make({0,0});Search search(10000,2,true);
     auto before=b.hash();auto features=b.features;
     Turn distant{{Cell{8,0},Cell{16,0}},2,0};
@@ -69,6 +86,39 @@ int main() {
     }
     assert(independent_count>shared_count && independent==returned && shared==returned);
     assert(open.hash()==open_key && Search::candidate_scores(open)==gains);
+    // A saved Seal attack wins even though either block leaves a free stone.
+    // Enumerate every legal filler after both independently known blocks, then
+    // replay its recorded strategy without using the support shortcut.
+    Board free_defense;
+    for(Cell c:std::vector<Cell>{
+        {0,0},{1,-2},{3,-3},{3,-1},{2,0},{4,-2},{4,-3},{1,0},{4,0},{3,0},
+        {2,-3},{-1,0},{-1,-3},{-3,0},{-1,-2},{5,-3},{2,-2},{4,-5},
+        {-3,-1},{-3,3},{1,-1},{-1,1},{-2,-1},{4,-1},{2,-1}
+    }) {assert(free_defense.legal(c));free_defense.make(c);}
+    const auto free_key=free_defense.hash();const auto free_features=free_defense.features;
+    CandidateGuard free_cache(free_defense);const auto free_gains=Search::candidate_scores(free_defense);
+    Search free_proof(10000,16);free_proof.proof_deadline=free_proof.deadline;
+    Turn free_attack{{Cell{0,-1},Cell{6,-1}},2,0};
+    int free_root=free_proof.free_attack(free_defense,free_attack,6);assert(free_root>=0);
+    {
+        Restore root_position(free_defense);apply(free_defense,free_attack);
+        const auto threats=free_defense.completions(1);
+        assert((threats==std::vector<std::vector<Cell>>{{{3,-4},{5,-6}}}));
+        std::set<std::pair<Cell,Cell>> expected;
+        for(Cell block:std::vector<Cell>{{3,-4},{5,-6}}) {
+            Restore first(free_defense);free_defense.make(block);
+            for(Cell filler:free_defense.legal_moves()) expected.insert(std::minmax(block,filler));
+        }
+        for(const auto& [reply,child]:free_proof.proof[free_root].replies) {
+            assert(reply.count==2 && expected.erase(std::minmax(reply.cells[0],reply.cells[1]))==1);
+            Restore response(free_defense);
+            for(auto cell:reply.cells) {assert(free_defense.legal(cell));free_defense.make(cell);}
+            assert(free_proof.replay(free_defense,child));
+        }
+        assert(expected.empty());
+    }
+    assert(free_defense.hash()==free_key && free_defense.features==free_features);
+    assert(Search::candidate_scores(free_defense)==free_gains);
     Board blocked;
     auto defended_opening=opening;defended_opening[5]=forcing.proof[root].attack.cells[0];
     for(auto c:defended_opening) {assert(blocked.legal(c));blocked.make(c);}

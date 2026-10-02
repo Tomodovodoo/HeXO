@@ -359,38 +359,49 @@ struct Board {
         auto v=std::clamp<int64_t>(evaluation+learned_score+residual,-500000,500000);
         return int(p==0?v:-v);
     }
-    std::vector<Cell> legal_moves() const {
+    template<class Check> std::vector<Cell> legal_moves(Check check) const {
+        check();
         if(winner>=0) return {};
         if(cells.empty()) return {{0,0}};
         constexpr int64_t limit=1000000000000LL;
         int64_t q0=limit,q1=-limit,r0=limit,r1=-limit;
-        for(auto [c,_]:cells) {q0=std::min(q0,c.q);q1=std::max(q1,c.q);r0=std::min(r0,c.r);r1=std::max(r1,c.r);}
+        for(auto [c,_]:cells) {check();q0=std::min(q0,c.q);q1=std::max(q1,c.q);r0=std::min(r0,c.r);r1=std::max(r1,c.r);}
         const int64_t width=q1-q0+17,height=r1-r0+17;
         if(width<=int64_t(1)<<22 && height<=int64_t(1)<<22 && width*height<=int64_t(1)<<22) {
             // Dense (q, r)-major grid over the stones' box plus radius 8: row-major scanning is the sorted order.
             std::vector<uint8_t> grid(size_t(width*height));
             for(auto [c,_]:cells) for(int q=-8;q<=8;++q) {
+                check();
                 auto row=grid.data()+(c.q-q0+8+q)*height+(c.r-r0+8);
                 for(int r=std::max(-8,-q-8);r<=std::min(8,-q+8);++r) row[r]=1;
             }
-            for(auto [c,_]:cells) grid[size_t((c.q-q0+8)*height+c.r-r0+8)]=0;
+            for(auto [c,_]:cells) {check();grid[size_t((c.q-q0+8)*height+c.r-r0+8)]=0;}
             std::vector<Cell> result;
-            for(int64_t i=0;i<width;++i) for(int64_t j=0;j<height;++j) if(grid[size_t(i*height+j)]) {
-                Cell p{q0-8+i,r0-8+j};
-                if(std::abs(p.q)<=limit && std::abs(p.r)<=limit) result.push_back(p);
+            for(int64_t i=0;i<width;++i) for(int64_t j=0;j<height;++j) {
+                if(!(j&255)) check();
+                if(grid[size_t(i*height+j)]) {
+                    Cell p{q0-8+i,r0-8+j};
+                    if(std::abs(p.q)<=limit && std::abs(p.r)<=limit) result.push_back(p);
+                }
             }
             return result;
         }
         std::unordered_set<Cell,CellHash> out;
-        for(auto [c,_]:cells) for(int q=-8;q<=8;++q)
+        for(auto [c,_]:cells) for(int q=-8;q<=8;++q) {
+            check();
             for(int r=std::max(-8,-q-8);r<=std::min(8,-q+8);++r) {
                 Cell p=c+Cell{q,r};
                 if(at(p)<0 && std::abs(p.q)<=1000000000000LL && std::abs(p.r)<=1000000000000LL) out.insert(p);
             }
-        std::vector<Cell> result(out.begin(),out.end());
-        std::sort(result.begin(),result.end());
+        }
+        std::vector<Cell> result;result.reserve(out.size());
+        size_t work=0;
+        for(auto cell:out) {if(!(++work&255)) check();result.push_back(cell);}
+        std::sort(result.begin(),result.end(),[&](Cell a,Cell z){if(!(++work&255)) check();return a<z;});
+        check();
         return result;
     }
+    std::vector<Cell> legal_moves() const {return legal_moves([]{});}
     std::vector<Cell> empty(Window w) const {
         std::vector<Cell> result;
         auto data=windows.find(w);
@@ -502,7 +513,8 @@ struct Search {
     std::vector<ForcingLine> proof;
     Clock::time_point proof_deadline;
     int proof_nodes=0,proof_limit=512;
-    Search(int ms,int width,bool inject=false):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(inject?1<<16:0),inject_tt(inject){}
+    Clock::duration proof_screen;
+    Search(int ms,int width,bool inject=false):deadline(Clock::now()+std::chrono::milliseconds(ms)),width(width),tt(inject?1<<16:0),inject_tt(inject),proof_screen(std::chrono::milliseconds(ms)/50){}
     void check() const { if(Clock::now()>=deadline) throw Timeout{}; }
     Turn immediate(Board& b) {
         auto completions=b.completions(b.player,b.remaining);
@@ -854,7 +866,7 @@ struct Search {
         proof_nodes=0;
         return prove(b,depth);
     }
-    bool replay(Board& b,int index) {
+    bool replay(Board& b,int index,std::unordered_set<Cell,CellHash>* support=nullptr) {
         if(Clock::now()>=proof_deadline) throw Timeout{};
         check();++nodes;const int attacker=b.player;
         struct RestoreCache {
@@ -864,11 +876,23 @@ struct Search {
         b.candidates=nullptr;
         const auto& line=proof[index];Restore restore(b);
         if(line.attack.count>b.remaining) return false;
+        if(support) for(int j=0;j<line.attack.count;++j) support->insert(line.attack.cells[j]);
         for(int j=0;j<line.attack.count;++j) {
             if(!b.legal(line.attack.cells[j])) return false;
             b.make(line.attack.cells[j]);if(b.winner>=0) return b.winner==attacker;
         }
         if(b.player==attacker) return false;
+        // An extra defender stone can alter this strategy only by occupying a
+        // played cell, blocking an attacking completion, or creating a defending
+        // completion. Three defending stones plus the extra stone can win in two.
+        size_t support_slots=0;
+        if(support) for(const auto& slot:b.windows.slots) {
+            if(!(++support_slots&255)) {check();if(Clock::now()>=proof_deadline) throw Timeout{};}
+            if(!slot.hash) continue;
+            auto n=slot.data.counts;
+            if((!n[1-attacker] && n[attacker]>=4) || (!n[attacker] && n[1-attacker]>=3))
+                for(auto c:b.empty(slot.key())) support->insert(c);
+        }
         std::vector<Turn> replies;
         if(!forced_replies(b,attacker,replies)) return false;
         for(const auto& defense:replies) {
@@ -877,9 +901,79 @@ struct Search {
             });
             if(found==line.replies.end()) return false;
             Restore reply(b);apply(b,defense);
-            if(!replay(b,found->second)) return false;
+            if(!replay(b,found->second,support)) return false;
         }
         return true;
+    }
+    int free_attack(Board& b,const Turn& attack,int depth) {
+        auto bounded=[&]{check();if(Clock::now()>=proof_deadline) throw Timeout{};};
+        const auto mark=proof.size();Restore position(b);const int attacker=b.player;
+        apply(b,attack);if(b.winner>=0 || b.player==attacker || immediate(b).count) return -1;
+        auto threats=b.completions(attacker);
+        std::erase_if(threats,[&](const auto& threat) {
+            return !std::all_of(threat.begin(),threat.end(),[&](Cell cell){return b.legal(cell);});
+        });
+        if(threats.empty()) return -1;
+        std::vector<std::vector<Cell>> defenses;std::vector<Cell> selected;
+        covers(threats,selected,b.remaining,defenses);
+        if(std::none_of(defenses.begin(),defenses.end(),[](const auto& d){return d.size()==1;})) return -1;
+        // Prove the attack with each mandatory block and a passed spare stone.
+        // Fillers outside the strategy's support leave every tactical test intact.
+        // All other legal fillers are checked individually below.
+        struct Supported {Cell block;int child;std::unordered_set<Cell,CellHash> cells;};
+        std::vector<Supported> supported;
+        for(const auto& cover:defenses) if(cover.size()==1) {
+            Restore block(b);b.make(cover[0]);
+            struct Phase {Board& b;int player,remaining;~Phase(){b.player=player;b.remaining=remaining;}} phase{b,b.player,b.remaining};
+            b.player=attacker;b.remaining=2;
+            // Reject unpromising attacks cheaply inside the existing root budget.
+            const auto end=proof_deadline;const int limit=proof_limit;
+            proof_deadline=std::min(end,Clock::now()+proof_screen);
+            proof_limit=std::min(limit,proof_nodes+32);int child=-1;
+            try {child=prove(b,depth);} catch(const Timeout&) {}
+            proof_deadline=end;proof_limit=limit;
+            if(child<0) {proof.resize(mark);return -1;}
+            Supported item{cover[0],child,{}};
+            if(!replay(b,child,&item.cells)) {proof.resize(mark);return -1;}
+            supported.push_back(std::move(item));
+        }
+        std::vector<Turn> replies;
+        for(const auto& cover:defenses) {
+            bounded();
+            if(cover.size()==2) {replies.push_back({{cover[0],cover[1]},2,0});continue;}
+            CandidatePause pause(b);Restore first(b);b.make(cover[0]);
+            for(auto cell:b.legal_moves(bounded)) {bounded();replies.push_back({{cover[0],cell},2,0});}
+        }
+        auto key=[](const Turn& t)->std::pair<Cell,Cell>{return std::minmax(t.cells[0],t.cells[1]);};
+        size_t work=0;
+        auto sorting=[&]{if(!(++work&255)) bounded();};
+        std::sort(replies.begin(),replies.end(),[&](const Turn& a,const Turn& z){sorting();return key(a)<key(z);});
+        replies.erase(std::unique(replies.begin(),replies.end(),[&](const Turn& a,const Turn& z){sorting();return key(a)==key(z);}),replies.end());
+        for(auto& reply:replies) {
+            check();if(Clock::now()>=proof_deadline) throw Timeout{};
+            CandidatePause pause(b);Restore order(b);const int defender=b.player;
+            b.make(reply.cells[0]);reply.score=b.placed_score(reply.cells[1],defender);
+        }
+        std::stable_sort(replies.begin(),replies.end(),[&](const Turn& a,const Turn& z){sorting();return a.score>z.score;});
+        ForcingLine line{attack,{}};std::vector<int> strategies;
+        for(const auto& defense:replies) {
+            check();if(Clock::now()>=proof_deadline) throw Timeout{};
+            int child=-1;
+            for(const auto& item:supported) {
+                int index=defense.cells[0]==item.block?1:defense.cells[1]==item.block?0:-1;
+                if(index>=0 && !item.cells.contains(defense.cells[index])) {child=item.child;break;}
+            }
+            if(child<0) {
+                Restore answer(b);apply(b,defense);
+                for(auto it=strategies.rbegin();it!=strategies.rend();++it)
+                    if(replay(b,*it)) {child=*it;break;}
+                if(child<0) child=prove(b,depth);
+                if(child<0) {proof.resize(mark);return -1;}
+            }
+            if(std::find(strategies.begin(),strategies.end(),child)==strategies.end()) strategies.push_back(child);
+            line.replies.emplace_back(defense,child);
+        }
+        proof.push_back(std::move(line));return int(proof.size())-1;
     }
     int resume(Board& b,const WinningPlan& plan) {
         if(plan.proof.empty() || plan.attacker!=b.player || plan.position.size()>b.cells.size()) return -1;
@@ -1032,7 +1126,12 @@ struct Search {
                     int own=-1;
                     try {
                         if(plan) own=resume(b,*plan);
-                        if(own<0 && forcing_material(b,b.player)) own=probe(b,std::min(6,max_depth/2));
+                        if(own<0 && forcing_material(b,b.player)) {
+                            for(size_t i=0;i<std::min<size_t>(2,roots.size()) && own<0;++i) {
+                                proof_nodes=0;own=free_attack(b,roots[i],std::min(6,max_depth/2));
+                            }
+                            if(own<0) own=probe(b,std::min(6,max_depth/2));
+                        }
                     } catch(const Timeout&) {}
                     if(own>=0) {
                         chosen=proof[own].attack;chosen.score=mate;output.depth=1;
