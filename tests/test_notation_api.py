@@ -733,12 +733,22 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(reply['move']['pieces']), 1)
         self.assertEqual(search.call_args.kwargs['ms'], 50)
 
-    async def test_socket_uses_game_token_and_plays_native(self):
+    async def test_socket_keeps_search_through_presence_replay_and_heartbeats(self):
         import aiohttp
         from aiohttp import web
         from aiohttp.test_utils import TestServer
-        from arena_bot import NativeArena
+        from arena_bot import NativeArena, answer
         received = []
+        threads = []
+        started, release = threading.Event(), threading.Event()
+
+        def slow_answer(*args):
+            threads.append(threading.get_ident())
+            if len(threads) == 1:
+                started.set()
+                if not release.wait(3):
+                    raise TimeoutError('Test did not release Native')
+            return answer(*args)
 
         async def session(request):
             self.assertNotIn('Authorization', request.headers)
@@ -748,6 +758,22 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
             await ws.send_json(dict(type='setup', board=dict(cells=[dict(q=0, r=0, p='x')])))
             await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=9,
                                     move_time_limit=5))
+            self.assertTrue(await asyncio.to_thread(started.wait, 3))
+            await bot.event(event)  # A reconnected presence stream repeats gameStart.
+            await ws.send_json(dict(type='heartbeat', waiting=True))
+            await asyncio.sleep(.03)
+            release.set()
+            received.append(await ws.receive_json(timeout=3))
+            # The next turn must use the same connection and Native worker.
+            own = received[0]['move']['pieces']
+            game = Game([(0, 0), *[(p['q'], p['r']) for p in own]])
+            try:
+                opponent = game.search(ms=20, width=8, depth=1)['moves']
+            finally:
+                game.close()
+            await ws.send_json(dict(type='move_request', side='o', request_id=10,
+                move_time_limit=5, previous=[dict(side='o', pieces=own),
+                    dict(side='x', pieces=[dict(q=q, r=r) for q, r in opponent])]))
             received.append(await ws.receive_json(timeout=3))
             await ws.close()
             return ws
@@ -757,9 +783,19 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
         async with TestServer(app) as server, aiohttp.ClientSession() as client:
             bot = NativeArena(str(server.make_url('/')), 'private-bot-token', ms=20, width=8, depth=1)
             bot.http = client
-            await asyncio.wait_for(bot.play(dict(gameId='local', engine=dict(socketUrl='/engine',
-                                                                            token='game-only'))), 5)
+            event = dict(type='gameStart', gameId='local', side='o', opponent=dict(name='local'),
+                         engine=dict(socketUrl='/engine', token='game-only'))
+            with patch('arena_bot.answer', side_effect=slow_answer):
+                try:
+                    await bot.event(event)
+                    await asyncio.wait_for(bot.games['local'], 5)
+                finally:
+                    release.set()
+                    await bot.finish('local')
         self.assertEqual(received[0]['request_id'], 9)
+        self.assertEqual(received[1]['request_id'], 10)
+        self.assertEqual(len(threads), 2)
+        self.assertEqual(threads[0], threads[1])
         game = Game([(0, 0)])
         try:
             for p in received[0]['move']['pieces']:

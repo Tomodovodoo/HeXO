@@ -78,6 +78,54 @@ class NativeArena:
         except (Refused, aiohttp.ClientError, asyncio.TimeoutError) as error:
             print(f'Challenge not accepted: {type(error).__name__}', flush=True)
 
+    async def session(self, socket, worker, game_id):
+        history = []
+        search = None
+        incoming = asyncio.create_task(socket.receive())
+
+        async def respond(packet):
+            confirmed, reply, result = await asyncio.get_running_loop().run_in_executor(
+                worker, answer, history, packet, self.ms, self.width, self.depth)
+            await socket.send_json(reply)
+            print(f'Game {game_id}: ply {len(confirmed)}, '
+                  f'{result["elapsed_ms"]:.1f} ms, depth {result["depth"]}', flush=True)
+            return confirmed
+
+        try:
+            while True:
+                waiting = [incoming] + ([search] if search is not None else [])
+                done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+                busy = search is not None
+                if search in done:
+                    history = search.result()
+                    search = None
+                if incoming not in done:
+                    continue
+                message = incoming.result()
+                if message.type == aiohttp.WSMsgType.ERROR:
+                    raise ConnectionError('Engine socket failed')
+                if message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                                    aiohttp.WSMsgType.CLOSED):
+                    return
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    packet = json.loads(message.data)
+                    if packet['type'] == 'setup':
+                        if packet['board']['cells'] != [{'q': 0, 'r': 0, 'p': 'x'}]:
+                            raise ValueError('Expected the Arena origin setup')
+                        history = [[0, 0]]
+                    elif packet['type'] == 'move_request':
+                        if search is not None:
+                            raise ValueError('Overlapping move requests')
+                        search = asyncio.create_task(respond(packet))
+                    elif packet['type'] == 'heartbeat' and packet['waiting'] and not busy:
+                        raise ConnectionError('Server is waiting on an idle session')
+                incoming = asyncio.create_task(socket.receive())
+        finally:
+            pending = [incoming] + ([search] if search is not None else [])
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
     async def play(self, event):
         game_id = event['gameId']
         endpoint = urlsplit(urljoin(self.url + '/', event['engine']['socketUrl']))
@@ -95,29 +143,8 @@ class NativeArena:
                 try:
                     async with self.http.ws_connect(socket_url,
                             params={'token': event['engine']['token']}, max_msg_size=65536) as socket:
-                        history = []
                         backoff = 1
-                        async for message in socket:
-                            if message.type == aiohttp.WSMsgType.ERROR:
-                                raise ConnectionError('Engine socket failed')
-                            if message.type != aiohttp.WSMsgType.TEXT:
-                                continue
-                            packet = json.loads(message.data)
-                            if packet['type'] == 'setup':
-                                board = packet['board']
-                                if board['cells'] != [{'q': 0, 'r': 0, 'p': 'x'}]:
-                                    raise ValueError('Expected the Arena origin setup')
-                                history = [[0, 0]]
-                            elif packet['type'] == 'move_request':
-                                history, reply, result = await asyncio.get_running_loop().run_in_executor(
-                                    worker, answer, history, packet, self.ms, self.width, self.depth)
-                                await socket.send_json(reply)
-                                print(f'Game {game_id}: ply {len(history)}, '
-                                      f'{result["elapsed_ms"]:.1f} ms, depth {result["depth"]}', flush=True)
-                            elif packet['type'] == 'heartbeat' and packet['waiting']:
-                                # Search is bounded and awaited above. Here a waiting
-                                # heartbeat means no move request is being processed.
-                                raise ConnectionError('Server is waiting on an idle session')
+                        await self.session(socket, worker, game_id)
                         if socket.close_code in (1000, 1001):
                             return
                 except aiohttp.WSServerHandshakeError as error:
@@ -140,6 +167,9 @@ class NativeArena:
         kind = event['type']
         if kind == 'gameStart':
             game_id = event['gameId']
+            active = self.games.get(game_id)
+            if active is not None and not active.done():
+                return
             await self.finish(game_id)
             print(f'Game {game_id} vs {event["opponent"]["name"]}, '
                   f'playing {event["side"]}', flush=True)
