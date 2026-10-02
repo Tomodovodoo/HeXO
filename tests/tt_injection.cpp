@@ -80,6 +80,36 @@ int main() {
     }
     auto counter_key=counter.hash();
     assert(!forcing.replay(counter,root) && counter.hash()==counter_key);
+    // A fresh Board and Search on every request must still finish a proven
+    // win, even when stateless reconstruction changes earlier placement order.
+    WinningPlan plan;forcing.remember(open,root,plan);
+    Board played;
+    for(auto c:opening) played.make(c);
+    int resumed_turns=0;
+    for(int turn=0;turn<8 && played.winner<0;++turn) {
+        Board position;
+        auto order=played.history;
+        if(turn%2==0) std::swap(order[3],order[4]);
+        for(const auto& step:order) {assert(position.legal(step.c));position.make(step.c);}
+        const auto key=position.hash();const auto features=position.features;
+        Search continuation(5000,16);
+        auto result=continuation.run(position,1,0,0,&plan);
+        assert(result.score==mate && continuation.proof_nodes==0);
+        if(!continuation.proof.empty()) ++resumed_turns;
+        assert(position.hash()==key && position.features==features);
+        Turn move{{Cell{result.q1,result.r1},Cell{result.q2,result.r2}},result.count,0};
+        for(int i=0;i<move.count;++i) {assert(played.legal(move.cells[i]));played.make(move.cells[i]);}
+        if(played.winner>=0) break;
+        std::vector<Turn> replies;
+        assert(continuation.forced_replies(played,plan.attacker,replies));
+        // With no covering pair, any legal defense leaves an immediate win.
+        auto defense=replies.empty()?continuation.turns(played,false).front():replies.back();
+        if(defense.count==2) std::swap(defense.cells[0],defense.cells[1]);
+        for(int i=0;i<defense.count;++i) {assert(played.legal(defense.cells[i]));played.make(defense.cells[i]);}
+    }
+    assert(played.winner==plan.attacker && resumed_turns>=2);
+    Search unrelated(5000,16);unrelated.proof_deadline=unrelated.deadline;
+    assert(unrelated.resume(counter,plan)<0 && counter.hash()==counter_key);
     Board spare;
     for(Cell c:std::vector<Cell>{{0,0},{-1,0},{0,5},{1,0},{2,0},{3,3},{-3,5},{3,0},{4,0}}) {
         assert(spare.legal(c));spare.make(c);
@@ -90,7 +120,8 @@ int main() {
     // rankings, and a winning continuation with no unblocked three-stone line.
     // Short continuations must also survive the proof work limit. All strategies
     // were checked separately by the raw-board Python verifier. These also
-    // cover a blocking first stone and reuse across forced defenses.
+    // cover a blocking first stone, reuse across forced defenses, and ordering
+    // the mandatory replies before spending the proof budget on them.
     for(const auto& history:std::vector<std::vector<Cell>>{
         {
             {0,0},{1,1},{-1,2},{-1,1},{3,-3},{1,-1},{1,0},{1,-3},{2,-3},{4,-3},
@@ -124,6 +155,15 @@ int main() {
             {1,-1},{-1,1},{5,-6},{2,-1},{-1,-1},{-2,-1},{3,-1},{-3,1},{-2,0},{-5,3},
             {-3,0},{1,-4},{2,-4},{0,-4},{-6,5},{-6,4},{4,-4},{5,-4},{-8,7},{4,-6},
             {-5,7},{-7,6},{-5,4},{-9,8},{-3,2}
+        },
+        {
+            {0,0},{1,1},{-1,2},{-1,1},{3,-3},{1,-1},{1,0},{1,-3},{2,-3},{1,2},
+            {4,-3},{1,3},{-1,-3},{-2,-3},{2,1},{0,3},{2,3},{0,2},{-1,3},{3,3},
+            {-2,2}
+        },
+        {
+            {0,0},{3,1},{-2,-6},{0,-1},{-1,1},{0,4},{-1,5},{1,-1},{-1,-1},{2,-2},
+            {1,3}
         }
     }) {
         Board position;

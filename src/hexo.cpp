@@ -478,6 +478,14 @@ constexpr int mate=10000000;
 struct Timeout {};
 struct Entry { uint64_t key=0; Turn best; };
 struct ForcingLine { Turn attack; std::vector<std::pair<Turn,int>> replies; };
+struct WinningPlan {
+    int attacker=-1;
+    std::vector<std::pair<Cell,int>> position;
+    std::vector<ForcingLine> proof;
+};
+// The player reconstructs its Board for each request in a persistent worker.
+// Keep one exact strategy per calling thread, never heuristic position scores.
+WinningPlan& winning_plan() {static thread_local WinningPlan plan;return plan;}
 struct Search {
     Clock::time_point deadline;
     int width;
@@ -781,6 +789,17 @@ struct Search {
             Restore restore(b);apply(b,attack);
             std::vector<Turn> replies;
             if(b.winner!=attacker && !forced_replies(b,attacker,replies)) continue;
+            // A continuation found against a stronger defense is more likely
+            // to survive the other replies when replayed below.
+            if(depth>1 && replies.size()>1) {
+                int defender=b.player;
+                for(auto& reply:replies) {
+                    if(Clock::now()>=proof_deadline) throw Timeout{};
+                    CandidatePause pause(b);Restore order(b);b.make(reply.cells[0]);
+                    reply.score=reply.count==2?b.placed_score(reply.cells[1],defender):b.score(defender);
+                }
+                std::stable_sort(replies.begin(),replies.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});
+            }
             ForcingLine line{attack,{}};bool won=true;
             for(const auto& defense:replies) {
                 Restore reply(b);apply(b,defense);
@@ -826,6 +845,7 @@ struct Search {
         } restore_cache{b,b.candidates};
         b.candidates=nullptr;
         const auto& line=proof[index];Restore restore(b);
+        if(line.attack.count>b.remaining) return false;
         for(int j=0;j<line.attack.count;++j) {
             if(!b.legal(line.attack.cells[j])) return false;
             b.make(line.attack.cells[j]);if(b.winner>=0) return b.winner==attacker;
@@ -842,6 +862,29 @@ struct Search {
             if(!replay(b,found->second)) return false;
         }
         return true;
+    }
+    int resume(Board& b,const WinningPlan& plan) {
+        if(plan.proof.empty() || plan.attacker!=b.player || plan.position.size()>b.cells.size()) return -1;
+        for(const auto& [cell,player]:plan.position) if(b.at(cell)!=player) return -1;
+        // Stateless callers can reconstruct a different placement order.
+        // Recheck the stored strategies on the actual board instead of
+        // inferring a chronology from its stones.
+        proof=plan.proof;
+        for(int index=int(proof.size())-1;index>=0;--index) if(replay(b,index)) {
+            // Children precede their parents, so this prefix keeps their indices.
+            proof.resize(index+1);return index;
+        }
+        proof.clear();return -1;
+    }
+    void remember(const Board& b,int root,WinningPlan& plan) const {
+        size_t bytes=b.history.size()*sizeof(std::pair<Cell,int>)+(root+1)*sizeof(ForcingLine);
+        for(int i=0;i<=root;++i) bytes+=proof[i].replies.size()*sizeof(std::pair<Turn,int>);
+        if(bytes>256*1024) return;
+        WinningPlan next;next.attacker=b.player;
+        next.position.reserve(b.history.size());
+        for(const auto& step:b.history) next.position.emplace_back(step.c,step.player);
+        next.proof.assign(proof.begin(),proof.begin()+root+1);
+        plan=std::move(next);
     }
     bool forcing_material(const Board& b,int player) const {
         // Two placements can turn two stones into a forcing four. Requiring
@@ -920,7 +963,7 @@ struct Search {
         std::stable_sort(base.begin(),base.end(),[](const auto& a,const auto& z){return a.score>z.score;});
         return base;
     }
-    HxResult run(Board& b,int max_depth,int root_seconds=0,int root_turns=0) {
+    HxResult run(Board& b,int max_depth,int root_seconds=0,int root_turns=0,WinningPlan* plan=nullptr) {
         auto start=Clock::now();CandidateGuard candidate_cache(b);Restore restore(b);HxResult output{};
         if(b.winner>=0) return output;
         Turn chosen=immediate(b);
@@ -956,9 +999,13 @@ struct Search {
                 if(!b.model) {
                     proof_deadline=std::min(deadline,Clock::now()+allowance*3/10);proof_nodes=0;
                     int own=-1;
-                    try {if(forcing_material(b,b.player)) own=probe(b,std::min(6,max_depth/2));} catch(const Timeout&) {}
+                    try {
+                        if(plan) own=resume(b,*plan);
+                        if(own<0 && forcing_material(b,b.player)) own=probe(b,std::min(6,max_depth/2));
+                    } catch(const Timeout&) {}
                     if(own>=0) {
                         chosen=proof[own].attack;chosen.score=mate;output.depth=1;
+                        if(plan) remember(b,own,*plan);
                         roots.clear();max_depth=0;
                     } else proof.clear();
                 }
@@ -1026,13 +1073,13 @@ int hx_size(void* p){return int(static_cast<Board*>(p)->history.size());}
 int hx_cell(void* p,int index,HxCell* out){auto& b=*static_cast<Board*>(p);if(index<0 || index>=int(b.history.size()))return 0;auto u=b.history[index];*out={u.c.q,u.c.r,u.player};return 1;}
 int hx_legal(void* p,int64_t q,int64_t r){return static_cast<Board*>(p)->legal({q,r});}
 int hx_moves(void* p,HxCell* out,int cap){auto cells=static_cast<Board*>(p)->legal_moves();for(int i=0;i<std::min(cap,int(cells.size()));++i)out[i]={cells[i].q,cells[i].r,-1};return int(cells.size());}
-int hx_search(void* p,int ms,int depth,int width,HxResult* out){if(ms<1 || depth<1 || width<2 || width>128)return 0;try{auto start=Clock::now();Search s(ms,width);*out=s.run(*static_cast<Board*>(p),depth);out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;}catch(...){return 0;}}
+int hx_search(void* p,int ms,int depth,int width,HxResult* out){if(ms<1 || depth<1 || width<2 || width>128)return 0;try{auto start=Clock::now();Search s(ms,width);*out=s.run(*static_cast<Board*>(p),depth,0,0,&winning_plan());out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;}catch(...){return 0;}}
 int hx_search_root(void* p,int ms,int depth,int width,int seconds,int cap,HxResult* out) {
     if(!seconds && !cap) return hx_search(p,ms,depth,width,out);
     if(ms<1 || depth<1 || width<2 || width>128 || seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024) return 0;
     try {
         auto start=Clock::now();Search search(ms,width);
-        *out=search.run(*static_cast<Board*>(p),depth,seconds,cap);
+        *out=search.run(*static_cast<Board*>(p),depth,seconds,cap,&winning_plan());
         out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;
     } catch(...) {return 0;}
 }
@@ -1041,7 +1088,7 @@ int hx_search_tt(void* p,int ms,int depth,int width,int seconds,int cap,HxResult
         ((seconds || cap) && (seconds<std::max(6,width/2) || seconds>128 || cap<2*width || cap>1024))) return 0;
     try {
         auto start=Clock::now();Search search(ms,width,true);
-        *out=search.run(*static_cast<Board*>(p),depth,seconds,cap);
+        *out=search.run(*static_cast<Board*>(p),depth,seconds,cap,&winning_plan());
         out->elapsed_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();return 1;
     } catch(...) {return 0;}
 }
