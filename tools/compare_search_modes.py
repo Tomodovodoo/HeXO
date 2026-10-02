@@ -108,7 +108,7 @@ def publish(run, state):
         if hashlib.sha256(path.read_bytes()).hexdigest() != sha:
             raise ValueError('Target run checkpoint weights differ from the comparison')
     ids = {'gumbel': state['checkpoint'], **{m: state['checkpoint']+'@'+state['names'][m] for m in ('puct', 'policy')}}
-    reports = []
+    reports, paths = [], []
     for a, b in itertools.combinations(MODES, 2):
         records = [dict(g, candidate=ids[a], opponent=ids[b]) for g in state['results']
                    if g['kind'] == 'match' and (g['a'], g['b']) == (a, b)]
@@ -131,9 +131,11 @@ def publish(run, state):
             if old['id'] != report['id'] or old['games'] != report['games']:
                 raise ValueError('An existing report differs')
             report = old
-        else:
-            write_json(path, report)
         reports.append(report)
+        paths.append(path)
+    for path, report in zip(paths, reports):
+        if not path.exists():
+            write_json(path, report)
     league = json.loads((run/'league.json').read_text(encoding='utf-8'))
     known = {v['id'] for v in league.get('variants', [])} | set(dense_eval.requests(run))
     for mode in ('puct', 'policy'):

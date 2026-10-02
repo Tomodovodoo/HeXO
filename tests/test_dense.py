@@ -5314,6 +5314,12 @@ class EvaluatorLoopTests(unittest.TestCase):
         for game in state['results']:
             if game['kind'] == 'match':
                 game['winner'] = game['challenger_color']
+        partial = dict(state, results=[g for g in state['results']
+                                      if g.get('a') != 'puct' or g.get('b') != 'policy'])
+        with self.assertRaisesRegex(ValueError, 'all three complete'):
+            compare_search_modes.publish(self.run, partial)
+        self.assertEqual(dense_eval.load_reports(self.run), [])
+        self.assertFalse(dense_eval.requests(self.run))
         compare_search_modes.publish(self.run, state)
         dense_eval.write_league(self.run, evaluator.league, evaluator.config)
         variants = self.league()['variants']
