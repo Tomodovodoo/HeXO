@@ -147,9 +147,13 @@ def native_comparison(args):
                         break
                     if not result["moves"]:
                         raise RuntimeError("Nonterminal search returned no move")
-                    for move in result["moves"]:
+                    for i, move in enumerate(result["moves"]):
                         board.play(*move)
                         history.append(move)
+                        if board.winner >= 0:
+                            if i+1 < len(result["moves"]):
+                                result = {**result, "submitted_moves": result["moves"], "moves": result["moves"][:i+1]}
+                            break
                     if board.winner < 0 and board.player == side:
                         raise RuntimeError("Search returned an incomplete turn")
                     searches.append({"engine": engine, "ply": len(history), **result})
