@@ -518,8 +518,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     def observe(n):
         watch(n)
         if live and tree is not None and not moves and time.monotonic() >= shown[0]:
-            shown[0] = time.monotonic() + .3
             if (seen := glimpse(tree)) is not None:
+                shown[0] = time.monotonic() + .3
                 live(seen)
 
     network = Watched(bubble.evaluator, observe)
