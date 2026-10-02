@@ -33,6 +33,8 @@ from hexo import Game
 from legacy.klent import digest
 from neural_search import HOLD, EvaluationCache, NeuralSearch, checked, native
 from legacy.train import write_json
+from proof import VerificationTimeout
+from tactical_proof import independent_verify
 
 # Crop cells per forward: 48 positions at 48x48, proportionally fewer for larger crops (a b6c96 forward peaks
 # near 0.14 GB; about 0.33 GB per process with the CUDA context). A crop-size group is padded into the next larger size present when that adds fewer than
@@ -648,7 +650,7 @@ class SelfPlayGame:
         ply = len(self.moves)
         if self.settings.proven_line_rows:
             trained = lambda p: self.opponent is None or p == self.learner
-            for (q, r), turns in line:
+            for (q, r), turns, proof_action in line:
                 if len(self.moves) >= self.settings.max_plies:
                     break
                 game = self.game
@@ -665,7 +667,7 @@ class SelfPlayGame:
                                       proof_turns=turns, proof_plies=dense_solver.proof_plies(game.remaining, turns, proven > 0),
                                       solver_nodes=0, solver_budget=0, line=True))
                 if proven > 0:
-                    self.rows[-1]['proof_action'] = full.action(self.moves)
+                    self.rows[-1]['proof_action'] = proof_action
                 self.values.append(float(proven) if trained(player) else None)
                 self.network_values.append(None)
                 self.full.append(False)
@@ -674,23 +676,41 @@ class SelfPlayGame:
         self.reason, self.adjudicated = 'proven', dict(ply=ply, winner=winner, line_plies=len(line))
 
     def forced_line(self, proof):
-        """[((q, r), proof_turns)] from the current position to the winner's six in a row along `proof`: the
-        attacker's certificate stones in either order, a covered defender reply sampled with the game's RNG, and after an
-        unstoppable node any legal stones off the attacker's threats; the line stops early where the certificate gives no
-        move."""
+        """[((q, r), proof_turns, proof_action)] to the winner's six along a checked strategy.
+
+        Training lines sample retained attacker alternatives after an independent board check, as well as covered
+        defender replies and either stone order. A failed or expired check keeps the primary strategy. Each row's
+        winning action comes from the strategy followed at that prefix. Analysis without line rows uses the primary
+        attacker choices. After an unstoppable node, defender stones avoid its threats; stop if no move is supplied.
+        """
         history, line = [tuple(m) for m in self.moves], []
         game = Game(history)
         try:
             while game.winner < 0:
-                _, move, node, _ = proof.walk(history)
+                _, move, node, played = proof.walk(history)
                 if move is None:
                     break
+                if (self.settings.proven_line_rows and node['kind'] == 'attacker_move' and not played
+                        and node.get('alternatives')):
+                    choice = self.rng.integers(1+len(node['alternatives']))
+                    if choice:
+                        alternative = node['alternatives'][choice-1]
+                        index, nodes = proof.nodes.index(node), list(proof.nodes)
+                        nodes[index] = dict(node, action=alternative['action'], child=alternative['child'])
+                        certificate = dict(version=1, width='wide', root=index, nodes=nodes)
+                        try:
+                            verified = independent_verify(certificate, history, deadline_seconds=.1) == 'PROVEN_WIN'
+                        except (ValueError, VerificationTimeout):
+                            verified = False
+                        if verified:
+                            proof = dense_solver.Proof(history, certificate)
+                            _, move, node, played = proof.walk(history)
                 stones = move[0] or proof.reply(history, self.rng)
                 if stones is None:
                     threats = {tuple(c) for t in node.get('threats', ()) for c in t}
                     stones = [next(tuple(m) for m in game.legal_moves() if tuple(m) not in threats)]
                 stone = stones[self.rng.integers(len(stones))]
-                line.append((stone, move[1]))
+                line.append((stone, move[1], proof.action(history)))
                 game.play(*stone)
                 history.append(stone)
         finally:

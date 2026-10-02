@@ -573,11 +573,14 @@ class Adjudication(unittest.TestCase):
         covered = {tuple(sorted(map(tuple, r['action']))) for r in node['responses']}
         winner = dense_solver.mover(base)
         lines, replies, orders = {}, set(), set()
+        checked, varied_actions = 0, 0
         for seed in [*range(12), 3]:
             game = from_position(dense_selfplay.SelfPlayGame([model, model], s, seed), base)
             try:
                 with mock.patch.object(model.evaluator, 'evaluate', side_effect=AssertionError('No neural search needed')):
-                    game.adjudicate(winner, proof)
+                    with mock.patch.object(dense_selfplay, 'independent_verify', wraps=dense_selfplay.independent_verify) as verifier:
+                        game.adjudicate(winner, proof)
+                    checked += verifier.call_count
                 self.assertEqual(game.game.winner, winner)
                 orders.add(tuple(map(tuple, game.moves[len(base):len(base)+len(first)])))
                 offset = len(base)+len(first)
@@ -589,6 +592,7 @@ class Adjudication(unittest.TestCase):
                     self.assertIsNone(row['policy'])
                     if row['player'] == winner:
                         self.assertIn(game.moves[row['ply']], row['proof_action'])
+                        varied_actions += row['proof_action'] != proof.action(game.moves[:row['ply']])
                 if seed in lines:
                     self.assertEqual(game.moves, lines[seed])
                 lines[seed] = game.moves
@@ -598,6 +602,21 @@ class Adjudication(unittest.TestCase):
                     tree.close()
         self.assertGreater(len(replies), 1)
         self.assertEqual(orders, {tuple(first), tuple(reversed(first))})
+        self.assertGreater(checked, 0)
+        self.assertGreater(varied_actions, 0)
+        for error in (ValueError('unverified alternative'), dense_selfplay.VerificationTimeout('expired')):
+            game = from_position(dense_selfplay.SelfPlayGame([model, model], s, 3), base)
+            try:
+                with mock.patch.object(dense_selfplay, 'independent_verify', side_effect=error) as verifier:
+                    game.adjudicate(winner, proof)
+                self.assertGreater(verifier.call_count, 0)
+                self.assertEqual(game.game.winner, winner)
+                for row in game.rows:
+                    self.assertEqual(row.get('proof_action'), proof.action(game.moves[:row['ply']]))
+            finally:
+                game.game.close()
+                for tree in game.trees.values():
+                    tree.close()
 
     def play(self, plies=40, **changes):
         model = tiny_model()
