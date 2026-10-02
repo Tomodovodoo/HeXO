@@ -268,9 +268,8 @@ builds it with the rest.
 The network is not committed. `python tools/build_web.py strix-network` downloads the file pinned in
 `tools/engines.json` (2.8 MB, checked against its SHA-256) into `web/engine/strix/` with `networks.json`; without
 that file the page does not offer Strix. The worker keeps `strix.wasm` and the network in the Cache API under their
-digests. Its licence is unstated: hexo.tyto.cc serves it publicly, and neither the site nor the repository grants
-permission to redistribute it. The Pages workflow therefore fetches it only when the repository variable
-`PUBLISH_STRIX_NETWORK` is `true`. The engine code is MIT (`web/engine/strix/LICENSE-hexo-strix.txt`); the Rust
+digests. The network's licence is unstated in the repository, and its author allows this use; the Pages workflow fetches it
+when the repository variable `PUBLISH_STRIX_NETWORK` is `true`, which it is. The engine code is MIT (`web/engine/strix/LICENSE-hexo-strix.txt`); the Rust
 crates it links (serde, serde_json, rand, safetensors, rayon, rustc-hash) are MIT or Apache 2.0.
 
 A search runs on one thread. On the Ryzen 9 5900X under node 24, from a 19-stone position, a turn takes 1.0 s at
