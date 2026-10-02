@@ -15,14 +15,22 @@ function depths(certificate) {
   return turns;
 }
 
+/** Steps between hex cells `a` and `b` ([q, r] axial). */
+function distance(a, b) {
+  const dq = a[0] - b[0], dr = a[1] - b[1];
+  return Math.max(Math.abs(dq), Math.abs(dr), Math.abs(dq + dr));
+}
+
 /**
  * The principal variation of a verified certificate for the side to move at `history` (play.principal_variation):
- * {pv: [[q, r, player], ...] up to the winning stone, plies: placements to it}. The attacker takes the certificate's
- * primary choice, the defender the covered reply lasting the most attacker turns (the first of equals); at an
- * unstoppable fork the defender's two stones are left out (counted in `plies`) and the shortest threat completes.
+ * {pv: [[q, r, player, ply], ...] up to the winning stone, plies: placements to it}. The attacker takes the
+ * certificate's primary choice, the defender the covered reply lasting the most attacker turns, among equals the one
+ * nearest the attacker's last stone (least summed hex distance), then the first listed; at an unstoppable fork the
+ * defender's two stones are left out, their plies skipped, and the shortest threat completes.
  */
 export function principalVariation(native, history, certificate) {
   const turns = depths(certificate), current = history.map(p => [...p]), pv = [];
+  const near = reply => reply.action.reduce((sum, cell) => sum + distance(cell, pv.at(-1)), 0);
   const attacker = native.game(current).player;
   let plies = 0, index = certificate.root;
   while (native.game(current).winner < 0) {
@@ -30,22 +38,23 @@ export function principalVariation(native, history, certificate) {
     if (node.kind === 'unstoppable') {
       if (node.threats?.length) {
         const threat = node.threats.reduce((a, b) => b.length < a.length ? b : a);
-        for (const [q, r] of threat) pv.push([q, r, attacker]);
+        threat.forEach(([q, r], i) => pv.push([q, r, attacker, plies + 3 + i]));
         plies += 2 + threat.length;
       }
       break;
     }
     let action;
     if (node.kind === 'defender_replies') {
-      const reply = node.responses.reduce((a, b) => turns(b.child) > turns(a.child) ? b : a);
+      const longer = (a, b) => turns(b.child) - turns(a.child) || near(a) - near(b);
+      const reply = node.responses.reduce((a, b) => longer(a, b) > 0 ? b : a);
       [action, index] = [reply.action, reply.child];
     } else [action, index] = [node.action, node.child];
     for (const [q, r] of action) {
       const state = native.game(current);
       if (state.winner >= 0) break;
-      pv.push([q, r, state.player]);
-      current.push([q, r]);
       plies++;
+      pv.push([q, r, state.player, plies]);
+      current.push([q, r]);
     }
     if (index === undefined) break;
   }

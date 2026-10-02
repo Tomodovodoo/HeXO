@@ -34,6 +34,9 @@ jobs:
           "$RUNNER_TEMP/emsdk/emsdk" install 6.0.10
           "$RUNNER_TEMP/emsdk/emsdk" activate 6.0.10
       - run: python tools/build_web.py ort model shrimp seal six --checkpoint "$RUNNER_TEMP/release/ema.pt" --emxx "$RUNNER_TEMP/emsdk/upstream/emscripten/em++"
+      # The Strix network's licence is unstated; it is published only once the repository variable says so.
+      - if: ${{ vars.PUBLISH_STRIX_NETWORK == 'true' }}
+        run: python tools/build_web.py strix-network
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
         with:

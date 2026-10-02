@@ -453,6 +453,19 @@ class GraphSearch(unittest.TestCase):
             self.assertEqual(len(game.trees), 2)
             game.finish()
 
+    def test_a_floor_variant_searches_only_its_own_side(self):
+        config = dense_config.RunConfig()
+        sides = (dense_eval.side_settings(config.evaluation, dense_eval.parse_settings(['q_range_floor=0.5'])),
+                 config.evaluation)
+        model = tiny_model()
+        with tempfile.TemporaryDirectory() as run:
+            book = dense_openings.Book(run, config.evaluation)
+        for game in dense_eval.paired_games(model, model, 2, 'test', config, config.evaluation, None, book, sides=sides):
+            colour = game.record['challenger_color']
+            self.assertEqual((game.floors[colour], game.floors[1-colour]), (.5, 0.))
+            self.assertEqual(len(game.trees), 2)
+            game.finish()
+
     def test_book_lines_search_with_the_evaluation_graph_setting(self):
         calls = []
         model = type('Model', (), dict(tree=lambda self, *args, graph=False: calls.append(args+(graph,))))()

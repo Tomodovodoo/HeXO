@@ -31,6 +31,14 @@ export async function cached(url, version, progress = () => {}) {
   return body;
 }
 
+/** Removes every cached version of `url`, for bytes that failed their check. */
+export async function forget(url) {
+  try {
+    const store = await caches.open(CACHE), base = new URL(url, location.href).href.split('?')[0];
+    for (const key of await store.keys()) if (key.url.split('?')[0] === base) await store.delete(key);
+  } catch {}
+}
+
 /**
  * The device to run on: {provider: 'webgpu' | 'wasm', precisions: candidate graphs, adapter}. WebGPU offers fp16
  * (shader-f16 adapters) and fp32, WebAssembly fp32. `prefer` 'wasm', 'webgpu-fp32' or 'webgpu-fp16' narrows it.

@@ -1,0 +1,22 @@
+[package]
+name = "hexo-strix-web"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hexo-infer = { git = "https://github.com/SootyOwl/hexo-strix", rev = "5a771e572553a8bd8e010112b2ce65f16e5afa1b" }
+hexo-mcts = { git = "https://github.com/SootyOwl/hexo-strix", rev = "5a771e572553a8bd8e010112b2ce65f16e5afa1b" }
+hexo-engine = { git = "https://github.com/SootyOwl/hexo-strix", rev = "5a771e572553a8bd8e010112b2ce65f16e5afa1b" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+rand_chacha = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
