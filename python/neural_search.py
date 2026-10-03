@@ -257,9 +257,9 @@ class Recheck:
     chooses the turn (GameGraph.after_turn). The check moves the root to the position after that turn and searches it
     with R; its values reach A through the shared nodes. Back at A, when the chosen stone's completed Q fell by more
     than `drop`, A is searched again with the last R; otherwise those simulations are not spent. No check runs when
-    R is 0, the first pass proved its root or the turn wins. `budget` is the first pass's simulations; give each
-    finished search's result to `step`, which returns the next search's simulations (the root already moved to its
-    position) or 0 once the root is back at A and the check is over."""
+    R is 0, the first pass proved its root, its turn has no known second stone or the turn wins. `budget` is the
+    first pass's simulations; give each finished search's result to `step`, which returns the next search's
+    simulations (the root already moved to its position) or 0 once the root is back at A and the check is over."""
 
     def __init__(self, graph, simulations, fraction, drop=PV_DROP):
         self.graph, self.drop = graph, drop
@@ -332,8 +332,9 @@ class GameGraph(NeuralSearch):
 
     def after_turn(self, result):
         """The history after the turn `result`, this root's finished search, chooses: its stone, then while the same
-        side is to move the stone the graph's improved policy ranks first there (none when that position was never
-        expanded). None when the result has no stone or a proof, or the turn wins. The root is left where it was."""
+        side is to move the stone the graph's improved policy ranks first there. None when the result has no stone or
+        a proof, the position after its stone was never expanded while the same side still moves, or the turn wins.
+        The root is left where it was."""
         if result['action'] is None or result['proven']:
             return None
         root = list(self.history)
@@ -346,11 +347,12 @@ class GameGraph(NeuralSearch):
                 self.at(line)
                 stats = self.result(0, 0, 0, 0)
                 self.at(root)
-                if len(stats['policy']) and stats['policy'].max() > 0:
-                    line.append(tuple(map(int, stats['actions'][int(np.argmax(stats['policy']))])))
-                    game.play(*line[-1])
-                    if game.winner >= 0:
-                        return None
+                if not len(stats['policy']) or not stats['policy'].max() > 0:
+                    return None
+                line.append(tuple(map(int, stats['actions'][int(np.argmax(stats['policy']))])))
+                game.play(*line[-1])
+                if game.winner >= 0:
+                    return None
         finally:
             game.close()
         return line

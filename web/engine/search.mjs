@@ -328,10 +328,9 @@ export class GameGraph extends NeuralSearch {
       this.at(line);
       const {actions, policy} = this.result();
       this.at(root);
-      if (policy.length && Math.max(...policy) > 0) {
-        line.push([...actions[policy.indexOf(Math.max(...policy))]]);
-        if (this.n.game(line).winner >= 0) return null;
-      }
+      if (!policy.length || !(Math.max(...policy) > 0)) return null;
+      line.push([...actions[policy.indexOf(Math.max(...policy))]]);
+      if (this.n.game(line).winner >= 0) return null;
     }
     return line;
   }

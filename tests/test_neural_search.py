@@ -957,6 +957,10 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual(spent, [32, 16, 16])
         with self.assertRaisesRegex(ValueError, 'pv_check must lie'):
             Recheck(graph, 64, .5)
+        # A chosen first stone never searched has no known second stone: no check.
+        unvisited = graph.result(0, 0, 0, 0)
+        unvisited.update(action=unvisited['actions'][int(np.argmin(unvisited['visits']))].tolist(), proven=0)
+        self.assertIsNone(graph.after_turn(unvisited))
         late = Recheck(graph, 64, .25)
         late.step(graph.search(late.budget, root_samples=8, batch_size=8))
         self.assertNotEqual(graph.history, a)
