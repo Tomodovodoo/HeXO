@@ -1,4 +1,5 @@
 /* Native Gumbel search (gumbel.wasm, the hxg_* ABI of src/gumbel.cpp) driven like python/neural_search.py. */
+import {nextTask} from './tasks.mjs';
 
 export class Native {
   /** Wraps an instantiated gumbel.mjs module. */
@@ -191,6 +192,7 @@ export class NeuralSearch {
             cache.put(items[0].key, {logits: Float64Array.from(predictions[i].logits), q: Float64Array.from(predictions[i].q)});
           });
           onBatch(stats);
+          await nextTask();
         } else if (active) {
           finished();
           if (active && idle >= 1) throw new Error('Native scheduler stalled without pending evaluations');

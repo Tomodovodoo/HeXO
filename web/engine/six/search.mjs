@@ -2,21 +2,12 @@
  * gives HTTTX cells and plays like python/six_engine.py SixEngine against sixengine: the same search, defaults and
  * radius, `go nodes N` with no time limit, and the tree kept while the game continues. */
 import createModule from './six.mjs';
+import {nextTask} from '../tasks.mjs';
 
 /** Six's frame for an HTTTX cell (q, r) and back: (q + r, -r) is its own inverse. */
 export const mirror = ([q, r]) => [q + r, -r];
 
 const RADIUS = 8;
-
-/** Resolves after the tasks already queued (a worker's messages, timers) have run: a WebAssembly session answers
- * through microtasks alone, which would hold a cancel back until the turn ends. */
-function pending() {
-  return new Promise(resolve => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = () => { channel.port1.close(); resolve(); };
-    channel.port2.postMessage(null);
-  });
-}
 
 export class SixSearch {
   static async create(ort) {
@@ -63,7 +54,7 @@ export class SixSearch {
     }
     for (const tensor of Object.values(result)) tensor.dispose?.();
     this.evaluations += batch;
-    await pending();
+    await nextTask();
   }
 
   /**
