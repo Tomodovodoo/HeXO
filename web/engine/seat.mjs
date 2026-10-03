@@ -38,6 +38,8 @@ let config = {seats: [null, null], analysis: null}, job = null, failed = null, p
 let fresh = true, notice = null;
 /** Engine and checkpoint pairs whose network is loaded: a timed move of any other holds the server's clock while it loads. */
 const warmed = new Set();
+/** While a timed move holds the server's clock to load its engine: {paused}, set when the person pauses meanwhile. */
+let holding = null;
 try {
   const saved = localStorage.getItem(STORE), known = choice => ENGINES.has(choice?.engine) ? pickEngine(choice.engine, choice, choice.checkpoint) : null;
   fresh = saved === null;
@@ -141,15 +143,20 @@ async function run(key, task) {
     current.loading = true;
     const timed = task.kind === 'move' && state()?.clock_spec && state().clock_spec.mode !== 'fixed', warm = `${task.engine}|${task.checkpoint}`;
     const hold = timed && !warmed.has(warm);
-    if (hold) { posting = true; await original.post('/pause', {paused: true}); }
+    if (hold) { posting = true; holding = {paused: false}; await original.post('/pause', {paused: true}); }
     try {
       entry.device = deviceLabel(await engine.load(f => { loads.set(task.engine, f); progress(); }));
       await engine.prepare?.(task.checkpoint, {signal: controller.signal});
       warmed.add(warm);
     } finally {
-      if (hold) { await original.post('/pause', {paused: false}); posting = false; }
+      if (hold) {
+        const kept = holding.paused;
+        holding = null;
+        if (!kept) await original.post('/pause', {paused: false});
+        posting = false;
+      }
     }
-    if (job !== current) return;
+    if (job !== current || hold && state()?.paused) { if (job === current) job = null; return; }
     current.loading = false;
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
     const ms = task.kind === 'move' && s?.clock && s.clock_spec?.mode !== 'fixed' ? turnTime(s.clock_spec, s.clock, task.side) : null;
@@ -220,6 +227,7 @@ function install() {
   };
   page.post = (path, body = {}) => {
     const s = state();
+    if (path === '/pause' && holding) holding.paused = !!body.paused;
     const fixed = id => ENGINES.has(id) && !ENGINES.get(id).entry.clocks ? ENGINES.get(id).entry.name : null;
     const refused = name => { original.toast(`${name} plays a fixed budget; it cannot keep a clock`); return Promise.resolve(null); };
     if (path === '/clock' && body.mode !== 'fixed') {

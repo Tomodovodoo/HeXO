@@ -1989,6 +1989,8 @@ class Session:
                             continue
             study.load(game['history'], True, saved_game=dict(batch=ident, name=directory.name, game=number,
                        players=[p['name'] for p in game['players']], winner=game['winner'], reason=game['reason']))
+            study.outcome = dict(winner=game['winner'], reason='time') if game['reason'] == 'time' else None
+            study.changed()
         return study
 
     def match_editable(self):

@@ -286,6 +286,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual([t['side'] for t in game['turns']], [0, 1, 0])
         self.assertEqual(game['history'], [[0, 0], [1, 3], [1, 4]])
         self.assertEqual((result['timed_out']['play'], result['late'], result['long_clock']), (400, 400, 200))
+        self.assertEqual(result['study_winner'], 1)
         self.assertEqual((result['fresh']['outcome'], result['fresh']['clock']['running']), (None, 'x'))
         self.assertGreater(result['fresh']['clock']['cross_ms'], 250)
         self.assertGreaterEqual(result['paused_turn'], 190)

@@ -547,6 +547,7 @@ export class BrowserSession extends OfflineSession {
     this.load(game.history, true, game.opening || null); this.seats = [human(), human()];
     this.saved_game = {batch: id, game: +number, players: game.players.map(p => p.name || 'Human'), winner: game.winner, reason: game.reason, clock: game.clock || null};
     this.clockTurns = copy(game.turns || []);
+    this.outcome = ['time', 'timeout'].includes(game.reason) && game.winner != null ? {winner: game.winner, reason: game.reason} : null;
     const last = this.clockTurns.at(-1), base = game.clock && (game.clock.mode === 'move' ? game.clock.ms : game.clock.base_ms);
     this.clock = game.clock ? {cross_ms: last?.cross_ms ?? base, circle_ms: last?.circle_ms ?? base, increment_ms: game.clock.increment_ms || 0} : null;
     this.records = game.records || Object.values(game.evaluations || {});

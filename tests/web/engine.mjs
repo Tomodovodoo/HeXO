@@ -107,6 +107,7 @@ if (job.kind === 'encode') {
   clearTimeout(s.flag); await wait(s.clockNow().cross_ms + 50);
   answer.late = s.answer('/play', {q: 9, r: 9})[0];
   answer.timed_out = {state: (({winner, outcome}) => ({winner, outcome}))(s.state()), game: (await s.saving, await s.storage.get('games', s.gameId)), play: s.answer('/play', {q: 9, r: 8})[0]};
+  { const v = new BrowserSession(native); v.storage = s.storage; await v.openGame(s.gameId, 1); answer.study_winner = v.state().winner; }
   s.answer('/new', {});
   answer.long_clock = s.answer('/clock', {mode: 'game', tc: '3000000'})[0];
   s.answer('/clock', {mode: 'game', tc: '0.3+1'});
