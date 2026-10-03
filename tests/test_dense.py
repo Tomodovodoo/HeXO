@@ -1205,6 +1205,14 @@ class DenseConfigTests(unittest.TestCase):
             for bad in (-.1, 2.5, float('nan')):
                 with self.assertRaisesRegex(ValueError, r'q_range_floor must lie in \[0, 2\]'):
                     settings(q_range_floor=bad)
+        noise_args = parser.parse_args(['--root-noise', '0.25'])
+        self.assertEqual(dense_config.override(base, noise_args).root_noise, .25)
+        self.assertEqual(dense_selfplay.actor_flags(noise_args), ['--root-noise', '0.25'])
+        self.assertEqual(base.root_noise, 0.)
+        self.assertFalse(hasattr(dense_config.EvaluationSettings(), 'root_noise'))
+        for bad in (-.1, 1., float('nan')):
+            with self.assertRaisesRegex(ValueError, r'root_noise must lie in \[0, 1\)'):
+                dense_config.ActorSettings(root_noise=bad)
         self.assertEqual(dense_selfplay.actor_flags(parser.parse_args(['--historical-weighting', 'uniform'])),
                          ['--historical-weighting', 'uniform'])
         prefixed = argparse.ArgumentParser()
@@ -3741,6 +3749,19 @@ class EngineTests(unittest.TestCase):
         slot.moves, slot.forced_plies = [[0, 0]]*2, 0
         dense_selfplay.SelfPlayGame.plan(slot)
         self.assertTrue(slot.is_full)
+
+    def test_root_noise_reaches_only_full_searches(self):
+        draws, calls = iter([.1, .9, .1, .1]), []
+        fake = SimpleNamespace(hxg_root_noise=lambda tree, noise: calls.append((tree, noise)) or 1)
+        slot = SimpleNamespace(settings=dense_config.ActorSettings(full_fraction=.5, root_noise=.25), moves=[],
+                               forced_plies=0, rng=SimpleNamespace(random=lambda: next(draws)),
+                               tree=SimpleNamespace(ptr='root'))
+        with unittest.mock.patch.object(dense_selfplay, 'native', fake):
+            for _ in range(3):
+                dense_selfplay.SelfPlayGame.plan(slot)
+            slot.settings = replace(slot.settings, root_noise=0.)
+            dense_selfplay.SelfPlayGame.plan(slot)
+        self.assertEqual(calls, [('root', .25), ('root', 0.), ('root', .25)])
 
     def test_leaf_proof_skips_inference_and_records_exact_value(self):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]

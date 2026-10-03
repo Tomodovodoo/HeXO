@@ -86,10 +86,11 @@ export class EvaluationCache {
 /**
  * One persistent search tree. `evaluate(requests)` takes [{history, actions}] (actions in native legal order) and
  * resolves to [{logits, q}] per request (array-likes of the action count; q is V(s) broadcast). `qRangeFloor` is
- * the least Q range of the completed-Q rescale (0 keeps mctx's), as python/neural_search.py's q_range_floor.
+ * the least Q range of the completed-Q rescale (0 keeps mctx's) and `rootNoise` the uniform share of the root's
+ * candidate sampling (0 samples by the prior), as python/neural_search.py's q_range_floor and root_noise.
  */
 export class NeuralSearch {
-  constructor(native, {seed = 1740, tactics = false, graph = false, qRangeFloor = 0, history = []} = {}) {
+  constructor(native, {seed = 1740, tactics = false, graph = false, qRangeFloor = 0, rootNoise = 0, history = []} = {}) {
     this.n = native;
     this.m = native.m;
     this.ptr = this.m._hxg_new(BigInt(seed));
@@ -98,6 +99,7 @@ export class NeuralSearch {
     native.checked(this.m._hxg_tactics(this.ptr, tactics ? 1 : 0));
     native.checked(this.m._hxg_graph(this.ptr, graph ? 1 : 0));
     native.checked(this.m._hxg_q_range_floor(this.ptr, qRangeFloor));
+    native.checked(this.m._hxg_root_noise(this.ptr, rootNoise));
     for (const point of history) this.advance(point);
   }
   close() {

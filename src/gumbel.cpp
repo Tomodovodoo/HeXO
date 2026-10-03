@@ -56,6 +56,7 @@ struct Tree {
  std::vector<Cell> priority;
  std::map<Cell,double> defence;
  double range_floor=0;  // least Q range of the completed-Q rescale (transformed)
+ double root_noise=0;   // uniform share of the root's candidate sampling distribution (sampling)
  double bonus(const Edge& e)const {auto i=defence.find(e.action);return i==defence.end()?0:i->second;}
  explicit Tree(uint64_t seed):rng(seed){}
  bool done()const {return requests.empty() && (board.winner>=0 || (root->expanded && root->exact_winner>=0) || completed>=budget);}
@@ -178,6 +179,17 @@ struct Tree {
   for(auto& x:q)x=(x-lo)/range*(50+maximum)*0.1;
   return q;
  }
+ // Root candidate sampling logits: each edge's logit, or with root_noise e > 0 log((1 - e) p + e / N) for the N
+ // eligible edges, p their softmax over the eligible logits. Only the opening phase's Gumbel-top-k draws on these;
+ // halving, the final choice, the improved policy and every non-root node use the edge logits.
+ std::vector<double> sampling(const Node& node)const {
+  std::vector<double> out;double maximum=-1e300,total=0;int n=0;
+  for(auto& e:node.edges){out.push_back(e.logit);if(e.eligible){maximum=std::max(maximum,e.logit);++n;}}
+  if(root_noise<=0 || !n)return out;
+  for(auto& e:node.edges)if(e.eligible)total+=std::exp(e.logit-maximum);
+  for(size_t i=0;i<out.size();++i)if(node.edges[i].eligible)out[i]=std::log((1-root_noise)*std::exp(out[i]-maximum)/total+root_noise/n);
+  return out;
+ }
  // `last` is the simulation index where the final candidate count begins (the last halving boundary), or the
  // budget when the schedule never halves.
  void schedule(int count) {
@@ -292,8 +304,8 @@ struct Tree {
     // Finish each visit layer before its values decide the next halving round.
     if(started && considered!=sequence[started-1] && !requests.empty())return 0;
     auto first=[&](const Edge& e){return considered==0 && std::find(priority.begin(),priority.end(),e.action)!=priority.end();};
-    bool forced=false;
-    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch!=considered)continue;bool admit=considered==0 && defence.contains(e.action);double score=e.gumbel+e.logit+(considered?q[i]:0)+(first(e)?1e6:0)+bonus(e);if((admit && !forced) || (admit==forced && score>best)){forced=admit;best=score;chosen=i;}}
+    bool forced=false;auto logits=considered?std::vector<double>():sampling(*node);
+    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch!=considered)continue;bool admit=considered==0 && defence.contains(e.action);double score=e.gumbel+(considered?e.logit:logits[i])+(considered?q[i]:0)+(first(e)?1e6:0)+bonus(e);if((admit && !forced) || (admit==forced && score>best)){forced=admit;best=score;chosen=i;}}
     // Marked-lost candidates can leave a round short of candidates; the best of the latest-eliminated ones step in.
     int reached=-1;
     if(chosen<0)for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch>considered)continue;double score=e.gumbel+e.logit+q[i]+bonus(e);if(e.epoch>reached || (e.epoch==reached && score>best)){reached=e.epoch;best=score;chosen=i;}}
@@ -426,6 +438,9 @@ HX_API int hxg_graph(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(p)
 // Sets the least Q range of the completed-Q rescale (0, the default, keeps 1e-8) for every later search and target;
 // 0 with no change when `floor` is negative or not finite.
 HX_API int hxg_q_range_floor(void* p,double floor){if(!std::isfinite(floor) || floor<0){gumbel::error="Invalid Q range floor";return 0;}static_cast<gumbel::Tree*>(p)->range_floor=floor;return 1;}
+// Sets the uniform share of the root's candidate sampling (Tree::sampling; 0, the default, samples by the prior)
+// for every later search; 0 with no change unless 0 <= `noise` < 1.
+HX_API int hxg_root_noise(void* p,double noise){if(!(noise>=0 && noise<1)){gumbel::error="Invalid root noise";return 0;}static_cast<gumbel::Tree*>(p)->root_noise=noise;return 1;}
 // Diagnostic census of the structure reachable from the root: out = {nodes, expanded, exact, expanded nodes whose turn
 // context was already expanded elsewhere (tree duplicates; 0 in a graph)}.
 HX_API int hxg_census(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);

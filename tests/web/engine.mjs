@@ -1,6 +1,6 @@
 // Node runner for tests/test_web_engine.py: reads one JSON job from stdin, writes one JSON answer to stdout.
 // {kind: 'encode', positions: [{history, actions}]} -> [{size, cells, far, ones: [flat plane indices], features: base64 float32}]
-// {kind: 'search', cases: [{history, seed, tactics, q_range_floor, steps: [{simulations, root_samples, batch_size}], batches}]}
+// {kind: 'search', cases: [{history, seed, tactics, q_range_floor, root_noise, steps: [{simulations, root_samples, batch_size}], batches}]}
 //   replays the recorded evaluations batch by batch -> [[{action, policy, visits, completed}] per step]
 // {kind: 'pv', history, certificate} -> {pv, plies} of the principal variation
 // {kind: 'rows', actions, policy, values, lead} -> top rows
@@ -25,7 +25,7 @@ const native = new Native(await createModule());
 
 async function search(item) {
   const batches = item.batches.slice(), tree = new NeuralSearch(native, {seed: item.seed, tactics: item.tactics,
-    qRangeFloor: item.q_range_floor ?? 0, history: item.history});
+    qRangeFloor: item.q_range_floor ?? 0, rootNoise: item.root_noise ?? 0, history: item.history});
   const cache = new EvaluationCache(), out = [];
   try {
     for (const step of item.steps) {
