@@ -306,7 +306,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['paused_save'], [dict(paused=True, completed=1, pending=True, current=2, resumedSeats=['other', 'test'])]*2)
         self.assertIsNone(result['deleted']['current'])
         self.assertTrue(all(m['single'] for m in result['deleted']['catalogue']))
-        self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]]))
+        self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]], renewed=True))
         self.assertEqual(result['stopped_timeout'], dict(paused=True, active=False, completed=0))
         self.assertEqual(result['forked_clock'], dict(match=None, clock=None))
         self.assertEqual(result['finished_opening_status'], 400)

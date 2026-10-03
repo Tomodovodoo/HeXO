@@ -150,7 +150,7 @@ export class BrowserSession extends OfflineSession {
     this.cache.clear(); this.index.clear();
     for (const r of evaluations) this.indexRecord(r);
     this.coverage = coverage?.counts || {};
-    this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false;
+    this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false; this.renewLines();
     if (saved) {
       this.native.game(saved.history); Object.assign(this, {...saved, paused: true});
       if (this.match) this.match.active = false;
