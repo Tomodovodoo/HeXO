@@ -4001,6 +4001,46 @@ class EngineTests(unittest.TestCase):
             engine.close()
             tree.close()
 
+        # A graph can move roots without starting another Engine slot. Raw predictions belong to the
+        # current position, independently of the estimates inherited from searches below it.
+        from native_feed import NativeFeed
+        graph = dense_selfplay.GameGraph(None, 'test', [(0,0)], seed=3, limit=16)
+        feed = NativeFeed(16)
+        try:
+            feed.begin(graph)
+            checked(native.hxg_begin(graph.ptr, 1, 1))
+            for value in (.375, -.25):
+                feed.gather(graph)
+                ids, leaves = feed.take(8)
+                self.assertEqual(len(leaves), 1)
+                pointer, request, history = leaves[0]
+                actions = hexcrop.encode_leaf(native, pointer, request, history).actions
+                feed.install(ids, [(actions, np.zeros(len(actions)), np.full(len(actions), value))])
+            self.assertTrue(native.hxg_done(graph.ptr))
+            result = graph.result(0, 0, 0, 0)
+            self.assertEqual(feed.root_value(graph), .375)
+            graph.advance(result['action'])
+            self.assertEqual(feed.root_value(graph), -.25)
+            unseen = next(tuple(a) for a in result['actions'] if list(a) != result['action'])
+            graph.at([(0,0), unseen])
+            self.assertIsNone(feed.root_value(graph))
+            checked(native.hxg_begin(graph.ptr, 1, 1))
+            feed.gather(graph)
+            ids, leaves = feed.take(8)
+            pointer, request, history = leaves[0]
+            actions = hexcrop.encode_leaf(native, pointer, request, history).actions
+            feed.install(ids, [(actions, np.zeros(len(actions)), np.full(len(actions), .625))])
+            self.assertEqual(feed.root_value(graph), .625)
+            native.hxg_cancel(graph.ptr)
+            graph.at([(0,0)])
+            self.assertEqual(feed.root_value(graph), .375)
+            feed.detach(graph)
+            self.assertIsNone(feed.root_value(graph))
+            self.assertEqual((feed.stats()['pending_rows'], feed.stats()['pending_requests']), (0, 0))
+        finally:
+            feed.close()
+            graph.close()
+
     def test_native_frontier_span_detaches_all_subscribers_and_models_are_separate(self):
         from native_feed import NativeFeed
         from neural_search import native, checked
@@ -4158,35 +4198,38 @@ class EngineTests(unittest.TestCase):
                     slot.game.close()
 
     def test_a_checked_full_search_records_the_root_after_its_check(self):
-        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
-        settings = replace(dense_config.ActorSettings(), full_sims=32, full_fraction=1., root_samples=8,
-                           opening_random_plies=0., game_graph=512, pv_check=.25)
-        history = [[0,0],[0,3],[1,3]]
-        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
-        engine = dense_selfplay.Engine(8, solver_async=False)
-        try:
-            self.assertIsInstance(slot.tree, dense_selfplay.GameGraph)
-            self.assertEqual(slot.budget, 16)
-            with unittest.mock.patch.object(slot, 'recheck', wraps=slot.recheck) as recheck, \
-                    unittest.mock.patch.object(slot, 'searched', wraps=slot.searched) as searched:
-                engine.add(slot)
-                while not searched.called:
-                    engine.step()
-            first, final = recheck.call_args_list[0].args[0], searched.call_args.args[0]
-            self.assertEqual(first['completed'], 16)
-            self.assertIn(final['completed'], (24, 32))
-            self.assertEqual(final['pv_check']['line'][0], first['action'])
-            self.assertEqual(final['network_value'], first['network_value'])
-            row = slot.rows[0]
-            np.testing.assert_array_equal(row['policy'], final['policy'].astype(np.float32))
-            self.assertFalse(np.array_equal(row['policy'], first['policy'].astype(np.float32)))
-            self.assertEqual(slot.values[len(history)], dense_selfplay.root_value(final, 0))
-            self.assertEqual(engine.searches, 1)
-        finally:
-            engine.close()
-            for tree in slot.trees.values():
-                tree.close()
-            slot.game.close()
+        for compiled, packed in ((False, False), (True, False), (True, True)):
+            with self.subTest(compiled=compiled, packed=packed):
+                torch.manual_seed(1839)
+                model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+                settings = replace(dense_config.ActorSettings(), full_sims=32, full_fraction=1., root_samples=8,
+                                   opening_random_plies=0., game_graph=512, pv_check=.25)
+                history = [[0,0],[0,3],[1,3]]
+                slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+                engine = dense_selfplay.Engine(8, solver_async=False, native_feed=compiled, native_packing=packed)
+                try:
+                    self.assertIsInstance(slot.tree, dense_selfplay.GameGraph)
+                    self.assertEqual(slot.budget, 16)
+                    with unittest.mock.patch.object(slot, 'recheck', wraps=slot.recheck) as recheck, \
+                            unittest.mock.patch.object(slot, 'searched', wraps=slot.searched) as searched:
+                        engine.add(slot)
+                        while not searched.called:
+                            engine.step()
+                    first, final = recheck.call_args_list[0].args[0], searched.call_args.args[0]
+                    self.assertEqual(first['completed'], 16)
+                    self.assertIn(final['completed'], (24, 32))
+                    self.assertEqual(final['pv_check']['line'][0], first['action'])
+                    self.assertEqual(final['network_value'], first['network_value'])
+                    row = slot.rows[0]
+                    np.testing.assert_array_equal(row['policy'], final['policy'].astype(np.float32))
+                    self.assertFalse(np.array_equal(row['policy'], first['policy'].astype(np.float32)))
+                    self.assertEqual(slot.values[len(history)], dense_selfplay.root_value(final, 0))
+                    self.assertEqual(engine.searches, 1)
+                finally:
+                    engine.close()
+                    for tree in slot.trees.values():
+                        tree.close()
+                    slot.game.close()
 
     def test_zero_simulation_exact_roots_record_only_informative_policies(self):
         def result(completed, winner, policy):

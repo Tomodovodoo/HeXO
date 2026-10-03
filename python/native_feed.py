@@ -30,11 +30,13 @@ class NativeFeed:
         if not self.ptr:
             checked(False)
         self.trees = {}
+        self.root_versions = {}
 
     def begin(self, tree, prediction=None):
         history = np.ascontiguousarray(tree.history, np.int64).reshape(-1, 2)
         checked(native.hxgf_begin(self.ptr, tree.ptr, history.ctypes.data, len(history)))
         self.trees[tree.ptr] = tree
+        self.root_versions[tree.ptr] = native.hxg_root_version(tree.ptr)
         if prediction is not None:
             actions = np.ascontiguousarray(prediction[0], np.int64)
             logits = np.ascontiguousarray(prediction[1], np.float64)
@@ -44,7 +46,12 @@ class NativeFeed:
             checked(native.hxgf_seed(self.ptr, tree.ptr, actions.ctypes.data, logits.ctypes.data,
                                     values.ctypes.data, len(logits)))
 
+    def sync_root(self, tree):
+        if tree.ptr in self.trees and self.root_versions[tree.ptr] != native.hxg_root_version(tree.ptr):
+            self.begin(tree)
+
     def gather(self, tree):
+        self.sync_root(tree)
         stats = np.empty(4, np.int64)
         status = native.hxgf_gather(self.ptr, tree.ptr, stats.ctypes.data)
         if status == -2:
@@ -108,9 +115,12 @@ class NativeFeed:
             checked(False)
         for tree in stopped[:count]:
             self.trees.pop(int(tree), None)
+            self.root_versions.pop(int(tree), None)
         return stopped[:count]
 
     def root_value(self, tree):
+        """The current root's raw prediction, or None when no prediction is retained for that context."""
+        self.sync_root(tree)
         value = C.c_double()
         return value.value if native.hxgf_root_value(self.ptr, tree.ptr, C.byref(value)) else None
 
@@ -118,6 +128,7 @@ class NativeFeed:
         if tree.ptr in self.trees:
             native.hxgf_detach(self.ptr, tree.ptr)
             self.trees.pop(tree.ptr)
+            self.root_versions.pop(tree.ptr)
 
     def stats(self):
         result = np.empty(6, np.int64)
@@ -142,3 +153,4 @@ class NativeFeed:
             native.hxgf_free(self.ptr)
             self.ptr = None
             self.trees.clear()
+            self.root_versions.clear()
