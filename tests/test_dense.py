@@ -4188,24 +4188,36 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(dense_selfplay.root_value(result, 0), 1.)
 
     def test_full_batch_counts_submitted_positions(self):
-        from neural_search import EvaluationCache
+        from neural_search import EvaluationCache, native
 
         class Evaluator:
             def submit(self, histories, legal):
                 return [(actions, np.zeros(len(actions)), np.zeros(len(actions))) for actions in legal]
 
-        model = type('Model', (), dict(cache=EvaluationCache(), evaluator=Evaluator()))()
-        trees = [NeuralSearch(None, 'test', history=history) for history in ((), ((0, 0),))]
-        try:
-            engine = dense_selfplay.Engine(2)
-            for tree in trees:
-                slot = SimpleNamespace(tree=tree, model=model, budget=2, samples=2, solver=None)
-                engine.add(slot)
-            engine.step()
-            self.assertEqual((engine.calls, engine.evals, engine.full_calls), (1, 2, 1))
-        finally:
-            for tree in trees:
-                tree.close()
+            def submit_leaves(self, leaves):
+                legal = [hexcrop.encode_leaf(native, ptr, request, history).actions
+                         for ptr, request, history in leaves]
+                return self.submit(None, legal)
+
+        for native_leaves in (False, True):
+            with self.subTest(native_leaves=native_leaves):
+                evaluator = Evaluator() if native_leaves else SimpleNamespace(submit=Evaluator().submit)
+                model = type('Model', (), dict(cache=EvaluationCache(), evaluator=evaluator))()
+                trees = [NeuralSearch(None, 'test', history=history) for history in ((), ((0, 0),))]
+                engine = dense_selfplay.Engine(2)
+                try:
+                    for tree in trees:
+                        slot = SimpleNamespace(tree=tree, model=model, budget=2, samples=2, solver=None)
+                        engine.add(slot)
+                    engine.step()
+                    self.assertEqual((engine.calls, engine.evals, engine.full_calls), (1, 2, 1))
+                    handle = engine.inflight[0][-1]
+                    for tree, prediction in zip(trees, handle):
+                        np.testing.assert_array_equal(prediction[0], legal(tree.history))
+                finally:
+                    engine.close()
+                    for tree in trees:
+                        tree.close()
 
     def test_position_wider_than_the_largest_crop_ends_the_game(self):
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 64, 256)

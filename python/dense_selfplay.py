@@ -491,8 +491,10 @@ class Engine:
                     progress = True
                 else:
                     if key not in pending.setdefault(model, {}):
-                        legal = np.empty((native.hxg_legal(ptr, request, None), 2), np.int64)
-                        native.hxg_legal(ptr, request, legal.ctypes.data)
+                        legal = None
+                        if not hasattr(model.evaluator, 'submit_leaves'):
+                            legal = np.empty((native.hxg_legal(ptr, request, None), 2), np.int64)
+                            native.hxg_legal(ptr, request, legal.ctypes.data)
                         pending[model][key] = [(history, legal)]
                     pending[model][key].append((slot, ptr, request))
                     count += 1
