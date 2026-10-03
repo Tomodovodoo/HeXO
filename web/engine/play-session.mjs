@@ -99,15 +99,16 @@ export class BrowserSession extends OfflineSession {
       }
     }
   }
-  /** `record` (or null) at `history` with what the game's proof table proves there (proof.mjs proven). */
-  withProofs(history, record) {
-    return proven(this.proofs, history, record, this.native.game(history).remaining);
+  /** `record` (or null) at `history`, `played` the game's next stone, with what the game's proof table proves there
+   * (proof.mjs proven). */
+  withProofs(history, record, played = null) {
+    return proven(this.proofs, history, record, this.native.game(history).remaining, played);
   }
   state() {
     const {winner, player, remaining} = this.native.game(this.history), evaluations = {};
     this.extendProofs();
     for (let ply = 0; ply <= this.history.length; ply++) {
-      const prefix = this.history.slice(0, ply), record = this.withProofs(prefix, this.lookup(prefix) || this.records.findLast(r => r.position === position(prefix) && (!this.analysis || r.engine_key === this.engineKey(this.analysis))) || null);
+      const prefix = this.history.slice(0, ply), record = this.withProofs(prefix, this.lookup(prefix) || this.records.findLast(r => r.position === position(prefix) && (!this.analysis || r.engine_key === this.engineKey(this.analysis))) || null, this.history[ply] ?? null);
       if (record) evaluations[ply] = record;
     }
     return {instance: `browser:${this.id}`, revision: this.revision, history: copy(this.history), player, remaining, winner,

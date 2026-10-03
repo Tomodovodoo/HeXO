@@ -702,7 +702,7 @@ class Proofs:
         base = frozenset((int(q), int(r), player_at(i)) for i, (q, r) in enumerate(history))
         found = {}
         with self.lock:
-            for extra in (2, 1):
+            for extra in (1, 2):
                 for key in self.sizes.get(size + extra, ()):
                     entry = self.entries[key]
                     if not base <= entry['stones']:
@@ -719,7 +719,7 @@ class Proofs:
                         else:
                             continue
                         old = found.get(first[:2])
-                        if old is None or second is None or old[2]['plies'] > outcome['plies']:
+                        if old is None or old[2]['plies'] > outcome['plies']:
                             found[first[:2]] = (outcome['winner'], outcome['plies'] + 1, outcome)
         return found
 
@@ -1604,12 +1604,12 @@ class Session:
         key = self.engine_key(seat) if seat else None
         return self.store.get(history, key, self.engines.effective(seat['budget'])) if key else None
 
-    def proven(self, history, found):
+    def proven(self, history, found, played=None):
         """`found` (an evaluation, or None) with what the game's proof table proves of `history`: when `found` has
         no proof, the position's own proof, its value (1 or 0 for the side to move) and its line; and each stone
-        to a proven position as a top row marked won or lost, proven wins first, the shortest leading, losses
-        last. A position the table proves without an evaluation gets one with no simulations; None when there is
-        neither."""
+        to a proven position as a top row marked won or lost, proven wins first, the shortest leading and among
+        equals the stone `played` next in the game, losses last. A position the table proves without an evaluation
+        gets one with no simulations; None when there is neither."""
         outcome, edges = self.proofs.known(history), self.proofs.edges(history)
         if found is None and outcome is None:
             return None
@@ -1634,7 +1634,8 @@ class Session:
             if row is not None:
                 row[3:] = [1., 1] if winner == mover else [0., -1]
         flag = lambda row: row[4] if len(row) > 4 else 0
-        rows.sort(key=lambda row: (1 - flag(row), edges.get(tuple(row[:2]), (0, math.inf))[1] if flag(row) > 0 else 0))
+        rows.sort(key=lambda row: (1 - flag(row), edges.get(tuple(row[:2]), (0, math.inf))[1] if flag(row) > 0 else 0,
+                                   flag(row) > 0 and played is not None and tuple(row[:2]) != tuple(played)))
         shown['top'] = rows[:5]
         return shown
 
@@ -1647,7 +1648,8 @@ class Session:
                 game.close()
             evaluations = {}
             for ply in range(len(history) + 1):
-                if (found := self.proven(history[:ply], self.lookup(history[:ply]))) is not None:
+                played = history[ply] if ply < len(history) else None
+                if (found := self.proven(history[:ply], self.lookup(history[:ply]), played)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes')}
             entries = [{k: e[k] for k in SHOWN if k in e} for e in self.entries.values()]

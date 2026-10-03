@@ -139,7 +139,7 @@ export class Proofs {
    * the stone itself; `outcome` is the position's {winner, plies, pv}. */
   edges(history) {
     const size = history.length, base = history.map(([q, r], i) => `${q},${r},${sideAt(i)}`), own = new Set(base), found = new Map();
-    for (const extra of [2, 1]) for (const key of this.sizes.get(size + extra) || []) {
+    for (const extra of [1, 2]) for (const key of this.sizes.get(size + extra) || []) {
       const entry = this.entries.get(key);
       if (!base.every(stone => entry.stones.has(stone))) continue;
       const stones = [...entry.stones].filter(stone => !own.has(stone)).map(stone => stone.split(',').map(Number));
@@ -151,7 +151,7 @@ export class Proofs {
           outcome = {winner: entry.winner, plies: entry.plies + 1, pv: [[second[0], second[1], entry.winner, 1], ...shifted(entry.pv, 1)]};
         } else continue;
         const action = `${first[0]},${first[1]}`, old = found.get(action);
-        if (!old || !second || old.outcome.plies > outcome.plies) found.set(action, {action: [first[0], first[1]], winner: outcome.winner, distance: outcome.plies + 1, outcome});
+        if (!old || old.outcome.plies > outcome.plies) found.set(action, {action: [first[0], first[1]], winner: outcome.winner, distance: outcome.plies + 1, outcome});
       }
     }
     return found;
@@ -209,9 +209,10 @@ export function settled(result, edges, mover) {
 
 /** `found` (an evaluation, or null) with what the table `known` proves of `history` (python/play.py Session.proven):
  * without its own proof, the position's proof, value and line; each stone to a proven position as a top row marked
- * won or lost, proven wins first, the shortest leading, losses last. A proven position without an evaluation gets one
- * with no simulations; null when there is neither. `remaining` is the mover's stones left in the turn. */
-export function proven(known, history, found, remaining) {
+ * won or lost, proven wins first, the shortest leading and among equals the stone `played` next in the game, losses
+ * last. A proven position without an evaluation gets one with no simulations; null when there is neither. `remaining`
+ * is the mover's stones left in the turn. */
+export function proven(known, history, found, remaining, played = null) {
   const outcome = known.known(history), edges = known.edges(history);
   if (!found && !outcome) return null;
   const mover = sideAt(history.length), shown = {...(found || {moves: [], top: [], threat: [], simulations: 0, solver_nodes: 0})};
@@ -228,7 +229,8 @@ export function proven(known, history, found, remaining) {
     if (row) row.splice(3, 2, winner === mover ? 1 : 0, winner === mover ? 1 : -1);
   }
   const flag = row => row[4] ?? 0, distance = row => flag(row) > 0 ? edges.get(`${row[0]},${row[1]}`)?.distance ?? Infinity : 0;
-  shown.top = rows.map((row, i) => [row, i]).sort(([a, i], [b, j]) => (1 - flag(a)) - (1 - flag(b)) || distance(a) - distance(b) || i - j)
+  const other = row => flag(row) > 0 && played !== null && (row[0] !== played[0] || row[1] !== played[1]) ? 1 : 0;
+  shown.top = rows.map((row, i) => [row, i]).sort(([a, i], [b, j]) => (1 - flag(a)) - (1 - flag(b)) || distance(a) - distance(b) || other(a) - other(b) || i - j)
     .map(([row]) => row).slice(0, 5);
   return shown;
 }
