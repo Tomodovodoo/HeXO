@@ -112,18 +112,21 @@ export class Proofs {
   list() {
     return [...this.entries.values()].map(({history, winner, plies, pv}) => ({history, winner, plies, pv}));
   }
-  /** Index `record` (the fields of a turn) at `history` when it holds a proof; `id` skips a record already indexed. */
+  /** Index `record` (the fields of a turn) at `history` when it holds a proof; `id` skips a record already indexed. A
+   * proof without `plies` takes the bound its `turns` give (python/play.py proof_plies). */
   add(history, record, id = null) {
     const proof = record?.proof;
-    if (!proof?.plies || id !== null && this.seen.has(id)) return;
+    if (!proof || id !== null && this.seen.has(id)) return;
     if (id !== null) this.seen.add(id);
     const current = history.map(([q, r]) => [q, r]), pv = record.pv || [];
-    this.put(current, proof.winner, proof.plies, pv);
+    const remaining = current.length % 2 ? 2 : 1, mover = sideAt(current.length);
+    const plies = proof.plies || remaining + (proof.winner === mover ? 0 : 2) + 4 * (proof.turns - 1);
+    this.put(current, proof.winner, plies, pv);
     for (let i = 0; i < pv.length; i++) {
       const [q, r, side, ply] = pv[i];
-      if (pv[i].length !== 4 || ply !== i + 1 || side !== sideAt(current.length) || ply >= proof.plies) break;
+      if (pv[i].length !== 4 || ply !== i + 1 || side !== sideAt(current.length) || ply >= plies) break;
       current.push([q, r]);
-      this.put(current, proof.winner, proof.plies - ply, shifted(pv.slice(i + 1), -ply));
+      this.put(current, proof.winner, plies - ply, shifted(pv.slice(i + 1), -ply));
     }
   }
   put(history, winner, plies, pv) {
