@@ -253,6 +253,13 @@ async function fetchEngine(id) {
     if (found.state === 'missing') await download(found.files, fraction => { slot.fraction = fraction; repaint(); });
     checks.delete(id);
     if (!READY.has((await check(id)).state)) throw new Error('the downloaded files did not reach the browser cache');
+    failed = null;   // let the work that failed for want of these files run again
+    const session = page.browserPlay;
+    if (session) {
+      session.jobs = session.jobs.filter(job => job.status !== 'failed');
+      session.changed();
+      session.pump();
+    } else schedule();
   } catch (error) {
     remember(id, Promise.resolve(failure(error)));
     if (error instanceof NotOnSite) unpublished(id);
