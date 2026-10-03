@@ -53,11 +53,11 @@ async function request(url, init = {}) {
   }
 }
 
-/** The JSON body of `response` (for `path`), rejecting when it is not read within LIMITS.idle ms. */
-function body(response, path) {
+/** `promise` (a body being read for `path`), rejecting when it has not settled within `ms`. */
+function bounded(promise, path, ms = LIMITS.idle) {
   let timer;
-  const idle = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${path}: no answer in ${LIMITS.idle / 1000} s`)), LIMITS.idle); });
-  return Promise.race([response.json(), idle]).finally(() => clearTimeout(timer));
+  const idle = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${path}: no answer in ${ms / 1000} s`)), ms); });
+  return Promise.race([promise, idle]).finally(() => clearTimeout(timer));
 }
 
 /** {response, local}: `path` from this origin, else (after a 404, a network error or no answer) from the site. */
@@ -80,7 +80,7 @@ async function locate(path, init = {}) {
 export async function json(path) {
   const store = await open(), id = `${new URL(path, BASE).href}?manifest`;
   try {
-    const {response, local} = await locate(path, {cache: 'no-cache'}), data = await body(response, path);
+    const {response, local} = await locate(path, {cache: 'no-cache'}), data = await bounded(response.json(), path);
     if (!local) await store?.put(id, new Response(JSON.stringify(data))).catch(() => {});   // keeping it is best effort
     return {data, local};
   } catch (error) {
@@ -97,7 +97,7 @@ export async function pins(path, {data, local}, same) {
   if (data.files || !local || !there) return data.files ?? {};
   const store = await open(), id = `${new URL(path, BASE).href}?site`;   // kept so the pins also answer offline
   const response = await request(there, {cache: 'no-cache', mode: 'cors'}).catch(() => null);
-  let other = response?.ok ? await body(response, path).catch(() => null) : null;
+  let other = response?.ok ? await bounded(response.json(), path).catch(() => null) : null;
   if (other) await store?.put(id, new Response(JSON.stringify(other))).catch(() => {});
   else other = await (await store?.match(id).catch(() => null))?.json() ?? null;
   return other && same(other) ? other.files ?? {} : {};
@@ -209,7 +209,7 @@ export async function cached(file, progress = () => {}) {
         progress(0, 0, 0);
         const again = await request(response.url, {cache: 'reload', ...(local ? {} : {mode: 'cors'})});
         if (!again.ok) throw new Error(`${file.path}: ${again.status}`);
-        return again.arrayBuffer();
+        return bounded(again.arrayBuffer(), file.path, LIMITS.whole);   // no chunks to watch: bound the whole read
       });
   if (file.sha256 && await sha256(body, file.lines) !== file.sha256) {
     await forget().catch(() => {});

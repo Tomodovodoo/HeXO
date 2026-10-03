@@ -5,10 +5,11 @@
  * engine-worker.mjs stops a stage that stays silent for LIMITS[name] ms. */
 
 /** Silence allowed per stage in ms; a stage that reports nothing for that long has stalled. A download reports every
- * chunk, the other stages once. Inside a stage, `adapter` bounds the WebGPU adapter request of the probe and `idle` a
- * download's wait for its next chunk (assets.mjs). */
+ * chunk, the other stages once. Inside a stage, `adapter` bounds the WebGPU adapter request of the probe, `idle` a
+ * request's wait for its answer or a download's for its next chunk, and `whole` a body read at once, without chunks
+ * (assets.mjs). */
 export const LIMITS = {probe: 20000, download: 45000, compile: 30000, session: 60000, timing: 30000, warmup: 60000,
-  adapter: 8000, idle: 30000};
+  adapter: 8000, idle: 30000, whole: 300000};
 
 /** Hosts on which the page's test parameters (assets.mjs `assets`, `stall`) are honoured: a development server on
  * this machine. */

@@ -260,6 +260,11 @@ out.unanswered = await attempt(() => assets.cached({path: 'silent.onnx', sha256:
 globalThis.fetch = async input => String(input).startsWith(BASE) ? new Response('missing', {status: 404})
   : new Response(new ReadableStream({start: controller => controller.enqueue(new TextEncoder().encode('{"networks": ['))}));
 out.unfinished = await attempt(() => assets.json('slow.json'));
+LIMITS.whole = 30;   // a stream that fails, then a whole-body retry that never finishes
+globalThis.fetch = async (input, init = {}) => String(input).startsWith(BASE) ? new Response('missing', {status: 404})
+  : Object.defineProperty(new Response(init.cache === 'reload' ? new ReadableStream({start: controller => controller.enqueue(new Uint8Array(1))})
+    : new ReadableStream({pull: controller => controller.error(new TypeError('input stream'))})), 'url', {value: String(input)});
+out.whole_stalls = await attempt(() => assets.cached({path: 'halted.onnx', sha256: 'x'}));
 globalThis.fetch = plain;
 
 const page = host => {
