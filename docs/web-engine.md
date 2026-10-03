@@ -247,13 +247,15 @@ notes of `networks` and Six's `NOTICE.txt`).
 `tests/test_web_six.py` plays recorded positions with the browser search in node (ONNX Runtime Web's WebAssembly
 build, one thread) and with `sixengine --cpu` through `SixEngine`, at 48 and 160 nodes, and three turns of one game on
 one tree: the moves are identical. It needs `models/six` (the play page's Six download) and takes about four minutes,
-since one thread evaluates about 2.7 positions per second. The standard preset (30,000 nodes) from the first stone gave the
+since one thread evaluates about 2.7 positions per second. A 30,000-position search from the first stone gave the
 same two stones on WebGPU in the browser (102 s) and from `sixengine --cpu` on the Ryzen 9 5900X (720 s).
 
-Speed on the RTX 3070 Ti (otherwise idle) in the Claude desktop browser pane, WebGPU, from one stone: lightning 1.3 s,
-quick 22 s, standard 102 s. The search itself and its threat solver run on one thread in the worker, so turns slow
-down as the tree grows. On WebAssembly a position costs about 0.4 s on one thread, so without WebGPU only lightning
-is practical.
+Speed on the RTX 3070 Ti (otherwise idle) in the Claude desktop browser pane, WebGPU, from one stone, measured before
+the ladder was rebased: 1,500 positions 1.3 s, 6,000 positions 22 s, 30,000 positions 102 s. On that scale the current
+presets cost about 0.5 s (lightning, 240), 3 s (quick, 960), 13 s (standard, 3,840) and a minute (strong, 15,360).
+The search itself and its threat solver run on one thread in the worker, so turns slow down as the tree grows. On
+WebAssembly a position costs about 0.4 s on one thread, so without WebGPU lightning takes about two minutes and the
+heavier presets are impractical.
 
 ## Strix (browser)
 
