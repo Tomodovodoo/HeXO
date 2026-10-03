@@ -305,8 +305,10 @@ export class NeuralSearch {
  * position. `search({..., pvCheck})` adds the principal-variation check (neural_search.Recheck).
  */
 export class GameGraph extends NeuralSearch {
+  /** `id` is unique to this graph, across reloads, so a session can tell a rebuilt graph from the one it searched. */
   constructor(native, options = {}) {
     super(native, {...options, limit: options.limit ?? GRAPH_LIMIT});
+    this.id = globalThis.crypto.randomUUID();
   }
   /** Moves the root to the position after `history`, keeping every node's statistics. */
   at(history) {

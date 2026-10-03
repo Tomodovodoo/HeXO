@@ -95,7 +95,7 @@ export class BrowserSession extends OfflineSession {
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
-    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graph = {key: null, generation: null, searches: 0};
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graph = {generation: null, searches: 0};
     this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
@@ -278,7 +278,7 @@ export class BrowserSession extends OfflineSession {
   /** Gives `sides` (both when none) a new line, the key of the game tree a Bubble seat searches (worker.mjs). */
   renewLines(...sides) {
     for (const side of sides.length ? sides : [0, 1]) this.lines[side] = uid();
-    if (!sides.length) { this.analysisLine = uid(); this.graph = {key: null, generation: null, searches: 0}; }
+    if (!sides.length) { this.analysisLine = uid(); this.graph = {generation: null, searches: 0}; }
   }
   forkGame() {
     if (this.saved_game || !this.gameId || this.match) {
@@ -407,14 +407,12 @@ export class BrowserSession extends OfflineSession {
     }
     return record;
   }
-  /** Counts a search of analysis job `job` on its line's graph and returns the stamp its evaluation is saved with,
-   * [generation, searches]. The worker rebuilds a line's graph when its network or Q range floor changes (GameGraphs);
-   * each such graph gets a new generation, unique across reloads. */
-  graphSearched(job) {
-    const key = [job.line, this.engineKey(job.spec), job.spec.budget.q_range_floor ?? 0].join('|'), graph = this.graph;
-    if (graph.key !== key) Object.assign(graph, {key, generation: uid(), searches: 0});
-    graph.searches += 1;
-    return [graph.generation, graph.searches];
+  /** Counts a search on the analysis graph `id` (GameGraph.id, unique to each graph the worker builds) and returns the
+   * stamp its evaluation is saved with, [id, searches]; a new id starts a new count. */
+  graphSearched(id) {
+    if (this.graph.generation !== id) this.graph = {generation: id, searches: 0};
+    this.graph.searches += 1;
+    return [id, this.graph.searches];
   }
   /** True when `record`, a saved evaluation, came from the graph analysis searched last and an analysis of another
    * position has searched that graph since (python/play.py Session.stale); a rebuilt graph never stales older records. */
@@ -577,9 +575,9 @@ export class BrowserSession extends OfflineSession {
       // The move came back at `at`; saving it must not run its clock out.
       if (job.kind === 'move') clearTimeout(this.flag);
       if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
-      const {graph_searched: searched, ...answer} = result;
+      const {graph_id: graph, ...answer} = result;
       result = answer;
-      if (job.kind === 'analyse' && job.line != null && searched) { result = {...result, graph: this.graphSearched(job)}; job.counted = true; }
+      if (job.kind === 'analyse' && job.line != null && graph) { result = {...result, graph: this.graphSearched(graph)}; job.counted = true; }
       await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));
       if (job.kind === 'analyse' && !job.refresh && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') this.refresh(history, job.spec, job.line);
       if (job.kind === 'move') {
@@ -596,7 +594,7 @@ export class BrowserSession extends OfflineSession {
       } else if (job.kind === 'review') { job.cursor++; job.done = job.cursor; }
     } catch (error) {
       // A cancelled or failed Bubble analysis that reached its search (a batch reported a live root) changed its graph.
-      if (job.kind === 'analyse' && job.line != null && job.searching && !job.counted) this.graphSearched(job);
+      if (job.kind === 'analyse' && job.line != null && job.searching && !job.counted && this.graph.generation) this.graphSearched(this.graph.generation);
       interrupted = error.name === 'AbortError' && !job.controller.signal.aborted;
       if (error.name !== 'AbortError') { job.status = 'failed'; job.error = error.message; if (job.kind === 'move') { this.freezeClock(); this.paused = true; } if (this.match) this.match.error = error.message; }
     } finally {
