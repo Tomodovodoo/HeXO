@@ -39,7 +39,7 @@ The main decisions:
    native feeder alone gave 10% (measured). The rest has to come from encoding off the owner thread, decoding in
    native code, and compact edges.
 9. Presets become time per stone for play and analysis. Fixed budgets stay for the evaluator and for reproducible
-   analysis. Actors get flags whose defaults keep today's rows bit for bit.
+   analysis. Actors get flags whose defaults keep today's behaviour: equal strength and equal targets within the seed-to-seed spread.
 10. A training row's value target is always its own root's value at the end of its own search. Later evidence
     never rewrites it, except an exact proof through the existing label path.
 
@@ -304,6 +304,54 @@ back carried targets in a new form. Rules:
 4. The row records provenance: `own_visits` (this search), `root_visits` (N at the end), `q_own` (value from own
    playouts only, kept in the view), `q_root` (the target), and `model` (the graph is dropped on a model change).
    The learner can then measure whether inherited evidence helps or hurts, by horizon, before using it.
+
+### B.9 The store, worked backwards from what one simulation touches
+
+What the loop needs per step: selection reads, for each child, logit, completed Q, visits, pending and the exact
+state, and per node the net value, total and max visits (Gumbel noise and the halving round at the root only);
+backup updates visits and pending along the path, the node's mean and dirty marks on parents; settle needs the
+exact state of every child and whether the children are the complete legal set; the graph needs the position key,
+the parents, re-root and eviction; the solver needs proof and disproof numbers, fresh nodes spent, a slice
+generation and an in-flight bit; the root target needs the improved policy over every legal move.
+
+What the engine constrains: legal moves are radius 8 around stones, about 217 cells early and 600 to 1000
+mid-game, and today every one becomes a 100-byte edge (gumbel.cpp:355), so one node is 50 to 100 KB and
+transformed() rebuilds the completed-Q logits over all of them on every pass. Two stones per turn make
+transpositions the norm, so graph mode is the only mode and most nodes have exactly two parents. A node with a
+capped child set cannot be declared lost by exhaustion; only the solver, which sees every legal move, or a node
+holding the complete set may do that, so completeness is a per-node bit that settle respects. One writer thread, no
+atomics. The browser runs the same code on wasm32 and phones with a node budget of a few hundred MB. The evaluator
+needs the same seed and budget to give the same move, which index-addressed storage with fixed child order gives
+and pointer-addressed storage does not.
+
+Precision: node mean value float64 (updated a million times at the root; float32 drifts); mirrored child Q and the
+cached transformed logit float32 (they feed an argmax and a softmax); logits float32 (the root target is built from
+them); visits int32; pending int16 (bounded by the batch); exact state packed in 16 bits (winner 2, bound 1,
+eligible 1, distance 12); action two int16; position key 128 bits; proof and disproof numbers uint32, spent uint16
+saturating, generation uint8.
+
+Layout: children are 32-byte records in the parent's contiguous block (node index, action, logit, mirrored Q,
+cached transformed logit, visits, pending, exact state); a node is one 64-byte line (key, float64 value, net value,
+visits, pending, first child and count, two inline parents plus an overflow index, proof and disproof numbers,
+spent, flags expanded/complete/dirty/solver-in-flight, generation). Flat arrays addressed by 32-bit index. No
+shared pointers, no vectors.
+
+Adaptive K: at expansion keep children in prior order until the kept mass reaches 0.995, bounded to 8..48, plus
+every forced cell from the leaf classify; with today's policy the median is about 12. The dropped mass is one rest
+entry with its aggregate prior so the improved policy normalises; if its improved share exceeds the weakest kept
+child it is materialised from the evaluation cache, which holds the full logits for that context. The cache is the
+source of truth; nodes hold what selection reads. The root keeps the full legal set, with Gumbel noise and the
+halving round in root-only side arrays.
+
+Mirrors instead of chases: a child's Q is copied into the parent's record on backup through that edge; when another
+parent's backup refreshes a shared child, the child's parents are marked dirty and refreshed before their next
+selection. Selection never touches a child node. The completed-Q logits are cached per node and recomputed only for
+nodes a backup touched. Re-root marks the subtree reachable from the new root and copies it into a fresh arena with
+remapped indices between batches when the store exceeds its budget; solver tables keep their own keys.
+
+Cost: selection at a node touches one line plus K times 32 bytes (six lines at K 12), about 140 lines or 9 KB over a
+20-ply path, L1-resident; today about one megabyte per simulation. Memory per expanded node falls from 50 to 100 KB
+to about 450 bytes at the median K, so two million simulations fit in one gigabyte, and the phone budget sets K.
 
 ## C. The scheduler's decision rule
 
@@ -643,7 +691,7 @@ but the size of the gain on real positions is open question 5.
 
 ### E.7 Solver API changes (tools/tactical, tactical_proof.py)
 
-Request, new optional fields (absent fields keep today's behaviour bit for bit, and the evaluator's fixed mode is
+Request, new optional fields (absent fields keep today's behaviour, and the evaluator's fixed mode is
 untouched):
 - `bounds: true`: report the root's proof and disproof numbers at the end, for UNKNOWN too.
 - `resume: true`: keep and reuse the resident table across this worker's queries without dropping it when the size
@@ -790,7 +838,7 @@ Two masks, kept apart (Sol):
 Staleness rule for carried values: B.6. In short, a value target is the row's own root value at the end of its own
 search, written once, with provenance fields; exact proofs relabel through the existing path.
 
-Actor flags (all default off, which keeps today's rows bit for bit):
+Actor flags (all default off, which keeps today's behaviour; the test is equal strength and equal targets within spread, not identical rows):
 
 | Flag | Default | Effect when on |
 |---|---|---|
@@ -807,6 +855,14 @@ Actor flags (all default off, which keeps today's rows bit for bit):
 | `offgame_rows` | False | write off-game proof rows |
 
 ## I. Measurement and acceptance
+
+Tests check behaviour, never implementation identity. No bit-for-bit, hash or identity comparisons against the old
+code. Acceptance is: correctness invariants (a proven node is never expanded again, settle never marks a capped
+node lost, proofs reach every parent, re-root and eviction keep every reachable node and proof, the same seed and
+budget give the same move twice); quality at fixed budgets (tactical suite, Tom's position, policy-target agreement
+within the seed-to-seed spread, paired matches at 128 and 512 simulations); and cost thresholds (microseconds per
+row, bytes per simulation).
+
 
 ### I.1 Counters (owner, per view and per process)
 
@@ -850,12 +906,12 @@ Build from what exists:
 | Stage | Gate |
 |---|---|
 | 0 counters | no behaviour change; counter overhead below 1% of host time |
-| 1 PR 328 merge | its own tests; actors bit for bit with flags off |
-| 2 views and edge visits | legacy path bit for bit; shared mode: Tom's position still shows the refutation at A after C; fixed-simulation match edge visits against child visits at 512 simulations not worse than -10 Elo (lower bound) |
+| 1 PR 328 merge | its own tests; actors with flags off play at equal strength and produce targets within the seed-to-seed spread |
+| 2 views and edge visits | legacy path at equal strength; shared mode: Tom's position still shows the refutation at A after C; fixed-simulation match edge visits against child visits at 512 simulations not worse than -10 Elo (lower bound) |
 | 3 interior proofs | a proof installed at a depth-4 node settles the root in the tactical suite; no regression in the 32 verified cases |
 | 4 feeder on the owner thread | exact rows with flags on at the layer barrier; host us per row at most 150 uncontended; GPU idle with work pending below 15% |
 | 5 phase barrier | fixed-simulation match phase against layer at 128 and 512 simulations: lower bound above -15 Elo; recorded policy target KL to the layer version within the seed-to-seed KL; play latency at 128 simulations at most 40% of today |
-| 6 solver frontier and API | fixed mode bit for bit; tactical suite at equal time: at least as many proofs; deadline overruns 0 in 1,000 stones |
+| 6 solver frontier and API | fixed mode deterministic at the same seed and budget; tactical suite at equal time: at least as many proofs; deadline overruns 0 in 1,000 stones |
 | 7 scheduler in play and analysis | equal-time match against today's play at standard and strong: SPRT accepts +30 Elo; no preset slower than today |
 | 8 actors | flags on: rows per GPU-second at least 1.3x; teacher study metric (unproved outcome BCE at 17 to 48 plies) not worse; calibration slope b(h=64) at least 0.5; then a strength trial of the resulting checkpoint against the incumbent |
 
@@ -879,7 +935,7 @@ gumbel_feed.cpp grown into a scheduler) drives them. Sol reviews each PR's desig
 | 5 | Feeder on the owner thread | Codex lane | rebase the native frontier on PR 3: requests by node ref, context key from the owner, one cache, per-canvas next batch, triggers, double buffering, encode in staging, native decode, encoder helpers | the lane's exact-replay tests; feeder with phase barrier and views | stage 4 |
 | 6 | Solver API | Codex lane | `bounds`, `resume`, `nodes_fresh`, cancel with bounds in lib.rs and tactical_proof.py | fixed mode unchanged; warm continuation spends fewer fresh nodes; cache hit reports 0 fresh | part of stage 6 |
 | 7 | Scheduler core | Codex lane | frontier queue and priority; line views; prefetch; root widening; time management; deadline; pondering; Python shell for play and analysis | fake-search and fake-pool unit tests (no overlap with reservations, priority order, continuation affinity, slices return bounds, deadline stop within one batch); CPU integration on Tom's position | stages 5 to 7 |
-| 8 | Training rows and actor flags | Claude lane | row kinds, provenance fields, flags, learner reads `kind` | bit for bit with flags off; rows with flags on carry post-proof targets | stage 8 (data checks) |
+| 8 | Training rows and actor flags | Claude lane | row kinds, provenance fields, flags, learner reads `kind` | flags off: equal strength and targets within spread; rows with flags on carry post-proof targets | stage 8 (data checks) |
 | 9 | Compact edges | Claude lane | the B.1 layout | memory and host time benchmarks; exact search results against PR 3 with the same random stream policy | memory per node at most 7 KB; host time not worse |
 | 10 | Browser twin | Claude lane | owner core in wasm, solver Web Workers | tests/web parity | browser parity |
 
