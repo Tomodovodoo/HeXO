@@ -1636,8 +1636,12 @@ class TurnTrees(unittest.TestCase):
                                  cache=neural_search.EvaluationCache())
         seen = []
         # A stopped clock: the first glimpse with statistics is shown at once and the throttle holds back the rest.
-        with unittest.mock.patch('play.time', SimpleNamespace(**(vars(time) | dict(monotonic=lambda: 0.)))):
+        with unittest.mock.patch('play.time', SimpleNamespace(**(vars(time) | dict(monotonic=lambda: 0.)))), \
+                unittest.mock.patch('hexcrop.encode', side_effect=AssertionError('Play should encode native leaves')), \
+                unittest.mock.patch.object(bubble.evaluator, 'evaluate_leaves',
+                                           wraps=bubble.evaluator.evaluate_leaves) as leaves:
             found = evaluate(bubble, None, [(0, 0)], 32, 0, live=seen.append)
+        self.assertGreater(leaves.call_count, 0)
         moves = found['moves']
         self.assertEqual(len(seen), 1)
         self.assertTrue(all(len(g['top']) <= 5 and 0 <= g['value'] <= 1 and g['top'][0][2] >= g['top'][-1][2]
