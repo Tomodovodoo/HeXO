@@ -199,7 +199,7 @@ if (job.kind === 'encode') {
   answer.given = answered(native, job.history.slice(0, job.ply - 1), table);
 } else if (job.kind === 'restore-pause') {
   const make = async clock => {
-    const s = new BrowserSession(native), entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', presets: {quick: {simulations: 1, solver_nodes: 0}, standard: {simulations: 1, solver_nodes: 0}}};
+    const s = new BrowserSession(native), entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', clocks: true, presets: {quick: {simulations: 1, solver_nodes: 0}, standard: {simulations: 1, solver_nodes: 0}}};
     s.registerEngine(entry, {turn: async history => ({moves: history.length ? [[1, 0], [2, 0]] : [[0, 0]], value: .5, top: []})});
     s.seats = [{engine: 'human'}, s.spec({engine: 'test'})]; s.changed();
     if (clock) await s.request('/clock', clock, 'POST');
