@@ -171,19 +171,20 @@ HX_API int hxgf_layout(void* p,int limit,int64_t* out){try{
  out[0]=int64_t(ids.size());out[1]=size;return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxgf_take(void* p,int count,uint64_t* ids,void** trees,int* requests,int64_t* offsets,int64_t* history,int64_t capacity){try{
- if(count<1 || !ids || !trees || !requests || !offsets || capacity<0 || (capacity&&!history))throw std::runtime_error("Invalid feed batch buffers");
+ bool handles_only=!offsets && !history && capacity==0;
+ if(count<1 || !ids || !trees || !requests || (!handles_only&&!offsets) || capacity<0 || (capacity&&!history))throw std::runtime_error("Invalid feed batch buffers");
  auto& f=*static_cast<feeding::Feed*>(p);auto batch=f.batch(count);
  if(int(batch.size())!=count)throw std::runtime_error("Changed feed batch layout");
  int64_t size=0;for(auto id:batch)size+=f.tasks.at(id).history.size()/2;
- if(size>capacity)throw std::runtime_error("Feed history buffer too small");
+ if(!handles_only && size>capacity)throw std::runtime_error("Feed history buffer too small");
  size=0;
  for(int i=0;i<count;++i){
   auto& task=f.tasks.at(batch[i]);auto subscriber=task.subscribers.front();
-  ids[i]=batch[i];trees[i]=subscriber.tree;requests[i]=subscriber.request;offsets[i]=size;
-  if(!task.history.empty())std::copy(task.history.begin(),task.history.end(),history+2*size);
+  ids[i]=batch[i];trees[i]=subscriber.tree;requests[i]=subscriber.request;
+  if(!handles_only){offsets[i]=size;if(!task.history.empty())std::copy(task.history.begin(),task.history.end(),history+2*size);}
   size+=task.history.size()/2;task.submitted=true;
  }
- offsets[count]=size;
+ if(!handles_only)offsets[count]=size;
  while(!f.ready.empty()){
   auto it=f.tasks.find(f.ready.front());if(it!=f.tasks.end()&&!it->second.submitted)break;f.ready.pop_front();
  }

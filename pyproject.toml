@@ -43,6 +43,7 @@ py-modules = [
   "hexo",
   "neural_search",
   "native_feed",
+  "native_dense",
   "puct_search",
   "notation",
   "play",

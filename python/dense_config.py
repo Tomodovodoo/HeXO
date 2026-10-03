@@ -29,6 +29,8 @@ class ModelSettings:
 class ActorSettings:
     games_in_flight: int = 128
     leaf_batch: int = 256
+    native_feed: bool = False    # compiled selection, context cache and batch installation
+    native_packing: bool = False # native crop packing/output decoding; requires native_feed
     full_sims: int = 64          # recorded policy targets come from these searches
     cheap_sims: int = 12         # value-only positions; no policy row
     full_fraction: float = .25   # KataGo playout-cap randomization share
@@ -105,6 +107,10 @@ class ActorSettings:
     cuda_graphs: bool = False  # reuse bounded CUDA graphs for frozen fused actor models
 
     def __post_init__(self):
+        if self.native_packing and not self.native_feed:
+            raise ValueError('native_packing requires native_feed')
+        if self.native_feed and self.solver_leaf_nodes:
+            raise ValueError('native_feed does not support synchronous per-leaf proof queries')
         if self.search_choice not in ('gumbel', 'policy'):
             raise ValueError('search_choice must be gumbel or policy')
         if not 0 <= self.q_range_floor <= 2:
