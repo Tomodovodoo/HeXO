@@ -46,6 +46,8 @@ class NativeStrategy(unittest.TestCase):
         self.assertEqual(independent_verify(result['certificate'], OPEN_THREE), 'PROVEN_WIN')
         cached = self.engine.history(OPEN_THREE, nodes=100000, ms=5000, idtt_nodes=1000)
         self.assertTrue(cached['cache_hit'])
+        self.assertGreater(result['nodes_fresh'], 0)
+        self.assertEqual(cached['nodes_fresh'], 0)
         for field in ('status', 'certificate', 'nodes_used', 'idtt_verdict', 'proof_turns'):
             self.assertEqual(cached[field], result[field], field)
         shallow = self.engine.history(OPEN_THREE, nodes=100000, ms=5000, idtt_nodes=1000, depth=2)
@@ -227,6 +229,51 @@ class NodeBudget(unittest.TestCase):
             self.assertEqual((result['status'], result['nodes_used']), ('UNKNOWN', nodes))
         split = self.engine.history(control, nodes=2000, idtt_nodes=500, ms=60000)
         self.assertEqual((split['idtt_verdict'], split['nodes_used']), ('BudgetExceeded', 2000))
+
+    def test_scoped_numbers_do_not_adjudicate_unknown_positions(self):
+        quiet = self.engine.history(NO_THREAT, nodes=135, bounds=True)
+        self.assertEqual(quiet['status'], 'UNKNOWN')
+        self.assertFalse(quiet['native_verified'])
+        self.assertEqual(quiet['proof_numbers']['scope'], 'wide-forcing')
+        self.assertEqual(quiet['proof_numbers']['dn'], 0)
+        self.assertFalse(quiet['proof_numbers']['game_exact'])
+        control = FIXTURE['positions'][FIXTURE['control']]
+        partial = self.engine.history(control, nodes=50, bounds=True, table_mb=4, resume=True)
+        self.assertEqual(partial['status'], 'UNKNOWN')
+        self.assertIsNotNone(partial['proof_numbers'])
+        self.assertLessEqual(partial['nodes_fresh'], 50)
+        with self.assertRaises(ValueError):
+            self.engine.history(control, resume=True)
+
+    def test_isolated_worker_returns_slice_accounting(self):
+        tactics = IsolatedTactics()
+        try:
+            first = tactics.history(OPEN_THREE, nodes=100000, ms=10000, bounds=True, resume=True, table_mb=4)
+            self.assertEqual(first['status'], 'PROVEN_WIN', first)
+            self.assertEqual(independent_verify(json.loads(first['certificate_json']), OPEN_THREE), 'PROVEN_WIN')
+            again = tactics.history(OPEN_THREE, nodes=100000, ms=10000, bounds=True, resume=True, table_mb=4)
+            self.assertTrue(again['cache_hit'])
+            self.assertEqual(again['nodes_fresh'], 0)
+            self.assertEqual(again['proof_numbers']['pn'], 0)
+        finally:
+            tactics.close()
+
+    def test_unfinished_proof_continues_after_table_growth(self):
+        history = FIXTURE['positions']['1790600287230040:30:248']
+        self.engine.history(NO_THREAT, nodes=1, table_mb=0)
+        try:
+            first = self.engine.history(history, nodes=512, ms=10000, bounds=True, resume=True, table_mb=4)
+            self.assertEqual(first['status'], 'UNKNOWN')
+            self.assertFalse(first['native_verified'])
+            self.assertIsNotNone(first['proof_numbers'])
+            continued = self.engine.history(history, nodes=512, ms=10000, bounds=True, resume=True, table_mb=8)
+            self.assertEqual(continued['status'], 'PROVEN_WIN', continued)
+            self.assertTrue(continued['resident_reused'])
+            self.assertFalse(continued['cache_hit'])
+            self.assertLess(continued['nodes_fresh'], first['nodes_fresh'])
+            self.assertEqual(independent_verify(continued['certificate'], history), 'PROVEN_WIN')
+        finally:
+            self.engine.history(NO_THREAT, nodes=1, table_mb=0)
 
     def test_same_budget_same_result_in_fresh_processes(self):
         """Verdict, certificate hash and work agree across fresh processes for the control and 20 shard positions."""

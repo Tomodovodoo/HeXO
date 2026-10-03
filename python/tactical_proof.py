@@ -86,8 +86,16 @@ def gated_nodes(history, attacker, nodes, gate):
 def unknown_result(reason, start, attacker, build_hash=None):
     """An UNKNOWN result with every documented field; `build_hash` is None when no library answered."""
     return dict(status=UNKNOWN, native_verified=False, moves=[], certificate=None, proof_turns=None, shortest=False,
-                nodes_used=0, attacker=attacker, build_hash=build_hash, reason=reason,
+                nodes_used=0, nodes_fresh=0, attacker=attacker, build_hash=build_hash, reason=reason,
                 elapsed_ms=(time.perf_counter()-start)*1000)
+
+
+def discard_verdict(result, reason, start):
+    """Withdraw exact evidence while keeping the answered query's work and bounds."""
+    result.update(status=UNKNOWN, native_verified=False, moves=[], certificate=None,
+                  proof_turns=None, shortest=False, reason=reason,
+                  elapsed_ms=(time.perf_counter()-start)*1000)
+    result.pop('certificate_json', None)
 
 
 def library(package=PACKAGE):
@@ -113,6 +121,13 @@ class NativeTactics:
     `attacker` and `build_hash`
     (SHA-256 of the loaded library). Verification accepts at most
     min(200000, max(50000, 8*budget)) certificate nodes and visits.
+
+    `nodes_fresh` counts only this attempt's metered work; a certificate cache hit
+    reports zero while `nodes_used` retains the original proof's cost. It is None
+    when dispatched work ends without returning its meter. `bounds=True`
+    returns `proof_numbers` for the wide forcing model, not a game verdict.
+    `resume=True` needs a positive `table_mb` and keeps worker-local entries and
+    proven witnesses through resizes. Level-2 trees and seed attempts are per query.
     """
 
     accepts_cancel_event = True
@@ -152,12 +167,16 @@ class NativeTactics:
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, cancel_event=None):
+                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, cancel_event=None,
+                bounds=False, resume=False):
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
+        if resume and not table_mb:
+            raise ValueError('Solver resume requires a positive table_mb')
         start = time.perf_counter()
         nodes, score = gated_nodes(history, attacker, nodes, gate)
         unknown = lambda reason: dict(unknown_result(reason, start, attacker, self.metadata['binary_sha256']),
-                                      budget=nodes, gate_score=score)
+                                      budget=nodes, gate_score=score,
+                                      **({'proof_numbers': None} if bounds else {}))
         if not self.lock.acquire(timeout=ms/1000):
             return unknown('lock deadline')
         try:
@@ -166,6 +185,10 @@ class NativeTactics:
                 return unknown('deadline')
             request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
                            attacker=attacker, table_mb=table_mb)
+            if bounds:
+                request['bounds'] = True
+            if resume:
+                request['resume'] = True
             if certificate is not None:
                 request['certificate'] = certificate
             if root_moves is not None:
@@ -186,19 +209,19 @@ class NativeTactics:
                 return unknown('request size limit')
             output = self.lib.hexo_tactical_query(payload)
             if not output:
-                return unknown('null native response')
+                return unknown('null native response') | dict(nodes_fresh=None)
             try:
-                result = unknown('native error') | json.loads(C.string_at(output))
+                result = unknown('native error') | dict(nodes_fresh=None) | json.loads(C.string_at(output))
             finally:
                 self.lib.hexo_tactical_free(output)
             if time.perf_counter()-start >= ms/1000:
-                result.update(unknown('deadline'), nodes_used=result['nodes_used'])
+                discard_verdict(result, 'deadline', start)
             result.update(elapsed_ms=(time.perf_counter()-start)*1000, budget=nodes, gate_score=score)
             if cancel_event is not None and cancel_event.is_set():
-                result.update(unknown('cancelled'), nodes_used=result['nodes_used'])
+                discard_verdict(result, 'cancelled', start)
             with self.control_lock:
                 if self.cancelled:
-                    result.update(unknown('cancelled'), nodes_used=result['nodes_used'])
+                    discard_verdict(result, 'cancelled', start)
                 if self.request_id:
                     self.lib.hexo_tactical_release(self.request_id)
                     self.request_id = 0
@@ -290,12 +313,15 @@ class IsolatedTactics:
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False):
+                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, bounds=False, resume=False):
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
+        if resume and not table_mb:
+            raise ValueError('Solver resume requires a positive table_mb')
         start = time.perf_counter()
         hard = start+(ms+self.grace_ms)/1000
+        dispatched = False
         unknown = lambda reason, build_hash=None: dict(unknown_result(reason, start, attacker, build_hash), budget=None,
-                                                       gate_score=None)
+                                                       gate_score=None, **({'proof_numbers': None} if bounds else {}))
         if not self.lock.acquire(timeout=ms/1000):
             return unknown('lock deadline')
         try:
@@ -323,6 +349,10 @@ class IsolatedTactics:
             request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
                            attacker=attacker, certificate=certificate, root_moves=root_moves, gate=gate,
                            table_mb=table_mb, shortest=shortest)
+            if bounds:
+                request['bounds'] = True
+            if resume:
+                request['resume'] = True
             with self.control_lock:
                 self.query_id += 1
                 request['query_id'] = self.query_id
@@ -330,34 +360,35 @@ class IsolatedTactics:
                 if len(payload) > REQUEST_LIMIT:
                     return unknown('request size limit')
                 self.active_query = self.process, self.query_id
+                dispatched = True
                 self.process.stdin.write(payload+'\n')
                 self.process.stdin.flush()
             result = self._line(hard)
             if result == 'timeout':
                 self._retire(killed=True)
-                return unknown('hard deadline; tactical worker killed')
+                return unknown('hard deadline; tactical worker killed') | dict(nodes_fresh=None)
             if result == 'exit':
                 self._retire(killed=False)
-                return unknown('tactical worker exited (memory cap or crash)')
+                return unknown('tactical worker exited (memory cap or crash)') | dict(nodes_fresh=None)
             if result == 'oversize':
                 self._retire(killed=True)
-                return unknown('response size limit')
+                return unknown('response size limit') | dict(nodes_fresh=None)
+            result.setdefault('nodes_fresh', None)
+            if bounds:
+                result.setdefault('proof_numbers', None)
             if result.get('background_worker_busy'):
                 self._retire(killed=True)
             if time.perf_counter()-start >= ms/1000:
-                result.update(unknown('deadline', result.get('build_hash')), nodes_used=result.get('nodes_used', 0),
-                              budget=result.get('budget'), gate_score=result.get('gate_score'))
+                discard_verdict(result, 'deadline', start)
             result['elapsed_ms'] = (time.perf_counter()-start)*1000
             with self.control_lock:
                 if self.active_query is not None and self.cancelled_query == self.active_query[1]:
-                    result.update(unknown('cancelled', result.get('build_hash')), nodes_used=result.get('nodes_used', 0),
-                                  budget=result.get('budget'), gate_score=result.get('gate_score'))
-                    result.pop('certificate_json', None)
+                    discard_verdict(result, 'cancelled', start)
                 self.active_query = None
             return result
         except OSError:
             self._retire(killed=False)
-            return unknown('tactical worker pipe closed')
+            return unknown('tactical worker pipe closed') | dict(nodes_fresh=None if dispatched else 0)
         finally:
             with self.control_lock:
                 self.active_query = None
@@ -521,6 +552,8 @@ def _serve(engine, package, memory_mb, priority='None'):
         if event.is_set():
             result = dict(unknown_result('cancelled', start, request.get('attacker', 'mover'), None),
                           budget=None, gate_score=None)
+            if request.get('bounds'):
+                result['proof_numbers'] = None
         else:
             if getattr(tactics, 'accepts_cancel_event', False):
                 request['cancel_event'] = event
@@ -529,8 +562,7 @@ def _serve(engine, package, memory_mb, priority='None'):
             current_id = None
             controls.pop(query_id, None)
             if event.is_set():
-                result.update(unknown_result('cancelled', start, request.get('attacker', 'mover'), result.get('build_hash')),
-                              nodes_used=result.get('nodes_used', 0))
+                discard_verdict(result, 'cancelled', start)
         certificate = result.pop('certificate', None)
         result.update(certificate=None, has_certificate=certificate is not None)
         print(json.dumps(result, separators=(',', ':')), flush=True)

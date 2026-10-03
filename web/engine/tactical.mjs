@@ -100,12 +100,14 @@ export async function loadTactical(source) {
   }
 
   function history(history, { nodes = 2500, ms = 1000, idtt_nodes = 0, depth = 8, attacker = 'mover',
-                               certificate, root_moves, table_mb = 0, shortest = false } = {}) {
+                               certificate, root_moves, table_mb = 0, shortest = false, bounds = false, resume = false } = {}) {
     checkBudgets(ms, nodes, idtt_nodes, depth, attacker, table_mb);
+    if (resume && !table_mb) throw new RangeError('Solver resume requires a positive table_mb');
     const start = performance.now();
     const unknown = reason => ({
-      status: 'UNKNOWN', native_verified: false, moves: [], certificate: null, proof_turns: null, shortest: false, nodes_used: 0,
+      status: 'UNKNOWN', native_verified: false, moves: [], certificate: null, proof_turns: null, shortest: false, nodes_used: 0, nodes_fresh: 0,
       attacker, build_hash: buildHash, reason, elapsed_ms: performance.now() - start, budget: nodes, gate_score: null,
+      ...(bounds ? { proof_numbers: null } : {}),
     });
     const remaining = Math.floor(ms - (performance.now() - start));
     if (remaining < 1) return unknown('deadline');
@@ -113,9 +115,13 @@ export async function loadTactical(source) {
     if (certificate != null) request.certificate = certificate;
     if (root_moves != null) request.root_moves = root_moves;
     if (shortest) request.shortest = true;
+    if (bounds) request.bounds = true;
+    if (resume) request.resume = true;
     if (JSON.stringify(request).length > REQUEST_LIMIT) return unknown('request size limit');
-    const result = { ...unknown('native error'), ...query(request) };
-    if (performance.now() - start >= ms) Object.assign(result, unknown('deadline'), { nodes_used: result.nodes_used });
+    const result = { ...unknown('native error'), nodes_fresh: null, ...query(request) };
+    if (performance.now() - start >= ms) Object.assign(result, {
+      status: 'UNKNOWN', native_verified: false, moves: [], certificate: null, proof_turns: null, shortest: false, reason: 'deadline',
+    });
     return Object.assign(result, { elapsed_ms: performance.now() - start, budget: nodes, gate_score: null });
   }
 

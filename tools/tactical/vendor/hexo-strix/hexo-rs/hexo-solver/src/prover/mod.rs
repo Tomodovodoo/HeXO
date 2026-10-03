@@ -205,6 +205,9 @@ impl Ctl {
     }
 }
 
+/// Sentinel used by the scoped proof/disproof numbers.
+pub const PROOF_NUMBER_INFINITY: u32 = pn::INF;
+
 /// A single driver's outcome, assembled into a [`Report`] by [`run`].
 #[derive(Clone, Debug)]
 pub struct DriverResult {
@@ -214,6 +217,12 @@ pub struct DriverResult {
     pub stats: Stats,
     pub unverified: Vec<UnverifiedBranch>,
     pub certificate: Option<ProofCertificate>,
+    /// Root numbers in this driver's forcing model. They guide continuation;
+    /// neither a zero disproof number nor an unverified zero proof number is a
+    /// game outcome.
+    pub proof_numbers: Option<(u32, u32)>,
+    /// This attempt began with entries retained by this worker.
+    pub resident_reused: bool,
 }
 
 impl DriverResult {
@@ -225,6 +234,8 @@ impl DriverResult {
             stats: Stats::default(),
             unverified: Vec::new(),
             certificate: None,
+            proof_numbers: None,
+            resident_reused: false,
         }
     }
 }

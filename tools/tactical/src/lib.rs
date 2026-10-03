@@ -46,6 +46,10 @@ struct Request {
     /// After a found proof, spend the rest of `nodes` tightening it to the fewest attacker turns
     /// (guided PDS-PN threshold probes); `shortest` in the response says whether that minimum is exact.
     #[serde(default)] shortest:bool,
+    /// Return scoped forcing-search numbers, including on UNKNOWN.
+    #[serde(default)] bounds:bool,
+    /// Carry resident entries and proven witnesses through table resizes.
+    #[serde(default)] resume:bool,
 }
 fn position(board:&check::Board,side:u8,remaining:u8)->Position {
     Position{stones:board.iter().map(|(&p,&s)|(p,if s==0{Player::P1}else{Player::P2})).collect(),
@@ -106,12 +110,14 @@ fn shorten(pos:&Position,cert:&ProofCertificate,req:&Request,ctl:&Ctl,meter:&Met
 /// safety cap, and a query that reaches it returns UNKNOWN.
 fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.nodes==0 || req.nodes>10_000_000
-        || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256 {return Err("invalid tactical limits".into());}
+        || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256
+        || (req.resume && req.table_mb==0) {return Err("invalid tactical limits".into());}
     let deadline=start+Duration::from_millis(req.ms as u64);
     let meter=Meter::new(req.nodes);
     let ctl=Ctl{deadline:Some(deadline),cancel,meter:Some(meter.clone())};
     if ctl.expired() {return Err("cancelled or deadline".into());}
-    prover::dfpn::set_resident(req.table_mb as usize);
+    if req.resume {prover::dfpn::set_resident_resume(req.table_mb as usize);}
+    else {prover::dfpn::set_resident(req.table_mb as usize);}
     let board=check::replay_controlled(&req.history,&ctl)?;
     let ply=if req.attacker==Attacker::Opponent {check::flip(req.history.len())} else {req.history.len()};
     let (side,remaining)=check::phase(ply);
@@ -129,11 +135,14 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
     let mut probe_verdict=None;
     let mut cached_nodes=None;
     let mut exact=false;
+    let mut proof_numbers=None;
+    let mut resident_reused=false;
     let cert=if let Some(cert)=req.certificate.clone() {Some(cert)} else if let Some(moves)=&req.root_moves {
         Some(complete_candidate(&board,ply,moves,&req,&ctl,&meter)?)
     } else {
         let saved=cache.lock().map_err(|_|"cache lock")?.get(&key).cloned();
         if let Some((cert,used,verdict,minimal))=saved {
+            proof_numbers=Some((0,prover::PROOF_NUMBER_INFINITY));
             cache_hit=true;cached_nodes=Some(used);probe_verdict=verdict;exact=minimal;Some(cert)
         } else {
             let pos=position(&board,side,remaining);
@@ -148,7 +157,11 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
                 probe_verdict=Some(format!("{:?}",probe.verdict));
             }
             // Only PDS-PN emits an all-defense DAG. An IDTT PV is never enough.
-            let found=if ctl.expired() {None} else {prover::pdspn::solve(&pos,&cfg,&ctl).certificate};
+            let found=if ctl.expired() {None} else {
+                let found=prover::pdspn::solve(&pos,&cfg,&ctl);
+                proof_numbers=found.proof_numbers;resident_reused=found.resident_reused;
+                found.certificate
+            };
             match found {
                 Some(cert) if req.shortest =>
                     match shorten(&pos,&cert,&req,&ctl,&meter) {
@@ -164,7 +177,13 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
         "revision":REVISION,"scope":scope,"cache_hit":cache_hit,"idtt_verdict":probe_verdict.clone(),
         "attacker":if req.attacker==Attacker::Opponent {"opponent"} else {"mover"},
         "reason":"no verified strategy","nodes_used":cached_nodes.unwrap_or(meter.spent().min(req.nodes)),"proof_turns":null,"elapsed_ms":0.0,
+        "nodes_fresh":meter.spent().min(req.nodes),
         "shortest":false});
+    if req.bounds {
+        response["proof_numbers"]=proof_numbers.map(|(pn,dn)|json!({"pn":pn,"dn":dn,
+            "infinity":prover::PROOF_NUMBER_INFINITY,"scope":"wide-forcing","game_exact":false})).unwrap_or(Value::Null);
+    }
+    if req.resume {response["resident_reused"]=json!(resident_reused);}
     if let Some(cert)=cert {
         match check::verify(&req.history,ply,&cert,&ctl,check_nodes(req.nodes)) {
             Ok((moves,turns))=>{
@@ -240,9 +259,11 @@ static WORKER:OnceLock<mpsc::SyncSender<Work>>=OnceLock::new();
 static BUSY:AtomicBool=AtomicBool::new(false);
 static LAST_WORK:OnceLock<Mutex<Value>>=OnceLock::new();
 #[cfg(target_family="wasm")]
-fn dispatch(req:Request,start:Instant)->Result<Value,String> {
+fn dispatch(req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String> {
     if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
     let cancel=query_control(req.request_id)?;
+    if cancel.load(Ordering::Acquire) {return Err("cancelled".into());}
+    *dispatched=true;
     run_controlled(req,start,cancel)
 }
 #[cfg(windows)]
@@ -261,7 +282,7 @@ fn thread_cpu_ms()->Option<f64> {
 #[cfg(not(any(windows,target_family="wasm")))]
 fn thread_cpu_ms()->Option<f64> {None}
 #[cfg(not(target_family="wasm"))]
-fn dispatch(req:Request,start:Instant)->Result<Value,String> {
+fn dispatch(req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String> {
     if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
     let deadline=start+Duration::from_millis(req.ms as u64);
     let worker=WORKER.get_or_init(|| {
@@ -298,6 +319,7 @@ fn dispatch(req:Request,start:Instant)->Result<Value,String> {
     }
     let (send,recv)=mpsc::channel();
     if worker.send((req,start,Arc::clone(&cancel),send)).is_err() {BUSY.store(false,Ordering::Release);return Err("native worker stopped".into());}
+    *dispatched=true;
     match recv.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(result)=>result,
         Err(_)=>{
@@ -311,16 +333,18 @@ fn dispatch(req:Request,start:Instant)->Result<Value,String> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hexo_tactical_query(input:*const c_char)->*mut c_char {
     let start=Instant::now();
-    let result=std::panic::catch_unwind(|| {
+    let mut dispatched=false;
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if input.is_null(){return Err("null request".to_string());}
         let bytes=unsafe{CStr::from_ptr(input)}.to_bytes();
         if bytes.len()>64*1024*1024{return Err("request size limit".into());}
-        serde_json::from_slice(bytes).map_err(|e|e.to_string()).and_then(|req|dispatch(req,start))
-    });
+        serde_json::from_slice(bytes).map_err(|e|e.to_string()).and_then(|req|dispatch(req,start,&mut dispatched))
+    }));
+    let fresh=if dispatched {Value::Null}else{json!(0)};
     let mut value=match result {
         Ok(Ok(v))=>v,
-        Ok(Err(reason))=>json!({"status":"UNKNOWN","native_verified":false,"reason":reason,"moves":[]}),
-        Err(_)=>json!({"status":"UNKNOWN","native_verified":false,"reason":"native panic","moves":[]}),
+        Ok(Err(reason))=>json!({"status":"UNKNOWN","native_verified":false,"reason":reason,"moves":[],"nodes_fresh":fresh}),
+        Err(_)=>json!({"status":"UNKNOWN","native_verified":false,"reason":"native panic","moves":[],"nodes_fresh":fresh}),
     };
     value["background_worker_busy"]=json!(BUSY.load(Ordering::Acquire));
     value["last_worker_completion"]=LAST_WORK.get_or_init(||Mutex::new(Value::Null))
@@ -359,9 +383,37 @@ mod tests {
         let req=serde_json::from_value(json!({"history":IMMEDIATE,"ms":1000,"nodes":1000,
             "idtt_nodes":0,"depth":8,"request_id":next})).unwrap();
         assert!(hexo_tactical_cancel(next));
-        assert!(dispatch(req,Instant::now()).unwrap_err().contains("cancelled"));
+        let mut dispatched=false;
+        assert!(dispatch(req,Instant::now(),&mut dispatched).unwrap_err().contains("cancelled"));
+        assert!(!dispatched);
         hexo_tactical_release(next);
         assert!(query_control(next).is_err());
+    }
+    #[test]
+    fn rejected_native_requests_have_confirmed_zero_fresh_work() {
+        let query=|input:&str| {
+            let input=CString::new(input).unwrap();
+            let raw=unsafe{hexo_tactical_query(input.as_ptr())};
+            let result:Value=unsafe{serde_json::from_slice(CStr::from_ptr(raw).to_bytes()).unwrap()};
+            unsafe{hexo_tactical_free(raw)};
+            assert_eq!(result["status"],"UNKNOWN");
+            assert_eq!(result["nodes_fresh"],0);
+            result
+        };
+        query("{");
+        query(r#"{"history":[],"ms":0,"nodes":1,"idtt_nodes":0,"depth":8}"#);
+        let token=hexo_tactical_prepare();
+        hexo_tactical_cancel(token);
+        let result=query(&json!({"history":[],"ms":1000,"nodes":1,"idtt_nodes":0,"depth":8,"request_id":token}).to_string());
+        assert_eq!(result["reason"],"cancelled");
+        hexo_tactical_release(token);
+        #[cfg(not(target_family="wasm"))]
+        {
+            assert!(!BUSY.swap(true,Ordering::AcqRel));
+            let result=query(r#"{"history":[],"ms":1000,"nodes":1,"idtt_nodes":0,"depth":8}"#);
+            BUSY.store(false,Ordering::Release);
+            assert!(result["reason"].as_str().unwrap().contains("busy"));
+        }
     }
     #[test]
     fn cancelled_certificate_checks_return_no_strategy() {
@@ -431,6 +483,45 @@ mod tests {
         assert!(fresh && first && again,"every search proves the win");
         assert!(warm<cold,"the resident table saves work: {warm} of {cold}");
         prover::dfpn::set_resident(0);
+    }
+    #[test]
+    fn resumed_proofs_survive_table_growth_and_shrink() {
+        let query=|table_mb:usize,resume:bool| {
+            let (pos,cfg,ctl,meter)=setup(1_000_000);
+            if resume {prover::dfpn::set_resident_resume(table_mb);}
+            else {prover::dfpn::set_resident(table_mb);}
+            let solved=prover::pdspn::solve(&pos,&cfg,&ctl);
+            let certificate=solved.certificate.unwrap();
+            assert!(check::verify(&OPEN_THREE,OPEN_THREE.len(),&certificate,&ctl,200000).is_ok());
+            (meter.spent(),solved.resident_reused)
+        };
+        let (cold,_)=query(0,false);
+        let (_,first_reused)=query(4,true);
+        assert!(!first_reused);
+        for table_mb in [8,1] {
+            let (spent,reused)=query(table_mb,true);
+            assert!(reused,"a resize retains usable search entries");
+            assert!(spent<cold,"verified warm proof uses less fresh work: {spent} vs {cold}");
+        }
+        prover::dfpn::set_resident(0);
+    }
+    #[test]
+    fn proof_cache_reports_no_fresh_work() {
+        let query=|| {
+            let req=serde_json::from_value(json!({"history":OPEN_THREE,"ms":60000,"nodes":987_654,
+                "idtt_nodes":0,"depth":8,"bounds":true})).unwrap();
+            run(req,Instant::now()).unwrap()
+        };
+        let found=query();
+        assert_eq!(found["status"],"PROVEN_WIN");
+        assert!(found["nodes_fresh"].as_u64().unwrap()>0);
+        let hit=query();
+        assert_eq!(hit["status"],"PROVEN_WIN");
+        assert_eq!(hit["cache_hit"],true);
+        assert_eq!(hit["nodes_fresh"],0);
+        assert!(hit["nodes_used"].as_u64().unwrap()>0);
+        assert_eq!(hit["proof_numbers"]["pn"],0);
+        assert_eq!(hit["proof_numbers"]["game_exact"],false);
     }
     #[test]
     fn resident_results_never_serve_cold_queries() {
