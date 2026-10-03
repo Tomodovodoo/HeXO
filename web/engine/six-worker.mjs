@@ -47,6 +47,7 @@ async function load(options = {}) {
     stages.enter('download');
     manifest = await json('six/networks/manifest.json');
     ort = await runtime(device.provider, options.threads, stages);
+    stages.enter('download');   // six/six.mjs fetches six.wasm
     search = await SixSearch.create(ort);
     current = null;
     return {provider: device.provider, adapter: device.adapter, threads: ort.env.wasm.numThreads,
