@@ -3,6 +3,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -331,13 +332,16 @@ def paired_openings(run, pairs, seed, *, suite=None, opening=None):
 
 
 def comparison_summary(results, use_sprt=False):
-    from dense_eval import tally, sprt
+    from dense_stats import tally, sprt
     valid = all(g['reason'] in ('win', 'time', 'resign', 'draw', 'capped', 'engine_timeout') for g in results)
     records = [dict(seed=g['seed'], challenger_color=int(g['swapped']),
                     winner=-1 if g['winner'] is None else int(g['winner'] == 'o')) for g in results]
     stats = tally(records, (lambda rows: sprt(rows, 0, 30, .05, .05)) if use_sprt and valid else None)
     stats['valid'] = valid
     stats['decision'] = None
+    if stats['pair_interval']:
+        stats['elo_interval'] = [None if p in (0, 1) else 400*math.log10(p/(1-p))
+                                 for p in stats['pair_interval']]
     if not valid:
         for key in ('pair_score', 'pair_interval', 'elo_delta', 'elo_interval', 'llr', 'bound_lower', 'bound_upper'):
             stats[key] = None

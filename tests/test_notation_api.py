@@ -293,6 +293,7 @@ class TimedClocks(unittest.TestCase):
         stats = comparison_summary(rows, True)
         self.assertEqual((stats['wins'], stats['losses'], stats['capped'], stats['pairs']), (2, 1, 1, 2))
         self.assertEqual(stats['pair_score'], .625)
+        self.assertEqual(stats['elo_interval'], [None, None])
         rows[-1]['reason'] = 'crash'
         stats = comparison_summary(rows, True)
         self.assertFalse(stats['valid'])
