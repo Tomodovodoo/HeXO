@@ -124,6 +124,11 @@ if (job.kind === 'encode') {
   const seated = Date.now(); slow.answer('/seat', {side: 1, engine: 'slow'}); await wait(500);
   answer.load_charged = {spent: slow.clockTurns[1]?.spent_ms ?? null, load: readyAt - seated};
   s.answer('/pause', {paused: true}); slow.answer('/pause', {paused: true});
+  { const m = new BrowserSession(native), entry = {id: 'net', name: 'Net', kind: 'bubble', checkpoints: ['1'], models: {'1': 'weights-a'}, presets: {standard: {simulations: 1, solver_nodes: 0}}};
+    m.registerEngine(entry, {turn: () => new Promise(() => {})});
+    await m.startMatch({players: [{engine: 'net'}, {engine: 'net'}], games: 2}); await m.request('/match', {action: 'stop'}, 'POST');
+    entry.models = {'1': 'weights-b'};
+    answer.rebuilt_model = (await m.request('/match', {action: 'resume'}, 'POST'))[1].error ?? null; m.cancelJobs(); }
   const r = new BrowserSession(native); r.answer('/clock', {mode: 'game', tc: '60'}); await wait(150);
   await r.persist(); await wait(250);
   const back = new BrowserSession(native); back.storage = r.storage; await back.restore();

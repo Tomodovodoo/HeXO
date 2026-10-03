@@ -494,7 +494,7 @@ export class BrowserSession extends OfflineSession {
     if (!Array.isArray(body.players) || body.players.length !== 2 || !Number.isInteger(body.games) || body.games < 2 || body.games > 10000 || body.games % 2) throw Error('Choose two engines and an even number of games');
     const max_placements = body.max_placements ?? 512;
     if (!Number.isSafeInteger(max_placements) || max_placements < 0 || max_placements === 1) throw Error('Stone limit must be at least 2, or 0 for uncapped');
-    const players = body.players.map(p => { const s = this.spec(p), entry = this.entries.get(s.engine); return {...s, name: entry.name, version: entry.version}; });
+    const players = body.players.map(p => { const s = this.spec(p), entry = this.entries.get(s.engine); return {...s, name: entry.name, version: this.engineKey(s)}; });
     const seed = body.seed ?? Math.floor(Math.random() * 4294967296), mode = body.opening_range || 'origin';
     const openings = mode === 'origin' ? (body.openings || [[[0, 0]]]).map(moves => ({moves})) : this.bookData?.select(mode, body.unique_openings || body.games / 2, seed);
     if (!openings?.length) throw Error('No opening book is available');
@@ -516,7 +516,7 @@ export class BrowserSession extends OfflineSession {
   }
   resumeMatch() {
     if (!this.match || this.match.completed >= this.match.games) throw Error('No unfinished match');
-    for (const p of this.match.players) if (p.version && this.entries.get(p.engine)?.version !== p.version) throw Error('This match used a different engine version. Start a new match.');
+    for (const p of this.match.players) if (p.version && this.engineKey(p) !== p.version) throw Error('This match used a different engine version. Start a new match.');
     if (this.match.pending_game) this.beginMatchGame();
     this.seats = copy(this.match.current % 2 ? this.match.players : [...this.match.players].reverse());
     this.jobs = this.jobs.filter(j => j.status !== 'failed'); this.match.error = null; this.match.active = true; this.paused = false;
@@ -614,7 +614,7 @@ export class BrowserSession extends OfflineSession {
           if (body.batch && this.match?.id !== body.batch) {
             this.editable(); const saved = await this.storage.get('matches', body.batch);
             if (!saved || saved.single || saved.completed >= saved.games) throw Error('No unfinished match');
-            for (const p of saved.players) if (p.version && this.entries.get(p.engine)?.version !== p.version) throw Error('This match used a different engine version. Start a new match.');
+            for (const p of saved.players) if (p.version && this.engineKey(p) !== p.version) throw Error('This match used a different engine version. Start a new match.');
             this.match = saved;
             this.match.players = this.match.players.map(p => ({...p, ...this.spec(p)}));
             if (!saved.pending_game && saved.position?.game === saved.completed + 1) {

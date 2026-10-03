@@ -1543,7 +1543,7 @@ class Session:
         waiting = self.match and self.match['active'] and (self.match['between'] or self.match['preparing'] or
                                                           self.match.get('outcome') or
                                                           self.match['max_placements'] and len(self.history) >= self.match['max_placements'])
-        freeplay = self.game_clock is not None and not self.match
+        freeplay = self.game_clock is not None and not self.match and not self.saved_game
         waiting = waiting or freeplay and (self.clock_preparing is not None or self.outcome is not None)
         if freeplay and winner < 0 and not self.paused and not waiting and self.game_clock.running is None:
             self.game_clock.start(player)

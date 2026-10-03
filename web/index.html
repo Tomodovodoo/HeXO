@@ -989,7 +989,7 @@ function renderPanels(){
   document.documentElement.style.setProperty('--turn',S.winner>=0?COLORS[S.winner]:COLORS[playerAt(view)]);
   renderCard();renderSeat(0);renderSeat(1);renderBook();renderClockRow();renderMatch();renderEngineHead();renderStudy();
   const engines=S.seats.some(s=>s.engine!=='human'),pause=$('pause');
-  setIcon(pause,S.paused?'play':'pause');pause.setAttribute('aria-label',S.paused?'Resume':'Pause');pause.disabled=!engines&&!(S.clock_spec&&S.clock_spec.mode!=='fixed');
+  setIcon(pause,S.paused?'play':'pause');pause.setAttribute('aria-label',S.paused?'Resume':'Pause');pause.disabled=!engines&&!(S.clock_spec&&S.clock_spec.mode!=='fixed'&&!S.saved_game);
   const held=S.paused&&S.winner<0&&S.seats[S.player].engine!=='human';
   pause.classList.toggle('attention',held);
   for(const side of[0,1])$('dot'+side)?.classList.toggle('held',held&&S.player===side);

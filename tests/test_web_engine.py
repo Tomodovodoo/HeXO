@@ -290,6 +290,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual((result['fresh']['outcome'], result['fresh']['clock']['running']), (None, 'x'))
         self.assertGreater(result['fresh']['clock']['cross_ms'], 250)
         self.assertGreaterEqual(result['paused_turn'], 190)
+        self.assertIn('different engine version', result['rebuilt_model'])
         self.assertGreaterEqual(result['load_charged']['load'], 290)
         self.assertLess(result['load_charged']['spent'], 150)
         self.assertLess(result['reloaded']['balance'], 59700)
