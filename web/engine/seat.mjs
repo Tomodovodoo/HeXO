@@ -14,7 +14,7 @@
 import {BubbleEngine, PRESETS, isolate} from './bubble.mjs';
 import {native} from './native.mjs';
 import {shrimp} from './shrimp.mjs';
-import {mountPlay} from './browser-play.mjs';
+import {mountPlay, deviceLabel} from './browser-play.mjs';
 import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 import {strix} from './strix.mjs';
@@ -133,7 +133,7 @@ async function run(key, task) {
   const {engine, entry, record} = ENGINES.get(task.engine);
   try {
     current.loading = true;
-    await engine.load(f => { loads.set(task.engine, f); progress(); });
+    entry.device = deviceLabel(await engine.load(f => { loads.set(task.engine, f); progress(); }));
     current.loading = false;
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})};
     const result = await engine.turn(task.history, budget, {signal: controller.signal,
@@ -237,7 +237,7 @@ function install() {
     const choice = side >= 0 && seat.engine === 'human' ? config.seats[side] : s && seat === s.analysis ? config.analysis : null;
     if (!choice) return original.shown(seat);
     const {entry} = ENGINES.get(choice.engine);
-    return [entry.badge || entry.kind, entry.label];
+    return [entry.badge || entry.kind, entry.label, entry.device];
   };
   page.isHuman = seat => {
     const s = state(), side = s ? s.seats.indexOf(seat) : -1;
@@ -262,7 +262,7 @@ function install() {
     const head = document.getElementById('engine-head'), s = state();
     if (!config.analysis || !head || !s?.analysis) return;
     const {entry} = ENGINES.get(config.analysis.engine);
-    const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.badge || entry.kind, entry.label));
+    const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.badge || entry.kind, entry.label, entry.device));
     const items = original.pickItems(analysable);
     pick.onclick = () => original.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: 'standard', auto: true}));
     const send = change => { config.analysis = {...config.analysis, ...change}; save(); page.renderPanels(); };

@@ -1,6 +1,14 @@
 import {BrowserSession} from './play-session.mjs';
 import {PlayStorage} from './storage.mjs';
 
+/** The tag the page shows for the device an engine's load resolved to: ONNX Runtime engines report {provider,
+ * precision, threads}; the others run their WebAssembly on one CPU thread. */
+export function deviceLabel(device) {
+  if (device?.provider === 'webgpu') return `WebGPU ${device.precision || 'fp32'}`;
+  if (device?.provider === 'wasm') return `WASM ${device.threads} thread${device.threads === 1 ? '' : 's'}`;
+  return 'CPU';
+}
+
 export async function mountPlay(engines, legacy) {
   const firstEngine = [...engines.values()].find(e => e.entry.kind === 'bubble') || engines.values().next().value;
   const entry = firstEngine.entry;
@@ -15,7 +23,7 @@ export async function mountPlay(engines, legacy) {
   const first = !await storage.get('sessions', id);
   if (first && study && params.has('batch')) await session.openGame(params.get('batch'), +params.get('game'));
   for (const {entry, engine, record} of engines.values()) session.registerEngine(entry, {
-    ready: f => engine.load(f),
+    ready: async f => { entry.device = deviceLabel(await engine.load(f)); },
     turn: async (history, budget, options) => {
       const result = await engine.turn(history, {...budget, ...(options.checkpoint ? {checkpoint: options.checkpoint} : {})}, options), preset = options.preset === 'custom' ? 'standard' : options.preset;
       return record ? {...record(result, history, preset), ...result} : result;

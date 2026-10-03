@@ -46,6 +46,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .kind{--k:var(--muted);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--k);flex:none;
   border:1px solid color-mix(in srgb,var(--k) 35%,transparent);border-radius:5px;padding:1px 6px;background:color-mix(in srgb,var(--k) 10%,transparent)}
 .kind[data-k=human]{--k:#e2e8f0}.kind[data-k=bubble]{--k:#2dd4bf}.kind[data-k=six]{--k:#a78bfa}.kind[data-k=strix]{--k:#fb7185}
+.kind.device{--k:var(--dim);text-transform:none;letter-spacing:.02em;font-weight:600}
 .kind[data-k=native]{--k:#94a3b8}.kind[data-k=seal]{--k:#a3e635}.kind[data-k=shrimp]{--k:#fb923c}
 .pick{flex:1;min-width:0;display:flex;align-items:center;gap:8px;text-align:left;padding:5px 8px;cursor:pointer;
   border:1px solid transparent;border-radius:8px;background:transparent;transition:background .15s,border-color .15s}
@@ -676,9 +677,9 @@ $('tabs').onclick=e=>{const b=e.target.closest('button');if(!b)return;$('app').d
 /* engine picker: an entry shows its badge (which bot it is; `kind` is how the server runs it), and its label when that
    differs from the badge */
 let menuFor=null,pinned=false;
-function badge(kind,label){return[el('span',{class:'kind','data-k':kind},kind),label&&label.toLowerCase()!==kind?el('span',{class:'name'},label):null]}
+function badge(kind,label,device){return[el('span',{class:'kind','data-k':kind},kind),label&&label.toLowerCase()!==kind?el('span',{class:'name'},label):null,device?el('span',{class:'kind device'},device):null]}
 function entryOf(id){return S.engines.find(x=>x.id===id)}
-function shown(seat){if(seat.engine==='human')return['human',null];const e=entryOf(seat.engine);return e?[e.badge||e.kind,e.label||e.name]:['?',seat.engine]}
+function shown(seat){if(seat.engine==='human')return['human',null];const e=entryOf(seat.engine);return e?[e.badge||e.kind,e.label||e.name,e.device]:['?',seat.engine]}
 function isHuman(seat){return seat.engine==='human'}
 function pickItems(filter){return S.engines.filter(filter).map(e=>({id:e.id,ids:[e.id],kind:e.badge||e.kind,label:e.label||e.name}))}
 function openMenu(anchor,items,current,choose){
@@ -761,10 +762,10 @@ function seatControls(seat,send,id,config,landed){
   return box;
 }
 function renderSeat(side){
-  const seat=S.seats[side],box=$('seat'+side),[kind,label]=shown(seat);
+  const seat=S.seats[side],box=$('seat'+side);
   if(S.saved_game){box.replaceChildren(el('div',{class:'seat-head'},el('i',{class:'hexdot'}),
     el('span',{class:'pick'},el('span',{class:'name'},S.saved_game.players[side]))));box.classList.remove('active');return}
-  const pick=el('button',{class:'pick'},...badge(kind,label));
+  const pick=el('button',{class:'pick'},...badge(...shown(seat)));
   const items=[{id:'human',ids:['human'],kind:'human',label:null},...pickItems(()=>true)];
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,seat.engine,it=>post('/seat',{side,engine:it.id}));
   const send=ch=>post('/seat',{side,engine:seat.engine,checkpoint:seat.checkpoint,preset:seat.preset,custom:seat.budget,...ch});
@@ -793,7 +794,7 @@ function sendAnalysis(change){
 function renderEngineHead(){
   const head=$('engine-head'),a=S.analysis;
   if(!a){head.replaceChildren();return}
-  const [kind,label]=shown(a),pick=el('button',{class:'pick'},...badge(kind,label));
+  const pick=el('button',{class:'pick'},...badge(...shown(a)));
   const items=pickItems(e=>e.kind==='bubble'||e.analysis);
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,a.engine,it=>sendAnalysis({engine:it.id,checkpoint:null,preset:'standard',custom:undefined}));
   const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},'Auto analysis',el('i'));
