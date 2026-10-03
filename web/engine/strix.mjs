@@ -56,12 +56,13 @@ export class StrixEngine {
     return ready;
   }
 
-  /** The downloaded files (assets.mjs records) a load reads: strix.wasm and the current network. */
-  async files() {
+  /** The downloaded files (assets.mjs records) loads read: strix.wasm and the networks with ids in `checkpoints` (the
+   * current one when none of them is known). */
+  async files(checkpoints = []) {
     await this.known();
-    const {data, local} = await json('build.json');
+    const {data, local} = await json('build.json'), chosen = checkpoints.map(id => this.networks.get(id)).filter(Boolean);
     return [{path: 'strix/strix.wasm', sha256: data.artefacts['strix/strix.wasm'], lines: true, local},
-      {path: this.network.path, sha256: this.network.sha256, bytes: this.network.size, local: this.network.local}];
+      ...(chosen.length ? chosen : [this.network]).map(n => ({path: n.path, sha256: n.sha256, bytes: n.size, local: n.local}))];
   }
 
   /** Ends the worker; the next load starts a new one. */

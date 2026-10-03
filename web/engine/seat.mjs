@@ -403,7 +403,13 @@ if (HOOKS.every(name => typeof original[name] === 'function')) {
     const fix = choice => choice?.engine === entry.id ? pickEngine(entry.id, choice, choice.checkpoint) : choice;
     config = {seats: config.seats.map(fix), analysis: fix(config.analysis)};
     save();
-    if (state()) page.renderPanels();
+    const session = page.browserPlay, stale = session && [...session.seats, session.analysis].filter(c => c?.engine === entry.id
+      && c.checkpoint && entry.checkpoints.length && !entry.checkpoints.includes(c.checkpoint));
+    if (stale?.length) {
+      for (const choice of stale) choice.checkpoint = entry.checkpoints[0];
+      session.persist();
+      page.accept(session.state());
+    } else if (state()) page.renderPanels();
   });
   serverless().then(active=>{if(!active||page.browserPlay)page.resolvePlayReady?.()}).catch(error=>{original.toast(error.message)});
 } else console.warn('The browser engines need the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));

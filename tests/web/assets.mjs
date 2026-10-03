@@ -170,6 +170,7 @@ site.set('strix/networks.json', JSON.stringify(manifests['strix/networks.json'])
 
 const late = new (await import('../../web/engine/strix.mjs')).StrixEngine([]);
 out.strix_retry = {files: (await late.files()).map(f => f.path), checkpoints: late.checkpoints};
+out.strix_chosen = (await late.files(['net', 'unknown'])).map(f => f.path);
 
 const sixLate = new (await import('../../web/engine/six.mjs')).SixEngine();
 await sixLate.files();

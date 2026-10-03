@@ -85,6 +85,7 @@ class Resolver(unittest.TestCase):
 
     def test_strix_reads_its_network_list_again_after_starting_without_one(self):
         self.assertEqual(self.out['strix_retry'], {'files': ['strix/strix.wasm', 'strix/net.safetensors'], 'checkpoints': ['net']})
+        self.assertEqual(self.out['strix_chosen'], ['strix/strix.wasm', 'strix/net.safetensors'])
 
 
     def test_six_fills_its_checkpoints_when_it_reads_the_manifest(self):
