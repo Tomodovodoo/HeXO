@@ -275,6 +275,23 @@ class Bundle(unittest.TestCase):
             [['https://hexo.mineking.dev/proxy/api/sandbox-positions/2mdyn02', 'GET']], []])
         self.assertIn('HTTTX', answers[2]['error'])
 
+    def test_browser_freeplay_runs_on_a_clock_with_increments_and_a_loss_on_time(self):
+        result = node(dict(kind='clock'))
+        self.assertEqual(result['set'], 200)
+        self.assertEqual((result['after_turn']['cross_ms'] > 1000, result['after_turn']['running']), (True, 'o'))
+        self.assertEqual(result['fixed_seat'][0], 400)
+        self.assertIn('cannot keep a clock', result['fixed_seat'][1]['error'])
+        turn = result['engine_turn']
+        self.assertEqual((turn['history'], turn['clock']['running']), (3, 'x'))
+        self.assertTrue(0 < turn['asked'][0] < 300)
+        self.assertGreater(turn['clock']['circle_ms'], 1000)
+        self.assertEqual(result['timed_out']['state'], dict(winner=1, outcome=dict(winner=1, reason='time')))
+        game = result['timed_out']['game']
+        self.assertEqual((game['winner'], game['reason'], game['clock']), (1, 'time', dict(mode='game', base_ms=300, increment_ms=1000)))
+        self.assertEqual([t['side'] for t in game['turns']], [0, 1, 0])
+        self.assertEqual(result['timed_out']['play'], 400)
+        self.assertEqual((result['fresh']['outcome'], result['fresh']['clock']['cross_ms']), (None, 300))
+
     def test_browser_notations_preserve_a_single_stone_final_turn(self):
         history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
         histories = [history[:1], history[:6], history]

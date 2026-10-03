@@ -92,6 +92,23 @@ if (job.kind === 'encode') {
     try { answer.push({history: await readGame(url, native, fetcher), asked}); }
     catch (error) { answer.push({error: error.message, asked}); }
   }
+} else if (job.kind === 'clock') {
+  const wait = ms => new Promise(r => setTimeout(r, ms)), s = new BrowserSession(native), asked = [];
+  s.registerEngine({id: 'fixed', name: 'Fixed', kind: 'strix', presets: {standard: {simulations: 1}}, clocks: false}, {turn: async () => ({moves: []})});
+  s.registerEngine({id: 'timed', name: 'Timed', kind: 'native', presets: {standard: {ms: 1000}}, clocks: true}, {
+    turn: async (history, budget, options) => { asked.push(options.ms); return {moves: [[history.length, 3], [history.length, 4]].slice(0, history.length ? 2 : 1)}; }});
+  answer = {set: s.answer('/clock', {mode: 'game', tc: '0.3+1'})[0]};
+  s.answer('/play', {q: 0, r: 0});
+  answer.after_turn = s.clockNow();
+  answer.fixed_seat = s.answer('/seat', {side: 1, engine: 'fixed'});
+  s.answer('/seat', {side: 1, engine: 'timed'});
+  await wait(60);
+  answer.engine_turn = {history: s.history.length, asked, clock: s.clockNow()};
+  s.answer('/play', {q: 9, r: 9});
+  await wait(1500);
+  answer.timed_out = {state: (({winner, outcome}) => ({winner, outcome}))(s.state()), game: (await s.saving, await s.storage.get('games', s.gameId)), play: s.answer('/play', {q: 9, r: 8})[0]};
+  s.answer('/new', {});
+  answer.fresh = {outcome: s.outcome, clock: s.clockNow()};
 } else if (job.kind === 'play') {
   const s = new BrowserSession(native), data = JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url)));
   s.bookData = new OpeningBook(data);
@@ -137,7 +154,7 @@ if (job.kind === 'encode') {
   const s = new BrowserSession(native), wait = ms => new Promise(r => setTimeout(r, ms));
   const until = async condition => { for (let i = 0; !condition(); i++) { if (i > 3000) throw Error('Move did not start'); await wait(1); } };
   s.bookData = new OpeningBook(JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url))));
-  s.registerEngine({id:'test', name:'Test', kind:'bubble', version:'v1', presets:{standard:{simulations:1,solver_nodes:0}}}, {
+  s.registerEngine({id:'test', name:'Test', kind:'bubble', version:'v1', presets:{standard:{simulations:1,solver_nodes:0}}, clocks:true}, {
     turn: (history, budget, options) => history.length === 1 ? Promise.resolve({moves:[[0,2],[1,2]],value:.5}) : new Promise((resolve,reject) => {
       options.signal.addEventListener('abort', () => reject(new DOMException('Cancelled','AbortError')), {once:true});
     })
@@ -158,7 +175,7 @@ if (job.kind === 'encode') {
   await until(() => !!s.running); await s.request('/match',{action:'stop'},'POST'); await s.idle;
   answer={before,after:{history:s.history,clock:s.clockNow(),timings:s.match.timings},bookStart,imported,auto:s.analysis.auto,sameBatchSeats};
 } else if (job.kind === 'lifecycle') {
-  const entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', presets: {standard: {simulations: 1, solver_nodes: 0}}};
+  const entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', presets: {standard: {simulations: 1, solver_nodes: 0}}, clocks: true};
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
   const until = async condition => { for (let i = 0; !condition(); i++) { if (i > 3000) throw Error('Job did not settle'); await wait(1); } };
   const s = new BrowserSession(native);
