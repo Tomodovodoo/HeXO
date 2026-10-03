@@ -120,9 +120,27 @@ class HexcropTests(unittest.TestCase):
                     np.testing.assert_array_equal(getattr(a, field), getattr(b, field))
                 for field in ('size', 'far', 'player', 'remaining', 'symmetry', 'offset'):
                     self.assertEqual(getattr(a, field), getattr(b, field))
+                batch = hexcrop.encode_leaves(native, [(tree.ptr, request, leaf_history)]*8)
+                for sample in batch:
+                    for field in ('planes', 'actions', 'cells'):
+                        np.testing.assert_array_equal(getattr(sample, field), getattr(b, field))
+                    for field in ('size', 'far', 'player', 'remaining', 'symmetry', 'offset'):
+                        self.assertEqual(getattr(sample, field), getattr(b, field))
+                    self.assertTrue(sample.actions.flags.owndata)
                 if hasattr(native, 'hxg_encode'):
                     self.assertEqual(native.hxg_encode(tree.ptr, request, a.planes.ctypes.data, 1, None, None), 0)
+                if hasattr(native, 'hxg_encode_many'):
+                    trees = np.full(8, tree.ptr, np.uintp)
+                    ids = np.full(8, request, np.int32)
+                    info = np.zeros((8, 12), np.int64)
+                    args = (trees.ctypes.data, ids.ctypes.data, 8, info.ctypes.data)
+                    self.assertEqual(native.hxg_encode_many(*args, None, 0, None, None, 0), 1)
+                    cells, actions = np.empty(8*len(a.actions), np.int64), np.empty((8*len(a.actions), 2), np.int64)
+                    self.assertEqual(native.hxg_encode_many(*args, a.planes.ctypes.data, 1,
+                        cells.ctypes.data, actions.ctypes.data, len(cells)), 0)
                 native.hxg_cancel(tree.ptr)
+                with self.assertRaisesRegex(ValueError, 'Unknown'):
+                    hexcrop.encode_leaves(native, [(tree.ptr, request, leaf_history)]*8)
             finally:
                 tree.close()
             game.close()
@@ -243,6 +261,23 @@ class HexcropTests(unittest.TestCase):
             request, history = tree.request()
             with self.assertRaises(hexcrop.SpanError):
                 hexcrop.encode_leaf(native, tree.ptr, request, history)
+            leaves = [(tree.ptr, request, history)]*8
+            with self.assertRaises(hexcrop.SpanError):
+                hexcrop.encode_leaves(native, leaves)
+            self.assertEqual(hexcrop.encode_leaves(native, leaves, allow_span=True), [None]*8)
+            small = NeuralSearch(None, 'span')
+            try:
+                checked(native.hxg_begin(small.ptr, 2, 2))
+                small_request, small_history = small.request()
+                leaves = [(tree.ptr, request, history), (small.ptr, small_request, small_history)]*4
+                batch = hexcrop.encode_leaves(native, leaves, allow_span=True)
+                expected = hexcrop.encode([])
+                for rejected, sample in zip(batch[::2], batch[1::2]):
+                    self.assertIsNone(rejected)
+                    for field in ('planes', 'actions', 'cells'):
+                        np.testing.assert_array_equal(getattr(sample, field), getattr(expected, field))
+            finally:
+                small.close()
         finally:
             tree.close()
 

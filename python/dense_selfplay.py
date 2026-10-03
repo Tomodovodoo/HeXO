@@ -142,13 +142,7 @@ class Evaluator(hexnet.DenseEvaluator):
 
     @torch.inference_mode()
     def submit_leaves(self, leaves):
-        samples = []
-        for tree, request, history in leaves:
-            try:
-                samples.append(hexcrop.encode_leaf(native, tree, request, history))
-            except hexcrop.SpanError:
-                samples.append(None)
-        return self.submit(samples)
+        return self.submit(hexcrop.encode_leaves(native, leaves, allow_span=True))
 
     @torch.inference_mode()
     def submit(self, histories, legal=None):
