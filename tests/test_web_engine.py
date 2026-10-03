@@ -83,9 +83,8 @@ def page(job):
 @unittest.skipUnless(NODE, 'needs node')
 class PlayPage(unittest.TestCase):
     """The opening-book default follows the seats as the page shows them until the person touches the switch."""
-    def follow(self, steps, enabled=True, available=True, stored=None, together=False, resumes=True):
-        return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored, together=together,
-                         resumes=resumes))
+    def follow(self, steps, enabled=True, available=True, stored=None, together=False):
+        return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored, together=together))
 
     def books(self, answer):
         return [body['enabled'] for path, body in answer['requests'] if path == '/book']
@@ -94,10 +93,6 @@ class PlayPage(unittest.TestCase):
         answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False)
         self.assertEqual(answer['requests'], [['/pause', dict(paused=True)], ['/seat', dict(side=0, engine='native')],
                                               ['/book', dict(enabled=True)]])
-        self.assertTrue(answer['enabled'])
-        self.assertFalse(answer['paused'])
-        answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False, resumes=False)
-        self.assertEqual(answer['requests'][-1], ['/new', {}])
         self.assertTrue(answer['enabled'])
         self.assertFalse(answer['paused'])
 
@@ -143,7 +138,7 @@ class PlayPage(unittest.TestCase):
     def test_the_static_page_session_starts_the_opening_for_new_seats(self):
         answer = page(dict(kind='static', steps=[['/seat', dict(side=1, engine='human')], ['/pause', dict(paused=False)],
                                                  ['/seat', dict(side=0, engine='browser:test')]]))
-        self.assertEqual(answer['requests'], ['/seat', '/book', '/pause', '/pause', '/seat', '/book', '/new'])
+        self.assertEqual(answer['requests'], ['/seat', '/book', '/pause', '/pause', '/seat', '/book'])
         self.assertTrue(answer['enabled'])
         self.assertFalse(answer['paused'])
         self.assertGreater(answer['stones'], 0)
