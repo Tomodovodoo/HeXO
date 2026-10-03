@@ -10,7 +10,7 @@ const copy = value => structuredClone(value), position = history => history.map(
 const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human'});
 /** The longest delay setTimeout keeps; a longer clock is checked again when it fires. */
 const MAX_TIMER = 2 ** 31 - 1;
-const REVIEW_PRESET = 'standard', FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
+const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
 /** Labels every complete turn of `history` as python/play.py review does; `lookup(prefix, ply)` is the evaluation of a
@@ -121,7 +121,7 @@ export class BrowserSession extends OfflineSession {
       paused: this.paused, seats: copy(this.seats), analysis: copy(this.analysis), engines: [...this.entries.values()], match: this.match,
       clock: this.clockNow(), clock_spec: this.control(), outcome: this.outcome, saved_game: this.saved_game, models_folder: null, notice: this.notice, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
-      evaluations, review: turns, review_preset: REVIEW_PRESET,
+      evaluations, review: turns, review_preset: this.analysis?.preset ?? null,
       jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live}) => ({id, kind, status, done, total, error, ply: history.length, side, live}))};
   }
   static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings', '/clock'].some(p => path === p || path.startsWith(p + '/')); }
@@ -130,7 +130,8 @@ export class BrowserSession extends OfflineSession {
     catch (error) { return [400, {error: error.message}]; }
   }
   changed() { this.revision++; this.runClock(); this.deepen(); this.onchange(this.state()); this.persist(); }
-  reviewSpec() { return this.analysis && this.entries.has(this.analysis.engine) ? this.spec({...this.analysis, preset: REVIEW_PRESET}) : null; }
+  /** The review's engine, checkpoint and strength: the analysis slot's, so every verdict compares one budget. */
+  reviewSpec() { return this.analysis && this.entries.has(this.analysis.engine) ? this.spec({...this.analysis, custom: this.analysis.budget}) : null; }
   deepening() {
     return this.analysis?.auto && !this.paused && this.native.game(this.history).winner < 0 && !this.match?.active && this.seats.some(s => this.adapters.has(s.engine));
   }

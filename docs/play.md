@@ -284,9 +284,9 @@ stone is saved as the evaluation of the position after its first stone, so every
 rings the stop of the evaluation shown. Engine moves by the same checkpoint count as
 evaluations, so a game against Bubble costs nothing extra on Bubble's turns.
 
-Review always evaluates at Standard (128 simulations per stone, 32,768 solver nodes), whatever the slider says,
-and labels each turn only from evaluations at exactly that budget, so a verdict never compares a deep evaluation
-with a shallow one; the Review button carries the Standard mark. It evaluates the missing positions in pooled
+Review evaluates with the analysis engine, network and strength the analysis slot is set to (its preset or custom
+budget), and labels each turn only from evaluations at exactly that budget, so a verdict never compares a deep
+evaluation with a shallow one; the Review button carries that preset's mark and counts the positions done. It evaluates the missing positions in pooled
 steps: fresh trees, one per position, search together so their leaves share network batches (64 on CPU, 256 on
 CUDA), and the solver queries run on four tactical workers at once, each distinct position solved once. Between
 steps it gives way to more urgent analysis, and it slows down while an engine seat searches. It labels each turn
@@ -305,7 +305,7 @@ from the mover's win probability before and after it:
 | · lost | the opponent already had a proven win |
 | ◆ | six in a row |
 
-For inaccuracies and worse the board outlines the engine's turn and the panel lists its line. Keys: ← and →
+For inaccuracies and worse the board outlines the engine's turn, beside the candidates of the position reached, and the panel lists its line. Keys: ← and →
 step one stone, ↑ and ↓ one turn, Home and End, F fits the board. Retry plays on from the shown position.
 Changing the analysis engine, checkpoint or strength evaluates the shown position again at once.
 

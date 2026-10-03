@@ -578,15 +578,15 @@ class Jobs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual([len(call[2]) for call in self.engines.calls], [0])
 
-    def test_review_uses_the_review_budget_whatever_the_slider_says(self):
+    def test_review_uses_the_analysis_strength(self):
         self.session.configure_seat(1, 'human')
         self.session.load([(0, 0), (1, 0), (2, 0)], True)
-        self.session.configure_analysis('bubble:fake', preset='deep', auto=False)
+        self.session.configure_analysis('bubble:fake', preset='quick', auto=False)
         self.session.review_game()
         wait(lambda: not self.session.state()['jobs'])
-        self.assertEqual({tuple(b.items()) for _, b, _ in self.engines.calls}, {tuple(STANDARD.items())})
+        self.assertEqual({tuple(b.items()) for _, b, _ in self.engines.calls}, {tuple(PRESETS['bubble']['quick'].items())})
         state = self.session.state()
-        self.assertEqual((state['review_preset'], [t['label'] is not None for t in state['review']]), ('standard', [True, True]))
+        self.assertEqual((state['review_preset'], [t['label'] is not None for t in state['review']]), ('quick', [True, True]))
 
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
@@ -1349,6 +1349,10 @@ class Matches(unittest.TestCase):
                 wait(lambda: not self.session.match_worker.is_alive())
                 result = json.loads((output / 'game-0001.json').read_text())
                 self.assertEqual((result['winner'], result['reason'], result['history']), (0, 'time', [[0, 0]]))
+                self.assertEqual((result['turns'][-1]['side'], result['turns'][-1]['circle_ms'], result['turns'][-1]['cross_ms']), (1, 0, 20))
+                ident = next(m['id'] for m in self.session.match_catalogue() if m['name'] == name)
+                opened = self.session.open_saved_game(ident, 1).state()['clock']
+                self.assertEqual((opened['cross_ms'], opened['circle_ms']), (20, 0))
                 self.assertEqual(self.session.match['wins'], [1, 0])
                 self.assertIsNone(self.session.match['error'])
 

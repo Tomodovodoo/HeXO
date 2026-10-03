@@ -52,7 +52,6 @@ PRESETS = dict(
     strix=dict(lightning=dict(simulations=2), quick=dict(simulations=8), standard=dict(simulations=64),
                strong=dict(simulations=128), deep=dict(simulations=512), dangerous=dict(simulations=4096)))
 PRESET_NAMES = list(PRESETS['bubble'])
-REVIEW_PRESET = 'standard'
 REVIEW_BATCH = dict(cpu=64, cuda=256)   # network leaves per pooled review batch
 REVIEW_SOLVERS = 4                      # tactical workers a review queries at once
 REVIEW_CHUNK = 24                       # positions per pooled review step; urgent analysis waits at most one step
@@ -1459,9 +1458,12 @@ class Session:
                    default=None)
 
     def review_seat(self):
-        """The analysis model at REVIEW_PRESET: reviews always use it, so every verdict compares evaluations made
-        with one budget."""
-        return self.seat(self.analysis['engine'], self.analysis['checkpoint'], REVIEW_PRESET) if self.analysis else None
+        """The analysis engine, checkpoint and strength (its preset, or its custom budget): a review uses it for every
+        position, so each verdict compares evaluations made with one budget."""
+        if not self.analysis:
+            return None
+        a = self.analysis
+        return self.seat(a['engine'], a['checkpoint'], a['preset'], a['budget'] if a['preset'] == 'custom' else None)
 
     def review_target(self):
         """(store key, budget) of the review evaluations, the key None without an analysis model."""
@@ -1503,7 +1505,7 @@ class Session:
                                   opening=self.opening),
                         evaluations=evaluations,
                         review=review(history, lambda h: self.review_lookup(h, target), board['winner']),
-                        review_preset=REVIEW_PRESET,
+                        review_preset=self.analysis['preset'] if self.analysis else None,
                         jobs=self.job_list())
 
     def job_list(self):
@@ -2276,6 +2278,12 @@ class Session:
                                      cross_ms=round(balances['cross_ms']), circle_ms=round(balances['circle_ms'])))
         return not expired
 
+    def balances(self, flagged=None):
+        """Both clock balances in whole ms for a turn record, the side that ran out of time (`flagged`) at zero."""
+        clock = self.game_clock.json()
+        return dict(cross_ms=0 if flagged == 0 else round(clock['cross_ms']),
+                    circle_ms=0 if flagged == 1 else round(clock['circle_ms']))
+
     def check_time(self):
         """A freeplay side whose clock ran out while it was to move loses on time (lock held)."""
         clock = self.game_clock
@@ -2438,7 +2446,8 @@ class Session:
                             match['outcome'] = dict(winner=1-side, reason='time')
                             self.pause_clock()
                             match['turns'].append(dict(ply=len(self.history), side=side, stop_reason='deadline',
-                                                      clock_spent_ms=match['partial_spent_ms'], completed=None, nodes=None))
+                                                      clock_spent_ms=match['partial_spent_ms'], completed=None, nodes=None,
+                                                      **self.balances(side)))
                             self.stop_moves()
                     if match['outcome']:
                         winner = match['outcome']['winner']
@@ -2644,6 +2653,8 @@ class Session:
                             self.match['partial_spent_ms'] = 0
                             if self.game_clock and not expired and self.match['clock']['mode'] == 'move':
                                 self.game_clock.balances = [int(self.match['clock']['ms']*1e6)]*2
+                            if self.game_clock:
+                                self.match['turns'][-1].update(self.balances(job.side if expired else None))
                         freeplay = self.game_clock is not None and not self.match and self.game_clock.running == job.side
                         if expired and freeplay:
                             self.clock_turn(job.side, job.received)
