@@ -888,6 +888,13 @@ class SharedGraph(unittest.TestCase):
         after = graph.result(0, 0, 0, 0)
         self.assertGreater(int(after['visits'][i]), visits)
         self.assertLess(abs(float(after['values'][i])-value), 2/(visits+1))
+        # An exact edge keeps its visits as well when a node is created for it again.
+        j = int(np.argsort(kept['visits'])[-2])
+        stone, visits = tuple(kept['actions'][j]), int(after['visits'][j])
+        graph.mark(stone, Game(a).player, 3)
+        graph.at([*a, stone])
+        graph.at(a)
+        self.assertEqual(int(graph.result(0, 0, 0, 0)['visits'][j]), visits)
 
     def test_the_pv_check_searches_again_only_after_a_drop(self):
         a = recorded_position(11)

@@ -143,7 +143,7 @@ struct Tree {
  // the playouts counted at the positions a root's history passes through (begin), so a child attached later brings
  // none. An exact child settles the edge; the parent's value becomes stale.
  void attach(Node& parent,Edge& e,const std::shared_ptr<Node>& child) {
-  if(e.visits>child->n && !child->n && e.exact_winner<0){
+  if(e.visits>child->n && !child->n){
    child->carried=child->n=e.visits;child->carried_sum=child->player==parent.player?e.sum:-e.sum;child->q=child->carried_sum/child->carried;
   }
   e.visits=child->n;
@@ -195,7 +195,7 @@ struct Tree {
    for(Node* x:leaves){
     if(expanded<=target)break;
     for(auto& w:x->parents)if(auto p=w.lock())for(auto& e:p->edges)if(e.child.get()==x){
-     e.visits=x->n;if(e.exact_winner<0 && x->n)e.sum=(x->player==p->player?x->q:-x->q)*x->n;
+     e.visits=x->n;e.sum=(e.exact_winner>=0?(e.exact_winner==p->player?1:-1):x->player==p->player?x->q:-x->q)*x->n;
      e.child.reset();
     }
     expanded-=x->expanded;++evicted;store.erase(x->context);
