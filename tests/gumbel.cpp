@@ -3,6 +3,25 @@
 #include <iostream>
 #include <functional>
 int main(){
+ // Interior probabilities match the direct stable softmax with mixed known/unknown edges, proof pruning,
+ // graph-shared values, pending visits and logits whose cached exponent underflows or becomes subnormal.
+ for(bool graph:{false,true})for(double scale:{5.,700.,1000.})for(double low:{-2.,-710.,-744.,-1000.}){
+  gumbel::Tree t(0);t.graph=graph;gumbel::Node n;n.value=.3;
+  for(int i=0;i<6;++i){gumbel::Edge e;e.logit=i==0?0:low+i*.01;e.prior=1./6;e.pending=i%2;
+   if(i==0){e.visits=1;e.sum=-1;}if(i==2){e.visits=2;e.sum=1;}if(i==3){e.exact_winner=0;e.eligible=false;}
+   if(i==4 && graph){e.child=std::make_shared<gumbel::Node>();e.child->n=1;e.child->q=.5;}
+   n.edges.push_back(std::move(e));}
+  auto q=t.transformed(n);for(auto& x:q)x*=scale;auto expected=q;double maximum=-1e300;
+  for(int i=0;i<6;++i){expected[i]=n.edges[i].eligible?expected[i]+n.edges[i].logit:-std::numeric_limits<double>::infinity();maximum=std::max(maximum,expected[i]);}
+  for(auto& x:expected)x=std::exp(x-maximum);
+  assert(t.interior(n,q)==6);
+  for(int i=0;i<6;++i){assert(std::isfinite(q[i]));assert(std::abs(q[i]-expected[i])<=1e-12*std::max(1.,expected[i]));}
+  // The cached weights remain valid as the completed Q changes on another visit.
+  n.edges[1].pending=2;q=t.transformed(n);expected=q;maximum=-1e300;
+  for(int i=0;i<6;++i){expected[i]=n.edges[i].eligible?expected[i]+n.edges[i].logit:-std::numeric_limits<double>::infinity();maximum=std::max(maximum,expected[i]);}
+  for(auto& x:expected)x=std::exp(x-maximum);assert(t.interior(n,q)==7);
+  for(int i=0;i<6;++i)assert(std::abs(q[i]-expected[i])<=1e-12*std::max(1.,expected[i]));
+ }
  // Exhaust all player-transition patterns up to four edges and terminal values.
  for(int depth=1;depth<=4;++depth)for(int mask=0;mask<(1<<(depth+1));++mask)for(double value:{-1.,-.25,0.,.75,1.}){
   gumbel::Tree tree(0);std::vector<gumbel::Node> nodes(depth+1);gumbel::Path path;
