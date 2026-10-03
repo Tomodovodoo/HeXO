@@ -220,11 +220,11 @@ async function paint(row) {
 /** Downloads browser engine `id`'s missing files into the Cache API; a failure shows its reason. */
 async function fetchEngine(id) {
   if (downloads.has(id)) return;
-  if ((await check(id)).state === 'failed') checks.delete(id);
-  const repaint = () => document.querySelectorAll(`#menu [data-engine="${id}"]`).forEach(paint);
   downloads.set(id, {fraction: 0});
-  repaint();
+  const repaint = () => document.querySelectorAll(`#menu [data-engine="${id}"]`).forEach(paint);
   try {
+    if ((await check(id)).state === 'failed') checks.delete(id);
+    repaint();
     const found = await check(id);
     if (found.state === 'failed') throw new Error(found.error);
     if (found.state === 'missing') await download(found.files, fraction => { downloads.get(id).fraction = fraction; repaint(); });

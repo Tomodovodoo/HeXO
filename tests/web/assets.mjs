@@ -70,6 +70,11 @@ await assets.cached({path: 'f.onnx', sha256: hash('second')});
 out.reuse.keys = [...store.keys()];
 
 reset();
+site.set('ort/x.mjs', 'export default 7;');
+const url = await assets.moduleUrl({path: 'ort/x.mjs', sha256: hash('export default 7;'), local: true});
+out.module = {text: await (await import('node:buffer')).resolveObjectURL(url).text(), requests: [...requests]};
+
+reset();
 site.set('m.json', '{"version": 3}');
 out.json = await assets.json('m.json');
 

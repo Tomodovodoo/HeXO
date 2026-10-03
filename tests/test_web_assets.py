@@ -50,6 +50,10 @@ class Resolver(unittest.TestCase):
         self.assertEqual(case['requests'], [])
         self.assertEqual(len(case['keys']), 1)
 
+    def test_module_missing_beside_a_local_manifest_comes_from_the_site(self):
+        self.assertEqual(self.out['module']['text'], 'export default 7;')
+        self.assertEqual(self.out['module']['requests'][-1], f'GET {SITE}ort/x.mjs')
+
     def test_manifest_falls_back_to_the_site(self):
         self.assertEqual(self.out['json'], {'data': {'version': 3}, 'local': False})
 

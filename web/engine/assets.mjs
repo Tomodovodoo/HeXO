@@ -104,10 +104,9 @@ export function wasmOptions(bytes) {
   return {wasmBinary: bytes, locateFile: () => url};
 }
 
-/** A URL to import JavaScript engine file `file` from: this origin's when `file.local`, else an object URL of its
- * checked bytes (cached()), which module workers and ONNX Runtime's thread workers can load under isolation. */
+/** A URL to import JavaScript engine file `file` from: an object URL of its bytes from cached() (this origin's copy,
+ * else the site's, checked), which module workers and ONNX Runtime's thread workers can load under isolation. */
 export async function moduleUrl(file, progress) {
-  if (file.local) return new URL(file.path, BASE).href;
   return URL.createObjectURL(new Blob([await cached(file, progress)], {type: 'text/javascript'}));
 }
 
