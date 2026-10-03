@@ -525,6 +525,7 @@ class Bundle(unittest.TestCase):
         answers = node(dict(kind='play', history=history, requests=requests))
         self.assertTrue(all(a['status'] == 200 for a in answers[:-1]))
         self.assertEqual(answers[3]['data']['review'][-1]['label'], 'win')
+        self.assertEqual(answers[-1]['asked'][:len(history)], list(range(len(history) - 1, -1, -1)))
         self.assertEqual(answers[6]['data']['match']['wins'], [1, 1])
         self.assertEqual(answers[6]['data']['match']['completed'], 2)
         games = answers[-1]['backup']['games']
