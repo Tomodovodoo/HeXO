@@ -394,7 +394,7 @@ class Jobs(unittest.TestCase):
         self.assertEqual(self.session.review_game(), job.id)
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual((job.done, job.total), (4, 4))
-        self.assertEqual(len(self.engines.calls), calls + 3)
+        self.assertEqual([len(c[2]) for c in self.engines.calls[calls:]], [3, 2, 0])
         turns = self.session.state()['review']
         self.assertEqual([t['label'] for t in turns], ['best', 'good'])
         self.assertTrue(all(g['label'] for t in turns for g in t['grades']))
@@ -431,7 +431,7 @@ class Jobs(unittest.TestCase):
         self.session.analyse(3)
         self.engines.release.set()
         wait(lambda: not self.session.state()['jobs'])
-        self.assertEqual([len(call[2]) for call in self.engines.calls], [0, 3, 1, 2, 4, 5])
+        self.assertEqual([len(call[2]) for call in self.engines.calls], [5, 3, 4, 2, 1, 0])
 
     def test_changing_the_analysis_engine_cancels_its_old_work(self):
         self.session.configure_seat(1, 'human')

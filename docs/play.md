@@ -311,9 +311,11 @@ before searching, as the server does.
 Review evaluates with the analysis engine, network and strength the analysis slot is set to (its preset or custom
 budget), and labels each turn only from evaluations at exactly that budget, so a verdict never compares a deep
 evaluation with a shallow one. It evaluates every position of the game, the ones after a turn's first stone too, so
-a review costs about twice the turns. The Review button carries that preset's mark and counts the positions done. It evaluates the missing positions in pooled
-steps: fresh trees, one per position, search together so their leaves share network batches (64 on CPU, 256 on
-CUDA), and the solver queries run on four tactical workers at once, each distinct position solved once. Between
+a review costs about twice the turns. The Review button carries that preset's mark and counts the positions done. It evaluates the missing positions from the
+last one backwards, so what a later position proves is already known when an earlier one is searched, in pooled
+steps: the solver queries run on four tactical workers at once, each distinct position solved once and its proof
+added to the game's proof table, then fresh trees, one per position, search together with that table so their
+leaves share network batches (64 on CPU, 256 on CUDA). Between
 steps it gives way to more urgent analysis, and it slows down while an engine seat searches. It labels each turn
 from the mover's win probability before and after it, and each stone the same way on its own. A first stone is
 judged against the engine's stones from the turn start, a second stone against the engine's second stone given

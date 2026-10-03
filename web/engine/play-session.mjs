@@ -310,7 +310,8 @@ export class BrowserSession extends OfflineSession {
       if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', this.history.slice(0, ply), this.analysis, {force: !!body.force});
     } else if (path === '/review') {
       if (!this.analysis || !this.adapters.has(this.analysis.engine)) throw Error('Choose an analysis engine');
-      const history = copy(this.history), plies = Array.from({length: history.length + (this.native.game(history).winner < 0)}, (_, i) => i);
+      // From the last position backwards: what a later position proves is known when an earlier one is searched.
+      const history = copy(this.history), plies = Array.from({length: history.length + (this.native.game(history).winner < 0)}, (_, i) => i).reverse();
       this.enqueue('review', history, this.reviewSpec(), {plies, cursor: 0, total: plies.length});
     } else if (path === '/cancel') {
       if (this.jobs.some(j => j.id === body.id && j.kind === 'move')) { this.paused = true; this.freezeClock(); }
