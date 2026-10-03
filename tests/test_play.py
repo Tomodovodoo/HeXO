@@ -282,7 +282,7 @@ class Jobs(unittest.TestCase):
                 session.configure_seat(1, 'native:Native', preset='quick')
                 session.configure_seat(0, 'six:slow')
                 self.assertEqual(json.loads(json.dumps(session.state()))['engines'][-1], dict(
-                    id='six:slow', name='slow', kind='six', presets=presets_of('six', None), clocks=True))
+                    id='six:slow', name='slow', kind='six', presets=presets_of('six', None), clocks=True, device='Server CPU'))
                 wait(lambda: len(session.history) == 1)
                 session.pause(True)
                 session.load([(0, 0), (1, 0), (2, 0)], False)
@@ -1428,6 +1428,14 @@ class FreeplayClock(unittest.TestCase):
         time.sleep(.2)
         after = self.session.state()
         self.assertEqual((after['clock']['running'], after['clock']['circle_ms'], after['outcome']), (None, before['circle_ms'], None))
+
+    def test_engines_report_where_the_server_runs_them(self):
+        from play import device_of
+        self.assertEqual([device_of(dict(kind='bubble'), 'cuda'), device_of(dict(kind='bubble'), 'cpu'),
+                          device_of(dict(kind='six', backend='TensorRT'), 'cpu'), device_of(dict(kind='six', backend='CPU'), 'cuda'),
+                          device_of(dict(kind='six', badge='shrimp'), 'cuda'), device_of(dict(kind='native'), 'cuda')],
+                         ['GPU', 'CPU', 'GPU', 'CPU', 'CPU', 'CPU'])
+        self.assertEqual({e['device'] for e in self.session.state()['engines']}, {'Server CPU'})
 
     def test_engines_that_cannot_keep_a_clock_are_refused(self):
         self.session.entries['six:shrimp'] = dict(id='six:shrimp', name='Shrimp', kind='six', badge='shrimp',

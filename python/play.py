@@ -1109,6 +1109,16 @@ def clock_spec(clock):
     raise ValueError('Clock mode must be fixed, move or game')
 
 
+def device_of(entry, device):
+    """'GPU' or 'CPU': where the server runs `entry`'s network, a Bubble on the player's `device` and Six on the backend
+    its catalogue entry names; engines without a network (Native, Seal) and other bots' drivers run on the CPU."""
+    if entry['kind'] == 'bubble':
+        return 'GPU' if str(device).startswith('cuda') else 'CPU'
+    if entry['kind'] == 'six' and entry.get('badge', 'six') == 'six':
+        return 'CPU' if entry.get('backend', 'CPU') == 'CPU' else 'GPU'
+    return 'CPU'
+
+
 def keeps_clock(entry):
     """Whether an engine plays to a clock through `timed_engine`: Bubble, Native, Seal and Six itself. Strix's adapter
     and the Six-protocol drivers of other bots (Shrimp) play a fixed budget."""
@@ -1478,7 +1488,9 @@ class Session:
                 if (found := self.lookup(history[:ply], keys)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes')}
-            entries = [{k: e[k] for k in SHOWN if k in e} | dict(clocks=keeps_clock(e)) for e in self.entries.values()]
+            device = getattr(self.engines, 'device', 'cpu')
+            entries = [{k: e[k] for k in SHOWN if k in e} | dict(clocks=keeps_clock(e), device='Server ' + device_of(e, device))
+                       for e in self.entries.values()]
             return dict(instance=self.instance, revision=self.revision, history=[list(p) for p in history], **board,
                         paused=self.paused, seats=self.seats, analysis=self.analysis, engines=entries,
                         match={k: v for k, v in self.match.items() if k not in ('results', 'openings', 'opening_selection')}

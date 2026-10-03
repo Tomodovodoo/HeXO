@@ -46,7 +46,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .kind{--k:var(--muted);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--k);flex:none;
   border:1px solid color-mix(in srgb,var(--k) 35%,transparent);border-radius:5px;padding:1px 6px;background:color-mix(in srgb,var(--k) 10%,transparent)}
 .kind[data-k=human]{--k:#e2e8f0}.kind[data-k=bubble]{--k:#2dd4bf}.kind[data-k=six]{--k:#a78bfa}.kind[data-k=strix]{--k:#fb7185}
-.kind.device{--k:var(--dim);text-transform:none;letter-spacing:.02em;font-weight:600;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.device{flex:none;font:11px var(--mono);color:var(--dim);white-space:nowrap}
 .kind[data-k=native]{--k:#94a3b8}.kind[data-k=seal]{--k:#a3e635}.kind[data-k=shrimp]{--k:#fb923c}
 .pick{flex:1;min-width:0;overflow:hidden;display:flex;align-items:center;gap:8px;text-align:left;padding:5px 8px;cursor:pointer;
   border:1px solid transparent;border-radius:8px;background:transparent;transition:background .15s,border-color .15s}
@@ -684,10 +684,10 @@ $('tabs').onclick=e=>{const b=e.target.closest('button');if(!b)return;$('app').d
 /* engine picker: an entry shows its badge (which bot it is; `kind` is how the server runs it), and its label when that
    differs from the badge */
 let menuFor=null,pinned=false;
-/* an engine's badge, its label when it says more than the badge, and the device a browser engine runs on, which
-   stands for the label's "(browser)" once known */
-function badge(kind,label,device){const said=(device?label?.replace(/ \(browser\)$/,''):label)?.toLowerCase();
-  return[el('span',{class:'kind','data-k':kind},kind),said&&said!==kind?el('span',{class:'name'},label):null,device?el('span',{class:'kind device'},device):null]}
+/* an engine's badge, its label when it says more than the badge, and where it runs: GPU or CPU in the browser, Server GPU
+   or Server CPU for play.py's engines; a browser engine's tag stands for its "(browser)" */
+function badge(kind,label,device){const said=(device&&!device.startsWith('Server')?label?.replace(/ \(browser\)$/,''):label)?.toLowerCase();
+  return[el('span',{class:'kind','data-k':kind},kind),said&&said!==kind?el('span',{class:'name'},label):null,device?el('span',{class:'device'},device):null]}
 function entryOf(id){return S.engines.find(x=>x.id===id)}
 function shown(seat){if(seat.engine==='human')return['human',null];const e=entryOf(seat.engine);return e?[e.badge||e.kind,e.label||e.name,e.device]:['?',seat.engine]}
 function isHuman(seat){return seat.engine==='human'}

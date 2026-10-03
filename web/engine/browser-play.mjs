@@ -2,12 +2,11 @@ import {BrowserSession} from './play-session.mjs';
 import {PlayStorage} from './storage.mjs';
 import {notePace} from './device.mjs';
 
-/** The tag the page shows for the device an engine's load resolved to: ONNX Runtime engines report {provider,
- * precision, threads}; the others run their WebAssembly on one CPU thread. */
+/** The tag the page shows for the device an engine's load resolved to: GPU when its network runs on WebGPU, CPU
+ * otherwise (ONNX Runtime on WebAssembly, or an engine with no network). The detail goes to the console. */
 export function deviceLabel(device) {
-  if (device?.provider === 'webgpu') return `WebGPU ${device.precision || 'fp32'}`;
-  if (device?.provider === 'wasm') return `WASM ${device.threads} thread${device.threads === 1 ? '' : 's'}`;
-  return 'CPU';
+  console.info('Browser engine device:', device);
+  return device?.provider === 'webgpu' ? 'GPU' : 'CPU';
 }
 
 export async function mountPlay(engines, legacy) {

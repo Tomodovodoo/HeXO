@@ -142,7 +142,7 @@ export class BrowserSession extends OfflineSession {
     if (!active || this.jobs.some(j => j.tier && j.status !== 'failed') || this.lookup(this.history)?.proof) return;
     const entry = this.entries.get(this.analysis.engine);
     if (!entry || !this.adapters.has(entry.id)) return;
-    const tiers = Object.keys(entry.presets), last = entry.device?.startsWith('WebGPU') ? tiers.length : tiers.indexOf('strong') + 1;
+    const tiers = Object.keys(entry.presets), last = entry.device === 'GPU' ? tiers.length : tiers.indexOf('strong') + 1;
     for (const tier of tiers.slice(0, last || tiers.length)) {
       const spec = this.spec({...this.analysis, preset: tier});
       if (!this.lookup(this.history, spec, true) && !this.jobs.some(j => j.tier === tier && j.key === `analyse|${this.cacheKey(this.history, spec)}` && j.status === 'failed')) {
