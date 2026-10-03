@@ -172,7 +172,7 @@ async function download(response, {path, start, bytes, keep}, progress) {
  * `lines`) and stored there, replacing other versions of the path and the parts of unfinished downloads. A file from
  * the site needs a `sha256`, and bytes that do not match it throw. A download stores its bytes in parts of PART bytes
  * as they arrive, so a load after an interrupted one asks for the rest only (an HTTP range; a server that answers
- * with the whole file starts over). `progress(fraction, received, total)` follows the download's bytes (`total` 0
+ * with the whole file starts over, keeping the held parts until that body completes). `progress(fraction, received, total)` follows the download's bytes (`total` 0
  * when unknown), from before the request is sent; a file from the Cache API reports progress(1) alone.
  */
 export async function cached(file, progress = () => {}) {
@@ -192,16 +192,16 @@ export async function cached(file, progress = () => {}) {
   let parts = await heldParts(store, id), offset = parts.reduce((sum, part) => sum + part.byteLength, 0);
   progress(0, offset, file.bytes || 0);   // the download stage covers a request that never answers too
   let found = offset ? await locate(file.path, {cache: 'no-cache', headers: {Range: `bytes=${offset}-`}}).catch(() => null) : null;
+  const replacing = parts.length > 0 && found?.response.status !== 206;   // the held parts stay until this body completes
   if (found?.response.status !== 206) {   // a new download, also when the server ignores the range
     found ??= await locate(file.path, {cache: 'no-cache'});   // a Cache API miss means new bytes: revalidate
-    if (parts.length) await forget().catch(() => {});   // only once the whole file is on its way
     parts = [];
     offset = 0;
   }
   const {response, local} = found;
   if (!local && !file.sha256) throw new Error(`${file.path}: the site's manifest has no SHA-256 for it`);
   let stored = parts.length;
-  const keep = blob => store?.put(partKey(id, stored), new Response(blob)).then(() => { stored++; }, () => {});
+  const keep = replacing ? () => {} : blob => store?.put(partKey(id, stored), new Response(blob)).then(() => { stored++; }, () => {});
   const body = !response.body ? await new Blob([...parts, await response.arrayBuffer()]).arrayBuffer()
     : await download(response, {path: file.path, start: offset, bytes: file.bytes, keep}, progress).then(chunks => new Blob([...parts, ...chunks]).arrayBuffer(),
       async error => {   // a browser whose body stream fails still delivers the whole body at once

@@ -229,9 +229,15 @@ globalThis.fetch = async (input, init) => { if (String(input).endsWith('big.onnx
 const offlineTry = await attempt(() => assets.cached(big));
 const kept = [...store.keys()].filter(k => k.includes('&part=')).length;
 globalThis.fetch = resumable;
+let whole200 = true;   // a server that ignores the range and then drops the whole body keeps the held part
+globalThis.fetch = async (input, init = {}) => resumable(input, whole200 && init.headers ? {...init, headers: {}} : init);
+const ignored = await attempt(() => assets.cached(big));
+const stillKept = [...store.keys()].filter(k => k.includes('&part=')).length;
+whole200 = false;
+globalThis.fetch = resumable;
 cut = false;
 const body = await assets.cached(big, (fraction, received, total) => seen.push([received, total]));
-out.resume = {first: first.error ?? 'loaded', parts: parts.length, offline: [Boolean(offlineTry.error), kept], ranges: ranged.filter(Boolean), same: Buffer.from(body).equals(whole),
+out.resume = {first: first.error ?? 'loaded', parts: parts.length, offline: [Boolean(offlineTry.error), kept], ignored: [Boolean(ignored.error), stillKept], ranges: ranged.filter(Boolean), same: Buffer.from(body).equals(whole),
   start: seen.slice(0, 2), keys: [...store.keys()].length};
 
 // A download that receives nothing for LIMITS.idle ms stops with an error instead of waiting.
