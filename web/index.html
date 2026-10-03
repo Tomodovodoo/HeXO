@@ -141,7 +141,10 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .more{display:grid;grid-template-rows:0fr;transition:grid-template-rows .25s var(--ease) .1s}
 .more>div{overflow:hidden;display:grid;gap:6px;padding:0 4px}
 .more>div>:first-child{margin-top:6px}.more>div>:last-child{margin-bottom:6px}
-#seats:hover .more,#seats.open .more,#seats:focus-within .more{grid-template-rows:1fr}
+#seats.open .more,#seats:focus-within .more{grid-template-rows:1fr}
+@media (hover:hover){#seats:hover .more{grid-template-rows:1fr}}
+@media (hover:none){#seats .more{grid-template-rows:1fr}}
+.card-head .sides{display:none}
 #seats .divider{height:1px;background:var(--line);margin:2px 6px}
 #match{display:grid;gap:6px;padding:4px 6px;font-size:12px;color:var(--muted)}
 #match[hidden]{display:none}
@@ -309,8 +312,9 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 .saved-game .downloads .btn{padding:5px 8px;font-size:11px}
 .chip{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 6px;border-radius:5px;background:rgba(148,163,184,.1);color:var(--muted)}
 .medal{width:10px;height:10px;border-radius:50%;background:var(--best);flex:none;box-shadow:0 0 0 3px color-mix(in srgb,var(--best) 20%,transparent)}
-/* medium and narrow */
-@media (max-width:759px){
+/* medium and narrow, and phones held sideways: tabs switch between analysis and moves, and the seats card folds to its
+   head, which names both sides, until the head is tapped */
+@media (max-width:759px),(max-height:499px) and (orientation:landscape){
   #app{grid-template-columns:minmax(0,1fr);grid-template-rows:min(56dvh,100vw) auto minmax(0,1fr);grid-template-areas:"board" "tabs" "panel"}
   #tabs{grid-area:tabs;display:grid;grid-auto-flow:column;grid-auto-columns:1fr;background:var(--panel);border-top:1px solid var(--line)}
   #tabs button{border:0;background:transparent;padding:10px;color:var(--muted);border-bottom:2px solid transparent;cursor:pointer}
@@ -319,12 +323,41 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
   #analysis,#review{grid-area:panel;background:var(--panel);padding:10px;overflow:hidden}
   #app:not([data-tab=review]) #review,#app[data-tab=review] #analysis{display:none}
   #moves{margin:0 -10px}
-  #seats{width:min(250px,calc(100% - 28px));left:8px;top:8px}
+  #seats{width:min(250px,calc(100% - 28px));left:8px;top:8px;padding:4px}
   #actions{right:8px;bottom:8px}#transport{bottom:8px;left:8px;transform:none}
   #transport .ib{width:26px}#ply{min-width:48px}
   #pips{left:auto;right:12px;transform:none}
-  #seats:hover .more,#seats:focus-within .more{grid-template-rows:0fr}#seats.open .more{grid-template-rows:1fr}
-  #seats{padding:4px}.card-head{display:flex}.seat-head .pick{padding:3px 6px}
+  #seats .more{grid-template-rows:1fr}
+  #seats:not(.open){width:auto;max-width:calc(100% - 64px)}
+  #seats:not(.open)>:not(.card-head,#match),#seats:not(.open) .card-head .title,#seats:not(.open) .games-button .label{display:none}
+  #seats:not(.open) .card-head{padding-bottom:2px}
+  #seats:not(.open) .card-head .sides{display:flex;align-items:center;gap:10px;min-width:0;overflow:hidden;font-weight:600}
+  .card-head .side{display:flex;align-items:center;gap:5px;min-width:0}
+  .card-head .side .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.card-head .side .kind~.name{display:none}
+  .card-head .games-button{flex:none}
+  .seat-head .pick{padding:3px 6px}
+}
+/* phones: a smaller analysis panel, so its head, strength, evaluation and first candidates fit beside the board */
+@media (max-width:599px),(max-height:499px) and (orientation:landscape){
+  :root{--gap:8px}
+  #tabs button{padding:7px}
+  #analysis,#review{padding:8px}
+  #moves{margin:0 -8px}
+  .engine{gap:6px}
+  .engine select{padding:4px 28px 4px 8px;font-size:13px}
+  .head .pick{padding:3px 6px}
+  .ends{font-size:10px}
+  .track{height:24px}
+  .evalbar{height:24px;border-radius:7px}.evalbar b{font-size:12px;padding:0 10px}
+  .proof{margin-top:-4px}
+  .top div{grid-template-columns:16px 70px 1fr 36px 30px;gap:6px;padding:2px 6px;font-size:11px}
+  .turn{padding:4px 8px;font-size:11px}
+}
+/* phones held sideways: the board takes the height on the left, the tabs the rest of the width */
+@media (max-height:499px) and (orientation:landscape){
+  #app{grid-template-columns:min(100dvh,58vw) minmax(0,1fr);grid-template-rows:auto minmax(0,1fr);grid-template-areas:"board tabs" "board panel"}
+  #tabs{border-top:0;border-left:1px solid var(--line)}
+  #analysis,#review{border-left:1px solid var(--line)}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 @media (max-width:420px){#t-tabs{order:3;width:100%;margin-left:0}.saved-game .downloads{grid-column:2 / 4;justify-self:end}.saved-game.freeplay .downloads{grid-column:1 / 3}}
@@ -668,14 +701,27 @@ function place(q,r){
     const done=await post('/play',{q,r});placing=placing.filter(p=>key(...p)!==k);
     if(!done){for(const p of[[q,r],...placing]){placed.delete(key(...p));landed.delete(key(...p))}placing=[]}draw()});
 }
-canvas.onpointerdown=e=>{drag={x:e.clientX,y:e.clientY,cx:cam.x,cy:cam.y,moved:false};canvas.setPointerCapture(e.pointerId)};
+/* one pointer drags the board, or places a stone when it lifts without moving; two pinch it, zooming about their
+   midpoint as the wheel does about the cursor */
+const pointers=new Map();let pinch=null;
+const fromCentre=(x,y)=>{const b=canvas.getBoundingClientRect();return[x-b.left-canvas.clientWidth/2,y-b.top-canvas.clientHeight/2]};
+function zoomAt([mx,my],size,from=cam){size=Math.max(8,Math.min(64,size));const k=size/from.size;cam.x=mx-(mx-from.x)*k;cam.y=my-(my-from.y)*k;cam.size=size}
+function pinchOf(){const[[ax,ay],[bx,by]]=[...pointers.values()];return{d:Math.hypot(ax-bx,ay-by)||1,mid:fromCentre((ax+bx)/2,(ay+by)/2)}}
+canvas.onpointerdown=e=>{canvas.setPointerCapture(e.pointerId);pointers.set(e.pointerId,[e.clientX,e.clientY]);
+  if(pointers.size===1)drag={id:e.pointerId,x:e.clientX,y:e.clientY,cx:cam.x,cy:cam.y,moved:false};
+  else if(pointers.size===2){drag=null;pinch={...pinchOf(),cam:{...cam}}}};
 canvas.onpointermove=e=>{const b=canvas.getBoundingClientRect();hover=axial(e.clientX-b.left,e.clientY-b.top);markTokens(key(...hover));
-  if(drag){const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(Math.abs(dx)+Math.abs(dy)>5)drag.moved=true;if(drag.moved){cam.x=drag.cx+dx;cam.y=drag.cy+dy}}draw()};
+  if(pointers.has(e.pointerId))pointers.set(e.pointerId,[e.clientX,e.clientY]);
+  if(pinch&&pointers.size>=2){const{d,mid}=pinchOf(),[mx,my]=pinch.mid;zoomAt([mx,my],pinch.cam.size*d/pinch.d,pinch.cam);cam.x+=mid[0]-mx;cam.y+=mid[1]-my}
+  else if(drag?.id===e.pointerId){const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(Math.abs(dx)+Math.abs(dy)>5)drag.moved=true;if(drag.moved){cam.x=drag.cx+dx;cam.y=drag.cy+dy}}draw()};
 canvas.onpointerleave=()=>{hover=null;markTokens(null);draw()};
-canvas.onpointerup=e=>{if(!drag)return;const moved=drag.moved;drag=null;if(moved)return;const b=canvas.getBoundingClientRect();
+/* a finger left after a pinch drags on without placing */
+function lift(e){pointers.delete(e.pointerId);if(!pinch)return false;
+  if(pointers.size<2){pinch=null;const[left]=pointers;drag=left&&{id:left[0],x:left[1][0],y:left[1][1],cx:cam.x,cy:cam.y,moved:true}}return true}
+canvas.onpointercancel=e=>{lift(e);drag=null};
+canvas.onpointerup=e=>{if(lift(e)||drag?.id!==e.pointerId)return;const moved=drag.moved;drag=null;if(moved)return;const b=canvas.getBoundingClientRect();
   const[q,r]=axial(e.clientX-b.left,e.clientY-b.top);if(canPlace())place(q,r)};
-canvas.onwheel=e=>{e.preventDefault();const b=canvas.getBoundingClientRect(),mx=e.clientX-b.left-canvas.clientWidth/2,my=e.clientY-b.top-canvas.clientHeight/2;
-  const f=e.deltaY>0?.9:1.1,size=Math.max(8,Math.min(64,cam.size*f)),k=size/cam.size;cam.x=mx-(mx-cam.x)*k;cam.y=my-(my-cam.y)*k;cam.size=size;draw()};
+canvas.onwheel=e=>{e.preventDefault();zoomAt(fromCentre(e.clientX,e.clientY),cam.size*(e.deltaY>0?.9:1.1));draw()};
 function go(p){if(!S)return;view=Math.max(0,Math.min(S.history.length,p));renderPanels();draw()}
 $('first').onclick=()=>go(0);$('prev').onclick=()=>go(view-1);$('next').onclick=()=>go(view+1);$('last').onclick=()=>go(1e9);
 $('retry').onclick=()=>post('/retry',{ply:view});
@@ -826,18 +872,22 @@ function renderSeat(side){
   box.replaceChildren(el('div',{class:'seat-head'},el('i',{class:'hexdot',id:'dot'+side}),pick,el('span',{class:'clock',id:'clock'+side}),el('span',{id:'cancel'+side})),
     el('div',{class:'bar',id:'busy'+side,style:'visibility:hidden'},el('i')),
     ...(controls.length?[el('div',{class:'more'},el('div',{},controls))]:[]));
-  box.firstChild.onclick=e=>{if(!e.target.closest('button')){pinned=!pinned;$('seats').classList.toggle('open',pinned)}};
+  box.firstChild.onclick=e=>{if(!e.target.closest('button'))pin(!pinned)};
   box.classList.toggle('active',S.winner<0&&S.player===side);
   for(const control of box.querySelectorAll('button,input,select'))control.disabled=!!S.match?.active;
 }
+/* the seats card stays open when `on`; folded, a narrow screen shows only its head */
+function pin(on){pinned=on;$('seats').classList.toggle('open',on)}
 function renderCard(){
   const head=$('card-head');
   const logo=el('span',{html:'<svg class="logo" viewBox="0 0 20 22"><path d="M10 1 19 6v10l-9 5-9-5V6z" fill="none" stroke="var(--o)" stroke-width="2"/><circle cx="10" cy="11" r="3.2" fill="var(--x)"/></svg>'});
   const title=S.saved_game?`Game ${S.saved_game.game}`:'Bubble';
   const extra=STUDY?el('a',{class:'ib ghost',href:globalThis.browserPlay?'./':'/','aria-label':'Live board',html:icon('home')}):
-    el('button',{class:'btn games-button','aria-label':'Games',onclick:e=>{e.stopPropagation();showTournaments()}},el('span',{html:icon('trophy')}),'Games');
-  head.replaceChildren(logo,el('span',{},title),el('span',{class:'spacer'}),extra);
-  head.onclick=e=>{if(!e.target.closest('a,button')){pinned=!pinned;$('seats').classList.toggle('open',pinned)}};
+    el('button',{class:'btn games-button','aria-label':'Games',onclick:e=>{e.stopPropagation();showTournaments()}},el('span',{html:icon('trophy')}),el('span',{class:'label'},'Games'));
+  const sides=[0,1].map(side=>el('span',{class:'side',style:`--c:${COLORS[side]}`},el('i',{class:'hexdot'}),
+    ...(S.saved_game?[el('span',{class:'name'},S.saved_game.players[side])]:badge(...shown(S.seats[side])))));
+  head.replaceChildren(logo,el('span',{class:'title'},title),el('span',{class:'sides'},sides),el('span',{class:'spacer'}),extra);
+  head.onclick=e=>{if(!e.target.closest('a,button'))pin(!pinned)};
 }
 function sendAnalysis(change){
   const a=S.analysis;

@@ -7,7 +7,8 @@
  *
  * ENGINES lists them. Each is {entry, engine, record, build, listed?}: `listed` settles once `entry.checkpoints` is
  * read (the saved choices are then checked against it and the page redraws), `build` is the command that builds its files into this
- * checkout (shown when the public site does not serve them), `entry` is its picker entry ({id, kind, name, label,
+ * checkout (named when a saved choice needs files the public site does not serve; no engine list shows such an engine),
+ * `entry` is its picker entry ({id, kind, name, label,
  * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
  * while it downloads), `engine.files()` lists the files it downloads (assets.mjs records, for the picker's download
  * button) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
@@ -81,6 +82,7 @@ function adopt(data) {
     config.seats = config.seats.map((choice, side) => data.seats[side].engine === 'human' ? choice : null);
     save();
   }
+  offer(data);
   if (data.analysis === null) {
     if (!config.analysis) {
       config.analysis = {engine: native.entry.id, preset: 'quick'};
@@ -245,13 +247,31 @@ const chosen = id => {
 const remember = (id, promise) => { checks.set(id, Object.assign(promise, {stamp: chosen(id).join(',')})); return promise; };
 const check = id => checks.get(id)?.stamp === chosen(id).join(',') ? checks.get(id)
   : remember(id, ENGINES.get(id).engine.files(chosen(id)).then(files => { if (ENGINES.get(id).listed) recheck(ENGINES.get(id).entry); return status(files); }).catch(failure));
+/** Ids of the browser engines whose files are on neither this origin nor the site: only a local build provides them. */
+const absent = new Set();
+/** `data` (a play state) without the absent browser engines in its `engines`, which every engine list on the page reads. */
+export function offer(data) {
+  if (data.engines) data.engines = data.engines.filter(entry => !absent.has(entry.id));
+  return data;
+}
+/** Checks every browser engine's files and takes those on neither origin off the engine lists, redrawing the page when
+ * it took one off; resolves once all are checked. */
+export async function survey() {
+  const states = await Promise.all([...ENGINES.keys()].map(async id => [id, (await check(id)).state]));
+  const gone = states.filter(([id, found]) => found === 'unpublished' && !absent.has(id));
+  for (const [id] of gone) absent.add(id);
+  if (gone.length && state()) {
+    offer(state());
+    page.renderPanels();
+  }
+}
 const unpublished = id => original.toast(`${ENGINES.get(id).entry.label} is not on the public site; build it here with ${ENGINES.get(id).build}`);
 /* States in which a browser engine plays without a download first: its files are here, cached, or cannot be cached. */
 const READY = new Set(['local', 'cached', 'uncached']);
 const megabytes = bytes => `${(bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0)} MB`;
 
 /** Draws picker row `row` of a browser engine: as it is when its files are here or cached, else as a download with
- * its size, and while downloading with its progress. */
+ * its size, and while downloading with its progress. A row whose files are on neither origin leaves the menu. */
 async function paint(row) {
   const id = row.dataset.engine, found = await check(id), running = downloads.get(id);
   if (!row.isConnected) return;
@@ -260,12 +280,12 @@ async function paint(row) {
   row.classList.remove('setup', 'running', 'failed');
   row.removeAttribute('aria-label');
   if (ready) return;
-  row.classList.add('setup', ...(running ? ['running'] : found.state === 'failed' ? ['failed'] : []));
   if (found.state === 'unpublished') {
-    row.setAttribute('aria-label', `${ENGINES.get(id).entry.label} needs a local build`);
-    row.append(original.el('span', {class: 'size', style: 'white-space:nowrap'}, 'local build'));
+    row.remove();
+    survey();
     return;
   }
+  row.classList.add('setup', ...(running ? ['running'] : found.state === 'failed' ? ['failed'] : []));
   const total = found.bytes ? megabytes(found.bytes) : '';
   const size = !running ? total : total ? `${megabytes(running.fraction * found.bytes)} / ${total}` : `${Math.round(running.fraction * 100)}%`;
   row.setAttribute('aria-label', `Download ${ENGINES.get(id).entry.label}`);
@@ -471,7 +491,7 @@ async function serverless() {
     if (response.ok && (response.headers.get('Content-Type') || '').includes('json')) return false;
   } catch {}
   if (await isolate()) return true;
-  Object.assign(page, original, {openMenu});
+  Object.assign(page, original, {openMenu, accept: data => original.accept(offer(data))});
   const [manifest, build] = await Promise.all([json(networkManifest()).then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);
   bubble.entry.version = [build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
   bubble.entry.models = NETWORKS.length ? Object.fromEntries(NETWORKS.map(n => [n.name, n.model_version])) : {'': manifest.model_version};
@@ -484,6 +504,7 @@ async function serverless() {
 
 if (HOOKS.every(name => typeof original[name] === 'function')) {
   install();
+  survey();
   for (const {entry, listed} of ENGINES.values()) listed?.then(() => recheck(entry));
   serverless().then(active=>{if(!active||page.browserPlay)page.resolvePlayReady?.()}).catch(error=>{original.toast(error.message)});
 } else console.warn('The browser engines need the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));
