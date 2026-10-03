@@ -285,7 +285,8 @@ if (job.kind === 'encode') {
   s.bookData = new OpeningBook(data);
   const entry = {id: 'browser:test', name: 'Test', kind: 'bubble', version: 'v1', checkpoints: [],
     presets: {standard: {simulations: 1, solver_nodes: 0}, quick: {simulations: 1, solver_nodes: 0}}};
-  s.registerEngine(entry, {turn: async history => ({moves: job.history.slice(history.length, history.length + native.game(history).remaining), value: .5, top: [], proof: null, line: []})});
+  const asked = [];
+  s.registerEngine(entry, {turn: async history => { asked.push(history.length); return {moves: job.history.slice(history.length, history.length + native.game(history).remaining), value: .5, top: [], proof: null, line: []}; }});
   s.analysis = s.spec({engine: entry.id, preset: 'standard'});
   answer = [];
   for (const [path, body] of job.requests) {
@@ -293,7 +294,7 @@ if (job.kind === 'encode') {
     while (s.running || s.jobs.some(j => j.status === 'queued')) await new Promise(r => setTimeout(r, 1));
     answer.push({status, data: path === '/state' ? s.state() : data});
   }
-  answer.push({backup: await s.storage.backup(), catalogue: await s.catalogue()});
+  answer.push({backup: await s.storage.backup(), catalogue: await s.catalogue(), asked});
 } else if (job.kind === 'book') {
   const book = new OpeningBook(JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url))));
   answer = ['narrow', 'wide', 'all'].map(mode => {

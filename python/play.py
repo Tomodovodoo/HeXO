@@ -982,11 +982,10 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
 def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, batch_size=64,
                   q_range_floor=0., known=None, leaf_nodes=0, leaf_ms=10):
     """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
-    position per prover in `provers` at a time, each distinct position solved once; then fresh trees, one per
-    position, search together, checking opt-in `leaf_nodes` proofs before sharing network batches of up to
-    `batch_size`, stone by stone. Each
-    result is what `evaluate` would give at that budget, with the proof table `known`. `watch` may raise
-    Cancelled."""
+    position per prover in `provers` at a time, each distinct position solved once, their proofs added to the
+    proof table `known`; then fresh trees, one per position, search together with that table, checking opt-in
+    `leaf_nodes` proofs before sharing network batches of up to `batch_size`, stone by stone. Each result is what
+    `evaluate` would give at that budget with the table. `watch` may raise Cancelled."""
     from concurrent.futures import ThreadPoolExecutor
     from neural_search import SearchCoordinator
     given = [answered(h, known) for h in histories]
@@ -1008,6 +1007,8 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
             unique = {k: h for k, h, a in zip(keys, histories, given) if a is None}
             for k, found in zip(unique, pool.map(ask, unique.values())):
                 solved[k] = found
+                if known is not None:
+                    known.add(unique[k], found)
     network = Watched(bubble.evaluator, watch)
     turns = []
     try:
@@ -3190,7 +3191,8 @@ class Session:
             return self.evaluation(job, seat, history, job.force)
         identity, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
         plies = review_plies(history)
-        missing = [p for p in dict.fromkeys(plies) if not self.store.get(history[:p], identity, budget)]
+        # From the last position backwards: what a later position proves is known when an earlier one is searched.
+        missing = [p for p in sorted(set(plies), reverse=True) if not self.store.get(history[:p], identity, budget)]
         job.done = len(plies) - len(missing)
         for start in range(0, len(missing), REVIEW_CHUNK):
             if job.cancelled:
