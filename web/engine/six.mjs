@@ -38,10 +38,10 @@ export class SixEngine extends EngineWorker {
 }
 
 const engine = new SixEngine();
-await engine.manifest().catch(() => {});
+engine.manifest().catch(() => {});
 
 /** Six (browser) for seat.mjs's ENGINES; its checkpoints fill in once the manifest is read (python tools/build_web.py
- * six builds it; the site's serves when this origin has none). */
+ * six builds it; the site's serves when this origin has none), which page startup does not wait for. */
 export const six = {
   entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, analysis: true},
   engine,

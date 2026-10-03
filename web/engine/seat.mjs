@@ -265,6 +265,7 @@ function openMenu(anchor, items, current, choose) {
     row.dataset.engine = item.id;
     row.onclick = async event => {
       const {state} = await check(item.id);
+      if (!row.isConnected) return;   // the menu closed or changed while the status was read
       if (!downloads.has(item.id) && READY.has(state)) pick(event);
       else fetchEngine(item.id);
     };

@@ -105,9 +105,10 @@ async function networks() {
   return data.networks.map(network => ({...network, path: `strix/${network.file}`, local}));
 }
 
-const engine = new StrixEngine(await networks().catch(() => []));
+const engine = new StrixEngine([]);
+engine.known().catch(() => {});   // page startup does not wait for the list
 
-/** The browser engine for seat.mjs. */
+/** The browser engine for seat.mjs; its checkpoints fill in once strix/networks.json is read. */
 export const strix = {
   entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, analysis: true},
   engine,
