@@ -1,3 +1,4 @@
+import io
 import json
 import os
 from pathlib import Path
@@ -6,7 +7,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from tactical_proof import IsolatedTactics
+from tactical_proof import IsolatedTactics, _serve
 
 ENGINE = 'tests.test_isolated_tactics:ScriptedTactics'
 
@@ -18,6 +19,10 @@ class ScriptedTactics:
         if Path(package).name == 'slow-start':
             time.sleep(60)
         self.hoard = [bytearray(512*2**20)] if Path(package).name == 'greedy-start' else []
+        self.cancelled = threading.Event()
+
+    def cancel(self):
+        self.cancelled.set()
 
     def history(self, history, *, ms, **budgets):
         mode = tuple(history[0]) if history else (0, 0)
@@ -25,6 +30,8 @@ class ScriptedTactics:
             time.sleep(60)  # ignores its deadline
         if mode == (3, 3):
             self.hoard.append(bytearray(512*2**20))
+        if mode == (6, 6):
+            self.cancelled.wait(60)
         certificate = dict(version=1, nodes=[dict(kind='immediate_win', action=[[5, 0]])]) if mode == (5, 5) else None
         return dict(status='UNKNOWN', native_verified=False, moves=[], certificate=certificate, reason='scripted',
                     pid=os.getpid(), ms=ms, background_worker_busy=mode == (2, 2),
@@ -75,6 +82,71 @@ class Isolation(unittest.TestCase):
         pid = self.tactics.history([[2, 2]], ms=10000)['pid']
         self.assertEqual(self.tactics.stats['kills'], 1)
         self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
+
+    def test_cooperative_cancel_reuses_child_and_ignores_idle_cancellation(self):
+        pid = self.tactics.history([[0, 0]], ms=10000)['pid']
+        self.assertFalse(self.tactics.cancel())
+
+        results = []
+        query = threading.Thread(target=lambda: results.append(self.tactics.history([[6, 6]], ms=20000)))
+        query.start()
+        time.sleep(.1)
+        start = time.perf_counter()
+        self.assertTrue(self.tactics.cancel())
+        query.join(2)
+        self.assertFalse(query.is_alive())
+        self.assertLess(time.perf_counter()-start, 1)
+        self.assertEqual(results[0]['reason'], 'cancelled')
+        self.assertEqual(results[0]['status'], 'UNKNOWN')
+        self.assertEqual(self.tactics.stats['kills'], 0)
+        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
+        self.assertFalse(self.tactics.cancel())
+
+    def test_cancel_during_result_transfer_suppresses_that_generation(self):
+        pid = self.tactics.history([[0, 0]], ms=10000)['pid']
+        entered, release = threading.Event(), threading.Event()
+        read = self.tactics._line
+
+        def delayed_result(deadline):
+            result = read(deadline)
+            entered.set()
+            release.wait(2)
+            return result
+
+        results = []
+        with patch.object(self.tactics, '_line', delayed_result):
+            query = threading.Thread(target=lambda: results.append(self.tactics.history([[5, 5]], ms=10000)))
+            query.start()
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(self.tactics.cancel())
+            release.set()
+            query.join(2)
+        self.assertFalse(query.is_alive())
+        self.assertEqual((results[0]['status'], results[0]['reason']), ('UNKNOWN', 'cancelled'))
+        self.assertIsNone(results[0]['certificate'])
+        self.assertNotIn('certificate_json', results[0])
+        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
+
+    def test_cancel_before_dispatch_keeps_result_schema(self):
+        request = dict(query_id=1, history=[[0, 0]], attacker='opponent', ms=1000)
+        source = io.StringIO('\n'+json.dumps(request)+'\n'+json.dumps(dict(cancel=1))+'\n')
+        output = io.StringIO()
+        import queue
+        make_queue = queue.Queue
+        # Consume both control messages before the server dispatches the query.
+        with patch('tactical_proof.sys.stdin', source), patch('tactical_proof.sys.stdout', output), \
+                patch.dict('sys.modules', resource=unittest.mock.Mock()), \
+                patch('tactical_proof.queue.Queue', side_effect=lambda _: make_queue()), \
+                patch('tactical_proof.threading.Thread') as reader:
+            reader.side_effect = lambda **kw: type('Reader', (), {'start': staticmethod(kw['target'])})()
+            _serve(ENGINE, '.', 256)
+        ready, result = map(json.loads, output.getvalue().splitlines())
+        self.assertTrue(ready['ready'])
+        self.assertEqual((result['status'], result['reason'], result['attacker']),
+                         ('UNKNOWN', 'cancelled', 'opponent'))
+        self.assertIsNone(result['budget'])
+        self.assertIsNone(result['gate_score'])
+        self.assertIsNone(result['certificate'])
 
     def test_memory_cap_ends_child(self):
         self.tactics.history([[0, 0]], ms=10000)
