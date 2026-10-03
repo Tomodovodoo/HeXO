@@ -265,7 +265,7 @@ class Bundle(unittest.TestCase):
         self.assertTrue(all(v == -1. for v in found['values']))
         self.assertLessEqual(found['nodes_used'], 524288)
         self.assertGreater(found['queries'], 0)
-        turn = node(dict(kind='worker-turn', history=history, simulations=2048, nodes=524288))
+        turn = node(dict(kind='worker-turn', history=history, simulations=2048, nodes=0, leafNodes=524288))
         self.assertEqual((turn['proof']['winner'], turn['value']), (0, 0.))
         self.assertLess(turn['actual_completed'], 2048)
         self.assertTrue(all(row[3:] == [0., -1] for row in turn['top']))

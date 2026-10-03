@@ -135,7 +135,8 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'worker-turn') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
   const messages = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
-  const context = {Native, NeuralSearch, EvaluationCache, createModule, principalVariation, topRows,
+  const context = {Native, NeuralSearch, EvaluationCache, GameTrees, createModule, principalVariation, topRows,
+    Proofs, answered, settled, proofTurns,
     URL, performance, setTimeout, clearTimeout, onmessage: null, postMessage: message => messages.push(message),
     probe: async () => ({provider: 'wasm', precisions: ['fp32']}),
     Network: {create: async () => ({version: 'uniform', precision: 'fp32', threads: 1,
@@ -152,7 +153,7 @@ if (job.kind === 'encode') {
   runInNewContext(source, context);
   await context.onmessage({data: {type: 'load', options: {prefer: 'wasm'}}});
   await context.onmessage({data: {type: 'turn', id: 1, history: job.history,
-    simulations: job.simulations, solverNodes: job.nodes}});
+    simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0}});
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);
   answer = messages.find(m => m.type === 'result').result;

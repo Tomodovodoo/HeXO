@@ -17,13 +17,6 @@ checkpoints and strength. New, Undo and Pause sit at the bottom right, the move 
 right panel holds the analysis engine, the evaluation bar, the candidate stones (policy share, then the mover's win
 chance after that stone), Import, Copy HTTTX, Review and the move list.
 
-With the solver enabled, search leaves also receive verified forced-win certificates. The two stones share
-an extra allowance of `solver_nodes` of solver work and 10 to 60 seconds of solver time, with at most 2048 nodes
-and 10 ms per leaf query, including verification. When that allowance runs out, search continues with neural
-values. Opponent threats from the initial query are suggestions until the actual defensive replies are checked;
-they do not establish a loss. Proven losing moves all have value zero in the page, with proof distance choosing
-resistance. The raw W/L value cannot distinguish faster losses.
-
 ## Watch a bot match
 
 The match command is a thin HTTP client. It uses an existing player on the port, or starts an idle one,

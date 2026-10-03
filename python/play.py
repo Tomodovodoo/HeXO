@@ -930,7 +930,7 @@ class TurnSearch:
 
 
 def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None, live=None, trees=None,
-             solved=None, q_range_floor=0., known=None):
+             solved=None, q_range_floor=0., known=None, leaf_nodes=0):
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
@@ -940,9 +940,9 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     proof the turn's own stones; [] when unproven) and
     `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a solver
     initial root query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
-    Search leaves also get verified solver proofs, with a shared extra `solver_nodes` allowance per turn and
-    at most 2048 nodes/10 ms per query; both stones share that allowance. `simulations` 0 plays the raw policy;
-    `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
+    Opt-in `leaf_nodes` adds a shared leaf-proof allowance per turn, with at most 2048 nodes/10 ms per query;
+    both stones share that allowance. Zero keeps leaf probing disabled. `simulations` 0 plays the raw policy;
+    `solver_nodes` 0 skips root queries, and no `prover` skips all solver work. `watch(n)` is called
     before each network batch of n positions and may raise Cancelled; `live(glimpse)` receives the search of the
     first stone as it goes, a few times a second. `trees` is `TurnSearch`'s tree source; `solved`, when given, is
     the solver's view (see `solve`) and no initial root query is made. `q_range_floor` is the fresh trees' neural_search floor.
@@ -964,7 +964,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         raise ValueError('The game has finished')
     if (found := answered(history, known)) is not None:
         return found
-    proofs = SearchProofs(prover, solver_nodes, watch) if prover is not None and solver_nodes and simulations else None
+    proofs = SearchProofs(prover, leaf_nodes, watch) if prover is not None and leaf_nodes and simulations else None
     turn = TurnSearch(bubble, Watched(bubble.evaluator, observe), history, simulations,
                       solved or solve(prover, history, solver_nodes, watch), trees, q_range_floor, known, proofs)
     try:
@@ -979,10 +979,11 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
 
 
 def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, batch_size=64,
-                  q_range_floor=0., known=None):
+                  q_range_floor=0., known=None, leaf_nodes=0):
     """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
     position per prover in `provers` at a time, each distinct position solved once; then fresh trees, one per
-    position, search together, checking leaf proofs within each turn allowance before sharing network batches of up to `batch_size`, stone by stone. Each
+    position, search together, checking opt-in `leaf_nodes` proofs before sharing network batches of up to
+    `batch_size`, stone by stone. Each
     result is what `evaluate` would give at that budget, with the proof table `known`. `watch` may raise
     Cancelled."""
     from concurrent.futures import ThreadPoolExecutor
@@ -1011,7 +1012,7 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
     try:
         for i, (k, history, a) in enumerate(zip(keys, histories, given)):
             if a is None:
-                proofs = SearchProofs(provers[i % len(provers)], solver_nodes, watch) if provers and solver_nodes and simulations else None
+                proofs = SearchProofs(provers[i % len(provers)], leaf_nodes, watch) if provers and leaf_nodes and simulations else None
                 turns.append(TurnSearch(bubble, network, history, simulations, solved.get(k) or solve(None, history, 0),
                                         q_range_floor=q_range_floor, known=known, proofs=proofs))
         coordinator = SearchCoordinator(network, bubble.sha256, bubble.cache)

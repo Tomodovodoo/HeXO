@@ -1781,7 +1781,7 @@ class TurnTrees(unittest.TestCase):
         history = [(0, 0), (4, 0), (7, 0), (-2, 0), (-1, 0), (1, 0), (6, 0), (5, 0), (-1, -1),
                    (-3, 1), (-1, 1), (-2, -1), (-4, 0), (-3, 0), (0, -1), (-2, -3), (-2, -2),
                    (-2, 1), (-2, -5), (-3, -1), (-1, -3), (-5, 1), (0, -4), (-4, 1), (-4, -1), (-5, -1)]
-        found = evaluate(self.bubble(), prover, history, 2048, 524288, solved=solve(None, history, 0))
+        found = evaluate(self.bubble(), prover, history, 2048, 0, solved=solve(None, history, 0), leaf_nodes=524288)
         self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
         self.assertGreater(found['proof']['plies'], 0)
         self.assertLess(found['actual_completed'], 2048)
@@ -1799,8 +1799,12 @@ class TurnTrees(unittest.TestCase):
             asked.append(budget)
             return dict(status='UNKNOWN', native_verified=False, nodes_used=budget['nodes'])
 
+        default = evaluate(self.bubble(), SimpleNamespace(history=history), [(0, 0)], 16, 3,
+                           solved=solve(None, [(0, 0)], 0))
+        self.assertFalse(asked)
+        self.assertEqual((default['actual_completed'], default['actual_solver_nodes']), (32, 0))
         found = evaluate(self.bubble(), SimpleNamespace(history=history), [(0, 0)], 16, 3,
-                         solved=solve(None, [(0, 0)], 0))
+                         solved=solve(None, [(0, 0)], 0), leaf_nodes=3)
         self.assertEqual([b['nodes'] for b in asked], [3])
         self.assertEqual(found['actual_solver_nodes'], 3)
         self.assertEqual(found['actual_completed'], 32)
@@ -1817,7 +1821,7 @@ class TurnTrees(unittest.TestCase):
             self.skipTest('needs the built tactical library')
         solved = solve(None, ONE_TURN, 0)
         solved['threat'] = [[0, 2], [5, 2]]
-        found = evaluate(self.bubble(), prover, ONE_TURN, 64, 2048, solved=solved)
+        found = evaluate(self.bubble(), prover, ONE_TURN, 64, 0, solved=solved, leaf_nodes=2048)
         self.assertTrue(found['proof'] is None or found['proof']['winner'] == 0)
         after = prover.history([list(p) for p in ONE_TURN] + found['moves'], nodes=2048, ms=1000)
         self.assertFalse(after['status'] == 'PROVEN_WIN' and after['proof_turns'] == 1)
@@ -1837,8 +1841,10 @@ class TurnTrees(unittest.TestCase):
                 if isinstance(prover, tactical_proof.IsolatedTactics):
                     prover.history([(0, 0)], nodes=1, ms=1000)
                 bubble = self.bubble()
-                with unittest.mock.patch.object(bubble.evaluator, 'evaluate', side_effect=AssertionError('proof needs no net')):
-                    found = evaluate(bubble, prover, history, 8, 1, solved=solve(None, history, 0))
+                with unittest.mock.patch.object(bubble.evaluator, 'evaluate', side_effect=AssertionError('proof needs no net')), \
+                        unittest.mock.patch.object(prover, 'history', wraps=prover.history) as calls:
+                    found = evaluate(bubble, prover, history, 8, 0, solved=solve(None, history, 0), leaf_nodes=1)
+                self.assertEqual(calls.call_count, 1)
                 self.assertEqual((found['proof']['winner'], found['value']), (0, 1.))
                 self.assertEqual(found['moves'], [[-4, -2], [-1, -5]])
                 self.assertEqual(found['actual_solver_nodes'], 1)
@@ -1856,7 +1862,7 @@ class TurnTrees(unittest.TestCase):
 
         prover = SimpleNamespace(history=lambda *a, **kw: asked.append(kw))
         with self.assertRaises(Cancelled):
-            evaluate(self.bubble(), prover, [(0, 0)], 16, 3, watch=watch, solved=solve(None, [(0, 0)], 0))
+            evaluate(self.bubble(), prover, [(0, 0)], 16, 3, watch=watch, solved=solve(None, [(0, 0)], 0), leaf_nodes=3)
         self.assertFalse(asked)
         self.assertTrue(self.trees)
         self.assertIsNone(self.trees[-1].ptr)
