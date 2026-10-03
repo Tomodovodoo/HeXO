@@ -529,7 +529,9 @@ export class BrowserSession extends OfflineSession {
       // The move came back at `at`; saving it must not run its clock out.
       if (job.kind === 'move') clearTimeout(this.flag);
       if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
-      if (job.kind === 'analyse' && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') {
+      const {graph_searched: searched, ...answer} = result;
+      result = answer;
+      if (job.kind === 'analyse' && job.line != null && searched) {
         // The worker rebuilds a line's graph when its network or Q range floor changes (GameGraphs); each graph gets a
         // new generation, unique across reloads.
         const key = [job.line, this.engineKey(job.spec), job.spec.budget.q_range_floor ?? 0].join('|'), graph = this.graph;

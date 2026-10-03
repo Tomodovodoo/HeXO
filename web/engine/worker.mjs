@@ -217,7 +217,8 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       if (after?.winner === proof.winner) pv.push(...after.pv.map(([q, r, side, ply]) => [q, r, side, ply + moves.length]));
     }
     return {moves, value: Math.round(value * 1e4) / 1e4, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
-      actual_completed: completed, actual_solver_nodes: solverUsed, ...(failure ? {solver_error: failure} : {})};
+      actual_completed: completed, actual_solver_nodes: solverUsed, graph_searched: line != null && tree !== null,
+      ...(failure ? {solver_error: failure} : {})};
   } finally {
     if (line == null) tree?.close();
   }

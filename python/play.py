@@ -3059,6 +3059,8 @@ class Session:
                 self.analysis_graph = graph
                 self.graph_searches[graph] = self.graph_searches.get(graph, 0) + 1
                 found['graph'] = [self.instance, graph, self.graph_searches[graph]]
+                for step in found.get('later', []):
+                    step['graph'] = found['graph']
         entry = self.entries[seat['engine']]
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
         job.incomplete = spent['solver_nodes'] < budget['solver_nodes']
