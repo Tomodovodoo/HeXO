@@ -1402,6 +1402,28 @@ class FreeplayClock(unittest.TestCase):
         self.assertEqual((state['winner'], state['outcome'], state['clock']['running']), (-1, None, 'x'))
         self.assertGreater(state['clock']['cross_ms'], 300)
 
+    def test_a_paused_turn_keeps_its_time_and_a_failed_engine_stops_the_clock(self):
+        self.session.set_clock(dict(mode='game', tc='60'))
+        time.sleep(.2)
+        self.session.pause(True)
+        self.session.pause(False)
+        time.sleep(.1)
+        self.session.play(0, 0)
+        self.assertGreaterEqual(self.session.clock_turns[0]['spent_ms'], 290)
+        class Broken:
+            def turn(self, *args, **kwargs):
+                raise RuntimeError('engine broke')
+
+            def close(self):
+                pass
+        self.session.prepare_timed = lambda: setattr(self.session, 'seat_engines', [None, Broken()])
+        self.session.configure_seat(1, 'native:Native')
+        wait(lambda: self.session.paused)
+        before = self.session.state()['clock']
+        time.sleep(.2)
+        after = self.session.state()
+        self.assertEqual((after['clock']['running'], after['clock']['circle_ms'], after['outcome']), (None, before['circle_ms'], None))
+
     def test_engines_that_cannot_keep_a_clock_are_refused(self):
         self.session.entries['six:shrimp'] = dict(id='six:shrimp', name='Shrimp', kind='six', badge='shrimp',
                                                   presets=PRESETS['six'], command=['shrimp'])

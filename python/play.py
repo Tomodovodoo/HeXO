@@ -1388,7 +1388,7 @@ class Session:
         self.match, self.match_worker = None, None
         self.game_clock, self.timed_engines = None, []
         self.clock_spec, self.seat_engines, self.clock_preparing = dict(mode='fixed'), [None, None], None
-        self.outcome, self.clock_turns, self.notice = None, [], None
+        self.outcome, self.clock_turns, self.notice, self.clock_partial_ms = None, [], None, 0
         self.match_file = None
         self.retries = {}
         self.jobs, self.queues, self.order = OrderedDict(), dict(move=[], analysis=[]), itertools.count()
@@ -2174,7 +2174,7 @@ class Session:
         held; a match or a saved game keeps its own clock."""
         if self.match or self.saved_game:
             return
-        self.game_clock, self.outcome, self.clock_turns = self.new_game_clock(), None, []
+        self.game_clock, self.outcome, self.clock_turns, self.clock_partial_ms = self.new_game_clock(), None, [], 0
 
     def set_clock(self, clock):
         """Put the freeplay game on `clock` (see `clock_spec`) from full balances at the current position. Engine seats
@@ -2238,10 +2238,11 @@ class Session:
     def clock_turn(self, side, at=None):
         """Charge `side`'s completed turn to the freeplay clock (lock held): finished after its time ran out it loses on
         time, otherwise it gets its increment, or a full allowance again on a per-turn clock. Logs the balances in
-        `clock_turns`; True when the turn stands."""
+        `clock_turns`, the turn's time including what it spent before a pause; True when the turn stands."""
         clock = self.game_clock
         expired = clock.expired(at)
-        spent = clock.stop(completed=not expired, at=at) / 1e6
+        spent = clock.stop(completed=not expired, at=at) / 1e6 + self.clock_partial_ms
+        self.clock_partial_ms = 0
         if expired:
             self.outcome = dict(winner=1 - side, reason='time')
         elif self.clock_spec['mode'] == 'move':
@@ -2254,7 +2255,7 @@ class Session:
     def check_time(self):
         """A freeplay side whose clock ran out while it was to move loses on time (lock held)."""
         clock = self.game_clock
-        if clock is None or self.match or self.outcome or clock.running is None or not clock.expired():
+        if clock is None or self.match or self.outcome or self.paused or clock.running is None or not clock.expired():
             return
         side = clock.running
         if any(j.kind == 'move' and j.status == 'running' and getattr(j, 'received', None) is not None
@@ -2273,6 +2274,8 @@ class Session:
             elapsed = self.game_clock.stop()/1e6
             if self.match:
                 self.match['partial_spent_ms'] = self.match.get('partial_spent_ms', 0) + elapsed
+            else:
+                self.clock_partial_ms += elapsed
 
     def resume_match(self, directory):
         with self.lock:
@@ -2594,6 +2597,8 @@ class Session:
                 if failure is not None:
                     job.status, job.error = 'failed', str(failure)
                     self.paused = self.paused or job.kind == 'move'
+                    if job.kind == 'move' and not self.match:
+                        self.pause_clock()
                     if self.match and self.match['active'] and job.kind == 'move':
                         self.match['error'] = str(failure)
                         self.pause_clock()
