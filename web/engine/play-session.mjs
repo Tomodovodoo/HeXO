@@ -10,6 +10,8 @@ const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human
 const REVIEW_PRESET = 'standard';
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
+/** Labels every complete turn of `history` as python/play.py review does; `lookup(prefix, ply)` is the evaluation of a
+ * position, given `ply` when the prefix is `history.slice(0, ply)`. */
 export function review(history, lookup, winner = -1) {
   const turns = [], ss = starts(history.length);
   for (let i = 0; i < ss.length; i++) {
@@ -18,7 +20,7 @@ export function review(history, lookup, winner = -1) {
     const turn = {ply, player: me, stones, label: null, before: null, after: null, better: null, line: null};
     turns.push(turn);
     if (end === history.length && winner === me) { turn.label = 'win'; continue; }
-    const before = lookup(history.slice(0, ply)), after = lookup(history.slice(0, end));
+    const before = lookup(history.slice(0, ply), ply), after = lookup(history.slice(0, end), end);
     if (!before || !after) continue;
     turn.before = before.value; turn.after = 1 - after.value;
     const had = before.proof?.winner, has = after.proof?.winner, loss = turn.before - turn.after;
@@ -60,7 +62,7 @@ export class BrowserSession extends OfflineSession {
     this.bookData = null; this.book = {enabled: false, mode: 'wide', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
-    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false;
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null;
   }
   registerEngine(entry, adapter) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
@@ -78,24 +80,36 @@ export class BrowserSession extends OfflineSession {
   }
   engineKey(spec) { return [spec.engine, spec.checkpoint, this.entries.get(spec.engine)?.version || ''].join('|'); }
   cacheKey(history, spec) { return `${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${position(history)}`; }
-  lookup(history, spec = this.analysis, exact = false) {
+  lookup(history, spec = this.analysis, exact = false) { return this.lookupAt(position(history), spec, exact); }
+  /** The evaluation of the position whose `position()` text is `at`: by `spec` at exactly its budget when `exact`,
+   * else the deepest by its engine. */
+  lookupAt(at, spec = this.analysis, exact = false) {
     if (!spec) return null;
-    const hit = this.cache.get(this.cacheKey(history, spec));
-    if (exact) return hit || null;
-    return (this.index.get(`${this.engineKey(spec)}|${position(history)}`) || [])
+    if (exact) return this.cache.get(`${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${at}`) || null;
+    return (this.index.get(`${this.engineKey(spec)}|${at}`) || [])
       .sort((a, b) => Boolean(b.proof) - Boolean(a.proof) || b.simulations - a.simulations || b.solver_nodes - a.solver_nodes || (b.budget?.ms || 0) - (a.budget?.ms || 0) || (b.budget?.nodes || 0) - (a.budget?.nodes || 0))[0] || null;
   }
-  state() {
-    const {winner, player, remaining} = this.native.game(this.history), evaluations = {};
-    for (let ply = 0; ply <= this.history.length; ply++) {
-      const prefix = this.history.slice(0, ply), record = this.lookup(prefix) || this.records.findLast(r => r.position === position(prefix) && (!this.analysis || r.engine_key === this.engineKey(this.analysis)));
+  /** The evaluations shown per ply and the review of the game, recomputed only after the game or the saved
+   * evaluations change. */
+  study(winner) {
+    const sig = `${this.revision}|${this.evaluationsVersion}|${this.records.length}`;
+    if (this.studied?.sig === sig) return this.studied;
+    const positions = [''], evaluations = {}, engine = this.analysis && this.engineKey(this.analysis), spec = this.reviewSpec();
+    for (const [q, r] of this.history) positions.push(positions.length > 1 ? `${positions.at(-1)};${q},${r}` : `${q},${r}`);
+    positions.forEach((at, ply) => {
+      const record = this.lookupAt(at) || this.records.findLast(r => r.position === at && (!engine || r.engine_key === engine));
       if (record) evaluations[ply] = record;
-    }
+    });
+    const turns = review(this.history, (h, ply) => this.lookupAt(ply === undefined ? position(h) : positions[ply], spec, true), winner);
+    return this.studied = {sig, evaluations, review: turns};
+  }
+  state() {
+    const {winner, player, remaining} = this.native.game(this.history), {evaluations, review: turns} = this.study(winner);
     return {instance: `browser:${this.id}`, revision: this.revision, history: copy(this.history), player, remaining, winner,
       paused: this.paused, seats: copy(this.seats), analysis: copy(this.analysis), engines: [...this.entries.values()], match: this.match,
       clock: this.clockNow(), saved_game: this.saved_game, models_folder: null, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
-      evaluations, review: review(this.history, h => this.lookup(h, this.reviewSpec(), true), winner), review_preset: REVIEW_PRESET,
+      evaluations, review: turns, review_preset: REVIEW_PRESET,
       jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side}) => ({id, kind, status, done, total, error, ply: history.length, side}))};
   }
   static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings'].some(p => path === p || path.startsWith(p + '/')); }
@@ -260,6 +274,7 @@ export class BrowserSession extends OfflineSession {
     return record;
   }
   indexRecord(record) {
+    this.evaluationsVersion++;
     this.cache.set(record.id, record);
     const key = `${record.engine_key}|${record.position}`, values = (this.index.get(key) || []).filter(r => r.id !== record.id);
     values.push(record); this.index.set(key, values);
