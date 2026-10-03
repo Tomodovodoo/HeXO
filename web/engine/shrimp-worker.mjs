@@ -3,7 +3,7 @@
  * Out: {type: 'progress', id?, fraction, stage?} | {type: 'ready', device} | {type: 'result', id, result} | {type: 'cancelled', id}
  *     | {type: 'error', id?, message, stage?}: stages.mjs's loading stages; a stage in an error is where it stopped. */
 import {cached, json} from './assets.mjs';
-import {probe} from './network.mjs';
+import {probe, runtime} from './network.mjs';
 import {Stages, errorReport, stall} from './stages.mjs';
 import {ShrimpNetwork} from './shrimp/network.mjs';
 import {Cancelled, ShrimpSearch, loadModule} from './shrimp/search.mjs';
@@ -40,7 +40,8 @@ async function play({id, history, visits}) {
     network_ms: Math.round(network.ms - before.ms)};
 }
 
-/** Probes the device, starts ONNX Runtime with the network and the search, and plays one visit, reporting each stage. */
+/** Probes the device, downloads shrimp.wasm, starts ONNX Runtime, loads the network and plays one visit, reporting each
+ * stage. Downloads finish before the runtime compiles, so no download reports over a later stage. */
 async function load(options = {}) {
   const stages = new Stages(postMessage);
   return stages.run(async () => {
@@ -48,10 +49,10 @@ async function load(options = {}) {
     const build = (await json('build.json')).data, device = await probe(options.prefer);
     stages.probed(device);
     const file = {path: 'shrimp/shrimp.wasm', sha256: build.artefacts['shrimp/shrimp.wasm'], lines: true};
-    const wasm = cached(file, stages.file(file.path)).then(loadModule);
-    wasm.catch(() => {});
-    network = await ShrimpNetwork.create({device, stages, threads: options.threads});
-    module = await wasm;
+    const wasm = await cached(file, stages.file(file.path));
+    const ort = await runtime(device.provider, options.threads, stages);
+    network = await ShrimpNetwork.create({device, ort, stages});
+    module = await loadModule(wasm);
     profile = network.manifest.search;
     stages.enter('warmup', device.provider);
     const t = performance.now();

@@ -273,7 +273,8 @@ class Loading(unittest.TestCase):
 
     def test_the_page_words_for_each_stage(self):
         self.assertEqual(self.out['words'], ['thinking', 'checking GPU', 'downloading 12 of 27 MB', 'downloading 2.5 of 4.6 MB',
-                                             'compiling', 'starting GPU', 'starting CPU', 'warming up', 'warming up'])
+                                             'downloading 17 MB', 'downloading', 'compiling', 'starting GPU', 'starting CPU',
+                                             'warming up', 'warming up'])
 
     def test_each_gpu_stage_that_hangs_or_fails_falls_back_to_webassembly(self):
         for case, words in [('gpu_compile_hangs', 'compiling timed out'), ('gpu_session_hangs', 'starting GPU timed out'),
@@ -335,6 +336,7 @@ class Loading(unittest.TestCase):
     def test_network_stages_time_both_graphs_only_when_both_load(self):
         self.assertEqual(self.out['network']['both'], dict(stages=['download', 'session', 'timing'], precision='fp16'))
         self.assertEqual(self.out['network']['fp16_only'], dict(stages=['download', 'session'], precision='fp16'))
+        self.assertEqual(self.out['network']['shrimp'], ['download', 'session'])
 
     def test_a_job_stuck_loading_gives_way_and_a_cpu_fallback_moves_choices_to_lightning(self):
         session = self.out['session']

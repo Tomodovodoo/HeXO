@@ -106,11 +106,11 @@ class Resolver(unittest.TestCase):
         self.assertEqual((case['first'], case['parts']), ('Failed to fetch', 1))
         self.assertEqual(case['ranges'], [f'bytes={4 * 2 ** 20}-'] * 2)
         self.assertTrue(case['same'])
-        self.assertEqual(case['start'], [int(4.5 * 2 ** 20), 5 * 2 ** 20])
+        self.assertEqual(case['start'], [[4 * 2 ** 20, 0], [int(4.5 * 2 ** 20), 5 * 2 ** 20]])
         self.assertEqual(case['keys'], 1)
 
     def test_a_download_that_goes_quiet_stops_with_an_error(self):
-        self.assertEqual(self.out['idle'], {'error': 'quiet.onnx: the download stalled', 'requests': 2})
+        self.assertEqual(self.out['idle'], {'error': 'quiet.onnx: the download stalled', 'requests': 2, 'reported': [[0, 0, 10]]})
 
     def test_assets_query_is_honoured_only_on_a_loopback_page(self):
         self.assertEqual(self.out['override'], {'public': SITE, 'loopback': 'https://other.example/engine/'})

@@ -155,7 +155,7 @@ async function download(response, {path, start, bytes, keep}, progress) {
  * the site needs a `sha256`, and bytes that do not match it throw. A download stores its bytes in parts of PART bytes
  * as they arrive, so a load after an interrupted one asks for the rest only (an HTTP range; a server that answers
  * with the whole file starts over). `progress(fraction, received, total)` follows the download's bytes (`total` 0
- * when unknown); a file from the Cache API reports progress(1) alone.
+ * when unknown), from before the request is sent; a file from the Cache API reports progress(1) alone.
  */
 export async function cached(file, progress = () => {}) {
   const store = await open(), id = key(file), hit = store && await store.match(id);
@@ -172,6 +172,7 @@ export async function cached(file, progress = () => {}) {
     for (const old of await store.keys()) if (old.url.split('?')[0] === base) await store.delete(old);
   };
   let parts = await heldParts(store, id), offset = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  progress(0, offset, file.bytes || 0);   // the download stage covers a request that never answers too
   let found = offset ? await locate(file.path, {cache: 'no-cache', headers: {Range: `bytes=${offset}-`}}).catch(() => null) : null;
   if (found?.response.status !== 206) {   // a new download, also when the server ignores the range
     if (parts.length) await forget().catch(() => {});

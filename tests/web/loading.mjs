@@ -106,7 +106,7 @@ out.threads = [{isolated: true, cores: 8}, {isolated: true, cores: 8, memory: 2}
   {isolated: true, cores: 24, memory: 0.5}].map(defaultThreads);
 
 out.words = [null, {name: 'probe'}, {name: 'download', received: 12.4e6, total: 27e6}, {name: 'download', received: 2.5e6, total: 4.6e6},
-  {name: 'compile'}, {name: 'session', provider: 'webgpu'}, {name: 'session', provider: 'wasm'}, {name: 'timing'}, {name: 'warmup'}].map(stageText);
+  {name: 'download', received: 17.1e6, total: 0}, {name: 'download', received: 0, total: 0}, {name: 'compile'}, {name: 'session', provider: 'webgpu'}, {name: 'session', provider: 'wasm'}, {name: 'timing'}, {name: 'warmup'}].map(stageText);
 
 // The probe with fake adapters: a fresh network.mjs each time, since probe() keeps its answer.
 let fresh = 0;
@@ -129,12 +129,14 @@ out.probe = {
 Object.defineProperty(globalThis, 'navigator', {value: {hardwareConcurrency: 8, deviceMemory: 8}, configurable: true});
 
 // Network.create with a fake ONNX Runtime and a fake origin that serves the model's manifest and graphs.
-const graphs = {'bubble-fp32.onnx': 'fp32 graph', 'bubble-fp16.onnx': 'fp16 graph'};
+const graphs = {'bubble-fp32.onnx': 'fp32 graph', 'bubble-fp16.onnx': 'fp16 graph', 'shrimp.onnx': 'shrimp graph'};
 const hash = text => createHash('sha256').update(text).digest('hex');
-const manifest = {model_version: 'm', files: Object.fromEntries(Object.entries(graphs).map(([name, text]) => [name, {sha256: hash(text), bytes: text.length}]))};
+const pinned = names => Object.fromEntries(names.map(name => [name, {sha256: hash(graphs[name]), bytes: graphs[name].length}]));
+const manifests = {'model/manifest.json': {model_version: 'm', files: pinned(['bubble-fp32.onnx', 'bubble-fp16.onnx'])},
+  'shrimp/model/manifest.json': {model_version: 's', files: pinned(['shrimp.onnx'])}};
 globalThis.fetch = async input => {
-  const name = String(input).split('/').pop();
-  if (name === 'manifest.json') return new Response(JSON.stringify(manifest));
+  const url = String(input), name = url.split('/').pop(), found = Object.keys(manifests).find(path => url.endsWith(path));
+  if (found) return new Response(JSON.stringify(manifests[found]));
   if (!graphs[name]) return new Response('missing', {status: 404});
   return new Response(graphs[name], {headers: {'Content-Length': String(graphs[name].length)}});
 };
@@ -158,6 +160,11 @@ async function created(precisions, ort) {
   return {stages: seen, precision: network.precision};
 }
 out.network = {both: await created(['fp32', 'fp16'], fakeOrt(0, 20)), fp16_only: await created(['fp16'], fakeOrt(0, 0))};
+const {ShrimpNetwork} = await import('../../web/engine/shrimp/network.mjs');
+const shrimpStages = [];
+await ShrimpNetwork.create({device: {provider: 'wasm'}, ort: fakeOrt(0, 0),
+  stages: new Stages(({stage}) => { if (shrimpStages.at(-1) !== stage.name) shrimpStages.push(stage.name); })});
+out.network.shrimp = shrimpStages;
 
 // A browser session job whose engine never finishes loading gives way when its seat changes engine, and an engine
 // that left the GPU moves its choices to lightning.

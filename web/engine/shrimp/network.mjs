@@ -1,7 +1,7 @@
 /* Shrimp's network (tools/shrimp_web/export.py) under ONNX Runtime Web: WebGPU when the device has it, else
  * WebAssembly. */
 import {cached, json} from '../assets.mjs';
-import {runtime, session} from '../network.mjs';
+import {session} from '../network.mjs';
 
 const FEATURES = 15;
 
@@ -48,12 +48,11 @@ export class ShrimpNetwork {
   }
 
   /**
-   * Starts ONNX Runtime on `device` (network.mjs probe(); WebGPU runs the fp32 graph too) and loads the graph named by
-   * the manifest at `model`, reporting each stage to `stages` (stages.mjs).
+   * Loads the graph named by the manifest at `model` on `device` (network.mjs probe(); WebGPU runs the fp32 graph too)
+   * with `ort` (network.mjs runtime() for its provider), reporting its download and session to `stages` (stages.mjs).
    */
-  static async create({model = 'shrimp/model/manifest.json', device, stages, threads = null}) {
-    const {manifest, file} = await ShrimpNetwork.files(model);
-    const [ort, graph] = await Promise.all([runtime(device.provider, threads, stages), cached(file, stages.file(file.path))]);
+  static async create({model = 'shrimp/model/manifest.json', device, ort, stages}) {
+    const {manifest, file} = await ShrimpNetwork.files(model), graph = await cached(file, stages.file(file.path));
     return new ShrimpNetwork(ort, await session(ort, graph, device.provider, stages), manifest, device.provider, ort.env.wasm.numThreads);
   }
 

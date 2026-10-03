@@ -222,7 +222,7 @@ const parts = [...store.keys()].filter(k => k.includes('&part='));
 cut = false;
 const body = await assets.cached(big, (fraction, received, total) => seen.push([received, total]));
 out.resume = {first: first.error ?? 'loaded', parts: parts.length, ranges: ranged.filter(Boolean), same: Buffer.from(body).equals(whole),
-  start: seen[0], keys: [...store.keys()].length};
+  start: seen.slice(0, 2), keys: [...store.keys()].length};
 
 // A download that receives nothing for LIMITS.idle ms stops with an error instead of waiting.
 reset();
@@ -233,7 +233,9 @@ globalThis.fetch = async (input, init = {}) => {
   if (String(input).startsWith(BASE)) return new Response('missing', {status: 404});
   return new Response(new ReadableStream({pull: () => new Promise(() => {})}), {headers: {'Content-Length': '10'}});
 };
-out.idle = {...await attempt(() => assets.cached({path: 'quiet.onnx', sha256: 'x'})), requests: requested.length};
+const quiet = [];
+out.idle = {...await attempt(() => assets.cached({path: 'quiet.onnx', sha256: 'x', bytes: 10}, (...args) => quiet.push(args))),
+  requests: requested.length, reported: quiet};
 globalThis.fetch = plain;
 
 const page = host => {

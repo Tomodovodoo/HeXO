@@ -31,7 +31,7 @@ export function stageText(stage) {
   if (!stage) return 'thinking';
   if (stage.name === 'download') {
     return stage.total ? `downloading ${megabytes(stage.received, stage.total)} of ${megabytes(stage.total, stage.total)} MB`
-      : `downloading ${megabytes(stage.received, stage.received)} MB`;
+      : stage.received ? `downloading ${megabytes(stage.received, stage.received)} MB` : 'downloading';
   }
   if (stage.name === 'session') return stage.provider === 'webgpu' ? 'starting GPU' : 'starting CPU';
   return {probe: 'checking GPU', compile: 'compiling', timing: 'warming up', warmup: 'warming up'}[stage.name] ?? stage.name;
