@@ -3,6 +3,8 @@
  * placement, with a network `python tools/build_web.py strix-network` placed in strix/ (listed in strix/networks.json,
  * the first is the default). Without that file `strix` is null and the page does not offer it. */
 
+import {NEURAL_PRESET} from './device.mjs';
+
 /** Simulations per placement, as python/play.py's Strix presets. */
 export const PRESETS = {lightning: {simulations: 2}, quick: {simulations: 8}, standard: {simulations: 64},
   strong: {simulations: 128}, deep: {simulations: 512}, dangerous: {simulations: 4096}};
@@ -84,7 +86,7 @@ const found = await networks();
 
 /** The browser engine for seat.mjs, or null when no network was built. */
 export const strix = found.length ? {
-  entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: found.map(n => n.id), presets: PRESETS, analysis: true, clocks: false},
+  entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: found.map(n => n.id), presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: false},
   engine: new StrixEngine(found),
   record: result => ({...result, proof: null, line: [], threat: [], engine: ID}),
 } : null;

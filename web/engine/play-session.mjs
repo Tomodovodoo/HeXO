@@ -76,7 +76,7 @@ export class BrowserSession extends OfflineSession {
     if (input.engine === 'human') return human();
     const entry = this.entries.get(input.engine);
     if (!entry) throw Error('This engine is not installed in the browser');
-    const preset = input.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget} : entry.presets[preset];
+    const preset = input.preset || entry.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget} : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
     for (const [name, value] of Object.entries(budget)) if (typeof value === 'number' && (!Number.isSafeInteger(value) || value < ({ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0)))) throw Error(`${FIELD_NAMES[name] || name} must be a whole number of at least ${({ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0))}`);
     const checkpoint = input.checkpoint ?? entry.checkpoints?.[0] ?? null;

@@ -2,6 +2,7 @@
  * engines (seat.mjs). It plays as the server's Shrimp entry (tools/engines.json): Six's driver with these visits per
  * stone, mirrored into Six's frame. */
 import {defaultThreads} from './network.mjs';
+import {NEURAL_PRESET} from './device.mjs';
 
 /** The server entry's presets, as visits per stone; `simulations` is what the analysis panel shows. */
 export const PRESETS = Object.fromEntries(Object.entries({lightning: 16, quick: 32, standard: 128, strong: 512, deep: 1024,
@@ -112,5 +113,5 @@ async function built(path) {
   try { return (await fetch(new URL(path, import.meta.url), {cache: 'no-cache'})).ok; } catch { return false; }
 }
 
-export const shrimp = await built('shrimp/model/manifest.json') ? {entry: {id: ID, kind: 'six', badge: 'shrimp', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true, clocks: false},
+export const shrimp = await built('shrimp/model/manifest.json') ? {entry: {id: ID, kind: 'six', badge: 'shrimp', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: false},
   engine: new ShrimpEngine(), record} : null;

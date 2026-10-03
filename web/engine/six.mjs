@@ -2,8 +2,13 @@
  * as the server's Six: the same presets in Six protocol nodes, with the networks this site was built with. */
 import {EngineWorker} from './engine-worker.mjs';
 
-export const PRESETS = {lightning: {nodes: 1500}, quick: {nodes: 6000}, standard: {nodes: 30000}, strong: {nodes: 135000},
-  deep: {nodes: 500000}, dangerous: {nodes: 2000000}};
+import {NEURAL_PRESET, WEBGPU} from './device.mjs';
+
+/** The server's Six protocol nodes on WebGPU; on WebAssembly, where a position costs about 0.3 s per thread, a ladder a
+ * tenth to a fortieth of that, so every stop is playable. */
+export const PRESETS = WEBGPU ? {lightning: {nodes: 1500}, quick: {nodes: 6000}, standard: {nodes: 30000}, strong: {nodes: 135000},
+  deep: {nodes: 500000}, dangerous: {nodes: 2000000}}
+  : {lightning: {nodes: 150}, quick: {nodes: 500}, standard: {nodes: 1500}, strong: {nodes: 5000}, deep: {nodes: 15000}, dangerous: {nodes: 50000}};
 const ID = 'browser:six', LABEL = 'Six (browser)';
 
 export class SixEngine extends EngineWorker {
@@ -41,7 +46,7 @@ const checkpoints = await networks();
 
 /** Six (browser) for seat.mjs's ENGINES, or null when the site has no Six networks. */
 export const six = checkpoints.length ? {
-  entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints, presets: PRESETS, analysis: true, clocks: true},
+  entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints, presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: true},
   engine: new SixEngine(),
   record: (result, history, preset) => ({...result, engine: ID}),
 } : null;

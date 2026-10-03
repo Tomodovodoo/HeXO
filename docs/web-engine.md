@@ -61,6 +61,21 @@ Once an engine has loaded, the seat and the analysis head tag it with its device
 | Seal (browser) | no | CPU, one thread | ms capped to the turn time |
 | Strix (browser) | no | CPU, one thread | none, fixed simulations |
 
+Without WebGPU (the probe finds no adapter) the neural engines start at Lightning for seats and analysis, Six's ladder
+is 150, 500, 1,500, 5,000, 15,000 and 50,000 positions instead of the server's 1,500 to 2,000,000, and the strength row
+shows the expected seconds per stone at the chosen stop, from the engine's own turns at that or another stop. Seconds
+per stone on WebAssembly, taken from the measurements in the sections below (Bubble with 8 threads and no solver, the
+others on one thread; Six from its 0.4 s per position):
+
+| Engine | Lightning | Quick | Standard |
+|---|---|---|---|
+| Bubble | 0.07 | 0.25 | 1 |
+| Six | 30 | 100 | 300 |
+| Shrimp | 2.5 | 5.7 | not measured |
+| Strix | 0.5 | 1.5 | 11.5 |
+
+Six stays slow without WebGPU even at its lightest stop.
+
 The turn time is `time_control.allowance`'s normal share (`web/engine/clock.mjs`); a per-turn clock gives the whole
 turn less 10 ms. A side whose clock runs out loses on time. Engines without a clock are refused while one is on.
 

@@ -1,5 +1,6 @@
 import {BrowserSession} from './play-session.mjs';
 import {PlayStorage} from './storage.mjs';
+import {notePace} from './device.mjs';
 
 /** The tag the page shows for the device an engine's load resolved to: ONNX Runtime engines report {provider,
  * precision, threads}; the others run their WebAssembly on one CPU thread. */
@@ -18,19 +19,22 @@ export async function mountPlay(engines, legacy) {
   try { storage = await PlayStorage.open(); }
   catch (error) { globalThis.toast(`Browser storage is unavailable: ${error.message}`); storage = new PlayStorage(null); }
   const id = study ? `study:${params.get('batch')}:${params.get('game')}` : 'live';
-  const session = await BrowserSession.create({engine: entry.id, preset: 'quick', budget: entry.presets.quick, auto: true}, {storage, id, book});
+  const start = entry.preset === 'lightning' ? 'lightning' : 'quick';
+  const session = await BrowserSession.create({engine: entry.id, preset: start, budget: entry.presets[start], auto: true}, {storage, id, book});
   session.initializing = true;
   const first = !await storage.get('sessions', id);
   if (first && study && params.has('batch')) await session.openGame(params.get('batch'), +params.get('game'));
   for (const {entry, engine, record} of engines.values()) session.registerEngine(entry, {
     ready: async (f, checkpoint) => { entry.device = deviceLabel(await engine.load(f)); await engine.prepare?.(checkpoint); },
     turn: async (history, budget, options) => {
+      const started = performance.now();
       const result = await engine.turn(history, {...budget, ...(options.checkpoint ? {checkpoint: options.checkpoint} : {})}, options), preset = options.preset === 'custom' ? 'standard' : options.preset;
+      if (options.ms == null && options.preset !== 'custom') notePace(entry, options.preset, performance.now() - started, result.moves?.length);
       return record ? {...record(result, history, preset), ...result} : result;
     }
   });
   if (first && !study) {
-    const choices = legacy?.seats?.some(Boolean) ? legacy.seats : [null, {engine: entry.id, preset: 'standard'}];
+    const choices = legacy?.seats?.some(Boolean) ? legacy.seats : [null, {engine: entry.id, preset: entry.preset || 'standard'}];
     session.seats = choices.map(choice => choice ? session.spec(typeof choice === 'string' ? {engine: entry.id, preset: choice} : choice) : {engine: 'human'});
     if (legacy?.analysis) session.analysis = session.spec({...typeof legacy.analysis === 'string' ? {engine: entry.id, preset: legacy.analysis} : legacy.analysis, auto: true});
     session.book.enabled = session.seats.some(s => s.engine !== 'human');

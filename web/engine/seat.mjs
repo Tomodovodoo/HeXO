@@ -17,12 +17,13 @@ import {native} from './native.mjs';
 import {shrimp} from './shrimp.mjs';
 import {mountPlay, deviceLabel} from './browser-play.mjs';
 import {turnTime} from './clock.mjs';
+import {NEURAL_PRESET, notePace} from './device.mjs';
 import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 import {strix} from './strix.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
-const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, analysis: true, clocks: true},
+const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: true},
   engine: new BubbleEngine(),
   record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
     solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE})};
@@ -47,11 +48,12 @@ const save = () => { failed = null; try { localStorage.setItem(STORE, JSON.strin
 const state = () => typeof S === 'undefined' ? null : S;
 const viewed = () => typeof view === 'undefined' ? 0 : view;
 const closeIcon = () => typeof icon === 'function' ? icon('close') : '×';
-/** The choice for browser engine `id`, keeping `current`'s preset and network when it chose the same engine. */
+/** The choice for browser engine `id`, keeping `current`'s preset and network when it chose the same engine, else at the
+ * engine's starting preset. */
 function pickEngine(id, current, checkpoint = null) {
   const same = current?.engine === id, {checkpoints} = ENGINES.get(id).entry;
   const network = [checkpoint, same ? current.checkpoint : null].find(c => checkpoints.includes(c)) ?? checkpoints[0] ?? null;
-  return {engine: id, preset: same ? current.preset : 'standard', checkpoint: network};
+  return {engine: id, preset: same ? current.preset : ENGINES.get(id).entry.preset || 'standard', checkpoint: network};
 }
 const analysable = e => e.kind === 'bubble' || e.analysis;
 const analysisKey = (choice, history) => `${choice.engine}|${choice.preset}|${choice.checkpoint}|${hk(history)}`;
@@ -151,8 +153,10 @@ async function run(key, task) {
     current.loading = false;
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
     const ms = task.kind === 'move' && s?.clock && s.clock_spec?.mode !== 'fixed' ? turnTime(s.clock_spec, s.clock, task.side) : null;
+    const started = performance.now();
     const result = await engine.turn(task.history, budget, {signal: controller.signal, ms,
       progress: f => { current.fraction = f; progress(); }});
+    if (ms == null) notePace(entry, task.preset, performance.now() - started, result.moves?.length);
     if (job !== current) return;
     job = null;
     if (task.kind === 'move') {
@@ -201,7 +205,7 @@ function controls(choice, send, id) {
     select.onchange = () => send({checkpoint: select.value});
     out.push(select);
   }
-  out.push(original.strength(choice, change => send({preset: change.preset}), id, null));
+  out.push(original.strength(choice, change => send({preset: change.preset}), id, null, -1, ENGINES.get(choice.engine).entry));
   return out;
 }
 
@@ -289,7 +293,7 @@ function install() {
     const {entry} = ENGINES.get(config.analysis.engine);
     const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.badge || entry.kind, entry.label, entry.device));
     const items = original.pickItems(analysable);
-    pick.onclick = () => original.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: 'standard', auto: true}));
+    pick.onclick = () => original.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: ENGINES.get(it.id)?.entry.preset || 'standard', auto: true}));
     const send = change => { config.analysis = {...config.analysis, ...change}; save(); page.renderPanels(); };
     head.replaceChildren(original.el('div', {class: 'head'}, pick), ...controls(config.analysis, send, 'analysis'));
   };
