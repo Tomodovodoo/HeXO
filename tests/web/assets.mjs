@@ -236,6 +236,11 @@ globalThis.fetch = async (input, init = {}) => {
 const quiet = [];
 out.idle = {...await attempt(() => assets.cached({path: 'quiet.onnx', sha256: 'x', bytes: 10}, (...args) => quiet.push(args))),
   requests: requested.length, reported: quiet};
+
+// A request that gets no answer at all stops after LIMITS.idle ms too.
+reset();
+globalThis.fetch = async (input, init = {}) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason)));
+out.unanswered = await attempt(() => assets.cached({path: 'silent.onnx', sha256: 'x'}));
 globalThis.fetch = plain;
 
 const page = host => {

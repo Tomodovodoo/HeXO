@@ -14,6 +14,7 @@ let module = null;
 async function load() {
   const stages = new Stages(postMessage);
   return stages.run(async () => {
+    stages.enter('download');
     const {revision, files: [glue, wasm]} = await files();
     const [{default: createModule}, wasmBinary] = await Promise.all([moduleUrl(glue, stages.file(glue.path)).then(url => import(url)),
       cached(wasm, stages.file(wasm.path))]);

@@ -337,6 +337,7 @@ class Loading(unittest.TestCase):
         self.assertEqual(self.out['network']['both'], dict(stages=['download', 'session', 'timing'], precision='fp16'))
         self.assertEqual(self.out['network']['fp16_only'], dict(stages=['download', 'session'], precision='fp16'))
         self.assertEqual(self.out['network']['shrimp'], ['download', 'session'])
+        self.assertEqual(self.out['network']['missing_manifest'], 'download')
 
     def test_a_job_stuck_loading_gives_way_and_a_cpu_fallback_moves_choices_to_lightning(self):
         session = self.out['session']

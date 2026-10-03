@@ -105,9 +105,11 @@ const START = Uint8Array.from(atob('CAgSADo7ChAKAXgSAXkiCElkZW50aXR5EgVzdGFydFoP
 
 /**
  * ONNX Runtime Web for `provider`, started (its wasm compiled, its thread workers or WebGPU device up) on `threads`
- * WebAssembly threads (null: deviceThreads()). `stages` (stages.mjs) follows the downloads, then the compile stage.
+ * WebAssembly threads (null: deviceThreads()). `stages` (stages.mjs) follows the manifest and the downloads, then the
+ * compile stage.
  */
 export async function runtime(provider, threads, stages) {
+  stages.enter('download');
   const [api, glue, wasm] = await runtimeFiles(provider);
   const [ort, mjs, wasmBinary] = await Promise.all([moduleUrl(api, stages.file(api.path)).then(url => import(url)),
     moduleUrl(glue, stages.file(glue.path)), cached(wasm, stages.file(wasm.path))]);
@@ -145,6 +147,7 @@ export class Network {
    * and keeps fp16 only when it is at least FASTER times quicker, since fp32 reproduces the server's evaluations.
    */
   static async create({model = 'model/manifest.json', device, ort, stages}) {
+    stages.enter('download');
     const {manifest, files} = await modelFiles(device.precisions, model);
     const graphs = await Promise.all(files.map(file => cached(file, stages.file(file.path))));
     const networks = [];

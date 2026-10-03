@@ -14,6 +14,7 @@ let native;
 async function load() {
   const stages = new Stages(postMessage);
   await stages.run(async () => {
+    stages.enter('download');
     const [wasm] = await files(), bytes = await cached(wasm, stages.file(wasm.path));
     stages.enter('compile');
     native = await NativeSearch.create(wasmOptions(bytes));

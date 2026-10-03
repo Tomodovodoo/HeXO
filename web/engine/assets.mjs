@@ -42,13 +42,24 @@ export class NotOnSite extends Error {
   }
 }
 
-/** {response, local}: `path` from this origin, else (after a 404 or a network error) from the site. */
+/** fetch(url, init), rejecting when no response arrives within LIMITS.idle ms; the body is the reader's to bound. */
+async function request(url, init = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`no answer in ${LIMITS.idle / 1000} s`)), LIMITS.idle);
+  try {
+    return await fetch(url, {...init, signal: controller.signal});
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** {response, local}: `path` from this origin, else (after a 404, a network error or no answer) from the site. */
 async function locate(path, init = {}) {
-  const here = await fetch(new URL(path, BASE), init).catch(() => null);
+  const here = await request(new URL(path, BASE), init).catch(() => null);
   if (here?.ok) return {response: here, local: true};
   const there = remote(path);
   if (!there) throw here?.status === 404 ? new NotOnSite(path) : new Error(`${path}: ${here ? here.status : 'unreachable'}`);
-  const response = await fetch(there, {...init, mode: 'cors'}).catch(error => { throw new Error(`${path}: ${error.message} (${there})`); });
+  const response = await request(there, {...init, mode: 'cors'}).catch(error => { throw new Error(`${path}: ${error.message} (${there})`); });
   if (response.status === 404) throw new NotOnSite(path);
   if (!response.ok) throw new Error(`${path}: ${response.status} (${there})`);
   return {response, local: false};
@@ -78,7 +89,7 @@ export async function pins(path, {data, local}, same) {
   const there = remote(path);
   if (data.files || !local || !there) return data.files ?? {};
   const store = await open(), id = `${new URL(path, BASE).href}?site`;   // kept so the pins also answer offline
-  const response = await fetch(there, {cache: 'no-cache', mode: 'cors'}).catch(() => null);
+  const response = await request(there, {cache: 'no-cache', mode: 'cors'}).catch(() => null);
   let other = response?.ok ? await response.json().catch(() => null) : null;
   if (other) await store?.put(id, new Response(JSON.stringify(other))).catch(() => {});
   else other = await (await store?.match(id).catch(() => null))?.json() ?? null;
@@ -189,7 +200,7 @@ export async function cached(file, progress = () => {}) {
       async error => {   // a browser whose body stream fails still delivers the whole body at once
         if (error instanceof Stalled) throw error;
         progress(0, 0, 0);
-        const again = await fetch(response.url, {cache: 'reload', ...(local ? {} : {mode: 'cors'})});
+        const again = await request(response.url, {cache: 'reload', ...(local ? {} : {mode: 'cors'})});
         if (!again.ok) throw new Error(`${file.path}: ${again.status}`);
         return again.arrayBuffer();
       });
@@ -223,9 +234,9 @@ export async function moduleUrl(file, progress) {
 /** Whether this origin serves `path`: a HEAD request, or a GET whose body is dropped when HEAD is not supported (as
  * python/play.py answers 501). */
 async function present(path) {
-  const url = new URL(path, BASE), head = await fetch(url, {method: 'HEAD'}).catch(() => null);
+  const url = new URL(path, BASE), head = await request(url, {method: 'HEAD'}).catch(() => null);
   if (head && head.status !== 405 && head.status !== 501) return head.ok;
-  const get = await fetch(url).catch(() => null);
+  const get = await request(url).catch(() => null);
   get?.body?.cancel();
   return Boolean(get?.ok);
 }
@@ -245,7 +256,7 @@ export async function status(files) {
   for (const file of away) if (!await store?.match(key(file))) missing.push(file);
   if (!missing.length) return {state: 'cached'};
   const sized = await Promise.all(missing.map(async file => {   // also tells files the site does not publish
-    const there = remote(file.path), head = there && await fetch(there, {method: 'HEAD', mode: 'cors'}).catch(() => null);
+    const there = remote(file.path), head = there && await request(there, {method: 'HEAD', mode: 'cors'}).catch(() => null);
     if (!there || head?.status === 404) throw new NotOnSite(file.path);
     return {...file, bytes: file.bytes || Number(head?.headers.get('Content-Length')) || 0};
   }));

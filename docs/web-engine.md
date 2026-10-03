@@ -88,7 +88,8 @@ turn or network change, so those calls show the download, session and warm-up st
 
 Each stage has a limit on silence (`LIMITS`): 20 s for the probe, 45 s between download chunks, 30 s to compile,
 60 s for a session, 30 s for the timing batch and 60 s to warm up. The adapter request inside the probe gets 8 s, and
-a download that receives nothing for 30 s stops with an error. When a stage stays silent past its limit, or fails,
+a request or download that receives nothing for 30 s stops with an error. Manifests are fetched in the download
+stage, so a network failure is never taken for a device failure. When a stage stays silent past its limit, or fails,
 the page ends the worker and starts the next one down the chain, logs the reason to the console and shows one toast
 such as "Bubble (browser): starting GPU timed out, running on CPU". A call that was waiting is sent again to the new
 worker. When no step is left, or a download fails (another device would not help), the move or analysis fails with a

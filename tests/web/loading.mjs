@@ -165,6 +165,9 @@ const shrimpStages = [];
 await ShrimpNetwork.create({device: {provider: 'wasm'}, ort: fakeOrt(0, 0),
   stages: new Stages(({stage}) => { if (shrimpStages.at(-1) !== stage.name) shrimpStages.push(stage.name); })});
 out.network.shrimp = shrimpStages;
+const lost = new Stages(() => {});
+out.network.missing_manifest = await lost.run(() => Network.create({model: 'model/missing/manifest.json', device: {provider: 'wasm', precisions: ['fp32']},
+  ort: fakeOrt(0, 0), stages: lost})).then(() => null, error => error.stage?.name ?? null);
 
 // A browser session job whose engine never finishes loading gives way when its seat changes engine, and an engine
 // that left the GPU moves its choices to lightning.

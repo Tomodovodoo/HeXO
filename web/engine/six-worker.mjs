@@ -42,9 +42,10 @@ async function load(options = {}) {
   const stages = new Stages(postMessage);
   return stages.run(async () => {
     stages.enter('probe');
-    manifest = await json('six/networks/manifest.json');
     device = await probe(options.prefer);
     stages.probed(device);
+    stages.enter('download');
+    manifest = await json('six/networks/manifest.json');
     ort = await runtime(device.provider, options.threads, stages);
     search = await SixSearch.create(ort);
     current = null;

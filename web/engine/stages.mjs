@@ -52,14 +52,16 @@ export class Stages {
     this.post = message => post(message);   // a worker's postMessage, called on the worker's global
     this.id = id;
     this.current = null;
+    this.fraction = 0;
     this.device = {};
     this.files = new Map();
   }
 
-  /** Enters stage `name` (probe, compile, session, timing, warmup); `provider` is the device a session runs on. */
+  /** Enters stage `name` (probe, download before a manifest or file request, compile, session, timing, warmup);
+   * `provider` is the device a session runs on. */
   enter(name, provider) {
     this.current = {name, ...this.device, ...(provider ? {provider} : {})};
-    this.send(FRACTIONS[name]);
+    this.send(FRACTIONS[name] ?? this.fraction);
   }
 
   /** Records the probe's device {provider, fallback?}; the stages after it carry them, so the page can tag the engine. */
@@ -85,6 +87,7 @@ export class Stages {
   }
 
   send(fraction) {
+    this.fraction = fraction;
     this.post({type: 'progress', ...(this.id === undefined ? {} : {id: this.id}), fraction, stage: this.current});
   }
 

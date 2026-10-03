@@ -52,6 +52,7 @@ export class ShrimpNetwork {
    * with `ort` (network.mjs runtime() for its provider), reporting its download and session to `stages` (stages.mjs).
    */
   static async create({model = 'shrimp/model/manifest.json', device, ort, stages}) {
+    stages.enter('download');
     const {manifest, file} = await ShrimpNetwork.files(model), graph = await cached(file, stages.file(file.path));
     return new ShrimpNetwork(ort, await session(ort, graph, device.provider, stages), manifest, device.provider, ort.env.wasm.numThreads);
   }

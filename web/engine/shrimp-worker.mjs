@@ -46,8 +46,10 @@ async function load(options = {}) {
   const stages = new Stages(postMessage);
   return stages.run(async () => {
     stages.enter('probe');
-    const build = (await json('build.json')).data, device = await probe(options.prefer);
+    const device = await probe(options.prefer);
     stages.probed(device);
+    stages.enter('download');
+    const build = (await json('build.json')).data;
     const file = {path: 'shrimp/shrimp.wasm', sha256: build.artefacts['shrimp/shrimp.wasm'], lines: true};
     const wasm = await cached(file, stages.file(file.path));
     const ort = await runtime(device.provider, options.threads, stages);
