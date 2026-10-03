@@ -300,9 +300,9 @@ export class BrowserSession extends OfflineSession {
     } else if (path === '/analyse') {
       const ply = body.ply ?? this.history.length;
       if (!Number.isInteger(ply) || ply < 0 || ply > this.history.length) throw Error('Invalid analysis position');
-      const history = this.history.slice(0, ply), saved = this.analysis && this.lookup(history, this.analysis, true);
+      const history = this.history.slice(0, ply), saved = this.analysis && this.lookup(history);
       // A position viewed again whose graph another analysis has searched since: search the graph there again.
-      if (!body.force && this.stale(saved) && !saved.proof) this.enqueue('analyse', history, this.analysis, {force: true, refresh: saved, line: this.analysisLine});
+      if (!body.force && this.stale(saved) && !saved.proof) this.enqueue('analyse', history, {...this.analysis, budget: copy(saved.budget)}, {force: true, refresh: saved, line: this.analysisLine});
       else if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', history, this.analysis, {force: !!body.force, line: this.analysisLine});
     } else if (path === '/review') {
       if (!this.analysis || !this.adapters.has(this.analysis.engine)) throw Error('Choose an analysis engine');
@@ -374,14 +374,14 @@ export class BrowserSession extends OfflineSession {
   stale(record) {
     return Boolean(record?.graph) && record.graph[0] === this.graph.generation && record.graph[1] < this.graph.searches;
   }
-  /** Queues a refresh of each position up to REFRESH_PLIES placements before `history` whose evaluation by `spec` came
-   * from this analysis graph, is now stale and holds no proof, nearest first: the search on the game graph `line` moved the values those positions reach
+  /** Queues a refresh of each position up to REFRESH_PLIES placements before `history` whose shown evaluation by `spec`'s
+   * engine (the deepest, a tier included) is stale and holds no proof, nearest first, at that evaluation's budget: the search on the game graph `line` moved the values those positions reach
    * (python/play.py Session.refresh). A refresh searches that graph again with the PV_CHECK share of the simulations
    * and no solver query, keeps the saved threat and replaces the saved evaluation. */
   refresh(history, spec, line) {
     for (let ply = history.length - 1; ply >= Math.max(0, history.length - REFRESH_PLIES); ply--) {
-      const saved = this.lookup(history.slice(0, ply), spec, true);
-      if (this.stale(saved) && !saved.proof) this.enqueue('analyse', history.slice(0, ply), spec, {force: true, refresh: saved, line});
+      const saved = this.lookup(history.slice(0, ply), spec);
+      if (this.stale(saved) && !saved.proof) this.enqueue('analyse', history.slice(0, ply), {...spec, budget: copy(saved.budget)}, {force: true, refresh: saved, line});
     }
   }
   indexRecord(record) {

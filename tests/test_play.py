@@ -401,6 +401,16 @@ class Jobs(unittest.TestCase):
         self.session.analyse(6, force=True)
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(self.session.state()['stale'], [])
+        # A deepening tier's evaluation is refreshed under its own key and budget.
+        session, deep = self.session, PRESETS['bubble']['deep']
+        key = session.engine_key(session.analysis) + ':kept'
+        session.store.add(session.history[:4], key, deep, dict(value=.5, moves=[[9, 9]], top=[], pv=[], threat=[],
+                                                             proof=None, graph=[session.instance, session.analysis_graph, 0]))
+        self.assertEqual(session.state()['stale'], [4])
+        session.analyse(4)
+        wait(lambda: not session.state()['jobs'])
+        refreshed = session.store.get(session.history[:4], key, deep)['graph']
+        self.assertEqual(refreshed[2], session.graph_searches[session.analysis_graph])
         line = self.session.analysis_line
         self.session.undo()
         self.assertNotEqual(self.session.analysis_line, line)

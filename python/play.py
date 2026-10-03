@@ -2111,8 +2111,8 @@ class Session:
                 deepening = ply == len(self.history) and self.deepening(game.winner)
             finally:
                 game.close()
-            history, key = self.history[:ply], self.engine_key(self.analysis)
-            saved = self.store.get(history, key, self.engines.effective(self.analysis['budget'])) if key else None
+            history = self.history[:ply]
+            saved = self.lookup(history)
             if not force and self.stale(saved) and not saved.get('proof'):
                 # A position viewed again: search the analysis graph there again, from what it holds now.
                 job = self.submit(Job('analyse', 0, history, seat=dict(self.analysis), force=True,
@@ -3036,9 +3036,12 @@ class Session:
         Analysis searches the analysis board's game graph and a move its seat's (see `Engines.evaluate`); a move
         never reuses a saved evaluation, and moves and deepening tiers are saved under the kept key. A finished
         analysis refreshes the earlier positions of its game (see `refresh`); a refresh job (`refresh`, the saved
-        evaluation it replaces) re-reads the graph at its position."""
+        evaluation it replaces) searches the graph at its position again and replaces that evaluation under its own
+        engine key and budget."""
         key, budget, keep = self.engine_key(seat), self.engines.effective(seat['budget']), hasattr(job, 'tier')
         line, game, refresh = getattr(job, 'line', None), getattr(job, 'game', None), getattr(job, 'refresh', None)
+        if refresh is not None:
+            budget = dict(simulations=refresh['simulations'], solver_nodes=refresh['solver_nodes'])
         if key is None:
             raise ValueError('The model file is gone; rescan the engines')
         key += ':kept' if keep else ''
@@ -3072,6 +3075,8 @@ class Session:
                 timer = threading.Timer(31, self.retry, args=(list(history),))
                 timer.daemon = True
                 timer.start()
+        if refresh is not None:
+            weights, spent = refresh['engine'], budget
         saved = self.save(history, weights, spent, found, model)
         if job.kind == 'analyse' and refresh is None and game is not None:
             self.refresh(history, seat, game)
@@ -3086,14 +3091,13 @@ class Session:
                 and stamp[2] < self.graph_searches[self.analysis_graph])
 
     def refresh(self, history, seat, game):
-        """Queue a refresh of each position up to REFRESH_PLIES placements before `history` whose evaluation by
-        `seat`, saved at its budget, came from the same analysis graph, is now stale (see `stale`) and holds no proof,
-        nearest first: the search on the game graph `game` moved the values those positions reach (see
+        """Queue a refresh of each position up to REFRESH_PLIES placements before `history` whose shown evaluation
+        (`lookup`, a fresh analysis or a deepening tier) is stale (see `stale`) and holds no proof, nearest first, with
+        `seat`'s network: the search on the game graph `game` moved the values those positions reach (see
         `Engines.evaluate`)."""
-        key, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
         with self.lock:
             for ply in range(len(history) - 1, max(-1, len(history) - REFRESH_PLIES - 1), -1):
-                saved = self.store.get(history[:ply], key, budget) if key else None
+                saved = self.lookup(history[:ply])
                 if self.stale(saved) and not saved.get('proof') and not any(
                         getattr(j, 'refresh', None) is not None and j.history == tuple(history[:ply])
                         and j.status == 'queued' for j in self.jobs.values()):
