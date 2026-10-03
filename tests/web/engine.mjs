@@ -28,7 +28,8 @@ import {principalVariation, topRows, Proofs, answered, settled, proofTurns} from
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
 import {defaultThreads} from '../../web/engine/network.mjs';
-import {BrowserSession} from '../../web/engine/play-session.mjs';
+import {Stages, errorReport, stall} from '../../web/engine/stages.mjs';
+import {BrowserSession, review} from '../../web/engine/play-session.mjs';
 import {PlayStorage} from '../../web/engine/storage.mjs';
 import {OpeningBook} from '../../web/engine/openings.mjs';
 import {exportGame, readGame} from '../../web/engine/notation.mjs';
@@ -166,7 +167,8 @@ if (job.kind === 'encode') {
   const context = {Native, NeuralSearch, EvaluationCache, GameGraphs, PV_CHECK, createModule, principalVariation, topRows,
     Proofs, answered, settled, proofTurns,
     URL, performance, setTimeout, clearTimeout, onmessage: null, postMessage: message => messages.push(message),
-    probe: async () => ({provider: 'wasm', precisions: ['fp32']}),
+    probe: async () => ({provider: 'wasm', precisions: ['fp32']}), runtime: async () => ({env: {wasm: {numThreads: 1}}}),
+    Stages, errorReport, stall,
     Network: {create: async () => ({version: 'uniform', precision: 'fp32', threads: 1,
       evaluate: async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}))})},
     Worker: class {
@@ -187,6 +189,11 @@ if (job.kind === 'encode') {
   answer = messages.find(m => m.type === 'result').result;
 } else if (job.kind === 'pv') {
   answer = principalVariation(native, job.history, job.certificate);
+} else if (job.kind === 'review') {
+  answer = job.cases.map(({history, evaluations, winner}) => {
+    const table = new Map(evaluations.map(([prefix, record]) => [JSON.stringify(prefix), record]));
+    return review(history, prefix => table.get(JSON.stringify(prefix)) ?? null, winner);
+  });
 } else if (job.kind === 'rows') {
   answer = topRows(job.actions, job.policy, job.values, job.lead);
 } else if (job.kind === 'overlay') {
@@ -225,6 +232,18 @@ if (job.kind === 'encode') {
   const table = new Proofs();
   table.add(job.history, job.found);
   answer.given = answered(native, job.history.slice(0, job.ply - 1), table);
+} else if (job.kind === 'restore-pause') {
+  const make = async clock => {
+    const s = new BrowserSession(native), entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', clocks: true, presets: {quick: {simulations: 1, solver_nodes: 0}, standard: {simulations: 1, solver_nodes: 0}}};
+    s.registerEngine(entry, {turn: async history => ({moves: history.length ? [[1, 0], [2, 0]] : [[0, 0]], value: .5, top: []})});
+    s.seats = [{engine: 'human'}, s.spec({engine: 'test'})]; s.changed();
+    if (clock) await s.request('/clock', clock, 'POST');
+    await s.request('/play', {q: 0, r: 0}, 'POST'); await s.saving;
+    const before = s.paused;
+    const back = new BrowserSession(native); back.storage = s.storage; await back.restore();
+    return {before, after: back.paused, clock: Boolean(back.clock)};
+  };
+  answer = {budget: await make(null), clocked: await make(job.clock)};
 } else if (job.kind === 'threads') {
   answer = job.contexts.map(defaultThreads);
 } else if (job.kind === 'offline') {
@@ -296,7 +315,8 @@ if (job.kind === 'encode') {
   s.bookData = new OpeningBook(data);
   const entry = {id: 'browser:test', name: 'Test', kind: 'bubble', version: 'v1', checkpoints: [],
     presets: {standard: {simulations: 1, solver_nodes: 0}, quick: {simulations: 1, solver_nodes: 0}}};
-  s.registerEngine(entry, {turn: async history => ({moves: job.history.slice(history.length, history.length + (history.length ? 2 : 1)), value: .5, top: [], proof: null, line: []})});
+  const asked = [];
+  s.registerEngine(entry, {turn: async history => { asked.push(history.length); return {moves: job.history.slice(history.length, history.length + native.game(history).remaining), value: .5, top: [], proof: null, line: []}; }});
   s.analysis = s.spec({engine: entry.id, preset: 'standard'});
   answer = [];
   for (const [path, body] of job.requests) {
@@ -304,7 +324,7 @@ if (job.kind === 'encode') {
     while (s.running || s.jobs.some(j => j.status === 'queued')) await new Promise(r => setTimeout(r, 1));
     answer.push({status, data: path === '/state' ? s.state() : data});
   }
-  answer.push({backup: await s.storage.backup(), catalogue: await s.catalogue()});
+  answer.push({backup: await s.storage.backup(), catalogue: await s.catalogue(), asked});
 } else if (job.kind === 'book') {
   const book = new OpeningBook(JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url))));
   answer = ['narrow', 'wide', 'all'].map(mode => {
@@ -401,9 +421,9 @@ if (job.kind === 'encode') {
     options.signal.addEventListener('abort', () => setTimeout(() => reject(new DOMException('Cancelled', 'AbortError')), 20));
   })});
   t.analysis = t.spec({engine: 'test'}); t.apply('/analyse', {ply: 0}); await until(() => !!t.running); await wait(2);
-  const backup = await t.storage.backup(); backup.sessions = [{...t.snapshot(), history: [[0, 0]], records: []}];
+  const backup = await t.storage.backup(); backup.sessions = [{...t.snapshot(), history: [[0, 0]], records: [], paused: false}];
   const lines = [...t.lines], [status] = await t.request('/import', {text: JSON.stringify(backup)}, 'POST');
-  answer.imported = {status, history: t.history, saved: (await t.storage.get('sessions', 'live')).history,
+  answer.imported = {status, history: t.history, paused: t.paused, saved: (await t.storage.get('sessions', 'live')).history,
     renewed: t.lines.every((line, side) => line !== lines[side])};
   const u = new BrowserSession(native); let expired = false;
   u.registerEngine(entry, {turn: (history, budget, options) => new Promise((resolve, reject) => {

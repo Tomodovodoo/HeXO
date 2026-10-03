@@ -73,7 +73,7 @@ cell(tr,box);cell(tr,swatch(r.index));cell(tr,r.run.name,'name');cell(tr,r.varia
 const e=r.run.elo[r.variant];cell(tr,e?`${fmt(e.elo)}${e.interval?` [${fmt(e.interval[0])}, ${fmt(e.interval[1])}]`:''} @ ${e.step}`:'Unrated');cell(tr,r.run.champion||'-');
 const lh=r.run.learner_heartbeat[r.variant];cell(tr,lh==null?'-':`${r.run.learner_stage[r.variant]||'?'} ${age(lh)} ago`,lh!=null&&lh<30?'live':'stale');
 cell(tr,r.run.actor_processes?`${r.run.actor_processes} proc, ${age(r.run.actor_heartbeat)} ago`:'-',r.run.actor_heartbeat!=null&&r.run.actor_heartbeat<30?'live':'stale');
-const a=document.createElement('a');a.href='/?run='+encodeURIComponent(r.run.name);a.textContent='Open';cell(tr,a);body.append(tr)}
+const a=document.createElement('a');a.href='/?'+new URLSearchParams({run:r.run.name,variant:r.variant});a.textContent='Open';cell(tr,a);body.append(tr)}
 const n=selected().length;$('showing').textContent=state.selected?`Showing ${n} of ${rows.length} runs`:`Showing first ${Math.min(10,rows.length)} runs`}
 function panelSeries(p){if(p.history)return [];const out=[],seen=new Set(),paired=new Set(),external=new Set();for(const r of selected()){if(p.perRun){if(seen.has(r.run.name))continue;seen.add(r.run.name)}
 if(p.metric)out.push({key:p.perRun?r.run.name:r.key,label:p.perRun?r.run.name:r.key,run:r.run,variant:p.perRun?'main':r.variant,index:r.index,metric:p.metric});

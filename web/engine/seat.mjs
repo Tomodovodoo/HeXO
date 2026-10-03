@@ -7,13 +7,16 @@
  *
  * ENGINES lists them. Each is {entry, engine, record, build, listed?}: `listed` settles once `entry.checkpoints` is
  * read (the saved choices are then checked against it and the page redraws), `build` is the command that builds its files into this
- * checkout (shown when the public site does not serve them), `entry` is its picker entry ({id, kind, name, label,
- * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
- * while it downloads), `engine.files()` lists the files it downloads (assets.mjs records, for the picker's download
- * button) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
+ * checkout (named when a saved choice needs files the public site does not serve; no engine list shows such an engine),
+ * `entry` is its picker entry ({id, kind, name, label,
+ * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction,
+ * stage) while it loads, stages.mjs's stages), `engine.files()` lists the files it downloads (assets.mjs records, for the picker's download
+ * button) and `engine.turn(history, budget, {signal, progress})` (progress(fraction, live, stage)) resolves to its turn {moves, ...} at a
  * preset's budget, plus `checkpoint` (one of `entry.checkpoints`, chosen in a select when there are several) when the
  * entry lists any, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
- * evaluation record the analysis panel shows for that turn. */
+ * evaluation record the analysis panel shows for that turn. A seat or the analysis shows the stage of its job next to
+ * its bar, and an engine's fallback notice (engine-worker.mjs `notices`) is a toast; a fallback to the CPU moves the
+ * engine's choices to lightning. */
 import {BubbleEngine, NETWORKS, PRESETS, isolate, networkManifest} from './bubble.mjs';
 import {native} from './native.mjs';
 import {shrimp} from './shrimp.mjs';
@@ -24,6 +27,8 @@ import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 import {strix} from './strix.mjs';
 import {NotOnSite, install as download, json, status} from './assets.mjs';
+import {notices} from './engine-worker.mjs';
+import {stageText} from './stages.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
 const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: true},
@@ -111,10 +116,12 @@ function progress() {
   const s = state();
   if (!s) return;
   const fraction = () => job.loading ? loads.get(job.engine) ?? 0 : job.fraction;
+  const words = (id, active) => { const label = document.getElementById(id); if (label) label.textContent = active ? job.stage ?? '' : ''; };
   for (const side of [0, 1]) {
     if (!config.seats[side]) continue;
     const active = job?.kind === 'move' && job.side === side, cancel = document.getElementById('cancel' + side);
     bar(document.getElementById('busy' + side), active ? fraction() : null);
+    words('stage' + side, active);
     document.getElementById('dot' + side)?.classList.toggle('thinking', active);
     if (!cancel) continue;
     if (!active) { cancel.replaceChildren(); continue; }
@@ -126,6 +133,7 @@ function progress() {
   if (config.analysis) {
     const active = job?.kind === 'analyse' && job.ply === viewed();
     bar(document.getElementById('analysis-progress'), active ? fraction() : null);
+    words('analysis-stage', active);
     document.getElementById('evalbar')?.classList.toggle('pending', active);
   }
 }
@@ -155,10 +163,16 @@ async function run(key, task) {
     const timed = task.kind === 'move' && state()?.clock_spec && state().clock_spec.mode !== 'fixed', warm = `${task.engine}|${task.checkpoint}`;
     const hold = timed && (!engine.ready || warmed.get(warm) !== engine.ready);
     if (hold) { posting = true; holding = {paused: false}; await original.post('/pause', {paused: true}); }
+    const report = (f, stage) => {
+      if (stage?.provider) entry.device = deviceLabel(stage);   // once the probe has finished
+      loads.set(task.engine, f);
+      current.stage = stageText(stage);
+      progress();
+    };
     try {
-      entry.device = deviceLabel(await engine.load(f => { loads.set(task.engine, f); progress(); }));
+      entry.device = deviceLabel(await engine.load(report));
       checks.delete(task.engine);
-      await engine.prepare?.(task.checkpoint, {signal: controller.signal});
+      await engine.prepare?.(task.checkpoint, {signal: controller.signal, progress: (f, live, stage) => report(f, stage)});
       warmed.set(warm, engine.ready);
     } finally {
       if (hold) {
@@ -168,13 +182,18 @@ async function run(key, task) {
         posting = false;
       }
     }
-    if (job !== current || hold && state()?.paused) { if (job === current) job = null; return; }
+    if (job !== current || hold && state()?.paused) {
+      if (job === current) job = null;
+      else if (!job) schedule();   // a CPU fallback ended this job while the clock was held: start its replacement
+      return;
+    }
     current.loading = false;
+    current.stage = stageText(null);
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
     const ms = task.kind === 'move' && s?.clock && s.clock_spec?.mode !== 'fixed' ? turnTime(s.clock_spec, s.clock, task.side) : null;
     const started = performance.now();
     const result = await engine.turn(task.history, budget, {signal: controller.signal, ms, line: task.line,
-      progress: f => { current.fraction = f; progress(); }});
+      progress: (f, live, stage) => { current.fraction = f; current.stage = stageText(stage); progress(); }});
     if (ms == null) notePace(entry, task.preset, performance.now() - started, result.moves?.length);
     if (job !== current) return;
     job = null;
@@ -245,13 +264,28 @@ const chosen = id => {
 const remember = (id, promise) => { checks.set(id, Object.assign(promise, {stamp: chosen(id).join(',')})); return promise; };
 const check = id => checks.get(id)?.stamp === chosen(id).join(',') ? checks.get(id)
   : remember(id, ENGINES.get(id).engine.files(chosen(id)).then(files => { if (ENGINES.get(id).listed) recheck(ENGINES.get(id).entry); return status(files); }).catch(failure));
+/** Ids of the browser engines whose files are on neither this origin nor the site: only a local build provides them. */
+const absent = new Set();
+/** Whether an engine list offers engine entry `entry`: not when it is an absent browser engine. A choice saved earlier
+ * keeps its entry in the play state, so its seat still shows its name and controls. */
+export const listed = entry => !absent.has(entry.id);
+/** The page's pickItems(filter), whose items every engine list (seats, analysis, tournament) shows, keeping listed entries. */
+const pickItems = filter => original.pickItems(entry => filter(entry) && listed(entry));
+/** Checks every browser engine's files and takes those on neither origin off the engine lists, redrawing the page when
+ * it took one off; resolves once all are checked. */
+export async function survey() {
+  const states = await Promise.all([...ENGINES.keys()].map(async id => [id, (await check(id)).state]));
+  const gone = states.filter(([id, found]) => found === 'unpublished' && !absent.has(id));
+  for (const [id] of gone) absent.add(id);
+  if (gone.length && state()) page.renderPanels();
+}
 const unpublished = id => original.toast(`${ENGINES.get(id).entry.label} is not on the public site; build it here with ${ENGINES.get(id).build}`);
 /* States in which a browser engine plays without a download first: its files are here, cached, or cannot be cached. */
 const READY = new Set(['local', 'cached', 'uncached']);
 const megabytes = bytes => `${(bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0)} MB`;
 
 /** Draws picker row `row` of a browser engine: as it is when its files are here or cached, else as a download with
- * its size, and while downloading with its progress. */
+ * its size, and while downloading with its progress. A row whose files are on neither origin leaves the menu. */
 async function paint(row) {
   const id = row.dataset.engine, found = await check(id), running = downloads.get(id);
   if (!row.isConnected) return;
@@ -260,12 +294,12 @@ async function paint(row) {
   row.classList.remove('setup', 'running', 'failed');
   row.removeAttribute('aria-label');
   if (ready) return;
-  row.classList.add('setup', ...(running ? ['running'] : found.state === 'failed' ? ['failed'] : []));
   if (found.state === 'unpublished') {
-    row.setAttribute('aria-label', `${ENGINES.get(id).entry.label} needs a local build`);
-    row.append(original.el('span', {class: 'size', style: 'white-space:nowrap'}, 'local build'));
+    row.remove();
+    survey();
     return;
   }
+  row.classList.add('setup', ...(running ? ['running'] : found.state === 'failed' ? ['failed'] : []));
   const total = found.bytes ? megabytes(found.bytes) : '';
   const size = !running ? total : total ? `${megabytes(running.fraction * found.bytes)} / ${total}` : `${Math.round(running.fraction * 100)}%`;
   row.setAttribute('aria-label', `Download ${ENGINES.get(id).entry.label}`);
@@ -352,8 +386,32 @@ function recheck(entry, force = false) {
   } else if (state()) page.renderPanels();
 }
 
+/** After browser engine `engine` left WebGPU for WebAssembly: lightning becomes its starting preset, and the saved
+ * choices (or the static page's session) that use it at another preset move to lightning, ending a job of it at
+ * another preset. */
+function lighten(engine) {
+  const found = [...ENGINES.values()].find(e => e.engine === engine);
+  if (!found) return;
+  const id = found.entry.id;
+  found.entry.preset = 'lightning';
+  if (page.browserPlay) { page.browserPlay.lighten(id); return; }
+  const light = choice => choice?.engine === id ? {...choice, preset: 'lightning'} : choice;
+  config = {seats: config.seats.map(light), analysis: light(config.analysis)};
+  save();
+  if (job?.engine === id && job.preset !== 'lightning') {
+    job.controller.abort();
+    job = null;
+  }
+  if (state()) page.renderPanels();
+}
+
 function install() {
+  notices.addEventListener('notice', ({detail}) => {
+    original.toast(detail.text);
+    if (detail.cpu) lighten(detail.engine);
+  });
   page.openMenu = openMenu;
+  page.pickItems = pickItems;
   page.accept = data => {
     adopt(data);
     inject(data);
@@ -425,7 +483,7 @@ function install() {
     const send = change => { config.seats[side] = {...config.seats[side], ...change}; renew(side); save(); page.renderPanels(); };
     const pick = box.querySelector('.pick');
     if (pick) {
-      const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...original.pickItems(() => true)];
+      const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...pickItems(() => true)];
       pick.onclick = () => page.openMenu(pick, items, config.seats[side].engine, it => page.post('/seat', {side, engine: it.id}));
     }
     const clock = ENGINES.get(config.seats[side].engine).entry.clocks && s.clock_spec
@@ -439,7 +497,7 @@ function install() {
     if (!config.analysis || !head || !s?.analysis) return;
     const {entry} = ENGINES.get(config.analysis.engine);
     const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.badge || entry.kind, entry.label, entry.device));
-    const items = original.pickItems(analysable);
+    const items = pickItems(analysable);
     pick.onclick = () => page.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: ENGINES.get(it.id)?.entry.preset || 'standard', auto: true}));
     const send = change => { config.analysis = {...config.analysis, ...change}; save(); page.renderPanels(); };
     head.replaceChildren(original.el('div', {class: 'head'}, pick), ...controls(config.analysis, send, 'analysis'));
@@ -471,7 +529,7 @@ async function serverless() {
     if (response.ok && (response.headers.get('Content-Type') || '').includes('json')) return false;
   } catch {}
   if (await isolate()) return true;
-  Object.assign(page, original, {openMenu});
+  Object.assign(page, original, {openMenu, pickItems});
   const [manifest, build] = await Promise.all([json(networkManifest()).then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);
   bubble.entry.version = [build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
   bubble.entry.models = NETWORKS.length ? Object.fromEntries(NETWORKS.map(n => [n.name, n.model_version])) : {'': manifest.model_version};
@@ -484,6 +542,7 @@ async function serverless() {
 
 if (HOOKS.every(name => typeof original[name] === 'function')) {
   install();
+  survey();
   for (const {entry, listed} of ENGINES.values()) listed?.then(() => recheck(entry));
   serverless().then(active=>{if(!active||page.browserPlay)page.resolvePlayReady?.()}).catch(error=>{original.toast(error.message)});
 } else console.warn('The browser engines need the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));

@@ -115,6 +115,8 @@ class NativeTactics:
     min(200000, max(50000, 8*budget)) certificate nodes and visits.
     """
 
+    accepts_cancel_event = True
+
     def __init__(self, package=PACKAGE):
         package = Path(package)
         binary = library(package)
@@ -129,12 +131,28 @@ class NativeTactics:
         self.lib.hexo_tactical_free.argtypes = [C.c_void_p]
         self.lib.hexo_tactical_free.restype = None
         self.lock = threading.Lock()
+        self.control_lock, self.request_id, self.cancelled = threading.Lock(), 0, False
+        self.prepare = getattr(self.lib, 'hexo_tactical_prepare', None)
+        if self.prepare is not None:
+            self.prepare.argtypes, self.prepare.restype = [], C.c_uint64
+            self.lib.hexo_tactical_cancel.argtypes = [C.c_uint64]
+            self.lib.hexo_tactical_cancel.restype = C.c_bool
+            self.lib.hexo_tactical_release.argtypes = [C.c_uint64]
+            self.lib.hexo_tactical_release.restype = None
+
+    def cancel(self):
+        """Cooperatively stop this instance's current query without cancelling its successor."""
+        with self.control_lock:
+            if self.request_id and self.lib.hexo_tactical_cancel(self.request_id):
+                self.cancelled = True
+                return True
+            return False
 
     def solve(self, game, **budgets):
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False):
+                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, cancel_event=None):
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         start = time.perf_counter()
         nodes, score = gated_nodes(history, attacker, nodes, gate)
@@ -154,6 +172,15 @@ class NativeTactics:
                 request['root_moves'] = root_moves
             if shortest:
                 request['shortest'] = True
+            with self.control_lock:
+                self.cancelled = False
+                if cancel_event is not None and cancel_event.is_set():
+                    return unknown('cancelled')
+                if self.prepare is not None:
+                    self.request_id = self.prepare()
+                    if not self.request_id:
+                        return unknown('cancellation token limit')
+                    request['request_id'] = self.request_id
             payload = json.dumps(request, separators=(',', ':')).encode()
             if len(payload) > REQUEST_LIMIT:
                 return unknown('request size limit')
@@ -167,8 +194,20 @@ class NativeTactics:
             if time.perf_counter()-start >= ms/1000:
                 result.update(unknown('deadline'), nodes_used=result['nodes_used'])
             result.update(elapsed_ms=(time.perf_counter()-start)*1000, budget=nodes, gate_score=score)
+            if cancel_event is not None and cancel_event.is_set():
+                result.update(unknown('cancelled'), nodes_used=result['nodes_used'])
+            with self.control_lock:
+                if self.cancelled:
+                    result.update(unknown('cancelled'), nodes_used=result['nodes_used'])
+                if self.request_id:
+                    self.lib.hexo_tactical_release(self.request_id)
+                    self.request_id = 0
             return result
         finally:
+            with self.control_lock:
+                if self.request_id:
+                    self.lib.hexo_tactical_release(self.request_id)
+                    self.request_id = 0
             self.lock.release()
 
 
@@ -202,6 +241,8 @@ class IsolatedTactics:
         self.grace_ms, self.startup_ms = grace_ms, startup_ms
         self.stats = dict(queries=0, spawns=0, kills=0, exits=0)
         self.lock = threading.Lock()
+        self.control_lock, self.query_id, self.active_query = threading.Lock(), 0, None
+        self.cancelled_query = None
         self.job = _memory_job(memory_mb) if sys.platform == 'win32' else None
         self.replacement = None
         self._spawn()
@@ -282,11 +323,15 @@ class IsolatedTactics:
             request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
                            attacker=attacker, certificate=certificate, root_moves=root_moves, gate=gate,
                            table_mb=table_mb, shortest=shortest)
-            payload = json.dumps(request, separators=(',', ':'))
-            if len(payload) > REQUEST_LIMIT:
-                return unknown('request size limit')
-            self.process.stdin.write(payload+'\n')
-            self.process.stdin.flush()
+            with self.control_lock:
+                self.query_id += 1
+                request['query_id'] = self.query_id
+                payload = json.dumps(request, separators=(',', ':'))
+                if len(payload) > REQUEST_LIMIT:
+                    return unknown('request size limit')
+                self.active_query = self.process, self.query_id
+                self.process.stdin.write(payload+'\n')
+                self.process.stdin.flush()
             result = self._line(hard)
             if result == 'timeout':
                 self._retire(killed=True)
@@ -303,12 +348,38 @@ class IsolatedTactics:
                 result.update(unknown('deadline', result.get('build_hash')), nodes_used=result.get('nodes_used', 0),
                               budget=result.get('budget'), gate_score=result.get('gate_score'))
             result['elapsed_ms'] = (time.perf_counter()-start)*1000
+            with self.control_lock:
+                if self.active_query is not None and self.cancelled_query == self.active_query[1]:
+                    result.update(unknown('cancelled', result.get('build_hash')), nodes_used=result.get('nodes_used', 0),
+                                  budget=result.get('budget'), gate_score=result.get('gate_score'))
+                    result.pop('certificate_json', None)
+                self.active_query = None
             return result
         except OSError:
             self._retire(killed=False)
             return unknown('tactical worker pipe closed')
         finally:
+            with self.control_lock:
+                self.active_query = None
             self.lock.release()
+
+    def cancel(self):
+        """Ask the current child query to stop, retaining its resident solver tables.
+
+        The normal hard deadline still replaces a child that cannot cooperate.
+        No acknowledgement is written into the result stream.
+        """
+        with self.control_lock:
+            if self.active_query is None:
+                return False
+            process, query_id = self.active_query
+            try:
+                process.stdin.write(json.dumps(dict(cancel=query_id))+'\n')
+                process.stdin.flush()
+            except OSError:
+                return False
+            self.cancelled_query = query_id
+            return True
 
     def abort(self):
         """End the running query now: it returns UNKNOWN and the worker restarts in the background."""
@@ -421,9 +492,45 @@ def _serve(engine, package, memory_mb, priority='None'):
         print(json.dumps(dict(error=f'{type(error).__name__}: {error}')), flush=True)
         return
     print(json.dumps(dict(ready=True)), flush=True)
-    for line in sys.stdin:
-        request = json.loads(line)
-        result = tactics.history(request.pop('history'), **request)
+    requests, controls, control_lock = queue.Queue(1), {}, threading.Lock()
+    current_id = None
+
+    def read_requests():
+        for line in sys.stdin:
+            request = json.loads(line)
+            with control_lock:
+                if 'cancel' in request:
+                    event = controls.get(request['cancel'])
+                    if event is not None:
+                        event.set()
+                        if request['cancel'] == current_id and hasattr(tactics, 'cancel'):
+                            tactics.cancel()
+                    continue
+                query_id = request.pop('query_id', 0)
+                event = threading.Event()
+                controls[query_id] = event
+            requests.put((query_id, event, request))
+        requests.put(None)
+
+    threading.Thread(target=read_requests, daemon=True).start()
+    while (work := requests.get()) is not None:
+        query_id, event, request = work
+        with control_lock:
+            current_id = query_id
+        start = time.perf_counter()
+        if event.is_set():
+            result = dict(unknown_result('cancelled', start, request.get('attacker', 'mover'), None),
+                          budget=None, gate_score=None)
+        else:
+            if getattr(tactics, 'accepts_cancel_event', False):
+                request['cancel_event'] = event
+            result = tactics.history(request.pop('history'), **request)
+        with control_lock:
+            current_id = None
+            controls.pop(query_id, None)
+            if event.is_set():
+                result.update(unknown_result('cancelled', start, request.get('attacker', 'mover'), result.get('build_hash')),
+                              nodes_used=result.get('nodes_used', 0))
         certificate = result.pop('certificate', None)
         result.update(certificate=None, has_certificate=certificate is not None)
         print(json.dumps(result, separators=(',', ':')), flush=True)

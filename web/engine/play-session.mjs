@@ -5,6 +5,7 @@ import {OpeningBook} from './openings.mjs';
 import {readGame, exportGame, htttx} from './notation.mjs';
 import {clockSpec, turnTime} from './clock.mjs';
 import {Proofs, proven} from './proof.mjs';
+import {stageText} from './stages.mjs';
 import {PV_CHECK} from './search.mjs';
 
 const REFRESH_PLIES = 4;  // earlier placements a finished analysis refreshes (python/play.py REFRESH_PLIES)
@@ -20,27 +21,49 @@ const MAX_BUDGET = 2 ** 31 - 1;
 const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
-/** Labels every complete turn of `history` as python/play.py review does; `lookup(prefix, ply)` is the evaluation of a
- * position, given `ply` when the prefix is `history.slice(0, ply)`. */
+/** `promise`, or an AbortError as soon as `signal` aborts, so a job never waits on a load it no longer needs. */
+function abortable(promise, signal) {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new DOMException('Cancelled', 'AbortError'));
+    if (signal.aborted) abort();
+    signal.addEventListener('abort', abort, {once: true});
+    Promise.resolve(promise).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+const UNGRADED = {label: null, before: null, after: null, better: null, line: null};
+
+/** Labels every turn of `history`, and each of its stones in `grades`, as python/play.py review does; `lookup(prefix,
+ * ply)` is the evaluation of a position, given `ply` when the prefix is `history.slice(0, ply)`. */
 export function review(history, lookup, winner = -1) {
+  const seen = new Map(), look = (prefix, ply) => {
+    const key = position(prefix);
+    if (!seen.has(key)) seen.set(key, lookup(prefix, ply));
+    return seen.get(key);
+  };
+  const judge = (s, e, me) => {
+    const stones = history.slice(s, e), grade = {...UNGRADED};
+    if (e === history.length && winner === me) return {...grade, label: 'win'};
+    const before = look(history.slice(0, s), s), after = look(history.slice(0, e), e);
+    if (!before || !after) return grade;
+    grade.before = before.value; grade.after = playerAt(e) === me ? after.value : 1 - after.value;
+    const had = before.proof?.winner, has = after.proof?.winner, loss = grade.before - grade.after, engine = (before.moves || []).map(p => p.join(','));
+    const best = engine.length > 0 && stones.every(p => engine.includes(p.join(',')));
+    grade.label = had === 1 - me ? 'lost' : had === me ? has === me || best ? 'kept' : 'missed' : has === 1 - me ? 'allowed'
+      : has === me ? 'found' : best ? 'best' : loss < .05 ? 'good' : loss < .1 ? 'inaccuracy' : loss < .2 ? 'mistake' : 'blunder';
+    if (['inaccuracy', 'mistake', 'blunder', 'missed', 'allowed'].includes(grade.label) && engine.length && !best) {
+      grade.better = before.moves.slice(0, stones.length);
+      grade.line = before.pv?.length ? before.pv : before.line?.length ? before.line : [...before.moves.map(p => [...p, me]), ...(look([...history.slice(0, s), ...before.moves])?.moves || []).map(p => [...p, 1 - me])];
+    }
+    return grade;
+  };
   const turns = [], ss = starts(history.length);
   for (let i = 0; i < ss.length; i++) {
-    const ply = ss[i], end = ss[i + 1] ?? history.length, me = playerAt(ply), stones = history.slice(ply, end);
-    if (stones.length < (ply ? 2 : 1) && !(end === history.length && winner === me)) break;
-    const turn = {ply, player: me, stones, label: null, before: null, after: null, better: null, line: null};
-    turns.push(turn);
-    if (end === history.length && winner === me) { turn.label = 'win'; continue; }
-    const before = lookup(history.slice(0, ply), ply), after = lookup(history.slice(0, end), end);
-    if (!before || !after) continue;
-    turn.before = before.value; turn.after = 1 - after.value;
-    const had = before.proof?.winner, has = after.proof?.winner, loss = turn.before - turn.after;
-    const best = before.moves?.length && JSON.stringify(before.moves.map(p => p.join(',')).sort()) === JSON.stringify(stones.map(p => p.join(',')).sort());
-    turn.label = had === 1 - me ? 'lost' : had === me ? has === me || best ? 'kept' : 'missed' : has === 1 - me ? 'allowed'
-      : has === me ? 'found' : best ? 'best' : loss < .05 ? 'good' : loss < .1 ? 'inaccuracy' : loss < .2 ? 'mistake' : 'blunder';
-    if (['inaccuracy', 'mistake', 'blunder', 'missed', 'allowed'].includes(turn.label) && before.moves?.length) {
-      turn.better = before.moves;
-      turn.line = before.pv?.length ? before.pv : before.line?.length ? before.line : [...before.moves.map(p => [...p, me]), ...(lookup([...history.slice(0, ply), ...before.moves])?.moves || []).map(p => [...p, 1 - me])];
-    }
+    const ply = ss[i], end = ss[i + 1] ?? history.length, me = playerAt(ply);
+    if (end === ply) break;
+    const complete = end - ply === (ply ? 2 : 1) || end === history.length && winner === me;
+    turns.push({ply, player: me, stones: history.slice(ply, end), ...(complete ? judge(ply, end, me) : UNGRADED),
+      grades: Array.from({length: end - ply}, (_, j) => judge(ply + j, ply + j + 1, me))});
   }
   return turns;
 }
@@ -76,10 +99,23 @@ export class BrowserSession extends OfflineSession {
     this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
-   * move's clock starts after it) and `adapter.turn(history, budget, options)` plays. */
+   * move's clock starts after it; `progress(fraction, stage)` with stages.mjs's stages) and `adapter.turn(history,
+   * budget, options)` plays (`options.progress(fraction, live, stage)`). */
   registerEngine(entry, adapter) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
     for (const seat of [...this.seats, this.analysis].filter(Boolean)) if (seat.engine === entry.id) Object.assign(seat, this.spec(seat));
+    this.changed(); this.pump();
+  }
+  /** After engine `id` left WebGPU for WebAssembly: lightning becomes its starting preset, and the seats and the
+   * analysis that use it at another preset move to lightning (outside a running match), ending their jobs. */
+  lighten(id) {
+    const entry = this.entries.get(id);
+    if (!entry) return;
+    entry.preset = 'lightning';
+    if (this.match?.active) return;
+    const light = spec => spec?.engine === id && spec.preset !== 'lightning' ? this.spec({...spec, preset: 'lightning'}) : spec;
+    this.seats = this.seats.map(light); this.analysis = light(this.analysis);
+    this.cancelJobs(job => job.spec.engine === id && job.spec.preset !== 'lightning' && !job.tier && job.kind !== 'review');
     this.changed(); this.pump();
   }
   spec(input) {
@@ -152,7 +188,7 @@ export class BrowserSession extends OfflineSession {
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
       evaluations, stale: Object.keys(evaluations).map(Number).filter(ply => this.stale(evaluations[ply])), review: turns,
       review_preset: this.analysis?.preset ?? null,
-      jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live}) => ({id, kind, status, done, total, error, ply: history.length, side, live}))};
+      jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live, stage}) => ({id, kind, status, done, total, error, ply: history.length, side, live, stage}))};
   }
   static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings', '/clock'].some(p => path === p || path.startsWith(p + '/')); }
   answer(path, body = {}) {
@@ -207,7 +243,9 @@ export class BrowserSession extends OfflineSession {
     }).catch(error => { this.gameSignature = null; this.storageError = `Could not save in this browser: ${error.message}`; this.onchange(this.state()); });
     return this.saving;
   }
-  async restore() {
+  /** Loads the saved session. A budget game resumes as it was left unless `paused` asks otherwise; a clocked game or a
+   * match always waits for Resume so no side's time runs unattended. */
+  async restore({paused = false} = {}) {
     const [saved, coverage, evaluations] = await Promise.all([this.storage.get('sessions', this.id), this.storage.get('coverage', 'book'), this.storage.all('evaluations')]);
     this.cache.clear(); this.index.clear(); this.provenRecords.clear(); this.proofs = new Proofs();
     for (const r of evaluations) this.indexRecord(r);
@@ -215,8 +253,8 @@ export class BrowserSession extends OfflineSession {
     this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false; this.renewLines();
     if (saved) {
       const {taken, ...fields} = saved;
-      this.native.game(saved.history); Object.assign(this, {...fields, paused: true});
-      if (this.match) this.match.active = false;
+      this.native.game(saved.history); Object.assign(this, {...fields, paused: paused || Boolean(fields.paused) || Boolean(fields.clock)});
+      if (this.match) { this.match.active = false; this.paused = true; }
       if (this.clock?.started != null && taken) {
         // The side was thinking when the page went away: the time since the snapshot counts against it.
         const field = this.clock.side ? 'circle_ms' : 'cross_ms', now = Date.now();
@@ -306,8 +344,8 @@ export class BrowserSession extends OfflineSession {
       else if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', history, this.analysis, {force: !!body.force, line: this.analysisLine});
     } else if (path === '/review') {
       if (!this.analysis || !this.adapters.has(this.analysis.engine)) throw Error('Choose an analysis engine');
-      const history = copy(this.history), plies = starts(history.length);
-      if (this.native.game(history).winner < 0 && !plies.includes(history.length)) plies.push(history.length);
+      // From the last position backwards: what a later position proves is known when an earlier one is searched.
+      const history = copy(this.history), plies = Array.from({length: history.length + (this.native.game(history).winner < 0)}, (_, i) => i).reverse();
       this.enqueue('review', history, this.reviewSpec(), {plies, cursor: 0, total: plies.length});
     } else if (path === '/cancel') {
       if (this.jobs.some(j => j.id === body.id && j.kind === 'move')) { this.paused = true; this.freezeClock(); }
@@ -368,6 +406,15 @@ export class BrowserSession extends OfflineSession {
       this.records = this.records.filter(r => r.id !== record.id); this.records.push(record);
     }
     return record;
+  }
+  /** Counts a search of analysis job `job` on its line's graph and returns the stamp its evaluation is saved with,
+   * [generation, searches]. The worker rebuilds a line's graph when its network or Q range floor changes (GameGraphs);
+   * each such graph gets a new generation, unique across reloads. */
+  graphSearched(job) {
+    const key = [job.line, this.engineKey(job.spec), job.spec.budget.q_range_floor ?? 0].join('|'), graph = this.graph;
+    if (graph.key !== key) Object.assign(graph, {key, generation: uid(), searches: 0});
+    graph.searches += 1;
+    return [graph.generation, graph.searches];
   }
   /** True when `record`, a saved evaluation, came from the graph analysis searched last and an analysis of another
    * position has searched that graph since (python/play.py Session.stale); a rebuilt graph never stales older records. */
@@ -493,8 +540,9 @@ export class BrowserSession extends OfflineSession {
     const history = job.kind === 'review' ? job.history.slice(0, job.plies[job.cursor]) : job.history;
     try {
       const adapter = this.adapters.get(job.spec.engine);
-      await adapter.ready?.(f => { job.done = f * .1; this.onchange(this.state()); }, job.spec.checkpoint);
-      if (job.controller.signal.aborted || job.attempt.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      await abortable(adapter.ready?.((f, stage) => { job.done = f * .1; job.stage = stageText(stage); this.onchange(this.state()); }, job.spec.checkpoint), signal);
+      if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      job.stage = stageText(null);
       if (job.kind === 'move') this.runClock(true);
       let timeout = false, limit = null, ms = null;
       if (job.kind === 'move' && this.clock) {
@@ -513,7 +561,7 @@ export class BrowserSession extends OfflineSession {
       try {
         result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
           known: job.kind === 'move' ? null : (this.extendProofs(), this.proofs.list()),
-          progress: (f, live) => { job.done = job.kind === 'review' ? job.cursor + f : f; if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
+          progress: (f, live, stage) => { job.done = job.kind === 'review' ? job.cursor + f : f; job.stage = stageText(stage); if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);
       const at = Date.now(), elapsed = this.clock?.started != null ? at - this.clock.started : null;
@@ -531,14 +579,7 @@ export class BrowserSession extends OfflineSession {
       if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
       const {graph_searched: searched, ...answer} = result;
       result = answer;
-      if (job.kind === 'analyse' && job.line != null && searched) {
-        // The worker rebuilds a line's graph when its network or Q range floor changes (GameGraphs); each graph gets a
-        // new generation, unique across reloads.
-        const key = [job.line, this.engineKey(job.spec), job.spec.budget.q_range_floor ?? 0].join('|'), graph = this.graph;
-        if (graph.key !== key) Object.assign(graph, {key, generation: uid(), searches: 0});
-        graph.searches += 1;
-        result = {...result, graph: [graph.generation, graph.searches]};
-      }
+      if (job.kind === 'analyse' && job.line != null && searched) result = {...result, graph: this.graphSearched(job)};
       await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));
       if (job.kind === 'analyse' && !job.refresh && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') this.refresh(history, job.spec, job.line);
       if (job.kind === 'move') {
@@ -554,6 +595,8 @@ export class BrowserSession extends OfflineSession {
         }
       } else if (job.kind === 'review') { job.cursor++; job.done = job.cursor; }
     } catch (error) {
+      // A cancelled or failed Bubble analysis may have searched its graph already: its other analyses are stale.
+      if (job.kind === 'analyse' && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') this.graphSearched(job);
       interrupted = error.name === 'AbortError' && !job.controller.signal.aborted;
       if (error.name !== 'AbortError') { job.status = 'failed'; job.error = error.message; if (job.kind === 'move') { this.freezeClock(); this.paused = true; } if (this.match) this.match.error = error.message; }
     } finally {
@@ -674,7 +717,7 @@ export class BrowserSession extends OfflineSession {
         if (json?.format === 'hexo-browser-save') {
           this.importing = true; this.paused = true; this.cancelJobs();
           try {
-            await this.idle; await this.saving; await this.storage.restore(json, this.native); await this.restore();
+            await this.idle; await this.saving; await this.storage.restore(json, this.native); await this.restore({paused: true});
             for (const spec of [...this.seats, this.analysis].filter(Boolean)) if (this.entries.has(spec.engine)) Object.assign(spec, this.spec(spec));
           } finally { this.importing = false; }
           this.changed(); data = this.state();

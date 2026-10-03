@@ -120,9 +120,27 @@ class HexcropTests(unittest.TestCase):
                     np.testing.assert_array_equal(getattr(a, field), getattr(b, field))
                 for field in ('size', 'far', 'player', 'remaining', 'symmetry', 'offset'):
                     self.assertEqual(getattr(a, field), getattr(b, field))
+                batch = hexcrop.encode_leaves(native, [(tree.ptr, request, leaf_history)]*8)
+                for sample in batch:
+                    for field in ('planes', 'actions', 'cells'):
+                        np.testing.assert_array_equal(getattr(sample, field), getattr(b, field))
+                    for field in ('size', 'far', 'player', 'remaining', 'symmetry', 'offset'):
+                        self.assertEqual(getattr(sample, field), getattr(b, field))
+                    self.assertTrue(sample.actions.flags.owndata)
                 if hasattr(native, 'hxg_encode'):
                     self.assertEqual(native.hxg_encode(tree.ptr, request, a.planes.ctypes.data, 1, None, None), 0)
+                if hasattr(native, 'hxg_encode_many'):
+                    trees = np.full(8, tree.ptr, np.uintp)
+                    ids = np.full(8, request, np.int32)
+                    info = np.zeros((8, 12), np.int64)
+                    args = (trees.ctypes.data, ids.ctypes.data, 8, info.ctypes.data)
+                    self.assertEqual(native.hxg_encode_many(*args, None, 0, None, None, 0), 1)
+                    cells, actions = np.empty(8*len(a.actions), np.int64), np.empty((8*len(a.actions), 2), np.int64)
+                    self.assertEqual(native.hxg_encode_many(*args, a.planes.ctypes.data, 1,
+                        cells.ctypes.data, actions.ctypes.data, len(cells)), 0)
                 native.hxg_cancel(tree.ptr)
+                with self.assertRaisesRegex(ValueError, 'Unknown'):
+                    hexcrop.encode_leaves(native, [(tree.ptr, request, leaf_history)]*8)
             finally:
                 tree.close()
             game.close()
@@ -243,6 +261,23 @@ class HexcropTests(unittest.TestCase):
             request, history = tree.request()
             with self.assertRaises(hexcrop.SpanError):
                 hexcrop.encode_leaf(native, tree.ptr, request, history)
+            leaves = [(tree.ptr, request, history)]*8
+            with self.assertRaises(hexcrop.SpanError):
+                hexcrop.encode_leaves(native, leaves)
+            self.assertEqual(hexcrop.encode_leaves(native, leaves, allow_span=True), [None]*8)
+            small = NeuralSearch(None, 'span')
+            try:
+                checked(native.hxg_begin(small.ptr, 2, 2))
+                small_request, small_history = small.request()
+                leaves = [(tree.ptr, request, history), (small.ptr, small_request, small_history)]*4
+                batch = hexcrop.encode_leaves(native, leaves, allow_span=True)
+                expected = hexcrop.encode([])
+                for rejected, sample in zip(batch[::2], batch[1::2]):
+                    self.assertIsNone(rejected)
+                    for field in ('planes', 'actions', 'cells'):
+                        np.testing.assert_array_equal(getattr(sample, field), getattr(expected, field))
+            finally:
+                small.close()
         finally:
             tree.close()
 
@@ -740,9 +775,9 @@ class FusedCudaTests(unittest.TestCase):
         from hexnet_graphs import ActorGraph
         torch.manual_seed(3070)
         model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
-        runner = ActorGraph(model)
+        runner = ActorGraph(model, max_batch=128)
         inputs, outputs, saved = [], [], []
-        for rows, side in ((19, 24), (7, 32), (1, 24), (2, 24), (3, 24)):
+        for rows, side in ((19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (64, 24), (128, 24), (64, 32), (64, 40)):
             x = torch.randint(0, 2, (rows, 8, side, side), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
             x[:, 3] = 1
             with torch.autocast('cuda', torch.bfloat16):
@@ -753,6 +788,9 @@ class FusedCudaTests(unittest.TestCase):
             inputs.append(x)
             outputs.append(out)
             saved.append({name: value.clone() for name, value in out.items()})
+        self.assertIn((24, 128), runner.graphs)
+        self.assertIn((32, 64), runner.graphs)
+        self.assertNotIn((40, 64), runner.graphs)
         for i in reversed(range(len(inputs))):
             out = runner(inputs[i])
             for name in out:
@@ -763,7 +801,7 @@ class FusedCudaTests(unittest.TestCase):
         runner.close()
         reserved = torch.cuda.memory_reserved()
         for _ in range(4):
-            replacement = ActorGraph(model)
+            replacement = ActorGraph(model, max_batch=128)
             out = replacement(inputs[0])
             for name in out:
                 torch.testing.assert_close(out[name], saved[0][name], rtol=0, atol=0)
@@ -3406,6 +3444,19 @@ class ValidationSourceTests(unittest.TestCase):
 
 
 class EvaluatorSearchTests(unittest.TestCase):
+    def test_actor_graph_batches_keep_small_tails_and_canvas_limits(self):
+        from hexnet_graphs import ActorGraph
+        for side, rows, expected in ((24, 128, [(128, 128)]), (32, 128, [(64, 64), (64, 64)]),
+                                      (40, 128, [(32, 32)]*4), (64, 32, [(16, 16)]*2),
+                                      (24, 147, [(128, 128), (16, 16), (3, 4)]),
+                                      (32, 83, [(64, 64), (16, 16), (3, 4)])):
+            parts = list(ActorGraph._segments(rows, ActorGraph._limit(side, 128)))
+            self.assertEqual(parts, expected)
+            self.assertEqual(sum(n for n, _ in parts), rows)
+            self.assertTrue(all(n <= cap and cap*side*side <= ActorGraph.MAX_CELLS for n, cap in parts))
+        for side in ActorGraph.CANVASES:
+            self.assertLessEqual(ActorGraph._limit(side), 32)
+
     def setUp(self):
         self.threads = torch.get_num_threads()
         torch.set_num_threads(2)
@@ -4227,24 +4278,36 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(dense_selfplay.root_value(result, 0), 1.)
 
     def test_full_batch_counts_submitted_positions(self):
-        from neural_search import EvaluationCache
+        from neural_search import EvaluationCache, native
 
         class Evaluator:
             def submit(self, histories, legal):
                 return [(actions, np.zeros(len(actions)), np.zeros(len(actions))) for actions in legal]
 
-        model = type('Model', (), dict(cache=EvaluationCache(), evaluator=Evaluator()))()
-        trees = [NeuralSearch(None, 'test', history=history) for history in ((), ((0, 0),))]
-        try:
-            engine = dense_selfplay.Engine(2)
-            for tree in trees:
-                slot = SimpleNamespace(tree=tree, model=model, budget=2, samples=2, solver=None)
-                engine.add(slot)
-            engine.step()
-            self.assertEqual((engine.calls, engine.evals, engine.full_calls), (1, 2, 1))
-        finally:
-            for tree in trees:
-                tree.close()
+            def submit_leaves(self, leaves):
+                legal = [hexcrop.encode_leaf(native, ptr, request, history).actions
+                         for ptr, request, history in leaves]
+                return self.submit(None, legal)
+
+        for native_leaves in (False, True):
+            with self.subTest(native_leaves=native_leaves):
+                evaluator = Evaluator() if native_leaves else SimpleNamespace(submit=Evaluator().submit)
+                model = type('Model', (), dict(cache=EvaluationCache(), evaluator=evaluator))()
+                trees = [NeuralSearch(None, 'test', history=history) for history in ((), ((0, 0),))]
+                engine = dense_selfplay.Engine(2)
+                try:
+                    for tree in trees:
+                        slot = SimpleNamespace(tree=tree, model=model, budget=2, samples=2, solver=None)
+                        engine.add(slot)
+                    engine.step()
+                    self.assertEqual((engine.calls, engine.evals, engine.full_calls), (1, 2, 1))
+                    handle = engine.inflight[0][-1]
+                    for tree, prediction in zip(trees, handle):
+                        np.testing.assert_array_equal(prediction[0], legal(tree.history))
+                finally:
+                    engine.close()
+                    for tree in trees:
+                        tree.close()
 
     def test_position_wider_than_the_largest_crop_ends_the_game(self):
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 64, 256)

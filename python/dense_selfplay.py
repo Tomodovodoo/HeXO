@@ -145,13 +145,7 @@ class Evaluator(hexnet.DenseEvaluator):
 
     @torch.inference_mode()
     def submit_leaves(self, leaves):
-        samples = []
-        for tree, request, history in leaves:
-            try:
-                samples.append(hexcrop.encode_leaf(native, tree, request, history))
-            except hexcrop.SpanError:
-                samples.append(None)
-        return self.submit(samples)
+        return self.submit(hexcrop.encode_leaves(native, leaves, allow_span=True))
 
     @torch.inference_mode()
     def submit(self, histories, legal=None):
@@ -510,8 +504,10 @@ class Engine:
                     progress = True
                 else:
                     if key not in pending.setdefault(model, {}):
-                        legal = np.empty((native.hxg_legal(ptr, request, None), 2), np.int64)
-                        native.hxg_legal(ptr, request, legal.ctypes.data)
+                        legal = None
+                        if not hasattr(model.evaluator, 'submit_leaves'):
+                            legal = np.empty((native.hxg_legal(ptr, request, None), 2), np.int64)
+                            native.hxg_legal(ptr, request, legal.ctypes.data)
                         pending[model][key] = [(history, legal)]
                     pending[model][key].append((slot, ptr, request))
                     count += 1

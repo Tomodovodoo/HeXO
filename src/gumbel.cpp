@@ -461,7 +461,7 @@ struct Tree {
    propagate(*path.leaf,path.edges.back().first);
    for(size_t j=1;j<path.edges.size();++j)propagate(*path.edges[j].first,path.edges[j-1].first);
   }
-  if(shared){propagate(*root,nullptr);for(Node* x:lineage)++x->n;}
+  if(shared){propagate(*root,nullptr);for(Node* x:lineage){++x->n;stale(*x);}}
   if(!path.edges.empty())++completed;
  }
  // Next leaf request id; 0 when nothing can be requested now, -1 after a simulation that ended on an exact edge or

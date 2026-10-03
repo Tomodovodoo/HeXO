@@ -1,6 +1,6 @@
 //! Raw-coordinate strategy checker. No upstream rules, completion or cover helpers.
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
+use hexo_solver::prover::Ctl;
 use hexo_solver::prover::certificate::{ProofCertificate, ProofNode};
 type Point = (i32,i32);
 pub type Board = BTreeMap<Point,u8>;
@@ -32,28 +32,34 @@ pub fn legal(board: &Board, p: Point) -> bool {
             a.abs().max(b.abs()).max((a+b).abs())<=8
         })}
 }
+#[cfg(test)]
 pub fn replay(history: &[Point]) -> Result<Board,String> {
+    replay_controlled(history,&Ctl::new(0.0))
+}
+pub fn replay_controlled(history: &[Point], ctl:&Ctl) -> Result<Board,String> {
     let mut b=Board::new();
     for (n,&p) in history.iter().enumerate() {
+        check(ctl)?;
         if p.0.unsigned_abs()>LIMIT as u32 || p.1.unsigned_abs()>LIMIT as u32 || !legal(&b,p) {return Err("illegal history".into());}
         let side=phase(n).0;b.insert(p,side);
         if won(&b,p,side) {return Err("terminal input history".into());}
     }
     Ok(b)
 }
-fn check(deadline: Instant) -> Result<(),String> {
-    if Instant::now()>=deadline {Err("verification deadline".into())} else {Ok(())}
+fn check(ctl: &Ctl) -> Result<(),String> {
+    if ctl.cancel.load(std::sync::atomic::Ordering::Acquire) {Err("verification cancelled".into())}
+    else if ctl.expired() {Err("verification deadline".into())} else {Ok(())}
 }
-fn completions(b:&Board, side:u8, allowance:u8, deadline:Instant) -> Result<BTreeSet<Vec<Point>>,String> {
+fn completions(b:&Board, side:u8, allowance:u8, ctl:&Ctl) -> Result<BTreeSet<Vec<Point>>,String> {
     let mut segments=BTreeSet::new();
     for (&(q,r),&owner) in b {
-        check(deadline)?;
+        check(ctl)?;
         if owner!=side {continue;}
         for (dq,dr) in AXES {for offset in 0..6 {segments.insert((q-offset*dq,r-offset*dr,dq,dr));}}
     }
     let mut out=BTreeSet::new();
     for (q,r,dq,dr) in segments {
-        check(deadline)?;
+        check(ctl)?;
         let points:Vec<_>=(0..6).map(|k|(q+k*dq,r+k*dr)).collect();
         if points.iter().any(|p| b.get(p)==Some(&(1-side))) {continue;}
         let mut empty:Vec<_>=points.into_iter().filter(|p|!b.contains_key(p)).collect();
@@ -64,14 +70,14 @@ fn completions(b:&Board, side:u8, allowance:u8, deadline:Instant) -> Result<BTre
     }
     Ok(out)
 }
-fn covers(threats:&BTreeSet<Vec<Point>>, deadline:Instant) -> Result<BTreeSet<Vec<Point>>,String> {
+fn covers(threats:&BTreeSet<Vec<Point>>, ctl:&Ctl) -> Result<BTreeSet<Vec<Point>>,String> {
     let endpoints:Vec<_>=threats.iter().flatten().copied().collect::<BTreeSet<_>>().into_iter().collect();
     let hits=|p:&[Point]| threats.iter().all(|t|p.iter().any(|x|t.contains(x)));
     let mut result=BTreeSet::new();
     for (i,&a) in endpoints.iter().enumerate() {
-        check(deadline)?;
+        check(ctl)?;
         if hits(&[a]) {result.insert(vec![a]);}
-        for &b in &endpoints[i+1..] {if hits(&[a,b]) {result.insert(vec![a,b]);}}
+        for &b in &endpoints[i+1..] {check(ctl)?;if hits(&[a,b]) {result.insert(vec![a,b]);}}
     }
     Ok(result)
 }
@@ -87,21 +93,21 @@ pub fn apply(b:&Board, n:usize, moves:&[Point]) -> Result<(Board,usize,bool),Str
     Ok((out,n+moves.len(),win))
 }
 
-pub fn defenses(b:&Board, attacker:u8, deadline:Instant) -> Result<BTreeMap<Vec<Point>,Vec<Point>>,String> {
-    if !completions(b,1-attacker,2,deadline)?.is_empty() {return Err("defender counterwin".into());}
-    let threats=completions(b,attacker,2,deadline)?;
+pub fn defenses(b:&Board, attacker:u8, ctl:&Ctl) -> Result<BTreeMap<Vec<Point>,Vec<Point>>,String> {
+    if !completions(b,1-attacker,2,ctl)?.is_empty() {return Err("defender counterwin".into());}
+    let threats=completions(b,attacker,2,ctl)?;
     if threats.is_empty() {return Err("quiet defender unsupported".into());}
-    let small=covers(&threats,deadline)?;
+    let small=covers(&threats,ctl)?;
     let mut result=BTreeMap::new();
     for cover in small {
-        check(deadline)?;
+        check(ctl)?;
         if cover.len()==2 {result.insert(cover.clone(),cover);continue;}
         let fixed=cover[0];let mut post=b.clone();post.insert(fixed,1-attacker);
         // Full finite legal frontier AFTER the mandatory block. This includes
         // fillers made legal by that first placement, with that order retained.
         let mut frontier=BTreeSet::new();
         for &(q,r) in post.keys() {
-            check(deadline)?;
+            check(ctl)?;
             for dq in -8i32..=8 {for dr in -8i32..=8 {
                 if dq.abs().max(dr.abs()).max((dq+dr).abs())<=8 && !post.contains_key(&(q+dq,r+dr)) {
                     frontier.insert((q+dq,r+dr));
@@ -109,7 +115,7 @@ pub fn defenses(b:&Board, attacker:u8, deadline:Instant) -> Result<BTreeMap<Vec<
             }}
         }
         for filler in frontier {
-            check(deadline)?;
+            check(ctl)?;
             let mut key=vec![fixed,filler];key.sort();
             result.entry(key).or_insert(vec![fixed,filler]);
             if result.len()>50000 {return Err("free-second coverage work limit".into());}
@@ -122,15 +128,16 @@ pub fn defenses(b:&Board, attacker:u8, deadline:Instant) -> Result<BTreeMap<Vec<
 /// `history` (`start` is `history.len()`, or `flip(history.len())` for a flipped-turn
 /// query). Returns the root action and the most attacker turns on any certificate
 /// path, counting the completing turn (an immediate win is 1 turn).
-pub fn verify(history:&[Point], start:usize, cert:&ProofCertificate, deadline:Instant, max_nodes:usize) -> Result<(Vec<Point>,u32),String> {
+pub fn verify(history:&[Point], start:usize, cert:&ProofCertificate, ctl:&Ctl, max_nodes:usize) -> Result<(Vec<Point>,u32),String> {
+    check(ctl)?;
     if cert.version!=1 || cert.width!="wide" || cert.nodes.len()>max_nodes {return Err("certificate format/size".into());}
     if start!=history.len() && start!=flip(history.len()) {return Err("invalid certificate root phase".into());}
-    let board=replay(history)?;
+    let board=replay_controlled(history,ctl)?;
     let attacker=phase(start).0;
-    struct Checker<'a> {cert:&'a ProofCertificate, attacker:u8, deadline:Instant, left:usize, stack:BTreeSet<u32>}
+    struct Checker<'a> {cert:&'a ProofCertificate, attacker:u8, ctl:&'a Ctl, left:usize, stack:BTreeSet<u32>}
     impl Checker<'_> {
         fn walk(&mut self,id:u32,b:&Board,n:usize) -> Result<u32,String> {
-            check(self.deadline)?;
+            check(self.ctl)?;
             if self.left==0 || self.stack.len()>=128 || !self.stack.insert(id) {return Err("certificate work limit/cycle/depth".into());}
             self.left-=1;
             let node=self.cert.nodes.get(id as usize).ok_or("invalid certificate edge")?;
@@ -148,8 +155,8 @@ pub fn verify(history:&[Point], start:usize, cert:&ProofCertificate, deadline:In
                 }
                 ProofNode::DefenderReplies{responses} => {
                     if side==self.attacker || remaining!=2 {return Err("defender phase mismatch".into());}
-                    if !completions(b,side,remaining,self.deadline)?.is_empty() {return Err("defender counterwin".into());}
-                    let required=defenses(b,self.attacker,self.deadline)?;
+                    if !completions(b,side,remaining,self.ctl)?.is_empty() {return Err("defender counterwin".into());}
+                    let required=defenses(b,self.attacker,self.ctl)?;
                     if required.is_empty() {return Err("defenses supplied for unstoppable position".into());}
                     if responses.len()!=required.len() {return Err("missing defense branch including free-second coverage".into());}
                     let mut seen=BTreeSet::new();let mut deepest=0;
@@ -165,18 +172,18 @@ pub fn verify(history:&[Point], start:usize, cert:&ProofCertificate, deadline:In
                 }
                 ProofNode::Unstoppable{..} => {
                     if side==self.attacker || remaining!=2 {return Err("unstoppable phase mismatch".into());}
-                    if !completions(b,side,remaining,self.deadline)?.is_empty() {return Err("defender counterwin".into());}
-                    let threats=completions(b,self.attacker,2,self.deadline)?;
-                    if threats.is_empty() || !covers(&threats,self.deadline)?.is_empty() {return Err("false unstoppable".into());}
+                    if !completions(b,side,remaining,self.ctl)?.is_empty() {return Err("defender counterwin".into());}
+                    let threats=completions(b,self.attacker,2,self.ctl)?;
+                    if threats.is_empty() || !covers(&threats,self.ctl)?.is_empty() {return Err("false unstoppable".into());}
                     1
                 }
             };
             self.stack.remove(&id);Ok(turns)
         }
     }
-    let mut checker=Checker{cert,attacker,deadline,left:max_nodes,stack:BTreeSet::new()};
+    let mut checker=Checker{cert,attacker,ctl,left:max_nodes,stack:BTreeSet::new()};
     let turns=checker.walk(cert.root,&board,start)?;
-    check(deadline)?;
+    check(ctl)?;
     match &cert.nodes[cert.root as usize] {
         ProofNode::ImmediateWin{action}|ProofNode::AttackerMove{action,..}=>Ok((action.clone(),turns)),
         _=>Err("root must be attacker action".into())
@@ -194,7 +201,7 @@ mod tests {
             b.insert((-sign,0),1);
             let fixed=(sign*5,0);let filler=(sign*13,0);
             assert!(!legal(&b,filler));
-            let replies=defenses(&b,0,Instant::now()+std::time::Duration::from_secs(1)).unwrap();
+            let replies=defenses(&b,0,&Ctl::new(1.0)).unwrap();
             let mut key=vec![fixed,filler];key.sort();
             assert_eq!(replies.get(&key),Some(&vec![fixed,filler]));
             b.insert(fixed,1);assert!(legal(&b,filler));

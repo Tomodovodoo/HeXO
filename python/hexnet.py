@@ -561,8 +561,7 @@ class DenseEvaluator:
     @torch.inference_mode()
     def evaluate_leaves(self, leaves):
         from neural_search import native
-        return self.evaluate([hexcrop.encode_leaf(native, tree, request, history)
-                              for tree, request, history in leaves])
+        return self.evaluate(hexcrop.encode_leaves(native, leaves))
 
     @torch.inference_mode()
     def evaluate(self, histories):

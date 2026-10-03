@@ -2,10 +2,9 @@ import {BrowserSession} from './play-session.mjs';
 import {PlayStorage} from './storage.mjs';
 import {notePace} from './device.mjs';
 
-/** The tag the page shows for the device an engine's load resolved to: GPU when its network runs on WebGPU, CPU
- * otherwise (ONNX Runtime on WebAssembly, or an engine with no network). The detail goes to the console. */
+/** The tag the page shows for the device of an engine's load or loading stage: GPU when its network runs on WebGPU,
+ * CPU otherwise (ONNX Runtime on WebAssembly, or an engine with no network). */
 export function deviceLabel(device) {
-  console.info('Browser engine device:', device);
   return device?.provider === 'webgpu' ? 'GPU' : 'CPU';
 }
 
@@ -23,15 +22,23 @@ export async function mountPlay(engines, legacy) {
   session.initializing = true;
   const first = !await storage.get('sessions', id);
   if (first && study && params.has('batch')) await session.openGame(params.get('batch'), +params.get('game'));
-  for (const {entry, engine, record} of engines.values()) session.registerEngine(entry, {
-    ready: async (f, checkpoint) => { entry.device = deviceLabel(await engine.load(f)); await engine.prepare?.(checkpoint); },
-    turn: async (history, budget, options) => {
-      const started = performance.now();
-      const result = await engine.turn(history, {...budget, ...(options.checkpoint ? {checkpoint: options.checkpoint} : {})}, options), preset = options.preset === 'custom' ? 'standard' : options.preset;
-      if (options.ms == null && options.preset !== 'custom') notePace(entry, options.preset, performance.now() - started, result.moves?.length);
-      return record ? {...record(result, history, preset), ...result} : result;
-    }
-  });
+  for (const {entry, engine, record} of engines.values()) {
+    const tag = stage => { if (stage?.provider) entry.device = deviceLabel(stage); };   // once the probe has finished
+    session.registerEngine(entry, {
+      ready: async (f, checkpoint) => {
+        const report = (fraction, stage) => { tag(stage); f(fraction, stage); };
+        entry.device = deviceLabel(await engine.load(report));
+        await engine.prepare?.(checkpoint, {progress: (fraction, live, stage) => report(fraction, stage)});
+      },
+      turn: async (history, budget, options) => {
+        const started = performance.now(), progress = (f, live, stage) => { tag(stage); options.progress(f, live, stage); };
+        const result = await engine.turn(history, {...budget, ...(options.checkpoint ? {checkpoint: options.checkpoint} : {})}, {...options, progress});
+        const preset = options.preset === 'custom' ? 'standard' : options.preset;
+        if (options.ms == null && options.preset !== 'custom') notePace(entry, options.preset, performance.now() - started, result.moves?.length);
+        return record ? {...record(result, history, preset), ...result} : result;
+      }
+    });
+  }
   if (first && !study) {
     const choices = legacy?.seats?.some(Boolean) ? legacy.seats : [null, {engine: entry.id, preset: entry.preset || 'standard'}];
     session.seats = choices.map(choice => choice ? session.spec(typeof choice === 'string' ? {engine: entry.id, preset: choice} : choice) : {engine: 'human'});
@@ -87,7 +94,7 @@ export async function mountPlay(engines, legacy) {
       if (link.target === '_blank') window.open(target.href, '_blank', 'noopener'); else location.href = target.href;
     }
   });
-  const leave = () => { session.freezeClock(); session.cancelJobs(); if (session.match) session.match.active = false; session.paused = true; if (session.dirty || session.clock) session.persist(); };
+  const leave = () => { session.freezeClock(); session.cancelJobs(); if (session.match) { session.match.active = false; session.paused = true; } if (session.clock) session.paused = true; if (session.dirty || session.clock) session.persist(); };
   addEventListener('pagehide', leave);
   const hint = document.getElementById('browser-storage');
   if (hint) hint.textContent = storage.db ? 'Games and analysis are saved in this browser.' : 'Browser storage is unavailable. Download your games before leaving.';

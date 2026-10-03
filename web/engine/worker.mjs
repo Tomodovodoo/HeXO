@@ -3,18 +3,19 @@
  *     | {type: 'cancel', id} | {type: 'bench', id, batches, sizes, repeats}
  *     | {type: 'search', id, history, simulations, batchSize, qRangeFloor}
  *     | {type: 'evaluate', id, histories}.
- * Out: {type: 'progress', id?, fraction} | {type: 'ready', device} | {type: 'result', id, result} | {type: 'cancelled', id}
- *     | {type: 'error', id?, message}.
+ * Out: {type: 'progress', id?, fraction, stage?} | {type: 'ready', device} | {type: 'result', id, result} | {type: 'cancelled', id}
+ *     | {type: 'error', id?, message, stage?}: stages.mjs's loading stages; a stage in an error is where it stopped.
  */
 import createModule from './gumbel.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameGraphs, PV_CHECK} from './search.mjs';
-import {Network, probe} from './network.mjs';
+import {Network, probe, runtime} from './network.mjs';
+import {Stages, errorReport, stall} from './stages.mjs';
 import {principalVariation, topRows, Proofs, answered, settled, proofTurns} from './proof.mjs';
 
 const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 'defender counterwin',
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
   'free-second coverage work limit']);
-let native, network, cache, games, device, settings = {}, solver = null, solverCalls = 0;
+let native, ort, network, cache, games, device, solver = null, solverCalls = 0;
 /** The latest game-tree turn: they run one at a time, so a cancelled turn still awaiting the network settles before
  * another turn advances, searches or evicts a game tree. */
 let gameTurn = Promise.resolve();
@@ -114,7 +115,7 @@ async function turn(request) {
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
 async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null}) {
-  await use(model, fraction => postMessage({type: 'progress', id, fraction}));
+  await use(model, new Stages(postMessage, id));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
@@ -234,23 +235,16 @@ async function bench({batches = [1, 16, 64], sizes = [24, 32], repeats = 10}) {
   return out;
 }
 
-/** Searches with the network whose manifest is `model` (relative to web/engine) from now on; the two most recently
- * used stay loaded. A WebGPU network that fails to start moves the engine to WebAssembly unless WebGPU was asked for. */
-async function use(model, report = () => {}) {
+/** Searches with the network whose manifest is `model` (relative to web/engine) from now on, reporting its download and
+ * session to `stages`; the two most recently used stay loaded. */
+async function use(model, stages) {
   if (held.has(model)) {
     network = held.get(model);
     held.delete(model);
     held.set(model, network);
     return;
   }
-  const create = () => Network.create({model, device, progress: report, threads: settings.threads});
-  try {
-    network = await create();
-  } catch (error) {
-    if (device.provider !== 'webgpu' || settings.prefer) throw error;
-    device = {provider: 'wasm', precisions: ['fp32'], adapter: '', fallback: String(error.message || error)};
-    network = await create();
-  }
+  network = await stages.run(() => Network.create({model, device, ort, stages}));
   held.set(model, network);
   while (held.size > 2) {
     const [old, released] = held.entries().next().value;
@@ -259,23 +253,31 @@ async function use(model, report = () => {}) {
   }
 }
 
+/** Probes the device, starts ONNX Runtime and the search, loads `options.model` and warms both up, reporting each
+ * stage. */
 async function load(options = {}) {
-  settings = options;
-  native = new Native(await createModule());
-  device = await probe(options.prefer);
-  await use(options.model, fraction => postMessage({type: 'progress', fraction: .95 * fraction}));
-  cache = new EvaluationCache(4096);
-  games = new GameGraphs(native);
-  const t = performance.now();
-  for (const history of [[[0, 0]], [[0, 0], [1, 0], [0, 1], [5, 0], [6, 0]]]) {
-    const leaf = {history, actions: native.legal(history)};
-    await network.evaluate([leaf]);
-    await network.evaluate(new Array(16).fill(leaf));
-  }
-  postMessage({type: 'progress', fraction: 1});
-  return {provider: device.provider, precision: network.precision, timings: network.timings, adapter: device.adapter, fallback: device.fallback,
-    threads: network.threads, isolated: Boolean(globalThis.crossOriginIsolated), warmup_ms: Math.round(performance.now() - t),
-    model: network.version};
+  const stages = new Stages(postMessage);
+  return stages.run(async () => {
+    stages.enter('probe');
+    device = await probe(options.prefer);
+    stages.probed(device);
+    stages.enter('download');   // gumbel.mjs fetches gumbel.wasm
+    native = new Native(await createModule());
+    ort = await runtime(device.provider, options.threads, stages);
+    await use(options.model, stages);
+    cache = new EvaluationCache(4096);
+    games = new GameGraphs(native);
+    stages.enter('warmup', device.provider);
+    const t = performance.now();
+    for (const history of [[[0, 0]], [[0, 0], [1, 0], [0, 1], [5, 0], [6, 0]]]) {
+      const leaf = {history, actions: native.legal(history)};
+      await stall('warmup', () => network.evaluate([leaf]));
+      await network.evaluate(new Array(16).fill(leaf));
+    }
+    return {provider: device.provider, precision: network.precision, timings: network.timings, adapter: device.adapter,
+      threads: network.threads, isolated: Boolean(globalThis.crossOriginIsolated), warmup_ms: Math.round(performance.now() - t),
+      model: network.version};
+  });
 }
 
 onmessage = async ({data}) => {
@@ -287,7 +289,7 @@ onmessage = async ({data}) => {
   try {
     if (data.type === 'load') postMessage({type: 'ready', device: await load(data.options)});
     else if (data.type === 'turn') postMessage({type: 'result', id: data.id, result: await turn(data)});
-    else if (data.type === 'use') { await use(data.model, fraction => postMessage({type: 'progress', id: data.id, fraction})); postMessage({type: 'result', id: data.id, result: null}); }
+    else if (data.type === 'use') { await use(data.model, new Stages(postMessage, data.id)); postMessage({type: 'result', id: data.id, result: null}); }
     else if (data.type === 'bench') postMessage({type: 'result', id: data.id, result: await bench(data)});
     else if (data.type === 'evaluate') {
       const leaves = data.histories.map(history => ({history, actions: native.legal(history)}));
@@ -311,7 +313,7 @@ onmessage = async ({data}) => {
       }
     }
   } catch (error) {
-    postMessage(error instanceof Cancelled ? {type: 'cancelled', id: data.id} : {type: 'error', id: data.id, message: String(error.message || error)});
+    postMessage(error instanceof Cancelled ? {type: 'cancelled', id: data.id} : errorReport(error, data.id));
   } finally {
     cancelled.delete(data.id);
   }

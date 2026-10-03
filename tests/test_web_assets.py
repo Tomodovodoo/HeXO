@@ -101,6 +101,22 @@ class Resolver(unittest.TestCase):
         self.assertEqual(self.out['six_chosen'], ['six/networks/gen-1.onnx'])
 
 
+    def test_an_interrupted_download_resumes_after_its_stored_part(self):
+        case = self.out['resume']
+        self.assertEqual((case['first'], case['parts'], case['offline'], case['ignored']), ('Failed to fetch', 1, [True, 1], [True, 1]))
+        self.assertEqual(case['ranges'], [f'bytes={4 * 2 ** 20}-'] * 2)
+        self.assertTrue(case['same'])
+        self.assertEqual(case['start'], [[4 * 2 ** 20, 0], [int(4.5 * 2 ** 20), 5 * 2 ** 20]])
+        self.assertEqual(case['keys'], 1)
+
+    def test_a_download_that_goes_quiet_stops_with_an_error(self):
+        self.assertEqual(self.out['idle'], {'error': 'quiet.onnx: the download stalled', 'requests': 2, 'reported': [[0, 0, 10]]})
+
+    def test_a_request_without_an_answer_stops_with_an_error(self):
+        self.assertEqual(self.out['unanswered'], {'error': f'silent.onnx: no answer in 0.03 s ({SITE}silent.onnx)'})
+        self.assertEqual(self.out['unfinished'], {'error': 'slow.json: no answer in 0.03 s'})
+        self.assertEqual(self.out['whole_stalls'], {'error': 'halted.onnx: no answer in 0.03 s'})
+
     def test_assets_query_is_honoured_only_on_a_loopback_page(self):
         self.assertEqual(self.out['override'], {'public': SITE, 'loopback': 'https://other.example/engine/'})
 
@@ -108,6 +124,9 @@ class Resolver(unittest.TestCase):
     def test_files_the_site_does_not_publish_need_a_local_build(self):
         self.assertEqual(self.out['unpublished'], {'manifest': 'not on site', 'status': 'not on site', 'seal': 'not on site',
                                                    'strix': 'not on site', 'unreachable': 'error'})
+
+    def test_engine_lists_leave_out_engines_whose_files_no_origin_has(self):
+        self.assertEqual(self.out['offered'], ['browser:bubble', 'browser:strix', 'browser:six', 'six'])
 
 
 class Loaders(unittest.TestCase):

@@ -289,7 +289,7 @@ pub fn guided_idtt(
             cfg.width_str(),
         ));
     }
-    let (_summary, mut hints, mut guide_nodes) = certificate::verify_with_hints(pos, certificate)?;
+    let (_summary, mut hints, mut guide_nodes) = certificate::verify_with_hints(pos, certificate, ctl)?;
     let t = Instant::now();
     let mut total_nodes = 0u64;
     let mut total_hint_hits = 0u64;
@@ -472,7 +472,7 @@ pub fn guided_pdspn_shortest(
     if cfg.depth_cap == 0 {
         return Err("shortest search depth cap must be at least 1".to_string());
     }
-    let summary = certificate::verify(pos, certificate)?;
+    let summary = certificate::verify_controlled(pos, certificate, ctl)?;
     let original_upper = u8::try_from(summary.max_attacker_turns)
         .map_err(|_| "certificate depth exceeds the supported 255-turn bound".to_string())?;
     if original_upper == 0 {
@@ -513,7 +513,7 @@ pub fn guided_pdspn_shortest(
             break;
         }
         let (_hint_summary, hints, _guide_nodes) =
-            certificate::verify_with_hints(pos, &current_cert)?;
+            certificate::verify_with_hints(pos, &current_cert, ctl)?;
         let hints = Rc::new(hints);
         let mut probe_cfg = cfg.clone();
         probe_cfg.depth_cap = target;
@@ -531,7 +531,7 @@ pub fn guided_pdspn_shortest(
                 // bound. The probe may have found an even shorter win than
                 // `target`; the verified summary is the honest new upper.
                 if let Some(candidate) = probe.certificate
-                    && let Ok(candidate_summary) = certificate::verify(pos, &candidate)
+                    && let Ok(candidate_summary) = certificate::verify_controlled(pos, &candidate, ctl)
                 {
                     let new_upper = u8::try_from(candidate_summary.max_attacker_turns)
                         .unwrap_or(upper);
@@ -559,18 +559,18 @@ pub fn guided_pdspn_shortest(
     // an original one-turn certificate, or an original upper followed by an
     // adjacent NO probe, already matches the exact bound without a WIN probe.
     let cert_tightened = exact
-        && certificate::verify(pos, &current_cert)
+        && certificate::verify_controlled(pos, &current_cert, ctl)
             .is_ok_and(|summary| summary.max_attacker_turns == u32::from(upper));
     // Present the defender's strongest tested resistance. The attacker takes
     // its quickest certified move and the defender takes the reply that delays
     // the win longest. This line witnesses the certificate's upper bound and is
     // much more useful than a cooperative example when explaining refutations.
-    if let Ok(pv) = certificate::worst_case_pv(pos, &current_cert)
+    if let Ok(pv) = certificate::worst_case_pv_controlled(pos, &current_cert, ctl)
         && dfpn::pv_replays_win(pos, &pv)
     {
         best_pv = pv;
     } else if best_pv.is_empty()
-        && let Ok(pv) = certificate::shortest_pv(pos, &current_cert)
+        && let Ok(pv) = certificate::shortest_pv_controlled(pos, &current_cert, ctl)
         && dfpn::pv_replays_win(pos, &pv)
     {
         best_pv = pv;

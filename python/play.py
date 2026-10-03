@@ -82,10 +82,10 @@ def turn_starts(length):
 
 
 def review_plies(history):
-    """Positions a review evaluates: every turn start, plus the final position unless the game is over."""
+    """Positions a review evaluates: every position before a stone, plus the final position unless the game is over."""
     game = replay(history)
     try:
-        return turn_starts(len(history)) + ([len(history)] if game.winner < 0 else [])
+        return list(range(len(history) + (game.winner < 0)))
     finally:
         game.close()
 
@@ -987,11 +987,10 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
 def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, batch_size=64,
                   q_range_floor=0., known=None, leaf_nodes=0, leaf_ms=10):
     """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
-    position per prover in `provers` at a time, each distinct position solved once; then fresh trees, one per
-    position, search together, checking opt-in `leaf_nodes` proofs before sharing network batches of up to
-    `batch_size`, stone by stone. Each
-    result is what `evaluate` would give at that budget, with the proof table `known`. `watch` may raise
-    Cancelled."""
+    position per prover in `provers` at a time, each distinct position solved once, their proofs added to the
+    proof table `known`; then fresh trees, one per position, search together with that table, checking opt-in
+    `leaf_nodes` proofs before sharing network batches of up to `batch_size`, stone by stone. Each result is what
+    `evaluate` would give at that budget with the table. `watch` may raise Cancelled."""
     from concurrent.futures import ThreadPoolExecutor
     from neural_search import SearchCoordinator
     given = [answered(h, known) for h in histories]
@@ -1013,6 +1012,8 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
             unique = {k: h for k, h, a in zip(keys, histories, given) if a is None}
             for k, found in zip(unique, pool.map(ask, unique.values())):
                 solved[k] = found
+                if known is not None:
+                    known.add(unique[k], found)
     network = Watched(bubble.evaluator, watch)
     turns = []
     try:
@@ -1106,7 +1107,7 @@ class Engines:
         return self.prover, build
 
     def evaluate(self, entry, checkpoint, budget, history, watch, device=None, live=None, keep=False, line=None,
-                 known=None, game=None, refresh=None):
+                 known=None, game=None, refresh=None, used=None):
         """`evaluate` with the entry's export and the proof table `known`; returns the evaluation, the budget it
         really had (no solver nodes when the solver is not built) and the key of the weights it used (see
         `model_key`). `line` (a seat's game, see `Session.lines`) or `game` (the analysis board's game, see
@@ -1115,13 +1116,14 @@ class Engines:
         the simulations the root lacks, and a proof the solver found for the position is reused. `refresh`, a saved
         evaluation of `history`, searches the game graph again with the PV_CHECK share of the simulations a stone
         and that evaluation's solver findings, and keeps its key and budget. A seat's evaluation or a tier's has a
-        key ending in `:kept`, so continued evaluations are never mistaken for fresh ones. An evaluation searched on
-        a game graph carries `graph_id`, the number `game_graph` gave that graph."""
+        key ending in `:kept`, so continued evaluations are never mistaken for fresh ones. `used`, a list, receives
+        the number `game_graph` gave each graph searched, before the search, so a caller sees it even when the
+        search is cancelled."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
         solver, build = self.solver() if budget['solver_nodes'] and refresh is None else (None, 'none')
         spent = budget if solver or refresh is not None else budget | dict(solver_nodes=0)
         trees = solved = None
-        floor, used = entry.get('q_range_floor', 0.), []
+        floor = entry.get('q_range_floor', 0.)
         if refresh is not None:
             build = self.solver_build() if budget['solver_nodes'] else 'none'
             share = max(1, round(PV_CHECK * budget['simulations']))
@@ -1139,8 +1141,6 @@ class Engines:
                          solved, floor, known, pv_check=PV_CHECK if trees else 0.)
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
-        if used:
-            found['graph_id'] = used[-1]
         weights = search_key(bubble.sha256[:16], entry)
         kept = ':kept' if keep or line is not None else ''
         return found, spent, f"{weights}:{build if spent['solver_nodes'] else 'none'}{kept}"
@@ -1510,35 +1510,47 @@ class Evaluations:
 # Review
 
 
+UNGRADED = dict(label=None, before=None, after=None, better=None, line=None)
+
+
 def review(history, lookup, winner=-1):
-    """Label every complete turn of `history` from saved evaluations.
+    """Label every turn of `history`, and each of its stones, from saved evaluations.
 
     `lookup(prefix)` returns the evaluation of a position (fields of `evaluate`) or None. A turn is judged on the
     mover's win probability before and after it; the first label that applies wins: win (made six), lost (the
-    opponent already had a proven win), kept or missed (the mover had one and kept it, or played the proven turn,
-    or lost it), allowed (handed the opponent one), found (proved one), best (the engine's own turn), then the
-    loss bands good (< 0.05), inaccuracy (< 0.10), mistake (< 0.20) and blunder. Turns lacking an evaluation get label None. For
-    inaccuracy and worse, missed and allowed, `better` is the engine's turn and `line` its continuation."""
-    turns = []
-    starts = turn_starts(len(history))
-    for s, e in zip(starts, [*starts[1:], len(history)]):
-        me = player_at(s)
+    opponent already had a proven win), kept or missed (the mover had one and kept it, or played the engine's
+    stones, or lost it), allowed (handed the opponent one), found (proved one), best (the engine's own stones), then
+    the loss bands good (< 0.05), inaccuracy (< 0.10), mistake (< 0.20) and blunder. For inaccuracy and worse,
+    missed and allowed, `better` is the engine's stones, as many as were played, and `line` its continuation, unless
+    the stones played were the engine's.
+    Each turn also has `grades`, one per stone with the same fields judged on that stone alone: the second stone
+    from the position after the first, where the engine's stone is its best second stone given the first. A turn
+    whose second stone is still to come is listed with label None and its first stone graded. Labels lacking an
+    evaluation are None."""
+    seen = {}
+
+    def look(prefix):
+        key = tuple(map(tuple, prefix))
+        if key not in seen:
+            seen[key] = lookup(prefix)
+        return seen[key]
+
+    def judge(s, e, me):
         stones = [list(p) for p in history[s:e]]
-        if e - s < (1 if s == 0 else 2) and not (e == len(history) and winner == me):
-            break
-        turn = dict(ply=s, player=me, stones=stones, label=None, before=None, after=None, better=None, line=None)
-        turns.append(turn)
+        grade = dict(UNGRADED)
         if e == len(history) and winner == me:
-            turn['label'] = 'win'
-            continue
-        before, after = lookup(history[:s]), lookup(history[:e])
+            grade['label'] = 'win'
+            return grade
+        before, after = look(history[:s]), look(history[:e])
         if before is None or after is None:
-            continue
-        turn['before'], turn['after'] = before['value'], 1 - after['value']
+            return grade
+        grade['before'] = before['value']
+        grade['after'] = after['value'] if player_at(e) == me else 1 - after['value']
         had = (before.get('proof') or {}).get('winner')
         has = (after.get('proof') or {}).get('winner')
-        loss = turn['before'] - turn['after']
-        played_best = bool(before['moves']) and sorted(map(tuple, before['moves'])) == sorted(map(tuple, stones))
+        loss = grade['before'] - grade['after']
+        engine = [tuple(m) for m in before['moves']]
+        played_best = bool(engine) and all(tuple(p) in engine for p in stones)
         if had == 1 - me:
             label = 'lost'
         elif had == me:
@@ -1551,15 +1563,26 @@ def review(history, lookup, winner=-1):
             label = 'best'
         else:
             label = 'good' if loss < .05 else 'inaccuracy' if loss < .1 else 'mistake' if loss < .2 else 'blunder'
-        turn['label'] = label
-        if label in ('inaccuracy', 'mistake', 'blunder', 'missed', 'allowed') and before['moves']:
-            turn['better'] = before['moves']
+        grade['label'] = label
+        if label in ('inaccuracy', 'mistake', 'blunder', 'missed', 'allowed') and engine and not played_best:
+            grade['better'] = before['moves'][:len(stones)]
             if before.get('pv'):
-                turn['line'] = before['pv']
+                grade['line'] = before['pv']
             else:
-                reply = lookup([*history[:s], *map(tuple, before['moves'])])
-                turn['line'] = [[*p, me] for p in before['moves']] + \
-                               [[*p, 1 - me] for p in (reply or {}).get('moves', [])]
+                reply = look([*history[:s], *engine])
+                grade['line'] = [[*p, me] for p in before['moves']] + \
+                                [[*p, 1 - me] for p in (reply or {}).get('moves', [])]
+        return grade
+
+    turns = []
+    starts = turn_starts(len(history))
+    for s, e in zip(starts, [*starts[1:], len(history)]):
+        if s == e:
+            break
+        me = player_at(s)
+        complete = e - s == (1 if s == 0 else 2) or e == len(history) and winner == me
+        turns.append(dict(ply=s, player=me, stones=[list(p) for p in history[s:e]],
+                          **(judge(s, e, me) if complete else UNGRADED), grades=[judge(p, p + 1, me) for p in range(s, e)]))
     return turns
 
 
@@ -3049,21 +3072,22 @@ class Session:
         if saved:
             return saved
         live = (lambda seen: setattr(job, 'live', seen)) if job.kind != 'review' else None
-        found, spent, weights = self.lane_engines(job).evaluate(
-            self.entries[seat['engine']], seat['checkpoint'], budget, history, self.watcher(job, job.kind != 'review'),
-            live=live, keep=keep, line=line, known=self.proofs if job.kind != 'move' else None,
-            **({'device': seat['device']} if 'device' in seat else {}), **({'game': game} if game is not None else {}),
-            **({'refresh': refresh} if refresh is not None else {}))
-        if job.cancelled:
-            raise Cancelled()
-        graph = found.pop('graph_id', None)
-        if job.kind == 'analyse' and graph is not None:
-            with self.lock:
-                self.analysis_graph = graph
-                self.graph_searches[graph] = self.graph_searches.get(graph, 0) + 1
-                found['graph'] = [self.instance, graph, self.graph_searches[graph]]
-                for step in found.get('later', []):
-                    step['graph'] = found['graph']
+        used = []
+        try:
+            found, spent, weights = self.lane_engines(job).evaluate(
+                self.entries[seat['engine']], seat['checkpoint'], budget, history, self.watcher(job, job.kind != 'review'),
+                live=live, keep=keep, line=line, known=self.proofs if job.kind != 'move' else None,
+                **({'device': seat['device']} if 'device' in seat else {}), **({'game': game} if game is not None else {}),
+                **({'refresh': refresh} if refresh is not None else {}), used=used)
+            if job.cancelled:
+                raise Cancelled()
+        finally:
+            # Any search, even a cancelled one, changed the graph: its other saved analyses are now stale.
+            stamp = self.searched(used[-1]) if job.kind == 'analyse' and used else None
+        if stamp is not None:
+            found['graph'] = stamp
+            for step in found.get('later', []):
+                step['graph'] = stamp
         entry = self.entries[seat['engine']]
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
         job.incomplete = spent['solver_nodes'] < budget['solver_nodes']
@@ -3081,6 +3105,14 @@ class Session:
         if job.kind == 'analyse' and refresh is None and game is not None:
             self.refresh(history, seat, game)
         return saved
+
+    def searched(self, graph):
+        """Count a search on analysis graph number `graph`, which becomes the graph analysis searched last; returns
+        the stamp an evaluation it produced is saved with: [instance, graph, searches so far]."""
+        with self.lock:
+            self.analysis_graph = graph
+            self.graph_searches[graph] = self.graph_searches.get(graph, 0) + 1
+            return [self.instance, graph, self.graph_searches[graph]]
 
     def stale(self, record):
         """True when `record`, a saved evaluation, came from the graph analysis searched last (the graph's number from
@@ -3216,7 +3248,8 @@ class Session:
             return self.evaluation(job, seat, history, job.force)
         identity, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
         plies = review_plies(history)
-        missing = [p for p in dict.fromkeys(plies) if not self.store.get(history[:p], identity, budget)]
+        # From the last position backwards: what a later position proves is known when an earlier one is searched.
+        missing = [p for p in sorted(set(plies), reverse=True) if not self.store.get(history[:p], identity, budget)]
         job.done = len(plies) - len(missing)
         for start in range(0, len(missing), REVIEW_CHUNK):
             if job.cancelled:

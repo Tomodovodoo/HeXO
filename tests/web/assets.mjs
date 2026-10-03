@@ -194,6 +194,79 @@ const sixLate = new (await import('../../web/engine/six.mjs')).SixEngine();
 await sixLate.files();
 out.six_retry = sixLate.checkpoints;
 
+// The page's engine lists while Seal's files are on neither origin and the site has every other engine's.
+const seat = await import('../../web/engine/seat.mjs');
+await seat.survey();
+out.offered = ['browser:bubble', 'browser:seal', 'browser:strix', 'browser:six', 'six'].filter(id => seat.listed({id}));
+
+// A download cut off after its first part: the next load asks for the rest with a range and joins them.
+reset();
+const {LIMITS} = await import('../../web/engine/stages.mjs');
+const whole = Buffer.from(Array.from({length: 5 * 2 ** 20}, (_, i) => i * 7 % 251)), MB = 2 ** 20;
+let cut = true;
+const ranged = [], seen = [], plain = globalThis.fetch;
+globalThis.fetch = async (input, init = {}) => {
+  const url = String(input);
+  if (!url.endsWith('big.onnx')) return plain(input, init);
+  ranged.push(init.headers?.Range ?? null);
+  if (url.startsWith(BASE)) return new Response('missing', {status: 404});
+  if (init.cache === 'reload') throw new TypeError('Failed to fetch');   // the whole-body retry fails too: the load ends
+  const start = Number(/bytes=(\d+)-/.exec(init.headers?.Range ?? '')?.[1] ?? 0), body = whole.subarray(start);
+  let at = 0;
+  const stream = new ReadableStream({pull(controller) {
+    if (cut && start + at >= 4.5 * MB) { controller.error(new TypeError('network changed')); return; }
+    if (at >= body.length) { controller.close(); return; }
+    controller.enqueue(body.subarray(at, at + MB / 2));
+    at += MB / 2;
+  }});
+  return Object.defineProperty(new Response(stream, {status: start ? 206 : 200, headers: {'Content-Length': String(body.length)}}), 'url', {value: url});
+};
+const big = {path: 'big.onnx', sha256: createHash('sha256').update(whole).digest('hex')};
+const first = await attempt(() => assets.cached(big));
+const parts = [...store.keys()].filter(k => k.includes('&part='));
+const resumable = globalThis.fetch;
+globalThis.fetch = async (input, init) => { if (String(input).endsWith('big.onnx')) throw new TypeError('Failed to fetch'); return resumable(input, init); };
+const offlineTry = await attempt(() => assets.cached(big));
+const kept = [...store.keys()].filter(k => k.includes('&part=')).length;
+globalThis.fetch = resumable;
+let whole200 = true;   // a server that ignores the range and then drops the whole body keeps the held part
+globalThis.fetch = async (input, init = {}) => resumable(input, whole200 && init.headers ? {...init, headers: {}} : init);
+const ignored = await attempt(() => assets.cached(big));
+const stillKept = [...store.keys()].filter(k => k.includes('&part=')).length;
+whole200 = false;
+globalThis.fetch = resumable;
+cut = false;
+const body = await assets.cached(big, (fraction, received, total) => seen.push([received, total]));
+out.resume = {first: first.error ?? 'loaded', parts: parts.length, offline: [Boolean(offlineTry.error), kept], ignored: [Boolean(ignored.error), stillKept], ranges: ranged.filter(Boolean), same: Buffer.from(body).equals(whole),
+  start: seen.slice(0, 2), keys: [...store.keys()].length};
+
+// A download that receives nothing for LIMITS.idle ms stops with an error instead of waiting.
+reset();
+LIMITS.idle = 30;
+const requested = [];
+globalThis.fetch = async (input, init = {}) => {
+  requested.push(String(input));
+  if (String(input).startsWith(BASE)) return new Response('missing', {status: 404});
+  return new Response(new ReadableStream({pull: () => new Promise(() => {})}), {headers: {'Content-Length': '10'}});
+};
+const quiet = [];
+out.idle = {...await attempt(() => assets.cached({path: 'quiet.onnx', sha256: 'x', bytes: 10}, (...args) => quiet.push(args))),
+  requests: requested.length, reported: quiet};
+
+// A request that gets no answer at all stops after LIMITS.idle ms too.
+reset();
+globalThis.fetch = async (input, init = {}) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason)));
+out.unanswered = await attempt(() => assets.cached({path: 'silent.onnx', sha256: 'x'}));
+globalThis.fetch = async input => String(input).startsWith(BASE) ? new Response('missing', {status: 404})
+  : new Response(new ReadableStream({start: controller => controller.enqueue(new TextEncoder().encode('{"networks": ['))}));
+out.unfinished = await attempt(() => assets.json('slow.json'));
+LIMITS.whole = 30;   // a stream that fails, then a whole-body retry that never finishes
+globalThis.fetch = async (input, init = {}) => String(input).startsWith(BASE) ? new Response('missing', {status: 404})
+  : Object.defineProperty(new Response(init.cache === 'reload' ? new ReadableStream({start: controller => controller.enqueue(new Uint8Array(1))})
+    : new ReadableStream({pull: controller => controller.error(new TypeError('input stream'))})), 'url', {value: String(input)});
+out.whole_stalls = await attempt(() => assets.cached({path: 'halted.onnx', sha256: 'x'}));
+globalThis.fetch = plain;
+
 const page = host => {
   globalThis.document = {querySelector: () => null};
   globalThis.location = {hostname: host, href: `http://${host}/`, search: '?assets=https://other.example/engine'};

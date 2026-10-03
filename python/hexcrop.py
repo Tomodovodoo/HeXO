@@ -177,6 +177,47 @@ def encode_leaf(native, tree, request, history):
                   tuple(map(int, info[4:8])))
 
 
+def encode_leaves(native, leaves, *, allow_span=False):
+    """Encode a pending batch in two native calls; returned action arrays own their cache storage."""
+    if len(leaves) < 8 or not hasattr(native, 'hxg_encode_many'):
+        samples = []
+        for tree, request, history in leaves:
+            try:
+                samples.append(encode_leaf(native, tree, request, history))
+            except SpanError:
+                if not allow_span:
+                    raise
+                samples.append(None)
+        return samples
+    encode = native.hxg_encode_many
+    encode.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_void_p, C.c_void_p, C.c_int64,
+                       C.c_void_p, C.c_void_p, C.c_int64]
+    encode.restype = C.c_int
+    trees = np.asarray([tree for tree, _, _ in leaves], np.uintp)
+    requests = np.asarray([request for _, request, _ in leaves], np.int32)
+    info = np.zeros((len(leaves), 12), np.int64)
+    if not encode(trees.ctypes.data, requests.ctypes.data, len(leaves), info.ctypes.data,
+                  None, 0, None, None, 0):
+        raise ValueError(native.hxg_error().decode())
+    if not allow_span and np.any(info[:, 0] == -2):
+        raise SpanError('Stones plus halo exceed the largest bucket')
+    sides = np.maximum(info[:, 0], 0)
+    planes = np.empty(int((len(PLANES)*sides*sides).sum()), np.uint8)
+    count = int(info[sides > 0, 1].sum())
+    cells, actions = np.empty(count, np.int64), np.empty((count, 2), np.int64)
+    if not encode(trees.ctypes.data, requests.ctypes.data, len(leaves), info.ctypes.data,
+                  planes.ctypes.data, len(planes), cells.ctypes.data, actions.ctypes.data, count):
+        raise ValueError(native.hxg_error().decode())
+    samples = []
+    for row in info:
+        size, n, player, remaining, symmetry, qmin, rmin, ox, oy, far, po, lo = map(int, row)
+        samples.append(None if size == -2 else Sample(
+            planes[po:po+len(PLANES)*size*size].reshape(len(PLANES), size, size), size,
+            cells[lo:lo+n], actions[lo:lo+n].copy(), far, player, remaining, symmetry,
+            (qmin, rmin, ox, oy)))
+    return samples
+
+
 def encode_game(game, history, *, symmetry=None, rng=None, actions=None):
     """Encode the position of `game`, whose placements are `history`; `actions` [N, 2], when given, must be its
     legal moves in native order (legal_array is skipped).

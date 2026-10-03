@@ -542,6 +542,7 @@ impl<'a> Dfpn<'a> {
         let mut turns: u8 = 0;
         let mut node = root;
         loop {
+            if self.ctl.expired() { break; }
             match node {
                 Node::Or { placements } => {
                     if remaining == Some(0) {
@@ -850,28 +851,28 @@ pub(crate) fn solve_mode_at_guided(
         if pds_mode {
             let rebuilt = match (remaining, d.hints.as_deref()) {
                 (Some(turns), Some(hints)) => super::certificate::reconstruct_bounded_guided(
-                    pos, cfg.wide, &mut d.proven, turns, hints,
+                    pos, cfg.wide, &mut d.proven, turns, hints, ctl,
                 ),
                 (Some(turns), None) => {
-                    super::certificate::reconstruct_bounded(pos, cfg.wide, &mut d.proven, turns)
+                    super::certificate::reconstruct_bounded(pos, cfg.wide, &mut d.proven, turns, ctl)
                 }
-                (None, _) => super::certificate::reconstruct(pos, cfg.wide, &mut d.proven),
+                (None, _) => super::certificate::reconstruct(pos, cfg.wide, &mut d.proven, ctl),
             };
             if let Ok(certificate) = rebuilt
-                && let Ok(summary) = super::certificate::verify(pos, &certificate)
+                && let Ok(summary) = super::certificate::verify_controlled(pos, &certificate, ctl)
             {
                 // Prefer the certificate's SHORTEST line as the sample PV: it is
                 // the most useful example for the UI (the fastest win the saved
                 // DAG can exhibit). Fall back to the worst-case (longest-defence)
                 // line, which attains the certified bound. Both are replayed
                 // through the engine before exposure.
-                if let Ok(pv) = super::certificate::shortest_pv(pos, &certificate)
+                if let Ok(pv) = super::certificate::shortest_pv_controlled(pos, &certificate, ctl)
                     && pv_replays_win(pos, &pv)
                 {
                     res.pv = pv;
                     res.depth = u8::try_from(summary.max_attacker_turns).ok();
                 } else if remaining.is_some()
-                    && let Ok(pv) = super::certificate::worst_case_pv(pos, &certificate)
+                    && let Ok(pv) = super::certificate::worst_case_pv_controlled(pos, &certificate, ctl)
                     && pv_replays_win(pos, &pv)
                 {
                     res.pv = pv;
@@ -885,7 +886,7 @@ pub(crate) fn solve_mode_at_guided(
         // proven inside a *discarded* level-2 PN tree, so their children aren't in
         // the proven set and this walk can come up short — fall back to the kernel
         // solver's own PV, which is guaranteed valid for a genuinely forced win.
-        if res.pv.is_empty()
+        if res.pv.is_empty() && !ctl.expired()
             && let Some(pv_ctx) = KernelCtx::new_wide(
             &pos.stones,
             pos.attacker,

@@ -86,6 +86,8 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .bar.running::after{content:"";position:absolute;top:0;bottom:0;left:0;width:30%;
   background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--c,var(--text)) 75%,transparent),transparent);animation:wait 1.6s ease-in-out infinite}
 @keyframes wait{from{transform:translateX(-100%)}to{transform:translateX(340%)}}
+.busy{display:flex;align-items:center;gap:6px;height:12px}.busy .bar{flex:1}
+.stage{font:10px var(--mono);color:var(--dim);white-space:nowrap}
 .spacer{flex:1}
 .row{display:flex;gap:6px;align-items:center}
 .stack{display:grid;gap:8px}
@@ -106,6 +108,9 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 @keyframes held{50%{opacity:.35}}
 #transport{left:50%;bottom:14px;transform:translateX(-50%);display:flex;gap:2px;align-items:center;padding:4px}
 #transport .ib{width:30px;height:30px}
+#perspective{left:14px;bottom:14px;display:flex;gap:2px;padding:4px}
+#perspective .ib{width:30px;height:30px}
+@media (max-width:899px){#perspective{bottom:60px}}
 #ply{font:12px var(--mono);color:var(--muted);min-width:62px;text-align:center}
 #retry{display:none;color:var(--turn)}#retry.show{display:grid}
 #actions{right:14px;bottom:14px;display:flex;gap:4px;padding:4px}
@@ -137,11 +142,14 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .clockpick .chips button:disabled{cursor:default;opacity:.5}
 .seat .x{width:22px;height:22px;border:0;background:transparent;color:var(--dim);cursor:pointer;display:grid;place-items:center;border-radius:6px}
 .seat .x:hover{color:var(--text);background:var(--raise-2)}
-.seat .bar{margin:2px 6px 0}
+.seat .busy{margin:1px 6px 0}
 .more{display:grid;grid-template-rows:0fr;transition:grid-template-rows .25s var(--ease) .1s}
 .more>div{overflow:hidden;display:grid;gap:6px;padding:0 4px}
 .more>div>:first-child{margin-top:6px}.more>div>:last-child{margin-bottom:6px}
-#seats:hover .more,#seats.open .more,#seats:focus-within .more{grid-template-rows:1fr}
+#seats.open .more,#seats:focus-within .more{grid-template-rows:1fr}
+@media (hover:hover){#seats:hover .more{grid-template-rows:1fr}}
+@media (hover:none){#seats .more{grid-template-rows:1fr}}
+.card-head .sides{display:none}
 #seats .divider{height:1px;background:var(--line);margin:2px 6px}
 #match{display:grid;gap:6px;padding:4px 6px;font-size:12px;color:var(--muted)}
 #match[hidden]{display:none}
@@ -235,6 +243,8 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .turn .st span:hover{background:var(--raise-2)}
 .turn .st span.on{color:var(--text);background:color-mix(in srgb,var(--c) 22%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 70%,transparent)}
 .turn .st span.off{opacity:.4}
+.mark{display:inline-grid;place-items:center;min-width:14px;height:13px;padding:0 2px;margin-left:5px;border-radius:4px;
+  font:800 9px/1 system-ui;font-style:normal;color:#0b1222;background:var(--g);vertical-align:1px}
 .detail .stones{display:flex;gap:4px;margin-left:auto;font:12px var(--mono);text-transform:none}
 .detail .stones span{padding:1px 6px;border-radius:6px;color:var(--muted)}
 .detail .stones span.on{color:var(--text);background:color-mix(in srgb,var(--c) 22%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 70%,transparent)}
@@ -250,6 +260,8 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .detail:empty{display:none}
 .detail h3{margin:0;font-size:14px;display:flex;align-items:center;gap:8px;text-transform:capitalize}
 .detail .nums{font:12px var(--mono);color:var(--muted);display:flex;gap:12px;flex-wrap:wrap}
+.detail .grade{align-items:center}.detail .grade.on{color:var(--text)}.detail .grade .mark{margin:0}
+.detail .grade b{font-weight:600;text-transform:capitalize}
 .empty{color:var(--dim);font-size:13px}
 /* menu and dialogs */
 #menu{position:fixed;z-index:10;padding:4px;max-height:min(60dvh,420px);overflow:auto;display:none;min-width:240px;transform-origin:top;animation:drop .16s var(--ease)}
@@ -309,8 +321,9 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 .saved-game .downloads .btn{padding:5px 8px;font-size:11px}
 .chip{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 6px;border-radius:5px;background:rgba(148,163,184,.1);color:var(--muted)}
 .medal{width:10px;height:10px;border-radius:50%;background:var(--best);flex:none;box-shadow:0 0 0 3px color-mix(in srgb,var(--best) 20%,transparent)}
-/* medium and narrow */
-@media (max-width:759px){
+/* medium and narrow, and phones held sideways: tabs switch between analysis and moves, and the seats card folds to its
+   head, which names both sides, until the head is tapped */
+@media (max-width:759px),(max-height:499px) and (orientation:landscape){
   #app{grid-template-columns:minmax(0,1fr);grid-template-rows:min(56dvh,100vw) auto minmax(0,1fr);grid-template-areas:"board" "tabs" "panel"}
   #tabs{grid-area:tabs;display:grid;grid-auto-flow:column;grid-auto-columns:1fr;background:var(--panel);border-top:1px solid var(--line)}
   #tabs button{border:0;background:transparent;padding:10px;color:var(--muted);border-bottom:2px solid transparent;cursor:pointer}
@@ -319,12 +332,41 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
   #analysis,#review{grid-area:panel;background:var(--panel);padding:10px;overflow:hidden}
   #app:not([data-tab=review]) #review,#app[data-tab=review] #analysis{display:none}
   #moves{margin:0 -10px}
-  #seats{width:min(250px,calc(100% - 28px));left:8px;top:8px}
-  #actions{right:8px;bottom:8px}#transport{bottom:8px;left:8px;transform:none}
+  #seats{width:min(250px,calc(100% - 28px));left:8px;top:8px;padding:4px}
+  #actions{right:8px;bottom:8px}#transport{bottom:8px;left:8px;transform:none}#perspective{left:8px;bottom:52px}
   #transport .ib{width:26px}#ply{min-width:48px}
   #pips{left:auto;right:12px;transform:none}
-  #seats:hover .more,#seats:focus-within .more{grid-template-rows:0fr}#seats.open .more{grid-template-rows:1fr}
-  #seats{padding:4px}.card-head{display:flex}.seat-head .pick{padding:3px 6px}
+  #seats .more{grid-template-rows:1fr}
+  #seats:not(.open){width:auto;max-width:calc(100% - 64px)}
+  #seats:not(.open)>:not(.card-head,#match),#seats:not(.open) .card-head .title,#seats:not(.open) .games-button .label{display:none}
+  #seats:not(.open) .card-head{padding-bottom:2px}
+  #seats:not(.open) .card-head .sides{display:flex;align-items:center;gap:10px;min-width:0;overflow:hidden;font-weight:600}
+  .card-head .side{display:flex;align-items:center;gap:5px;min-width:0}
+  .card-head .side .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.card-head .side .kind~.name{display:none}
+  .card-head .games-button{flex:none}
+  .seat-head .pick{padding:3px 6px}
+}
+/* phones: a smaller analysis panel, so its head, strength, evaluation and first candidates fit beside the board */
+@media (max-width:599px),(max-height:499px) and (orientation:landscape){
+  :root{--gap:8px}
+  #tabs button{padding:7px}
+  #analysis,#review{padding:8px}
+  #moves{margin:0 -8px}
+  .engine{gap:6px}
+  .engine select{padding:4px 28px 4px 8px;font-size:13px}
+  .head .pick{padding:3px 6px}
+  .ends{font-size:10px}
+  .track{height:24px}
+  .evalbar{height:24px;border-radius:7px}.evalbar b{font-size:12px;padding:0 10px}
+  .proof{margin-top:-4px}
+  .top div{grid-template-columns:16px 70px 1fr 36px 30px;gap:6px;padding:2px 6px;font-size:11px}
+  .turn{padding:4px 8px;font-size:11px}
+}
+/* phones held sideways: the board takes the height on the left, the tabs the rest of the width */
+@media (max-height:499px) and (orientation:landscape){
+  #app{grid-template-columns:min(100dvh,58vw) minmax(0,1fr);grid-template-rows:auto minmax(0,1fr);grid-template-areas:"board tabs" "board panel"}
+  #tabs{border-top:0;border-left:1px solid var(--line)}
+  #analysis,#review{border-left:1px solid var(--line)}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 @media (max-width:420px){#t-tabs{order:3;width:100%;margin-left:0}.saved-game .downloads{grid-column:2 / 4;justify-self:end}.saved-game.freeplay .downloads{grid-column:1 / 3}}
@@ -351,6 +393,10 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
       <button class="ib ghost" id="next" aria-label="Next"></button><button class="ib ghost" id="last" aria-label="Latest position"></button>
       <button class="ib ghost" id="retry" aria-label="Play on from here"></button>
     </div>
+    <div id="perspective" class="float glass">
+      <button class="ib ghost" id="view-left" aria-label="Rotate board left" title="Rotate left ([)"></button><button class="ib ghost" id="view-right" aria-label="Rotate board right" title="Rotate right (])"></button>
+      <button class="ib ghost" id="view-mirror" aria-label="Mirror board" title="Mirror (M)"></button><button class="ib ghost" id="view-reset" aria-label="Reset board perspective" title="HTTTX orientation (0)"></button>
+    </div>
     <div id="actions" class="float glass">
       <button class="ib ghost" id="new" aria-label="New game"></button>
       <button class="ib ghost" id="undo" aria-label="Undo"></button>
@@ -361,7 +407,7 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
     <div class="part" id="analysis">
       <div class="engine" id="engine-head"></div>
       <div class="evalbar idle" id="evalbar"><i></i><b id="xv"></b><b id="ov"></b></div>
-      <div class="bar" id="analysis-progress" style="visibility:hidden;margin-top:-8px"><i></i></div>
+      <div class="busy" style="margin-top:-8px"><div class="bar" id="analysis-progress" style="visibility:hidden"><i></i></div><span class="stage" id="analysis-stage"></span></div>
       <div class="proof"><span id="xproof"></span><span id="oproof"></span></div>
       <div class="top" id="top"></div>
     </div>
@@ -434,7 +480,9 @@ const ICON={
   import:'<path d="M8 10.5V3M5 6l3-3 3 3M3 11v2.5h10V11"/>',caret:'<path d="M3 7.5 6 4.5 9 7.5"/>',side:'<path d="M7.5 3 4.5 6l3 3"/>',book:'<path d="M3 3.5h4a1.5 1.5 0 0 1 1 .5 1.5 1.5 0 0 1 1-.5h4V12H9a1 1 0 0 0-1 1 1 1 0 0 0-1-1H3z"/>',copy:'<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/>',
   check:'<path d="m3 8.5 3 3 7-7"/>',config:'<path d="M3 4.5h6M12 4.5h1M3 11.5h1M7 11.5h6"/><circle cx="10.5" cy="4.5" r="1.5"/><circle cx="5.5" cy="11.5" r="1.5"/>',close:'<path d="m4 4 8 8M12 4l-8 8"/>',again:'<path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M13 2.5v3h-3"/>',
   stop:'<rect x="4" y="4" width="8" height="8" rx="1.5"/>',open:'<path d="M9 3h4v4M13 3 7.5 8.5M11 9.5V13H3V5h3.5"/>',
-  download:'<path d="M8 2.5v7M5 7l3 3 3-3M3 13.5h10"/>',more:'<circle cx="3.5" cy="8" r=".6"/><circle cx="8" cy="8" r=".6"/><circle cx="12.5" cy="8" r=".6"/>',home:'<path d="M2.5 7.5 8 3l5.5 4.5M4 6.5V13h8V6.5"/>',rescan:'<path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M13 2.5v3h-3"/>'};
+  download:'<path d="M8 2.5v7M5 7l3 3 3-3M3 13.5h10"/>',more:'<circle cx="3.5" cy="8" r=".6"/><circle cx="8" cy="8" r=".6"/><circle cx="12.5" cy="8" r=".6"/>',home:'<path d="M2.5 7.5 8 3l5.5 4.5M4 6.5V13h8V6.5"/>',rescan:'<path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M13 2.5v3h-3"/>',
+  'view-left':'<path d="M3.5 8a4.5 4.5 0 1 0 1.3-3.2"/><path d="M4.5 2v3h3"/>','view-right':'<path d="M12.5 8a4.5 4.5 0 1 1-1.3-3.2"/><path d="M11.5 2v3h-3"/>',
+  'view-mirror':'<path d="M2 8h12M8 2.5 5 6h6zM8 13.5 5 10h6z"/>','view-reset':'<path d="M3 12.5h10M11 10.5l2 2-2 2M3 12.5 7.5 4.5M5 4.6l2.5-.1 1.2 2.2"/>'};
 const icon=name=>`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${ICON[name]}</svg>`;
 const setIcon=(b,name)=>{if(b.dataset.icon!==name){b.dataset.icon=name;b.innerHTML=icon(name)}};
 const hexagon=r=>{const p=[];for(let k=0;k<6;k++){const a=(60*k-90)*Math.PI/180;p.push((10+r*Math.cos(a)).toFixed(2)+' '+(10+r*Math.sin(a)).toFixed(2))}return'M'+p.join('L')+'Z'};
@@ -446,7 +494,7 @@ const STOP_ICON=[
   glyph(`<path class="glyph-f" d="${hexagon(4.4)}"/><circle class="glyph-o" cx="10" cy="10" r="8"/>`),
   glyph(`<path class="glyph-o" d="${hexagon(5.2)}" transform="translate(2.2 -2.2)"/><path class="glyph-f" d="${hexagon(5.2)}" transform="translate(-1.6 1.6)"/>`),
   glyph('<path class="glyph-f" d="M10 2.2 18.4 17.2H1.6z"/><path class="glyph-o" d="M10 7.6v4.6M10 14.3v.2"/>','hazard')];
-for(const id of['first','prev','next','last','retry','new','undo'])setIcon($(id),id);
+for(const id of['first','prev','next','last','retry','new','undo','view-left','view-right','view-mirror','view-reset'])setIcon($(id),id);
 setIcon($('import'),'import');setIcon($('import-close'),'close');setIcon($('tournament-close'),'close');
 
 /* server */
@@ -484,15 +532,29 @@ function accept(data){
   renderJobs();tickClocks();draw();
 }
 
-/* board geometry */
-function screen(q,r){return[canvas.clientWidth/2+cam.x+cam.size*SQ3*(q+r/2),canvas.clientHeight/2+cam.y+cam.size*1.5*r]}
-function axial(x,y){x-=canvas.clientWidth/2+cam.x;y-=canvas.clientHeight/2+cam.y;const q=(SQ3/3*x-y/3)/cam.size,r=2*y/3/cam.size,s=-q-r;
+/* board geometry: HTTTX axial cells, pointy-top, q to the right and r up and to the right as the notation's diagram draws them */
+/* the viewer's perspective is one of the 12 hex symmetries (web/engine/symmetry.mjs, loaded before the first state),
+   applied to a cell only where it is drawn or picked: the game, its notation and its records keep HTTTX coordinates.
+   It persists per browser (localStorage) and defaults to 0, the notation's own orientation. */
+let symmetry=null,perspective=0;try{const v=Number(localStorage.getItem('board-perspective'));if(Number.isInteger(v)&&v>0&&v<12)perspective=v}catch(e){}
+const geometryReady=import('./engine/symmetry.mjs').then(m=>{symmetry=m;showPerspective()});
+/* the cell [q, r] in board units as the perspective shows it */
+function project(q,r){[q,r]=symmetry.turn([q,r],perspective);return[SQ3*(q+r/2),-1.5*r]}
+function screen(q,r){const[x,y]=project(q,r);return[canvas.clientWidth/2+cam.x+cam.size*x,canvas.clientHeight/2+cam.y+cam.size*y]}
+function axial(x,y){x-=canvas.clientWidth/2+cam.x;y-=canvas.clientHeight/2+cam.y;const q=(SQ3/3*x+y/3)/cam.size,r=-2*y/3/cam.size,s=-q-r;
   let a=Math.round(q),b=Math.round(r),c=Math.round(s);const da=Math.abs(a-q),db=Math.abs(b-r),dc=Math.abs(c-s);
-  if(da>db&&da>dc)a=-b-c;else if(db>dc)b=-a-c;return[a,b]}
+  if(da>db&&da>dc)a=-b-c;else if(db>dc)b=-a-c;return symmetry.turn([a,b],symmetry.inverse(perspective))}
+/* turns the view to `next`, keeping the cell at the board's centre there, and remembers it */
+function setPerspective(next){
+  const centre=axial(canvas.clientWidth/2,canvas.clientHeight/2);perspective=next;
+  try{localStorage.setItem('board-perspective',String(next))}catch(e){}
+  const[x,y]=project(...centre);cam.x=-cam.size*x;cam.y=-cam.size*y;showPerspective();draw();
+}
+function showPerspective(){$('view-reset').disabled=!perspective}
 function fit(){
   const h=S?S.history.slice(0,view):[];fitted=true;
   if(!h.length){cam={x:0,y:0,size:Math.max(16,Math.min(34,canvas.clientWidth/20,canvas.clientHeight/16))};return}
-  const pts=h.map(([q,r])=>[SQ3*(q+r/2),1.5*r]),xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
+  const pts=h.map(p=>project(...p)),xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
   const w=Math.max(...xs)-Math.min(...xs)+10,hh=Math.max(...ys)-Math.min(...ys)+10;
   const size=Math.max(10,Math.min(34,canvas.clientWidth/w,(canvas.clientHeight-90)/hh));
   cam={size,x:-size*(Math.max(...xs)+Math.min(...xs))/2,y:-size*(Math.max(...ys)+Math.min(...ys))/2};
@@ -526,7 +588,7 @@ let frame=0;
 function draw(){if(!frame)frame=requestAnimationFrame(()=>{frame=0;paint()})}
 /* the stones shown: the history up to the viewed ply, then the person's stones still on their way to the server */
 function shownStones(){return view===S.history.length?[...S.history,...placing]:S.history.slice(0,view)}
-/* the lattice and the settled stones are kept in `layer`: rebuilt when the camera moves or the stones change other
+/* the lattice and the settled stones are kept in `layer`: rebuilt when the camera or perspective moves or the stones change other
    than by new ones, otherwise patched, so a placement redraws only the cells it touches and a landing animation or a
    hover only the stones that move */
 const layer=document.createElement('canvas'),lctx=layer.getContext('2d');let drawn={sig:null};
@@ -536,14 +598,14 @@ function emptyCell(x,y,near){
 }
 function clearCell(x,y){lctx.save();hexPath(x,y,CELL()+.6,lctx);lctx.clip();lctx.clearRect(x-cam.size,y-cam.size,2*cam.size,2*cam.size);lctx.restore()}
 function paintLayer(w,h,ratio,stones,occupied,legal,settled){
-  const sig=[w,h,ratio,cam.x,cam.y,cam.size].join('|'),size=cam.size,seen=(x,y)=>x>-size&&x<w+size&&y>-size&&y<h+size;
+  const sig=[w,h,ratio,cam.x,cam.y,cam.size,perspective].join('|'),size=cam.size,seen=(x,y)=>x>-size&&x<w+size&&y>-size&&y<h+size;
   const grows=drawn.sig===sig&&drawn.stones.length<=stones.length&&drawn.stones.every((k,i)=>k===key(...stones[i]))&&[...drawn.settled].every(i=>settled.has(i));
   lctx.setTransform(ratio,0,0,ratio,0,0);lctx.lineWidth=1;
   if(!grows){
     if(layer.width!==canvas.width||layer.height!==canvas.height){layer.width=canvas.width;layer.height=canvas.height}
     lctx.setTransform(ratio,0,0,ratio,0,0);lctx.lineWidth=1;lctx.clearRect(0,0,w,h);
     const corners=[[0,0],[w,0],[0,h],[w,h]].map(([x,y])=>axial(x,y)),qs=corners.map(c=>c[0]),rs=corners.map(c=>c[1]);
-    for(let q=Math.min(...qs)-3;q<=Math.max(...qs)+3;q++)for(let r=Math.min(...rs)-2;r<=Math.max(...rs)+2;r++){
+    for(let q=Math.min(...qs)-3;q<=Math.max(...qs)+3;q++)for(let r=Math.min(...rs)-3;r<=Math.max(...rs)+3;r++){
       const[x,y]=screen(q,r),k=key(q,r);if(seen(x,y)&&!occupied.has(k))emptyCell(x,y,legal.has(k))}
     drawn={sig,stones:[],settled:new Set(),legal};
   }else{
@@ -668,20 +730,38 @@ function place(q,r){
     const done=await post('/play',{q,r});placing=placing.filter(p=>key(...p)!==k);
     if(!done){for(const p of[[q,r],...placing]){placed.delete(key(...p));landed.delete(key(...p))}placing=[]}draw()});
 }
-canvas.onpointerdown=e=>{drag={x:e.clientX,y:e.clientY,cx:cam.x,cy:cam.y,moved:false};canvas.setPointerCapture(e.pointerId)};
+/* one pointer drags the board, or places a stone when it lifts without moving; two pinch it, zooming about their
+   midpoint as the wheel does about the cursor */
+const pointers=new Map();let pinch=null;
+const fromCentre=(x,y)=>{const b=canvas.getBoundingClientRect();return[x-b.left-canvas.clientWidth/2,y-b.top-canvas.clientHeight/2]};
+function zoomAt([mx,my],size,from=cam){size=Math.max(8,Math.min(64,size));const k=size/from.size;cam.x=mx-(mx-from.x)*k;cam.y=my-(my-from.y)*k;cam.size=size}
+function pinchOf(){const[[ax,ay],[bx,by]]=[...pointers.values()];return{d:Math.hypot(ax-bx,ay-by)||1,mid:fromCentre((ax+bx)/2,(ay+by)/2)}}
+canvas.onpointerdown=e=>{canvas.setPointerCapture(e.pointerId);pointers.set(e.pointerId,[e.clientX,e.clientY]);
+  if(pointers.size===1)drag={id:e.pointerId,x:e.clientX,y:e.clientY,cx:cam.x,cy:cam.y,moved:false};
+  else if(pointers.size===2){drag=null;pinch={...pinchOf(),cam:{...cam}}}};
 canvas.onpointermove=e=>{const b=canvas.getBoundingClientRect();hover=axial(e.clientX-b.left,e.clientY-b.top);markTokens(key(...hover));
-  if(drag){const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(Math.abs(dx)+Math.abs(dy)>5)drag.moved=true;if(drag.moved){cam.x=drag.cx+dx;cam.y=drag.cy+dy}}draw()};
+  if(pointers.has(e.pointerId))pointers.set(e.pointerId,[e.clientX,e.clientY]);
+  if(pinch&&pointers.size>=2){const{d,mid}=pinchOf(),[mx,my]=pinch.mid;zoomAt([mx,my],pinch.cam.size*d/pinch.d,pinch.cam);cam.x+=mid[0]-mx;cam.y+=mid[1]-my}
+  else if(drag?.id===e.pointerId){const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(Math.abs(dx)+Math.abs(dy)>5)drag.moved=true;if(drag.moved){cam.x=drag.cx+dx;cam.y=drag.cy+dy}}draw()};
 canvas.onpointerleave=()=>{hover=null;markTokens(null);draw()};
-canvas.onpointerup=e=>{if(!drag)return;const moved=drag.moved;drag=null;if(moved)return;const b=canvas.getBoundingClientRect();
+/* a finger left after a pinch drags on without placing */
+function lift(e){pointers.delete(e.pointerId);if(!pinch)return false;
+  if(pointers.size<2){pinch=null;const[left]=pointers;drag=left&&{id:left[0],x:left[1][0],y:left[1][1],cx:cam.x,cy:cam.y,moved:true}}return true}
+canvas.onpointercancel=e=>{lift(e);drag=null};
+canvas.onpointerup=e=>{if(lift(e)||drag?.id!==e.pointerId)return;const moved=drag.moved;drag=null;if(moved)return;const b=canvas.getBoundingClientRect();
   const[q,r]=axial(e.clientX-b.left,e.clientY-b.top);if(canPlace())place(q,r)};
-canvas.onwheel=e=>{e.preventDefault();const b=canvas.getBoundingClientRect(),mx=e.clientX-b.left-canvas.clientWidth/2,my=e.clientY-b.top-canvas.clientHeight/2;
-  const f=e.deltaY>0?.9:1.1,size=Math.max(8,Math.min(64,cam.size*f)),k=size/cam.size;cam.x=mx-(mx-cam.x)*k;cam.y=my-(my-cam.y)*k;cam.size=size;draw()};
+canvas.onwheel=e=>{e.preventDefault();zoomAt(fromCentre(e.clientX,e.clientY),cam.size*(e.deltaY>0?.9:1.1));draw()};
 function go(p){if(!S)return;view=Math.max(0,Math.min(S.history.length,p));renderPanels();draw()}
 $('first').onclick=()=>go(0);$('prev').onclick=()=>go(view-1);$('next').onclick=()=>go(view+1);$('last').onclick=()=>go(1e9);
 $('retry').onclick=()=>post('/retry',{ply:view});
-addEventListener('keydown',e=>{if(e.defaultPrevented||e.target.closest('input,textarea,select,dialog'))return;
+$('view-left').onclick=()=>setPerspective(symmetry.compose(perspective,symmetry.TURN_LEFT));
+$('view-right').onclick=()=>setPerspective(symmetry.compose(perspective,symmetry.TURN_RIGHT));
+$('view-mirror').onclick=()=>setPerspective(symmetry.compose(perspective,symmetry.MIRROR));
+$('view-reset').onclick=()=>setPerspective(0);
+addEventListener('keydown',e=>{if(e.defaultPrevented||e.ctrlKey||e.metaKey||e.altKey||e.target.closest('input,textarea,select,dialog'))return;
   const k={ArrowLeft:()=>go(view-1),ArrowRight:()=>go(view+1),Home:()=>go(0),End:()=>go(1e9),
-    ArrowUp:()=>go(turnEdge(-1)),ArrowDown:()=>go(turnEdge(1)),f:()=>{fit();draw()}}[e.key];if(k){e.preventDefault();k()}});
+    ArrowUp:()=>go(turnEdge(-1)),ArrowDown:()=>go(turnEdge(1)),f:()=>{fit();draw()},
+    '[':()=>$('view-left').click(),']':()=>$('view-right').click(),m:()=>$('view-mirror').click(),0:()=>$('view-reset').click()}[e.key];if(k){e.preventDefault();k()}});
 function turnEdge(d){const ends=[0,...S.review.map(t=>t.ply+t.stones.length)];return d<0?Math.max(0,...ends.filter(p=>p<view)):Math.min(S.history.length,...ends.filter(p=>p>view))}
 new ResizeObserver(draw).observe(canvas);
 $('tabs').onclick=e=>{const b=e.target.closest('button');if(!b)return;$('app').dataset.tab=b.dataset.tab;
@@ -824,20 +904,24 @@ function renderSeat(side){
   const controls=seat.engine==='human'?[]:seatControls(seat,send,'seat'+side,configButton('seat'+side,seat));
   if(seat.engine!=='human'&&entryOf(seat.engine)?.clocks)controls.push(clockPicker(S.clock_spec,spec=>post('/clock',spec),'clock-seat'+side));
   box.replaceChildren(el('div',{class:'seat-head'},el('i',{class:'hexdot',id:'dot'+side}),pick,el('span',{class:'clock',id:'clock'+side}),el('span',{id:'cancel'+side})),
-    el('div',{class:'bar',id:'busy'+side,style:'visibility:hidden'},el('i')),
+    el('div',{class:'busy'},el('div',{class:'bar',id:'busy'+side,style:'visibility:hidden'},el('i')),el('span',{class:'stage',id:'stage'+side})),
     ...(controls.length?[el('div',{class:'more'},el('div',{},controls))]:[]));
-  box.firstChild.onclick=e=>{if(!e.target.closest('button')){pinned=!pinned;$('seats').classList.toggle('open',pinned)}};
+  box.firstChild.onclick=e=>{if(!e.target.closest('button'))pin(!pinned)};
   box.classList.toggle('active',S.winner<0&&S.player===side);
   for(const control of box.querySelectorAll('button,input,select'))control.disabled=!!S.match?.active;
 }
+/* the seats card stays open when `on`; folded, a narrow screen shows only its head */
+function pin(on){pinned=on;$('seats').classList.toggle('open',on)}
 function renderCard(){
   const head=$('card-head');
   const logo=el('span',{html:'<svg class="logo" viewBox="0 0 20 22"><path d="M10 1 19 6v10l-9 5-9-5V6z" fill="none" stroke="var(--o)" stroke-width="2"/><circle cx="10" cy="11" r="3.2" fill="var(--x)"/></svg>'});
   const title=S.saved_game?`Game ${S.saved_game.game}`:'Bubble';
   const extra=STUDY?el('a',{class:'ib ghost',href:globalThis.browserPlay?'./':'/','aria-label':'Live board',html:icon('home')}):
-    el('button',{class:'btn games-button','aria-label':'Games',onclick:e=>{e.stopPropagation();showTournaments()}},el('span',{html:icon('trophy')}),'Games');
-  head.replaceChildren(logo,el('span',{},title),el('span',{class:'spacer'}),extra);
-  head.onclick=e=>{if(!e.target.closest('a,button')){pinned=!pinned;$('seats').classList.toggle('open',pinned)}};
+    el('button',{class:'btn games-button','aria-label':'Games',onclick:e=>{e.stopPropagation();showTournaments()}},el('span',{html:icon('trophy')}),el('span',{class:'label'},'Games'));
+  const sides=[0,1].map(side=>el('span',{class:'side',style:`--c:${COLORS[side]}`},el('i',{class:'hexdot'}),
+    ...(S.saved_game?[el('span',{class:'name'},S.saved_game.players[side])]:badge(...shown(S.seats[side])))));
+  head.replaceChildren(logo,el('span',{class:'title'},title),el('span',{class:'sides'},sides),el('span',{class:'spacer'}),extra);
+  head.onclick=e=>{if(!e.target.closest('a,button'))pin(!pinned)};
 }
 function sendAnalysis(change){
   const a=S.analysis;
@@ -923,13 +1007,12 @@ function renderMoves(){
   const box=$('moves'),sel=selectedTurn(),keep=box.scrollTop,atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-4;
   box.replaceChildren(...S.review.map((t,i)=>{
     const label=t.label&&LABEL[t.label],fresh=t.label&&seenLabels.has(t.ply)&&seenLabels.get(t.ply)!==t.label;
-    const loss=t.before!=null&&t.after!=null?Math.round((t.before-t.after)*100):null;
     const row=el('div',{class:'turn'+(t===sel?' sel':''),style:`--c:${COLORS[t.player]}`},el('span',{class:'n'},i+1),
-      el('span',{class:'st'},t.stones.map((p,j)=>{const at=t.ply+j,s=el('span',{class:t===sel?(at===view-1?'on':at>=view?'off':''):''},p[0]+','+p[1]);
+      el('span',{class:'st'},t.stones.map((p,j)=>{const at=t.ply+j,s=el('span',{class:t===sel?(at===view-1?'on':at>=view?'off':''):''},p[0]+','+p[1],...stoneMark(t,j));
         s.onmouseenter=()=>{hot=[p[0],p[1]];draw()};s.onmouseleave=()=>{hot=null;draw()};
         s.onclick=e=>{e.stopPropagation();go(at+1)};return s})),
       label?el('span',{class:'glyph'+(fresh?' new':''),style:`--c:var(${label[1]})`},label[0]):el('span'),
-      el('span',{class:'loss'},loss>0&&!['best','win','found','kept'].includes(t.label)?'−'+loss:''));
+      el('span',{class:'loss'},lossOf(t)));
     row.onclick=()=>go(t.ply+t.stones.length);return row}));
   for(const t of S.review)seenLabels.set(t.ply,t.label);
   const bad=['inaccuracy','mistake','blunder','missed','allowed'];
@@ -939,15 +1022,24 @@ function renderMoves(){
   if(atEnd&&view===S.history.length)box.scrollTop=box.scrollHeight;else box.scrollTop=keep;
   const s=box.querySelector('.sel');if(s&&renderMoves.view!==view)s.scrollIntoView({block:'nearest'});renderMoves.view=view;
 }
+/* a stone's own grade as a small badge, unless the stone is the whole graded turn */
+function stoneMark(t,j){const g=(t.stones.length>1||!t.label)&&t.grades?.[j]?.label;
+  return g?[el('i',{class:'mark',style:`--g:var(${LABEL[g][1]})`},LABEL[g][0])]:[]}
+function lossOf(g){const loss=g.before!=null&&g.after!=null?Math.round((g.before-g.after)*100):null;
+  return loss>0&&!['best','win','found','kept'].includes(g.label)?'−'+loss:''}
 function renderDetail(){
-  const t=selectedTurn(),d=$('detail');
-  if(!t||!t.label){d.replaceChildren();return}
+  const t=selectedTurn(),d=$('detail'),graded=t?t.stones.map((p,j)=>[p,j,stoneMark(t,j)]).filter(s=>s[2].length):[];
+  if(!t||!t.label&&!graded.length){d.replaceChildren();return}
+  const rows=graded.map(([p,j,mark])=>{const g=t.grades[j];return el('div',{class:'nums grade'+(t.ply+j===view-1?' on':'')},mark[0],el('b',{},g.label),
+    el('span',{},p[0]+','+p[1]),el('span',{},lossOf(g)),
+    ...(g.better?[el('span',{style:`color:${COLORS[t.player]}`},'★ '+g.better.map(p=>p.join(',')).join('  '))]:[]))});
+  if(!t.label){d.replaceChildren(...rows);return}
   const[g,c]=LABEL[t.label],nums=[];
   if(t.before!=null)nums.push(el('span',{},pct(t.before)+' → '+pct(t.after)));
   if(t.better)nums.push(el('span',{style:`color:${COLORS[t.player]}`},'★ '+t.better.map(p=>p.join(',')).join('  ')));
   const stones=el('span',{class:'stones',style:`--c:${COLORS[t.player]}`},t.stones.map((p,j)=>el('span',{class:t.ply+j===view-1?'on':''},p[0]+','+p[1])));
   d.replaceChildren(el('h3',{},el('span',{class:'glyph',style:`--c:var(${c})`},g),t.label,stones),el('div',{class:'nums'},nums),
-    ...(t.line&&t.line.length>(t.better||[]).length?[el('div',{class:'nums'},t.line.slice(0,8).map(p=>el('span',{style:`color:${COLORS[p[2]]}`},p[0]+','+p[1])))]:[]));
+    ...(t.line&&t.line.length>(t.better||[]).length?[el('div',{class:'nums'},t.line.slice(0,8).map(p=>el('span',{style:`color:${COLORS[p[2]]}`},p[0]+','+p[1])))]:[]),...rows);
 }
 const BOOKS=[['narrow','narrow'],['wide','on-policy'],['all','all']];
 /* the clock choice in the card when people play both seats (an engine seat shows it under its strength) */
@@ -1007,7 +1099,7 @@ function renderJobs(){
   for(const side of[0,1]){const box=$('busy'+side);if(!box)continue;const job=S.jobs.find(j=>j.kind==='move'&&j.side===side);
     $('dot'+side)?.classList.toggle('thinking',!!job);
     const cancel=$('cancel'+side);
-    box.style.visibility=job?'visible':'hidden';
+    box.style.visibility=job?'visible':'hidden';$('stage'+side).textContent=job?.status==='running'?job.stage||'':'';
     if(!job){cancel.replaceChildren();continue}
     box.classList.toggle('running',job.status==='running');
     box.firstChild.style.transform=`scaleX(${Math.min(1,job.done/job.total)})`;
@@ -1022,6 +1114,7 @@ function renderJobs(){
   const ajob=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view&&j.status==='running'),progress=$('analysis-progress');
   progress.style.visibility=ajob?'visible':'hidden';progress.style.setProperty('--c',COLORS[playerAt(view)]);
   progress.classList.toggle('running',!!ajob);progress.firstChild.style.transform=`scaleX(${ajob?Math.min(1,ajob.done/ajob.total):0})`;
+  $('analysis-stage').textContent=ajob?.stage||'';
   const again=$('again');if(again){setIcon(again,analysing.length?'close':'again');
     again.onclick=async()=>{if(!analysing.length)return post('/analyse',{ply:view,force:true});
       const a=S.analysis;if(a.auto)await post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.budget,auto:false});
@@ -1118,9 +1211,9 @@ function savedGameRow(match,r){
 }
 /* a tournament entrant: engine, checkpoint, the same strength stops as a seat and its custom budget */
 function entrantRow(i){
-  const spec=entrants[i],engines=S.engines.filter(e=>globalThis.browserPlay||!e.id.startsWith('browser:'));if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
+  const spec=entrants[i],engines=pickItems(e=>globalThis.browserPlay||!e.id.startsWith('browser:'));if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
   const entry=entryOf(spec.engine);if(entry&&!(entry.checkpoints||[]).includes(spec.checkpoint))spec.checkpoint=entry.checkpoints?.[0]??null;
-  const pick=el('select',{'aria-label':'Engine',id:'t-engine'+i},engines.map(e=>{const b=e.badge||e.kind;return el('option',{value:e.id},b+(e.label&&e.label.toLowerCase()!==b?' · '+e.label:''))}));
+  const pick=el('select',{'aria-label':'Engine',id:'t-engine'+i},engines.map(e=>el('option',{value:e.id},e.kind+(e.label&&e.label.toLowerCase()!==e.kind?' · '+e.label:''))));
   pick.value=spec.engine;pick.onchange=()=>{spec.engine=pick.value;spec.checkpoint=null;spec.preset='quick';spec.custom=null;renderTournamentForm()};
   const parts=[pick];
   if(entry?.checkpoints?.length>1){const cp=el('select',{'aria-label':'Checkpoint',id:'t-checkpoint'+i},entry.checkpoints.map(c=>el('option',{value:c},c)));
@@ -1189,7 +1282,7 @@ async function showTournaments(tab,kind){
 $('tournament-close').onclick=()=>$('tournament-dialog').close();
 $('restore-local').onclick=()=>{$('tournament-dialog').close();$('import-text').value='';$('import-dialog').showModal()};
 (async()=>{
-  await globalThis.playReady;
+  await Promise.all([globalThis.playReady,geometryReady]);
   if(STUDY&&PAGE.has('batch')&&!globalThis.browserPlay){
     try{const response=await fetch('/matches/open',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({batch:PAGE.get('batch'),game:Number(PAGE.get('game'))})});

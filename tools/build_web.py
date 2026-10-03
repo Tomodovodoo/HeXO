@@ -194,7 +194,8 @@ def build_ort():
     with tarfile.open(fileobj=io.BytesIO(data)) as archive:
         for name in ORT_FILES:
             (out/name).write_bytes(archive.extractfile(f'package/dist/{name}').read())
-    (out/'version.json').write_text(json.dumps(dict(version=ORT_VERSION, files=sha256s(out, ORT_FILES)))+'\n', encoding='utf-8')
+    sizes = {name: (out/name).stat().st_size for name in ORT_FILES}
+    (out/'version.json').write_text(json.dumps(dict(version=ORT_VERSION, files=sha256s(out, ORT_FILES), sizes=sizes))+'\n', encoding='utf-8')
 
 
 def pinned(data, sha256, name):

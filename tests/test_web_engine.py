@@ -156,6 +156,23 @@ class PlayPage(unittest.TestCase):
             self.assertNotIn('data-k=you', text)
 
 
+@unittest.skipUnless(NODE, 'needs node')
+class BoardPerspective(unittest.TestCase):
+    """web/engine/symmetry.mjs: the 12 views of the play page's board and the steps between them."""
+    cells = [[0, 0], [1, 0], [0, 1], [2, -1], [-3, 5], [4, 2], [-1, -1]]
+
+    def test_views_are_the_hex_symmetries_and_their_inverses_undo_them(self):
+        done = subprocess.run([NODE, str(ROOT/'tests'/'web'/'symmetry.mjs')], input=json.dumps(dict(cells=self.cells)),
+                              capture_output=True, text=True, encoding='utf-8', check=True)
+        answer = json.loads(done.stdout)
+        cells = np.array(self.cells)
+        self.assertEqual({tuple(map(tuple, image)) for image in answer['images']},
+                         {tuple(map(tuple, cells @ m)) for m in hexcrop.SYMMETRIES})
+        for undone in answer['undone']:
+            self.assertEqual(undone, self.cells)
+        self.assertEqual(answer['reached'], list(range(12)))
+
+
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 @unittest.skipUnless(NODE, 'needs node')
 class Overlay(unittest.TestCase):
@@ -254,6 +271,107 @@ class BrowserProofs(unittest.TestCase):
             self.assertEqual((shown['proof'], shown['pv']), (dict(winner=0, turns=4, plies=14), line))
 
 
+@unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
+class Loading(unittest.TestCase):
+    """A browser engine's load reports its stages, and a stalled or failed stage moves it down the fallback chain."""
+    LOAD = ['checking GPU', 'downloading 5 of 10 MB', 'downloading 10 of 10 MB', 'compiling']
+
+    @classmethod
+    def setUpClass(cls):
+        done = subprocess.run([NODE, str(ROOT/'tests'/'web'/'loading.mjs')], capture_output=True, text=True, encoding='utf-8')
+        if done.returncode:
+            raise RuntimeError(done.stderr)
+        cls.out = json.loads(done.stdout)
+
+    def test_a_load_reports_each_stage_and_tags_the_device_after_the_probe(self):
+        case = self.out['clean']
+        self.assertEqual(case['stages'], [*self.LOAD, 'starting GPU', 'warming up'])
+        self.assertEqual((case['tags'], case['notices'], len(case['starts'])), (['webgpu'], [], 1))
+        self.assertNotIn('fallback', case['device'])
+
+    def test_the_page_words_for_each_stage(self):
+        self.assertEqual(self.out['words'], ['thinking', 'checking GPU', 'downloading 12 of 27 MB', 'downloading 2.5 of 4.6 MB',
+                                             'downloading 17 MB', 'downloading', 'compiling', 'starting GPU', 'starting CPU',
+                                             'warming up', 'warming up'])
+
+    def test_each_gpu_stage_that_hangs_or_fails_falls_back_to_webassembly(self):
+        for case, words in [('gpu_compile_hangs', 'compiling timed out'), ('gpu_session_hangs', 'starting GPU timed out'),
+                            ('gpu_timing_hangs', 'warming up timed out'), ('gpu_warmup_hangs', 'warming up timed out'),
+                            ('gpu_session_fails', 'starting GPU failed')]:
+            with self.subTest(case=case):
+                found = self.out[case]
+                self.assertEqual(found['notices'], [dict(text=f'Bubble: {words}, running on CPU', cpu=True)])
+                self.assertEqual(found['starts'], [dict(prefer=None, threads=None), dict(prefer='wasm', threads=None)])
+                self.assertEqual(found['device'], dict(provider='wasm', threads=7, fallback=words))
+                self.assertEqual(found['tags'], ['webgpu', 'wasm'])
+                self.assertEqual(found['stages'][-2:], ['starting CPU', 'warming up'])
+
+    def test_a_threaded_start_that_stalls_retries_on_one_thread(self):
+        found = self.out['threads_stall']
+        self.assertEqual(found['starts'], [dict(prefer='wasm', threads=None), dict(prefer='wasm', threads=1)])
+        self.assertEqual(found['notices'], [dict(text='Bubble: compiling timed out, running on one thread', cpu=False)])
+        self.assertEqual(found['device']['threads'], 1)
+
+    def test_the_chain_ends_in_an_error_naming_the_stage(self):
+        found = self.out['everything_hangs']
+        self.assertEqual(found['starts'], [dict(prefer=None, threads=None), dict(prefer='wasm', threads=None), dict(prefer='wasm', threads=1)])
+        self.assertEqual([n['cpu'] for n in found['notices']], [True, False])
+        self.assertEqual(found['error'], 'Bubble: starting CPU timed out')
+        self.assertEqual(self.out['silent']['error'], 'Bubble: checking GPU timed out')
+        self.assertEqual(len(self.out['silent']['starts']), 3)
+
+    def test_a_fixed_device_and_thread_count_do_not_fall_back(self):
+        for case in ('fixed_device', 'fixed_gpu'):
+            found = self.out[case]
+            self.assertEqual((found['error'], found['notices'], len(found['starts'])), ('Bubble: starting GPU timed out', [], 1))
+
+    def test_a_failed_download_is_not_retried_on_another_device(self):
+        found = self.out['download_fails']
+        self.assertEqual((found['error'], found['notices'], len(found['starts'])),
+                         ('Bubble: downloading 5 of 10 MB failed: network error', [], 1))
+
+    def test_a_probe_that_fell_back_is_noticed_once_and_keeps_later_loads_off_webgpu(self):
+        found = self.out['probe_fell_back']
+        self.assertEqual(found['notices'], [dict(text='Bubble: checking GPU timed out, running on CPU', cpu=True)])
+        self.assertEqual((found['device']['fallback'], found['tags']), ('checking GPU timed out', ['wasm']))
+
+    def test_a_call_that_stalls_loading_a_network_restarts_the_worker_and_is_sent_again(self):
+        found = self.out['call_restarts']
+        self.assertEqual(found['result'], 'wasm')
+        self.assertEqual(found['starts'], [dict(prefer=None, threads=None), dict(prefer='wasm', threads=None)])
+        self.assertEqual(found['call_stages'], ['starting GPU', *self.LOAD, 'starting CPU', 'warming up'])
+        self.assertEqual(self.out['call_first'], 'done')
+        overlap = self.out['calls_overlap']
+        self.assertEqual((overlap['result'], len(overlap['starts'])), (['done', 'wasm'], 2))
+
+    def test_engines_without_a_chain_still_end_a_silent_stage(self):
+        self.assertEqual(self.out['single'], dict(native='Native (browser): compiling timed out', seal='Seal (browser): compiling timed out',
+                                                  strix='Strix (browser): compiling timed out', reporting='loaded'))
+
+    def test_threads_follow_device_memory(self):
+        self.assertEqual(self.out['threads'], [7, 2, 4, 7, 1, 1, 2])
+
+    def test_the_probe_times_out_and_prefers_fp16_on_a_limited_adapter(self):
+        probe = self.out['probe']
+        self.assertEqual(probe['hangs'], dict(provider='wasm', precisions=['fp32'], fallback='timed out', same=True))
+        self.assertEqual(probe['rejects']['fallback'], 'failed (blocked)')
+        self.assertIsNone(probe['none']['fallback'])
+        self.assertEqual([probe[k]['precisions'] for k in ('desktop', 'phone', 'phone_without_f16', 'phone_asked_fp32')],
+                         [['fp32', 'fp16'], ['fp16'], ['fp32'], ['fp32']])
+
+    def test_network_stages_time_both_graphs_only_when_both_load(self):
+        self.assertEqual(self.out['network']['both'], dict(stages=['download', 'session', 'timing'], precision='fp16'))
+        self.assertEqual(self.out['network']['fp16_only'], dict(stages=['download', 'session'], precision='fp16'))
+        self.assertEqual(self.out['network']['shrimp'], ['download', 'session'])
+        self.assertEqual(self.out['network']['missing_manifest'], 'download')
+
+    def test_a_job_stuck_loading_gives_way_and_a_cpu_fallback_moves_choices_to_lightning(self):
+        session = self.out['session']
+        self.assertEqual(session['stuck'], [dict(kind='move', status='running', stage='starting GPU')])
+        self.assertEqual((session['loads'][:2], session['history']), (['stuck', 'quick'], [[0, 0]]))
+        self.assertEqual(self.out['lighten'], dict(seats=['lightning', 'lightning'], preset='lightning'))
+
+
 class Bundle(unittest.TestCase):
     def test_solver_leaves_prove_a_losing_half_turn(self):
         history = [[0, 0], [4, 0], [7, 0], [-2, 0], [-1, 0], [1, 0], [6, 0], [5, 0], [-1, -1],
@@ -318,6 +436,30 @@ class Bundle(unittest.TestCase):
             found = node(dict(kind='rows', actions=actions.tolist(), policy=policy.tolist(),
                               values=None if values is None else values.tolist(), lead=lead))
             self.assertEqual(json.loads(json.dumps(found)), json.loads(json.dumps(expected)), case)
+
+    def test_review_matches_play(self):
+        rng = np.random.default_rng(5)
+        history = [[0, 0], [1, 0], [1, 1], [-1, 0], [-2, 0], [2, 2], [3, 3], [4, 4]]
+        win = lambda side: dict(winner=side, turns=1, plies=2)
+        cases = []
+        for case in range(24):
+            length = int(rng.integers(1, len(history) + 1))
+            evaluations = []
+            for ply in range(length + 1):
+                if rng.random() < .15:
+                    continue
+                moves = history[ply:ply + 2] if ply < length and rng.random() < .3 else rng.integers(5, 9, (2, 2)).tolist()
+                proof = win(int(rng.integers(2))) if rng.random() < .2 else None
+                evaluations.append([history[:ply], dict(value=round(float(rng.random()), 4), moves=moves, proof=proof,
+                                                        pv=[[*moves[0], 0, 1]] if proof and rng.random() < .5 else [])])
+            cases.append(dict(history=history[:length], evaluations=evaluations, winner=int(rng.integers(-1, 2))))
+        cases.append(dict(history=[], evaluations=[[[], dict(value=.5, moves=[[0, 0]], proof=None, pv=[])]], winner=-1))
+        found = node(dict(kind='review', cases=cases))
+        for case, answer in zip(cases, found):
+            table = {json.dumps(prefix): record for prefix, record in case['evaluations']}
+            expected = play.review(case['history'], lambda prefix: table.get(json.dumps([list(p) for p in prefix])),
+                                   case['winner'])
+            self.assertEqual(answer, json.loads(json.dumps(expected)), case)
 
     def test_thread_count_follows_isolation_and_cores(self):
         contexts = [dict(isolated=True, cores=24), dict(isolated=False, cores=24), dict(isolated=True, cores=2),
@@ -402,6 +544,7 @@ class Bundle(unittest.TestCase):
         answers = node(dict(kind='play', history=history, requests=requests))
         self.assertTrue(all(a['status'] == 200 for a in answers[:-1]))
         self.assertEqual(answers[3]['data']['review'][-1]['label'], 'win')
+        self.assertEqual(answers[-1]['asked'][:len(history)], list(range(len(history) - 1, -1, -1)))
         self.assertEqual(answers[6]['data']['match']['wins'], [1, 1])
         self.assertEqual(answers[6]['data']['match']['completed'], 2)
         games = answers[-1]['backup']['games']
@@ -419,7 +562,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['paused_save'], [dict(paused=True, completed=1, pending=True, current=2, resumedSeats=['other', 'test'])]*2)
         self.assertIsNone(result['deleted']['current'])
         self.assertTrue(all(m['single'] for m in result['deleted']['catalogue']))
-        self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]], renewed=True))
+        self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], paused=True, saved=[[0, 0]], renewed=True))
         self.assertEqual(result['stopped_timeout'], dict(paused=True, active=False, completed=0))
         self.assertEqual(result['forked_clock'], dict(match=None, clock=None))
         self.assertEqual(result['finished_opening_status'], 400)
@@ -432,6 +575,13 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['stale_tab'], dict(conflicted=True, history=[[0, 0], [1, 0]], archive=[[0, 0], [1, 0]],
                                                  games=1, identity=True, mutation_status=400))
         self.assertEqual(result['stale_match'], dict(conflicted=True, session_completed=0, archive_completed=0, archived_games=0))
+
+    def test_restored_budget_game_is_not_paused(self):
+        result = node(dict(kind='restore-pause', clock=dict(mode='game', tc='60+1')))
+        self.assertFalse(result['budget']['before'])
+        self.assertFalse(result['budget']['after'])
+        self.assertTrue(result['clocked']['clock'])
+        self.assertTrue(result['clocked']['after'])
 
     def test_freeplay_updates_until_new_game(self):
         win = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]

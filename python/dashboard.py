@@ -3,7 +3,7 @@ multi-run comparison page at / and per-run detail at /?run=<name>. Read-only exc
 server appends to for dense runs with a live process (dense_config layout)."""
 import argparse
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import hashlib
 import math
@@ -1073,6 +1073,16 @@ class Handler(BaseHTTPRequestHandler):
         return run
 
     def do_GET(self):
+        # Data requests share incremental caches; static files must not wait for their scans.
+        if urllib.parse.urlsplit(self.path).path.startswith('/api/'):
+            with self.data_lock:
+                self.get_resource()
+        else:
+            self.get_resource()
+
+    data_lock = threading.Lock()
+
+    def get_resource(self):
         url = urllib.parse.urlsplit(self.path)
         query = dict(urllib.parse.parse_qsl(url.query))
         try:
@@ -1214,4 +1224,4 @@ if __name__ == "__main__":
     threading.Thread(target=sample_gpu, args=(lambda: [r for r in candidates() if dense_config_of(r) and live(r)],),
                      daemon=True).start()
     print(f"Training dashboard: http://127.0.0.1:{args.port}", flush=True)
-    HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
