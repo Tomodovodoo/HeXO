@@ -41,7 +41,7 @@ const columns = [
 
 function miniature(moves) {
   // Same pointy hex projection and paired turn ownership as web/index.html and hexcrop.
-  const project=([q,r])=>[Math.sqrt(3)*(q+r/2),1.5*r], cells=new Map();
+  const project=([q,r])=>[Math.sqrt(3)*(q+r/2),-1.5*r], cells=new Map();
   for(const [q,r] of moves.length?moves:[[0,0]])for(const [dq,dr] of [[0,0],[1,0],[-1,0],[0,1],[0,-1],[1,-1],[-1,1]])cells.set(`${q+dq},${r+dr}`,[q+dq,r+dr]);
   const points=[...cells.values()].map(project),xs=points.map(p=>p[0]),ys=points.map(p=>p[1]);
   const loX=Math.min(...xs)-1,loY=Math.min(...ys)-1,w=Math.max(...xs)-loX+1,h=Math.max(...ys)-loY+1;

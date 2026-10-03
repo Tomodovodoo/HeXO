@@ -337,7 +337,9 @@ The move list shows the turn's label on its row and each stone's own label besid
 names the turn, its line, and each stone's label, loss and the engine's stone in its place; the stone of the shown
 position is highlighted, so stepping one stone at a time reads every grade. A turn still missing its second stone
 gets a row with its first stone graded. For inaccuracies and worse the board outlines the engine's turn, beside the candidates of the position reached, and the panel lists its line. Keys: ← and →
-step one stone, ↑ and ↓ one turn, Home and End, F fits the board. Retry plays on from the shown position.
+step one stone, ↑ and ↓ one turn, Home and End, F fits the board. Retry plays on from the shown position. The
+board draws HTTTX's `[q, r]` as the notation's diagram does: q to the right, r up and to the right, so a position
+looks the same here as on the sites that use the notation.
 Changing the analysis engine, checkpoint or strength evaluates the shown position again at once.
 
 Each cell has fixed places for its marks, so none hides another. A candidate is a ring with its rank and, below,

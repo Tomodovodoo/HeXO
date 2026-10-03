@@ -26,7 +26,7 @@ function drawOpening(){
   const points=item.moves.length?item.moves:[[0,0]],margin=2;
   const qmin=Math.min(...points.map(p=>p[0]))-margin,qmax=Math.max(...points.map(p=>p[0]))+margin;
   const rmin=Math.min(...points.map(p=>p[1]))-margin,rmax=Math.max(...points.map(p=>p[1]))+margin;
-  const cells=[];for(let q=qmin;q<=qmax;q++)for(let r=rmin;r<=rmax;r++)cells.push([q,r,Math.sqrt(3)*(q+r/2),1.5*r]);
+  const cells=[];for(let q=qmin;q<=qmax;q++)for(let r=rmin;r<=rmax;r++)cells.push([q,r,Math.sqrt(3)*(q+r/2),-1.5*r]);
   const xs=cells.map(p=>p[2]),ys=cells.map(p=>p[3]),xmin=Math.min(...xs),xmax=Math.max(...xs),ymin=Math.min(...ys),ymax=Math.max(...ys);
   const size=Math.min(29,(w-20)/(xmax-xmin+2),(h-20)/(ymax-ymin+2));
   for(const [q,r,px,py] of cells){
