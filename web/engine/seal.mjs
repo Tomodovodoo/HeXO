@@ -54,7 +54,8 @@ export function sealTurn(module, history, ms) {
 export async function files() {
   const found = await json('seal/manifest.json'), {data, local} = found;
   const files = await pins('seal/manifest.json', found, other => other.revision === data.revision && other.files?.['engine.wasm'] === data.sha256);
-  return {revision: data.revision, files: ['engine.mjs', 'engine.wasm'].map(name => ({path: `seal/${name}`, sha256: files[name], local}))};
+  return {revision: data.revision, files: ['engine.mjs', 'engine.wasm'].map(name => ({path: `seal/${name}`,
+    sha256: files[name] ?? (name === 'engine.wasm' ? data.sha256 : undefined), local}))};
 }
 
 /** The page-side handle of seal-worker.mjs. A cancelled turn ends its worker; the next call starts another. */

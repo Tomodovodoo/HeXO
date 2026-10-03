@@ -247,12 +247,13 @@ async function fetchEngine(id) {
   try {
     if (['failed', 'unpublished'].includes((await check(id)).state)) checks.delete(id);   // the site or a build may have changed
     repaint();
-    const found = await check(id);
+    const found = await check(id), stamp = checks.get(id).stamp;
     if (found.state === 'unpublished') { unpublished(id); return; }
     if (found.state === 'failed') throw new Error(found.error);
     if (found.state === 'missing') await download(found.files, fraction => { slot.fraction = fraction; repaint(); });
     checks.delete(id);
-    if (!READY.has((await check(id)).state)) {   // the browser would not keep them (a full quota): each load downloads them
+    const after = await check(id);
+    if (checks.get(id).stamp === stamp && !READY.has(after.state)) {   // the same files did not stay (a full quota): each load downloads them
       remember(id, Promise.resolve({state: 'uncached'}));
       original.toast(`${ENGINES.get(id).entry.label}: the browser did not keep the files, so each start downloads them`);
     }
@@ -309,8 +310,11 @@ function recheck(entry, force = false) {
   const stale = choices?.filter(c => c?.engine === entry.id && c.checkpoint && entry.checkpoints.length && !entry.checkpoints.includes(c.checkpoint));
   if (stale?.length) {
     for (const choice of stale) choice.checkpoint = entry.checkpoints[0];
+    session.cancelJobs(job => job.spec.engine === entry.id && !entry.checkpoints.includes(job.spec.checkpoint));
+    session.jobs = session.jobs.filter(job => job.status !== 'failed' || job.spec.engine !== entry.id);
     session.persist();
     page.accept(session.state());
+    session.pump();
   } else if (state()) page.renderPanels();
 }
 
