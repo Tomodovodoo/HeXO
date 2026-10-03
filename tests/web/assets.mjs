@@ -251,6 +251,9 @@ out.idle = {...await attempt(() => assets.cached({path: 'quiet.onnx', sha256: 'x
 reset();
 globalThis.fetch = async (input, init = {}) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason)));
 out.unanswered = await attempt(() => assets.cached({path: 'silent.onnx', sha256: 'x'}));
+globalThis.fetch = async input => String(input).startsWith(BASE) ? new Response('missing', {status: 404})
+  : new Response(new ReadableStream({start: controller => controller.enqueue(new TextEncoder().encode('{"networks": ['))}));
+out.unfinished = await attempt(() => assets.json('slow.json'));
 globalThis.fetch = plain;
 
 const page = host => {

@@ -53,6 +53,13 @@ async function request(url, init = {}) {
   }
 }
 
+/** The JSON body of `response` (for `path`), rejecting when it is not read within LIMITS.idle ms. */
+function body(response, path) {
+  let timer;
+  const idle = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${path}: no answer in ${LIMITS.idle / 1000} s`)), LIMITS.idle); });
+  return Promise.race([response.json(), idle]).finally(() => clearTimeout(timer));
+}
+
 /** {response, local}: `path` from this origin, else (after a 404, a network error or no answer) from the site. */
 async function locate(path, init = {}) {
   const here = await request(new URL(path, BASE), init).catch(() => null);
@@ -73,7 +80,7 @@ async function locate(path, init = {}) {
 export async function json(path) {
   const store = await open(), id = `${new URL(path, BASE).href}?manifest`;
   try {
-    const {response, local} = await locate(path, {cache: 'no-cache'}), data = await response.json();
+    const {response, local} = await locate(path, {cache: 'no-cache'}), data = await body(response, path);
     if (!local) await store?.put(id, new Response(JSON.stringify(data))).catch(() => {});   // keeping it is best effort
     return {data, local};
   } catch (error) {
@@ -90,7 +97,7 @@ export async function pins(path, {data, local}, same) {
   if (data.files || !local || !there) return data.files ?? {};
   const store = await open(), id = `${new URL(path, BASE).href}?site`;   // kept so the pins also answer offline
   const response = await request(there, {cache: 'no-cache', mode: 'cors'}).catch(() => null);
-  let other = response?.ok ? await response.json().catch(() => null) : null;
+  let other = response?.ok ? await body(response, path).catch(() => null) : null;
   if (other) await store?.put(id, new Response(JSON.stringify(other))).catch(() => {});
   else other = await (await store?.match(id).catch(() => null))?.json() ?? null;
   return other && same(other) ? other.files ?? {} : {};

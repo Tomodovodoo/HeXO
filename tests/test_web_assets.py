@@ -114,6 +114,7 @@ class Resolver(unittest.TestCase):
 
     def test_a_request_without_an_answer_stops_with_an_error(self):
         self.assertEqual(self.out['unanswered'], {'error': f'silent.onnx: no answer in 0.03 s ({SITE}silent.onnx)'})
+        self.assertEqual(self.out['unfinished'], {'error': 'slow.json: no answer in 0.03 s'})
 
     def test_assets_query_is_honoured_only_on_a_loopback_page(self):
         self.assertEqual(self.out['override'], {'public': SITE, 'loopback': 'https://other.example/engine/'})
