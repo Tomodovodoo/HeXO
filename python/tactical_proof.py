@@ -374,6 +374,8 @@ class IsolatedTactics:
                 self._retire(killed=True)
                 return unknown('response size limit') | dict(nodes_fresh=None)
             result.setdefault('nodes_fresh', None)
+            if bounds:
+                result.setdefault('proof_numbers', None)
             if result.get('background_worker_busy'):
                 self._retire(killed=True)
             if time.perf_counter()-start >= ms/1000:
@@ -550,6 +552,8 @@ def _serve(engine, package, memory_mb, priority='None'):
         if event.is_set():
             result = dict(unknown_result('cancelled', start, request.get('attacker', 'mover'), None),
                           budget=None, gate_score=None)
+            if request.get('bounds'):
+                result['proof_numbers'] = None
         else:
             if getattr(tactics, 'accepts_cancel_event', False):
                 request['cancel_event'] = event

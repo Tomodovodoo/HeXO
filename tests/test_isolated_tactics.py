@@ -147,7 +147,7 @@ class Isolation(unittest.TestCase):
         self.assertEqual(result['proof_numbers']['dn'], 9)
 
     def test_cancel_before_dispatch_keeps_result_schema(self):
-        request = dict(query_id=1, history=[[0, 0]], attacker='opponent', ms=1000)
+        request = dict(query_id=1, history=[[0, 0]], attacker='opponent', ms=1000, bounds=True)
         source = io.StringIO('\n'+json.dumps(request)+'\n'+json.dumps(dict(cancel=1))+'\n')
         output = io.StringIO()
         import queue
@@ -167,6 +167,7 @@ class Isolation(unittest.TestCase):
         self.assertIsNone(result['gate_score'])
         self.assertIsNone(result['certificate'])
         self.assertEqual(result['nodes_fresh'], 0)
+        self.assertIsNone(result['proof_numbers'])
 
     def test_memory_cap_ends_child(self):
         self.tactics.history([[0, 0]], ms=10000)
