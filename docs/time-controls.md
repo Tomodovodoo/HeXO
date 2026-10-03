@@ -114,6 +114,13 @@ The host charges queueing and transport until receipt of a complete legal respon
 
 Events include `cross_ms`, `circle_ms`, `increment_ms`, `running`, request identifiers, state and optional thinking. A UI can interpolate between events with its own monotonic clock. The host decides timeout. On service restart, saved unfinished matches load paused. An explicit resume prepares their engines again.
 
+## The play page
+
+The play page (docs/play.md) uses these clocks for a single game and for tournaments: Turn is `{"mode": "move"}`,
+Absolute and Fischer are `{"mode": "game"}` without and with an increment. On the static page the browser session
+keeps the same clock and gives Bubble, Native, Seal and Six (browser) the same allowance; Strix and Shrimp play a
+fixed budget and are refused.
+
 ## Timed comparisons and records
 
 ```sh

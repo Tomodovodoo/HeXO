@@ -59,8 +59,8 @@ The clock belongs to the match and applies to both seats:
 Engines warm before clocks start. Under a clock, search budgets are ceilings: Bubble caps simulations
 across the whole turn and keeps solver work inside the allowance; Six receives nodes plus movetime or
 both clocks and increments; Native and Seal receive the smaller of their ms ceiling and the allocated time.
-Strix/Pulsatrix clock requests are rejected because their current adapter cannot return an interrupted
-search's best move. Fixed-budget games remain supported. Timing uses the clock/controller from the existing
+Strix/Pulsatrix and Six-protocol drivers of other bots (Shrimp) are refused under a clock: their adapters play a
+fixed budget and cannot return an interrupted search's best move. Fixed-budget games remain supported. Timing uses the clock/controller from the existing
 timed engine; CPU/GPU and backend identities are saved, since they affect clocked strength.
 
 Opening selection reads the player's existing `openings.json` from `--run`, or an explicit `--book path`:
@@ -91,10 +91,24 @@ null. Complete colour pairs use the evaluator's pentanomial scoring and `dense_p
 relative Elo estimate and 95% interval. These exploratory results stay in the batch directory and do not
 change the training league or its calibrated-opponent scoreboard.
 
+### A single game on a clock
+
+An engine seat's strength panel holds the same four clock choices under its slider: Budget, Turn, Absolute and
+Fischer, with the base time and the increment in seconds. The clock belongs to the game and covers both sides,
+people included; each seat head shows its remaining time and the side to move counts down. Choosing a clock
+starts both balances full at the shown position; New, Undo, Retry and Import start them again. Engine seats play
+through the timed engines above, which warm before their clock runs, so Bubble, Native, Seal and Six spend the turn's
+allowance with their budget as a ceiling. A seat whose engine cannot keep a clock (Strix, Shrimp) is refused while a
+clock is on, and a clock is refused while such an engine plays. A side whose time runs out loses on time, also while a
+person thinks. The saved game records the control (`clock`) and, after each complete turn, the time spent and both
+balances (`turns`).
+
 The trophy button opens Tournaments. New starts a batch on this board between two engines (A and B, each with
 its checkpoint and strength), for a number of games, from the origin or from narrow, wide or all book openings
-(each played twice with colours swapped), on the seats' fixed budgets, a time per turn or a game clock; an
-unfinished game against a person is cleared first. Results lists saved batches with the score, the Elo of A over B
+(each played twice with colours swapped). Each entrant has the seat's six strength stops and its custom budget
+(the sliders button). The clock is Budget (the seats' own budgets), Turn (seconds per complete turn), Absolute
+(seconds per game) or Fischer (seconds per game plus seconds after each complete turn). An unfinished game
+against a person is cleared first. Results lists saved batches with the score, the Elo of A over B
 with its 95% interval from complete colour pairs, and every completed game's result. Click a game to open it
 in the player's analysis board in another tab, or download its HTTTX. The analysis board has its own CPU
 engine queue, move timeline, analysis controls and Review button, so browsing and analysing a saved game
@@ -144,6 +158,7 @@ curl -X POST http://127.0.0.1:8772/match -H "Content-Type: application/json" -d 
 
 A player specification can also be `{"engine":"dense-v1","checkpoint":"main/150000","preset":"custom","custom":{"simulations":128,"solver_nodes":32768}}`.
 Clock JSON is `{"mode":"fixed"}`, `{"mode":"move","ms":5000}`, or `{"mode":"game","tc":"180+2"}`.
+`POST /clock` with the same JSON puts the single game on this board on that clock.
 The API is loopback-only. Each player port holds one visible game; use a separate port for another simultaneous match.
 
 ## Engines
