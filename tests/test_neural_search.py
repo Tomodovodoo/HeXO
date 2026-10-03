@@ -960,6 +960,11 @@ class SharedGraph(unittest.TestCase):
         graph.at([*a, stone])
         graph.at(a)
         self.assertEqual(int(graph.result(0, 0, 0, 0)['visits'][j]), visits)
+        graph.search(64, root_samples=8, batch_size=8)
+        graph.at(a)
+        store = graph.store()
+        self.assertGreater(store['evicted'], 4)
+        self.assertLessEqual(store['summaries'], 4)   # four times the limit of one
 
     def test_the_pv_check_searches_again_only_after_a_drop(self):
         a = recorded_position(11)
