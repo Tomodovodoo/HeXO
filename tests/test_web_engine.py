@@ -576,6 +576,18 @@ class Bundle(unittest.TestCase):
                                                  games=1, identity=True, mutation_status=400))
         self.assertEqual(result['stale_match'], dict(conflicted=True, session_completed=0, archive_completed=0, archived_games=0))
 
+    def test_a_refresh_never_stales_other_positions(self):
+        result = node(dict(kind='stale-loop', history=[[0, 0], [1, 0], [2, 0], [3, 0], [4, 0]]))
+        # The analysis at 4 refreshes 2 at a quarter of its budget; that refresh stales nothing, so nothing is left to redo.
+        self.assertEqual(result['asked'], [[2, 4], [4, 4], [2, 1]])
+        self.assertEqual(result['stale'], [])
+        self.assertEqual(result['asked_after_view'], result['asked'])
+        self.assertEqual(result['stale_after_view'], [])
+        # A refresh whose value keeps moving runs REFRESH_ROUNDS times at 2 and then settles.
+        result = node(dict(kind='stale-loop', history=[[0, 0], [1, 0], [2, 0], [3, 0], [4, 0]], drift=.1))
+        self.assertEqual(result['asked'], [[2, 4], [4, 4], [2, 1], [2, 1], [2, 1]])
+        self.assertEqual(result['stale'], [])
+
     def test_restored_budget_game_is_not_paused(self):
         result = node(dict(kind='restore-pause', clock=dict(mode='game', tc='60+1')))
         self.assertFalse(result['budget']['before'])

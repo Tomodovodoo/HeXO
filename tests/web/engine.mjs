@@ -244,6 +244,18 @@ if (job.kind === 'encode') {
     return {before, after: back.paused, clock: Boolean(back.clock)};
   };
   answer = {budget: await make(null), clocked: await make(job.clock)};
+} else if (job.kind === 'stale-loop') {
+  const s = new BrowserSession(native), asked = [];
+  const entry = {id: 'browser:test', name: 'Test', kind: 'bubble', version: 'v1', checkpoints: [], presets: {standard: {simulations: 4, solver_nodes: 0}, quick: {simulations: 4, solver_nodes: 0}}};
+  s.registerEngine(entry, {turn: async (history, budget) => { asked.push([history.length, budget.simulations]); const value = budget.simulations < 4 && job.drift ? .5 + job.drift * asked.length : .5; return {moves: history.length ? [[9, 9], [9, 8]] : [[0, 0]], value, top: [], proof: null, line: [], graph_id: 'g'}; }});
+  s.seats = [{engine: 'human'}, {engine: 'human'}]; s.analysis = s.spec({engine: entry.id, preset: 'standard'});
+  const idle = async () => { while (s.running || s.jobs.some(j => j.status === 'queued')) await new Promise(r => setTimeout(r, 1)); };
+  for (const [q, r] of job.history) await s.request('/play', {q, r}, 'POST');
+  await s.request('/analyse', {ply: 2, force: true}, 'POST'); await idle();
+  await s.request('/analyse', {ply: 4, force: true}, 'POST'); await idle();
+  const after = {stale: s.state().stale, asked: [...asked]};
+  await s.request('/analyse', {ply: 2}, 'POST'); await idle();
+  answer = {...after, asked_after_view: [...asked], stale_after_view: s.state().stale};
 } else if (job.kind === 'threads') {
   answer = job.contexts.map(defaultThreads);
 } else if (job.kind === 'offline') {

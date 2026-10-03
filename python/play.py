@@ -54,6 +54,8 @@ PRESETS = dict(
 PRESET_NAMES = list(PRESETS['bubble'])
 PV_CHECK = .25   # principal-variation check share of Bubble's play and analysis searches (neural_search.Recheck)
 REFRESH_PLIES = 4  # earlier placements whose saved analysis a finished analysis searches again (Session.refresh)
+REFRESH_ROUNDS = 3  # further refreshes of one position while each refresh still moves its result
+REFRESH_MOVE = .05  # a refresh moved its result when its value changed by more than this, or its stones changed
 REVIEW_BATCH = dict(cpu=64, cuda=256)   # network leaves per pooled review batch
 REVIEW_SOLVERS = 4                      # tactical workers a review queries at once
 REVIEW_CHUNK = 24                       # positions per pooled review step; urgent analysis waits at most one step
@@ -74,6 +76,13 @@ SIX_LIBRARIES = dict(cuda=('cudart64_12.dll', 'libcudart.so.12'), cudnn=('cudnn6
 def player_at(ply):
     """Side placing stone number `ply` (0-based): X opens with one stone, then two per turn."""
     return 0 if ply == 0 else ((ply - 1) // 2 + 1) % 2
+
+
+def moved(found, before):
+    """True when the evaluation `found` differs from the saved evaluation `before` in its stones or by more than
+    REFRESH_MOVE in value."""
+    stones = lambda record: sorted(tuple(map(int, p)) for p in record.get('moves') or [])
+    return stones(found) != stones(before) or abs(float(found['value']) - float(before['value'])) > REFRESH_MOVE
 
 
 def turn_starts(length):
@@ -1682,7 +1691,7 @@ class Session:
         self.proofs = Proofs()
         self.line_ids = itertools.count()
         self.lines = [next(self.line_ids), next(self.line_ids)]
-        self.analysis_line, self.analysis_graph, self.graph_searches = next(self.line_ids), None, {}
+        self.analysis_line, self.analysis_graph, self.graph_plies = next(self.line_ids), None, {}
         self.instance, self.closing = os.urandom(4).hex(), False
         self.match, self.match_worker = None, None
         self.game_clock, self.timed_engines = None, []
@@ -1827,7 +1836,7 @@ class Session:
                 if (found := self.proven(history[:ply], self.lookup(history[:ply], keys), played)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes')}
-                    if self.stale(found):
+                    if self.stale(found, ply):
                         stale.append(ply)
             device = getattr(self.engines, 'device', 'cpu')
             entries = [{k: e[k] for k in SHOWN if k in e} | dict(clocks=keeps_clock(e), device='Server ' + device_of(e, device))
@@ -2144,7 +2153,7 @@ class Session:
                 game.close()
             history = self.history[:ply]
             saved = self.lookup(history)
-            if not force and self.stale(saved) and not saved.get('proof'):
+            if not force and self.stale(saved, ply) and not saved.get('proof'):
                 # A position viewed again: search the analysis graph there again, from what it holds now.
                 job = self.submit(Job('analyse', 0, history, seat=dict(self.analysis), force=True,
                                       game=self.analysis_line, refresh=saved))
@@ -3088,8 +3097,8 @@ class Session:
             if job.cancelled:
                 raise Cancelled()
         finally:
-            # Any search, even a cancelled one, changed the graph: its other saved analyses are now stale.
-            stamp = self.searched(used[-1]) if job.kind == 'analyse' and used else None
+            # Any primary search, even a cancelled one, changed the graph for the positions before it.
+            stamp = self.searched(used[-1], len(history), refresh is None) if job.kind == 'analyse' and used else None
         if stamp is not None:
             found['graph'] = stamp
             for step in found.get('later', []):
@@ -3108,25 +3117,43 @@ class Session:
         if refresh is not None:
             weights, spent = refresh['engine'], dict(simulations=refresh['simulations'], solver_nodes=refresh['solver_nodes'])
         saved = self.save(history, weights, spent, found, model)
-        if job.kind == 'analyse' and refresh is None and game is not None:
-            self.refresh(history, seat, game)
+        if job.kind == 'analyse' and game is not None:
+            if refresh is None:
+                self.refresh(history, seat, game)
+            elif used and moved(found, refresh):
+                # The refresh changed this position's result: that is new evidence for the positions before it, and
+                # worth another round here while the result keeps moving.
+                self.searched(used[-1], len(history))
+                self.refresh(history, seat, game)
+                rounds = getattr(job, 'rounds', 0) + 1
+                if rounds < REFRESH_ROUNDS:
+                    with self.lock:
+                        self.submit(Job('analyse', 2, history, seat=dict(seat), force=True, game=game, refresh=saved, rounds=rounds))
         return saved
 
-    def searched(self, graph):
-        """Count a search on analysis graph number `graph`, which becomes the graph analysis searched last; returns
-        the stamp an evaluation it produced is saved with: [instance, graph, searches so far]."""
+    def searched(self, graph, ply, count=True):
+        """Note a search at `ply` on analysis graph number `graph`, which becomes the graph analysis searched last, and
+        return the stamp an evaluation it produced is saved with: [instance, graph, searches so far]. A primary
+        analysis counts (`count`) and records its ply; a refresh re-reads evidence the graph already holds, so it
+        takes the current count without adding to it and never stales another position."""
         with self.lock:
             self.analysis_graph = graph
-            self.graph_searches[graph] = self.graph_searches.get(graph, 0) + 1
-            return [self.instance, graph, self.graph_searches[graph]]
+            plies = self.graph_plies.setdefault(graph, [])
+            if count:
+                plies.append(ply)
+            return [self.instance, graph, len(plies)]
 
-    def stale(self, record):
-        """True when `record`, a saved evaluation, came from the graph analysis searched last (the graph's number from
-        `Engines.game_graph`, in this session) and an analysis of another position has searched that graph since:
-        its statistics there may have changed. A rebuilt graph has a new number, so it never stales older records."""
-        stamp = record.get('graph') if record else None
-        return (bool(stamp) and stamp[:2] == [self.instance, self.analysis_graph]
-                and stamp[2] < self.graph_searches[self.analysis_graph])
+    def stale(self, record, ply):
+        """True when `record`, the saved evaluation of the position at `ply`, predates a primary analysis of a deeper
+        position on the graph analysis searched last (the graph's number from `Engines.game_graph`, in this
+        session): values under that position flowed up to this one. A record the graph stamped is older than the
+        searches after its stamp; one without a stamp of this graph (a review's, or an earlier graph's) is older
+        than every search on it. A refresh never stales a record, and a proven record is never stale."""
+        if not record or record.get('proof') or self.analysis_graph is None:
+            return False
+        stamp = record.get('graph')
+        since = stamp[2] if stamp and stamp[:2] == [self.instance, self.analysis_graph] else 0
+        return any(searched > ply for searched in self.graph_plies.get(self.analysis_graph, [])[since:])
 
     def refresh(self, history, seat, game):
         """Queue a refresh of each position up to REFRESH_PLIES placements before `history` whose shown evaluation
@@ -3136,7 +3163,7 @@ class Session:
         with self.lock:
             for ply in range(len(history) - 1, max(-1, len(history) - REFRESH_PLIES - 1), -1):
                 saved = self.lookup(history[:ply])
-                if self.stale(saved) and not saved.get('proof') and not any(
+                if self.stale(saved, ply) and not saved.get('proof') and not any(
                         getattr(j, 'refresh', None) is not None and j.history == tuple(history[:ply])
                         and j.status == 'queued' for j in self.jobs.values()):
                     self.submit(Job('analyse', 2, history[:ply], seat=dict(seat), force=True, game=game, refresh=saved))
