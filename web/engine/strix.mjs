@@ -34,6 +34,17 @@ export class StrixEngine {
     if (!this.network) this.use(await networks());
   }
 
+  /** Reads strix/networks.json again and replaces the choices, keeping the current network's id; a worker whose
+   * network changed bytes ends, and the next load starts one on the new file. Throws when neither origin answers. */
+  async refresh() {
+    const list = await networks(), before = this.network;
+    this.networks = new Map();
+    this.network = null;
+    this.use(list);
+    this.network = this.networks.get(before?.id) ?? this.network;
+    if (before && this.network?.sha256 !== before.sha256) this.close();
+  }
+
   /** Starts the worker with the current network; `progress(fraction)` reports the download. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
@@ -59,7 +70,7 @@ export class StrixEngine {
   /** The downloaded files (assets.mjs records) loads read: strix.wasm and the networks with ids in `checkpoints` (the
    * current one when none of them is known). */
   async files(checkpoints = []) {
-    await this.known();
+    await this.refresh();
     const {data, local} = await json('build.json'), chosen = checkpoints.map(id => this.networks.get(id)).filter(Boolean);
     return [{path: 'strix/strix.wasm', sha256: data.artefacts['strix/strix.wasm'], lines: true, local},
       ...(chosen.length ? chosen : [this.network]).map(n => ({path: n.path, sha256: n.sha256, bytes: n.size, local: n.local}))];
