@@ -121,7 +121,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   if (state.winner >= 0) throw new Error('The game has finished');
   const table = known ? new Proofs(known) : null, given = answered(native, history, table);
   if (given) return {...given, ms: Math.round(performance.now() - start)};
-  let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null;
+  let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null, touched = null;
   let failure = null;
   const note = r => { if (r.reason?.startsWith(FAILED)) failure = r.reason; return r; };
   const timed = ms != null, end = start + (ms ?? 0), solverEnd = start + .25 * (ms ?? 0);
@@ -184,6 +184,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         tree ??= line == null ? new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current})
           : games.graph(line, current, {seed: 1740, tactics: true, qRangeFloor, model: network.version});
         const evaluate = leaves => network.evaluate(leaves);
+        if (line != null) touched = tree.id;
         const unmarked = await tree.settle(table ? table.edges(current) : new Map(), {evaluate, cache, version: network.version});
         check();
         const result = settled(await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
@@ -218,8 +219,12 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       if (after?.winner === proof.winner) pv.push(...after.pv.map(([q, r, side, ply]) => [q, r, side, ply + moves.length]));
     }
     return {moves, value: Math.round(value * 1e4) / 1e4, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
-      actual_completed: completed, actual_solver_nodes: solverUsed, graph_id: line != null && tree ? tree.id : null,
+      actual_completed: completed, actual_solver_nodes: solverUsed, graph_id: touched,
       ...(failure ? {solver_error: failure} : {})};
+  } catch (error) {
+    // A turn that stops after touching its game graph names the graph, so the session can count that search.
+    if (error && typeof error === 'object') error.graph = touched;
+    throw error;
   } finally {
     if (line == null) tree?.close();
   }
@@ -313,7 +318,8 @@ onmessage = async ({data}) => {
       }
     }
   } catch (error) {
-    postMessage(error instanceof Cancelled ? {type: 'cancelled', id: data.id} : errorReport(error, data.id));
+    const graph = error?.graph ? {graph: error.graph} : {};
+    postMessage(error instanceof Cancelled ? {type: 'cancelled', id: data.id, ...graph} : {...errorReport(error, data.id), ...graph});
   } finally {
     cancelled.delete(data.id);
   }

@@ -164,7 +164,12 @@ export class EngineWorker {
         if (data.type === 'error' && RETRIED.has(data.stage?.name)) { calling(this.failure('failed', data.stage, data.message)); return; }
         this.waits.delete(data.id);
         if (data.type === 'result') wait.resolve(data.result);
-        else wait.reject(data.type === 'cancelled' ? new DOMException('Cancelled', 'AbortError') : this.failure('failed', data.stage, data.message));
+        else {
+          // A worker that stopped a search names the search graph it changed (worker.mjs), for the session's count.
+          const error = data.type === 'cancelled' ? new DOMException('Cancelled', 'AbortError') : this.failure('failed', data.stage, data.message);
+          if (data.graph) error.graph = data.graph;
+          wait.reject(error);
+        }
       };
       worker.onerror = event => {
         if (this.worker !== worker) return;
