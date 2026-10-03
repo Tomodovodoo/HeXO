@@ -59,7 +59,7 @@ export class BrowserSession extends OfflineSession {
     super(native, analysis);
     this.storage = new PlayStorage(null); this.id = 'live'; this.seats = [human(), human()];
     this.entries = new Map(); this.adapters = new Map(); this.cache = new Map(); this.index = new Map(); this.jobs = [];
-    this.bookData = null; this.book = {enabled: false, mode: 'wide', opening: null}; this.coverage = {};
+    this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
     this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null;
@@ -215,14 +215,7 @@ export class BrowserSession extends OfflineSession {
       while (people.length && this.history.length && !(people.includes(playerAt(this.history.length)) && this.history.length % 2)) this.history.pop();
       this.saved_game = null;
     } else if (path === '/new') {
-      this.match = null; let history = [], opening = null;
-      if (this.book.enabled && this.bookData) {
-        const side = this.seats.findIndex(s => s.engine === 'human'), n = this.bookData.pick(this.book.mode, this.coverage, side);
-        history = n.moves; opening = {mode: this.book.mode, key: n.key, symmetry: n.symmetry, ply: history.length};
-        const k = `${side}:${n.key}`; this.coverage[k] = (this.coverage[k] || 0) + 1;
-        this.storage.put('coverage', {id: 'book', counts: copy(this.coverage)}).catch(e => { this.storageError = e.message; });
-      }
-      this.load(history, false, opening);
+      this.match = null; this.newGame(body.people);
     } else if (path === '/retry') {
       if (!Number.isInteger(body.ply) || body.ply < 0 || body.ply > this.history.length) throw Error('Invalid retry position');
       this.load(this.history.slice(0, body.ply), false, body.ply >= this.book.opening?.ply ? this.book.opening : null); this.match = null;
@@ -251,8 +244,25 @@ export class BrowserSession extends OfflineSession {
       if (!this.bookData) throw Error('The opening book has not loaded');
       if (body.mode) { this.bookData.pool(body.mode); this.book.mode = body.mode; }
       if ('enabled' in body) this.book.enabled = !!body.enabled;
+      if (this.book.enabled && !this.history.length && !this.match?.active) this.newGame(body.people);
     } else if (!['/state', '/rescan', '/models'].includes(path)) throw Error('Unknown Play request');
     if (path !== '/state') { this.changed(); queueMicrotask(() => this.pump()); }
+  }
+  /** Starts a new game; with the book on, from one of its openings in a random orientation: against one person
+   * (`people`, the sides people play, else the human seats) the least played line on that side, otherwise uniformly. */
+  newGame(people = [0, 1].filter(i => this.seats[i].engine === 'human')) {
+    let history = [], opening = null;
+    if (this.book.enabled && this.bookData) {
+      const side = people.length === 1 ? people[0] : null, pool = this.bookData.pool(this.book.mode);
+      const n = side === null ? this.bookData.pick(this.book.mode, {}, -1, Math.random, pool[Math.floor(Math.random() * pool.length)])
+        : this.bookData.pick(this.book.mode, this.coverage, side);
+      history = n.moves; opening = {mode: this.book.mode, key: n.key, symmetry: n.symmetry, ply: history.length};
+      if (side !== null) {
+        const k = `${side}:${n.key}`; this.coverage[k] = (this.coverage[k] || 0) + 1;
+        this.storage.put('coverage', {id: 'book', counts: copy(this.coverage)}).catch(e => { this.storageError = e.message; });
+      }
+    }
+    this.load(history, false, opening);
   }
   enqueue(kind, history, spec, fields = {}) {
     if (this.importing) return;
