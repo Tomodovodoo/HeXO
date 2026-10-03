@@ -956,6 +956,25 @@ plan, on the Claude lane's side.
 | 11 | Fewer actor processes with more games each once H drops? | Rows per GPU-second and VRAM with 2 x 256 games against 4 x 128 games, learner running. |
 | 12 | What explains about 30 Six positions per Bubble simulation? | Count Six's cache and terminal visits per position, and Bubble's tactics-settled replies per expansion, on the same positions. Informational only. |
 
+### K.13 Depth on an over-focused policy
+
+Tom's observation (2026-10-03): the current policy puts almost all its mass on one move, so any deeper search
+below the root follows one line, and the sharpened target then teaches the next network that the line was the
+whole story. Depth confirms the over-focus instead of correcting it. Two experiments settle what the scheduler
+must assume:
+
+1. Interior exploration floor. Add a flag that mixes a temperature or a small uniform share into interior logits
+   (below the root only; the root keeps Gumbel's sampling). Measure at fixed simulations: paired match at 128 and
+   512, policy entropy of the targets, and whether line views and prefetch rows change any root decision. Without
+   a floor the line views in section C assume a spread that does not exist today.
+2. Target sharpening. The completed-Q transform scales by 0.1 times (50 + max visits), which turns a small value
+   gap into a 100.0 target at deeper budgets. Train from the same checkpoint with the scale capped, and with the
+   target mixed with the visit distribution; judge on policy entropy, the certified-stone metrics and a strength
+   match. This is a learner experiment and is separate from the play-time q_range_floor, which measured worse.
+
+Until one of these lands, the scheduler's depth work (line views, depth extensions) should be measured on the
+tactical suite and Tom's position only, not expected to move Elo.
+
 ## References
 
 - KataGo, Monte-Carlo Graph Search from First Principles: https://github.com/lightvector/KataGo/blob/master/docs/GraphSearch.md
