@@ -330,11 +330,11 @@ class GameGraph(NeuralSearch):
         return native.hxg_root_version(self.ptr)
 
     def store(self):
-        """{nodes, expanded, evicted, limit, summaries: evicted nodes' statistics kept} of the store (native
-        hxg_store)."""
-        out = np.zeros(5, np.int64)
+        """{nodes, expanded, evicted, limit, summaries: evicted nodes' statistics kept, outcomes: proven positions
+        kept} of the store (native hxg_store)."""
+        out = np.zeros(6, np.int64)
         native.hxg_store(self.ptr, out.ctypes.data)
-        return dict(zip(('nodes', 'expanded', 'evicted', 'limit', 'summaries'), map(int, out)))
+        return dict(zip(('nodes', 'expanded', 'evicted', 'limit', 'summaries', 'outcomes'), map(int, out)))
 
     def after_turn(self, result):
         """The history after the turn `result`, this root's finished search, chooses: its stone, then while the same

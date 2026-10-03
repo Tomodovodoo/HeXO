@@ -965,6 +965,7 @@ class SharedGraph(unittest.TestCase):
         store = graph.store()
         self.assertGreater(store['evicted'], 4)
         self.assertLessEqual(store['summaries'], 4)   # four times the limit of one
+        self.assertLessEqual(store['outcomes'], max(16, store['nodes']))
 
     def test_the_pv_check_searches_again_only_after_a_drop(self):
         a = recorded_position(11)

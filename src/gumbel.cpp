@@ -187,7 +187,8 @@ struct Tree {
   if(n>=2 && mover(n-1)==mover(n-2)){std::vector<Cell> other(history.begin(),history.end()-2);other.push_back(history.back());join(other,history[n-2]);}
  }
  // Shared graph: while more than `limit` expanded nodes are stored, removes the least recently used leaves (nodes
- // without a child) other than the root, down to seven eighths of the limit. A removed child's last visits and value
+ // without a child) other than the root, down to seven eighths of the limit, and bounds the summaries and outcomes
+ // kept for positions no longer stored. A removed child's last visits and value
  // stay on its parents' edges.
  void evict() {
   if(!shared || !limit || !requests.empty())return;
@@ -201,6 +202,7 @@ struct Tree {
    std::sort(leaves.begin(),leaves.end(),[](const Node* x,const Node* y){return x->used<y->used;});
    for(Node* x:leaves){
     if(expanded<=target)break;
+    clean(*x);
     for(auto& w:x->parents)if(auto p=w.lock())for(auto& e:p->edges)if(e.child.get()==x){
      e.sum=(e.exact_winner>=0?(e.exact_winner==p->player?1:-1):x->player==p->player?x->q:-x->q)*e.visits;
      e.child.reset();
@@ -218,6 +220,8 @@ struct Tree {
   std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
   for(auto& [key,list]:positions)std::erase_if(list,[](const auto& w){return w.expired();});
   std::erase_if(positions,[](const auto& entry){return entry.second.empty();});
+  // Proven outcomes stay while a stored node holds their position; beyond sixteen times `limit` the others go.
+  if(outcomes.size()>16*limit)std::erase_if(outcomes,[&](const auto& entry){return !positions.contains(entry.first);});
  }
  // Shared graph: moves the root to the position after `history`, a node of the store or a new one attached under
  // its stored parents; every node keeps its statistics.
@@ -683,10 +687,10 @@ HX_API int hxg_share(void* p,int64_t limit){auto& t=*static_cast<gumbel::Tree*>(
 HX_API int hxg_root_at(void* p,const int64_t* history,int n){try{std::vector<Cell> h;for(int i=0;i<n;++i)h.push_back({history[2*i],history[2*i+1]});static_cast<gumbel::Tree*>(p)->root_at(h);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Shared graph: the number of root changes so far (hxg_root_at, hxg_advance), for callers that track the root.
 HX_API int64_t hxg_root_version(void* p){return static_cast<gumbel::Tree*>(p)->version;}
-// Shared graph store: out = {stored nodes, expanded stored nodes, nodes evicted so far, limit, evicted summaries kept};
-// 0 when unshared.
+// Shared graph store: out = {stored nodes, expanded stored nodes, nodes evicted so far, limit, evicted summaries kept,
+// proven outcomes kept}; 0 when unshared.
 HX_API int hxg_store(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);if(!t.shared)return 0;int64_t expanded=0;for(auto& [key,n]:t.store)expanded+=n->expanded;
- out[0]=int64_t(t.store.size());out[1]=expanded;out[2]=t.evicted;out[3]=int64_t(t.limit);out[4]=int64_t(t.evicted_stats.size());return 1;}
+ out[0]=int64_t(t.store.size());out[1]=expanded;out[2]=t.evicted;out[3]=int64_t(t.limit);out[4]=int64_t(t.evicted_stats.size());out[5]=int64_t(t.outcomes.size());return 1;}
 // Completed Q in value units for the root's mover, per root edge in hxg_stats order (Tree::completed_q); the edge
 // count, 0 before the root is expanded.
 HX_API int hxg_q(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;if(t.shared)t.current(n);int maximum=0;auto& q=t.completed_q(n,maximum);if(out)std::copy(q.begin(),q.end(),out);return int(q.size());}
