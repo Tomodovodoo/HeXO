@@ -2,8 +2,8 @@
  * (tools/build_web.py seal), searched in seal-worker.mjs. Seal's budget is a clock in ms. Without that bundle `seal`
  * is null and the page does not offer it. */
 
-export const PRESETS = {lightning: {ms: 50}, quick: {ms: 100}, standard: {ms: 500}, strong: {ms: 2000}, deep: {ms: 8000},
-  dangerous: {ms: 30000}};
+export const PRESETS = {lightning: {ms: 100}, quick: {ms: 250}, standard: {ms: 1000}, strong: {ms: 3000}, deep: {ms: 10000},
+  dangerous: {ms: 60000}};
 
 const AXES = [[1, 0], [0, 1], [1, -1]];
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;

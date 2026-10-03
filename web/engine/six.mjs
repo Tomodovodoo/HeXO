@@ -2,8 +2,8 @@
  * as the server's Six: the same presets in Six protocol nodes, with the networks this site was built with. */
 import {EngineWorker} from './engine-worker.mjs';
 
-export const PRESETS = {lightning: {nodes: 1500}, quick: {nodes: 6000}, standard: {nodes: 30000}, strong: {nodes: 135000},
-  deep: {nodes: 500000}, dangerous: {nodes: 2000000}};
+export const PRESETS = {lightning: {nodes: 240}, quick: {nodes: 960}, standard: {nodes: 3840}, strong: {nodes: 15360},
+  deep: {nodes: 61440}, dangerous: {nodes: 2000000}};
 const ID = 'browser:six', LABEL = 'Six (browser)';
 
 export class SixEngine extends EngineWorker {

@@ -189,7 +189,8 @@ included: it has no licence and no published weights.
 
 Seal is the alpha-beta bot by Ramora0 ([HexTicTacToe](https://github.com/Ramora0/HexTicTacToe), revision `3474edb`),
 the community's reference bot. **Seal (browser)** in the picker plays a seat or the analysis with the server's
-presets: lightning 50, quick 100, standard 500, strong 2000, deep 8000 and dangerous 30000 ms per turn.
+presets: lightning 100, quick 250, standard 1000, strong 3000, deep 10000 and dangerous 60000 ms per turn, the same
+ladder as Native.
 
 ```sh
 python tools/build_web.py seal --emxx path/to/em++   # seal/engine.mjs, engine.wasm, manifest.json (ignored)
@@ -230,7 +231,7 @@ positions sent out to ONNX Runtime Web. HeXO adds three exports to `web_bot.cpp`
 turn at its next batch, `six_score` and `six_nodes`. Both seats and the analysis panel can use it. As analysis it
 shows its turn: the first stone as the top move, both stones as the line, the win chance from its score (100% when
 its threat solver proves a win, whose distance Six does not report) and the positions searched; the presets give it the server's
-Six protocol nodes (lightning 1,500 to dangerous 2,000,000) and the network select lists the site's networks, newest
+Six positions (lightning 240 to dangerous 2,000,000) and the network select lists the site's networks, newest
 first. It plays like the server's Six (`python/six_engine.py` driving `sixengine`): Six's default search settings,
 radius 8, mirrored coordinates, `go nodes N` with no time limit, and the tree kept while the game continues.
 
