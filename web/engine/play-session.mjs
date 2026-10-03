@@ -9,6 +9,9 @@ import {stageText} from './stages.mjs';
 import {PV_CHECK} from './search.mjs';
 
 const REFRESH_PLIES = 4;  // earlier placements a finished analysis refreshes (python/play.py REFRESH_PLIES)
+const REFRESH_ROUNDS = 3, REFRESH_MOVE = .05;  // further refreshes of one position while each still moves its result (python/play.py)
+/** True when the evaluation `found` differs from the saved evaluation `before` in its stones or by more than REFRESH_MOVE in value. */
+const moved = (found, before) => JSON.stringify((found.moves || []).map(p => p.join(',')).sort()) !== JSON.stringify((before.moves || []).map(p => p.join(',')).sort()) || Math.abs(found.value - before.value) > REFRESH_MOVE;
 
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 const copy = value => structuredClone(value), position = history => history.map(p => p.join(',')).join(';');
@@ -186,7 +189,7 @@ export class BrowserSession extends OfflineSession {
       paused: this.paused, seats: copy(this.seats), analysis: copy(this.analysis), engines: [...this.entries.values()], match: this.match,
       clock: this.clockNow(), clock_spec: this.control(), outcome: this.outcome, saved_game: this.saved_game, models_folder: null, notice: this.notice, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
-      evaluations, stale: Object.keys(evaluations).map(Number).filter(ply => this.stale(evaluations[ply])), review: turns,
+      evaluations, stale: Object.keys(evaluations).map(Number).filter(ply => this.stale(evaluations[ply], ply)), review: turns,
       review_preset: this.analysis?.preset ?? null,
       jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live, stage}) => ({id, kind, status, done, total, error, ply: history.length, side, live, stage}))};
   }
@@ -278,7 +281,7 @@ export class BrowserSession extends OfflineSession {
   /** Gives `sides` (both when none) a new line, the key of the game tree a Bubble seat searches (worker.mjs). */
   renewLines(...sides) {
     for (const side of sides.length ? sides : [0, 1]) this.lines[side] = uid();
-    if (!sides.length) { this.analysisLine = uid(); this.graph = {generation: null, searches: 0}; }
+    if (!sides.length) { this.analysisLine = uid(); this.graph = {generation: null, plies: []}; }
   }
   forkGame() {
     if (this.saved_game || !this.gameId || this.match) {
@@ -340,7 +343,7 @@ export class BrowserSession extends OfflineSession {
       if (!Number.isInteger(ply) || ply < 0 || ply > this.history.length) throw Error('Invalid analysis position');
       const history = this.history.slice(0, ply), saved = this.analysis && this.lookup(history);
       // A position viewed again whose graph another analysis has searched since: search the graph there again.
-      if (!body.force && this.stale(saved) && !saved.proof) this.enqueue('analyse', history, {...this.analysis, budget: copy(saved.budget)}, {force: true, refresh: saved, line: this.analysisLine});
+      if (!body.force && this.stale(saved, ply) && !saved.proof) this.enqueue('analyse', history, {...this.analysis, budget: copy(saved.budget)}, {force: true, refresh: saved, line: this.analysisLine});
       else if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', history, this.analysis, {force: !!body.force, line: this.analysisLine});
     } else if (path === '/review') {
       if (!this.analysis || !this.adapters.has(this.analysis.engine)) throw Error('Choose an analysis engine');
@@ -407,17 +410,23 @@ export class BrowserSession extends OfflineSession {
     }
     return record;
   }
-  /** Counts a search on the analysis graph `id` (GameGraph.id, unique to each graph the worker builds) and returns the
-   * stamp its evaluation is saved with, [id, searches]; a new id starts a new count. */
-  graphSearched(id) {
-    if (this.graph.generation !== id) this.graph = {generation: id, searches: 0};
-    this.graph.searches += 1;
-    return [id, this.graph.searches];
+  /** Notes a search at `ply` on the analysis graph `id` (GameGraph.id, unique to each graph the worker builds) and
+   * returns the stamp its evaluation is saved with, [id, searches so far]; a new id starts a new count. A primary
+   * analysis counts and records its ply; a refresh re-reads evidence the graph already holds, so it takes the current
+   * count without adding to it and never stales another position (python/play.py Session.searched). */
+  graphSearched(id, ply, count = true) {
+    if (this.graph.generation !== id) this.graph = {generation: id, plies: []};
+    if (count) this.graph.plies.push(ply);
+    return [id, this.graph.plies.length];
   }
-  /** True when `record`, a saved evaluation, came from the graph analysis searched last and an analysis of another
-   * position has searched that graph since (python/play.py Session.stale); a rebuilt graph never stales older records. */
-  stale(record) {
-    return Boolean(record?.graph) && record.graph[0] === this.graph.generation && record.graph[1] < this.graph.searches;
+  /** True when `record`, the saved evaluation of the position at `ply`, predates a primary analysis of a deeper position
+   * on the graph analysis searched last (python/play.py Session.stale): a stamped record is older than the searches
+   * after its stamp, an unstamped one (a review's, or an earlier graph's) than every search. A refresh never stales a
+   * record and a proven record is never stale. */
+  stale(record, ply) {
+    if (!record || record.proof || this.graph.generation == null) return false;
+    const since = record.graph?.[0] === this.graph.generation ? record.graph[1] : 0;
+    return this.graph.plies.slice(since).some(searched => searched > ply);
   }
   /** Queues a refresh of each position up to REFRESH_PLIES placements before `history` whose shown evaluation by `spec`'s
    * engine (the deepest, a tier included) is stale and holds no proof, nearest first, at that evaluation's budget: the search on the game graph `line` moved the values those positions reach
@@ -426,7 +435,7 @@ export class BrowserSession extends OfflineSession {
   refresh(history, spec, line) {
     for (let ply = history.length - 1; ply >= Math.max(0, history.length - REFRESH_PLIES); ply--) {
       const saved = this.lookup(history.slice(0, ply), spec);
-      if (this.stale(saved) && !saved.proof) this.enqueue('analyse', history.slice(0, ply), {...spec, budget: copy(saved.budget)}, {force: true, refresh: saved, line});
+      if (this.stale(saved, ply) && !saved.proof) this.enqueue('analyse', history.slice(0, ply), {...spec, budget: copy(saved.budget)}, {force: true, refresh: saved, line});
     }
   }
   indexRecord(record) {
@@ -577,9 +586,17 @@ export class BrowserSession extends OfflineSession {
       if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
       const {graph_id: graph, ...answer} = result;
       result = answer;
-      if (job.kind === 'analyse' && job.line != null && graph) { result = {...result, graph: this.graphSearched(graph)}; job.counted = true; }
+      if (job.kind === 'analyse' && job.line != null && graph) { result = {...result, graph: this.graphSearched(graph, history.length, !job.refresh)}; job.counted = true; }
       await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));
-      if (job.kind === 'analyse' && !job.refresh && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') this.refresh(history, job.spec, job.line);
+      if (job.kind === 'analyse' && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') {
+        if (!job.refresh) this.refresh(history, job.spec, job.line);
+        else if (graph && moved(result, job.refresh)) {
+          // The refresh changed this position's result: new evidence for the positions before it, and another round here.
+          this.graphSearched(graph, history.length); this.refresh(history, job.spec, job.line);
+          const rounds = (job.rounds || 0) + 1;
+          if (rounds < REFRESH_ROUNDS) this.enqueue('analyse', history, job.spec, {force: true, refresh: this.lookup(history, job.spec), line: job.line, rounds});
+        }
+      }
       if (job.kind === 'move') {
         if (job.controller.signal.aborted || position(this.history) !== position(history) || this.paused) { this.armFlag(); return; }
         if (!this.match?.active) this.forkGame();
@@ -593,8 +610,8 @@ export class BrowserSession extends OfflineSession {
         }
       } else if (job.kind === 'review') { job.cursor++; job.done = job.cursor; }
     } catch (error) {
-      // A cancelled or failed analysis that touched its game graph (the worker names the graph) changed it.
-      if (job.kind === 'analyse' && job.line != null && error.graph && !job.counted) this.graphSearched(error.graph);
+      // A cancelled or failed primary analysis that touched its game graph (the worker names the graph) changed it.
+      if (job.kind === 'analyse' && job.line != null && error.graph && !job.counted) this.graphSearched(error.graph, history.length, !job.refresh);
       interrupted = error.name === 'AbortError' && !job.controller.signal.aborted;
       if (error.name !== 'AbortError') { job.status = 'failed'; job.error = error.message; if (job.kind === 'move') { this.freezeClock(); this.paused = true; } if (this.match) this.match.error = error.message; }
     } finally {

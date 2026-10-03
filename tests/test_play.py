@@ -84,7 +84,8 @@ class FakeEngines:
             time.sleep(.01)
         watch(budget['simulations'])
         moves = legal_turn(history)
-        found = dict(moves=moves, value=.5, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1)
+        value = .5 + getattr(self, 'drift', 0) * len(self.refreshes) if refresh is not None else .5
+        found = dict(moves=moves, value=value, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1)
         return found, budget, f'{model_key(export_path(entry, checkpoint))}:none' + (':kept' if keep or line is not None else '')
 
     def evaluate_many(self, entry, checkpoint, budget, histories, watch, known=None):
@@ -426,19 +427,25 @@ class Jobs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(self.engines.refreshes, [3])
         self.assertEqual(set(self.engines.games), {self.session.analysis_line})
-        # Ply 1 is too far back to be refreshed at once, and the refresh at 3 searched the graph after 6 was saved;
-        # viewing 1 again searches the graph there again, which in turn leaves 3 and 6 behind.
-        self.assertEqual(self.session.state()['stale'], [1, 6])
+        # Ply 1 is too far back to be refreshed at once; the refresh at 3 re-read the graph and stales nothing, so 6
+        # stays fresh. Viewing 1 again searches the graph there again, and that refresh stales nothing either.
+        self.assertEqual(self.session.state()['stale'], [1])
         self.session.analyse(1)
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(self.engines.refreshes, [3, 1])
-        self.assertEqual(self.session.state()['stale'], [3, 6])
-        # Another network's graph, then a rebuilt one for the first: neither stales what the first graph saved.
+        self.assertEqual(self.session.state()['stale'], [])
+        # Another network's graph holds nothing for this network's records. A rebuilt graph for this network starts
+        # empty, so its first deep analysis leaves every earlier record behind it: 3 is refreshed, 1 is too far back.
         self.session.configure_analysis('bubble:fake', 'main/000001', auto=False)
         self.session.analyse(6, force=True)
         wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(self.engines.refreshes, [3, 1])
         self.session.configure_analysis('bubble:fake', auto=False)
         self.session.analyse(6, force=True)
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(self.engines.refreshes, [3, 1, 3])
+        self.assertEqual(self.session.state()['stale'], [1])
+        self.session.analyse(1)
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(self.session.state()['stale'], [])
         # A deepening tier's evaluation is refreshed under its own key and budget.
@@ -450,13 +457,25 @@ class Jobs(unittest.TestCase):
         session.analyse(4)
         wait(lambda: not session.state()['jobs'])
         refreshed = session.store.get(session.history[:4], key, deep)['graph']
-        self.assertEqual(refreshed[2], session.graph_searches[session.analysis_graph])
-        self.assertEqual(session.state()['stale'], [6])
+        self.assertEqual(refreshed[2], len(session.graph_plies[session.analysis_graph]))
+        self.assertEqual(session.state()['stale'], [])
         session.new_lines()   # undo, a new or loaded game: the next analysis searches a new graph
         self.assertEqual(session.state()['stale'], [])
         line = self.session.analysis_line
         self.session.undo()
         self.assertNotEqual(self.session.analysis_line, line)
+
+    def test_a_refresh_that_moves_its_result_continues_and_then_settles(self):
+        self.session.configure_seat(1, 'human')
+        for move in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]:
+            self.session.play(*move)
+        self.engines.drift = .1
+        for ply in (2, 5):
+            self.session.analyse(ply, force=True)
+            wait(lambda: not self.session.state()['jobs'])
+        # The analysis at 5 refreshes 2; each refresh moves the value there, so it runs REFRESH_ROUNDS times and stops.
+        self.assertEqual(self.engines.refreshes, [2, 2, 2])
+        self.assertEqual(self.session.state()['stale'], [])
 
     def test_a_cancelled_analysis_still_counts_its_graph_search(self):
         self.session.configure_seat(1, 'human')
@@ -497,7 +516,8 @@ class Jobs(unittest.TestCase):
         self.session.analyse(3)
         self.engines.release.set()
         wait(lambda: not self.session.state()['jobs'])
-        # The review's evaluations came from fresh trees, so the analysis at 3 refreshes none of them.
+        # The review's later evaluations come from fresh trees after the analysis at 3; it refreshes none of them
+        # at once (they do not exist yet), and viewing them later re-reads the graph there.
         self.assertEqual(([len(call[2]) for call in self.engines.calls], self.engines.refreshes), ([5, 3, 4, 2, 1, 0], []))
 
     def test_changing_the_analysis_engine_cancels_its_old_work(self):
