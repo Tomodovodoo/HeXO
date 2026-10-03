@@ -127,7 +127,7 @@ class NativeTactics:
     when dispatched work ends without returning its meter. `bounds=True`
     returns `proof_numbers` for the wide forcing model, not a game verdict.
     `resume=True` needs a positive `table_mb` and keeps worker-local entries and
-    completed level-2 seeds. Resizing can evict entries; level-2 trees are discarded.
+    proven witnesses through resizes. Level-2 trees and seed attempts are per query.
     """
 
     accepts_cancel_event = True

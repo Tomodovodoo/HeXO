@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import unittest
-from tactical_proof import NativeTactics, library
+from tactical_proof import NativeTactics, library, independent_verify
 from tests.test_tactical_proof import FIXTURE, IMMEDIATE, NO_THREAT, OPEN_THREE, TWO_TURN
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +35,32 @@ def wasm_results(queries):
 
 @unittest.skipUnless(NODE and WASM.exists() and library().exists(), 'needs node, web/engine/tactical.wasm and the native library')
 class WebTacticalParity(unittest.TestCase):
+    def test_resumed_browser_slices_report_bounds_and_fresh_work(self):
+        history = FIXTURE['positions']['1790600287230040:30:248']
+        options = dict(nodes=512, ms=20000, bounds=True, resume=True)
+        first, continued, cached = wasm_results([
+            (history, dict(options, table_mb=4)),
+            (history, dict(options, table_mb=8)),
+            (history, dict(options, table_mb=8)),
+        ])
+        self.assertEqual(first['status'], 'UNKNOWN')
+        self.assertFalse(first['native_verified'])
+        self.assertEqual(first['proof_numbers']['scope'], 'wide-forcing')
+        self.assertFalse(first['proof_numbers']['game_exact'])
+        self.assertEqual(continued['status'], 'PROVEN_WIN', continued)
+        self.assertTrue(continued['resident_reused'])
+        self.assertFalse(continued['cache_hit'])
+        self.assertLess(continued['nodes_fresh'], first['nodes_fresh'])
+        self.assertEqual(independent_verify(continued['certificate'], history), 'PROVEN_WIN')
+        self.assertTrue(cached['cache_hit'])
+        self.assertEqual(cached['nodes_fresh'], 0)
+        self.assertGreater(cached['nodes_used'], 0)
+
+    def test_browser_resume_requires_a_resident_table(self):
+        with self.assertRaises(subprocess.CalledProcessError) as error:
+            wasm_results([(NO_THREAT, dict(nodes=1, resume=True))])
+        self.assertIn('positive table_mb', error.exception.stderr)
+
     def test_wasm_matches_native(self):
         native = NativeTactics()
         queries = [(history, dict(options, ms=20000)) for history, options in QUERIES]

@@ -48,7 +48,7 @@ struct Request {
     #[serde(default)] shortest:bool,
     /// Return scoped forcing-search numbers, including on UNKNOWN.
     #[serde(default)] bounds:bool,
-    /// Carry resident entries and level-2 seed bookkeeping between slices.
+    /// Carry resident entries and proven witnesses through table resizes.
     #[serde(default)] resume:bool,
 }
 fn position(board:&check::Board,side:u8,remaining:u8)->Position {
