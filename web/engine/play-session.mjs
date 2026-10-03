@@ -122,13 +122,16 @@ export class BrowserSession extends OfflineSession {
   deepening() {
     return this.analysis?.auto && !this.paused && this.native.game(this.history).winner < 0 && !this.match?.active && this.seats.some(s => this.adapters.has(s.engine));
   }
+  /** While Auto is on and an engine seat plays, evaluates the current position at each preset in turn, fastest first,
+   * up to strong unless the analysis engine runs on WebGPU. */
   deepen() {
     const active = this.deepening(), current = position(this.history);
     this.cancelJobs(j => j.tier && (!active || position(j.history) !== current));
     if (!active || this.jobs.some(j => j.tier && j.status !== 'failed') || this.lookup(this.history)?.proof) return;
     const entry = this.entries.get(this.analysis.engine);
     if (!entry || !this.adapters.has(entry.id)) return;
-    for (const tier of Object.keys(entry.presets)) {
+    const tiers = Object.keys(entry.presets), last = entry.device?.startsWith('WebGPU') ? tiers.length : tiers.indexOf('strong') + 1;
+    for (const tier of tiers.slice(0, last || tiers.length)) {
       const spec = this.spec({...this.analysis, preset: tier});
       if (!this.lookup(this.history, spec, true) && !this.jobs.some(j => j.tier === tier && j.key === `analyse|${this.cacheKey(this.history, spec)}` && j.status === 'failed')) {
         this.enqueue('analyse', this.history, spec, {tier}); return;
@@ -305,17 +308,24 @@ export class BrowserSession extends OfflineSession {
     return clock;
   }
   freezeClock() { this.clock = this.clockNow(); if (this.clock) { delete this.clock.started; delete this.clock.side; } }
+  /** Runs the next job: an engine move first, then analysis, review and deepening. A queued move interrupts a running
+   * job of another kind, which goes back to the queue (a review keeps its finished positions). */
   async pump() {
-    if (this.running || this.importing || this.conflicted) return;
+    if (this.importing || this.conflicted) return;
     const state = this.native.game(this.history), seat = this.seats[state.player];
     if (!this.paused && state.winner < 0 && this.adapters.has(seat.engine) && !this.jobs.some(j => j.kind === 'move')) this.enqueue('move', this.history, seat, {side: state.player});
+    if (this.running) {
+      if (this.running.kind !== 'move' && this.jobs.some(j => j.kind === 'move' && j.status === 'queued')) this.running.attempt.abort();
+      return;
+    }
     const job = this.jobs.find(j => j.status === 'queued' && j.kind === 'move') || this.jobs.find(j => j.status === 'queued' && j.kind === 'analyse' && !j.tier)
       || this.jobs.find(j => j.status === 'queued' && j.kind === 'review') || this.jobs.find(j => j.status === 'queued' && j.tier);
     if (!job) return;
     let settled;
     this.idle = new Promise(resolve => { settled = resolve; });
-    this.running = job; job.status = 'running'; this.changed();
-    let timer;
+    this.running = job; job.status = 'running'; job.attempt = new AbortController(); this.changed();
+    const signal = AbortSignal.any([job.controller.signal, job.attempt.signal]);
+    let timer, interrupted = false;
     const match = job.kind === 'move' && this.match?.active ? this.match : null;
     const history = job.kind === 'review' ? job.history.slice(0, job.plies[job.cursor]) : job.history;
     try {
@@ -332,7 +342,7 @@ export class BrowserSession extends OfflineSession {
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
       try {
-        result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal: job.controller.signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms: limit,
+        result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms: limit,
           progress: (f, live) => { job.done = job.kind === 'review' ? job.cursor + f : f; if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);
@@ -357,10 +367,12 @@ export class BrowserSession extends OfflineSession {
         }
       } else if (job.kind === 'review') { job.cursor++; job.done = job.cursor; }
     } catch (error) {
+      interrupted = error.name === 'AbortError' && !job.controller.signal.aborted;
       if (error.name !== 'AbortError') { job.status = 'failed'; job.error = error.message; if (job.kind === 'move') { this.freezeClock(); this.paused = true; } if (this.match) this.match.error = error.message; }
     } finally {
       clearTimeout(timer); this.running = null;
-      if (job.status !== 'failed' && (job.kind !== 'review' || job.cursor >= job.plies.length || job.controller.signal.aborted)) this.jobs = this.jobs.filter(j => j !== job);
+      if (interrupted) job.status = 'queued';
+      else if (job.status !== 'failed' && (job.kind !== 'review' || job.cursor >= job.plies.length || job.controller.signal.aborted)) this.jobs = this.jobs.filter(j => j !== job);
       else if (job.status !== 'failed') job.status = 'queued';
       this.changed(); await this.saving;
       settled();
