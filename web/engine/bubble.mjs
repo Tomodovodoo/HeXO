@@ -26,17 +26,13 @@ export async function isolate() {
 }
 
 import {EngineWorker} from './engine-worker.mjs';
+import {json, workerUrl} from './assets.mjs';
+import {loadFiles, modelFiles, probe} from './network.mjs';
 
-/** The exported networks (python tools/build_web.py model), newest first, as model/networks.json lists them:
+/** The exported networks (python tools/build_web.py model), newest first, as model/networks.json (here, else the
+ * public site's) lists them:
  * [{name, manifest (relative to model/), model_version}]; empty when the site holds a single model/manifest.json. */
-export const NETWORKS = await (async () => {
-  try {
-    const response = await fetch(new URL('model/networks.json', import.meta.url), {cache: 'no-cache'});
-    return response.ok ? (await response.json()).networks : [];
-  } catch {
-    return [];
-  }
-})();
+export const NETWORKS = await json('model/networks.json').then(found => found.data.networks, () => []);
 
 /** The manifest of network `name` relative to web/engine: the newest when null, model/manifest.json without a list. */
 export function networkManifest(name = null) {
@@ -46,10 +42,17 @@ export function networkManifest(name = null) {
 }
 
 export class BubbleEngine extends EngineWorker {
-  /** `model` is the default manifest URL relative to web/engine; `prefer` 'wasm', 'webgpu-fp32' or 'webgpu-fp16'
-   * narrows the device choice. */
+  /** `model` is the default manifest's path under web/engine; `prefer` 'wasm', 'webgpu-fp32' or 'webgpu-fp16' narrows the device choice. */
   constructor({model = networkManifest(), prefer = null, threads = null} = {}) {
-    super(new URL('worker.mjs', import.meta.url), 'Bubble (browser)', {model, prefer, threads});
+    super(workerUrl('worker.mjs'), 'Bubble (browser)', {model, prefer, threads});
+  }
+
+  /** The downloaded files (assets.mjs records) a load on this device may read: ONNX Runtime and the model graphs,
+   * with the WebAssembly runtime and the fp32 graph a WebGPU fallback needs. */
+  async files() {
+    const {provider, precisions} = await probe(this.options.prefer), {prefer} = this.options;
+    const graphs = provider === 'webgpu' && !prefer ? [...new Set([...precisions, 'fp32'])] : precisions;
+    return [...await loadFiles(provider, prefer), ...(await modelFiles(graphs, this.options.model)).files];
   }
 
   /**

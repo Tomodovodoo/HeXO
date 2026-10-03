@@ -1,62 +1,6 @@
 /* The exported network (python/export_web.py) under ONNX Runtime Web: WebGPU when the device has it, else WebAssembly. */
 import {encode, features, CHANNELS} from './encode.mjs';
-
-const CACHE = 'bubble-engine-v1';
-
-/** The body of `url` as an ArrayBuffer, from the Cache API when it holds `url` at `version`; `progress(fraction)`. */
-export async function cached(url, version, progress = () => {}) {
-  const key = new URL(url, location.href);
-  key.searchParams.set('v', version);
-  let store = null;
-  try { store = await caches.open(CACHE); } catch {}
-  const hit = store && await store.match(key);
-  if (hit) {
-    try {
-      const body = await hit.arrayBuffer();
-      progress(1);
-      return body;
-    } catch {                                   // an entry the browser can no longer read is fetched afresh
-      await store.delete(key);
-    }
-  }
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`${url}: ${response.status}`);
-  const body = await download(response, progress).catch(async () => {   // a browser whose body stream fails
-    progress(0);                                                         // still delivers the whole body at once
-    const again = await fetch(url, {cache: 'reload'});
-    if (!again.ok) throw new Error(`${url}: ${again.status}`);
-    return again.arrayBuffer();
-  });
-  if (store) {
-    for (const old of await store.keys()) if (old.url.split('?')[0] === key.href.split('?')[0]) await store.delete(old);
-    await store.put(key, new Response(body.slice(0)));
-  }
-  progress(1);
-  return body;
-}
-
-/** The body of `response` as an ArrayBuffer, read in chunks so `progress(fraction)` can follow the download. */
-async function download(response, progress) {
-  if (!response.body) return response.arrayBuffer();
-  const total = Number(response.headers.get('Content-Length')) || 0, parts = [];
-  let received = 0;
-  for (const reader = response.body.getReader(); ;) {
-    const {done, value} = await reader.read();
-    if (done) break;
-    parts.push(value);
-    received += value.length;
-    if (total) progress(Math.min(1, received / total));
-  }
-  return new Blob(parts).arrayBuffer();
-}
-
-/** Removes every cached version of `url`, for bytes that failed their check. */
-export async function forget(url) {
-  try {
-    const store = await caches.open(CACHE), base = new URL(url, location.href).href.split('?')[0];
-    for (const key of await store.keys()) if (key.url.split('?')[0] === base) await store.delete(key);
-  } catch {}
-}
+import {cached, json, moduleUrl, pins} from './assets.mjs';
 
 /**
  * The device to run on: {provider: 'webgpu' | 'wasm', precisions: candidate graphs, adapter}. WebGPU offers fp16
@@ -106,35 +50,60 @@ export function defaultThreads({isolated, cores}) {
   return isolated ? Math.max(1, Math.min(8, cores - 1)) : 1;
 }
 
+const RUNTIMES = {webgpu: ['ort.webgpu.min.mjs', 'ort-wasm-simd-threaded.asyncify'], wasm: ['ort.wasm.min.mjs', 'ort-wasm-simd-threaded']};
+
+/** ONNX Runtime Web's files for `provider` ('webgpu' or 'wasm') as ort/version.json pins them: the API module, the
+ * runtime module and its wasm (assets.mjs file records, cached under the runtime's version). */
+export async function runtimeFiles(provider) {
+  const found = await json('ort/version.json'), {data, local} = found, [api, runtime] = RUNTIMES[provider];
+  const files = await pins('ort/version.json', found, other => other.version === data.version);
+  return [api, `${runtime}.mjs`, `${runtime}.wasm`].map(name => ({path: `ort/${name}`, sha256: files[name], version: data.version, local}));
+}
+
+/** The runtime files a load on `provider` may read: runtimeFiles(provider), plus the WebAssembly runtime that a
+ * failed WebGPU start falls back to unless `prefer` fixed the device. */
+export async function loadFiles(provider, prefer) {
+  const files = await runtimeFiles(provider);
+  return provider === 'webgpu' && !prefer ? [...files, ...await runtimeFiles('wasm')] : files;
+}
+
+/** ONNX Runtime Web for `provider` on `threads` WebAssembly threads (null: defaultThreads); `progress(fraction)`
+ * follows the wasm download. */
+export async function runtime(provider, threads, progress = () => {}) {
+  const [api, glue, wasm] = await runtimeFiles(provider);
+  const [ort, mjs, wasmBinary] = await Promise.all([moduleUrl(api).then(url => import(url)), moduleUrl(glue), cached(wasm, progress)]);
+  ort.env.wasm.wasmPaths = {mjs};
+  ort.env.wasm.wasmBinary = wasmBinary;
+  ort.env.wasm.numThreads = threads ?? defaultThreads({isolated: Boolean(globalThis.crossOriginIsolated), cores: navigator.hardwareConcurrency || 2});
+  ort.env.wasm.proxy = false;
+  ort.env.logLevel = 'error';
+  return ort;
+}
+
+/** The model graphs for `precisions` that the Bubble manifest at `model` (a path under web/engine) pins. */
+export async function modelFiles(precisions, model = 'model/manifest.json') {
+  const {data, local} = await json(model), folder = model.slice(0, model.lastIndexOf('/') + 1);
+  return {manifest: data, files: precisions.map(precision => {
+    const name = `bubble-${precision}.onnx`, {sha256, bytes} = data.files[name];
+    return {path: folder + name, sha256, bytes, local};
+  })};
+}
+
 export class Network {
   /**
-   * Loads ONNX Runtime and the model from `base` (the web/engine URL): `model` is the manifest URL, `device` a probe()
-   * result, `progress(fraction)` reports downloads. With two candidate precisions it times a batch of 16 under each
-   * and keeps fp16 only when it is at least FASTER times quicker, since fp32 reproduces the server's evaluations.
+   * Loads ONNX Runtime and the model: `model` is the manifest's path under web/engine, `device` a probe() result,
+   * `progress(fraction)` reports downloads. With two candidate precisions it times a batch of 16 under each and keeps
+   * fp16 only when it is at least FASTER times quicker, since fp32 reproduces the server's evaluations.
    */
-  static async create(base, {model = 'model/manifest.json', device, progress = () => {}, threads = null} = {}) {
-    const manifestUrl = new URL(model, base), manifest = await (await fetch(manifestUrl, {cache: 'no-cache'})).json();
-    const gpu = device.provider === 'webgpu';
-    const ortBase = new URL('ort/', base), ortVersion = (await (await fetch(new URL('version.json', ortBase))).json()).version;
-    const runtime = gpu ? 'ort-wasm-simd-threaded.asyncify' : 'ort-wasm-simd-threaded';
-    const shares = new Array(1 + device.precisions.length).fill(0), weights = [.8, ...device.precisions.map(() => .2 / device.precisions.length)];
+  static async create({model = 'model/manifest.json', device, progress = () => {}, threads = null} = {}) {
+    const {manifest, files} = await modelFiles(device.precisions, model);
+    const shares = new Array(1 + files.length).fill(0), weights = [.8, ...files.map(() => .2 / files.length)];
     const report = (i, f) => { shares[i] = f; progress(shares.reduce((sum, s, j) => sum + s * weights[j], 0)); };
-    const [ort, wasmBinary, ...graphs] = await Promise.all([
-      import(new URL(gpu ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs', ortBase).href),
-      cached(new URL(`${runtime}.wasm`, ortBase).href, ortVersion, f => report(0, f)),
-      ...device.precisions.map((precision, i) => {
-        const file = `bubble-${precision}.onnx`;
-        return cached(new URL(file, manifestUrl).href, manifest.files[file].sha256, f => report(i + 1, f));
-      })]);
-    ort.env.wasm.wasmPaths = {mjs: new URL(`${runtime}.mjs`, ortBase).href};
-    ort.env.wasm.wasmBinary = wasmBinary;
-    ort.env.wasm.numThreads = threads ?? defaultThreads({isolated: Boolean(globalThis.crossOriginIsolated),
-      cores: navigator.hardwareConcurrency || 2});
-    ort.env.wasm.proxy = false;
-    ort.env.logLevel = 'error';
+    const [ort, ...graphs] = await Promise.all([runtime(device.provider, threads, f => report(0, f)),
+      ...files.map((file, i) => cached(file, f => report(i + 1, f)))]);
     const networks = [];
     for (const [i, precision] of device.precisions.entries()) {
-      const session = await ort.InferenceSession.create(new Uint8Array(graphs[i]), {executionProviders: [gpu ? 'webgpu' : 'wasm'],
+      const session = await ort.InferenceSession.create(new Uint8Array(graphs[i]), {executionProviders: [device.provider],
         graphOptimizationLevel: 'all', enableCpuMemArena: true, logSeverityLevel: 3});
       networks.push(new Network(ort, session, precision, manifest, ort.env.wasm.numThreads));
     }

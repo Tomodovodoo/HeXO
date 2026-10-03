@@ -3,41 +3,19 @@
  * In: {type: 'load'} | {type: 'turn', id, history, ms}.
  * Out: {type: 'progress', fraction} | {type: 'ready', revision} | {type: 'result', id, result} | {type: 'error', id?, message}.
  */
-import createModule from './seal/engine.mjs';
-import {sealTurn} from './seal.mjs';
+import {cached, moduleUrl, wasmOptions} from './assets.mjs';
+import {files, sealTurn} from './seal.mjs';
 
-const CACHE = 'seal-engine-v1';
 let module = null;
 
-const sha256 = async bytes => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)),
-  b => b.toString(16).padStart(2, '0')).join('');
-
-/** seal/engine.wasm with SHA-256 `digest`: from the Cache API, else fetched by that digest and kept once it matches. */
-async function wasm(digest) {
-  const url = new URL(`seal/engine.wasm?v=${digest}`, import.meta.url);
-  let store = null;
-  try { store = await caches.open(CACHE); } catch {}
-  const hit = await store?.match(url);
-  if (hit) {
-    const bytes = await hit.arrayBuffer();
-    if (await sha256(bytes) === digest) return bytes;
-  }
-  const response = await fetch(url, {cache: 'no-store'});
-  if (!response.ok) throw new Error(`seal/engine.wasm: ${response.status}`);
-  const bytes = await response.arrayBuffer();
-  if (await sha256(bytes) !== digest) throw new Error('seal/engine.wasm does not match seal/manifest.json');
-  if (store) {
-    for (const old of await store.keys()) await store.delete(old);
-    await store.put(url, new Response(bytes.slice(0)));
-  }
-  return bytes;
-}
-
+/** Seal's module and wasm through assets.mjs (checked against seal/manifest.json when they come from the site). */
 async function load() {
-  const manifest = await (await fetch(new URL('seal/manifest.json', import.meta.url), {cache: 'no-store'})).json();
-  module = await createModule({wasmBinary: await wasm(manifest.sha256)});
+  const {revision, files: [glue, wasm]} = await files();
+  const [{default: createModule}, wasmBinary] = await Promise.all([moduleUrl(glue).then(url => import(url)),
+    cached(wasm, fraction => postMessage({type: 'progress', fraction: .99 * fraction}))]);
+  module = await createModule(wasmOptions(wasmBinary));
   postMessage({type: 'progress', fraction: 1});
-  return manifest.revision;
+  return revision;
 }
 
 onmessage = async ({data}) => {

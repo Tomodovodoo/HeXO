@@ -194,7 +194,7 @@ async function use(model, report = () => {}) {
     held.set(model, network);
     return;
   }
-  const create = () => Network.create(new URL('./', import.meta.url), {model, device, progress: report, threads: settings.threads});
+  const create = () => Network.create({model, device, progress: report, threads: settings.threads});
   try {
     network = await create();
   } catch (error) {
