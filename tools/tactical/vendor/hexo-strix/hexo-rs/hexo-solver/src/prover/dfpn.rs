@@ -866,7 +866,7 @@ pub(crate) fn solve_mode_at_guided(
     };
 
     let mut res = DriverResult::new(verdict);
-    res.proof_numbers = Some(d.tt.probe(node_key_at(d.k.hash(), root, remaining)).unwrap_or((pn, dn)));
+    res.proof_numbers = Some(d.tt.peek(node_key_at(d.k.hash(), root, remaining)).unwrap_or((pn, dn)));
     res.resident_reused = resident_reused;
     if verdict == Verdict::Win {
         // PDS-PN retains every node key that reached `pn == 0`, including nodes

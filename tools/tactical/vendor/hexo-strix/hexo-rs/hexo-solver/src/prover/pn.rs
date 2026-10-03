@@ -154,11 +154,18 @@ impl ProofTt {
     /// Look up `(pn, dn)` for a node key; `None` on miss (unknown → `(1, 1)`).
     #[inline]
     pub(crate) fn probe(&mut self, key: u64) -> Option<(u32, u32)> {
+        let found = self.peek(key);
+        self.hits += u64::from(found.is_some());
+        found
+    }
+
+    /// Reporting reads must not count as search transposition hits.
+    #[inline]
+    pub(crate) fn peek(&self, key: u64) -> Option<(u32, u32)> {
         let b = self.base(key);
         for w in 0..WAYS {
             let s = self.slots[b + w];
             if s.occupied && s.key == key {
-                self.hits += 1;
                 return Some((s.pn, s.dn));
             }
         }
