@@ -452,7 +452,7 @@ async function poll(){
   try{const res=await fetch(endpoint('/state')+(S?'?since='+S.revision:''));if(res.ok)accept(await res.json())}catch(e){}
   setTimeout(poll,S&&S.jobs.length?350:1500);
 }
-const failures=new Set();
+const failures=new Set();let noticed=null;
 function active(jobs,instance){
   for(const j of jobs){const id=instance+':'+j.id;if(j.status==='failed'&&!failures.has(id)){failures.add(id);toast(j.error)}}
   return jobs.filter(j=>j.status!=='failed');
@@ -462,6 +462,7 @@ function accept(data){
   if(S&&!('history' in data)&&data.instance!==S.instance){S.revision=-1;return}
   if(S&&'history' in data&&data.instance===S.instance&&data.revision===S.revision)data={instance:data.instance,revision:data.revision,jobs:data.jobs,clock:data.clock};
   data.jobs=active(data.jobs,data.instance);
+  if(data.notice&&data.notice!==noticed)toast(noticed=data.notice);
   if('history' in data){
     const live=!S||view>=S.history.length,before=S?S.history.length:null;
     S=data;

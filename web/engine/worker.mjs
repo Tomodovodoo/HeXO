@@ -49,7 +49,7 @@ function send(id) {
     solver = new Worker(new URL('solver-worker.mjs', import.meta.url), {type: 'module'});
     solver.onmessage = ({data}) => settle(data.id, data.result);
     solver.onerror = event => {
-      for (const id of [...solverWaits.keys()]) settle(id, unknown(`solver worker failed: ${event.message || 'error'}`));
+      for (const id of [...solverWaits.keys()]) settle(id, unknown(`${FAILED}: ${event.message || 'error'}`));
       replace();
     };
   }
@@ -73,6 +73,7 @@ function stopSolver(owner) {
 }
 
 const verified = r => r.status === 'PROVEN_WIN' && r.native_verified;
+const FAILED = 'solver worker failed';
 const searched = r => verified(r) || VERDICTS.has(r.reason);
 
 function proofTurns(plies, remaining, moverWins) {
@@ -88,16 +89,19 @@ function rootRows(tree, choice) {
   return {value: Math.round((value + 1) / 2 * 1e4) / 1e4, top: topRows(actions, policy, values, action)};
 }
 
-/** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms). */
+/** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms),
+ * plus `solver_error` when the solver's worker could not run, so the turn has no proof or threat. */
 async function turn({id, history, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0}) {
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
   let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null;
+  let failure = null;
+  const note = r => { if (r.reason?.startsWith(FAILED)) failure = r.reason; return r; };
   const deadline = Math.min(60000, Math.max(10000, Math.floor(solverNodes / 8)));
   try {
     if (solverNodes) {
-      const mine = await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: deadline, shortest: true});
+      const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: deadline, shortest: true}));
       check();
       solved = searched(mine);
       solverUsed += mine.nodes_used || 0;
@@ -108,7 +112,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
         proof = {winner: player, turns: mine.proof_turns, plies: found.plies};
         top = [[...moves[0], 1, 1, 1]];
       } else {
-        const theirs = await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: deadline});
+        const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: deadline}));
         check();
         solved = solved && searched(theirs);
         solverUsed += theirs.nodes_used || 0;
@@ -155,7 +159,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
     if (proof) value = proof.winner === player ? 1 : 0;
     if (proof && !pv.length) pv = moves.map(([q, r], i) => [q, r, player, i + 1]);
     return {moves, value: Math.round(value * 1e4) / 1e4, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
-      actual_completed: completed, actual_solver_nodes: solverUsed};
+      actual_completed: completed, actual_solver_nodes: solverUsed, ...(failure ? {solver_error: failure} : {})};
   } finally {
     tree?.close();
   }

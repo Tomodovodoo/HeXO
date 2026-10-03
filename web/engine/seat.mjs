@@ -32,7 +32,7 @@ const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, 
 const analyses = new Map(), loads = new Map(), hk = history => history.map(p => p.join(',')).join(';');
 /** Each seat and the analysis: null, or {engine: an ENGINES id, preset, checkpoint}. */
 let config = {seats: [null, null], analysis: null}, job = null, failed = null, posting = false;
-let fresh = true;
+let fresh = true, notice = null;
 try {
   const saved = localStorage.getItem(STORE), known = choice => ENGINES.has(choice?.engine) ? pickEngine(choice.engine, choice, choice.checkpoint) : null;
   fresh = saved === null;
@@ -157,6 +157,7 @@ async function run(key, task) {
         posting = false;
       }
     } else {
+      if (result.solver_error && notice !== result.solver_error) original.toast(`The solver could not run in this browser (${notice = result.solver_error}), so evaluations have no proofs`);
       const evaluation = record(result, task.history, task.preset);
       analyses.set(analysisKey(task, task.history), evaluation);
       const s = state();

@@ -62,7 +62,7 @@ export class BrowserSession extends OfflineSession {
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
-    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null;
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null;
   }
   registerEngine(entry, adapter) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
@@ -107,7 +107,7 @@ export class BrowserSession extends OfflineSession {
     const {winner, player, remaining} = this.native.game(this.history), {evaluations, review: turns} = this.study(winner);
     return {instance: `browser:${this.id}`, revision: this.revision, history: copy(this.history), player, remaining, winner,
       paused: this.paused, seats: copy(this.seats), analysis: copy(this.analysis), engines: [...this.entries.values()], match: this.match,
-      clock: this.clockNow(), saved_game: this.saved_game, models_folder: null, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
+      clock: this.clockNow(), saved_game: this.saved_game, models_folder: null, notice: this.notice, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
       evaluations, review: turns, review_preset: REVIEW_PRESET,
       jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live}) => ({id, kind, status, done, total, error, ply: history.length, side, live}))};
@@ -277,10 +277,14 @@ export class BrowserSession extends OfflineSession {
     if (kind === 'analyse') this.cancelJobs(j => j.kind === 'analyse' && j.status !== 'failed' && (fields.tier ? j.tier : true));
     this.jobs.push({id: ++this.nextJob, kind, history: copy(history), spec: copy(spec), key, controller: new AbortController(), status: 'queued', done: 0, total: 1, ...fields});
   }
+  /** Saves the evaluation `result` of `history` by `spec`. One whose solver could not run (`solver_error`) is kept for
+   * this visit only and raises the session's `notice`, so a later visit evaluates the position again with proofs. */
   async record(history, spec, result) {
     const record = {...result, id: this.cacheKey(history, spec), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
-    this.indexRecord(record); await this.storage.put('evaluations', record);
+    this.indexRecord(record);
+    if (result.solver_error) this.notice = `The solver could not run in this browser (${result.solver_error}), so evaluations have no proofs`;
+    else await this.storage.put('evaluations', record);
     if (position(this.history.slice(0, history.length)) === position(history)) {
       this.records = this.records.filter(r => r.id !== record.id); this.records.push(record);
     }
