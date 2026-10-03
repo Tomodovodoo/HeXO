@@ -598,7 +598,7 @@ function collectMarks(){
   const done=turn&&turn.label&&view===turn.ply+turn.stones.length;six=[];
   if(done){const[g,c]=LABEL[turn.label],last=turn.stones.at(-1);at(last[0],last[1]).badge={color:css(c),text:g};
     for(const p of turn.better||[])body(p[0],p[1],{kind:'better',color:COLORS[turn.player]})}
-  if(ev&&!(done&&turn.better)){
+  if(ev){
     const o=boardOverlay(ev,S.history.slice(0,view).map((p,i)=>[p[0],p[1],playerAt(i)])),mover=COLORS[playerAt(view)];
     for(const c of o.candidates)body(c.q,c.r,{kind:'candidate',color:mover,n:c.n,weight:c.weight});
     for(const p of o.plies)body(p.q,p.r,{kind:'ply',color:COLORS[p.player],n:p.n,weight:p.fade});
