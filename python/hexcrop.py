@@ -157,6 +157,26 @@ def encode(history, *, symmetry=None, rng=None):
         game.close()
 
 
+def encode_leaf(native, tree, request, history):
+    """Encode an existing native search leaf; old libraries retain the non-replay Python path."""
+    if not hasattr(native, 'hxg_encode'):
+        return encode_game(Position(np.asarray(history, np.int64)), history)
+    info = np.empty(9, np.int64)
+    size = native.hxg_encode(tree, request, None, 0, None, info.ctypes.data)
+    if size == -2:
+        raise SpanError('Stones plus halo exceed the largest bucket')
+    if size == 0:
+        raise ValueError(native.hxg_error().decode())
+    actions = np.empty((int(info[0]), 2), np.int64)
+    native.hxg_legal(tree, request, actions.ctypes.data)
+    planes = np.empty((len(PLANES), size, size), np.uint8)
+    cells = np.empty(len(actions), np.int64)
+    if native.hxg_encode(tree, request, planes.ctypes.data, planes.size, cells.ctypes.data, info.ctypes.data) != size:
+        raise ValueError(native.hxg_error().decode())
+    return Sample(planes, size, cells, actions, int(info[8]), int(info[1]), int(info[2]), int(info[3]),
+                  tuple(map(int, info[4:8])))
+
+
 def encode_game(game, history, *, symmetry=None, rng=None, actions=None):
     """Encode the position of `game`, whose placements are `history`; `actions` [N, 2], when given, must be its
     legal moves in native order (legal_array is skipped).
