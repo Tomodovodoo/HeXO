@@ -687,7 +687,8 @@ function openMenu(anchor,items,current,choose){
     b.onclick=()=>{closeMenu();if(!it.ids.includes(current))choose(it)};return b});
   const models=!S.engines.some(e=>['bubble','six','strix'].includes(e.kind));
   const rescan=el('button',{class:'ib ghost','aria-label':'Rescan',html:icon('rescan'),onclick:async()=>{closeMenu();await post('/rescan')}});
-  m.replaceChildren(...rows,...(anchor.closest('#seats')&&!STUDY?setupRows(choose):[]),el('div',{class:'hint'},models?el('span',{class:'spacer'},'Add models to ',el('code',{},S.models_folder||'models/')):el('span',{class:'spacer'}),rescan));
+  const server=!globalThis.browserPlay;
+  m.replaceChildren(...rows,...(server&&anchor.closest('#seats')&&!STUDY?setupRows(choose):[]),...(server?[el('div',{class:'hint'},models?el('span',{class:'spacer'},'Add models to ',el('code',{},S.models_folder||'models/')):el('span',{class:'spacer'}),rescan)]:[]));
   const r=anchor.getBoundingClientRect();m.style.left=Math.min(r.left,innerWidth-260)+'px';m.style.width=Math.max(240,r.width)+'px';
   m.classList.add('show');const below=innerHeight-r.bottom;m.style.top=(below>260?r.bottom+4:Math.max(8,r.top-4-m.offsetHeight))+'px';
 }
