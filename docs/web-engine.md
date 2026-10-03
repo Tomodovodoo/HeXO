@@ -69,7 +69,7 @@ others on one thread; Six from its 0.4 s per position):
 | Engine | Lightning | Quick | Standard |
 |---|---|---|---|
 | Bubble | 0.07 | 0.25 | 1 |
-| Six | 300 | 1,200 | 6,000 |
+| Six | 48 | 190 | 770 |
 | Shrimp | 2.5 | 5.7 | not measured |
 | Strix | 0.5 | 1.5 | 11.5 |
 
@@ -244,7 +244,8 @@ included: it has no licence and no published weights.
 
 Seal is the alpha-beta bot by Ramora0 ([HexTicTacToe](https://github.com/Ramora0/HexTicTacToe), revision `3474edb`),
 the community's reference bot. **Seal (browser)** in the picker plays a seat or the analysis with the server's
-presets: lightning 50, quick 100, standard 500, strong 2000, deep 8000 and dangerous 30000 ms per turn.
+presets: lightning 100, quick 250, standard 1000, strong 3000, deep 10000 and dangerous 60000 ms per turn, the same
+ladder as Native.
 
 ```sh
 python tools/build_web.py seal --emxx path/to/em++   # seal/engine.mjs, engine.wasm, manifest.json (ignored)
@@ -285,7 +286,7 @@ positions sent out to ONNX Runtime Web. HeXO adds three exports to `web_bot.cpp`
 turn at its next batch, `six_score` and `six_nodes`. Both seats and the analysis panel can use it. As analysis it
 shows its turn: the first stone as the top move, both stones as the line, the win chance from its score (100% when
 its threat solver proves a win, whose distance Six does not report) and the positions searched; the presets give it the server's
-Six protocol nodes (lightning 1,500 to dangerous 2,000,000) and the network select lists the site's networks, newest
+Six positions (lightning 240 to dangerous 2,000,000) and the network select lists the site's networks, newest
 first. It plays like the server's Six (`python/six_engine.py` driving `sixengine`): Six's default search settings,
 radius 8, mirrored coordinates, `go nodes N` with no time limit, and the tree kept while the game continues.
 
@@ -301,13 +302,15 @@ notes of `networks` and Six's `NOTICE.txt`).
 `tests/test_web_six.py` plays recorded positions with the browser search in node (ONNX Runtime Web's WebAssembly
 build, one thread) and with `sixengine --cpu` through `SixEngine`, at 48 and 160 nodes, and three turns of one game on
 one tree: the moves are identical. It needs `models/six` (the play page's Six download) and takes about four minutes,
-since one thread evaluates about 2.7 positions per second. The standard preset (30,000 nodes) from the first stone gave the
+since one thread evaluates about 2.7 positions per second. A 30,000-position search from the first stone gave the
 same two stones on WebGPU in the browser (102 s) and from `sixengine --cpu` on the Ryzen 9 5900X (720 s).
 
-Speed on the RTX 3070 Ti (otherwise idle) in the Claude desktop browser pane, WebGPU, from one stone: lightning 1.3 s,
-quick 22 s, standard 102 s. The search itself and its threat solver run on one thread in the worker, so turns slow
-down as the tree grows. On WebAssembly a position costs about 0.4 s on one thread, so without WebGPU only lightning
-is practical.
+Speed on the RTX 3070 Ti (otherwise idle) in the Claude desktop browser pane, WebGPU, from one stone, measured before
+the ladder was rebased: 1,500 positions 1.3 s, 6,000 positions 22 s, 30,000 positions 102 s. On that scale the current
+presets cost about 0.5 s (lightning, 240), 3 s (quick, 960), 13 s (standard, 3,840) and a minute (strong, 15,360).
+The search itself and its threat solver run on one thread in the worker, so turns slow down as the tree grows. On
+WebAssembly a position costs about 0.4 s on one thread, so without WebGPU lightning takes about two minutes and the
+heavier presets are impractical.
 
 ## Strix (browser)
 

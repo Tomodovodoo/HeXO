@@ -45,10 +45,10 @@ PRESETS = dict(
                 deep=dict(simulations=2048, solver_nodes=524288), dangerous=dict(simulations=65536, solver_nodes=4_000_000)),
     native=dict(lightning=dict(ms=100), quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000),
                 deep=dict(ms=10000), dangerous=dict(ms=60000)),
-    seal=dict(lightning=dict(ms=50), quick=dict(ms=100), standard=dict(ms=500), strong=dict(ms=2000), deep=dict(ms=8000),
-              dangerous=dict(ms=30000)),
-    six=dict(lightning=dict(nodes=1500), quick=dict(nodes=6000), standard=dict(nodes=30000), strong=dict(nodes=135000),
-             deep=dict(nodes=500000), dangerous=dict(nodes=2_000_000)),
+    seal=dict(lightning=dict(ms=100), quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000), deep=dict(ms=10000),
+              dangerous=dict(ms=60000)),
+    six=dict(lightning=dict(nodes=240), quick=dict(nodes=960), standard=dict(nodes=3840), strong=dict(nodes=15360),
+             deep=dict(nodes=61440), dangerous=dict(nodes=2_000_000)),
     strix=dict(lightning=dict(simulations=2), quick=dict(simulations=8), standard=dict(simulations=64),
                strong=dict(simulations=128), deep=dict(simulations=512), dangerous=dict(simulations=4096)))
 PRESET_NAMES = list(PRESETS['bubble'])

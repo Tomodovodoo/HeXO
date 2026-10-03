@@ -509,7 +509,7 @@ class Jobs(unittest.TestCase):
         self.session.configure_seat(1, six['id'], 'gen-1', 'lightning')
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
-        self.assertEqual(self.engines.turns[-1], (six['id'], 'gen-1', dict(nodes=1500)))
+        self.assertEqual(self.engines.turns[-1], (six['id'], 'gen-1', dict(nodes=240)))
         with self.assertRaises(ValueError):
             self.session.configure_seat(1, six['id'], 'gen-3')
 
@@ -531,7 +531,7 @@ class Jobs(unittest.TestCase):
                    networks={f'gen-{n}': Path(f'gen-{n}.onnx') for n in range(3)})
         engines = Engines('cpu')
         with unittest.mock.patch('six_engine.SixEngine', Fake):
-            for network, nodes in (('gen-2', 30000), ('gen-2', 6000), ('gen-1', 6000), ('gen-2', 6000), ('gen-0', 6000)):
+            for network, nodes in (('gen-2', 3840), ('gen-2', 960), ('gen-1', 960), ('gen-2', 960), ('gen-0', 960)):
                 engines.turn(six, dict(nodes=nodes), [], checkpoint=network)
         self.assertEqual([c[2] for c in started], ['gen-2.onnx', 'gen-1.onnx', 'gen-0.onnx'])
         self.assertEqual([c[2] for c in closed], ['gen-1.onnx'])
@@ -732,18 +732,18 @@ class Jobs(unittest.TestCase):
         with self.assertRaises(ValueError):
             budget_of(PRESETS['native'], 'heavy')
         self.assertEqual(presets_of('six', dict(quick=dict(args=['--visits', '8'])))['quick'],
-                         dict(nodes=6000, args=['--visits', '8']))
+                         dict(nodes=960, args=['--visits', '8']))
         shrimp = presets_of('six', dict(quick=dict(nodes=1, args=['--visits', '32'])))
         self.assertEqual(budget_of(shrimp, 'custom', dict(nodes=9, args=['--visits', '1'])), dict(nodes=9))
         self.assertEqual(budget_of(shrimp, 'quick'), dict(nodes=1, args=['--visits', '32']))
         lightning = {kind: presets_of(kind, None)['lightning'] for kind in PRESETS}
         self.assertEqual(lightning, dict(bubble=dict(simulations=8, solver_nodes=2048), native=dict(ms=100),
-                                         seal=dict(ms=50), six=dict(nodes=1500), strix=dict(simulations=2)))
+                                         seal=dict(ms=100), six=dict(nodes=240), strix=dict(simulations=2)))
         self.assertEqual([list(PRESETS[kind]) for kind in PRESETS], [['lightning', 'quick', 'standard', 'strong', 'deep', 'dangerous']] * 5)
-        self.assertEqual(presets_of('six', dict(quick=dict(nodes=1)))['lightning'], dict(nodes=1500))
+        self.assertEqual(presets_of('six', dict(quick=dict(nodes=1)))['lightning'], dict(nodes=240))
         self.assertEqual({kind: presets_of(kind, None)['dangerous'] for kind in PRESETS},
                          dict(bubble=dict(simulations=65536, solver_nodes=4_000_000), native=dict(ms=60000),
-                              seal=dict(ms=30000), six=dict(nodes=2_000_000), strix=dict(simulations=4096)))
+                              seal=dict(ms=60000), six=dict(nodes=2_000_000), strix=dict(simulations=4096)))
         self.assertEqual(budget_of(PRESETS['bubble'], 'custom', dict(simulations=100_000, solver_nodes=10_000_000)),
                          dict(simulations=100_000, solver_nodes=10_000_000))
         with self.assertRaisesRegex(ValueError, 'at least 0'):
