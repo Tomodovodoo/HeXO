@@ -80,8 +80,11 @@ export async function json(path) {
 export async function pins(path, {data, local}, same) {
   const there = remote(path);
   if (data.files || !local || !there) return data.files ?? {};
+  const store = await open(), id = `${new URL(path, BASE).href}?site`;   // kept so the pins also answer offline
   const response = await fetch(there, {cache: 'no-cache', mode: 'cors'}).catch(() => null);
-  const other = response?.ok ? await response.json().catch(() => null) : null;
+  let other = response?.ok ? await response.json().catch(() => null) : null;
+  if (other) await store?.put(id, new Response(JSON.stringify(other))).catch(() => {});
+  else other = await (await store?.match(id).catch(() => null))?.json() ?? null;
   return other && same(other) ? other.files ?? {} : {};
 }
 

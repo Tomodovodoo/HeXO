@@ -210,7 +210,7 @@ const chosen = id => {
 };
 const remember = (id, promise) => { checks.set(id, Object.assign(promise, {stamp: chosen(id).join(',')})); return promise; };
 const check = id => checks.get(id)?.stamp === chosen(id).join(',') ? checks.get(id)
-  : remember(id, ENGINES.get(id).engine.files(chosen(id)).then(status).catch(failure));
+  : remember(id, ENGINES.get(id).engine.files(chosen(id)).then(files => { if (ENGINES.get(id).listed) recheck(ENGINES.get(id).entry); return status(files); }).catch(failure));
 const unpublished = id => original.toast(`${ENGINES.get(id).entry.label} is not on the public site; build it here with ${ENGINES.get(id).build}`);
 /* States in which a browser engine plays without a download first: its files are here, cached, or cannot be cached. */
 const READY = new Set(['local', 'cached', 'uncached']);
@@ -292,8 +292,13 @@ function openMenu(anchor, items, current, choose) {
 }
 
 /** Checks the saved choices and the static page's session choices (seats, analysis, a stored match's players) for
- * engine `entry` against its loaded network list: a network the list no longer has becomes its newest. Then redraws. */
-function recheck(entry) {
+ * engine `entry` against its loaded network list: a network the list no longer has becomes its newest. Then redraws.
+ * Runs when the list changed since the last check, or always with `force`. */
+const rechecked = new Map();
+function recheck(entry, force = false) {
+  const list = entry.checkpoints.join(',');
+  if (!force && rechecked.get(entry.id) === list) return;   // nothing new to check against
+  rechecked.set(entry.id, list);
   const fix = choice => choice?.engine === entry.id ? pickEngine(entry.id, choice, choice.checkpoint) : choice;
   const fixed = {seats: config.seats.map(fix), analysis: fix(config.analysis)};
   if (JSON.stringify(fixed) !== JSON.stringify(config)) {   // save() also clears the failed key, so only on a change
@@ -422,7 +427,7 @@ async function serverless() {
   native.entry.version = build.artefacts['native/native.wasm'];
   for (const {entry} of ENGINES.values()) entry.version ||= JSON.stringify(build.artefacts);
   await mountPlay(ENGINES, config);
-  for (const {entry, listed} of ENGINES.values()) listed?.then(() => recheck(entry));   // the session's own choices
+  for (const {entry, listed} of ENGINES.values()) listed?.then(() => recheck(entry, true));   // the session's own choices
   return true;
 }
 

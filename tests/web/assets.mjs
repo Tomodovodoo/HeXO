@@ -120,6 +120,8 @@ reset();
 here.set('ort/version.json', JSON.stringify({version: '1.30.0'}));
 site.set('ort/version.json', JSON.stringify({version: '1.30.0', files: {'ort.wasm.min.mjs': 'a', 'ort-wasm-simd-threaded.mjs': 'b', 'ort-wasm-simd-threaded.wasm': 'c'}}));
 out.legacy_pins = (await (await import('../../web/engine/network.mjs')).runtimeFiles('wasm')).map(f => [f.sha256, f.local]);
+site.delete('ort/version.json');
+out.legacy_pins_kept = (await (await import('../../web/engine/network.mjs')).runtimeFiles('wasm')).map(f => f.sha256);
 
 const open = caches.open;
 caches.open = async () => { throw new Error('no Cache API'); };
