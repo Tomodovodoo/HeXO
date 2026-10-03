@@ -252,8 +252,9 @@ export class BrowserSession extends OfflineSession {
     if (kind === 'analyse') this.cancelJobs(j => j.kind === 'analyse' && j.status !== 'failed' && (fields.tier ? j.tier : true));
     this.jobs.push({id: ++this.nextJob, kind, history: copy(history), spec: copy(spec), key, controller: new AbortController(), status: 'queued', done: 0, total: 1, ...fields});
   }
-  async record(history, spec, result) {
-    const record = {...result, id: this.cacheKey(history, spec), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
+  /** Saves `result`; a `kept` one (a seat's move on its game tree) is shown but never reused as a fresh evaluation. */
+  async record(history, spec, result, kept = false) {
+    const record = {...result, id: this.cacheKey(history, spec) + (kept ? '|kept' : ''), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
     this.indexRecord(record); await this.storage.put('evaluations', record);
     if (position(this.history.slice(0, history.length)) === position(history)) {
@@ -320,7 +321,7 @@ export class BrowserSession extends OfflineSession {
         if (timeout || limit != null && elapsed > limit) { await this.finishMatch(1 - job.side, 'timeout'); return; }
       }
       if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-      await this.record(history, job.spec, result);
+      await this.record(history, job.spec, result, job.kind === 'move' && this.entries.get(job.spec.engine)?.kind === 'bubble');
       if (job.kind === 'move') {
         if (job.controller.signal.aborted || position(this.history) !== position(history) || this.paused) return;
         if (!this.match?.active) this.forkGame();

@@ -15,6 +15,9 @@ const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
   'free-second coverage work limit']);
 let native, network, cache, games, solver = null, solverCalls = 0;
+/** The latest game-tree turn: they run one at a time, so a cancelled turn still awaiting the network settles before
+ * another turn advances, searches or evicts a game tree. */
+let gameTurn = Promise.resolve();
 const cancelled = new Set(), solverWaits = new Map();
 
 class Cancelled extends Error {}
@@ -91,7 +94,14 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
   if (state.winner >= 0) throw new Error('The game has finished');
   let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null;
   const deadline = Math.min(60000, Math.max(10000, Math.floor(solverNodes / 8)));
+  const previous = gameTurn;
+  let release = null;
+  if (line !== null) gameTurn = new Promise(resolve => { release = resolve; });
   try {
+    if (line !== null) {
+      await previous;
+      check();
+    }
     if (solverNodes) {
       const mine = await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: deadline, shortest: true});
       check();
@@ -154,6 +164,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
       actual_completed: completed, actual_solver_nodes: solverUsed};
   } finally {
     if (line === null) tree?.close();
+    release?.();
   }
 }
 

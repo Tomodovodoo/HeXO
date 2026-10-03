@@ -135,6 +135,9 @@ if (job.kind === 'encode') {
   s.registerEngine(entry, adapter);
   s.seats = [s.spec({engine: 'test'}), {engine: 'human'}]; s.analysis = s.spec({engine: 'test', auto: true}); s.changed(); s.pump();
   for (let i = 0; s.running || s.jobs.some(j => j.status === 'queued'); i++) { if (i > 1000) throw Error('Analysis did not finish'); await new Promise(r => setTimeout(r, 1)); }
+  const moved = s.lookup([], s.spec({engine: 'test', preset: 'standard'}), true);
+  await s.request('/analyse', {ply: 0}, 'POST');
+  for (let i = 0; s.running || s.jobs.some(j => j.status === 'queued'); i++) { if (i > 1000) throw Error('Analysis did not finish'); await new Promise(r => setTimeout(r, 1)); }
   await s.saving;
   const id = s.gameId, original = JSON.stringify(await s.savedReplay(id, 1));
   const study = new BrowserSession(native); study.storage = s.storage; study.id = 'study'; await study.openGame(id, 1); study.registerEngine(entry, adapter);
@@ -146,7 +149,7 @@ if (job.kind === 'encode') {
   const label = imported.state().review[0].label;
   imported.registerEngine({...entry, version: 'v2'}, adapter);
   answer = {calls, history: reopened.history, simulations: reopened.state().evaluations[1].simulations, catalogue: await s.catalogue(), preserved: JSON.stringify(await s.savedReplay(id, 1)) === original,
-    variation: (await study.savedReplay(study.gameId, 1)).history, imported_label: label, changed_version: imported.state().evaluations, restored_identity: reopened.gameId === id};
+    variation: (await study.savedReplay(study.gameId, 1)).history, imported_label: label, move_reused: moved !== null, changed_version: imported.state().evaluations, restored_identity: reopened.gameId === id};
 } else if (job.kind === 'resume') {
   const s = new BrowserSession(native), wait = ms => new Promise(r => setTimeout(r, ms));
   const until = async condition => { for (let i = 0; !condition(); i++) { if (i > 3000) throw Error('Move did not start'); await wait(1); } };

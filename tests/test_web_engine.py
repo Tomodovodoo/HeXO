@@ -340,6 +340,7 @@ class Bundle(unittest.TestCase):
         self.assertTrue(result['preserved'])
         self.assertEqual(result['variation'], [[0, 0], [1, 0]])
         self.assertEqual(result['imported_label'], 'best')
+        self.assertFalse(result['move_reused'])
         self.assertEqual(result['changed_version'], {})
         self.assertTrue(result['restored_identity'])
 
