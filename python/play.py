@@ -784,17 +784,18 @@ def answered(history, known):
 class SearchProofs:
     """Leaf proofs within one turn's extra node and solver-time allowance.
 
-    Each query gets at most 2048 nodes and 10 ms, including certificate verification. Only solver time
+    Each query gets at most 2048 nodes and `query_ms` (default 10), including certificate verification. Only solver time
     consumes the time allowance; neural inference does not. Exhaustion leaves the search on neural values.
     """
 
-    def __init__(self, prover, nodes, watch):
+    def __init__(self, prover, nodes, watch, query_ms=10):
         self.prover, self.left, self.watch = prover, nodes, watch
+        self.query_ms = query_ms
         self.ms = min(60_000, max(10_000, nodes // 8))
         self.used = 0
 
     def history(self, history, *, ms=10, certificate=None):
-        allowance = min(ms, 10, int(self.ms))
+        allowance = min(ms, self.query_ms, int(self.ms))
         if allowance < 1 or (not self.left and certificate is None):
             return dict(status='UNKNOWN', native_verified=False)
         self.watch(0)
@@ -870,7 +871,7 @@ class TurnSearch:
             for action, (winner, distance, _) in sorted(edges.items(), key=lambda e: (e[1][0] == mover, e[1][1], e[0])):
                 with contextlib.suppress(ValueError):
                     tree.mark(action, winner, distance)
-        tree.proof_solver, tree.proof_ms = self.proofs, 10
+        tree.proof_solver, tree.proof_ms = self.proofs, self.proofs.query_ms if self.proofs else 10
         return tree, simulations
 
     def take(self, result):
@@ -930,7 +931,7 @@ class TurnSearch:
 
 
 def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None, live=None, trees=None,
-             solved=None, q_range_floor=0., known=None, leaf_nodes=0):
+             solved=None, q_range_floor=0., known=None, leaf_nodes=0, leaf_ms=10):
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
@@ -940,7 +941,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     proof the turn's own stones; [] when unproven) and
     `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a solver
     initial root query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
-    Opt-in `leaf_nodes` adds a shared leaf-proof allowance per turn, with at most 2048 nodes/10 ms per query;
+    Opt-in `leaf_nodes` adds a shared leaf-proof allowance per turn, with at most 2048 nodes/`leaf_ms` per query;
     both stones share that allowance. Zero keeps leaf probing disabled. `simulations` 0 plays the raw policy;
     `solver_nodes` 0 skips root queries, and no `prover` skips all solver work. `watch(n)` is called
     before each network batch of n positions and may raise Cancelled; `live(glimpse)` receives the search of the
@@ -964,7 +965,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         raise ValueError('The game has finished')
     if (found := answered(history, known)) is not None:
         return found
-    proofs = SearchProofs(prover, leaf_nodes, watch) if prover is not None and leaf_nodes and simulations else None
+    proofs = SearchProofs(prover, leaf_nodes, watch, leaf_ms) if prover is not None and leaf_nodes and simulations else None
     turn = TurnSearch(bubble, Watched(bubble.evaluator, observe), history, simulations,
                       solved or solve(prover, history, solver_nodes, watch), trees, q_range_floor, known, proofs)
     try:
@@ -979,7 +980,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
 
 
 def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, batch_size=64,
-                  q_range_floor=0., known=None, leaf_nodes=0):
+                  q_range_floor=0., known=None, leaf_nodes=0, leaf_ms=10):
     """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
     position per prover in `provers` at a time, each distinct position solved once; then fresh trees, one per
     position, search together, checking opt-in `leaf_nodes` proofs before sharing network batches of up to
@@ -1012,7 +1013,7 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
     try:
         for i, (k, history, a) in enumerate(zip(keys, histories, given)):
             if a is None:
-                proofs = SearchProofs(provers[i % len(provers)], leaf_nodes, watch) if provers and leaf_nodes and simulations else None
+                proofs = SearchProofs(provers[i % len(provers)], leaf_nodes, watch, leaf_ms) if provers and leaf_nodes and simulations else None
                 turns.append(TurnSearch(bubble, network, history, simulations, solved.get(k) or solve(None, history, 0),
                                         q_range_floor=q_range_floor, known=known, proofs=proofs))
         coordinator = SearchCoordinator(network, bubble.sha256, bubble.cache)

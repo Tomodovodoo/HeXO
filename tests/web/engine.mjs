@@ -153,7 +153,7 @@ if (job.kind === 'encode') {
   runInNewContext(source, context);
   await context.onmessage({data: {type: 'load', options: {prefer: 'wasm'}}});
   await context.onmessage({data: {type: 'turn', id: 1, history: job.history,
-    simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0}});
+    simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10}});
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);
   answer = messages.find(m => m.type === 'result').result;

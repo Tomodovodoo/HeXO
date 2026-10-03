@@ -1781,7 +1781,7 @@ class TurnTrees(unittest.TestCase):
         history = [(0, 0), (4, 0), (7, 0), (-2, 0), (-1, 0), (1, 0), (6, 0), (5, 0), (-1, -1),
                    (-3, 1), (-1, 1), (-2, -1), (-4, 0), (-3, 0), (0, -1), (-2, -3), (-2, -2),
                    (-2, 1), (-2, -5), (-3, -1), (-1, -3), (-5, 1), (0, -4), (-4, 1), (-4, -1), (-5, -1)]
-        found = evaluate(self.bubble(), prover, history, 2048, 0, solved=solve(None, history, 0), leaf_nodes=524288)
+        found = evaluate(self.bubble(), prover, history, 2048, 0, solved=solve(None, history, 0), leaf_nodes=524288, leaf_ms=100)
         self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
         self.assertGreater(found['proof']['plies'], 0)
         self.assertLess(found['actual_completed'], 2048)

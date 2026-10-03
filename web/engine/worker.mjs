@@ -113,7 +113,7 @@ async function turn(request) {
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null}) {
+async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null}) {
   await use(model, fraction => postMessage({type: 'progress', id, fraction}));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
@@ -128,7 +128,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   const solverMs = () => timed ? Math.max(1, Math.floor(Math.min(deadline, solverEnd - performance.now()))) : deadline;
   let leafNodes = leafBudget, leafMs = Math.min(60000, Math.max(10000, Math.floor(leafBudget / 8)));
   const prove = leafBudget ? async leaves => {
-    const ms = Math.min(10, Math.floor(leafMs), timed ? Math.floor(solverEnd - performance.now()) : 10);
+    const ms = Math.min(leafQueryMs, Math.floor(leafMs), timed ? Math.floor(solverEnd - performance.now()) : leafQueryMs);
     if (!leafNodes || ms < 1) return null;
     check();
     const before = performance.now();
