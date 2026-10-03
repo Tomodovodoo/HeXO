@@ -405,7 +405,7 @@ const FIELDS={simulations:'Search',solver_nodes:'Solver',nodes:'Positions',ms:'m
 const PAGE=new URLSearchParams(location.search),STUDY=PAGE.has('study');
 globalThis.playReady=new Promise(resolve=>{globalThis.resolvePlayReady=resolve});
 const endpoint=path=>(STUDY&&!path.startsWith('/matches')?'/study':'')+path;
-let S=null,view=0,cam={x:0,y:0,size:26},hover=null,hot=null,drag=null,fitted=false,seenLabels=new Map(),landed=new Map(),asked=new Map();
+let S=null,view=0,placing=[],placed=new Set(),cam={x:0,y:0,size:26},hover=null,hot=null,drag=null,fitted=false,seenLabels=new Map(),landed=new Map(),asked=new Map();
 const canvas=$('board'),ctx=canvas.getContext('2d'),overlay=$('marks'),mctx=overlay.getContext('2d');
 const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const key=(q,r)=>q+','+r,dist=(a,b,c,d)=>Math.max(Math.abs(a-c),Math.abs(b-d),Math.abs(a+b-c-d));
@@ -459,13 +459,14 @@ function active(jobs,instance){
 function accept(data){
   if(S&&data.instance===S.instance&&data.revision<S.revision)return;
   if(S&&!('history' in data)&&data.instance!==S.instance){S.revision=-1;return}
+  if(S&&'history' in data&&data.instance===S.instance&&data.revision===S.revision)data={instance:data.instance,revision:data.revision,jobs:data.jobs,clock:data.clock};
   data.jobs=active(data.jobs,data.instance);
   if('history' in data){
     const live=!S||view>=S.history.length,before=S?S.history.length:null;
     S=data;
     if(live||view>S.history.length)view=S.history.length;
     const now=performance.now(),grown=before===null?0:S.history.length-before;
-    if(grown>0&&grown<=2)for(let i=before;i<S.history.length;i++)landed.set(key(...S.history[i]),now+(i-before)*110);
+    if(grown>0&&grown<=2)for(let i=before;i<S.history.length;i++){const k=key(...S.history[i]);placing=placing.filter(p=>key(...p)!==k);if(!placed.delete(k))landed.set(k,now+(i-before)*110)}
     if(grown<0||before===null){seenLabels.clear();landed.clear();hot=null;renderAnalysis.sig=null}
     if(!fitted||before===null||grown<0||grown>2)fit();
     renderPanels();
@@ -488,11 +489,13 @@ function fit(){
 }
 const CELL=()=>cam.size-1;
 function hexPath(x,y,s,c=ctx){c.beginPath();for(let k=0;k<6;k++){const a=(60*k-30)*Math.PI/180;const px=x+s*Math.cos(a),py=y+s*Math.sin(a);k?c.lineTo(px,py):c.moveTo(px,py)}c.closePath()}
+/* the cells within 8 of a stone, built on the previous set when the stones only grew */
 let legalCache={id:null,set:null};
 function legalSet(stones){
   const id=stones.join(';');if(legalCache.id===id)return legalCache.set;
-  const set=new Set();if(!stones.length)set.add('0,0');
-  for(const[q,r]of stones)for(let dq=-8;dq<=8;dq++)for(let dr=Math.max(-8,-dq-8);dr<=Math.min(8,-dq+8);dr++)set.add(key(q+dq,r+dr));
+  const grown=legalCache.id&&id.startsWith(legalCache.id+';'),set=grown?new Set(legalCache.set):new Set(),from=grown?legalCache.id.split(';').length:0;
+  if(!stones.length)set.add('0,0');
+  for(const[q,r]of stones.slice(from))for(let dq=-8;dq<=8;dq++)for(let dr=Math.max(-8,-dq-8);dr<=Math.min(8,-dq+8);dr++)set.add(key(q+dq,r+dr));
   return(legalCache={id,set}).set;
 }
 function sixLine(stones){
@@ -509,27 +512,58 @@ function stone(x,y,s,color,c=ctx){
   hexPath(x,y,s-1.5,c);c.strokeStyle='rgba(255,255,255,.22)';c.lineWidth=1;c.stroke();
 }
 let frame=0;
-function draw(){cancelAnimationFrame(frame);frame=requestAnimationFrame(paint)}
+/* one paint per frame: a request while one is pending joins it, so a stone placed earlier in a frame is not put off */
+function draw(){if(!frame)frame=requestAnimationFrame(()=>{frame=0;paint()})}
+/* the stones shown: the history up to the viewed ply, then the person's stones still on their way to the server */
+function shownStones(){return view===S.history.length?[...S.history,...placing]:S.history.slice(0,view)}
+/* the lattice and the settled stones are kept in `layer`: rebuilt when the camera moves or the stones change other
+   than by new ones, otherwise patched, so a placement redraws only the cells it touches and a landing animation or a
+   hover only the stones that move */
+const layer=document.createElement('canvas'),lctx=layer.getContext('2d');let drawn={sig:null};
+function emptyCell(x,y,near){
+  hexPath(x,y,CELL(),lctx);if(near){lctx.fillStyle='#14203a';lctx.fill()}
+  lctx.strokeStyle='rgba(148,163,184,'+(near?.13:.05)+')';lctx.stroke();
+}
+function clearCell(x,y){lctx.save();hexPath(x,y,CELL()+.6,lctx);lctx.clip();lctx.clearRect(x-cam.size,y-cam.size,2*cam.size,2*cam.size);lctx.restore()}
+function paintLayer(w,h,ratio,stones,occupied,legal,settled){
+  const sig=[w,h,ratio,cam.x,cam.y,cam.size].join('|'),size=cam.size,seen=(x,y)=>x>-size&&x<w+size&&y>-size&&y<h+size;
+  const grows=drawn.sig===sig&&drawn.stones.length<=stones.length&&drawn.stones.every((k,i)=>k===key(...stones[i]))&&[...drawn.settled].every(i=>settled.has(i));
+  lctx.setTransform(ratio,0,0,ratio,0,0);lctx.lineWidth=1;
+  if(!grows){
+    if(layer.width!==canvas.width||layer.height!==canvas.height){layer.width=canvas.width;layer.height=canvas.height}
+    lctx.setTransform(ratio,0,0,ratio,0,0);lctx.lineWidth=1;lctx.clearRect(0,0,w,h);
+    const corners=[[0,0],[w,0],[0,h],[w,h]].map(([x,y])=>axial(x,y)),qs=corners.map(c=>c[0]),rs=corners.map(c=>c[1]);
+    for(let q=Math.min(...qs)-3;q<=Math.max(...qs)+3;q++)for(let r=Math.min(...rs)-2;r<=Math.max(...rs)+2;r++){
+      const[x,y]=screen(q,r),k=key(q,r);if(seen(x,y)&&!occupied.has(k))emptyCell(x,y,legal.has(k))}
+    drawn={sig,stones:[],settled:new Set(),legal};
+  }else{
+    for(const[q,r]of stones.slice(drawn.stones.length)){
+      const[x,y]=screen(q,r);if(seen(x,y))clearCell(x,y);
+      for(let dq=-8;dq<=8;dq++)for(let dr=Math.max(-8,-dq-8);dr<=Math.min(8,-dq+8);dr++){
+        const k=key(q+dq,r+dr);if(drawn.legal.has(k)||occupied.has(k))continue;
+        const[cx,cy]=screen(q+dq,r+dr);if(seen(cx,cy)){clearCell(cx,cy);emptyCell(cx,cy,true)}}
+    }
+    drawn.legal=legal;
+  }
+  drawn.stones=stones.map(p=>key(...p));
+  for(const i of settled)if(!drawn.settled.has(i)){const[x,y]=screen(...stones[i]);if(seen(x,y))stone(x,y,CELL(),COLORS[playerAt(i)],lctx);drawn.settled.add(i)}
+}
 function paint(){
   if(!S)return;
   const ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;
   if(canvas.width!==Math.round(w*ratio)||canvas.height!==Math.round(h*ratio)){canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio)}
-  ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);
-  const stones=S.history.slice(0,view),occupied=new Map(stones.map((s,i)=>[key(...s),playerAt(i)])),legal=legalSet(stones);
-  const size=cam.size,corners=[[0,0],[w,0],[0,h],[w,h]].map(([x,y])=>axial(x,y)),qs=corners.map(c=>c[0]),rs=corners.map(c=>c[1]);
-  ctx.lineWidth=1;
-  for(let q=Math.min(...qs)-3;q<=Math.max(...qs)+3;q++)for(let r=Math.min(...rs)-2;r<=Math.max(...rs)+2;r++){
-    const[x,y]=screen(q,r);if(x<-size||x>w+size||y<-size||y>h+size)continue;
-    const k=key(q,r);if(occupied.has(k))continue;
-    hexPath(x,y,CELL());
-    if(legal.has(k)){ctx.fillStyle='#14203a';ctx.fill()}
-    ctx.strokeStyle='rgba(148,163,184,'+(legal.has(k)?.13:.05)+')';ctx.stroke();
-  }
+  const stones=shownStones(),occupied=new Map(stones.map((s,i)=>[key(...s),playerAt(i)])),legal=legalSet(stones);
   const now=performance.now();let moving=false;
   const win=S.winner>=0&&view===S.history.length?new Set(sixLine(stones).map(s=>key(...s))):new Set();
+  const settled=new Set(stones.keys());
+  stones.forEach((p,i)=>{const k=key(...p);if(i>=stones.length-2||win.has(k)||MOTION&&landed.has(k))settled.delete(i)});
+  paintLayer(w,h,ratio,stones,occupied,legal,settled);
+  ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(layer,0,0);
+  ctx.setTransform(ratio,0,0,ratio,0,0);
   stones.forEach(([q,r],i)=>{
+    if(settled.has(i))return;
     const[x,y]=screen(q,r),k=key(q,r),t0=landed.get(k),recent=i>=stones.length-2;let s=CELL(),a=1;
-    if(MOTION&&t0!==undefined){const t=(now-t0)/260;if(t<0){a=0}else if(t<1){const e=1-Math.pow(1-t,3);s*=.55+.45*e;a=e;moving=true}else landed.delete(k)}
+    if(MOTION&&t0!==undefined){const t=(now-t0)/260;if(t<0){a=0;moving=true}else if(t<1){const e=1-Math.pow(1-t,3);s*=.55+.45*e;a=e;moving=true}else landed.delete(k)}
     if(!a)return;ctx.globalAlpha=a;
     if(win.has(k)||recent){ctx.shadowColor=COLORS[playerAt(i)];ctx.shadowBlur=win.has(k)?18:14}
     stone(x,y,s,COLORS[playerAt(i)]);ctx.shadowBlur=0;
@@ -538,7 +572,7 @@ function paint(){
     ctx.globalAlpha=1;
   });
   if(hover&&canPlace()&&legal.has(key(...hover))&&!occupied.has(key(...hover))){const[x,y]=screen(...hover);
-    ctx.globalAlpha=.4;stone(x,y,CELL(),COLORS[S.player]);ctx.globalAlpha=1}
+    ctx.globalAlpha=.4;stone(x,y,CELL(),COLORS[playerAt(stones.length)]);ctx.globalAlpha=1}
   marks=collectMarks();drawMarks();
   if(moving)draw();
 }
@@ -612,13 +646,20 @@ function drawMarks(){
 }
 
 /* interaction */
-function canPlace(){return S&&view===S.history.length&&S.winner<0&&S.seats[S.player].engine==='human'}
+function canPlace(){return S&&view===S.history.length&&S.winner<0&&S.seats[S.player].engine==='human'&&placing.length<S.remaining}
+/* a person's stone is drawn at once and sent in order; the server's answer confirms it, a refusal takes it back */
+let sending=Promise.resolve();
+function place(q,r){
+  const k=key(q,r),stones=shownStones();if(!legalSet(stones).has(k)||stones.some(p=>key(...p)===k))return;
+  placing.push([q,r]);placed.add(k);landed.set(k,performance.now());draw();
+  sending=sending.then(async()=>{const done=await post('/play',{q,r});placing=placing.filter(p=>key(...p)!==k);if(!done){placed.delete(k);landed.delete(k)}draw()});
+}
 canvas.onpointerdown=e=>{drag={x:e.clientX,y:e.clientY,cx:cam.x,cy:cam.y,moved:false};canvas.setPointerCapture(e.pointerId)};
 canvas.onpointermove=e=>{const b=canvas.getBoundingClientRect();hover=axial(e.clientX-b.left,e.clientY-b.top);markTokens(key(...hover));
   if(drag){const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(Math.abs(dx)+Math.abs(dy)>5)drag.moved=true;if(drag.moved){cam.x=drag.cx+dx;cam.y=drag.cy+dy}}draw()};
 canvas.onpointerleave=()=>{hover=null;markTokens(null);draw()};
 canvas.onpointerup=e=>{if(!drag)return;const moved=drag.moved;drag=null;if(moved)return;const b=canvas.getBoundingClientRect();
-  const[q,r]=axial(e.clientX-b.left,e.clientY-b.top);if(canPlace())post('/play',{q,r})};
+  const[q,r]=axial(e.clientX-b.left,e.clientY-b.top);if(canPlace())place(q,r)};
 canvas.onwheel=e=>{e.preventDefault();const b=canvas.getBoundingClientRect(),mx=e.clientX-b.left-canvas.clientWidth/2,my=e.clientY-b.top-canvas.clientHeight/2;
   const f=e.deltaY>0?.9:1.1,size=Math.max(8,Math.min(64,cam.size*f)),k=size/cam.size;cam.x=mx-(mx-cam.x)*k;cam.y=my-(my-cam.y)*k;cam.size=size;draw()};
 function go(p){if(!S)return;view=Math.max(0,Math.min(S.history.length,p));renderPanels();draw()}
