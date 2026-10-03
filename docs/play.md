@@ -199,14 +199,17 @@ server, so the page names the sides people play (`people`) when it asks for a ne
 Until the switch or its set is changed in this browser session, each seat change sets the book from who plays
 the seats: off when both are Human, on otherwise (a seat a browser engine plays is an engine).
 
-| Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms | Six protocol nodes | Strix simulations |
+| Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms | Six positions | Strix simulations |
 |---|---|---|---|---|---|
-| Lightning | 8 | 2,048 | 100 and 50 | 1,500 | 2 |
-| Quick | 32 | 2,048 | 250 and 100 | 6,000 | 8 |
-| Standard | 128 | 32,768 | 1,000 and 500 | 30,000 | 64 |
-| Strong | 512 | 131,072 | 3,000 and 2,000 | 135,000 | 128 |
-| Deep | 2,048 | 524,288 | 10,000 and 8,000 | 500,000 | 512 |
-| Dangerous | 65,536 | 4,000,000 | 60,000 and 30,000 | 2,000,000 | 4,096 |
+| Lightning | 8 | 2,048 | 100 | 240 | 2 |
+| Quick | 32 | 2,048 | 250 | 960 | 8 |
+| Standard | 128 | 32,768 | 1,000 | 3,840 | 64 |
+| Strong | 512 | 131,072 | 3,000 | 15,360 | 128 |
+| Deep | 2,048 | 524,288 | 10,000 | 61,440 | 512 |
+| Dangerous | 65,536 | 4,000,000 | 60,000 | 2,000,000 | 4,096 |
+
+Six's ladder is 30 positions per Bubble simulation, the ratio of the 170-game Bubble-versus-Six tournament, where the
+two sides took about the same time per turn at every tier.
 
 On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at Quick to Deep;
 Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows a progress line (a moving one when
