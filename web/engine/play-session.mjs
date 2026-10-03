@@ -4,9 +4,11 @@ import {PlayStorage} from './storage.mjs';
 import {OpeningBook} from './openings.mjs';
 import {readGame, exportGame, htttx} from './notation.mjs';
 import {clockSpec, turnTime} from './clock.mjs';
+import {Proofs, proven} from './proof.mjs';
 
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 const copy = value => structuredClone(value), position = history => history.map(p => p.join(',')).join(';');
+const stones = text => text ? text.split(';').map(p => p.split(',').map(Number)) : [];
 const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human'});
 /** The longest delay setTimeout keeps; a longer clock is checked again when it fires. */
 const MAX_TIMER = 2 ** 31 - 1;
@@ -68,6 +70,7 @@ export class BrowserSession extends OfflineSession {
     this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
     this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()];
+    this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
    * move's clock starts after it) and `adapter.turn(history, budget, options)` plays. */
@@ -107,16 +110,34 @@ export class BrowserSession extends OfflineSession {
   }
   /** The evaluations shown per ply and the review of the game, recomputed only after the game or the saved
    * evaluations change. */
+  /** Indexes into the game's proof table (`proofs`, proof.mjs Proofs) every saved evaluation of a position of the game
+   * that holds a proof, and the game's own records. */
+  extendProofs() {
+    for (const record of this.records) this.proofs.add(stones(record.position), record, `${record.id}|${record.saved_at}`);
+    for (let ply = 0; ply <= this.history.length; ply++) {
+      for (const id of this.provenRecords.get(position(this.history.slice(0, ply))) || []) {
+        const record = this.cache.get(id);
+        if (record) this.proofs.add(this.history.slice(0, ply), record, `${record.id}|${record.saved_at}`);
+      }
+    }
+  }
+  /** `record` (or null) at `history`, `played` the game's next stone, with what the game's proof table proves there
+   * (proof.mjs proven). */
+  withProofs(history, record, played = null) {
+    return proven(this.proofs, history, record, this.native.game(history).remaining, played);
+  }
   study(winner) {
     const sig = `${this.revision}|${this.evaluationsVersion}|${this.records.length}`;
     if (this.studied?.sig === sig) return this.studied;
     const positions = [''], evaluations = {}, engine = this.analysis && this.engineKey(this.analysis), spec = this.reviewSpec();
     for (const [q, r] of this.history) positions.push(positions.length > 1 ? `${positions.at(-1)};${q},${r}` : `${q},${r}`);
+    this.extendProofs();
     positions.forEach((at, ply) => {
-      const record = this.lookupAt(at) || this.records.findLast(r => r.position === at && (!engine || r.engine_key === engine));
+      const found = this.lookupAt(at) || this.records.findLast(r => r.position === at && (!engine || r.engine_key === engine));
+      const record = this.withProofs(this.history.slice(0, ply), found || null, this.history[ply] ?? null);
       if (record) evaluations[ply] = record;
     });
-    const turns = review(this.history, (h, ply) => this.lookupAt(ply === undefined ? position(h) : positions[ply], spec, true), winner);
+    const turns = review(this.history, (h, ply) => this.withProofs(h, this.lookupAt(ply === undefined ? position(h) : positions[ply], spec, true)), winner);
     return this.studied = {sig, evaluations, review: turns};
   }
   state() {
@@ -184,7 +205,7 @@ export class BrowserSession extends OfflineSession {
   }
   async restore() {
     const [saved, coverage, evaluations] = await Promise.all([this.storage.get('sessions', this.id), this.storage.get('coverage', 'book'), this.storage.all('evaluations')]);
-    this.cache.clear(); this.index.clear();
+    this.cache.clear(); this.index.clear(); this.provenRecords.clear(); this.proofs = new Proofs();
     for (const r of evaluations) this.indexRecord(r);
     this.coverage = coverage?.counts || {};
     this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false; this.renewLines();
@@ -208,7 +229,7 @@ export class BrowserSession extends OfflineSession {
   }
   editable() { if (this.conflicted) throw Error(this.storageError); if (this.match?.active) throw Error('Stop the match before changing its players or position'); }
   load(history, paused = false, opening = null) {
-    this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.paused = paused; this.saved_game = null; this.renewLines();
+    this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.proofs = new Proofs(); this.paused = paused; this.saved_game = null; this.renewLines();
     this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
     this.book.opening = copy(opening); this.freshClock();
   }
@@ -322,13 +343,17 @@ export class BrowserSession extends OfflineSession {
   /** Saves the evaluation `result` of `history` by `spec`. One whose solver could not run (`solver_error`) is kept for
    * this visit only and raises the session's `notice`, so a later visit evaluates the position again with proofs. A
    * `kept` one (a seat's move on its game tree, or one cut short by a clock) is shown but never reused as a fresh
+   * evaluation. A saved evaluation holding a proof is kept over an unproven result of the same id. Resolves to the saved
    * evaluation. */
   async record(history, spec, result, kept = false) {
-    const record = {...result, id: this.cacheKey(history, spec) + (kept ? '|kept' : ''), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
+    const id = this.cacheKey(history, spec) + (kept ? '|kept' : ''), saved = this.cache.get(id);
+    const record = saved?.proof && !result.proof ? saved : {...result, id, position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
-    this.indexRecord(record);
-    if (result.solver_error) this.notice = `The solver could not run in this browser (${result.solver_error}), so evaluations have no proofs`;
-    else await this.storage.put('evaluations', record);
+    if (record !== saved) {
+      this.indexRecord(record); this.proofs.add(history, record, `${record.id}|${record.saved_at}`);
+      if (result.solver_error) this.notice = `The solver could not run in this browser (${result.solver_error}), so evaluations have no proofs`;
+      else await this.storage.put('evaluations', record);
+    }
     if (position(this.history.slice(0, history.length)) === position(history)) {
       this.records = this.records.filter(r => r.id !== record.id); this.records.push(record);
     }
@@ -337,6 +362,10 @@ export class BrowserSession extends OfflineSession {
   indexRecord(record) {
     this.evaluationsVersion++;
     this.cache.set(record.id, record);
+    if (record.proof) {
+      if (!this.provenRecords.has(record.position)) this.provenRecords.set(record.position, new Set());
+      this.provenRecords.get(record.position).add(record.id);
+    }
     const key = `${record.engine_key}|${record.position}`, values = (this.index.get(key) || []).filter(r => r.id !== record.id);
     values.push(record); this.index.set(key, values);
   }
@@ -456,6 +485,7 @@ export class BrowserSession extends OfflineSession {
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
       try {
         result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
+          known: job.kind === 'move' ? null : (this.extendProofs(), this.proofs.list()),
           progress: (f, live) => { job.done = job.kind === 'review' ? job.cursor + f : f; if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);

@@ -1,5 +1,6 @@
-/* Rows of a browser analysis record: the candidate rows (python/play.py top_rows) and the principal variation of a
- * verified solver certificate (python/play.py principal_variation). */
+/* Rows of a browser analysis record: the candidate rows (python/play.py top_rows), the principal variation of a
+ * verified solver certificate (python/play.py principal_variation) and the game's table of proven positions
+ * (python/play.py Proofs). */
 
 /** Most attacker turns on any path of `certificate` from each node, the completing turn included. */
 function depths(certificate) {
@@ -76,4 +77,168 @@ export function topRows(actions, policy, values, lead) {
   const order = Array.from(policy, (p, i) => i).filter(i => i !== first && (policy[i] >= .00005 || rank(i) === 0))
     .sort((a, b) => rank(a) - rank(b) || policy[b] - policy[a]);
   return (first >= 0 ? [first, ...order] : order).slice(0, 5).map(i => moveRow(actions[i], policy[i], values?.[i]));
+}
+
+const sideAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
+const shifted = (pv, by) => pv.map(([q, r, side, ply]) => [q, r, side, ply + by]);
+
+/** The winner's turns in a proof `plies` placements long from a position whose mover has `remaining` stones left
+ * (python/play.py proof_turns). */
+export function proofTurns(plies, remaining, moverWins) {
+  if (moverWins) return plies <= remaining ? 1 : 1 + Math.ceil((plies - remaining) / 4);
+  return Math.ceil((plies - remaining) / 4);
+}
+
+/** `history`'s position whatever the order of its stones (python/play.py proof_key). */
+export function proofKey(history) {
+  const sides = [[], []];
+  history.forEach(([q, r], i) => sides[sideAt(i)].push([q, r]));
+  return sides.map(side => side.sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(p => p.join(',')).join(' ')).join(' / ');
+}
+
+/**
+ * The proven positions of a game (python/play.py Proofs): {winner, plies, pv} by `proofKey`, the winner completing six
+ * within `plies` placements against any defence along the known line `pv` ([q, r, player, ply], ply from 1). `add`
+ * indexes a saved evaluation holding a proof with the positions along its line; `list()` is the table as plain data
+ * and `new Proofs(list)` rebuilds it, so a worker gets the session's table with each turn request.
+ */
+export class Proofs {
+  constructor(list = []) {
+    this.entries = new Map();
+    this.sizes = new Map();
+    this.seen = new Set();
+    for (const {history, winner, plies, pv} of list) this.put(history, winner, plies, pv);
+  }
+  list() {
+    return [...this.entries.values()].map(({history, winner, plies, pv}) => ({history, winner, plies, pv}));
+  }
+  /** Index `record` (the fields of a turn) at `history` when it holds a proof; `id` skips a record already indexed. A
+   * proof without `plies` takes the bound its `turns` give (python/play.py proof_plies). */
+  add(history, record, id = null) {
+    const proof = record?.proof;
+    if (!proof || id !== null && this.seen.has(id)) return;
+    if (id !== null) this.seen.add(id);
+    const current = history.map(([q, r]) => [q, r]), pv = record.pv || [];
+    const remaining = current.length % 2 ? 2 : 1, mover = sideAt(current.length);
+    const plies = proof.plies || remaining + (proof.winner === mover ? 0 : 2) + 4 * (proof.turns - 1);
+    this.put(current, proof.winner, plies, pv);
+    for (let i = 0; i < pv.length; i++) {
+      const [q, r, side, ply] = pv[i];
+      if (pv[i].length !== 4 || ply !== i + 1 || side !== sideAt(current.length) || ply >= plies) break;
+      current.push([q, r]);
+      this.put(current, proof.winner, plies - ply, shifted(pv.slice(i + 1), -ply));
+    }
+  }
+  put(history, winner, plies, pv) {
+    const key = proofKey(history), old = this.entries.get(key), witnessed = line => line.length > 0 && line.every(stone => stone.length === 4);
+    if (old && !(old.winner === winner && (plies < old.plies || plies === old.plies && witnessed(pv) && !witnessed(old.pv)))) return;
+    const stones = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));
+    this.entries.set(key, {history: history.map(([q, r]) => [q, r]), winner, plies, pv, stones});
+    if (!this.sizes.has(history.length)) this.sizes.set(history.length, new Set());
+    this.sizes.get(history.length).add(key);
+  }
+  /** Map 'q,r' -> {action, winner, distance, outcome} for each stone from `history` whose position is proven: in the
+   * table, or because one more stone by that position's mover reaches a position the mover wins. `distance` counts
+   * the stone itself; `outcome` is the position's {winner, plies, pv}. */
+  edges(history) {
+    const size = history.length, base = history.map(([q, r], i) => `${q},${r},${sideAt(i)}`), own = new Set(base), found = new Map();
+    for (const extra of [1, 2]) for (const key of this.sizes.get(size + extra) || []) {
+      const entry = this.entries.get(key);
+      if (!base.every(stone => entry.stones.has(stone))) continue;
+      const stones = [...entry.stones].filter(stone => !own.has(stone)).map(stone => stone.split(',').map(Number));
+      for (const [first, second] of extra === 1 ? [[stones[0], null]] : [stones, [stones[1], stones[0]]]) {
+        if (first[2] !== sideAt(size)) continue;
+        let outcome;
+        if (!second) outcome = {winner: entry.winner, plies: entry.plies, pv: entry.pv};
+        else if (second[2] === sideAt(size + 1) && entry.winner === second[2]) {
+          outcome = {winner: entry.winner, plies: entry.plies + 1, pv: [[second[0], second[1], entry.winner, 1], ...shifted(entry.pv, 1)]};
+        } else continue;
+        const action = `${first[0]},${first[1]}`, old = found.get(action);
+        if (!old || old.outcome.plies > outcome.plies) found.set(action, {action: [first[0], first[1]], winner: outcome.winner, distance: outcome.plies + 1, outcome});
+      }
+    }
+    return found;
+  }
+  /** The outcome of `history` ({winner, plies, pv}) from its own entry, else the shortest win of the side to move
+   * through `edges`, its line led by that stone; null when nothing is known. */
+  known(history) {
+    const own = this.entries.get(proofKey(history));
+    if (own) return {winner: own.winner, plies: own.plies, pv: own.pv};
+    const mover = sideAt(history.length);
+    const wins = [...this.edges(history).values()].filter(e => e.winner === mover)
+      .sort((a, b) => a.distance - b.distance || a.action[0] - b.action[0] || a.action[1] - b.action[1]);
+    if (!wins.length) return null;
+    const {action, distance, outcome} = wins[0];
+    return {winner: mover, plies: distance, pv: [[...action, mover, 1], ...shifted(outcome.pv, 1)]};
+  }
+}
+
+/** The turn the table `known` gives at `history` without a search (python/play.py answered): when it proves a win for
+ * the side to move whose line holds the rest of the turn, its stones, value 1, the winning stone as the only top row,
+ * the proof and the line; else null. */
+export function answered(native, history, known) {
+  const outcome = known?.known(history), {player, remaining} = native.game(history);
+  if (!outcome || outcome.winner !== player) return null;
+  const moves = [];
+  for (const stone of outcome.pv.slice(0, remaining)) {
+    if (stone.length !== 4 || stone[2] !== player || stone[3] !== moves.length + 1) break;
+    moves.push([stone[0], stone[1]]);
+  }
+  if (!moves.length || moves.length < remaining && native.game([...history, ...moves]).winner !== player) return null;
+  return {moves, value: 1, top: [[...moves[0], 1, 1, 1]], proof: {winner: player, turns: proofTurns(outcome.plies, remaining, true), plies: outcome.plies},
+    pv: outcome.pv, threat: [], solved: true, actual_completed: 0, actual_solver_nodes: 0};
+}
+
+/** A search `result` (search.mjs NeuralSearch.result) of the side `mover` with the stones `edges` (Proofs.edges)
+ * proves settled: their values become 1 or -1, a proven win is the choice (the shortest) and proves the position, a
+ * proven loss leaves the policy and the choice while a stone remains that is not proven lost, and when every stone is
+ * proven lost the position is lost and the choice is the loss that lasts longest. */
+export function settled(result, edges, mover) {
+  if (!edges.size) return result;
+  const values = [...result.values], policy = [...result.policy];
+  let win = null;
+  result.actions.forEach(([q, r], i) => {
+    const edge = edges.get(`${q},${r}`);
+    if (!edge) return;
+    values[i] = edge.winner === mover ? 1 : -1;
+    if (edge.winner !== mover) policy[i] = 0;
+    else if (!win || edge.distance < win.distance) win = edge;
+  });
+  if (win) return {...result, values, action: win.action, proven: 1, exact_winner: mover, proof_plies: win.distance};
+  const total = policy.reduce((a, b) => a + b, 0);
+  if (!total && result.actions.every(([q, r]) => edges.has(`${q},${r}`))) {
+    const longest = result.actions.map(([q, r]) => edges.get(`${q},${r}`)).reduce((a, b) => b.distance > a.distance ? b : a);
+    return {...result, values, policy, action: longest.action, proven: -1, exact_winner: 1 - mover, proof_plies: longest.distance};
+  }
+  if (!total) return {...result, values};
+  const shares = policy.map(p => p / total), lost = edges.get(result.action?.join(','));
+  return {...result, values, policy: shares, action: lost ? result.actions[shares.indexOf(Math.max(...shares))] : result.action};
+}
+
+/** `found` (an evaluation, or null) with what the table `known` proves of `history` (python/play.py Session.proven):
+ * without its own proof, the position's proof, value and line; each stone to a proven position as a top row marked
+ * won or lost, proven wins first, the shortest leading and among equals the stone `played` next in the game, losses
+ * last. A proven position without an evaluation gets one with no simulations; null when there is neither. `remaining`
+ * is the mover's stones left in the turn. */
+export function proven(known, history, found, remaining, played = null) {
+  const outcome = known.known(history), edges = known.edges(history);
+  if (!found && !outcome) return null;
+  const mover = sideAt(history.length), shown = {...(found || {moves: [], top: [], threat: [], simulations: 0, solver_nodes: 0})};
+  if (outcome && !shown.proof) {
+    const won = outcome.winner === mover;
+    Object.assign(shown, {value: won ? 1 : 0, pv: outcome.pv,
+      proof: {winner: outcome.winner, turns: proofTurns(outcome.plies, remaining, won), plies: outcome.plies}});
+    if (!found && won) shown.moves = outcome.pv.slice(0, remaining).filter((p, i) => p[2] === mover && p[3] === i + 1).map(p => [p[0], p[1]]);
+  }
+  const rows = (shown.top || []).map(row => [...row]);
+  for (const {action, winner} of edges.values()) {
+    let row = rows.find(r => r[0] === action[0] && r[1] === action[1]);
+    if (!row && winner === mover) rows.push(row = [...action, 0]);
+    if (row) row.splice(3, 2, winner === mover ? 1 : 0, winner === mover ? 1 : -1);
+  }
+  const flag = row => row[4] ?? 0, distance = row => flag(row) > 0 ? edges.get(`${row[0]},${row[1]}`)?.distance ?? Infinity : 0;
+  const other = row => flag(row) > 0 && played !== null && (row[0] !== played[0] || row[1] !== played[1]) ? 1 : 0;
+  shown.top = rows.map((row, i) => [row, i]).sort(([a, i], [b, j]) => (1 - flag(a)) - (1 - flag(b)) || distance(a) - distance(b) || other(a) - other(b) || i - j)
+    .map(([row]) => row).slice(0, 5);
+  return shown;
 }

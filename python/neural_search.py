@@ -167,6 +167,30 @@ class NeuralSearch:
             game.close()
         return True
 
+    def expand(self):
+        """Evaluate the root (through the cache) when it has no edges yet and the game goes on, so `mark` can
+        settle its edges before a search."""
+        if native.hxg_stats(self.ptr, None, None, None, None):
+            return
+        checked(native.hxg_begin(self.ptr, 1, 1))
+        try:
+            request, history = self.request()
+            if request > 0:
+                key = self.cache.key(history, self.model_version)
+                prediction = self.cache.get(key)
+                if prediction is None:
+                    prediction = {k: np.asarray(v).copy() for k, v in self.evaluator.evaluate([history])[0].items()
+                                  if k in ('actions', 'logits', 'q')}
+                    self.cache.put(key, prediction)
+                self.fulfill(request, prediction)
+        finally:
+            native.hxg_cancel(self.ptr)
+
+    def mark(self, action, winner, distance):
+        """Settle the expanded root's edge `action` as won by `winner` within `distance` placements, the stone
+        itself included (hxg_mark_exact); ValueError when `action` is not a root edge."""
+        checked(native.hxg_mark_exact(self.ptr, int(action[0]), int(action[1]), int(winner), int(distance)))
+
     def census(self):
         """{nodes, expanded, exact, duplicates} reachable from the root (native hxg_census)."""
         out = np.zeros(4, np.int64)

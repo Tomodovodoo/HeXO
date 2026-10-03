@@ -59,13 +59,14 @@ export class BubbleEngine extends EngineWorker {
    * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor and
    * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Under a clock
    * `options.ms` is the turn's time and the budget a ceiling (see worker.mjs). `options.line`, a seat's game key,
-   * continues that game's search tree. Aborting `signal` cancels it (rejects with an AbortError).
+   * continues that game's search tree; `options.known` is the game's proof table (proof.mjs Proofs.list()) the turn
+   * may use. Aborting `signal` cancels it (rejects with an AbortError).
    */
   turn(history, budget, options = {}) {
     return this.call({type: 'turn', history, model: budget.checkpoint ? networkManifest(budget.checkpoint) : this.options.model,
       simulations: budget.simulations, solverNodes: budget.solver_nodes,
       batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
-      ms: options.ms ?? null, line: options.line ?? null}, options);
+      ms: options.ms ?? null, line: options.line ?? null, known: options.known ?? null}, options);
   }
 
   /** Loads network `checkpoint` (a NETWORKS name, the default when null), so a timed turn does not spend its clock on it. */

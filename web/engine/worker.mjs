@@ -1,5 +1,5 @@
 /* Bubble in a Web Worker: network (network.mjs), native search (gumbel.wasm) and the tactical solver (solver-worker.mjs).
- * In: {type: 'load', options} | {type: 'use', id, model} | {type: 'turn', id, history, model, simulations, solverNodes, batchSize, qRangeFloor, ms, line}
+ * In: {type: 'load', options} | {type: 'use', id, model} | {type: 'turn', id, history, model, simulations, solverNodes, batchSize, qRangeFloor, ms, line, known}
  *     | {type: 'cancel', id} | {type: 'bench', id, batches, sizes, repeats}
  *     | {type: 'search', id, history, simulations, batchSize, qRangeFloor}
  *     | {type: 'evaluate', id, histories}.
@@ -9,7 +9,7 @@
 import createModule from './gumbel.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameTrees} from './search.mjs';
 import {Network, probe} from './network.mjs';
-import {principalVariation, topRows} from './proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled, proofTurns} from './proof.mjs';
 
 const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 'defender counterwin',
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
@@ -80,11 +80,6 @@ const verified = r => r.status === 'PROVEN_WIN' && r.native_verified;
 const FAILED = 'solver worker failed';
 const searched = r => verified(r) || VERDICTS.has(r.reason);
 
-function proofTurns(plies, remaining, moverWins) {
-  if (moverWins) return plies <= remaining ? 1 : 1 + Math.ceil((plies - remaining) / 4);
-  return Math.ceil((plies - remaining) / 4);
-}
-
 /** The root of the first stone's running search as the analysis panel shows it: {value (the mover's win chance), top}. */
 function rootRows(tree, choice) {
   const {action, actions, policy, values} = tree.result(choice);
@@ -114,12 +109,16 @@ async function turn(request) {
 }
 
 /** The search of `turn`, with `line` (a seat's game, see GameTrees) continuing that game's tree as a play.py seat does;
- * without it the turn searches a tree of its own. */
-async function playTurn({id, history, model, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null}) {
+ * without it the turn searches a tree of its own. `known` (Proofs.list() of the game's table, or null) answers a
+ * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
+ * proof and line, and settles the proven stones of each search (proof.mjs settled). */
+async function playTurn({id, history, model, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null}) {
   await use(model, fraction => postMessage({type: 'progress', id, fraction}));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
+  const table = known ? new Proofs(known) : null, given = answered(native, history, table);
+  if (given) return {...given, ms: Math.round(performance.now() - start)};
   let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null;
   let failure = null;
   const note = r => { if (r.reason?.startsWith(FAILED)) failure = r.reason; return r; };
@@ -146,6 +145,11 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
         if (verified(theirs)) threat = theirs.moves.map(m => [...m]);
       }
     }
+    const outcome = proof === null ? table?.known(history) : null;
+    if (outcome && outcome.winner !== player) {
+      proof = {winner: outcome.winner, turns: proofTurns(outcome.plies, state.remaining, false), plies: outcome.plies};
+      pv = outcome.pv;
+    }
     const given = moves.length > 0, current = history.map(p => [...p]), searchStart = performance.now();
     for (let local = native.game(current); !given && local.player === player && local.winner < 0; local = native.game(current)) {
       let action, policy, actions, stoneValue, values = null;
@@ -163,10 +167,10 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
       if (simulations) {
         tree ??= line == null ? new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current})
           : games.tree(line, current, {seed: 1740, tactics: true, qRangeFloor});
-        const result = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
+        const result = settled(await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
           evaluate: leaves => network.evaluate(leaves), stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
           onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
-            ...(stone ? {} : {live: rootRows(tree, choice)})})});
+            ...(stone ? {} : {live: rootRows(tree, choice)})})}), table ? table.edges(current) : new Map(), local.player);
         check();
         completed += result.completed;
         if (result.action) {
@@ -188,7 +192,11 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
       tree?.advance(action);
     }
     if (proof) value = proof.winner === player ? 1 : 0;
-    if (proof && !pv.length) pv = moves.map(([q, r], i) => [q, r, player, i + 1]);
+    if (proof && !pv.length) {
+      const after = table?.known([...history, ...moves]);
+      pv = moves.map(([q, r], i) => [q, r, player, i + 1]);
+      if (after?.winner === proof.winner) pv.push(...after.pv.map(([q, r, side, ply]) => [q, r, side, ply + moves.length]));
+    }
     return {moves, value: Math.round(value * 1e4) / 1e4, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
       actual_completed: completed, actual_solver_nodes: solverUsed, ...(failure ? {solver_error: failure} : {})};
   } finally {

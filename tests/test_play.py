@@ -66,7 +66,7 @@ class FakeEngines:
     def __init__(self):
         self.calls, self.turns, self.lines, self.hold, self.release = [], [], [], False, threading.Event()
 
-    def evaluate(self, entry, checkpoint, budget, history, watch, live=None, keep=False, line=None):
+    def evaluate(self, entry, checkpoint, budget, history, watch, live=None, keep=False, line=None, known=None):
         self.calls.append((checkpoint, dict(budget), [tuple(p) for p in history]))
         self.lines.append(line)
         while self.hold and not self.release.is_set():
@@ -77,7 +77,7 @@ class FakeEngines:
         found = dict(moves=moves, value=.5, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1)
         return found, budget, f'{model_key(export_path(entry, checkpoint))}:none' + (':kept' if keep or line is not None else '')
 
-    def evaluate_many(self, entry, checkpoint, budget, histories, watch):
+    def evaluate_many(self, entry, checkpoint, budget, histories, watch, known=None):
         return [self.evaluate(entry, checkpoint, budget, history, watch) for history in histories]
 
     def solver_build(self):
@@ -557,7 +557,7 @@ class Jobs(unittest.TestCase):
                           and j['status'] == 'queued'])
 
     def test_a_preset_without_a_solver_verdict_is_not_deepened_again(self):
-        def unsolved(entry, checkpoint, budget, history, watch, live=None, keep=False, line=None):
+        def unsolved(entry, checkpoint, budget, history, watch, live=None, keep=False, line=None, known=None):
             found, spent, key = FakeEngines.evaluate(self.engines, entry, checkpoint, budget, history, watch, keep=keep,
                                                      line=line)
             return found, spent | dict(solver_nodes=0), key
@@ -1716,6 +1716,49 @@ class TurnTrees(unittest.TestCase):
         later = found['later'][0]
         self.assertEqual((later['proof']['winner'], later['value']), (1, 1.))
 
+    def test_a_proven_continuation_settles_its_edge_before_the_search(self):
+        from play import Proofs, evaluate
+        known = Proofs()
+        known.add([(0, 0), (1, 0)], dict(proof=dict(winner=1, turns=2, plies=5), pv=[]))
+        found = evaluate(self.bubble(), None, [(0, 0)], 16, 0, known=known)
+        self.assertEqual((found['moves'][0], found['proof']), ([1, 0], dict(winner=1, plies=6, turns=2)))
+        self.assertEqual((found['top'][0][:2], found['top'][0][3:], found['pv'][0]), ([1, 0], [1., 1], [1, 0, 1, 1]))
+        self.assertEqual(self.trees[0].searched[0][:2], ([(0, 0)], 0))
+
+    def test_a_lost_continuation_leaves_the_search(self):
+        from play import Proofs, TurnSearch, solve
+        known, bubble = Proofs(), self.bubble()
+        known.add([(0, 0), (1, 0)], dict(proof=dict(winner=0, turns=1, plies=3), pv=[]))
+        turn = TurnSearch(bubble, bubble.evaluator, [(0, 0)], 16, solve(None, [(0, 0)], 0), known=known)
+        try:
+            tree, simulations = turn.request()
+            result = tree.search(simulations, root_samples=16, batch_size=16)
+        finally:
+            turn.close()
+        lost = result['actions'].tolist().index([1, 0])
+        self.assertEqual((result['values'][lost], result['policy'][lost]), (-1., 0.))
+        self.assertNotEqual(result['action'], [1, 0])
+
+    def test_a_known_win_without_its_turn_is_not_claimed_for_another_turn(self):
+        from play import Proofs, evaluate
+        won, known = Proofs(), Proofs()
+        won.add([(0, 0)], dict(proof=dict(winner=1, turns=3), pv=[]))
+        self.assertEqual(evaluate(self.bubble(), None, [(0, 0)], 8, 0, known=won)['proof'], None)
+        known.add([(0, 0), (1, 0), (2, 0)], dict(proof=dict(winner=1, turns=2, plies=7), pv=[]))
+        lost = evaluate(self.bubble(), None, [(0, 0), (1, 0), (2, 0)], 8, 0, known=known)
+        self.assertEqual((lost['proof'], lost['value']), (dict(winner=1, turns=2, plies=7), 0.))
+
+    def test_two_stones_to_a_won_position_answer_without_a_search(self):
+        from play import Proofs, evaluate
+        known = Proofs()
+        known.add([(0, 0), (1, 0), (2, 0)], dict(proof=dict(winner=1, turns=1, plies=4), pv=[[3, 0, 0, 1], [-1, 0, 0, 2]]))
+        self.assertEqual(known.known([(0, 0)]), dict(winner=1, plies=6, pv=[[1, 0, 1, 1], [2, 0, 1, 2], [3, 0, 0, 3],
+                                                                             [-1, 0, 0, 4]]))
+        self.assertEqual(known.known([(0, 0), (1, 0), (2, 0), (3, 0)])['plies'], 3)
+        found = evaluate(self.bubble(), None, [(0, 0)], 16, 0, known=known)
+        self.assertEqual((found['moves'], found['value'], found['proof']), ([[1, 0], [2, 0]], 1., dict(winner=1, turns=2, plies=6)))
+        self.assertEqual(self.trees, [])
+
     def test_pooled_evaluations_match_single_ones(self):
         from play import evaluate, evaluate_many
         histories = [[(0, 0)], [(0, 0), (1, 0), (1, 1)], [(0, 0), (1, 0)]]
@@ -1780,6 +1823,82 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(top_rows(actions, policy, None, lead=[9, 9], won=True)[0], [9, 9, 0., 1., 1])
         self.assertEqual(len(top_rows(actions, policy, values, count=2, lead=[9, 9], won=True)), 2)
         self.assertEqual(len(top_rows(actions, policy, values, count=3, lead=[2, 0], won=True)), 3)
+
+
+class GameProofs(unittest.TestCase):
+    """A proof found at one position of the game is shown and used at the positions before it, with the solver."""
+
+    def setUp(self):
+        import hexnet
+        import tactical_proof
+        import torch
+        from tests.test_tactical_proof import LATE_WIN
+        if not tactical_proof.library().exists():
+            self.skipTest('needs the native tactical library')
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / 'ema.pt'
+        torch.manual_seed(0)
+        hexnet.save_model(path, hexnet.HexNet(hexnet.HexNetConfig(
+            blocks=1, channels=8, pool_every=1, line_length=5, value_hidden=8, head_channels=4)))
+        entry = dict(id='bubble:tiny', name='tiny', kind='bubble', presets=PRESETS['bubble'], checkpoints=[], path=path)
+        self.session = Session({'bubble:tiny': entry}, Engines('cpu'), Evaluations(), save_initial=False)
+        self.addCleanup(self.session.close)
+        self.session.configure_seat(1, 'human')
+        # Side 0 to move with a forced win in four turns; its winning turn starts at (-1, -11).
+        self.start = [tuple(p) for p in LATE_WIN]
+        self.session.load(self.start + [(-1, -11)], True)
+
+    def analyse(self, ply, solver_nodes, preset='custom', force=False):
+        self.session.configure_analysis('bubble:tiny', preset=preset, auto=False,
+                                        custom=dict(simulations=8, solver_nodes=solver_nodes))
+        self.session.analyse(ply, force)
+        wait(lambda: not self.session.state()['jobs'], 60)
+        return self.session.state()['evaluations'][ply]
+
+    def test_a_proof_carries_back_to_the_played_move_and_stays(self):
+        seven = self.analyse(80, 32768)
+        self.assertEqual(seven['proof'], dict(winner=0, turns=4, plies=13))
+        six = self.analyse(79, 0)
+        line = [[-1, -11, 0, 1]] + [[*p[:3], p[3] + 1] for p in seven['pv']]
+        self.assertEqual((six['proof'], six['value'], six['pv']), (dict(winner=0, turns=4, plies=14), 1., line))
+        self.assertEqual((six['top'][0][:2], six['top'][0][3:]), ([-1, -11], [1., 1]))
+        saved = self.session.lookup(self.start)
+        self.assertEqual(saved['proof']['plies'], 14)
+        budget = dict(simulations=saved['simulations'], solver_nodes=saved['solver_nodes'])
+        self.session.save(self.start, self.session.engine_key(self.session.analysis), budget,
+                          dict(moves=[], value=.5, top=[], proof=None, pv=[], threat=[]), 'tiny')
+        self.assertEqual(self.session.lookup(self.start)['proof']['plies'], 14)
+        self.session.undo()
+        self.assertEqual(len(self.session.history), 79)
+        self.assertEqual(self.session.state()['evaluations'][79]['proof']['plies'], 14)
+        self.assertEqual(self.analyse(79, 0, force=True)['proof']['plies'], 14)
+        self.assertEqual(self.analyse(79, 0, preset='lightning')['proof']['plies'], 14)
+
+    def test_a_reopened_game_keeps_the_proofs_of_positions_it_undid(self):
+        archive = tempfile.TemporaryDirectory()
+        self.addCleanup(archive.cleanup)
+        self.session.archive = Path(archive.name)
+        self.session.load(self.start + [(-1, -11)], True)
+        self.assertEqual(self.analyse(80, 32768)['proof']['plies'], 13)
+        self.session.undo()
+        self.session.save_freeplay()
+        ident = self.session.remember_match(self.session.freeplay_directory)
+        reopened = Session(dict(self.session.entries), FakeEngines(), Evaluations(), archive=archive.name, save_initial=False)
+        self.addCleanup(reopened.close)
+        study = reopened.open_saved_game(ident, 1)
+        self.addCleanup(study.close)
+        self.assertEqual(len(study.history), 79)
+        self.assertEqual(study.state()['evaluations'][79]['proof'], dict(winner=0, turns=4, plies=14))
+
+    def test_positions_inside_a_line_are_proven_after_a_reload(self):
+        seven = self.analyse(80, 32768)
+        line = [tuple(p[:2]) for p in seven['pv'][:3]]
+        self.session.load(self.start + [(-1, -11), *line], True)
+        inside = self.analyse(81, 0)
+        self.assertEqual((inside['proof']['winner'], inside['proof']['plies'], inside['value']), (0, 12, 0.))
+        self.assertEqual(self.session.state()['evaluations'][83]['proof'], dict(winner=0, turns=3, plies=10))
+        self.assertEqual(self.session.state()['evaluations'][79]['proof']['plies'], 14)
 
 
 class PrincipalVariation(unittest.TestCase):
