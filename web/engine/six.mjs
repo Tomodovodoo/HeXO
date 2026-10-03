@@ -9,9 +9,11 @@ export const PRESETS = {lightning: {nodes: 1500}, quick: {nodes: 6000}, standard
 const ID = 'browser:six', LABEL = 'Six (browser)', MANIFEST = 'six/networks/manifest.json';
 
 export class SixEngine extends EngineWorker {
-  /** `prefer` 'wasm' keeps the network off WebGPU; `threads` fixes ONNX Runtime's WebAssembly thread count. */
+  /** `prefer` 'wasm' keeps the network off WebGPU; `threads` fixes ONNX Runtime's WebAssembly thread count.
+   * `checkpoints` holds the manifest's network names, newest first, refreshed whenever files() reads it. */
   constructor({prefer = null, threads = null} = {}) {
     super(workerUrl('six-worker.mjs'), LABEL, {prefer, threads});
+    this.checkpoints = [];
   }
 
   /** Six's turn at `history` ([[q, r], ...]) within `budget.nodes` new positions, with network `budget.checkpoint` (a
@@ -21,28 +23,27 @@ export class SixEngine extends EngineWorker {
     return this.call({type: 'turn', history, nodes: budget.nodes, network: budget.checkpoint ?? null}, options);
   }
 
+  /** {data, local}: six/networks/manifest.json (assets.mjs json()), whose network names refresh `checkpoints`. */
+  async manifest() {
+    const found = await json(MANIFEST);
+    this.checkpoints.splice(0, Infinity, ...found.data.networks.map(n => n.name));
+    return found;
+  }
+
   /** The downloaded files (assets.mjs records) a first turn on this device reads: ONNX Runtime and the newest network. */
   async files() {
-    const [{provider}, {data, local}] = await Promise.all([probe(this.options.prefer), json(MANIFEST)]), [newest] = data.networks;
+    const [{provider}, {data, local}] = await Promise.all([probe(this.options.prefer), this.manifest()]), [newest] = data.networks;
     return [...await runtimeFiles(provider), {path: `six/networks/${newest.file}`, sha256: newest.sha256, bytes: newest.bytes, local}];
   }
 }
 
-/** The networks this site was built with (python tools/build_web.py six), newest first, from the site when this origin
- * has none; none when neither answers. */
-async function networks() {
-  try {
-    return (await json(MANIFEST)).data.networks.map(n => n.name);
-  } catch {
-    return [];
-  }
-}
+const engine = new SixEngine();
+await engine.manifest().catch(() => {});
 
-const checkpoints = await networks();
-
-/** Six (browser) for seat.mjs's ENGINES. */
+/** Six (browser) for seat.mjs's ENGINES; its checkpoints fill in once the manifest is read (python tools/build_web.py
+ * six builds it; the site's serves when this origin has none). */
 export const six = {
-  entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints, presets: PRESETS, analysis: true},
-  engine: new SixEngine(),
+  entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, analysis: true},
+  engine,
   record: (result, history, preset) => ({...result, engine: ID}),
 };

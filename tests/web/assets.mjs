@@ -137,4 +137,8 @@ for (const [id, engine] of Object.entries(engines)) {
 const late = new (await import('../../web/engine/strix.mjs')).StrixEngine([]);
 out.strix_retry = {files: (await late.files()).map(f => f.path), checkpoints: late.checkpoints};
 
+const sixLate = new (await import('../../web/engine/six.mjs')).SixEngine();
+await sixLate.files();
+out.six_retry = sixLate.checkpoints;
+
 process.stdout.write(JSON.stringify(out));

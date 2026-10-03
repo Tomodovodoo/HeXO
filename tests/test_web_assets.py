@@ -82,6 +82,10 @@ class Resolver(unittest.TestCase):
         self.assertEqual(self.out['strix_retry'], {'files': ['strix/strix.wasm', 'strix/net.safetensors'], 'checkpoints': ['net']})
 
 
+    def test_six_fills_its_checkpoints_when_it_reads_the_manifest(self):
+        self.assertEqual(self.out['six_retry'], ['gen-2'])
+
+
 class Loaders(unittest.TestCase):
     def test_engine_loaders_fetch_through_assets(self):
         for name in LOADERS:
