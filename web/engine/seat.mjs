@@ -288,14 +288,14 @@ function openMenu(anchor, items, current, choose) {
   });
 }
 
-/** Checks the saved choices and the static page's session choices for engine `entry` against its loaded network list:
- * a network the list no longer has becomes its newest. Then redraws. */
+/** Checks the saved choices and the static page's session choices (seats, analysis, a stored match's players) for
+ * engine `entry` against its loaded network list: a network the list no longer has becomes its newest. Then redraws. */
 function recheck(entry) {
   const fix = choice => choice?.engine === entry.id ? pickEngine(entry.id, choice, choice.checkpoint) : choice;
   config = {seats: config.seats.map(fix), analysis: fix(config.analysis)};
   save();
-  const session = page.browserPlay, stale = session && [...session.seats, session.analysis].filter(c => c?.engine === entry.id
-    && c.checkpoint && entry.checkpoints.length && !entry.checkpoints.includes(c.checkpoint));
+  const session = page.browserPlay, choices = session && [...session.seats, session.analysis, ...session.match?.players ?? []];
+  const stale = choices?.filter(c => c?.engine === entry.id && c.checkpoint && entry.checkpoints.length && !entry.checkpoints.includes(c.checkpoint));
   if (stale?.length) {
     for (const choice of stale) choice.checkpoint = entry.checkpoints[0];
     session.persist();
