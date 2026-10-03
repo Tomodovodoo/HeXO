@@ -1073,7 +1073,7 @@ class Engines:
     def __init__(self, device, tactical_package=None, seal=None):
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
         self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
-        self.helpers, self.kept, self.graphs = [], None, OrderedDict()
+        self.helpers, self.kept, self.graphs, self.graph_ids = [], None, OrderedDict(), itertools.count(1)
         self.external = {}
         self.children = {}
         self.last_turn = {}
@@ -1115,15 +1115,17 @@ class Engines:
         the simulations the root lacks, and a proof the solver found for the position is reused. `refresh`, a saved
         evaluation of `history`, searches the game graph again with the PV_CHECK share of the simulations a stone
         and that evaluation's solver findings, and keeps its key and budget. A seat's evaluation or a tier's has a
-        key ending in `:kept`, so continued evaluations are never mistaken for fresh ones."""
+        key ending in `:kept`, so continued evaluations are never mistaken for fresh ones. An evaluation searched on
+        a game graph carries `graph_id`, the number `game_graph` gave that graph."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
         solver, build = self.solver() if budget['solver_nodes'] and refresh is None else (None, 'none')
         spent = budget if solver or refresh is not None else budget | dict(solver_nodes=0)
         trees = solved = None
-        floor = entry.get('q_range_floor', 0.)
+        floor, used = entry.get('q_range_floor', 0.), []
         if refresh is not None:
             build = self.solver_build() if budget['solver_nodes'] else 'none'
-            trees = self.game_graph(bubble, game, build, floor, max(1, round(PV_CHECK * budget['simulations'])))
+            share = max(1, round(PV_CHECK * budget['simulations']))
+            trees = self.game_graph(bubble, game, build, floor, share, used=used)
             solved = dict(moves=[], pv=[], proof=None, threat=refresh.get('threat') or [], solved=True, used=0)
         elif line is not None or game is not None:
             if keep and answered(history, known) is None:
@@ -1132,20 +1134,23 @@ class Engines:
                 if not (self.kept[1] and self.kept[1]['proof']):
                     self.kept = self.kept[0], solve(solver, history, spent['solver_nodes'], watch)
                 solved = self.kept[1]
-            trees = self.game_graph(bubble, game if line is None else ('seat', line), build, floor, keep=keep)
+            trees = self.game_graph(bubble, game if line is None else ('seat', line), build, floor, keep=keep, used=used)
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
                          solved, floor, known, pv_check=PV_CHECK if trees else 0.)
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
+        if used:
+            found['graph_id'] = used[-1]
         weights = search_key(bubble.sha256[:16], entry)
         kept = ':kept' if keep or line is not None else ''
         return found, spent, f"{weights}:{build if spent['solver_nodes'] else 'none'}{kept}"
 
-    def game_graph(self, bubble, game, build='none', q_range_floor=0., simulations=None, keep=False):
+    def game_graph(self, bubble, game, build='none', q_range_floor=0., simulations=None, keep=False, used=None):
         """A `TurnSearch` tree source over the GameGraph of `game`: one graph per game, model, solver `build` and
         `q_range_floor`, moved to each stone's position and searched there with the full simulations, or with
         `simulations` when given, or with `keep` only those its root lacks (at least one). The three most recently
-        used games (two seats and the analysis board) keep their graphs; a game whose key changed starts a new one."""
+        used games (two seats and the analysis board) keep their graphs; a game whose key changed starts a new one.
+        `used`, when given, receives the number of the graph searched; each graph built gets a new number."""
         from neural_search import GameGraph
         key = (bubble.sha256, build, q_range_floor)
 
@@ -1154,9 +1159,15 @@ class Engines:
             if kept and kept[0] != key:
                 kept[1].close()
                 kept = None
-            graph = kept[1] if kept else GameGraph(network, bubble.sha256, cells, seed=1740, cache=bubble.cache,
-                                                   tactics=True, q_range_floor=q_range_floor)
-            self.graphs[game] = key, graph
+            if kept:
+                graph, ident = kept[1:]
+            else:
+                graph = GameGraph(network, bubble.sha256, cells, seed=1740, cache=bubble.cache, tactics=True,
+                                  q_range_floor=q_range_floor)
+                ident = next(self.graph_ids)
+            self.graphs[game] = key, graph, ident
+            if used is not None:
+                used.append(ident)
             while len(self.graphs) > 3:
                 self.graphs.popitem(last=False)[1][1].close()
             graph.at(cells)
@@ -1640,7 +1651,7 @@ class Session:
         self.proofs = Proofs()
         self.line_ids = itertools.count()
         self.lines = [next(self.line_ids), next(self.line_ids)]
-        self.analysis_line, self.graph_searches = next(self.line_ids), 0
+        self.analysis_line, self.analysis_graph, self.graph_searches = next(self.line_ids), None, {}
         self.instance, self.closing = os.urandom(4).hex(), False
         self.match, self.match_worker = None, None
         self.game_clock, self.timed_engines = None, []
@@ -3042,10 +3053,12 @@ class Session:
             **({'refresh': refresh} if refresh is not None else {}))
         if job.cancelled:
             raise Cancelled()
-        if job.kind == 'analyse' and game is not None:
+        graph = found.pop('graph_id', None)
+        if job.kind == 'analyse' and graph is not None:
             with self.lock:
-                self.graph_searches += refresh is None
-                found['graph'] = [self.instance, game, self.graph_searches]
+                self.analysis_graph = graph
+                self.graph_searches[graph] = self.graph_searches.get(graph, 0) + (refresh is None)
+                found['graph'] = [self.instance, graph, self.graph_searches[graph]]
         entry = self.entries[seat['engine']]
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
         job.incomplete = spent['solver_nodes'] < budget['solver_nodes']
@@ -3063,10 +3076,12 @@ class Session:
         return saved
 
     def stale(self, record):
-        """True when `record`, a saved evaluation, came from this session's current analysis graph and an analysis
-        of another position has searched that graph since: its statistics there may have changed."""
+        """True when `record`, a saved evaluation, came from the graph analysis searched last (the graph's number from
+        `Engines.game_graph`, in this session) and an analysis of another position has searched that graph since:
+        its statistics there may have changed. A rebuilt graph has a new number, so it never stales older records."""
         stamp = record.get('graph') if record else None
-        return bool(stamp) and stamp[:2] == [self.instance, self.analysis_line] and stamp[2] < self.graph_searches
+        return (bool(stamp) and stamp[:2] == [self.instance, self.analysis_graph]
+                and stamp[2] < self.graph_searches[self.analysis_graph])
 
     def refresh(self, history, seat, game):
         """Queue a refresh of each position up to REFRESH_PLIES placements before `history` whose evaluation by

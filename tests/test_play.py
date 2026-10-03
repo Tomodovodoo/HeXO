@@ -65,7 +65,7 @@ class FakeEngines:
 
     def __init__(self):
         self.calls, self.turns, self.lines, self.hold, self.release = [], [], [], False, threading.Event()
-        self.games, self.refreshes = [], []
+        self.games, self.refreshes, self.graph = [], [], (None, 0)
 
     def evaluate(self, entry, checkpoint, budget, history, watch, live=None, keep=False, line=None, known=None,
                  game=None, refresh=None):
@@ -80,6 +80,10 @@ class FakeEngines:
         watch(budget['simulations'])
         moves = legal_turn(history)
         found = dict(moves=moves, value=.5, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1)
+        if game is not None:   # one graph per game, a new one when the weights change, as Engines.game_graph
+            if self.graph[0] != (game, checkpoint):
+                self.graph = (game, checkpoint), self.graph[1] + 1
+            found['graph_id'] = self.graph[1]
         return found, budget, f'{model_key(export_path(entry, checkpoint))}:none' + (':kept' if keep or line is not None else '')
 
     def evaluate_many(self, entry, checkpoint, budget, histories, watch, known=None):
@@ -387,6 +391,14 @@ class Jobs(unittest.TestCase):
         self.session.analyse(1)
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(self.engines.refreshes, [3, 1])
+        self.assertEqual(self.session.state()['stale'], [])
+        # Another network's graph, then a rebuilt one for the first: neither stales what the first graph saved.
+        self.session.configure_analysis('bubble:fake', 'main/000001', auto=False)
+        self.session.analyse(6, force=True)
+        wait(lambda: not self.session.state()['jobs'])
+        self.session.configure_analysis('bubble:fake', auto=False)
+        self.session.analyse(6, force=True)
+        wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(self.session.state()['stale'], [])
         line = self.session.analysis_line
         self.session.undo()

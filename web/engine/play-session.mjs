@@ -72,7 +72,7 @@ export class BrowserSession extends OfflineSession {
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
-    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graphSearches = 0;
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graph = {key: null, generation: 0, searches: 0};
     this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
@@ -369,10 +369,10 @@ export class BrowserSession extends OfflineSession {
     }
     return record;
   }
-  /** True when `record`, a saved evaluation, came from the current analysis graph and an analysis of another position
-   * has searched that graph since (python/play.py Session.stale). */
+  /** True when `record`, a saved evaluation, came from the graph analysis searched last and an analysis of another
+   * position has searched that graph since (python/play.py Session.stale); a rebuilt graph never stales older records. */
   stale(record) {
-    return Boolean(record?.graph) && record.graph[0] === this.analysisLine && record.graph[1] < this.graphSearches;
+    return Boolean(record?.graph) && record.graph[0] === this.graph.generation && record.graph[1] < this.graph.searches;
   }
   /** Queues a refresh of each position up to REFRESH_PLIES placements before `history` whose evaluation by `spec` came
    * from this analysis graph, is now stale and holds no proof, nearest first: the search on the game graph `line` moved the values those positions reach
@@ -530,8 +530,11 @@ export class BrowserSession extends OfflineSession {
       if (job.kind === 'move') clearTimeout(this.flag);
       if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
       if (job.kind === 'analyse' && job.line != null) {
-        this.graphSearches += job.refresh ? 0 : 1;
-        result = {...result, graph: [job.line, this.graphSearches]};
+        // The worker rebuilds a line's graph when its network or Q range floor changes (GameGraphs); so does this count.
+        const key = [job.line, this.engineKey(job.spec), job.spec.budget.q_range_floor ?? 0].join('|'), graph = this.graph;
+        if (graph.key !== key) Object.assign(graph, {key, generation: graph.generation + 1, searches: 0});
+        graph.searches += job.refresh ? 0 : 1;
+        result = {...result, graph: [graph.generation, graph.searches]};
       }
       await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));
       if (job.kind === 'analyse' && !job.refresh && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') this.refresh(history, job.spec, job.line);
