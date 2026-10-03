@@ -281,6 +281,21 @@ function openMenu(anchor, items, current, choose) {
   });
 }
 
+/** Checks the saved choices and the static page's session choices for engine `entry` against its loaded network list:
+ * a network the list no longer has becomes its newest. Then redraws. */
+function recheck(entry) {
+  const fix = choice => choice?.engine === entry.id ? pickEngine(entry.id, choice, choice.checkpoint) : choice;
+  config = {seats: config.seats.map(fix), analysis: fix(config.analysis)};
+  save();
+  const session = page.browserPlay, stale = session && [...session.seats, session.analysis].filter(c => c?.engine === entry.id
+    && c.checkpoint && entry.checkpoints.length && !entry.checkpoints.includes(c.checkpoint));
+  if (stale?.length) {
+    for (const choice of stale) choice.checkpoint = entry.checkpoints[0];
+    session.persist();
+    page.accept(session.state());
+  } else if (state()) page.renderPanels();
+}
+
 function install() {
   page.openMenu = openMenu;
   page.accept = data => {
@@ -394,22 +409,12 @@ async function serverless() {
   native.entry.version = build.artefacts['native/native.wasm'];
   for (const {entry} of ENGINES.values()) entry.version ||= JSON.stringify(build.artefacts);
   await mountPlay(ENGINES, config);
+  for (const {entry, listed} of ENGINES.values()) listed?.then(() => recheck(entry));   // the session's own choices
   return true;
 }
 
 if (HOOKS.every(name => typeof original[name] === 'function')) {
   install();
-  for (const {entry, listed} of ENGINES.values()) listed?.then(() => {   // check restored networks against the list
-    const fix = choice => choice?.engine === entry.id ? pickEngine(entry.id, choice, choice.checkpoint) : choice;
-    config = {seats: config.seats.map(fix), analysis: fix(config.analysis)};
-    save();
-    const session = page.browserPlay, stale = session && [...session.seats, session.analysis].filter(c => c?.engine === entry.id
-      && c.checkpoint && entry.checkpoints.length && !entry.checkpoints.includes(c.checkpoint));
-    if (stale?.length) {
-      for (const choice of stale) choice.checkpoint = entry.checkpoints[0];
-      session.persist();
-      page.accept(session.state());
-    } else if (state()) page.renderPanels();
-  });
+  for (const {entry, listed} of ENGINES.values()) listed?.then(() => recheck(entry));
   serverless().then(active=>{if(!active||page.browserPlay)page.resolvePlayReady?.()}).catch(error=>{original.toast(error.message)});
 } else console.warn('The browser engines need the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));
