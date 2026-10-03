@@ -230,8 +230,8 @@ On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds 
 Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows a progress line (a moving one when
 the engine reports no progress) and its cancel button. The custom budget shows the engine's own fields: Search
 (simulations, 0 plays the raw policy) and Solver (nodes, 0 turns it off; the solver gets up to a minute) for Bubble,
-Positions for Six, Search for Strix (at least 1), and ms (at least 10) for Native and Seal. Any larger whole number is
-accepted on both pages; it only takes longer.
+Positions for Six, Search for Strix (at least 1), and ms (at least 10) for Native and Seal. Any larger whole number up to
+2,147,483,647 (the engines take 32-bit budgets) is accepted on both pages; it only takes longer.
 A Bubble seat, served or in the browser, keeps its search tree across turns like the evaluator, adding each turn's
 simulations to the visits already under the position until undo, a new or loaded game or a seat change, so its
 moves are saved with the kept-tree evaluations and never read back from the store.

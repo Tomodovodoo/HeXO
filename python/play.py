@@ -56,6 +56,8 @@ REVIEW_BATCH = dict(cpu=64, cuda=256)   # network leaves per pooled review batch
 REVIEW_SOLVERS = 4                      # tactical workers a review queries at once
 REVIEW_CHUNK = 24                       # positions per pooled review step; urgent analysis waits at most one step
 LIMITS = dict(simulations=0, solver_nodes=0, ms=10, nodes=1)
+# The engines take budgets as 32-bit signed integers.
+MAX_BUDGET = 2 ** 31 - 1
 KIND_LIMITS = dict(strix=dict(simulations=1))
 HEXO_SITES = {'hexo.did.science': 'https://hexo.did.science/api',
               'hexo.mineking.dev': 'https://hexo.mineking.dev/proxy/api'}
@@ -289,7 +291,7 @@ def presets_of(kind, spec):
                 continue
             limits = LIMITS | KIND_LIMITS.get(kind, {})
             if (key not in PRESETS[kind]['standard'] or type(value) is not int
-                    or value < limits[key]):
+                    or not limits[key] <= value <= MAX_BUDGET):
                 raise ValueError(f'bad {key} in preset {name}')
         presets[name] = presets[name] | budget
     return presets
@@ -1396,8 +1398,8 @@ def budget_of(presets, preset, custom=None, kind=None):
             continue
         if key not in budget or key not in limits:
             raise ValueError(f'{key} is not a budget of this engine')
-        if type(value) is not int or value < limits[key]:
-            raise ValueError(f'{key} must be an integer of at least {limits[key]}')
+        if type(value) is not int or not limits[key] <= value <= MAX_BUDGET:
+            raise ValueError(f'{key} must be an integer from {limits[key]} to {MAX_BUDGET}')
         budget[key] = value
     return budget
 
@@ -2627,6 +2629,8 @@ class Session:
                 self.seats, self.analysis = seats, analysis
                 self.stop_moves()
                 self.stop_analysis()
+                if not self.match:
+                    self.prepare_timed()
                 self.changed()
 
     # Working

@@ -10,6 +10,8 @@ const copy = value => structuredClone(value), position = history => history.map(
 const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human'});
 /** The longest delay setTimeout keeps; a longer clock is checked again when it fires. */
 const MAX_TIMER = 2 ** 31 - 1;
+/** The engines take budgets as 32-bit signed integers. */
+const MAX_BUDGET = 2 ** 31 - 1;
 const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
@@ -80,7 +82,10 @@ export class BrowserSession extends OfflineSession {
     if (!entry) throw Error('This engine is not installed in the browser');
     const preset = input.preset || entry.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget} : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
-    for (const [name, value] of Object.entries(budget)) if (typeof value === 'number' && (!Number.isSafeInteger(value) || value < ({ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0)))) throw Error(`${FIELD_NAMES[name] || name} must be a whole number of at least ${({ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0))}`);
+    for (const [name, value] of Object.entries(budget)) {
+      const least = {ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0);
+      if (typeof value === 'number' && (!Number.isInteger(value) || value < least || value > MAX_BUDGET)) throw Error(`${FIELD_NAMES[name] || name} must be a whole number from ${least} to ${MAX_BUDGET}`);
+    }
     const checkpoint = input.checkpoint ?? entry.checkpoints?.[0] ?? null;
     if (entry.checkpoints?.length && !entry.checkpoints.includes(checkpoint)) throw Error('Unknown checkpoint');
     return {engine: input.engine, checkpoint, preset, budget: copy(budget), auto: input.auto ?? false};
