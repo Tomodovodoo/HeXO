@@ -88,19 +88,20 @@ export class SealEngine {
   }
 
   /**
-   * Seal's turn at `history` with `budget` {ms} (a PRESETS entry): {moves, raw, ms}. `progress(fraction)` follows the
-   * clock; aborting `signal` ends the worker and rejects with an AbortError. One turn runs at a time.
+   * Seal's turn at `history` with `budget` {ms} (a PRESETS entry), under a clock no longer than `ms`: {moves, raw, ms}.
+   * `progress(fraction)` follows the clock; aborting `signal` ends the worker and rejects with an AbortError. One turn
+   * runs at a time.
    */
-  async turn(history, budget, {signal, progress = () => {}} = {}) {
+  async turn(history, budget, {signal, progress = () => {}, ms = null} = {}) {
     await this.load();
     if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
     if (this.pending) throw new Error('Seal is already thinking');
-    const id = ++this.calls, start = performance.now();
+    const id = ++this.calls, start = performance.now(), time = Math.max(1, Math.floor(Math.min(budget.ms, ms ?? Infinity)));
     return new Promise((resolve, reject) => {
-      const timer = setInterval(() => progress(Math.min(1, (performance.now() - start) / budget.ms)), 50);
+      const timer = setInterval(() => progress(Math.min(1, (performance.now() - start) / time)), 50);
       this.pending = {id, resolve, reject, timer};
       signal?.addEventListener('abort', () => { if (this.pending?.id === id) this.fail(new DOMException('Cancelled', 'AbortError')); }, {once: true});
-      this.worker.postMessage({type: 'turn', id, history, ms: budget.ms});
+      this.worker.postMessage({type: 'turn', id, history, ms: time});
     });
   }
 
@@ -139,5 +140,5 @@ async function built(path) {
   try { return (await fetch(new URL(path, import.meta.url), {cache: 'no-cache'})).ok; } catch { return false; }
 }
 
-export const seal = await built('seal/manifest.json') ? {entry: {id: ID, kind: 'seal', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
+export const seal = await built('seal/manifest.json') ? {entry: {id: ID, kind: 'seal', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true, clocks: true},
   engine: new SealEngine(), record} : null;

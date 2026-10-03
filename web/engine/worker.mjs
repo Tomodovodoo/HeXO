@@ -91,8 +91,11 @@ function rootRows(tree, choice) {
 }
 
 /** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms),
- * plus `solver_error` when the solver's worker could not run, so the turn has no proof or threat. */
-async function turn({id, history, model, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0}) {
+ * plus `solver_error` when the solver's worker could not run, so the turn has no proof or threat. Under a clock `ms` is the
+ * turn's time, as the timed engine spends it: the solver gets at most a quarter, the first stone 60% of the rest and the
+ * simulations are a ceiling; a stone whose search has not finished by its time plays the search's choice so far, or the
+ * network's policy before any. */
+async function turn({id, history, model, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null}) {
   await use(model, fraction => postMessage({type: 'progress', id, fraction}));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
@@ -100,10 +103,12 @@ async function turn({id, history, model, simulations, solverNodes, batchSize = 1
   let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null;
   let failure = null;
   const note = r => { if (r.reason?.startsWith(FAILED)) failure = r.reason; return r; };
+  const timed = ms != null, end = start + (ms ?? 0), solverEnd = start + .25 * (ms ?? 0);
   const deadline = Math.min(60000, Math.max(10000, Math.floor(solverNodes / 8)));
+  const solverMs = () => timed ? Math.max(1, Math.floor(Math.min(deadline, solverEnd - performance.now()))) : deadline;
   try {
     if (solverNodes) {
-      const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: deadline, shortest: true}));
+      const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true}));
       check();
       solved = searched(mine);
       solverUsed += mine.nodes_used || 0;
@@ -114,33 +119,18 @@ async function turn({id, history, model, simulations, solverNodes, batchSize = 1
         proof = {winner: player, turns: mine.proof_turns, plies: found.plies};
         top = [[...moves[0], 1, 1, 1]];
       } else {
-        const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: deadline}));
+        const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs()}));
         check();
         solved = solved && searched(theirs);
         solverUsed += theirs.nodes_used || 0;
         if (verified(theirs)) threat = theirs.moves.map(m => [...m]);
       }
     }
-    const given = moves.length > 0, current = history.map(p => [...p]);
+    const given = moves.length > 0, current = history.map(p => [...p]), searchStart = performance.now();
     for (let local = native.game(current); !given && local.player === player && local.winner < 0; local = native.game(current)) {
       let action, policy, actions, stoneValue, values = null;
-      if (simulations) {
-        tree ??= new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current});
-        const stone = moves.length;
-        const result = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
-          evaluate: leaves => network.evaluate(leaves), stop: () => cancelled.has(id),
-          onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
-            ...(stone ? {} : {live: rootRows(tree, choice)})})});
-        check();
-        ({action, policy, actions, values} = result);
-        completed += result.completed;
-        stoneValue = result.proven ? result.proven : result.exact_winner >= 0 ? (result.exact_winner === local.player ? 1 : -1)
-          : policy.reduce((sum, p, i) => sum + p * result.values[i], 0);
-        if (proof === null && (result.proven > 0 || (result.proven < 0 && !moves.length))) {
-          proof = {winner: result.proven > 0 ? player : 1 - player, turns: proofTurns(result.proof_plies, local.remaining, result.proven > 0),
-            plies: result.proof_plies + moves.length};
-        }
-      } else {
+      const stone = moves.length, stoneEnd = !timed || local.remaining === 1 || stone ? end : searchStart + .6 * (end - searchStart);
+      const raw = async () => {
         actions = native.legal(current);
         const [prediction] = await network.evaluate([{history: current, actions}]);
         check();
@@ -149,7 +139,25 @@ async function turn({id, history, model, simulations, solverNodes, batchSize = 1
         policy = weights.map(w => w / total);
         action = actions[policy.indexOf(Math.max(...policy))];
         stoneValue = prediction.q[0];
-      }
+      };
+      if (simulations) {
+        tree ??= new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current});
+        const result = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
+          evaluate: leaves => network.evaluate(leaves), stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
+          onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
+            ...(stone ? {} : {live: rootRows(tree, choice)})})});
+        check();
+        completed += result.completed;
+        if (result.action) {
+          ({action, policy, actions, values} = result);
+          stoneValue = result.proven ? result.proven : result.exact_winner >= 0 ? (result.exact_winner === local.player ? 1 : -1)
+            : policy.reduce((sum, p, i) => sum + p * result.values[i], 0);
+          if (proof === null && (result.proven > 0 || (result.proven < 0 && !moves.length))) {
+            proof = {winner: result.proven > 0 ? player : 1 - player, turns: proofTurns(result.proof_plies, local.remaining, result.proven > 0),
+              plies: result.proof_plies + moves.length};
+          }
+        } else await raw();
+      } else await raw();
       if (!moves.length) {
         top = topRows(actions, policy, values, action);
         value = (stoneValue + 1) / 2;

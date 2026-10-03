@@ -86,7 +86,7 @@ async function load(options = {}) {
  * `moves` and `line`, the first as the one `top` row, the mover's win probability from its score (1 when its threat
  * solver proved a win, whose distance Six does not report, so there is no `proof`) and the positions searched. The
  * network (the newest when null) is fetched on its first turn; progress follows that download, then the search. */
-async function turn({id, history, nodes, network}) {
+async function turn({id, history, nodes, network, ms = 0}) {
   if (cancelled.has(id)) throw new Cancelled();
   await use(network ?? manifest.networks[0].name, fraction => postMessage({type: 'progress', id, fraction}));
   if (cancelled.has(id)) throw new Cancelled();
@@ -94,7 +94,7 @@ async function turn({id, history, nodes, network}) {
   running = id;
   let result;
   try {
-    result = await search.turn(history, nodes, count => postMessage({type: 'progress', id, fraction: Math.min(1, count / nodes)}));
+    result = await search.turn(history, nodes, ms, count => postMessage({type: 'progress', id, fraction: Math.min(1, count / nodes)}));
   } finally {
     running = null;
   }

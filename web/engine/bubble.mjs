@@ -54,13 +54,15 @@ export class BubbleEngine extends EngineWorker {
 
   /**
    * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor and
-   * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Aborting `signal` cancels
-   * it (rejects with an AbortError).
+   * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Under a clock
+   * `options.ms` is the turn's time and the budget a ceiling (see worker.mjs). Aborting `signal` cancels it (rejects
+   * with an AbortError).
    */
   turn(history, budget, options = {}) {
     return this.call({type: 'turn', history, model: budget.checkpoint ? networkManifest(budget.checkpoint) : this.options.model,
       simulations: budget.simulations, solverNodes: budget.solver_nodes,
-      batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0}, options);
+      batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
+      ms: options.ms ?? null}, options);
   }
 
   /** One search of `simulations` from `history` (no solver): action, completed, elapsed_ms, evaluated, batches, policy.

@@ -38,21 +38,21 @@ export class NativeEngine {
 
   /**
    * Native's turn at `history` ([[q, r], ...]) with `budget` {ms, depth?} (a PRESETS entry; depth defaults to the
-   * server's 12): {moves, score, depth, nodes, elapsed_ms}. `progress(fraction)` follows the clock. Aborting
-   * `signal` ends the worker (a search cannot be interrupted inside it) and rejects with an AbortError; the next
-   * call starts a new one.
+   * server's 12): {moves, score, depth, nodes, elapsed_ms}. Under a clock `ms` caps the budget's time. `progress(fraction)`
+   * follows the clock. Aborting `signal` ends the worker (a search cannot be interrupted inside it) and rejects with an
+   * AbortError; the next call starts a new one.
    */
-  async turn(history, budget, {signal, progress = () => {}} = {}) {
+  async turn(history, budget, {signal, progress = () => {}, ms = null} = {}) {
     await this.load();
     if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
-    const id = ++this.calls, start = performance.now();
-    const timer = setInterval(() => progress(Math.min(1, (performance.now() - start) / budget.ms)), 50);
+    const id = ++this.calls, start = performance.now(), time = Math.max(1, Math.floor(Math.min(budget.ms, ms ?? Infinity)));
+    const timer = setInterval(() => progress(Math.min(1, (performance.now() - start) / time)), 50);
     const cancel = () => this.fail(new DOMException('Cancelled', 'AbortError'));
     signal?.addEventListener('abort', cancel, {once: true});
     try {
       return await new Promise((resolve, reject) => {
         this.waits.set(id, {resolve, reject});
-        this.worker.postMessage({type: 'turn', id, history, ms: budget.ms, depth: budget.depth ?? DEPTH});
+        this.worker.postMessage({type: 'turn', id, history, ms: time, depth: budget.depth ?? DEPTH});
       });
     } finally {
       clearInterval(timer);
@@ -88,5 +88,5 @@ export function record(result, history, preset) {
     score: result.score, depth: result.depth, nodes: result.nodes, engine: ID};
 }
 
-export const native = {entry: {id: ID, kind: 'native', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
+export const native = {entry: {id: ID, kind: 'native', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true, clocks: true},
   engine: new NativeEngine(), record};

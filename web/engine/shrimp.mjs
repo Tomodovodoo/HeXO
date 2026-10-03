@@ -112,5 +112,5 @@ async function built(path) {
   try { return (await fetch(new URL(path, import.meta.url), {cache: 'no-cache'})).ok; } catch { return false; }
 }
 
-export const shrimp = await built('shrimp/model/manifest.json') ? {entry: {id: ID, kind: 'six', badge: 'shrimp', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
+export const shrimp = await built('shrimp/model/manifest.json') ? {entry: {id: ID, kind: 'six', badge: 'shrimp', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true, clocks: false},
   engine: new ShrimpEngine(), record} : null;

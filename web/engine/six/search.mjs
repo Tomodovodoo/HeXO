@@ -58,11 +58,12 @@ export class SixSearch {
   }
 
   /**
-   * The rest of the turn at `history` ([[q, r], ...]) within `nodes` new positions: {moves, score, nodes, stopped},
+   * The rest of the turn at `history` ([[q, r], ...]) within `nodes` new positions and `ms` (0 for no time limit):
+   * {moves, score, nodes, stopped},
    * with `score` 1000 times the mover's value or 1000000 for a proven win and `nodes` the positions searched. `progress(nodes)` reports the search a few
    * times a second. After stop() the turn ends early with `stopped` set, and the next turn starts a new tree.
    */
-  async turn(history, nodes, progress = null) {
+  async turn(history, nodes, ms = 0, progress = null) {
     const continues = this.played && this.played.length <= history.length
       && this.played.every(([q, r], i) => history[i][0] === q && history[i][1] === r);
     if (!continues) this.forget();
@@ -71,7 +72,7 @@ export class SixSearch {
     let reply;
     try {
       reply = await this.module.ccall('six_turn', 'string', ['string', 'number', 'number', 'number'],
-        [history.map(mirror).flat().join(' '), RADIUS, 0, nodes], {async: true});
+        [history.map(mirror).flat().join(' '), RADIUS, ms, nodes], {async: true});
     } finally {
       this.module.onProgress = null;
     }

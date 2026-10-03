@@ -13,10 +13,12 @@ export class SixEngine extends EngineWorker {
   }
 
   /** Six's turn at `history` ([[q, r], ...]) within `budget.nodes` new positions, with network `budget.checkpoint` (a
-   * manifest name; the newest when absent): the fields of python/play.py evaluate. Aborting `options.signal` cancels
-   * it at the search's next network batch and rejects with an AbortError. */
+   * manifest name; the newest when absent): the fields of python/play.py evaluate. Under a clock `options.ms` is Six's
+   * movetime, the nodes a ceiling. Aborting `options.signal` cancels it at the search's next network batch and rejects
+   * with an AbortError. */
   turn(history, budget, options = {}) {
-    return this.call({type: 'turn', history, nodes: budget.nodes, network: budget.checkpoint ?? null}, options);
+    return this.call({type: 'turn', history, nodes: budget.nodes, network: budget.checkpoint ?? null,
+      ms: options.ms == null ? 0 : Math.max(1, Math.floor(options.ms))}, options);
   }
 }
 
@@ -34,7 +36,7 @@ const checkpoints = await networks();
 
 /** Six (browser) for seat.mjs's ENGINES, or null when the site has no Six networks. */
 export const six = checkpoints.length ? {
-  entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints, presets: PRESETS, analysis: true},
+  entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints, presets: PRESETS, analysis: true, clocks: true},
   engine: new SixEngine(),
   record: (result, history, preset) => ({...result, engine: ID}),
 } : null;

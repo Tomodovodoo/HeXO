@@ -84,7 +84,7 @@ const found = await networks();
 
 /** The browser engine for seat.mjs, or null when no network was built. */
 export const strix = found.length ? {
-  entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: found.map(n => n.id), presets: PRESETS, analysis: true},
+  entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: found.map(n => n.id), presets: PRESETS, analysis: true, clocks: false},
   engine: new StrixEngine(found),
   record: result => ({...result, proof: null, line: [], threat: [], engine: ID}),
 } : null;
