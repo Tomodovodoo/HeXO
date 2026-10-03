@@ -36,6 +36,8 @@ enum Attacker {#[default] Mover, Opponent}
 #[serde(deny_unknown_fields)]
 struct Request {
     history:Vec<(i32,i32)>, ms:u32, nodes:u64, idtt_nodes:u64, depth:u8,
+    /// Prepared cancellation token; zero keeps the legacy query ABI.
+    #[serde(default)] request_id:u64,
     #[serde(default)] attacker:Attacker,
     #[serde(default)] certificate:Option<ProofCertificate>,
     #[serde(default)] root_moves:Option<Vec<(i32,i32)>>,
@@ -54,7 +56,7 @@ fn complete_candidate(board:&check::Board,start:usize,moves:&[(i32,i32)],req:&Re
     let side=check::phase(start).0;
     let (post,ply,terminal)=check::apply(board,start,moves)?;
     if terminal {return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::ImmediateWin{action:moves.to_vec()}]});}
-    let defenses=check::defenses(&post,side,ctl.deadline.ok_or("candidate needs a deadline")?)?;
+    let defenses=check::defenses(&post,side,ctl)?;
     let mut cert=ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![
         ProofNode::AttackerMove{action:moves.to_vec(),child:1,alternatives:vec![]},
         ProofNode::Unstoppable{threats:vec![]} ]};
@@ -102,12 +104,15 @@ fn shorten(pos:&Position,cert:&ProofCertificate,req:&Request,ctl:&Ctl,meter:&Met
 /// earlier queries of the worker. The checker accepts at most
 /// clamp(8 * nodes, 50,000, 200,000) certificate nodes and visits. `ms` is only a
 /// safety cap, and a query that reaches it returns UNKNOWN.
-fn run(req:Request, start:Instant) -> Result<Value,String> {
+fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.nodes==0 || req.nodes>10_000_000
         || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256 {return Err("invalid tactical limits".into());}
-    prover::dfpn::set_resident(req.table_mb as usize);
     let deadline=start+Duration::from_millis(req.ms as u64);
-    let board=check::replay(&req.history)?;
+    let meter=Meter::new(req.nodes);
+    let ctl=Ctl{deadline:Some(deadline),cancel,meter:Some(meter.clone())};
+    if ctl.expired() {return Err("cancelled or deadline".into());}
+    prover::dfpn::set_resident(req.table_mb as usize);
+    let board=check::replay_controlled(&req.history,&ctl)?;
     let ply=if req.attacker==Attacker::Opponent {check::flip(req.history.len())} else {req.history.len()};
     let (side,remaining)=check::phase(ply);
     let fresh=req.certificate.is_none() && req.root_moves.is_none();
@@ -119,8 +124,6 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
         "budget":{"nodes":req.nodes,"idtt_nodes":req.idtt_nodes,"idtt_depth_cap":req.depth,"safety_ms":req.ms,
             "work":"one shared meter over IDTT nodes, PDS-PN level-1 nodes and level-2 expansions; verifier path limit 128",
             "check_nodes":check_nodes(req.nodes)}});
-    let meter=Meter::new(req.nodes);
-    let ctl=Ctl{deadline:Some(deadline),cancel:Arc::new(AtomicBool::new(false)),meter:Some(meter.clone())};
     let cache=CACHE.get_or_init(||Mutex::new(BTreeMap::new()));
     let mut cache_hit=false;
     let mut probe_verdict=None;
@@ -149,7 +152,7 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
             match found {
                 Some(cert) if req.shortest =>
                     match shorten(&pos,&cert,&req,&ctl,&meter) {
-                        Some((tight,minimal)) if check::verify(&req.history,ply,&tight,deadline,check_nodes(req.nodes)).is_ok() =>
+                        Some((tight,minimal)) if check::verify(&req.history,ply,&tight,&ctl,check_nodes(req.nodes)).is_ok() =>
                             {exact=minimal;Some(tight)}
                         _=>Some(cert),
                     },
@@ -163,7 +166,7 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
         "reason":"no verified strategy","nodes_used":cached_nodes.unwrap_or(meter.spent().min(req.nodes)),"proof_turns":null,"elapsed_ms":0.0,
         "shortest":false});
     if let Some(cert)=cert {
-        match check::verify(&req.history,ply,&cert,deadline,check_nodes(req.nodes)) {
+        match check::verify(&req.history,ply,&cert,&ctl,check_nodes(req.nodes)) {
             Ok((moves,turns))=>{
                 // A shortening cut short by the time cap is not a function of the key, so it is not kept.
                 if !cache_hit && fresh && (exact || !req.shortest) {
@@ -180,20 +183,58 @@ fn run(req:Request, start:Instant) -> Result<Value,String> {
         }
     }
     // Certificate reconstruction/serialization and verification share the safety cap.
-    if Instant::now()>=deadline {
+    if ctl.expired() {
         response["status"]=json!("UNKNOWN");response["native_verified"]=json!(false);
         response["moves"]=json!([]);response["certificate"]=Value::Null;response["proof_turns"]=Value::Null;
-        response["reason"]=json!("deadline");
+        response["shortest"]=json!(false);
+        response["reason"]=json!(if ctl.cancel.load(Ordering::Acquire) {"cancelled"} else {"deadline"});
     }
     response["elapsed_ms"]=json!(start.elapsed().as_secs_f64()*1000.0);
     Ok(response)
 }
 
-// Upstream certificate reconstruction has no cancellation hook. A single native
-// worker contains that overrun; callers stop waiting at their absolute deadline.
-// No queue of abandoned work and no per-request process/thread creation.
+#[cfg(test)]
+fn run(req:Request,start:Instant)->Result<Value,String> {
+    run_controlled(req,start,Arc::new(AtomicBool::new(false)))
+}
+
+// Tokens exist before admission, so cancellation also covers the handoff to the
+// worker. IDs are never reused; releasing a caller's token does not invalidate
+// the Arc retained by a timed-out worker or cancel its next query.
+#[derive(Default)]
+struct Controls {next:u64, pending:BTreeMap<u64,Arc<AtomicBool>>}
+static CONTROLS:OnceLock<Mutex<Controls>>=OnceLock::new();
+fn controls()->&'static Mutex<Controls> {CONTROLS.get_or_init(||Mutex::new(Controls::default()))}
+#[unsafe(no_mangle)]
+pub extern "C" fn hexo_tactical_prepare()->u64 {
+    let Ok(mut controls)=controls().lock() else {return 0;};
+    if controls.pending.len()>=64 {return 0;}
+    let Some(id)=controls.next.checked_add(1) else {return 0;};
+    controls.next=id;
+    controls.pending.insert(id,Arc::new(AtomicBool::new(false)));
+    id
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn hexo_tactical_cancel(request_id:u64)->bool {
+    let Ok(controls)=controls().lock() else {return false;};
+    let Some(cancel)=controls.pending.get(&request_id) else {return false;};
+    cancel.store(true,Ordering::Release);
+    true
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn hexo_tactical_release(request_id:u64) {
+    if let Ok(mut controls)=controls().lock() {controls.pending.remove(&request_id);}
+}
+fn query_control(request_id:u64)->Result<Arc<AtomicBool>,String> {
+    if request_id==0 {return Ok(Arc::new(AtomicBool::new(false)));}
+    controls().lock().map_err(|_|"cancellation token lock")?
+        .pending.get(&request_id).cloned().ok_or("unknown cancellation token".into())
+}
+
+// One resident native worker. Search, certificate work and the raw-board checker
+// share a cancellation token; the isolated wrapper remains the hard-stop fallback.
 #[cfg(not(target_family="wasm"))]
-type Work=(Request,Instant,mpsc::Sender<Result<Value,String>>);
+type Work=(Request,Instant,Arc<AtomicBool>,mpsc::Sender<Result<Value,String>>);
 #[cfg(not(target_family="wasm"))]
 static WORKER:OnceLock<mpsc::SyncSender<Work>>=OnceLock::new();
 static BUSY:AtomicBool=AtomicBool::new(false);
@@ -201,7 +242,8 @@ static LAST_WORK:OnceLock<Mutex<Value>>=OnceLock::new();
 #[cfg(target_family="wasm")]
 fn dispatch(req:Request,start:Instant)->Result<Value,String> {
     if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
-    run(req,start)
+    let cancel=query_control(req.request_id)?;
+    run_controlled(req,start,cancel)
 }
 #[cfg(windows)]
 fn thread_cpu_ms()->Option<f64> {
@@ -225,9 +267,9 @@ fn dispatch(req:Request,start:Instant)->Result<Value,String> {
     let worker=WORKER.get_or_init(|| {
         let (sender,receiver)=mpsc::sync_channel::<Work>(1);
         std::thread::spawn(move || {
-            while let Ok((req,start,reply))=receiver.recv() {
+            while let Ok((req,start,cancel,reply))=receiver.recv() {
                 let budget_ms=req.ms;let cpu_start=thread_cpu_ms();
-                let result=std::panic::catch_unwind(||run(req,start))
+                let result=std::panic::catch_unwind(||run_controlled(req,start,Arc::clone(&cancel)))
                     .unwrap_or_else(|_|Err("native worker panic".into()));
                 let elapsed=start.elapsed().as_secs_f64()*1000.0;
                 let cpu=thread_cpu_ms().zip(cpu_start).map(|(a,b)|a-b);
@@ -235,7 +277,8 @@ fn dispatch(req:Request,start:Instant)->Result<Value,String> {
                     let late=elapsed>=budget_ms as f64;
                     let previous=stats.clone();
                     let row=json!({"elapsed_ms":elapsed,"thread_cpu_ms":cpu,
-                        "requested_ms":budget_ms,"completed_after_deadline":late});
+                        "requested_ms":budget_ms,"completed_after_deadline":late,
+                        "cancelled":cancel.load(Ordering::Acquire)});
                     *stats=json!({"latest":row,"completed_queries":previous["completed_queries"].as_u64().unwrap_or(0)+1,
                         "completed_after_deadline_count":previous["completed_after_deadline_count"].as_u64().unwrap_or(0)+u64::from(late),
                         "total_worker_elapsed_ms":previous["total_worker_elapsed_ms"].as_f64().unwrap_or(0.0)+elapsed,
@@ -248,13 +291,20 @@ fn dispatch(req:Request,start:Instant)->Result<Value,String> {
         });
         sender
     });
+    let cancel=query_control(req.request_id)?;
+    if cancel.load(Ordering::Acquire) {return Err("cancelled".into());}
     if BUSY.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err() {
         return Err("native worker busy finishing bounded prior query".into());
     }
     let (send,recv)=mpsc::channel();
-    if worker.send((req,start,send)).is_err() {BUSY.store(false,Ordering::Release);return Err("native worker stopped".into());}
-    recv.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_|"deadline; prior native work may still be finishing".to_string())?
+    if worker.send((req,start,Arc::clone(&cancel),send)).is_err() {BUSY.store(false,Ordering::Release);return Err("native worker stopped".into());}
+    match recv.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result)=>result,
+        Err(_)=>{
+            cancel.store(true,Ordering::Release);
+            Err("deadline; prior native work cancelling".into())
+        }
+    }
 }
 
 /// One serialized native query at a time. Python holds a lock around calls.
@@ -294,6 +344,36 @@ mod tests {
     use super::*;
     const OPEN_THREE:[(i32,i32);7]=[(0,0),(0,8),(2,8),(1,0),(2,0),(4,8),(6,8)];
     const IMMEDIATE:[(i32,i32);11]=[(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(4,0),(4,3),(5,4)];
+    #[test]
+    fn cancellation_tokens_survive_handoff_and_never_alias_successors() {
+        let old=hexo_tactical_prepare();
+        assert_ne!(old,0);
+        let retained=query_control(old).unwrap();
+        assert!(hexo_tactical_cancel(old));
+        hexo_tactical_release(old);
+        let next=hexo_tactical_prepare();
+        assert_ne!(old,next);
+        assert!(!hexo_tactical_cancel(old));
+        assert!(retained.load(Ordering::Acquire));
+        assert!(!query_control(next).unwrap().load(Ordering::Acquire));
+        let req=serde_json::from_value(json!({"history":IMMEDIATE,"ms":1000,"nodes":1000,
+            "idtt_nodes":0,"depth":8,"request_id":next})).unwrap();
+        assert!(hexo_tactical_cancel(next));
+        assert!(dispatch(req,Instant::now()).unwrap_err().contains("cancelled"));
+        hexo_tactical_release(next);
+        assert!(query_control(next).is_err());
+    }
+    #[test]
+    fn cancelled_certificate_checks_return_no_strategy() {
+        let (pos,_,ctl,_)=setup(100000);
+        let certificate=prover::pdspn::solve(&pos,&ProverConfig{wide:true,node_budget:100000,
+            tt_mb:1,pn2_nodes:1000,..Default::default()},&ctl).certificate.unwrap();
+        ctl.cancel.store(true,Ordering::Release);
+        assert!(check::verify(&OPEN_THREE,OPEN_THREE.len(),&certificate,&ctl,200000).is_err());
+        let req=serde_json::from_value(json!({"history":OPEN_THREE,"ms":1000,"nodes":100000,
+            "idtt_nodes":0,"depth":8,"certificate":certificate})).unwrap();
+        assert!(run_controlled(req,Instant::now(),Arc::clone(&ctl.cancel)).is_err());
+    }
     #[test]
     fn certificate_limit_follows_node_budget() {
         assert_eq!((check_nodes(1),check_nodes(8192),check_nodes(27000)),(50000,65536,200000));

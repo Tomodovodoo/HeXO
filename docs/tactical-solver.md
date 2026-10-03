@@ -17,6 +17,8 @@ The build needs Rust and Cargo with edition 2024 support and writes the library 
 
 `IsolatedTactics` runs the library in a disposable child process with a deadline and a memory cap (1536 MB); a child that overruns is killed and replaced, so one slow query never delays the next. `forcing_material.worth_solving(game)` is the cheap gate the searches use before asking: it needs a live window with three of the mover's stones.
 
+Both wrappers expose `cancel()` to stop the current query cooperatively. Search, certificate reconstruction, guided shortening, and both native checkers share its stop token. Request IDs prevent a late cancellation from stopping the next query. Cooperative cancellation retains the isolated child and its resident tables; `abort()` and the hard deadline still replace a child that cannot stop. Rebuild the tactical library to enable cooperative cancellation.
+
 ## In the search
 
 `dense_solver.Schedule` runs the solver queries of the actor and evaluator searches (settings `solver_*` in `ActorSettings` and `EvaluationSettings`). Three queries per turn start: a root query (can the mover force a win), a threat query (could the opponent, moving now), and finalist queries on the second stone (does each of the top candidates lose by force). A root proof decides the move; a threat certificate's cells are searched first; a finalist proof marks its candidate lost in the tree the moment the verdict arrives.
