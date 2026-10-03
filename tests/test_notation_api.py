@@ -317,19 +317,41 @@ class TimedClocks(unittest.TestCase):
                           now=lambda: clock[0], directory=directory)
             try:
                 match.start()
+                clock[0] = 20_000_000
                 state = play_turn(match, engine, wait_worker=True, record_engine=True)
                 self.assertEqual(state['history'], [[0, 0], [1, 0], [2, 0]])
                 self.assertEqual((state['cross_ms'], state['circle_ms']), (1000, 920))
                 self.assertIsNone(engine.options['clock'])
-                self.assertEqual(engine.options['milliseconds'], 100)
+                self.assertEqual(engine.options['milliseconds'], 80)
                 events = [json.loads(line) for line in (match.directory/'events.jsonl').read_text().splitlines()]
                 reply = next(e for e in events if e['type'] == 'engine_reply')
-                self.assertEqual((reply['controller_ns'], reply['worker_wait_ms']), (80_000_000, 420))
+                self.assertEqual((reply['controller_ns'], reply['worker_wait_ms']), (60_000_000, 420))
                 self.assertEqual(next(e for e in events if e['type'] == 'turn')['elapsed_ns'], 80_000_000)
                 clock[0] += 10_000_000
                 self.assertEqual(match.snapshot()['cross_ms'], 990)
             finally:
                 match.close()
+
+    def test_worker_drain_failure_invalidates_a_comparison(self):
+        from timed_match import Match, play_turn, comparison_summary
+        clock = [0]
+        class Engine:
+            def turn(self, *_args, **_kwargs):
+                clock[0] = 80_000_000
+                return dict(moves=[[1, 0], [2, 0]])
+            def wait_idle(self):
+                clock[0] = 500_000_000
+                raise TimeoutError('still running')
+        match = Match(dict(players=dict(cross=dict(kind='native'), circle=dict(kind='native')),
+                           time_control='1', turn_cap_ms=100), now=lambda: clock[0])
+        self.addCleanup(match.close)
+        match.start()
+        state = play_turn(match, Engine(), wait_worker=True)
+        self.assertEqual(state['result']['reason'], 'crash')
+        self.assertEqual(state['history'], [[0, 0]])
+        stats = comparison_summary([dict(seed=0, swapped=False, **state['result'])])
+        self.assertFalse(stats['valid'])
+        self.assertIsNone(stats['elo_delta'])
 
     def test_clocked_runner_saves_every_game_and_color_pair(self):
         from timed_match import main
