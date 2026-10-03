@@ -117,6 +117,12 @@ out.single = {
   seal: await silent((await import('../../web/engine/seal.mjs')).seal.engine),
   strix: await silent(new (await import('../../web/engine/strix.mjs')).StrixEngine([{id: 'net', path: 'strix/net.safetensors', sha256: 'x', size: 1}])),
 };
+script = {load(options, post) {   // a compile that keeps reporting for longer than its limit
+  const stages = new Stages(post);
+  stages.enter('compile');
+  (async () => { for (let i = 0; i < 6; i++) { await wait(25); stages.send(.9); } post({type: 'ready', info: {}}); })();
+}, call() {}};
+out.single.reporting = await silent(new (await import('../../web/engine/strix.mjs')).StrixEngine([{id: 'net', path: 'strix/net.safetensors', sha256: 'x', size: 1}]));
 
 out.threads = [{isolated: true, cores: 8}, {isolated: true, cores: 8, memory: 2}, {isolated: true, cores: 8, memory: 4},
   {isolated: true, cores: 8, memory: 8}, {isolated: true, cores: 2, memory: 2}, {isolated: false, cores: 8, memory: 8},

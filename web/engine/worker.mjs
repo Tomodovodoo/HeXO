@@ -259,6 +259,7 @@ async function load(options = {}) {
     stages.enter('probe');
     device = await probe(options.prefer);
     stages.probed(device);
+    stages.enter('download');   // gumbel.mjs fetches gumbel.wasm
     native = new Native(await createModule());
     ort = await runtime(device.provider, options.threads, stages);
     await use(options.model, stages);

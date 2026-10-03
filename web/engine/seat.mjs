@@ -383,7 +383,8 @@ function recheck(entry, force = false) {
 }
 
 /** After browser engine `engine` left WebGPU for WebAssembly: lightning becomes its starting preset, and the saved
- * choices (or the static page's session) that use it at another preset move to lightning. */
+ * choices (or the static page's session) that use it at another preset move to lightning, ending a job of it at
+ * another preset. */
 function lighten(engine) {
   const found = [...ENGINES.values()].find(e => e.engine === engine);
   if (!found) return;
@@ -393,6 +394,10 @@ function lighten(engine) {
   const light = choice => choice?.engine === id ? {...choice, preset: 'lightning'} : choice;
   config = {seats: config.seats.map(light), analysis: light(config.analysis)};
   save();
+  if (job?.engine === id && job.preset !== 'lightning') {
+    job.controller.abort();
+    job = null;
+  }
   if (state()) page.renderPanels();
 }
 

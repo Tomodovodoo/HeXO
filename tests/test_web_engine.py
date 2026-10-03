@@ -326,7 +326,7 @@ class Loading(unittest.TestCase):
 
     def test_engines_without_a_chain_still_end_a_silent_stage(self):
         self.assertEqual(self.out['single'], dict(native='Native (browser): compiling timed out', seal='Seal (browser): compiling timed out',
-                                                  strix='Strix (browser): compiling timed out'))
+                                                  strix='Strix (browser): compiling timed out', reporting='loaded'))
 
     def test_threads_follow_device_memory(self):
         self.assertEqual(self.out['threads'], [7, 2, 4, 7, 1, 1, 2])

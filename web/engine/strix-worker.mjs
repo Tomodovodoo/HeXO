@@ -17,7 +17,8 @@ async function load(network) {
     const wasmFile = {path: 'strix/strix.wasm', sha256: (await json('build.json')).data.artefacts['strix/strix.wasm'], lines: true};
     const [wasm, weights] = await Promise.all([cached(wasmFile, stages.file(wasmFile.path)), cached(network, stages.file(network.path))]);
     stages.enter('compile');
-    const engine = await loadStrix(wasm, {progress: fraction => postMessage({type: 'progress', id: current, fraction})});
+    const engine = await loadStrix(wasm, {progress: fraction => postMessage(current === null   // the load's own, in its compile stage
+      ? {type: 'progress', fraction, stage: stages.current} : {type: 'progress', id: current, fraction})});
     const info = engine.load(weights);
     strix = engine;
     return {source_checkpoint: info.source_checkpoint};
