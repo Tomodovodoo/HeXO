@@ -7,7 +7,8 @@
  *
  * ENGINES lists them. Each is {entry, engine, record}: `entry` is its picker entry ({id, kind, name, label,
  * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
- * while it downloads) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
+ * while it downloads), `engine.files()` lists the files it downloads (assets.mjs records, for the picker's download
+ * button) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
  * preset's budget, plus `checkpoint` (one of `entry.checkpoints`, chosen in a select when there are several) when the
  * entry lists any, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
  * evaluation record the analysis panel shows for that turn. */
@@ -18,16 +19,17 @@ import {mountPlay} from './browser-play.mjs';
 import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 import {strix} from './strix.mjs';
+import {install as download, json, status} from './assets.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
 const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: [], presets: PRESETS, analysis: true},
   engine: new BubbleEngine(),
   record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
     solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE})};
-const ENGINES = new Map([bubble, native, shrimp, seal, six, strix].filter(Boolean).map(e => [e.entry.id, e]));
+const ENGINES = new Map([bubble, native, shrimp, seal, six, strix].map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
-  'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems', 'isHuman'];
+  'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems', 'isHuman', 'setupRing'];
 const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, page[name]]));
 const analyses = new Map(), loads = new Map(), hk = history => history.map(p => p.join(',')).join(';');
 /** Each seat and the analysis: null, or {engine: an ENGINES id, preset, checkpoint}. */
@@ -134,6 +136,7 @@ async function run(key, task) {
   try {
     current.loading = true;
     await engine.load(f => { loads.set(task.engine, f); progress(); });
+    checks.delete(task.engine);
     current.loading = false;
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})};
     const result = await engine.turn(task.history, budget, {signal: controller.signal,
@@ -189,7 +192,71 @@ function controls(choice, send, id) {
   return out;
 }
 
+/* Engine id -> a promise of its files' assets.mjs status(), or {state: 'failed', error} when they cannot be listed. */
+const checks = new Map(), downloads = new Map();
+const check = id => {
+  if (!checks.has(id)) checks.set(id, ENGINES.get(id).engine.files().then(status, error => ({state: 'failed', error: error.message})));
+  return checks.get(id);
+};
+const megabytes = bytes => `${(bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0)} MB`;
+
+/** Draws picker row `row` of a browser engine: as it is when its files are here or cached, else as a download with
+ * its size, and while downloading with its progress. */
+async function paint(row) {
+  const id = row.dataset.engine, found = await check(id), running = downloads.get(id);
+  if (!row.isConnected) return;
+  row.querySelectorAll('.get, .size').forEach(node => node.remove());
+  const ready = !running && (found.state === 'local' || found.state === 'cached');
+  row.classList.remove('setup', 'running', 'failed');
+  row.removeAttribute('aria-label');
+  if (ready) return;
+  row.classList.add('setup', ...(running ? ['running'] : found.state === 'failed' ? ['failed'] : []));
+  const total = found.bytes ? megabytes(found.bytes) : '';
+  const size = !running ? total : total ? `${megabytes(running.fraction * found.bytes)} / ${total}` : `${Math.round(running.fraction * 100)}%`;
+  row.setAttribute('aria-label', `Download ${ENGINES.get(id).entry.label}`);
+  row.append(original.el('span', {class: 'size', style: 'white-space:nowrap'}, size), original.setupRing(running ? {state: 'running', progress: running.fraction} : null));
+}
+
+/** Downloads browser engine `id`'s missing files into the Cache API; a failure shows its reason. */
+async function fetchEngine(id) {
+  if (downloads.has(id)) return;
+  if ((await check(id)).state === 'failed') checks.delete(id);
+  const repaint = () => document.querySelectorAll(`#menu [data-engine="${id}"]`).forEach(paint);
+  downloads.set(id, {fraction: 0});
+  repaint();
+  try {
+    const found = await check(id);
+    if (found.state === 'failed') throw new Error(found.error);
+    if (found.state === 'missing') await download(found.files, fraction => { downloads.get(id).fraction = fraction; repaint(); });
+    checks.set(id, Promise.resolve({state: 'cached'}));
+  } catch (error) {
+    checks.set(id, Promise.resolve({state: 'failed', error: error.message}));
+    original.toast(`${ENGINES.get(id).entry.label}: ${error.message}`);
+  } finally {
+    downloads.delete(id);
+    repaint();
+  }
+}
+
+/** The page's engine picker, with a browser engine's row offering its download until its files are here. */
+function openMenu(anchor, items, current, choose) {
+  original.openMenu(anchor, items, current, choose);
+  const rows = [...document.getElementById('menu').children];
+  items.forEach((item, i) => {
+    if (!ENGINES.has(item.id)) return;
+    const row = rows[i], pick = row.onclick;
+    row.dataset.engine = item.id;
+    row.onclick = async event => {
+      const {state} = await check(item.id);
+      if (!downloads.has(item.id) && (state === 'local' || state === 'cached')) pick(event);
+      else fetchEngine(item.id);
+    };
+    paint(row);
+  });
+}
+
 function install() {
+  page.openMenu = openMenu;
   page.accept = data => {
     adopt(data);
     inject(data);
@@ -252,7 +319,7 @@ function install() {
     const pick = box.querySelector('.pick');
     if (pick) {
       const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...original.pickItems(() => true)];
-      pick.onclick = () => original.openMenu(pick, items, config.seats[side].engine, it => page.post('/seat', {side, engine: it.id}));
+      pick.onclick = () => page.openMenu(pick, items, config.seats[side].engine, it => page.post('/seat', {side, engine: it.id}));
     }
     box.append(original.el('div', {class: 'more'}, original.el('div', {}, ...controls(config.seats[side], send, 'seat' + side))));
     progress();
@@ -264,7 +331,7 @@ function install() {
     const {entry} = ENGINES.get(config.analysis.engine);
     const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.badge || entry.kind, entry.label));
     const items = original.pickItems(analysable);
-    pick.onclick = () => original.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: 'standard', auto: true}));
+    pick.onclick = () => page.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: 'standard', auto: true}));
     const send = change => { config.analysis = {...config.analysis, ...change}; save(); page.renderPanels(); };
     head.replaceChildren(original.el('div', {class: 'head'}, pick), ...controls(config.analysis, send, 'analysis'));
   };
@@ -295,8 +362,8 @@ async function serverless() {
     if (response.ok && (response.headers.get('Content-Type') || '').includes('json')) return false;
   } catch {}
   if (await isolate()) return true;
-  Object.assign(page, original);
-  const [manifest, build] = await Promise.all(['model/manifest.json', 'build.json'].map(async path => (await fetch(new URL(path, import.meta.url), {cache:'no-cache'})).json()));
+  Object.assign(page, original, {openMenu});
+  const [manifest, build] = await Promise.all([json('model/manifest.json').then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);
   bubble.entry.version = [manifest.model_version, build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
   native.entry.version = build.artefacts['native/native.wasm'];
   for (const {entry} of ENGINES.values()) entry.version ||= JSON.stringify(build.artefacts);

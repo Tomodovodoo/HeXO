@@ -6,7 +6,7 @@ wasm   src/gumbel.cpp -> gumbel.mjs + gumbel.wasm and src/hexo.cpp -> native/nat
        search, built as Six builds it for its site); build.json binds them to their sources (committed).
 strix  only tools/strix_web -> strix/strix.wasm, refreshing its entries in build.json.
 strix-network  the Strix network pinned in tools/engines.json (hexo.tyto.cc's pulsatrix-10-best, licence unstated)
-       into strix/ with strix/networks.json (ignored). Without it the page does not offer Strix (browser).
+       into strix/ with strix/networks.json (ignored). Without it the page downloads the public site's.
 ort    onnxruntime-web from the npm registry, checked against its published integrity, into ort/ (ignored).
 model  --checkpoint ema.pt, or --release TAG (or 'latest') from the GitHub releases, exported by export_web into
        model/ (ignored).
@@ -155,7 +155,7 @@ def build_strix_network():
 
 def build_seal(emxx):
     """Compile tools/seal_adapter.cpp against Seal's pinned headers into seal/; seal/manifest.json names Seal's
-    revision and the wasm's SHA-256, which the browser caches it under."""
+    revision and the SHA-256 of engine.mjs and engine.wasm, which the browser checks and caches them under."""
     spec = json.loads((ROOT/'tools'/'engines.json').read_text(encoding='utf-8'))['seal']
     with tempfile.TemporaryDirectory() as folder:
         for file in spec['files']:
@@ -168,8 +168,13 @@ def build_seal(emxx):
         SEAL.mkdir(exist_ok=True)
         subprocess.run([emxx, str(ROOT/'tools'/'seal_adapter.cpp'), '-I', str(Path(folder)/'cpp'), *WASM_FLAGS,
                         '-sEXPORTED_FUNCTIONS=_malloc,_free,_seal_move', '-o', str(SEAL/'engine.mjs')], check=True)
-    manifest = dict(revision=spec['revision'], sha256=hashlib.sha256((SEAL/'engine.wasm').read_bytes()).hexdigest())
+    manifest = dict(revision=spec['revision'], files=sha256s(SEAL, ('engine.mjs', 'engine.wasm')))
     (SEAL/'manifest.json').write_text(json.dumps(manifest)+'\n', encoding='utf-8')
+
+
+def sha256s(folder, names):
+    """{name: SHA-256 of folder/name}: the pins a page on another origin checks these files against."""
+    return {name: hashlib.sha256((folder/name).read_bytes()).hexdigest() for name in names}
 
 
 def fetch(url):
@@ -186,7 +191,7 @@ def build_ort():
     with tarfile.open(fileobj=io.BytesIO(data)) as archive:
         for name in ORT_FILES:
             (out/name).write_bytes(archive.extractfile(f'package/dist/{name}').read())
-    (out/'version.json').write_text(json.dumps(dict(version=ORT_VERSION))+'\n', encoding='utf-8')
+    (out/'version.json').write_text(json.dumps(dict(version=ORT_VERSION, files=sha256s(out, ORT_FILES)))+'\n', encoding='utf-8')
 
 
 def pinned(data, sha256, name):

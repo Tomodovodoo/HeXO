@@ -2,7 +2,8 @@
  * In: {type: 'load', options} | {type: 'turn', id, history, visits} | {type: 'cancel', id}.
  * Out: {type: 'progress', id?, fraction} | {type: 'ready', device} | {type: 'result', id, result} | {type: 'cancelled', id}
  *     | {type: 'error', id?, message}. */
-import {cached, probe} from './network.mjs';
+import {cached, json} from './assets.mjs';
+import {probe} from './network.mjs';
 import {ShrimpNetwork} from './shrimp/network.mjs';
 import {Cancelled, ShrimpSearch, loadModule} from './shrimp/search.mjs';
 
@@ -39,11 +40,11 @@ async function play({id, history, visits}) {
 }
 
 async function load(options = {}) {
-  const base = new URL('./', import.meta.url), report = fraction => postMessage({type: 'progress', fraction: .95 * fraction});
-  const build = await (await fetch(new URL('build.json', base), {cache: 'no-cache'})).json();
+  const report = fraction => postMessage({type: 'progress', fraction: .95 * fraction});
+  const build = (await json('build.json')).data;
   let device = await probe(options.prefer);
-  const create = () => ShrimpNetwork.create(base, {device, progress: report, threads: options.threads});
-  const wasm = cached(new URL('shrimp/shrimp.wasm', base).href, build.artefacts['shrimp/shrimp.wasm']).then(loadModule);
+  const create = () => ShrimpNetwork.create({device, progress: report, threads: options.threads});
+  const wasm = cached({path: 'shrimp/shrimp.wasm', sha256: build.artefacts['shrimp/shrimp.wasm'], lines: true}).then(loadModule);
   try {
     network = await create();
   } catch (error) {

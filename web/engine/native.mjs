@@ -1,12 +1,19 @@
 /* "Native (browser)": Native (src/hexo.cpp) as WebAssembly in native-worker.mjs, for the play page's browser engines
  * (seat.mjs). It plays as python/play.py's Native: the same presets in ms, depth 12, width 16. */
 import {DEPTH} from './native/search.mjs';
+import {json, workerUrl} from './assets.mjs';
 
 export const PRESETS = {lightning: {ms: 100}, quick: {ms: 250}, standard: {ms: 1000}, strong: {ms: 3000},
   deep: {ms: 10000}, dangerous: {ms: 60000}};
 const ID = 'browser:native', LABEL = 'Native (browser)', MATE = 10000000;
 const SCALE = 1000;   // score units per factor e of the shown odds; Native's score is a heuristic, not a probability
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
+
+/** Native's files (assets.mjs records): native.wasm as web/engine/build.json pins it. */
+export async function files() {
+  const {data, local} = await json('build.json');
+  return [{path: 'native/native.wasm', sha256: data.artefacts['native/native.wasm'], lines: true, local}];
+}
 
 export class NativeEngine {
   constructor() {
@@ -19,7 +26,7 @@ export class NativeEngine {
   /** Starts the worker and loads native.wasm; `progress(fraction)` reports the download. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
-    const worker = this.worker = new Worker(new URL('native-worker.mjs', import.meta.url), {type: 'module'});
+    const worker = this.worker = new Worker(workerUrl('native-worker.mjs'), {type: 'module'});
     const ready = this.ready = new Promise((resolve, reject) => {
       this.waits.set(0, {resolve, reject});
       worker.onmessage = ({data}) => {
@@ -58,6 +65,10 @@ export class NativeEngine {
       clearInterval(timer);
       signal?.removeEventListener('abort', cancel);
     }
+  }
+
+  files() {
+    return files();
   }
 
   /** Ends the worker; pending calls reject with an AbortError. */

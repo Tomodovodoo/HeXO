@@ -26,6 +26,26 @@ Without a play server the page answers its own game requests (`web/engine/offlin
 and the analysis, server-only controls (review, tournaments, import and export) are hidden, and `web/coi-sw.js`, scoped
 to the site's path, adds the cross-origin isolation headers after one reload.
 
+## Running a local copy
+
+A copy of `web/` (a static server, or the page `python/play.py` serves) usually lacks the build outputs: ONNX
+Runtime, the Bubble model, Six's networks, Shrimp's model, Seal and the Strix network. Every browser engine stays in
+the picker anyway. One whose files are neither on this origin nor already downloaded shows a download button with
+its size; click it to fetch the files from the public site, after which the engine plays as usual. Picking such an
+engine for a seat without clicking downloads the same files on its first move.
+
+`web/engine/assets.mjs` resolves each file. It asks this origin first and, on a 404 or a network error, fetches the
+file from <https://tomodovodoo.github.io/HeXO/engine/>, which allows any origin to read it. A file from the site must
+match the SHA-256 that this origin's manifest gives (`build.json`, `model/manifest.json`, `ort/version.json` and the
+other manifests), or the site's own manifest when this origin has none. A mismatch, or a file the manifest does not
+pin, fails the download with a message on the page. The bytes go into the Cache API store `bubble-engine-v1` of
+this origin, keyed by the file's URL here and its version, so a reload or a later visit reads them from the cache.
+The public site finds every file on its own origin and never fetches from elsewhere. The wasm that is committed and
+loaded by its own glue (`gumbel.wasm`, `tactical.wasm`, `six/six.wasm`) is always present and loads as before.
+
+For development, `?assets=<url of an engine folder>` on the page, or a `data-assets` attribute on the page's
+`seat.mjs` script tag, points the fallback at another site; workers receive it on their script URL.
+
 ## Layout
 
 | File | Role |
@@ -34,7 +54,8 @@ to the site's path, adds the cross-origin isolation headers after one reload.
 | `web/engine/engine-worker.mjs` | `EngineWorker`: a browser engine's worker from the page, with loading, cancellable calls and the one-thread retry |
 | `web/engine/bubble.mjs` | Page API: `BubbleEngine.load/turn/search/evaluate/bench`, `PRESETS`, `isolate()` |
 | `web/engine/worker.mjs` | Engine worker: a turn exactly like `python/play.py evaluate` |
-| `web/engine/network.mjs` | Device probe, cached downloads (Cache API), sessions, batched evaluation |
+| `web/engine/assets.mjs` | Engine files from this origin or the public site, checked and kept in the Cache API |
+| `web/engine/network.mjs` | Device probe, ONNX Runtime loading, sessions, batched evaluation |
 | `web/engine/encode.mjs` | `hexcrop.encode` and `hexnet.LineFeatures` |
 | `web/engine/search.mjs` | `hxg_*` driver: the `neural_search` loop, evaluation cache, root statistics |
 | `web/engine/tactical.mjs`, `solver-worker.mjs` | Solver with a WASI shim, in a worker that a cancel terminates |
@@ -201,8 +222,8 @@ against its SHA-256 and compiles them with `tools/seal_adapter.cpp`, the server'
 as `gumbel.wasm`. The headers are never committed; the Pages workflow installs emsdk 6.0.10 and builds Seal on every
 deployment. HexTicTacToe has no licence file; its author allows this use, so the site serves the compiled Seal.
 
-The wasm is 115 KB and its glue 10 KB. The worker fetches `seal/manifest.json`, then the wasm from the Cache API
-under its SHA-256, and calls `seal_move` exactly as the server does; Seal's clock is `performance.now()` in the
+The wasm is 115 KB and its glue 10 KB. The worker fetches `seal/manifest.json`, which pins both, then the glue and
+the wasm through `assets.mjs`, and calls `seal_move` exactly as the server does; Seal's clock is `performance.now()` in the
 worker. The search blocks the worker, so a cancel terminates it and the next turn starts a new one, which loses
 Seal's transposition table. The page cuts the answer to the stones left in the turn and stops at a winning stone,
 as `play.checked_turn` does. As analysis, Seal shows its first stone as the top move and both stones as the line.
@@ -267,7 +288,7 @@ builds it with the rest.
 
 The network is not committed. `python tools/build_web.py strix-network` downloads the file pinned in
 `tools/engines.json` (2.8 MB, checked against its SHA-256) into `web/engine/strix/` with `networks.json`; without
-that file the page does not offer Strix. The worker keeps `strix.wasm` and the network in the Cache API under their
+that file the page downloads the public site's ([Running a local copy](#running-a-local-copy)). The worker keeps `strix.wasm` and the network in the Cache API under their
 digests. The network's licence is unstated in the repository, and its author allows this use; the Pages workflow fetches it
 when the repository variable `PUBLISH_STRIX_NETWORK` is `true`, which it is. The engine code is MIT (`web/engine/strix/LICENSE-hexo-strix.txt`); the Rust
 crates it links (serde, serde_json, rand, safetensors, rayon, rustc-hash) are MIT or Apache 2.0.

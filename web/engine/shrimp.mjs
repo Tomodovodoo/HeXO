@@ -1,7 +1,9 @@
 /* "Shrimp (browser)": Shrimp (Cmiller132/hexo-bot main_7, MIT) in shrimp-worker.mjs, for the play page's browser
  * engines (seat.mjs). It plays as the server's Shrimp entry (tools/engines.json): Six's driver with these visits per
  * stone, mirrored into Six's frame. */
-import {defaultThreads} from './network.mjs';
+import {json, workerUrl} from './assets.mjs';
+import {defaultThreads, probe, runtimeFiles} from './network.mjs';
+import {ShrimpNetwork} from './shrimp/network.mjs';
 
 /** The server entry's presets, as visits per stone; `simulations` is what the analysis panel shows. */
 export const PRESETS = Object.fromEntries(Object.entries({lightning: 16, quick: 32, standard: 128, strong: 512, deep: 1024,
@@ -39,7 +41,7 @@ export class ShrimpEngine {
 
   start(progress) {
     return new Promise((resolve, reject) => {
-      const worker = this.worker = new Worker(new URL('shrimp-worker.mjs', import.meta.url), {type: 'module'});
+      const worker = this.worker = new Worker(workerUrl('shrimp-worker.mjs'), {type: 'module'});
       const threaded = this.options.threads == null && defaultThreads({isolated: Boolean(globalThis.crossOriginIsolated),
         cores: navigator.hardwareConcurrency || 2}) > 1;
       let timer = null;
@@ -77,6 +79,12 @@ export class ShrimpEngine {
       signal?.addEventListener('abort', () => worker.postMessage({type: 'cancel', id}), {once: true});
       worker.postMessage({type: 'turn', id, history, visits: budget.visits});
     });
+  }
+
+  /** The downloaded files (assets.mjs records) a load on this device reads: ONNX Runtime, the graph and shrimp.wasm. */
+  async files() {
+    const [{provider}, {file}, {data, local}] = await Promise.all([probe(this.options.prefer), ShrimpNetwork.files(), json('build.json')]);
+    return [...await runtimeFiles(provider), file, {path: 'shrimp/shrimp.wasm', sha256: data.artefacts['shrimp/shrimp.wasm'], lines: true, local}];
   }
 
   /** Ends the worker; pending loads and calls reject with an AbortError. */

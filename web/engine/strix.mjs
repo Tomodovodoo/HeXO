@@ -1,15 +1,16 @@
 /* "Strix (browser)": Strix's network and Gumbel search (tools/strix_web as strix/strix.wasm) in strix-worker.mjs, for
  * the play page's browser engines (seat.mjs). It plays as python/play.py's Strix: the same presets in simulations per
  * placement, with a network `python tools/build_web.py strix-network` placed in strix/ (listed in strix/networks.json,
- * the first is the default). Without that file `strix` is null and the page does not offer it. */
+ * the first is the default), or the site's when this origin has none. */
+import {json, workerUrl} from './assets.mjs';
 
 /** Simulations per placement, as python/play.py's Strix presets. */
 export const PRESETS = {lightning: {simulations: 2}, quick: {simulations: 8}, standard: {simulations: 64},
   strong: {simulations: 128}, deep: {simulations: 512}, dangerous: {simulations: 4096}};
-const ID = 'browser:strix', LABEL = 'Strix (browser)', MANIFEST = new URL('strix/networks.json', import.meta.url);
+const ID = 'browser:strix', LABEL = 'Strix (browser)', MISSING = new Error('strix/networks.json is on neither this site nor the public one');
 
 export class StrixEngine {
-  /** `networks` are the strix/networks.json entries with their `url`, the default first. */
+  /** `networks` are the strix/networks.json entries with their `path` under web/engine, the default first. */
   constructor(networks) {
     this.networks = new Map(networks.map(network => [network.id, network]));
     this.network = networks[0];
@@ -21,7 +22,8 @@ export class StrixEngine {
   /** Starts the worker with the current network; `progress(fraction)` reports the download. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
-    const worker = this.worker = new Worker(new URL('strix-worker.mjs', import.meta.url), {type: 'module'});
+    if (!this.network) return Promise.reject(MISSING);
+    const worker = this.worker = new Worker(workerUrl('strix-worker.mjs'), {type: 'module'});
     const ready = this.ready = new Promise((resolve, reject) => {
       worker.onmessage = ({data}) => {
         if (data.type === 'progress' && data.id === undefined) progress(data.fraction);
@@ -31,8 +33,16 @@ export class StrixEngine {
       worker.onerror = event => reject(new Error(event.message || 'Strix worker failed'));
     });
     ready.catch(() => { if (this.ready === ready) this.close(); });
-    worker.postMessage({type: 'load', network: {url: this.network.url, sha256: this.network.sha256}});
+    worker.postMessage({type: 'load', network: {path: this.network.path, sha256: this.network.sha256, bytes: this.network.size}});
     return ready;
+  }
+
+  /** The downloaded files (assets.mjs records) a load reads: strix.wasm and the current network. */
+  async files() {
+    if (!this.network) throw MISSING;
+    const {data, local} = await json('build.json');
+    return [{path: 'strix/strix.wasm', sha256: data.artefacts['strix/strix.wasm'], lines: true, local},
+      {path: this.network.path, sha256: this.network.sha256, bytes: this.network.size, local: this.network.local}];
   }
 
   /** Ends the worker; the next load starts a new one. */
@@ -70,11 +80,11 @@ export class StrixEngine {
   }
 }
 
+/** The strix/networks.json entries, from the site when this origin has none; none when neither answers. */
 async function networks() {
   try {
-    const response = await fetch(MANIFEST, {cache: 'no-store'});
-    if (!response.ok) return [];
-    return (await response.json()).networks.map(network => ({...network, url: new URL(network.file, MANIFEST).href}));
+    const {data, local} = await json('strix/networks.json');
+    return data.networks.map(network => ({...network, path: `strix/${network.file}`, local}));
   } catch {
     return [];
   }
@@ -82,9 +92,9 @@ async function networks() {
 
 const found = await networks();
 
-/** The browser engine for seat.mjs, or null when no network was built. */
-export const strix = found.length ? {
+/** The browser engine for seat.mjs. */
+export const strix = {
   entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: found.map(n => n.id), presets: PRESETS, analysis: true},
   engine: new StrixEngine(found),
   record: result => ({...result, proof: null, line: [], threat: [], engine: ID}),
-} : null;
+};

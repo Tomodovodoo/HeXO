@@ -1,5 +1,6 @@
 /* Seal (Ramora0/HexTicTacToe) running in the browser: tools/seal_adapter.cpp compiled to seal/engine.wasm
  * (tools/build_web.py seal), searched in seal-worker.mjs. Seal's budget is a clock in ms. */
+import {json, workerUrl} from './assets.mjs';
 
 export const PRESETS = {lightning: {ms: 50}, quick: {ms: 100}, standard: {ms: 500}, strong: {ms: 2000}, deep: {ms: 8000},
   dangerous: {ms: 30000}};
@@ -49,6 +50,12 @@ export function sealTurn(module, history, ms) {
   }
 }
 
+/** {revision, files}: Seal's revision and its module and wasm (assets.mjs records) as seal/manifest.json pins them. */
+export async function files() {
+  const {data, local} = await json('seal/manifest.json');
+  return {revision: data.revision, files: ['engine.mjs', 'engine.wasm'].map(name => ({path: `seal/${name}`, sha256: data.files?.[name], local}))};
+}
+
 /** The page-side handle of seal-worker.mjs. A cancelled turn ends its worker; the next call starts another. */
 export class SealEngine {
   constructor() {
@@ -59,10 +66,10 @@ export class SealEngine {
     this.calls = 0;
   }
 
-  /** Starts the worker and loads the wasm (Cache API, keyed by its SHA-256); `progress(1)` once it is loaded. */
+  /** Starts the worker and loads Seal (assets.mjs); `progress(fraction)` follows the wasm download. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
-    const worker = this.worker = new Worker(new URL('seal-worker.mjs', import.meta.url), {type: 'module'});
+    const worker = this.worker = new Worker(workerUrl('seal-worker.mjs'), {type: 'module'});
     const ready = this.ready = new Promise((resolve, reject) => {
       this.abandon = reject;
       worker.onmessage = ({data}) => {
@@ -117,6 +124,10 @@ export class SealEngine {
       clearInterval(pending.timer);
       pending.reject(error);
     }
+  }
+
+  async files() {
+    return (await files()).files;
   }
 
   close() {
