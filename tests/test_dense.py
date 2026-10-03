@@ -3568,6 +3568,66 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_losing_next_turn_labels_the_preceding_winning_pair(self):
+        history = [[0,0],[-1,2],[1,1],[1,2],[2,-1],[-4,3],[-3,3],[0,-1],[-2,3],[1,-1],
+                   [-1,0],[-1,4],[-1,-2],[0,-2],[2,1],[-1,7],[0,6],[-1,6],[1,5],[-3,10],
+                   [-2,9],[-1,8],[-2,8],[0,8],[-3,11],[0,9],[-3,12],[-5,10],[-6,11],[-5,11],[-4,10]]
+        settings = replace(dense_config.ActorSettings(), full_fraction=0., opening_random_plies=0.,
+                           adjudicate_proven=True, proven_line_rows=False)
+        model = unittest.mock.Mock()
+        for bound in (12, 0):
+            with self.subTest(bound=bound):
+                slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+                def result(action, proven=0):
+                    actions = np.asarray(slot.game.legal_moves(), np.int64)
+                    return dict(actions=actions, action=action, policy=np.ones(len(actions))/len(actions),
+                                values=np.zeros(len(actions)), exact_winner=0 if proven else -1,
+                                proven=proven, proof_turns=0, proof_plies=bound if proven else 0,
+                                solver_nodes=0, solver_budget=0, proof_action=[])
+                try:
+                    self.assertTrue(slot.searched(result([0,4])))
+                    self.assertTrue(slot.searched(result([0,3])))
+                    self.assertFalse(slot.searched(result(slot.game.legal_moves()[0], -1)))
+                    first, second, losing = slot.rows
+                    self.assertEqual([r.get('proven', 0) for r in slot.rows], [1, 1, -1])
+                    self.assertEqual(first['proof_action'], [[0,4],[0,3]])
+                    self.assertEqual(second['proof_action'], [[0,3]])
+                    if bound:
+                        self.assertEqual([r['proof_plies'] for r in slot.rows], [bound+2, bound+1, bound])
+                    else:
+                        self.assertNotIn('proof_plies', first)
+                        self.assertNotIn('proof_plies', second)
+                    self.assertEqual(slot.adjudicated['winner'], 0)
+                finally:
+                    slot.game.close()
+
+    def test_losing_child_labels_only_the_previous_players_choice(self):
+        settings = replace(dense_config.ActorSettings(), full_fraction=0., opening_random_plies=0.,
+                           adjudicate_proven=True, proven_line_rows=False)
+        model = unittest.mock.Mock()
+        for history in ([[0,0]], [[0,0],[0,3],[1,3]]):
+            for complete_turn in (False, True):
+                with self.subTest(history=history, complete_turn=complete_turn):
+                    slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+                    def result(action, proven=0):
+                        actions = np.asarray(slot.game.legal_moves(), np.int64)
+                        return dict(actions=actions, action=action, policy=np.ones(len(actions))/len(actions),
+                                    values=np.zeros(len(actions)), exact_winner=1-slot.game.player if proven else -1,
+                                    proven=proven, proof_turns=2 if proven else 0, proof_plies=8 if proven else 0,
+                                    solver_nodes=0, solver_budget=0, proof_action=[])
+                    try:
+                        self.assertTrue(slot.searched(result([1,0])))
+                        if complete_turn:
+                            self.assertTrue(slot.searched(result([2,0])))
+                        self.assertFalse(slot.searched(result(slot.game.legal_moves()[0], -1)))
+                        self.assertEqual([r.get('proven', 0) for r in slot.rows],
+                                         [1, 1, -1] if complete_turn else [0, -1])
+                        if complete_turn:
+                            self.assertEqual([r['proof_plies'] for r in slot.rows], [10, 9, 8])
+                            self.assertEqual([r['proof_turns'] for r in slot.rows], [3, 3, 2])
+                    finally:
+                        slot.game.close()
+
     def test_second_stone_proof_labels_the_searched_first_stone(self):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
         model = unittest.mock.Mock()
