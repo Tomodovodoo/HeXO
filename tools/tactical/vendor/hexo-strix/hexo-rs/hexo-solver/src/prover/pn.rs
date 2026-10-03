@@ -154,11 +154,18 @@ impl ProofTt {
     /// Look up `(pn, dn)` for a node key; `None` on miss (unknown → `(1, 1)`).
     #[inline]
     pub(crate) fn probe(&mut self, key: u64) -> Option<(u32, u32)> {
+        let found = self.peek(key);
+        self.hits += u64::from(found.is_some());
+        found
+    }
+
+    /// Reporting reads must not count as search transposition hits.
+    #[inline]
+    pub(crate) fn peek(&self, key: u64) -> Option<(u32, u32)> {
         let b = self.base(key);
         for w in 0..WAYS {
             let s = self.slots[b + w];
             if s.occupied && s.key == key {
-                self.hits += 1;
                 return Some((s.pn, s.dn));
             }
         }
@@ -208,6 +215,27 @@ impl ProofTt {
 
     pub(crate) fn hits(&self) -> u64 {
         self.hits
+    }
+
+    pub(crate) fn has_entries(&self) -> bool {
+        self.stored > 0
+    }
+
+    /// Rehash into the requested byte budget. Shrinking may evict entries;
+    /// the same resolved-first/work replacement rule applies as during search.
+    pub(crate) fn resize(&mut self, tt_mb: usize) {
+        let mut next = Self::new(tt_mb);
+        if next.slots.len() == self.slots.len() {
+            return;
+        }
+        for slot in &self.slots {
+            if slot.occupied {
+                next.store(slot.key, slot.pn, slot.dn, slot.work);
+            }
+        }
+        next.hits = self.hits;
+        next.stored = self.stored;
+        *self = next;
     }
 
     pub(crate) fn bytes(&self) -> u64 {
