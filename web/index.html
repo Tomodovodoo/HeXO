@@ -957,7 +957,7 @@ function renderJobs(){
     if(!cancel.children.length)cancel.append(el('button',{class:'x','aria-label':'Cancel',html:icon('close')}));
     cancel.firstChild.onclick=()=>post('/cancel',{id:job.id})}
   const review=$('review-go'),rjob=S.jobs.find(j=>j.kind==='review'),mark=STOP_ICON[STOPS.indexOf(S.review_preset)]||'';
-  review.innerHTML=mark;review.append(rjob?`${rjob.done} / ${rjob.total}  ×`:'Review');
+  review.innerHTML=mark;review.append(rjob?`${Math.floor(rjob.done)} / ${rjob.total}  ×`:'Review');
   review.onclick=()=>rjob?post('/cancel',{id:rjob.id}):post('/review');
   renderAnalysis();
   const pending=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view),analysing=S.jobs.filter(j=>j.kind==='analyse');
