@@ -55,7 +55,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .pick::after{content:"";margin-left:auto;width:8px;height:8px;flex:none;border:solid var(--dim);border-width:0 1.5px 1.5px 0;
   transform:translateY(-2px) rotate(45deg);opacity:0;transition:opacity .15s}
 .pick:hover::after,.pick.on::after{opacity:1}
-.strength{display:grid;gap:5px}
+.strength{display:grid;grid-template-columns:minmax(0,1fr);gap:5px}
 .ends{display:flex;align-items:center;font-size:11px;color:var(--dim);letter-spacing:.02em;padding:0 2px}
 .ends .ib{width:24px;height:24px;margin-left:8px}
 .ends .pace{font:11px var(--mono);color:var(--muted)}
@@ -150,8 +150,8 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .score span:last-child{text-align:right}.score em{font-style:normal;color:var(--dim);font-size:11px}
 .progress{height:4px;border-radius:2px;background:var(--line);overflow:hidden}.progress i{display:block;height:100%;background:var(--text);transition:width .4s}
 /* study */
-.engine{display:grid;gap:8px}
-.head{display:flex;align-items:center;gap:6px}
+.engine{display:grid;grid-template-columns:minmax(0,1fr);gap:8px}
+.head{display:flex;align-items:center;gap:6px;min-width:0}
 .head .pick{flex:1}
 .switch{display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;padding:4px;border-radius:8px;font-size:11px;color:var(--dim)}
 .switch.on{color:var(--muted)}

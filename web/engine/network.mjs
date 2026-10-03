@@ -10,9 +10,34 @@ export async function cached(url, version, progress = () => {}) {
   let store = null;
   try { store = await caches.open(CACHE); } catch {}
   const hit = store && await store.match(key);
-  if (hit) { progress(1); return hit.arrayBuffer(); }
+  if (hit) {
+    try {
+      const body = await hit.arrayBuffer();
+      progress(1);
+      return body;
+    } catch {                                   // an entry the browser can no longer read is fetched afresh
+      await store.delete(key);
+    }
+  }
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url}: ${response.status}`);
+  const body = await download(response, progress).catch(async () => {   // a browser whose body stream fails
+    progress(0);                                                         // still delivers the whole body at once
+    const again = await fetch(url, {cache: 'reload'});
+    if (!again.ok) throw new Error(`${url}: ${again.status}`);
+    return again.arrayBuffer();
+  });
+  if (store) {
+    for (const old of await store.keys()) if (old.url.split('?')[0] === key.href.split('?')[0]) await store.delete(old);
+    await store.put(key, new Response(body.slice(0)));
+  }
+  progress(1);
+  return body;
+}
+
+/** The body of `response` as an ArrayBuffer, read in chunks so `progress(fraction)` can follow the download. */
+async function download(response, progress) {
+  if (!response.body) return response.arrayBuffer();
   const total = Number(response.headers.get('Content-Length')) || 0, parts = [];
   let received = 0;
   for (const reader = response.body.getReader(); ;) {
@@ -22,13 +47,7 @@ export async function cached(url, version, progress = () => {}) {
     received += value.length;
     if (total) progress(Math.min(1, received / total));
   }
-  const body = await new Blob(parts).arrayBuffer();
-  if (store) {
-    for (const old of await store.keys()) if (old.url.split('?')[0] === key.href.split('?')[0]) await store.delete(old);
-    await store.put(key, new Response(body.slice(0)));
-  }
-  progress(1);
-  return body;
+  return new Blob(parts).arrayBuffer();
 }
 
 /** Removes every cached version of `url`, for bytes that failed their check. */
