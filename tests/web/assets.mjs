@@ -75,6 +75,11 @@ const url = await assets.moduleUrl({path: 'ort/x.mjs', sha256: hash('export defa
 out.module = {text: await (await import('node:buffer')).resolveObjectURL(url).text(), requests: [...requests]};
 
 reset();
+here.set('k.wasm', 'versioned');
+await assets.cached({path: 'k.wasm', version: '1.0', sha256: hash('versioned')});
+out.digest_key = [...store.keys()][0].split('v=')[1] === hash('versioned');
+
+reset();
 site.set('m.json', '{"version": 3}');
 out.json = await assets.json('m.json');
 

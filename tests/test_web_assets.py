@@ -54,6 +54,9 @@ class Resolver(unittest.TestCase):
         self.assertEqual(self.out['module']['text'], 'export default 7;')
         self.assertEqual(self.out['module']['requests'][-1], f'GET {SITE}ort/x.mjs')
 
+    def test_a_pinned_file_is_keyed_by_its_digest_not_its_version(self):
+        self.assertTrue(self.out['digest_key'])
+
     def test_manifest_falls_back_to_the_site(self):
         self.assertEqual(self.out['json'], {'data': {'version': 3}, 'local': False})
 

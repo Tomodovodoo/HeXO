@@ -57,10 +57,10 @@ async function open() {
   try { return await caches.open(CACHE); } catch { return null; }
 }
 
-/** The Cache API key of `file`: this origin's URL of its path at `?v=` its version (its SHA-256 by default). */
+/** The Cache API key of `file`: this origin's URL of its path at `?v=` its SHA-256, or its version when it has none. */
 function key(file) {
   const url = new URL(file.path, BASE);
-  url.searchParams.set('v', file.version ?? file.sha256 ?? '');
+  url.searchParams.set('v', file.sha256 ?? file.version ?? '');
   return url.href;
 }
 
@@ -131,11 +131,14 @@ export async function status(files) {
   return {state: 'missing', files: sized, bytes: sized.reduce((sum, file) => sum + file.bytes, 0)};
 }
 
-/** Downloads `files` into the Cache API (cached()); `progress(fraction)` follows them together, weighted by `bytes`. */
+/** Downloads `files` into the Cache API (cached()); `progress(fraction)` follows them together, weighted by `bytes`.
+ * Settles once every download has, rejecting with the first failure. */
 export async function install(files, progress = () => {}) {
   const shares = files.map(() => 0), weights = files.map(file => file.bytes || 1), total = weights.reduce((a, b) => a + b, 0);
-  await Promise.all(files.map((file, i) => cached(file, fraction => {
+  const settled = await Promise.allSettled(files.map((file, i) => cached(file, fraction => {
     shares[i] = fraction;
     progress(shares.reduce((sum, share, j) => sum + share * weights[j], 0) / total);
   })));
+  const failed = settled.find(result => result.status === 'rejected');
+  if (failed) throw failed.reason;
 }

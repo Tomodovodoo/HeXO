@@ -222,14 +222,15 @@ async function paint(row) {
 /** Downloads browser engine `id`'s missing files into the Cache API; a failure shows its reason. */
 async function fetchEngine(id) {
   if (downloads.has(id)) return;
-  downloads.set(id, {fraction: 0});
+  const slot = {fraction: 0};
+  downloads.set(id, slot);
   const repaint = () => document.querySelectorAll(`#menu [data-engine="${id}"]`).forEach(paint);
   try {
     if ((await check(id)).state === 'failed') checks.delete(id);
     repaint();
     const found = await check(id);
     if (found.state === 'failed') throw new Error(found.error);
-    if (found.state === 'missing') await download(found.files, fraction => { downloads.get(id).fraction = fraction; repaint(); });
+    if (found.state === 'missing') await download(found.files, fraction => { slot.fraction = fraction; repaint(); });
     checks.delete(id);
     if (!READY.has((await check(id)).state)) throw new Error('the downloaded files did not reach the browser cache');
   } catch (error) {
