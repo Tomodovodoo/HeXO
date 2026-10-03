@@ -2,6 +2,8 @@
 // {kind: 'encode', positions: [{history, actions}]} -> [{size, cells, far, ones: [flat plane indices], features: base64 float32}]
 // {kind: 'search', cases: [{history, seed, tactics, q_range_floor, root_noise, steps: [{simulations, root_samples, batch_size}], batches}]}
 //   replays the recorded evaluations batch by batch -> [[{action, policy, visits, completed}] per step]
+// {kind: 'game', simulations} -> turns of seats on GameTrees lines with a ranked network: the root visits each stone's
+//   search started from on the first and second turn of one line, at an undo and on a new line, and the lines kept
 // {kind: 'pv', history, certificate} -> {pv, plies} of the principal variation
 // {kind: 'rows', actions, policy, values, lead} -> top rows
 // {kind: 'overlay', cases: [{ev, stones}]} -> [boardOverlay(ev, stones)] from web/engine/overlay.js
@@ -10,7 +12,7 @@
 import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
-import {Native, NeuralSearch, EvaluationCache} from '../../web/engine/search.mjs';
+import {Native, NeuralSearch, EvaluationCache, GameTrees} from '../../web/engine/search.mjs';
 import {principalVariation, topRows} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
@@ -59,6 +61,25 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'search') {
   answer = [];
   for (const item of job.cases) answer.push(await search(item));
+} else if (job.kind === 'game') {
+  const trees = new GameTrees(native), cache = new EvaluationCache(), options = {seed: 1740, tactics: true, qRangeFloor: 0};
+  const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map((_, i) => -2 * i), q: actions.map(() => 0)}));
+  const turn = async (line, history) => {
+    const player = native.game(history).player, current = history.map(p => [...p]), carried = [];
+    while (native.game(current).player === player && native.game(current).winner < 0) {
+      const tree = trees.tree(line, current, options);
+      carried.push(tree.result().visits.reduce((a, b) => a + b, 0));
+      current.push((await tree.search({simulations: job.simulations, rootSamples: 16, cache, evaluate})).action);
+    }
+    return {history: current, carried, tree: trees.trees.get(line).tree};
+  };
+  const first = await turn('a', [[0, 0]]), reply = [...first.history];
+  for (let i = 0; i < 2; i++) reply.push(native.legal(reply)[0]);
+  const second = await turn('a', reply);
+  answer = {first: first.carried, second: second.carried, same: second.tree === first.tree,
+    undone: (await turn('a', [[0, 0]])).carried, fresh: (await turn('b', reply)).carried};
+  await turn('c', [[0, 0]]);
+  answer.lines = [...trees.trees.keys()];
 } else if (job.kind === 'pv') {
   answer = principalVariation(native, job.history, job.certificate);
 } else if (job.kind === 'rows') {

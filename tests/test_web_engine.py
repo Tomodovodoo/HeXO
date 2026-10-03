@@ -355,6 +355,14 @@ class Bundle(unittest.TestCase):
         self.assertFalse(result['auto'])
         self.assertEqual(result['sameBatchSeats'], ['test', 'test'])
 
+    def test_a_seat_line_carries_its_tree_across_turns(self):
+        answer = node(dict(kind='game', simulations=128))
+        self.assertEqual(answer['first'][0], 0)
+        self.assertGreater(answer['second'][0], 0)
+        self.assertTrue(answer['same'])
+        self.assertEqual((answer['undone'][0], answer['fresh'][0]), (0, 0))
+        self.assertEqual(answer['lines'], ['b', 'c'])
+
     def test_search_matches_native(self):
         """Same seed, position, budget, Q range floor, root noise and evaluations: the same actions, visits and policy
         as the native library."""

@@ -60,7 +60,7 @@ export class BrowserSession extends OfflineSession {
     this.bookData = null; this.book = {enabled: false, mode: 'wide', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
-    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false;
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.lines = [uid(), uid()];
   }
   registerEngine(entry, adapter) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
@@ -165,10 +165,12 @@ export class BrowserSession extends OfflineSession {
   }
   editable() { if (this.conflicted) throw Error(this.storageError); if (this.match?.active) throw Error('Stop the match before changing its players or position'); }
   load(history, paused = false, opening = null) {
-    this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.paused = paused; this.saved_game = null;
+    this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.paused = paused; this.saved_game = null; this.renewLines();
     this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
     this.book.opening = copy(opening);
   }
+  /** Gives `sides` (both when none) a new line, the key of the game tree a Bubble seat searches (worker.mjs). */
+  renewLines(...sides) { for (const side of sides.length ? sides : [0, 1]) this.lines[side] = uid(); }
   forkGame() {
     if (this.saved_game || !this.gameId || this.match) {
       this.saved_game = null; this.match = null; this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
@@ -197,7 +199,7 @@ export class BrowserSession extends OfflineSession {
       if (this.native.game(this.history).winner >= 0) throw Error('The game has finished');
       this.native.game([...this.history, point]); this.forkGame(); this.history.push(point); this.paused = false;
     } else if (path === '/undo') {
-      this.cancelJobs(); this.forkGame(); const people = body.people || [0, 1].filter(i => this.seats[i].engine === 'human'); this.history.pop();
+      this.cancelJobs(); this.forkGame(); this.renewLines(); const people = body.people || [0, 1].filter(i => this.seats[i].engine === 'human'); this.history.pop();
       while (people.length && this.history.length && !(people.includes(playerAt(this.history.length)) && this.history.length % 2)) this.history.pop();
       this.paused = true; this.saved_game = null;
     } else if (path === '/new') {
@@ -214,7 +216,7 @@ export class BrowserSession extends OfflineSession {
       this.load(this.history.slice(0, body.ply), false, body.ply >= this.book.opening?.ply ? this.book.opening : null); this.match = null;
     } else if (path === '/seat') {
       if (![0, 1].includes(body.side)) throw Error('Invalid seat');
-      this.cancelJobs(j => j.kind === 'move'); this.seats[body.side] = this.spec({...this.seats[body.side], ...body, budget: body.preset === 'custom' ? body.custom : undefined});
+      this.cancelJobs(j => j.kind === 'move'); this.renewLines(body.side); this.seats[body.side] = this.spec({...this.seats[body.side], ...body, budget: body.preset === 'custom' ? body.custom : undefined});
     } else if (path === '/analysis') {
       this.cancelJobs(j => j.kind !== 'move'); this.analysis = this.spec({...this.analysis, ...body, budget: body.preset === 'custom' ? body.custom : undefined});
     } else if (path === '/analyse') {
@@ -283,7 +285,7 @@ export class BrowserSession extends OfflineSession {
   async pump() {
     if (this.running || this.importing || this.conflicted) return;
     const state = this.native.game(this.history), seat = this.seats[state.player];
-    if (!this.paused && state.winner < 0 && this.adapters.has(seat.engine) && !this.jobs.some(j => j.kind === 'move')) this.enqueue('move', this.history, seat, {side: state.player});
+    if (!this.paused && state.winner < 0 && this.adapters.has(seat.engine) && !this.jobs.some(j => j.kind === 'move')) this.enqueue('move', this.history, seat, {side: state.player, line: this.lines[state.player]});
     const job = this.jobs.find(j => j.status === 'queued' && j.kind === 'move') || this.jobs.find(j => j.status === 'queued' && j.kind === 'analyse' && !j.tier)
       || this.jobs.find(j => j.status === 'queued' && j.kind === 'review') || this.jobs.find(j => j.status === 'queued' && j.tier);
     if (!job) return;
@@ -307,7 +309,7 @@ export class BrowserSession extends OfflineSession {
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
       try {
-        result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal: job.controller.signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms: limit,
+        result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal: job.controller.signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms: limit, line: job.line,
           progress: f => { job.done = job.kind === 'review' ? job.cursor + f : f; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);

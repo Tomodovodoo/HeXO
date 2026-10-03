@@ -1,5 +1,5 @@
 /* Bubble in a Web Worker: network (network.mjs), native search (gumbel.wasm) and the tactical solver (solver-worker.mjs).
- * In: {type: 'load', options} | {type: 'turn', id, history, simulations, solverNodes, batchSize, qRangeFloor}
+ * In: {type: 'load', options} | {type: 'turn', id, history, simulations, solverNodes, batchSize, qRangeFloor, line}
  *     | {type: 'cancel', id} | {type: 'bench', id, batches, sizes, repeats}
  *     | {type: 'search', id, history, simulations, batchSize, qRangeFloor}
  *     | {type: 'evaluate', id, histories}.
@@ -7,14 +7,14 @@
  *     | {type: 'error', id?, message}.
  */
 import createModule from './gumbel.mjs';
-import {Native, NeuralSearch, EvaluationCache} from './search.mjs';
+import {Native, NeuralSearch, EvaluationCache, GameTrees} from './search.mjs';
 import {Network, probe} from './network.mjs';
 import {principalVariation, topRows} from './proof.mjs';
 
 const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 'defender counterwin',
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
   'free-second coverage work limit']);
-let native, network, cache, solver = null, solverCalls = 0;
+let native, network, cache, games, solver = null, solverCalls = 0;
 const cancelled = new Set(), solverWaits = new Map();
 
 class Cancelled extends Error {}
@@ -80,8 +80,12 @@ function proofTurns(plies, remaining, moverWins) {
   return Math.ceil((plies - remaining) / 4);
 }
 
-/** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms). */
-async function turn({id, history, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0}) {
+/**
+ * Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms).
+ * With `line` (a seat's game, see GameTrees) the search continues that game's tree, as a play.py seat does; without
+ * it the turn searches a tree of its own.
+ */
+async function turn({id, history, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0, line = null}) {
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
@@ -111,7 +115,8 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
     for (let local = native.game(current); !given && local.player === player && local.winner < 0; local = native.game(current)) {
       let action, policy, actions, stoneValue, values = null;
       if (simulations) {
-        tree ??= new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current});
+        tree ??= line === null ? new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current})
+          : games.tree(line, current, {seed: 1740, tactics: true, qRangeFloor});
         const stone = moves.length;
         const result = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
           evaluate: leaves => network.evaluate(leaves), stop: () => cancelled.has(id),
@@ -148,7 +153,7 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
     return {moves, value: Math.round(value * 1e4) / 1e4, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
       actual_completed: completed, actual_solver_nodes: solverUsed};
   } finally {
-    tree?.close();
+    if (line === null) tree?.close();
   }
 }
 
@@ -175,6 +180,7 @@ async function load(options = {}) {
     network = await create();
   }
   cache = new EvaluationCache(4096);
+  games = new GameTrees(native);
   const t = performance.now();
   for (const history of [[[0, 0]], [[0, 0], [1, 0], [0, 1], [5, 0], [6, 0]]]) {
     const leaf = {history, actions: native.legal(history)};
