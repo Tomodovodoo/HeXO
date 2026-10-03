@@ -1741,6 +1741,22 @@ class GameProofs(unittest.TestCase):
         self.assertEqual(self.analyse(79, 0, force=True)['proof']['plies'], 14)
         self.assertEqual(self.analyse(79, 0, preset='lightning')['proof']['plies'], 14)
 
+    def test_a_reopened_game_keeps_the_proofs_of_positions_it_undid(self):
+        archive = tempfile.TemporaryDirectory()
+        self.addCleanup(archive.cleanup)
+        self.session.archive = Path(archive.name)
+        self.session.load(self.start + [(-1, -11)], True)
+        self.assertEqual(self.analyse(80, 32768)['proof']['plies'], 13)
+        self.session.undo()
+        self.session.save_freeplay()
+        ident = self.session.remember_match(self.session.freeplay_directory)
+        reopened = Session(dict(self.session.entries), FakeEngines(), Evaluations(), archive=archive.name, save_initial=False)
+        self.addCleanup(reopened.close)
+        study = reopened.open_saved_game(ident, 1)
+        self.addCleanup(study.close)
+        self.assertEqual(len(study.history), 79)
+        self.assertEqual(study.state()['evaluations'][79]['proof'], dict(winner=0, turns=4, plies=14))
+
     def test_positions_inside_a_line_are_proven_after_a_reload(self):
         seven = self.analyse(80, 32768)
         line = [tuple(p[:2]) for p in seven['pv'][:3]]

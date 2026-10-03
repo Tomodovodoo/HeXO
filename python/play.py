@@ -2157,7 +2157,7 @@ class Session:
             if study.analysis:
                 study.analysis['auto'] = False
             # Reuse the game's evaluations without editing its files.
-            path = directory / 'evaluations.jsonl'
+            path, proven = directory / 'evaluations.jsonl', []
             if path.exists():
                 with study.store.lock, path.open(encoding='utf-8') as lines:
                     for line in lines:
@@ -2167,10 +2167,15 @@ class Session:
                                    (record['simulations'], record['solver_nodes']))
                             if key not in study.store.order:
                                 study.store.index(record, line.strip())
+                            if record.get('proof'):
+                                proven.append((record, line.strip()))
                         except (ValueError, KeyError, TypeError):
                             continue
             study.load(game['history'], True, saved_game=dict(batch=ident, name=directory.name, game=number,
                        players=[p['name'] for p in game['players']], winner=game['winner'], reason=game['reason']))
+            # The game's file also keeps evaluations of positions it left by undo; their proofs belong to its table.
+            for record, line in proven:
+                study.proofs.add([tuple(map(int, cell.split(','))) for cell in record['position'].split()], record, line)
         return study
 
     def match_editable(self):
