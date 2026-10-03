@@ -52,6 +52,8 @@ PRESETS = dict(
     strix=dict(lightning=dict(simulations=2), quick=dict(simulations=8), standard=dict(simulations=64),
                strong=dict(simulations=128), deep=dict(simulations=512), dangerous=dict(simulations=4096)))
 PRESET_NAMES = list(PRESETS['bubble'])
+PV_CHECK = .25   # principal-variation check share of Bubble's play and analysis searches (neural_search.Recheck)
+REFRESH_PLIES = 4  # earlier placements whose saved analysis a finished analysis searches again (Session.refresh)
 REVIEW_BATCH = dict(cpu=64, cuda=256)   # network leaves per pooled review batch
 REVIEW_SOLVERS = 4                      # tactical workers a review queries at once
 REVIEW_CHUNK = 24                       # positions per pooled review step; urgent analysis waits at most one step
@@ -576,8 +578,9 @@ def interruptible(call, watch, abort):
 
 
 def move_row(action, probability, value=None):
-    """A `top` row: [q, r, probability], then, from a search, the mover's win probability after the stone and
-    1 or -1 when the search proved that stone wins or loses (an exact child has value exactly +-1), else 0."""
+    """A `top` row: [q, r, probability] (from a search, the stone's share of the improved policy), then, from a
+    search, the stone's completed Q as the mover's win probability and 1 or -1 when the search proved that stone wins
+    or loses (an exact child has value exactly +-1), else 0."""
     row = [*map(int, action), round(float(probability), 4)]
     if value is None:
         return row
@@ -611,7 +614,7 @@ def glimpse(tree):
     if not len(actions) or not policy.sum() > 0:
         return None
     policy = policy / policy.sum()
-    top = top_rows(actions, policy, values)
+    top = top_rows(actions, policy, stats['completed_q'])
     return dict(top=top, value=round((float(policy @ values) + 1) / 2, 4), completed=int(stats['completed']))
 
 
@@ -886,7 +889,7 @@ class TurnSearch:
             policy /= policy.sum()
             action, stone_value, exact = actions[policy.argmax()].tolist(), float(found['q'][0]), None
         else:
-            action, policy, actions, values = result['action'], result['policy'], result['actions'], result['values']
+            action, policy, actions, values = result['action'], result['policy'], result['actions'], result['completed_q']
             self.completed += result.get('completed', 0)
             stone_value = root_value(result, self.local.player)
             proven = result.get('proven') or 0
@@ -931,7 +934,7 @@ class TurnSearch:
 
 
 def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None, live=None, trees=None,
-             solved=None, q_range_floor=0., known=None, leaf_nodes=0, leaf_ms=10):
+             solved=None, q_range_floor=0., known=None, leaf_nodes=0, leaf_ms=10, pv_check=0.):
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
@@ -948,7 +951,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     first stone as it goes, a few times a second. `trees` is `TurnSearch`'s tree source; `solved`, when given, is
     the solver's view (see `solve`) and no initial root query is made. `q_range_floor` is the fresh trees' neural_search floor.
     `known`, a proof table (`Proofs`), answers a position it proves won for the side to move without solver or
-    search (see `answered`) and otherwise informs the search (see `TurnSearch`)."""
+    search (see `answered`) and otherwise informs the search (see `TurnSearch`). `pv_check`, for trees that are a
+    GameGraph, is the share of each stone's simulations its principal-variation check takes (neural_search.Recheck)."""
     turn, shown = None, [0.]
 
     def observe(n):
@@ -973,7 +977,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
             tree, count = asked
             if tree is not None:
                 turn.tree = tree
-            turn.take(tree.search(max(1, count), root_samples=16, batch_size=16) if tree is not None else None)
+            check = dict(pv_check=pv_check) if pv_check else {}
+            turn.take(tree.search(max(1, count), root_samples=16, batch_size=16, **check) if tree is not None else None)
         return turn.record()
     finally:
         turn.close()
@@ -1068,7 +1073,7 @@ class Engines:
     def __init__(self, device, tactical_package=None, seal=None):
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
         self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
-        self.helpers, self.kept, self.games = [], None, OrderedDict()
+        self.helpers, self.kept, self.graphs = [], None, OrderedDict()
         self.external = {}
         self.children = {}
         self.last_turn = {}
@@ -1101,85 +1106,65 @@ class Engines:
         return self.prover, build
 
     def evaluate(self, entry, checkpoint, budget, history, watch, device=None, live=None, keep=False, line=None,
-                 known=None):
+                 known=None, game=None, refresh=None):
         """`evaluate` with the entry's export and the proof table `known`; returns the evaluation, the budget it
         really had (no solver nodes when the solver is not built) and the key of the weights it used (see
-        `model_key`). With `keep` the search continues the trees kept from the last kept evaluation of this
-        position and model, running only the simulations they lack, and a proof found then is reused. With `line`
-        (a seat's game, see `Session.lines`) the search continues that game's tree (see `game_trees`). Either way
-        its key ends in `:kept`, so continued evaluations are never mistaken for fresh ones."""
+        `model_key`). `line` (a seat's game, see `Session.lines`) or `game` (the analysis board's game, see
+        `Session.analysis_line`) searches that game's graph (see `game_graph`) with the principal-variation check
+        PV_CHECK; without either the turn searches fresh trees. With `keep` (a deepening tier) the search runs only
+        the simulations the root lacks, and a proof the solver found for the position is reused. `refresh`, a saved
+        evaluation of `history`, searches the game graph again with the PV_CHECK share of the simulations a stone
+        and that evaluation's solver findings, and keeps its key and budget. A seat's evaluation or a tier's has a
+        key ending in `:kept`, so continued evaluations are never mistaken for fresh ones."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
-        solver, build = self.solver() if budget['solver_nodes'] else (None, 'none')
-        spent = budget if solver else budget | dict(solver_nodes=0)
+        solver, build = self.solver() if budget['solver_nodes'] and refresh is None else (None, 'none')
+        spent = budget if solver or refresh is not None else budget | dict(solver_nodes=0)
         trees = solved = None
-        if keep:
-            if answered(history, known) is None:
-                trees, kept = self.kept_trees(bubble, history, build, entry.get('q_range_floor', 0.)), self.kept
-                proven = kept['solved'] if kept['solved'] and kept['solved']['proof'] else None
-                solved = proven or solve(solver, history, spent['solver_nodes'], watch)
-                kept['solved'] = solved
-        elif line is not None:
-            trees = self.game_trees(bubble, line, build, entry.get('q_range_floor', 0.))
+        floor = entry.get('q_range_floor', 0.)
+        if refresh is not None:
+            build = self.solver_build() if budget['solver_nodes'] else 'none'
+            trees = self.game_graph(bubble, game, build, floor, max(1, round(PV_CHECK * budget['simulations'])))
+            solved = dict(moves=[], pv=[], proof=None, threat=refresh.get('threat') or [], solved=True, used=0)
+        elif line is not None or game is not None:
+            if keep and answered(history, known) is None:
+                if self.kept is None or self.kept[0] != (bubble.sha256, position_text(history), build):
+                    self.kept = (bubble.sha256, position_text(history), build), None
+                if not (self.kept[1] and self.kept[1]['proof']):
+                    self.kept = self.kept[0], solve(solver, history, spent['solver_nodes'], watch)
+                solved = self.kept[1]
+            trees = self.game_graph(bubble, game if line is None else ('seat', line), build, floor, keep=keep)
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
-                         solved, entry.get('q_range_floor', 0.), known)
+                         solved, floor, known, pv_check=PV_CHECK if trees else 0.)
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
         weights = search_key(bubble.sha256[:16], entry)
-        return found, spent, f"{weights}:{build if spent['solver_nodes'] else 'none'}" + (':kept' if keep or line is not None else '')
+        kept = ':kept' if keep or line is not None else ''
+        return found, spent, f"{weights}:{build if spent['solver_nodes'] else 'none'}{kept}"
 
-    def kept_trees(self, bubble, history, build='none', q_range_floor=0.):
-        """A `TurnSearch` tree source that keeps one tree per position of `history`'s turn for the next kept
-        evaluation of the same position, model, solver `build` and `q_range_floor`, and runs only the simulations
-        its root has not had yet (an interrupted search counts what it finished); the trees of anything else are
-        dropped."""
-        from neural_search import NeuralSearch
-        key = (bubble.sha256, position_text(history), build, q_range_floor)
-        if self.kept is None or self.kept['key'] != key:
-            self.drop_kept()
-            self.kept = dict(key=key, trees={}, solved=None)
-        kept = self.kept
-
-        def trees(cells, simulations, network):
-            tree = kept['trees'].get(position_text(cells))
-            if tree is None:
-                tree = kept['trees'][position_text(cells)] = NeuralSearch(network, bubble.sha256, cells, seed=1740,
-                                                                         cache=bubble.cache, tactics=True,
-                                                                         q_range_floor=q_range_floor)
-            tree.evaluator = network
-            visits = int(tree.result(0, 0, 0, 0)['visits'].sum())
-            return tree, max(1, simulations - visits)
-        return trees
-
-    def game_trees(self, bubble, line, build='none', q_range_floor=0.):
-        """A `TurnSearch` tree source over the game tree of `line`: one tree per line, model, solver `build` and
-        `q_range_floor`, advanced through every stone played since its last search, by either side, then searched
-        with the full simulations on top of the visits it carried over. A position that does not extend the
-        tree's stones builds it afresh. The two most recently used lines keep their trees. Advancing frees every
-        subtree off the played line, so a tree holds only the subtree of its current position."""
-        from neural_search import NeuralSearch
+    def game_graph(self, bubble, game, build='none', q_range_floor=0., simulations=None, keep=False):
+        """A `TurnSearch` tree source over the GameGraph of `game`: one graph per game, model, solver `build` and
+        `q_range_floor`, moved to each stone's position and searched there with the full simulations, or with
+        `simulations` when given, or with `keep` only those its root lacks (at least one). The three most recently
+        used games (two seats and the analysis board) keep their graphs; a game whose key changed starts a new one."""
+        from neural_search import GameGraph
         key = (bubble.sha256, build, q_range_floor)
 
-        def trees(cells, simulations, network):
-            kept = self.games.pop(line, None)
-            if kept and (kept[0] != key or kept[1].history != cells[:len(kept[1].history)]):
+        def trees(cells, count, network):
+            kept = self.graphs.pop(game, None)
+            if kept and kept[0] != key:
                 kept[1].close()
                 kept = None
-            tree = kept[1] if kept else NeuralSearch(network, bubble.sha256, cells, seed=1740, cache=bubble.cache,
-                                                     tactics=True, q_range_floor=q_range_floor)
-            self.games[line] = key, tree
-            while len(self.games) > 2:
-                self.games.popitem(last=False)[1][1].close()
-            for cell in cells[len(tree.history):]:
-                tree.advance(cell)
-            tree.evaluator = network
-            return tree, simulations
+            graph = kept[1] if kept else GameGraph(network, bubble.sha256, cells, seed=1740, cache=bubble.cache,
+                                                   tactics=True, q_range_floor=q_range_floor)
+            self.graphs[game] = key, graph
+            while len(self.graphs) > 3:
+                self.graphs.popitem(last=False)[1][1].close()
+            graph.at(cells)
+            graph.evaluator = network
+            if simulations is not None:
+                return graph, simulations
+            return graph, max(1, count - int(graph.result(0, 0, 0, 0)['visits'].sum())) if keep else count
         return trees
-
-    def drop_kept(self):
-        if self.kept is not None:
-            for tree in self.kept['trees'].values():
-                tree.close()
-        self.kept = None
 
     def solvers(self, count):
         """Up to `count` tactical workers of one build, and that build: the solver and helpers kept for pooled
@@ -1311,9 +1296,9 @@ class Engines:
 
     def close(self):
         """Release the models and end every child process."""
-        self.drop_kept()
-        while self.games:
-            self.games.popitem()[1][1].close()
+        self.kept = None
+        while self.graphs:
+            self.graphs.popitem()[1][1].close()
         for helper, _ in self.helpers:
             helper.close()
         self.helpers = []
@@ -1655,6 +1640,7 @@ class Session:
         self.proofs = Proofs()
         self.line_ids = itertools.count()
         self.lines = [next(self.line_ids), next(self.line_ids)]
+        self.analysis_line = next(self.line_ids)
         self.instance, self.closing = os.urandom(4).hex(), False
         self.match, self.match_worker = None, None
         self.game_clock, self.timed_engines = None, []
@@ -1690,10 +1676,13 @@ class Session:
         return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget)
 
     def new_lines(self, *sides):
-        """Give `sides` (both when none) a new line: the game tree their Bubble seats search (see
-        `Engines.game_trees`). Undo, a new or loaded game and a seat change start one."""
+        """Give `sides` (both when none) a new line: the game graph their Bubble seats search (see
+        `Engines.game_graph`). Undo, a new or loaded game and a seat change start one; giving both sides one also
+        starts a new `analysis_line`, the graph analysis searches."""
         for side in sides or (0, 1):
             self.lines[side] = next(self.line_ids)
+        if not sides:
+            self.analysis_line = next(self.line_ids)
 
     def engine_key(self, seat):
         """Evaluations are keyed by the weights and the solver build that produced them ('none' for a budget
@@ -1901,7 +1890,7 @@ class Session:
             seat = self.seat(self.analysis['engine'], self.analysis['checkpoint'], tier)
             key, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
             if key and not failed and not self.store.covering(current, key + ':kept', budget):
-                self.submit(Job('analyse', 3, current, seat=seat, force=False, tier=tier))
+                self.submit(Job('analyse', 3, current, seat=seat, force=False, tier=tier, game=self.analysis_line))
                 return
 
     def submit(self, job):
@@ -1937,7 +1926,7 @@ class Session:
         key, budget = self.engine_key(settings), self.engines.effective(settings['budget'])
         if key is None or not force and self.store.covering(history, key, budget):
             return None
-        return self.submit(Job('analyse', priority, history, seat=settings, force=force))
+        return self.submit(Job('analyse', priority, history, seat=settings, force=force, game=self.analysis_line))
 
     def play(self, q, r):
         """Place a person's stone; placing one resumes a paused game, so the engine seat answers it."""
@@ -3024,10 +3013,12 @@ class Session:
 
     def evaluation(self, job, seat, history, force=False):
         """The evaluation of `history` for `seat`, saved. Unless forced, a saved one at least as deep is reused.
-        A deepening tier continues the kept trees of its position and a move continues its seat's game tree (see
-        `Engines.evaluate`); a move never reuses a saved evaluation, and both are saved under the kept key."""
+        Analysis searches the analysis board's game graph and a move its seat's (see `Engines.evaluate`); a move
+        never reuses a saved evaluation, and moves and deepening tiers are saved under the kept key. A finished
+        analysis refreshes the earlier positions of its game (see `refresh`); a refresh job (`refresh`, the saved
+        evaluation it replaces) re-reads the graph at its position."""
         key, budget, keep = self.engine_key(seat), self.engines.effective(seat['budget']), hasattr(job, 'tier')
-        line = getattr(job, 'line', None)
+        line, game, refresh = getattr(job, 'line', None), getattr(job, 'game', None), getattr(job, 'refresh', None)
         if key is None:
             raise ValueError('The model file is gone; rescan the engines')
         key += ':kept' if keep else ''
@@ -3038,7 +3029,8 @@ class Session:
         found, spent, weights = self.lane_engines(job).evaluate(
             self.entries[seat['engine']], seat['checkpoint'], budget, history, self.watcher(job, job.kind != 'review'),
             live=live, keep=keep, line=line, known=self.proofs if job.kind != 'move' else None,
-            **({'device': seat['device']} if 'device' in seat else {}))
+            **({'device': seat['device']} if 'device' in seat else {}), **({'game': game} if game is not None else {}),
+            **({'refresh': refresh} if refresh is not None else {}))
         if job.cancelled:
             raise Cancelled()
         entry = self.entries[seat['engine']]
@@ -3052,7 +3044,23 @@ class Session:
                 timer = threading.Timer(31, self.retry, args=(list(history),))
                 timer.daemon = True
                 timer.start()
-        return self.save(history, weights, spent, found, model)
+        saved = self.save(history, weights, spent, found, model)
+        if job.kind == 'analyse' and refresh is None and game is not None:
+            self.refresh(history, seat, game)
+        return saved
+
+    def refresh(self, history, seat, game):
+        """Queue a refresh of each position up to REFRESH_PLIES placements before `history` whose evaluation by
+        `seat`, saved at its budget, holds no proof, nearest first: the search on the game graph `game` moved the
+        values those positions reach (see `Engines.evaluate`)."""
+        key, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
+        with self.lock:
+            for ply in range(len(history) - 1, max(-1, len(history) - REFRESH_PLIES - 1), -1):
+                saved = self.store.get(history[:ply], key, budget) if key else None
+                if saved is not None and not saved.get('proof') and not any(
+                        getattr(j, 'refresh', None) is not None and j.history == tuple(history[:ply])
+                        and j.status == 'queued' for j in self.jobs.values()):
+                    self.submit(Job('analyse', 2, history[:ply], seat=dict(seat), force=True, game=game, refresh=saved))
 
     def save_timed(self, seat, history, moves, found):
         """Save a timed Bubble move's search as a kept-tree evaluation of `history` at the work it completed: shown in

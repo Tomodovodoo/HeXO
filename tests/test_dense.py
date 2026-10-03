@@ -1238,6 +1238,14 @@ class DenseConfigTests(unittest.TestCase):
         for bad in (-.1, 1., float('nan')):
             with self.assertRaisesRegex(ValueError, r'root_noise must lie in \[0, 1\)'):
                 dense_config.ActorSettings(root_noise=bad)
+        graph_args = parser.parse_args(['--game-graph', '512', '--pv-check', '0.25'])
+        self.assertEqual(dense_selfplay.actor_flags(graph_args), ['--game-graph', '512', '--pv-check', '0.25'])
+        got = dense_config.override(base, graph_args)
+        self.assertEqual((got.game_graph, got.pv_check), (512, .25))
+        self.assertEqual((base.game_graph, base.pv_check), (0, 0.))
+        for bad in (dict(pv_check=.25), dict(game_graph=512, pv_check=.5), dict(game_graph=-1)):
+            with self.assertRaisesRegex(ValueError, 'game_graph must be nonnegative'):
+                dense_config.ActorSettings(**bad)
         self.assertEqual(dense_selfplay.actor_flags(parser.parse_args(['--historical-weighting', 'uniform'])),
                          ['--historical-weighting', 'uniform'])
         prefixed = argparse.ArgumentParser()
@@ -3713,6 +3721,37 @@ class EngineTests(unittest.TestCase):
                     for tree in slot.trees.values():
                         tree.close()
                     slot.game.close()
+
+    def test_a_checked_full_search_records_the_root_after_its_check(self):
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        settings = replace(dense_config.ActorSettings(), full_sims=32, full_fraction=1., root_samples=8,
+                           opening_random_plies=0., game_graph=512, pv_check=.25)
+        history = [[0,0],[0,3],[1,3]]
+        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
+        engine = dense_selfplay.Engine(8, solver_async=False)
+        try:
+            self.assertIsInstance(slot.tree, dense_selfplay.GameGraph)
+            self.assertEqual(slot.budget, 16)
+            with unittest.mock.patch.object(slot, 'recheck', wraps=slot.recheck) as recheck, \
+                    unittest.mock.patch.object(slot, 'searched', wraps=slot.searched) as searched:
+                engine.add(slot)
+                while not searched.called:
+                    engine.step()
+            first, final = recheck.call_args_list[0].args[0], searched.call_args.args[0]
+            self.assertEqual(first['completed'], 16)
+            self.assertIn(final['completed'], (24, 32))
+            self.assertEqual(final['pv_check']['line'][0], first['action'])
+            self.assertEqual(final['network_value'], first['network_value'])
+            row = slot.rows[0]
+            np.testing.assert_array_equal(row['policy'], final['policy'].astype(np.float32))
+            self.assertFalse(np.array_equal(row['policy'], first['policy'].astype(np.float32)))
+            self.assertEqual(slot.values[len(history)], dense_selfplay.root_value(final, 0))
+            self.assertEqual(engine.searches, 1)
+        finally:
+            engine.close()
+            for tree in slot.trees.values():
+                tree.close()
+            slot.game.close()
 
     def test_zero_simulation_exact_roots_record_only_informative_policies(self):
         def result(completed, winner, policy):

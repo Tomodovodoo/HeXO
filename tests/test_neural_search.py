@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 import numpy as np
 from hexo import Game
-from neural_search import NeuralSearch, EvaluationCache, SearchCoordinator, native
+from neural_search import NeuralSearch, EvaluationCache, GameGraph, Recheck, SearchCoordinator, native
 from tests.reference import Reference
 
 class Uniform:
@@ -773,6 +773,102 @@ class NeuralTree(unittest.TestCase):
         with self.assertRaises(ValueError):
             search.fulfill(request, prediction)
         native.hxg_cancel(search.ptr)
+
+class Refuted(Ranked):
+    """Ranked logits. A position below `line` (a strict extension of it) is lost for `mover`: value -0.9 for that
+    side to move, 0.9 for the other; every other position is worth 0. `line` None refutes nothing."""
+    def __init__(self, mover, line=None):
+        self.mover, self.line = mover, line
+
+    def evaluate(self, histories):
+        out = []
+        for h, p in zip(histories, super().evaluate(histories)):
+            below = self.line is not None and len(h) > len(self.line) and \
+                [tuple(c) for c in h[:len(self.line)]] == [tuple(c) for c in self.line]
+            value = (-.9 if (len(h)+1)//2 % 2 == self.mover else .9) if below else 0.
+            out.append(dict(p, q=np.full(len(p['actions']), value)))
+        return out
+
+class SharedGraph(unittest.TestCase):
+    def graph(self, evaluator, history, **options):
+        graph = GameGraph(evaluator, 'game-graph', history, seed=5, tactics=True, **options)
+        self.addCleanup(graph.close)
+        return graph
+
+    def edge(self, result, action):
+        return result['actions'].tolist().index(list(action))
+
+    def test_a_later_search_reaches_the_earlier_root(self):
+        # A is a turn start (two stones to place). Its first search picks the turn A -> B -> C; a deeper search at C
+        # finds C lost for A's mover, and A's edge to B carries C's visits and value without searching A again.
+        a = recorded_position(11)
+        evaluator = Refuted(Game(a).player)
+        graph = self.graph(evaluator, a)
+        first = graph.search(64, root_samples=8, batch_size=8)
+        c = graph.after_turn(first)
+        self.assertEqual(len(c), len(a)+2)
+        before = first['values'][self.edge(first, c[len(a)])]
+        evaluator.line = c
+        graph.at(c)
+        deep = graph.search(2048, root_samples=16, batch_size=64)
+        self.assertEqual(deep['completed'], 2048)
+        self.assertGreater(float(deep['policy'] @ deep['values']), .8)
+        graph.at(c[:-1])
+        b = graph.result(0, 0, 0, 0)
+        self.assertGreaterEqual(b['visits'][self.edge(b, c[-1])], 2048)
+        graph.at(a)
+        after = graph.result(0, 0, 0, 0)
+        i = self.edge(after, c[len(a)])
+        self.assertGreaterEqual(after['visits'][i], 2048)
+        self.assertLess(after['values'][i], before-.5)
+        self.assertLess(after['values'][i], -.8)
+        again = graph.search(32, root_samples=8, batch_size=8)
+        self.assertNotEqual(again['action'], list(c[len(a)]))
+
+    def test_the_store_survives_advances_and_keeps_its_bound(self):
+        a = recorded_position(11)
+        graph = self.graph(Uniform(), a, limit=48)
+        first = graph.search(128, root_samples=8, batch_size=8)
+        self.assertGreater(graph.store()['expanded'], 48)
+        graph.advance(first['action'])
+        graph.at(a)
+        np.testing.assert_array_equal(graph.result(0, 0, 0, 0)['visits'], first['visits'])
+        store = graph.store()
+        self.assertLessEqual(store['expanded'], 48)
+        self.assertGreater(store['evicted'], 0)
+        graph.search(8, root_samples=4, batch_size=4)
+        self.assertLessEqual(graph.store()['expanded'], 48+8)
+        self.assertEqual(int(graph.result(0, 0, 0, 0)['visits'].sum()), int(first['visits'].sum())+8)
+        unbounded = self.graph(Uniform(), a, limit=0)
+        unbounded.search(128, root_samples=8, batch_size=8)
+        unbounded.search(8, root_samples=4, batch_size=4)
+        self.assertEqual(unbounded.store()['evicted'], 0)
+
+    def test_the_pv_check_searches_again_only_after_a_drop(self):
+        a = recorded_position(11)
+        mover = Game(a).player
+        quiet = self.graph(Refuted(mover), a).search(64, root_samples=8, batch_size=8, pv_check=.25)
+        self.assertFalse(quiet['pv_check']['searched'])
+        self.assertEqual(quiet['completed'], 48)
+        evaluator = Refuted(mover)
+        graph = self.graph(evaluator, a)
+        check = Recheck(graph, 64, .25)
+        self.assertEqual((check.budget, check.reserve), (32, 16))
+        first = graph.search(check.budget, root_samples=8, batch_size=8)
+        evaluator.line = graph.after_turn(first)
+        spent, budget = [first['completed']], check.step(first)
+        self.assertEqual(graph.history, evaluator.line)
+        while budget:
+            result = graph.search(budget, root_samples=8, batch_size=8)
+            spent.append(result['completed'])
+            budget = check.step(result)
+        summary = check.summary()
+        self.assertEqual(graph.history, a)
+        self.assertTrue(summary['searched'])
+        self.assertLess(summary['after'], summary['before']-.1)
+        self.assertEqual(spent, [32, 16, 16])
+        with self.assertRaisesRegex(ValueError, 'pv_check must lie'):
+            Recheck(graph, 64, .5)
 
 if __name__ == '__main__':
     unittest.main()

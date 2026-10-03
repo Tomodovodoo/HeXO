@@ -42,7 +42,13 @@ bind('hxg_priority', C.c_int, ptr, ints, C.c_int)
 if hasattr(native, 'hxg_defence'):
     bind('hxg_defence', C.c_int, ptr, ints, doubles, C.c_int)
 bind('hxg_mark_exact', C.c_int, ptr, C.c_int64, C.c_int64, C.c_int, C.c_int)
+bind('hxg_share', C.c_int, ptr, C.c_int64)
+bind('hxg_root_at', C.c_int, ptr, ints, C.c_int)
+bind('hxg_store', C.c_int, ptr, ptr)
+bind('hxg_q', C.c_int, ptr, ptr)
 HOLD = -3  # hxg_next: the search waits at its armed hold
+GRAPH_LIMIT = 4096  # expanded nodes a GameGraph keeps between searches, about 56 KB each at 640 legal moves
+PV_DROP = .05       # completed-Q fall (value units, -1 to 1) of the chosen stone that sends a checked search back
 
 def checked(ok):
     if not ok:
@@ -79,9 +85,12 @@ class NeuralSearch:
     """One native tree. `q_range_floor` is the least Q range of the completed-Q rescale (0 keeps mctx's
     min-max rescale); it applies to every search and policy target of the tree. `root_noise` e in [0, 1) is the
     uniform share of the root's candidate sampling: Gumbel-top-k draws the root samples from (1 - e) p + e / N over
-    the N eligible moves instead of the prior p, while halving, the final choice and the policy target keep p."""
+    the N eligible moves instead of the prior p, while halving, the final choice and the policy target keep p.
+    `limit`, when given, makes the tree a shared game graph (see GameGraph) keeping at most that many expanded nodes
+    between searches (0: no bound)."""
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None,
-                 tactics=False, proof_solver=None, proof_ms=100, graph=False, q_range_floor=0., root_noise=0.):
+                 tactics=False, proof_solver=None, proof_ms=100, graph=False, q_range_floor=0., root_noise=0.,
+                 limit=None):
         if not model_version:
             raise ValueError('A model version is required')
         self.evaluator, self.model_version = evaluator, model_version
@@ -94,6 +103,8 @@ class NeuralSearch:
         checked(native.hxg_tactics(self.ptr, int(tactics)))
         checked(native.hxg_graph(self.ptr, int(graph)))
         try:
+            if limit is not None:
+                checked(native.hxg_share(self.ptr, int(limit)))
             checked(native.hxg_q_range_floor(self.ptr, q_range_floor))
             checked(native.hxg_root_noise(self.ptr, root_noise))
             for point in history:
@@ -210,6 +221,8 @@ class NeuralSearch:
         native.hxg_stats(self.ptr, actions.ctypes.data, visits.ctypes.data, values.ctypes.data, scores.ctypes.data)
         policy = np.empty(n)
         native.hxg_policy(self.ptr, policy.ctypes.data)
+        completed_q = np.empty(n)
+        native.hxg_q(self.ptr, completed_q.ctypes.data)
         selected = int(np.argmax(scores)) if n and np.isfinite(scores).any() else None
         winner = native.hxg_exact(self.ptr)
         proven = 0 if winner < 0 else 1 if winner == ((len(self.history)+1)//2)%2 else -1
@@ -218,7 +231,7 @@ class NeuralSearch:
         # A won root offers only its shortest winning moves, so those are the finite scores.
         shortest = [actions[i].tolist() for i in range(n) if np.isfinite(scores[i])] if proven > 0 else []
         return dict(action=actions[selected].tolist() if selected is not None else None,
-                    actions=actions, visits=visits, values=values, policy=policy, scores=scores,
+                    actions=actions, visits=visits, values=values, policy=policy, scores=scores, completed_q=completed_q,
                     completed=native.hxg_completed(self.ptr), evaluated=evaluated, cache_hits=hits,
                     elapsed_ms=(finished-start)*1000,
                     exact_winner=winner,
@@ -227,6 +240,134 @@ class NeuralSearch:
                     proof_status=('UNKNOWN' if winner < 0 else
                                   'PROVEN_WIN' if proven > 0 else 'PROVEN_LOSS'))
 
+
+def pv_reserve(simulations, fraction):
+    """Simulations a principal-variation check of share `fraction` (0 <= fraction < 0.5) reserves twice from a search
+    of `simulations`: round(fraction * simulations), 0 when that is 0 or would leave the first pass none."""
+    if not 0 <= fraction < .5:
+        raise ValueError('pv_check must lie in [0, 0.5)')
+    reserve = int(round(fraction*simulations))
+    return reserve if reserve and simulations-2*reserve >= 1 else 0
+
+
+class Recheck:
+    """The principal-variation check of one search on a GameGraph, run as a sequence of searches at the graph's root.
+
+    With reserve R = pv_reserve(simulations, fraction): the first pass searches the root A with simulations - 2R and
+    chooses the turn (GameGraph.after_turn). The check moves the root to the position after that turn and searches it
+    with R; its values reach A through the shared nodes. Back at A, when the chosen stone's completed Q fell by more
+    than `drop`, A is searched again with the last R; otherwise those simulations are not spent. No check runs when
+    R is 0, the first pass proved its root or the turn wins. `budget` is the first pass's simulations; give each
+    finished search's result to `step`, which returns the next search's simulations (the root already moved to its
+    position) or 0 once the root is back at A and the check is over."""
+
+    def __init__(self, graph, simulations, fraction, drop=PV_DROP):
+        self.graph, self.drop = graph, drop
+        self.reserve = pv_reserve(simulations, fraction)
+        self.budget = simulations-2*self.reserve
+        self.root, self.phase, self.line, self.before, self.after = list(graph.history), 'first', None, None, None
+        self.searched = False
+
+    def step(self, result):
+        if self.phase == 'first':
+            self.phase = 'done'
+            self.line = self.graph.after_turn(result) if self.reserve else None
+            if self.line is None:
+                return 0
+            self.index = result['actions'].tolist().index(list(map(int, result['action'])))
+            self.before = float(result['values'][self.index])
+            self.graph.at(self.line)
+            self.phase = 'check'
+            return self.reserve
+        if self.phase == 'check':
+            self.graph.at(self.root)
+            self.after = float(self.graph.result(0, 0, 0, 0)['values'][self.index])
+            self.searched = self.before-self.after > self.drop
+            self.phase = 'again' if self.searched else 'done'
+            return self.reserve if self.searched else 0
+        self.phase = 'done'
+        return 0
+
+    def summary(self):
+        """{line: the checked turn's stones, before and after: the chosen stone's completed Q, searched: whether the
+        root was searched again}, or None when no check ran."""
+        if self.line is None:
+            return None
+        return dict(line=[list(p) for p in self.line[len(self.root):]], before=self.before, after=self.after,
+                    searched=self.searched)
+
+
+class GameGraph(NeuralSearch):
+    """One game's shared search graph (native hxg_share). The store keeps every node the game's searches expanded,
+    keyed by turn context, with its visits, values, exact marks and proof distances; a search reads each stored
+    child's visits and value as its edge's, so a search at a later position moves the values of every earlier
+    position that reaches it, and each playout also counts toward the root's first parents up the game. `at(history)`
+    moves the root to any position, stored or new; `advance` keeps the siblings of the played stone. Between
+    searches at most `limit` expanded nodes are kept (0: no bound), the least recently used leaves leaving first.
+    `search(..., pv_check=f)` adds the principal-variation check (Recheck)."""
+
+    def __init__(self, evaluator, model_version, history=(), seed=0, cache=None, tactics=False, proof_solver=None,
+                 proof_ms=100, q_range_floor=0., root_noise=0., limit=GRAPH_LIMIT):
+        super().__init__(evaluator, model_version, history, seed, cache, tactics, proof_solver, proof_ms,
+                         q_range_floor=q_range_floor, root_noise=root_noise, limit=limit)
+
+    def at(self, history):
+        """Move the root to the position after `history`, keeping every node's statistics."""
+        cells = [(int(q), int(r)) for q, r in history]
+        checked(native.hxg_root_at(self.ptr, np.asarray(cells, dtype=np.int64).reshape(-1, 2), len(cells)))
+        self.history = cells
+
+    def store(self):
+        """{nodes, expanded, evicted, limit} of the store (native hxg_store)."""
+        out = np.zeros(4, np.int64)
+        native.hxg_store(self.ptr, out.ctypes.data)
+        return dict(zip(('nodes', 'expanded', 'evicted', 'limit'), map(int, out)))
+
+    def after_turn(self, result):
+        """The history after the turn `result`, this root's finished search, chooses: its stone, then while the same
+        side is to move the stone the graph's improved policy ranks first there (none when that position was never
+        expanded). None when the result has no stone or a proof, or the turn wins. The root is left where it was."""
+        if result['action'] is None or result['proven']:
+            return None
+        root = list(self.history)
+        line = [*root, tuple(map(int, result['action']))]
+        game = Game(line)
+        try:
+            if game.winner >= 0:
+                return None
+            if game.player == player_of(len(root)):
+                self.at(line)
+                stats = self.result(0, 0, 0, 0)
+                self.at(root)
+                if len(stats['policy']) and stats['policy'].max() > 0:
+                    line.append(tuple(map(int, stats['actions'][int(np.argmax(stats['policy']))])))
+                    game.play(*line[-1])
+                    if game.winner >= 0:
+                        return None
+        finally:
+            game.close()
+        return line
+
+    def search(self, simulations=128, root_samples=None, batch_size=16, milliseconds=None, *, pv_check=0.,
+               pv_drop=PV_DROP, **options):
+        """NeuralSearch.search with the principal-variation check of share `pv_check` (Recheck). With a check the
+        result is the root's after it, with `completed`, `evaluated`, `cache_hits` and `elapsed_ms` summed over every
+        pass and `pv_check` (Recheck.summary)."""
+        check = Recheck(self, simulations, pv_check, pv_drop)
+        passes = [super().search(check.budget, root_samples, batch_size, milliseconds, **options)]
+        while budget := check.step(passes[-1]):
+            passes.append(super().search(budget, root_samples, batch_size, milliseconds, **options))
+        if len(passes) == 1:
+            return passes[0]
+        result = passes[-1] if check.searched else self.result(0, 0, 0, 0, choice=options.get('choice', 'policy'))
+        result.update({key: sum(p[key] for p in passes) for key in ('completed', 'evaluated', 'cache_hits', 'elapsed_ms')},
+                      pv_check=check.summary())
+        return result
+
+
+def player_of(length):
+    """The side to move after `length` placements."""
+    return (length+1)//2 % 2
 
 
 class SearchCoordinator:

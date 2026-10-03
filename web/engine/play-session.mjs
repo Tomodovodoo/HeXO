@@ -5,6 +5,9 @@ import {OpeningBook} from './openings.mjs';
 import {readGame, exportGame, htttx} from './notation.mjs';
 import {clockSpec, turnTime} from './clock.mjs';
 import {Proofs, proven} from './proof.mjs';
+import {PV_CHECK} from './search.mjs';
+
+const REFRESH_PLIES = 4;  // earlier placements a finished analysis refreshes (python/play.py REFRESH_PLIES)
 
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 const copy = value => structuredClone(value), position = history => history.map(p => p.join(',')).join(';');
@@ -69,7 +72,7 @@ export class BrowserSession extends OfflineSession {
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
-    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()];
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid();
     this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
@@ -173,7 +176,7 @@ export class BrowserSession extends OfflineSession {
     for (const tier of tiers.slice(0, last || tiers.length)) {
       const spec = this.spec({...this.analysis, preset: tier});
       if (!this.lookup(this.history, spec, true) && !this.jobs.some(j => j.tier === tier && j.key === `analyse|${this.cacheKey(this.history, spec)}` && j.status === 'failed')) {
-        this.enqueue('analyse', this.history, spec, {tier}); return;
+        this.enqueue('analyse', this.history, spec, {tier, line: this.analysisLine}); return;
       }
     }
   }
@@ -234,7 +237,10 @@ export class BrowserSession extends OfflineSession {
     this.book.opening = copy(opening); this.freshClock();
   }
   /** Gives `sides` (both when none) a new line, the key of the game tree a Bubble seat searches (worker.mjs). */
-  renewLines(...sides) { for (const side of sides.length ? sides : [0, 1]) this.lines[side] = uid(); }
+  renewLines(...sides) {
+    for (const side of sides.length ? sides : [0, 1]) this.lines[side] = uid();
+    if (!sides.length) this.analysisLine = uid();
+  }
   forkGame() {
     if (this.saved_game || !this.gameId || this.match) {
       this.saved_game = null; this.match = null; this.freshClock(); this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
@@ -293,7 +299,7 @@ export class BrowserSession extends OfflineSession {
     } else if (path === '/analyse') {
       const ply = body.ply ?? this.history.length;
       if (!Number.isInteger(ply) || ply < 0 || ply > this.history.length) throw Error('Invalid analysis position');
-      if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', this.history.slice(0, ply), this.analysis, {force: !!body.force});
+      if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', this.history.slice(0, ply), this.analysis, {force: !!body.force, line: this.analysisLine});
     } else if (path === '/review') {
       if (!this.analysis || !this.adapters.has(this.analysis.engine)) throw Error('Choose an analysis engine');
       const history = copy(this.history), plies = starts(history.length);
@@ -337,7 +343,7 @@ export class BrowserSession extends OfflineSession {
     if (fields.force) this.cancelJobs(j => j.key === key);
     if (this.jobs.some(j => j.key === key)) return;
     if (kind === 'analyse' && !fields.force && this.lookup(history, spec, true)) return;
-    if (kind === 'analyse') this.cancelJobs(j => j.kind === 'analyse' && j.status !== 'failed' && (fields.tier ? j.tier : true));
+    if (kind === 'analyse' && !fields.refresh) this.cancelJobs(j => j.kind === 'analyse' && j.status !== 'failed' && (fields.tier ? j.tier : true));
     this.jobs.push({id: ++this.nextJob, kind, history: copy(history), spec: copy(spec), key, controller: new AbortController(), status: 'queued', done: 0, total: 1, ...fields});
   }
   /** Saves the evaluation `result` of `history` by `spec`. One whose solver could not run (`solver_error`) is kept for
@@ -358,6 +364,16 @@ export class BrowserSession extends OfflineSession {
       this.records = this.records.filter(r => r.id !== record.id); this.records.push(record);
     }
     return record;
+  }
+  /** Queues a refresh of each position up to REFRESH_PLIES placements before `history` whose evaluation by `spec` is saved
+   * without a proof, nearest first: the search on the game graph `line` moved the values those positions reach
+   * (python/play.py Session.refresh). A refresh searches that graph again with the PV_CHECK share of the simulations
+   * and no solver query, keeps the saved threat and replaces the saved evaluation. */
+  refresh(history, spec, line) {
+    for (let ply = history.length - 1; ply >= Math.max(0, history.length - REFRESH_PLIES); ply--) {
+      const saved = this.lookup(history.slice(0, ply), spec, true);
+      if (saved && !saved.proof) this.enqueue('analyse', history.slice(0, ply), spec, {force: true, refresh: saved, line});
+    }
   }
   indexRecord(record) {
     this.evaluationsVersion++;
@@ -483,8 +499,10 @@ export class BrowserSession extends OfflineSession {
         timer = setTimeout(expire, Math.min(MAX_TIMER, Math.max(1, limit)));
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
+      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(PV_CHECK * job.spec.budget.simulations)), solver_nodes: 0}
+        : job.spec.budget;
       try {
-        result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
+        result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
           known: job.kind === 'move' ? null : (this.extendProofs(), this.proofs.list()),
           progress: (f, live) => { job.done = job.kind === 'review' ? job.cursor + f : f; if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
@@ -501,7 +519,9 @@ export class BrowserSession extends OfflineSession {
       if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
       // The move came back at `at`; saving it must not run its clock out.
       if (job.kind === 'move') clearTimeout(this.flag);
+      if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
       await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));
+      if (job.kind === 'analyse' && !job.refresh && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') this.refresh(history, job.spec, job.line);
       if (job.kind === 'move') {
         if (job.controller.signal.aborted || position(this.history) !== position(history) || this.paused) { this.armFlag(); return; }
         if (!this.match?.active) this.forkGame();

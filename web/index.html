@@ -883,8 +883,8 @@ function renderAnalysis(){
   const rows=top.map((t,i)=>{const d=el('div',{style:`--c:${candidateColor(top,i)};animation-delay:${ev.live?0:i*30}ms`},el('span',{class:'rank'},i+1),el('span',{class:'cell'},t[0]+', '+t[1],
       t[4]?el('i',{class:'proven'+(t[4]<0?' loss':'')},t[4]>0?'✓':'✕'):null,
       (ev.threat||[]).some(p=>p[0]===t[0]&&p[1]===t[1])?el('i',{class:'threat',style:`--t:${COLORS[1-side]}`},'!'):null),
-      el('em',{style:`transform:scaleX(${t[2]/max})`}),el('span',{class:'p'},(t[2]*100).toFixed(1)),
-      t.length>3?el('span',{class:'v'},moveValue(t)):el('span'));
+      el('em',{style:`transform:scaleX(${t[2]/max})`}),el('span',{class:'p',title:'Share of the improved policy'},(t[2]*100).toFixed(1)),
+      t.length>3?el('span',{class:'v',title:'Completed Q'},moveValue(t)):el('span'));
     d.onclick=()=>{const[sx,sy]=screen(t[0],t[1]);cam.x+=canvas.clientWidth/2-sx;cam.y+=canvas.clientHeight/2-sy;draw()};
     d.onmouseenter=()=>{hot=[t[0],t[1]];draw()};d.onmouseleave=()=>{hot=null;draw()};return d});
   while(rows.length<5)rows.push(el('div',{class:'blank'},el('span',{},rows.length+1),el('span',{},'·'),el('em'),el('span'),el('span')));

@@ -1,10 +1,12 @@
 // Node runner for tests/test_web_engine.py: reads one JSON job from stdin, writes one JSON answer to stdout.
 // {kind: 'encode', positions: [{history, actions}]} -> [{size, cells, far, ones: [flat plane indices], features: base64 float32}]
-// {kind: 'search', cases: [{history, seed, tactics, q_range_floor, root_noise, steps: [{simulations, root_samples, batch_size, marks}], batches}]}
-//   replays the recorded evaluations batch by batch, a step's `marks` ([q, r, winner, distance]) settled before its search
-//   -> [[{action, policy, visits, completed, proven, unmarked}] per step]
-// {kind: 'game', simulations} -> turns of seats on GameTrees lines with a ranked network: the root visits each stone's
-//   search started from on the first and second turn of one line, at an undo and on a new line, and the lines kept
+// {kind: 'search', cases: [{history, seed, tactics, q_range_floor, root_noise, limit, steps: [{simulations, root_samples, batch_size, marks, at}], batches}]}
+//   replays the recorded evaluations batch by batch, a step's `marks` ([q, r, winner, distance]) settled before its search;
+//   with `limit` the tree is a GameGraph and a step's `at` (a history) moves its root before the search, else each step
+//   advances by the previous step's action -> [[{action, policy, visits, completed, proven, unmarked}] per step]
+// {kind: 'game', simulations} -> turns of seats on GameGraphs lines with a ranked network: the root visits each stone's
+//   search started from on the first and second turn of one line, back at the first position and on a new line, and
+//   the lines kept
 // {kind: 'pv', history, certificate} -> {pv, plies} of the principal variation
 // {kind: 'rows', actions, policy, values, lead} -> top rows
 // {kind: 'overlay', cases: [{ev, stones}]} -> [boardOverlay(ev, stones)] from web/engine/overlay.js
@@ -18,7 +20,7 @@
 import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
-import {Native, NeuralSearch, EvaluationCache, GameTrees} from '../../web/engine/search.mjs';
+import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, PV_CHECK} from '../../web/engine/search.mjs';
 import {principalVariation, topRows, Proofs, answered, settled, proofTurns} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
@@ -33,8 +35,9 @@ const job = JSON.parse(readFileSync(0, 'utf8'));
 const native = new Native(await createModule());
 
 async function search(item) {
-  const batches = item.batches.slice(), tree = new NeuralSearch(native, {seed: item.seed, tactics: item.tactics,
-    qRangeFloor: item.q_range_floor ?? 0, rootNoise: item.root_noise ?? 0, history: item.history});
+  const options = {seed: item.seed, tactics: item.tactics, qRangeFloor: item.q_range_floor ?? 0, rootNoise: item.root_noise ?? 0,
+    history: item.history};
+  const batches = item.batches.slice(), tree = item.limit == null ? new NeuralSearch(native, options) : new GameGraph(native, {...options, limit: item.limit});
   const cache = new EvaluationCache(), out = [];
   const evaluate = async leaves => {
     const batch = batches.shift();
@@ -46,6 +49,7 @@ async function search(item) {
   };
   try {
     for (const step of item.steps) {
+      if (step.at) tree.at(step.at);
       const marks = new Map((step.marks || []).map(([q, r, winner, distance]) => [`${q},${r}`, {action: [q, r], winner, distance}]));
       const unmarked = await tree.settle(marks, {cache, evaluate});
       const result = await tree.search({simulations: step.simulations, rootSamples: step.root_samples, batchSize: step.batch_size, cache,
@@ -53,7 +57,7 @@ async function search(item) {
       out.push({action: result.action, policy: result.policy, visits: result.visits, completed: result.completed, proven: result.proven,
         unmarked: unmarked.size});
       if (!result.action) break;
-      tree.advance(result.action);
+      if (item.limit == null) tree.advance(result.action);
     }
   } finally {
     tree.close();
@@ -98,16 +102,16 @@ if (job.kind === 'encode') {
   answer = [];
   for (const item of job.cases) answer.push(await search(item));
 } else if (job.kind === 'game') {
-  const trees = new GameTrees(native), cache = new EvaluationCache(), options = {seed: 1740, tactics: true, qRangeFloor: 0};
+  const trees = new GameGraphs(native), cache = new EvaluationCache(), options = {seed: 1740, tactics: true, qRangeFloor: 0};
   const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map((_, i) => -2 * i), q: actions.map(() => 0)}));
   const turn = async (line, history) => {
     const player = native.game(history).player, current = history.map(p => [...p]), carried = [];
     while (native.game(current).player === player && native.game(current).winner < 0) {
-      const tree = trees.tree(line, current, options);
+      const tree = trees.graph(line, current, options);
       carried.push(tree.result().visits.reduce((a, b) => a + b, 0));
       current.push((await tree.search({simulations: job.simulations, rootSamples: 16, cache, evaluate})).action);
     }
-    return {history: current, carried, tree: trees.trees.get(line).tree};
+    return {history: current, carried, tree: trees.graphs.get(line).graph};
   };
   const first = await turn('a', [[0, 0]]), reply = [...first.history];
   for (let i = 0; i < 2; i++) reply.push(native.legal(reply)[0]);
@@ -115,7 +119,8 @@ if (job.kind === 'encode') {
   answer = {first: first.carried, second: second.carried, same: second.tree === first.tree,
     undone: (await turn('a', [[0, 0]])).carried, fresh: (await turn('b', reply)).carried};
   await turn('c', [[0, 0]]);
-  answer.lines = [...trees.trees.keys()];
+  await turn('d', [[0, 0]]);
+  answer.lines = [...trees.graphs.keys()];
 } else if (job.kind === 'proof-search') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
   const tree = new NeuralSearch(native, {tactics: true, graph: true, history: job.history});
@@ -135,7 +140,7 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'worker-turn') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
   const messages = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
-  const context = {Native, NeuralSearch, EvaluationCache, GameTrees, createModule, principalVariation, topRows,
+  const context = {Native, NeuralSearch, EvaluationCache, GameGraphs, PV_CHECK, createModule, principalVariation, topRows,
     Proofs, answered, settled, proofTurns,
     URL, performance, setTimeout, clearTimeout, onmessage: null, postMessage: message => messages.push(message),
     probe: async () => ({provider: 'wasm', precisions: ['fp32']}),

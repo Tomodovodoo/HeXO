@@ -1,6 +1,10 @@
 /* Native Gumbel search (gumbel.wasm, the hxg_* ABI of src/gumbel.cpp) driven like python/neural_search.py. */
 import {nextTask} from './tasks.mjs';
 
+export const GRAPH_LIMIT = 4096;  // expanded nodes a GameGraph keeps between searches (neural_search.GRAPH_LIMIT)
+export const PV_DROP = .05;       // completed-Q fall that sends a checked search back (neural_search.PV_DROP)
+export const PV_CHECK = .25;      // principal-variation check share of play and analysis searches (play.PV_CHECK)
+
 export class Native {
   /** Wraps an instantiated gumbel.mjs module. */
   constructor(module) {
@@ -87,10 +91,11 @@ export class EvaluationCache {
  * One persistent search tree. `evaluate(requests)` takes [{history, actions}] (actions in native legal order) and
  * resolves to [{logits, q}] per request (array-likes of the action count; q is V(s) broadcast). `qRangeFloor` is
  * the least Q range of the completed-Q rescale (0 keeps mctx's) and `rootNoise` the uniform share of the root's
- * candidate sampling (0 samples by the prior), as python/neural_search.py's q_range_floor and root_noise.
+ * candidate sampling (0 samples by the prior), as python/neural_search.py's q_range_floor and root_noise. `limit`,
+ * when given, makes the tree a shared game graph keeping at most that many expanded nodes (see GameGraph).
  */
 export class NeuralSearch {
-  constructor(native, {seed = 1740, tactics = false, graph = false, qRangeFloor = 0, rootNoise = 0, history = []} = {}) {
+  constructor(native, {seed = 1740, tactics = false, graph = false, qRangeFloor = 0, rootNoise = 0, history = [], limit = null} = {}) {
     this.n = native;
     this.m = native.m;
     this.ptr = this.m._hxg_new(BigInt(seed));
@@ -98,6 +103,7 @@ export class NeuralSearch {
     this.history = [];
     native.checked(this.m._hxg_tactics(this.ptr, tactics ? 1 : 0));
     native.checked(this.m._hxg_graph(this.ptr, graph ? 1 : 0));
+    if (limit !== null) native.checked(this.m._hxg_share(this.ptr, BigInt(limit)));
     native.checked(this.m._hxg_q_range_floor(this.ptr, qRangeFloor));
     native.checked(this.m._hxg_root_noise(this.ptr, rootNoise));
     for (const point of history) this.advance(point);
@@ -263,16 +269,18 @@ export class NeuralSearch {
     return {...this.result(choice), evaluated: stats.evaluated, cache_hits: stats.hits, inference_batches: stats.batches,
       largest_batch: stats.largest, network_ms: stats.network_ms, stopped, elapsed_ms: performance.now() - start};
   }
-  /** Root statistics as NeuralSearch.result: action, actions, visits, values, policy, scores, exact fields. */
+  /** Root statistics as NeuralSearch.result: action, actions, visits, values, completed_q, policy, scores, exact fields. */
   result(choice = 'gumbel') {
     const m = this.m, n = m._hxg_stats(this.ptr, 0, 0, 0, 0);
     const a = this.n.alloc(16 * n), v = this.n.alloc(4 * n), q = this.n.alloc(8 * n), s = this.n.alloc(8 * n), p = this.n.alloc(8 * n);
+    const c = this.n.alloc(8 * n);
     try {
       m._hxg_stats(this.ptr, a, v, q, s);
       m._hxg_policy(this.ptr, p);
+      m._hxg_q(this.ptr, c);
       const actions = this.n.pairs(a, n), visits = Array.from(this.n.view(Int32Array, v, n));
       const values = Array.from(this.n.view(Float64Array, q, n)), scores = Array.from(this.n.view(Float64Array, s, n));
-      const policy = Array.from(this.n.view(Float64Array, p, n));
+      const policy = Array.from(this.n.view(Float64Array, p, n)), completed_q = Array.from(this.n.view(Float64Array, c, n));
       let selected = -1;
       scores.forEach((score, i) => { if (Number.isFinite(score) && (selected < 0 || score > scores[selected])) selected = i; });
       const winner = m._hxg_exact(this.ptr), mover = ((this.history.length + 1) >> 1) % 2;
@@ -281,46 +289,104 @@ export class NeuralSearch {
         selected = 0;
         policy.forEach((p, i) => { if (p > policy[selected]) selected = i; });
       }
-      return {action: selected >= 0 ? actions[selected] : null, actions, visits, values, policy, scores,
+      return {action: selected >= 0 ? actions[selected] : null, actions, visits, values, completed_q, policy, scores,
         completed: m._hxg_completed(this.ptr), exact_winner: winner, proven,
         proof_plies: proven ? m._hxg_distance(this.ptr) : 0,
         proof_action: proven > 0 ? actions.filter((_, i) => Number.isFinite(scores[i])) : []};
     } finally {
-      for (const pointer of [a, v, q, s, p]) m._free(pointer);
+      for (const pointer of [a, v, q, s, p, c]) m._free(pointer);
     }
   }
 }
 
 /**
- * Search trees that follow games, one per line (a key the page changes on undo, a new or loaded game and a seat
- * change). `tree(line, history, options)` is the line's tree advanced through the stones played since it last
- * searched, by either side; it is built afresh from `options` (NeuralSearch's) when the line is new, `options`
- * differ or `history` does not extend its stones. The `limit` most recently used lines keep their trees. Advancing
- * frees every subtree off the played line, so a tree holds only the subtree of its current position.
+ * One game's shared search graph (python/neural_search.py GameGraph): the store keeps every node the game's searches
+ * expanded, a search reads each stored child's visits and value as its edge's, and `at(history)` moves the root to any
+ * position. `search({..., pvCheck})` adds the principal-variation check (neural_search.Recheck).
  */
-export class GameTrees {
-  constructor(native, limit = 2) {
+export class GameGraph extends NeuralSearch {
+  constructor(native, options = {}) {
+    super(native, {...options, limit: options.limit ?? GRAPH_LIMIT});
+  }
+  /** Moves the root to the position after `history`, keeping every node's statistics. */
+  at(history) {
+    const cells = this.n.cells(history);
+    try {
+      this.n.checked(this.m._hxg_root_at(this.ptr, cells, history.length));
+    } finally {
+      this.m._free(cells);
+    }
+    this.history = history.map(([q, r]) => [q, r]);
+  }
+  /** The history after the turn `result` chooses at this root (GameGraph.after_turn), or null; the root stays. */
+  afterTurn(result) {
+    if (!result.action || result.proven) return null;
+    const root = this.history.map(p => [...p]), line = [...root, [...result.action]], mover = ((root.length + 1) >> 1) % 2;
+    const state = this.n.game(line);
+    if (state.winner >= 0) return null;
+    if (state.player === mover) {
+      this.at(line);
+      const {actions, policy} = this.result();
+      this.at(root);
+      if (policy.length && Math.max(...policy) > 0) {
+        line.push([...actions[policy.indexOf(Math.max(...policy))]]);
+        if (this.n.game(line).winner >= 0) return null;
+      }
+    }
+    return line;
+  }
+  /** NeuralSearch.search with the principal-variation check of share `pvCheck` (python/neural_search.py Recheck): with a
+   * check the result is the root's after it, its counts summed over every pass, and `pv_check`. */
+  async search({pvCheck = 0, ...options} = {}) {
+    const simulations = options.simulations ?? 128, reserve = Math.round(pvCheck * simulations);
+    if (!(pvCheck > 0 && reserve && simulations - 2 * reserve >= 1)) return super.search(options);
+    const root = this.history.map(p => [...p]), first = await super.search({...options, simulations: simulations - 2 * reserve});
+    const line = first.stopped ? null : this.afterTurn(first);
+    if (!line) return first;
+    const index = first.actions.findIndex(([q, r]) => q === first.action[0] && r === first.action[1]), before = first.values[index];
+    const passes = [first];
+    this.at(line);
+    try {
+      passes.push(await super.search({...options, simulations: reserve}));
+    } finally {
+      this.at(root);
+    }
+    const after = this.result().values[index], searched = before - after > PV_DROP && !passes[1].stopped;
+    if (searched) passes.push(await super.search({...options, simulations: reserve}));
+    const result = searched ? passes[2] : {...passes[1], ...this.result(options.choice ?? 'policy')};
+    for (const key of ['completed', 'evaluated', 'cache_hits', 'elapsed_ms']) result[key] = passes.reduce((sum, p) => sum + p[key], 0);
+    return {...result, stopped: passes.some(p => p.stopped), pv_check: {line: line.slice(root.length), before, after, searched}};
+  }
+}
+
+/**
+ * Game graphs that follow games, one per line (a key the page changes on undo, a new or loaded game and, for a seat,
+ * a seat change). `graph(line, history, options)` is the line's GameGraph moved to `history`; it is built afresh from
+ * `options` (GameGraph's) when the line is new or `options` differ. The `limit` most recently used lines keep their
+ * graphs.
+ */
+export class GameGraphs {
+  constructor(native, limit = 3) {
     this.native = native;
     this.limit = limit;
-    this.trees = new Map();
+    this.graphs = new Map();
   }
-  tree(line, history, options) {
+  graph(line, history, options) {
     const key = JSON.stringify(options);
-    let kept = this.trees.get(line);
-    this.trees.delete(line);
-    if (kept && (kept.key !== key || kept.tree.history.length > history.length
-      || kept.tree.history.some(([q, r], i) => history[i][0] !== q || history[i][1] !== r))) {
-      kept.tree.close();
+    let kept = this.graphs.get(line);
+    this.graphs.delete(line);
+    if (kept && kept.key !== key) {
+      kept.graph.close();
       kept = null;
     }
-    kept ??= {key, tree: new NeuralSearch(this.native, {...options, history})};
-    this.trees.set(line, kept);
-    for (const [old, {tree}] of this.trees) {
-      if (this.trees.size <= this.limit) break;
-      tree.close();
-      this.trees.delete(old);
+    kept ??= {key, graph: new GameGraph(this.native, {...options, history})};
+    this.graphs.set(line, kept);
+    for (const [old, {graph}] of this.graphs) {
+      if (this.graphs.size <= this.limit) break;
+      graph.close();
+      this.graphs.delete(old);
     }
-    for (const point of history.slice(kept.tree.history.length)) kept.tree.advance(point);
-    return kept.tree;
+    kept.graph.at(history);
+    return kept.graph;
   }
 }

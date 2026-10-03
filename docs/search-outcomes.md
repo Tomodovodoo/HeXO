@@ -48,7 +48,10 @@ turn; `dense_selfplay.position_key`), so the two orders of a turn meet at the ne
 and proofs. Backup follows the MCGS rule: a node's value is recomputed from its network value and its edges' visits
 times their children's current values, and a playout stops without inference at a child that already holds more
 visits than its edge. Proven outcomes are also kept by position key (stones, mover, remaining), which ignores the
-turn context because the game value does not depend on it, so a new node of a proven position starts exact. HeXO
+turn context because the game value does not depend on it, so a new node of a proven position starts exact. A shared game
+graph (`hxg_share`) keeps this store across roots: an edge takes its child's visits and value, so values found at one
+root reach every stored position that leads to it, and proofs propagate to every stored parent as they do within a
+search. HeXO
 never removes stones, so the graph is acyclic and a position with fewer stones than the board can not recur; both
 tables drop such entries when the tree advances. Keys are two independent 64-bit sums of mixed cell hashes.
 
@@ -71,7 +74,7 @@ Together that is 18.5/36. The samples are small and show no strength difference 
 **What is kept today.** `advance` (`src/gumbel.cpp`, `Tree::advance`) moves the root to the played edge's child and keeps that whole subtree: its visits, values, network priors and proofs. The siblings of the played move are freed. They are unreachable, because stones are never removed.
 - **Actors.** A game keeps one tree per distinct model (`SelfPlayGame.trees`). In self-play both colours are the same model, so the opponent's search extends the same tree the next own search reads from. Every placement advances it, both stones of a turn and the opponent's turn alike.
 - **Evaluator.** One tree per model and graph setting (`MatchGame.trees`). Two checkpoints therefore keep separate trees. That is required: one network's Q estimates must not steer the other's search.
-- **Play server.** `play.py` builds a fresh tree for every placement and discards it, so nothing is reused.
+- **Play page.** Each Bubble seat and the analysis board keep one game graph per game (`GameGraph`, [neural-search.md](neural-search.md)): its store keeps the siblings of played stones and every earlier position, so analysis at any position reads the visits and values of every other searched position it reaches.
 - **Evaluation cache.** An actor process holds one LRU cache of 4096 positions per model, shared by its 128 games: about 32 positions per game. It removes duplicates within a batch but is mostly evicted by the next search. The tree itself keeps the network outputs of every reachable expanded node.
 
 **Measured reuse.** CPU, champion `main/110000`, 8 turn starts from recent games, 5 placements each (ours, ours, theirs, theirs, ours):

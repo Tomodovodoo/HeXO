@@ -7,7 +7,7 @@
  *     | {type: 'error', id?, message}.
  */
 import createModule from './gumbel.mjs';
-import {Native, NeuralSearch, EvaluationCache, GameTrees} from './search.mjs';
+import {Native, NeuralSearch, EvaluationCache, GameGraphs, PV_CHECK} from './search.mjs';
 import {Network, probe} from './network.mjs';
 import {principalVariation, topRows, Proofs, answered, settled, proofTurns} from './proof.mjs';
 
@@ -82,10 +82,10 @@ const searched = r => verified(r) || VERDICTS.has(r.reason);
 
 /** The root of the first stone's running search as the analysis panel shows it: {value (the mover's win chance), top}. */
 function rootRows(tree, choice) {
-  const {action, actions, policy, values} = tree.result(choice);
+  const {action, actions, policy, values, completed_q} = tree.result(choice);
   if (!action) return null;
   const value = policy.reduce((sum, p, i) => sum + p * values[i], 0);
-  return {value: Math.round((value + 1) / 2 * 1e4) / 1e4, top: topRows(actions, policy, values, action)};
+  return {value: Math.round((value + 1) / 2 * 1e4) / 1e4, top: topRows(actions, policy, completed_q, action)};
 }
 
 /** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms),
@@ -108,8 +108,8 @@ async function turn(request) {
   }
 }
 
-/** The search of `turn`, with `line` (a seat's game, see GameTrees) continuing that game's tree as a play.py seat does;
- * without it the turn searches a tree of its own. `known` (Proofs.list() of the game's table, or null) answers a
+/** The search of `turn`, with `line` (a seat's or the analysis board's game, see GameGraphs) searching that game's graph
+ * with the principal-variation check PV_CHECK as play.py does; without it the turn searches a tree of its own. `known` (Proofs.list() of the game's table, or null) answers a
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
@@ -181,18 +181,19 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       };
       if (simulations) {
         tree ??= line == null ? new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current})
-          : games.tree(line, current, {seed: 1740, tactics: true, qRangeFloor});
+          : games.graph(line, current, {seed: 1740, tactics: true, qRangeFloor});
         const evaluate = leaves => network.evaluate(leaves);
         const unmarked = await tree.settle(table ? table.edges(current) : new Map(), {evaluate, cache, version: network.version});
         check();
         const result = settled(await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
+          ...(line == null ? {} : {pvCheck: PV_CHECK}),
           evaluate, prove, stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
           onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
             ...(stone ? {} : {live: rootRows(tree, choice)})})}), unmarked, local.player);
         check();
         completed += result.completed;
         if (result.action) {
-          ({action, policy, actions, values} = result);
+          ({action, policy, actions, completed_q: values} = result);
           stoneValue = result.proven ? result.proven : result.exact_winner >= 0 ? (result.exact_winner === local.player ? 1 : -1)
             : policy.reduce((sum, p, i) => sum + p * result.values[i], 0);
           if (proof === null && (result.proven > 0 || (result.proven < 0 && !moves.length))) {
@@ -263,7 +264,7 @@ async function load(options = {}) {
   device = await probe(options.prefer);
   await use(options.model, fraction => postMessage({type: 'progress', fraction: .95 * fraction}));
   cache = new EvaluationCache(4096);
-  games = new GameTrees(native);
+  games = new GameGraphs(native);
   const t = performance.now();
   for (const history of [[[0, 0]], [[0, 0], [1, 0], [0, 1], [5, 0], [6, 0]]]) {
     const leaf = {history, actions: native.legal(history)};

@@ -14,7 +14,7 @@ import hexcrop
 import hexnet
 import play
 import tactical_proof
-from neural_search import EvaluationCache, NeuralSearch
+from neural_search import EvaluationCache, GameGraph, NeuralSearch
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT/'web'/'engine'
@@ -204,8 +204,9 @@ class BrowserProofs(unittest.TestCase):
                    ([[0, 0], [-2, 0], [-2, 1]], dict(proof=dict(winner=0, turns=2), pv=[[-3, 1, 0, 1]]))]
         queries = [[[0, 0]], [[0, 0], [1, 0]], [[0, 0], [5, 5]], [[0, 0], [1, 0], [2, 0], [3, 0]], [[0, 0], [9, 9]],
                    [[0, 0], [2, 2], [3, 2]], [[0, 0], [-2, 0], [-2, 1], [-3, 1]]]
-        result = dict(actions=[[1, 0], [4, 4], [7, 7]], values=[.1, .2, .3], policy=[.2, .5, .3], action=[4, 4], proven=0)
-        lost = dict(actions=[[4, 4]], values=[.4], policy=[1.], action=[4, 4], proven=0)
+        result = dict(actions=[[1, 0], [4, 4], [7, 7]], values=[.1, .2, .3], completed_q=[.1, .2, .3], policy=[.2, .5, .3],
+                      action=[4, 4], proven=0)
+        lost = dict(actions=[[4, 4]], values=[.4], completed_q=[.4], policy=[1.], action=[4, 4], proven=0)
         exact = dict(result, action=[7, 7], proven=1, exact_winner=1, proof_plies=3)
         found = node(dict(kind='table', records=records, queries=queries, result=result, lost=lost, exact=exact, mover=1))
         table = play.Proofs()
@@ -214,8 +215,8 @@ class BrowserProofs(unittest.TestCase):
         for history, answer in zip(queries, found['queries']):
             edges = sorted([*action, winner, distance] for action, (winner, distance, _) in table.edges(history).items())
             self.assertEqual((answer['known'], sorted(answer['edges'])), (table.known(history), edges), history)
-        self.assertEqual({k: found['settled'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
-                         dict(action=[1, 0], proven=1, proof_plies=6, values=[1, -1, .3]))
+        self.assertEqual({k: found['settled'][k] for k in ('action', 'proven', 'proof_plies', 'values', 'completed_q')},
+                         dict(action=[1, 0], proven=1, proof_plies=6, values=[1, -1, .3], completed_q=[1, -1, .3]))
         self.assertEqual({k: found['exact'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
                          dict(action=[7, 7], proven=1, proof_plies=3, values=[1, -1, .3]))
         self.assertEqual({k: found['lost'][k] for k in ('action', 'proven', 'exact_winner', 'proof_plies')},
@@ -477,12 +478,14 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answer['first'][0], 0)
         self.assertGreater(answer['second'][0], 0)
         self.assertTrue(answer['same'])
-        self.assertEqual((answer['undone'][0], answer['fresh'][0]), (0, 0))
-        self.assertEqual(answer['lines'], ['b', 'c'])
+        self.assertGreater(answer['undone'][0], 0)
+        self.assertEqual(answer['fresh'][0], 0)
+        self.assertEqual(answer['lines'], ['b', 'c', 'd'])
 
     def test_search_matches_native(self):
         """Same seed, position, budget, Q range floor, root noise and evaluations: the same actions, visits and policy
-        as the native library."""
+        as the native library, on trees and on a shared game graph whose root moves to the position after the turn
+        it chose and back."""
         model, games = random_model(1), export_web.histories(every=9)
         tactical = list(json.loads((ROOT/'tests'/'fixtures'/'tactical_positions.json').read_text())['positions'].values())[:4]
         cases = []
@@ -520,6 +523,20 @@ class Bundle(unittest.TestCase):
                 tree.close()
             cases.append((dict(history=history, seed=1740, tactics=True, q_range_floor=floor, root_noise=noise, steps=steps,
                                batches=recorder.batches), results))
+        recorder, history, steps, results = Recorder(model), games[5], [], []
+        graph = GameGraph(recorder, 'test', history, seed=1740, cache=EvaluationCache(), tactics=True, limit=4096)
+        try:
+            for simulations in (64, 64, 32):
+                at = None if not results else graph.after_turn(results[0]) if len(results) == 1 else history
+                if at is not None:
+                    graph.at(at)
+                results.append(graph.search(simulations, root_samples=16, batch_size=16))
+                steps.append(dict(simulations=simulations, root_samples=16, batch_size=16, **({'at': at} if at else {})))
+        finally:
+            graph.close()
+        self.assertGreater(len(steps[1]['at']), len(history))
+        cases.insert(0, (dict(history=history, seed=1740, tactics=True, limit=4096, steps=steps,
+                              batches=recorder.batches), results))
         answers = node(dict(kind='search', cases=[case for case, _ in cases]))
         for (case, results), answer in zip(cases, answers):
             self.assertEqual(len(answer), len(results))
