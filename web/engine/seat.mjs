@@ -5,9 +5,12 @@
  * A task that failed is not retried until the position, preset or engine choice changes. Choices persist per browser
  * (localStorage).
  *
- * ENGINES lists them. Each is {entry, engine, record}: `entry` is its picker entry ({id, kind, name, label,
+ * ENGINES lists them. Each is {entry, engine, record, build, listed?}: `listed` settles once `entry.checkpoints` is
+ * read (the saved choices are then checked against it and the page redraws), `build` is the command that builds its files into this
+ * checkout (shown when the public site does not serve them), `entry` is its picker entry ({id, kind, name, label,
  * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
- * while it downloads) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
+ * while it downloads), `engine.files()` lists the files it downloads (assets.mjs records, for the picker's download
+ * button) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
  * preset's budget, plus `checkpoint` (one of `entry.checkpoints`, chosen in a select when there are several) when the
  * entry lists any, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
  * evaluation record the analysis panel shows for that turn. */
@@ -18,16 +21,18 @@ import {mountPlay} from './browser-play.mjs';
 import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 import {strix} from './strix.mjs';
+import {NotOnSite, install as download, json, status} from './assets.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
 const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: [], presets: PRESETS, analysis: true},
   engine: new BubbleEngine(),
   record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
-    solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE})};
-const ENGINES = new Map([bubble, native, shrimp, seal, six, strix].filter(Boolean).map(e => [e.entry.id, e]));
+    solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE}),
+  build: 'python tools/build_web.py ort model'};
+const ENGINES = new Map([bubble, native, shrimp, seal, six, strix].map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
-  'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems', 'isHuman'];
+  'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems', 'isHuman', 'setupRing'];
 const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, page[name]]));
 const analyses = new Map(), loads = new Map(), hk = history => history.map(p => p.join(',')).join(';');
 /** Each seat and the analysis: null, or {engine: an ENGINES id, preset, checkpoint}. */
@@ -47,10 +52,11 @@ const save = () => { failed = null; try { localStorage.setItem(STORE, JSON.strin
 const state = () => typeof S === 'undefined' ? null : S;
 const viewed = () => typeof view === 'undefined' ? 0 : view;
 const closeIcon = () => typeof icon === 'function' ? icon('close') : '×';
-/** The choice for browser engine `id`, keeping `current`'s preset and network when it chose the same engine. */
+/** The choice for browser engine `id`, keeping `current`'s preset and network when it chose the same engine. A network
+ * is checked against the entry's checkpoints once they are known; before its manifest arrives it is kept as given. */
 function pickEngine(id, current, checkpoint = null) {
-  const same = current?.engine === id, {checkpoints} = ENGINES.get(id).entry;
-  const network = [checkpoint, same ? current.checkpoint : null].find(c => checkpoints.includes(c)) ?? checkpoints[0] ?? null;
+  const same = current?.engine === id, {checkpoints} = ENGINES.get(id).entry, wanted = [checkpoint, same ? current.checkpoint : null];
+  const network = checkpoints.length ? wanted.find(c => checkpoints.includes(c)) ?? checkpoints[0] : wanted.find(Boolean) ?? null;
   return {engine: id, preset: same ? current.preset : 'standard', checkpoint: network};
 }
 const analysable = e => e.kind === 'bubble' || e.analysis;
@@ -138,6 +144,7 @@ async function run(key, task) {
   try {
     current.loading = true;
     await engine.load(f => { loads.set(task.engine, f); progress(); });
+    checks.delete(task.engine);
     current.loading = false;
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})};
     const result = await engine.turn(task.history, budget, {signal: controller.signal, line: task.line,
@@ -173,7 +180,8 @@ async function run(key, task) {
   } catch (error) {
     if (error.name !== 'AbortError') {
       failed = key;
-      original.toast(error.message);
+      if ((await check(task.engine)).state === 'unpublished') unpublished(task.engine);   // a worker's error is a plain message
+      else original.toast(error.message);
     }
     if (job === current) job = null;
   }
@@ -193,7 +201,129 @@ function controls(choice, send, id) {
   return out;
 }
 
+/* Engine id -> a promise of its files' assets.mjs status(), {state: 'unpublished'} when neither this origin nor the
+ * site has one of them (only a local build provides it), or {state: 'failed', error} for another failure. Its
+ * `stamp` names the networks it covered; a different saved choice checks again. */
+const checks = new Map(), downloads = new Map();
+const failure = error => error instanceof NotOnSite ? {state: 'unpublished'} : {state: 'failed', error: error.message};
+/** The networks the seat and analysis choices pick for engine `id`, which its files() should cover: the browser
+ * session's on a static page, else the saved ones. */
+const chosen = id => {
+  const session = page.browserPlay, choices = session ? [...session.seats, session.analysis] : [...config.seats, config.analysis];
+  return [...new Set(choices.filter(c => c?.engine === id && c.checkpoint).map(c => c.checkpoint))];
+};
+const remember = (id, promise) => { checks.set(id, Object.assign(promise, {stamp: chosen(id).join(',')})); return promise; };
+const check = id => checks.get(id)?.stamp === chosen(id).join(',') ? checks.get(id)
+  : remember(id, ENGINES.get(id).engine.files(chosen(id)).then(files => { if (ENGINES.get(id).listed) recheck(ENGINES.get(id).entry); return status(files); }).catch(failure));
+const unpublished = id => original.toast(`${ENGINES.get(id).entry.label} is not on the public site; build it here with ${ENGINES.get(id).build}`);
+/* States in which a browser engine plays without a download first: its files are here, cached, or cannot be cached. */
+const READY = new Set(['local', 'cached', 'uncached']);
+const megabytes = bytes => `${(bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0)} MB`;
+
+/** Draws picker row `row` of a browser engine: as it is when its files are here or cached, else as a download with
+ * its size, and while downloading with its progress. */
+async function paint(row) {
+  const id = row.dataset.engine, found = await check(id), running = downloads.get(id);
+  if (!row.isConnected) return;
+  row.querySelectorAll('.get, .size').forEach(node => node.remove());
+  const ready = !running && READY.has(found.state);
+  row.classList.remove('setup', 'running', 'failed');
+  row.removeAttribute('aria-label');
+  if (ready) return;
+  row.classList.add('setup', ...(running ? ['running'] : found.state === 'failed' ? ['failed'] : []));
+  if (found.state === 'unpublished') {
+    row.setAttribute('aria-label', `${ENGINES.get(id).entry.label} needs a local build`);
+    row.append(original.el('span', {class: 'size', style: 'white-space:nowrap'}, 'local build'));
+    return;
+  }
+  const total = found.bytes ? megabytes(found.bytes) : '';
+  const size = !running ? total : total ? `${megabytes(running.fraction * found.bytes)} / ${total}` : `${Math.round(running.fraction * 100)}%`;
+  row.setAttribute('aria-label', `Download ${ENGINES.get(id).entry.label}`);
+  row.append(original.el('span', {class: 'size', style: 'white-space:nowrap'}, size), original.setupRing(running ? {state: 'running', progress: running.fraction} : null));
+}
+
+/** Downloads browser engine `id`'s missing files into the Cache API; a failure shows its reason. */
+async function fetchEngine(id) {
+  if (downloads.has(id)) return;
+  const slot = {fraction: 0};
+  downloads.set(id, slot);
+  const repaint = () => document.querySelectorAll(`#menu [data-engine="${id}"]`).forEach(paint);
+  try {
+    if (['failed', 'unpublished'].includes((await check(id)).state)) checks.delete(id);   // the site or a build may have changed
+    repaint();
+    const found = await check(id), stamp = checks.get(id).stamp;
+    if (found.state === 'unpublished') { unpublished(id); return; }
+    if (found.state === 'failed') throw new Error(found.error);
+    if (found.state === 'missing') await download(found.files, fraction => { slot.fraction = fraction; repaint(); });
+    checks.delete(id);
+    const after = await check(id);
+    if (checks.get(id).stamp === stamp && !READY.has(after.state)) {   // the same files did not stay (a full quota): each load downloads them
+      remember(id, Promise.resolve({state: 'uncached'}));
+      original.toast(`${ENGINES.get(id).entry.label}: the browser did not keep the files, so each start downloads them`);
+    }
+    if (failed?.split('|')[1] === id) failed = null;   // let this engine's work that failed for want of its files run again
+    const session = page.browserPlay;
+    if (session) {
+      session.jobs = session.jobs.filter(job => job.status !== 'failed' || job.spec.engine !== id);
+      session.changed();
+      session.pump();
+    } else schedule();
+  } catch (error) {
+    remember(id, Promise.resolve(failure(error)));
+    if (error instanceof NotOnSite) unpublished(id);
+    else original.toast(`${ENGINES.get(id).entry.label}: ${error.message}`);
+  } finally {
+    downloads.delete(id);
+    repaint();
+  }
+}
+
+/** The page's engine picker, with a browser engine's row offering its download until its files are here. */
+function openMenu(anchor, items, current, choose) {
+  original.openMenu(anchor, items, current, choose);
+  const rows = [...document.getElementById('menu').children];
+  items.forEach((item, i) => {
+    if (!ENGINES.has(item.id)) return;
+    const row = rows[i], pick = row.onclick;
+    row.dataset.engine = item.id;
+    row.onclick = async event => {
+      const {state} = await check(item.id);
+      if (!row.isConnected) return;   // the menu closed or changed while the status was read
+      if (!downloads.has(item.id) && READY.has(state)) pick(event);
+      else fetchEngine(item.id);
+    };
+    paint(row);
+  });
+}
+
+/** Checks the saved choices and the static page's session choices (seats, analysis, a stored match's players) for
+ * engine `entry` against its loaded network list: a network the list no longer has becomes its newest. Then redraws.
+ * Runs when the list changed since the last check, or always with `force`. */
+const rechecked = new Map();
+function recheck(entry, force = false) {
+  const list = entry.checkpoints.join(',');
+  if (!force && rechecked.get(entry.id) === list) return;   // nothing new to check against
+  rechecked.set(entry.id, list);
+  const fix = choice => choice?.engine === entry.id ? pickEngine(entry.id, choice, choice.checkpoint) : choice;
+  const fixed = {seats: config.seats.map(fix), analysis: fix(config.analysis)};
+  if (JSON.stringify(fixed) !== JSON.stringify(config)) {   // save() also clears the failed key, so only on a change
+    config = fixed;
+    save();
+  }
+  const session = page.browserPlay, choices = session && [...session.seats, session.analysis, ...session.match?.players ?? []];
+  const stale = choices?.filter(c => c?.engine === entry.id && c.checkpoint && entry.checkpoints.length && !entry.checkpoints.includes(c.checkpoint));
+  if (stale?.length) {
+    for (const choice of stale) choice.checkpoint = entry.checkpoints[0];
+    session.cancelJobs(job => job.spec.engine === entry.id && !entry.checkpoints.includes(job.spec.checkpoint));
+    session.jobs = session.jobs.filter(job => job.status !== 'failed' || job.spec.engine !== entry.id);
+    session.persist();
+    page.accept(session.state());
+    session.pump();
+  } else if (state()) page.renderPanels();
+}
+
 function install() {
+  page.openMenu = openMenu;
   page.accept = data => {
     adopt(data);
     inject(data);
@@ -258,7 +388,7 @@ function install() {
     const pick = box.querySelector('.pick');
     if (pick) {
       const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...original.pickItems(() => true)];
-      pick.onclick = () => original.openMenu(pick, items, config.seats[side].engine, it => page.post('/seat', {side, engine: it.id}));
+      pick.onclick = () => page.openMenu(pick, items, config.seats[side].engine, it => page.post('/seat', {side, engine: it.id}));
     }
     box.append(original.el('div', {class: 'more'}, original.el('div', {}, ...controls(config.seats[side], send, 'seat' + side))));
     progress();
@@ -270,7 +400,7 @@ function install() {
     const {entry} = ENGINES.get(config.analysis.engine);
     const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.badge || entry.kind, entry.label));
     const items = original.pickItems(analysable);
-    pick.onclick = () => original.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: 'standard', auto: true}));
+    pick.onclick = () => page.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: 'standard', auto: true}));
     const send = change => { config.analysis = {...config.analysis, ...change}; save(); page.renderPanels(); };
     head.replaceChildren(original.el('div', {class: 'head'}, pick), ...controls(config.analysis, send, 'analysis'));
   };
@@ -301,16 +431,18 @@ async function serverless() {
     if (response.ok && (response.headers.get('Content-Type') || '').includes('json')) return false;
   } catch {}
   if (await isolate()) return true;
-  Object.assign(page, original);
-  const [manifest, build] = await Promise.all(['model/manifest.json', 'build.json'].map(async path => (await fetch(new URL(path, import.meta.url), {cache:'no-cache'})).json()));
+  Object.assign(page, original, {openMenu});
+  const [manifest, build] = await Promise.all([json('model/manifest.json').then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);
   bubble.entry.version = [manifest.model_version, build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
   native.entry.version = build.artefacts['native/native.wasm'];
   for (const {entry} of ENGINES.values()) entry.version ||= JSON.stringify(build.artefacts);
   await mountPlay(ENGINES, config);
+  for (const {entry, listed} of ENGINES.values()) listed?.then(() => recheck(entry, true));   // the session's own choices
   return true;
 }
 
 if (HOOKS.every(name => typeof original[name] === 'function')) {
   install();
+  for (const {entry, listed} of ENGINES.values()) listed?.then(() => recheck(entry));
   serverless().then(active=>{if(!active||page.browserPlay)page.resolvePlayReady?.()}).catch(error=>{original.toast(error.message)});
 } else console.warn('The browser engines need the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));

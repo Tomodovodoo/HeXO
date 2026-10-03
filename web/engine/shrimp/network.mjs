@@ -1,6 +1,7 @@
 /* Shrimp's network (tools/shrimp_web/export.py) under ONNX Runtime Web: WebGPU when the device has it, else
  * WebAssembly. */
-import {cached, defaultThreads} from '../network.mjs';
+import {cached, json} from '../assets.mjs';
+import {runtime} from '../network.mjs';
 
 const FEATURES = 15;
 
@@ -40,30 +41,23 @@ export function pack(rows, bias) {
 }
 
 export class ShrimpNetwork {
+  /** {manifest, file}: the manifest at `model` (a path under web/engine) and the graph it pins (an assets.mjs record). */
+  static async files(model = 'shrimp/model/manifest.json') {
+    const {data, local} = await json(model), name = Object.keys(data.files)[0];
+    return {manifest: data, file: {path: model.slice(0, model.lastIndexOf('/') + 1) + name, ...data.files[name], local}};
+  }
+
   /**
-   * Loads ONNX Runtime and the graph named by the manifest at `model` (relative to `base`, the web/engine URL) on
-   * `device` (network.mjs probe(); WebGPU runs the fp32 graph too). `progress(fraction)` reports downloads.
+   * Loads ONNX Runtime and the graph named by the manifest at `model` on `device` (network.mjs probe(); WebGPU runs
+   * the fp32 graph too). `progress(fraction)` reports downloads.
    */
-  static async create(base, {model = 'shrimp/model/manifest.json', device, progress = () => {}, threads = null} = {}) {
-    const manifestUrl = new URL(model, base), manifest = await (await fetch(manifestUrl, {cache: 'no-cache'})).json();
-    const gpu = device.provider === 'webgpu';
-    const ortBase = new URL('ort/', base), ortVersion = (await (await fetch(new URL('version.json', ortBase))).json()).version;
-    const runtime = gpu ? 'ort-wasm-simd-threaded.asyncify' : 'ort-wasm-simd-threaded';
-    const file = Object.keys(manifest.files)[0], shares = [0, 0];
+  static async create({model = 'shrimp/model/manifest.json', device, progress = () => {}, threads = null} = {}) {
+    const {manifest, file} = await ShrimpNetwork.files(model), shares = [0, 0];
     const report = (i, f) => { shares[i] = f; progress(.3 * shares[0] + .7 * shares[1]); };
-    const [ort, wasmBinary, graph] = await Promise.all([
-      import(new URL(gpu ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs', ortBase).href),
-      cached(new URL(`${runtime}.wasm`, ortBase).href, ortVersion, f => report(0, f)),
-      cached(new URL(file, manifestUrl).href, manifest.files[file].sha256, f => report(1, f))]);
-    ort.env.wasm.wasmPaths = {mjs: new URL(`${runtime}.mjs`, ortBase).href};
-    ort.env.wasm.wasmBinary = wasmBinary;
-    ort.env.wasm.numThreads = threads ?? defaultThreads({isolated: Boolean(globalThis.crossOriginIsolated),
-      cores: navigator.hardwareConcurrency || 2});
-    ort.env.wasm.proxy = false;
-    ort.env.logLevel = 'error';
-    const session = await ort.InferenceSession.create(new Uint8Array(graph), {executionProviders: [gpu ? 'webgpu' : 'wasm'],
+    const [ort, graph] = await Promise.all([runtime(device.provider, threads, f => report(0, f)), cached(file, f => report(1, f))]);
+    const session = await ort.InferenceSession.create(new Uint8Array(graph), {executionProviders: [device.provider],
       graphOptimizationLevel: 'all', enableCpuMemArena: true, logSeverityLevel: 3});
-    return new ShrimpNetwork(ort, session, manifest, gpu ? 'webgpu' : 'wasm', ort.env.wasm.numThreads);
+    return new ShrimpNetwork(ort, session, manifest, device.provider, ort.env.wasm.numThreads);
   }
 
   constructor(ort, session, manifest, provider, threads) {

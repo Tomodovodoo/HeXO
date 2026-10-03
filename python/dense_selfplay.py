@@ -642,8 +642,9 @@ class SelfPlayGame:
         for tree in self.trees.values():
             tree.advance((q, r))
         self.moves.append([q, r])
-        if result.get('proven') == 1:
-            self.label(ply, 1, result['proof_turns'], row.get('proof_action') or [[q, r]])
+        if result.get('proven'):
+            action = (row.get('proof_action') or [[q, r]]) if result['proven'] > 0 else None
+            self.label(ply, result['proven'], result['proof_turns'], action)
         if game.winner >= 0:
             return False
         if self.settings.adjudicate_proven and result.get('proven'):
@@ -740,7 +741,8 @@ class SelfPlayGame:
         """Record a proof's verdict (+1 / -1: the side to move wins / loses) on the row of `ply` unless it has one;
         return the number of newly labelled rows. A winning second-stone row also proves its preceding
         same-player first-stone row, with the played first stone and winning continuations as policy targets
-        and one additional placement on its win bound."""
+        and one additional placement on its win bound. An opponent's exact loss at the next turn proves
+        the preceding played second stone winning, then the same first-stone rule applies."""
         index = ply-(len(self.moves)-len(self.rows))
         row = self.rows[index] if 0 <= index < len(self.rows) else None
         if row is None:
@@ -753,6 +755,16 @@ class SelfPlayGame:
             if 'remaining' in row:
                 row['proof_plies'] = dense_solver.proof_plies(row['remaining'], turns, proven > 0)
             labelled = 1
+        if row.get('proven') == -1 and index > 0:
+            previous = self.rows[index-1]
+            if (previous.get('remaining') == 1 and previous['player'] != row['player']
+                    and previous['ply'] == ply-1 and not previous.get('proven')):
+                previous.update(proven=1, proof_turns=turns+1 if turns else 0)
+                if row.get('proof_plies', 0) > 0:
+                    previous['proof_plies'] = row['proof_plies']+1
+                else:
+                    previous.pop('proof_plies', None)
+                labelled += 1+self.label(ply-1, 1, previous['proof_turns'], [self.moves[ply-1]])
         if row.get('proven') == 1 and row.get('remaining') == 1 and index > 0:
             first = self.rows[index-1]
             if first.get('remaining') == 2 and first['player'] == row['player'] and first['ply'] == ply-1:
