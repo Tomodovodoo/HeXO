@@ -2089,7 +2089,11 @@ class TurnTrees(unittest.TestCase):
         graph = engines.graphs[1][1]
         visits = int(graph.result(0, 0, 0, 0)['visits'].sum())
         self.assertGreaterEqual(visits, 128)
-        self.assertLess(visits, 128 + 16)
+        # Both roots of the turn already hold 128 visits, so one more tier runs one simulation at each; the second
+        # stone's also counts at the first stone's edge.
+        evaluate(bubble, None, history, 128, 0, trees=engines.game_graph(bubble, 1, keep=True))
+        graph.at(history)
+        self.assertEqual(int(graph.result(0, 0, 0, 0)['visits'].sum()), visits + 2)
         trees = engines.game_graph(bubble, 1, 'abc', keep=True)
         tree, missing = trees([(0, 0)], 32, bubble.evaluator)
         self.assertIsNot(tree, graph)

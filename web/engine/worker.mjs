@@ -212,6 +212,13 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       current.push([action[0], action[1]]);
       tree?.advance(action);
     }
+    if (line != null && tree && moves.length > 1 && !given) {
+      // The later stones' searches changed the graph under the first root: read that root again.
+      tree.at(history.map(p => [...p]));
+      const root = tree.result(choice);
+      top = topRows(root.actions, root.policy, root.completed_q, moves[0]);
+      value = (root.policy.reduce((sum, p, i) => sum + p * root.values[i], 0) + 1) / 2;
+    }
     if (proof) value = proof.winner === player ? 1 : 0;
     if (proof && !pv.length) {
       const after = table?.known([...history, ...moves]);

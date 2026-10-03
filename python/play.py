@@ -916,6 +916,14 @@ class TurnSearch:
         self.played += 1
 
     def record(self):
+        from neural_search import GameGraph
+        if isinstance(self.tree, GameGraph) and self.played > 1 and not self.given:
+            # The later stones' searches changed the graph under the first root: read that root again.
+            from dense_selfplay import root_value
+            self.tree.at(self.history)
+            stats = self.tree.result(0, 0, 0, 0, choice='policy')
+            self.top = top_rows(stats['actions'], stats['policy'], stats['completed_q'], lead=self.moves[0])
+            self.value = (root_value(stats, self.player) + 1) / 2
         value = (1. if self.proof['winner'] == self.player else 0.) if self.proof else self.value
         pv = self.pv or ([[*m, self.player, i + 1] for i, m in enumerate(self.moves)] if self.proof else [])
         extended = self.known is not None and pv and not self.pv
