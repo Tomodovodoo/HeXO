@@ -277,7 +277,8 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 .dialog-head{display:flex;align-items:center;gap:10px;font-weight:700;flex-wrap:wrap}
 .games-button{display:flex;align-items:center;gap:6px;padding:5px 8px;font-size:12px}.games-button svg{width:16px;height:16px}
 #saved-batch{width:100%}
-#t-new[hidden],#t-results[hidden],#saved-batch[hidden],#browser-library[hidden]{display:none}
+#t-new[hidden],#t-results[hidden],#saved-batch[hidden],#browser-library[hidden],#clock-row[hidden]{display:none}
+#clock-row{padding:2px 6px 4px}
 .tabs{display:inline-flex;gap:2px;padding:2px;border-radius:9px;background:var(--bg);border:1px solid var(--line);margin-left:8px}
 .tabs button{border:0;background:transparent;color:var(--muted);border-radius:7px;padding:4px 12px;cursor:pointer;font:600 12px system-ui}
 .tabs button.on{background:var(--raise-2);color:var(--text)}
@@ -339,6 +340,7 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
       <div class="seat" id="seat0" style="--c:var(--x)"></div>
       <div class="seat" id="seat1" style="--c:var(--o)"></div>
       <div id="book-row" hidden></div>
+      <div id="clock-row" hidden></div>
       <div id="match" hidden></div>
     </div>
     <div id="pips" class="float"></div>
@@ -655,12 +657,16 @@ function drawMarks(){
 
 /* interaction */
 function canPlace(){return S&&view===S.history.length&&S.winner<0&&S.seats[S.player].engine==='human'&&placing.length<S.remaining}
-/* a person's stone is drawn at once and sent in order; the server's answer confirms it, a refusal takes it back */
+/* a person's stone is drawn at once and sent in order; the server's answer confirms it, a refusal takes it back with
+   the stones queued after it */
 let sending=Promise.resolve();
 function place(q,r){
   const k=key(q,r),stones=shownStones();if(!legalSet(stones).has(k)||stones.some(p=>key(...p)===k))return;
   placing.push([q,r]);placed.add(k);landed.set(k,performance.now());draw();
-  sending=sending.then(async()=>{const done=await post('/play',{q,r});placing=placing.filter(p=>key(...p)!==k);if(!done){placed.delete(k);landed.delete(k)}draw()});
+  sending=sending.then(async()=>{
+    if(!placing.some(p=>key(...p)===k))return;
+    const done=await post('/play',{q,r});placing=placing.filter(p=>key(...p)!==k);
+    if(!done){for(const p of[[q,r],...placing]){placed.delete(key(...p));landed.delete(key(...p))}placing=[]}draw()});
 }
 canvas.onpointerdown=e=>{drag={x:e.clientX,y:e.clientY,cx:cam.x,cy:cam.y,moved:false};canvas.setPointerCapture(e.pointerId)};
 canvas.onpointermove=e=>{const b=canvas.getBoundingClientRect();hover=axial(e.clientX-b.left,e.clientY-b.top);markTokens(key(...hover));
@@ -944,6 +950,11 @@ function renderDetail(){
     ...(t.line&&t.line.length>(t.better||[]).length?[el('div',{class:'nums'},t.line.slice(0,8).map(p=>el('span',{style:`color:${COLORS[p[2]]}`},p[0]+','+p[1])))]:[]));
 }
 const BOOKS=[['narrow','narrow'],['wide','on-policy'],['all','all']];
+/* the clock choice in the card when people play both seats (an engine seat shows it under its strength) */
+function renderClockRow(){
+  const box=$('clock-row');box.hidden=!!S.saved_game||!!S.match||!S.seats.every(isHuman);
+  box.replaceChildren(...(box.hidden?[]:[clockPicker(S.clock_spec,spec=>post('/clock',spec),'clock-card')]));
+}
 function renderBook(){
   const box=$('book-row');box.hidden=!(S.book?.available&&!S.saved_game);if(box.hidden)return;
   const on=S.book.enabled,sw=el('span',{class:'switch'+(on?' on':''),role:'switch','aria-checked':on,'aria-label':'Opening book',tabindex:0},el('i'));
@@ -976,7 +987,7 @@ function renderPanels(){
   if(!S)return;
   const focused=document.activeElement?.id;
   document.documentElement.style.setProperty('--turn',S.winner>=0?COLORS[S.winner]:COLORS[playerAt(view)]);
-  renderCard();renderSeat(0);renderSeat(1);renderBook();renderMatch();renderEngineHead();renderStudy();
+  renderCard();renderSeat(0);renderSeat(1);renderBook();renderClockRow();renderMatch();renderEngineHead();renderStudy();
   const engines=S.seats.some(s=>s.engine!=='human'),pause=$('pause');
   setIcon(pause,S.paused?'play':'pause');pause.setAttribute('aria-label',S.paused?'Resume':'Pause');pause.disabled=!engines;
   const held=S.paused&&S.winner<0&&S.seats[S.player].engine!=='human';
