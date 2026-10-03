@@ -561,7 +561,7 @@ export class BrowserSession extends OfflineSession {
       try {
         result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
           known: job.kind === 'move' ? null : (this.extendProofs(), this.proofs.list()),
-          progress: (f, live, stage) => { job.done = job.kind === 'review' ? job.cursor + f : f; job.stage = stageText(stage); if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
+          progress: (f, live, stage) => { job.done = job.kind === 'review' ? job.cursor + f : f; job.stage = stageText(stage); job.searching ||= live !== undefined; if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);
       const at = Date.now(), elapsed = this.clock?.started != null ? at - this.clock.started : null;
@@ -579,7 +579,7 @@ export class BrowserSession extends OfflineSession {
       if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
       const {graph_searched: searched, ...answer} = result;
       result = answer;
-      if (job.kind === 'analyse' && job.line != null && searched) result = {...result, graph: this.graphSearched(job)};
+      if (job.kind === 'analyse' && job.line != null && searched) { result = {...result, graph: this.graphSearched(job)}; job.counted = true; }
       await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));
       if (job.kind === 'analyse' && !job.refresh && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') this.refresh(history, job.spec, job.line);
       if (job.kind === 'move') {
@@ -595,8 +595,8 @@ export class BrowserSession extends OfflineSession {
         }
       } else if (job.kind === 'review') { job.cursor++; job.done = job.cursor; }
     } catch (error) {
-      // A cancelled or failed Bubble analysis may have searched its graph already: its other analyses are stale.
-      if (job.kind === 'analyse' && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') this.graphSearched(job);
+      // A cancelled or failed Bubble analysis that reached its search (a batch reported a live root) changed its graph.
+      if (job.kind === 'analyse' && job.line != null && job.searching && !job.counted) this.graphSearched(job);
       interrupted = error.name === 'AbortError' && !job.controller.signal.aborted;
       if (error.name !== 'AbortError') { job.status = 'failed'; job.error = error.message; if (job.kind === 'move') { this.freezeClock(); this.paused = true; } if (this.match) this.match.error = error.message; }
     } finally {

@@ -467,15 +467,15 @@ struct Tree {
   }
   if(shared){
    propagate(*root,nullptr);
+   // Only an edge whose value is known takes the credit, and only its node counts the visit, so no visit enters an
+   // edge or a node without a value.
    for(auto [x,index]:lineage){
-    ++x->n;
-    // Only an edge whose value is known takes the credit, so no visit enters an edge without a value.
-    if(index>=0){
-     auto& e=x->edges[index];
-     if(e.exact_winner>=0){++e.visits;e.sum=(e.exact_winner==x->player?1:-1)*e.visits;}
-     else if(e.child && e.child->n){++e.visits;e.sum+=e.child->player==x->player?e.child->q:-e.child->q;}
-    }
-    stale(*x);
+    if(index<0)continue;
+    auto& e=x->edges[index];
+    if(e.exact_winner>=0){++e.visits;e.sum=(e.exact_winner==x->player?1:-1)*e.visits;}
+    else if(e.child && e.child->n){++e.visits;e.sum+=e.child->player==x->player?e.child->q:-e.child->q;}
+    else continue;
+    ++x->n;stale(*x);
    }
   }
   if(!path.edges.empty())++completed;
