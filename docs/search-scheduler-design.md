@@ -774,6 +774,22 @@ helpers want about 3 cores (estimate: the feeder is mostly blocked). Defaults:
 Never more than cores minus the owner, feeder and encoder threads of all engine processes. Solver processes run at
 below-normal priority so they never starve the owner.
 
+### E.10 The prover reads the graph
+
+The prover never sees the search graph today, which is why a position whose every reply is refuted still has no
+proof (issue 347): the refuted replies are invisible to it and the search cannot exhaust the rest. Two obligations
+close this, and they are the contract between prover and graph:
+
+1. Graph nodes as prover terminals. A query carries a handle to the game's graph and proof table; any node they
+   hold as exact is a terminal for the prover, which takes the stored verdict (winner, distance, bound) instead of
+   expanding it. The library's hits on issue 341 use the same hook.
+2. A defender root. A query may start at the node of the side being refuted; the prover's own defence
+   enumeration (all two-stone covers plus the free second stone) then proves every reply lost, refusing with UNKNOWN
+   when the root is not forcing, so the scope stays sound.
+
+The scheduler asks for a defender-root query whenever a view's root has every sampled candidate exact lost and is
+not complete, and installs the result through hxg_prove_at.
+
 ## F. Keeping the GPU and the solver busy
 
 Two queues, one owner: the next GPU batch (per canvas) and the solver frontier. The owner refills both on every loop
