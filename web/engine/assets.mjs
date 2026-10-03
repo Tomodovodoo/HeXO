@@ -102,7 +102,7 @@ function key(file) {
 export async function cached(file, progress = () => {}) {
   const store = await open(), id = key(file), hit = store && await store.match(id);
   if (hit) { progress(1); return hit.arrayBuffer(); }
-  const {response, local} = await locate(file.path);
+  const {response, local} = await locate(file.path, {cache: 'no-cache'});   // a Cache API miss means new bytes: revalidate
   if (!local && !file.sha256) throw new Error(`${file.path}: the site's manifest has no SHA-256 for it`);
   const total = Number(response.headers.get('Content-Length')) || file.bytes || 0, parts = [];
   let received = 0;
