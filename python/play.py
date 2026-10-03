@@ -56,8 +56,8 @@ REVIEW_PRESET = 'standard'
 REVIEW_BATCH = dict(cpu=64, cuda=256)   # network leaves per pooled review batch
 REVIEW_SOLVERS = 4                      # tactical workers a review queries at once
 REVIEW_CHUNK = 24                       # positions per pooled review step; urgent analysis waits at most one step
-LIMITS = dict(simulations=(0, 65536), solver_nodes=(0, 4_000_000), ms=(10, 120_000), nodes=(1, 50_000_000))
-KIND_LIMITS = dict(strix=dict(simulations=(1, 16384)))
+LIMITS = dict(simulations=0, solver_nodes=0, ms=10, nodes=1)
+KIND_LIMITS = dict(strix=dict(simulations=1))
 HEXO_SITES = {'hexo.did.science': 'https://hexo.did.science/api',
               'hexo.mineking.dev': 'https://hexo.mineking.dev/proxy/api'}
 SHOWN = ('id', 'name', 'label', 'kind', 'badge', 'presets', 'checkpoints')
@@ -290,7 +290,7 @@ def presets_of(kind, spec):
                 continue
             limits = LIMITS | KIND_LIMITS.get(kind, {})
             if (key not in PRESETS[kind]['standard'] or type(value) is not int
-                    or not limits[key][0] <= value <= limits[key][1]):
+                    or value < limits[key]):
                 raise ValueError(f'bad {key} in preset {name}')
         presets[name] = presets[name] | budget
     return presets
@@ -1342,7 +1342,7 @@ class Job:
 
 def budget_of(presets, preset, custom=None, kind=None):
     """The budget of `preset` from an entry's `presets`, or the standard budget with `custom` values checked
-    against LIMITS and the `kind`'s own limits (a preset's launch `args` are not custom)."""
+    against the smallest values in LIMITS and the `kind`'s own (larger budgets only take longer) (a preset's launch `args` are not custom)."""
     limits = LIMITS | KIND_LIMITS.get(kind, {})
     if preset != 'custom':
         if preset not in presets:
@@ -1356,9 +1356,8 @@ def budget_of(presets, preset, custom=None, kind=None):
             continue
         if key not in budget or key not in limits:
             raise ValueError(f'{key} is not a budget of this engine')
-        low, high = limits[key]
-        if type(value) is not int or not low <= value <= high:
-            raise ValueError(f'{key} must be {low}..{high}')
+        if type(value) is not int or value < limits[key]:
+            raise ValueError(f'{key} must be an integer of at least {limits[key]}')
         budget[key] = value
     return budget
 

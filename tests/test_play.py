@@ -725,7 +725,8 @@ class Jobs(unittest.TestCase):
     def test_budgets(self):
         bubble = PRESETS['bubble']
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
-        for custom in (dict(simulations=10 ** 6), dict(ms=5), dict(simulations='8')):
+        self.assertEqual(budget_of(bubble, 'custom', dict(simulations=10 ** 6))['simulations'], 10 ** 6)
+        for custom in (dict(simulations=-1), dict(ms=5), dict(simulations='8')):
             with self.assertRaises(ValueError):
                 budget_of(bubble, 'custom', custom)
         with self.assertRaises(ValueError):
@@ -743,8 +744,10 @@ class Jobs(unittest.TestCase):
         self.assertEqual({kind: presets_of(kind, None)['dangerous'] for kind in PRESETS},
                          dict(bubble=dict(simulations=65536, solver_nodes=4_000_000), native=dict(ms=60000),
                               seal=dict(ms=30000), six=dict(nodes=2_000_000), strix=dict(simulations=4096)))
-        self.assertEqual(budget_of(PRESETS['bubble'], 'custom', dict(simulations=65536, solver_nodes=4_000_000)),
-                         dict(simulations=65536, solver_nodes=4_000_000))
+        self.assertEqual(budget_of(PRESETS['bubble'], 'custom', dict(simulations=100_000, solver_nodes=10_000_000)),
+                         dict(simulations=100_000, solver_nodes=10_000_000))
+        with self.assertRaisesRegex(ValueError, 'at least 0'):
+            budget_of(PRESETS['bubble'], 'custom', dict(solver_nodes=-1))
         for spec in (dict(heavy=dict(nodes=1)), dict(quick=dict(nodes=0)), dict(quick=dict(args='--x')), [1],
                      dict(quick=dict(ms=1000))):
             with self.assertRaises(ValueError):

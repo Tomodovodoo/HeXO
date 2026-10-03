@@ -8,7 +8,7 @@ import {clockSpec, turnTime} from './clock.mjs';
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 const copy = value => structuredClone(value), position = history => history.map(p => p.join(',')).join(';');
 const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human'});
-const REVIEW_PRESET = 'standard';
+const REVIEW_PRESET = 'standard', FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
 /** Labels every complete turn of `history` as python/play.py review does; `lookup(prefix, ply)` is the evaluation of a
@@ -76,7 +76,7 @@ export class BrowserSession extends OfflineSession {
     if (!entry) throw Error('This engine is not installed in the browser');
     const preset = input.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget} : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
-    for (const [name, value] of Object.entries(budget)) if (typeof value === 'number' && (!Number.isInteger(value) || value < 0 || value > ({simulations: 65536, solver_nodes: 4000000, ms: 120000, nodes: 50000000}[name] ?? 50000000))) throw Error(`Invalid ${name} budget`);
+    for (const [name, value] of Object.entries(budget)) if (typeof value === 'number' && (!Number.isSafeInteger(value) || value < ({ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0)))) throw Error(`${FIELD_NAMES[name] || name} must be a whole number of at least ${({ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0))}`);
     const checkpoint = input.checkpoint ?? entry.checkpoints?.[0] ?? null;
     if (entry.checkpoints?.length && !entry.checkpoints.includes(checkpoint)) throw Error('Unknown checkpoint');
     return {engine: input.engine, checkpoint, preset, budget: copy(budget), auto: input.auto ?? false};

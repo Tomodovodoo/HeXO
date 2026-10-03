@@ -220,8 +220,9 @@ the seats: off when both are Human, on otherwise (a seat a browser engine plays 
 On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at Quick to Deep;
 Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows a progress line (a moving one when
 the engine reports no progress) and its cancel button. The custom budget shows the engine's own fields: Search
-(simulations, 0 plays the raw policy, up to 65,536) and Solver (nodes, 0 turns it off, up to 4,000,000; the solver
-gets up to a minute) for Bubble, Positions for Six, Search for Strix, and 10 to 120,000 ms for Native and Seal.
+(simulations, 0 plays the raw policy) and Solver (nodes, 0 turns it off; the solver gets up to a minute) for Bubble,
+Positions for Six, Search for Strix (at least 1), and ms (at least 10) for Native and Seal. Any larger whole number is
+accepted on both pages; it only takes longer.
 
 ### By hand
 
