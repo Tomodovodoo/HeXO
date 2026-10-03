@@ -182,7 +182,11 @@ async function run(key, task) {
         posting = false;
       }
     }
-    if (job !== current || hold && state()?.paused) { if (job === current) job = null; return; }
+    if (job !== current || hold && state()?.paused) {
+      if (job === current) job = null;
+      else if (!job) schedule();   // a CPU fallback ended this job while the clock was held: start its replacement
+      return;
+    }
     current.loading = false;
     current.stage = stageText(null);
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
