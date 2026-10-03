@@ -508,7 +508,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['paused_save'], [dict(paused=True, completed=1, pending=True, current=2, resumedSeats=['other', 'test'])]*2)
         self.assertIsNone(result['deleted']['current'])
         self.assertTrue(all(m['single'] for m in result['deleted']['catalogue']))
-        self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]], renewed=True))
+        self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], paused=True, saved=[[0, 0]], renewed=True))
         self.assertEqual(result['stopped_timeout'], dict(paused=True, active=False, completed=0))
         self.assertEqual(result['forked_clock'], dict(match=None, clock=None))
         self.assertEqual(result['finished_opening_status'], 400)
@@ -521,6 +521,13 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['stale_tab'], dict(conflicted=True, history=[[0, 0], [1, 0]], archive=[[0, 0], [1, 0]],
                                                  games=1, identity=True, mutation_status=400))
         self.assertEqual(result['stale_match'], dict(conflicted=True, session_completed=0, archive_completed=0, archived_games=0))
+
+    def test_restored_budget_game_is_not_paused(self):
+        result = node(dict(kind='restore-pause', clock=dict(mode='game', tc='60+1')))
+        self.assertFalse(result['budget']['before'])
+        self.assertFalse(result['budget']['after'])
+        self.assertTrue(result['clocked']['clock'])
+        self.assertTrue(result['clocked']['after'])
 
     def test_freeplay_updates_until_new_game(self):
         win = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
