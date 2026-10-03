@@ -5,6 +5,7 @@
  * (q + r, -r); the driver moves the first stone to the origin, searches each stone of the turn with the same session
  * (the second stone reuses the first one's tree), and maps the stones back. Every turn is a new game to the driver
  * (the server sends `newgame` before each turn), so its session starts empty and its game key counts up per engine. */
+import {nextTask} from '../tasks.mjs';
 
 const SEED_MASK = (1n << 63n) - 1n;
 const FEATURES = 15;
@@ -151,6 +152,7 @@ export class ShrimpSearch {
     this.check(this.withInts(moves.flat(), pointer => this.x.sh_begin(handle, pointer, moves.length, visits, seed, this.gameKey)));
     for (let count = this.check(this.x.sh_step(handle)); count > 0; count = this.check(this.x.sh_step(handle))) {
       const answer = await evaluate(this.rows(handle, count));
+      await nextTask();
       if (stop()) throw new Cancelled();
       this.fulfill(handle, answer);
       progress(this.check(this.x.sh_completed(handle)));

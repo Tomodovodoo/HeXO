@@ -8,8 +8,10 @@ strix  only tools/strix_web -> strix/strix.wasm, refreshing its entries in build
 strix-network  the Strix network pinned in tools/engines.json (hexo.tyto.cc's pulsatrix-10-best, licence unstated)
        into strix/ with strix/networks.json (ignored). Without it the page downloads the public site's.
 ort    onnxruntime-web from the npm registry, checked against its published integrity, into ort/ (ignored).
-model  --checkpoint ema.pt, or --release TAG (or 'latest') from the GitHub releases, exported by export_web into
-       model/ (ignored).
+model  every bubble-<step> GitHub release (--release all, the default), one release (--release TAG or 'latest'), or a
+       local --checkpoint ema.pt (named by its step folder, else by its digest), exported by export_web into
+       model/<name>/ with model/networks.json listing every exported network, newest step first (ignored). A network
+       already exported from the same file is kept.
 shrimp Shrimp's main_7 weights, --shrimp-weights or downloaded from hexo-bot at their pinned SHA-256, exported by
        tools/shrimp_web/export.py into shrimp/model/ (ignored).
 seal   Seal's headers at the revision pinned in tools/engines.json, each checked against its SHA-256, with
@@ -276,16 +278,56 @@ def build_six(archive=None):
     (out/'manifest.json').write_text(json.dumps(manifest, indent=1)+'\n', encoding='utf-8')
 
 
+RELEASES = 'https://github.com/Tomodovodoo/HeXO/releases/'
+
+
+def bubble_releases(release):
+    """Tags of the Bubble releases to export: every bubble-<step> release with an ema.pt for 'all', else `release`
+    ('latest' resolved)."""
+    if release == 'latest':
+        return [urlopen(Request(RELEASES+'latest', headers={'User-Agent': 'hexo-build-web'})).geturl().rsplit('/', 1)[1]]
+    if release != 'all':
+        return [release]
+    headers = {'User-Agent': 'hexo-build-web', **({'Authorization': f"Bearer {os.environ['GH_TOKEN']}"} if os.environ.get('GH_TOKEN') else {})}
+    with urlopen(Request('https://api.github.com/repos/Tomodovodoo/HeXO/releases?per_page=100', headers=headers)) as response:
+        found = json.load(response)
+    return [r['tag_name'] for r in found if r['tag_name'].startswith('bubble-') and any(a['name'] == 'ema.pt' for a in r['assets'])]
+
+
+def network_name(checkpoint, data):
+    """A local checkpoint's network name: its step folder (runs/<run>/checkpoints/<variant>/<step>/ema.pt), else the
+    first 12 hex digits of its SHA-256."""
+    step = Path(checkpoint).resolve().parent.name
+    return step if step.isdigit() else hashlib.sha256(data).hexdigest()[:12]
+
+
+def list_networks(folder):
+    """Write `folder`/networks.json: every exported network (a subfolder with a manifest), newest step first."""
+    networks = []
+    for manifest in folder.glob('*/manifest.json'):
+        data = json.loads(manifest.read_text(encoding='utf-8'))
+        networks.append(dict(name=manifest.parent.name, manifest=f'{manifest.parent.name}/manifest.json',
+                             model_version=data['model_version'], source_sha256=data['source_sha256']))
+    networks.sort(key=lambda n: (not n['name'].isdigit(), -int(n['name']) if n['name'].isdigit() else 0, n['name']))
+    listing = json.dumps(dict(schema='bubble-web-networks-v1', networks=networks), indent=1)
+    (folder/'networks.json').write_text(listing+'\n', encoding='utf-8')
+    return networks
+
+
 def build_model(checkpoint, release):
     sys.path.insert(0, str(ROOT/'python'))
     import export_web
+    out = ENGINE/'model'
+    sources = [(network_name(checkpoint, Path(checkpoint).read_bytes()), Path(checkpoint).read_bytes())] if checkpoint else         [(tag.removeprefix('bubble-'), fetch(f'{RELEASES}download/{tag}/ema.pt')) for tag in bubble_releases(release)]
     with tempfile.TemporaryDirectory() as folder:
-        if checkpoint is None:
-            base = 'https://github.com/Tomodovodoo/HeXO/releases/'
-            tag = release if release != 'latest' else urlopen(Request(base+'latest', headers={'User-Agent': 'hexo-build-web'})).geturl().rsplit('/', 1)[1]
-            checkpoint = Path(folder)/'ema.pt'
-            checkpoint.write_bytes(fetch(f'{base}download/{tag}/ema.pt'))
-        export_web.export(checkpoint, ENGINE/'model')
+        for name, data in sources:
+            target = out/name
+            if (target/'manifest.json').exists() and json.loads((target/'manifest.json').read_text(encoding='utf-8'))['source_sha256'] == hashlib.sha256(data).hexdigest():
+                continue
+            source = Path(folder)/f'{name}.pt'
+            source.write_bytes(data)
+            export_web.export(source, target)
+    list_networks(out)
 
 
 def build_shrimp(weights):
@@ -306,7 +348,7 @@ def main():
     parser.add_argument('--emxx', default=shutil.which('em++') or 'em++')
     parser.add_argument('--cargo', default='cargo')
     parser.add_argument('--checkpoint', type=Path)
-    parser.add_argument('--release', default='latest')
+    parser.add_argument('--release', default='all')
     parser.add_argument('--shrimp-weights', type=Path)
     parser.add_argument('--six-archive', type=Path)
     args = parser.parse_args()

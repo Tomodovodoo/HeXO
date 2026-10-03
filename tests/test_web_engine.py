@@ -83,9 +83,8 @@ def page(job):
 @unittest.skipUnless(NODE, 'needs node')
 class PlayPage(unittest.TestCase):
     """The opening-book default follows the seats as the page shows them until the person touches the switch."""
-    def follow(self, steps, enabled=True, available=True, stored=None, together=False, resumes=True):
-        return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored, together=together,
-                         resumes=resumes))
+    def follow(self, steps, enabled=True, available=True, stored=None, together=False):
+        return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored, together=together))
 
     def books(self, answer):
         return [body['enabled'] for path, body in answer['requests'] if path == '/book']
@@ -94,10 +93,6 @@ class PlayPage(unittest.TestCase):
         answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False)
         self.assertEqual(answer['requests'], [['/pause', dict(paused=True)], ['/seat', dict(side=0, engine='native')],
                                               ['/book', dict(enabled=True)]])
-        self.assertTrue(answer['enabled'])
-        self.assertFalse(answer['paused'])
-        answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False, resumes=False)
-        self.assertEqual(answer['requests'][-1], ['/new', {}])
         self.assertTrue(answer['enabled'])
         self.assertFalse(answer['paused'])
 
@@ -143,7 +138,7 @@ class PlayPage(unittest.TestCase):
     def test_the_static_page_session_starts_the_opening_for_new_seats(self):
         answer = page(dict(kind='static', steps=[['/seat', dict(side=1, engine='human')], ['/pause', dict(paused=False)],
                                                  ['/seat', dict(side=0, engine='browser:test')]]))
-        self.assertEqual(answer['requests'], ['/seat', '/book', '/pause', '/pause', '/seat', '/book', '/new'])
+        self.assertEqual(answer['requests'], ['/seat', '/book', '/pause', '/pause', '/seat', '/book'])
         self.assertTrue(answer['enabled'])
         self.assertFalse(answer['paused'])
         self.assertGreater(answer['stones'], 0)
@@ -313,6 +308,45 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answers[6][1], [])
         self.assertEqual([a[2] for a in answers[-2:]], [True, False])
 
+    def test_browser_game_links_read_the_sites_through_their_open_mirror(self):
+        site = ROOT/'tests'/'fixtures'/'hexo-site'
+        game, sandbox = (json.loads((site/name).read_text(encoding='utf-8')) for name in ('finished-game.json', 'sandbox-position.json'))
+        links = [['https://hexo.did.science/games/8211f449-5020-4a5a-9a93-581c5f720aac/', game],
+                 ['https://hexo.mineking.dev/sandbox/2MDYN02', sandbox], ['https://hexo.tyto.cc/#g=ebb77124', {}]]
+        answers = node(dict(kind='links', links=links))
+        for (url, data), answer in zip(links[:2], answers):
+            self.assertEqual(answer['history'], play.linked_history(url, lambda api, body=None: data))
+        self.assertEqual([a['asked'] for a in answers], [
+            [['https://hexo.mineking.dev/proxy/api/finished-games/8211f449-5020-4a5a-9a93-581c5f720aac', 'GET']],
+            [['https://hexo.mineking.dev/proxy/api/sandbox-positions/2mdyn02', 'GET']], []])
+        self.assertIn('HTTTX', answers[2]['error'])
+
+    def test_browser_freeplay_runs_on_a_clock_with_increments_and_a_loss_on_time(self):
+        result = node(dict(kind='clock'))
+        self.assertEqual(result['set'], 200)
+        self.assertEqual((result['after_turn']['cross_ms'] > 1000, result['after_turn']['running']), (True, 'o'))
+        self.assertEqual(result['fixed_seat'][0], 400)
+        self.assertIn('cannot keep a clock', result['fixed_seat'][1]['error'])
+        turn = result['engine_turn']
+        self.assertEqual((turn['history'], turn['clock']['running']), (3, 'x'))
+        self.assertTrue(0 < turn['asked'][0] < 300)
+        self.assertGreater(turn['clock']['circle_ms'], 1000)
+        self.assertEqual(result['timed_out']['state'], dict(winner=1, outcome=dict(winner=1, reason='time')))
+        game = result['timed_out']['game']
+        self.assertEqual((game['winner'], game['reason'], game['clock']), (1, 'time', dict(mode='game', base_ms=300, increment_ms=1000)))
+        self.assertEqual([t['side'] for t in game['turns']], [0, 1, 0])
+        self.assertEqual(game['history'], [[0, 0], [1, 3], [1, 4]])
+        self.assertEqual((result['timed_out']['play'], result['late'], result['long_clock']), (400, 400, 200))
+        self.assertEqual(result['study_winner'], 1)
+        self.assertEqual((result['fresh']['outcome'], result['fresh']['clock']['running']), (None, 'x'))
+        self.assertGreater(result['fresh']['clock']['cross_ms'], 250)
+        self.assertGreaterEqual(result['paused_turn'], 190)
+        self.assertIn('different engine version', result['rebuilt_model'])
+        self.assertGreaterEqual(result['load_charged']['load'], 290)
+        self.assertLess(result['load_charged']['spent'], 150)
+        self.assertLess(result['reloaded']['balance'], 59700)
+        self.assertGreaterEqual(result['reloaded']['partial'], 390)
+
     def test_browser_notations_preserve_a_single_stone_final_turn(self):
         history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
         histories = [history[:1], history[:6], history]
@@ -365,6 +399,8 @@ class Bundle(unittest.TestCase):
         self.assertTrue(all(r['placements'] == 3 and r['reason'] == 'capped' for r in result['capped']['results']))
         self.assertEqual(result['uncapped'], dict(completed=2, capped=0, wins=[1, 1]))
         self.assertTrue(result['failure_clock_frozen'])
+        spec = dict(mode='game', base_ms=60000, increment_ms=1000)
+        self.assertEqual(result['timed_replay'], dict(clock=spec, turns=1, opened=dict(spec=spec, turns=1, running=None)))
         self.assertEqual(result['stale_tab'], dict(conflicted=True, history=[[0, 0], [1, 0]], archive=[[0, 0], [1, 0]],
                                                  games=1, identity=True, mutation_status=400))
         self.assertEqual(result['stale_match'], dict(conflicted=True, session_completed=0, archive_completed=0, archived_games=0))
@@ -400,6 +436,8 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['before']['history'], [[0, 0], [0, 2], [1, 2]])
         self.assertEqual(result['after']['history'], result['before']['history'])
         self.assertEqual(result['after']['timings'], result['before']['timings'])
+        self.assertEqual(result['after']['turns'], result['before']['turns'])
+        self.assertGreater(result['before']['turns'], 0)
         self.assertEqual(result['after']['clock']['circle_ms'], result['before']['clock']['circle_ms'])
         self.assertGreater(result['after']['clock']['circle_ms'], 180000)
         self.assertIsNotNone(result['bookStart'])
