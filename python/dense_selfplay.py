@@ -639,7 +639,8 @@ class SelfPlayGame:
         if not (ply and ply % 2 == 0 and ply > self.forced_plies):
             self.is_full = bool(self.rng.random() < s.full_fraction)
         self.budget = s.full_sims if self.is_full else s.cheap_sims
-        self.check, self.passes = (Recheck(self.tree, self.budget, s.pv_check), []) if s.pv_check and self.is_full else (None, [])
+        self.check = Recheck(self.tree, self.budget, s.pv_check) if s.pv_check and self.is_full else None
+        self.passes = []
         if self.check is not None:
             self.budget = self.check.budget
         self.samples = s.root_samples if self.is_full else min(s.root_samples, s.cheap_root_samples, s.cheap_sims)

@@ -482,6 +482,19 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answer['fresh'][0], 0)
         self.assertEqual(answer['lines'], ['b', 'c', 'd'])
 
+    def test_a_root_reads_and_resumes_its_deeper_branch(self):
+        """A -> B -> A in the browser's GameGraph: after B is searched as a root and found lost for A's mover, A's
+        statistics for B hold that, A stops preferring B, and A's next search continues its counts."""
+        found = node(dict(kind='revisit', history=export_web.histories(every=9)[5]))
+        first, back, again = found['first'], found['back'], found['again']
+        stone = [j for j, p in enumerate(first['policy']) if p == max(first['policy'])][0]
+        self.assertGreater(first['policy'][stone], .5)
+        self.assertLess(back['completed_q'][stone], first['completed_q'][stone]-.5)
+        self.assertLess(back['policy'][stone], .5)
+        self.assertGreaterEqual(back['visits'][stone], 1024)
+        self.assertNotEqual(again['action'], first['action'])
+        self.assertEqual(sum(again['visits']), sum(back['visits'])+32)
+
     def test_search_matches_native(self):
         """Same seed, position, budget, Q range floor, root noise and evaluations: the same actions, visits and policy
         as the native library, on trees and on a shared game graph whose root moves to the position after the turn

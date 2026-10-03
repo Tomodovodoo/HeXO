@@ -343,7 +343,7 @@ export class GameGraph extends NeuralSearch {
     const root = this.history.map(p => [...p]), first = await super.search({...options, simulations: simulations - 2 * reserve});
     const line = first.stopped ? null : this.afterTurn(first);
     if (!line) return first;
-    const index = first.actions.findIndex(([q, r]) => q === first.action[0] && r === first.action[1]), before = first.values[index];
+    const index = first.actions.findIndex(([q, r]) => q === first.action[0] && r === first.action[1]), before = first.completed_q[index];
     const passes = [first];
     this.at(line);
     try {
@@ -351,7 +351,7 @@ export class GameGraph extends NeuralSearch {
     } finally {
       this.at(root);
     }
-    const after = this.result().values[index], searched = before - after > PV_DROP && !passes[1].stopped;
+    const after = this.result().completed_q[index], searched = before - after > PV_DROP && !passes[1].stopped;
     if (searched) passes.push(await super.search({...options, simulations: reserve}));
     const result = searched ? passes[2] : {...passes[1], ...this.result(options.choice ?? 'policy')};
     for (const key of ['completed', 'evaluated', 'cache_hits', 'elapsed_ms']) result[key] = passes.reduce((sum, p) => sum + p[key], 0);

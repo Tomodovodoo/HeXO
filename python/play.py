@@ -1640,7 +1640,7 @@ class Session:
         self.proofs = Proofs()
         self.line_ids = itertools.count()
         self.lines = [next(self.line_ids), next(self.line_ids)]
-        self.analysis_line = next(self.line_ids)
+        self.analysis_line, self.graph_searches = next(self.line_ids), 0
         self.instance, self.closing = os.urandom(4).hex(), False
         self.match, self.match_worker = None, None
         self.game_clock, self.timed_engines = None, []
@@ -1779,12 +1779,14 @@ class Session:
                 game.close()
             if board['winner'] < 0 and self.outcome:
                 board['winner'] = self.outcome['winner']
-            evaluations, keys, target = {}, self.analysis_keys(), self.review_target()
+            evaluations, stale, keys, target = {}, [], self.analysis_keys(), self.review_target()
             for ply in range(len(history) + 1):
                 played = history[ply] if ply < len(history) else None
                 if (found := self.proven(history[:ply], self.lookup(history[:ply], keys), played)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes')}
+                    if self.stale(found):
+                        stale.append(ply)
             device = getattr(self.engines, 'device', 'cpu')
             entries = [{k: e[k] for k in SHOWN if k in e} | dict(clocks=keeps_clock(e), device='Server ' + device_of(e, device))
                        for e in self.entries.values()]
@@ -1798,7 +1800,7 @@ class Session:
                         saved_game=self.saved_game, models_folder=self.models_folder,
                         book=dict(available=bool(self.book), enabled=self.opening_book, mode=self.book_mode,
                                   opening=self.opening),
-                        evaluations=evaluations,
+                        evaluations=evaluations, stale=stale,
                         review=review(history, lambda h: self.proven(h, self.review_lookup(h, target)), board['winner']),
                         review_preset=self.analysis['preset'] if self.analysis else None,
                         jobs=self.job_list())
@@ -2098,7 +2100,14 @@ class Session:
                 deepening = ply == len(self.history) and self.deepening(game.winner)
             finally:
                 game.close()
-            job = None if deepening and not force else self.request_analysis(self.history[:ply], 0, force)
+            history, key = self.history[:ply], self.engine_key(self.analysis)
+            saved = self.store.get(history, key, self.engines.effective(self.analysis['budget'])) if key else None
+            if not force and self.stale(saved) and not saved.get('proof'):
+                # A position viewed again: search the analysis graph there again, from what it holds now.
+                job = self.submit(Job('analyse', 0, history, seat=dict(self.analysis), force=True,
+                                      game=self.analysis_line, refresh=saved))
+            else:
+                job = None if deepening and not force else self.request_analysis(history, 0, force)
             self.lock.notify_all()
             return job.id if job else None
 
@@ -3033,6 +3042,10 @@ class Session:
             **({'refresh': refresh} if refresh is not None else {}))
         if job.cancelled:
             raise Cancelled()
+        if job.kind == 'analyse' and game is not None:
+            with self.lock:
+                self.graph_searches += refresh is None
+                found['graph'] = [self.instance, game, self.graph_searches]
         entry = self.entries[seat['engine']]
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
         job.incomplete = spent['solver_nodes'] < budget['solver_nodes']
@@ -3049,15 +3062,22 @@ class Session:
             self.refresh(history, seat, game)
         return saved
 
+    def stale(self, record):
+        """True when `record`, a saved evaluation, came from this session's current analysis graph and an analysis
+        of another position has searched that graph since: its statistics there may have changed."""
+        stamp = record.get('graph') if record else None
+        return bool(stamp) and stamp[:2] == [self.instance, self.analysis_line] and stamp[2] < self.graph_searches
+
     def refresh(self, history, seat, game):
         """Queue a refresh of each position up to REFRESH_PLIES placements before `history` whose evaluation by
-        `seat`, saved at its budget, holds no proof, nearest first: the search on the game graph `game` moved the
-        values those positions reach (see `Engines.evaluate`)."""
+        `seat`, saved at its budget, came from the same analysis graph, is now stale (see `stale`) and holds no proof,
+        nearest first: the search on the game graph `game` moved the values those positions reach (see
+        `Engines.evaluate`)."""
         key, budget = self.engine_key(seat), self.engines.effective(seat['budget'])
         with self.lock:
             for ply in range(len(history) - 1, max(-1, len(history) - REFRESH_PLIES - 1), -1):
                 saved = self.store.get(history[:ply], key, budget) if key else None
-                if saved is not None and not saved.get('proof') and not any(
+                if self.stale(saved) and not saved.get('proof') and not any(
                         getattr(j, 'refresh', None) is not None and j.history == tuple(history[:ply])
                         and j.status == 'queued' for j in self.jobs.values()):
                     self.submit(Job('analyse', 2, history[:ply], seat=dict(seat), force=True, game=game, refresh=saved))

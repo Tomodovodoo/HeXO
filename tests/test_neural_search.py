@@ -825,6 +825,28 @@ class SharedGraph(unittest.TestCase):
         again = graph.search(32, root_samples=8, batch_size=8)
         self.assertNotEqual(again['action'], list(c[len(a)]))
 
+    def test_returning_to_a_position_reads_and_resumes_the_deeper_branch(self):
+        # A -> B -> A: B, A's favourite, turns out lost for A's mover once B is searched as a root. Back at A the
+        # statistics under B already hold that, A stops preferring B, and A's next search continues its counts.
+        a = recorded_position(11)
+        evaluator = Refuted(Game(a).player)
+        graph = self.graph(evaluator, a)
+        first = graph.search(64, root_samples=8, batch_size=8)
+        i = self.edge(first, first['action'])
+        self.assertGreater(first['policy'][i], .5)
+        b = [*a, tuple(first['action'])]
+        evaluator.line = b
+        graph.at(b)
+        graph.search(1024, root_samples=16, batch_size=32)
+        graph.at(a)
+        back = graph.result(0, 0, 0, 0)
+        self.assertLess(back['completed_q'][i], first['completed_q'][i]-.5)
+        self.assertLess(back['policy'][i], .5)
+        self.assertGreaterEqual(back['visits'][i], 1024)
+        again = graph.search(32, root_samples=8, batch_size=8)
+        self.assertNotEqual(again['action'], first['action'])
+        self.assertEqual(int(again['visits'].sum()), int(back['visits'].sum())+32)
+
     def test_the_store_survives_advances_and_keeps_its_bound(self):
         a = recorded_position(11)
         graph = self.graph(Uniform(), a, limit=48)

@@ -7,6 +7,9 @@
 // {kind: 'game', simulations} -> turns of seats on GameGraphs lines with a ranked network: the root visits each stone's
 //   search started from on the first and second turn of one line, back at the first position and on a new line, and
 //   the lines kept
+// {kind: 'revisit', history} -> A -> B -> A on one GameGraph with ranked priors: A searched, its chosen B searched as
+//   a root where every position below B is lost for A's mover, A read again and searched again ->
+//   {first, back, again: {action, visits, policy, completed_q} of A}
 // {kind: 'pv', history, certificate} -> {pv, plies} of the principal variation
 // {kind: 'rows', actions, policy, values, lead} -> top rows
 // {kind: 'overlay', cases: [{ev, stones}]} -> [boardOverlay(ev, stones)] from web/engine/overlay.js
@@ -121,6 +124,26 @@ if (job.kind === 'encode') {
   await turn('c', [[0, 0]]);
   await turn('d', [[0, 0]]);
   answer.lines = [...trees.graphs.keys()];
+} else if (job.kind === 'revisit') {
+  const a = job.history, mover = native.game(a).player;
+  let refuted = null;
+  const evaluate = async leaves => leaves.map(({history, actions}) => {
+    const below = refuted && history.length > refuted.length && refuted.every(([q, r], i) => history[i][0] === q && history[i][1] === r);
+    const value = below ? ((((history.length + 1) >> 1) % 2) === mover ? -.9 : .9) : 0;
+    return {logits: actions.map((_, i) => -2 * i), q: actions.map(() => value)};
+  });
+  const graph = new GameGraph(native, {seed: 5, tactics: true, history: a}), cache = new EvaluationCache();
+  const pick = ({action, visits, policy, completed_q}) => ({action, visits, policy, completed_q});
+  try {
+    const first = await graph.search({simulations: 64, rootSamples: 8, batchSize: 8, cache, evaluate});
+    refuted = [...a, first.action];
+    graph.at(refuted);
+    await graph.search({simulations: 1024, rootSamples: 16, batchSize: 32, cache: new EvaluationCache(), evaluate});
+    graph.at(a);
+    const back = graph.result('policy');
+    const again = await graph.search({simulations: 32, rootSamples: 8, batchSize: 8, cache: new EvaluationCache(), evaluate});
+    answer = {first: pick(first), back: pick(back), again: pick(again)};
+  } finally { graph.close(); }
 } else if (job.kind === 'proof-search') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
   const tree = new NeuralSearch(native, {tactics: true, graph: true, history: job.history});

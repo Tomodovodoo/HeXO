@@ -292,8 +292,9 @@ simulations it lacks, and keeps a solver proof it already has; these evaluations
 game graph, kept until undo or a new or loaded game: a position reached from several analysed positions is one node,
 and the visits and values a search finds there count for every position before it. Each search runs the
 principal-variation check with a quarter of the simulations. When an analysis lands, the saved analyses of the four
-placements before it are searched again with a quarter of their budget, so stepping back shows what the later
-search found. The share of the improved policy saturates at high budgets: its Q weight grows with the visits, so a
+placements before it that came from the same graph are searched again with a quarter of their budget, so stepping
+back shows what the later search found; any other position of the game the graph has changed since its analysis is
+searched again the same way when you step to it. That search goes on from the visits the graph holds there. The share of the improved policy saturates at high budgets: its Q weight grows with the visits, so a
 deep search gives one stone nearly all of it. A position without a saved
 evaluation shows the search of the engine or analysis working on it as it goes. The search of a turn's second
 stone is saved as the evaluation of the position after its first stone, so every placement has rows. The slider

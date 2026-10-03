@@ -72,7 +72,7 @@ export class BrowserSession extends OfflineSession {
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
-    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid();
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graphSearches = 0;
     this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
@@ -150,7 +150,8 @@ export class BrowserSession extends OfflineSession {
       paused: this.paused, seats: copy(this.seats), analysis: copy(this.analysis), engines: [...this.entries.values()], match: this.match,
       clock: this.clockNow(), clock_spec: this.control(), outcome: this.outcome, saved_game: this.saved_game, models_folder: null, notice: this.notice, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
-      evaluations, review: turns, review_preset: this.analysis?.preset ?? null,
+      evaluations, stale: Object.keys(evaluations).map(Number).filter(ply => this.stale(evaluations[ply])), review: turns,
+      review_preset: this.analysis?.preset ?? null,
       jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live}) => ({id, kind, status, done, total, error, ply: history.length, side, live}))};
   }
   static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings', '/clock'].some(p => path === p || path.startsWith(p + '/')); }
@@ -299,7 +300,10 @@ export class BrowserSession extends OfflineSession {
     } else if (path === '/analyse') {
       const ply = body.ply ?? this.history.length;
       if (!Number.isInteger(ply) || ply < 0 || ply > this.history.length) throw Error('Invalid analysis position');
-      if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', this.history.slice(0, ply), this.analysis, {force: !!body.force, line: this.analysisLine});
+      const history = this.history.slice(0, ply), saved = this.analysis && this.lookup(history, this.analysis, true);
+      // A position viewed again whose graph another analysis has searched since: search the graph there again.
+      if (!body.force && this.stale(saved) && !saved.proof) this.enqueue('analyse', history, this.analysis, {force: true, refresh: saved, line: this.analysisLine});
+      else if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', history, this.analysis, {force: !!body.force, line: this.analysisLine});
     } else if (path === '/review') {
       if (!this.analysis || !this.adapters.has(this.analysis.engine)) throw Error('Choose an analysis engine');
       const history = copy(this.history), plies = starts(history.length);
@@ -365,14 +369,19 @@ export class BrowserSession extends OfflineSession {
     }
     return record;
   }
-  /** Queues a refresh of each position up to REFRESH_PLIES placements before `history` whose evaluation by `spec` is saved
-   * without a proof, nearest first: the search on the game graph `line` moved the values those positions reach
+  /** True when `record`, a saved evaluation, came from the current analysis graph and an analysis of another position
+   * has searched that graph since (python/play.py Session.stale). */
+  stale(record) {
+    return Boolean(record?.graph) && record.graph[0] === this.analysisLine && record.graph[1] < this.graphSearches;
+  }
+  /** Queues a refresh of each position up to REFRESH_PLIES placements before `history` whose evaluation by `spec` came
+   * from this analysis graph, is now stale and holds no proof, nearest first: the search on the game graph `line` moved the values those positions reach
    * (python/play.py Session.refresh). A refresh searches that graph again with the PV_CHECK share of the simulations
    * and no solver query, keeps the saved threat and replaces the saved evaluation. */
   refresh(history, spec, line) {
     for (let ply = history.length - 1; ply >= Math.max(0, history.length - REFRESH_PLIES); ply--) {
       const saved = this.lookup(history.slice(0, ply), spec, true);
-      if (saved && !saved.proof) this.enqueue('analyse', history.slice(0, ply), spec, {force: true, refresh: saved, line});
+      if (this.stale(saved) && !saved.proof) this.enqueue('analyse', history.slice(0, ply), spec, {force: true, refresh: saved, line});
     }
   }
   indexRecord(record) {
@@ -520,6 +529,10 @@ export class BrowserSession extends OfflineSession {
       // The move came back at `at`; saving it must not run its clock out.
       if (job.kind === 'move') clearTimeout(this.flag);
       if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
+      if (job.kind === 'analyse' && job.line != null) {
+        this.graphSearches += job.refresh ? 0 : 1;
+        result = {...result, graph: [job.line, this.graphSearches]};
+      }
       await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));
       if (job.kind === 'analyse' && !job.refresh && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') this.refresh(history, job.spec, job.line);
       if (job.kind === 'move') {

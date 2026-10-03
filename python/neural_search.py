@@ -275,13 +275,13 @@ class Recheck:
             if self.line is None:
                 return 0
             self.index = result['actions'].tolist().index(list(map(int, result['action'])))
-            self.before = float(result['values'][self.index])
+            self.before = float(result['completed_q'][self.index])
             self.graph.at(self.line)
             self.phase = 'check'
             return self.reserve
         if self.phase == 'check':
             self.graph.at(self.root)
-            self.after = float(self.graph.result(0, 0, 0, 0)['values'][self.index])
+            self.after = float(self.graph.result(0, 0, 0, 0)['completed_q'][self.index])
             self.searched = self.before-self.after > self.drop
             self.phase = 'again' if self.searched else 'done'
             return self.reserve if self.searched else 0

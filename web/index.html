@@ -897,7 +897,7 @@ function renderStudy(){
 function autoAnalyse(){
   if(S.importing)return;
   const ev=S.evaluations[view],need=S.analysis&&S.analysis.budget,job=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);
-  const short=!ev||need&&Object.entries(need).some(([k,v])=>typeof v==='number'&&(ev.budget?.[k]??ev[k]??0)<v);
+  const short=!ev||(S.stale||[]).includes(view)||need&&Object.entries(need).some(([k,v])=>typeof v==='number'&&(ev.budget?.[k]??ev[k]??0)<v);
   if(!short||!S.analysis||!S.analysis.auto||job||finished())return;
   const a=S.analysis,tag=[a.engine,a.checkpoint,JSON.stringify(a.budget),S.history.slice(0,view).join(';')].join('|'),now=Date.now();
   if(now-(asked.get(tag)||0)>3000){asked.set(tag,now);post('/analyse',{ply:view})}

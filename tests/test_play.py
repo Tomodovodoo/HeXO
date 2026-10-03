@@ -382,6 +382,12 @@ class Jobs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(self.engines.refreshes, [3])
         self.assertEqual(set(self.engines.games), {self.session.analysis_line})
+        # Ply 1 is too far back to be refreshed at once; viewing it again searches the graph there again.
+        self.assertEqual(self.session.state()['stale'], [1])
+        self.session.analyse(1)
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(self.engines.refreshes, [3, 1])
+        self.assertEqual(self.session.state()['stale'], [])
         line = self.session.analysis_line
         self.session.undo()
         self.assertNotEqual(self.session.analysis_line, line)
@@ -412,9 +418,8 @@ class Jobs(unittest.TestCase):
         self.session.analyse(3)
         self.engines.release.set()
         wait(lambda: not self.session.state()['jobs'])
-        plies = [len(call[2]) for call in self.engines.calls]
-        # The analysis at 3 also refreshes the reviewed position 0 before it (Session.refresh).
-        self.assertEqual((plies[:2], sorted(plies[2:]), self.engines.refreshes), ([0, 3], [0, 1, 5], [0]))
+        # The review's evaluations came from fresh trees, so the analysis at 3 refreshes none of them.
+        self.assertEqual(([len(call[2]) for call in self.engines.calls], self.engines.refreshes), ([0, 3, 1, 5], []))
 
     def test_changing_the_analysis_engine_cancels_its_old_work(self):
         self.session.configure_seat(1, 'human')
@@ -885,25 +890,51 @@ class GraphAnalysis(unittest.TestCase):
     """Analysis on one game graph with the real network on CPU. At A, yellow to move, a deep fresh search plays
     [-2, 0] then [1, 0] at 87 percent; the position C after that turn is about even once searched as a root."""
 
-    def test_a_search_after_the_turn_lowers_the_turn_start(self):
-        a = import_history('version[1];\n1. [4,0][7,0];\n2. [0,-1][0,-2];\n3. [0,-3][6,0];\n4. [-1,0][5,0];\n'
-                           '5. [-2,1][-1,-1];')
-        c = [*a, (-2, 0), (1, 0)]
-        engines = Engines('cpu', tactical_package=Path(RUN.name) / 'missing')
-        self.addCleanup(engines.close)
-        entry = dict(kind='bubble', path=CHAMPION.parents[3])
-        evaluate = lambda history, simulations: engines.evaluate(
-            entry, 'main/185000', dict(simulations=simulations, solver_nodes=0), history, lambda n: None, game=1)[0]
-        deep = evaluate(c, 512)
-        self.assertLess(deep['value'], .55)
-        found = evaluate(a, 256)
-        self.assertLess(found['value'], .8)
-        graph = engines.graphs[1][1]
-        graph.at(a)
+    def setUp(self):
+        self.a = import_history('version[1];\n1. [4,0][7,0];\n2. [0,-1][0,-2];\n3. [0,-3][6,0];\n4. [-1,0][5,0];\n'
+                                '5. [-2,1][-1,-1];')
+        self.c = [*self.a, (-2, 0), (1, 0)]
+        self.engines = Engines('cpu', tactical_package=Path(RUN.name) / 'missing')
+        self.addCleanup(self.engines.close)
+        self.entry = dict(kind='bubble', path=CHAMPION.parents[3])
+
+    def evaluate(self, history, simulations, refresh=None):
+        return self.engines.evaluate(self.entry, 'main/185000', dict(simulations=simulations, solver_nodes=0), history,
+                                     lambda n: None, game=1, **({'refresh': refresh} if refresh else {}))[0]
+
+    def turn(self):
+        """{stone: (completed Q as yellow's win chance, visits)} of the turn's two stones at A, and A's visits."""
+        graph = self.engines.graphs[1][1]
+        graph.at(self.a)
         stats = graph.result(0, 0, 0, 0)
-        for stone in ([-2, 0], [1, 0]):
-            i = stats['actions'].tolist().index(stone)
-            self.assertLess((stats['completed_q'][i] + 1) / 2, .65)
+        found = {stone: ((stats['completed_q'][i] + 1) / 2, int(stats['visits'][i]))
+                 for stone in ((-2, 0), (1, 0)) for i in [stats['actions'].tolist().index(list(stone))]}
+        return found, int(stats['visits'].sum())
+
+    def test_a_search_after_the_turn_lowers_the_turn_start(self):
+        deep = self.evaluate(self.c, 512)
+        self.assertLess(deep['value'], .55)
+        self.assertLess(self.evaluate(self.a, 256)['value'], .8)
+        for value, _ in self.turn()[0].values():
+            self.assertLess(value, .65)
+
+    def test_stepping_back_after_the_turn_redoes_the_turn_start(self):
+        # A, then C two stones on, then back at A: A's turn stones now carry C's search, and A's own search goes on
+        # from its counts instead of starting again.
+        first = self.evaluate(self.a, 256)
+        before, visits = self.turn()
+        self.evaluate(self.c, 512)
+        after, _ = self.turn()
+        again = self.evaluate(self.a, 512, refresh=first)
+        resumed, total = self.turn()
+        self.assertGreater(total, visits + 128)
+        for stone in before:
+            self.assertLess(after[stone][0], .65)
+            self.assertLess(after[stone][0], before[stone][0])
+            self.assertGreaterEqual(resumed[stone][1], after[stone][1])
+        self.assertNotIn(tuple(again['moves'][0]), before)
+        shares = {tuple(row[:2]): row[2] for row in again['top']}
+        self.assertTrue(all(shares.get(stone, 0.) < .5 for stone in before))
 
 
 class Http(unittest.TestCase):
