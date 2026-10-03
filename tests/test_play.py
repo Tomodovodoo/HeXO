@@ -18,7 +18,8 @@ import formats
 from hexo import Game
 from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings,
                   budget_of, command_of, export, export_path, file_digest, file_identity, import_history, linked_history,
-                  model_key, move_row, pair_elo, pick_opening, position_text, presets_of, proof_turns, read_game, review, scan, six_backend)
+                  model_key, move_row, pair_elo, pick_opening, position_text, presets_of, proof_turns, read_game, review,
+                  review_plies, scan, six_backend)
 from process_tree import TreeProcess
 
 STANDARD = PRESETS['bubble']['standard']
@@ -249,6 +250,42 @@ class Review(unittest.TestCase):
         self.assertEqual(game.winner, 1)
         game.close()
         self.assertEqual(self.labels({}, 1, history)[-1]['label'], 'win')
+        self.assertEqual([g['label'] for g in self.labels({}, 1, history)[-1]['grades']], [None, 'win'])
+
+    def test_each_stone_is_graded_from_the_position_before_it(self):
+        base = {(): evaluation(.5, [(0, 0)]), (0,): evaluation(.6, [(2, 2), (3, 3)])}
+        first_blunder = self.labels(base | {(0, 1): evaluation(.3, [(4, 4)]), (0, 1, 2): evaluation(.72)})[1]
+        self.assertEqual(first_blunder['label'], 'blunder')
+        first, second = first_blunder['grades']
+        self.assertEqual((first['label'], first['better'], first['line']), ('blunder', [[2, 2]], [[2, 2, 1], [3, 3, 1]]))
+        self.assertAlmostEqual(first['before'] - first['after'], .3)
+        self.assertEqual((second['label'], second['better']), ('good', None))
+        self.assertAlmostEqual(second['before'] - second['after'], .02)
+        second_blunder = self.labels(base | {(0, 1): evaluation(.58, [(4, 4)]), (0, 1, 2): evaluation(.7)})[1]
+        first, second = second_blunder['grades']
+        self.assertEqual((first['label'], second['label'], second['better'], second['line']),
+                         ('good', 'blunder', [[4, 4]], [[4, 4, 1]]))
+        self.assertEqual(second_blunder['label'], 'blunder')
+
+    def test_a_stone_of_the_engine_turn_is_best_in_either_order(self):
+        turn = self.labels({(0,): evaluation(.5, [(3, 3), (1, 0)]), (0, 1): evaluation(.5, [(1, 1)]),
+                            (0, 1, 2): evaluation(.5)})[1]
+        self.assertEqual([g['label'] for g in turn['grades']], ['best', 'best'])
+        self.assertEqual(turn['label'], 'good')
+        turn = self.labels({(0,): evaluation(.5, [(3, 3), (1, 0)]), (0, 1): evaluation(.5, [(1, 1)]),
+                            (0, 1, 2): evaluation(.5, [], dict(winner=0, turns=1))})[1]
+        self.assertEqual([(g['label'], g['better']) for g in turn['grades']], [('best', None), ('allowed', None)])
+        self.assertEqual((turn['label'], turn['better']), ('allowed', [[3, 3], [1, 0]]))
+
+    def test_a_turn_waiting_for_its_second_stone_grades_its_first(self):
+        history = self.history[:4]
+        turns = self.labels({(0, 1, 2): evaluation(.5, [(5, 5), (6, 6)]), (0, 1, 2, 3): evaluation(.25)}, history=history)
+        self.assertEqual((len(turns), turns[-1]['stones'], turns[-1]['label']), (3, [[-1, 0]], None))
+        self.assertEqual(turns[-1]['grades'][0]['label'], 'blunder')
+
+    def test_review_plies_count_every_stone(self):
+        self.assertEqual(review_plies(self.history), [0, 1, 2, 3, 4, 5])
+        self.assertEqual(review_plies(self.history[:2]), [0, 1, 2])
 
 
 class Jobs(unittest.TestCase):
@@ -344,7 +381,7 @@ class Jobs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(self.history(), [(0, 0), (1, 0), (2, 0)])
 
-    def test_analysis_reuses_deeper_evaluations_and_review_fills_every_turn(self):
+    def test_analysis_reuses_deeper_evaluations_and_review_fills_every_position(self):
         self.session.configure_seat(1, 'human')
         for move in [(0, 0), (1, 0), (2, 0)]:
             self.session.play(*move)
@@ -355,9 +392,11 @@ class Jobs(unittest.TestCase):
         job = self.session.jobs[self.session.review_game()]
         self.assertEqual(self.session.review_game(), job.id)
         wait(lambda: not self.session.state()['jobs'])
-        self.assertEqual((job.done, job.total), (3, 3))
-        self.assertEqual(len(self.engines.calls), calls + 2)
-        self.assertEqual([t['label'] for t in self.session.state()['review']], ['best', 'good'])
+        self.assertEqual((job.done, job.total), (4, 4))
+        self.assertEqual(len(self.engines.calls), calls + 3)
+        turns = self.session.state()['review']
+        self.assertEqual([t['label'] for t in turns], ['best', 'good'])
+        self.assertTrue(all(g['label'] for t in turns for g in t['grades']))
         self.session.configure_analysis('bubble:fake', preset='deep', auto=False)
         self.session.analyse(1)
         wait(lambda: not self.session.state()['jobs'])
@@ -391,7 +430,7 @@ class Jobs(unittest.TestCase):
         self.session.analyse(3)
         self.engines.release.set()
         wait(lambda: not self.session.state()['jobs'])
-        self.assertEqual([len(call[2]) for call in self.engines.calls], [0, 3, 1, 5])
+        self.assertEqual([len(call[2]) for call in self.engines.calls], [0, 3, 1, 2, 4, 5])
 
     def test_changing_the_analysis_engine_cancels_its_old_work(self):
         self.session.configure_seat(1, 'human')
@@ -1662,6 +1701,24 @@ class TurnTrees(unittest.TestCase):
         model = hexnet.load_model(self.path)
         return SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=64), sha256='tiny',
                                cache=neural_search.EvaluationCache())
+
+    def test_a_position_after_the_first_stone_ranks_the_second(self):
+        import tactical_proof
+        from play import evaluate
+        history = [(0, 0), (1, 0), (1, 1), (-1, 0)]
+        provers = [None]
+        if tactical_proof.library().exists():
+            provers.append(tactical_proof.IsolatedTactics(package=tactical_proof.PACKAGE, priority='below_normal'))
+            self.addCleanup(provers[-1].close)
+        for prover in provers:
+            self.trees.clear()
+            found = evaluate(self.bubble(), prover, history, 16, 64 if prover else 0)
+            [stone] = found['moves']
+            self.assertNotIn(tuple(stone), history)
+            self.assertEqual(found['top'][0][:2], stone)
+            self.assertTrue(all(tuple(row[:2]) not in history and 0 <= row[3] <= 1 for row in found['top']))
+            self.assertTrue(0 <= found['value'] <= 1)
+            self.assertEqual((found['later'], [h for h, _, _ in self.trees[0].searched]), ([], [history]))
 
     def test_a_turn_the_solver_gave_still_ranks_each_of_its_positions(self):
         from play import evaluate

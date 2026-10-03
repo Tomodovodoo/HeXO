@@ -23,7 +23,7 @@ import {principalVariation, topRows, Proofs, answered, settled, proofTurns} from
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
 import {defaultThreads} from '../../web/engine/network.mjs';
-import {BrowserSession} from '../../web/engine/play-session.mjs';
+import {BrowserSession, review} from '../../web/engine/play-session.mjs';
 import {PlayStorage} from '../../web/engine/storage.mjs';
 import {OpeningBook} from '../../web/engine/openings.mjs';
 import {exportGame, readGame} from '../../web/engine/notation.mjs';
@@ -159,6 +159,11 @@ if (job.kind === 'encode') {
   answer = messages.find(m => m.type === 'result').result;
 } else if (job.kind === 'pv') {
   answer = principalVariation(native, job.history, job.certificate);
+} else if (job.kind === 'review') {
+  answer = job.cases.map(({history, evaluations, winner}) => {
+    const table = new Map(evaluations.map(([prefix, record]) => [JSON.stringify(prefix), record]));
+    return review(history, prefix => table.get(JSON.stringify(prefix)) ?? null, winner);
+  });
 } else if (job.kind === 'rows') {
   answer = topRows(job.actions, job.policy, job.values, job.lead);
 } else if (job.kind === 'overlay') {
@@ -280,7 +285,7 @@ if (job.kind === 'encode') {
   s.bookData = new OpeningBook(data);
   const entry = {id: 'browser:test', name: 'Test', kind: 'bubble', version: 'v1', checkpoints: [],
     presets: {standard: {simulations: 1, solver_nodes: 0}, quick: {simulations: 1, solver_nodes: 0}}};
-  s.registerEngine(entry, {turn: async history => ({moves: job.history.slice(history.length, history.length + (history.length ? 2 : 1)), value: .5, top: [], proof: null, line: []})});
+  s.registerEngine(entry, {turn: async history => ({moves: job.history.slice(history.length, history.length + native.game(history).remaining), value: .5, top: [], proof: null, line: []})});
   s.analysis = s.spec({engine: entry.id, preset: 'standard'});
   answer = [];
   for (const [path, body] of job.requests) {
