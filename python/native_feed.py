@@ -77,9 +77,33 @@ class NativeFeed:
         values = np.ascontiguousarray(np.concatenate([p[2] for p in valid]) if valid else [], np.float64)
         if len(logits) != offsets[-1] or len(values) != offsets[-1] or actions.size != 2*offsets[-1]:
             raise ValueError('Incomplete native feed prediction')
+        return self._install(ids, offsets.ctypes.data, actions.ctypes.data, logits.ctypes.data, values.ctypes.data)
+
+    def take_packed(self, limit):
+        from native_dense import PackedRows
+        layout = np.empty(2, np.int64)
+        checked(native.hxgf_layout(self.ptr, limit, layout.ctypes.data))
+        count = int(layout[0])
+        if not count:
+            return None
+        ids = np.empty(count, np.uint64)
+        trees, requests = np.empty(count, np.uintp), np.empty(count, np.int32)
+        checked(native.hxgf_take(self.ptr, count, ids.ctypes.data, trees.ctypes.data, requests.ctypes.data,
+                                None, None, 0))
+        return ids, PackedRows(trees, requests)
+
+    def install_packed(self, ids, rows):
+        if rows.count != len(ids):
+            raise ValueError('Incomplete native feed batch')
+        try:
+            return self._install(ids, *rows.outputs())
+        finally:
+            rows.close()
+
+    def _install(self, ids, offsets, actions, logits, values):
         stopped = np.empty(len(self.trees), np.uintp)
-        count = native.hxgf_install(self.ptr, ids.ctypes.data, len(ids), offsets.ctypes.data, actions.ctypes.data,
-                                   logits.ctypes.data, values.ctypes.data, stopped.ctypes.data, len(stopped))
+        count = native.hxgf_install(self.ptr, ids.ctypes.data, len(ids), offsets, actions,
+                                   logits, values, stopped.ctypes.data, len(stopped))
         if count < 0:
             checked(False)
         for tree in stopped[:count]:

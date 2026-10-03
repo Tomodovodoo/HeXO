@@ -313,11 +313,15 @@ class Engine:
     This is opt-in because its CPU cost competes with producing GPU batches.
     """
 
-    def __init__(self, leaf_batch, solver_async=True, schedule=None, leaf_nodes=0, native_feed=False):
+    def __init__(self, leaf_batch, solver_async=True, schedule=None, leaf_nodes=0, native_feed=False, native_packing=False):
         if native_feed and leaf_nodes:
             raise ValueError('Native feeding does not support synchronous per-leaf proof queries')
+        if native_packing and not native_feed:
+            raise ValueError('Native packing requires native feeding')
         self.leaf_batch, self.slots, self.cursor, self.inflight = leaf_batch, [], 0, []
         self.native_feed, self.feeds = native_feed, {}
+        self.native_packing = native_packing
+        self.packed_handles = set()
         self.retired_feed_stats = np.zeros(6, np.int64)
         self.evals = self.calls = self.full_calls = self.hits = self.searches = 0
         self.solver_async, self.schedule = solver_async, schedule or dense_solver.Schedule()
@@ -360,12 +364,29 @@ class Engine:
             self.solver.drain()
 
     def close(self):
+        errors = []
+        if self.native_packing:
+            for handle in self.packed_handles:
+                try:
+                    handle.close()
+                except BaseException as error:
+                    errors.append(error)
+            self.packed_handles.clear()
+            self.inflight.clear()
         for feed in self.feeds.values():
-            feed.close()
+            try:
+                feed.close()
+            except BaseException as error:
+                errors.append(error)
         self.feeds.clear()
         if self.solver:
-            self.solver.close()
+            try:
+                self.solver.close()
+            except BaseException as error:
+                errors.append(error)
             self.solver = None
+        if errors:
+            raise errors[0]
 
     def feed_stats(self):
         totals = self.retired_feed_stats.copy()
@@ -392,7 +413,7 @@ class Engine:
     def synchronize_inflight(self):
         """Finish submitted GPU work without consuming predictions or advancing any tree."""
         for _, _, _, handle in self.inflight:
-            event = handle[2]
+            event = handle.event if self.native_packing else handle[2]
             if event is not None:
                 event.synchronize()
 
@@ -539,11 +560,16 @@ class Engine:
         launched = []
         if self.native_feed:
             for model, feed in self.feeds.items():
-                batch = feed.take(2**31-1)
+                batch = feed.take_packed(2**31-1) if self.native_packing else feed.take(2**31-1)
                 if batch is None:
                     continue
                 keys, leaves = batch
-                handle = model.evaluator.submit_leaves(leaves)
+                if self.native_packing:
+                    from native_dense import submit
+                    handle = submit(model.evaluator, leaves, MAX_CELLS)
+                    self.packed_handles.add(handle)
+                else:
+                    handle = model.evaluator.submit_leaves(leaves)
                 launched.append((model, feed, keys, handle))
                 self.calls += 1
                 self.evals += len(keys)
@@ -563,7 +589,11 @@ class Engine:
         stopped, collecting = set(), time.perf_counter()
         for model, positions, keys, handle in self.inflight:
             if self.native_feed:
-                pointers = set(map(int, positions.install(keys, model.evaluator.collect(handle))))
+                if self.native_packing:
+                    pointers = set(map(int, positions.install_packed(keys, handle.collect())))
+                    self.packed_handles.remove(handle)
+                else:
+                    pointers = set(map(int, positions.install(keys, model.evaluator.collect(handle))))
                 stopped.update(slot for slot in slots if slot.tree.ptr in pointers)
                 continue
             for key, prediction in zip(keys, model.evaluator.collect(handle)):
@@ -1153,7 +1183,8 @@ def worker(args):
     restart_rng = np.random.default_rng(seeds.spawn(1)[0]) if restarts else None
     book_starts = BookStarts(run, settings.max_plies) if settings.book_fraction > 0 else None
     start_rng = np.random.default_rng(seeds.spawn(1)[0]) if book_starts else restart_rng
-    engine = Engine(settings.leaf_batch, settings.solver_async, dense_solver.Schedule.of(settings), settings.solver_leaf_nodes)
+    engine = Engine(settings.leaf_batch, settings.solver_async, dense_solver.Schedule.of(settings), settings.solver_leaf_nodes,
+                    native_feed=settings.native_feed, native_packing=settings.native_packing)
     began, solver_failures = time.perf_counter(), 0
     state = dict(published(run, args.worker), error=None)
     target = None if args.games is None else args.games+state['games_completed']

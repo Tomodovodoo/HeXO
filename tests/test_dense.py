@@ -96,6 +96,86 @@ POSITIONS = [h for h in fixed_positions() if active(h)]
 
 
 class HexcropTests(unittest.TestCase):
+    def test_packed_crops_and_predictions_follow_encoder_contract_after_tree_close(self):
+        import ctypes as C
+        from neural_search import native, checked
+        from native_dense import PackedRows
+        histories = [[(0,0)], line_history(6), line_history(10), line_history(31), line_history(33)]
+        trees = [NeuralSearch(None, 'packed', h) for h in histories]
+        batch = None
+        try:
+            leaves = []
+            for tree in trees:
+                checked(native.hxg_begin(tree.ptr, 2, 2))
+                request, history = tree.request()
+                leaves.append((tree.ptr, request, history))
+            samples = hexcrop.encode_leaves(native, leaves, allow_span=True)
+            groups = {}
+            for i, s in enumerate(samples):
+                if s is not None:
+                    groups.setdefault(s.size, []).append(i)
+            sizes = sorted(groups)
+            for small, large in zip(sizes, sizes[1:]):
+                if len(groups[small])*(large*large-small*small) < dense_selfplay.MERGE_CELLS:
+                    groups[large] = groups.pop(small)+groups[large]
+            batch = PackedRows(np.asarray([t.ptr for t in trees], np.uintp),
+                               np.asarray([leaf[1] for leaf in leaves], np.int32))
+            for tree in trees:
+                tree.close()
+            expected = [None]*len(samples)
+            with self.assertRaisesRegex(ValueError, 'Incomplete'):
+                batch.outputs()
+            for index, (side, count) in enumerate(batch.groups):
+                planes = np.empty((count, 8, side, side), np.uint8)
+                batch.pack(index, planes)
+                self.assertEqual(count, len(groups[side]))
+                for row, i in enumerate(groups[side]):
+                    sample = samples[i]
+                    padded = np.zeros((8, side, side), np.uint8)
+                    padded[:, :sample.size, :sample.size] = sample.planes
+                    np.testing.assert_array_equal(planes[row], padded)
+                packed = np.broadcast_to(np.arange(side*side+2, dtype=np.float32)/100,
+                                         (count, side*side+2)).copy()
+                packed[:, -1] = -.75
+                with self.assertRaisesRegex(ValueError, 'float32'):
+                    batch.decode(index, 0, packed.astype(np.float16))
+                with self.assertRaisesRegex(ValueError, 'float32'):
+                    batch.decode(index, 0, packed[:, ::2])
+                broken = packed.copy()
+                broken[0, 0] = np.nan
+                with self.assertRaisesRegex(ValueError, 'Nonfinite'):
+                    batch.decode(index, 0, broken)
+                for start in range(count):
+                    batch.decode(index, start, packed[start:start+1])
+                with self.assertRaisesRegex(ValueError, 'Duplicate'):
+                    batch.decode(index, 0, packed[:1])
+                for row, i in enumerate(groups[side]):
+                    sample = samples[i]
+                    cells = np.where(sample.cells >= 0, sample.cells//sample.size*side+sample.cells % sample.size, -1)
+                    logits = packed[row, np.maximum(cells, 0)].astype(np.float64)
+                    if sample.far:
+                        logits[cells < 0] = float(packed[row, -2])-np.log(sample.far)
+                    expected[i] = logits
+            pointers = batch.outputs()
+            offsets = np.ctypeslib.as_array(C.cast(pointers[0], C.POINTER(C.c_int64)), shape=(len(samples)+1,))
+            size = int(offsets[-1])
+            actions = np.ctypeslib.as_array(C.cast(pointers[1], C.POINTER(C.c_int64)), shape=(size, 2))
+            logits = np.ctypeslib.as_array(C.cast(pointers[2], C.POINTER(C.c_double)), shape=(size,))
+            values = np.ctypeslib.as_array(C.cast(pointers[3], C.POINTER(C.c_double)), shape=(size,))
+            for i, sample in enumerate(samples):
+                start, end = offsets[i:i+2]
+                if sample is None:
+                    self.assertEqual(start, end)
+                else:
+                    np.testing.assert_array_equal(actions[start:end], sample.actions)
+                    np.testing.assert_allclose(logits[start:end], expected[i], atol=1e-12)
+                    np.testing.assert_allclose(values[start:end], np.tanh(-.75/2), atol=1e-12)
+        finally:
+            if batch:
+                batch.close()
+            for tree in trees:
+                tree.close()
+
     def test_position_encodes_like_a_replayed_game(self):
         from neural_search import NeuralSearch, native, checked
         for history in [*fixed_positions(), line_history(31)]:
@@ -944,6 +1024,21 @@ class FusedCudaTests(unittest.TestCase):
 
 
 class DenseConfigTests(unittest.TestCase):
+    def test_native_packing_flags_reach_actor_workers_and_reject_incompatible_queries(self):
+        self.assertFalse(dense_config.ActorSettings().native_feed)
+        self.assertFalse(dense_config.ActorSettings().native_packing)
+        parser = argparse.ArgumentParser()
+        dense_config.add_arguments(parser, dense_config.ActorSettings)
+        args = parser.parse_args(['--native-feed', '--native-packing'])
+        actor = dense_config.override(dense_config.ActorSettings(), args)
+        self.assertTrue(actor.native_feed and actor.native_packing)
+        self.assertIn('--native-feed', dense_selfplay.actor_flags(args))
+        self.assertIn('--native-packing', dense_selfplay.actor_flags(args))
+        with self.assertRaisesRegex(ValueError, 'requires native_feed'):
+            dense_config.ActorSettings(native_packing=True)
+        with self.assertRaisesRegex(ValueError, 'per-leaf'):
+            dense_config.ActorSettings(native_feed=True, solver_leaf_nodes=32)
+
     def test_fused_actor_cache_warms_before_workers_and_isolates_compiles(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
@@ -3644,6 +3739,141 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_packed_engine_deduplicates_roots_and_completes_legal_searches(self):
+        torch.manual_seed(1753)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        trees = [NeuralSearch(None, 'tiny', [(0,0)], seed=i, graph=True) for i in range(4)]
+        results = []
+        engine = dense_selfplay.Engine(8, native_feed=True, native_packing=True)
+        slots = [SimpleNamespace(tree=tree, model=model, budget=16, samples=4, solver=None,
+                                 searched=lambda r: results.append(r) or False) for tree in trees]
+        try:
+            for slot in slots:
+                engine.add(slot)
+            for _ in range(100):
+                if not engine.slots and not engine.closing:
+                    break
+                engine.step()
+            self.assertFalse(engine.slots or engine.closing or engine.packed_handles)
+            self.assertEqual(len(results), 4)
+            for result in results:
+                self.assertEqual(result['completed'], 16)
+                self.assertTrue(np.isfinite(result['network_value']))
+                self.assertTrue(np.isfinite(result['policy']).all())
+                self.assertAlmostEqual(float(result['policy'].sum()), 1.)
+                self.assertIn(tuple(result['action']), set(map(tuple, result['actions'])))
+            stats = engine.feed_stats()
+            self.assertGreaterEqual(stats['joined'], 3)
+            self.assertEqual((stats['pending_rows'], stats['pending_requests']), (0, 0))
+            self.assertFalse(engine.feeds)
+        finally:
+            engine.close()
+            for tree in trees:
+                tree.close()
+
+    def test_packed_engine_close_releases_outstanding_batches_and_subscribers(self):
+        from neural_search import native, checked
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        tree = NeuralSearch(None, 'tiny', [(0,0)])
+        engine = dense_selfplay.Engine(8, native_feed=True, native_packing=True)
+        slot = SimpleNamespace(tree=tree, model=model, budget=16, samples=4, solver=None,
+                               searched=lambda r: False)
+        try:
+            engine.add(slot)
+            engine.step()
+            handle = next(iter(engine.packed_handles))
+            feed = engine.feeds[model]
+            self.assertIsNotNone(handle.rows.ptr)
+            handle.event = unittest.mock.Mock()
+            engine.synchronize_inflight()
+            handle.event.synchronize.assert_called_once()
+            self.assertEqual(feed.stats()['pending_rows'], 1)
+            self.assertIsNotNone(handle.rows.ptr)
+            engine.close()
+            self.assertIsNone(handle.rows.ptr)
+            self.assertIsNone(feed.ptr)
+            self.assertFalse(engine.inflight or engine.packed_handles or engine.feeds)
+            checked(native.hxg_begin(tree.ptr, 2, 2))
+            self.assertGreater(native.hxg_next(tree.ptr), 0)
+        finally:
+            engine.close()
+            tree.close()
+
+    def test_packed_gpu_failure_preserves_staging_and_cleans_independent_cpu_work(self):
+        import native_dense
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        tree = NeuralSearch(None, 'tiny', [(0,0)])
+        engine = dense_selfplay.Engine(8, native_feed=True, native_packing=True)
+        slot = SimpleNamespace(tree=tree, model=model, budget=16, samples=4, solver=None,
+                               searched=lambda r: False)
+        try:
+            engine.add(slot)
+            engine.step()
+            handle = next(iter(engine.packed_handles))
+            feed = engine.feeds[model]
+            handle.event = unittest.mock.Mock()
+            handle.event.synchronize.side_effect = RuntimeError('GPU completion failed')
+            solver = engine.solver = unittest.mock.Mock()
+            with unittest.mock.patch.object(native_dense, '_quarantined', []):
+                with self.assertRaisesRegex(RuntimeError, 'GPU completion failed'):
+                    engine.close()
+                self.assertIn(handle, native_dense._quarantined)
+                self.assertIsNotNone(handle.staging)
+                self.assertIsNone(handle.rows.ptr)
+                self.assertIsNone(feed.ptr)
+                solver.close.assert_called_once()
+                self.assertIsNone(engine.solver)
+                self.assertFalse(engine.inflight or engine.packed_handles or engine.feeds)
+                handle.event = None
+                handle.close()
+                self.assertFalse(native_dense._quarantined)
+        finally:
+            engine.close()
+            tree.close()
+
+    def test_packed_submission_fence_failure_quarantines_storage_and_frees_snapshot(self):
+        import native_dense
+        from native_feed import NativeFeed
+        from neural_search import native, checked
+        def predict(x):
+            count, _, side, _ = x.shape
+            return dict(policy=torch.zeros(count, side*side), far=torch.zeros(count), value_logit=torch.zeros(count))
+        allocate = hexnet.staging_buffer
+        for failure in ('create', 'record'):
+            with self.subTest(failure=failure):
+                tree = NeuralSearch(None, 'test', [(0,0)])
+                feed = NativeFeed(8)
+                evaluator = SimpleNamespace(cuda=True, free=[], graph=None, max_batch=8,
+                                            device=torch.device('cpu'), memory_format=torch.contiguous_format,
+                                            predict=unittest.mock.Mock(side_effect=predict))
+                try:
+                    checked(native.hxg_begin(tree.ptr, 2, 2))
+                    feed.begin(tree)
+                    feed.gather(tree)
+                    _, rows = feed.take_packed(8)
+                    event = unittest.mock.Mock()
+                    event.record.side_effect = RuntimeError('fence failed')
+                    make_event = unittest.mock.Mock(side_effect=RuntimeError('fence failed')) if failure == 'create' else unittest.mock.Mock(return_value=event)
+                    with unittest.mock.patch.object(native_dense, '_quarantined', []), \
+                         unittest.mock.patch.object(native_dense.torch.cuda, 'Event', make_event), \
+                         unittest.mock.patch.object(hexnet, 'staging_buffer', side_effect=lambda *a: allocate(*a[:-1], False)):
+                        with self.assertRaisesRegex(RuntimeError, 'fence failed'):
+                            native_dense.submit(evaluator, rows)
+                        self.assertGreater(evaluator.predict.call_count, 0)
+                        handle = native_dense._quarantined[0]
+                        self.assertIsNotNone(handle.staging)
+                        self.assertIsNone(rows.ptr)
+                        self.assertFalse(evaluator.free)
+                        with self.assertRaisesRegex(RuntimeError, 'not established'):
+                            handle.close()
+                        # These buffers were CPU-only in the fake; release them after checking ownership.
+                        evaluator.cuda = False
+                        handle.close()
+                        self.assertFalse(native_dense._quarantined)
+                finally:
+                    feed.close()
+                    tree.close()
+
     def test_native_frontier_shares_inflight_predictions_and_keeps_context(self):
         from native_feed import NativeFeed
         from neural_search import native, checked
