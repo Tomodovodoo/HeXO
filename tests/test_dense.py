@@ -97,7 +97,8 @@ POSITIONS = [h for h in fixed_positions() if active(h)]
 
 class HexcropTests(unittest.TestCase):
     def test_position_encodes_like_a_replayed_game(self):
-        for history in fixed_positions():
+        from neural_search import NeuralSearch, native, checked
+        for history in [*fixed_positions(), line_history(31)]:
             game = Game(history)
             if game.winner >= 0:
                 continue
@@ -109,6 +110,21 @@ class HexcropTests(unittest.TestCase):
                 np.testing.assert_array_equal(a.planes, b.planes)
                 np.testing.assert_array_equal(a.actions, b.actions)
             np.testing.assert_array_equal(hexcrop.native_legal(position), legal(history))
+            tree = NeuralSearch(None, 'encode-parity', history=history, tactics=False, graph=True)
+            try:
+                checked(native.hxg_begin(tree.ptr, 2, 2))
+                request, leaf_history = tree.request()
+                a = hexcrop.encode_leaf(native, tree.ptr, request, leaf_history)
+                b = hexcrop.encode_game(game, moves)
+                for field in ('planes', 'actions', 'cells'):
+                    np.testing.assert_array_equal(getattr(a, field), getattr(b, field))
+                for field in ('size', 'far', 'player', 'remaining', 'symmetry', 'offset'):
+                    self.assertEqual(getattr(a, field), getattr(b, field))
+                if hasattr(native, 'hxg_encode'):
+                    self.assertEqual(native.hxg_encode(tree.ptr, request, a.planes.ctypes.data, 1, None, None), 0)
+                native.hxg_cancel(tree.ptr)
+            finally:
+                tree.close()
             game.close()
 
     def test_legal_array_matches_engine_on_100_positions(self):
@@ -205,6 +221,7 @@ class HexcropTests(unittest.TestCase):
             self.assertGreater(len(seen), 1)
 
     def test_far_mode_covers_every_legal_cell(self):
+        from neural_search import native, checked
         self.assertEqual(hexcrop.encode(line_history(15)).size, 192)
         history = line_history(31)          # span 240: legal cells need 257, stones plus halo 249
         for kwargs in ({}, {'rng': np.random.default_rng(1)}, {'symmetry': 5}):
@@ -220,6 +237,14 @@ class HexcropTests(unittest.TestCase):
             np.testing.assert_array_equal(inside, s.cells >= 0)
         with self.assertRaises(hexcrop.SpanError):
             hexcrop.encode(line_history(33))  # stones plus halo exceed the largest bucket
+        tree = NeuralSearch(None, 'span', history=line_history(33))
+        try:
+            checked(native.hxg_begin(tree.ptr, 2, 2))
+            request, history = tree.request()
+            with self.assertRaises(hexcrop.SpanError):
+                hexcrop.encode_leaf(native, tree.ptr, request, history)
+        finally:
+            tree.close()
 
     def test_point_inverts_every_crop_index(self):
         for history in (POSITIONS[20], line_history(6)):
@@ -717,7 +742,7 @@ class FusedCudaTests(unittest.TestCase):
         model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
         runner = ActorGraph(model)
         inputs, outputs, saved = [], [], []
-        for rows, side in ((19, 24), (7, 32)):
+        for rows, side in ((19, 24), (7, 32), (1, 24), (2, 24), (3, 24)):
             x = torch.randint(0, 2, (rows, 8, side, side), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
             x[:, 3] = 1
             with torch.autocast('cuda', torch.bfloat16):
