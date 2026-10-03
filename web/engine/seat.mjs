@@ -9,12 +9,14 @@
  * read (the saved choices are then checked against it and the page redraws), `build` is the command that builds its files into this
  * checkout (named when a saved choice needs files the public site does not serve; no engine list shows such an engine),
  * `entry` is its picker entry ({id, kind, name, label,
- * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
- * while it downloads), `engine.files()` lists the files it downloads (assets.mjs records, for the picker's download
- * button) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
+ * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction,
+ * stage) while it loads, stages.mjs's stages), `engine.files()` lists the files it downloads (assets.mjs records, for the picker's download
+ * button) and `engine.turn(history, budget, {signal, progress})` (progress(fraction, live, stage)) resolves to its turn {moves, ...} at a
  * preset's budget, plus `checkpoint` (one of `entry.checkpoints`, chosen in a select when there are several) when the
  * entry lists any, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
- * evaluation record the analysis panel shows for that turn. */
+ * evaluation record the analysis panel shows for that turn. A seat or the analysis shows the stage of its job next to
+ * its bar, and an engine's fallback notice (engine-worker.mjs `notices`) is a toast; a fallback to the CPU moves the
+ * engine's choices to lightning. */
 import {BubbleEngine, NETWORKS, PRESETS, isolate, networkManifest} from './bubble.mjs';
 import {native} from './native.mjs';
 import {shrimp} from './shrimp.mjs';
@@ -25,6 +27,8 @@ import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 import {strix} from './strix.mjs';
 import {NotOnSite, install as download, json, status} from './assets.mjs';
+import {notices} from './engine-worker.mjs';
+import {stageText} from './stages.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
 const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: true},
@@ -112,10 +116,12 @@ function progress() {
   const s = state();
   if (!s) return;
   const fraction = () => job.loading ? loads.get(job.engine) ?? 0 : job.fraction;
+  const words = (id, active) => { const label = document.getElementById(id); if (label) label.textContent = active ? job.stage ?? '' : ''; };
   for (const side of [0, 1]) {
     if (!config.seats[side]) continue;
     const active = job?.kind === 'move' && job.side === side, cancel = document.getElementById('cancel' + side);
     bar(document.getElementById('busy' + side), active ? fraction() : null);
+    words('stage' + side, active);
     document.getElementById('dot' + side)?.classList.toggle('thinking', active);
     if (!cancel) continue;
     if (!active) { cancel.replaceChildren(); continue; }
@@ -127,6 +133,7 @@ function progress() {
   if (config.analysis) {
     const active = job?.kind === 'analyse' && job.ply === viewed();
     bar(document.getElementById('analysis-progress'), active ? fraction() : null);
+    words('analysis-stage', active);
     document.getElementById('evalbar')?.classList.toggle('pending', active);
   }
 }
@@ -156,10 +163,16 @@ async function run(key, task) {
     const timed = task.kind === 'move' && state()?.clock_spec && state().clock_spec.mode !== 'fixed', warm = `${task.engine}|${task.checkpoint}`;
     const hold = timed && (!engine.ready || warmed.get(warm) !== engine.ready);
     if (hold) { posting = true; holding = {paused: false}; await original.post('/pause', {paused: true}); }
+    const report = (f, stage) => {
+      if (stage?.provider) entry.device = deviceLabel(stage);   // once the probe has finished
+      loads.set(task.engine, f);
+      current.stage = stageText(stage);
+      progress();
+    };
     try {
-      entry.device = deviceLabel(await engine.load(f => { loads.set(task.engine, f); progress(); }));
+      entry.device = deviceLabel(await engine.load(report));
       checks.delete(task.engine);
-      await engine.prepare?.(task.checkpoint, {signal: controller.signal});
+      await engine.prepare?.(task.checkpoint, {signal: controller.signal, progress: (f, live, stage) => report(f, stage)});
       warmed.set(warm, engine.ready);
     } finally {
       if (hold) {
@@ -169,13 +182,18 @@ async function run(key, task) {
         posting = false;
       }
     }
-    if (job !== current || hold && state()?.paused) { if (job === current) job = null; return; }
+    if (job !== current || hold && state()?.paused) {
+      if (job === current) job = null;
+      else if (!job) schedule();   // a CPU fallback ended this job while the clock was held: start its replacement
+      return;
+    }
     current.loading = false;
+    current.stage = stageText(null);
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
     const ms = task.kind === 'move' && s?.clock && s.clock_spec?.mode !== 'fixed' ? turnTime(s.clock_spec, s.clock, task.side) : null;
     const started = performance.now();
     const result = await engine.turn(task.history, budget, {signal: controller.signal, ms, line: task.line,
-      progress: f => { current.fraction = f; progress(); }});
+      progress: (f, live, stage) => { current.fraction = f; current.stage = stageText(stage); progress(); }});
     if (ms == null) notePace(entry, task.preset, performance.now() - started, result.moves?.length);
     if (job !== current) return;
     job = null;
@@ -368,7 +386,30 @@ function recheck(entry, force = false) {
   } else if (state()) page.renderPanels();
 }
 
+/** After browser engine `engine` left WebGPU for WebAssembly: lightning becomes its starting preset, and the saved
+ * choices (or the static page's session) that use it at another preset move to lightning, ending a job of it at
+ * another preset. */
+function lighten(engine) {
+  const found = [...ENGINES.values()].find(e => e.engine === engine);
+  if (!found) return;
+  const id = found.entry.id;
+  found.entry.preset = 'lightning';
+  if (page.browserPlay) { page.browserPlay.lighten(id); return; }
+  const light = choice => choice?.engine === id ? {...choice, preset: 'lightning'} : choice;
+  config = {seats: config.seats.map(light), analysis: light(config.analysis)};
+  save();
+  if (job?.engine === id && job.preset !== 'lightning') {
+    job.controller.abort();
+    job = null;
+  }
+  if (state()) page.renderPanels();
+}
+
 function install() {
+  notices.addEventListener('notice', ({detail}) => {
+    original.toast(detail.text);
+    if (detail.cpu) lighten(detail.engine);
+  });
   page.openMenu = openMenu;
   page.pickItems = pickItems;
   page.accept = data => {

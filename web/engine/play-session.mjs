@@ -5,6 +5,7 @@ import {OpeningBook} from './openings.mjs';
 import {readGame, exportGame, htttx} from './notation.mjs';
 import {clockSpec, turnTime} from './clock.mjs';
 import {Proofs, proven} from './proof.mjs';
+import {stageText} from './stages.mjs';
 
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 const copy = value => structuredClone(value), position = history => history.map(p => p.join(',')).join(';');
@@ -16,6 +17,16 @@ const MAX_TIMER = 2 ** 31 - 1;
 const MAX_BUDGET = 2 ** 31 - 1;
 const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
+
+/** `promise`, or an AbortError as soon as `signal` aborts, so a job never waits on a load it no longer needs. */
+function abortable(promise, signal) {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new DOMException('Cancelled', 'AbortError'));
+    if (signal.aborted) abort();
+    signal.addEventListener('abort', abort, {once: true});
+    Promise.resolve(promise).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
 
 const UNGRADED = {label: null, before: null, after: null, better: null, line: null};
 
@@ -85,10 +96,23 @@ export class BrowserSession extends OfflineSession {
     this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
-   * move's clock starts after it) and `adapter.turn(history, budget, options)` plays. */
+   * move's clock starts after it; `progress(fraction, stage)` with stages.mjs's stages) and `adapter.turn(history,
+   * budget, options)` plays (`options.progress(fraction, live, stage)`). */
   registerEngine(entry, adapter) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
     for (const seat of [...this.seats, this.analysis].filter(Boolean)) if (seat.engine === entry.id) Object.assign(seat, this.spec(seat));
+    this.changed(); this.pump();
+  }
+  /** After engine `id` left WebGPU for WebAssembly: lightning becomes its starting preset, and the seats and the
+   * analysis that use it at another preset move to lightning (outside a running match), ending their jobs. */
+  lighten(id) {
+    const entry = this.entries.get(id);
+    if (!entry) return;
+    entry.preset = 'lightning';
+    if (this.match?.active) return;
+    const light = spec => spec?.engine === id && spec.preset !== 'lightning' ? this.spec({...spec, preset: 'lightning'}) : spec;
+    this.seats = this.seats.map(light); this.analysis = light(this.analysis);
+    this.cancelJobs(job => job.spec.engine === id && job.spec.preset !== 'lightning' && !job.tier && job.kind !== 'review');
     this.changed(); this.pump();
   }
   spec(input) {
@@ -160,7 +184,7 @@ export class BrowserSession extends OfflineSession {
       clock: this.clockNow(), clock_spec: this.control(), outcome: this.outcome, saved_game: this.saved_game, models_folder: null, notice: this.notice, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
       evaluations, review: turns, review_preset: this.analysis?.preset ?? null,
-      jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live}) => ({id, kind, status, done, total, error, ply: history.length, side, live}))};
+      jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live, stage}) => ({id, kind, status, done, total, error, ply: history.length, side, live, stage}))};
   }
   static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings', '/clock'].some(p => path === p || path.startsWith(p + '/')); }
   answer(path, body = {}) {
@@ -482,8 +506,9 @@ export class BrowserSession extends OfflineSession {
     const history = job.kind === 'review' ? job.history.slice(0, job.plies[job.cursor]) : job.history;
     try {
       const adapter = this.adapters.get(job.spec.engine);
-      await adapter.ready?.(f => { job.done = f * .1; this.onchange(this.state()); }, job.spec.checkpoint);
-      if (job.controller.signal.aborted || job.attempt.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      await abortable(adapter.ready?.((f, stage) => { job.done = f * .1; job.stage = stageText(stage); this.onchange(this.state()); }, job.spec.checkpoint), signal);
+      if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      job.stage = stageText(null);
       if (job.kind === 'move') this.runClock(true);
       let timeout = false, limit = null, ms = null;
       if (job.kind === 'move' && this.clock) {
@@ -500,7 +525,7 @@ export class BrowserSession extends OfflineSession {
       try {
         result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
           known: job.kind === 'move' ? null : (this.extendProofs(), this.proofs.list()),
-          progress: (f, live) => { job.done = job.kind === 'review' ? job.cursor + f : f; if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
+          progress: (f, live, stage) => { job.done = job.kind === 'review' ? job.cursor + f : f; job.stage = stageText(stage); if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);
       const at = Date.now(), elapsed = this.clock?.started != null ? at - this.clock.started : null;

@@ -2,31 +2,28 @@
  * site, which serves every build output with `Access-Control-Allow-Origin: *`. Downloads are kept in the Cache API
  * under this origin's URL of the file, so a local copy of web/ that lacks the build outputs downloads each file once.
  * A file from the site must match a SHA-256 from this origin's manifest or, when this origin has none, the site's. */
+import {LIMITS, localParam} from './stages.mjs';
 
 export const SITE = 'https://tomodovodoo.github.io/HeXO/engine/';
 const BASE = new URL('./', import.meta.url).href, CACHE = 'bubble-engine-v1';
 
-/** Hosts on which the page's `assets` query parameter is honoured: a development server on this machine. */
-const LOOPBACK = /^(localhost|127\.0\.0\.1|\[::1\])$|\.localhost$/;
-
 /**
- * The engine folder files come from when this origin lacks them. In a page: the `data-assets` attribute of a page
- * script, else the `assets` query parameter when the page is on a loopback host (so a link cannot point another
- * site's page at foreign code), else SITE. In a worker: the `assets` parameter of its script URL, which only
- * workerUrl sets.
+ * The engine folder files come from when this origin lacks them: the `data-assets` attribute of a page script, else
+ * localParam('assets'), else SITE.
  */
 export function site() {
-  const query = new URLSearchParams(globalThis.location?.search).get('assets'), page = globalThis.document;
-  const chosen = page ? page.querySelector('script[data-assets]')?.dataset.assets ?? (LOOPBACK.test(location.hostname) ? query : null) : query;
+  const chosen = globalThis.document?.querySelector('script[data-assets]')?.dataset.assets ?? localParam('assets');
   if (!chosen) return SITE;
   const href = new URL(chosen, globalThis.location?.href).href;
   return href.endsWith('/') ? href : href + '/';
 }
 
-/** The URL of worker script `path` (under web/engine), carrying a site other than SITE to the worker's site(). */
+/** The URL of worker script `path` (under web/engine), carrying a site other than SITE and the `stall` parameter to
+ * the worker's localParam. */
 export function workerUrl(path) {
-  const url = new URL(path, BASE), chosen = site();
+  const url = new URL(path, BASE), chosen = site(), stalls = localParam('stall');
   if (chosen !== SITE) url.searchParams.set('assets', chosen);
+  if (stalls) url.searchParams.set('stall', stalls);
   return url;
 }
 
@@ -45,13 +42,31 @@ export class NotOnSite extends Error {
   }
 }
 
-/** {response, local}: `path` from this origin, else (after a 404 or a network error) from the site. */
+/** fetch(url, init), rejecting when no response arrives within LIMITS.idle ms; the body is the reader's to bound. */
+async function request(url, init = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`no answer in ${LIMITS.idle / 1000} s`)), LIMITS.idle);
+  try {
+    return await fetch(url, {...init, signal: controller.signal});
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** `promise` (a body being read for `path`), rejecting when it has not settled within `ms`. */
+function bounded(promise, path, ms = LIMITS.idle) {
+  let timer;
+  const idle = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${path}: no answer in ${ms / 1000} s`)), ms); });
+  return Promise.race([promise, idle]).finally(() => clearTimeout(timer));
+}
+
+/** {response, local}: `path` from this origin, else (after a 404, a network error or no answer) from the site. */
 async function locate(path, init = {}) {
-  const here = await fetch(new URL(path, BASE), init).catch(() => null);
+  const here = await request(new URL(path, BASE), init).catch(() => null);
   if (here?.ok) return {response: here, local: true};
   const there = remote(path);
   if (!there) throw here?.status === 404 ? new NotOnSite(path) : new Error(`${path}: ${here ? here.status : 'unreachable'}`);
-  const response = await fetch(there, {...init, mode: 'cors'}).catch(error => { throw new Error(`${path}: ${error.message} (${there})`); });
+  const response = await request(there, {...init, mode: 'cors'}).catch(error => { throw new Error(`${path}: ${error.message} (${there})`); });
   if (response.status === 404) throw new NotOnSite(path);
   if (!response.ok) throw new Error(`${path}: ${response.status} (${there})`);
   return {response, local: false};
@@ -65,7 +80,7 @@ async function locate(path, init = {}) {
 export async function json(path) {
   const store = await open(), id = `${new URL(path, BASE).href}?manifest`;
   try {
-    const {response, local} = await locate(path, {cache: 'no-cache'}), data = await response.json();
+    const {response, local} = await locate(path, {cache: 'no-cache'}), data = await bounded(response.json(), path);
     if (!local) await store?.put(id, new Response(JSON.stringify(data))).catch(() => {});   // keeping it is best effort
     return {data, local};
   } catch (error) {
@@ -81,8 +96,8 @@ export async function pins(path, {data, local}, same) {
   const there = remote(path);
   if (data.files || !local || !there) return data.files ?? {};
   const store = await open(), id = `${new URL(path, BASE).href}?site`;   // kept so the pins also answer offline
-  const response = await fetch(there, {cache: 'no-cache', mode: 'cors'}).catch(() => null);
-  let other = response?.ok ? await response.json().catch(() => null) : null;
+  const response = await request(there, {cache: 'no-cache', mode: 'cors'}).catch(() => null);
+  let other = response?.ok ? await bounded(response.json(), path).catch(() => null) : null;
   if (other) await store?.put(id, new Response(JSON.stringify(other))).catch(() => {});
   else other = await (await store?.match(id).catch(() => null))?.json() ?? null;
   return other && same(other) ? other.files ?? {} : {};
@@ -106,27 +121,59 @@ function key(file) {
   return url.href;
 }
 
-/** The body of `response` as an ArrayBuffer, read in chunks so `progress(fraction)` follows it (`bytes` stands in for
- * a missing Content-Length). */
-async function download(response, bytes, progress) {
-  if (!response.body) return response.arrayBuffer();
-  const total = Number(response.headers.get('Content-Length')) || bytes || 0, parts = [];
-  let received = 0;
-  for (const reader = response.body.getReader(); ;) {
-    const {done, value} = await reader.read();
-    if (done) break;
-    parts.push(value);
+/** Bytes after which an unfinished download stores what it has as a part; a later load resumes after the parts. */
+const PART = 1 << 22;
+class Stalled extends Error {}
+
+/** The Cache API key of part `n` of the download of the file at key `id`. */
+const partKey = (id, n) => `${id}&part=${n}`;
+
+/** The stored parts (ArrayBuffers, in order) of an unfinished download of the file at key `id`. */
+async function heldParts(store, id) {
+  const parts = [];
+  for (let hit; store && (hit = await store.match(partKey(id, parts.length)).catch(() => null));) parts.push(await hit.arrayBuffer());
+  return parts;
+}
+
+/**
+ * The rest of `response` (a body that starts at byte `start` of the file) as chunks, read so `progress(fraction,
+ * received, total)` follows the file's bytes. `total` is the manifest's `bytes`, else the Content-Length, else 0
+ * (unknown); a compressed response's Content-Length counts the compressed bytes, so a total the body outgrows becomes
+ * 0. Every PART bytes `keep(blob)` stores the chunks since the last part. Throws Stalled when no chunk arrives for
+ * LIMITS.idle ms.
+ */
+async function download(response, {path, start, bytes, keep}, progress) {
+  const length = Number(response.headers.get('Content-Length'));
+  let total = bytes || (length ? start + length : 0);
+  const chunks = [], reader = response.body.getReader();
+  let received = start, pending = 0, from = 0;
+  for (;;) {
+    let timer;
+    const idle = new Promise((_, reject) => { timer = setTimeout(() => reject(new Stalled(`${path}: the download stalled`)), LIMITS.idle); });
+    const {done, value} = await Promise.race([reader.read(), idle]).catch(error => { reader.cancel().catch(() => {}); throw error; })
+      .finally(() => clearTimeout(timer));
+    if (done) return chunks;
+    chunks.push(value);
     received += value.length;
-    if (total) progress(Math.min(1, received / total));
+    pending += value.length;
+    if (pending >= PART) {
+      await keep(new Blob(chunks.slice(from)));
+      from = chunks.length;
+      pending = 0;
+    }
+    if (received > total) total = 0;
+    progress(total ? received / total : 0, received, total);
   }
-  return new Blob(parts).arrayBuffer();
 }
 
 /**
  * The bytes of engine file `file` {path, sha256?, version?, lines?} as an ArrayBuffer: from the Cache API when it holds
  * the file's key, else fetched (this origin first, then the site), checked against `sha256` (CRLF read as LF when
- * `lines`) and stored there, replacing other versions of the path. A file from the site needs a `sha256`, and bytes
- * that do not match it throw. `progress(fraction)` follows the download.
+ * `lines`) and stored there, replacing other versions of the path and the parts of unfinished downloads. A file from
+ * the site needs a `sha256`, and bytes that do not match it throw. A download stores its bytes in parts of PART bytes
+ * as they arrive, so a load after an interrupted one asks for the rest only (an HTTP range; a server that answers
+ * with the whole file starts over, keeping the held parts until that body completes). `progress(fraction, received, total)` follows the download's bytes (`total` 0
+ * when unknown), from before the request is sent; a file from the Cache API reports progress(1) alone.
  */
 export async function cached(file, progress = () => {}) {
   const store = await open(), id = key(file), hit = store && await store.match(id);
@@ -139,21 +186,38 @@ export async function cached(file, progress = () => {}) {
       await store.delete(id).catch(() => {});
     }
   }
-  const {response, local} = await locate(file.path, {cache: 'no-cache'});   // a Cache API miss means new bytes: revalidate
+  const base = id.split('?')[0], forget = async () => {
+    for (const old of await store.keys()) if (old.url.split('?')[0] === base) await store.delete(old);
+  };
+  let parts = await heldParts(store, id), offset = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  progress(0, offset, file.bytes || 0);   // the download stage covers a request that never answers too
+  let found = offset ? await locate(file.path, {cache: 'no-cache', headers: {Range: `bytes=${offset}-`}}).catch(() => null) : null;
+  const replacing = parts.length > 0 && found?.response.status !== 206;   // the held parts stay until this body completes
+  if (found?.response.status !== 206) {   // a new download, also when the server ignores the range
+    found ??= await locate(file.path, {cache: 'no-cache'});   // a Cache API miss means new bytes: revalidate
+    parts = [];
+    offset = 0;
+  }
+  const {response, local} = found;
   if (!local && !file.sha256) throw new Error(`${file.path}: the site's manifest has no SHA-256 for it`);
-  const body = await download(response, file.bytes, progress).catch(async () => {   // a browser whose body stream fails
-    progress(0);                                                                   // still delivers the whole body at once
-    const again = await fetch(response.url, {cache: 'reload', ...(local ? {} : {mode: 'cors'})});
-    if (!again.ok) throw new Error(`${file.path}: ${again.status}`);
-    return again.arrayBuffer();
-  });
+  let stored = parts.length;
+  const keep = replacing ? () => {} : blob => store?.put(partKey(id, stored), new Response(blob)).then(() => { stored++; }, () => {});
+  const body = !response.body ? await new Blob([...parts, await response.arrayBuffer()]).arrayBuffer()
+    : await download(response, {path: file.path, start: offset, bytes: file.bytes, keep}, progress).then(chunks => new Blob([...parts, ...chunks]).arrayBuffer(),
+      async error => {   // a browser whose body stream fails still delivers the whole body at once
+        if (error instanceof Stalled) throw error;
+        progress(0, 0, 0);
+        const again = await request(response.url, {cache: 'reload', ...(local ? {} : {mode: 'cors'})});
+        if (!again.ok) throw new Error(`${file.path}: ${again.status}`);
+        return bounded(again.arrayBuffer(), file.path, LIMITS.whole);   // no chunks to watch: bound the whole read
+      });
   if (file.sha256 && await sha256(body, file.lines) !== file.sha256) {
+    await forget().catch(() => {});
     throw new Error(`${file.path} from ${local ? 'this site' : site()} does not match its SHA-256`);
   }
   if (store) {   // keeping the bytes is best effort: a full quota still returns them
-    const base = id.split('?')[0];
     try {
-      for (const old of await store.keys()) if (old.url.split('?')[0] === base) await store.delete(old);
+      await forget();
       await store.put(id, new Response(body.slice(0)));
     } catch {}
   }
@@ -177,9 +241,9 @@ export async function moduleUrl(file, progress) {
 /** Whether this origin serves `path`: a HEAD request, or a GET whose body is dropped when HEAD is not supported (as
  * python/play.py answers 501). */
 async function present(path) {
-  const url = new URL(path, BASE), head = await fetch(url, {method: 'HEAD'}).catch(() => null);
+  const url = new URL(path, BASE), head = await request(url, {method: 'HEAD'}).catch(() => null);
   if (head && head.status !== 405 && head.status !== 501) return head.ok;
-  const get = await fetch(url).catch(() => null);
+  const get = await request(url).catch(() => null);
   get?.body?.cancel();
   return Boolean(get?.ok);
 }
@@ -199,7 +263,7 @@ export async function status(files) {
   for (const file of away) if (!await store?.match(key(file))) missing.push(file);
   if (!missing.length) return {state: 'cached'};
   const sized = await Promise.all(missing.map(async file => {   // also tells files the site does not publish
-    const there = remote(file.path), head = there && await fetch(there, {method: 'HEAD', mode: 'cors'}).catch(() => null);
+    const there = remote(file.path), head = there && await request(there, {method: 'HEAD', mode: 'cors'}).catch(() => null);
     if (!there || head?.status === 404) throw new NotOnSite(file.path);
     return {...file, bytes: file.bytes || Number(head?.headers.get('Content-Length')) || 0};
   }));

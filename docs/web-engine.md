@@ -49,7 +49,7 @@ single `model/manifest.json` still loads it, with no select.
 
 ## Devices and clocks
 
-Once an engine has loaded, the seat and the analysis head tag it with its device:
+Once an engine's probe has finished, the seat and the analysis head tag it with its device:
 
 | Engine | WebGPU | Otherwise | Clock |
 |---|---|---|---|
@@ -76,6 +76,52 @@ Six stays slow without WebGPU even at its lightest stop.
 
 The turn time is `time_control.allowance`'s normal share (`web/engine/clock.mjs`); a per-turn clock gives the whole
 turn less 10 ms. A side whose clock runs out loses on time. Engines without a clock are refused while one is on.
+
+## Loading
+
+A browser engine's worker reports the stage it is in (`web/engine/stages.mjs`), and the seat and the analysis head
+show it next to the busy bar: "checking GPU" (the WebGPU probe), "downloading 12 of 27 MB" (all files of the load
+that are not in the Cache API), "compiling" (the runtime's wasm, its thread workers or its WebGPU device, started on a
+one-node graph), "starting GPU" or "starting CPU" (a network's session), "warming up" (Bubble's fp32 and fp16 timing
+batch and a first batch for every engine) and then "thinking" while it searches. Six loads its network on its first
+turn or network change, so those calls show the download, session and warm-up stages too.
+
+Each stage has a limit on silence (`LIMITS`): 20 s for the probe, 45 s between download chunks, 30 s to compile,
+60 s for a session, 30 s for the timing batch and 60 s to warm up. The adapter request inside the probe gets 8 s, and
+a request or download that receives nothing for 30 s stops with an error. Manifests are fetched in the download
+stage, so a network failure is never taken for a device failure. When a stage stays silent past its limit, or fails,
+the page ends the worker and starts the next one down the chain, logs the reason to the console and shows one toast
+such as "Bubble (browser): starting GPU timed out, running on CPU". A call that was waiting is sent again to the new
+worker. When no step is left, or a download fails (another device would not help), the move or analysis fails with a
+toast naming the engine and the stage. A job whose engine is still loading gives way when its seat or the analysis
+changes engine.
+
+| Engine | Fallback chain |
+|---|---|
+| Bubble, Six, Shrimp | WebGPU, then WebAssembly with threads, then WebAssembly on one thread, then an error |
+| Bubble, Six, Shrimp without WebGPU | WebAssembly with threads, then one thread, then an error |
+| Native, Seal, Strix | WebAssembly on one thread; a stage that stalls or fails ends in an error naming it |
+
+A probe whose adapter request fails or times out counts as no WebGPU and shows the same toast ("checking GPU timed
+out, running on CPU"). An engine that falls back from WebGPU to WebAssembly starts at Lightning from then on, and the
+seats and analysis that use it move to Lightning (outside a running match), since Six on WebAssembly is slow even
+there (see Six below). `prefer` or `threads` given to an engine fix that step of the chain.
+
+Phones get two more rules. ONNX Runtime's threaded WebAssembly build runs one worker per thread on shared memory, and
+`defaultThreads` (the cores but one, at most 8) gave an 8-core phone with 4 GB seven of them. With
+`navigator.deviceMemory` (Chromium only, rounded down to 0.25, 0.5, 1, 2, 4 or 8) the count is at most 2 under 4 GB
+and at most 4 under 8 GB, so the Vivo Y52 and the OnePlus Nord N20 (both report 4) run 4 threads. And an adapter whose
+`maxBufferSize` is at most 256 MiB, the WebGPU default that phone GPUs report (desktop GPUs report gigabytes), is
+limited: Bubble loads only the fp16 graph there when the adapter has `shader-f16` (else fp32), so the phone never
+holds both sessions and skips the timing batch.
+
+Every download keeps what it has received in the Cache API in parts of 4 MiB, so a load after a reload or a dropped
+connection asks for the rest with an HTTP range and joins the parts; a server that answers the range with the whole
+file starts over. The complete file then replaces its parts.
+
+To test this without a phone, a page on localhost, 127.0.0.1 or [::1] takes `?stall=adapter,compile,session,timing,warmup`
+(any of them): that step never answers, in the page and in the workers, and the watchdogs take over. Chrome's device
+emulation shows the layout and the stage words at phone width.
 
 ## Running a local copy
 
@@ -108,7 +154,8 @@ the choice on their script URL.
 | File | Role |
 |---|---|
 | `python/export_web.py` | HexNet to ONNX (opset 17, dynamic batch and crop size, fp32 and fp16) with a parity report |
-| `web/engine/engine-worker.mjs` | `EngineWorker`: a browser engine's worker from the page, with loading, cancellable calls and the one-thread retry |
+| `web/engine/engine-worker.mjs` | `EngineWorker`: a browser engine's worker from the page, with loading, cancellable calls, the stage watchdogs and the fallback chain |
+| `web/engine/stages.mjs` | Loading stages: the worker's reports, the words the page shows, the limits and the `?stall=` test hook |
 | `web/engine/bubble.mjs` | Page API: `BubbleEngine.load/turn/search/evaluate/bench`, `PRESETS`, `isolate()` |
 | `web/engine/worker.mjs` | Engine worker: a turn exactly like `python/play.py evaluate` |
 | `web/engine/assets.mjs` | Engine files from this origin or the public site, checked and kept in the Cache API |
@@ -136,7 +183,8 @@ the choice on their script URL.
 ## Device choice
 
 WebGPU with `shader-f16` loads both graphs, times a batch of 16 at crop 24 under each and keeps fp16 only when it is
-1.25 times faster; fp32 reproduces the server's evaluations, fp16 does not. Without WebGPU it runs the WebAssembly
+1.25 times faster; fp32 reproduces the server's evaluations, fp16 does not. A limited adapter (see Loading) loads
+fp16 alone. Without WebGPU it runs the WebAssembly
 build with SIMD, and threads when the page is cross-origin isolated (`play.py` sends COOP/COEP; static hosts use
 `isolate()`). The search batch stays 16, as on the server, so a browser search is the server's search. A larger
 batch raises WebGPU throughput (64 leaves in 63 ms against 16 in 26 ms) but changes which leaves are searched;
@@ -260,7 +308,7 @@ Seconds per two-stone turn from a 9-stone position, Chrome in the Claude desktop
 | strong 512 | 3.5 | | 61 |
 
 WebGPU and WebAssembly chose the same stones. The pane does not start ONNX Runtime's thread workers, so threaded
-WebAssembly is not measured; as with Bubble, a stalled start falls back to one thread after 20 s.
+WebAssembly is not measured; as with Bubble, a compile that stalls for 30 s falls back to one thread (see Loading).
 
 What the bundle contains: hexo-bot's Rust and the weights (MIT, Colton Miller), the crates they use (ahash, half,
 serde, thiserror; MIT or Apache 2.0) and ONNX Runtime Web (MIT). Mantis Shrimp (Cmiller132/Hexo-Shrimp-Bot) is not
@@ -336,7 +384,8 @@ the ladder was rebased: 1,500 positions 1.3 s, 6,000 positions 22 s, 30,000 posi
 presets cost about 0.5 s (lightning, 240), 3 s (quick, 960), 13 s (standard, 3,840) and a minute (strong, 15,360).
 The search itself and its threat solver run on one thread in the worker, so turns slow down as the tree grows. On
 WebAssembly a position costs about 0.4 s on one thread, so without WebGPU lightning takes about two minutes and the
-heavier presets are impractical.
+heavier presets are impractical. A device whose WebGPU cannot start, create or run Six's graph falls back to
+WebAssembly at lightning (see Loading).
 
 ## Strix (browser)
 
