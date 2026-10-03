@@ -27,18 +27,39 @@ export async function isolate() {
 
 import {EngineWorker} from './engine-worker.mjs';
 
+/** The exported networks (python tools/build_web.py model), newest first, as model/networks.json lists them:
+ * [{name, manifest (relative to model/), model_version}]; empty when the site holds a single model/manifest.json. */
+export const NETWORKS = await (async () => {
+  try {
+    const response = await fetch(new URL('model/networks.json', import.meta.url), {cache: 'no-cache'});
+    return response.ok ? (await response.json()).networks : [];
+  } catch {
+    return [];
+  }
+})();
+
+/** The manifest of network `name` relative to web/engine: the newest when null, model/manifest.json without a list. */
+export function networkManifest(name = null) {
+  const network = name === null ? NETWORKS[0] : NETWORKS.find(n => n.name === name);
+  if (name !== null && !network) throw new Error(`Bubble has no network ${name}`);
+  return network ? `model/${network.manifest}` : 'model/manifest.json';
+}
+
 export class BubbleEngine extends EngineWorker {
-  /** `model` is the manifest URL relative to web/engine; `prefer` 'wasm', 'webgpu-fp32' or 'webgpu-fp16' narrows the device choice. */
-  constructor({model = 'model/manifest.json', prefer = null, threads = null} = {}) {
+  /** `model` is the default manifest URL relative to web/engine; `prefer` 'wasm', 'webgpu-fp32' or 'webgpu-fp16'
+   * narrows the device choice. */
+  constructor({model = networkManifest(), prefer = null, threads = null} = {}) {
     super(new URL('worker.mjs', import.meta.url), 'Bubble (browser)', {model, prefer, threads});
   }
 
   /**
-   * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor} (a
-   * PRESETS entry): the fields of python/play.py evaluate. Aborting `signal` cancels it (rejects with an AbortError).
+   * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor and
+   * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Aborting `signal` cancels
+   * it (rejects with an AbortError).
    */
   turn(history, budget, options = {}) {
-    return this.call({type: 'turn', history, simulations: budget.simulations, solverNodes: budget.solver_nodes,
+    return this.call({type: 'turn', history, model: budget.checkpoint ? networkManifest(budget.checkpoint) : this.options.model,
+      simulations: budget.simulations, solverNodes: budget.solver_nodes,
       batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0}, options);
   }
 

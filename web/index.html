@@ -753,7 +753,7 @@ function strength(seat,send,id,config,landed=-1){
 function seatControls(seat,send,id,config,landed){
   const box=[],entry=entryOf(seat.engine);if(!entry)return box;
   if(entry.checkpoints?.length>1){const sel=el('select',{'aria-label':entry.kind==='six'?'Network':'Checkpoint'},
-      entry.checkpoints.map((c,i)=>el('option',{value:c},c+(i===0&&entry.kind==='bubble'?' ★':''))));
+      entry.checkpoints.map((c,i)=>el('option',{value:c},c+(i===0&&entry.kind==='bubble'&&!entry.id.startsWith('browser:')?' ★':''))));
     sel.value=seat.checkpoint;sel.onchange=()=>send({checkpoint:sel.value});box.push(sel)}
   box.push(strength(seat,send,id,config,landed));
   if(configured.has(id))box.push(el('div',{class:'custom'},Object.entries(seat.budget).filter(([k,v])=>typeof v==='number').map(([k,v])=>{

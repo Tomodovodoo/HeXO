@@ -76,9 +76,15 @@ export class BrowserSession extends OfflineSession {
     const preset = input.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget} : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
     for (const [name, value] of Object.entries(budget)) if (typeof value === 'number' && (!Number.isInteger(value) || value < 0 || value > ({simulations: 65536, solver_nodes: 4000000, ms: 120000, nodes: 50000000}[name] ?? 50000000))) throw Error(`Invalid ${name} budget`);
-    return {engine: input.engine, checkpoint: input.checkpoint ?? null, preset, budget: copy(budget), auto: input.auto ?? false};
+    const checkpoint = input.checkpoint ?? entry.checkpoints?.[0] ?? null;
+    if (entry.checkpoints?.length && !entry.checkpoints.includes(checkpoint)) throw Error('Unknown checkpoint');
+    return {engine: input.engine, checkpoint, preset, budget: copy(budget), auto: input.auto ?? false};
   }
-  engineKey(spec) { return [spec.engine, spec.checkpoint, this.entries.get(spec.engine)?.version || ''].join('|'); }
+  /** Evaluations are keyed by the engine, its checkpoint, its build `version` and the checkpoint's weights (`models`). */
+  engineKey(spec) {
+    const entry = this.entries.get(spec.engine);
+    return [spec.engine, spec.checkpoint, entry?.version || '', entry?.models?.[spec.checkpoint ?? ''] ?? ''].join('|');
+  }
   cacheKey(history, spec) { return `${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${position(history)}`; }
   lookup(history, spec = this.analysis, exact = false) { return this.lookupAt(position(history), spec, exact); }
   /** The evaluation of the position whose `position()` text is `at`: by `spec` at exactly its budget when `exact`,

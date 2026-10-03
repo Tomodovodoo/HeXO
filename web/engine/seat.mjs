@@ -11,7 +11,7 @@
  * preset's budget, plus `checkpoint` (one of `entry.checkpoints`, chosen in a select when there are several) when the
  * entry lists any, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
  * evaluation record the analysis panel shows for that turn. */
-import {BubbleEngine, PRESETS, isolate} from './bubble.mjs';
+import {BubbleEngine, NETWORKS, PRESETS, isolate, networkManifest} from './bubble.mjs';
 import {native} from './native.mjs';
 import {shrimp} from './shrimp.mjs';
 import {mountPlay, deviceLabel} from './browser-play.mjs';
@@ -20,7 +20,7 @@ import {six} from './six.mjs';
 import {strix} from './strix.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
-const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: [], presets: PRESETS, analysis: true},
+const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, analysis: true},
   engine: new BubbleEngine(),
   record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
     solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE})};
@@ -297,8 +297,9 @@ async function serverless() {
   } catch {}
   if (await isolate()) return true;
   Object.assign(page, original);
-  const [manifest, build] = await Promise.all(['model/manifest.json', 'build.json'].map(async path => (await fetch(new URL(path, import.meta.url), {cache:'no-cache'})).json()));
-  bubble.entry.version = [manifest.model_version, build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
+  const [manifest, build] = await Promise.all([networkManifest(), 'build.json'].map(async path => (await fetch(new URL(path, import.meta.url), {cache:'no-cache'})).json()));
+  bubble.entry.version = [build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
+  bubble.entry.models = NETWORKS.length ? Object.fromEntries(NETWORKS.map(n => [n.name, n.model_version])) : {'': manifest.model_version};
   native.entry.version = build.artefacts['native/native.wasm'];
   for (const {entry} of ENGINES.values()) entry.version ||= JSON.stringify(build.artefacts);
   await mountPlay(ENGINES, config);

@@ -25,15 +25,14 @@ jobs:
       - run: python -m pip install numpy==2.4.3 -r requirements/web.txt
       - run: python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install --no-deps -e .
-      - run: gh release download --repo "$GITHUB_REPOSITORY" --pattern ema.pt --dir "$RUNNER_TEMP/release"
-        env:
-          GH_TOKEN: ${{ github.token }}
       - run: |
           git clone --quiet https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
           git -C "$RUNNER_TEMP/emsdk" checkout --quiet a2b92777574c2feda07994cd4f1079a3dfc151f8
           "$RUNNER_TEMP/emsdk/emsdk" install 6.0.10
           "$RUNNER_TEMP/emsdk/emsdk" activate 6.0.10
-      - run: python tools/build_web.py ort model shrimp seal six --checkpoint "$RUNNER_TEMP/release/ema.pt" --emxx "$RUNNER_TEMP/emsdk/upstream/emscripten/em++"
+      - run: python tools/build_web.py ort model shrimp seal six --emxx "$RUNNER_TEMP/emsdk/upstream/emscripten/em++"
+        env:
+          GH_TOKEN: ${{ github.token }}
       # The Strix network's licence is unstated; it is published only once the repository variable says so.
       - if: ${{ vars.PUBLISH_STRIX_NETWORK == 'true' }}
         run: python tools/build_web.py strix-network

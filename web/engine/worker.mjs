@@ -1,5 +1,5 @@
 /* Bubble in a Web Worker: network (network.mjs), native search (gumbel.wasm) and the tactical solver (solver-worker.mjs).
- * In: {type: 'load', options} | {type: 'turn', id, history, simulations, solverNodes, batchSize, qRangeFloor}
+ * In: {type: 'load', options} | {type: 'turn', id, history, model, simulations, solverNodes, batchSize, qRangeFloor}
  *     | {type: 'cancel', id} | {type: 'bench', id, batches, sizes, repeats}
  *     | {type: 'search', id, history, simulations, batchSize, qRangeFloor}
  *     | {type: 'evaluate', id, histories}.
@@ -14,7 +14,8 @@ import {principalVariation, topRows} from './proof.mjs';
 const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 'defender counterwin',
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
   'free-second coverage work limit']);
-let native, network, cache, solver = null, solverCalls = 0;
+let native, network, cache, device, settings = {}, solver = null, solverCalls = 0;
+const held = new Map();
 const cancelled = new Set(), solverWaits = new Map();
 
 class Cancelled extends Error {}
@@ -91,7 +92,8 @@ function rootRows(tree, choice) {
 
 /** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms),
  * plus `solver_error` when the solver's worker could not run, so the turn has no proof or threat. */
-async function turn({id, history, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0}) {
+async function turn({id, history, model, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0}) {
+  await use(model, fraction => postMessage({type: 'progress', id, fraction}));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
@@ -175,18 +177,36 @@ async function bench({batches = [1, 16, 64], sizes = [24, 32], repeats = 10}) {
   return out;
 }
 
-async function load(options = {}) {
-  native = new Native(await createModule());
-  let device = await probe(options.prefer);
-  const report = fraction => postMessage({type: 'progress', fraction: .95 * fraction});
-  const create = () => Network.create(new URL('./', import.meta.url), {model: options.model, device, progress: report, threads: options.threads});
+/** Searches with the network whose manifest is `model` (relative to web/engine) from now on; the two most recently
+ * used stay loaded. A WebGPU network that fails to start moves the engine to WebAssembly unless WebGPU was asked for. */
+async function use(model, report = () => {}) {
+  if (held.has(model)) {
+    network = held.get(model);
+    held.delete(model);
+    held.set(model, network);
+    return;
+  }
+  const create = () => Network.create(new URL('./', import.meta.url), {model, device, progress: report, threads: settings.threads});
   try {
     network = await create();
   } catch (error) {
-    if (device.provider !== 'webgpu' || options.prefer) throw error;
+    if (device.provider !== 'webgpu' || settings.prefer) throw error;
     device = {provider: 'wasm', precisions: ['fp32'], adapter: '', fallback: String(error.message || error)};
     network = await create();
   }
+  held.set(model, network);
+  while (held.size > 2) {
+    const [old, released] = held.entries().next().value;
+    held.delete(old);
+    await released.session.release();
+  }
+}
+
+async function load(options = {}) {
+  settings = options;
+  native = new Native(await createModule());
+  device = await probe(options.prefer);
+  await use(options.model, fraction => postMessage({type: 'progress', fraction: .95 * fraction}));
   cache = new EvaluationCache(4096);
   const t = performance.now();
   for (const history of [[[0, 0]], [[0, 0], [1, 0], [0, 1], [5, 0], [6, 0]]]) {
