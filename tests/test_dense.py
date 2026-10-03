@@ -3628,6 +3628,160 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_native_frontier_shares_inflight_predictions_and_keeps_context(self):
+        from native_feed import NativeFeed
+        from neural_search import native, checked
+        h = [[0,0],[1,0],[2,0],[0,1],[0,2],[3,0],[4,0]]
+        same = h[:5]+[h[6], h[5]]
+        different = [h[0],h[5],h[6],h[3],h[4],h[1],h[2]]
+        trees = [NeuralSearch(None, 'test', history, seed=k) for k, history in enumerate((h, same, different))]
+        feed = NativeFeed(2)
+        try:
+            for tree in trees:
+                checked(native.hxg_begin(tree.ptr, 2, 2))
+                feed.begin(tree)
+            feed.gather(trees[0])
+            ids, leaves = feed.take(2)
+            actions = hexcrop.encode_leaf(native, *leaves[0]).actions
+            prediction = (actions, np.zeros(len(actions)), np.full(len(actions), .25))
+            feed.gather(trees[1])
+            self.assertEqual(feed.stats()['joined'], 1)
+            feed.gather(trees[2])
+            self.assertEqual(feed.stats()['new_rows'], 2)
+            # The representative can close after encoding; its subscriber keeps the result alive.
+            feed.detach(trees[0])
+            trees[0].close()
+            self.assertEqual(list(feed.install(ids, [prediction])), [])
+            self.assertEqual(feed.root_value(trees[1]), .25)
+            self.assertIsNone(feed.root_value(trees[2]))
+            self.assertEqual(feed.stats()['installed'], 1)
+            other_ids, other_leaves = feed.take(2)
+            other_actions = hexcrop.encode_leaf(native, *other_leaves[0]).actions
+            feed.install(other_ids, [(other_actions, np.zeros(len(other_actions)), np.zeros(len(other_actions)))])
+            self.assertEqual((feed.stats()['pending_rows'], feed.stats()['pending_requests']), (0, 0))
+        finally:
+            feed.close()
+            for tree in trees:
+                tree.close()
+
+    def test_native_frontier_handles_late_join_and_matches_search_targets(self):
+        from neural_search import EvaluationCache, native
+        class Evaluator:
+            def submit_leaves(self, leaves):
+                return [(s.actions, np.zeros(len(s.actions)), np.full(len(s.actions), .25))
+                        for s in hexcrop.encode_leaves(native, leaves)]
+            def collect(self, handle):
+                return handle
+        class Slot:
+            def __init__(self, model, seed):
+                self.tree = NeuralSearch(None, 'test', [(0,0)], seed=seed)
+                self.model, self.budget, self.samples, self.solver = model, 16, 4, None
+            def searched(self, result):
+                answers[self.seed] = result
+                return False
+        comparisons = []
+        for compiled in (False, True):
+            answers = {}
+            model = type('Model', (), dict(cache=EvaluationCache(128), evaluator=Evaluator()))()
+            engine = dense_selfplay.Engine(16, native_feed=compiled)
+            slots = [Slot(model, k) for k in range(4)]
+            for k, slot in enumerate(slots):
+                slot.seed = k
+            try:
+                engine.add(slots[0])
+                engine.step()
+                for slot in slots[1:]:
+                    engine.add(slot)
+                # The first root is in flight; the new roots must join it.
+                engine.step()
+                if compiled:
+                    self.assertEqual(engine.evals, 1)
+                else:
+                    self.assertEqual(engine.evals, 2)
+                for _ in range(100):
+                    if not engine.slots and not engine.closing:
+                        break
+                    engine.step()
+                self.assertFalse(engine.slots or engine.closing)
+                comparisons.append([(answers[k]['action'], answers[k]['policy'].tolist(),
+                                     answers[k]['values'].tolist(), answers[k]['visits'].tolist()) for k in range(4)])
+                self.assertTrue(all(r['network_value'] == .25 for r in answers.values()))
+                if compiled:
+                    stats = engine.feed_stats()
+                    self.assertGreaterEqual(stats['joined'], 3)
+                    self.assertEqual((stats['pending_rows'], stats['pending_requests']), (0, 0))
+                    self.assertFalse(engine.feeds, 'completed models must release their caches and evaluators')
+            finally:
+                engine.close()
+                for slot in slots:
+                    slot.tree.close()
+        self.assertEqual(comparisons[0], comparisons[1])
+
+    def test_native_frontier_preserves_cached_prediction_on_carried_root(self):
+        from neural_search import EvaluationCache, native, checked
+        class Evaluator:
+            def submit_leaves(self, leaves):
+                return [(s.actions, np.zeros(len(s.actions)), np.zeros(len(s.actions)))
+                        for s in hexcrop.encode_leaves(native, leaves)]
+            def collect(self, handle):
+                return handle
+        model = type('Model', (), dict(cache=EvaluationCache(32), evaluator=Evaluator()))()
+        tree = NeuralSearch(None, 'test', [(0,0)])
+        engine = dense_selfplay.Engine(8, native_feed=True)
+        results = []
+        slot = SimpleNamespace(tree=tree, model=model, budget=2, samples=2, solver=None,
+                               searched=lambda r: results.append(r) or False)
+        try:
+            checked(native.hxg_begin(tree.ptr, 2, 2))
+            request = native.hxg_next(tree.ptr)
+            actions = legal(tree.history)
+            prediction = actions, np.zeros(len(actions)), np.full(len(actions), .375)
+            checked(native.hxg_fulfill(tree.ptr, request, *prediction, len(actions)))
+            model.cache.put(dense_selfplay.position_key(np.asarray(tree.history, np.int64)), prediction)
+            engine.add(slot)
+            while engine.slots or engine.closing:
+                engine.step()
+            self.assertEqual(results[0]['network_value'], .375)
+            self.assertFalse(engine.feeds)
+        finally:
+            engine.close()
+            tree.close()
+
+    def test_native_frontier_span_detaches_all_subscribers_and_models_are_separate(self):
+        from native_feed import NativeFeed
+        from neural_search import native, checked
+        histories = [[(0,0)], [(0,0)], [(0,0),(1,0),(2,0)], [(0,0)]]
+        trees = [NeuralSearch(None, 'test', h, seed=k) for k, h in enumerate(histories)]
+        feeds = [NativeFeed(4), NativeFeed(4)]
+        try:
+            for k, tree in enumerate(trees):
+                checked(native.hxg_begin(tree.ptr, 2, 2))
+                feeds[k == 3].begin(tree)
+            feed, other = feeds
+            feed.gather(trees[0])
+            ids, _ = feed.take(8)
+            feed.gather(trees[1])
+            feed.gather(trees[2])
+            other.gather(trees[3])
+            self.assertEqual((feed.stats()['joined'], other.stats()['joined']), (1, 0))
+            stopped = set(map(int, feed.install(ids, [None])))
+            self.assertEqual(stopped, {trees[0].ptr, trees[1].ptr})
+            self.assertEqual(feed.stats()['pending_requests'], 1)
+            for owned in feeds:
+                more_ids, leaves = owned.take(8)
+                predictions = []
+                for pointer, request, history in leaves:
+                    actions = hexcrop.encode_leaf(native, pointer, request, history).actions
+                    predictions.append((actions, np.zeros(len(actions)), np.zeros(len(actions))))
+                owned.install(more_ids, predictions)
+                self.assertEqual(owned.stats()['pending_rows'], 0)
+            self.assertEqual(other.stats()['installed'], 1)
+        finally:
+            for feed in feeds:
+                feed.close()
+            for tree in trees:
+                tree.close()
+
     def test_losing_next_turn_labels_the_preceding_winning_pair(self):
         history = [[0,0],[-1,2],[1,1],[1,2],[2,-1],[-4,3],[-3,3],[0,-1],[-2,3],[1,-1],
                    [-1,0],[-1,4],[-1,-2],[0,-2],[2,1],[-1,7],[0,6],[-1,6],[1,5],[-3,10],
@@ -3715,14 +3869,14 @@ class EngineTests(unittest.TestCase):
     def test_native_exact_root_stops_early_and_supplies_actor_labels_with_and_without_plan(self):
         import dense_solver
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
-        for planned in (False, True):
-            with self.subTest(planned=planned):
+        for planned, compiled in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(planned=planned, compiled=compiled):
                 model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
                 settings = replace(dense_config.ActorSettings(), full_sims=65536, full_fraction=1.,
                                    root_samples=16, opening_random_plies=0., adjudicate_proven=True,
                                    proven_line_rows=False, solver_root_nodes=1 if planned else 0)
                 slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
-                engine = dense_selfplay.Engine(8, solver_async=False)
+                engine = dense_selfplay.Engine(8, solver_async=False, native_feed=compiled)
                 try:
                     if planned:
                         try:

@@ -313,8 +313,12 @@ class Engine:
     This is opt-in because its CPU cost competes with producing GPU batches.
     """
 
-    def __init__(self, leaf_batch, solver_async=True, schedule=None, leaf_nodes=0):
+    def __init__(self, leaf_batch, solver_async=True, schedule=None, leaf_nodes=0, native_feed=False):
+        if native_feed and leaf_nodes:
+            raise ValueError('Native feeding does not support synchronous per-leaf proof queries')
         self.leaf_batch, self.slots, self.cursor, self.inflight = leaf_batch, [], 0, []
+        self.native_feed, self.feeds = native_feed, {}
+        self.retired_feed_stats = np.zeros(6, np.int64)
         self.evals = self.calls = self.full_calls = self.hits = self.searches = 0
         self.solver_async, self.schedule = solver_async, schedule or dense_solver.Schedule()
         self.solver, self.plans, self.closing = None, {}, []
@@ -330,6 +334,11 @@ class Engine:
         key = position_key(np.asarray(slot.tree.history, np.int64).reshape(-1, 2))
         cached = slot.model.cache.get(key)
         self.root_predictions[id(slot)] = slot.model, key, float(cached[2][0]) if cached is not None else None
+        if self.native_feed:
+            from native_feed import NativeFeed
+            if slot.model not in self.feeds:
+                self.feeds[slot.model] = NativeFeed(slot.model.cache.capacity)
+            self.feeds[slot.model].begin(slot.tree, cached)
         checked(native.hxg_begin(slot.tree.ptr, slot.budget, slot.samples))
         plan = self.plans.get(id(slot))
         active = dense_solver.active(slot.solver, self.schedule)
@@ -351,9 +360,34 @@ class Engine:
             self.solver.drain()
 
     def close(self):
+        for feed in self.feeds.values():
+            feed.close()
+        self.feeds.clear()
         if self.solver:
             self.solver.close()
             self.solver = None
+
+    def feed_stats(self):
+        totals = self.retired_feed_stats.copy()
+        names = ('new_rows', 'joined', 'cache_hits', 'installed', 'pending_rows', 'pending_requests')
+        for feed in self.feeds.values():
+            totals += np.fromiter(feed.stats().values(), np.int64, count=6)
+        return dict(zip(names, map(int, totals)))
+
+    def retire_feeds(self):
+        needed = {model for model, _, _, _ in self.inflight}
+        for slot in [*self.slots, *(entry[0] for entry in self.closing)]:
+            needed.add(slot.model)
+            needed.update(getattr(slot, 'trees', {}))
+        for model in list(self.feeds):
+            if model not in needed:
+                feed = self.feeds[model]
+                stats = np.fromiter(feed.stats().values(), np.int64, count=6)
+                if np.any(stats[4:]):
+                    raise RuntimeError('Retiring a native feed with pending requests')
+                self.retired_feed_stats += stats
+                feed.close()
+                del self.feeds[model]
 
     def synchronize_inflight(self):
         """Finish submitted GPU work without consuming predictions or advancing any tree."""
@@ -378,7 +412,13 @@ class Engine:
                 continue
             ptr = slot.tree.ptr
             while True:
-                request = native.hxg_next(ptr)
+                if self.native_feed:
+                    request, stats = self.feeds[slot.model].gather(slot.tree)
+                    count += int(stats[0]+stats[2])
+                    self.hits += int(stats[1])
+                    progress |= bool(stats[3])
+                else:
+                    request = native.hxg_next(ptr)
                 if request == HOLD:
                     progress = True
                     if plan.hold(slot):
@@ -404,6 +444,10 @@ class Engine:
                             result.update(proven=1, proof=proof, proof_turns=turns, proof_action=[list(s) for s in stones],
                                           proof_plies=bound, action=list(stones[0]))
                     result['network_value'] = self.root_predictions[id(slot)][2]
+                    if self.native_feed:
+                        value = self.feeds[slot.model].root_value(slot.tree)
+                        if value is not None:
+                            result['network_value'] = value
                     self.searches += 1
                     if not slot.searched(result):
                         done.append(slot)
@@ -493,6 +537,17 @@ class Engine:
                     pending[model][key].append((slot, ptr, request))
                     count += 1
         launched = []
+        if self.native_feed:
+            for model, feed in self.feeds.items():
+                batch = feed.take(2**31-1)
+                if batch is None:
+                    continue
+                keys, leaves = batch
+                handle = model.evaluator.submit_leaves(leaves)
+                launched.append((model, feed, keys, handle))
+                self.calls += 1
+                self.evals += len(keys)
+                self.full_calls += len(keys) == self.leaf_batch
         for model, positions in pending.items():
             keys = list(positions)
             histories, legal = zip(*(positions[k][0] for k in keys))
@@ -507,6 +562,10 @@ class Engine:
             self.full_calls += len(keys) == self.leaf_batch
         stopped, collecting = set(), time.perf_counter()
         for model, positions, keys, handle in self.inflight:
+            if self.native_feed:
+                pointers = set(map(int, positions.install(keys, model.evaluator.collect(handle))))
+                stopped.update(slot for slot in slots if slot.tree.ptr in pointers)
+                continue
             for key, prediction in zip(keys, model.evaluator.collect(handle)):
                 if prediction is None:
                     stopped.update(slot for slot, _, _ in positions[key][1:])
@@ -519,9 +578,10 @@ class Engine:
                             self.root_predictions[id(slot)] = model, key, float(prediction[2][0])
                 model.cache.put(key, prediction)
         if stopped:
-            for _, positions, _, _ in launched:
-                for waiting in positions.values():
-                    waiting[1:] = [w for w in waiting[1:] if w[0] not in stopped]
+            if not self.native_feed:
+                for _, positions, _, _ in launched:
+                    for waiting in positions.values():
+                        waiting[1:] = [w for w in waiting[1:] if w[0] not in stopped]
             for slot in stopped:
                 slot.reason = 'span'
                 if slot in self.slots and slot not in done:
@@ -534,6 +594,11 @@ class Engine:
         self.inflight = launched
         if done:
             finished = set(map(id, done))
+            if self.native_feed:
+                for slot in done:
+                    for tree in getattr(slot, 'trees', {None: slot.tree}).values():
+                        for feed in self.feeds.values():
+                            feed.detach(tree)
             for key in finished:
                 self.root_predictions.pop(key, None)
             self.slots = [s for s in self.slots if id(s) not in finished]
@@ -552,6 +617,8 @@ class Engine:
             self.solver.idle()
         if self.solver:
             self.solver.tick((time.perf_counter()-started)*1000, (collected-collecting)*1000)
+        if self.native_feed:
+            self.retire_feeds()
         return done
 
 
