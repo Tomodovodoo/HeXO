@@ -1542,6 +1542,22 @@ class FreeplayClock(unittest.TestCase):
             self.assertIs(self.session.seat_engines[1], kept)
             kept.close.assert_not_called()
 
+    def test_a_timed_bubble_move_is_kept_as_an_evaluation(self):
+        class Timed:
+            def turn(self, game, ms=None, clock=None, cancel=None, publish=None):
+                moves = legal_turn([cell[:2] for cell in game.cells])
+                return dict(moves=moves, win_probability=.62, completed=40, solver_nodes=0)
+
+            def close(self):
+                pass
+        self.session.prepare_timed = lambda sides=(0, 1): setattr(self.session, 'seat_engines', [None, Timed()])
+        self.session.configure_seat(1, 'bubble:fake')
+        self.session.set_clock(dict(mode='game', tc='60'))
+        self.session.play(0, 0)
+        wait(lambda: len(self.session.history) == 3)
+        found = self.session.state()['evaluations'][1]
+        self.assertEqual((found['value'], found['simulations'], found['moves']), (.62, 40, [list(p) for p in self.session.history[1:]]))
+
     def test_leaving_a_match_rebuilds_the_seats_timed_engines(self):
         rebuilt = []
         self.session.prepare_timed = lambda sides=(0, 1): rebuilt.append(tuple(sides))

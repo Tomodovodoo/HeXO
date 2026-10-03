@@ -316,7 +316,8 @@ export class BrowserSession extends OfflineSession {
   }
   /** Saves the evaluation `result` of `history` by `spec`. One whose solver could not run (`solver_error`) is kept for
    * this visit only and raises the session's `notice`, so a later visit evaluates the position again with proofs. A
-   * `kept` one (a seat's move on its game tree) is shown but never reused as a fresh evaluation. */
+   * `kept` one (a seat's move on its game tree, or one cut short by a clock) is shown but never reused as a fresh
+   * evaluation. */
   async record(history, spec, result, kept = false) {
     const record = {...result, id: this.cacheKey(history, spec) + (kept ? '|kept' : ''), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
@@ -465,7 +466,7 @@ export class BrowserSession extends OfflineSession {
       if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
       // The move came back at `at`; saving it must not run its clock out.
       if (job.kind === 'move') clearTimeout(this.flag);
-      await this.record(history, job.spec, result, job.kind === 'move' && this.entries.get(job.spec.engine)?.kind === 'bubble');
+      await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));
       if (job.kind === 'move') {
         if (job.controller.signal.aborted || position(this.history) !== position(history) || this.paused) { this.armFlag(); return; }
         if (!this.match?.active) this.forkGame();

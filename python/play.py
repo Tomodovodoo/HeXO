@@ -2778,6 +2778,18 @@ class Session:
                 timer.start()
         return self.save(history, weights, spent, found, model)
 
+    def save_timed(self, seat, history, moves, found):
+        """Save a timed Bubble move's search as a kept-tree evaluation of `history` at the work it completed: shown in
+        the game and its replay like any evaluation, never reused for a budget."""
+        entry, value = self.entries[seat['engine']], found.get('win_probability')
+        key = self.engine_key(seat) if entry['kind'] == 'bubble' and value is not None else None
+        if key is None:
+            return
+        spent = dict(simulations=int(found.get('completed') or 0), solver_nodes=int(found.get('solver_nodes') or 0))
+        model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
+        self.store.add(history, key + ':kept', spent, dict(value=round(float(value), 4), moves=moves, top=[[*moves[0], 1.0, float(value)]],
+                                                           pv=[], threat=[], proof=None, model=model))
+
     def save(self, history, weights, spent, found, model):
         """Save an evaluation, and the searches of the later stones of its turn (see `TurnSearch`) as evaluations
         of those positions without solver checks."""
@@ -2849,7 +2861,10 @@ class Session:
                         raise Cancelled()
                     job.measurements = {k: found.get(k) for k in ('elapsed_ms', 'completed', 'evaluated', 'solver_nodes',
                                                                   'nodes', 'stop_reason', 'allowance')}
-                    return checked_turn(history, found['moves'])
+                    moves = checked_turn(history, found['moves'])
+                    if not self.match:
+                        self.save_timed(seat, history, moves, found)
+                    return moves
                 finally:
                     game.close()
             if entry['kind'] == 'bubble':
