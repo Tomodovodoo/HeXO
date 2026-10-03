@@ -181,7 +181,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       };
       if (simulations) {
         tree ??= line == null ? new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current})
-          : games.graph(line, current, {seed: 1740, tactics: true, qRangeFloor});
+          : games.graph(line, current, {seed: 1740, tactics: true, qRangeFloor, model: network.version});
         const evaluate = leaves => network.evaluate(leaves);
         const unmarked = await tree.settle(table ? table.edges(current) : new Map(), {evaluate, cache, version: network.version});
         check();

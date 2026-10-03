@@ -288,6 +288,13 @@ class Recheck:
         self.phase = 'done'
         return 0
 
+    def abandon(self):
+        """End the check before its next search: the root moves back to the first position."""
+        if self.phase == 'check':
+            self.graph.at(self.root)
+        self.searched = self.searched and self.phase != 'again'
+        self.phase = 'done'
+
     def summary(self):
         """{line: the checked turn's stones, before and after: the chosen stone's completed Q, searched: whether the
         root was searched again}, or None when no check ran."""
@@ -352,11 +359,17 @@ class GameGraph(NeuralSearch):
                pv_drop=PV_DROP, **options):
         """NeuralSearch.search with the principal-variation check of share `pv_check` (Recheck). With a check the
         result is the root's after it, with `completed`, `evaluated`, `cache_hits` and `elapsed_ms` summed over every
-        pass and `pv_check` (Recheck.summary)."""
+        pass and `pv_check` (Recheck.summary). `milliseconds` caps all passes together: a pass gets what the earlier
+        ones left, and the check ends, back at the root, when nothing is left."""
+        start = time.perf_counter()
         check = Recheck(self, simulations, pv_check, pv_drop)
         passes = [super().search(check.budget, root_samples, batch_size, milliseconds, **options)]
         while budget := check.step(passes[-1]):
-            passes.append(super().search(budget, root_samples, batch_size, milliseconds, **options))
+            left = None if milliseconds is None else milliseconds-(time.perf_counter()-start)*1000
+            if left is not None and left <= 0:
+                check.abandon()
+                break
+            passes.append(super().search(budget, root_samples, batch_size, left, **options))
         if len(passes) == 1:
             return passes[0]
         result = passes[-1] if check.searched else self.result(0, 0, 0, 0, choice=options.get('choice', 'policy'))

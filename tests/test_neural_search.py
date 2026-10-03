@@ -908,6 +908,11 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual(spent, [32, 16, 16])
         with self.assertRaisesRegex(ValueError, 'pv_check must lie'):
             Recheck(graph, 64, .5)
+        late = Recheck(graph, 64, .25)
+        late.step(graph.search(late.budget, root_samples=8, batch_size=8))
+        self.assertNotEqual(graph.history, a)
+        late.abandon()   # out of time before the check's search
+        self.assertEqual((graph.history, late.summary()['searched'], late.step(None)), (a, False, 0))
 
 if __name__ == '__main__':
     unittest.main()
