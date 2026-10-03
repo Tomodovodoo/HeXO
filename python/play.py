@@ -1990,6 +1990,12 @@ class Session:
             study.load(game['history'], True, saved_game=dict(batch=ident, name=directory.name, game=number,
                        players=[p['name'] for p in game['players']], winner=game['winner'], reason=game['reason']))
             study.outcome = dict(winner=game['winner'], reason='time') if game['reason'] == 'time' else None
+            study.clock_spec = clock_spec(game.get('clock'))
+            study.clock_turns = list(game.get('turns') or [])
+            study.game_clock = study.new_game_clock()
+            last = study.clock_turns[-1] if study.clock_turns else {}
+            if study.game_clock and last.get('cross_ms') is not None and last.get('circle_ms') is not None:
+                study.game_clock.balances = [int(last['cross_ms'] * 1e6), int(last['circle_ms'] * 1e6)]
             study.changed()
         return study
 
