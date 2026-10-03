@@ -908,6 +908,28 @@ class SharedGraph(unittest.TestCase):
         unbounded.search(8, root_samples=4, batch_size=4)
         self.assertEqual(unbounded.store()['evicted'], 0)
 
+    def test_a_stored_winning_child_is_sampled_at_the_root_whatever_its_prior(self):
+        # The graph holds a win below stone x (found from the position after it). Back at the position before it, x
+        # competes on that evidence in the root sampling, so a uniform prior and two samples still pick it.
+        a = recorded_position(11)
+        probe = self.graph(Uniform(), a)
+        actions = [tuple(map(int, action)) for action in probe.search(2, root_samples=2, batch_size=2)['actions']]
+        x = actions[-1]
+        mover = lambda n: 0 if n == 0 else ((n - 1) // 2 + 1) % 2
+        class Likes(Uniform):
+            def evaluate(self, histories):
+                predictions = super().evaluate(histories)
+                for history, prediction in zip(histories, predictions):
+                    if len(history) > len(a) and tuple(map(int, history[len(a)])) == x:
+                        prediction['q'][:] = 1. if mover(len(history)) == mover(len(a) + 1) else -1.
+                return predictions
+        graph = self.graph(Likes(), [*a, x])
+        graph.search(32, root_samples=4, batch_size=4)
+        graph.at(a)
+        chosen = graph.search(4, root_samples=2, batch_size=2)
+        self.assertEqual(tuple(map(int, chosen['action'])), x)
+        self.assertGreater(chosen['visits'][self.edge(chosen, x)], 0)
+
     def test_a_search_counts_toward_the_order_of_its_own_history(self):
         # Both orders of A's turn reach C; a search at C reached by one order counts at that order's first stone only.
         a = recorded_position(11)
