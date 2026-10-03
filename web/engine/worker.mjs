@@ -1,5 +1,5 @@
 /* Bubble in a Web Worker: network (network.mjs), native search (gumbel.wasm) and the tactical solver (solver-worker.mjs).
- * In: {type: 'load', options} | {type: 'use', id, model} | {type: 'turn', id, history, model, simulations, solverNodes, batchSize, qRangeFloor, ms, line, known}
+ * In: {type: 'load', options} | {type: 'use', id, model} | {type: 'turn', id, history, model, simulations, solverNodes, leafNodes, batchSize, qRangeFloor, ms, line, known}
  *     | {type: 'cancel', id} | {type: 'bench', id, batches, sizes, repeats}
  *     | {type: 'search', id, history, simulations, batchSize, qRangeFloor}
  *     | {type: 'evaluate', id, histories}.
@@ -113,7 +113,7 @@ async function turn(request) {
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null}) {
+async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null}) {
   await use(model, fraction => postMessage({type: 'progress', id, fraction}));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
@@ -126,6 +126,20 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
   const timed = ms != null, end = start + (ms ?? 0), solverEnd = start + .25 * (ms ?? 0);
   const deadline = Math.min(60000, Math.max(10000, Math.floor(solverNodes / 8)));
   const solverMs = () => timed ? Math.max(1, Math.floor(Math.min(deadline, solverEnd - performance.now()))) : deadline;
+  let leafNodes = leafBudget, leafMs = Math.min(60000, Math.max(10000, Math.floor(leafBudget / 8)));
+  const prove = leafBudget ? async leaves => {
+    const ms = Math.min(leafQueryMs, Math.floor(leafMs), timed ? Math.floor(solverEnd - performance.now()) : leafQueryMs);
+    if (!leafNodes || ms < 1) return null;
+    check();
+    const before = performance.now();
+    const found = note(await solve(id, leaves, {nodes: Math.min(2048, leafNodes), ms}));
+    const used = found.nodes_used || 0;
+    leafNodes = Math.max(0, leafNodes - used);
+    leafMs -= performance.now() - before;
+    solverUsed += used;
+    check();
+    return found;
+  } : null;
   try {
     if (solverNodes) {
       const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true}));
@@ -172,7 +186,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
         const unmarked = await tree.settle(table ? table.edges(current) : new Map(), {evaluate, cache, version: network.version});
         check();
         const result = settled(await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
-          evaluate, stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
+          evaluate, prove, stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
           onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
             ...(stone ? {} : {live: rootRows(tree, choice)})})}), unmarked, local.player);
         check();

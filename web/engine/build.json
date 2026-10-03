@@ -81,8 +81,8 @@
   "tools/strix_web/src/lib.rs": "40e36d710556f8e17362e15404a3caa7981936cc91c26383d1bde61ca8c0ecf4"
  },
  "artefacts": {
-  "gumbel.mjs": "bab13931e73456e79c928e9f5cbf6cfc6eba1c8b52167ed0bbb92c14ecc56676",
-  "gumbel.wasm": "021191fc5878aa1240484634653cfba9dcb846724069e717f4a8da6479fc7cdf",
+  "gumbel.mjs": "27f4b55479808bee08e312f5352127179bd7cea1bab332a62c0ae392b8f3b3e9",
+  "gumbel.wasm": "d0c7fd471ddf4aa180ecd291e029a7008603a06130ba3569f5349bd0d1c22639",
   "tactical.wasm": "4f38302a4e9b37181ac285135a8c49b2064c64e5d6e02b2e149c32073dbad8f9",
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
   "native/native.wasm": "1bcd1d85021001f1afe9a9f62749dc606c7b210ae648ecc15f72fd2b95320dcd",

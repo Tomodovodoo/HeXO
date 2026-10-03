@@ -251,6 +251,11 @@ class NeuralTree(unittest.TestCase):
                    nodes=[dict(kind='immediate_win', action=[[8,0],[9,0]])])
         self.assertFalse(search.fulfill_proof(request, pending_history, bad))
         self.assertEqual(native.hxg_exact(search.ptr), -1)
+        verified = solver.history(pending_history, ms=1000, certificate=cert)
+        self.assertEqual(verified['status'], 'PROVEN_WIN')
+        for attacker in ('opponent', None):
+            self.assertFalse(search._install_verified_proof(request, pending_history, dict(verified, attacker=attacker)))
+            self.assertEqual(native.hxg_exact(search.ptr), -1)
         changed = [list(p) for p in pending_history]
         changed[8] = [8,4]
         with self.assertRaisesRegex(ValueError, 'Proof history mismatch'):
@@ -494,7 +499,8 @@ class NeuralTree(unittest.TestCase):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]]
         class Slow:
             def history(self, history, ms, certificate=None, **kwargs):
-                return dict(status='PROVEN_WIN', native_verified=True, moves=[[-3,-3],[-3,-2]], proof_turns=3)
+                return dict(status='PROVEN_WIN', native_verified=True, attacker='mover',
+                            moves=[[-3,-3],[-3,-2]], proof_turns=3)
         search = NeuralSearch(Uniform(), 'longer-certificate', history, tactics=True, proof_solver=Slow())
         self.addCleanup(search.close)
         self.assertTrue(native.hxg_begin(search.ptr, 8, 4))

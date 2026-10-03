@@ -152,7 +152,12 @@ class NeuralSearch:
             raise ValueError('A native certificate verifier is required')
         result = self.proof_solver.history(history, ms=self.proof_ms if milliseconds is None else milliseconds,
                                           certificate=certificate)
-        if result.get('status') != 'PROVEN_WIN' or not result.get('native_verified'):
+        return self._install_verified_proof(request, history, result)
+
+    def _install_verified_proof(self, request, history, result):
+        """Install this leaf's already verified solver verdict; native checks its history, phase and turn."""
+        if (result.get('status') != 'PROVEN_WIN' or not result.get('native_verified')
+                or result.get('attacker') != 'mover'):
             return False
         moves = result.get('moves', [])
         if not moves:
@@ -336,10 +341,9 @@ class SearchCoordinator:
                                     proof_spent[i] += (time.perf_counter()-proof_start)*1000
                                     if finished(i):
                                         continue
-                                    allowance = proof_budget()
-                                    if (allowance and proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified')):
+                                    if proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified'):
                                         proof_start = time.perf_counter()
-                                        fulfilled = search.fulfill_proof(request, history, proof['certificate'], allowance)
+                                        fulfilled = search._install_verified_proof(request, history, proof)
                                         proof_spent[i] += (time.perf_counter()-proof_start)*1000
                                         if fulfilled:
                                             continue

@@ -254,6 +254,22 @@ class BrowserProofs(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_solver_leaves_prove_a_losing_half_turn(self):
+        history = [[0, 0], [4, 0], [7, 0], [-2, 0], [-1, 0], [1, 0], [6, 0], [5, 0], [-1, -1],
+                   [-3, 1], [-1, 1], [-2, -1], [-4, 0], [-3, 0], [0, -1], [-2, -3], [-2, -2],
+                   [-2, 1], [-2, -5], [-3, -1], [-1, -3], [-5, 1], [0, -4], [-4, 1], [-4, -1], [-5, -1]]
+        found = node(dict(kind='proof-search', history=history, simulations=2048, nodes=524288))
+        self.assertEqual((found['exact_winner'], found['proven']), (0, -1))
+        self.assertGreater(found['proof_plies'], 0)
+        self.assertLess(found['completed'], 2048)
+        self.assertTrue(all(v == -1. for v in found['values']))
+        self.assertLessEqual(found['nodes_used'], 524288)
+        self.assertGreater(found['queries'], 0)
+        turn = node(dict(kind='worker-turn', history=history, simulations=2048, nodes=0, leafNodes=524288, leafQueryMs=100))
+        self.assertEqual((turn['proof']['winner'], turn['value']), (0, 0.))
+        self.assertLess(turn['actual_completed'], 2048)
+        self.assertTrue(all(row[3:] == [0., -1] for row in turn['top']))
+
     def test_artefacts_match_their_sources(self):
         record = json.loads((ENGINE/'build.json').read_text(encoding='utf-8'))
         self.assertEqual(record['sources'], build_web.sources())
