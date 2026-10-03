@@ -32,8 +32,12 @@ class ScriptedTactics:
             self.hoard.append(bytearray(512*2**20))
         if mode == (6, 6):
             self.cancelled.wait(60)
-        certificate = dict(version=1, nodes=[dict(kind='immediate_win', action=[[5, 0]])]) if mode == (5, 5) else None
+        if mode == (7, 7):
+            time.sleep(.08)  # answer after the soft deadline but within its grace period
+        certificate = dict(version=1, nodes=[dict(kind='immediate_win', action=[[5, 0]])]) if mode in ((5, 5), (7, 7)) else None
         return dict(status='UNKNOWN', native_verified=False, moves=[], certificate=certificate, reason='scripted',
+                    nodes_used=120, nodes_fresh=17, budget=250, resident_reused=True,
+                    proof_numbers=dict(pn=3, dn=9, scope='wide-forcing', game_exact=False) if budgets.get('bounds') else None,
                     pid=os.getpid(), ms=ms, background_worker_busy=mode == (2, 2),
                     padding='x'*(17*2**20) if mode == (4, 4) else '')
 
@@ -62,6 +66,7 @@ class Isolation(unittest.TestCase):
         self.assertEqual(hung['status'], 'UNKNOWN')
         self.assertIn('hard deadline', hung['reason'])
         self.assertEqual((hung['attacker'], hung['build_hash'], hung['nodes_used']), ('mover', None, 0))
+        self.assertIsNone(hung['nodes_fresh'])
         self.assertEqual(self.tactics.stats['kills'], 1)
         self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
 
@@ -88,7 +93,7 @@ class Isolation(unittest.TestCase):
         self.assertFalse(self.tactics.cancel())
 
         results = []
-        query = threading.Thread(target=lambda: results.append(self.tactics.history([[6, 6]], ms=20000)))
+        query = threading.Thread(target=lambda: results.append(self.tactics.history([[6, 6]], ms=20000, bounds=True)))
         query.start()
         time.sleep(.1)
         start = time.perf_counter()
@@ -98,6 +103,8 @@ class Isolation(unittest.TestCase):
         self.assertLess(time.perf_counter()-start, 1)
         self.assertEqual(results[0]['reason'], 'cancelled')
         self.assertEqual(results[0]['status'], 'UNKNOWN')
+        self.assertEqual(results[0]['nodes_fresh'], 17)
+        self.assertEqual(results[0]['proof_numbers']['pn'], 3)
         self.assertEqual(self.tactics.stats['kills'], 0)
         self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
         self.assertFalse(self.tactics.cancel())
@@ -115,7 +122,7 @@ class Isolation(unittest.TestCase):
 
         results = []
         with patch.object(self.tactics, '_line', delayed_result):
-            query = threading.Thread(target=lambda: results.append(self.tactics.history([[5, 5]], ms=10000)))
+            query = threading.Thread(target=lambda: results.append(self.tactics.history([[5, 5]], ms=10000, bounds=True)))
             query.start()
             self.assertTrue(entered.wait(2))
             self.assertTrue(self.tactics.cancel())
@@ -125,7 +132,19 @@ class Isolation(unittest.TestCase):
         self.assertEqual((results[0]['status'], results[0]['reason']), ('UNKNOWN', 'cancelled'))
         self.assertIsNone(results[0]['certificate'])
         self.assertNotIn('certificate_json', results[0])
+        self.assertEqual((results[0]['nodes_used'], results[0]['nodes_fresh'], results[0]['budget']), (120, 17, 250))
+        self.assertEqual(results[0]['proof_numbers']['pn'], 3)
+        self.assertTrue(results[0]['resident_reused'])
         self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
+
+    def test_late_answer_keeps_work_and_bounds_but_not_certificate(self):
+        self.tactics.history([[0, 0]], ms=10000)
+        result = self.tactics.history([[7, 7]], ms=40, bounds=True)
+        self.assertEqual((result['status'], result['reason']), ('UNKNOWN', 'deadline'))
+        self.assertIsNone(result['certificate'])
+        self.assertNotIn('certificate_json', result)
+        self.assertEqual((result['nodes_used'], result['nodes_fresh'], result['budget']), (120, 17, 250))
+        self.assertEqual(result['proof_numbers']['dn'], 9)
 
     def test_cancel_before_dispatch_keeps_result_schema(self):
         request = dict(query_id=1, history=[[0, 0]], attacker='opponent', ms=1000)
@@ -147,6 +166,7 @@ class Isolation(unittest.TestCase):
         self.assertIsNone(result['budget'])
         self.assertIsNone(result['gate_score'])
         self.assertIsNone(result['certificate'])
+        self.assertEqual(result['nodes_fresh'], 0)
 
     def test_memory_cap_ends_child(self):
         self.tactics.history([[0, 0]], ms=10000)
@@ -176,6 +196,7 @@ class Isolation(unittest.TestCase):
         with patch('tactical_proof.REQUEST_LIMIT', 8*2**20):
             result = self.tactics.history([[0, 0]], ms=1000, certificate=dict(padding='x'*(9*2**20)))
         self.assertEqual(result['reason'], 'request size limit')
+        self.assertEqual(result['nodes_fresh'], 0)
         self.assertEqual(self.tactics.history([[0, 0]], ms=1000)['reason'], 'scripted')
 
     def test_oversized_response_is_discarded(self):

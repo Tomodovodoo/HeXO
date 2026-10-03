@@ -210,6 +210,27 @@ impl ProofTt {
         self.hits
     }
 
+    pub(crate) fn has_entries(&self) -> bool {
+        self.stored > 0
+    }
+
+    /// Rehash into the requested byte budget. Shrinking may evict entries;
+    /// the same resolved-first/work replacement rule applies as during search.
+    pub(crate) fn resize(&mut self, tt_mb: usize) {
+        let mut next = Self::new(tt_mb);
+        if next.slots.len() == self.slots.len() {
+            return;
+        }
+        for slot in &self.slots {
+            if slot.occupied {
+                next.store(slot.key, slot.pn, slot.dn, slot.work);
+            }
+        }
+        next.hits = self.hits;
+        next.stored = self.stored;
+        *self = next;
+    }
+
     pub(crate) fn bytes(&self) -> u64 {
         (self.slots.len() * std::mem::size_of::<Slot>()) as u64
     }

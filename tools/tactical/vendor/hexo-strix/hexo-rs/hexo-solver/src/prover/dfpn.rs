@@ -49,14 +49,15 @@ const MOVE_RANK_BIAS: u32 = 0;
 /// plies), so this only fires on pathological non-terminating forcing.
 const MAX_PLY: u32 = 1024;
 
-/// Resident search state of one attacker: the transposition table and the proven-node set.
-type Resident = (ProofTt, FxHashSet<u64>);
+/// Resident search state of one attacker: table, witnesses and completed level-2 seeds.
+type Resident = (ProofTt, FxHashSet<u64>, FxHashSet<u64>);
 /// Proven-node keys kept per resident megabyte; past that the whole state is dropped, since the table's
 /// resolved entries need their proven witnesses for certificate reconstruction.
 const PROVEN_PER_MB: usize = 32768;
 
 thread_local! {
     static RESIDENT_MB: Cell<usize> = const { Cell::new(0) };
+    static RESUME: Cell<bool> = const { Cell::new(false) };
     static RESIDENT: RefCell<Vec<(bool, Resident)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -66,8 +67,29 @@ thread_local! {
 /// searches, and a kept proven node still has to be re-walked into a certificate that is verified. A search is
 /// then no longer a function of its position and budget alone.
 pub fn set_resident(mb: usize) {
+    RESUME.with(|c| c.set(false));
     if RESIDENT_MB.with(|c| c.replace(mb)) != mb {
         RESIDENT.with(|r| r.borrow_mut().clear());
+    }
+}
+
+/// Slice mode keeps usable search entries when changing table size. A shrink
+/// can evict entries, and the witness/seed limit can still discard a state.
+/// The disposable level-2 search trees are not retained.
+pub fn set_resident_resume(mb: usize) {
+    if mb == 0 {
+        set_resident(0);
+        return;
+    }
+    RESUME.with(|c| c.set(true));
+    if RESIDENT_MB.with(|c| c.replace(mb)) != mb {
+        RESIDENT.with(|r| {
+            let mut states = r.borrow_mut();
+            states.retain(|(_, state)| state.1.len() + state.2.len() <= mb * PROVEN_PER_MB);
+            for (_, state) in states.iter_mut() {
+                state.0.resize(mb);
+            }
+        });
     }
 }
 
@@ -81,14 +103,14 @@ fn take_resident(attacker: Player) -> Option<Resident> {
         let mut r = r.borrow_mut();
         Some(match r.iter().position(|e| e.0 == side) {
             Some(i) => r.swap_remove(i).1,
-            None => (ProofTt::new(mb), FxHashSet::default()),
+            None => (ProofTt::new(mb), FxHashSet::default(), FxHashSet::default()),
         })
     })
 }
 
 fn keep_resident(attacker: Player, state: Resident) {
     let mb = RESIDENT_MB.with(|c| c.get());
-    if state.1.len() <= mb * PROVEN_PER_MB {
+    if state.1.len() + state.2.len() <= mb * PROVEN_PER_MB {
         RESIDENT.with(|r| r.borrow_mut().push((attacker == Player::P1, state)));
     }
 }
@@ -159,7 +181,8 @@ impl<'a> Dfpn<'a> {
         hints: Option<Rc<WinDepthHints>>,
         resident: Option<Resident>,
     ) -> Dfpn<'a> {
-        let (tt, proven) = resident.unwrap_or_else(|| (ProofTt::new(cfg.tt_mb), FxHashSet::default()));
+        let (tt, proven, seeded) = resident.unwrap_or_else(||
+            (ProofTt::new(cfg.tt_mb), FxHashSet::default(), FxHashSet::default()));
         Dfpn {
             k,
             tt,
@@ -179,7 +202,7 @@ impl<'a> Dfpn<'a> {
             pn2_nodes: cfg.pn2_nodes,
             pn2_scale: cfg.pn2_scale,
             pn2_scale_inverse: cfg.pn2_scale_inverse,
-            pn_seeded: FxHashSet::default(),
+            pn_seeded: if RESUME.with(|c| c.get()) { seeded } else { FxHashSet::default() },
             leaf_solves: 0,
             hints,
         }
@@ -810,6 +833,7 @@ pub(crate) fn solve_mode_at_guided(
     };
     let resident = take_resident(pos.attacker);
     let keep = resident.is_some();
+    let resident_reused = resident.as_ref().is_some_and(|state| state.0.has_entries());
     let mut d = Dfpn::new(ctx, cfg, ctl, pds_mode, hints, resident);
     let root = Node::Or { placements: pos.placements_remaining };
     // `Instant::now()` traps at runtime on wasm32-unknown-unknown (no monotonic
@@ -842,6 +866,8 @@ pub(crate) fn solve_mode_at_guided(
     };
 
     let mut res = DriverResult::new(verdict);
+    res.proof_numbers = Some(d.tt.probe(node_key_at(d.k.hash(), root, remaining)).unwrap_or((pn, dn)));
+    res.resident_reused = resident_reused;
     if verdict == Verdict::Win {
         // PDS-PN retains every node key that reached `pn == 0`, including nodes
         // proved inside its disposable level-2 PN searches. Rewalk that proof
@@ -912,7 +938,8 @@ pub(crate) fn solve_mode_at_guided(
     }
     res.stats = d.stats(elapsed);
     if keep {
-        keep_resident(pos.attacker, (d.tt, d.proven));
+        let seeded = if RESUME.with(|c| c.get()) { d.pn_seeded } else { FxHashSet::default() };
+        keep_resident(pos.attacker, (d.tt, d.proven, seeded));
     }
     res
 }
