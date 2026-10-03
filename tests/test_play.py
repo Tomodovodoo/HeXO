@@ -1834,6 +1834,8 @@ class TurnTrees(unittest.TestCase):
                    (-2, 1), (-2, -5), (-3, -1), (-1, -3), (-5, 1), (0, -4), (-4, 1), (-4, -1), (-5, -1), (8, -8)]
         for prover in (prover, tactical_proof.IsolatedTactics(package=tactical_proof.PACKAGE)):
             try:
+                if isinstance(prover, tactical_proof.IsolatedTactics):
+                    prover.history([(0, 0)], nodes=1, ms=1000)
                 bubble = self.bubble()
                 with unittest.mock.patch.object(bubble.evaluator, 'evaluate', side_effect=AssertionError('proof needs no net')):
                     found = evaluate(bubble, prover, history, 8, 1, solved=solve(None, history, 0))
