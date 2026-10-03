@@ -861,6 +861,34 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual((after['exact_winner'], after['proven']), (mover, 1))
         self.assertEqual(after['values'][self.edge(after, b[-1])], 1.)
 
+    def test_the_same_seed_and_budgets_choose_the_same_moves(self):
+        a = recorded_position(11)
+        def run():
+            graph = self.graph(Ranked(), a)
+            first = graph.search(32, root_samples=8, batch_size=8)
+            graph.at(graph.after_turn(first))
+            deep = graph.search(64, root_samples=8, batch_size=8)
+            graph.at(a)
+            return [first['action'], deep['action'], graph.search(16, root_samples=8, batch_size=8)['action']]
+        self.assertEqual(run(), run())
+
+    def test_eviction_keeps_proofs_and_a_proven_root_is_not_searched_again(self):
+        a = recorded_position(11)
+        mover = Game(a).player
+        graph = self.graph(Ranked(), a, limit=1)
+        first = graph.search(32, root_samples=4, batch_size=4)
+        b = [*a, tuple(first['action'])]
+        graph.at(b)
+        second = graph.search(16, root_samples=4, batch_size=4)
+        graph.mark(tuple(second['actions'][0]), mover, 5)
+        graph.at(a)   # evicts every expanded node but the root
+        self.assertEqual(graph.store()['expanded'], 1)
+        graph.at(b)
+        again = graph.search(16, root_samples=4, batch_size=4)
+        self.assertEqual((again['exact_winner'], again['completed']), (mover, 0))
+        graph.at(a)
+        self.assertEqual(graph.search(16, root_samples=4, batch_size=4)['completed'], 0)
+
     def test_the_store_survives_advances_and_keeps_its_bound(self):
         a = recorded_position(11)
         graph = self.graph(Uniform(), a, limit=48)
