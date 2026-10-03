@@ -517,11 +517,13 @@ struct Tree {
    auto& q=transformed(*node);int chosen=-1;double best=-1e300;
    if(node==root.get()){
     int considered=sequence[started];
+    // A shared graph samples root candidates with their completed Q as well: an edge whose stored child already
+    // holds evidence (a win found from a later position) competes on it, not on its prior alone.
     // Finish each visit layer before its values decide the next halving round.
     if(started && considered!=sequence[started-1] && !requests.empty())return 0;
     auto first=[&](const Edge& e){return considered==0 && std::find(priority.begin(),priority.end(),e.action)!=priority.end();};
     bool forced=false;auto logits=considered?std::vector<double>():sampling(*node);
-    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch!=considered)continue;bool admit=considered==0 && defence.contains(e.action);double score=e.gumbel+(considered?e.logit:logits[i])+(considered?q[i]:0)+(first(e)?1e6:0)+bonus(e);if((admit && !forced) || (admit==forced && score>best)){forced=admit;best=score;chosen=i;}}
+    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch!=considered)continue;bool admit=considered==0 && defence.contains(e.action);double score=e.gumbel+(considered?e.logit:logits[i])+(considered||shared?q[i]:0)+(first(e)?1e6:0)+bonus(e);if((admit && !forced) || (admit==forced && score>best)){forced=admit;best=score;chosen=i;}}
     // Marked-lost candidates can leave a round short of candidates; the best of the latest-eliminated ones step in.
     int reached=-1;
     if(chosen<0)for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || e.epoch>considered)continue;double score=e.gumbel+e.logit+q[i]+bonus(e);if(e.epoch>reached || (e.epoch==reached && score>best)){reached=e.epoch;best=score;chosen=i;}}
