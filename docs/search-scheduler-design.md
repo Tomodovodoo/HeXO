@@ -197,7 +197,7 @@ Proposed layout (estimate of sizes):
 | Q movement (EMA of absolute change per backup) | float | 4 | section C |
 | parents | small vector of node refs | 16 + 8 per extra | usually 1 or 2 |
 | legal list: action (int32 q, int32 r) and logit (float) | per legal move | 12 x L | sorted by prior, descending; coordinates stay wide, a translated compact board can exceed int16 (lane review) |
-| touched edges: index, visits, pending, exact, distance, bound, eligible, child ref | per edge with a child, a visit, a pending descent or a proof | 20 x T | sparse |
+| touched edges: index, visits, pending, exact, distance, bound, eligible, child ref, value sum (float) | per edge with a child, a visit, a pending descent or a proof | 24 x T | sparse; the sum is the edge's own running mean, which B.3's v(n,a) falls back to when the child is evicted, so an evicted child's statistics stay on its own edge (Codex review) |
 
 Total for L = 640 and T = 10: about 8 KB, seven times smaller than today. Unvisited edges with no stored child
 need only their prior, because every such eligible edge shares the same completed Q; the deterministic interior
@@ -345,9 +345,12 @@ shared pointers, no vectors.
 Adaptive K: at expansion keep children in prior order until the kept mass reaches 0.995, bounded to 8..48, plus
 every forced cell from the leaf classify; with today's policy the median is about 12. The dropped mass is one rest
 entry with its aggregate prior so the improved policy normalises; if its improved share exceeds the weakest kept
-child it is materialised from the evaluation cache, which holds the full logits for that context. The cache is the
-source of truth; nodes hold what selection reads. The root keeps the full legal set, with Gumbel noise and the
-halving round in root-only side arrays.
+child it is materialised from the node's own compact legal list (B.1: action and logit per legal move, sorted by
+prior), which every node keeps for its lifetime. The evaluation cache is an LRU of 4,096 entries shared across
+games (python/neural_search.py) and cannot be relied on for this, so the legal list, not the cache, is the source of
+omitted logits; a node promoted to a root therefore has its full legal set at hand (Codex review). Child records
+hold what selection reads. The root keeps the full legal set, with Gumbel noise and the halving round in root-only
+side arrays.
 
 Mirrors instead of chases: a child's Q is copied into the parent's record on backup through that edge; when another
 parent's backup refreshes a shared child, the child's parents are marked dirty and refreshed before their next
@@ -463,10 +466,13 @@ After each halving phase of the main view, for the top candidates a by improved 
 
 ```
 K      = number of candidates with pi'(a) >= p_line, at most K_max
-R_a    = round(f_line * S * pi'(a) / sum over the K candidates of pi')      simulations
+A      = f_line * S                                        the line-view allowance of the whole main view
+R_a    = round((A - spent so far on line views) / phases left * pi'(a) / sum over the K candidates of pi')
 C_a    = position after a and, while the same side moves, the improved-policy best next stone (PR 328's turn rule)
 ```
 
+The allowance A is cumulative over the main view: with four halving phases each phase hands out a quarter of what
+is left, so line views never exceed f_line x S in total and the stated budget comparison holds (Codex review).
 Defaults: p_line = 0.15, K_max = 2 (play), 3 (analysis), 0 (actors and evaluator); f_line = 0.25. S is the main
 view's budget, or for a time-based view the estimated simulations in its allotment (rows per second x seconds). All
 tunable.
@@ -833,8 +839,11 @@ Fixed budgets stay:
 - The evaluator keeps fixed simulations, the layer barrier and fixed per-point solver budgets (reproducibility
   between checkpoints). Out of scope for this design.
 - Reproducible analysis: `deterministic = true` uses fixed simulations, fixed solver nodes per job instead of time
-  slices, a pinned seed, empty solver tables at start, GPU completions applied in submission order, and solver results
-  applied only at phase boundaries in job-id order. Same inputs then give the same graph.
+  slices, a pinned seed, GPU completions applied in submission order, and solver results applied only at phase
+  boundaries in job-id order. Resident solver tables are off in this mode (every job runs cold) and jobs go to
+  workers by job id modulo worker count, never to "the worker that holds the table" or "an idle worker", because
+  with warm tables and timing-dependent assignment two runs could prove different things (Codex review). Same
+  inputs then give the same graph.
 
 Pondering: while a game is open and the opponent thinks, the main view sits at the current position, and ponder views
 run at our turn-end positions after the opponent's top replies (by its improved policy, K_max = 2). When the opponent
@@ -848,8 +857,8 @@ Row kinds:
 
 | Kind | Source | Policy target | Value target | Default for actors |
 |---|---|---|---|---|
-| root comparison | a main or actor view's search of a position on the game line | yes for full searches (as today) | own root q (B.6) | on (today's rows) |
-| depth extension | a line view's root (off the game line) | only if it ran at least full_sims own visits with its own root sampling; off by default | own root q | off |
+| root comparison | a main or actor view's search of a position on the game line | yes for full searches (as today) | records its own root q as the root search estimate (B.6); the learner's teacher is unchanged (policy-weighted raw child values with the fallback) unless `teacher=root_q` | on (today's rows) |
+| depth extension | a line view's root (off the game line) | only if it ran at least full_sims own visits with its own root sampling; off by default | records its own root q; teacher as above | off |
 | breadth fill | prefetch rows | never | never | n/a |
 | off-game proof | a proof installed on a node off the game line | the witness stones for a win (pair targets, PR 238 style); none for a loss | exact +1/-1 with distance | off |
 
@@ -862,7 +871,7 @@ Two masks, kept apart (Sol):
 Staleness rule for carried values: B.6. In short, a value target is the row's own root value at the end of its own
 search, written once, with provenance fields; exact proofs relabel through the existing path.
 
-Actor flags (all default off, which keeps today's behaviour; the test is equal strength and equal targets within spread, not identical rows):
+Actor flags (all default off, which keeps today's behaviour; the test is equal strength and equal targets within spread, not identical rows). `teacher=root_q` is the separate flag B.6 asks for: with it the learner takes the recorded root search estimate as the value teacher; without it the teacher is today's. Other flags:
 
 | Flag | Default | Effect when on |
 |---|---|---|
