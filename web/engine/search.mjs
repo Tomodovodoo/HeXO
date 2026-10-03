@@ -141,7 +141,8 @@ export class NeuralSearch {
    * evaluates the root through `cache` (else `evaluate`, as in search) when it has no edges yet, then marks each edge
    * exact for its winner within its distance, the stone itself included (hxg_mark_exact): the mover's losses first,
    * then its wins from the shortest, since the first win settles the root. Resolves to the edges the tree did not
-   * take (not a root edge), keyed as `edges`.
+   * take, keyed as `edges`: those that are not root edges, or all of them when the root was exact already (a carried
+   * tree), since an exact root ignores marks.
    */
   async settle(edges, {evaluate, cache = new EvaluationCache(), version = 'web'}) {
     const unmarked = new Map(edges);
@@ -164,6 +165,7 @@ export class NeuralSearch {
         this.m._hxg_cancel(this.ptr);
       }
     }
+    if (this.m._hxg_exact(this.ptr) >= 0) return unmarked;
     const mover = ((this.history.length + 1) >> 1) % 2, won = edge => edge.winner === mover ? 1 : 0;
     const order = [...edges].sort(([, a], [, b]) => won(a) - won(b) || a.distance - b.distance || a.action[0] - b.action[0] || a.action[1] - b.action[1]);
     for (const [key, {action: [q, r], winner, distance}] of order) {
