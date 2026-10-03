@@ -386,12 +386,13 @@ class Jobs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(self.engines.refreshes, [3])
         self.assertEqual(set(self.engines.games), {self.session.analysis_line})
-        # Ply 1 is too far back to be refreshed at once; viewing it again searches the graph there again.
-        self.assertEqual(self.session.state()['stale'], [1])
+        # Ply 1 is too far back to be refreshed at once, and the refresh at 3 searched the graph after 6 was saved;
+        # viewing 1 again searches the graph there again, which in turn leaves 3 and 6 behind.
+        self.assertEqual(self.session.state()['stale'], [1, 6])
         self.session.analyse(1)
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual(self.engines.refreshes, [3, 1])
-        self.assertEqual(self.session.state()['stale'], [])
+        self.assertEqual(self.session.state()['stale'], [3, 6])
         # Another network's graph, then a rebuilt one for the first: neither stales what the first graph saved.
         self.session.configure_analysis('bubble:fake', 'main/000001', auto=False)
         self.session.analyse(6, force=True)

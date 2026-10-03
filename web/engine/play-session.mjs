@@ -534,7 +534,7 @@ export class BrowserSession extends OfflineSession {
         // new generation, unique across reloads.
         const key = [job.line, this.engineKey(job.spec), job.spec.budget.q_range_floor ?? 0].join('|'), graph = this.graph;
         if (graph.key !== key) Object.assign(graph, {key, generation: uid(), searches: 0});
-        graph.searches += job.refresh ? 0 : 1;
+        graph.searches += 1;
         result = {...result, graph: [graph.generation, graph.searches]};
       }
       await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));

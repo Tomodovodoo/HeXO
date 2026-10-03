@@ -3057,7 +3057,7 @@ class Session:
         if job.kind == 'analyse' and graph is not None:
             with self.lock:
                 self.analysis_graph = graph
-                self.graph_searches[graph] = self.graph_searches.get(graph, 0) + (refresh is None)
+                self.graph_searches[graph] = self.graph_searches.get(graph, 0) + 1
                 found['graph'] = [self.instance, graph, self.graph_searches[graph]]
         entry = self.entries[seat['engine']]
         model = f"{entry['name']}/{seat['checkpoint']}" if seat['checkpoint'] else entry['name']
