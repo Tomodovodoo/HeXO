@@ -45,6 +45,7 @@ bind('hxg_mark_exact', C.c_int, ptr, C.c_int64, C.c_int64, C.c_int, C.c_int)
 bind('hxg_share', C.c_int, ptr, C.c_int64)
 bind('hxg_root_at', C.c_int, ptr, ints, C.c_int)
 bind('hxg_store', C.c_int, ptr, ptr)
+bind('hxg_root_version', C.c_int64, ptr)
 bind('hxg_q', C.c_int, ptr, ptr)
 HOLD = -3  # hxg_next: the search waits at its armed hold
 GRAPH_LIMIT = 4096  # expanded nodes a GameGraph keeps between searches, about 56 KB each at 640 legal moves
@@ -306,10 +307,9 @@ class Recheck:
 
 class GameGraph(NeuralSearch):
     """One game's shared search graph (native hxg_share). The store keeps every node the game's searches expanded,
-    keyed by turn context, with its visits, values, exact marks and proof distances; a search reads each stored
-    child's visits and value as its edge's, so a search at a later position moves the values of every earlier
-    position that reaches it, and each playout also counts at the stored positions the root's history passes
-    through. `at(history)` moves the root to any position, stored or new; `advance` keeps the siblings of the played stone. Between
+    keyed by turn context, with its visits, values, exact marks and proof distances; an edge keeps its own visits
+    and reads its stored child's value, so a search at a later position moves the values of every earlier position
+    that reaches it, and each playout also counts as a visit of every stored edge along the root's history. `at(history)` moves the root to any position, stored or new; `advance` keeps the siblings of the played stone. Between
     searches at most `limit` expanded nodes are kept (0: no bound), the least recently used leaves leaving first.
     `search(..., pv_check=f)` adds the principal-variation check (Recheck)."""
 
@@ -323,6 +323,11 @@ class GameGraph(NeuralSearch):
         cells = [(int(q), int(r)) for q, r in history]
         checked(native.hxg_root_at(self.ptr, np.asarray(cells, dtype=np.int64).reshape(-1, 2), len(cells)))
         self.history = cells
+
+    @property
+    def root_version(self):
+        """The number of root moves so far (native hxg_root_version): `at` and `advance` each add one."""
+        return native.hxg_root_version(self.ptr)
 
     def store(self):
         """{nodes, expanded, evicted, limit} of the store (native hxg_store)."""

@@ -66,9 +66,9 @@ struct Tree {
  bool graph=false;std::unordered_map<Key,std::weak_ptr<Node>,KeyHash> nodes;std::unordered_map<Key,std::vector<std::weak_ptr<Node>>,KeyHash> positions;std::unordered_map<Key,Outcome,KeyHash> outcomes;
  // Shared game graph (opt-in, implies graph): `store` owns every node by turn-context key so roots can move to any
  // position (root_at) and back; an edge reads its child's visits and value (current); `limit` bounds the expanded
- // nodes kept (evict); `lineage` holds the stored positions the root's history passes through, credited with each
- // playout.
- bool shared=false;size_t limit=0;uint64_t clock=0;int64_t evicted=0;std::unordered_map<Key,std::shared_ptr<Node>,KeyHash> store;std::vector<Node*> lineage;
+ // nodes kept (evict); `lineage` holds the stored positions the root's history passes through, each with the edge of
+ // that history out of it (-1 when unexpanded), credited with each playout; `version` counts root changes.
+ bool shared=false;size_t limit=0;uint64_t clock=0;int64_t evicted=0;std::unordered_map<Key,std::shared_ptr<Node>,KeyHash> store;std::vector<std::pair<Node*,int>> lineage;int64_t version=0;
  std::mt19937_64 rng;int budget=0,started=0,completed=0,next_id=1,samples=0,last=0;bool tactics=false,hold=false;std::vector<int> sequence;
  // Root actions sampled first in the opening phase of the current search; ordering only (set_priority).
  std::vector<Cell> priority;
@@ -109,8 +109,7 @@ struct Tree {
    for(auto& w:x->parents)if(auto p=w.lock())work.push_back(p.get());
   }
  }
- // Shared graph: recomputes every stale node below and including `top`, children first: each edge with a child
- // takes the child's visits, then the node's value is refreshed.
+ // Shared graph: recomputes every stale node below and including `top`, children first.
  void clean(Node& top) {
   if(!top.dirty)return;
   std::vector<std::pair<Node*,size_t>> work{{&top,0}};
@@ -118,35 +117,36 @@ struct Tree {
    auto& [x,i]=work.back();
    if(i<x->edges.size()){auto& e=x->edges[i++];if(e.child && e.child->dirty)work.emplace_back(e.child.get(),0);continue;}
    Node* done=x;work.pop_back();
-   for(auto& e:done->edges)if(e.child)e.visits=e.child->n;
    refresh(*done);done->dirty=false;
   }
  }
- // Shared graph: brings the node's edges up to date with their children (an edge's visits are its child's) before
- // they are read.
+ // Shared graph: brings the node's children up to date before its edges' values are read. An edge keeps its own
+ // visits (the playouts that went through it, and the credits of roots below it on their history) and reads its
+ // child's value, so a child reached by both orders of a turn is not weighted twice.
  void current(Node& node) {
-  for(auto& e:node.edges)if(e.child){clean(*e.child);e.visits=e.child->n;}
+  for(auto& e:node.edges)if(e.child)clean(*e.child);
  }
  void renew(Node& node) {current(node);refresh(node);node.dirty=false;}
- // Shared graph: the stored nodes of the positions after the first `length` stones of `history` and each shorter
- // prefix, the longest first.
- std::vector<Node*> prefixes(const std::vector<Cell>& history,size_t length) {
-  std::vector<Node*> out;std::vector<Cell> prefix(history.begin(),history.begin()+length);
-  for(;;){
-   if(auto found=nodes.find(keys(prefix).second);found!=nodes.end())if(auto n=found->second.lock())out.push_back(n.get());
-   if(prefix.empty())return out;
-   prefix.pop_back();
+ // Shared graph: the stored positions `history`'s strict prefixes reach, the longest first, each with the index of
+ // its edge along `history` (-1 when the node is unexpanded).
+ std::vector<std::pair<Node*,int>> prefixes(const std::vector<Cell>& history) {
+  std::vector<std::pair<Node*,int>> out;std::vector<Cell> prefix(history);
+  while(!prefix.empty()){
+   const Cell action=prefix.back();prefix.pop_back();
+   auto found=nodes.find(keys(prefix).second);if(found==nodes.end())continue;
+   auto n=found->second.lock();if(!n)continue;
+   int index=-1;for(int i=0;i<int(n->edges.size());++i)if(n->edges[i].action==action){index=i;break;}
+   out.emplace_back(n.get(),index);
   }
+  return out;
  }
- // Shared graph: makes `child` the child of `parent`'s edge `e`. A new child of an edge that kept the statistics
- // of an evicted one carries them on; any other child's visits replace the edge's. Visits reach a parent only through
- // the playouts counted at the positions a root's history passes through (begin), so a child attached later brings
- // none. An exact child settles the edge; the parent's value becomes stale.
+ // Shared graph: makes `child` the child of `parent`'s edge `e`. The edge keeps its visits; a new child of an edge
+ // that kept the statistics of an evicted one carries them on, so the edge's value does not restart from one sample.
+ // An exact child settles the edge; the parent's value becomes stale.
  void attach(Node& parent,Edge& e,const std::shared_ptr<Node>& child) {
-  if(e.visits>child->n && !child->n){
+  if(e.visits && !child->n){
    child->carried=child->n=e.visits;child->carried_sum=child->player==parent.player?e.sum:-e.sum;child->q=child->carried_sum/child->carried;
   }
-  e.visits=child->n;
   e.child=child;child->parents.push_back(parent.weak_from_this());
   if(child->exact_winner>=0 && tighten(child->exact_winner,child->distance+1,child->bound,e.exact_winner,e.distance,e.bound)){settle(parent);learn(parent);}
   stale(parent);
@@ -195,7 +195,7 @@ struct Tree {
    for(Node* x:leaves){
     if(expanded<=target)break;
     for(auto& w:x->parents)if(auto p=w.lock())for(auto& e:p->edges)if(e.child.get()==x){
-     e.visits=x->n;e.sum=(e.exact_winner>=0?(e.exact_winner==p->player?1:-1):x->player==p->player?x->q:-x->q)*x->n;
+     e.sum=(e.exact_winner>=0?(e.exact_winner==p->player?1:-1):x->player==p->player?x->q:-x->q)*e.visits;
      e.child.reset();
     }
     expanded-=x->expanded;++evicted;store.erase(x->context);
@@ -210,7 +210,7 @@ struct Tree {
  void root_at(const std::vector<Cell>& history) {
   if(!shared || !requests.empty())throw std::runtime_error("Root changes need a shared graph and no pending requests");
   Board next;for(auto c:history){if(!next.legal(c))throw std::runtime_error("Illegal root history");next.make(c);}
-  board=next;priority.clear();defence.clear();hold=false;budget=started=completed=0;lineage.clear();
+  board=next;priority.clear();defence.clear();hold=false;budget=started=completed=0;lineage.clear();++version;
   root=child_here();root->player=board.player;root->used=++clock;adopt(root,history);
   evict();
  }
@@ -432,7 +432,7 @@ struct Tree {
   if(shared){
    evict();current(*root);
    std::vector<Cell> history;for(auto& u:board.history)history.push_back(u.c);
-   lineage=history.empty()?std::vector<Node*>{}:prefixes(history,history.size()-1);
+   lineage=prefixes(history);
   }
   schedule(root->expanded?int(std::count_if(root->edges.begin(),root->edges.end(),[](auto& e){return e.eligible;})):int(board.legal_moves().size()));
   for(auto& e:root->edges){e.epoch=0;double u=std::generate_canonical<double,53>(rng);e.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));}
@@ -461,7 +461,18 @@ struct Tree {
    propagate(*path.leaf,path.edges.back().first);
    for(size_t j=1;j<path.edges.size();++j)propagate(*path.edges[j].first,path.edges[j-1].first);
   }
-  if(shared){propagate(*root,nullptr);for(Node* x:lineage){++x->n;stale(*x);}}
+  if(shared){
+   propagate(*root,nullptr);
+   for(auto [x,index]:lineage){
+    ++x->n;
+    if(index>=0){
+     auto& e=x->edges[index];++e.visits;
+     if(e.exact_winner>=0)e.sum=(e.exact_winner==x->player?1:-1)*e.visits;
+     else if(e.child && e.child->n)e.sum+=e.child->player==x->player?e.child->q:-e.child->q;
+    }
+    stale(*x);
+   }
+  }
   if(!path.edges.empty())++completed;
  }
  // Next leaf request id; 0 when nothing can be requested now, -1 after a simulation that ended on an exact edge or
@@ -581,7 +592,7 @@ struct Tree {
   for(auto& e:root->edges)if(e.action==action){winner=e.exact_winner;distance=e.distance;bound=e.bound;next=shared?e.child:std::move(e.child);break;}
   board.make(action);root=next?std::move(next):child_here();root->player=board.player;budget=started=completed=0;
   // A shared graph keeps the siblings and every earlier position; a new root joins its stored parents.
-  if(shared){std::vector<Cell> history;for(auto& u:board.history)history.push_back(u.c);adopt(root,history);lineage.clear();root->used=++clock;}
+  if(shared){std::vector<Cell> history;for(auto& u:board.history)history.push_back(u.c);adopt(root,history);lineage.clear();root->used=++clock;++version;}
   if(winner>=0 && winner!=root->player){root->exact_winner=winner;root->distance=distance-1;root->bound=bound;}
   if(graph){
    std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
@@ -655,6 +666,8 @@ HX_API int hxg_share(void* p,int64_t limit){auto& t=*static_cast<gumbel::Tree*>(
 // Shared graph: moves the root to the position after `history` (n int64 q/r pairs), keeping every node's statistics
 // (Tree::root_at); 0 with the error set for an illegal history, an unshared tree or pending requests.
 HX_API int hxg_root_at(void* p,const int64_t* history,int n){try{std::vector<Cell> h;for(int i=0;i<n;++i)h.push_back({history[2*i],history[2*i+1]});static_cast<gumbel::Tree*>(p)->root_at(h);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+// Shared graph: the number of root changes so far (hxg_root_at, hxg_advance), for callers that track the root.
+HX_API int64_t hxg_root_version(void* p){return static_cast<gumbel::Tree*>(p)->version;}
 // Shared graph store: out = {stored nodes, expanded stored nodes, nodes evicted so far, limit}; 0 when unshared.
 HX_API int hxg_store(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);if(!t.shared)return 0;int64_t expanded=0;for(auto& [key,n]:t.store)expanded+=n->expanded;
  out[0]=int64_t(t.store.size());out[1]=expanded;out[2]=t.evicted;out[3]=int64_t(t.limit);return 1;}

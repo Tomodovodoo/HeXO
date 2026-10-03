@@ -996,7 +996,7 @@ class GraphAnalysis(unittest.TestCase):
         self.assertLess(deep['value'], .55)
         self.assertLess(self.evaluate(self.a, 256)['value'], .8)
         for value, _ in self.turn()[0].values():
-            self.assertLess(value, .65)
+            self.assertLess(value, .7)   # 87 percent before; C's value reaches A through the visits A gives it
 
     def test_stepping_back_after_the_turn_redoes_the_turn_start(self):
         # A, then C two stones on, then back at A: A's turn stones now carry C's search, and A's own search goes on
