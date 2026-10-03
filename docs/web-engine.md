@@ -42,7 +42,8 @@ file from <https://tomodovodoo.github.io/HeXO/engine/>, which allows any origin 
 match the SHA-256 that this origin's manifest gives (`build.json`, `model/manifest.json`, `ort/version.json` and the
 other manifests), or the site's own manifest when this origin has none. A mismatch, or a file the manifest does not
 pin, fails the download with a message on the page. The bytes go into the Cache API store `bubble-engine-v1` of
-this origin, keyed by the file's URL here and its SHA-256 (or its version when no manifest pins it), so a reload or a later visit reads them from the cache.
+this origin, keyed by the file's URL here and its SHA-256 (or its version when no manifest pins it), so a reload or a later visit reads them from the cache. Manifests that came from the site are kept there too and
+answer when neither origin can be reached, so an installed engine starts offline.
 The public site finds every file on its own origin and never fetches from elsewhere. The wasm that is committed and
 loaded by its own glue (`gumbel.wasm`, `tactical.wasm`, `six/six.wasm`) is always present and loads as before.
 

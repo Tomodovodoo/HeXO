@@ -57,10 +57,22 @@ async function locate(path, init = {}) {
   return {response, local: false};
 }
 
-/** {data, local}: the JSON manifest at `path`, revalidated on each call; `local` is false when it came from the site. */
+/**
+ * {data, local}: the JSON manifest at `path`, revalidated on each call; `local` is false when it came from the site.
+ * A manifest from the site is kept in the Cache API and answers when neither origin can be reached (not when the site
+ * answers 404), so installed engines start offline.
+ */
 export async function json(path) {
-  const {response, local} = await locate(path, {cache: 'no-cache'});
-  return {data: await response.json(), local};
+  const store = await open(), id = `${new URL(path, BASE).href}?manifest`;
+  try {
+    const {response, local} = await locate(path, {cache: 'no-cache'}), data = await response.json();
+    if (!local) await store?.put(id, new Response(JSON.stringify(data)));
+    return {data, local};
+  } catch (error) {
+    const kept = !(error instanceof NotOnSite) && await store?.match(id);
+    if (!kept) throw error;
+    return {data: await kept.json(), local: false};
+  }
 }
 
 /** SHA-256 hex of `bytes`, with CRLF read as LF when `lines` (as tools/build_web.py records build.json's files). */

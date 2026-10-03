@@ -239,7 +239,7 @@ async function fetchEngine(id) {
   downloads.set(id, slot);
   const repaint = () => document.querySelectorAll(`#menu [data-engine="${id}"]`).forEach(paint);
   try {
-    if ((await check(id)).state === 'failed') checks.delete(id);
+    if (['failed', 'unpublished'].includes((await check(id)).state)) checks.delete(id);   // the site or a build may have changed
     repaint();
     const found = await check(id);
     if (found.state === 'unpublished') { unpublished(id); return; }

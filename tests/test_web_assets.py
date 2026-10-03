@@ -59,6 +59,7 @@ class Resolver(unittest.TestCase):
 
     def test_manifest_falls_back_to_the_site(self):
         self.assertEqual(self.out['json'], {'data': {'version': 3}, 'local': False})
+        self.assertEqual(self.out['json_offline'], {'data': {'version': 3}, 'local': False})
 
     def test_status_and_install(self):
         case = self.out['status']

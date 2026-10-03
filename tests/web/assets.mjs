@@ -83,6 +83,10 @@ out.digest_key = [...store.keys()][0].split('v=')[1] === hash('versioned');
 reset();
 site.set('m.json', '{"version": 3}');
 out.json = await assets.json('m.json');
+const online = globalThis.fetch;
+globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+out.json_offline = await assets.json('m.json');
+globalThis.fetch = online;
 
 reset();
 here.set('g.wasm', 'here');
