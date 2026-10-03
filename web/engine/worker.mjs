@@ -175,7 +175,7 @@ async function load(options = {}) {
   native = new Native(await createModule());
   let device = await probe(options.prefer);
   const report = fraction => postMessage({type: 'progress', fraction: .95 * fraction});
-  const create = () => Network.create(new URL('./', import.meta.url), {model: options.model, device, progress: report, threads: options.threads});
+  const create = () => Network.create({model: options.model, device, progress: report, threads: options.threads});
   try {
     network = await create();
   } catch (error) {
