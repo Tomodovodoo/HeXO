@@ -190,7 +190,8 @@ export function answered(native, history, known) {
 }
 
 /** A search `result` (search.mjs NeuralSearch.result) of the side `mover` with the stones `edges` (Proofs.edges)
- * proves settled: their values become 1 or -1, a proven win is the choice (the shortest) and proves the position, a
+ * proves settled: their values become 1 or -1, a proven win is the choice (the shortest, unless the search proved a
+ * win at most as long) and proves the position, a
  * proven loss leaves the policy and the choice while a stone remains that is not proven lost, and when every stone is
  * proven lost the position is lost and the choice is the loss that lasts longest. */
 export function settled(result, edges, mover) {
@@ -204,6 +205,7 @@ export function settled(result, edges, mover) {
     if (edge.winner !== mover) policy[i] = 0;
     else if (!win || edge.distance < win.distance) win = edge;
   });
+  if (win && result.proven > 0 && result.proof_plies <= win.distance) return {...result, values};
   if (win) return {...result, values, action: win.action, proven: 1, exact_winner: mover, proof_plies: win.distance};
   const total = policy.reduce((a, b) => a + b, 0);
   if (!total && result.actions.every(([q, r]) => edges.has(`${q},${r}`))) {

@@ -206,7 +206,8 @@ class BrowserProofs(unittest.TestCase):
                    [[0, 0], [2, 2], [3, 2]], [[0, 0], [-2, 0], [-2, 1], [-3, 1]]]
         result = dict(actions=[[1, 0], [4, 4], [7, 7]], values=[.1, .2, .3], policy=[.2, .5, .3], action=[4, 4], proven=0)
         lost = dict(actions=[[4, 4]], values=[.4], policy=[1.], action=[4, 4], proven=0)
-        found = node(dict(kind='table', records=records, queries=queries, result=result, lost=lost, mover=1))
+        exact = dict(result, action=[7, 7], proven=1, exact_winner=1, proof_plies=3)
+        found = node(dict(kind='table', records=records, queries=queries, result=result, lost=lost, exact=exact, mover=1))
         table = play.Proofs()
         for history, record in records:
             table.add(history, record)
@@ -215,6 +216,8 @@ class BrowserProofs(unittest.TestCase):
             self.assertEqual((answer['known'], sorted(answer['edges'])), (table.known(history), edges), history)
         self.assertEqual({k: found['settled'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
                          dict(action=[1, 0], proven=1, proof_plies=6, values=[1, -1, .3]))
+        self.assertEqual({k: found['exact'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
+                         dict(action=[7, 7], proven=1, proof_plies=3, values=[1, -1, .3]))
         self.assertEqual({k: found['lost'][k] for k in ('action', 'proven', 'exact_winner', 'proof_plies')},
                          dict(action=[4, 4], proven=-1, exact_winner=0, proof_plies=4))
         self.assertEqual(table.known([[0, 0], [4, 4]])['pv'], [[5, 4, 1, 1], [6, 4, 1, 2]])

@@ -10,8 +10,8 @@
 // {kind: 'overlay', cases: [{ev, stones}]} -> [boardOverlay(ev, stones)] from web/engine/overlay.js
 // {kind: 'offline', requests: [[path, body]]} -> [[status, history or error, paused]] from an OfflineSession
 // {kind: 'threads', contexts: [{isolated, cores}]} -> the WebAssembly thread count the loader would pick
-// {kind: 'table', records: [[history, record]], queries: [history], result, lost, mover} -> {known, edges} per query from a
-//   proof.mjs Proofs and `settled` of `result` and `lost` with the edges of the first query
+// {kind: 'table', records: [[history, record]], queries: [history], result, lost, exact, mover} -> {known, edges} per query
+//   from a proof.mjs Proofs and `settled` of `result`, `lost` and `exact` with the edges of the first query
 // {kind: 'proofs', history, ply, found} -> a BrowserSession whose engine proves `found` at `ply` and searches other positions
 //   with the stones the proof table it is sent proves marked (see `searched`): the evaluations at ply - 1 after analysis,
 //   undo, another preset and a reload, and `given`, the turn proof.mjs answered gives at ply - 1 from `found`'s table
@@ -128,7 +128,8 @@ if (job.kind === 'encode') {
   for (const [history, record] of job.records) table.add(history, record);
   const rebuilt = new Proofs(table.list());
   answer = {queries: job.queries.map(h => ({known: rebuilt.known(h), edges: [...rebuilt.edges(h).values()].map(e => [...e.action, e.winner, e.distance])})),
-    settled: settled(job.result, rebuilt.edges(job.queries[0]), job.mover), lost: settled(job.lost, rebuilt.edges(job.queries[0]), job.mover)};
+    settled: settled(job.result, rebuilt.edges(job.queries[0]), job.mover), lost: settled(job.lost, rebuilt.edges(job.queries[0]), job.mover),
+    exact: settled(job.exact, rebuilt.edges(job.queries[0]), job.mover)};
 } else if (job.kind === 'proofs') {
   const s = new BrowserSession(native), sent = [], wait = () => new Promise(resolve => setTimeout(resolve, 1));
   const settle = async () => { for (let i = 0; s.running || s.jobs.some(j => j.status === 'queued'); i++) { if (i > 3000) throw Error('Analysis did not finish'); await wait(); } await s.saving; };
