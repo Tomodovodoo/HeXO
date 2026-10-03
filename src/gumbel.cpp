@@ -54,7 +54,7 @@ struct Edge { Cell action;double logit=0,prior=0,sum=0,gumbel=0,weight=-1;int vi
 // With graph search a node also keeps its visits `n`, its utility `q` for its mover (the MCGS value) and its parents.
 // In a shared graph `dirty` marks a value that a descendant's statistics have changed since it was computed, `used`
 // the last search step that touched the node, `context` its key in the store, and `carried` and `carried_sum` the
-// visits and value sum (for its mover) an evicted node of its context left on the edge it was attached to again.
+// visits and value sum (for its mover) an evicted node of its context had when it left the store.
 struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false;double value=0,q=0,carried_sum=0;uint64_t used=0;Key position,context;std::vector<Edge> edges;std::vector<std::weak_ptr<Node>> parents; };
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
@@ -69,6 +69,8 @@ struct Tree {
  // nodes kept (evict); `lineage` holds the stored positions the root's history passes through, each with the edge of
  // that history out of it (-1 when unexpanded), credited with each playout; `version` counts root changes.
  bool shared=false;size_t limit=0;uint64_t clock=0;int64_t evicted=0;std::unordered_map<Key,std::shared_ptr<Node>,KeyHash> store;std::vector<std::pair<Node*,int>> lineage;int64_t version=0;
+ // Shared graph: the visits and value (for its mover) of each evicted node, by context, for a node created again there.
+ std::unordered_map<Key,std::pair<int,double>,KeyHash> evicted_stats;
  std::mt19937_64 rng;int budget=0,started=0,completed=0,next_id=1,samples=0,last=0;bool tactics=false,hold=false;std::vector<int> sequence;
  // Root actions sampled first in the opening phase of the current search; ordering only (set_priority).
  std::vector<Cell> priority;
@@ -94,7 +96,12 @@ struct Tree {
   auto [position,context]=keys(board);auto& slot=nodes[context];
   if(auto n=slot.lock())return n;
   auto n=std::make_shared<Node>();n->player=board.player;n->position=position;n->context=context;n->stones=int(board.cells.size());slot=n;positions[position].push_back(n);
-  if(shared){store[context]=n;n->used=clock;}
+  if(shared){
+   store[context]=n;n->used=clock;
+   if(auto old=evicted_stats.find(context);old!=evicted_stats.end()){
+    n->carried=n->n=old->second.first;n->q=old->second.second;n->carried_sum=n->q*n->carried;evicted_stats.erase(old);
+   }
+  }
   if(auto o=outcomes.find(position);o!=outcomes.end())apply(o->second,*n);
   return n;
  }
@@ -140,13 +147,9 @@ struct Tree {
   }
   return out;
  }
- // Shared graph: makes `child` the child of `parent`'s edge `e`. The edge keeps its visits; a new child of an edge
- // that kept the statistics of an evicted one carries them on, so the edge's value does not restart from one sample.
- // An exact child settles the edge; the parent's value becomes stale.
+ // Shared graph: makes `child` the child of `parent`'s edge `e`; the edge keeps its visits. An exact child settles
+ // the edge; the parent's value becomes stale.
  void attach(Node& parent,Edge& e,const std::shared_ptr<Node>& child) {
-  if(e.visits && !child->n){
-   child->carried=child->n=e.visits;child->carried_sum=child->player==parent.player?e.sum:-e.sum;child->q=child->carried_sum/child->carried;
-  }
   e.child=child;child->parents.push_back(parent.weak_from_this());
   if(child->exact_winner>=0 && tighten(child->exact_winner,child->distance+1,child->bound,e.exact_winner,e.distance,e.bound)){settle(parent);learn(parent);}
   stale(parent);
@@ -198,6 +201,7 @@ struct Tree {
      e.sum=(e.exact_winner>=0?(e.exact_winner==p->player?1:-1):x->player==p->player?x->q:-x->q)*e.visits;
      e.child.reset();
     }
+    if(x->n)evicted_stats[x->context]={x->n,x->q};
     expanded-=x->expanded;++evicted;store.erase(x->context);
    }
   }
@@ -465,10 +469,11 @@ struct Tree {
    propagate(*root,nullptr);
    for(auto [x,index]:lineage){
     ++x->n;
+    // Only an edge whose value is known takes the credit, so no visit enters an edge without a value.
     if(index>=0){
-     auto& e=x->edges[index];++e.visits;
-     if(e.exact_winner>=0)e.sum=(e.exact_winner==x->player?1:-1)*e.visits;
-     else if(e.child && e.child->n)e.sum+=e.child->player==x->player?e.child->q:-e.child->q;
+     auto& e=x->edges[index];
+     if(e.exact_winner>=0){++e.visits;e.sum=(e.exact_winner==x->player?1:-1)*e.visits;}
+     else if(e.child && e.child->n){++e.visits;e.sum+=e.child->player==x->player?e.child->q:-e.child->q;}
     }
     stale(*x);
    }
