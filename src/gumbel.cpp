@@ -8,6 +8,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 namespace gumbel {
 struct Node;
 // One proven edge of a position, sorted by action like the legal moves.
@@ -71,7 +72,7 @@ struct Tree {
  bool shared=false;size_t limit=0;uint64_t clock=0;int64_t evicted=0;std::unordered_map<Key,std::shared_ptr<Node>,KeyHash> store;std::vector<std::pair<Node*,int>> lineage;int64_t version=0;
  // Shared graph: the visits and value (for its mover) of evicted nodes, by context, for a node created again there;
  // evict keeps at most four times `limit` of them, those with the most visits.
- std::unordered_map<Key,std::pair<int,double>,KeyHash> evicted_stats;
+ struct Summary { int n=0;double q=0;Key position; };std::unordered_map<Key,Summary,KeyHash> evicted_stats;
  std::mt19937_64 rng;int budget=0,started=0,completed=0,next_id=1,samples=0,last=0;bool tactics=false,hold=false;std::vector<int> sequence;
  // Root actions sampled first in the opening phase of the current search; ordering only (set_priority).
  std::vector<Cell> priority;
@@ -100,7 +101,7 @@ struct Tree {
   if(shared){
    store[context]=n;n->used=clock;
    if(auto old=evicted_stats.find(context);old!=evicted_stats.end()){
-    n->carried=n->n=old->second.first;n->q=old->second.second;n->carried_sum=n->q*n->carried;evicted_stats.erase(old);
+    n->carried=n->n=old->second.n;n->q=old->second.q;n->carried_sum=n->q*n->carried;evicted_stats.erase(old);
    }
   }
   if(auto o=outcomes.find(position);o!=outcomes.end())apply(o->second,*n);
@@ -209,21 +210,25 @@ struct Tree {
      e.sum=(e.exact_winner>=0?(e.exact_winner==p->player?1:-1):x->player==p->player?x->q:-x->q)*e.visits;
      e.child.reset();
     }
-    if(x->n)evicted_stats[x->context]={x->n,x->q};
+    if(x->n)evicted_stats[x->context]={x->n,x->q,x->position};
     expanded-=x->expanded;++evicted;store.erase(x->context);
    }
   }
   // At most four times `limit` summaries: those with the fewest visits leave first.
   if(evicted_stats.size()>4*limit){
-   std::vector<std::pair<int,Key>> order;for(auto& [key,stats]:evicted_stats)order.emplace_back(stats.first,key);
+   std::vector<std::pair<int,Key>> order;for(auto& [key,stats]:evicted_stats)order.emplace_back(stats.n,key);
    std::nth_element(order.begin(),order.begin()+(order.size()-4*limit),order.end(),[](const auto& x,const auto& y){return x.first<y.first;});
    for(size_t i=0;i<order.size()-4*limit;++i)evicted_stats.erase(order[i].second);
   }
   std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
   for(auto& [key,list]:positions)std::erase_if(list,[](const auto& w){return w.expired();});
   std::erase_if(positions,[](const auto& entry){return entry.second.empty();});
-  // Proven outcomes stay while a stored node holds their position; beyond sixteen times `limit` the others go.
-  if(outcomes.size()>16*limit)std::erase_if(outcomes,[&](const auto& entry){return !positions.contains(entry.first);});
+  // Proven outcomes stay while a stored node or a kept summary holds their position; beyond sixteen times `limit` the
+  // others go.
+  if(outcomes.size()>16*limit){
+   std::unordered_set<Key,KeyHash> summarised;for(auto& [key,stats]:evicted_stats)summarised.insert(stats.position);
+   std::erase_if(outcomes,[&](const auto& entry){return !positions.contains(entry.first) && !summarised.contains(entry.first);});
+  }
  }
  // Shared graph: moves the root to the position after `history`, a node of the store or a new one attached under
  // its stored parents; every node keeps its statistics.
