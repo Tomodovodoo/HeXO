@@ -213,7 +213,7 @@ export class BrowserSession extends OfflineSession {
     } else if (path === '/undo') {
       this.cancelJobs(); this.forkGame(); const people = body.people || [0, 1].filter(i => this.seats[i].engine === 'human'); this.history.pop();
       while (people.length && this.history.length && !(people.includes(playerAt(this.history.length)) && this.history.length % 2)) this.history.pop();
-      this.paused = true; this.saved_game = null;
+      this.saved_game = null;
     } else if (path === '/new') {
       this.match = null; let history = [], opening = null;
       if (this.book.enabled && this.bookData) {
