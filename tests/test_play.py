@@ -282,7 +282,7 @@ class Jobs(unittest.TestCase):
                 session.configure_seat(1, 'native:Native', preset='quick')
                 session.configure_seat(0, 'six:slow')
                 self.assertEqual(json.loads(json.dumps(session.state()))['engines'][-1], dict(
-                    id='six:slow', name='slow', kind='six', presets=presets_of('six', None)))
+                    id='six:slow', name='slow', kind='six', presets=presets_of('six', None), clocks=True))
                 wait(lambda: len(session.history) == 1)
                 session.pause(True)
                 session.load([(0, 0), (1, 0), (2, 0)], False)
@@ -1362,9 +1362,58 @@ class Matches(unittest.TestCase):
     def test_simulations_only_adapter_refuses_a_clock_before_start(self):
         self.session.entries['strix:Strix'] = dict(id='strix:Strix', name='Strix', kind='strix',
             presets=PRESETS['strix'], model=Path(RUN.name) / 'checkpoints/main/000001/ema.pt')
-        with self.assertRaisesRegex(ValueError, 'cannot enforce a clock'):
+        with self.assertRaisesRegex(ValueError, 'cannot keep a clock'):
             self.session.start_match(['Native', 'Strix'], output=self.output, clock=dict(mode='game', tc='180+2'))
         self.assertFalse(self.output.exists())
+
+
+class FreeplayClock(unittest.TestCase):
+    """A single game on a clock: balances per side, the increment after a complete turn, a loss on time and the turn
+    log in the saved game."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.session = Session(entries(), FakeEngines(), Evaluations(), archive=Path(self.directory.name))
+        self.addCleanup(self.session.close)
+        self.session.configure_analysis('bubble:fake', auto=False)
+        self.session.configure_seat(1, 'human')
+
+    def test_people_play_on_a_fischer_clock_and_lose_on_time(self):
+        self.session.set_clock(dict(mode='game', tc='0.4+1'))
+        state = self.session.state()
+        self.assertEqual((state['clock_spec'], state['clock']['running']), (dict(mode='game', base_ms=400., increment_ms=1000.), 'x'))
+        self.session.play(0, 0)
+        state = self.session.state()
+        self.assertGreater(state['clock']['cross_ms'], 1000)
+        self.assertEqual(state['clock']['running'], 'o')
+        self.session.play(1, 0)
+        self.assertEqual(self.session.state()['clock']['running'], 'o')
+        time.sleep(.5)
+        state = self.session.state()
+        self.assertEqual((state['winner'], state['outcome']), (0, dict(winner=0, reason='time')))
+        with self.assertRaisesRegex(ValueError, 'finished'):
+            self.session.play(2, 0)
+        saved = json.loads(next(Path(self.directory.name).glob('*-freeplay-*/game-0001.json')).read_text())
+        self.assertEqual((saved['winner'], saved['reason'], saved['clock']['increment_ms']), (0, 'time', 1000.))
+        self.assertEqual([t['side'] for t in saved['turns']], [0, 1])
+        self.session.new_game()
+        state = self.session.state()
+        self.assertEqual((state['winner'], state['outcome'], state['clock']['running']), (-1, None, 'x'))
+        self.assertGreater(state['clock']['cross_ms'], 300)
+
+    def test_engines_that_cannot_keep_a_clock_are_refused(self):
+        self.session.entries['six:shrimp'] = dict(id='six:shrimp', name='Shrimp', kind='six', badge='shrimp',
+                                                  presets=PRESETS['six'], command=['shrimp'])
+        self.session.configure_seat(1, 'six:shrimp')
+        with self.assertRaisesRegex(ValueError, 'cannot keep a clock'):
+            self.session.set_clock(dict(mode='move', ms=1000))
+        self.assertEqual(self.session.state()['clock_spec'], dict(mode='fixed'))
+        self.session.configure_seat(1, 'human')
+        self.session.set_clock(dict(mode='move', ms=1000))
+        with self.assertRaisesRegex(ValueError, 'cannot keep a clock'):
+            self.session.configure_seat(1, 'six:shrimp')
+        self.assertEqual([e['clocks'] for e in self.session.models() if e['id'] in ('six:shrimp', 'native:Native')], [True, False])
 
 
 class Proofs(unittest.TestCase):

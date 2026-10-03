@@ -1094,6 +1094,27 @@ def position_key(stones):
     return hashlib.blake2b(position_text(stones).encode(), digest_size=16).digest()
 
 
+def clock_spec(clock):
+    """A clock request checked and normalized: {"mode": "fixed"}, {"mode": "move", "ms": N} (a complete turn in N ms,
+    no banking) or {"mode": "game", "tc": "180+2"} (Absolute, or Fischer with an increment), which carries base_ms and
+    increment_ms."""
+    clock = clock or dict(mode='fixed')
+    mode = clock.get('mode') if isinstance(clock, dict) else None
+    if mode == 'fixed':
+        return dict(mode='fixed')
+    if mode == 'move':
+        return dict(mode='move', ms=milliseconds(clock.get('ms'), 'move time', positive=True))
+    if mode == 'game':
+        return dict(mode='game', **TimeControl.parse(clock.get('tc', clock)).json())
+    raise ValueError('Clock mode must be fixed, move or game')
+
+
+def keeps_clock(entry):
+    """Whether an engine plays to a clock through `timed_engine`: Bubble, Native, Seal and Six itself. Strix's adapter
+    and the Six-protocol drivers of other bots (Shrimp) play a fixed budget."""
+    return entry['kind'] in ('bubble', 'native', 'seal') or entry['kind'] == 'six' and entry.get('badge', 'six') == 'six'
+
+
 def well_formed(record):
     """True for a dict with the fields of a saved evaluation, each of the right shape."""
     def number(v):
@@ -1365,7 +1386,9 @@ class Session:
         self.history, self.revision, self.paused = [], 0, False
         self.instance, self.closing = os.urandom(4).hex(), False
         self.match, self.match_worker = None, None
-        self.match_clock, self.timed_engines = None, []
+        self.game_clock, self.timed_engines = None, []
+        self.clock_spec, self.seat_engines, self.clock_preparing = dict(mode='fixed'), [None, None], None
+        self.outcome, self.clock_turns, self.notice = None, [], None
         self.match_file = None
         self.retries = {}
         self.jobs, self.queues, self.order = OrderedDict(), dict(move=[], analysis=[]), itertools.count()
@@ -1409,8 +1432,7 @@ class Session:
 
     def models(self):
         with self.lock:
-            return [{k: e[k] for k in SHOWN if k in e} |
-                    dict(clocks=e['kind'] in ('bubble', 'six', 'native', 'seal')) for e in self.entries.values()]
+            return [{k: e[k] for k in SHOWN if k in e} | dict(clocks=keeps_clock(e)) for e in self.entries.values()]
 
     def analysis_keys(self):
         """The store keys of the analysis model's fresh and kept-tree evaluations, with and without solver checks."""
@@ -1444,22 +1466,27 @@ class Session:
 
     def state(self):
         with self.lock:
+            self.check_time()
             history, game = list(self.history), replay(self.history)
             try:
                 board = dict(player=game.player, remaining=game.remaining, winner=game.winner)
             finally:
                 game.close()
+            if board['winner'] < 0 and self.outcome:
+                board['winner'] = self.outcome['winner']
             evaluations, keys, target = {}, self.analysis_keys(), self.review_target()
             for ply in range(len(history) + 1):
                 if (found := self.lookup(history[:ply], keys)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes')}
-            entries = [{k: e[k] for k in SHOWN if k in e} for e in self.entries.values()]
+            entries = [{k: e[k] for k in SHOWN if k in e} | dict(clocks=keeps_clock(e)) for e in self.entries.values()]
             return dict(instance=self.instance, revision=self.revision, history=[list(p) for p in history], **board,
                         paused=self.paused, seats=self.seats, analysis=self.analysis, engines=entries,
                         match={k: v for k, v in self.match.items() if k not in ('results', 'openings', 'opening_selection')}
                         if self.match else None,
-                        clock=self.match_clock.json() if self.match_clock else None,
+                        clock=self.game_clock.json() if self.game_clock else None,
+                        clock_spec=self.match['clock'] if self.match else self.clock_spec,
+                        clock_preparing=self.clock_preparing is not None, outcome=self.outcome, notice=self.notice,
                         saved_game=self.saved_game, models_folder=self.models_folder,
                         book=dict(available=bool(self.book), enabled=self.opening_book, mode=self.book_mode,
                                   opening=self.opening),
@@ -1478,9 +1505,10 @@ class Session:
 
     def poll(self, since):
         with self.lock:
+            self.check_time()
             if since == self.revision:
                 return dict(instance=self.instance, revision=self.revision, jobs=self.job_list(),
-                            **(dict(clock=self.match_clock.json()) if self.match_clock else {}))
+                            **(dict(clock=self.game_clock.json()) if self.game_clock else {}))
         return self.state()
 
     # Changing
@@ -1493,15 +1521,21 @@ class Session:
             player, winner, remaining = game.player, game.winner, game.remaining
         finally:
             game.close()
+        if winner < 0 and self.outcome and not self.match:
+            winner = self.outcome['winner']
         seat = self.seats[player]
         busy = any(j.kind == 'move' and j.status in ('queued', 'running') and not j.cancelled
                    and j.history == tuple(self.history) for j in self.jobs.values())
         waiting = self.match and self.match['active'] and (self.match['between'] or self.match['preparing'] or
                                                           self.match.get('outcome') or
                                                           self.match['max_placements'] and len(self.history) >= self.match['max_placements'])
+        freeplay = self.game_clock is not None and not self.match
+        waiting = waiting or freeplay and (self.clock_preparing is not None or self.outcome is not None)
+        if freeplay and winner < 0 and not self.paused and not waiting and self.game_clock.running is None:
+            self.game_clock.start(player)
         if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy and not waiting:
-            if self.match_clock and self.match and self.match['active'] and self.match_clock.running is None:
-                self.match_clock.start(player)
+            if self.game_clock and self.match and self.match['active'] and self.game_clock.running is None:
+                self.game_clock.start(player)
             self.submit(Job('move', 1, self.history, side=player, seat=dict(seat)))
         for job in self.jobs.values():
             stale = job.history != tuple(self.history[:len(job.history)])
@@ -1589,15 +1623,22 @@ class Session:
         """Place a person's stone; placing one resumes a paused game, so the engine seat answers it."""
         with self.lock:
             self.match_editable()
+            self.check_time()
             game = replay(self.history)
             try:
-                if game.winner >= 0 or self.seats[game.player]['engine'] != 'human':
+                side = game.player
+                if game.winner >= 0 or self.outcome and not self.match:
+                    raise ValueError('The game has finished')
+                if self.seats[side]['engine'] != 'human':
                     raise ValueError('It is not your turn')
                 game.play(q, r)
+                done = game.winner >= 0 or game.player != side
             finally:
                 game.close()
             self.fork_freeplay()
             self.history.append((q, r))
+            if done and self.game_clock is not None and not self.match and self.game_clock.running == side:
+                self.clock_turn(side)
             self.paused = False
             self.changed()
 
@@ -1624,6 +1665,7 @@ class Session:
                                                    and len(self.history) in turn_starts(len(self.history) + 1)):
                 self.history.pop()
             self.stop_moves()
+            self.reset_clock()
             self.changed()
 
     def new_game(self, people=None):
@@ -1674,8 +1716,8 @@ class Session:
             self.freeplay_records = {}
             self.history, self.paused, self.opening = [tuple(map(int, p)) for p in history], paused, None
             self.match = None
-            self.match_clock = None
             self.saved_game = saved_game
+            self.reset_clock()
             self.stop_moves()
             self.changed()
 
@@ -1690,8 +1732,13 @@ class Session:
     def configure_seat(self, side, engine, checkpoint=None, preset='standard', custom=None):
         with self.lock:
             self.match_editable()
-            self.seats[side] = self.seat(engine, checkpoint, preset, custom)
+            seat = self.seat(engine, checkpoint, preset, custom)
+            if self.clock_spec['mode'] != 'fixed' and not self.match and seat['engine'] != 'human':
+                self.timed_config(seat)
+            self.seats[side] = seat
             self.stop_moves(side)
+            if not self.match:
+                self.prepare_timed()
             self.changed()
 
     def configure_analysis(self, engine, checkpoint=None, preset='standard', custom=None, auto=True):
@@ -1767,7 +1814,7 @@ class Session:
                 job.cancelled = True
                 if job.kind == 'move':
                     self.paused = True
-                    if self.match_clock:
+                    if self.game_clock:
                         self.pause_clock()
                         self.save_match_position()
                 if job.status == 'queued':
@@ -1779,7 +1826,7 @@ class Session:
             self.paused = bool(paused)
             if self.paused:
                 self.stop_moves()
-                if self.match_clock:
+                if self.game_clock:
                     self.pause_clock()
             if self.match:
                 self.save_match_position()
@@ -1802,7 +1849,7 @@ class Session:
     def fork_freeplay(self):
         if self.saved_game or self.match:
             self.saved_game, self.match = None, None
-            self.match_clock = None
+            self.reset_clock()
             self.freeplay_directory, self.freeplay_signature = None, None
             self.freeplay_records = {}
 
@@ -1835,8 +1882,13 @@ class Session:
                     for budget in sorted(self.store.by_position.get((position, key), ())):
                         self.freeplay_records[(position, key, budget)] = self.store.order[(position, key, budget)]
         records = list(self.freeplay_records.values())
+        reason = 'six' if winner is not None else 'saved'
+        if winner is None and self.outcome:
+            winner, reason = self.outcome['winner'], self.outcome['reason']
         record = dict(format='bubble-replay', version=1, game=1, history=list(self.history), players=players,
-                      winner=winner, reason='six' if winner is not None else 'saved', opening=self.opening)
+                      winner=winner, reason=reason, opening=self.opening)
+        if self.clock_spec['mode'] != 'fixed':
+            record.update(clock=self.clock_spec, turns=self.clock_turns)
         signature = json.dumps(record) + '\n'.join(records)
         if signature == self.freeplay_signature:
             return
@@ -2034,14 +2086,8 @@ class Session:
             if type(max_placements) is not int or max_placements < 0 or max_placements == 1:
                 raise ValueError('max_placements must be at least 2, or 0 for uncapped')
             seats = [self.match_seat(p, preset) for p in players]
-            clock = clock or dict(mode='fixed')
+            clock = clock_spec(clock)
             mode = clock['mode']
-            if mode not in ('fixed', 'move', 'game'):
-                raise ValueError('Clock mode must be fixed, move or game')
-            if mode == 'move':
-                clock = dict(mode=mode, ms=milliseconds(clock['ms'], 'move time', positive=True))
-            elif mode == 'game':
-                clock = dict(mode=mode, **TimeControl.parse(clock.get('tc', clock)).json())
             if mode != 'fixed':
                 for seat in seats:
                     self.timed_config(seat)  # Refuse unsupported adapters before starting or writing results.
@@ -2089,7 +2135,7 @@ class Session:
             self.store = Evaluations(evaluation_path)
             self.match = match
             self.match_file = lock_match(directory)
-            self.match_clock = self.new_match_clock()
+            self.game_clock = self.new_game_clock()
             for job in self.jobs.values():
                 if job.status in ('queued', 'running'):
                     job.cancelled = True
@@ -2109,8 +2155,9 @@ class Session:
         temporary.write_text(json.dumps(match if data is None else data, indent=2), encoding='utf-8')
         temporary.replace(path)
 
-    def new_match_clock(self):
-        specification = self.match['clock']
+    def new_game_clock(self):
+        """Full balances for the match's clock, or the freeplay clock (`clock_spec`) outside a match; None for fixed."""
+        specification = self.match['clock'] if self.match else self.clock_spec
         if specification['mode'] == 'fixed':
             return None
         return Clock(dict(base_ms=specification['ms']) if specification['mode'] == 'move' else specification)
@@ -2120,12 +2167,112 @@ class Session:
             self.write_match(self.match, 'current.json', dict(game=self.match['current'], history=list(self.history),
                              seats=self.seats, turns=self.match['turns'],
                              partial_spent_ms=self.match.get('partial_spent_ms', 0),
-                             balances=self.match_clock.remaining() if self.match_clock else None))
+                             balances=self.game_clock.remaining() if self.game_clock else None))
+
+    def reset_clock(self):
+        """Full balances for a freeplay game on `clock_spec`, with no outcome and an empty turn log. Call with the lock
+        held; a match or a saved game keeps its own clock."""
+        if self.match or self.saved_game:
+            return
+        self.game_clock, self.outcome, self.clock_turns = self.new_game_clock(), None, []
+
+    def set_clock(self, clock):
+        """Put the freeplay game on `clock` (see `clock_spec`) from full balances at the current position. Engine seats
+        then play through timed engines (`timed_config`), started before the clock runs; a seat whose engine cannot keep
+        a clock is refused."""
+        spec = clock_spec(clock)
+        with self.lock:
+            self.match_editable()
+            if self.saved_game:
+                raise ValueError('A saved game has no clock')
+            if spec['mode'] != 'fixed':
+                for seat in self.seats:
+                    if seat['engine'] != 'human':
+                        self.timed_config(seat)
+            self.match, self.clock_spec, self.notice = None, spec, None
+            self.stop_moves()
+            self.reset_clock()
+            self.prepare_timed()
+            self.changed()
+
+    def prepare_timed(self):
+        """Replace the freeplay seats' timed engines: for a clocked game, one per engine seat, started in the background
+        while `clock_preparing` holds the clock and the moves. Call with the lock held."""
+        for engine in self.seat_engines:
+            if engine:
+                engine.close()
+        self.seat_engines = [None, None]
+        seats = [dict(seat) if seat['engine'] != 'human' else None for seat in self.seats]
+        if self.match or self.clock_spec['mode'] == 'fixed' or not any(seats):
+            self.clock_preparing = None
+            return
+        self.clock_preparing = generation = object()
+
+        def prepare():
+            from timed_engine import TimedEngine
+            engines, failure = [None, None], None
+            try:
+                for side, seat in enumerate(seats):
+                    if seat:
+                        engines[side] = TimedEngine(self.timed_config(seat))
+            except Exception as error:
+                failure = error
+            with self.lock:
+                if self.clock_preparing is not generation or self.closing:
+                    for engine in engines:
+                        if engine:
+                            engine.close()
+                    return
+                self.clock_preparing = None
+                if failure is None:
+                    self.seat_engines = engines
+                else:
+                    for engine in engines:
+                        if engine:
+                            engine.close()
+                    self.clock_spec, self.notice = dict(mode='fixed'), f'The clock is off: {failure}'
+                    self.reset_clock()
+                self.changed()
+        threading.Thread(target=prepare, daemon=True).start()
+
+    def clock_turn(self, side, at=None):
+        """Charge `side`'s completed turn to the freeplay clock (lock held): finished after its time ran out it loses on
+        time, otherwise it gets its increment, or a full allowance again on a per-turn clock. Logs the balances in
+        `clock_turns`; True when the turn stands."""
+        clock = self.game_clock
+        expired = clock.expired(at)
+        spent = clock.stop(completed=not expired, at=at) / 1e6
+        if expired:
+            self.outcome = dict(winner=1 - side, reason='time')
+        elif self.clock_spec['mode'] == 'move':
+            clock.balances = [int(self.clock_spec['ms'] * 1e6)] * 2
+        balances = clock.json()
+        self.clock_turns.append(dict(ply=len(self.history), side=side, spent_ms=round(spent),
+                                     cross_ms=round(balances['cross_ms']), circle_ms=round(balances['circle_ms'])))
+        return not expired
+
+    def check_time(self):
+        """A freeplay side whose clock ran out while it was to move loses on time (lock held)."""
+        clock = self.game_clock
+        if clock is None or self.match or self.outcome or clock.running is None or not clock.expired():
+            return
+        side = clock.running
+        if any(j.kind == 'move' and j.status == 'running' and getattr(j, 'received', None) is not None
+               and not clock.expired(j.received) for j in self.jobs.values()):
+            return
+        clock.stop()
+        self.outcome = dict(winner=1 - side, reason='time')
+        self.clock_turns.append(dict(ply=len(self.history), side=side, spent_ms=None, cross_ms=0 if side == 0 else None,
+                                     circle_ms=0 if side == 1 else None))
+        self.stop_moves()
+        self.changed()
 
     def pause_clock(self):
-        if self.match_clock:
-            elapsed = self.match_clock.stop()/1e6
-            self.match['partial_spent_ms'] = self.match.get('partial_spent_ms', 0) + elapsed
+        """Stop the running clock without an increment, charging the time spent so far."""
+        if self.game_clock:
+            elapsed = self.game_clock.stop()/1e6
+            if self.match:
+                self.match['partial_spent_ms'] = self.match.get('partial_spent_ms', 0) + elapsed
 
     def resume_match(self, directory):
         with self.lock:
@@ -2193,9 +2340,9 @@ class Session:
                 match['partial_spent_ms'] = saved.get('partial_spent_ms', 0) if continuing else 0
                 self.entries.update(registry)
                 self.match, self.match_file = match, handle
-                self.match_clock = self.new_match_clock()
-                if self.match_clock and continuing and saved.get('balances'):
-                    self.match_clock.balances = saved['balances']
+                self.game_clock = self.new_game_clock()
+                if self.game_clock and continuing and saved.get('balances'):
+                    self.game_clock.balances = saved['balances']
                 self.store = Evaluations(directory / 'evaluations.jsonl')
                 self.history = list(map(tuple, history))
                 order = [0, 1] if number % 2 else [1, 0]
@@ -2214,14 +2361,16 @@ class Session:
                 raise
 
     def timed_config(self, seat):
+        """The `timed_engine` configuration of `seat`, its budget as a ceiling; ValueError for an engine that cannot
+        keep a clock (`keeps_clock`)."""
         entry, budget = self.entries[seat['engine']], seat['budget']
         kind = entry['kind']
-        if kind not in ('bubble', 'six', 'native', 'seal'):
-            raise ValueError(f"{entry['name']} supports fixed simulations only; its adapter cannot enforce a clock")
+        if not keeps_clock(entry):
+            raise ValueError(f"{entry['name']} plays a fixed budget; its adapter cannot keep a clock")
         if kind == 'bubble':
             return dict(kind=kind, model=str(export_path(entry, seat['checkpoint']).resolve()),
                         tactical_package=str(self.engines.tactical_package) if getattr(self.engines, 'tactical_package', None) else None,
-                        device=seat['device'], search=dict(enabled=budget['simulations'] > 0,
+                        device=seat.get('device', getattr(self.engines, 'device', 'cpu')), search=dict(enabled=budget['simulations'] > 0,
                         max_simulations=max(1, budget['simulations']), q_range_floor=entry.get('q_range_floor', 0.)),
                         solver=dict(enabled=budget['solver_nodes'] > 0, nodes=max(1, budget['solver_nodes'])))
         if kind == 'six':
@@ -2251,11 +2400,11 @@ class Session:
                         winner = game.winner
                     finally:
                         game.close()
-                    if self.match_clock and self.match_clock.expired():
+                    if self.game_clock and self.game_clock.expired():
                         received = any(j.status == 'running' and getattr(j, 'received', None) is not None
-                                       and not self.match_clock.expired(j.received) for j in self.jobs.values())
+                                       and not self.game_clock.expired(j.received) for j in self.jobs.values())
                         if not received:
-                            side = self.match_clock.running
+                            side = self.game_clock.running
                             match['outcome'] = dict(winner=1-side, reason='time')
                             self.pause_clock()
                             match['turns'].append(dict(ply=len(self.history), side=side, stop_reason='deadline',
@@ -2264,7 +2413,7 @@ class Session:
                     if match['outcome']:
                         winner = match['outcome']['winner']
                     if winner < 0 and (not match['max_placements'] or len(self.history) < match['max_placements']):
-                        self.lock.wait(timeout=.1 if self.match_clock else None)
+                        self.lock.wait(timeout=.1 if self.game_clock else None)
                         continue
                     number = match['current']
                     order = [0, 1] if number % 2 else [1, 0]
@@ -2311,7 +2460,7 @@ class Session:
                     match['between'] = False
                     match['outcome'], match['turns'] = None, []
                     match['partial_spent_ms'] = 0
-                    self.match_clock = self.new_match_clock()
+                    self.game_clock = self.new_game_clock()
                     self.history = [tuple(p) for p in match['openings'][(number // 2) % len(match['openings'])]]
                     order = [0, 1] if match['current'] % 2 else [1, 0]
                     self.seats = [{k: v for k, v in match['players'][i].items() if k not in ('name', 'source')}
@@ -2326,7 +2475,7 @@ class Session:
                 match['active'] = False
                 self.paused = True
                 self.stop_moves()
-                if self.match_clock:
+                if self.game_clock:
                     self.pause_clock()
                 try:
                     self.save_match_position()
@@ -2348,7 +2497,7 @@ class Session:
                 self.match['active'] = False
             self.paused = True
             self.stop_moves()
-            if self.match_clock:
+            if self.game_clock:
                 self.pause_clock()
             self.save_match_position()
             self.changed()
@@ -2400,6 +2549,9 @@ class Session:
             worker.join(timeout)
         if self.match_worker:
             self.match_worker.join(timeout)
+        for engine in self.seat_engines:
+            if engine:
+                engine.close()
         self.engines.close()
         if self.analysis_engines is not self.engines:
             self.analysis_engines.close()
@@ -2449,21 +2601,26 @@ class Session:
                 else:
                     job.status = 'cancelled' if job.cancelled else 'done'
                     if job.kind == 'move' and not job.cancelled and list(job.history) == self.history:
-                        expired = self.match_clock and self.match_clock.expired(job.received)
+                        expired = self.game_clock and self.game_clock.expired(job.received)
                         if self.match and self.match['active']:
                             if expired:
                                 self.match['outcome'] = dict(winner=1-job.side, reason='time')
-                            elapsed = self.match_clock.stop(completed=not expired, at=job.received) if self.match_clock else None
+                            elapsed = self.game_clock.stop(completed=not expired, at=job.received) if self.game_clock else None
                             self.match['turns'].append(dict(ply=len(job.history), side=job.side,
                                 **getattr(job, 'measurements', {}),
                                 clock_spent_ms=elapsed/1e6+self.match['partial_spent_ms'] if elapsed is not None else None))
                             self.match['partial_spent_ms'] = 0
-                            if self.match_clock and not expired and self.match['clock']['mode'] == 'move':
-                                self.match_clock.balances = [int(self.match['clock']['ms']*1e6)]*2
+                            if self.game_clock and not expired and self.match['clock']['mode'] == 'move':
+                                self.game_clock.balances = [int(self.match['clock']['ms']*1e6)]*2
+                        freeplay = self.game_clock is not None and not self.match and self.game_clock.running == job.side
+                        if expired and freeplay:
+                            self.clock_turn(job.side, job.received)
                         if not expired:
                             if not (self.match and self.match['active']):
                                 self.fork_freeplay()
                             self.history.extend(tuple(p) for p in result)
+                            if freeplay:
+                                self.clock_turn(job.side, job.received)
                         if self.match and self.match['active']:
                             self.match['error'] = None
                             self.save_match_position()
@@ -2565,23 +2722,29 @@ class Session:
                 files = source['files'] | ({source['weights']: source['weights_sha256']} if source.get('weights') else {})
                 if any(file_digest(file_identity(path)) != digest for path, digest in files.items()):
                     raise ValueError('An engine or checkpoint file changed during this batch')
-            if self.match and self.match['active'] and self.match_clock:
-                side = job.side if self.match['current'] % 2 else 1-job.side
+            if self.game_clock and (not self.match or self.match['active']):
+                with self.lock:
+                    if self.match:
+                        engine = self.timed_engines[job.side if self.match['current'] % 2 else 1-job.side]
+                    else:
+                        engine = self.seat_engines[job.side]
+                    specification = self.match['clock'] if self.match else self.clock_spec
+                    clock = self.game_clock.json() if specification['mode'] == 'game' else None
+                    move_ms = self.game_clock.json()['cross_ms' if job.side == 0 else 'circle_ms'] if clock is None else None
+                if engine is None:
+                    raise ValueError('The timed engine for this seat is not running')
                 game = replay(history)
                 try:
                     def publish(found):
                         job.done = found.get('completed') or found.get('nodes') or 0
-                    with self.lock:
-                        clock = self.match_clock.json() if self.match['clock']['mode'] == 'game' else None
-                        move_ms = self.match_clock.json()['cross_ms' if job.side == 0 else 'circle_ms'] if clock is None else None
                     try:
-                        found = self.timed_engines[side].turn(game, move_ms, clock=clock, cancel=job, publish=publish)
+                        found = engine.turn(game, move_ms, clock=clock, cancel=job, publish=publish)
                     except TimeoutError:
                         # External adapters stop before the response reserve. Let the host clock
                         # finish that allowance, then score the timeout instead of pausing the batch.
                         with self.lock:
-                            self.lock.wait_for(lambda: job.cancelled or self.match_clock.expired(),
-                                timeout=max(0, self.match_clock.remaining()[job.side]/1e9))
+                            self.lock.wait_for(lambda: job.cancelled or self.game_clock.expired(),
+                                timeout=max(0, self.game_clock.remaining()[job.side]/1e9))
                         if job.cancelled:
                             raise Cancelled()
                         job.measurements = dict(stop_reason='deadline')
@@ -2927,6 +3090,8 @@ class Handler(BaseHTTPRequestHandler):
                 reply = dict(job=session.review_game())
             elif self.path == '/cancel':
                 session.cancel(args['id'])
+            elif self.path == '/clock':
+                session.set_clock(args)
             elif self.path == '/pause':
                 session.pause(args['paused'])
             elif self.path == '/rescan':
