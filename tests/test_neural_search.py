@@ -847,6 +847,20 @@ class SharedGraph(unittest.TestCase):
         self.assertNotEqual(again['action'], first['action'])
         self.assertEqual(int(again['visits'].sum()), int(back['visits'].sum())+32)
 
+    def test_a_proof_marked_at_a_later_root_reaches_the_earlier_one(self):
+        a = recorded_position(11)
+        mover = Game(a).player
+        graph = self.graph(Ranked(), a)
+        first = graph.search(32, root_samples=4, batch_size=4)
+        b = [*a, tuple(first['action'])]
+        graph.at(b)
+        second = graph.search(16, root_samples=4, batch_size=4)
+        graph.mark(tuple(second['actions'][0]), mover, 5)
+        graph.at(a)
+        after = graph.result(0, 0, 0, 0)
+        self.assertEqual((after['exact_winner'], after['proven']), (mover, 1))
+        self.assertEqual(after['values'][self.edge(after, b[-1])], 1.)
+
     def test_the_store_survives_advances_and_keeps_its_bound(self):
         a = recorded_position(11)
         graph = self.graph(Uniform(), a, limit=48)

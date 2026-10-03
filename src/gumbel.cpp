@@ -416,12 +416,15 @@ struct Tree {
  // Records an externally proven winner of the root edge `action` within `distance` placements (the edge's own
  // included): its value becomes exact (Q = +-1 for the root's mover) and the root is settled, so a lost edge leaves
  // the remaining halving rounds and the final selection. A root that is already exact is left unchanged.
+ // In a shared graph the root's stored parents take the new verdict and value.
  void mark(Cell action,int winner,int distance) {
   if(!root->expanded || (winner!=0 && winner!=1) || distance<1)throw std::runtime_error("Mark needs an expanded root, a winner and a distance");
   auto edge=std::find_if(root->edges.begin(),root->edges.end(),[&](const Edge& e){return e.action==action;});
   if(edge==root->edges.end())throw std::runtime_error("Mark action is not a root edge");
   if(root->exact_winner>=0)return;
   edge->exact_winner=winner;edge->distance=distance;edge->bound=true;edge->sum=winner==root->player?edge->visits:-edge->visits;settle(*root);
+  // A shared graph hands the verdict and the changed value on to the root's stored parents.
+  if(shared){learn(*root);revise(*root);}
  }
  void begin(int simulations,int sample) {
   if(!requests.empty()||simulations<1||sample<1)throw std::runtime_error("Invalid search budget or pending requests");
