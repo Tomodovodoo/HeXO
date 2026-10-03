@@ -430,8 +430,8 @@ export class BrowserSession extends OfflineSession {
     try {
       const adapter = this.adapters.get(job.spec.engine);
       await adapter.ready?.(f => { job.done = f * .1; this.onchange(this.state()); }, job.spec.checkpoint);
+      if (job.controller.signal.aborted || job.attempt.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
       if (job.kind === 'move') this.runClock(true);
-      if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
       let timeout = false, limit = null, ms = null;
       if (job.kind === 'move' && this.clock) {
         const clock = this.clockNow();

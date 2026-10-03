@@ -1646,6 +1646,9 @@ class Session:
                 done = game.winner >= 0 or game.player != side
             finally:
                 game.close()
+            if done and self.game_clock is not None and not self.match and self.game_clock.running == side                     and self.game_clock.expired():
+                self.check_time()
+                raise ValueError('The game has finished')
             self.fork_freeplay()
             self.history.append((q, r))
             if done and self.game_clock is not None and not self.match and self.game_clock.running == side:
