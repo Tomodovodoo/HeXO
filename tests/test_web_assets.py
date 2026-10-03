@@ -89,6 +89,10 @@ class Resolver(unittest.TestCase):
         self.assertEqual(self.out['six_retry'], ['gen-2'])
 
 
+    def test_assets_query_is_honoured_only_on_a_loopback_page(self):
+        self.assertEqual(self.out['override'], {'public': SITE, 'loopback': 'https://other.example/engine/'})
+
+
 class Loaders(unittest.TestCase):
     def test_engine_loaders_fetch_through_assets(self):
         for name in LOADERS:

@@ -6,11 +6,18 @@
 export const SITE = 'https://tomodovodoo.github.io/HeXO/engine/';
 const BASE = new URL('./', import.meta.url).href, CACHE = 'bubble-engine-v1';
 
-/** The engine folder files come from when this origin lacks them: the `assets` query parameter of the page (a
- * worker sees it on its script URL, see workerUrl), else the `data-assets` attribute of a page script, else SITE. */
+/** Hosts on which the page's `assets` query parameter is honoured: a development server on this machine. */
+const LOOPBACK = /^(localhost|127\.0\.0\.1|\[::1\])$|\.localhost$/;
+
+/**
+ * The engine folder files come from when this origin lacks them. In a page: the `data-assets` attribute of a page
+ * script, else the `assets` query parameter when the page is on a loopback host (so a link cannot point another
+ * site's page at foreign code), else SITE. In a worker: the `assets` parameter of its script URL, which only
+ * workerUrl sets.
+ */
 export function site() {
-  const chosen = new URLSearchParams(globalThis.location?.search).get('assets')
-    ?? globalThis.document?.querySelector('script[data-assets]')?.dataset.assets;
+  const query = new URLSearchParams(globalThis.location?.search).get('assets'), page = globalThis.document;
+  const chosen = page ? page.querySelector('script[data-assets]')?.dataset.assets ?? (LOOPBACK.test(location.hostname) ? query : null) : query;
   if (!chosen) return SITE;
   const href = new URL(chosen, globalThis.location?.href).href;
   return href.endsWith('/') ? href : href + '/';

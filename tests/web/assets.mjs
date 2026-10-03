@@ -146,4 +146,14 @@ const sixLate = new (await import('../../web/engine/six.mjs')).SixEngine();
 await sixLate.files();
 out.six_retry = sixLate.checkpoints;
 
+const page = host => {
+  globalThis.document = {querySelector: () => null};
+  globalThis.location = {hostname: host, href: `http://${host}/`, search: '?assets=https://other.example/engine'};
+  const chosen = assets.site();
+  delete globalThis.document;
+  delete globalThis.location;
+  return chosen;
+};
+out.override = {public: page('tomodovodoo.github.io'), loopback: page('127.0.0.1')};
+
 process.stdout.write(JSON.stringify(out));

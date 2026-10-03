@@ -43,8 +43,10 @@ this origin, keyed by the file's URL here and its SHA-256 (or its version when n
 The public site finds every file on its own origin and never fetches from elsewhere. The wasm that is committed and
 loaded by its own glue (`gumbel.wasm`, `tactical.wasm`, `six/six.wasm`) is always present and loads as before.
 
-For development, `?assets=<url of an engine folder>` on the page, or a `data-assets` attribute on the page's
-`seat.mjs` script tag, points the fallback at another site; workers receive it on their script URL.
+For development, a `data-assets` attribute on the page's `seat.mjs` script tag points the fallback at another
+engine folder. `?assets=<url of an engine folder>` does the same, but only on a page served from localhost,
+127.0.0.1 or [::1], so a link cannot make a deployed page import code from a site of its choosing. Workers receive
+the choice on their script URL.
 
 ## Layout
 
