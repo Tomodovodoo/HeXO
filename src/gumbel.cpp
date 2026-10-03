@@ -55,7 +55,8 @@ struct Edge { Cell action;double logit=0,prior=0,sum=0,gumbel=0,weight=-1;int vi
 // With graph search a node also keeps its visits `n`, its utility `q` for its mover (the MCGS value) and its parents.
 // In a shared graph `dirty` marks a value that a descendant's statistics have changed since it was computed, `used`
 // the last search step that touched the node, `context` its key in the store, and `carried` and `carried_sum` the
-// visits and value sum (for its mover) an evicted node of its context had when it left the store.
+// visits and value sum (for its mover) an evicted node of its context had when it left the store, less its own
+// network value, which the node's expansion supplies again.
 struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false;double value=0,q=0,carried_sum=0;uint64_t used=0;Key position,context;std::vector<Edge> edges;std::vector<std::weak_ptr<Node>> parents; };
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
@@ -72,7 +73,7 @@ struct Tree {
  bool shared=false;size_t limit=0;uint64_t clock=0;int64_t evicted=0;std::unordered_map<Key,std::shared_ptr<Node>,KeyHash> store;std::vector<std::pair<Node*,int>> lineage;int64_t version=0;
  // Shared graph: the visits and value (for its mover) of evicted nodes, by context, for a node created again there;
  // evict keeps at most four times `limit` of them, those with the most visits.
- struct Summary { int n=0;double q=0;Key position; };std::unordered_map<Key,Summary,KeyHash> evicted_stats;
+ struct Summary { int n=0;double q=0,value=0;Key position; };std::unordered_map<Key,Summary,KeyHash> evicted_stats;
  std::mt19937_64 rng;int budget=0,started=0,completed=0,next_id=1,samples=0,last=0;bool tactics=false,hold=false;std::vector<int> sequence;
  // Root actions sampled first in the opening phase of the current search; ordering only (set_priority).
  std::vector<Cell> priority;
@@ -101,7 +102,7 @@ struct Tree {
   if(shared){
    store[context]=n;n->used=clock;
    if(auto old=evicted_stats.find(context);old!=evicted_stats.end()){
-    n->carried=n->n=old->second.n;n->q=old->second.q;n->carried_sum=n->q*n->carried;evicted_stats.erase(old);
+    auto& o=old->second;n->n=o.n;n->q=o.q;n->carried=o.n-1;n->carried_sum=o.q*o.n-o.value;evicted_stats.erase(old);
    }
   }
   if(auto o=outcomes.find(position);o!=outcomes.end())apply(o->second,*n);
@@ -210,7 +211,7 @@ struct Tree {
      e.sum=(e.exact_winner>=0?(e.exact_winner==p->player?1:-1):x->player==p->player?x->q:-x->q)*e.visits;
      e.child.reset();
     }
-    if(x->n)evicted_stats[x->context]={x->n,x->q,x->position};
+    if(x->n)evicted_stats[x->context]={x->n,x->q,x->value,x->position};
     expanded-=x->expanded;++evicted;store.erase(x->context);
    }
   }
