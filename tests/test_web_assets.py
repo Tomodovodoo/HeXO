@@ -78,6 +78,10 @@ class Resolver(unittest.TestCase):
                 self.assertLessEqual(fetched, {f['path'] for f in engine['files']})
 
 
+    def test_strix_reads_its_network_list_again_after_starting_without_one(self):
+        self.assertEqual(self.out['strix_retry'], {'files': ['strix/strix.wasm', 'strix/net.safetensors'], 'checkpoints': ['net']})
+
+
 class Loaders(unittest.TestCase):
     def test_engine_loaders_fetch_through_assets(self):
         for name in LOADERS:

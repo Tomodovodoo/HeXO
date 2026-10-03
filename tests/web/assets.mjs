@@ -134,4 +134,7 @@ for (const [id, engine] of Object.entries(engines)) {
     downloads: requests.filter(r => !r.endsWith('.json')), cached: (await assets.status(listed)).state};
 }
 
+const late = new (await import('../../web/engine/strix.mjs')).StrixEngine([]);
+out.strix_retry = {files: (await late.files()).map(f => f.path), checkpoints: late.checkpoints};
+
 process.stdout.write(JSON.stringify(out));

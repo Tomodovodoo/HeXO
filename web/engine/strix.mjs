@@ -7,22 +7,41 @@ import {json, workerUrl} from './assets.mjs';
 /** Simulations per placement, as python/play.py's Strix presets. */
 export const PRESETS = {lightning: {simulations: 2}, quick: {simulations: 8}, standard: {simulations: 64},
   strong: {simulations: 128}, deep: {simulations: 512}, dangerous: {simulations: 4096}};
-const ID = 'browser:strix', LABEL = 'Strix (browser)', MISSING = new Error('strix/networks.json is on neither this site nor the public one');
+const ID = 'browser:strix', LABEL = 'Strix (browser)';
 
 export class StrixEngine {
-  /** `networks` are the strix/networks.json entries with their `path` under web/engine, the default first. */
+  /** `networks` are the strix/networks.json entries with their `path` under web/engine, the default first; with none,
+   * the engine reads the list again before its next load. `checkpoints` lists their ids. */
   constructor(networks) {
-    this.networks = new Map(networks.map(network => [network.id, network]));
-    this.network = networks[0];
+    this.checkpoints = [];
+    this.networks = new Map();
+    this.network = null;
+    this.use(networks);
     this.worker = null;
     this.ready = null;
     this.calls = 0;
   }
 
+  /** Adds `networks` (strix/networks.json entries) to the choices; the first becomes current when none is. */
+  use(networks) {
+    for (const network of networks) this.networks.set(network.id, network);
+    this.checkpoints.splice(0, Infinity, ...this.networks.keys());
+    this.network ??= networks[0] ?? null;
+  }
+
+  /** Reads strix/networks.json again when the engine has no network yet; throws when it still has none. */
+  async known() {
+    if (!this.network) this.use(await networks());
+  }
+
   /** Starts the worker with the current network; `progress(fraction)` reports the download. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
-    if (!this.network) return Promise.reject(MISSING);
+    if (!this.network) {
+      const ready = this.ready = this.known().then(() => { this.ready = null; return this.load(progress); });
+      ready.catch(() => { if (this.ready === ready) this.ready = null; });
+      return ready;
+    }
     const worker = this.worker = new Worker(workerUrl('strix-worker.mjs'), {type: 'module'});
     const ready = this.ready = new Promise((resolve, reject) => {
       worker.onmessage = ({data}) => {
@@ -39,7 +58,7 @@ export class StrixEngine {
 
   /** The downloaded files (assets.mjs records) a load reads: strix.wasm and the current network. */
   async files() {
-    if (!this.network) throw MISSING;
+    await this.known();
     const {data, local} = await json('build.json');
     return [{path: 'strix/strix.wasm', sha256: data.artefacts['strix/strix.wasm'], lines: true, local},
       {path: this.network.path, sha256: this.network.sha256, bytes: this.network.size, local: this.network.local}];
@@ -57,7 +76,7 @@ export class StrixEngine {
    * the worker (a search cannot be interrupted inside it) and rejects with an AbortError; the next call starts a new one.
    */
   async turn(history, budget, {signal, progress = () => {}} = {}) {
-    const network = this.networks.get(budget.checkpoint) ?? this.networks.values().next().value;
+    const network = this.networks.get(budget.checkpoint) ?? this.networks.values().next().value ?? null;
     if (network !== this.network) {
       this.close();
       this.network = network;
@@ -80,21 +99,17 @@ export class StrixEngine {
   }
 }
 
-/** The strix/networks.json entries, from the site when this origin has none; none when neither answers. */
+/** The strix/networks.json entries, from the site when this origin has none; throws when neither answers. */
 async function networks() {
-  try {
-    const {data, local} = await json('strix/networks.json');
-    return data.networks.map(network => ({...network, path: `strix/${network.file}`, local}));
-  } catch {
-    return [];
-  }
+  const {data, local} = await json('strix/networks.json');
+  return data.networks.map(network => ({...network, path: `strix/${network.file}`, local}));
 }
 
-const found = await networks();
+const engine = new StrixEngine(await networks().catch(() => []));
 
 /** The browser engine for seat.mjs. */
 export const strix = {
-  entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: found.map(n => n.id), presets: PRESETS, analysis: true},
-  engine: new StrixEngine(found),
+  entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, analysis: true},
+  engine,
   record: result => ({...result, proof: null, line: [], threat: [], engine: ID}),
 };
