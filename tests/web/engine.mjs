@@ -385,9 +385,9 @@ if (job.kind === 'encode') {
     options.signal.addEventListener('abort', () => setTimeout(() => reject(new DOMException('Cancelled', 'AbortError')), 20));
   })});
   t.analysis = t.spec({engine: 'test'}); t.apply('/analyse', {ply: 0}); await until(() => !!t.running); await wait(2);
-  const backup = await t.storage.backup(); backup.sessions = [{...t.snapshot(), history: [[0, 0]], records: []}];
+  const backup = await t.storage.backup(); backup.sessions = [{...t.snapshot(), history: [[0, 0]], records: [], paused: false}];
   const lines = [...t.lines], [status] = await t.request('/import', {text: JSON.stringify(backup)}, 'POST');
-  answer.imported = {status, history: t.history, saved: (await t.storage.get('sessions', 'live')).history,
+  answer.imported = {status, history: t.history, paused: t.paused, saved: (await t.storage.get('sessions', 'live')).history,
     renewed: t.lines.every((line, side) => line !== lines[side])};
   const u = new BrowserSession(native); let expired = false;
   u.registerEngine(entry, {turn: (history, budget, options) => new Promise((resolve, reject) => {

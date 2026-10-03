@@ -203,7 +203,9 @@ export class BrowserSession extends OfflineSession {
     }).catch(error => { this.gameSignature = null; this.storageError = `Could not save in this browser: ${error.message}`; this.onchange(this.state()); });
     return this.saving;
   }
-  async restore() {
+  /** Loads the saved session. A budget game resumes as it was left unless `paused` asks otherwise; a clocked game or a
+   * match always waits for Resume so no side's time runs unattended. */
+  async restore({paused = false} = {}) {
     const [saved, coverage, evaluations] = await Promise.all([this.storage.get('sessions', this.id), this.storage.get('coverage', 'book'), this.storage.all('evaluations')]);
     this.cache.clear(); this.index.clear(); this.provenRecords.clear(); this.proofs = new Proofs();
     for (const r of evaluations) this.indexRecord(r);
@@ -211,8 +213,7 @@ export class BrowserSession extends OfflineSession {
     this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false; this.renewLines();
     if (saved) {
       const {taken, ...fields} = saved;
-      // A budget game resumes as it was left; a clocked game waits for Resume so no side's time runs unattended.
-      this.native.game(saved.history); Object.assign(this, {...fields, paused: Boolean(fields.paused) || Boolean(fields.clock)});
+      this.native.game(saved.history); Object.assign(this, {...fields, paused: paused || Boolean(fields.paused) || Boolean(fields.clock)});
       if (this.match) { this.match.active = false; this.paused = true; }
       if (this.clock?.started != null && taken) {
         // The side was thinking when the page went away: the time since the snapshot counts against it.
@@ -636,7 +637,7 @@ export class BrowserSession extends OfflineSession {
         if (json?.format === 'hexo-browser-save') {
           this.importing = true; this.paused = true; this.cancelJobs();
           try {
-            await this.idle; await this.saving; await this.storage.restore(json, this.native); await this.restore();
+            await this.idle; await this.saving; await this.storage.restore(json, this.native); await this.restore({paused: true});
             for (const spec of [...this.seats, this.analysis].filter(Boolean)) if (this.entries.has(spec.engine)) Object.assign(spec, this.spec(spec));
           } finally { this.importing = false; }
           this.changed(); data = this.state();
