@@ -775,9 +775,9 @@ class FusedCudaTests(unittest.TestCase):
         from hexnet_graphs import ActorGraph
         torch.manual_seed(3070)
         model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
-        runner = ActorGraph(model)
+        runner = ActorGraph(model, max_batch=128)
         inputs, outputs, saved = [], [], []
-        for rows, side in ((19, 24), (7, 32), (1, 24), (2, 24), (3, 24)):
+        for rows, side in ((19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (64, 24), (128, 24), (64, 32), (64, 40)):
             x = torch.randint(0, 2, (rows, 8, side, side), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
             x[:, 3] = 1
             with torch.autocast('cuda', torch.bfloat16):
@@ -788,6 +788,9 @@ class FusedCudaTests(unittest.TestCase):
             inputs.append(x)
             outputs.append(out)
             saved.append({name: value.clone() for name, value in out.items()})
+        self.assertIn((24, 128), runner.graphs)
+        self.assertIn((32, 64), runner.graphs)
+        self.assertNotIn((40, 64), runner.graphs)
         for i in reversed(range(len(inputs))):
             out = runner(inputs[i])
             for name in out:
@@ -798,7 +801,7 @@ class FusedCudaTests(unittest.TestCase):
         runner.close()
         reserved = torch.cuda.memory_reserved()
         for _ in range(4):
-            replacement = ActorGraph(model)
+            replacement = ActorGraph(model, max_batch=128)
             out = replacement(inputs[0])
             for name in out:
                 torch.testing.assert_close(out[name], saved[0][name], rtol=0, atol=0)
@@ -3433,6 +3436,19 @@ class ValidationSourceTests(unittest.TestCase):
 
 
 class EvaluatorSearchTests(unittest.TestCase):
+    def test_actor_graph_batches_keep_small_tails_and_canvas_limits(self):
+        from hexnet_graphs import ActorGraph
+        for side, rows, expected in ((24, 128, [(128, 128)]), (32, 128, [(64, 64), (64, 64)]),
+                                      (40, 128, [(32, 32)]*4), (64, 32, [(16, 16)]*2),
+                                      (24, 147, [(128, 128), (16, 16), (3, 4)]),
+                                      (32, 83, [(64, 64), (16, 16), (3, 4)])):
+            parts = list(ActorGraph._segments(rows, ActorGraph._limit(side, 128)))
+            self.assertEqual(parts, expected)
+            self.assertEqual(sum(n for n, _ in parts), rows)
+            self.assertTrue(all(n <= cap and cap*side*side <= ActorGraph.MAX_CELLS for n, cap in parts))
+        for side in ActorGraph.CANVASES:
+            self.assertLessEqual(ActorGraph._limit(side), 32)
+
     def setUp(self):
         self.threads = torch.get_num_threads()
         torch.set_num_threads(2)
