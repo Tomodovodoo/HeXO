@@ -10,11 +10,20 @@ export async function cached(url, version, progress = () => {}) {
   let store = null;
   try { store = await caches.open(CACHE); } catch {}
   const hit = store && await store.match(key);
-  if (hit) { progress(1); return hit.arrayBuffer(); }
+  if (hit) {
+    try {
+      const body = await hit.arrayBuffer();
+      progress(1);
+      return body;
+    } catch {                                   // an entry the browser can no longer read is fetched afresh
+      await store.delete(key);
+    }
+  }
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url}: ${response.status}`);
   const body = await download(response, progress).catch(async () => {   // a browser whose body stream fails
-    const again = await fetch(url);                                      // still delivers the whole body at once
+    progress(0);                                                         // still delivers the whole body at once
+    const again = await fetch(url, {cache: 'reload'});
     if (!again.ok) throw new Error(`${url}: ${again.status}`);
     return again.arrayBuffer();
   });
