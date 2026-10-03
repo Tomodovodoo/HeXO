@@ -82,7 +82,7 @@ const searched = r => verified(r) || VERDICTS.has(r.reason);
  * Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms).
  * With `line` (a seat's game, see GameTrees) the search continues that game's tree, as a play.py seat does; without
  * it the turn searches a tree of its own. `known` (Proofs.list() of the game's table, or null) answers a position it
- * proves won for the mover without solver or search, gives a position it proves its proof and line, and settles the
+ * proves won for the mover without solver or search, gives a position it proves lost for the mover its proof and line, and settles the
  * proven stones of each search (proof.mjs settled).
  */
 async function turn({id, history, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0, line = null, known = null}) {
@@ -121,8 +121,8 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
       }
     }
     const outcome = proof === null ? table?.known(history) : null;
-    if (outcome) {
-      proof = {winner: outcome.winner, turns: proofTurns(outcome.plies, state.remaining, outcome.winner === player), plies: outcome.plies};
+    if (outcome && outcome.winner !== player) {
+      proof = {winner: outcome.winner, turns: proofTurns(outcome.plies, state.remaining, false), plies: outcome.plies};
       pv = outcome.pv;
     }
     const given = moves.length > 0, current = history.map(p => [...p]);

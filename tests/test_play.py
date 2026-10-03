@@ -1605,6 +1605,15 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual((result['values'][lost], result['policy'][lost]), (-1., 0.))
         self.assertNotEqual(result['action'], [1, 0])
 
+    def test_a_known_win_without_its_turn_is_not_claimed_for_another_turn(self):
+        from play import Proofs, evaluate
+        won, known = Proofs(), Proofs()
+        won.add([(0, 0)], dict(proof=dict(winner=1, turns=3), pv=[]))
+        self.assertEqual(evaluate(self.bubble(), None, [(0, 0)], 8, 0, known=won)['proof'], None)
+        known.add([(0, 0), (1, 0), (2, 0)], dict(proof=dict(winner=1, turns=2, plies=7), pv=[]))
+        lost = evaluate(self.bubble(), None, [(0, 0), (1, 0), (2, 0)], 8, 0, known=known)
+        self.assertEqual((lost['proof'], lost['value']), (dict(winner=1, turns=2, plies=7), 0.))
+
     def test_two_stones_to_a_won_position_answer_without_a_search(self):
         from play import Proofs, evaluate
         known = Proofs()

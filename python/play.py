@@ -782,9 +782,10 @@ class TurnSearch:
     complete, (None, 0) for the raw policy; `take(result)` applies that search's result, None for the raw policy.
     `trees(history, simulations, network)` gives the tree and the simulations to run for a stone; by default one
     tree is advanced through the turn, each stone searched afresh with `simulations`. A seat's move passes its game
-    tree (`Engines.game_trees`). With a proof table `known` (`Proofs`) a position it proves gets that proof and line
-    unless the solver proved one, each search starts with the root's proven edges settled (`Proofs.edges`), and a
-    proof whose turn reaches a proven position continues into that position's line."""
+    tree (`Engines.game_trees`). With a proof table `known` (`Proofs`) a position it proves lost for the side to move
+    gets that proof and line unless the solver proved one (a proven win needs its turn, see `answered`), each search
+    starts with the root's proven edges settled (`Proofs.edges`), and a proof whose turn reaches a proven position
+    continues into that position's line."""
 
     def __init__(self, bubble, network, history, simulations, solved, trees=None, q_range_floor=0., known=None):
         self.bubble, self.network, self.simulations, self.q_range_floor = bubble, network, simulations, q_range_floor
@@ -801,9 +802,9 @@ class TurnSearch:
         self.trees = trees or self.advanced
         self.known = known
         outcome = known.known(self.history) if known is not None and self.proof is None else None
-        if outcome is not None:
+        if outcome is not None and outcome['winner'] != self.player:
             self.proof = dict(winner=outcome['winner'], plies=outcome['plies'],
-                              turns=proof_turns(outcome['plies'], self.local.remaining, outcome['winner'] == self.player))
+                              turns=proof_turns(outcome['plies'], self.local.remaining, False))
             self.pv = outcome['pv']
 
     def advanced(self, history, simulations, network):
