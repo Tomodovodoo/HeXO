@@ -1088,6 +1088,12 @@ def position_text(history):
     return ' '.join(f'{int(q)},{int(r)}' for q, r in history)
 
 
+@functools.lru_cache(maxsize=4096)
+def position_key(stones):
+    """The index key of the position `stones`, a tuple of (q, r) tuples."""
+    return hashlib.blake2b(position_text(stones).encode(), digest_size=16).digest()
+
+
 def well_formed(record):
     """True for a dict with the fields of a saved evaluation, each of the right shape."""
     def number(v):
@@ -1152,7 +1158,7 @@ class Evaluations:
 
     @staticmethod
     def key(history):
-        return hashlib.blake2b(position_text(history).encode(), digest_size=16).digest()
+        return position_key(tuple(map(tuple, history)))
 
     def index(self, record, line):
         """Index one record; ValueError unless `well_formed(record)`."""
@@ -1406,12 +1412,18 @@ class Session:
             return [{k: e[k] for k in SHOWN if k in e} |
                     dict(clocks=e['kind'] in ('bubble', 'six', 'native', 'seal')) for e in self.entries.values()]
 
-    def lookup(self, history):
-        """The evaluation of `history` to show: the best of the analysis model's fresh and kept-tree ones, with
-        and without solver checks (see `Evaluations.best`)."""
+    def analysis_keys(self):
+        """The store keys of the analysis model's fresh and kept-tree evaluations, with and without solver checks."""
         key = self.engine_key(self.analysis) if self.analysis else None
-        bare = key.split(':')[0] + ':none' if key else None
-        found = [e for k in dict.fromkeys((key, key + ':kept', bare, bare + ':kept')) if (e := self.store.best(history, k))]             if key else []
+        if key is None:
+            return ()
+        bare = key.split(':')[0] + ':none'
+        return tuple(dict.fromkeys((key, key + ':kept', bare, bare + ':kept')))
+
+    def lookup(self, history, keys=None):
+        """The evaluation of `history` to show: the best of those under `keys` (`analysis_keys()` when None), see
+        `Evaluations.best`."""
+        found = [e for k in (self.analysis_keys() if keys is None else keys) if (e := self.store.best(history, k))]
         return max(found, key=lambda e: (e.get('proof') is not None, valued(e), e['simulations'], e['solver_nodes']),
                    default=None)
 
@@ -1420,11 +1432,15 @@ class Session:
         with one budget."""
         return self.seat(self.analysis['engine'], self.analysis['checkpoint'], REVIEW_PRESET) if self.analysis else None
 
-    def review_lookup(self, history):
-        """The evaluation of `history` at exactly the review budget, or None."""
+    def review_target(self):
+        """(store key, budget) of the review evaluations, the key None without an analysis model."""
         seat = self.review_seat()
-        key = self.engine_key(seat) if seat else None
-        return self.store.get(history, key, self.engines.effective(seat['budget'])) if key else None
+        return (self.engine_key(seat), self.engines.effective(seat['budget'])) if seat else (None, None)
+
+    def review_lookup(self, history, target=None):
+        """The evaluation of `history` at exactly the review budget (`target` as `review_target()`), or None."""
+        key, budget = self.review_target() if target is None else target
+        return self.store.get(history, key, budget) if key else None
 
     def state(self):
         with self.lock:
@@ -1433,9 +1449,9 @@ class Session:
                 board = dict(player=game.player, remaining=game.remaining, winner=game.winner)
             finally:
                 game.close()
-            evaluations = {}
+            evaluations, keys, target = {}, self.analysis_keys(), self.review_target()
             for ply in range(len(history) + 1):
-                if (found := self.lookup(history[:ply])) is not None:
+                if (found := self.lookup(history[:ply], keys)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes')}
             entries = [{k: e[k] for k in SHOWN if k in e} for e in self.entries.values()]
@@ -1448,7 +1464,8 @@ class Session:
                         book=dict(available=bool(self.book), enabled=self.opening_book, mode=self.book_mode,
                                   opening=self.opening),
                         evaluations=evaluations,
-                        review=review(history, self.review_lookup, board['winner']), review_preset=REVIEW_PRESET,
+                        review=review(history, lambda h: self.review_lookup(h, target), board['winner']),
+                        review_preset=REVIEW_PRESET,
                         jobs=self.job_list())
 
     def job_list(self):
