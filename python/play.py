@@ -1122,11 +1122,11 @@ class Engines:
         `Session.analysis_line`) searches that game's graph (see `game_graph`) with the principal-variation check
         PV_CHECK; without either the turn searches fresh trees. With `keep` (a deepening tier) the search runs only
         the simulations the root lacks, and a proof the solver found for the position is reused. `refresh`, a saved
-        evaluation of `history`, searches the game graph again with the PV_CHECK share of the simulations a stone
-        and that evaluation's solver findings, and keeps its key and budget. A seat's evaluation or a tier's has a
-        key ending in `:kept`, so continued evaluations are never mistaken for fresh ones. `used`, a list, receives
-        the number `game_graph` gave each graph searched, before the search, so a caller sees it even when the
-        search is cancelled."""
+        evaluation of `history`, searches the game graph again with the PV_CHECK share of that evaluation's
+        simulations a stone and its solver findings; the graph is the one `budget` (the seat's) selects. A seat's
+        evaluation or a tier's has a key ending in `:kept`, so continued evaluations are never mistaken for fresh
+        ones. `used`, a list, receives the number `game_graph` gave each graph searched, before the search, so a
+        caller sees it even when the search is cancelled."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
         solver, build = self.solver() if budget['solver_nodes'] and refresh is None else (None, 'none')
         spent = budget if solver or refresh is not None else budget | dict(solver_nodes=0)
@@ -1134,7 +1134,7 @@ class Engines:
         floor = entry.get('q_range_floor', 0.)
         if refresh is not None:
             build = self.solver_build() if budget['solver_nodes'] else 'none'
-            share = max(1, round(PV_CHECK * budget['simulations']))
+            share = max(1, round(PV_CHECK * refresh['simulations']))
             trees = self.game_graph(bubble, game, build, floor, share, used=used)
             solved = dict(moves=[], pv=[], proof=None, threat=refresh.get('threat') or [], solved=True, used=0)
         elif line is not None or game is not None:
@@ -3071,8 +3071,6 @@ class Session:
         engine key and budget."""
         key, budget, keep = self.engine_key(seat), self.engines.effective(seat['budget']), hasattr(job, 'tier')
         line, game, refresh = getattr(job, 'line', None), getattr(job, 'game', None), getattr(job, 'refresh', None)
-        if refresh is not None:
-            budget = dict(simulations=refresh['simulations'], solver_nodes=refresh['solver_nodes'])
         if key is None:
             raise ValueError('The model file is gone; rescan the engines')
         key += ':kept' if keep else ''
@@ -3108,7 +3106,7 @@ class Session:
                 timer.daemon = True
                 timer.start()
         if refresh is not None:
-            weights, spent = refresh['engine'], budget
+            weights, spent = refresh['engine'], dict(simulations=refresh['simulations'], solver_nodes=refresh['solver_nodes'])
         saved = self.save(history, weights, spent, found, model)
         if job.kind == 'analyse' and refresh is None and game is not None:
             self.refresh(history, seat, game)

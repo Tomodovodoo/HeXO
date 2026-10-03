@@ -1005,7 +1005,7 @@ class GraphAnalysis(unittest.TestCase):
         before, visits = self.turn()
         self.evaluate(self.c, 512)
         after, _ = self.turn()
-        again = self.evaluate(self.a, 512, refresh=first)
+        again = self.evaluate(self.a, 512, refresh=dict(first, simulations=512, solver_nodes=0))   # as saved
         resumed, total = self.turn()
         self.assertGreater(total, visits + 128)
         for stone in before:
