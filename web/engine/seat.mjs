@@ -292,8 +292,11 @@ function openMenu(anchor, items, current, choose) {
  * engine `entry` against its loaded network list: a network the list no longer has becomes its newest. Then redraws. */
 function recheck(entry) {
   const fix = choice => choice?.engine === entry.id ? pickEngine(entry.id, choice, choice.checkpoint) : choice;
-  config = {seats: config.seats.map(fix), analysis: fix(config.analysis)};
-  save();
+  const fixed = {seats: config.seats.map(fix), analysis: fix(config.analysis)};
+  if (JSON.stringify(fixed) !== JSON.stringify(config)) {   // save() also clears the failed key, so only on a change
+    config = fixed;
+    save();
+  }
   const session = page.browserPlay, choices = session && [...session.seats, session.analysis, ...session.match?.players ?? []];
   const stale = choices?.filter(c => c?.engine === entry.id && c.checkpoint && entry.checkpoints.length && !entry.checkpoints.includes(c.checkpoint));
   if (stale?.length) {

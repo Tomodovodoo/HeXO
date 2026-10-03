@@ -1,6 +1,6 @@
 /* The exported network (python/export_web.py) under ONNX Runtime Web: WebGPU when the device has it, else WebAssembly. */
 import {encode, features, CHANNELS} from './encode.mjs';
-import {cached, json, moduleUrl} from './assets.mjs';
+import {cached, json, moduleUrl, pins} from './assets.mjs';
 
 /**
  * The device to run on: {provider: 'webgpu' | 'wasm', precisions: candidate graphs, adapter}. WebGPU offers fp16
@@ -55,8 +55,9 @@ const RUNTIMES = {webgpu: ['ort.webgpu.min.mjs', 'ort-wasm-simd-threaded.asyncif
 /** ONNX Runtime Web's files for `provider` ('webgpu' or 'wasm') as ort/version.json pins them: the API module, the
  * runtime module and its wasm (assets.mjs file records, cached under the runtime's version). */
 export async function runtimeFiles(provider) {
-  const {data, local} = await json('ort/version.json'), [api, runtime] = RUNTIMES[provider];
-  return [api, `${runtime}.mjs`, `${runtime}.wasm`].map(name => ({path: `ort/${name}`, sha256: data.files?.[name], version: data.version, local}));
+  const found = await json('ort/version.json'), {data, local} = found, [api, runtime] = RUNTIMES[provider];
+  const files = await pins('ort/version.json', found, other => other.version === data.version);
+  return [api, `${runtime}.mjs`, `${runtime}.wasm`].map(name => ({path: `ort/${name}`, sha256: files[name], version: data.version, local}));
 }
 
 /** The runtime files a load on `provider` may read: runtimeFiles(provider), plus the WebAssembly runtime that a

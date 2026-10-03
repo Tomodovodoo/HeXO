@@ -116,6 +116,11 @@ out.no_head = {here: (await assets.status([{path: 'g.wasm', local: true}])).stat
   partial: (await assets.status([{path: 'g.wasm', local: true}, {path: 'gone.wasm', sha256: hash('gone'), bytes: 4, local: true}])).state};
 noHead = false;
 
+reset();
+here.set('ort/version.json', JSON.stringify({version: '1.30.0'}));
+site.set('ort/version.json', JSON.stringify({version: '1.30.0', files: {'ort.wasm.min.mjs': 'a', 'ort-wasm-simd-threaded.mjs': 'b', 'ort-wasm-simd-threaded.wasm': 'c'}}));
+out.legacy_pins = (await (await import('../../web/engine/network.mjs')).runtimeFiles('wasm')).map(f => [f.sha256, f.local]);
+
 const open = caches.open;
 caches.open = async () => { throw new Error('no Cache API'); };
 out.uncached = await assets.status(files);

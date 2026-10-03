@@ -75,6 +75,16 @@ export async function json(path) {
   }
 }
 
+/** The `files` pins ({name: SHA-256}) of manifest `found` (a json() result for `path`). A local manifest written before
+ * builds pinned their files borrows the site's pins when `same(site manifest)` says both describe one build. */
+export async function pins(path, {data, local}, same) {
+  const there = remote(path);
+  if (data.files || !local || !there) return data.files ?? {};
+  const response = await fetch(there, {cache: 'no-cache', mode: 'cors'}).catch(() => null);
+  const other = response?.ok ? await response.json().catch(() => null) : null;
+  return other && same(other) ? other.files ?? {} : {};
+}
+
 /** SHA-256 hex of `bytes`, with CRLF read as LF when `lines` (as tools/build_web.py records build.json's files). */
 export async function sha256(bytes, lines = false) {
   let data = new Uint8Array(bytes);

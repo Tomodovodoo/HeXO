@@ -60,6 +60,9 @@ class Resolver(unittest.TestCase):
     def test_a_failing_body_stream_falls_back_to_a_whole_download(self):
         self.assertEqual(self.out['stream_fallback'], {'body': 'streamed', 'requests': 3, 'reset': True})
 
+    def test_a_local_manifest_without_pins_borrows_the_sites_for_the_same_build(self):
+        self.assertEqual(self.out['legacy_pins'], [['a', True], ['b', True], ['c', True]])
+
     def test_manifest_falls_back_to_the_site(self):
         self.assertEqual(self.out['json'], {'data': {'version': 3}, 'local': False})
         self.assertEqual(self.out['json_offline'], {'data': {'version': 3}, 'local': False})
