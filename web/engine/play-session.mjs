@@ -65,7 +65,7 @@ export class BrowserSession extends OfflineSession {
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
-    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null;
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()];
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
    * move's clock starts after it) and `adapter.turn(history, budget, options)` plays. */
@@ -182,7 +182,7 @@ export class BrowserSession extends OfflineSession {
     this.cache.clear(); this.index.clear();
     for (const r of evaluations) this.indexRecord(r);
     this.coverage = coverage?.counts || {};
-    this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false;
+    this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false; this.renewLines();
     if (saved) {
       const {taken, ...fields} = saved;
       this.native.game(saved.history); Object.assign(this, {...fields, paused: true});
@@ -203,10 +203,12 @@ export class BrowserSession extends OfflineSession {
   }
   editable() { if (this.conflicted) throw Error(this.storageError); if (this.match?.active) throw Error('Stop the match before changing its players or position'); }
   load(history, paused = false, opening = null) {
-    this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.paused = paused; this.saved_game = null;
+    this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.paused = paused; this.saved_game = null; this.renewLines();
     this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
     this.book.opening = copy(opening); this.freshClock();
   }
+  /** Gives `sides` (both when none) a new line, the key of the game tree a Bubble seat searches (worker.mjs). */
+  renewLines(...sides) { for (const side of sides.length ? sides : [0, 1]) this.lines[side] = uid(); }
   forkGame() {
     if (this.saved_game || !this.gameId || this.match) {
       this.saved_game = null; this.match = null; this.freshClock(); this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
@@ -241,7 +243,7 @@ export class BrowserSession extends OfflineSession {
       const after = this.native.game([...this.history, point]); this.forkGame(); this.history.push(point); this.paused = false;
       if (after.winner >= 0 || after.player !== before.player) this.chargeTurn(before.player);
     } else if (path === '/undo') {
-      this.cancelJobs(); this.forkGame(); const people = body.people || [0, 1].filter(i => this.seats[i].engine === 'human'); this.history.pop();
+      this.cancelJobs(); this.forkGame(); this.renewLines(); const people = body.people || [0, 1].filter(i => this.seats[i].engine === 'human'); this.history.pop();
       while (people.length && this.history.length && !(people.includes(playerAt(this.history.length)) && this.history.length % 2)) this.history.pop();
       this.saved_game = null; this.freshClock();
     } else if (path === '/new') {
@@ -253,7 +255,7 @@ export class BrowserSession extends OfflineSession {
       if (![0, 1].includes(body.side)) throw Error('Invalid seat');
       const seat = this.spec({...this.seats[body.side], ...body, budget: body.preset === 'custom' ? body.custom : undefined});
       if (this.timeControl.mode !== 'fixed') this.clockable(seat);
-      this.cancelJobs(j => j.kind === 'move' && j.side === body.side); this.seats[body.side] = seat;
+      this.cancelJobs(j => j.kind === 'move' && j.side === body.side); this.renewLines(body.side); this.seats[body.side] = seat;
       if (this.clock?.side === body.side) this.freezeClock();
     } else if (path === '/clock') {
       if (this.saved_game) throw Error('A saved game has no clock');
@@ -313,9 +315,10 @@ export class BrowserSession extends OfflineSession {
     this.jobs.push({id: ++this.nextJob, kind, history: copy(history), spec: copy(spec), key, controller: new AbortController(), status: 'queued', done: 0, total: 1, ...fields});
   }
   /** Saves the evaluation `result` of `history` by `spec`. One whose solver could not run (`solver_error`) is kept for
-   * this visit only and raises the session's `notice`, so a later visit evaluates the position again with proofs. */
-  async record(history, spec, result) {
-    const record = {...result, id: this.cacheKey(history, spec), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
+   * this visit only and raises the session's `notice`, so a later visit evaluates the position again with proofs. A
+   * `kept` one (a seat's move on its game tree) is shown but never reused as a fresh evaluation. */
+  async record(history, spec, result, kept = false) {
+    const record = {...result, id: this.cacheKey(history, spec) + (kept ? '|kept' : ''), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
     this.indexRecord(record);
     if (result.solver_error) this.notice = `The solver could not run in this browser (${result.solver_error}), so evaluations have no proofs`;
@@ -413,7 +416,7 @@ export class BrowserSession extends OfflineSession {
   async pump() {
     if (this.importing || this.conflicted) return;
     const state = this.native.game(this.history), seat = this.seats[state.player];
-    if (!this.paused && state.winner < 0 && this.adapters.has(seat.engine) && !this.jobs.some(j => j.kind === 'move')) this.enqueue('move', this.history, seat, {side: state.player});
+    if (!this.paused && state.winner < 0 && this.adapters.has(seat.engine) && !this.jobs.some(j => j.kind === 'move')) this.enqueue('move', this.history, seat, {side: state.player, line: this.lines[state.player]});
     if (this.running) {
       if (this.running.kind !== 'move' && this.jobs.some(j => j.kind === 'move' && j.status === 'queued')) this.running.attempt.abort();
       return;
@@ -446,7 +449,7 @@ export class BrowserSession extends OfflineSession {
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
       try {
-        result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms,
+        result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
           progress: (f, live) => { job.done = job.kind === 'review' ? job.cursor + f : f; if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);
@@ -462,7 +465,7 @@ export class BrowserSession extends OfflineSession {
       if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
       // The move came back at `at`; saving it must not run its clock out.
       if (job.kind === 'move') clearTimeout(this.flag);
-      await this.record(history, job.spec, result);
+      await this.record(history, job.spec, result, job.kind === 'move' && this.entries.get(job.spec.engine)?.kind === 'bubble');
       if (job.kind === 'move') {
         if (job.controller.signal.aborted || position(this.history) !== position(history) || this.paused) { this.armFlag(); return; }
         if (!this.match?.active) this.forkGame();

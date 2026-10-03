@@ -232,6 +232,9 @@ the engine reports no progress) and its cancel button. The custom budget shows t
 (simulations, 0 plays the raw policy) and Solver (nodes, 0 turns it off; the solver gets up to a minute) for Bubble,
 Positions for Six, Search for Strix (at least 1), and ms (at least 10) for Native and Seal. Any larger whole number is
 accepted on both pages; it only takes longer.
+A Bubble seat, served or in the browser, keeps its search tree across turns like the evaluator, adding each turn's
+simulations to the visits already under the position until undo, a new or loaded game or a seat change, so its
+moves are saved with the kept-tree evaluations and never read back from the store.
 
 ### By hand
 

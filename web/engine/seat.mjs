@@ -39,6 +39,10 @@ const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, 
 const analyses = new Map(), loads = new Map(), hk = history => history.map(p => p.join(',')).join(';');
 /** Each seat and the analysis: null, or {engine: an ENGINES id, preset, checkpoint}. */
 let config = {seats: [null, null], analysis: null}, job = null, failed = null, posting = false;
+/** Each seat's line, the key of the game tree its Bubble searches (worker.mjs); undo, a new or loaded game and a seat change renew it. */
+const lines = [0, 1];
+let nextLine = 2;
+const renew = (...sides) => { for (const side of sides.length ? sides : [0, 1]) lines[side] = nextLine++; };
 let fresh = true, notice = null;
 /** Engine and checkpoint pairs whose network is loaded, with the engine's `ready` promise of the worker that loaded it (an
  * engine that discards its worker on cancel starts a new one): a timed move of any other holds the server's clock while it
@@ -133,7 +137,7 @@ function schedule() {
   const move = s.winner < 0 && seat && !s.paused && !s.match?.active && s.seats[side].engine === 'human';
   const prefix = s.history.slice(0, viewed());
   const analyse = a && !(s.winner >= 0 && prefix.length === s.history.length) && !analyses.has(analysisKey(a, prefix));
-  const task = move ? {kind: 'move', side, ...seat, history: s.history.map(p => [...p])}
+  const task = move ? {kind: 'move', side, ...seat, line: lines[side], history: s.history.map(p => [...p])}
     : analyse ? {kind: 'analyse', ply: prefix.length, ...a, history: prefix.map(p => [...p])} : null;
   const key = task && `${task.kind}|${task.engine}|${task.preset}|${task.checkpoint}|${hk(task.history)}`;
   if (job?.key === key || (key && key === failed)) return;
@@ -169,7 +173,7 @@ async function run(key, task) {
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
     const ms = task.kind === 'move' && s?.clock && s.clock_spec?.mode !== 'fixed' ? turnTime(s.clock_spec, s.clock, task.side) : null;
     const started = performance.now();
-    const result = await engine.turn(task.history, budget, {signal: controller.signal, ms,
+    const result = await engine.turn(task.history, budget, {signal: controller.signal, ms, line: task.line,
       progress: f => { current.fraction = f; progress(); }});
     if (ms == null) notePace(entry, task.preset, performance.now() - started, result.moves?.length);
     if (job !== current) return;
@@ -358,6 +362,8 @@ function install() {
   };
   page.post = (path, body = {}) => {
     const s = state();
+    if (['/undo', '/new', '/book', '/import', '/retry', '/match'].includes(path)) renew();
+    if (path === '/seat') renew(body.side);
     if (path === '/pause' && holding) holding.paused = !!body.paused;
     const fixed = id => ENGINES.has(id) && !ENGINES.get(id).entry.clocks ? ENGINES.get(id).entry.name : null;
     const refused = name => { original.toast(`${name} plays a fixed budget; it cannot keep a clock`); return Promise.resolve(null); };
@@ -416,7 +422,7 @@ function install() {
     original.renderSeat(side);
     const box = document.getElementById('seat' + side), s = state();
     if (!config.seats[side] || !box || s.saved_game) return;
-    const send = change => { config.seats[side] = {...config.seats[side], ...change}; save(); page.renderPanels(); };
+    const send = change => { config.seats[side] = {...config.seats[side], ...change}; renew(side); save(); page.renderPanels(); };
     const pick = box.querySelector('.pick');
     if (pick) {
       const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...original.pickItems(() => true)];
