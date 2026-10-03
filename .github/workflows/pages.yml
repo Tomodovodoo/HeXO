@@ -30,10 +30,13 @@ jobs:
           git -C "$RUNNER_TEMP/emsdk" checkout --quiet a2b92777574c2feda07994cd4f1079a3dfc151f8
           "$RUNNER_TEMP/emsdk/emsdk" install 6.0.10
           "$RUNNER_TEMP/emsdk/emsdk" activate 6.0.10
-      - run: python tools/build_web.py ort model shrimp seal six --emxx "$RUNNER_TEMP/emsdk/upstream/emscripten/em++"
+      - run: python tools/build_web.py ort model shrimp six --emxx "$RUNNER_TEMP/emsdk/upstream/emscripten/em++"
         env:
           GH_TOKEN: ${{ github.token }}
-      # The Strix network's licence is unstated; it is published only once the repository variable says so.
+      # Seal and the Strix network have no licence of their own. The site serves them only while the repository
+      # variables say so; a local build (`python tools/build_web.py seal strix-network`) always makes them.
+      - if: ${{ vars.PUBLISH_SEAL == 'true' }}
+        run: python tools/build_web.py seal --emxx "$RUNNER_TEMP/emsdk/upstream/emscripten/em++"
       - if: ${{ vars.PUBLISH_STRIX_NETWORK == 'true' }}
         run: python tools/build_web.py strix-network
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d

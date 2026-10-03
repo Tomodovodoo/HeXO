@@ -1,5 +1,6 @@
 /* Seal (Ramora0/HexTicTacToe) running in the browser: tools/seal_adapter.cpp compiled to seal/engine.wasm
- * (tools/build_web.py seal), searched in seal-worker.mjs. Seal's budget is a clock in ms. */
+ * (tools/build_web.py seal), searched in seal-worker.mjs. Seal's budget is a clock in ms. Without that bundle `seal`
+ * is null and the page does not offer it. */
 
 export const PRESETS = {lightning: {ms: 50}, quick: {ms: 100}, standard: {ms: 500}, strong: {ms: 2000}, deep: {ms: 8000},
   dangerous: {ms: 30000}};
@@ -135,10 +136,14 @@ export function record(result, history, preset) {
     line: result.moves.map(([q, r]) => [q, r, player]), threat: [], proof: null, ms: PRESETS[preset].ms, engine: ID};
 }
 
-/** Whether the site has Seal's build (its manifest answers). */
-async function built(path) {
-  try { return (await fetch(new URL(path, import.meta.url), {cache: 'no-cache'})).ok; } catch { return false; }
+async function built() {
+  try {
+    return (await fetch(new URL('seal/manifest.json', import.meta.url), {cache: 'no-store'})).ok;
+  } catch {
+    return false;
+  }
 }
 
-export const seal = await built('seal/manifest.json') ? {entry: {id: ID, kind: 'seal', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true, clocks: true},
+/** The browser engine for seat.mjs, or null when no Seal bundle was built (`python tools/build_web.py seal`). */
+export const seal = await built() ? {entry: {id: ID, kind: 'seal', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true, clocks: true},
   engine: new SealEngine(), record} : null;
