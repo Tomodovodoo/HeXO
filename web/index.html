@@ -129,7 +129,12 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 @keyframes think{50%{opacity:.4}}
 .hexdot.held::before,.hexdot.held::after{content:"";position:absolute;top:5px;width:2px;height:6px;background:#0b1222;border-radius:1px}
 .hexdot.held::before{left:4px}.hexdot.held::after{right:4px}
-.clock{font:12px var(--mono);color:var(--muted)}
+.clock{font:12px var(--mono);color:var(--muted);flex:none}.clock.running{color:var(--text)}.clock.out{color:var(--blunder)}
+.clockpick{display:grid;gap:6px}
+.clockpick .chips{display:flex;gap:2px;padding:2px;border-radius:8px;background:var(--bg);border:1px solid var(--line)}
+.clockpick .chips button{flex:1;border:0;background:transparent;color:var(--dim);font:600 11px system-ui;padding:4px 6px;border-radius:6px;cursor:pointer}
+.clockpick .chips button.on{background:var(--raise-2);color:var(--text)}
+.clockpick .chips button:disabled{cursor:default;opacity:.5}
 .seat .x{width:22px;height:22px;border:0;background:transparent;color:var(--dim);cursor:pointer;display:grid;place-items:center;border-radius:6px}
 .seat .x:hover{color:var(--text);background:var(--raise-2)}
 .seat .bar{margin:2px 6px 0}
@@ -473,7 +478,8 @@ function accept(data){
     if(!fitted||before===null||grown<0||grown>2)fit();
     renderPanels();
   }else{S.jobs=data.jobs;if('clock' in data)S.clock=data.clock}
-  renderJobs();draw();
+  if('clock' in data)clockAt=performance.now();
+  renderJobs();tickClocks();draw();
 }
 
 /* board geometry */
@@ -727,6 +733,31 @@ function paintSetups(){
 }
 
 /* panels */
+/* time controls: Budget (the seat's own budget), Turn (seconds per complete turn), Absolute (seconds per game) and
+   Fischer (seconds per game plus seconds after each complete turn), as the server's clock JSON */
+const CLOCKS=[['fixed','Budget'],['move','Turn'],['absolute','Absolute'],['fischer','Fischer']];
+function clockMode(spec){return!spec||spec.mode==='fixed'?'fixed':spec.mode==='move'?'move':spec.increment_ms?'fischer':'absolute'}
+function clockTimes(spec){return{turn:spec?.mode==='move'?spec.ms/1000:5,base:spec?.mode==='game'?spec.base_ms/1000:180,inc:spec?.mode==='game'&&spec.increment_ms?spec.increment_ms/1000:2}}
+function clockRequest(mode,t){return mode==='fixed'?{mode:'fixed'}:mode==='move'?{mode:'move',ms:Math.round(t.turn*1000)}:{mode:'game',tc:mode==='fischer'?`${t.base}+${t.inc}`:`${t.base}`}}
+/* the time control choice for `spec` (clock JSON); `send(request)` applies a choice */
+function clockPicker(spec,send,id){
+  const mode=clockMode(spec),times=clockTimes(spec);
+  const chips=el('span',{class:'chips',role:'radiogroup','aria-label':'Clock'},CLOCKS.map(([m,name])=>{
+    const b=el('button',{type:'button',class:m===mode?'on':'',role:'radio','aria-checked':m===mode},name);b.onclick=()=>{if(m!==mode)send(clockRequest(m,times))};return b}));
+  const field=(key,label)=>{const i=el('input',{type:'number',inputmode:'decimal',min:key==='inc'?0:.1,step:'any',value:times[key],'aria-label':label,id:`${id}-${key}`});
+    i.onchange=()=>{if(Number(i.value)>0||key==='inc'&&Number(i.value)===0)send(clockRequest(mode,{...times,[key]:Number(i.value)}))};return el('label',{class:'field'},el('span',{},label),i)};
+  const fields=mode==='move'?[field('turn','Turn s')]:mode==='absolute'?[field('base','Base s')]:mode==='fischer'?[field('base','Base s'),field('inc','Inc s')]:[];
+  return el('div',{class:'clockpick'},chips,...(fields.length?[el('div',{class:'custom'},fields)]:[]));
+}
+/* the seats' clocks, counted down between server updates for the side whose clock runs */
+let clockAt=0;
+const clockText=ms=>`${Math.floor(ms/60000)}:${(ms%60000/1000).toFixed(1).padStart(4,'0')}`;
+function tickClocks(){
+  for(const side of[0,1]){const box=$('clock'+side);if(!box)continue;const c=S?.clock,running=c?.running===['x','o'][side];
+    const ms=c?Math.max(0,c[side?'circle_ms':'cross_ms']-(running?performance.now()-clockAt:0)):null;
+    box.textContent=ms==null?'':clockText(ms);box.classList.toggle('running',running);box.classList.toggle('out',ms===0||S?.outcome?.reason==='time'&&S.outcome.winner!==side)}
+}
+setInterval(tickClocks,100);
 function configButton(id,seat){
   const b=el('button',{class:'ib ghost'+(configured.has(id)?' on':''),'aria-label':'Custom budget',html:icon('config')});
   b.onclick=()=>{configured.has(id)?configured.delete(id):configured.add(id);renderPanels()};return b;
@@ -771,6 +802,7 @@ function renderSeat(side){
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,seat.engine,it=>post('/seat',{side,engine:it.id}));
   const send=ch=>post('/seat',{side,engine:seat.engine,checkpoint:seat.checkpoint,preset:seat.preset,custom:seat.budget,...ch});
   const controls=seat.engine==='human'?[]:seatControls(seat,send,'seat'+side,configButton('seat'+side,seat));
+  if(seat.engine!=='human'&&entryOf(seat.engine)?.clocks)controls.push(clockPicker(S.clock_spec,spec=>post('/clock',spec),'clock-seat'+side));
   box.replaceChildren(el('div',{class:'seat-head'},el('i',{class:'hexdot',id:'dot'+side}),pick,el('span',{class:'clock',id:'clock'+side}),el('span',{id:'cancel'+side})),
     el('div',{class:'bar',id:'busy'+side,style:'visibility:hidden'},el('i')),
     ...(controls.length?[el('div',{class:'more'},el('div',{},controls))]:[]));
@@ -948,8 +980,6 @@ function renderJobs(){
   if(!S)return;
   autoAnalyse();
   for(const side of[0,1]){const box=$('busy'+side);if(!box)continue;const job=S.jobs.find(j=>j.kind==='move'&&j.side===side);
-    const clock=$('clock'+side),ms=S.clock?.[side===0?'cross_ms':'circle_ms'];
-    if(clock)clock.textContent=ms==null?'':`${Math.floor(ms/60000)}:${(ms%60000/1000).toFixed(1).padStart(4,'0')}`;
     $('dot'+side)?.classList.toggle('thinking',!!job);
     const cancel=$('cancel'+side);
     box.style.visibility=job?'visible':'hidden';

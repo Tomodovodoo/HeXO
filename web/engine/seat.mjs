@@ -6,28 +6,30 @@
  * (localStorage).
  *
  * ENGINES lists them. Each is {entry, engine, record}: `entry` is its picker entry ({id, kind, name, label,
- * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
- * while it downloads) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
- * preset's budget, plus `checkpoint` (one of `entry.checkpoints`, chosen in a select when there are several) when the
+ * checkpoints, presets, clocks}, with `badge` when the bot is not its kind, `analysis: true` when it can analyse and
+ * `clocks` true when it keeps a clock), `engine.load(progress)` starts it (progress(fraction) while it downloads, resolving
+ * to its device) and `engine.turn(history, budget, {signal, progress, ms})` resolves to its turn {moves, ...} at a
+ * preset's budget, within `ms` under a clock, plus `checkpoint` (one of `entry.checkpoints`, chosen in a select when there are several) when the
  * entry lists any, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
  * evaluation record the analysis panel shows for that turn. */
 import {BubbleEngine, NETWORKS, PRESETS, isolate, networkManifest} from './bubble.mjs';
 import {native} from './native.mjs';
 import {shrimp} from './shrimp.mjs';
 import {mountPlay, deviceLabel} from './browser-play.mjs';
+import {turnTime} from './clock.mjs';
 import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 import {strix} from './strix.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
-const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, analysis: true},
+const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, analysis: true, clocks: true},
   engine: new BubbleEngine(),
   record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
     solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE})};
 const ENGINES = new Map([bubble, native, shrimp, seal, six, strix].filter(Boolean).map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
-  'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems', 'isHuman'];
+  'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems', 'isHuman', 'clockPicker'];
 const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, page[name]]));
 const analyses = new Map(), loads = new Map(), hk = history => history.map(p => p.join(',')).join(';');
 /** Each seat and the analysis: null, or {engine: an ENGINES id, preset, checkpoint}. */
@@ -135,8 +137,9 @@ async function run(key, task) {
     current.loading = true;
     entry.device = deviceLabel(await engine.load(f => { loads.set(task.engine, f); progress(); }));
     current.loading = false;
-    const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})};
-    const result = await engine.turn(task.history, budget, {signal: controller.signal,
+    const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
+    const ms = task.kind === 'move' && s?.clock && s.clock_spec?.mode !== 'fixed' ? turnTime(s.clock_spec, s.clock, task.side) : null;
+    const result = await engine.turn(task.history, budget, {signal: controller.signal, ms,
       progress: f => { current.fraction = f; progress(); }});
     if (job !== current) return;
     job = null;
@@ -199,6 +202,13 @@ function install() {
   };
   page.post = (path, body = {}) => {
     const s = state();
+    const fixed = id => ENGINES.has(id) && !ENGINES.get(id).entry.clocks ? ENGINES.get(id).entry.name : null;
+    const refused = name => { original.toast(`${name} plays a fixed budget; it cannot keep a clock`); return Promise.resolve(null); };
+    if (path === '/clock' && body.mode !== 'fixed') {
+      const name = config.seats.map(choice => choice && fixed(choice.engine)).find(Boolean);
+      if (name) return refused(name);
+    }
+    if (path === '/seat' && fixed(body.engine) && s?.clock_spec && s.clock_spec.mode !== 'fixed') return refused(fixed(body.engine));
     if (path === '/seat' && body.engine !== undefined) {
       const browser = ENGINES.has(body.engine);
       config.seats[body.side] = browser ? pickEngine(body.engine, config.seats[body.side], body.checkpoint) : null;
@@ -255,7 +265,9 @@ function install() {
       const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...original.pickItems(() => true)];
       pick.onclick = () => original.openMenu(pick, items, config.seats[side].engine, it => page.post('/seat', {side, engine: it.id}));
     }
-    box.append(original.el('div', {class: 'more'}, original.el('div', {}, ...controls(config.seats[side], send, 'seat' + side))));
+    const clock = ENGINES.get(config.seats[side].engine).entry.clocks && s.clock_spec
+      ? [original.clockPicker(s.clock_spec, spec => page.post('/clock', spec), 'clock-seat' + side)] : [];
+    box.append(original.el('div', {class: 'more'}, original.el('div', {}, ...controls(config.seats[side], send, 'seat' + side), ...clock)));
     progress();
   };
   page.renderEngineHead = () => {
