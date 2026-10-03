@@ -240,6 +240,8 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .turn .st span:hover{background:var(--raise-2)}
 .turn .st span.on{color:var(--text);background:color-mix(in srgb,var(--c) 22%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 70%,transparent)}
 .turn .st span.off{opacity:.4}
+.mark{display:inline-grid;place-items:center;min-width:14px;height:13px;padding:0 2px;margin-left:5px;border-radius:4px;
+  font:800 9px/1 system-ui;font-style:normal;color:#0b1222;background:var(--g);vertical-align:1px}
 .detail .stones{display:flex;gap:4px;margin-left:auto;font:12px var(--mono);text-transform:none}
 .detail .stones span{padding:1px 6px;border-radius:6px;color:var(--muted)}
 .detail .stones span.on{color:var(--text);background:color-mix(in srgb,var(--c) 22%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 70%,transparent)}
@@ -255,6 +257,8 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .detail:empty{display:none}
 .detail h3{margin:0;font-size:14px;display:flex;align-items:center;gap:8px;text-transform:capitalize}
 .detail .nums{font:12px var(--mono);color:var(--muted);display:flex;gap:12px;flex-wrap:wrap}
+.detail .grade{align-items:center}.detail .grade.on{color:var(--text)}.detail .grade .mark{margin:0}
+.detail .grade b{font-weight:600;text-transform:capitalize}
 .empty{color:var(--dim);font-size:13px}
 /* menu and dialogs */
 #menu{position:fixed;z-index:10;padding:4px;max-height:min(60dvh,420px);overflow:auto;display:none;min-width:240px;transform-origin:top;animation:drop .16s var(--ease)}
@@ -975,13 +979,12 @@ function renderMoves(){
   const box=$('moves'),sel=selectedTurn(),keep=box.scrollTop,atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-4;
   box.replaceChildren(...S.review.map((t,i)=>{
     const label=t.label&&LABEL[t.label],fresh=t.label&&seenLabels.has(t.ply)&&seenLabels.get(t.ply)!==t.label;
-    const loss=t.before!=null&&t.after!=null?Math.round((t.before-t.after)*100):null;
     const row=el('div',{class:'turn'+(t===sel?' sel':''),style:`--c:${COLORS[t.player]}`},el('span',{class:'n'},i+1),
-      el('span',{class:'st'},t.stones.map((p,j)=>{const at=t.ply+j,s=el('span',{class:t===sel?(at===view-1?'on':at>=view?'off':''):''},p[0]+','+p[1]);
+      el('span',{class:'st'},t.stones.map((p,j)=>{const at=t.ply+j,s=el('span',{class:t===sel?(at===view-1?'on':at>=view?'off':''):''},p[0]+','+p[1],...stoneMark(t,j));
         s.onmouseenter=()=>{hot=[p[0],p[1]];draw()};s.onmouseleave=()=>{hot=null;draw()};
         s.onclick=e=>{e.stopPropagation();go(at+1)};return s})),
       label?el('span',{class:'glyph'+(fresh?' new':''),style:`--c:var(${label[1]})`},label[0]):el('span'),
-      el('span',{class:'loss'},loss>0&&!['best','win','found','kept'].includes(t.label)?'−'+loss:''));
+      el('span',{class:'loss'},lossOf(t)));
     row.onclick=()=>go(t.ply+t.stones.length);return row}));
   for(const t of S.review)seenLabels.set(t.ply,t.label);
   const bad=['inaccuracy','mistake','blunder','missed','allowed'];
@@ -991,15 +994,24 @@ function renderMoves(){
   if(atEnd&&view===S.history.length)box.scrollTop=box.scrollHeight;else box.scrollTop=keep;
   const s=box.querySelector('.sel');if(s&&renderMoves.view!==view)s.scrollIntoView({block:'nearest'});renderMoves.view=view;
 }
+/* a stone's own grade as a small badge, unless the stone is the whole graded turn */
+function stoneMark(t,j){const g=(t.stones.length>1||!t.label)&&t.grades?.[j]?.label;
+  return g?[el('i',{class:'mark',style:`--g:var(${LABEL[g][1]})`},LABEL[g][0])]:[]}
+function lossOf(g){const loss=g.before!=null&&g.after!=null?Math.round((g.before-g.after)*100):null;
+  return loss>0&&!['best','win','found','kept'].includes(g.label)?'−'+loss:''}
 function renderDetail(){
-  const t=selectedTurn(),d=$('detail');
-  if(!t||!t.label){d.replaceChildren();return}
+  const t=selectedTurn(),d=$('detail'),graded=t?t.stones.map((p,j)=>[p,j,stoneMark(t,j)]).filter(s=>s[2].length):[];
+  if(!t||!t.label&&!graded.length){d.replaceChildren();return}
+  const rows=graded.map(([p,j,mark])=>{const g=t.grades[j];return el('div',{class:'nums grade'+(t.ply+j===view-1?' on':'')},mark[0],el('b',{},g.label),
+    el('span',{},p[0]+','+p[1]),el('span',{},lossOf(g)),
+    ...(g.better?[el('span',{style:`color:${COLORS[t.player]}`},'★ '+g.better.map(p=>p.join(',')).join('  '))]:[]))});
+  if(!t.label){d.replaceChildren(...rows);return}
   const[g,c]=LABEL[t.label],nums=[];
   if(t.before!=null)nums.push(el('span',{},pct(t.before)+' → '+pct(t.after)));
   if(t.better)nums.push(el('span',{style:`color:${COLORS[t.player]}`},'★ '+t.better.map(p=>p.join(',')).join('  ')));
   const stones=el('span',{class:'stones',style:`--c:${COLORS[t.player]}`},t.stones.map((p,j)=>el('span',{class:t.ply+j===view-1?'on':''},p[0]+','+p[1])));
   d.replaceChildren(el('h3',{},el('span',{class:'glyph',style:`--c:var(${c})`},g),t.label,stones),el('div',{class:'nums'},nums),
-    ...(t.line&&t.line.length>(t.better||[]).length?[el('div',{class:'nums'},t.line.slice(0,8).map(p=>el('span',{style:`color:${COLORS[p[2]]}`},p[0]+','+p[1])))]:[]));
+    ...(t.line&&t.line.length>(t.better||[]).length?[el('div',{class:'nums'},t.line.slice(0,8).map(p=>el('span',{style:`color:${COLORS[p[2]]}`},p[0]+','+p[1])))]:[]),...rows);
 }
 const BOOKS=[['narrow','narrow'],['wide','on-policy'],['all','all']];
 /* the clock choice in the card when people play both seats (an engine seat shows it under its strength) */
