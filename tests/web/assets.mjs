@@ -197,7 +197,7 @@ out.six_retry = sixLate.checkpoints;
 // The page's engine lists while Seal's files are on neither origin and the site has every other engine's.
 const seat = await import('../../web/engine/seat.mjs');
 await seat.survey();
-out.offered = seat.offer({engines: ['browser:bubble', 'browser:seal', 'browser:strix', 'browser:six', 'six'].map(id => ({id}))}).engines.map(e => e.id);
+out.offered = ['browser:bubble', 'browser:seal', 'browser:strix', 'browser:six', 'six'].filter(id => seat.listed({id}));
 
 const page = host => {
   globalThis.document = {querySelector: () => null};

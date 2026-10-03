@@ -1168,9 +1168,9 @@ function savedGameRow(match,r){
 }
 /* a tournament entrant: engine, checkpoint, the same strength stops as a seat and its custom budget */
 function entrantRow(i){
-  const spec=entrants[i],engines=S.engines.filter(e=>globalThis.browserPlay||!e.id.startsWith('browser:'));if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
+  const spec=entrants[i],engines=pickItems(e=>globalThis.browserPlay||!e.id.startsWith('browser:'));if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
   const entry=entryOf(spec.engine);if(entry&&!(entry.checkpoints||[]).includes(spec.checkpoint))spec.checkpoint=entry.checkpoints?.[0]??null;
-  const pick=el('select',{'aria-label':'Engine',id:'t-engine'+i},engines.map(e=>{const b=e.badge||e.kind;return el('option',{value:e.id},b+(e.label&&e.label.toLowerCase()!==b?' · '+e.label:''))}));
+  const pick=el('select',{'aria-label':'Engine',id:'t-engine'+i},engines.map(e=>el('option',{value:e.id},e.kind+(e.label&&e.label.toLowerCase()!==e.kind?' · '+e.label:''))));
   pick.value=spec.engine;pick.onchange=()=>{spec.engine=pick.value;spec.checkpoint=null;spec.preset='quick';spec.custom=null;renderTournamentForm()};
   const parts=[pick];
   if(entry?.checkpoints?.length>1){const cp=el('select',{'aria-label':'Checkpoint',id:'t-checkpoint'+i},entry.checkpoints.map(c=>el('option',{value:c},c)));

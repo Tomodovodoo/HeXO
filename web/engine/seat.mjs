@@ -82,7 +82,6 @@ function adopt(data) {
     config.seats = config.seats.map((choice, side) => data.seats[side].engine === 'human' ? choice : null);
     save();
   }
-  offer(data);
   if (data.analysis === null) {
     if (!config.analysis) {
       config.analysis = {engine: native.entry.id, preset: 'quick'};
@@ -249,21 +248,18 @@ const check = id => checks.get(id)?.stamp === chosen(id).join(',') ? checks.get(
   : remember(id, ENGINES.get(id).engine.files(chosen(id)).then(files => { if (ENGINES.get(id).listed) recheck(ENGINES.get(id).entry); return status(files); }).catch(failure));
 /** Ids of the browser engines whose files are on neither this origin nor the site: only a local build provides them. */
 const absent = new Set();
-/** `data` (a play state) without the absent browser engines in its `engines`, which every engine list on the page reads. */
-export function offer(data) {
-  if (data.engines) data.engines = data.engines.filter(entry => !absent.has(entry.id));
-  return data;
-}
+/** Whether an engine list offers engine entry `entry`: not when it is an absent browser engine. A choice saved earlier
+ * keeps its entry in the play state, so its seat still shows its name and controls. */
+export const listed = entry => !absent.has(entry.id);
+/** The page's pickItems(filter), whose items every engine list (seats, analysis, tournament) shows, keeping listed entries. */
+const pickItems = filter => original.pickItems(entry => filter(entry) && listed(entry));
 /** Checks every browser engine's files and takes those on neither origin off the engine lists, redrawing the page when
  * it took one off; resolves once all are checked. */
 export async function survey() {
   const states = await Promise.all([...ENGINES.keys()].map(async id => [id, (await check(id)).state]));
   const gone = states.filter(([id, found]) => found === 'unpublished' && !absent.has(id));
   for (const [id] of gone) absent.add(id);
-  if (gone.length && state()) {
-    offer(state());
-    page.renderPanels();
-  }
+  if (gone.length && state()) page.renderPanels();
 }
 const unpublished = id => original.toast(`${ENGINES.get(id).entry.label} is not on the public site; build it here with ${ENGINES.get(id).build}`);
 /* States in which a browser engine plays without a download first: its files are here, cached, or cannot be cached. */
@@ -374,6 +370,7 @@ function recheck(entry, force = false) {
 
 function install() {
   page.openMenu = openMenu;
+  page.pickItems = pickItems;
   page.accept = data => {
     adopt(data);
     inject(data);
@@ -445,7 +442,7 @@ function install() {
     const send = change => { config.seats[side] = {...config.seats[side], ...change}; renew(side); save(); page.renderPanels(); };
     const pick = box.querySelector('.pick');
     if (pick) {
-      const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...original.pickItems(() => true)];
+      const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...pickItems(() => true)];
       pick.onclick = () => page.openMenu(pick, items, config.seats[side].engine, it => page.post('/seat', {side, engine: it.id}));
     }
     const clock = ENGINES.get(config.seats[side].engine).entry.clocks && s.clock_spec
@@ -459,7 +456,7 @@ function install() {
     if (!config.analysis || !head || !s?.analysis) return;
     const {entry} = ENGINES.get(config.analysis.engine);
     const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.badge || entry.kind, entry.label, entry.device));
-    const items = original.pickItems(analysable);
+    const items = pickItems(analysable);
     pick.onclick = () => page.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: ENGINES.get(it.id)?.entry.preset || 'standard', auto: true}));
     const send = change => { config.analysis = {...config.analysis, ...change}; save(); page.renderPanels(); };
     head.replaceChildren(original.el('div', {class: 'head'}, pick), ...controls(config.analysis, send, 'analysis'));
@@ -491,7 +488,7 @@ async function serverless() {
     if (response.ok && (response.headers.get('Content-Type') || '').includes('json')) return false;
   } catch {}
   if (await isolate()) return true;
-  Object.assign(page, original, {openMenu, accept: data => original.accept(offer(data))});
+  Object.assign(page, original, {openMenu, pickItems});
   const [manifest, build] = await Promise.all([json(networkManifest()).then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);
   bubble.entry.version = [build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
   bubble.entry.models = NETWORKS.length ? Object.fromEntries(NETWORKS.map(n => [n.name, n.model_version])) : {'': manifest.model_version};
