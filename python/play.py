@@ -781,11 +781,39 @@ def answered(history, known):
                 pv=outcome['pv'], threat=[], solved=True, ms=0, actual_completed=0, actual_solver_nodes=0, later=[])
 
 
+class SearchProofs:
+    """Leaf proofs within one turn's extra node and solver-time allowance.
+
+    Each query gets at most 2048 nodes and 10 ms, including certificate verification. Only solver time
+    consumes the time allowance; neural inference does not. Exhaustion leaves the search on neural values.
+    """
+
+    def __init__(self, prover, nodes, watch):
+        self.prover, self.left, self.watch = prover, nodes, watch
+        self.ms = min(60_000, max(10_000, nodes // 8))
+        self.used = 0
+
+    def history(self, history, *, ms=10, certificate=None):
+        allowance = min(ms, 10, int(self.ms))
+        if allowance < 1 or (not self.left and certificate is None):
+            return dict(status='UNKNOWN', native_verified=False)
+        self.watch(0)
+        start = time.perf_counter()
+        result = self.prover.history(history, nodes=min(2048, max(1, self.left)), ms=allowance, certificate=certificate)
+        spent = result.get('nodes_used', 0)
+        self.used += spent
+        self.left = max(0, self.left - spent)
+        self.ms -= (time.perf_counter() - start) * 1000
+        self.watch(0)
+        return result
+
+
 class TurnSearch:
     """One evaluation under way (see `evaluate`): the solver's findings, then a search per stone of the turn until
     the turn is complete. When the solver already gave the turn, its stones are played and each position of the turn
     is still searched, for its rows. The searches of later stones are kept in `later` as evaluations of the positions
-    inside the turn, without solver checks of their own; on a solver-proven turn they carry the rest of its `pv`.
+    inside the turn, with leaf proofs but no separate full-budget root query; on a solver-proven turn they carry
+    the rest of its `pv`.
     Without a solver proof, a position the search proves has the turn's own stones as its `pv`. `request()` names the tree and simulations of the next search, None when the turn is
     complete, (None, 0) for the raw policy; `take(result)` applies that search's result, None for the raw policy.
     `trees(history, simulations, network)` gives the tree and the simulations to run for a stone; by default one
@@ -796,7 +824,7 @@ class TurnSearch:
     shortest, since the first win settles the root), and a proof whose turn reaches a proven position
     continues into that position's line."""
 
-    def __init__(self, bubble, network, history, simulations, solved, trees=None, q_range_floor=0., known=None):
+    def __init__(self, bubble, network, history, simulations, solved, trees=None, q_range_floor=0., known=None, proofs=None):
         self.bubble, self.network, self.simulations, self.q_range_floor = bubble, network, simulations, q_range_floor
         self.history = [tuple(map(int, p)) for p in history]
         self.local = replay(self.history)
@@ -815,6 +843,7 @@ class TurnSearch:
             self.proof = dict(winner=outcome['winner'], plies=outcome['plies'],
                               turns=proof_turns(outcome['plies'], self.local.remaining, False))
             self.pv = outcome['pv']
+        self.proofs = proofs
 
     def advanced(self, history, simulations, network):
         from neural_search import NeuralSearch
@@ -839,6 +868,7 @@ class TurnSearch:
             for action, (winner, distance, _) in sorted(edges.items(), key=lambda e: (e[1][0] == mover, e[1][1], e[0])):
                 with contextlib.suppress(ValueError):
                     tree.mark(action, winner, distance)
+        tree.proof_solver, tree.proof_ms = self.proofs, 10
         return tree, simulations
 
     def take(self, result):
@@ -888,7 +918,8 @@ class TurnSearch:
             pv = pv + [[*p[:3], p[3] + len(self.moves)] for p in after['pv']]
         return dict(moves=self.moves, value=round(value, 4), top=self.top, proof=self.proof, pv=pv,
                     threat=self.threat, solved=self.solved, ms=round((time.perf_counter() - self.start) * 1000),
-                    actual_completed=self.completed, actual_solver_nodes=self.solver_used, later=self.later)
+                    actual_completed=self.completed,
+                    actual_solver_nodes=self.solver_used + (self.proofs.used if self.proofs else 0), later=self.later)
 
     def close(self):
         if self.trees == self.advanced and self.tree is not None:
@@ -906,11 +937,13 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     `pv` (the principal variation as [q, r, player, ply]: the solver's, see `principal_variation`, else on a search
     proof the turn's own stones; [] when unproven) and
     `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a solver
-    query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
-    `simulations` 0 plays the raw policy; `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
+    initial root query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
+    Search leaves also get verified solver proofs, with a shared extra `solver_nodes` allowance per turn and
+    at most 2048 nodes/10 ms per query; both stones share that allowance. `simulations` 0 plays the raw policy;
+    `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
     before each network batch of n positions and may raise Cancelled; `live(glimpse)` receives the search of the
     first stone as it goes, a few times a second. `trees` is `TurnSearch`'s tree source; `solved`, when given, is
-    the solver's view (see `solve`) and no query is made. `q_range_floor` is the fresh trees' neural_search floor.
+    the solver's view (see `solve`) and no initial root query is made. `q_range_floor` is the fresh trees' neural_search floor.
     `known`, a proof table (`Proofs`), answers a position it proves won for the side to move without solver or
     search (see `answered`) and otherwise informs the search (see `TurnSearch`)."""
     turn, shown = None, [0.]
@@ -929,8 +962,9 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         raise ValueError('The game has finished')
     if (found := answered(history, known)) is not None:
         return found
+    proofs = SearchProofs(prover, solver_nodes, watch) if prover is not None and solver_nodes and simulations else None
     turn = TurnSearch(bubble, Watched(bubble.evaluator, observe), history, simulations,
-                      solved or solve(prover, history, solver_nodes, watch), trees, q_range_floor, known)
+                      solved or solve(prover, history, solver_nodes, watch), trees, q_range_floor, known, proofs)
     try:
         while (asked := turn.request()) is not None:
             tree, count = asked
@@ -946,7 +980,7 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
                   q_range_floor=0., known=None):
     """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
     position per prover in `provers` at a time, each distinct position solved once; then fresh trees, one per
-    position, search together so their leaves share network batches of up to `batch_size`, stone by stone. Each
+    position, search together, checking leaf proofs within each turn allowance before sharing network batches of up to `batch_size`, stone by stone. Each
     result is what `evaluate` would give at that budget, with the proof table `known`. `watch` may raise
     Cancelled."""
     from concurrent.futures import ThreadPoolExecutor
@@ -973,10 +1007,11 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
     network = Watched(bubble.evaluator, watch)
     turns = []
     try:
-        for k, history, a in zip(keys, histories, given):
+        for i, (k, history, a) in enumerate(zip(keys, histories, given)):
             if a is None:
+                proofs = SearchProofs(provers[i % len(provers)], solver_nodes, watch) if provers and solver_nodes and simulations else None
                 turns.append(TurnSearch(bubble, network, history, simulations, solved.get(k) or solve(None, history, 0),
-                                        q_range_floor=q_range_floor, known=known))
+                                        q_range_floor=q_range_floor, known=known, proofs=proofs))
         coordinator = SearchCoordinator(network, bubble.sha256, bubble.cache)
         while asked := [(turn, request) for turn in turns if (request := turn.request()) is not None]:
             if not simulations:

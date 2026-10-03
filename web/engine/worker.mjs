@@ -126,6 +126,20 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
   const timed = ms != null, end = start + (ms ?? 0), solverEnd = start + .25 * (ms ?? 0);
   const deadline = Math.min(60000, Math.max(10000, Math.floor(solverNodes / 8)));
   const solverMs = () => timed ? Math.max(1, Math.floor(Math.min(deadline, solverEnd - performance.now()))) : deadline;
+  let leafNodes = solverNodes, leafMs = deadline;
+  const prove = solverNodes ? async leaves => {
+    const ms = Math.min(10, Math.floor(leafMs), timed ? Math.floor(solverEnd - performance.now()) : 10);
+    if (!leafNodes || ms < 1) return null;
+    check();
+    const before = performance.now();
+    const found = note(await solve(id, leaves, {nodes: Math.min(2048, leafNodes), ms}));
+    const used = found.nodes_used || 0;
+    leafNodes = Math.max(0, leafNodes - used);
+    leafMs -= performance.now() - before;
+    solverUsed += used;
+    check();
+    return found;
+  } : null;
   try {
     if (solverNodes) {
       const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true}));
@@ -172,7 +186,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
         const unmarked = await tree.settle(table ? table.edges(current) : new Map(), {evaluate, cache, version: network.version});
         check();
         const result = settled(await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
-          evaluate, stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
+          evaluate, prove, stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
           onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
             ...(stone ? {} : {live: rootRows(tree, choice)})})}), unmarked, local.player);
         check();

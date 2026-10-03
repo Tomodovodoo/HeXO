@@ -27,6 +27,7 @@ import {BrowserSession} from '../../web/engine/play-session.mjs';
 import {PlayStorage} from '../../web/engine/storage.mjs';
 import {OpeningBook} from '../../web/engine/openings.mjs';
 import {exportGame, readGame} from '../../web/engine/notation.mjs';
+import {loadTactical} from '../../web/engine/tactical.mjs';
 
 const job = JSON.parse(readFileSync(0, 'utf8'));
 const native = new Native(await createModule());
@@ -115,6 +116,46 @@ if (job.kind === 'encode') {
     undone: (await turn('a', [[0, 0]])).carried, fresh: (await turn('b', reply)).carried};
   await turn('c', [[0, 0]]);
   answer.lines = [...trees.trees.keys()];
+} else if (job.kind === 'proof-search') {
+  const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
+  const tree = new NeuralSearch(native, {tactics: true, graph: true, history: job.history});
+  let nodes = job.nodes, queries = 0;
+  try {
+    const found = await tree.search({simulations: job.simulations, rootSamples: 16,
+      prove: async history => {
+        if (!nodes) return null;
+        queries++;
+        const proof = solver.history(history, {nodes: Math.min(2048, nodes), ms: 100});
+        nodes = Math.max(0, nodes - proof.nodes_used);
+        return proof;
+      },
+      evaluate: async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}))});
+    answer = {...found, queries, nodes_used: job.nodes - nodes};
+  } finally { tree.close(); }
+} else if (job.kind === 'worker-turn') {
+  const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
+  const messages = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
+  const context = {Native, NeuralSearch, EvaluationCache, createModule, principalVariation, topRows,
+    URL, performance, setTimeout, clearTimeout, onmessage: null, postMessage: message => messages.push(message),
+    probe: async () => ({provider: 'wasm', precisions: ['fp32']}),
+    Network: {create: async () => ({version: 'uniform', precision: 'fp32', threads: 1,
+      evaluate: async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}))})},
+    Worker: class {
+      postMessage({id, history, options}) {
+        const result = solver.history(history, options);
+        queueMicrotask(() => this.onmessage({data: {id, result}}));
+      }
+      terminate() {}
+    }};
+  const source = readFileSync(workerUrl, 'utf8').replace(/^import .*;\r?$/gm, '')
+    .replaceAll('import.meta.url', JSON.stringify(workerUrl.href));
+  runInNewContext(source, context);
+  await context.onmessage({data: {type: 'load', options: {prefer: 'wasm'}}});
+  await context.onmessage({data: {type: 'turn', id: 1, history: job.history,
+    simulations: job.simulations, solverNodes: job.nodes}});
+  const error = messages.find(m => m.type === 'error');
+  if (error) throw new Error(error.message);
+  answer = messages.find(m => m.type === 'result').result;
 } else if (job.kind === 'pv') {
   answer = principalVariation(native, job.history, job.certificate);
 } else if (job.kind === 'rows') {

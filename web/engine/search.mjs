@@ -136,6 +136,17 @@ export class NeuralSearch {
       this.m._free(a); this.m._free(l); this.m._free(q);
     }
   }
+  /** Installs a native-verified mover certificate at its pending leaf before exact backup. */
+  fulfillProof(id, leaf, proof) {
+    if (proof.attacker !== 'mover') throw new Error('A leaf proof must belong to the side to move');
+    const state = this.n.game(leaf.history), history = this.n.cells(leaf.history), moves = this.n.cells(proof.moves);
+    try {
+      this.n.checked(this.m._hxg_prove(this.ptr, id, history, leaf.history.length, state.player, state.remaining,
+        moves, proof.moves.length, proof.proof_turns));
+    } finally {
+      this.m._free(history); this.m._free(moves);
+    }
+  }
   /**
    * Settles the root's stones `edges` (proof.mjs Proofs.edges) before a search, as python/play.py TurnSearch.request:
    * evaluates the root through `cache` (else `evaluate`, as in search) when it has no edges yet, then marks each edge
@@ -175,10 +186,11 @@ export class NeuralSearch {
   }
   /**
    * Runs one search like SearchCoordinator.search_many for a single tree; `stop()` true cancels it (the result is
-   * then the partial search). Resolves to the result fields of NeuralSearch.result.
+   * then the partial search). `prove(history)`, when supplied, returns a native-verified mover certificate or
+   * UNKNOWN before cache lookup and neural evaluation. Resolves to the result fields of NeuralSearch.result.
    */
   async search({simulations = 128, rootSamples = null, batchSize = 16, evaluate, cache = new EvaluationCache(), version = 'web',
-    stop = () => false, onBatch = () => {}, choice = 'policy'} = {}) {
+    stop = () => false, onBatch = () => {}, choice = 'policy', prove = null} = {}) {
     if (batchSize < 1 || simulations < 1) throw new Error('Positive search budgets required');
     if (choice !== 'policy' && choice !== 'gumbel') throw new Error('choice must be policy or gumbel');
     const start = performance.now(), stats = {evaluated: 0, hits: 0, batches: 0, largest: 0, network_ms: 0};
@@ -205,6 +217,14 @@ export class NeuralSearch {
             else if (id === 0) idle += 1;
             else {
               idle = 0;
+              if (prove) {
+                const proof = await prove(leaf.history);
+                if (finished()) continue;
+                if (proof?.status === 'PROVEN_WIN' && proof.native_verified) {
+                  this.fulfillProof(id, leaf, proof);
+                  continue;
+                }
+              }
               const key = cache.key(leaf.history, version), cached = cache.get(key);
               if (cached === undefined) pending.push({id, leaf, key});
               else { this.fulfill(id, leaf.actions, cached); stats.hits++; }
