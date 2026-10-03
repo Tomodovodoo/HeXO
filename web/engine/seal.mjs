@@ -134,5 +134,10 @@ export function record(result, history, preset) {
     line: result.moves.map(([q, r]) => [q, r, player]), threat: [], proof: null, ms: PRESETS[preset].ms, engine: ID};
 }
 
-export const seal = {entry: {id: ID, kind: 'seal', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
-  engine: new SealEngine(), record};
+/** Whether the site has Seal's build (its manifest answers). */
+async function built(path) {
+  try { return (await fetch(new URL(path, import.meta.url), {cache: 'no-cache'})).ok; } catch { return false; }
+}
+
+export const seal = await built('seal/manifest.json') ? {entry: {id: ID, kind: 'seal', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
+  engine: new SealEngine(), record} : null;

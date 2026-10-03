@@ -107,5 +107,10 @@ export function record(result, history, preset) {
     simulations: PRESETS[preset].visits, solver_nodes: 0, ms: result.ms, engine: ID};
 }
 
-export const shrimp = {entry: {id: ID, kind: 'six', badge: 'shrimp', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
-  engine: new ShrimpEngine(), record};
+/** Whether the site has Shrimp's build (its manifest answers). */
+async function built(path) {
+  try { return (await fetch(new URL(path, import.meta.url), {cache: 'no-cache'})).ok; } catch { return false; }
+}
+
+export const shrimp = await built('shrimp/model/manifest.json') ? {entry: {id: ID, kind: 'six', badge: 'shrimp', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
+  engine: new ShrimpEngine(), record} : null;
