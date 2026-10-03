@@ -13,17 +13,21 @@ import torch
 
 class ActorGraph:
     CANVASES = (24, 32, 40, 48, 64)
-    BATCHES = (1, 2, 4, 8, 16, 32)
+    BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
+    LARGE_BATCHES = {24: 128, 32: 64}
     MAX_CELLS = 110592
     STREAMS = {}
     LOCK = threading.Lock()
 
-    def __init__(self, model, max_incremental_bytes=384*1024*1024):
+    def __init__(self, model, max_incremental_bytes=384*1024*1024, max_batch=32):
         if model.training or model.net_kernels != 'fused':
             raise ValueError('ActorGraph requires a frozen fused eval model')
         device = next(model.parameters()).device
         if device.type != 'cuda':
             raise ValueError('ActorGraph requires a CUDA model')
+        if max_batch not in self.BATCHES:
+            raise ValueError('ActorGraph max_batch must be a capture capacity')
+        self.max_batch = max_batch
         self.model = model
         self.device = device
         self.lock = self.LOCK
@@ -80,11 +84,16 @@ class ActorGraph:
         while rows > limit:
             yield limit, limit
             rows -= limit
-        if limit == 32 and 16 < rows <= 24:
+        if 16 < rows <= 24:
             yield 16, 16
             rows -= 16
         if rows:
             yield rows, next(cap for cap in ActorGraph.BATCHES if rows <= cap <= limit)
+
+    @classmethod
+    def _limit(cls, side, max_batch=32):
+        ceiling = min(max_batch, cls.LARGE_BATCHES.get(side, 32))
+        return max(cap for cap in cls.BATCHES if cap <= ceiling and cap*side*side <= cls.MAX_CELLS)
 
     @torch.inference_mode()
     def __call__(self, planes):
@@ -103,7 +112,7 @@ class ActorGraph:
             if side not in self.CANVASES:
                 packed = self._fallback(planes)
             else:
-                limit = max(cap for cap in self.BATCHES if cap*side*side <= self.MAX_CELLS)
+                limit = self._limit(side, self.max_batch)
                 pieces = []
                 start = 0
                 for rows, capacity in self._segments(b, limit):
