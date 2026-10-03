@@ -1725,6 +1725,14 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual((found['top'][0][:2], found['top'][0][3:], found['pv'][0]), ([1, 0], [1., 1], [1, 0, 1, 1]))
         self.assertEqual(self.trees[0].searched[0][:2], ([(0, 0)], 0))
 
+    def test_the_shortest_of_several_proven_continuations_settles_the_root(self):
+        from play import Proofs, evaluate
+        known = Proofs()
+        known.add([(0, 0), (1, 0)], dict(proof=dict(winner=1, turns=3, plies=9), pv=[]))
+        known.add([(0, 0), (2, 0)], dict(proof=dict(winner=1, turns=2, plies=5), pv=[]))
+        found = evaluate(self.bubble(), None, [(0, 0)], 16, 0, known=known)
+        self.assertEqual((found['moves'][0], found['proof']), ([2, 0], dict(winner=1, plies=6, turns=2)))
+
     def test_a_lost_continuation_leaves_the_search(self):
         from play import Proofs, TurnSearch, solve
         known, bubble = Proofs(), self.bubble()

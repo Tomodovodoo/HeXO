@@ -469,7 +469,8 @@ class Bundle(unittest.TestCase):
         cases = []
         positions = [(h, 64, None, 0., 0.) for h in games[::3]]+[(h, 128, None, 0., 0.) for h in tactical]
         positions += [(games[5], 512, None, 0., 0.), (games[5], 64, 'gumbel', 0., 0.), (tactical[0], 128, 'gumbel', 0., 0.)]
-        positions += [(games[5], 128, None, .5, 0.), (games[27], 128, 'gumbel', 0., .25), (games[5], 128, None, 0., 0., True)]
+        positions += [(games[5], 128, None, .5, 0.), (games[27], 128, 'gumbel', 0., .25)]
+        positions += [(games[5], 128, None, 0., 0., 'lost'), (games[5], 64, None, 0., 0., 'wins')]
         for history, simulations, choice, floor, noise, *marked in positions:
             recorder, steps, results = Recorder(model), [], []
             tree = NeuralSearch(recorder, 'test', history, seed=1740, cache=EvaluationCache(), tactics=True,
@@ -478,12 +479,17 @@ class Bundle(unittest.TestCase):
                 for _ in range(2 if len(history) % 2 else 1):
                     option = dict(choice=choice) if choice else {}
                     if marked and not steps:
-                        # The first root's most likely stone is proven lost for the mover three placements on.
+                        # 'lost': the first root's most likely stone is proven lost for the mover three placements on.
+                        # 'wins': its two most likely stones win for the mover, the second sooner; the web side gets
+                        # them longest first and must still settle the root on the shorter.
                         prior = recorder.inner.evaluate([history])[0]
-                        lost = prior['actions'][prior['logits'].argmax()].tolist()
-                        option['marks'] = [[*lost, 1 - play.player_at(len(history)), 3]]
+                        first, second = (prior['actions'][i].tolist() for i in np.argsort(-prior['logits'])[:2])
+                        mover = play.player_at(len(history))
+                        option['marks'] = ([[*first, 1 - mover, 3]] if marked == ['lost'] else
+                                           [[*first, mover, 7], [*second, mover, 5]])
                         tree.expand()
-                        tree.mark(lost, *option['marks'][0][2:])
+                        for q, r, winner, distance in sorted(option['marks'], key=lambda m: (m[2] == mover, m[3])):
+                            tree.mark((q, r), winner, distance)
                     result = tree.search(simulations, root_samples=16, batch_size=16,
                                          **{k: v for k, v in option.items() if k != 'marks'})
                     steps.append(dict(simulations=simulations, root_samples=16, batch_size=16, **option))
@@ -504,9 +510,11 @@ class Bundle(unittest.TestCase):
                 self.assertEqual(web['completed'], native['completed'])
                 self.assertEqual((web['proven'], web['unmarked']), (native['proven'], 0))
                 np.testing.assert_allclose(web['policy'], native['policy'], rtol=0, atol=1e-12)
-        marked, web = cases[-1][1][0], answers[-1][0]
-        lost = marked['actions'].tolist().index(cases[-1][0]['steps'][0]['marks'][0][:2])
+        marked, web = cases[-2][1][0], answers[-2][0]
+        lost = marked['actions'].tolist().index(cases[-2][0]['steps'][0]['marks'][0][:2])
         self.assertEqual((marked['values'][lost], web['policy'][lost]), (-1., 0.))
+        won, web = cases[-1][1][0], answers[-1][0]
+        self.assertEqual((web['proven'], web['action'], won['proof_plies']), (1, cases[-1][0]['steps'][0]['marks'][1][:2], 5))
 
 
 if __name__ == '__main__':
