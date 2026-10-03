@@ -211,8 +211,9 @@ export class BrowserSession extends OfflineSession {
     this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false; this.renewLines();
     if (saved) {
       const {taken, ...fields} = saved;
-      this.native.game(saved.history); Object.assign(this, {...fields, paused: true});
-      if (this.match) this.match.active = false;
+      // A budget game resumes as it was left; a clocked game waits for Resume so no side's time runs unattended.
+      this.native.game(saved.history); Object.assign(this, {...fields, paused: Boolean(fields.paused) || Boolean(fields.clock)});
+      if (this.match) { this.match.active = false; this.paused = true; }
       if (this.clock?.started != null && taken) {
         // The side was thinking when the page went away: the time since the snapshot counts against it.
         const field = this.clock.side ? 'circle_ms' : 'cross_ms', now = Date.now();

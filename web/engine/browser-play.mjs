@@ -87,7 +87,7 @@ export async function mountPlay(engines, legacy) {
       if (link.target === '_blank') window.open(target.href, '_blank', 'noopener'); else location.href = target.href;
     }
   });
-  const leave = () => { session.freezeClock(); session.cancelJobs(); if (session.match) session.match.active = false; session.paused = true; if (session.dirty || session.clock) session.persist(); };
+  const leave = () => { session.freezeClock(); session.cancelJobs(); if (session.match) { session.match.active = false; session.paused = true; } if (session.clock) session.paused = true; if (session.dirty || session.clock) session.persist(); };
   addEventListener('pagehide', leave);
   const hint = document.getElementById('browser-storage');
   if (hint) hint.textContent = storage.db ? 'Games and analysis are saved in this browser.' : 'Browser storage is unavailable. Download your games before leaving.';

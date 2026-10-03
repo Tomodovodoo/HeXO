@@ -432,6 +432,13 @@ class Bundle(unittest.TestCase):
                                                  games=1, identity=True, mutation_status=400))
         self.assertEqual(result['stale_match'], dict(conflicted=True, session_completed=0, archive_completed=0, archived_games=0))
 
+    def test_restored_budget_game_is_not_paused(self):
+        result = node(dict(kind='restore-pause', clock=dict(mode='game', tc='60+1')))
+        self.assertFalse(result['budget']['before'])
+        self.assertFalse(result['budget']['after'])
+        self.assertTrue(result['clocked']['clock'])
+        self.assertTrue(result['clocked']['after'])
+
     def test_freeplay_updates_until_new_game(self):
         win = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
         requests = [['/play', dict(q=0, r=0)], ['/play', dict(q=1, r=0)]] + [['/storage/save', {}]]*20 + [['/new', {}]]
