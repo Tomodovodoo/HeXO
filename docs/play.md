@@ -341,7 +341,10 @@ position is highlighted, so stepping one stone at a time reads every grade. A tu
 gets a row with its first stone graded. For inaccuracies and worse the board outlines the engine's turn, beside the candidates of the position reached, and the panel lists its line. Keys: ← and →
 step one stone, ↑ and ↓ one turn, Home and End, F fits the board. Retry plays on from the shown position. The
 board draws HTTTX's `[q, r]` as the notation's diagram does: q to the right, r up and to the right, so a position
-looks the same here as on the sites that use the notation.
+looks the same here as on the sites that use the notation. The buttons at the board's lower left turn it 60 degrees
+either way, mirror it top to bottom and reset it, which shows a position from any of its 12 sides. The keys are [
+and ], M and 0. Only the drawing changes. The move list, exports, analysis and saved games keep HTTTX coordinates,
+and the browser remembers the view without putting it in links or saved games.
 Changing the analysis engine, checkpoint or strength evaluates the shown position again at once.
 
 Each cell has fixed places for its marks, so none hides another. A candidate is a ring with its rank and, below,
