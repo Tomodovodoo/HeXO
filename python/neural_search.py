@@ -301,8 +301,8 @@ class GameGraph(NeuralSearch):
     """One game's shared search graph (native hxg_share). The store keeps every node the game's searches expanded,
     keyed by turn context, with its visits, values, exact marks and proof distances; a search reads each stored
     child's visits and value as its edge's, so a search at a later position moves the values of every earlier
-    position that reaches it, and each playout also counts toward the root's first parents up the game. `at(history)`
-    moves the root to any position, stored or new; `advance` keeps the siblings of the played stone. Between
+    position that reaches it, and each playout also counts at the stored positions the root's history passes
+    through. `at(history)` moves the root to any position, stored or new; `advance` keeps the siblings of the played stone. Between
     searches at most `limit` expanded nodes are kept (0: no bound), the least recently used leaves leaving first.
     `search(..., pv_check=f)` adds the principal-variation check (Recheck)."""
 

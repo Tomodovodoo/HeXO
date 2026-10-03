@@ -844,6 +844,45 @@ class SharedGraph(unittest.TestCase):
         unbounded.search(8, root_samples=4, batch_size=4)
         self.assertEqual(unbounded.store()['evicted'], 0)
 
+    def test_a_search_counts_toward_the_order_of_its_own_history(self):
+        # Both orders of A's turn reach C; a search at C reached by one order counts at that order's first stone only.
+        a = recorded_position(11)
+        graph = self.graph(Ranked(), a)
+        first = graph.search(16, root_samples=4, batch_size=4)
+        x, y = (tuple(first['actions'][i]) for i in range(2))
+        for stone in (x, y):
+            graph.at([*a, stone])
+            graph.search(8, root_samples=4, batch_size=4)
+        graph.at(a)
+        before = graph.result(0, 0, 0, 0)['visits']
+        graph.at([*a, y, x])
+        graph.search(64, root_samples=8, batch_size=8)
+        graph.at(a)
+        after = graph.result(0, 0, 0, 0)['visits']
+        self.assertIn((after - before)[self.edge(first, y)], (64, 65))   # 65 when the search expanded C itself
+        self.assertEqual((after - before)[self.edge(first, x)], 0)
+
+    def test_an_evicted_child_hands_its_statistics_to_the_next_one(self):
+        a = recorded_position(11)
+        class Varied(Ranked):
+            def evaluate(self, histories):
+                return [dict(p, q=np.full(len(p['actions']), .8*np.sin(1.3*h[-1][0]+.7*h[-1][1])))
+                        for h, p in zip(histories, super().evaluate(histories))]
+        graph = self.graph(Varied(), a, limit=1)
+        first = graph.search(256, root_samples=8, batch_size=8)
+        graph.at(a)
+        self.assertEqual(graph.store()['expanded'], 1)
+        kept = graph.result(0, 0, 0, 0)
+        i = int(np.argmax(kept['visits']))
+        stone, visits, value = tuple(kept['actions'][i]), int(kept['visits'][i]), float(kept['values'][i])
+        np.testing.assert_array_equal(kept['visits'], first['visits'])
+        graph.at([*a, stone])
+        graph.search(1, root_samples=1, batch_size=1)
+        graph.at(a)
+        after = graph.result(0, 0, 0, 0)
+        self.assertGreater(int(after['visits'][i]), visits)
+        self.assertLess(abs(float(after['values'][i])-value), 2/(visits+1))
+
     def test_the_pv_check_searches_again_only_after_a_drop(self):
         a = recorded_position(11)
         mover = Game(a).player
