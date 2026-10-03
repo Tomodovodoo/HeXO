@@ -559,8 +559,14 @@ class DenseEvaluator:
             return self.graph(planes) if self.graph is not None else self.model(planes, planes[:, 3:4], aux=False)
 
     @torch.inference_mode()
+    def evaluate_leaves(self, leaves):
+        from neural_search import native
+        return self.evaluate([hexcrop.encode_leaf(native, tree, request, history)
+                              for tree, request, history in leaves])
+
+    @torch.inference_mode()
     def evaluate(self, histories):
-        samples = [hexcrop.encode(h) for h in histories]
+        samples = [h if isinstance(h, hexcrop.Sample) else hexcrop.encode(h) for h in histories]
         result = [None]*len(samples)
         for size, indices in hexcrop.group_by_size(samples).items():
             for start in range(0, len(indices), self.max_batch):

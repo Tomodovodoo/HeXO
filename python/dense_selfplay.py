@@ -141,12 +141,26 @@ class Evaluator(hexnet.DenseEvaluator):
         self.free = []
 
     @torch.inference_mode()
+    def submit_leaves(self, leaves):
+        samples = []
+        for tree, request, history in leaves:
+            try:
+                samples.append(hexcrop.encode_leaf(native, tree, request, history))
+            except hexcrop.SpanError:
+                samples.append(None)
+        return self.submit(samples)
+
+    @torch.inference_mode()
     def submit(self, histories, legal=None):
         """Launch the forwards for `histories`; `legal[i]`, when given, is history i's native legal list."""
         samples, groups = [], {}
         for i, h in enumerate(histories):
+            if h is None:
+                samples.append(None)
+                continue
             try:
-                samples.append(hexcrop.encode_game(hexcrop.Position(h), h, actions=None if legal is None else legal[i]))
+                samples.append(h if isinstance(h, hexcrop.Sample) else
+                               hexcrop.encode_game(hexcrop.Position(h), h, actions=None if legal is None else legal[i]))
             except hexcrop.SpanError:
                 samples.append(None)
                 continue
@@ -486,7 +500,12 @@ class Engine:
         for model, positions in pending.items():
             keys = list(positions)
             histories, legal = zip(*(positions[k][0] for k in keys))
-            launched.append((model, positions, keys, model.evaluator.submit(histories, legal)))
+            if hasattr(model.evaluator, 'submit_leaves'):
+                leaves = [(positions[k][1][1], positions[k][1][2], positions[k][0][0]) for k in keys]
+                handle = model.evaluator.submit_leaves(leaves)
+            else:
+                handle = model.evaluator.submit(histories, legal)
+            launched.append((model, positions, keys, handle))
             self.calls += 1
             self.evals += len(keys)
             self.full_calls += len(keys) == self.leaf_batch

@@ -13,7 +13,7 @@ import torch
 
 class ActorGraph:
     CANVASES = (24, 32, 40, 48, 64)
-    BATCHES = (8, 16, 32)
+    BATCHES = (1, 2, 4, 8, 16, 32)
     MAX_CELLS = 110592
     STREAMS = {}
     LOCK = threading.Lock()

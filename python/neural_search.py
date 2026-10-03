@@ -20,6 +20,8 @@ bind('hxg_begin', C.c_int, ptr, C.c_int, C.c_int)
 bind('hxg_next', C.c_int, ptr)
 bind('hxg_history', C.c_int, ptr, C.c_int, ptr)
 bind('hxg_legal', C.c_int, ptr, C.c_int, ptr)
+if hasattr(native, 'hxg_encode'):
+    bind('hxg_encode', C.c_int, ptr, C.c_int, ptr, C.c_int, ptr, ptr)
 bind('hxg_fulfill', C.c_int, ptr, C.c_int, ints, doubles, doubles, C.c_int)
 bind('hxg_cancel', None, ptr)
 bind('hxg_advance', C.c_int, ptr, C.c_int64, C.c_int64)
@@ -368,7 +370,11 @@ class SearchCoordinator:
                         grouped.setdefault(item[3], []).append(item)
                     unique = list(grouped.values())
                     batch_start = time.perf_counter()
-                    predictions = self.evaluator.evaluate([items[0][2] for items in unique])
+                    leaves = [(searches[items[0][0]].ptr, items[0][1], items[0][2]) for items in unique]
+                    if hasattr(self.evaluator, 'evaluate_leaves'):
+                        predictions = self.evaluator.evaluate_leaves(leaves)
+                    else:
+                        predictions = self.evaluator.evaluate([items[0][2] for items in unique])
                     batch_seconds = max(batch_seconds, time.perf_counter()-batch_start)
                     self.last_stats["inference_batches"] += 1
                     self.last_stats["unique_positions"] += len(unique)
