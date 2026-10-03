@@ -104,6 +104,8 @@ const said = [];
 out.call_restarts = await observe(loader(gpu('use')), {}, async (engine, note) => engine.call({type: 'use'},
   {progress: (fraction, live, stage) => { note(stage); said.push(stageText(stage)); }}));
 out.call_restarts.call_stages = [...new Set(said)];
+script = loader(() => 'go');
+out.call_first = await new EngineWorker('worker.mjs', 'Bubble').call({type: 'evaluate'}).catch(error => error.message);
 out.calls_overlap = await observe(loader(gpu('use')), {}, async engine => {
   const use = engine.call({type: 'use'});
   await wait(5);

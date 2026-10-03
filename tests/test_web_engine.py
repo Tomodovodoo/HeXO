@@ -322,6 +322,7 @@ class Loading(unittest.TestCase):
         self.assertEqual(found['result'], 'wasm')
         self.assertEqual(found['starts'], [dict(prefer=None, threads=None), dict(prefer='wasm', threads=None)])
         self.assertEqual(found['call_stages'], ['starting GPU', *self.LOAD, 'starting CPU', 'warming up'])
+        self.assertEqual(self.out['call_first'], 'done')
         overlap = self.out['calls_overlap']
         self.assertEqual((overlap['result'], len(overlap['starts'])), (['done', 'wasm'], 2))
 

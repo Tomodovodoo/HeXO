@@ -195,10 +195,11 @@ export class EngineWorker {
   /** Sends `message` once the worker is ready; aborting `signal` cancels it (rejects with an AbortError). A call that
    * a restart catches goes to the new worker. */
   async call(message, {signal, progress = () => {}} = {}) {
-    for (let ready = null; ready !== this.ready;) {
+    let ready;
+    do {
       ready = this.load();
       await ready;
-    }
+    } while (ready !== this.ready);
     const id = ++this.calls;
     return new Promise((resolve, reject) => {
       if (signal?.aborted || !this.worker) { reject(new DOMException(signal?.aborted ? 'Cancelled' : 'Closed', 'AbortError')); return; }
