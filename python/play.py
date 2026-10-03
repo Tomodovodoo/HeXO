@@ -1732,9 +1732,11 @@ class Session:
             self.freeplay_directory, self.freeplay_signature = None, None
             self.freeplay_records = {}
             self.history, self.paused, self.opening = [tuple(map(int, p)) for p in history], paused, None
-            self.match = None
+            leaving, self.match = self.match is not None, None
             self.saved_game = saved_game
             self.reset_clock()
+            if leaving:
+                self.prepare_timed()
             self.stop_moves()
             self.changed()
 
@@ -1865,8 +1867,11 @@ class Session:
 
     def fork_freeplay(self):
         if self.saved_game or self.match:
+            leaving = self.match is not None
             self.saved_game, self.match = None, None
             self.reset_clock()
+            if leaving:
+                self.prepare_timed()
             self.freeplay_directory, self.freeplay_signature = None, None
             self.freeplay_records = {}
 

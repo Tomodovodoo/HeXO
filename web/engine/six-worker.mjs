@@ -103,7 +103,7 @@ onmessage = ({data}) => {
     try {
       if (data.type === 'load') postMessage({type: 'ready', device: await load(data.options)});
       else if (data.type === 'turn') postMessage({type: 'result', id: data.id, result: await turn(data)});
-      else if (data.type === 'use') { await use(data.network ?? manifest.networks[0].name, fraction => postMessage({type: 'progress', id: data.id, fraction})); postMessage({type: 'result', id: data.id, result: null}); }
+      else if (data.type === 'use') { await use(data.network ?? manifest.data.networks[0].name, fraction => postMessage({type: 'progress', id: data.id, fraction})); postMessage({type: 'result', id: data.id, result: null}); }
     } catch (error) {
       postMessage(error instanceof Cancelled ? {type: 'cancelled', id: data.id} : {type: 'error', id: data.id, message: String(error.message || error)});
     } finally {

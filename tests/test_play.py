@@ -1454,6 +1454,15 @@ class FreeplayClock(unittest.TestCase):
             self.assertIs(self.session.seat_engines[1], kept)
             kept.close.assert_not_called()
 
+    def test_leaving_a_match_rebuilds_the_seats_timed_engines(self):
+        rebuilt = []
+        self.session.prepare_timed = lambda sides=(0, 1): rebuilt.append(tuple(sides))
+        self.session.match = dict(active=False, clock=dict(mode='fixed'))
+        self.session.load([(0, 0)], True)
+        self.assertEqual((self.session.match, rebuilt), (None, [(0, 1)]))
+        self.session.load([], True)
+        self.assertEqual(rebuilt, [(0, 1)])
+
     def test_engines_report_where_the_server_runs_them(self):
         from play import device_of
         self.assertEqual([device_of(dict(kind='bubble'), 'cuda'), device_of(dict(kind='bubble'), 'cpu'),
