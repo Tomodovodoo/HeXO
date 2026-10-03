@@ -259,9 +259,11 @@ static WORKER:OnceLock<mpsc::SyncSender<Work>>=OnceLock::new();
 static BUSY:AtomicBool=AtomicBool::new(false);
 static LAST_WORK:OnceLock<Mutex<Value>>=OnceLock::new();
 #[cfg(target_family="wasm")]
-fn dispatch(req:Request,start:Instant)->Result<Value,String> {
+fn dispatch(req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String> {
     if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
     let cancel=query_control(req.request_id)?;
+    if cancel.load(Ordering::Acquire) {return Err("cancelled".into());}
+    *dispatched=true;
     run_controlled(req,start,cancel)
 }
 #[cfg(windows)]
@@ -280,7 +282,7 @@ fn thread_cpu_ms()->Option<f64> {
 #[cfg(not(any(windows,target_family="wasm")))]
 fn thread_cpu_ms()->Option<f64> {None}
 #[cfg(not(target_family="wasm"))]
-fn dispatch(req:Request,start:Instant)->Result<Value,String> {
+fn dispatch(req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String> {
     if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
     let deadline=start+Duration::from_millis(req.ms as u64);
     let worker=WORKER.get_or_init(|| {
@@ -317,6 +319,7 @@ fn dispatch(req:Request,start:Instant)->Result<Value,String> {
     }
     let (send,recv)=mpsc::channel();
     if worker.send((req,start,Arc::clone(&cancel),send)).is_err() {BUSY.store(false,Ordering::Release);return Err("native worker stopped".into());}
+    *dispatched=true;
     match recv.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(result)=>result,
         Err(_)=>{
@@ -330,16 +333,18 @@ fn dispatch(req:Request,start:Instant)->Result<Value,String> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hexo_tactical_query(input:*const c_char)->*mut c_char {
     let start=Instant::now();
-    let result=std::panic::catch_unwind(|| {
+    let mut dispatched=false;
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if input.is_null(){return Err("null request".to_string());}
         let bytes=unsafe{CStr::from_ptr(input)}.to_bytes();
         if bytes.len()>64*1024*1024{return Err("request size limit".into());}
-        serde_json::from_slice(bytes).map_err(|e|e.to_string()).and_then(|req|dispatch(req,start))
-    });
+        serde_json::from_slice(bytes).map_err(|e|e.to_string()).and_then(|req|dispatch(req,start,&mut dispatched))
+    }));
+    let fresh=if dispatched {Value::Null}else{json!(0)};
     let mut value=match result {
         Ok(Ok(v))=>v,
-        Ok(Err(reason))=>json!({"status":"UNKNOWN","native_verified":false,"reason":reason,"moves":[],"nodes_fresh":null}),
-        Err(_)=>json!({"status":"UNKNOWN","native_verified":false,"reason":"native panic","moves":[],"nodes_fresh":null}),
+        Ok(Err(reason))=>json!({"status":"UNKNOWN","native_verified":false,"reason":reason,"moves":[],"nodes_fresh":fresh}),
+        Err(_)=>json!({"status":"UNKNOWN","native_verified":false,"reason":"native panic","moves":[],"nodes_fresh":fresh}),
     };
     value["background_worker_busy"]=json!(BUSY.load(Ordering::Acquire));
     value["last_worker_completion"]=LAST_WORK.get_or_init(||Mutex::new(Value::Null))
@@ -378,9 +383,37 @@ mod tests {
         let req=serde_json::from_value(json!({"history":IMMEDIATE,"ms":1000,"nodes":1000,
             "idtt_nodes":0,"depth":8,"request_id":next})).unwrap();
         assert!(hexo_tactical_cancel(next));
-        assert!(dispatch(req,Instant::now()).unwrap_err().contains("cancelled"));
+        let mut dispatched=false;
+        assert!(dispatch(req,Instant::now(),&mut dispatched).unwrap_err().contains("cancelled"));
+        assert!(!dispatched);
         hexo_tactical_release(next);
         assert!(query_control(next).is_err());
+    }
+    #[test]
+    fn rejected_native_requests_have_confirmed_zero_fresh_work() {
+        let query=|input:&str| {
+            let input=CString::new(input).unwrap();
+            let raw=unsafe{hexo_tactical_query(input.as_ptr())};
+            let result:Value=unsafe{serde_json::from_slice(CStr::from_ptr(raw).to_bytes()).unwrap()};
+            unsafe{hexo_tactical_free(raw)};
+            assert_eq!(result["status"],"UNKNOWN");
+            assert_eq!(result["nodes_fresh"],0);
+            result
+        };
+        query("{");
+        query(r#"{"history":[],"ms":0,"nodes":1,"idtt_nodes":0,"depth":8}"#);
+        let token=hexo_tactical_prepare();
+        hexo_tactical_cancel(token);
+        let result=query(&json!({"history":[],"ms":1000,"nodes":1,"idtt_nodes":0,"depth":8,"request_id":token}).to_string());
+        assert_eq!(result["reason"],"cancelled");
+        hexo_tactical_release(token);
+        #[cfg(not(target_family="wasm"))]
+        {
+            assert!(!BUSY.swap(true,Ordering::AcqRel));
+            let result=query(r#"{"history":[],"ms":1000,"nodes":1,"idtt_nodes":0,"depth":8}"#);
+            BUSY.store(false,Ordering::Release);
+            assert!(result["reason"].as_str().unwrap().contains("busy"));
+        }
     }
     #[test]
     fn cancelled_certificate_checks_return_no_strategy() {
