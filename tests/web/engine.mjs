@@ -256,7 +256,8 @@ if (job.kind === 'encode') {
   const frozen = failed.clockNow(); await wait(25);
   answer.timed_replay = await (async () => { const v = new BrowserSession(native); v.registerEngine(entry, {turn: async history => ({moves: job.history.slice(history.length, history.length + (history.length ? 2 : 1)), value: .5})});
     await v.startMatch({players: [{engine: 'test'}, {engine: 'test'}], games: 2, max_placements: 3, clock: {mode: 'game', tc: '60+1'}}); await until(() => v.match.completed === 2);
-    const g = await v.storage.get('games', v.match.results[0].id); return {clock: g.clock, turns: g.turns.length}; })();
+    const g = await v.storage.get('games', v.match.results[0].id); await v.openGame(v.match.id, 1); const st = v.state();
+    return {clock: g.clock, turns: g.turns.length, opened: {spec: st.clock_spec, turns: v.clockTurns.length, running: st.clock?.running ?? null}}; })();
   answer.failure_clock_frozen = failed.paused && !('started' in failed.clock) && JSON.stringify(frozen) === JSON.stringify(failed.clockNow());
   const writer = new BrowserSession(native);
   writer.registerEngine(entry, {turn:async()=>null});

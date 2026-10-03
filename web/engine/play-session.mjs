@@ -61,7 +61,7 @@ export class BrowserSession extends OfflineSession {
     this.storage = new PlayStorage(null); this.id = 'live'; this.seats = [human(), human()];
     this.entries = new Map(); this.adapters = new Map(); this.cache = new Map(); this.index = new Map(); this.jobs = [];
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
-    this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.loaded = new Set(); this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
+    this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
     this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null;
   }
@@ -339,8 +339,8 @@ export class BrowserSession extends OfflineSession {
     if (this.clock?.started != null) this.clockPartial += Date.now() - this.clock.started;
     this.clock = this.clockNow(); if (this.clock) { delete this.clock.started; delete this.clock.side; delete this.clock.running; }
   }
-  /** The time control in force: the match's, else the freeplay one. */
-  control() { return this.match ? this.match.clock : this.timeControl; }
+  /** The time control in force: the match's, a saved game's recorded one, else the freeplay one. */
+  control() { return this.match ? this.match.clock : this.saved_game ? this.saved_game.clock || {mode: 'fixed'} : this.timeControl; }
   /** Refuses `seat` under a clock when its engine plays a fixed budget. */
   clockable(seat) {
     const entry = this.entries.get(seat.engine);
@@ -353,17 +353,22 @@ export class BrowserSession extends OfflineSession {
     this.clock = c.mode === 'fixed' ? null : {cross_ms: base, circle_ms: base, increment_ms: c.mode === 'game' ? c.increment_ms : 0};
     this.clockTurns = []; this.outcome = null; this.clockPartial = 0;
   }
-  /** Starts the clock of the side to move while the game runs on one; an engine side's clock starts once its engine has
-   * loaded. Arms the loss on time. */
-  runClock() {
+  /** Starts the clock of the side to move while the game runs on one. An engine side's clock starts only from its move
+   * job, once `ready` (its engine and the checkpoint's network loaded for that job). Arms the loss on time. */
+  runClock(ready = false) {
     const c = this.clock;
     if (!c || c.started != null || this.paused || this.outcome || this.saved_game || this.conflicted || this.importing) return;
     if (this.match && (!this.match.active || this.match.pending_game)) return;
     const {winner, player} = this.native.game(this.history), seat = this.seats[player];
-    if (winner >= 0 || seat.engine !== 'human' && !this.loaded.has(seat.engine)) return;
+    if (winner >= 0 || seat.engine !== 'human' && !ready) return;
     Object.assign(c, {started: Date.now(), side: player});
+    this.armFlag();
+  }
+  /** Arms the loss on time for the running clock. */
+  armFlag() {
     clearTimeout(this.flag);
-    this.flag = setTimeout(() => this.checkTime(), c[player ? 'circle_ms' : 'cross_ms'] + 20);
+    const c = this.clock;
+    if (c?.started != null) this.flag = setTimeout(() => this.checkTime(), Math.max(0, c[c.side ? 'circle_ms' : 'cross_ms'] - (Date.now() - c.started)) + 20);
   }
   /** Charges `side`'s completed turn at time `at`, with what it spent before a pause (`clockPartial`): finished late it loses on time; otherwise it gains its increment, or
    * a whole turn again on a per-turn clock. Logs the balances in `clockTurns`; true when the turn stands. */
@@ -413,12 +418,10 @@ export class BrowserSession extends OfflineSession {
     try {
       const adapter = this.adapters.get(job.spec.engine);
       await adapter.ready?.(f => { job.done = f * .1; this.onchange(this.state()); }, job.spec.checkpoint);
-      this.loaded.add(job.spec.engine);
-      if (job.kind === 'move') this.runClock();
+      if (job.kind === 'move') this.runClock(true);
       if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
       let timeout = false, limit = null, ms = null;
       if (job.kind === 'move' && this.clock) {
-        this.runClock();
         const clock = this.clockNow();
         limit = clock[job.side ? 'circle_ms' : 'cross_ms']; ms = turnTime(this.control(), clock, job.side);
         timer = setTimeout(() => { timeout = true; job.attempt.abort(); }, Math.max(1, limit));
@@ -439,9 +442,11 @@ export class BrowserSession extends OfflineSession {
         }
       }
       if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      // The move came back at `at`; saving it must not run its clock out.
+      if (job.kind === 'move') clearTimeout(this.flag);
       await this.record(history, job.spec, result);
       if (job.kind === 'move') {
-        if (job.controller.signal.aborted || position(this.history) !== position(history) || this.paused) return;
+        if (job.controller.signal.aborted || position(this.history) !== position(history) || this.paused) { this.armFlag(); return; }
         if (!this.match?.active) this.forkGame();
         this.history.push(...copy(this.checkedTurn(history, result.moves)));
         this.chargeTurn(job.side, at);
@@ -528,7 +533,10 @@ export class BrowserSession extends OfflineSession {
   async openGame(id, number) {
     const game = await this.savedReplay(id, number);
     this.load(game.history, true, game.opening || null); this.seats = [human(), human()];
-    this.saved_game = {batch: id, game: +number, players: game.players.map(p => p.name || 'Human'), winner: game.winner, reason: game.reason};
+    this.saved_game = {batch: id, game: +number, players: game.players.map(p => p.name || 'Human'), winner: game.winner, reason: game.reason, clock: game.clock || null};
+    this.clockTurns = copy(game.turns || []);
+    const last = this.clockTurns.at(-1), base = game.clock && (game.clock.mode === 'move' ? game.clock.ms : game.clock.base_ms);
+    this.clock = game.clock ? {cross_ms: last?.cross_ms ?? base, circle_ms: last?.circle_ms ?? base, increment_ms: game.clock.increment_ms || 0} : null;
     this.records = game.records || Object.values(game.evaluations || {});
     if (this.analysis) this.analysis.auto = false;
     this.changed();

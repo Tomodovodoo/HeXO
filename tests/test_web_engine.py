@@ -343,7 +343,8 @@ class Bundle(unittest.TestCase):
         self.assertTrue(all(r['placements'] == 3 and r['reason'] == 'capped' for r in result['capped']['results']))
         self.assertEqual(result['uncapped'], dict(completed=2, capped=0, wins=[1, 1]))
         self.assertTrue(result['failure_clock_frozen'])
-        self.assertEqual(result['timed_replay'], dict(clock=dict(mode='game', base_ms=60000, increment_ms=1000), turns=1))
+        spec = dict(mode='game', base_ms=60000, increment_ms=1000)
+        self.assertEqual(result['timed_replay'], dict(clock=spec, turns=1, opened=dict(spec=spec, turns=1, running=None)))
         self.assertEqual(result['stale_tab'], dict(conflicted=True, history=[[0, 0], [1, 0]], archive=[[0, 0], [1, 0]],
                                                  games=1, identity=True, mutation_status=400))
         self.assertEqual(result['stale_match'], dict(conflicted=True, session_completed=0, archive_completed=0, archived_games=0))
