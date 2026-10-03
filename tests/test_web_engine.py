@@ -334,6 +334,7 @@ class Bundle(unittest.TestCase):
                 evaluations.append([history[:ply], dict(value=round(float(rng.random()), 4), moves=moves, proof=proof,
                                                         pv=[[*moves[0], 0, 1]] if proof and rng.random() < .5 else [])])
             cases.append(dict(history=history[:length], evaluations=evaluations, winner=int(rng.integers(-1, 2))))
+        cases.append(dict(history=[], evaluations=[[[], dict(value=.5, moves=[[0, 0]], proof=None, pv=[])]], winner=-1))
         found = node(dict(kind='review', cases=cases))
         for case, answer in zip(cases, found):
             table = {json.dumps(prefix): record for prefix, record in case['evaluations']}

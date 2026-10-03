@@ -46,6 +46,7 @@ export function review(history, lookup, winner = -1) {
   const turns = [], ss = starts(history.length);
   for (let i = 0; i < ss.length; i++) {
     const ply = ss[i], end = ss[i + 1] ?? history.length, me = playerAt(ply);
+    if (end === ply) break;
     const complete = end - ply === (ply ? 2 : 1) || end === history.length && winner === me;
     turns.push({ply, player: me, stones: history.slice(ply, end), ...(complete ? judge(ply, end, me) : UNGRADED),
       grades: Array.from({length: end - ply}, (_, j) => judge(ply + j, ply + j + 1, me))});

@@ -281,6 +281,7 @@ class Review(unittest.TestCase):
         history = self.history[:4]
         turns = self.labels({(0, 1, 2): evaluation(.5, [(5, 5), (6, 6)]), (0, 1, 2, 3): evaluation(.25)}, history=history)
         self.assertEqual((len(turns), turns[-1]['stones'], turns[-1]['label']), (3, [[-1, 0]], None))
+        self.assertEqual(review([], lambda prefix: evaluation(.5)), [])
         self.assertEqual(turns[-1]['grades'][0]['label'], 'blunder')
 
     def test_review_plies_count_every_stone(self):

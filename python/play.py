@@ -1581,6 +1581,8 @@ def review(history, lookup, winner=-1):
     turns = []
     starts = turn_starts(len(history))
     for s, e in zip(starts, [*starts[1:], len(history)]):
+        if s == e:
+            break
         me = player_at(s)
         complete = e - s == (1 if s == 0 else 2) or e == len(history) and winner == me
         turns.append(dict(ply=s, player=me, stones=[list(p) for p in history[s:e]],
