@@ -77,6 +77,7 @@ export class StrixEngine {
    * the worker (a search cannot be interrupted inside it) and rejects with an AbortError; the next call starts a new one.
    */
   async turn(history, budget, {signal, progress = () => {}} = {}) {
+    await this.known();   // the requested network may be in a list that has not arrived yet
     const network = this.networks.get(budget.checkpoint) ?? this.networks.values().next().value ?? null;
     if (network !== this.network) {
       this.close();

@@ -6,7 +6,7 @@ import {createHash} from 'node:crypto';
 const BASE = new URL('../../web/engine/', import.meta.url).href, SITE = 'https://tomodovodoo.github.io/HeXO/engine/';
 const hash = text => createHash('sha256').update(text).digest('hex');
 const requests = [], here = new Map(), site = new Map(), store = new Map();
-let offline = false, noHead = false;
+let offline = false, noHead = false, broken = 0;
 
 globalThis.fetch = async (input, init = {}) => {
   const url = String(input), method = init.method ?? 'GET';
@@ -19,7 +19,9 @@ globalThis.fetch = async (input, init = {}) => {
   }
   const body = site.get(url.slice(SITE.length));
   if (body === undefined) return new Response('missing', {status: 404});
-  return new Response(method === 'HEAD' ? null : body, {headers: {'Content-Length': String(Buffer.byteLength(body))}});
+  const stream = broken-- > 0 && method === 'GET'
+    ? new ReadableStream({pull: controller => controller.error(new TypeError('input stream'))}) : method === 'HEAD' ? null : body;
+  return Object.defineProperty(new Response(stream, {headers: {'Content-Length': String(Buffer.byteLength(body))}}), 'url', {value: url});
 };
 globalThis.caches = {open: async () => ({
   match: async key => store.has(String(key)) ? new Response(store.get(String(key))) : undefined,
@@ -74,6 +76,13 @@ reset();
 site.set('ort/x.mjs', 'export default 7;');
 const url = await assets.moduleUrl({path: 'ort/x.mjs', sha256: hash('export default 7;'), local: true});
 out.module = {text: await (await import('node:buffer')).resolveObjectURL(url).text(), requests: [...requests]};
+
+reset();
+site.set('s.onnx', 'streamed');
+broken = 1;
+const fractions2 = [];
+out.stream_fallback = {body: text(await assets.cached({path: 's.onnx', sha256: hash('streamed')}, f => fractions2.push(f))),
+  requests: requests.filter(r => r.includes('s.onnx')).length, reset: fractions2.includes(0)};
 
 reset();
 here.set('k.wasm', 'versioned');

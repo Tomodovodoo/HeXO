@@ -93,18 +93,11 @@ function key(file) {
   return url.href;
 }
 
-/**
- * The bytes of engine file `file` {path, sha256?, version?, lines?} as an ArrayBuffer: from the Cache API when it holds
- * the file's key, else fetched (this origin first, then the site), checked against `sha256` (CRLF read as LF when
- * `lines`) and stored there, replacing other versions of the path. A file from the site needs a `sha256`, and bytes
- * that do not match it throw. `progress(fraction)` follows the download.
- */
-export async function cached(file, progress = () => {}) {
-  const store = await open(), id = key(file), hit = store && await store.match(id);
-  if (hit) { progress(1); return hit.arrayBuffer(); }
-  const {response, local} = await locate(file.path, {cache: 'no-cache'});   // a Cache API miss means new bytes: revalidate
-  if (!local && !file.sha256) throw new Error(`${file.path}: the site's manifest has no SHA-256 for it`);
-  const total = Number(response.headers.get('Content-Length')) || file.bytes || 0, parts = [];
+/** The body of `response` as an ArrayBuffer, read in chunks so `progress(fraction)` follows it (`bytes` stands in for
+ * a missing Content-Length). */
+async function download(response, bytes, progress) {
+  if (!response.body) return response.arrayBuffer();
+  const total = Number(response.headers.get('Content-Length')) || bytes || 0, parts = [];
   let received = 0;
   for (const reader = response.body.getReader(); ;) {
     const {done, value} = await reader.read();
@@ -113,7 +106,34 @@ export async function cached(file, progress = () => {}) {
     received += value.length;
     if (total) progress(Math.min(1, received / total));
   }
-  const body = await new Blob(parts).arrayBuffer();
+  return new Blob(parts).arrayBuffer();
+}
+
+/**
+ * The bytes of engine file `file` {path, sha256?, version?, lines?} as an ArrayBuffer: from the Cache API when it holds
+ * the file's key, else fetched (this origin first, then the site), checked against `sha256` (CRLF read as LF when
+ * `lines`) and stored there, replacing other versions of the path. A file from the site needs a `sha256`, and bytes
+ * that do not match it throw. `progress(fraction)` follows the download.
+ */
+export async function cached(file, progress = () => {}) {
+  const store = await open(), id = key(file), hit = store && await store.match(id);
+  if (hit) {
+    try {
+      const body = await hit.arrayBuffer();
+      progress(1);
+      return body;
+    } catch {   // an entry the browser can no longer read is fetched afresh
+      await store.delete(id).catch(() => {});
+    }
+  }
+  const {response, local} = await locate(file.path, {cache: 'no-cache'});   // a Cache API miss means new bytes: revalidate
+  if (!local && !file.sha256) throw new Error(`${file.path}: the site's manifest has no SHA-256 for it`);
+  const body = await download(response, file.bytes, progress).catch(async () => {   // a browser whose body stream fails
+    progress(0);                                                                   // still delivers the whole body at once
+    const again = await fetch(response.url, {cache: 'reload', ...(local ? {} : {mode: 'cors'})});
+    if (!again.ok) throw new Error(`${file.path}: ${again.status}`);
+    return again.arrayBuffer();
+  });
   if (file.sha256 && await sha256(body, file.lines) !== file.sha256) {
     throw new Error(`${file.path} from ${local ? 'this site' : site()} does not match its SHA-256`);
   }
