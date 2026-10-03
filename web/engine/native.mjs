@@ -100,4 +100,4 @@ export function record(result, history, preset) {
 }
 
 export const native = {entry: {id: ID, kind: 'native', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
-  engine: new NativeEngine(), record};
+  engine: new NativeEngine(), record, build: 'python tools/build_web.py wasm'};

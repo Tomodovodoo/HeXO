@@ -157,7 +157,8 @@ once it is registered. A failure shows its error for a few seconds and the butto
 The browser engines (Bubble, Native, Six, Strix, Shrimp and Seal, each marked "(browser)") install themselves. When
 this checkout lacks their build outputs, the picker shows a download button with the size; it fetches the files from
 the public site, checks them against their SHA-256 and keeps them in the browser's cache, so only the first use
-downloads ([Running a local copy](web-engine.md#running-a-local-copy)).
+downloads ([Running a local copy](web-engine.md#running-a-local-copy)). An engine the public site does not serve
+shows "local build" instead, and clicking it shows the `python tools/build_web.py` command to run.
 
 | Engine | Source, licence | One click |
 |---|---|---|

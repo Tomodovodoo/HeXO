@@ -36,13 +36,23 @@ function remote(path) {
   return there === BASE ? null : new URL(path, there).href;
 }
 
+/** Thrown for a file that neither this origin nor the site has (both answer 404): the site does not publish it, so
+ * only a local build provides it. Other failures (a network error, another status) are plain Errors. */
+export class NotOnSite extends Error {
+  constructor(path) {
+    super(`${path} is neither here nor on ${site()}`);
+    this.path = path;
+  }
+}
+
 /** {response, local}: `path` from this origin, else (after a 404 or a network error) from the site. */
 async function locate(path, init = {}) {
   const here = await fetch(new URL(path, BASE), init).catch(() => null);
   if (here?.ok) return {response: here, local: true};
   const there = remote(path);
-  if (!there) throw new Error(`${path}: ${here ? here.status : 'unreachable'}`);
+  if (!there) throw here?.status === 404 ? new NotOnSite(path) : new Error(`${path}: ${here ? here.status : 'unreachable'}`);
   const response = await fetch(there, {...init, mode: 'cors'}).catch(error => { throw new Error(`${path}: ${error.message} (${there})`); });
+  if (response.status === 404) throw new NotOnSite(path);
   if (!response.ok) throw new Error(`${path}: ${response.status} (${there})`);
   return {response, local: false};
 }
@@ -133,8 +143,11 @@ export async function status(files) {
   const missing = [];
   for (const file of away) if (!await store.match(key(file))) missing.push(file);
   if (!missing.length) return {state: 'cached'};
-  const sized = await Promise.all(missing.map(async file => file.bytes ? file : {...file,
-    bytes: Number((await fetch(remote(file.path), {method: 'HEAD', mode: 'cors'}).catch(() => null))?.headers.get('Content-Length')) || 0}));
+  const sized = await Promise.all(missing.map(async file => {
+    const there = remote(file.path), head = there && await fetch(there, {method: 'HEAD', mode: 'cors'}).catch(() => null);
+    if (!there || head?.status === 404) throw new NotOnSite(file.path);
+    return {...file, bytes: file.bytes || Number(head?.headers.get('Content-Length')) || 0};
+  }));
   return {state: 'missing', files: sized, bytes: sized.reduce((sum, file) => sum + file.bytes, 0)};
 }
 

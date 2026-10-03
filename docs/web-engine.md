@@ -32,7 +32,10 @@ A copy of `web/` (a static server, or the page `python/play.py` serves) usually 
 Runtime, the Bubble model, Six's networks, Shrimp's model, Seal and the Strix network. Every browser engine stays in
 the picker anyway. One whose files are neither on this origin nor already downloaded shows a download button with
 its size; click it to fetch the files from the public site, after which the engine plays as usual. Picking such an
-engine for a seat without clicking downloads the same files on its first move.
+engine for a seat without clicking downloads the same files on its first move. When the site answers 404 for one of
+an engine's files too (the site may stop publishing Seal and the Strix network), the row reads "local build" and a
+click shows the `tools/build_web.py` command that builds them here; nothing is downloaded or retried. Once the site
+serves the files again, the download works with no code change.
 
 `web/engine/assets.mjs` resolves each file. It asks this origin first and, on a 404 or a network error, fetches the
 file from <https://tomodovodoo.github.io/HeXO/engine/>, which allows any origin to read it. A file from the site must

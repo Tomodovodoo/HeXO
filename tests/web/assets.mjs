@@ -139,6 +139,23 @@ for (const [id, engine] of Object.entries(engines)) {
     downloads: requests.filter(r => !r.endsWith('.json')), cached: (await assets.status(listed)).state};
 }
 
+const kind = async run => { try { await run(); return 'ok'; } catch (error) { return error instanceof assets.NotOnSite ? 'not on site' : 'error'; } };
+site.delete('seal/manifest.json');
+site.delete('strix/networks.json');
+out.unpublished = {
+  manifest: await kind(() => assets.json('nowhere/manifest.json')),
+  status: await kind(() => assets.status([{path: 'nowhere.onnx', sha256: 'x', local: false}])),
+  seal: await kind(() => engines.seal.files()),
+  strix: await kind(async () => new (await import('../../web/engine/strix.mjs')).StrixEngine([]).files()),
+};
+offline = true;
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (input, init) => { if (!String(input).startsWith(BASE)) throw new TypeError('Failed to fetch'); return realFetch(input, init); };
+out.unpublished.unreachable = await kind(() => assets.json('nowhere/manifest.json'));
+globalThis.fetch = realFetch;
+offline = false;
+site.set('strix/networks.json', JSON.stringify(manifests['strix/networks.json']));
+
 const late = new (await import('../../web/engine/strix.mjs')).StrixEngine([]);
 out.strix_retry = {files: (await late.files()).map(f => f.path), checkpoints: late.checkpoints};
 

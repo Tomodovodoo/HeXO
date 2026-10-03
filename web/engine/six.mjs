@@ -46,4 +46,5 @@ export const six = {
   entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, analysis: true},
   engine,
   record: (result, history, preset) => ({...result, engine: ID}),
+  build: 'python tools/build_web.py ort six',
 };

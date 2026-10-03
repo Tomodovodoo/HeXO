@@ -5,7 +5,8 @@
  * A task that failed is not retried until the position, preset or engine choice changes. Choices persist per browser
  * (localStorage).
  *
- * ENGINES lists them. Each is {entry, engine, record}: `entry` is its picker entry ({id, kind, name, label,
+ * ENGINES lists them. Each is {entry, engine, record, build}: `build` is the command that builds its files into this
+ * checkout (shown when the public site does not serve them), `entry` is its picker entry ({id, kind, name, label,
  * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
  * while it downloads), `engine.files()` lists the files it downloads (assets.mjs records, for the picker's download
  * button) and `engine.turn(history, budget, {signal, progress})` resolves to its turn {moves, ...} at a
@@ -19,13 +20,14 @@ import {mountPlay} from './browser-play.mjs';
 import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 import {strix} from './strix.mjs';
-import {install as download, json, status} from './assets.mjs';
+import {NotOnSite, install as download, json, status} from './assets.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
 const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: [], presets: PRESETS, analysis: true},
   engine: new BubbleEngine(),
   record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
-    solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE})};
+    solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE}),
+  build: 'python tools/build_web.py ort model'};
 const ENGINES = new Map([bubble, native, shrimp, seal, six, strix].map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
@@ -172,7 +174,8 @@ async function run(key, task) {
   } catch (error) {
     if (error.name !== 'AbortError') {
       failed = key;
-      original.toast(error.message);
+      if ((await check(task.engine)).state === 'unpublished') unpublished(task.engine);   // a worker's error is a plain message
+      else original.toast(error.message);
     }
     if (job === current) job = null;
   }
@@ -192,12 +195,15 @@ function controls(choice, send, id) {
   return out;
 }
 
-/* Engine id -> a promise of its files' assets.mjs status(), or {state: 'failed', error} when they cannot be listed. */
+/* Engine id -> a promise of its files' assets.mjs status(), {state: 'unpublished'} when neither this origin nor the
+ * site has one of them (only a local build provides it), or {state: 'failed', error} for another failure. */
 const checks = new Map(), downloads = new Map();
+const failure = error => error instanceof NotOnSite ? {state: 'unpublished'} : {state: 'failed', error: error.message};
 const check = id => {
-  if (!checks.has(id)) checks.set(id, ENGINES.get(id).engine.files().then(status, error => ({state: 'failed', error: error.message})));
+  if (!checks.has(id)) checks.set(id, ENGINES.get(id).engine.files().then(status).catch(failure));
   return checks.get(id);
 };
+const unpublished = id => original.toast(`${ENGINES.get(id).entry.label} is not on the public site; build it here with ${ENGINES.get(id).build}`);
 /* States in which a browser engine plays without a download first: its files are here, cached, or cannot be cached. */
 const READY = new Set(['local', 'cached', 'uncached']);
 const megabytes = bytes => `${(bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0)} MB`;
@@ -213,6 +219,11 @@ async function paint(row) {
   row.removeAttribute('aria-label');
   if (ready) return;
   row.classList.add('setup', ...(running ? ['running'] : found.state === 'failed' ? ['failed'] : []));
+  if (found.state === 'unpublished') {
+    row.setAttribute('aria-label', `${ENGINES.get(id).entry.label} needs a local build`);
+    row.append(original.el('span', {class: 'size', style: 'white-space:nowrap'}, 'local build'));
+    return;
+  }
   const total = found.bytes ? megabytes(found.bytes) : '';
   const size = !running ? total : total ? `${megabytes(running.fraction * found.bytes)} / ${total}` : `${Math.round(running.fraction * 100)}%`;
   row.setAttribute('aria-label', `Download ${ENGINES.get(id).entry.label}`);
@@ -229,13 +240,15 @@ async function fetchEngine(id) {
     if ((await check(id)).state === 'failed') checks.delete(id);
     repaint();
     const found = await check(id);
+    if (found.state === 'unpublished') { unpublished(id); return; }
     if (found.state === 'failed') throw new Error(found.error);
     if (found.state === 'missing') await download(found.files, fraction => { slot.fraction = fraction; repaint(); });
     checks.delete(id);
     if (!READY.has((await check(id)).state)) throw new Error('the downloaded files did not reach the browser cache');
   } catch (error) {
-    checks.set(id, Promise.resolve({state: 'failed', error: error.message}));
-    original.toast(`${ENGINES.get(id).entry.label}: ${error.message}`);
+    checks.set(id, Promise.resolve(failure(error)));
+    if (error instanceof NotOnSite) unpublished(id);
+    else original.toast(`${ENGINES.get(id).entry.label}: ${error.message}`);
   } finally {
     downloads.delete(id);
     repaint();

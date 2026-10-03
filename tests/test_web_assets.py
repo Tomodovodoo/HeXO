@@ -93,6 +93,11 @@ class Resolver(unittest.TestCase):
         self.assertEqual(self.out['override'], {'public': SITE, 'loopback': 'https://other.example/engine/'})
 
 
+    def test_files_the_site_does_not_publish_need_a_local_build(self):
+        self.assertEqual(self.out['unpublished'], {'manifest': 'not on site', 'status': 'not on site', 'seal': 'not on site',
+                                                   'strix': 'not on site', 'unreachable': 'error'})
+
+
 class Loaders(unittest.TestCase):
     def test_engine_loaders_fetch_through_assets(self):
         for name in LOADERS:

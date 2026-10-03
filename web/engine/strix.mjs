@@ -111,5 +111,6 @@ const engine = new StrixEngine(await networks().catch(() => []));
 export const strix = {
   entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, analysis: true},
   engine,
+  build: 'python tools/build_web.py strix-network',
   record: result => ({...result, proof: null, line: [], threat: [], engine: ID}),
 };
