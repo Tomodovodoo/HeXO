@@ -3831,6 +3831,49 @@ class EngineTests(unittest.TestCase):
             engine.close()
             tree.close()
 
+    def test_packed_submission_fence_failure_quarantines_storage_and_frees_snapshot(self):
+        import native_dense
+        from native_feed import NativeFeed
+        from neural_search import native, checked
+        def predict(x):
+            count, _, side, _ = x.shape
+            return dict(policy=torch.zeros(count, side*side), far=torch.zeros(count), value_logit=torch.zeros(count))
+        allocate = hexnet.staging_buffer
+        for failure in ('create', 'record'):
+            with self.subTest(failure=failure):
+                tree = NeuralSearch(None, 'test', [(0,0)])
+                feed = NativeFeed(8)
+                evaluator = SimpleNamespace(cuda=True, free=[], graph=None, max_batch=8,
+                                            device=torch.device('cpu'), memory_format=torch.contiguous_format,
+                                            predict=unittest.mock.Mock(side_effect=predict))
+                try:
+                    checked(native.hxg_begin(tree.ptr, 2, 2))
+                    feed.begin(tree)
+                    feed.gather(tree)
+                    _, rows = feed.take_packed(8)
+                    event = unittest.mock.Mock()
+                    event.record.side_effect = RuntimeError('fence failed')
+                    make_event = unittest.mock.Mock(side_effect=RuntimeError('fence failed')) if failure == 'create' else unittest.mock.Mock(return_value=event)
+                    with unittest.mock.patch.object(native_dense, '_quarantined', []), \
+                         unittest.mock.patch.object(native_dense.torch.cuda, 'Event', make_event), \
+                         unittest.mock.patch.object(hexnet, 'staging_buffer', side_effect=lambda *a: allocate(*a[:-1], False)):
+                        with self.assertRaisesRegex(RuntimeError, 'fence failed'):
+                            native_dense.submit(evaluator, rows)
+                        self.assertGreater(evaluator.predict.call_count, 0)
+                        handle = native_dense._quarantined[0]
+                        self.assertIsNotNone(handle.staging)
+                        self.assertIsNone(rows.ptr)
+                        self.assertFalse(evaluator.free)
+                        with self.assertRaisesRegex(RuntimeError, 'not established'):
+                            handle.close()
+                        # These buffers were CPU-only in the fake; release them after checking ownership.
+                        evaluator.cuda = False
+                        handle.close()
+                        self.assertFalse(native_dense._quarantined)
+                finally:
+                    feed.close()
+                    tree.close()
+
     def test_native_frontier_shares_inflight_predictions_and_keeps_context(self):
         from native_feed import NativeFeed
         from neural_search import native, checked

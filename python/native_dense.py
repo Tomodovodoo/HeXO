@@ -69,6 +69,10 @@ class Forward:
         self.chunks, self.event = [], None
 
     def release(self):
+        if self.evaluator.cuda and self.event is None:
+            if self not in _quarantined:
+                _quarantined.append(self)
+            raise RuntimeError('GPU completion fence not established')
         if self.event is not None:
             try:
                 self.event.synchronize()
@@ -121,13 +125,20 @@ def submit(evaluator, rows, max_cells=48*48*48):
                 target = result[start:start+size].copy_(packed, non_blocking=True)
                 handle.chunks.append((index, start, target))
         if evaluator.cuda:
-            handle.event = torch.cuda.Event(blocking=True)
-            handle.event.record()
+            event = torch.cuda.Event(blocking=True)
+            event.record()
+            handle.event = event
         return handle
     except BaseException:
         # A failure may follow an asynchronous copy. Do not recycle its host buffer early.
-        if evaluator.cuda:
-            handle.event = torch.cuda.Event(blocking=True)
-            handle.event.record()
-        handle.close()
+        if handle not in _quarantined:
+            _quarantined.append(handle)
+        try:
+            if evaluator.cuda:
+                event = torch.cuda.Event(blocking=True)
+                event.record()
+                handle.event = event
+            handle.close()
+        finally:
+            handle.rows.close()
         raise
