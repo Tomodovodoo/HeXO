@@ -40,6 +40,7 @@ class ActorSettings:
     search_graph: bool = False   # share transposed turn contexts and proven positions (neural_search graph)
     search_choice: str = 'gumbel'  # final move: Gumbel score or highest improved search policy ('policy')
     q_range_floor: float = 0.    # least Q range of the completed-Q rescale, 0 to 2 (neural_search); 0 keeps mctx's
+    root_noise: float = 0.       # full searches' uniform share of root sampling, [0, 1) (neural_search); 0 = prior
     cache_positions: int = 4096
     shard_games: int = 32
     opening_random_plies: float = 2.  # mean of an exponential; sampled from the search policy
@@ -108,6 +109,8 @@ class ActorSettings:
             raise ValueError('search_choice must be gumbel or policy')
         if not 0 <= self.q_range_floor <= 2:
             raise ValueError('q_range_floor must lie in [0, 2]')
+        if not 0 <= self.root_noise < 1:
+            raise ValueError('root_noise must lie in [0, 1)')
         if self.cheap_root_samples < 1 or self.solver_leaf_nodes < 0:
             raise ValueError('cheap_root_samples must be positive and solver_leaf_nodes nonnegative')
         if self.net_kernels not in ('reference', 'fused'):
