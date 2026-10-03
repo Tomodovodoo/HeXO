@@ -75,6 +75,7 @@ class Resolver(unittest.TestCase):
         self.assertEqual(case['local'], {'state': 'local'})
         self.assertEqual(case['last'], 1)
         self.assertEqual(self.out['uncached'], {'state': 'uncached'})
+        self.assertEqual(self.out['uncached_unpublished'], 'not on site')
         self.assertEqual(self.out['partial']['state'], 'missing')
         self.assertEqual(self.out['partial']['bytes'], 4)
         self.assertEqual(self.out['no_head'], {'here': 'local', 'partial': 'missing'})

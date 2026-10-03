@@ -195,15 +195,15 @@ export async function status(files) {
   const here = await Promise.all(files.map(file => file.local && present(file.path)));
   const away = files.filter((file, i) => !here[i]), store = await open();
   if (!away.length) return {state: 'local'};
-  if (!store) return {state: 'uncached'};
   const missing = [];
-  for (const file of away) if (!await store.match(key(file))) missing.push(file);
+  for (const file of away) if (!await store?.match(key(file))) missing.push(file);
   if (!missing.length) return {state: 'cached'};
-  const sized = await Promise.all(missing.map(async file => {
+  const sized = await Promise.all(missing.map(async file => {   // also tells files the site does not publish
     const there = remote(file.path), head = there && await fetch(there, {method: 'HEAD', mode: 'cors'}).catch(() => null);
     if (!there || head?.status === 404) throw new NotOnSite(file.path);
     return {...file, bytes: file.bytes || Number(head?.headers.get('Content-Length')) || 0};
   }));
+  if (!store) return {state: 'uncached'};
   return {state: 'missing', files: sized, bytes: sized.reduce((sum, file) => sum + file.bytes, 0)};
 }
 

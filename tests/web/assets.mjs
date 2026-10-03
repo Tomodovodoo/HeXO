@@ -32,6 +32,7 @@ globalThis.caches = {open: async () => ({
 
 const assets = await import('../../web/engine/assets.mjs');
 const text = buffer => new TextDecoder().decode(buffer);
+const kind = async run => { try { await run(); return 'ok'; } catch (error) { return error instanceof assets.NotOnSite ? 'not on site' : 'error'; } };
 const attempt = async run => { try { return {value: await run()}; } catch (error) { return {error: error.message}; } };
 const reset = () => { requests.length = 0; here.clear(); site.clear(); store.clear(); offline = false; };
 const out = {};
@@ -125,7 +126,9 @@ out.legacy_pins_kept = (await (await import('../../web/engine/network.mjs')).run
 
 const open = caches.open;
 caches.open = async () => { throw new Error('no Cache API'); };
-out.uncached = await assets.status(files);
+site.set('h.onnx', '12345');
+out.uncached = await assets.status([{path: 'h.onnx', sha256: hash('12345'), local: false}]);
+out.uncached_unpublished = await kind(() => assets.status([{path: 'nowhere.onnx', sha256: 'x', local: false}]));
 caches.open = open;
 
 // The engines' file lists on an origin without build outputs: everything comes from the site's manifests.
@@ -167,7 +170,6 @@ for (const [id, engine] of Object.entries(engines)) {
 }
 
 out.six_chosen = (await engines.six.files(['gen-1'])).map(f => f.path).filter(p => p.startsWith('six/'));
-const kind = async run => { try { await run(); return 'ok'; } catch (error) { return error instanceof assets.NotOnSite ? 'not on site' : 'error'; } };
 site.delete('seal/manifest.json');
 site.delete('strix/networks.json');
 out.unpublished = {
