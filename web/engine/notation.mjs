@@ -198,19 +198,20 @@ export async function readGame(text, native, fetcher = fetch) {
       let response;
       try {
         if (url.hostname === 'hexo.tyto.cc' && params.has('g')) {
-          response = await fetcher('https://hexo.tyto.cc/game_htttx', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({game_id: params.get('g')})});
-          if (!response.ok) throw Error(`HTTP ${response.status}`);
-          history = readHTTTX((await response.json()).htttx);
+          throw Error('hexo.tyto.cc does not let other sites read its games');
         } else if (['hexo.did.science', 'hexo.mineking.dev'].includes(url.hostname)) {
-          const m = url.pathname.match(/^\/(?:account\/)?games\/([\w-]+)$/), sandbox = url.pathname.match(/^\/sandbox\/([\w-]+)$/);
-          if (!m && !sandbox) throw Error('Not a game or sandbox link');
-          const base = url.hostname === 'hexo.did.science' ? 'https://hexo.did.science/api' : 'https://hexo.mineking.dev/proxy/api';
-          response = await fetcher(`${base}/${m ? 'finished-games' : 'sandbox-positions'}/${(m || sandbox)[1]}`);
+          // Both sites serve the same API; only the mineking mirror lets other sites read it.
+          const found = url.pathname.match(/^\/(?:account\/)?(games|sandbox)\/([\w-]{1,64})\/?$/);
+          if (!found) throw Error('Not a game or sandbox link');
+          const game = found[1] === 'games';
+          response = await fetcher(`https://hexo.mineking.dev/proxy/api/${game ? `finished-games/${found[2]}` : `sandbox-positions/${found[2].toLowerCase()}`}`);
           if (!response.ok) throw Error(`HTTP ${response.status}`);
-          const data = await response.json(), rows = (m ? data.moves : data.cells).sort((a, b) => (a.moveNumber ?? a.moveId) - (b.moveNumber ?? b.moveId));
+          const data = await response.json(), rows = game ? [...data.moves].sort((a, b) => a.moveNumber - b.moveNumber)
+            : [...data.gamePosition.cells].sort((a, b) => a.moveId - b.moveId);
+          if (!rows.length) throw Error('That link holds no stones');
           const origin = [rows[0].x, rows[0].y], owners = [];
           history = rows.map((row, i) => {
-            const id = row.playerId ?? row.player;
+            const id = game ? row.playerId : row.player;
             if (!owners.includes(id)) owners.push(id);
             if (owners.indexOf(id) !== ((i + 1) >> 1) % 2) throw Error('Player order does not match HeXO turns');
             return fromSite([row.x - origin[0], row.y - origin[1]]);

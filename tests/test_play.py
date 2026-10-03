@@ -283,7 +283,7 @@ class Jobs(unittest.TestCase):
                 session.configure_seat(1, 'native:Native', preset='quick')
                 session.configure_seat(0, 'six:slow')
                 self.assertEqual(json.loads(json.dumps(session.state()))['engines'][-1], dict(
-                    id='six:slow', name='slow', kind='six', presets=presets_of('six', None)))
+                    id='six:slow', name='slow', kind='six', presets=presets_of('six', None), clocks=True, device='Server CPU'))
                 wait(lambda: len(session.history) == 1)
                 session.pause(True)
                 session.load([(0, 0), (1, 0), (2, 0)], False)
@@ -580,15 +580,15 @@ class Jobs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual([len(call[2]) for call in self.engines.calls], [0])
 
-    def test_review_uses_the_review_budget_whatever_the_slider_says(self):
+    def test_review_uses_the_analysis_strength(self):
         self.session.configure_seat(1, 'human')
         self.session.load([(0, 0), (1, 0), (2, 0)], True)
-        self.session.configure_analysis('bubble:fake', preset='deep', auto=False)
+        self.session.configure_analysis('bubble:fake', preset='quick', auto=False)
         self.session.review_game()
         wait(lambda: not self.session.state()['jobs'])
-        self.assertEqual({tuple(b.items()) for _, b, _ in self.engines.calls}, {tuple(STANDARD.items())})
+        self.assertEqual({tuple(b.items()) for _, b, _ in self.engines.calls}, {tuple(PRESETS['bubble']['quick'].items())})
         state = self.session.state()
-        self.assertEqual((state['review_preset'], [t['label'] is not None for t in state['review']]), ('standard', [True, True]))
+        self.assertEqual((state['review_preset'], [t['label'] is not None for t in state['review']]), ('quick', [True, True]))
 
     def test_undo_returns_to_the_players_last_turn(self):
         self.session.play(0, 0)
@@ -747,7 +747,8 @@ class Jobs(unittest.TestCase):
     def test_budgets(self):
         bubble = PRESETS['bubble']
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
-        for custom in (dict(simulations=10 ** 6), dict(ms=5), dict(simulations='8')):
+        self.assertEqual(budget_of(bubble, 'custom', dict(simulations=10 ** 6))['simulations'], 10 ** 6)
+        for custom in (dict(simulations=-1), dict(simulations=2 ** 31), dict(ms=5), dict(simulations='8')):
             with self.assertRaises(ValueError):
                 budget_of(bubble, 'custom', custom)
         with self.assertRaises(ValueError):
@@ -765,8 +766,10 @@ class Jobs(unittest.TestCase):
         self.assertEqual({kind: presets_of(kind, None)['dangerous'] for kind in PRESETS},
                          dict(bubble=dict(simulations=65536, solver_nodes=4_000_000), native=dict(ms=60000),
                               seal=dict(ms=60000), six=dict(nodes=2_000_000), strix=dict(simulations=4096)))
-        self.assertEqual(budget_of(PRESETS['bubble'], 'custom', dict(simulations=65536, solver_nodes=4_000_000)),
-                         dict(simulations=65536, solver_nodes=4_000_000))
+        self.assertEqual(budget_of(PRESETS['bubble'], 'custom', dict(simulations=100_000, solver_nodes=10_000_000)),
+                         dict(simulations=100_000, solver_nodes=10_000_000))
+        with self.assertRaisesRegex(ValueError, 'from 0'):
+            budget_of(PRESETS['bubble'], 'custom', dict(solver_nodes=-1))
         for spec in (dict(heavy=dict(nodes=1)), dict(quick=dict(nodes=0)), dict(quick=dict(args='--x')), [1],
                      dict(quick=dict(ms=1000))):
             with self.assertRaises(ValueError):
@@ -1434,6 +1437,10 @@ class Matches(unittest.TestCase):
                 wait(lambda: not self.session.match_worker.is_alive())
                 result = json.loads((output / 'game-0001.json').read_text())
                 self.assertEqual((result['winner'], result['reason'], result['history']), (0, 'time', [[0, 0]]))
+                self.assertEqual((result['turns'][-1]['side'], result['turns'][-1]['circle_ms'], result['turns'][-1]['cross_ms']), (1, 0, 20))
+                ident = next(m['id'] for m in self.session.match_catalogue() if m['name'] == name)
+                opened = self.session.open_saved_game(ident, 1).state()['clock']
+                self.assertEqual((opened['cross_ms'], opened['circle_ms']), (20, 0))
                 self.assertEqual(self.session.match['wins'], [1, 0])
                 self.assertIsNone(self.session.match['error'])
 
@@ -1450,9 +1457,136 @@ class Matches(unittest.TestCase):
     def test_simulations_only_adapter_refuses_a_clock_before_start(self):
         self.session.entries['strix:Strix'] = dict(id='strix:Strix', name='Strix', kind='strix',
             presets=PRESETS['strix'], model=Path(RUN.name) / 'checkpoints/main/000001/ema.pt')
-        with self.assertRaisesRegex(ValueError, 'cannot enforce a clock'):
+        with self.assertRaisesRegex(ValueError, 'cannot keep a clock'):
             self.session.start_match(['Native', 'Strix'], output=self.output, clock=dict(mode='game', tc='180+2'))
         self.assertFalse(self.output.exists())
+
+
+class FreeplayClock(unittest.TestCase):
+    """A single game on a clock: balances per side, the increment after a complete turn, a loss on time and the turn
+    log in the saved game."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.session = Session(entries(), FakeEngines(), Evaluations(), archive=Path(self.directory.name))
+        self.addCleanup(self.session.close)
+        self.session.configure_analysis('bubble:fake', auto=False)
+        self.session.configure_seat(1, 'human')
+
+    def test_people_play_on_a_fischer_clock_and_lose_on_time(self):
+        self.session.set_clock(dict(mode='game', tc='0.4+1'))
+        state = self.session.state()
+        self.assertEqual((state['clock_spec'], state['clock']['running']), (dict(mode='game', base_ms=400., increment_ms=1000.), 'x'))
+        self.session.play(0, 0)
+        state = self.session.state()
+        self.assertGreater(state['clock']['cross_ms'], 1000)
+        self.assertEqual(state['clock']['running'], 'o')
+        self.session.play(1, 0)
+        self.assertEqual(self.session.state()['clock']['running'], 'o')
+        time.sleep(.5)
+        state = self.session.state()
+        self.assertEqual((state['winner'], state['outcome']), (0, dict(winner=0, reason='time')))
+        with self.assertRaisesRegex(ValueError, 'finished'):
+            self.session.play(2, 0)
+        saved = json.loads(next(Path(self.directory.name).glob('*-freeplay-*/game-0001.json')).read_text())
+        self.assertEqual((saved['winner'], saved['reason'], saved['clock']['increment_ms']), (0, 'time', 1000.))
+        self.assertEqual(saved['turns'][-1]['circle_ms'], 0)
+        self.assertGreater(saved['turns'][-1]['cross_ms'], 1000)
+        self.assertEqual([t['side'] for t in saved['turns']], [0, 1])
+        ident = next(m['id'] for m in self.session.match_catalogue() if m['results'][0]['reason'] == 'time')
+        study = self.session.open_saved_game(ident, 1)
+        opened = study.state()
+        self.assertEqual((opened['winner'], opened['outcome']['reason'], opened['clock_spec']['increment_ms']), (0, 'time', 1000.))
+        self.assertEqual((opened['clock']['circle_ms'], opened['clock']['running']), (0, None))
+        self.assertEqual(len(study.clock_turns), 2)
+        self.session.new_game()
+        state = self.session.state()
+        self.assertEqual((state['winner'], state['outcome'], state['clock']['running']), (-1, None, 'x'))
+        self.assertGreater(state['clock']['cross_ms'], 300)
+
+    def test_a_paused_turn_keeps_its_time_and_a_failed_engine_stops_the_clock(self):
+        self.session.set_clock(dict(mode='game', tc='60'))
+        time.sleep(.2)
+        self.session.pause(True)
+        self.session.pause(False)
+        time.sleep(.1)
+        self.session.play(0, 0)
+        self.assertGreaterEqual(self.session.clock_turns[0]['spent_ms'], 290)
+        class Broken:
+            def turn(self, *args, **kwargs):
+                raise RuntimeError('engine broke')
+
+            def close(self):
+                pass
+        self.session.prepare_timed = lambda sides=(0, 1): setattr(self.session, 'seat_engines', [None, Broken()])
+        self.session.configure_seat(1, 'native:Native')
+        wait(lambda: self.session.paused)
+        before = self.session.state()['clock']
+        time.sleep(.2)
+        after = self.session.state()
+        self.assertEqual((after['clock']['running'], after['clock']['circle_ms'], after['outcome']), (None, before['circle_ms'], None))
+
+    def test_changing_one_seat_keeps_the_other_seats_timed_engine(self):
+        with unittest.mock.patch('timed_engine.TimedEngine') as engine:
+            engine.side_effect = lambda config: unittest.mock.MagicMock(name=config['kind'])
+            self.session.configure_seat(0, 'native:Native')
+            self.session.configure_seat(1, 'native:Native')
+            self.session.pause(True)
+            self.session.set_clock(dict(mode='game', tc='60'))
+            wait(lambda: self.session.clock_preparing is None and all(self.session.seat_engines))
+            kept = self.session.seat_engines[1]
+            with self.session.lock:
+                self.session.prepare_timed([0])
+            wait(lambda: self.session.clock_preparing is None and self.session.seat_engines[0] is not None)
+            self.assertIs(self.session.seat_engines[1], kept)
+            kept.close.assert_not_called()
+
+    def test_a_timed_bubble_move_is_kept_as_an_evaluation(self):
+        class Timed:
+            def turn(self, game, ms=None, clock=None, cancel=None, publish=None):
+                moves = legal_turn([cell[:2] for cell in game.cells])
+                return dict(moves=moves, win_probability=.62, completed=40, solver_nodes=0)
+
+            def close(self):
+                pass
+        self.session.prepare_timed = lambda sides=(0, 1): setattr(self.session, 'seat_engines', [None, Timed()])
+        self.session.configure_seat(1, 'bubble:fake')
+        self.session.set_clock(dict(mode='game', tc='60'))
+        self.session.play(0, 0)
+        wait(lambda: len(self.session.history) == 3)
+        found = self.session.state()['evaluations'][1]
+        self.assertEqual((found['value'], found['simulations'], found['moves']), (.62, 40, [list(p) for p in self.session.history[1:]]))
+
+    def test_leaving_a_match_rebuilds_the_seats_timed_engines(self):
+        rebuilt = []
+        self.session.prepare_timed = lambda sides=(0, 1): rebuilt.append(tuple(sides))
+        self.session.match = dict(active=False, clock=dict(mode='fixed'))
+        self.session.load([(0, 0)], True)
+        self.assertEqual((self.session.match, rebuilt), (None, [(0, 1)]))
+        self.session.load([], True)
+        self.assertEqual(rebuilt, [(0, 1)])
+
+    def test_engines_report_where_the_server_runs_them(self):
+        from play import device_of
+        self.assertEqual([device_of(dict(kind='bubble'), 'cuda'), device_of(dict(kind='bubble'), 'cpu'),
+                          device_of(dict(kind='six', backend='TensorRT'), 'cpu'), device_of(dict(kind='six', backend='CPU'), 'cuda'),
+                          device_of(dict(kind='six', badge='shrimp'), 'cuda'), device_of(dict(kind='native'), 'cuda')],
+                         ['GPU', 'CPU', 'GPU', 'CPU', 'CPU', 'CPU'])
+        self.assertEqual({e['device'] for e in self.session.state()['engines']}, {'Server CPU'})
+
+    def test_engines_that_cannot_keep_a_clock_are_refused(self):
+        self.session.entries['six:shrimp'] = dict(id='six:shrimp', name='Shrimp', kind='six', badge='shrimp',
+                                                  presets=PRESETS['six'], command=['shrimp'])
+        self.session.configure_seat(1, 'six:shrimp')
+        with self.assertRaisesRegex(ValueError, 'cannot keep a clock'):
+            self.session.set_clock(dict(mode='move', ms=1000))
+        self.assertEqual(self.session.state()['clock_spec'], dict(mode='fixed'))
+        self.session.configure_seat(1, 'human')
+        self.session.set_clock(dict(mode='move', ms=1000))
+        with self.assertRaisesRegex(ValueError, 'cannot keep a clock'):
+            self.session.configure_seat(1, 'six:shrimp')
+        self.assertEqual([e['clocks'] for e in self.session.models() if e['id'] in ('six:shrimp', 'native:Native')], [True, False])
 
 
 class Proofs(unittest.TestCase):

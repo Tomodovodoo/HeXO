@@ -3,6 +3,7 @@
 import {EngineWorker} from './engine-worker.mjs';
 import {json, workerUrl} from './assets.mjs';
 import {loadFiles, probe} from './network.mjs';
+import {NEURAL_PRESET} from './device.mjs';
 
 export const PRESETS = {lightning: {nodes: 240}, quick: {nodes: 960}, standard: {nodes: 3840}, strong: {nodes: 15360},
   deep: {nodes: 61440}, dangerous: {nodes: 2000000}};
@@ -17,11 +18,18 @@ export class SixEngine extends EngineWorker {
     this.networks = null;
   }
 
+  /** Loads network `checkpoint` (the newest when null), so a timed turn does not spend its clock on it. */
+  prepare(checkpoint = null, options = {}) {
+    return this.call({type: 'use', network: checkpoint}, options);
+  }
+
   /** Six's turn at `history` ([[q, r], ...]) within `budget.nodes` new positions, with network `budget.checkpoint` (a
-   * manifest name; the newest when absent): the fields of python/play.py evaluate. Aborting `options.signal` cancels
-   * it at the search's next network batch and rejects with an AbortError. */
+   * manifest name; the newest when absent): the fields of python/play.py evaluate. Under a clock `options.ms` is Six's
+   * movetime, the nodes a ceiling. Aborting `options.signal` cancels it at the search's next network batch and rejects
+   * with an AbortError. */
   turn(history, budget, options = {}) {
-    return this.call({type: 'turn', history, nodes: budget.nodes, network: budget.checkpoint ?? null}, options);
+    return this.call({type: 'turn', history, nodes: budget.nodes, network: budget.checkpoint ?? null,
+      ms: options.ms == null ? 0 : Math.max(1, Math.floor(options.ms))}, options);
   }
 
   /** {data, local}: six/networks/manifest.json (assets.mjs json()), whose network names refresh `checkpoints`. A changed
@@ -54,7 +62,7 @@ const engine = new SixEngine();
 /** Six (browser) for seat.mjs's ENGINES; its checkpoints fill in once the manifest is read (python tools/build_web.py
  * six builds it; the site's serves when this origin has none), which page startup does not wait for. */
 export const six = {
-  entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, analysis: true},
+  entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: true},
   engine,
   listed: engine.manifest().then(() => {}, () => {}),
   record: (result, history, preset) => ({...result, engine: ID}),

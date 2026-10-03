@@ -3,13 +3,20 @@ import {OfflineSession} from './offline.mjs';
 import {PlayStorage} from './storage.mjs';
 import {OpeningBook} from './openings.mjs';
 import {readGame, exportGame, htttx} from './notation.mjs';
+import {clockSpec, turnTime} from './clock.mjs';
 
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 const copy = value => structuredClone(value), position = history => history.map(p => p.join(',')).join(';');
 const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human'});
-const REVIEW_PRESET = 'standard';
+/** The longest delay setTimeout keeps; a longer clock is checked again when it fires. */
+const MAX_TIMER = 2 ** 31 - 1;
+/** The engines take budgets as 32-bit signed integers. */
+const MAX_BUDGET = 2 ** 31 - 1;
+const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
+/** Labels every complete turn of `history` as python/play.py review does; `lookup(prefix, ply)` is the evaluation of a
+ * position, given `ply` when the prefix is `history.slice(0, ply)`. */
 export function review(history, lookup, winner = -1) {
   const turns = [], ss = starts(history.length);
   for (let i = 0; i < ss.length; i++) {
@@ -18,7 +25,7 @@ export function review(history, lookup, winner = -1) {
     const turn = {ply, player: me, stones, label: null, before: null, after: null, better: null, line: null};
     turns.push(turn);
     if (end === history.length && winner === me) { turn.label = 'win'; continue; }
-    const before = lookup(history.slice(0, ply)), after = lookup(history.slice(0, end));
+    const before = lookup(history.slice(0, ply), ply), after = lookup(history.slice(0, end), end);
     if (!before || !after) continue;
     turn.before = before.value; turn.after = 1 - after.value;
     const had = before.proof?.winner, has = after.proof?.winner, loss = turn.before - turn.after;
@@ -57,11 +64,13 @@ export class BrowserSession extends OfflineSession {
     super(native, analysis);
     this.storage = new PlayStorage(null); this.id = 'live'; this.seats = [human(), human()];
     this.entries = new Map(); this.adapters = new Map(); this.cache = new Map(); this.index = new Map(); this.jobs = [];
-    this.bookData = null; this.book = {enabled: false, mode: 'wide', opening: null}; this.coverage = {};
-    this.match = null; this.saved_game = null; this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
+    this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
+    this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
-    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.lines = [uid(), uid()];
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()];
   }
+  /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
+   * move's clock starts after it) and `adapter.turn(history, budget, options)` plays. */
   registerEngine(entry, adapter) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
     for (const seat of [...this.seats, this.analysis].filter(Boolean)) if (seat.engine === entry.id) Object.assign(seat, this.spec(seat));
@@ -71,50 +80,76 @@ export class BrowserSession extends OfflineSession {
     if (input.engine === 'human') return human();
     const entry = this.entries.get(input.engine);
     if (!entry) throw Error('This engine is not installed in the browser');
-    const preset = input.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget} : entry.presets[preset];
+    const preset = input.preset || entry.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget} : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
-    for (const [name, value] of Object.entries(budget)) if (typeof value === 'number' && (!Number.isInteger(value) || value < 0 || value > ({simulations: 65536, solver_nodes: 4000000, ms: 120000, nodes: 50000000}[name] ?? 50000000))) throw Error(`Invalid ${name} budget`);
-    return {engine: input.engine, checkpoint: input.checkpoint ?? null, preset, budget: copy(budget), auto: input.auto ?? false};
+    for (const [name, value] of Object.entries(budget)) {
+      const least = {ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0);
+      if (typeof value === 'number' && (!Number.isInteger(value) || value < least || value > MAX_BUDGET)) throw Error(`${FIELD_NAMES[name] || name} must be a whole number from ${least} to ${MAX_BUDGET}`);
+    }
+    const checkpoint = input.checkpoint ?? entry.checkpoints?.[0] ?? null;
+    if (entry.checkpoints?.length && !entry.checkpoints.includes(checkpoint)) throw Error('Unknown checkpoint');
+    return {engine: input.engine, checkpoint, preset, budget: copy(budget), auto: input.auto ?? false};
   }
-  engineKey(spec) { return [spec.engine, spec.checkpoint, this.entries.get(spec.engine)?.version || ''].join('|'); }
+  /** Evaluations are keyed by the engine, its checkpoint, its build `version` and the checkpoint's weights (`models`). */
+  engineKey(spec) {
+    const entry = this.entries.get(spec.engine);
+    return [spec.engine, spec.checkpoint, entry?.version || '', entry?.models?.[spec.checkpoint ?? ''] ?? ''].join('|');
+  }
   cacheKey(history, spec) { return `${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${position(history)}`; }
-  lookup(history, spec = this.analysis, exact = false) {
+  lookup(history, spec = this.analysis, exact = false) { return this.lookupAt(position(history), spec, exact); }
+  /** The evaluation of the position whose `position()` text is `at`: by `spec` at exactly its budget when `exact`,
+   * else the deepest by its engine. */
+  lookupAt(at, spec = this.analysis, exact = false) {
     if (!spec) return null;
-    const hit = this.cache.get(this.cacheKey(history, spec));
-    if (exact) return hit || null;
-    return (this.index.get(`${this.engineKey(spec)}|${position(history)}`) || [])
+    if (exact) return this.cache.get(`${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${at}`) || null;
+    return (this.index.get(`${this.engineKey(spec)}|${at}`) || [])
       .sort((a, b) => Boolean(b.proof) - Boolean(a.proof) || b.simulations - a.simulations || b.solver_nodes - a.solver_nodes || (b.budget?.ms || 0) - (a.budget?.ms || 0) || (b.budget?.nodes || 0) - (a.budget?.nodes || 0))[0] || null;
   }
-  state() {
-    const {winner, player, remaining} = this.native.game(this.history), evaluations = {};
-    for (let ply = 0; ply <= this.history.length; ply++) {
-      const prefix = this.history.slice(0, ply), record = this.lookup(prefix) || this.records.findLast(r => r.position === position(prefix) && (!this.analysis || r.engine_key === this.engineKey(this.analysis)));
+  /** The evaluations shown per ply and the review of the game, recomputed only after the game or the saved
+   * evaluations change. */
+  study(winner) {
+    const sig = `${this.revision}|${this.evaluationsVersion}|${this.records.length}`;
+    if (this.studied?.sig === sig) return this.studied;
+    const positions = [''], evaluations = {}, engine = this.analysis && this.engineKey(this.analysis), spec = this.reviewSpec();
+    for (const [q, r] of this.history) positions.push(positions.length > 1 ? `${positions.at(-1)};${q},${r}` : `${q},${r}`);
+    positions.forEach((at, ply) => {
+      const record = this.lookupAt(at) || this.records.findLast(r => r.position === at && (!engine || r.engine_key === engine));
       if (record) evaluations[ply] = record;
-    }
+    });
+    const turns = review(this.history, (h, ply) => this.lookupAt(ply === undefined ? position(h) : positions[ply], spec, true), winner);
+    return this.studied = {sig, evaluations, review: turns};
+  }
+  state() {
+    const board = this.native.game(this.history), {player, remaining} = board, winner = board.winner >= 0 ? board.winner : this.outcome?.winner ?? -1;
+    const {evaluations, review: turns} = this.study(winner);
     return {instance: `browser:${this.id}`, revision: this.revision, history: copy(this.history), player, remaining, winner,
       paused: this.paused, seats: copy(this.seats), analysis: copy(this.analysis), engines: [...this.entries.values()], match: this.match,
-      clock: this.clockNow(), saved_game: this.saved_game, models_folder: null, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
+      clock: this.clockNow(), clock_spec: this.control(), outcome: this.outcome, saved_game: this.saved_game, models_folder: null, notice: this.notice, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
-      evaluations, review: review(this.history, h => this.lookup(h, this.reviewSpec(), true), winner), review_preset: REVIEW_PRESET,
-      jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side}) => ({id, kind, status, done, total, error, ply: history.length, side}))};
+      evaluations, review: turns, review_preset: this.analysis?.preset ?? null,
+      jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live}) => ({id, kind, status, done, total, error, ply: history.length, side, live}))};
   }
-  static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings'].some(p => path === p || path.startsWith(p + '/')); }
+  static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings', '/clock'].some(p => path === p || path.startsWith(p + '/')); }
   answer(path, body = {}) {
     try { this.apply(path.replace(/^\/study/, ''), body); return [200, this.state()]; }
     catch (error) { return [400, {error: error.message}]; }
   }
-  changed() { this.revision++; this.deepen(); this.onchange(this.state()); this.persist(); }
-  reviewSpec() { return this.analysis && this.entries.has(this.analysis.engine) ? this.spec({...this.analysis, preset: REVIEW_PRESET}) : null; }
+  changed() { this.revision++; this.runClock(); this.deepen(); this.onchange(this.state()); this.persist(); }
+  /** The review's engine, checkpoint and strength: the analysis slot's, so every verdict compares one budget. */
+  reviewSpec() { return this.analysis && this.entries.has(this.analysis.engine) ? this.spec({...this.analysis, custom: this.analysis.budget}) : null; }
   deepening() {
     return this.analysis?.auto && !this.paused && this.native.game(this.history).winner < 0 && !this.match?.active && this.seats.some(s => this.adapters.has(s.engine));
   }
+  /** While Auto is on and an engine seat plays, evaluates the current position at each preset in turn, fastest first,
+   * up to strong unless the analysis engine runs on WebGPU. */
   deepen() {
     const active = this.deepening(), current = position(this.history);
     this.cancelJobs(j => j.tier && (!active || position(j.history) !== current));
     if (!active || this.jobs.some(j => j.tier && j.status !== 'failed') || this.lookup(this.history)?.proof) return;
     const entry = this.entries.get(this.analysis.engine);
     if (!entry || !this.adapters.has(entry.id)) return;
-    for (const tier of Object.keys(entry.presets)) {
+    const tiers = Object.keys(entry.presets), last = entry.device === 'GPU' ? tiers.length : tiers.indexOf('strong') + 1;
+    for (const tier of tiers.slice(0, last || tiers.length)) {
       const spec = this.spec({...this.analysis, preset: tier});
       if (!this.lookup(this.history, spec, true) && !this.jobs.some(j => j.tier === tier && j.key === `analyse|${this.cacheKey(this.history, spec)}` && j.status === 'failed')) {
         this.enqueue('analyse', this.history, spec, {tier}); return;
@@ -123,7 +158,8 @@ export class BrowserSession extends OfflineSession {
   }
   snapshot() {
     return {id: this.id, history: copy(this.history), seats: copy(this.seats), analysis: copy(this.analysis), paused: this.paused,
-      book: copy(this.book), match: copy(this.match), saved_game: copy(this.saved_game), clock: this.clockNow(), gameId: this.gameId, gameCreated: this.gameCreated, records: copy(this.records)};
+      book: copy(this.book), match: copy(this.match), saved_game: copy(this.saved_game), clock: this.clockNow(), timeControl: copy(this.timeControl),
+      clockTurns: copy(this.clockTurns), clockPartial: this.clockPartial, outcome: copy(this.outcome), taken: Date.now(), gameId: this.gameId, gameCreated: this.gameCreated, records: copy(this.records)};
   }
   storageConflict() {
     this.conflicted = true; this.paused = true; this.freezeClock(); this.cancelJobs();
@@ -134,7 +170,8 @@ export class BrowserSession extends OfflineSession {
     if (this.importing || this.initializing || this.conflicted) return this.saving;
     this.dirty = true;
     if (this.match && !this.match.pending_game && this.match.completed < this.match.games) {
-      this.match.position = {game: this.match.current, history: copy(this.history), records: copy(this.records), clock: this.clockNow(), opening: copy(this.book.opening)};
+      this.match.position = {game: this.match.current, history: copy(this.history), records: copy(this.records), clock: this.clockNow(), clockTurns: copy(this.clockTurns),
+        clockPartial: this.clockPartial + (this.clock?.started != null ? Date.now() - this.clock.started : 0), opening: copy(this.book.opening)};
     }
     const snapshot = this.snapshot(), freeplay = this.freeplay();
     this.saving = this.saving.then(async () => {
@@ -152,9 +189,15 @@ export class BrowserSession extends OfflineSession {
     this.coverage = coverage?.counts || {};
     this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false; this.renewLines();
     if (saved) {
-      this.native.game(saved.history); Object.assign(this, {...saved, paused: true});
+      const {taken, ...fields} = saved;
+      this.native.game(saved.history); Object.assign(this, {...fields, paused: true});
       if (this.match) this.match.active = false;
-      if (this.clock) { delete this.clock.started; delete this.clock.side; }
+      if (this.clock?.started != null && taken) {
+        // The side was thinking when the page went away: the time since the snapshot counts against it.
+        const field = this.clock.side ? 'circle_ms' : 'cross_ms', now = Date.now();
+        this.clock[field] = Math.max(0, this.clock[field] - (now - taken)); this.clockPartial = (this.clockPartial || 0) + now - this.clock.started;
+      }
+      if (this.clock) { delete this.clock.started; delete this.clock.side; delete this.clock.running; }
       const game = this.gameId && await this.storage.get('games', this.gameId);
       if (game) { const {saved_at, ...content} = game; this.gameSignature = JSON.stringify(content); }
     }
@@ -166,21 +209,22 @@ export class BrowserSession extends OfflineSession {
   editable() { if (this.conflicted) throw Error(this.storageError); if (this.match?.active) throw Error('Stop the match before changing its players or position'); }
   load(history, paused = false, opening = null) {
     this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.paused = paused; this.saved_game = null; this.renewLines();
-    this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
-    this.book.opening = copy(opening);
+    this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
+    this.book.opening = copy(opening); this.freshClock();
   }
   /** Gives `sides` (both when none) a new line, the key of the game tree a Bubble seat searches (worker.mjs). */
   renewLines(...sides) { for (const side of sides.length ? sides : [0, 1]) this.lines[side] = uid(); }
   forkGame() {
     if (this.saved_game || !this.gameId || this.match) {
-      this.saved_game = null; this.match = null; this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
+      this.saved_game = null; this.match = null; this.freshClock(); this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
     }
   }
   freeplay() {
     if (this.match || this.saved_game || !this.gameId) return null;
-    const winner = this.native.game(this.history).winner, players = this.seats.map(s => ({...s, name: this.entries.get(s.engine)?.name || 'Human'}));
+    const board = this.native.game(this.history).winner, winner = board >= 0 ? board : this.outcome?.winner ?? -1, players = this.seats.map(s => ({...s, name: this.entries.get(s.engine)?.name || 'Human'}));
     const game = {id: this.gameId, format: 'bubble-replay', version: 1, history: copy(this.history), players, winner: winner < 0 ? null : winner,
-      reason: winner < 0 ? 'saved' : 'six', records: copy(this.records), evaluations: this.state().evaluations, opening: copy(this.book.opening), created_at: this.gameCreated};
+      reason: this.outcome ? this.outcome.reason : winner >= 0 ? 'six' : 'saved', records: copy(this.records),
+      ...(this.timeControl.mode === 'fixed' ? {} : {clock: copy(this.timeControl), turns: copy(this.clockTurns)}), evaluations: this.state().evaluations, opening: copy(this.book.opening), created_at: this.gameCreated};
     const signature = JSON.stringify(game);
     if (signature === this.gameSignature) return null;
     this.gameSignature = signature; game.saved_at = new Date().toISOString();
@@ -192,31 +236,37 @@ export class BrowserSession extends OfflineSession {
   async saveGame() { await this.persist(); }
   apply(path, body) {
     if (this.conflicted && path !== '/state') throw Error(this.storageError);
-    if (['/new', '/undo', '/retry', '/seat'].includes(path)) this.editable();
+    if (['/new', '/undo', '/retry', '/seat', '/clock'].includes(path)) this.editable();
     if (path === '/play') {
       const point = [body.q, body.r];
       if (!point.every(Number.isSafeInteger)) throw Error('Coordinates must be integers');
-      if (this.native.game(this.history).winner >= 0) throw Error('The game has finished');
-      this.native.game([...this.history, point]); this.forkGame(); this.history.push(point); this.paused = false;
+      const before = this.native.game(this.history);
+      if (before.winner < 0 && !this.outcome && this.clock?.side === before.player && this.clockNow()[before.player ? 'circle_ms' : 'cross_ms'] <= 0) {
+        this.chargeTurn(before.player); this.changed();
+      }
+      if (before.winner >= 0 || this.outcome) throw Error('The game has finished');
+      const after = this.native.game([...this.history, point]); this.forkGame(); this.history.push(point); this.paused = false;
+      if (after.winner >= 0 || after.player !== before.player) this.chargeTurn(before.player);
     } else if (path === '/undo') {
       this.cancelJobs(); this.forkGame(); this.renewLines(); const people = body.people || [0, 1].filter(i => this.seats[i].engine === 'human'); this.history.pop();
       while (people.length && this.history.length && !(people.includes(playerAt(this.history.length)) && this.history.length % 2)) this.history.pop();
-      this.paused = true; this.saved_game = null;
+      this.saved_game = null; this.freshClock();
     } else if (path === '/new') {
-      this.match = null; let history = [], opening = null;
-      if (this.book.enabled && this.bookData) {
-        const side = this.seats.findIndex(s => s.engine === 'human'), n = this.bookData.pick(this.book.mode, this.coverage, side);
-        history = n.moves; opening = {mode: this.book.mode, key: n.key, symmetry: n.symmetry, ply: history.length};
-        const k = `${side}:${n.key}`; this.coverage[k] = (this.coverage[k] || 0) + 1;
-        this.storage.put('coverage', {id: 'book', counts: copy(this.coverage)}).catch(e => { this.storageError = e.message; });
-      }
-      this.load(history, false, opening);
+      this.match = null; this.newGame(body.people);
     } else if (path === '/retry') {
       if (!Number.isInteger(body.ply) || body.ply < 0 || body.ply > this.history.length) throw Error('Invalid retry position');
       this.load(this.history.slice(0, body.ply), false, body.ply >= this.book.opening?.ply ? this.book.opening : null); this.match = null;
     } else if (path === '/seat') {
       if (![0, 1].includes(body.side)) throw Error('Invalid seat');
-      this.cancelJobs(j => j.kind === 'move'); this.renewLines(body.side); this.seats[body.side] = this.spec({...this.seats[body.side], ...body, budget: body.preset === 'custom' ? body.custom : undefined});
+      const seat = this.spec({...this.seats[body.side], ...body, budget: body.preset === 'custom' ? body.custom : undefined});
+      if (this.timeControl.mode !== 'fixed') this.clockable(seat);
+      this.cancelJobs(j => j.kind === 'move' && j.side === body.side); this.renewLines(body.side); this.seats[body.side] = seat;
+      if (this.clock?.side === body.side) this.freezeClock();
+    } else if (path === '/clock') {
+      if (this.saved_game) throw Error('A saved game has no clock');
+      const control = clockSpec(body);
+      if (control.mode !== 'fixed') this.seats.forEach(seat => this.clockable(seat));
+      this.cancelJobs(j => j.kind === 'move'); this.match = null; this.timeControl = control; this.freshClock();
     } else if (path === '/analysis') {
       this.cancelJobs(j => j.kind !== 'move'); this.analysis = this.spec({...this.analysis, ...body, budget: body.preset === 'custom' ? body.custom : undefined});
     } else if (path === '/analyse') {
@@ -239,8 +289,25 @@ export class BrowserSession extends OfflineSession {
       if (!this.bookData) throw Error('The opening book has not loaded');
       if (body.mode) { this.bookData.pool(body.mode); this.book.mode = body.mode; }
       if ('enabled' in body) this.book.enabled = !!body.enabled;
+      if (this.book.enabled && !this.history.length && !this.match?.active) this.newGame(body.people);
     } else if (!['/state', '/rescan', '/models'].includes(path)) throw Error('Unknown Play request');
     if (path !== '/state') { this.changed(); queueMicrotask(() => this.pump()); }
+  }
+  /** Starts a new game; with the book on, from one of its openings in a random orientation: against one person
+   * (`people`, the sides people play, else the human seats) the least played line on that side, otherwise uniformly. */
+  newGame(people = [0, 1].filter(i => this.seats[i].engine === 'human')) {
+    let history = [], opening = null;
+    if (this.book.enabled && this.bookData) {
+      const side = people.length === 1 ? people[0] : null, pool = this.bookData.pool(this.book.mode);
+      const n = side === null ? this.bookData.pick(this.book.mode, {}, -1, Math.random, pool[Math.floor(Math.random() * pool.length)])
+        : this.bookData.pick(this.book.mode, this.coverage, side);
+      history = n.moves; opening = {mode: this.book.mode, key: n.key, symmetry: n.symmetry, ply: history.length};
+      if (side !== null) {
+        const k = `${side}:${n.key}`; this.coverage[k] = (this.coverage[k] || 0) + 1;
+        this.storage.put('coverage', {id: 'book', counts: copy(this.coverage)}).catch(e => { this.storageError = e.message; });
+      }
+    }
+    this.load(history, false, opening);
   }
   enqueue(kind, history, spec, fields = {}) {
     if (this.importing) return;
@@ -252,17 +319,23 @@ export class BrowserSession extends OfflineSession {
     if (kind === 'analyse') this.cancelJobs(j => j.kind === 'analyse' && j.status !== 'failed' && (fields.tier ? j.tier : true));
     this.jobs.push({id: ++this.nextJob, kind, history: copy(history), spec: copy(spec), key, controller: new AbortController(), status: 'queued', done: 0, total: 1, ...fields});
   }
-  /** Saves `result`; a `kept` one (a seat's move on its game tree) is shown but never reused as a fresh evaluation. */
+  /** Saves the evaluation `result` of `history` by `spec`. One whose solver could not run (`solver_error`) is kept for
+   * this visit only and raises the session's `notice`, so a later visit evaluates the position again with proofs. A
+   * `kept` one (a seat's move on its game tree, or one cut short by a clock) is shown but never reused as a fresh
+   * evaluation. */
   async record(history, spec, result, kept = false) {
     const record = {...result, id: this.cacheKey(history, spec) + (kept ? '|kept' : ''), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
-    this.indexRecord(record); await this.storage.put('evaluations', record);
+    this.indexRecord(record);
+    if (result.solver_error) this.notice = `The solver could not run in this browser (${result.solver_error}), so evaluations have no proofs`;
+    else await this.storage.put('evaluations', record);
     if (position(this.history.slice(0, history.length)) === position(history)) {
       this.records = this.records.filter(r => r.id !== record.id); this.records.push(record);
     }
     return record;
   }
   indexRecord(record) {
+    this.evaluationsVersion++;
     this.cache.set(record.id, record);
     const key = `${record.engine_key}|${record.position}`, values = (this.index.get(key) || []).filter(r => r.id !== record.id);
     values.push(record); this.index.set(key, values);
@@ -280,53 +353,130 @@ export class BrowserSession extends OfflineSession {
     if (!this.clock) return null;
     const clock = {...this.clock};
     if (clock.started != null) { const field = clock.side ? 'circle_ms' : 'cross_ms'; clock[field] = Math.max(0, clock[field] - (Date.now() - clock.started)); }
+    clock.running = clock.started != null ? ['x', 'o'][clock.side] : null;
     return clock;
   }
-  freezeClock() { this.clock = this.clockNow(); if (this.clock) { delete this.clock.started; delete this.clock.side; } }
+  freezeClock() {
+    clearTimeout(this.flag);
+    if (this.clock?.started != null) this.clockPartial += Date.now() - this.clock.started;
+    this.clock = this.clockNow(); if (this.clock) { delete this.clock.started; delete this.clock.side; delete this.clock.running; }
+  }
+  /** The time control in force: the match's, a saved game's recorded one, else the freeplay one. */
+  control() { return this.match ? this.match.clock : this.saved_game ? this.saved_game.clock || {mode: 'fixed'} : this.timeControl; }
+  /** Refuses `seat` under a clock when its engine plays a fixed budget. */
+  clockable(seat) {
+    const entry = this.entries.get(seat.engine);
+    if (seat.engine !== 'human' && !entry?.clocks) throw Error(`${entry?.name || seat.engine} plays a fixed budget; it cannot keep a clock`);
+  }
+  /** Full balances for the game under `control()` (none for a fixed budget), no outcome and an empty turn log. */
+  freshClock() {
+    clearTimeout(this.flag);
+    const c = this.control(), base = c.mode === 'move' ? c.ms : c.base_ms ?? c.initial_ms;
+    this.clock = c.mode === 'fixed' ? null : {cross_ms: base, circle_ms: base, increment_ms: c.mode === 'game' ? c.increment_ms : 0};
+    this.clockTurns = []; this.outcome = null; this.clockPartial = 0;
+  }
+  /** Starts the clock of the side to move while the game runs on one. An engine side's clock starts only from its move
+   * job, once `ready` (its engine and the checkpoint's network loaded for that job). Arms the loss on time. */
+  runClock(ready = false) {
+    const c = this.clock;
+    if (!c || c.started != null || this.paused || this.outcome || this.saved_game || this.conflicted || this.importing) return;
+    if (this.match && (!this.match.active || this.match.pending_game)) return;
+    const {winner, player} = this.native.game(this.history), seat = this.seats[player];
+    if (winner >= 0 || seat.engine !== 'human' && !ready) return;
+    Object.assign(c, {started: Date.now(), side: player});
+    this.armFlag();
+  }
+  /** Arms the loss on time for the running clock. */
+  armFlag() {
+    clearTimeout(this.flag);
+    const c = this.clock;
+    if (c?.started != null) this.flag = setTimeout(() => this.checkTime(), Math.min(MAX_TIMER, Math.max(0, c[c.side ? 'circle_ms' : 'cross_ms'] - (Date.now() - c.started)) + 20));
+  }
+  /** Charges `side`'s completed turn at time `at`, with what it spent before a pause (`clockPartial`): finished late it loses on time; otherwise it gains its increment, or
+   * a whole turn again on a per-turn clock. Logs the balances in `clockTurns`; true when the turn stands. */
+  chargeTurn(side, at = Date.now()) {
+    const c = this.clock;
+    if (!c || c.started == null || c.side !== side) return true;
+    clearTimeout(this.flag);
+    const field = side ? 'circle_ms' : 'cross_ms', left = c[field] - (at - c.started), spent = at - c.started + this.clockPartial, control = this.control();
+    this.clockPartial = 0;
+    delete c.started; delete c.side;
+    if (left <= 0) { c[field] = 0; this.outcome = {winner: 1 - side, reason: 'time'}; }
+    else c[field] = control.mode === 'move' ? control.ms : left + (c.increment_ms || 0);
+    this.clockTurns.push({ply: this.history.length, side, spent_ms: spent, cross_ms: c.cross_ms, circle_ms: c.circle_ms});
+    return left > 0;
+  }
+  /** The side to move whose clock ran out loses on time; its engine's search is cancelled. */
+  async checkTime() {
+    const c = this.clock;
+    if (!c || c.started == null) return;
+    const side = c.side, left = this.clockNow()[side ? 'circle_ms' : 'cross_ms'];
+    if (left > 0) { this.flag = setTimeout(() => this.checkTime(), Math.min(MAX_TIMER, left + 20)); return; }
+    this.cancelJobs(j => j.kind === 'move');
+    this.chargeTurn(side);
+    if (this.match?.active) await this.finishMatch(1 - side, 'timeout');
+    this.changed();
+  }
+  /** Runs the next job: an engine move first, then analysis, review and deepening. A queued move interrupts a running
+   * job of another kind, which goes back to the queue (a review keeps its finished positions). */
   async pump() {
-    if (this.running || this.importing || this.conflicted) return;
+    if (this.importing || this.conflicted) return;
     const state = this.native.game(this.history), seat = this.seats[state.player];
     if (!this.paused && state.winner < 0 && this.adapters.has(seat.engine) && !this.jobs.some(j => j.kind === 'move')) this.enqueue('move', this.history, seat, {side: state.player, line: this.lines[state.player]});
+    if (this.running) {
+      if (this.running.kind !== 'move' && this.jobs.some(j => j.kind === 'move' && j.status === 'queued')) this.running.attempt.abort();
+      return;
+    }
     const job = this.jobs.find(j => j.status === 'queued' && j.kind === 'move') || this.jobs.find(j => j.status === 'queued' && j.kind === 'analyse' && !j.tier)
       || this.jobs.find(j => j.status === 'queued' && j.kind === 'review') || this.jobs.find(j => j.status === 'queued' && j.tier);
     if (!job) return;
     let settled;
     this.idle = new Promise(resolve => { settled = resolve; });
-    this.running = job; job.status = 'running'; this.changed();
-    let timer;
+    this.running = job; job.status = 'running'; job.attempt = new AbortController(); this.changed();
+    const signal = AbortSignal.any([job.controller.signal, job.attempt.signal]);
+    let timer, interrupted = false;
     const match = job.kind === 'move' && this.match?.active ? this.match : null;
     const history = job.kind === 'review' ? job.history.slice(0, job.plies[job.cursor]) : job.history;
     try {
       const adapter = this.adapters.get(job.spec.engine);
-      await adapter.ready?.(f => { job.done = f * .1; this.onchange(this.state()); });
-      if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-      const start = Date.now(); let timeout = false, limit = null;
-      if (job.kind === 'move' && this.match?.active) {
-        const c = this.match.clock;
-        limit = c.mode === 'move' ? c.ms : c.mode === 'game' ? this.clock[job.side ? 'circle_ms' : 'cross_ms'] : null;
-        if (c.mode === 'game') Object.assign(this.clock, {started: start, side: job.side});
-        if (limit != null) timer = setTimeout(() => { timeout = true; job.controller.abort(); }, Math.max(1, limit));
-        job.controller.signal.addEventListener('abort', () => clearTimeout(timer), {once: true});
+      await adapter.ready?.(f => { job.done = f * .1; this.onchange(this.state()); }, job.spec.checkpoint);
+      if (job.controller.signal.aborted || job.attempt.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      if (job.kind === 'move') this.runClock(true);
+      let timeout = false, limit = null, ms = null;
+      if (job.kind === 'move' && this.clock) {
+        const clock = this.clockNow();
+        limit = clock[job.side ? 'circle_ms' : 'cross_ms']; ms = turnTime(this.control(), clock, job.side);
+        const field = job.side ? 'circle_ms' : 'cross_ms', expire = () => {
+          const left = this.clockNow()?.[field] ?? 0;
+          if (left > 0) { timer = setTimeout(expire, Math.min(MAX_TIMER, left)); return; }
+          timeout = true; job.attempt.abort();
+        };
+        timer = setTimeout(expire, Math.min(MAX_TIMER, Math.max(1, limit)));
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
       try {
-        result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal: job.controller.signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms: limit, line: job.line,
-          progress: f => { job.done = job.kind === 'review' ? job.cursor + f : f; this.onchange(this.state()); }});
+        result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
+          progress: (f, live) => { job.done = job.kind === 'review' ? job.cursor + f : f; if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);
-      const elapsed = Date.now() - start;
+      const at = Date.now(), elapsed = this.clock?.started != null ? at - this.clock.started : null;
       if (job.kind === 'move') {
         if (match && (this.match !== match || !match.active || this.paused || !this.jobs.includes(job))) return;
-        this.freezeClock();
-        if (timeout || limit != null && elapsed > limit) { await this.finishMatch(1 - job.side, 'timeout'); return; }
+        if (timeout || !this.outcome && this.clock && this.clockNow()[job.side ? 'circle_ms' : 'cross_ms'] <= 0) {
+          this.chargeTurn(job.side, at);
+          if (match) await this.finishMatch(1 - job.side, 'timeout');
+          return;
+        }
       }
       if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-      await this.record(history, job.spec, result, job.kind === 'move' && this.entries.get(job.spec.engine)?.kind === 'bubble');
+      // The move came back at `at`; saving it must not run its clock out.
+      if (job.kind === 'move') clearTimeout(this.flag);
+      await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));
       if (job.kind === 'move') {
-        if (job.controller.signal.aborted || position(this.history) !== position(history) || this.paused) return;
+        if (job.controller.signal.aborted || position(this.history) !== position(history) || this.paused) { this.armFlag(); return; }
         if (!this.match?.active) this.forkGame();
         this.history.push(...copy(this.checkedTurn(history, result.moves)));
-        if (this.clock) this.clock[job.side ? 'circle_ms' : 'cross_ms'] += this.match.clock.increment_ms;
+        this.chargeTurn(job.side, at);
         if (this.match?.active) {
           this.match.timings.push({ply: history.length, side: job.side, engine: job.spec.engine, elapsed_ms: elapsed});
           const winner = this.native.game(this.history).winner;
@@ -335,10 +485,12 @@ export class BrowserSession extends OfflineSession {
         }
       } else if (job.kind === 'review') { job.cursor++; job.done = job.cursor; }
     } catch (error) {
+      interrupted = error.name === 'AbortError' && !job.controller.signal.aborted;
       if (error.name !== 'AbortError') { job.status = 'failed'; job.error = error.message; if (job.kind === 'move') { this.freezeClock(); this.paused = true; } if (this.match) this.match.error = error.message; }
     } finally {
       clearTimeout(timer); this.running = null;
-      if (job.status !== 'failed' && (job.kind !== 'review' || job.cursor >= job.plies.length || job.controller.signal.aborted)) this.jobs = this.jobs.filter(j => j !== job);
+      if (interrupted) job.status = 'queued';
+      else if (job.status !== 'failed' && (job.kind !== 'review' || job.cursor >= job.plies.length || job.controller.signal.aborted)) this.jobs = this.jobs.filter(j => j !== job);
       else if (job.status !== 'failed') job.status = 'queued';
       this.changed(); await this.saving;
       settled();
@@ -351,19 +503,13 @@ export class BrowserSession extends OfflineSession {
     if (!Array.isArray(body.players) || body.players.length !== 2 || !Number.isInteger(body.games) || body.games < 2 || body.games > 10000 || body.games % 2) throw Error('Choose two engines and an even number of games');
     const max_placements = body.max_placements ?? 512;
     if (!Number.isSafeInteger(max_placements) || max_placements < 0 || max_placements === 1) throw Error('Stone limit must be at least 2, or 0 for uncapped');
-    const players = body.players.map(p => { const s = this.spec(p), entry = this.entries.get(s.engine); return {...s, name: entry.name, version: entry.version}; });
+    const players = body.players.map(p => { const s = this.spec(p), entry = this.entries.get(s.engine); return {...s, name: entry.name, version: this.engineKey(s)}; });
     const seed = body.seed ?? Math.floor(Math.random() * 4294967296), mode = body.opening_range || 'origin';
     const openings = mode === 'origin' ? (body.openings || [[[0, 0]]]).map(moves => ({moves})) : this.bookData?.select(mode, body.unique_openings || body.games / 2, seed);
     if (!openings?.length) throw Error('No opening book is available');
     openings.forEach(n => { if (this.native.game(n.moves).winner >= 0 || max_placements && n.moves.length >= max_placements) throw Error('Match openings must be unfinished and shorter than the stone limit'); });
-    const clock = {...body.clock || {mode: 'fixed'}};
-    if (!['fixed', 'move', 'game'].includes(clock.mode)) throw Error('Unknown clock mode');
-    if (clock.mode === 'move' && (!Number.isInteger(clock.ms) || clock.ms < 1)) throw Error('Seconds per turn must be positive');
-    if (clock.mode === 'game') {
-      const m = String(clock.tc).match(/^(\d+(?:\.\d+)?)(?:\+(\d+(?:\.\d+)?))?$/);
-      if (!m || +m[1] <= 0) throw Error('Use seconds+increment, such as 180+2');
-      clock.initial_ms = +m[1] * 1000; clock.increment_ms = +(m[2] || 0) * 1000;
-    }
+    const clock = clockSpec(body.clock);
+    if (clock.mode !== 'fixed') players.forEach(p => this.clockable(p));
     await this.saveGame(); this.cancelJobs();
     if (this.analysis) this.analysis.auto = false;
     this.match = {id: uid(), name: new Date().toISOString().slice(0, 19).replace('T', ' '), active: true, players, games: body.games,
@@ -375,11 +521,11 @@ export class BrowserSession extends OfflineSession {
     const opening = match.openings[Math.floor((number - 1) / 2) % match.openings.length];
     this.load(opening.moves, false, opening.key ? {mode: match.opening_range, key: opening.key, symmetry: opening.symmetry, ply: opening.moves.length} : null);
     this.seats = copy(number % 2 ? match.players : [...match.players].reverse()); match.current = number; match.timings = []; match.pending_game = false;
-    if (match.clock.mode === 'game') this.clock = {cross_ms: match.clock.initial_ms, circle_ms: match.clock.initial_ms};
+    this.freshClock();
   }
   resumeMatch() {
     if (!this.match || this.match.completed >= this.match.games) throw Error('No unfinished match');
-    for (const p of this.match.players) if (p.version && this.entries.get(p.engine)?.version !== p.version) throw Error('This match used a different engine version. Start a new match.');
+    for (const p of this.match.players) if (p.version && this.engineKey(p) !== p.version) throw Error('This match used a different engine version. Start a new match.');
     if (this.match.pending_game) this.beginMatchGame();
     this.seats = copy(this.match.current % 2 ? this.match.players : [...this.match.players].reverse());
     this.jobs = this.jobs.filter(j => j.status !== 'failed'); this.match.error = null; this.match.active = true; this.paused = false;
@@ -387,11 +533,12 @@ export class BrowserSession extends OfflineSession {
   async finishMatch(winner, reason) {
     const m = this.match, game = m.current, aWinner = winner == null ? null : game % 2 ? winner : 1 - winner, id = `${m.id}:${game}`;
     const record = {id, format: 'bubble-replay', version: 1, game, history: copy(this.history), players: copy(this.seats), winner, reason,
-      evaluations: this.state().evaluations, records: copy(this.records), timings: copy(m.timings), opening: copy(this.book.opening), saved_at: new Date().toISOString()};
+      evaluations: this.state().evaluations, records: copy(this.records), timings: copy(m.timings), opening: copy(this.book.opening), saved_at: new Date().toISOString(),
+      ...(m.clock.mode === 'fixed' ? {} : {clock: copy(m.clock), turns: copy(this.clockTurns)})};
     m.results.push({id, game, winner: aWinner, reason, placements: this.history.length, opening: Math.floor((game - 1) / 2)});
     if (winner == null) m.capped++; else m.wins[aWinner]++;
     m.completed++; m.elo = pairElo(m.results);
-    if (m.completed >= m.games) { m.active = false; if (this.match === m) { this.paused = true; this.clock = null; } }
+    if (m.completed >= m.games) { m.active = false; if (this.match === m) { this.paused = true; this.freezeClock(); } }
     else { m.pending_game = true; m.current = m.completed + 1; }
     await this.persist([record]);
     if (!this.conflicted && !this.paused && this.match === m && m.active && m.completed < m.games) this.beginMatchGame();
@@ -413,7 +560,11 @@ export class BrowserSession extends OfflineSession {
   async openGame(id, number) {
     const game = await this.savedReplay(id, number);
     this.load(game.history, true, game.opening || null); this.seats = [human(), human()];
-    this.saved_game = {batch: id, game: +number, players: game.players.map(p => p.name || 'Human'), winner: game.winner, reason: game.reason};
+    this.saved_game = {batch: id, game: +number, players: game.players.map(p => p.name || 'Human'), winner: game.winner, reason: game.reason, clock: game.clock || null};
+    this.clockTurns = copy(game.turns || []);
+    this.outcome = ['time', 'timeout'].includes(game.reason) && game.winner != null ? {winner: game.winner, reason: game.reason} : null;
+    const last = this.clockTurns.at(-1), base = game.clock && (game.clock.mode === 'move' ? game.clock.ms : game.clock.base_ms);
+    this.clock = game.clock ? {cross_ms: last?.cross_ms ?? base, circle_ms: last?.circle_ms ?? base, increment_ms: game.clock.increment_ms || 0} : null;
     this.records = game.records || Object.values(game.evaluations || {});
     if (this.analysis) this.analysis.auto = false;
     this.changed();
@@ -472,12 +623,13 @@ export class BrowserSession extends OfflineSession {
           if (body.batch && this.match?.id !== body.batch) {
             this.editable(); const saved = await this.storage.get('matches', body.batch);
             if (!saved || saved.single || saved.completed >= saved.games) throw Error('No unfinished match');
-            for (const p of saved.players) if (p.version && this.entries.get(p.engine)?.version !== p.version) throw Error('This match used a different engine version. Start a new match.');
+            for (const p of saved.players) if (p.version && this.engineKey(p) !== p.version) throw Error('This match used a different engine version. Start a new match.');
             this.match = saved;
             this.match.players = this.match.players.map(p => ({...p, ...this.spec(p)}));
             if (!saved.pending_game && saved.position?.game === saved.completed + 1) {
               this.load(saved.position.history, true, saved.position.opening);
               this.records = copy(saved.position.records); this.clock = copy(saved.position.clock);
+              this.clockTurns = copy(saved.position.clockTurns || []); this.clockPartial = saved.position.clockPartial || 0;
               if (this.clock) { delete this.clock.started; delete this.clock.side; }
               this.seats = copy(saved.current % 2 ? saved.players : [...saved.players].reverse());
             } else this.beginMatchGame();

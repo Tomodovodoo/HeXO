@@ -14,17 +14,19 @@
  * preset's budget, plus `checkpoint` (one of `entry.checkpoints`, chosen in a select when there are several) when the
  * entry lists any, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
  * evaluation record the analysis panel shows for that turn. */
-import {BubbleEngine, PRESETS, isolate} from './bubble.mjs';
+import {BubbleEngine, NETWORKS, PRESETS, isolate, networkManifest} from './bubble.mjs';
 import {native} from './native.mjs';
 import {shrimp} from './shrimp.mjs';
-import {mountPlay} from './browser-play.mjs';
+import {mountPlay, deviceLabel} from './browser-play.mjs';
+import {turnTime} from './clock.mjs';
+import {NEURAL_PRESET, notePace} from './device.mjs';
 import {seal} from './seal.mjs';
 import {six} from './six.mjs';
 import {strix} from './strix.mjs';
 import {NotOnSite, install as download, json, status} from './assets.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
-const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: [], presets: PRESETS, analysis: true},
+const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: true},
   engine: new BubbleEngine(),
   record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
     solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE}),
@@ -32,7 +34,7 @@ const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bu
 const ENGINES = new Map([bubble, native, shrimp, seal, six, strix].map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
-  'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems', 'isHuman', 'setupRing'];
+  'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems', 'isHuman', 'setupRing', 'clockPicker'];
 const page = globalThis, original = Object.fromEntries(HOOKS.map(name => [name, page[name]]));
 const analyses = new Map(), loads = new Map(), hk = history => history.map(p => p.join(',')).join(';');
 /** Each seat and the analysis: null, or {engine: an ENGINES id, preset, checkpoint}. */
@@ -41,7 +43,13 @@ let config = {seats: [null, null], analysis: null}, job = null, failed = null, p
 const lines = [0, 1];
 let nextLine = 2;
 const renew = (...sides) => { for (const side of sides.length ? sides : [0, 1]) lines[side] = nextLine++; };
-let fresh = true;
+let fresh = true, notice = null;
+/** Engine and checkpoint pairs whose network is loaded, with the engine's `ready` promise of the worker that loaded it (an
+ * engine that discards its worker on cancel starts a new one): a timed move of any other holds the server's clock while it
+ * loads. */
+const warmed = new Map();
+/** While a timed move holds the server's clock to load its engine: {paused}, set when the person pauses meanwhile. */
+let holding = null;
 try {
   const saved = localStorage.getItem(STORE), known = choice => ENGINES.has(choice?.engine) ? pickEngine(choice.engine, choice, choice.checkpoint) : null;
   fresh = saved === null;
@@ -52,12 +60,13 @@ const save = () => { failed = null; try { localStorage.setItem(STORE, JSON.strin
 const state = () => typeof S === 'undefined' ? null : S;
 const viewed = () => typeof view === 'undefined' ? 0 : view;
 const closeIcon = () => typeof icon === 'function' ? icon('close') : '×';
-/** The choice for browser engine `id`, keeping `current`'s preset and network when it chose the same engine. A network
+/** The choice for browser engine `id`, keeping `current`'s preset and network when it chose the same engine, else
+ * at the engine's starting preset. A network
  * is checked against the entry's checkpoints once they are known; before its manifest arrives it is kept as given. */
 function pickEngine(id, current, checkpoint = null) {
   const same = current?.engine === id, {checkpoints} = ENGINES.get(id).entry, wanted = [checkpoint, same ? current.checkpoint : null];
   const network = checkpoints.length ? wanted.find(c => checkpoints.includes(c)) ?? checkpoints[0] : wanted.find(Boolean) ?? null;
-  return {engine: id, preset: same ? current.preset : 'standard', checkpoint: network};
+  return {engine: id, preset: same ? current.preset : ENGINES.get(id).entry.preset || 'standard', checkpoint: network};
 }
 const analysable = e => e.kind === 'bubble' || e.analysis;
 const analysisKey = (choice, history) => `${choice.engine}|${choice.preset}|${choice.checkpoint}|${hk(history)}`;
@@ -143,12 +152,30 @@ async function run(key, task) {
   const {engine, entry, record} = ENGINES.get(task.engine);
   try {
     current.loading = true;
-    await engine.load(f => { loads.set(task.engine, f); progress(); });
-    checks.delete(task.engine);
+    const timed = task.kind === 'move' && state()?.clock_spec && state().clock_spec.mode !== 'fixed', warm = `${task.engine}|${task.checkpoint}`;
+    const hold = timed && (!engine.ready || warmed.get(warm) !== engine.ready);
+    if (hold) { posting = true; holding = {paused: false}; await original.post('/pause', {paused: true}); }
+    try {
+      entry.device = deviceLabel(await engine.load(f => { loads.set(task.engine, f); progress(); }));
+      checks.delete(task.engine);
+      await engine.prepare?.(task.checkpoint, {signal: controller.signal});
+      warmed.set(warm, engine.ready);
+    } finally {
+      if (hold) {
+        const kept = holding.paused;
+        holding = null;
+        if (!kept) await original.post('/pause', {paused: false});
+        posting = false;
+      }
+    }
+    if (job !== current || hold && state()?.paused) { if (job === current) job = null; return; }
     current.loading = false;
-    const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})};
-    const result = await engine.turn(task.history, budget, {signal: controller.signal, line: task.line,
+    const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
+    const ms = task.kind === 'move' && s?.clock && s.clock_spec?.mode !== 'fixed' ? turnTime(s.clock_spec, s.clock, task.side) : null;
+    const started = performance.now();
+    const result = await engine.turn(task.history, budget, {signal: controller.signal, ms, line: task.line,
       progress: f => { current.fraction = f; progress(); }});
+    if (ms == null) notePace(entry, task.preset, performance.now() - started, result.moves?.length);
     if (job !== current) return;
     job = null;
     if (task.kind === 'move') {
@@ -168,6 +195,7 @@ async function run(key, task) {
         posting = false;
       }
     } else {
+      if (result.solver_error && notice !== result.solver_error) original.toast(`The solver could not run in this browser (${notice = result.solver_error}), so evaluations have no proofs`);
       const evaluation = record(result, task.history, task.preset);
       analyses.set(analysisKey(task, task.history), evaluation);
       const s = state();
@@ -182,6 +210,8 @@ async function run(key, task) {
       failed = key;
       if ((await check(task.engine)).state === 'unpublished') unpublished(task.engine);   // a worker's error is a plain message
       else original.toast(error.message);
+      // The server counts a browser seat as a person, so its clock would run on into a loss on time.
+      if (task.kind === 'move' && state()?.clock_spec && state().clock_spec.mode !== 'fixed') original.post('/pause', {paused: true});
     }
     if (job === current) job = null;
   }
@@ -197,7 +227,7 @@ function controls(choice, send, id) {
     select.onchange = () => send({checkpoint: select.value});
     out.push(select);
   }
-  out.push(original.strength(choice, change => send({preset: change.preset}), id, null));
+  out.push(original.strength(choice, change => send({preset: change.preset}), id, null, -1, ENGINES.get(choice.engine).entry));
   return out;
 }
 
@@ -334,6 +364,14 @@ function install() {
     const s = state();
     if (['/undo', '/new', '/book', '/import', '/retry', '/match'].includes(path)) renew();
     if (path === '/seat') renew(body.side);
+    if (path === '/pause' && holding) holding.paused = !!body.paused;
+    const fixed = id => ENGINES.has(id) && !ENGINES.get(id).entry.clocks ? ENGINES.get(id).entry.name : null;
+    const refused = name => { original.toast(`${name} plays a fixed budget; it cannot keep a clock`); return Promise.resolve(null); };
+    if (path === '/clock' && body.mode !== 'fixed') {
+      const name = config.seats.map(choice => choice && fixed(choice.engine)).find(Boolean);
+      if (name) return refused(name);
+    }
+    if (path === '/seat' && fixed(body.engine) && s?.clock_spec && s.clock_spec.mode !== 'fixed') return refused(fixed(body.engine));
     if (path === '/seat' && body.engine !== undefined) {
       const browser = ENGINES.has(body.engine);
       config.seats[body.side] = browser ? pickEngine(body.engine, config.seats[body.side], body.checkpoint) : null;
@@ -373,7 +411,7 @@ function install() {
     const choice = side >= 0 && seat.engine === 'human' ? config.seats[side] : s && seat === s.analysis ? config.analysis : null;
     if (!choice) return original.shown(seat);
     const {entry} = ENGINES.get(choice.engine);
-    return [entry.badge || entry.kind, entry.label];
+    return [entry.badge || entry.kind, entry.label, entry.device];
   };
   page.isHuman = seat => {
     const s = state(), side = s ? s.seats.indexOf(seat) : -1;
@@ -390,7 +428,9 @@ function install() {
       const items = [{id: 'human', ids: ['human'], kind: 'human', label: null}, ...original.pickItems(() => true)];
       pick.onclick = () => page.openMenu(pick, items, config.seats[side].engine, it => page.post('/seat', {side, engine: it.id}));
     }
-    box.append(original.el('div', {class: 'more'}, original.el('div', {}, ...controls(config.seats[side], send, 'seat' + side))));
+    const clock = ENGINES.get(config.seats[side].engine).entry.clocks && s.clock_spec
+      ? [original.clockPicker(s.clock_spec, spec => page.post('/clock', spec), 'clock-seat' + side)] : [];
+    box.append(original.el('div', {class: 'more'}, original.el('div', {}, ...controls(config.seats[side], send, 'seat' + side), ...clock)));
     progress();
   };
   page.renderEngineHead = () => {
@@ -398,9 +438,9 @@ function install() {
     const head = document.getElementById('engine-head'), s = state();
     if (!config.analysis || !head || !s?.analysis) return;
     const {entry} = ENGINES.get(config.analysis.engine);
-    const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.badge || entry.kind, entry.label));
+    const pick = original.el('button', {class: 'pick'}, ...original.badge(entry.badge || entry.kind, entry.label, entry.device));
     const items = original.pickItems(analysable);
-    pick.onclick = () => page.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: 'standard', auto: true}));
+    pick.onclick = () => page.openMenu(pick, items, entry.id, it => page.post('/analysis', {engine: it.id, checkpoint: null, preset: ENGINES.get(it.id)?.entry.preset || 'standard', auto: true}));
     const send = change => { config.analysis = {...config.analysis, ...change}; save(); page.renderPanels(); };
     head.replaceChildren(original.el('div', {class: 'head'}, pick), ...controls(config.analysis, send, 'analysis'));
   };
@@ -432,8 +472,9 @@ async function serverless() {
   } catch {}
   if (await isolate()) return true;
   Object.assign(page, original, {openMenu});
-  const [manifest, build] = await Promise.all([json('model/manifest.json').then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);
-  bubble.entry.version = [manifest.model_version, build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
+  const [manifest, build] = await Promise.all([json(networkManifest()).then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);
+  bubble.entry.version = [build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
+  bubble.entry.models = NETWORKS.length ? Object.fromEntries(NETWORKS.map(n => [n.name, n.model_version])) : {'': manifest.model_version};
   native.entry.version = build.artefacts['native/native.wasm'];
   for (const {entry} of ENGINES.values()) entry.version ||= JSON.stringify(build.artefacts);
   await mountPlay(ENGINES, config);

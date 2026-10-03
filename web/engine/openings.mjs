@@ -23,7 +23,10 @@ export class OpeningBook {
     const selected = mode === 'narrow' ? pool.slice(0, count) : shuffle(pool, rng).slice(0, count);
     return shuffle(selected, rng).map(n => ({...n, symmetry: Math.floor(rng() * 12)})).map(n => ({...n, moves: transform(n.moves, n.symmetry)}));
   }
-  pick(mode, coverage, side, rng = Math.random) {
+  /** A start of `mode` in a random orientation: `node` when given, else walking the branches that still hold the
+   * start `side` has played least (`coverage` counts `side:key`). */
+  pick(mode, coverage, side, rng = Math.random, node = null) {
+    if (node) { const symmetry = Math.floor(rng() * 12); return {...node, symmetry, moves: transform(node.moves, symmetry)}; }
     let candidates = this.pool(mode), prefix = [];
     // Walk the book's branches that still contain an unplayed start, as Play does.
     const plays = n => coverage[`${side}:${n.key}`] || 0, least = Math.min(...candidates.map(plays));

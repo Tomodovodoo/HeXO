@@ -26,12 +26,24 @@ export async function isolate() {
 }
 
 import {EngineWorker} from './engine-worker.mjs';
-import {workerUrl} from './assets.mjs';
+import {json, workerUrl} from './assets.mjs';
 import {loadFiles, modelFiles, probe} from './network.mjs';
 
+/** The exported networks (python tools/build_web.py model), newest first, as model/networks.json (here, else the
+ * public site's) lists them:
+ * [{name, manifest (relative to model/), model_version}]; empty when the site holds a single model/manifest.json. */
+export const NETWORKS = await json('model/networks.json').then(found => found.data.networks, () => []);
+
+/** The manifest of network `name` relative to web/engine: the newest when null, model/manifest.json without a list. */
+export function networkManifest(name = null) {
+  const network = name === null ? NETWORKS[0] : NETWORKS.find(n => n.name === name);
+  if (name !== null && !network) throw new Error(`Bubble has no network ${name}`);
+  return network ? `model/${network.manifest}` : 'model/manifest.json';
+}
+
 export class BubbleEngine extends EngineWorker {
-  /** `model` is the manifest's path under web/engine; `prefer` 'wasm', 'webgpu-fp32' or 'webgpu-fp16' narrows the device choice. */
-  constructor({model = 'model/manifest.json', prefer = null, threads = null} = {}) {
+  /** `model` is the default manifest's path under web/engine; `prefer` 'wasm', 'webgpu-fp32' or 'webgpu-fp16' narrows the device choice. */
+  constructor({model = networkManifest(), prefer = null, threads = null} = {}) {
     super(workerUrl('worker.mjs'), 'Bubble (browser)', {model, prefer, threads});
   }
 
@@ -44,14 +56,21 @@ export class BubbleEngine extends EngineWorker {
   }
 
   /**
-   * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor} (a
-   * PRESETS entry): the fields of python/play.py evaluate. `options.line`, a seat's game key, continues that game's
-   * search tree (worker.mjs). Aborting `signal` cancels it (rejects with an AbortError).
+   * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor and
+   * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Under a clock
+   * `options.ms` is the turn's time and the budget a ceiling (see worker.mjs). `options.line`, a seat's game key,
+   * continues that game's search tree. Aborting `signal` cancels it (rejects with an AbortError).
    */
   turn(history, budget, options = {}) {
-    return this.call({type: 'turn', history, simulations: budget.simulations, solverNodes: budget.solver_nodes,
+    return this.call({type: 'turn', history, model: budget.checkpoint ? networkManifest(budget.checkpoint) : this.options.model,
+      simulations: budget.simulations, solverNodes: budget.solver_nodes,
       batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
-      line: options.line ?? null}, options);
+      ms: options.ms ?? null, line: options.line ?? null}, options);
+  }
+
+  /** Loads network `checkpoint` (a NETWORKS name, the default when null), so a timed turn does not spend its clock on it. */
+  prepare(checkpoint = null, options = {}) {
+    return this.call({type: 'use', model: checkpoint ? networkManifest(checkpoint) : this.options.model}, options);
   }
 
   /** One search of `simulations` from `history` (no solver): action, completed, elapsed_ms, evaluated, batches, policy.

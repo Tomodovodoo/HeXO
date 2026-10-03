@@ -4,6 +4,7 @@
 import {json, workerUrl} from './assets.mjs';
 import {defaultThreads, loadFiles, probe} from './network.mjs';
 import {ShrimpNetwork} from './shrimp/network.mjs';
+import {NEURAL_PRESET} from './device.mjs';
 
 /** The server entry's presets, as visits per stone; `simulations` is what the analysis panel shows. */
 export const PRESETS = Object.fromEntries(Object.entries({lightning: 16, quick: 32, standard: 128, strong: 512, deep: 1024,
@@ -116,5 +117,5 @@ export function record(result, history, preset) {
     simulations: PRESETS[preset].visits, solver_nodes: 0, ms: result.ms, engine: ID};
 }
 
-export const shrimp = {entry: {id: ID, kind: 'six', badge: 'shrimp', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true},
+export const shrimp = {entry: {id: ID, kind: 'six', badge: 'shrimp', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: false},
   engine: new ShrimpEngine(), record, build: 'python tools/build_web.py ort shrimp'};

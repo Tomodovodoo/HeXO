@@ -1,8 +1,8 @@
 // Node runner for tests/test_web_engine.py: reads one JSON job from stdin, writes one JSON answer to stdout.
-// {kind: 'follow', enabled, available, stored, steps: [[path, body]], together, resumes} -> {requests: [[path, body]], enabled, paused, stored}
+// {kind: 'follow', enabled, available, stored, steps: [[path, body]], together} -> {requests: [[path, body]], enabled, paused, stored}
 //   drives web/engine/book.mjs on a stand-in play server whose page plays 'browser:bubble' seats itself, as seat.mjs does
-//   and answers /book later than /seat (turning it on for an empty board resumes the game, as a new game does on the
-//   play server, unless `resumes` is false, as in the static page's session);
+//   and answers /book later than /seat (turning it on for an empty board resumes the game, as a new game does on both
+//   pages);
 //   `together` sends every step at once instead of one after another
 // {kind: 'offline', steps: [[path, body]]} -> [path] of every request an OfflineSession answered
 // {kind: 'static', steps: [[path, body]]} -> {requests: [path], enabled, paused, stones} from the static page's BrowserSession,
@@ -31,7 +31,7 @@ if (job.kind === 'follow') {
       state = {...state, seats: state.seats.map((seat, side) => side === body.side ? {engine: mine ? 'human' : body.engine} : seat)};
     } else if (path === '/book') {
       await new Promise(done => setTimeout(done, 20));
-      state = {...state, book: {...state.book, enabled: body.enabled}, paused: state.paused && !(body.enabled && job.resumes !== false)};
+      state = {...state, book: {...state.book, enabled: body.enabled}, paused: state.paused && !body.enabled};
     } else if (path === '/pause') state = {...state, paused: body.paused};
     else if (path === '/new') state = {...state, paused: false};
     return state;

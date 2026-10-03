@@ -4,6 +4,8 @@
  * the first is the default), or the site's when this origin has none. */
 import {json, workerUrl} from './assets.mjs';
 
+import {NEURAL_PRESET} from './device.mjs';
+
 /** Simulations per placement, as python/play.py's Strix presets. */
 export const PRESETS = {lightning: {simulations: 2}, quick: {simulations: 8}, standard: {simulations: 64},
   strong: {simulations: 128}, deep: {simulations: 512}, dangerous: {simulations: 4096}};
@@ -132,7 +134,7 @@ const engine = new StrixEngine([]);
 
 /** The browser engine for seat.mjs; its checkpoints fill in once strix/networks.json is read. */
 export const strix = {
-  entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, analysis: true},
+  entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: false},
   engine,
   listed: engine.known().then(() => {}, () => {}),
   build: 'python tools/build_web.py strix-network',

@@ -106,6 +106,54 @@ if (job.kind === 'encode') {
     }
     answer.push(formats);
   }
+} else if (job.kind === 'links') {
+  answer = [];
+  for (const [url, data] of job.links) {
+    const asked = [], fetcher = async (api, init = {}) => { asked.push([api, init.method || 'GET']); return {ok: true, json: async () => data}; };
+    try { answer.push({history: await readGame(url, native, fetcher), asked}); }
+    catch (error) { answer.push({error: error.message, asked}); }
+  }
+} else if (job.kind === 'clock') {
+  const wait = ms => new Promise(r => setTimeout(r, ms)), s = new BrowserSession(native), asked = [];
+  s.registerEngine({id: 'fixed', name: 'Fixed', kind: 'strix', presets: {standard: {simulations: 1}}, clocks: false}, {turn: async () => ({moves: []})});
+  s.registerEngine({id: 'timed', name: 'Timed', kind: 'native', presets: {standard: {ms: 1000}}, clocks: true}, {
+    turn: async (history, budget, options) => { asked.push(options.ms); return {moves: [[history.length, 3], [history.length, 4]].slice(0, history.length ? 2 : 1)}; }});
+  answer = {set: s.answer('/clock', {mode: 'game', tc: '0.3+1'})[0]};
+  s.answer('/play', {q: 0, r: 0});
+  answer.after_turn = s.clockNow();
+  answer.fixed_seat = s.answer('/seat', {side: 1, engine: 'fixed'});
+  s.answer('/seat', {side: 1, engine: 'timed'});
+  await wait(60);
+  answer.engine_turn = {history: s.history.length, asked, clock: s.clockNow()};
+  clearTimeout(s.flag); await wait(s.clockNow().cross_ms + 50);
+  answer.late = s.answer('/play', {q: 9, r: 9})[0];
+  answer.timed_out = {state: (({winner, outcome}) => ({winner, outcome}))(s.state()), game: (await s.saving, await s.storage.get('games', s.gameId)), play: s.answer('/play', {q: 9, r: 8})[0]};
+  { const v = new BrowserSession(native); v.storage = s.storage; await v.openGame(s.gameId, 1); answer.study_winner = v.state().winner; }
+  s.answer('/new', {});
+  answer.long_clock = s.answer('/clock', {mode: 'game', tc: '3000000'})[0];
+  s.answer('/clock', {mode: 'game', tc: '0.3+1'});
+  answer.fresh = {outcome: s.outcome, clock: s.clockNow()};
+  s.answer('/seat', {side: 1, engine: 'human'}); s.answer('/clock', {mode: 'game', tc: '60'});
+  await wait(100); s.answer('/pause', {paused: true}); await wait(100); s.answer('/pause', {paused: false}); await wait(100);
+  s.answer('/play', {q: 0, r: 0});
+  answer.paused_turn = s.clockTurns[0].spent_ms;
+  const slow = new BrowserSession(native); let readyAt = 0;
+  slow.registerEngine({id: 'slow', name: 'Slow', kind: 'native', presets: {standard: {ms: 1000}}, clocks: true}, {
+    ready: async () => { await wait(300); readyAt = Date.now(); },
+    turn: async history => ({moves: [[history.length, 3], [history.length, 4]]})});
+  slow.answer('/clock', {mode: 'game', tc: '60'}); slow.answer('/play', {q: 0, r: 0});
+  const seated = Date.now(); slow.answer('/seat', {side: 1, engine: 'slow'}); await wait(500);
+  answer.load_charged = {spent: slow.clockTurns[1]?.spent_ms ?? null, load: readyAt - seated};
+  s.answer('/pause', {paused: true}); slow.answer('/pause', {paused: true});
+  { const m = new BrowserSession(native), entry = {id: 'net', name: 'Net', kind: 'bubble', checkpoints: ['1'], models: {'1': 'weights-a'}, presets: {standard: {simulations: 1, solver_nodes: 0}}};
+    m.registerEngine(entry, {turn: () => new Promise(() => {})});
+    await m.startMatch({players: [{engine: 'net'}, {engine: 'net'}], games: 2}); await m.request('/match', {action: 'stop'}, 'POST');
+    entry.models = {'1': 'weights-b'};
+    answer.rebuilt_model = (await m.request('/match', {action: 'resume'}, 'POST'))[1].error ?? null; m.cancelJobs(); }
+  const r = new BrowserSession(native); r.answer('/clock', {mode: 'game', tc: '60'}); await wait(150);
+  await r.persist(); await wait(250);
+  const back = new BrowserSession(native); back.storage = r.storage; await back.restore();
+  answer.reloaded = {balance: back.clock.cross_ms, partial: back.clockPartial}; r.freezeClock();
 } else if (job.kind === 'play') {
   const s = new BrowserSession(native), data = JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url)));
   s.bookData = new OpeningBook(data);
@@ -154,7 +202,7 @@ if (job.kind === 'encode') {
   const s = new BrowserSession(native), wait = ms => new Promise(r => setTimeout(r, ms));
   const until = async condition => { for (let i = 0; !condition(); i++) { if (i > 3000) throw Error('Move did not start'); await wait(1); } };
   s.bookData = new OpeningBook(JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url))));
-  s.registerEngine({id:'test', name:'Test', kind:'bubble', version:'v1', presets:{standard:{simulations:1,solver_nodes:0}}}, {
+  s.registerEngine({id:'test', name:'Test', kind:'bubble', version:'v1', presets:{standard:{simulations:1,solver_nodes:0}}, clocks:true}, {
     turn: (history, budget, options) => history.length === 1 ? Promise.resolve({moves:[[0,2],[1,2]],value:.5}) : new Promise((resolve,reject) => {
       options.signal.addEventListener('abort', () => reject(new DOMException('Cancelled','AbortError')), {once:true});
     })
@@ -163,7 +211,7 @@ if (job.kind === 'encode') {
   await s.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,clock:{mode:'game',tc:'180+2'}});
   await until(() => s.history.length === 3 && s.running?.history.length === 3);
   await s.request('/match',{action:'stop'},'POST'); await s.idle; await s.saving;
-  const id=s.match.id, before={history:structuredClone(s.history),clock:s.clockNow(),timings:structuredClone(s.match.timings)};
+  const id=s.match.id, before={history:structuredClone(s.history),clock:s.clockNow(),timings:structuredClone(s.match.timings),turns:s.clockTurns.length};
   s.apply('/seat',{side:0,engine:'human'}); s.apply('/seat',{side:1,engine:'human'});
   await s.request('/match',{action:'resume'},'POST'); await until(()=>!!s.running);
   const sameBatchSeats=s.seats.map(s=>s.engine);
@@ -173,9 +221,9 @@ if (job.kind === 'encode') {
   await s.request('/import',{text:JSON.stringify({history:[[0,0]]})},'POST'); const imported=s.book.opening;
   await s.request('/match',{action:'resume',batch:id},'POST');
   await until(() => !!s.running); await s.request('/match',{action:'stop'},'POST'); await s.idle;
-  answer={before,after:{history:s.history,clock:s.clockNow(),timings:s.match.timings},bookStart,imported,auto:s.analysis.auto,sameBatchSeats};
+  answer={before,after:{history:s.history,clock:s.clockNow(),timings:s.match.timings,turns:s.clockTurns.length},bookStart,imported,auto:s.analysis.auto,sameBatchSeats};
 } else if (job.kind === 'lifecycle') {
-  const entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', presets: {standard: {simulations: 1, solver_nodes: 0}}};
+  const entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', presets: {standard: {simulations: 1, solver_nodes: 0}}, clocks: true};
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
   const until = async condition => { for (let i = 0; !condition(); i++) { if (i > 3000) throw Error('Job did not settle'); await wait(1); } };
   const s = new BrowserSession(native);
@@ -243,6 +291,10 @@ if (job.kind === 'encode') {
   await failed.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,clock:{mode:'game',tc:'180+2'}});
   await until(() => !failed.running);
   const frozen = failed.clockNow(); await wait(25);
+  answer.timed_replay = await (async () => { const v = new BrowserSession(native); v.registerEngine(entry, {turn: async history => ({moves: job.history.slice(history.length, history.length + (history.length ? 2 : 1)), value: .5})});
+    await v.startMatch({players: [{engine: 'test'}, {engine: 'test'}], games: 2, max_placements: 3, clock: {mode: 'game', tc: '60+1'}}); await until(() => v.match.completed === 2);
+    const g = await v.storage.get('games', v.match.results[0].id); await v.openGame(v.match.id, 1); const st = v.state();
+    return {clock: g.clock, turns: g.turns.length, opened: {spec: st.clock_spec, turns: v.clockTurns.length, running: st.clock?.running ?? null}}; })();
   answer.failure_clock_frozen = failed.paused && !('started' in failed.clock) && JSON.stringify(frozen) === JSON.stringify(failed.clockNow());
   const writer = new BrowserSession(native);
   writer.registerEngine(entry, {turn:async()=>null});

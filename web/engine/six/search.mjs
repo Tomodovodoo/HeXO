@@ -2,21 +2,12 @@
  * gives HTTTX cells and plays like python/six_engine.py SixEngine against sixengine: the same search, defaults and
  * radius, `go nodes N` with no time limit, and the tree kept while the game continues. */
 import createModule from './six.mjs';
+import {nextTask} from '../tasks.mjs';
 
 /** Six's frame for an HTTTX cell (q, r) and back: (q + r, -r) is its own inverse. */
 export const mirror = ([q, r]) => [q + r, -r];
 
 const RADIUS = 8;
-
-/** Resolves after the tasks already queued (a worker's messages, timers) have run: a WebAssembly session answers
- * through microtasks alone, which would hold a cancel back until the turn ends. */
-function pending() {
-  return new Promise(resolve => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = () => { channel.port1.close(); resolve(); };
-    channel.port2.postMessage(null);
-  });
-}
 
 export class SixSearch {
   static async create(ort) {
@@ -63,15 +54,16 @@ export class SixSearch {
     }
     for (const tensor of Object.values(result)) tensor.dispose?.();
     this.evaluations += batch;
-    await pending();
+    await nextTask();
   }
 
   /**
-   * The rest of the turn at `history` ([[q, r], ...]) within `nodes` new positions: {moves, score, nodes, stopped},
+   * The rest of the turn at `history` ([[q, r], ...]) within `nodes` new positions and `ms` (0 for no time limit):
+   * {moves, score, nodes, stopped},
    * with `score` 1000 times the mover's value or 1000000 for a proven win and `nodes` the positions searched. `progress(nodes)` reports the search a few
    * times a second. After stop() the turn ends early with `stopped` set, and the next turn starts a new tree.
    */
-  async turn(history, nodes, progress = null) {
+  async turn(history, nodes, ms = 0, progress = null) {
     const continues = this.played && this.played.length <= history.length
       && this.played.every(([q, r], i) => history[i][0] === q && history[i][1] === r);
     if (!continues) this.forget();
@@ -80,7 +72,7 @@ export class SixSearch {
     let reply;
     try {
       reply = await this.module.ccall('six_turn', 'string', ['string', 'number', 'number', 'number'],
-        [history.map(mirror).flat().join(' '), RADIUS, 0, nodes], {async: true});
+        [history.map(mirror).flat().join(' '), RADIUS, ms, nodes], {async: true});
     } finally {
       this.module.onProgress = null;
     }

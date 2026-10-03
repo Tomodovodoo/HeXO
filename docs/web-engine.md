@@ -8,7 +8,7 @@ standard 128/32768, strong 512/131072, deep 2048/524288 and dangerous 65536/4000
 ```sh
 python tools/build_web.py wasm                      # gumbel, native, tactical and six wasm (committed)
 python tools/build_web.py ort                       # onnxruntime-web 1.30.0 into web/engine/ort
-python tools/build_web.py model                     # newest release, or --checkpoint path/to/ema.pt
+python tools/build_web.py model                     # every bubble-<step> release, or --checkpoint path/to/ema.pt
 python tools/build_web.py six                       # Six's networks (pinned) into web/engine/six/networks
 python -m unittest tests.test_web_engine tests.test_web_tactical tests.test_web_six
 ```
@@ -19,12 +19,63 @@ tests fail when they are stale. `ort`, `model` and `six` write ignored files; a 
 
 ## GitHub Pages
 
-`.github/workflows/pages.yml` builds the bundle on every push to `main` (ONNX Runtime, and the model exported from the
-newest release) and publishes `web/` as the site, so the play page opens at <https://tomodovodoo.github.io/HeXO/>.
+`.github/workflows/pages.yml` builds the bundle on every push to `main` (ONNX Runtime, and every Bubble release
+exported as a network) and publishes `web/` as the site, so the play page opens at <https://tomodovodoo.github.io/HeXO/>.
 It runs once the repository is public and Settings > Pages > Build and deployment > Source is set to GitHub Actions.
-Without a play server the page answers its own game requests (`web/engine/offline.mjs`): Bubble (browser) holds seat O
-and the analysis, server-only controls (review, tournaments, import and export) are hidden, and `web/coi-sw.js`, scoped
-to the site's path, adds the cross-origin isolation headers after one reload.
+`web/coi-sw.js`, scoped to the site's path, adds the cross-origin isolation headers after one reload.
+
+Without a play server the page answers its own requests in a browser session (`web/engine/play-session.mjs` on
+`offline.mjs`'s rules): seats, analysis with auto-deepening, review, saved games and evaluations in IndexedDB with a
+backup file, import and export, the opening book, tournaments and clocks. It differs from the server in these ways:
+
+- One job runs at a time. An engine move goes first and sends a running analysis, review step or deepening back to
+  the queue; deepening stops at strong unless the analysis engine runs on WebGPU.
+- A search reads a cancel between network batches, so Cancel, Pause and seat changes take effect within one batch.
+- When the solver's worker cannot start (some embedded browsers forbid a worker inside a worker), the page says so once
+  and keeps those evaluations, which have no proofs, for the visit only.
+- Game links are read through hexo.mineking.dev's API mirror, the only one of the sites that lets another site read
+  it; hexo.tyto.cc game links cannot be read cross-site, so the page asks for the game's HTTTX. Tyto analysis links
+  are decoded in the page.
+
+## Bubble networks
+
+`build_web.py model` downloads every GitHub release named `bubble-<step>` that carries an `ema.pt` and exports each
+into `model/<step>/` (both graphs and a manifest); `--release TAG` takes one release and `--checkpoint path/ema.pt`
+a local file, named by its step folder (`checkpoints/<variant>/<step>/ema.pt`) or else by the first 12 hex digits of
+its SHA-256. A network already exported from the same file is kept. `model/networks.json` lists the exported networks
+newest step first, and the seat and analysis pickers offer them in the network select, as for Six. A new release
+reaches the site with the next push to `main`, whose Pages build fetches all releases. A bundle with only the older
+single `model/manifest.json` still loads it, with no select.
+
+## Devices and clocks
+
+Once an engine has loaded, the seat and the analysis head tag it with its device:
+
+| Engine | WebGPU | Otherwise | Clock |
+|---|---|---|---|
+| Bubble (browser) | yes, fp32 or fp16 | WASM, threads when isolated | turn time: solver at most a quarter, first stone 60% of the rest, simulations a ceiling |
+| Six (browser) | yes, fp32 | WASM | Six's movetime, nodes a ceiling |
+| Shrimp (browser) | yes, fp32 | WASM | none, fixed visits |
+| Native (browser) | no | CPU, one thread | ms capped to the turn time |
+| Seal (browser) | no | CPU, one thread | ms capped to the turn time |
+| Strix (browser) | no | CPU, one thread | none, fixed simulations |
+
+Without WebGPU (the probe finds no adapter) the neural engines start at Lightning for seats and analysis, and the
+strength row shows the expected seconds per stone at the chosen stop, from the engine's own turns at that or another stop. Seconds
+per stone on WebAssembly, taken from the measurements in the sections below (Bubble with 8 threads and no solver, the
+others on one thread; Six from its 0.4 s per position):
+
+| Engine | Lightning | Quick | Standard |
+|---|---|---|---|
+| Bubble | 0.07 | 0.25 | 1 |
+| Six | 48 | 190 | 770 |
+| Shrimp | 2.5 | 5.7 | not measured |
+| Strix | 0.5 | 1.5 | 11.5 |
+
+Six stays slow without WebGPU even at its lightest stop.
+
+The turn time is `time_control.allowance`'s normal share (`web/engine/clock.mjs`); a per-turn clock gives the whole
+turn less 10 ms. A side whose clock runs out loses on time. Engines without a clock are refused while one is on.
 
 ## Running a local copy
 
@@ -76,7 +127,10 @@ the choice on their script URL.
 | `web/engine/strix.mjs`, `strix-worker.mjs` | Strix (browser): page API and worker |
 | `web/engine/strix/` | `strix.wasm` and its loader `core.mjs`, built from `tools/strix_web`; the network when built |
 | `web/engine/book.mjs` | Play page hook: the opening-book default that follows the seats |
-| `web/engine/offline.mjs` | The play server's game requests answered in the page, for static hosting |
+| `web/engine/offline.mjs` | The game rules behind the browser session |
+| `web/engine/play-session.mjs`, `browser-play.mjs` | The browser session that answers the page's requests on a static host |
+| `web/engine/clock.mjs` | Clock requests and turn allowances |
+| `web/engine/tasks.mjs` | `nextTask()`, which lets a worker read a cancel between network batches |
 | `web/coi-sw.js` | Cross-origin isolation on static hosts (`isolate()`), for WebAssembly threads |
 
 ## Device choice

@@ -1,7 +1,7 @@
 /* The page side of a browser engine's Web Worker. The worker answers {type: 'load', options} with 'progress'
  * ({fraction}) messages and then 'ready' ({device}) or 'error' ({message}); each call {type, id, ...} with 'progress'
- * ({id, fraction}) messages and then 'result' ({id, result}), 'error' ({id, message}) or, after {type: 'cancel', id},
- * 'cancelled' ({id}). */
+ * ({id, fraction, live?}, `live` being a running search's root rows, passed to progress as its second argument)
+ * messages and then 'result' ({id, result}), 'error' ({id, message}) or, after {type: 'cancel', id}, 'cancelled' ({id}). */
 import {defaultThreads} from './network.mjs';
 
 const READY_MS = 20000, STALLED = Symbol('stalled');
@@ -59,7 +59,7 @@ export class EngineWorker {
         }
         const wait = this.waits.get(data.id);
         if (!wait) return;
-        if (data.type === 'progress') { wait.progress(data.fraction); return; }
+        if (data.type === 'progress') { wait.progress(data.fraction, data.live); return; }
         this.waits.delete(data.id);
         if (data.type === 'result') wait.resolve(data.result);
         else wait.reject(data.type === 'cancelled' ? new DOMException('Cancelled', 'AbortError') : new Error(data.message));

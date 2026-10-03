@@ -59,8 +59,8 @@ The clock belongs to the match and applies to both seats:
 Engines warm before clocks start. Under a clock, search budgets are ceilings: Bubble caps simulations
 across the whole turn and keeps solver work inside the allowance; Six receives nodes plus movetime or
 both clocks and increments; Native and Seal receive the smaller of their ms ceiling and the allocated time.
-Strix/Pulsatrix clock requests are rejected because their current adapter cannot return an interrupted
-search's best move. Fixed-budget games remain supported. Timing uses the clock/controller from the existing
+Strix/Pulsatrix and Six-protocol drivers of other bots (Shrimp) are refused under a clock: their adapters play a
+fixed budget and cannot return an interrupted search's best move. Fixed-budget games remain supported. Timing uses the clock/controller from the existing
 timed engine; CPU/GPU and backend identities are saved, since they affect clocked strength.
 
 Opening selection reads the player's existing `openings.json` from `--run`, or an explicit `--book path`:
@@ -91,10 +91,24 @@ null. Complete colour pairs use the evaluator's pentanomial scoring and `dense_p
 relative Elo estimate and 95% interval. These exploratory results stay in the batch directory and do not
 change the training league or its calibrated-opponent scoreboard.
 
+### A single game on a clock
+
+An engine seat's strength panel holds the same four clock choices under its slider: Budget, Turn, Absolute and
+Fischer, with the base time and the increment in seconds. The clock belongs to the game and covers both sides,
+people included; each seat head shows its remaining time and the side to move counts down. Choosing a clock
+starts both balances full at the shown position; New, Undo, Retry and Import start them again. Engine seats play
+through the timed engines above, which warm before their clock runs, so Bubble, Native, Seal and Six spend the turn's
+allowance with their budget as a ceiling. A seat whose engine cannot keep a clock (Strix, Shrimp) is refused while a
+clock is on, and a clock is refused while such an engine plays. A side whose time runs out loses on time, also while a
+person thinks. The saved game records the control (`clock`) and, after each complete turn, the time spent and both
+balances (`turns`).
+
 The trophy button opens Tournaments. New starts a batch on this board between two engines (A and B, each with
 its checkpoint and strength), for a number of games, from the origin or from narrow, wide or all book openings
-(each played twice with colours swapped), on the seats' fixed budgets, a time per turn or a game clock; an
-unfinished game against a person is cleared first. Results lists saved batches with the score, the Elo of A over B
+(each played twice with colours swapped). Each entrant has the seat's six strength stops and its custom budget
+(the sliders button). The clock is Budget (the seats' own budgets), Turn (seconds per complete turn), Absolute
+(seconds per game) or Fischer (seconds per game plus seconds after each complete turn). An unfinished game
+against a person is cleared first. Results lists saved batches with the score, the Elo of A over B
 with its 95% interval from complete colour pairs, and every completed game's result. Click a game to open it
 in the player's analysis board in another tab, or download its HTTTX. The analysis board has its own CPU
 engine queue, move timeline, analysis controls and Review button, so browsing and analysing a saved game
@@ -144,6 +158,7 @@ curl -X POST http://127.0.0.1:8772/match -H "Content-Type: application/json" -d 
 
 A player specification can also be `{"engine":"dense-v1","checkpoint":"main/150000","preset":"custom","custom":{"simulations":128,"solver_nodes":32768}}`.
 Clock JSON is `{"mode":"fixed"}`, `{"mode":"move","ms":5000}`, or `{"mode":"game","tc":"180+2"}`.
+`POST /clock` with the same JSON puts the single game on this board on that clock.
 The API is loopback-only. Each player port holds one visible game; use a separate port for another simultaneous match.
 
 ## Engines
@@ -214,8 +229,9 @@ two sides took about the same time per turn at every tier.
 On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at Quick to Deep;
 Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows a progress line (a moving one when
 the engine reports no progress) and its cancel button. The custom budget shows the engine's own fields: Search
-(simulations, 0 plays the raw policy, up to 65,536) and Solver (nodes, 0 turns it off, up to 4,000,000; the solver
-gets up to a minute) for Bubble, Positions for Six, Search for Strix, and 10 to 120,000 ms for Native and Seal.
+(simulations, 0 plays the raw policy) and Solver (nodes, 0 turns it off; the solver gets up to a minute) for Bubble,
+Positions for Six, Search for Strix (at least 1), and ms (at least 10) for Native and Seal. Any larger whole number up to
+2,147,483,647 (the engines take 32-bit budgets) is accepted on both pages; it only takes longer.
 A Bubble seat, served or in the browser, keeps its search tree across turns like the evaluator, adding each turn's
 simulations to the visits already under the position until undo, a new or loaded game or a seat change, so its
 moves are saved with the kept-tree evaluations and never read back from the store.
@@ -277,9 +293,9 @@ stone is saved as the evaluation of the position after its first stone, so every
 rings the stop of the evaluation shown. Engine moves by the same checkpoint count as
 evaluations, so a game against Bubble costs nothing extra on Bubble's turns.
 
-Review always evaluates at Standard (128 simulations per stone, 32,768 solver nodes), whatever the slider says,
-and labels each turn only from evaluations at exactly that budget, so a verdict never compares a deep evaluation
-with a shallow one; the Review button carries the Standard mark. It evaluates the missing positions in pooled
+Review evaluates with the analysis engine, network and strength the analysis slot is set to (its preset or custom
+budget), and labels each turn only from evaluations at exactly that budget, so a verdict never compares a deep
+evaluation with a shallow one; the Review button carries that preset's mark and counts the positions done. It evaluates the missing positions in pooled
 steps: fresh trees, one per position, search together so their leaves share network batches (64 on CPU, 256 on
 CUDA), and the solver queries run on four tactical workers at once, each distinct position solved once. Between
 steps it gives way to more urgent analysis, and it slows down while an engine seat searches. It labels each turn
@@ -298,7 +314,7 @@ from the mover's win probability before and after it:
 | · lost | the opponent already had a proven win |
 | ◆ | six in a row |
 
-For inaccuracies and worse the board outlines the engine's turn and the panel lists its line. Keys: ← and →
+For inaccuracies and worse the board outlines the engine's turn, beside the candidates of the position reached, and the panel lists its line. Keys: ← and →
 step one stone, ↑ and ↓ one turn, Home and End, F fits the board. Retry plays on from the shown position.
 Changing the analysis engine, checkpoint or strength evaluates the shown position again at once.
 
