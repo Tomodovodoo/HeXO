@@ -467,6 +467,12 @@ class Watched:
         self.watch(len(histories))
         return self.inner.evaluate(histories)
 
+    def evaluate_leaves(self, leaves):
+        self.watch(len(leaves))
+        if hasattr(self.inner, 'evaluate_leaves'):
+            return self.inner.evaluate_leaves(leaves)
+        return self.inner.evaluate([history for _, _, history in leaves])
+
 
 class Bubble:
     """One HexNet export on `device` with its evaluation cache."""
