@@ -111,7 +111,8 @@ async function turn(request) {
 /** The search of `turn`, with `line` (a seat's game, see GameTrees) continuing that game's tree as a play.py seat does;
  * without it the turn searches a tree of its own. `known` (Proofs.list() of the game's table, or null) answers a
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
- * proof and line, and settles the proven stones of each search (proof.mjs settled). */
+ * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
+ * stone the tree does not take is applied to the search's result (proof.mjs settled). */
 async function playTurn({id, history, model, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null}) {
   await use(model, fraction => postMessage({type: 'progress', id, fraction}));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
@@ -167,10 +168,13 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
       if (simulations) {
         tree ??= line == null ? new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current})
           : games.tree(line, current, {seed: 1740, tactics: true, qRangeFloor});
+        const evaluate = leaves => network.evaluate(leaves);
+        const unmarked = await tree.settle(table ? table.edges(current) : new Map(), {evaluate, cache, version: network.version});
+        check();
         const result = settled(await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
-          evaluate: leaves => network.evaluate(leaves), stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
+          evaluate, stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
           onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
-            ...(stone ? {} : {live: rootRows(tree, choice)})})}), table ? table.edges(current) : new Map(), local.player);
+            ...(stone ? {} : {live: rootRows(tree, choice)})})}), unmarked, local.player);
         check();
         completed += result.completed;
         if (result.action) {
