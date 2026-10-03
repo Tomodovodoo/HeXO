@@ -148,14 +148,12 @@ struct Tree {
   }
   return out;
  }
- // Shared graph: makes `child` the child of `parent`'s edge `e`; the edge keeps its visits. A child with no visits
- // under an edge that has some (an evicted child whose summary was dropped) starts from the edge's statistics, so
- // one new sample never stands for all of them. An exact child settles the edge and the parent's verdict reaches its
- // own stored parents (revise); otherwise the parent's value becomes stale.
+ // Shared graph: makes `child` the child of `parent`'s edge `e`; the edge keeps its visits. An edge whose evicted
+ // child left no summary (dropped by evict) and whose new child has no visits restarts at zero, so one new sample
+ // never stands for the edge's history. An exact child settles the edge and the parent's verdict reaches its own
+ // stored parents (revise); otherwise the parent's value becomes stale.
  void attach(Node& parent,Edge& e,const std::shared_ptr<Node>& child) {
-  if(e.visits && !child->n){
-   child->carried=child->n=e.visits;child->carried_sum=child->player==parent.player?e.sum:-e.sum;child->q=child->carried_sum/child->carried;
-  }
+  if(e.visits && !child->n && e.exact_winner<0){e.visits=0;e.sum=0;}
   e.child=child;child->parents.push_back(parent.weak_from_this());
   if(child->exact_winner>=0 && tighten(child->exact_winner,child->distance+1,child->bound,e.exact_winner,e.distance,e.bound)){
    settle(parent);learn(parent);revise(parent);

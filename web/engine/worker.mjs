@@ -183,15 +183,17 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       if (simulations) {
         tree ??= line == null ? new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current})
           : games.graph(line, current, {seed: 1740, tactics: true, qRangeFloor, model: network.version});
-        const evaluate = leaves => network.evaluate(leaves);
-        if (line != null) touched = tree.id;
-        const unmarked = await tree.settle(table ? table.edges(current) : new Map(), {evaluate, cache, version: network.version});
+        const evaluate = leaves => network.evaluate(leaves), edges = table ? table.edges(current) : new Map();
+        // `touched` names the game graph once this turn changed its statistics: marks settled, or a batch backed up.
+        const unmarked = await tree.settle(edges, {evaluate, cache, version: network.version});
+        if (line != null && edges.size) touched = tree.id;
         check();
         const result = settled(await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
           ...(line == null ? {} : {pvCheck: PV_CHECK}),
           evaluate, prove, stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
-          onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
-            ...(stone ? {} : {live: rootRows(tree, choice)})})}), unmarked, local.player);
+          onBatch: () => (line != null && (touched = tree.id), postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
+            ...(stone ? {} : {live: rootRows(tree, choice)})}))}), unmarked, local.player);
+        if (line != null && result.completed) touched = tree.id;
         check();
         completed += result.completed;
         if (result.action) {
