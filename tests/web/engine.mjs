@@ -7,11 +7,15 @@
 // {kind: 'overlay', cases: [{ev, stones}]} -> [boardOverlay(ev, stones)] from web/engine/overlay.js
 // {kind: 'offline', requests: [[path, body]]} -> [[status, history or error, paused]] from an OfflineSession
 // {kind: 'threads', contexts: [{isolated, cores}]} -> the WebAssembly thread count the loader would pick
+// {kind: 'table', records: [[history, record]], queries: [history], result, mover} -> {known, edges} per query from a
+//   proof.mjs Proofs and `settled(result, edges of the first query, mover)`
+// {kind: 'proofs', history, ply, found} -> a BrowserSession whose engine proves `found` at `ply` and answers other positions
+//   from the proof table it is sent: the evaluations at ply - 1 after analysis, undo, another preset and a reload
 import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
 import {Native, NeuralSearch, EvaluationCache} from '../../web/engine/search.mjs';
-import {principalVariation, topRows} from '../../web/engine/proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
 import {defaultThreads} from '../../web/engine/network.mjs';
@@ -67,6 +71,33 @@ if (job.kind === 'encode') {
   const page = {};
   runInNewContext(readFileSync(new URL('../../web/engine/overlay.js', import.meta.url), 'utf8'), page);
   answer = job.cases.map(({ev, stones}) => page.boardOverlay(ev, stones));
+} else if (job.kind === 'table') {
+  const table = new Proofs();
+  for (const [history, record] of job.records) table.add(history, record);
+  const rebuilt = new Proofs(table.list());
+  answer = {queries: job.queries.map(h => ({known: rebuilt.known(h), edges: [...rebuilt.edges(h).values()].map(e => [...e.action, e.winner, e.distance])})),
+    settled: settled(job.result, rebuilt.edges(job.queries[0]), job.mover)};
+} else if (job.kind === 'proofs') {
+  const s = new BrowserSession(native), sent = [], wait = () => new Promise(resolve => setTimeout(resolve, 1));
+  const settle = async () => { for (let i = 0; s.running || s.jobs.some(j => j.status === 'queued'); i++) { if (i > 3000) throw Error('Analysis did not finish'); await wait(); } await s.saving; };
+  const entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', checkpoints: [],
+    presets: {quick: {simulations: 1, solver_nodes: 0}, standard: {simulations: 2, solver_nodes: 0}}};
+  const adapter = {turn: async (history, budget, options) => {
+    sent.push(options.known?.length ?? null);
+    if (history.length === job.ply) return job.found;
+    return answered(native, history, new Proofs(options.known)) || {moves: [], value: .5, top: [], proof: null, pv: [], threat: []};
+  }};
+  s.registerEngine(entry, adapter);
+  s.analysis = s.spec({engine: 'test', preset: 'standard'});
+  await s.request('/import', {text: JSON.stringify({history: job.history})}, 'POST');
+  const shown = () => s.state().evaluations[job.ply - 1];
+  for (const ply of [job.ply, job.ply - 1]) { await s.request('/analyse', {ply}, 'POST'); await settle(); }
+  answer = {analysed: shown(), sent: [...sent]};
+  await s.request('/undo', {}, 'POST'); answer.undone = {length: s.history.length, shown: shown()};
+  await s.request('/analysis', {engine: 'test', preset: 'quick'}, 'POST'); await s.request('/analyse', {ply: job.ply - 1}, 'POST'); await settle();
+  answer.quick = {shown: shown(), saved: s.lookup(s.history.slice(0, job.ply - 1))};
+  const reopened = new BrowserSession(native); reopened.storage = s.storage; await reopened.restore(); reopened.registerEngine(entry, adapter);
+  answer.reloaded = reopened.state().evaluations[job.ply - 1];
 } else if (job.kind === 'threads') {
   answer = job.contexts.map(defaultThreads);
 } else if (job.kind === 'offline') {

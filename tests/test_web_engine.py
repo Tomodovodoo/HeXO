@@ -196,6 +196,48 @@ class Overlay(unittest.TestCase):
         self.assertEqual(old, dict(candidates=[], plies=[], six=[]))
 
 
+@unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
+class BrowserProofs(unittest.TestCase):
+    """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
+
+    def test_the_table_matches_play(self):
+        records = [([[0, 0], [1, 0], [2, 0]], dict(proof=dict(winner=1, turns=1, plies=4), pv=[[3, 0, 0, 1], [-1, 0, 0, 2]])),
+                   ([[0, 0], [4, 4]], dict(proof=dict(winner=0, turns=1, plies=3), pv=[])),
+                   ([[0, 0], [5, 5], [6, 6]], dict(proof=dict(winner=1, turns=2, plies=7), pv=[[7, 7, 0, 1], [8, 8, 0, 2]]))]
+        queries = [[[0, 0]], [[0, 0], [1, 0]], [[0, 0], [5, 5]], [[0, 0], [1, 0], [2, 0], [3, 0]], [[0, 0], [9, 9]]]
+        result = dict(actions=[[1, 0], [4, 4], [7, 7]], values=[.1, .2, .3], policy=[.2, .5, .3], action=[4, 4], proven=0)
+        found = node(dict(kind='table', records=records, queries=queries, result=result, mover=1))
+        table = play.Proofs()
+        for history, record in records:
+            table.add(history, record)
+        for history, answer in zip(queries, found['queries']):
+            edges = sorted([*action, winner, distance] for action, (winner, distance, _) in table.edges(history).items())
+            self.assertEqual((answer['known'], sorted(answer['edges'])), (table.known(history), edges), history)
+        self.assertEqual({k: found['settled'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
+                         dict(action=[1, 0], proven=1, proof_plies=6, values=[1, -1, .3]))
+
+    def test_a_proof_carries_back_and_stays_in_the_browser_session(self):
+        from tests.test_tactical_proof import LATE_WIN
+        if not tactical_proof.library().exists():
+            self.skipTest('needs the native tactical library')
+        history = [tuple(p) for p in LATE_WIN] + [(-1, -11)]
+        prover = tactical_proof.NativeTactics()
+        prover.abort = lambda: None
+        solved = play.solve(prover, history, 32768)
+        found = dict(moves=solved['moves'], value=1, top=[[*solved['moves'][0], 1, 1, 1]], proof=solved['proof'], pv=solved['pv'],
+                     threat=[], solved=True)
+        answer = node(dict(kind='proofs', history=[list(p) for p in history], ply=len(history), found=found))
+        line = [[-1, -11, 0, 1]] + [[*p[:3], p[3] + 1] for p in solved['pv']]
+        analysed = answer['analysed']
+        self.assertEqual((analysed['proof'], analysed['value'], analysed['pv']), (dict(winner=0, turns=4, plies=14), 1, line))
+        self.assertEqual((analysed['top'][0][:2], analysed['top'][0][3:]), ([-1, -11], [1, 1]))
+        self.assertEqual(answer['sent'][0], 0)
+        self.assertGreater(answer['sent'][1], 1)
+        self.assertEqual(answer['undone']['length'], len(history) - 1)
+        for shown in (answer['undone']['shown'], answer['quick']['shown'], answer['quick']['saved'], answer['reloaded']):
+            self.assertEqual((shown['proof'], shown['pv']), (dict(winner=0, turns=4, plies=14), line))
+
+
 class Bundle(unittest.TestCase):
     def test_artefacts_match_their_sources(self):
         record = json.loads((ENGINE/'build.json').read_text(encoding='utf-8'))

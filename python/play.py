@@ -637,6 +637,142 @@ def solve(prover, history, solver_nodes, watch=lambda n: None):
     return found
 
 
+def proof_key(history):
+    """`history`'s position whatever the order of its stones: each side's cells, sorted. The stone count fixes the
+    side to move and its remaining stones, so equal keys have equal game values."""
+    sides = ([], [])
+    for i, (q, r) in enumerate(history):
+        sides[player_at(i)].append((int(q), int(r)))
+    return ' / '.join(' '.join(f'{q},{r}' for q, r in sorted(side)) for side in sides)
+
+
+def proof_plies(proof, history):
+    """Placements to the winning stone of a saved `proof` ({winner, turns, plies?}) at `history`: its `plies`, else
+    the bound its `turns` give (docs/search-outcomes.md)."""
+    if proof.get('plies'):
+        return int(proof['plies'])
+    game = replay(history)
+    try:
+        return game.remaining + (0 if proof['winner'] == game.player else 2) + 4 * (int(proof['turns']) - 1)
+    finally:
+        game.close()
+
+
+class Proofs:
+    """The proven positions of a game, keyed by `proof_key`: {winner, plies, pv}, where the winner completes six
+    within `plies` placements against any defence and `pv` ([q, r, player, ply], ply from 1) is the known line from
+    that position. `add` indexes a saved evaluation that holds a proof together with the positions along its line;
+    `edges` and `known` read what a position's continuations prove. Safe to use from several threads."""
+
+    def __init__(self):
+        self.entries, self.sizes, self.seen, self.lock = {}, {}, set(), threading.Lock()
+
+    def add(self, history, record, line=None):
+        """Index `record` (fields of `evaluate`) at `history` when it holds a proof; `line`, the record's saved
+        text, skips a record already indexed."""
+        proof = record.get('proof')
+        if not proof or line in self.seen:
+            return
+        current = [tuple(map(int, p)) for p in history]
+        plies, pv = proof_plies(proof, current), [list(p) for p in record.get('pv') or []]
+        with self.lock:
+            if line is not None:
+                self.seen.add(line)
+            self.put(current, proof['winner'], plies, pv)
+            for i, stone in enumerate(pv):
+                if len(stone) != 4 or stone[3] != i + 1 or stone[2] != player_at(len(current)) or stone[3] >= plies:
+                    break
+                q, r, _, ply = stone
+                current.append((q, r))
+                self.put(current, proof['winner'], plies - ply, [[*p[:3], p[3] - ply] for p in pv[i + 1:]])
+
+    def put(self, history, winner, plies, pv):
+        key = proof_key(history)
+        old = self.entries.get(key)
+        if old is None or old['winner'] == winner and plies < old['plies']:
+            stones = frozenset((q, r, player_at(i)) for i, (q, r) in enumerate(history))
+            self.entries[key] = dict(winner=int(winner), plies=int(plies), pv=pv, stones=stones)
+            self.sizes.setdefault(len(history), set()).add(key)
+
+    def edges(self, history):
+        """{(q, r): (winner, distance, outcome)} for each stone from `history` whose position is proven: in the
+        table, or because one more stone by that position's mover reaches a position the mover wins. `distance`
+        counts the stone itself, as hxg_mark_exact takes it; `outcome` is the position's {winner, plies, pv}."""
+        size = len(history)
+        base = frozenset((int(q), int(r), player_at(i)) for i, (q, r) in enumerate(history))
+        found = {}
+        with self.lock:
+            for extra in (2, 1):
+                for key in self.sizes.get(size + extra, ()):
+                    entry = self.entries[key]
+                    if not base <= entry['stones']:
+                        continue
+                    stones = list(entry['stones'] - base)
+                    for first, second in ([(stones[0], None)] if extra == 1 else [stones, stones[::-1]]):
+                        if first[2] != player_at(size):
+                            continue
+                        if second is None:
+                            outcome = {k: entry[k] for k in ('winner', 'plies', 'pv')}
+                        elif second[2] == player_at(size + 1) == entry['winner']:
+                            outcome = dict(winner=entry['winner'], plies=entry['plies'] + 1,
+                                           pv=[[*second[:2], entry['winner'], 1]] + [[*p[:3], p[3] + 1] for p in entry['pv']])
+                        else:
+                            continue
+                        old = found.get(first[:2])
+                        if old is None or second is None or old[2]['plies'] > outcome['plies']:
+                            found[first[:2]] = (outcome['winner'], outcome['plies'] + 1, outcome)
+        return found
+
+    def known(self, history):
+        """The outcome of `history` ({winner, plies, pv}) from its own entry, else the shortest win of the side to
+        move through `edges`, its line led by that stone; None when nothing is known."""
+        with self.lock:
+            entry = self.entries.get(proof_key(history))
+        if entry is not None:
+            return {k: entry[k] for k in ('winner', 'plies', 'pv')}
+        mover = player_at(len(history))
+        wins = sorted((d, a, o) for a, (w, d, o) in self.edges(history).items() if w == mover)
+        if not wins:
+            return None
+        distance, action, outcome = wins[0]
+        return dict(winner=mover, plies=distance,
+                    pv=[[*action, mover, 1]] + [[*p[:3], p[3] + 1] for p in outcome['pv']])
+
+    def extend(self, store, history):
+        """Index the saved evaluations holding a proof of every position of `history` (see `Evaluations.proven`)."""
+        for ply in range(len(history) + 1):
+            for line in store.proven(history[:ply]):
+                if line not in self.seen:
+                    self.add(history[:ply], json.loads(line), line)
+
+
+def answered(history, known):
+    """The evaluation of `history` that the proof table `known` gives without a search, when it proves a win for
+    the side to move whose line holds the rest of the turn: `moves` (those stones), `value` 1, the winning stone as
+    the only top row, `proof` and `pv`; else None."""
+    outcome = known.known(history) if known is not None else None
+    if outcome is None:
+        return None
+    game = replay(history)
+    try:
+        mover, remaining = game.player, game.remaining
+        if outcome['winner'] != mover:
+            return None
+        moves = []
+        for stone in outcome['pv'][:remaining]:
+            if len(stone) != 4 or stone[2] != mover or stone[3] != len(moves) + 1:
+                break
+            moves.append(stone[:2])
+            game.play(*stone[:2])
+        if not moves or len(moves) < remaining and game.winner != mover:
+            return None
+    finally:
+        game.close()
+    return dict(moves=moves, value=1., top=[[*moves[0], 1., 1., 1]],
+                proof=dict(winner=mover, turns=proof_turns(outcome['plies'], remaining, True), plies=outcome['plies']),
+                pv=outcome['pv'], threat=[], solved=True, ms=0, actual_completed=0, actual_solver_nodes=0, later=[])
+
+
 class TurnSearch:
     """One evaluation under way (see `evaluate`): the solver's findings, then a search per stone of the turn until
     the turn is complete. When the solver already gave the turn, its stones are played and each position of the turn
@@ -645,9 +781,12 @@ class TurnSearch:
     Without a solver proof, a position the search proves has the turn's own stones as its `pv`. `request()` names the tree and simulations of the next search, None when the turn is
     complete, (None, 0) for the raw policy; `take(result)` applies that search's result, None for the raw policy.
     `trees(history, simulations, network)` gives the tree and the simulations to run for a stone; by default one
-    tree is advanced through the turn, each stone searched afresh with `simulations`."""
+    tree is advanced through the turn, each stone searched afresh with `simulations`. With a proof table `known`
+    (`Proofs`) a position it proves gets that proof and line unless the solver proved one, each search starts with
+    the root's proven edges settled (`Proofs.edges`), and a proof whose turn reaches a proven position continues
+    into that position's line."""
 
-    def __init__(self, bubble, network, history, simulations, solved, trees=None, q_range_floor=0.):
+    def __init__(self, bubble, network, history, simulations, solved, trees=None, q_range_floor=0., known=None):
         self.bubble, self.network, self.simulations, self.q_range_floor = bubble, network, simulations, q_range_floor
         self.history = [tuple(map(int, p)) for p in history]
         self.local = replay(self.history)
@@ -660,6 +799,12 @@ class TurnSearch:
         self.given, self.top, self.value, self.completed, self.tree = bool(self.moves), [], None, 0, None
         self.later, self.played = [], 0
         self.trees = trees or self.advanced
+        self.known = known
+        outcome = known.known(self.history) if known is not None and self.proof is None else None
+        if outcome is not None:
+            self.proof = dict(winner=outcome['winner'], plies=outcome['plies'],
+                              turns=proof_turns(outcome['plies'], self.local.remaining, outcome['winner'] == self.player))
+            self.pv = outcome['pv']
 
     def advanced(self, history, simulations, network):
         from neural_search import NeuralSearch
@@ -675,7 +820,15 @@ class TurnSearch:
             return None
         if not self.simulations:
             return None, 0
-        return self.trees([tuple(cell[:2]) for cell in self.local.cells], self.simulations, self.network)
+        cells = [tuple(cell[:2]) for cell in self.local.cells]
+        tree, simulations = self.trees(cells, self.simulations, self.network)
+        edges = self.known.edges(cells) if self.known is not None else {}
+        if edges:
+            tree.expand()
+            for action, (winner, distance, _) in edges.items():
+                with contextlib.suppress(ValueError):
+                    tree.mark(action, winner, distance)
+        return tree, simulations
 
     def take(self, result):
         """Apply a search result, or with simulations 0 evaluate the raw policy."""
@@ -718,6 +871,10 @@ class TurnSearch:
     def record(self):
         value = (1. if self.proof['winner'] == self.player else 0.) if self.proof else self.value
         pv = self.pv or ([[*m, self.player, i + 1] for i, m in enumerate(self.moves)] if self.proof else [])
+        extended = self.known is not None and pv and not self.pv
+        after = self.known.known([*self.history, *map(tuple, self.moves)]) if extended else None
+        if after is not None and after['winner'] == self.proof['winner']:
+            pv = pv + [[*p[:3], p[3] + len(self.moves)] for p in after['pv']]
         return dict(moves=self.moves, value=round(value, 4), top=self.top, proof=self.proof, pv=pv,
                     threat=self.threat, solved=self.solved, ms=round((time.perf_counter() - self.start) * 1000),
                     actual_completed=self.completed, actual_solver_nodes=self.solver_used, later=self.later)
@@ -729,7 +886,7 @@ class TurnSearch:
 
 
 def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None, live=None, trees=None,
-             solved=None, q_range_floor=0.):
+             solved=None, q_range_floor=0., known=None):
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
@@ -742,7 +899,9 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     `simulations` 0 plays the raw policy; `solver_nodes` 0 or no `prover` skips the solver. `watch(n)` is called
     before each network batch of n positions and may raise Cancelled; `live(glimpse)` receives the search of the
     first stone as it goes, a few times a second. `trees` is `TurnSearch`'s tree source; `solved`, when given, is
-    the solver's view (see `solve`) and no query is made. `q_range_floor` is the fresh trees' neural_search floor."""
+    the solver's view (see `solve`) and no query is made. `q_range_floor` is the fresh trees' neural_search floor.
+    `known`, a proof table (`Proofs`), answers a position it proves won for the side to move without solver or
+    search (see `answered`) and otherwise informs the search (see `TurnSearch`)."""
     turn, shown = None, [0.]
 
     def observe(n):
@@ -757,8 +916,10 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     game.close()
     if finished:
         raise ValueError('The game has finished')
+    if (found := answered(history, known)) is not None:
+        return found
     turn = TurnSearch(bubble, Watched(bubble.evaluator, observe), history, simulations,
-                      solved or solve(prover, history, solver_nodes, watch), trees, q_range_floor)
+                      solved or solve(prover, history, solver_nodes, watch), trees, q_range_floor, known)
     try:
         while (asked := turn.request()) is not None:
             tree, count = asked
@@ -771,13 +932,15 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
 
 
 def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, batch_size=64,
-                  q_range_floor=0.):
+                  q_range_floor=0., known=None):
     """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
     position per prover in `provers` at a time, each distinct position solved once; then fresh trees, one per
     position, search together so their leaves share network batches of up to `batch_size`, stone by stone. Each
-    result is what `evaluate` would give at that budget. `watch` may raise Cancelled."""
+    result is what `evaluate` would give at that budget, with the proof table `known`. `watch` may raise
+    Cancelled."""
     from concurrent.futures import ThreadPoolExecutor
     from neural_search import SearchCoordinator
+    given = [answered(h, known) for h in histories]
     keys = [position_text(h) for h in histories]
     solved = {}
     if provers and solver_nodes:
@@ -793,15 +956,16 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
                 free.put(prover)
 
         with ThreadPoolExecutor(len(provers)) as pool:
-            unique = {k: h for k, h in zip(keys, histories)}
+            unique = {k: h for k, h, a in zip(keys, histories, given) if a is None}
             for k, found in zip(unique, pool.map(ask, unique.values())):
                 solved[k] = found
     network = Watched(bubble.evaluator, watch)
     turns = []
     try:
-        for k, history in zip(keys, histories):
-            turns.append(TurnSearch(bubble, network, history, simulations, solved.get(k) or solve(None, history, 0),
-                                    q_range_floor=q_range_floor))
+        for k, history, a in zip(keys, histories, given):
+            if a is None:
+                turns.append(TurnSearch(bubble, network, history, simulations, solved.get(k) or solve(None, history, 0),
+                                        q_range_floor=q_range_floor, known=known))
         coordinator = SearchCoordinator(network, bubble.sha256, bubble.cache)
         while asked := [(turn, request) for turn in turns if (request := turn.request()) is not None]:
             if not simulations:
@@ -812,7 +976,8 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
                                               batch_size=batch_size)
             for (turn, _), result in zip(asked, results):
                 turn.take(result)
-        return [turn.record() for turn in turns]
+        searched = iter(turns)
+        return [a if a is not None else next(searched).record() for a in given]
     finally:
         for turn in turns:
             turn.close()
@@ -885,23 +1050,23 @@ class Engines:
             self.prover, self.prover_build = tactical_proof.IsolatedTactics(package, priority='below_normal'), build
         return self.prover, build
 
-    def evaluate(self, entry, checkpoint, budget, history, watch, device=None, live=None, keep=False):
-        """`evaluate` with the entry's export; returns the evaluation, the budget it really had (no solver nodes
-        when the solver is not built) and the key of the weights it used (see `model_key`). With `keep` the
-        search continues the trees kept from the last kept evaluation of this position and model, running only
-        the simulations they lack, and a proof found then is reused; its key ends in `:kept`, so continued
-        evaluations are never mistaken for fresh ones."""
+    def evaluate(self, entry, checkpoint, budget, history, watch, device=None, live=None, keep=False, known=None):
+        """`evaluate` with the entry's export and the proof table `known`; returns the evaluation, the budget it
+        really had (no solver nodes when the solver is not built) and the key of the weights it used (see
+        `model_key`). With `keep` the search continues the trees kept from the last kept evaluation of this
+        position and model, running only the simulations they lack, and a proof found then is reused; its key ends
+        in `:kept`, so continued evaluations are never mistaken for fresh ones."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
         solver, build = self.solver() if budget['solver_nodes'] else (None, 'none')
         spent = budget if solver else budget | dict(solver_nodes=0)
         trees = solved = None
-        if keep:
+        if keep and answered(history, known) is None:
             trees, kept = self.kept_trees(bubble, history, build, entry.get('q_range_floor', 0.)), self.kept
             proven = kept['solved'] if kept['solved'] and kept['solved']['proof'] else None
             solved = proven or solve(solver, history, spent['solver_nodes'], watch)
             kept['solved'] = solved
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
-                         solved, entry.get('q_range_floor', 0.))
+                         solved, entry.get('q_range_floor', 0.), known)
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
         weights = search_key(bubble.sha256[:16], entry)
@@ -953,15 +1118,16 @@ class Engines:
             self.helpers.append((tactical_proof.IsolatedTactics(package, priority='below_normal'), build))
         return [prover, *(helper for helper, _ in self.helpers[:count - 1])], build
 
-    def evaluate_many(self, entry, checkpoint, budget, histories, watch, device=None):
-        """`evaluate_many` of `histories` with the entry's export, its solver queries spread over REVIEW_SOLVERS
-        workers; returns (evaluation, budget it really had, key of the weights) per position as `evaluate` does."""
+    def evaluate_many(self, entry, checkpoint, budget, histories, watch, device=None, known=None):
+        """`evaluate_many` of `histories` with the entry's export and the proof table `known`, its solver queries
+        spread over REVIEW_SOLVERS workers; returns (evaluation, budget it really had, key of the weights) per
+        position as `evaluate` does."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
         provers, build = self.solvers(REVIEW_SOLVERS) if budget['solver_nodes'] else ([], 'none')
         spent = budget if provers else budget | dict(solver_nodes=0)
         found = evaluate_many(bubble, provers, histories, spent['simulations'], spent['solver_nodes'], watch,
                               REVIEW_BATCH['cuda' if str(device or self.device).startswith('cuda') else 'cpu'],
-                              entry.get('q_range_floor', 0.))
+                              entry.get('q_range_floor', 0.), known)
         out = []
         for record in found:
             used = spent if record.pop('solved') else spent | dict(solver_nodes=0)
@@ -1125,13 +1291,13 @@ class Evaluations:
 
     Each line holds `position` (the ordered stones), `engine` (see `model_key`), `simulations`, `solver_nodes`,
     the evaluation fields, `model` (a readable name) and `at`. The index keeps the newest `limit` (position, engine, budget)
-    entries; `best` picks the one to show for a position and engine. The file is only appended to; on start a
-    dated copy is kept next to it, the newest `backups` of them."""
+    entries; `best` picks the one to show for a position and engine, `proven` lists those holding a proof. The file
+    is only appended to; on start a dated copy is kept next to it, the newest `backups` of them."""
 
     def __init__(self, path=None, limit=200_000, backups=3):
         self.path, self.limit = Path(path) if path else None, limit
         self.lock = threading.Lock()
-        self.order, self.by_position = OrderedDict(), {}
+        self.order, self.by_position, self.proofs = OrderedDict(), {}, {}
         if self.path and self.path.exists():
             stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
             shutil.copyfile(self.path, self.path.with_name(f'{self.path.name}.{stamp}.bak'))
@@ -1164,12 +1330,17 @@ class Evaluations:
         self.order.pop(full, None)
         self.order[full] = line
         self.by_position.setdefault((position, record['engine']), set()).add(budget)
+        if record.get('proof'):
+            self.proofs.setdefault(position, set()).add(full)
+        else:
+            self.proofs.get(position, set()).discard(full)
         while len(self.order) > self.limit:
             (old, engine, spent), _ = self.order.popitem(last=False)
             budgets = self.by_position[(old, engine)]
             budgets.discard(spent)
             if not budgets:
                 del self.by_position[(old, engine)]
+            self.proofs.get(old, set()).discard((old, engine, spent))
 
     def add(self, history, engine, budget, evaluation):
         record = dict(position=position_text(history), engine=engine, simulations=budget['simulations'],
@@ -1203,6 +1374,11 @@ class Evaluations:
                              if b[0] >= need[0] and b[1] >= need[1]), reverse=True)
             lines = [self.order[(position, engine, b)] for b in enough]
         return next((r for r in map(json.loads, lines) if valued(r)), None)
+
+    def proven(self, history):
+        """The saved lines of every evaluation of `history` that holds a proof, whatever its engine and budget."""
+        with self.lock:
+            return [self.order[full] for full in self.proofs.get(self.key(history), ())]
 
     def best(self, history, engine):
         """The saved evaluation of `history` by `engine` to show, or None: one holding a proof first, since a proof
@@ -1340,7 +1516,8 @@ class Session:
     """The game, the seats, the analysis settings and the job queues. HTTP threads call the public methods; two
     worker threads run the jobs: engine moves through `engines`, analysis and review through `analysis_engines`
     (`engines` when not given), so analysis keeps up while engines play. `revision` grows with every change the
-    page must redraw."""
+    page must redraw. `proofs` (`Proofs`) indexes the proven positions of the game's saved evaluations and of their
+    lines; analysis and review search with it, and the page is shown what it proves (see `proven`)."""
 
     def __init__(self, entries, engines, store, rescan=lambda: None, book=None, archive=None, study_store=None,
                  analysis_engines=None, save_initial=True):
@@ -1357,6 +1534,7 @@ class Session:
         self.coverage = Coverage(Path(store.path).with_name('play-openings.jsonl') if store.path else None)
         self.lock, self.rescanning = threading.Condition(), threading.Lock()
         self.history, self.revision, self.paused = [], 0, False
+        self.proofs = Proofs()
         self.instance, self.closing = os.urandom(4).hex(), False
         self.match, self.match_worker = None, None
         self.match_clock, self.timed_engines = None, []
@@ -1426,6 +1604,40 @@ class Session:
         key = self.engine_key(seat) if seat else None
         return self.store.get(history, key, self.engines.effective(seat['budget'])) if key else None
 
+    def proven(self, history, found):
+        """`found` (an evaluation, or None) with what the game's proof table proves of `history`: when `found` has
+        no proof, the position's own proof, its value (1 or 0 for the side to move) and its line; and each stone
+        to a proven position as a top row marked won or lost, proven wins first, the shortest leading, losses
+        last. A position the table proves without an evaluation gets one with no simulations; None when there is
+        neither."""
+        outcome, edges = self.proofs.known(history), self.proofs.edges(history)
+        if found is None and outcome is None:
+            return None
+        mover = player_at(len(history))
+        shown = dict(found or dict(moves=[], top=[], threat=[], simulations=0, solver_nodes=0))
+        if outcome is not None and not shown.get('proof'):
+            game = replay(history)
+            try:
+                remaining = game.remaining
+            finally:
+                game.close()
+            won = outcome['winner'] == mover
+            shown.update(value=1. if won else 0., pv=outcome['pv'], proof=dict(
+                winner=outcome['winner'], plies=outcome['plies'], turns=proof_turns(outcome['plies'], remaining, won)))
+            if found is None and won:
+                shown['moves'] = [p[:2] for i, p in enumerate(outcome['pv'][:remaining]) if p[2] == mover and p[3] == i + 1]
+        rows = [list(row) for row in shown.get('top') or []]
+        for action, (winner, distance, _) in edges.items():
+            row = next((row for row in rows if tuple(row[:2]) == action), None)
+            if row is None and winner == mover:
+                rows.append(row := [*action, 0.])
+            if row is not None:
+                row[3:] = [1., 1] if winner == mover else [0., -1]
+        flag = lambda row: row[4] if len(row) > 4 else 0
+        rows.sort(key=lambda row: (1 - flag(row), edges.get(tuple(row[:2]), (0, math.inf))[1] if flag(row) > 0 else 0))
+        shown['top'] = rows[:5]
+        return shown
+
     def state(self):
         with self.lock:
             history, game = list(self.history), replay(self.history)
@@ -1435,7 +1647,7 @@ class Session:
                 game.close()
             evaluations = {}
             for ply in range(len(history) + 1):
-                if (found := self.lookup(history[:ply])) is not None:
+                if (found := self.proven(history[:ply], self.lookup(history[:ply]))) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
                                         ('value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes')}
             entries = [{k: e[k] for k in SHOWN if k in e} for e in self.entries.values()]
@@ -1448,7 +1660,8 @@ class Session:
                         book=dict(available=bool(self.book), enabled=self.opening_book, mode=self.book_mode,
                                   opening=self.opening),
                         evaluations=evaluations,
-                        review=review(history, self.review_lookup, board['winner']), review_preset=REVIEW_PRESET,
+                        review=review(history, lambda h: self.proven(h, self.review_lookup(h)), board['winner']),
+                        review_preset=REVIEW_PRESET,
                         jobs=self.job_list())
 
     def job_list(self):
@@ -1471,6 +1684,7 @@ class Session:
     def changed(self):
         """Call with the lock held after any change: bumps the revision and queues the jobs the change calls for."""
         self.revision += 1
+        self.proofs.extend(self.store, self.history)
         game = replay(self.history)
         try:
             player, winner, remaining = game.player, game.winner, game.remaining
@@ -1656,6 +1870,7 @@ class Session:
             self.freeplay_directory, self.freeplay_signature = None, None
             self.freeplay_records = {}
             self.history, self.paused, self.opening = [tuple(map(int, p)) for p in history], paused, None
+            self.proofs = Proofs()
             self.match = None
             self.match_clock = None
             self.saved_game = saved_game
@@ -2492,7 +2707,8 @@ class Session:
         live = (lambda seen: setattr(job, 'live', seen)) if job.kind != 'review' else None
         found, spent, weights = self.lane_engines(job).evaluate(
             self.entries[seat['engine']], seat['checkpoint'], budget, history, self.watcher(job, job.kind != 'review'),
-            live=live, keep=keep, **({'device': seat['device']} if 'device' in seat else {}))
+            live=live, keep=keep, known=self.proofs if job.kind != 'move' else None,
+            **({'device': seat['device']} if 'device' in seat else {}))
         if job.cancelled:
             raise Cancelled()
         entry = self.entries[seat['engine']]
@@ -2510,18 +2726,21 @@ class Session:
 
     def save(self, history, weights, spent, found, model):
         """Save an evaluation, and the searches of the later stones of its turn (see `TurnSearch`) as evaluations
-        of those positions without solver checks."""
+        of those positions without solver checks; the proof table takes the proofs among them."""
         later = found.pop('later', [])
         record = self.store.add(history, weights, spent, found | dict(model=model))
+        self.proofs.add(history, record)
         bare = weights.split(':')[0] + ':none' + (':kept' if weights.endswith(':kept') else '')
         for step in later:
-            self.store.add(step.pop('history'), bare, spent | dict(solver_nodes=0), step | dict(model=model))
+            position = step.pop('history')
+            self.proofs.add(position, self.store.add(position, bare, spent | dict(solver_nodes=0), step | dict(model=model)))
         return record
 
     def evaluations(self, job, seat, histories):
         """Fresh evaluations of `histories` for `seat` at its budget, pooled (see `Engines.evaluate_many`), saved."""
         entry, budget = self.entries[seat['engine']], self.engines.effective(seat['budget'])
         found = self.lane_engines(job).evaluate_many(entry, seat['checkpoint'], budget, histories, self.watcher(job, False),
+                                                     known=self.proofs,
                                                      **({'device': seat['device']} if 'device' in seat else {}))
         if job.cancelled:
             raise Cancelled()

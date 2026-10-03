@@ -268,6 +268,21 @@ stone is saved as the evaluation of the position after its first stone, so every
 rings the stop of the evaluation shown. Engine moves by the same checkpoint count as
 evaluations, so a game against Bubble costs nothing extra on Bubble's turns.
 
+A proof, once found, stays with the game. Each game keeps a table of proven positions: every saved evaluation of
+one of its positions that ends proven, by the solver or by the search's exact root, and every position along that
+proof's line, each with its winner, its distance in placements and the line from there. It is built from the saved
+evaluations, so it survives a restart, an undo, another preset or another checkpoint. An analysis or review
+consults it first. A position it proves won for the side to move gets that turn and line at once, with no solver
+query or search. Otherwise each search starts with the stones it proves already settled, one stone ahead or two
+when the second stone wins for the player placing it: a proven loss leaves the candidates, and a proven win ends
+the search. Stepping back from a proven position therefore shows the stone that led there as proven. When that
+stone wins for the player who placed it, the position before it is proven too: the stone leads the candidates,
+the eval bar shows 100 for that player and the line runs on into the known one. The page shows
+what the table proves even for an evaluation saved before the proof was found, and review labels use it. Engine
+seats never read the table. The static page keeps the same table in its session, rebuilt from the evaluations it
+saves in the browser, and sends it with each analysis request. Its search cannot settle stones in the tree
+(gumbel.wasm does not export `hxg_mark_exact`), so it applies the proven stones to the search's result instead.
+
 Review always evaluates at Standard (128 simulations per stone, 32,768 solver nodes), whatever the slider says,
 and labels each turn only from evaluations at exactly that budget, so a verdict never compares a deep evaluation
 with a shallow one; the Review button carries the Standard mark. It evaluates the missing positions in pooled

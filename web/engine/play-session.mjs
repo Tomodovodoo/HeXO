@@ -3,9 +3,11 @@ import {OfflineSession} from './offline.mjs';
 import {PlayStorage} from './storage.mjs';
 import {OpeningBook} from './openings.mjs';
 import {readGame, exportGame, htttx} from './notation.mjs';
+import {Proofs, proven} from './proof.mjs';
 
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 const copy = value => structuredClone(value), position = history => history.map(p => p.join(',')).join(';');
+const stones = text => text ? text.split(';').map(p => p.split(',').map(Number)) : [];
 const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human'});
 const REVIEW_PRESET = 'standard';
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
@@ -61,6 +63,7 @@ export class BrowserSession extends OfflineSession {
     this.match = null; this.saved_game = null; this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
     this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false;
+    this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   registerEngine(entry, adapter) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
@@ -85,17 +88,33 @@ export class BrowserSession extends OfflineSession {
     return (this.index.get(`${this.engineKey(spec)}|${position(history)}`) || [])
       .sort((a, b) => Boolean(b.proof) - Boolean(a.proof) || b.simulations - a.simulations || b.solver_nodes - a.solver_nodes || (b.budget?.ms || 0) - (a.budget?.ms || 0) || (b.budget?.nodes || 0) - (a.budget?.nodes || 0))[0] || null;
   }
+  /** Indexes into the game's proof table (`proofs`, proof.mjs Proofs) every saved evaluation of a position of the game
+   * that holds a proof, and the game's own records. */
+  extendProofs() {
+    for (const record of this.records) this.proofs.add(stones(record.position), record, `${record.id}|${record.saved_at}`);
+    for (let ply = 0; ply <= this.history.length; ply++) {
+      for (const id of this.provenRecords.get(position(this.history.slice(0, ply))) || []) {
+        const record = this.cache.get(id);
+        if (record) this.proofs.add(this.history.slice(0, ply), record, `${record.id}|${record.saved_at}`);
+      }
+    }
+  }
+  /** `record` (or null) at `history` with what the game's proof table proves there (proof.mjs proven). */
+  withProofs(history, record) {
+    return proven(this.proofs, history, record, this.native.game(history).remaining);
+  }
   state() {
     const {winner, player, remaining} = this.native.game(this.history), evaluations = {};
+    this.extendProofs();
     for (let ply = 0; ply <= this.history.length; ply++) {
-      const prefix = this.history.slice(0, ply), record = this.lookup(prefix) || this.records.findLast(r => r.position === position(prefix) && (!this.analysis || r.engine_key === this.engineKey(this.analysis)));
+      const prefix = this.history.slice(0, ply), record = this.withProofs(prefix, this.lookup(prefix) || this.records.findLast(r => r.position === position(prefix) && (!this.analysis || r.engine_key === this.engineKey(this.analysis))) || null);
       if (record) evaluations[ply] = record;
     }
     return {instance: `browser:${this.id}`, revision: this.revision, history: copy(this.history), player, remaining, winner,
       paused: this.paused, seats: copy(this.seats), analysis: copy(this.analysis), engines: [...this.entries.values()], match: this.match,
       clock: this.clockNow(), saved_game: this.saved_game, models_folder: null, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
-      evaluations, review: review(this.history, h => this.lookup(h, this.reviewSpec(), true), winner), review_preset: REVIEW_PRESET,
+      evaluations, review: review(this.history, h => this.withProofs(h, this.lookup(h, this.reviewSpec(), true)), winner), review_preset: REVIEW_PRESET,
       jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side}) => ({id, kind, status, done, total, error, ply: history.length, side}))};
   }
   static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings'].some(p => path === p || path.startsWith(p + '/')); }
@@ -147,7 +166,7 @@ export class BrowserSession extends OfflineSession {
   }
   async restore() {
     const [saved, coverage, evaluations] = await Promise.all([this.storage.get('sessions', this.id), this.storage.get('coverage', 'book'), this.storage.all('evaluations')]);
-    this.cache.clear(); this.index.clear();
+    this.cache.clear(); this.index.clear(); this.provenRecords.clear(); this.proofs = new Proofs();
     for (const r of evaluations) this.indexRecord(r);
     this.coverage = coverage?.counts || {};
     this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false;
@@ -165,7 +184,7 @@ export class BrowserSession extends OfflineSession {
   }
   editable() { if (this.conflicted) throw Error(this.storageError); if (this.match?.active) throw Error('Stop the match before changing its players or position'); }
   load(history, paused = false, opening = null) {
-    this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.paused = paused; this.saved_game = null;
+    this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.proofs = new Proofs(); this.paused = paused; this.saved_game = null;
     this.clock = null; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
     this.book.opening = copy(opening);
   }
@@ -253,7 +272,7 @@ export class BrowserSession extends OfflineSession {
   async record(history, spec, result) {
     const record = {...result, id: this.cacheKey(history, spec), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
-    this.indexRecord(record); await this.storage.put('evaluations', record);
+    this.indexRecord(record); this.proofs.add(history, record, `${record.id}|${record.saved_at}`); await this.storage.put('evaluations', record);
     if (position(this.history.slice(0, history.length)) === position(history)) {
       this.records = this.records.filter(r => r.id !== record.id); this.records.push(record);
     }
@@ -261,6 +280,10 @@ export class BrowserSession extends OfflineSession {
   }
   indexRecord(record) {
     this.cache.set(record.id, record);
+    if (record.proof) {
+      if (!this.provenRecords.has(record.position)) this.provenRecords.set(record.position, new Set());
+      this.provenRecords.get(record.position).add(record.id);
+    }
     const key = `${record.engine_key}|${record.position}`, values = (this.index.get(key) || []).filter(r => r.id !== record.id);
     values.push(record); this.index.set(key, values);
   }
@@ -308,6 +331,7 @@ export class BrowserSession extends OfflineSession {
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
       try {
         result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal: job.controller.signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms: limit,
+          known: job.kind === 'move' ? null : (this.extendProofs(), this.proofs.list()),
           progress: f => { job.done = job.kind === 'review' ? job.cursor + f : f; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);
