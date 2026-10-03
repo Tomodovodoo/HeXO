@@ -3,16 +3,15 @@
  * Out: {type: 'progress', fraction} | {type: 'ready'} | {type: 'result', id, result} | {type: 'error', id?, message}.
  */
 import {NativeSearch} from './native/search.mjs';
-import {cached} from './network.mjs';
+import {cached, wasmOptions} from './assets.mjs';
+import {files} from './native.mjs';
 
 let native;
 
-/** native.wasm from the Cache API under the digest web/engine/build.json records for it. */
+/** native.wasm through assets.mjs, checked against the digest web/engine/build.json records for it. */
 async function load() {
-  const record = await (await fetch(new URL('build.json', import.meta.url), {cache: 'no-cache'})).json();
-  const url = new URL('native/native.wasm', import.meta.url).href;
-  const wasmBinary = await cached(url, record.artefacts['native/native.wasm'], fraction => postMessage({type: 'progress', fraction}));
-  native = await NativeSearch.create({wasmBinary});
+  const [wasm] = await files();
+  native = await NativeSearch.create(wasmOptions(await cached(wasm, fraction => postMessage({type: 'progress', fraction}))));
 }
 
 onmessage = async ({data}) => {
