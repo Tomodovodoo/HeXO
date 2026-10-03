@@ -64,17 +64,18 @@ class FakeEngines:
     """Plays the first legal cells; `hold` makes evaluations wait until cancelled or released."""
 
     def __init__(self):
-        self.calls, self.turns, self.hold, self.release = [], [], False, threading.Event()
+        self.calls, self.turns, self.lines, self.hold, self.release = [], [], [], False, threading.Event()
 
-    def evaluate(self, entry, checkpoint, budget, history, watch, live=None, keep=False):
+    def evaluate(self, entry, checkpoint, budget, history, watch, live=None, keep=False, line=None):
         self.calls.append((checkpoint, dict(budget), [tuple(p) for p in history]))
+        self.lines.append(line)
         while self.hold and not self.release.is_set():
             watch(1)
             time.sleep(.01)
         watch(budget['simulations'])
         moves = legal_turn(history)
         found = dict(moves=moves, value=.5, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1)
-        return found, budget, f'{model_key(export_path(entry, checkpoint))}:none' + (':kept' if keep else '')
+        return found, budget, f'{model_key(export_path(entry, checkpoint))}:none' + (':kept' if keep or line is not None else '')
 
     def evaluate_many(self, entry, checkpoint, budget, histories, watch):
         return [self.evaluate(entry, checkpoint, budget, history, watch) for history in histories]
@@ -556,8 +557,9 @@ class Jobs(unittest.TestCase):
                           and j['status'] == 'queued'])
 
     def test_a_preset_without_a_solver_verdict_is_not_deepened_again(self):
-        def unsolved(entry, checkpoint, budget, history, watch, live=None, keep=False):
-            found, spent, key = FakeEngines.evaluate(self.engines, entry, checkpoint, budget, history, watch, keep=keep)
+        def unsolved(entry, checkpoint, budget, history, watch, live=None, keep=False, line=None):
+            found, spent, key = FakeEngines.evaluate(self.engines, entry, checkpoint, budget, history, watch, keep=keep,
+                                                     line=line)
             return found, spent | dict(solver_nodes=0), key
         self.engines.evaluate = unsolved
         self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
@@ -597,6 +599,26 @@ class Jobs(unittest.TestCase):
         self.assertEqual(self.history(), [(0, 0), *map(tuple, legal_turn([(0, 0)]))])
         self.session.undo()
         self.assertEqual(self.history(), [])
+
+    def test_a_seat_keeps_its_game_tree_line_until_undo_a_new_game_or_a_seat_change(self):
+        def reply(count):
+            for move in legal_turn(self.history()):
+                self.session.play(*move)
+            wait(lambda: len(self.history()) == count)
+
+        self.session.play(0, 0)
+        wait(lambda: len(self.history()) == 3)
+        reply(7)
+        self.session.undo()
+        reply(7)
+        self.session.new_game()
+        self.session.play(0, 0)
+        wait(lambda: len(self.history()) == 3)
+        self.session.configure_seat(1, 'bubble:fake', 'main/000001')
+        reply(7)
+        first, second, undone, fresh, changed = self.engines.lines
+        self.assertEqual(first, second)
+        self.assertEqual(len({first, undone, fresh, changed}), 4)
 
     def test_undo_skips_a_seat_the_page_plays(self):
         self.session.configure_seat(1, 'human')
@@ -755,6 +777,72 @@ class Jobs(unittest.TestCase):
             presets_of('strix', dict(quick=dict(simulations=0)))
         with self.assertRaises(ValueError):
             presets_of('strix', dict(quick=dict(nodes=100)))
+
+
+class Ranked:
+    """A network whose prior falls by e^2 per legal move in native order and whose values are all even."""
+
+    def evaluate(self, histories):
+        import numpy as np
+        out = []
+        for history in histories:
+            game = Game(history)
+            actions = np.asarray(game.legal_moves(), dtype=np.int64)
+            game.close()
+            out.append(dict(actions=actions, logits=-2. * np.arange(len(actions)), q=np.zeros(len(actions))))
+        return out
+
+
+class GameTrees(unittest.TestCase):
+    """A seat's game tree (Engines.game_trees) on the native search with a fake network."""
+
+    def setUp(self):
+        from types import SimpleNamespace
+        from neural_search import EvaluationCache, NeuralSearch
+        self.engines = Engines('cpu', tactical_package=Path(RUN.name) / 'missing')
+        self.addCleanup(self.engines.close)
+        stub = SimpleNamespace(sha256='ranked', evaluator=Ranked(), cache=EvaluationCache())
+        self.engines.bubble = lambda path, device=None: stub
+        self.seen, search = [], NeuralSearch.search
+
+        def counted(tree, *args, **options):
+            self.seen.append(int(tree.result(0, 0, 0, 0)['visits'].sum()))
+            return search(tree, *args, **options)
+        patch = unittest.mock.patch.object(NeuralSearch, 'search', counted)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def turn(self, history, line):
+        """Bubble's turn at `history` on `line` at 128 simulations; the visits each stone's search started from are
+        in `seen`."""
+        self.seen.clear()
+        entry = dict(kind='bubble', path=Path(RUN.name))
+        found, _, weights = self.engines.evaluate(entry, '', dict(simulations=128, solver_nodes=0), history,
+                                                  lambda n: None, line=line)
+        self.assertTrue(weights.endswith(':kept'))
+        return [*history, *map(tuple, found['moves'])]
+
+    def test_the_next_turn_starts_from_the_visits_under_the_reply(self):
+        history = self.turn([(0, 0)], 1)
+        self.assertEqual(self.seen[0], 0)
+        tree = self.engines.games[1][1]
+        reply = legal_turn(history)
+        history += map(tuple, reply)
+        self.turn(history, 1)
+        self.assertIs(self.engines.games[1][1], tree)
+        self.assertGreater(self.seen[0], 0)
+
+    def test_undo_a_new_game_and_a_new_line_start_afresh(self):
+        history = self.turn([(0, 0)], 1)
+        history += map(tuple, legal_turn(history))
+        tree = self.engines.games[1][1]
+        self.turn(history[:1], 1)
+        self.assertEqual(self.seen[0], 0)
+        self.assertIsNot(self.engines.games[1][1], tree)
+        self.turn(history, 2)
+        self.assertEqual(self.seen[0], 0)
+        self.turn([(0, 0)], 3)
+        self.assertEqual(list(self.engines.games), [2, 3])
 
 
 class Http(unittest.TestCase):

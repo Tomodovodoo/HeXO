@@ -231,3 +231,37 @@ export class NeuralSearch {
     }
   }
 }
+
+/**
+ * Search trees that follow games, one per line (a key the page changes on undo, a new or loaded game and a seat
+ * change). `tree(line, history, options)` is the line's tree advanced through the stones played since it last
+ * searched, by either side; it is built afresh from `options` (NeuralSearch's) when the line is new, `options`
+ * differ or `history` does not extend its stones. The `limit` most recently used lines keep their trees. Advancing
+ * frees every subtree off the played line, so a tree holds only the subtree of its current position.
+ */
+export class GameTrees {
+  constructor(native, limit = 2) {
+    this.native = native;
+    this.limit = limit;
+    this.trees = new Map();
+  }
+  tree(line, history, options) {
+    const key = JSON.stringify(options);
+    let kept = this.trees.get(line);
+    this.trees.delete(line);
+    if (kept && (kept.key !== key || kept.tree.history.length > history.length
+      || kept.tree.history.some(([q, r], i) => history[i][0] !== q || history[i][1] !== r))) {
+      kept.tree.close();
+      kept = null;
+    }
+    kept ??= {key, tree: new NeuralSearch(this.native, {...options, history})};
+    this.trees.set(line, kept);
+    for (const [old, {tree}] of this.trees) {
+      if (this.trees.size <= this.limit) break;
+      tree.close();
+      this.trees.delete(old);
+    }
+    for (const point of history.slice(kept.tree.history.length)) kept.tree.advance(point);
+    return kept.tree;
+  }
+}

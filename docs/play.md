@@ -216,6 +216,9 @@ Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows 
 the engine reports no progress) and its cancel button. The custom budget shows the engine's own fields: Search
 (simulations, 0 plays the raw policy, up to 65,536) and Solver (nodes, 0 turns it off, up to 4,000,000; the solver
 gets up to a minute) for Bubble, Positions for Six, Search for Strix, and 10 to 120,000 ms for Native and Seal.
+A Bubble seat, served or in the browser, keeps its search tree across turns like the evaluator, adding each turn's
+simulations to the visits already under the position until undo, a new or loaded game or a seat change, so its
+moves are saved with the kept-tree evaluations and never read back from the store.
 
 ### By hand
 

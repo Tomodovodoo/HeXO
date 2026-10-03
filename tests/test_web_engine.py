@@ -306,7 +306,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['paused_save'], [dict(paused=True, completed=1, pending=True, current=2, resumedSeats=['other', 'test'])]*2)
         self.assertIsNone(result['deleted']['current'])
         self.assertTrue(all(m['single'] for m in result['deleted']['catalogue']))
-        self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]]))
+        self.assertEqual(result['imported'], dict(status=200, history=[[0, 0]], saved=[[0, 0]], renewed=True))
         self.assertEqual(result['stopped_timeout'], dict(paused=True, active=False, completed=0))
         self.assertEqual(result['forked_clock'], dict(match=None, clock=None))
         self.assertEqual(result['finished_opening_status'], 400)
@@ -340,6 +340,7 @@ class Bundle(unittest.TestCase):
         self.assertTrue(result['preserved'])
         self.assertEqual(result['variation'], [[0, 0], [1, 0]])
         self.assertEqual(result['imported_label'], 'best')
+        self.assertFalse(result['move_reused'])
         self.assertEqual(result['changed_version'], {})
         self.assertTrue(result['restored_identity'])
 
@@ -354,6 +355,14 @@ class Bundle(unittest.TestCase):
         self.assertIsNone(result['imported'])
         self.assertFalse(result['auto'])
         self.assertEqual(result['sameBatchSeats'], ['test', 'test'])
+
+    def test_a_seat_line_carries_its_tree_across_turns(self):
+        answer = node(dict(kind='game', simulations=128))
+        self.assertEqual(answer['first'][0], 0)
+        self.assertGreater(answer['second'][0], 0)
+        self.assertTrue(answer['same'])
+        self.assertEqual((answer['undone'][0], answer['fresh'][0]), (0, 0))
+        self.assertEqual(answer['lines'], ['b', 'c'])
 
     def test_search_matches_native(self):
         """Same seed, position, budget, Q range floor, root noise and evaluations: the same actions, visits and policy
