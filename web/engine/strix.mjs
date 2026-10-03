@@ -3,7 +3,7 @@
  * placement, with a network `python tools/build_web.py strix-network` placed in strix/ (listed in strix/networks.json,
  * the first is the default), or the site's when this origin has none. */
 import {json, workerUrl} from './assets.mjs';
-import {workerError} from './stages.mjs';
+import {watchdog, workerError} from './stages.mjs';
 
 import {NEURAL_PRESET} from './device.mjs';
 
@@ -49,7 +49,8 @@ export class StrixEngine {
     if (before && this.network?.sha256 !== before.sha256) this.close();
   }
 
-  /** Starts the worker with the current network; `progress(fraction, stage)` reports the download and the compile. */
+  /** Starts the worker with the current network; `progress(fraction, stage)` reports the download and the compile, and
+   * a stage that stays silent for its stages.mjs LIMITS entry fails the load. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
     if (!this.network) {
@@ -59,11 +60,11 @@ export class StrixEngine {
     }
     const worker = this.worker = new Worker(workerUrl('strix-worker.mjs'), {type: 'module'});
     const ready = this.ready = new Promise((resolve, reject) => {
-      const fail = error => { this.pending.delete(fail); reject(error); };
+      const fail = error => { dog.stop(); this.pending.delete(fail); reject(error); }, dog = watchdog(LABEL, fail);
       this.pending.add(fail);
       worker.onmessage = ({data}) => {
-        if (data.type === 'progress' && data.id === undefined) progress(data.fraction, data.stage);
-        else if (data.type === 'ready') { this.pending.delete(fail); resolve(data.info); }
+        if (data.type === 'progress' && data.id === undefined) { dog.watch(data.stage); progress(data.fraction, data.stage); }
+        else if (data.type === 'ready') { dog.stop(); this.pending.delete(fail); resolve(data.info); }
         else if (data.type === 'error') fail(workerError(LABEL, data));
       };
       worker.onerror = event => fail(new Error(event.message || 'Strix worker failed'));

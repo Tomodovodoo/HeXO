@@ -107,6 +107,20 @@ export function errorReport(error, id) {
   return {type: 'error', id, message: String(error?.message || error), ...(error?.stage ? {stage: error.stage} : {})};
 }
 
+/** The load watchdog of an engine without EngineWorker's fallback chain (Native, Seal, Strix): `watch(stage)` re-arms
+ * it for LIMITS[stage.name] (a load starts in the download stage), `stop()` ends it, and when it fires `reject` gets an
+ * Error naming engine `name` and the stage. */
+export function watchdog(name, reject) {
+  let timer = null;
+  const stop = () => clearTimeout(timer);
+  const watch = (stage = {name: 'download'}) => {
+    stop();
+    timer = setTimeout(() => reject(new Error(`${name}: ${stageText(stage)} timed out`)), LIMITS[stage.name] ?? LIMITS.download);
+  };
+  watch();
+  return {watch, stop};
+}
+
 /** The page's Error for engine `name`'s worker error {message, stage?}: it names the stage the worker stopped in. */
 export function workerError(name, {message, stage}) {
   return new Error(stage ? `${name}: ${stageText(stage)} failed: ${message}` : message);

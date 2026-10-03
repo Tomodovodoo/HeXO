@@ -109,6 +109,15 @@ out.calls_overlap = await observe(loader(gpu('use')), {}, async engine => {
   return [await engine.call({type: 'evaluate'}), await use];
 });
 
+// Native, Seal and Strix have no fallback, but a load that goes silent in a stage still ends with an error naming it.
+script = {load(options, post) { const stages = new Stages(post); stages.enter('download'); stages.enter('compile'); }, call() {}};
+const silent = async engine => engine.load().then(() => 'loaded', error => error.message);
+out.single = {
+  native: await silent((await import('../../web/engine/native.mjs')).native.engine),
+  seal: await silent((await import('../../web/engine/seal.mjs')).seal.engine),
+  strix: await silent(new (await import('../../web/engine/strix.mjs')).StrixEngine([{id: 'net', path: 'strix/net.safetensors', sha256: 'x', size: 1}])),
+};
+
 out.threads = [{isolated: true, cores: 8}, {isolated: true, cores: 8, memory: 2}, {isolated: true, cores: 8, memory: 4},
   {isolated: true, cores: 8, memory: 8}, {isolated: true, cores: 2, memory: 2}, {isolated: false, cores: 8, memory: 8},
   {isolated: true, cores: 24, memory: 0.5}].map(defaultThreads);

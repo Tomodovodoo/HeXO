@@ -100,7 +100,7 @@ changes engine.
 |---|---|
 | Bubble, Six, Shrimp | WebGPU, then WebAssembly with threads, then WebAssembly on one thread, then an error |
 | Bubble, Six, Shrimp without WebGPU | WebAssembly with threads, then one thread, then an error |
-| Native, Seal, Strix | WebAssembly on one thread; a stalled download ends in an error |
+| Native, Seal, Strix | WebAssembly on one thread; a stage that stalls or fails ends in an error naming it |
 
 A probe whose adapter request fails or times out counts as no WebGPU and shows the same toast ("checking GPU timed
 out, running on CPU"). An engine that falls back from WebGPU to WebAssembly starts at Lightning from then on, and the

@@ -2,7 +2,7 @@
  * (seat.mjs). It plays as python/play.py's Native: the same presets in ms, depth 12, width 16. */
 import {DEPTH} from './native/search.mjs';
 import {json, workerUrl} from './assets.mjs';
-import {workerError} from './stages.mjs';
+import {watchdog, workerError} from './stages.mjs';
 
 export const PRESETS = {lightning: {ms: 100}, quick: {ms: 250}, standard: {ms: 1000}, strong: {ms: 3000},
   deep: {ms: 10000}, dangerous: {ms: 60000}};
@@ -24,14 +24,16 @@ export class NativeEngine {
     this.waits = new Map();
   }
 
-  /** Starts the worker and loads native.wasm; `progress(fraction, stage)` reports the download and the compile. */
+  /** Starts the worker and loads native.wasm; `progress(fraction, stage)` reports the download and the compile, and a
+   * stage that stays silent for its stages.mjs LIMITS entry fails the load. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
     const worker = this.worker = new Worker(workerUrl('native-worker.mjs'), {type: 'module'});
     const ready = this.ready = new Promise((resolve, reject) => {
-      this.waits.set(0, {resolve, reject});
+      const dog = watchdog(LABEL, reject);
+      this.waits.set(0, {resolve: value => { dog.stop(); resolve(value); }, reject: error => { dog.stop(); reject(error); }});
       worker.onmessage = ({data}) => {
-        if (data.type === 'progress') { progress(data.fraction, data.stage); return; }
+        if (data.type === 'progress') { dog.watch(data.stage); progress(data.fraction, data.stage); return; }
         const id = data.type === 'ready' ? 0 : data.id ?? 0, wait = this.waits.get(id);
         this.waits.delete(id);
         if (data.type === 'error') wait?.reject(workerError(LABEL, data));
