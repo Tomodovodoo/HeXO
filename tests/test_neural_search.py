@@ -861,6 +861,12 @@ class SharedGraph(unittest.TestCase):
         after = graph.result(0, 0, 0, 0)['visits']
         self.assertIn((after - before)[self.edge(first, y)], (64, 65))   # 65 when the search expanded C itself
         self.assertEqual((after - before)[self.edge(first, x)], 0)
+        # A graph built at C stores its prefixes unexpanded, and C's 64 playouts and its expansion count at them once:
+        # attaching C under B when A's search expands B adds nothing more.
+        late = self.graph(Ranked(), [*a, y, x])
+        late.search(64, root_samples=8, batch_size=8)
+        late.at(a)
+        self.assertEqual(int(late.search(8, root_samples=4, batch_size=4)['visits'].sum()), 65+8)
 
     def test_an_evicted_child_hands_its_statistics_to_the_next_one(self):
         a = recorded_position(11)

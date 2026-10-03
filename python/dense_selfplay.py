@@ -51,8 +51,9 @@ STALE_SECONDS = 120.  # learner heartbeats older than this are ignored by Yield
 RESTART_SOURCE = ('shard', 'game', 'ply', 'kind', 'regret', 'plies_to_proof')  # buffer entry fields a restart records
 RESTART_SHARDS = 16   # source shards whose moves Restarts keeps
 CLOSE_SECONDS = 10.   # longest a finished game waits for proofs that may label its rows
-# Fields the solver plan and the Engine add to a search result; a checked search keeps its first pass's.
-CARRIED = ('proven', 'proof_turns', 'proof_plies', 'proof_action', 'proof_status', 'solver_nodes', 'solver_budget')
+# Solver counts a checked search keeps from its first pass; proof fields come from the root after the check (a
+# first pass the solver or the tree proved is never checked).
+CARRIED = ('solver_nodes', 'solver_budget')
 
 
 def checkpoints(run):
@@ -304,7 +305,7 @@ class Engine:
     A slot may also expose `recheck(result)` and `checking` (SelfPlayGame): each finished search goes through
     `recheck` before `searched`; None means it started another search on the slot's tree, a principal-variation check
     whose searches take no solver plan step, leaf proof or root prediction and whose final result keeps the first
-    search's.
+    search's solver counts and network value.
 
     Solver (dense_solver): a slot whose budgets are active under `schedule` (dense_solver.active) gets a dense_solver.Plan on the Engine's Solver (created on
     first use with `schedule`, default fixed budgets; `solver_async` picks its backend). A search that submits
@@ -653,7 +654,7 @@ class SelfPlayGame:
     def recheck(self, result):
         """Feed a finished search to the principal-variation check (neural_search.Recheck). None after starting
         the check's next search on the tree; otherwise the result to play and record: `result` itself without a
-        check, else the root's statistics after it, with the first search's solver fields and network value and
+        check, else the root's statistics after it, with the first search's solver counts and network value and
         `completed` summed over every pass."""
         if self.check is None:
             return result

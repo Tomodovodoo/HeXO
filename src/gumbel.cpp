@@ -98,10 +98,6 @@ struct Tree {
   if(auto o=outcomes.find(position);o!=outcomes.end())apply(o->second,*n);
   return n;
  }
- // Shared graph: whether any parent of the node is alive.
- static bool parented(const Node& node) {
-  return std::any_of(node.parents.begin(),node.parents.end(),[](const auto& w){return !w.expired();});
- }
  // Shared graph: marks `node` and every ancestor stale. A stale node's ancestors are always stale, so the walk stops
  // at a node already marked.
  void stale(Node& node) {
@@ -142,12 +138,11 @@ struct Tree {
    prefix.pop_back();
   }
  }
- // Shared graph: makes `child` the child of `parent`'s edge `e`, `parent` being the position after the first `length`
- // stones of `history`. A child without a live parent brings its visits to `parent` and the stored positions before
- // it on `history`. A new child of an edge that kept the statistics of an evicted one carries them on; any other
- // child's visits replace the edge's. An exact child settles the edge; the parent's value becomes stale.
- void attach(Node& parent,Edge& e,const std::shared_ptr<Node>& child,const std::vector<Cell>& history,size_t length) {
-  if(!parented(*child) && child->n)for(Node* x:prefixes(history,length))x->n+=child->n;
+ // Shared graph: makes `child` the child of `parent`'s edge `e`. A new child of an edge that kept the statistics
+ // of an evicted one carries them on; any other child's visits replace the edge's. Visits reach a parent only through
+ // the playouts counted at the positions a root's history passes through (begin), so a child attached later brings
+ // none. An exact child settles the edge; the parent's value becomes stale.
+ void attach(Node& parent,Edge& e,const std::shared_ptr<Node>& child) {
   if(e.visits>child->n && !child->n && e.exact_winner<0){
    child->carried=child->n=e.visits;child->carried_sum=child->player==parent.player?e.sum:-e.sum;child->q=child->carried_sum/child->carried;
   }
@@ -167,7 +162,7 @@ struct Tree {
    auto h=CellHash{}(e.action);
    if(!positions.contains(Key{a+mix(h^mix(p+1)),b+mix(h+mix(p+911))}))continue;
    history.back()=e.action;
-   if(auto found=nodes.find(keys(history).second);found!=nodes.end())if(auto child=found->second.lock())attach(node,e,child,path.history,path.history.size());
+   if(auto found=nodes.find(keys(history).second);found!=nodes.end())if(auto child=found->second.lock())attach(node,e,child);
   }
  }
  // Shared graph: attaches `node`, the position after `history`, under the expanded nodes that reach it by its last
@@ -177,7 +172,7 @@ struct Tree {
   auto join=[&](const std::vector<Cell>& before,Cell action){
    auto found=nodes.find(keys(before).second);if(found==nodes.end())return;
    auto parent=found->second.lock();if(!parent || !parent->expanded)return;
-   for(auto& e:parent->edges)if(e.action==action){if(!e.child)attach(*parent,e,node,before,before.size());return;}
+   for(auto& e:parent->edges)if(e.action==action){if(!e.child)attach(*parent,e,node);return;}
   };
   auto mover=[](size_t i){return (i+1)/2%2;};
   if(!n)return;
@@ -499,7 +494,7 @@ struct Tree {
    if(chosen<0)return 0;
    auto& edge=node->edges[chosen];if(edge.child && edge.child->pending)return 0;
    path.edges.emplace_back(node,chosen);board.make(edge.action);path.history.push_back(edge.action);
-   if(!edge.child){if(shared)attach(*node,edge,child_here(),path.history,path.history.size()-1);else {edge.child=child_here();if(graph)edge.child->parents.push_back(node->weak_from_this());}}
+   if(!edge.child){if(shared)attach(*node,edge,child_here());else {edge.child=child_here();if(graph)edge.child->parents.push_back(node->weak_from_this());}}
    node=edge.child.get();path.leaf=node;if(shared)node->used=clock;
    if(board.winner>=0 || edge.exact_winner>=0 || node->exact_winner>=0){
     if(board.winner>=0){node->exact_winner=board.winner;node->distance=0;node->bound=false;}
