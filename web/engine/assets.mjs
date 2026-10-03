@@ -127,16 +127,25 @@ export async function moduleUrl(file, progress) {
   return URL.createObjectURL(new Blob([await cached(file, progress)], {type: 'text/javascript'}));
 }
 
+/** Whether this origin serves `path`: a HEAD request, or a GET whose body is dropped when HEAD is not supported (as
+ * python/play.py answers 501). */
+async function present(path) {
+  const url = new URL(path, BASE), head = await fetch(url, {method: 'HEAD'}).catch(() => null);
+  if (head && head.status !== 405 && head.status !== 501) return head.ok;
+  const get = await fetch(url).catch(() => null);
+  get?.body?.cancel();
+  return Boolean(get?.ok);
+}
+
 /**
  * Where an engine's `files` are: {state: 'local'} when this origin has them all (a file marked `local` counts when
- * a HEAD request for it here neither fails nor answers 404), {state: 'cached'} when the Cache API holds the others,
+ * present() finds it), {state: 'cached'} when the Cache API holds the others,
  * {state: 'uncached'} when there is no Cache API (each load downloads them), else
  * {state: 'missing', files, bytes}: the files still to download, each with its size in `bytes` (from its manifest,
  * else the site's Content-Length), and their total.
  */
 export async function status(files) {
-  const here = await Promise.all(files.map(async file => file.local
-    && ((await fetch(new URL(file.path, BASE), {method: 'HEAD'}).catch(() => null))?.status ?? 404) !== 404));
+  const here = await Promise.all(files.map(file => file.local && present(file.path)));
   const away = files.filter((file, i) => !here[i]), store = await open();
   if (!away.length) return {state: 'local'};
   if (!store) return {state: 'uncached'};

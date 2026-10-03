@@ -6,13 +6,14 @@ import {createHash} from 'node:crypto';
 const BASE = new URL('../../web/engine/', import.meta.url).href, SITE = 'https://tomodovodoo.github.io/HeXO/engine/';
 const hash = text => createHash('sha256').update(text).digest('hex');
 const requests = [], here = new Map(), site = new Map(), store = new Map();
-let offline = false;
+let offline = false, noHead = false;
 
 globalThis.fetch = async (input, init = {}) => {
   const url = String(input), method = init.method ?? 'GET';
   requests.push(`${method} ${url}`);
   if (url.startsWith(BASE)) {
     if (offline) throw new TypeError('Failed to fetch');
+    if (noHead && method === 'HEAD') return new Response('unsupported', {status: 501});
     const body = here.get(url.slice(BASE.length));
     return body === undefined ? new Response('missing', {status: 404}) : new Response(body);
   }
@@ -96,6 +97,11 @@ out.status = {before: {state: before.state, bytes: before.bytes}, after: await a
 
 site.set('gone.wasm', 'gone');
 out.partial = await assets.status([{path: 'g.wasm', local: true}, {path: 'gone.wasm', sha256: hash('gone'), bytes: 4, local: true}]);
+
+noHead = true;
+out.no_head = {here: (await assets.status([{path: 'g.wasm', local: true}])).state,
+  partial: (await assets.status([{path: 'g.wasm', local: true}, {path: 'gone.wasm', sha256: hash('gone'), bytes: 4, local: true}])).state};
+noHead = false;
 
 const open = caches.open;
 caches.open = async () => { throw new Error('no Cache API'); };

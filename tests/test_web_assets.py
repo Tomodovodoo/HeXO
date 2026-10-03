@@ -69,6 +69,7 @@ class Resolver(unittest.TestCase):
         self.assertEqual(self.out['uncached'], {'state': 'uncached'})
         self.assertEqual(self.out['partial']['state'], 'missing')
         self.assertEqual(self.out['partial']['bytes'], 4)
+        self.assertEqual(self.out['no_head'], {'here': 'local', 'partial': 'missing'})
 
     def test_every_engine_lists_pinned_files_and_downloads_them_from_the_site(self):
         self.assertEqual(sorted(self.out['engines']), ['bubble', 'native', 'seal', 'shrimp', 'six', 'strix'])
