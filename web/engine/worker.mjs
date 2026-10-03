@@ -1,5 +1,5 @@
 /* Bubble in a Web Worker: network (network.mjs), native search (gumbel.wasm) and the tactical solver (solver-worker.mjs).
- * In: {type: 'load', options} | {type: 'turn', id, history, model, simulations, solverNodes, batchSize, qRangeFloor}
+ * In: {type: 'load', options} | {type: 'use', id, model} | {type: 'turn', id, history, model, simulations, solverNodes, batchSize, qRangeFloor}
  *     | {type: 'cancel', id} | {type: 'bench', id, batches, sizes, repeats}
  *     | {type: 'search', id, history, simulations, batchSize, qRangeFloor}
  *     | {type: 'evaluate', id, histories}.
@@ -237,6 +237,7 @@ onmessage = async ({data}) => {
   try {
     if (data.type === 'load') postMessage({type: 'ready', device: await load(data.options)});
     else if (data.type === 'turn') postMessage({type: 'result', id: data.id, result: await turn(data)});
+    else if (data.type === 'use') { await use(data.model, fraction => postMessage({type: 'progress', id: data.id, fraction})); postMessage({type: 'result', id: data.id, result: null}); }
     else if (data.type === 'bench') postMessage({type: 'result', id: data.id, result: await bench(data)});
     else if (data.type === 'evaluate') {
       const leaves = data.histories.map(history => ({history, actions: native.legal(history)}));

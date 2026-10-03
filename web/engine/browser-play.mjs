@@ -23,7 +23,7 @@ export async function mountPlay(engines, legacy) {
   const first = !await storage.get('sessions', id);
   if (first && study && params.has('batch')) await session.openGame(params.get('batch'), +params.get('game'));
   for (const {entry, engine, record} of engines.values()) session.registerEngine(entry, {
-    ready: async f => { entry.device = deviceLabel(await engine.load(f)); },
+    ready: async (f, checkpoint) => { entry.device = deviceLabel(await engine.load(f)); await engine.prepare?.(checkpoint); },
     turn: async (history, budget, options) => {
       const result = await engine.turn(history, {...budget, ...(options.checkpoint ? {checkpoint: options.checkpoint} : {})}, options), preset = options.preset === 'custom' ? 'standard' : options.preset;
       return record ? {...record(result, history, preset), ...result} : result;

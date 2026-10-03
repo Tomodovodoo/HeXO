@@ -12,6 +12,11 @@ export class SixEngine extends EngineWorker {
     super(new URL('six-worker.mjs', import.meta.url), LABEL, {prefer, threads});
   }
 
+  /** Loads network `checkpoint` (the newest when null), so a timed turn does not spend its clock on it. */
+  prepare(checkpoint = null, options = {}) {
+    return this.call({type: 'use', network: checkpoint}, options);
+  }
+
   /** Six's turn at `history` ([[q, r], ...]) within `budget.nodes` new positions, with network `budget.checkpoint` (a
    * manifest name; the newest when absent): the fields of python/play.py evaluate. Under a clock `options.ms` is Six's
    * movetime, the nodes a ceiling. Aborting `options.signal` cancels it at the search's next network batch and rejects

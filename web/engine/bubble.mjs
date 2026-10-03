@@ -65,6 +65,11 @@ export class BubbleEngine extends EngineWorker {
       ms: options.ms ?? null}, options);
   }
 
+  /** Loads network `checkpoint` (a NETWORKS name, the default when null), so a timed turn does not spend its clock on it. */
+  prepare(checkpoint = null, options = {}) {
+    return this.call({type: 'use', model: checkpoint ? networkManifest(checkpoint) : this.options.model}, options);
+  }
+
   /** One search of `simulations` from `history` (no solver): action, completed, elapsed_ms, evaluated, batches, policy.
    * `options.qRangeFloor` is the tree's Q range floor (0 by default). Aborting `options.signal` cancels it (rejects
    * with an AbortError). */

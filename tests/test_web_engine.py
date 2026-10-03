@@ -287,6 +287,9 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['timed_out']['play'], 400)
         self.assertEqual((result['fresh']['outcome'], result['fresh']['clock']['running']), (None, 'x'))
         self.assertGreater(result['fresh']['clock']['cross_ms'], 250)
+        self.assertGreaterEqual(result['paused_turn'], 190)
+        self.assertGreaterEqual(result['load_charged']['load'], 290)
+        self.assertLess(result['load_charged']['spent'], 150)
 
     def test_browser_notations_preserve_a_single_stone_final_turn(self):
         history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]

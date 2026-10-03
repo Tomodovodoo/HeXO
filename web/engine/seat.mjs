@@ -35,6 +35,8 @@ const analyses = new Map(), loads = new Map(), hk = history => history.map(p => 
 /** Each seat and the analysis: null, or {engine: an ENGINES id, preset, checkpoint}. */
 let config = {seats: [null, null], analysis: null}, job = null, failed = null, posting = false;
 let fresh = true, notice = null;
+/** Engine and checkpoint pairs whose network is loaded: a timed move of any other holds the server's clock while it loads. */
+const warmed = new Set();
 try {
   const saved = localStorage.getItem(STORE), known = choice => ENGINES.has(choice?.engine) ? pickEngine(choice.engine, choice, choice.checkpoint) : null;
   fresh = saved === null;
@@ -135,7 +137,17 @@ async function run(key, task) {
   const {engine, entry, record} = ENGINES.get(task.engine);
   try {
     current.loading = true;
-    entry.device = deviceLabel(await engine.load(f => { loads.set(task.engine, f); progress(); }));
+    const timed = task.kind === 'move' && state()?.clock_spec && state().clock_spec.mode !== 'fixed', warm = `${task.engine}|${task.checkpoint}`;
+    const hold = timed && !warmed.has(warm);
+    if (hold) { posting = true; await original.post('/pause', {paused: true}); }
+    try {
+      entry.device = deviceLabel(await engine.load(f => { loads.set(task.engine, f); progress(); }));
+      await engine.prepare?.(task.checkpoint, {signal: controller.signal});
+      warmed.add(warm);
+    } finally {
+      if (hold) { await original.post('/pause', {paused: false}); posting = false; }
+    }
+    if (job !== current) return;
     current.loading = false;
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
     const ms = task.kind === 'move' && s?.clock && s.clock_spec?.mode !== 'fixed' ? turnTime(s.clock_spec, s.clock, task.side) : null;

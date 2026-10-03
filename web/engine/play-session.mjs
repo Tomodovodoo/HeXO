@@ -61,10 +61,12 @@ export class BrowserSession extends OfflineSession {
     this.storage = new PlayStorage(null); this.id = 'live'; this.seats = [human(), human()];
     this.entries = new Map(); this.adapters = new Map(); this.cache = new Map(); this.index = new Map(); this.jobs = [];
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
-    this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.loaded = new Set(); this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
+    this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.loaded = new Set(); this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
     this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null;
   }
+  /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
+   * move's clock starts after it) and `adapter.turn(history, budget, options)` plays. */
   registerEngine(entry, adapter) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
     for (const seat of [...this.seats, this.analysis].filter(Boolean)) if (seat.engine === entry.id) Object.assign(seat, this.spec(seat));
@@ -149,7 +151,7 @@ export class BrowserSession extends OfflineSession {
   snapshot() {
     return {id: this.id, history: copy(this.history), seats: copy(this.seats), analysis: copy(this.analysis), paused: this.paused,
       book: copy(this.book), match: copy(this.match), saved_game: copy(this.saved_game), clock: this.clockNow(), timeControl: copy(this.timeControl),
-      clockTurns: copy(this.clockTurns), outcome: copy(this.outcome), gameId: this.gameId, gameCreated: this.gameCreated, records: copy(this.records)};
+      clockTurns: copy(this.clockTurns), clockPartial: this.clockPartial, outcome: copy(this.outcome), gameId: this.gameId, gameCreated: this.gameCreated, records: copy(this.records)};
   }
   storageConflict() {
     this.conflicted = true; this.paused = true; this.freezeClock(); this.cancelJobs();
@@ -239,6 +241,7 @@ export class BrowserSession extends OfflineSession {
       const seat = this.spec({...this.seats[body.side], ...body, budget: body.preset === 'custom' ? body.custom : undefined});
       if (this.timeControl.mode !== 'fixed') this.clockable(seat);
       this.cancelJobs(j => j.kind === 'move'); this.seats[body.side] = seat;
+      if (this.clock?.side === body.side) this.freezeClock();
     } else if (path === '/clock') {
       if (this.saved_game) throw Error('A saved game has no clock');
       const control = clockSpec(body);
@@ -331,7 +334,11 @@ export class BrowserSession extends OfflineSession {
     clock.running = clock.started != null ? ['x', 'o'][clock.side] : null;
     return clock;
   }
-  freezeClock() { clearTimeout(this.flag); this.clock = this.clockNow(); if (this.clock) { delete this.clock.started; delete this.clock.side; } }
+  freezeClock() {
+    clearTimeout(this.flag);
+    if (this.clock?.started != null) this.clockPartial += Date.now() - this.clock.started;
+    this.clock = this.clockNow(); if (this.clock) { delete this.clock.started; delete this.clock.side; delete this.clock.running; }
+  }
   /** The time control in force: the match's, else the freeplay one. */
   control() { return this.match ? this.match.clock : this.timeControl; }
   /** Refuses `seat` under a clock when its engine plays a fixed budget. */
@@ -344,7 +351,7 @@ export class BrowserSession extends OfflineSession {
     clearTimeout(this.flag);
     const c = this.control(), base = c.mode === 'move' ? c.ms : c.base_ms ?? c.initial_ms;
     this.clock = c.mode === 'fixed' ? null : {cross_ms: base, circle_ms: base, increment_ms: c.mode === 'game' ? c.increment_ms : 0};
-    this.clockTurns = []; this.outcome = null;
+    this.clockTurns = []; this.outcome = null; this.clockPartial = 0;
   }
   /** Starts the clock of the side to move while the game runs on one; an engine side's clock starts once its engine has
    * loaded. Arms the loss on time. */
@@ -358,13 +365,14 @@ export class BrowserSession extends OfflineSession {
     clearTimeout(this.flag);
     this.flag = setTimeout(() => this.checkTime(), c[player ? 'circle_ms' : 'cross_ms'] + 20);
   }
-  /** Charges `side`'s completed turn at time `at`: finished late it loses on time; otherwise it gains its increment, or
+  /** Charges `side`'s completed turn at time `at`, with what it spent before a pause (`clockPartial`): finished late it loses on time; otherwise it gains its increment, or
    * a whole turn again on a per-turn clock. Logs the balances in `clockTurns`; true when the turn stands. */
   chargeTurn(side, at = Date.now()) {
     const c = this.clock;
     if (!c || c.started == null || c.side !== side) return true;
     clearTimeout(this.flag);
-    const field = side ? 'circle_ms' : 'cross_ms', spent = at - c.started, left = c[field] - spent, control = this.control();
+    const field = side ? 'circle_ms' : 'cross_ms', left = c[field] - (at - c.started), spent = at - c.started + this.clockPartial, control = this.control();
+    this.clockPartial = 0;
     delete c.started; delete c.side;
     if (left <= 0) { c[field] = 0; this.outcome = {winner: 1 - side, reason: 'time'}; }
     else c[field] = control.mode === 'move' ? control.ms : left + (c.increment_ms || 0);
@@ -404,7 +412,7 @@ export class BrowserSession extends OfflineSession {
     const history = job.kind === 'review' ? job.history.slice(0, job.plies[job.cursor]) : job.history;
     try {
       const adapter = this.adapters.get(job.spec.engine);
-      await adapter.ready?.(f => { job.done = f * .1; this.onchange(this.state()); });
+      await adapter.ready?.(f => { job.done = f * .1; this.onchange(this.state()); }, job.spec.checkpoint);
       this.loaded.add(job.spec.engine);
       if (job.kind === 'move') this.runClock();
       if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');

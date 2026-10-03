@@ -109,6 +109,18 @@ if (job.kind === 'encode') {
   answer.timed_out = {state: (({winner, outcome}) => ({winner, outcome}))(s.state()), game: (await s.saving, await s.storage.get('games', s.gameId)), play: s.answer('/play', {q: 9, r: 8})[0]};
   s.answer('/new', {});
   answer.fresh = {outcome: s.outcome, clock: s.clockNow()};
+  s.answer('/seat', {side: 1, engine: 'human'}); s.answer('/clock', {mode: 'game', tc: '60'});
+  await wait(100); s.answer('/pause', {paused: true}); await wait(100); s.answer('/pause', {paused: false}); await wait(100);
+  s.answer('/play', {q: 0, r: 0});
+  answer.paused_turn = s.clockTurns[0].spent_ms;
+  const slow = new BrowserSession(native); let readyAt = 0;
+  slow.registerEngine({id: 'slow', name: 'Slow', kind: 'native', presets: {standard: {ms: 1000}}, clocks: true}, {
+    ready: async () => { await wait(300); readyAt = Date.now(); },
+    turn: async history => ({moves: [[history.length, 3], [history.length, 4]]})});
+  slow.answer('/clock', {mode: 'game', tc: '60'}); slow.answer('/play', {q: 0, r: 0});
+  const seated = Date.now(); slow.answer('/seat', {side: 1, engine: 'slow'}); await wait(500);
+  answer.load_charged = {spent: slow.clockTurns[1]?.spent_ms ?? null, load: readyAt - seated};
+  s.answer('/pause', {paused: true}); slow.answer('/pause', {paused: true});
 } else if (job.kind === 'play') {
   const s = new BrowserSession(native), data = JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url)));
   s.bookData = new OpeningBook(data);
