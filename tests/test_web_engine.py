@@ -262,6 +262,19 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answers[6][1], [])
         self.assertEqual([a[2] for a in answers[-2:]], [True, False])
 
+    def test_browser_game_links_read_the_sites_through_their_open_mirror(self):
+        site = ROOT/'tests'/'fixtures'/'hexo-site'
+        game, sandbox = (json.loads((site/name).read_text(encoding='utf-8')) for name in ('finished-game.json', 'sandbox-position.json'))
+        links = [['https://hexo.did.science/games/8211f449-5020-4a5a-9a93-581c5f720aac/', game],
+                 ['https://hexo.mineking.dev/sandbox/2MDYN02', sandbox], ['https://hexo.tyto.cc/#g=ebb77124', {}]]
+        answers = node(dict(kind='links', links=links))
+        for (url, data), answer in zip(links[:2], answers):
+            self.assertEqual(answer['history'], play.linked_history(url, lambda api, body=None: data))
+        self.assertEqual([a['asked'] for a in answers], [
+            [['https://hexo.mineking.dev/proxy/api/finished-games/8211f449-5020-4a5a-9a93-581c5f720aac', 'GET']],
+            [['https://hexo.mineking.dev/proxy/api/sandbox-positions/2mdyn02', 'GET']], []])
+        self.assertIn('HTTTX', answers[2]['error'])
+
     def test_browser_notations_preserve_a_single_stone_final_turn(self):
         history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]
         histories = [history[:1], history[:6], history]

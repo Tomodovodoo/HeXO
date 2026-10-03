@@ -85,6 +85,13 @@ if (job.kind === 'encode') {
     }
     answer.push(formats);
   }
+} else if (job.kind === 'links') {
+  answer = [];
+  for (const [url, data] of job.links) {
+    const asked = [], fetcher = async (api, init = {}) => { asked.push([api, init.method || 'GET']); return {ok: true, json: async () => data}; };
+    try { answer.push({history: await readGame(url, native, fetcher), asked}); }
+    catch (error) { answer.push({error: error.message, asked}); }
+  }
 } else if (job.kind === 'play') {
   const s = new BrowserSession(native), data = JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url)));
   s.bookData = new OpeningBook(data);
