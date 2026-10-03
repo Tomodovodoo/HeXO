@@ -1,7 +1,8 @@
 // Node runner for tests/test_web_engine.py: reads one JSON job from stdin, writes one JSON answer to stdout.
 // {kind: 'encode', positions: [{history, actions}]} -> [{size, cells, far, ones: [flat plane indices], features: base64 float32}]
-// {kind: 'search', cases: [{history, seed, tactics, q_range_floor, root_noise, steps: [{simulations, root_samples, batch_size}], batches}]}
-//   replays the recorded evaluations batch by batch -> [[{action, policy, visits, completed}] per step]
+// {kind: 'search', cases: [{history, seed, tactics, q_range_floor, root_noise, steps: [{simulations, root_samples, batch_size, marks}], batches}]}
+//   replays the recorded evaluations batch by batch, a step's `marks` ([q, r, winner, distance]) settled before its search
+//   -> [[{action, policy, visits, completed, proven, unmarked}] per step]
 // {kind: 'game', simulations} -> turns of seats on GameTrees lines with a ranked network: the root visits each stone's
 //   search started from on the first and second turn of one line, at an undo and on a new line, and the lines kept
 // {kind: 'pv', history, certificate} -> {pv, plies} of the principal variation
@@ -9,15 +10,16 @@
 // {kind: 'overlay', cases: [{ev, stones}]} -> [boardOverlay(ev, stones)] from web/engine/overlay.js
 // {kind: 'offline', requests: [[path, body]]} -> [[status, history or error, paused]] from an OfflineSession
 // {kind: 'threads', contexts: [{isolated, cores}]} -> the WebAssembly thread count the loader would pick
-// {kind: 'table', records: [[history, record]], queries: [history], result, lost, mover} -> {known, edges} per query from a
-//   proof.mjs Proofs and `settled` of `result` and `lost` with the edges of the first query
-// {kind: 'proofs', history, ply, found} -> a BrowserSession whose engine proves `found` at `ply` and answers other positions
-//   from the proof table it is sent: the evaluations at ply - 1 after analysis, undo, another preset and a reload
+// {kind: 'table', records: [[history, record]], queries: [history], result, lost, exact, mover} -> {known, edges} per query
+//   from a proof.mjs Proofs and `settled` of `result`, `lost` and `exact` with the edges of the first query
+// {kind: 'proofs', history, ply, found} -> a BrowserSession whose engine proves `found` at `ply` and searches other positions
+//   with the stones the proof table it is sent proves marked (see `searched`): the evaluations at ply - 1 after analysis,
+//   undo, another preset and a reload, and `given`, the turn proof.mjs answered gives at ply - 1 from `found`'s table
 import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameTrees} from '../../web/engine/search.mjs';
-import {principalVariation, topRows, Proofs, answered, settled} from '../../web/engine/proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled, proofTurns} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
 import {defaultThreads} from '../../web/engine/network.mjs';
@@ -33,19 +35,22 @@ async function search(item) {
   const batches = item.batches.slice(), tree = new NeuralSearch(native, {seed: item.seed, tactics: item.tactics,
     qRangeFloor: item.q_range_floor ?? 0, rootNoise: item.root_noise ?? 0, history: item.history});
   const cache = new EvaluationCache(), out = [];
+  const evaluate = async leaves => {
+    const batch = batches.shift();
+    if (!batch || batch.length !== leaves.length) throw new Error('Batch shape differs from the native run');
+    return leaves.map((leaf, i) => {
+      if (JSON.stringify(leaf.history) !== JSON.stringify(batch[i].history)) throw new Error('Leaf differs from the native run');
+      return batch[i];
+    });
+  };
   try {
     for (const step of item.steps) {
+      const marks = new Map((step.marks || []).map(([q, r, winner, distance]) => [`${q},${r}`, {action: [q, r], winner, distance}]));
+      const unmarked = await tree.settle(marks, {cache, evaluate});
       const result = await tree.search({simulations: step.simulations, rootSamples: step.root_samples, batchSize: step.batch_size, cache,
-        ...(step.choice ? {choice: step.choice} : {}),
-        evaluate: async leaves => {
-          const batch = batches.shift();
-          if (!batch || batch.length !== leaves.length) throw new Error('Batch shape differs from the native run');
-          return leaves.map((leaf, i) => {
-            if (JSON.stringify(leaf.history) !== JSON.stringify(batch[i].history)) throw new Error('Leaf differs from the native run');
-            return batch[i];
-          });
-        }});
-      out.push({action: result.action, policy: result.policy, visits: result.visits, completed: result.completed});
+        ...(step.choice ? {choice: step.choice} : {}), evaluate});
+      out.push({action: result.action, policy: result.policy, visits: result.visits, completed: result.completed, proven: result.proven,
+        unmarked: unmarked.size});
       if (!result.action) break;
       tree.advance(result.action);
     }
@@ -53,6 +58,32 @@ async function search(item) {
     tree.close();
   }
   return out;
+}
+
+/** The turn at `history` as the worker searches it, on a network with fixed priors and 8 simulations a stone: each
+ * root's stones `table` (a Proofs) proves are marked exact before its search, and the first stone's root gives the
+ * value, top rows and proof; a proof's line is the turn's stones, then the table's line from there. Throws when the
+ * tree does not take a mark. */
+async function searched(history, table) {
+  const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map((_, i) => -2 * i), q: actions.map(() => 0)}));
+  const {player, remaining} = native.game(history), current = history.map(p => [...p]), moves = [];
+  let first = null;
+  while (native.game(current).player === player && native.game(current).winner < 0) {
+    const tree = new NeuralSearch(native, {seed: 1740, tactics: true, history: current});
+    try {
+      if ((await tree.settle(table.edges(current), {evaluate})).size) throw new Error('The tree did not take a proven stone');
+      const result = await tree.search({simulations: 8, rootSamples: 16, evaluate});
+      first ??= result;
+      moves.push(result.action);
+      current.push(result.action);
+    } finally {
+      tree.close();
+    }
+  }
+  const won = first.proven > 0, after = table.known(current)?.pv ?? [];
+  return {moves, value: won ? 1 : .5, top: topRows(first.actions, first.policy, first.values, first.action), threat: [],
+    proof: won ? {winner: player, turns: proofTurns(first.proof_plies, remaining, true), plies: first.proof_plies} : null,
+    pv: won ? [...moves.map(([q, r], i) => [q, r, player, i + 1]), ...after.map(([q, r, side, ply]) => [q, r, side, ply + moves.length])] : []};
 }
 
 let answer;
@@ -97,7 +128,8 @@ if (job.kind === 'encode') {
   for (const [history, record] of job.records) table.add(history, record);
   const rebuilt = new Proofs(table.list());
   answer = {queries: job.queries.map(h => ({known: rebuilt.known(h), edges: [...rebuilt.edges(h).values()].map(e => [...e.action, e.winner, e.distance])})),
-    settled: settled(job.result, rebuilt.edges(job.queries[0]), job.mover), lost: settled(job.lost, rebuilt.edges(job.queries[0]), job.mover)};
+    settled: settled(job.result, rebuilt.edges(job.queries[0]), job.mover), lost: settled(job.lost, rebuilt.edges(job.queries[0]), job.mover),
+    exact: settled(job.exact, rebuilt.edges(job.queries[0]), job.mover)};
 } else if (job.kind === 'proofs') {
   const s = new BrowserSession(native), sent = [], wait = () => new Promise(resolve => setTimeout(resolve, 1));
   const settle = async () => { for (let i = 0; s.running || s.jobs.some(j => j.status === 'queued'); i++) { if (i > 3000) throw Error('Analysis did not finish'); await wait(); } await s.saving; };
@@ -106,7 +138,7 @@ if (job.kind === 'encode') {
   const adapter = {turn: async (history, budget, options) => {
     sent.push(options.known?.length ?? null);
     if (history.length === job.ply) return job.found;
-    return answered(native, history, new Proofs(options.known)) || {moves: [], value: .5, top: [], proof: null, pv: [], threat: []};
+    return searched(history, new Proofs(options.known));
   }};
   s.registerEngine(entry, adapter);
   s.analysis = s.spec({engine: 'test', preset: 'standard'});
@@ -120,6 +152,9 @@ if (job.kind === 'encode') {
   answer.quick = {shown: shown(), saved: s.lookup(s.history.slice(0, job.ply - 1))};
   const reopened = new BrowserSession(native); reopened.storage = s.storage; await reopened.restore(); reopened.registerEngine(entry, adapter);
   answer.reloaded = reopened.state().evaluations[job.ply - 1];
+  const table = new Proofs();
+  table.add(job.history, job.found);
+  answer.given = answered(native, job.history.slice(0, job.ply - 1), table);
 } else if (job.kind === 'threads') {
   answer = job.contexts.map(defaultThreads);
 } else if (job.kind === 'offline') {

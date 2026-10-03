@@ -305,8 +305,8 @@ stone wins for the player who placed it, the position before it is proven too: t
 the eval bar shows 100 for that player and the line runs on into the known one. The page shows
 what the table proves even for an evaluation saved before the proof was found, and review labels use it. Engine
 seats never read the table. The static page keeps the same table in its session, rebuilt from the evaluations it
-saves in the browser, and sends it with each analysis request. Its search cannot settle stones in the tree
-(gumbel.wasm does not export `hxg_mark_exact`), so it applies the proven stones to the search's result instead.
+saves in the browser, and sends it with each analysis request. Its search settles the proven stones in the tree
+before searching, as the server does.
 
 Review evaluates with the analysis engine, network and strength the analysis slot is set to (its preset or custom
 budget), and labels each turn only from evaluations at exactly that budget, so a verdict never compares a deep

@@ -792,7 +792,8 @@ class TurnSearch:
     tree is advanced through the turn, each stone searched afresh with `simulations`. A seat's move passes its game
     tree (`Engines.game_trees`). With a proof table `known` (`Proofs`) a position it proves lost for the side to move
     gets that proof and line unless the solver proved one (a proven win needs its turn, see `answered`), each search
-    starts with the root's proven edges settled (`Proofs.edges`), and a proof whose turn reaches a proven position
+    starts with the root's proven edges settled (`Proofs.edges`; the mover's losses first, then its wins from the
+    shortest, since the first win settles the root), and a proof whose turn reaches a proven position
     continues into that position's line."""
 
     def __init__(self, bubble, network, history, simulations, solved, trees=None, q_range_floor=0., known=None):
@@ -834,7 +835,8 @@ class TurnSearch:
         edges = self.known.edges(cells) if self.known is not None else {}
         if edges:
             tree.expand()
-            for action, (winner, distance, _) in edges.items():
+            mover = self.local.player
+            for action, (winner, distance, _) in sorted(edges.items(), key=lambda e: (e[1][0] == mover, e[1][1], e[0])):
                 with contextlib.suppress(ValueError):
                     tree.mark(action, winner, distance)
         return tree, simulations

@@ -206,7 +206,8 @@ class BrowserProofs(unittest.TestCase):
                    [[0, 0], [2, 2], [3, 2]], [[0, 0], [-2, 0], [-2, 1], [-3, 1]]]
         result = dict(actions=[[1, 0], [4, 4], [7, 7]], values=[.1, .2, .3], policy=[.2, .5, .3], action=[4, 4], proven=0)
         lost = dict(actions=[[4, 4]], values=[.4], policy=[1.], action=[4, 4], proven=0)
-        found = node(dict(kind='table', records=records, queries=queries, result=result, lost=lost, mover=1))
+        exact = dict(result, action=[7, 7], proven=1, exact_winner=1, proof_plies=3)
+        found = node(dict(kind='table', records=records, queries=queries, result=result, lost=lost, exact=exact, mover=1))
         table = play.Proofs()
         for history, record in records:
             table.add(history, record)
@@ -215,6 +216,8 @@ class BrowserProofs(unittest.TestCase):
             self.assertEqual((answer['known'], sorted(answer['edges'])), (table.known(history), edges), history)
         self.assertEqual({k: found['settled'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
                          dict(action=[1, 0], proven=1, proof_plies=6, values=[1, -1, .3]))
+        self.assertEqual({k: found['exact'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
+                         dict(action=[7, 7], proven=1, proof_plies=3, values=[1, -1, .3]))
         self.assertEqual({k: found['lost'][k] for k in ('action', 'proven', 'exact_winner', 'proof_plies')},
                          dict(action=[4, 4], proven=-1, exact_winner=0, proof_plies=4))
         self.assertEqual(table.known([[0, 0], [4, 4]])['pv'], [[5, 4, 1, 1], [6, 4, 1, 2]])
@@ -234,6 +237,14 @@ class BrowserProofs(unittest.TestCase):
         analysed = answer['analysed']
         self.assertEqual((analysed['proof'], analysed['value'], analysed['pv']), (dict(winner=0, turns=4, plies=14), 1, line))
         self.assertEqual((analysed['top'][0][:2], analysed['top'][0][3:]), ([-1, -11], [1, 1]))
+        table = play.Proofs()
+        table.add(history, found)
+        server = json.loads(json.dumps(play.evaluate(None, None, history[:-1], 8, 0, known=table)))
+        fields = ('moves', 'proof', 'value', 'pv')
+        for shown in (analysed, answer['given']):
+            self.assertEqual({k: shown[k] for k in fields}, {k: server[k] for k in fields})
+        self.assertEqual(answer['given']['top'], server['top'])
+        self.assertEqual((analysed['top'][0][:2], analysed['top'][0][3:]), (server['top'][0][:2], server['top'][0][3:]))
         self.assertEqual(answer['kept'], dict(winner=0, turns=4, plies=14))
         self.assertEqual(answer['sent'][0], 0)
         self.assertGreater(answer['sent'][1], 1)
@@ -462,14 +473,28 @@ class Bundle(unittest.TestCase):
         positions = [(h, 64, None, 0., 0.) for h in games[::3]]+[(h, 128, None, 0., 0.) for h in tactical]
         positions += [(games[5], 512, None, 0., 0.), (games[5], 64, 'gumbel', 0., 0.), (tactical[0], 128, 'gumbel', 0., 0.)]
         positions += [(games[5], 128, None, .5, 0.), (games[27], 128, 'gumbel', 0., .25)]
-        for history, simulations, choice, floor, noise in positions:
+        positions += [(games[5], 128, None, 0., 0., 'lost'), (games[5], 64, None, 0., 0., 'wins')]
+        for history, simulations, choice, floor, noise, *marked in positions:
             recorder, steps, results = Recorder(model), [], []
             tree = NeuralSearch(recorder, 'test', history, seed=1740, cache=EvaluationCache(), tactics=True,
                                 q_range_floor=floor, root_noise=noise)
             try:
                 for _ in range(2 if len(history) % 2 else 1):
                     option = dict(choice=choice) if choice else {}
-                    result = tree.search(simulations, root_samples=16, batch_size=16, **option)
+                    if marked and not steps:
+                        # 'lost': the first root's most likely stone is proven lost for the mover three placements on.
+                        # 'wins': its two most likely stones win for the mover, the second sooner; the web side gets
+                        # them longest first and must still settle the root on the shorter.
+                        prior = recorder.inner.evaluate([history])[0]
+                        first, second = (prior['actions'][i].tolist() for i in np.argsort(-prior['logits'])[:2])
+                        mover = play.player_at(len(history))
+                        option['marks'] = ([[*first, 1 - mover, 3]] if marked == ['lost'] else
+                                           [[*first, mover, 7], [*second, mover, 5]])
+                        tree.expand()
+                        for q, r, winner, distance in sorted(option['marks'], key=lambda m: (m[2] == mover, m[3])):
+                            tree.mark((q, r), winner, distance)
+                    result = tree.search(simulations, root_samples=16, batch_size=16,
+                                         **{k: v for k, v in option.items() if k != 'marks'})
                     steps.append(dict(simulations=simulations, root_samples=16, batch_size=16, **option))
                     results.append(result)
                     if result['action'] is None:
@@ -486,7 +511,13 @@ class Bundle(unittest.TestCase):
                 self.assertEqual(web['action'], native['action'])
                 self.assertEqual(web['visits'], native['visits'].tolist())
                 self.assertEqual(web['completed'], native['completed'])
+                self.assertEqual((web['proven'], web['unmarked']), (native['proven'], 0))
                 np.testing.assert_allclose(web['policy'], native['policy'], rtol=0, atol=1e-12)
+        marked, web = cases[-2][1][0], answers[-2][0]
+        lost = marked['actions'].tolist().index(cases[-2][0]['steps'][0]['marks'][0][:2])
+        self.assertEqual((marked['values'][lost], web['policy'][lost]), (-1., 0.))
+        won, web = cases[-1][1][0], answers[-1][0]
+        self.assertEqual((web['proven'], web['action'], won['proof_plies']), (1, cases[-1][0]['steps'][0]['marks'][1][:2], 5))
 
 
 if __name__ == '__main__':
