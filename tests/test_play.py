@@ -411,6 +411,9 @@ class Jobs(unittest.TestCase):
         wait(lambda: not session.state()['jobs'])
         refreshed = session.store.get(session.history[:4], key, deep)['graph']
         self.assertEqual(refreshed[2], session.graph_searches[session.analysis_graph])
+        self.assertEqual(session.state()['stale'], [6])
+        session.new_lines()   # undo, a new or loaded game: the next analysis searches a new graph
+        self.assertEqual(session.state()['stale'], [])
         line = self.session.analysis_line
         self.session.undo()
         self.assertNotEqual(self.session.analysis_line, line)

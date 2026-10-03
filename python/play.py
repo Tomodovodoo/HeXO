@@ -1693,7 +1693,7 @@ class Session:
         for side in sides or (0, 1):
             self.lines[side] = next(self.line_ids)
         if not sides:
-            self.analysis_line = next(self.line_ids)
+            self.analysis_line, self.analysis_graph = next(self.line_ids), None
 
     def engine_key(self, seat):
         """Evaluations are keyed by the weights and the solver build that produced them ('none' for a budget

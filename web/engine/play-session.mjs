@@ -240,7 +240,7 @@ export class BrowserSession extends OfflineSession {
   /** Gives `sides` (both when none) a new line, the key of the game tree a Bubble seat searches (worker.mjs). */
   renewLines(...sides) {
     for (const side of sides.length ? sides : [0, 1]) this.lines[side] = uid();
-    if (!sides.length) this.analysisLine = uid();
+    if (!sides.length) { this.analysisLine = uid(); this.graph = {key: null, generation: null, searches: 0}; }
   }
   forkGame() {
     if (this.saved_game || !this.gameId || this.match) {
