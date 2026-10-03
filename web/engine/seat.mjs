@@ -36,8 +36,10 @@ const analyses = new Map(), loads = new Map(), hk = history => history.map(p => 
 /** Each seat and the analysis: null, or {engine: an ENGINES id, preset, checkpoint}. */
 let config = {seats: [null, null], analysis: null}, job = null, failed = null, posting = false;
 let fresh = true, notice = null;
-/** Engine and checkpoint pairs whose network is loaded: a timed move of any other holds the server's clock while it loads. */
-const warmed = new Set();
+/** Engine and checkpoint pairs whose network is loaded, with the engine's `ready` promise of the worker that loaded it (an
+ * engine that discards its worker on cancel starts a new one): a timed move of any other holds the server's clock while it
+ * loads. */
+const warmed = new Map();
 /** While a timed move holds the server's clock to load its engine: {paused}, set when the person pauses meanwhile. */
 let holding = null;
 try {
@@ -142,12 +144,12 @@ async function run(key, task) {
   try {
     current.loading = true;
     const timed = task.kind === 'move' && state()?.clock_spec && state().clock_spec.mode !== 'fixed', warm = `${task.engine}|${task.checkpoint}`;
-    const hold = timed && !warmed.has(warm);
+    const hold = timed && (!engine.ready || warmed.get(warm) !== engine.ready);
     if (hold) { posting = true; holding = {paused: false}; await original.post('/pause', {paused: true}); }
     try {
       entry.device = deviceLabel(await engine.load(f => { loads.set(task.engine, f); progress(); }));
       await engine.prepare?.(task.checkpoint, {signal: controller.signal});
-      warmed.add(warm);
+      warmed.set(warm, engine.ready);
     } finally {
       if (hold) {
         const kept = holding.paused;
