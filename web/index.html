@@ -193,7 +193,7 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .part{display:flex;flex-direction:column;gap:var(--gap);min-height:0}#analysis{flex:none}#review{flex:1}
 .part>*,.panel>*{flex:none}
 .toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
-.toolbar #review-go{margin-left:auto;display:flex;align-items:center;gap:6px;flex:none;white-space:nowrap}
+.toolbar #review-go{margin-left:auto;display:flex;align-items:center;justify-content:center;gap:6px;flex:none;white-space:nowrap;min-width:118px;font-variant-numeric:tabular-nums}
 #accuracy{flex-wrap:wrap;row-gap:4px}
 .toolbar #review-go svg{width:14px;height:14px}
 .split{display:inline-flex;flex:none;border:1px solid var(--line-2);border-radius:8px;overflow:hidden;
@@ -1014,7 +1014,7 @@ function renderJobs(){
     if(!cancel.children.length)cancel.append(el('button',{class:'x','aria-label':'Cancel',html:icon('close')}));
     cancel.firstChild.onclick=()=>post('/cancel',{id:job.id})}
   const review=$('review-go'),rjob=S.jobs.find(j=>j.kind==='review'),mark=STOP_ICON[STOPS.indexOf(S.review_preset)]||'';
-  review.innerHTML=mark;review.append(rjob?`${Math.floor(rjob.done)} / ${rjob.total}  ×`:'Review');
+  review.innerHTML=mark;review.append(rjob?`${(Math.floor(rjob.done*10)/10).toFixed(1)} / ${rjob.total}  ×`:'Review');
   review.onclick=()=>rjob?post('/cancel',{id:rjob.id}):post('/review');
   renderAnalysis();
   const pending=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view),analysing=S.jobs.filter(j=>j.kind==='analyse');
