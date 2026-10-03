@@ -156,7 +156,8 @@ class NeuralSearch:
 
     def _install_verified_proof(self, request, history, result):
         """Install this leaf's already verified solver verdict; native checks its history, phase and turn."""
-        if result.get('status') != 'PROVEN_WIN' or not result.get('native_verified'):
+        if (result.get('status') != 'PROVEN_WIN' or not result.get('native_verified')
+                or result.get('attacker') != 'mover'):
             return False
         moves = result.get('moves', [])
         if not moves:
