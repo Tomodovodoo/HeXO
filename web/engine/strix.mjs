@@ -20,6 +20,7 @@ export class StrixEngine {
     this.worker = null;
     this.ready = null;
     this.calls = 0;
+    this.pending = new Set();   // the reject functions of the running load and turn
   }
 
   /** Adds `networks` (strix/networks.json entries) to the choices; the first becomes current when none is. */
@@ -55,12 +56,14 @@ export class StrixEngine {
     }
     const worker = this.worker = new Worker(workerUrl('strix-worker.mjs'), {type: 'module'});
     const ready = this.ready = new Promise((resolve, reject) => {
+      const fail = error => { this.pending.delete(fail); reject(error); };
+      this.pending.add(fail);
       worker.onmessage = ({data}) => {
         if (data.type === 'progress' && data.id === undefined) progress(data.fraction);
-        else if (data.type === 'ready') resolve(data.info);
-        else if (data.type === 'error') reject(new Error(data.message));
+        else if (data.type === 'ready') { this.pending.delete(fail); resolve(data.info); }
+        else if (data.type === 'error') fail(new Error(data.message));
       };
-      worker.onerror = event => reject(new Error(event.message || 'Strix worker failed'));
+      worker.onerror = event => fail(new Error(event.message || 'Strix worker failed'));
     });
     ready.catch(() => { if (this.ready === ready) this.close(); });
     worker.postMessage({type: 'load', network: {path: this.network.path, sha256: this.network.sha256, bytes: this.network.size}});
@@ -76,10 +79,13 @@ export class StrixEngine {
       ...(chosen.length ? chosen : [this.network]).map(n => ({path: n.path, sha256: n.sha256, bytes: n.size, local: n.local}))];
   }
 
-  /** Ends the worker; the next load starts a new one. */
+  /** Ends the worker and rejects its running load and turn with an AbortError; the next load starts a new one. */
   close() {
     this.worker?.terminate();
     this.worker = this.ready = null;
+    const pending = [...this.pending];
+    this.pending.clear();
+    for (const reject of pending) reject(new DOMException('Closed', 'AbortError'));
   }
 
   /**
@@ -97,16 +103,20 @@ export class StrixEngine {
     await this.load();
     const worker = this.worker, id = ++this.calls;
     return new Promise((resolve, reject) => {
-      const abort = () => { if (this.worker === worker) this.close(); reject(new DOMException('Cancelled', 'AbortError')); };
+      const fail = error => { this.pending.delete(fail); signal?.removeEventListener('abort', abort); reject(error); };
+      const abort = () => { fail(new DOMException('Cancelled', 'AbortError')); if (this.worker === worker) this.close(); };
       if (signal?.aborted) { abort(); return; }
+      this.pending.add(fail);
       signal?.addEventListener('abort', abort, {once: true});
       worker.onmessage = ({data}) => {
         if (data.id !== id) return;
         if (data.type === 'progress') { progress(data.fraction); return; }
+        if (data.type !== 'result') { fail(new Error(data.message)); return; }
+        this.pending.delete(fail);
         signal?.removeEventListener('abort', abort);
-        data.type === 'result' ? resolve(data.result) : reject(new Error(data.message));
+        resolve(data.result);
       };
-      worker.onerror = event => { if (this.worker === worker) this.close(); reject(new Error(event.message || 'Strix worker failed')); };
+      worker.onerror = event => { fail(new Error(event.message || 'Strix worker failed')); if (this.worker === worker) this.close(); };
       worker.postMessage({type: 'turn', id, history, simulations: budget.simulations});
     });
   }
