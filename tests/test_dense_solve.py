@@ -346,6 +346,26 @@ class WorkerCountTests(unittest.TestCase):
                              max(1, dense_solve.physical_cores()-2))
 
 
+    def test_workers_follow_the_configured_variant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = new_run(Path(tmp)/'run', variant='reset')
+            now = [1000.]
+            coordinator = dense_solve.Pass(run, run, replace(SMALL, solve_workers_max=3), clock=lambda: now[0])
+            heartbeat = lambda variant, **status: write_json(run/f'learner-status{variant}.json',
+                                                           dict(updated_at=now[0], **status))
+            heartbeat('', stage='training', phase_rows=1000)
+            self.assertEqual(coordinator.workers()[0], 1)
+            heartbeat('-reset', stage='phase-idle', phase_rows=1000)
+            self.assertEqual(coordinator.workers()[0], 1)
+            heartbeat('-reset', stage='training', phase_rows=1000)
+            heartbeat('', stage='phase-idle', phase_rows=1000)
+            self.assertEqual(coordinator.workers()[0], 3)
+            heartbeat('-reset', stage='exporting', phase_rows=1000)
+            self.assertEqual(coordinator.workers()[0], 3)
+            now[0] += dense_solve.STALE_SECONDS+1
+            self.assertEqual(coordinator.workers()[0], 1)
+
+
 class RestartBufferTests(unittest.TestCase):
     def entry(self, ply, value, kind='attack', added_at=10.):
         return dict(shard='s', game=0, ply=ply, side_to_move=0, kind=kind, regret=dense_solve.regret(kind, value),

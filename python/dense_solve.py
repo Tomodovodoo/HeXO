@@ -13,7 +13,8 @@ REJECTED stops the pass; one that fails in any other way logs an error event and
 shard on its first attempt is pending or running (status shards_failed: {name: failed attempts}); after a second
 failure the coordinator skips it.
 
-Workers (Pass.workers). While the main learner's fresh heartbeat (learner-status.json, at most STALE_SECONDS old)
+Workers (Pass.workers). While the configured learner's fresh heartbeat (learner-status.json for main,
+learner-status-<variant>.json otherwise, at most STALE_SECONDS old)
 shows a phased learner (phase_rows > 0) in its training phase (stage 'training' or 'exporting'), the actors are
 paused and the pass runs solve_workers_max shard workers (0: physical cores minus 2); otherwise it runs
 solve_workers_min, so the actors keep the CPU. Workers beyond a lowered target are stopped at once; their shards
@@ -447,9 +448,10 @@ class Pass:
         return sorted(names, key=lambda n: self.failed[n])
 
     def workers(self):
-        """(shard workers, reason) from the main learner's heartbeat (module contract)."""
+        """(shard workers, reason) from the configured learner's heartbeat (module contract)."""
+        path = self.run/('learner-status.json' if self.variant == 'main' else f'learner-status-{self.variant}.json')
         try:
-            status = json.loads((self.run/'learner-status.json').read_text(encoding='utf-8'))
+            status = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             status = {}
         fresh = self.clock()-float(status.get('updated_at') or 0) <= STALE_SECONDS
