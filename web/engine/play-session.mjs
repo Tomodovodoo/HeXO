@@ -72,7 +72,7 @@ export class BrowserSession extends OfflineSession {
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
-    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graph = {key: null, generation: 0, searches: 0};
+    this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graph = {key: null, generation: null, searches: 0};
     this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
@@ -529,10 +529,11 @@ export class BrowserSession extends OfflineSession {
       // The move came back at `at`; saving it must not run its clock out.
       if (job.kind === 'move') clearTimeout(this.flag);
       if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
-      if (job.kind === 'analyse' && job.line != null) {
-        // The worker rebuilds a line's graph when its network or Q range floor changes (GameGraphs); so does this count.
+      if (job.kind === 'analyse' && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') {
+        // The worker rebuilds a line's graph when its network or Q range floor changes (GameGraphs); each graph gets a
+        // new generation, unique across reloads.
         const key = [job.line, this.engineKey(job.spec), job.spec.budget.q_range_floor ?? 0].join('|'), graph = this.graph;
-        if (graph.key !== key) Object.assign(graph, {key, generation: graph.generation + 1, searches: 0});
+        if (graph.key !== key) Object.assign(graph, {key, generation: uid(), searches: 0});
         graph.searches += job.refresh ? 0 : 1;
         result = {...result, graph: [graph.generation, graph.searches]};
       }
