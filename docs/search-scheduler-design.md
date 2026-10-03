@@ -353,6 +353,19 @@ Cost: selection at a node touches one line plus K times 32 bytes (six lines at K
 20-ply path, L1-resident; today about one megabyte per simulation. Memory per expanded node falls from 50 to 100 KB
 to about 450 bytes at the median K, so two million simulations fit in one gigabyte, and the phone budget sets K.
 
+### B.10 Order of the store changes (after Sol's second audit)
+
+First group the untouched moves: every unvisited edge without shared evidence gets the same mixed completed Q, so
+their improved-policy weight is one maintained sum of exp(logit) times exp(sigma(q_u)), and the best untouched
+candidate follows the stored logit order. The hot scan then covers only visited, pending, transposed and proven
+edges while every legal move stays available. Adaptive K (B.9) is the second step, measured separately, so the
+savings from layout are not confused with the savings from searching less. A rest entry is never a legal move and
+never evidence that omitted replies lose; the completeness bit governs loss by exhaustion.
+
+Rows record a root search estimate with provenance (kind, root, budget, visits of its own, inherited share); the
+learner constructs the value target from it as it does today (outcome, bootstrapped and calibrated forms), and a
+later qualified reanalysis may add a versioned target for the same position without changing the original.
+
 ## C. The scheduler's decision rule
 
 ### C.1 Views
@@ -477,6 +490,8 @@ Every fill pass orders candidate rows by class, then by priority within the clas
 3. Prefetch rows, priority P_fetch.
 
 Fill stops at the launch trigger (section D). Classes 2 and 3 never delay a launch that class 1 could make.
+
+Note: inside a halving round the second visit to a candidate needs the child's policy from the first and pending collisions force flushes, so 128 simulations take about 8 to 12 launches, not 4. Six's self-play search is Gumbel top-m with sequential halving at the root and PUCT below (tools/six/src/mcts.cpp:516) and is the reference for batching under that contract. The phase-barrier prototype runs on the current store, in parallel with the store work, with three counters: issued work, completed work and comparison credits.
 
 ## D. Batching
 
