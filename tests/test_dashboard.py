@@ -248,6 +248,37 @@ class OpeningBookPages(unittest.TestCase):
         with urlopen(f'http://127.0.0.1:{self.server.server_port}{path}?'+urlencode(dict(run='synthetic', **query))) as response:
             return json.load(response)
 
+    def test_scripts_load_while_data_requests_wait_for_shared_cache(self):
+        entered, release, second = threading.Event(), threading.Event(), threading.Event()
+        results, errors = [], []
+        def slow_project(_):
+            if entered.is_set(): second.set()
+            entered.set()
+            if not release.wait(5): raise TimeoutError('test did not release data request')
+            return dict(runs=[])
+        def request():
+            try: results.append(self.get('/api/project'))
+            except Exception as error: errors.append(error)
+        with patch('dashboard.project', side_effect=slow_project):
+            first = threading.Thread(target=request)
+            queued = threading.Thread(target=request)
+            first.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                queued.start()
+                for script in ('openings.js', 'book.js', 'game-lengths.js'):
+                    with urlopen(f'http://127.0.0.1:{self.server.server_port}/{script}', timeout=2) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(response.headers.get_content_type(), 'text/javascript')
+                        self.assertTrue(response.read())
+                self.assertFalse(second.is_set())
+            finally:
+                release.set()
+                first.join(5)
+                if queued.ident is not None: queued.join(5)
+        self.assertFalse(errors)
+        self.assertEqual(results, [dict(runs=[]), dict(runs=[])])
+
     def test_game_length_api_and_query_validation(self):
         folder = self.run/'shards/001'
         self.write(folder/'manifest.json', dict(origin='actor', created_at=100))
