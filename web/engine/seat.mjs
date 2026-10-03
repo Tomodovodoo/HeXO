@@ -47,10 +47,11 @@ const save = () => { failed = null; try { localStorage.setItem(STORE, JSON.strin
 const state = () => typeof S === 'undefined' ? null : S;
 const viewed = () => typeof view === 'undefined' ? 0 : view;
 const closeIcon = () => typeof icon === 'function' ? icon('close') : '×';
-/** The choice for browser engine `id`, keeping `current`'s preset and network when it chose the same engine. */
+/** The choice for browser engine `id`, keeping `current`'s preset and network when it chose the same engine. A network
+ * is checked against the entry's checkpoints once they are known; before its manifest arrives it is kept as given. */
 function pickEngine(id, current, checkpoint = null) {
-  const same = current?.engine === id, {checkpoints} = ENGINES.get(id).entry;
-  const network = [checkpoint, same ? current.checkpoint : null].find(c => checkpoints.includes(c)) ?? checkpoints[0] ?? null;
+  const same = current?.engine === id, {checkpoints} = ENGINES.get(id).entry, wanted = [checkpoint, same ? current.checkpoint : null];
+  const network = checkpoints.length ? wanted.find(c => checkpoints.includes(c)) ?? checkpoints[0] : wanted.find(Boolean) ?? null;
   return {engine: id, preset: same ? current.preset : 'standard', checkpoint: network};
 }
 const analysable = e => e.kind === 'bubble' || e.analysis;
