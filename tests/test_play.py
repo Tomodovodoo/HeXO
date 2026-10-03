@@ -1632,6 +1632,11 @@ class GameProofs(unittest.TestCase):
         line = [[-1, -11, 0, 1]] + [[*p[:3], p[3] + 1] for p in seven['pv']]
         self.assertEqual((six['proof'], six['value'], six['pv']), (dict(winner=0, turns=4, plies=14), 1., line))
         self.assertEqual((six['top'][0][:2], six['top'][0][3:]), ([-1, -11], [1., 1]))
+        saved = self.session.lookup(self.start)
+        self.assertEqual(saved['proof']['plies'], 14)
+        budget = dict(simulations=saved['simulations'], solver_nodes=saved['solver_nodes'])
+        self.session.save(self.start, self.session.engine_key(self.session.analysis), budget,
+                          dict(moves=[], value=.5, top=[], proof=None, pv=[], threat=[]), 'tiny')
         self.assertEqual(self.session.lookup(self.start)['proof']['plies'], 14)
         self.session.undo()
         self.assertEqual(len(self.session.history), 79)

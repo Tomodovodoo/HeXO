@@ -92,7 +92,8 @@ if (job.kind === 'encode') {
   await s.request('/import', {text: JSON.stringify({history: job.history})}, 'POST');
   const shown = () => s.state().evaluations[job.ply - 1];
   for (const ply of [job.ply, job.ply - 1]) { await s.request('/analyse', {ply}, 'POST'); await settle(); }
-  answer = {analysed: shown(), sent: [...sent]};
+  await s.record(s.history.slice(0, job.ply - 1), s.analysis, {moves: [], value: .5, top: [], proof: null, pv: [], threat: []});
+  answer = {analysed: shown(), sent: [...sent], kept: s.lookup(s.history.slice(0, job.ply - 1))?.proof ?? null};
   await s.request('/undo', {}, 'POST'); answer.undone = {length: s.history.length, shown: shown()};
   await s.request('/analysis', {engine: 'test', preset: 'quick'}, 'POST'); await s.request('/analyse', {ply: job.ply - 1}, 'POST'); await settle();
   answer.quick = {shown: shown(), saved: s.lookup(s.history.slice(0, job.ply - 1))};

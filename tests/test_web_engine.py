@@ -231,6 +231,7 @@ class BrowserProofs(unittest.TestCase):
         analysed = answer['analysed']
         self.assertEqual((analysed['proof'], analysed['value'], analysed['pv']), (dict(winner=0, turns=4, plies=14), 1, line))
         self.assertEqual((analysed['top'][0][:2], analysed['top'][0][3:]), ([-1, -11], [1, 1]))
+        self.assertEqual(answer['kept'], dict(winner=0, turns=4, plies=14))
         self.assertEqual(answer['sent'][0], 0)
         self.assertGreater(answer['sent'][1], 1)
         self.assertEqual(answer['undone']['length'], len(history) - 1)

@@ -270,10 +270,13 @@ export class BrowserSession extends OfflineSession {
     if (kind === 'analyse') this.cancelJobs(j => j.kind === 'analyse' && j.status !== 'failed' && (fields.tier ? j.tier : true));
     this.jobs.push({id: ++this.nextJob, kind, history: copy(history), spec: copy(spec), key, controller: new AbortController(), status: 'queued', done: 0, total: 1, ...fields});
   }
+  /** Saves `result` as the evaluation of `history` by `spec`; a saved evaluation holding a proof is kept over an unproven
+   * result of the same position, engine and budget. Resolves to the saved evaluation. */
   async record(history, spec, result) {
-    const record = {...result, id: this.cacheKey(history, spec), position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
+    const id = this.cacheKey(history, spec), saved = this.cache.get(id);
+    const record = saved?.proof && !result.proof ? saved : {...result, id, position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
-    this.indexRecord(record); this.proofs.add(history, record, `${record.id}|${record.saved_at}`); await this.storage.put('evaluations', record);
+    if (record !== saved) { this.indexRecord(record); this.proofs.add(history, record, `${record.id}|${record.saved_at}`); await this.storage.put('evaluations', record); }
     if (position(this.history.slice(0, history.length)) === position(history)) {
       this.records = this.records.filter(r => r.id !== record.id); this.records.push(record);
     }

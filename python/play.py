@@ -2728,9 +2728,14 @@ class Session:
 
     def save(self, history, weights, spent, found, model):
         """Save an evaluation, and the searches of the later stones of its turn (see `TurnSearch`) as evaluations
-        of those positions without solver checks; the proof table takes the proofs among them."""
+        of those positions without solver checks; the proof table takes the proofs among them. A saved evaluation
+        holding a proof is kept over an unproven one of the same position, engine and budget."""
         later = found.pop('later', [])
-        record = self.store.add(history, weights, spent, found | dict(model=model))
+        saved = self.store.get(history, weights, spent)
+        if saved and saved.get('proof') and not found.get('proof'):
+            record = saved
+        else:
+            record = self.store.add(history, weights, spent, found | dict(model=model))
         self.proofs.add(history, record)
         bare = weights.split(':')[0] + ':none' + (':kept' if weights.endswith(':kept') else '')
         for step in later:
