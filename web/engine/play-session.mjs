@@ -110,7 +110,7 @@ export class BrowserSession extends OfflineSession {
       clock: this.clockNow(), saved_game: this.saved_game, models_folder: null, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
       evaluations, review: turns, review_preset: REVIEW_PRESET,
-      jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side}) => ({id, kind, status, done, total, error, ply: history.length, side}))};
+      jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live}) => ({id, kind, status, done, total, error, ply: history.length, side, live}))};
   }
   static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings'].some(p => path === p || path.startsWith(p + '/')); }
   answer(path, body = {}) {
@@ -333,7 +333,7 @@ export class BrowserSession extends OfflineSession {
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
       try {
         result ||= await adapter.turn(copy(history), copy(job.spec.budget), {signal: job.controller.signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms: limit,
-          progress: f => { job.done = job.kind === 'review' ? job.cursor + f : f; this.onchange(this.state()); }});
+          progress: (f, live) => { job.done = job.kind === 'review' ? job.cursor + f : f; if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);
       const elapsed = Date.now() - start;

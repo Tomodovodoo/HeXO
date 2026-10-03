@@ -80,6 +80,14 @@ function proofTurns(plies, remaining, moverWins) {
   return Math.ceil((plies - remaining) / 4);
 }
 
+/** The root of the first stone's running search as the analysis panel shows it: {value (the mover's win chance), top}. */
+function rootRows(tree, choice) {
+  const {action, actions, policy, values} = tree.result(choice);
+  if (!action) return null;
+  const value = policy.reduce((sum, p, i) => sum + p * values[i], 0);
+  return {value: Math.round((value + 1) / 2 * 1e4) / 1e4, top: topRows(actions, policy, values, action)};
+}
+
 /** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms). */
 async function turn({id, history, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0}) {
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
@@ -115,7 +123,8 @@ async function turn({id, history, simulations, solverNodes, batchSize = 16, choi
         const stone = moves.length;
         const result = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
           evaluate: leaves => network.evaluate(leaves), stop: () => cancelled.has(id),
-          onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining)})});
+          onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
+            ...(stone ? {} : {live: rootRows(tree, choice)})})});
         check();
         ({action, policy, actions, values} = result);
         completed += result.completed;
