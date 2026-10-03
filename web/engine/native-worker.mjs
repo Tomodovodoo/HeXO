@@ -1,17 +1,24 @@
 /* Native in a Web Worker. A search runs to its end inside the module, so the page cancels a turn by ending this worker.
  * In: {type: 'load'} | {type: 'turn', id, history, ms, depth}.
- * Out: {type: 'progress', fraction} | {type: 'ready'} | {type: 'result', id, result} | {type: 'error', id?, message}.
+ * Out: {type: 'progress', fraction, stage} | {type: 'ready'} | {type: 'result', id, result} | {type: 'error', id?, message, stage?}
+ * (stages.mjs's download and compile).
  */
 import {NativeSearch} from './native/search.mjs';
 import {cached, wasmOptions} from './assets.mjs';
 import {files} from './native.mjs';
+import {Stages, errorReport} from './stages.mjs';
 
 let native;
 
 /** native.wasm through assets.mjs, checked against the digest web/engine/build.json records for it. */
 async function load() {
-  const [wasm] = await files();
-  native = await NativeSearch.create(wasmOptions(await cached(wasm, fraction => postMessage({type: 'progress', fraction}))));
+  const stages = new Stages(postMessage);
+  await stages.run(async () => {
+    stages.enter('download');
+    const [wasm] = await files(), bytes = await cached(wasm, stages.file(wasm.path));
+    stages.enter('compile');
+    native = await NativeSearch.create(wasmOptions(bytes));
+  });
 }
 
 onmessage = async ({data}) => {
@@ -23,6 +30,6 @@ onmessage = async ({data}) => {
       postMessage({type: 'result', id: data.id, result: native.turn(data.history, data.ms, data.depth)});
     }
   } catch (error) {
-    postMessage({type: 'error', id: data.id, message: String(error.message || error)});
+    postMessage(errorReport(error, data.id));
   }
 };

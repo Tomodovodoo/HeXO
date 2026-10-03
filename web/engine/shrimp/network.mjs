@@ -1,7 +1,7 @@
 /* Shrimp's network (tools/shrimp_web/export.py) under ONNX Runtime Web: WebGPU when the device has it, else
  * WebAssembly. */
 import {cached, json} from '../assets.mjs';
-import {runtime} from '../network.mjs';
+import {session} from '../network.mjs';
 
 const FEATURES = 15;
 
@@ -48,16 +48,13 @@ export class ShrimpNetwork {
   }
 
   /**
-   * Loads ONNX Runtime and the graph named by the manifest at `model` on `device` (network.mjs probe(); WebGPU runs
-   * the fp32 graph too). `progress(fraction)` reports downloads.
+   * Loads the graph named by the manifest at `model` on `device` (network.mjs probe(); WebGPU runs the fp32 graph too)
+   * with `ort` (network.mjs runtime() for its provider), reporting its download and session to `stages` (stages.mjs).
    */
-  static async create({model = 'shrimp/model/manifest.json', device, progress = () => {}, threads = null} = {}) {
-    const {manifest, file} = await ShrimpNetwork.files(model), shares = [0, 0];
-    const report = (i, f) => { shares[i] = f; progress(.3 * shares[0] + .7 * shares[1]); };
-    const [ort, graph] = await Promise.all([runtime(device.provider, threads, f => report(0, f)), cached(file, f => report(1, f))]);
-    const session = await ort.InferenceSession.create(new Uint8Array(graph), {executionProviders: [device.provider],
-      graphOptimizationLevel: 'all', enableCpuMemArena: true, logSeverityLevel: 3});
-    return new ShrimpNetwork(ort, session, manifest, device.provider, ort.env.wasm.numThreads);
+  static async create({model = 'shrimp/model/manifest.json', device, ort, stages}) {
+    stages.enter('download');
+    const {manifest, file} = await ShrimpNetwork.files(model), graph = await cached(file, stages.file(file.path));
+    return new ShrimpNetwork(ort, await session(ort, graph, device.provider, stages), manifest, device.provider, ort.env.wasm.numThreads);
   }
 
   constructor(ort, session, manifest, provider, threads) {

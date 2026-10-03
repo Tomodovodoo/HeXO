@@ -1,6 +1,7 @@
 /* Seal (Ramora0/HexTicTacToe) running in the browser: tools/seal_adapter.cpp compiled to seal/engine.wasm
  * (tools/build_web.py seal), searched in seal-worker.mjs. Seal's budget is a clock in ms. */
 import {json, pins, workerUrl} from './assets.mjs';
+import {watchdog, workerError} from './stages.mjs';
 
 export const PRESETS = {lightning: {ms: 100}, quick: {ms: 250}, standard: {ms: 1000}, strong: {ms: 3000}, deep: {ms: 10000},
   dangerous: {ms: 60000}};
@@ -68,16 +69,18 @@ export class SealEngine {
     this.calls = 0;
   }
 
-  /** Starts the worker and loads Seal (assets.mjs); `progress(fraction)` follows the wasm download. */
+  /** Starts the worker and loads Seal (assets.mjs); `progress(fraction, stage)` follows the download and the compile,
+   * and a stage that stays silent for its stages.mjs LIMITS entry fails the load. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
     const worker = this.worker = new Worker(workerUrl('seal-worker.mjs'), {type: 'module'});
     const ready = this.ready = new Promise((resolve, reject) => {
       this.abandon = reject;
+      const dog = watchdog(LABEL, reject);
       worker.onmessage = ({data}) => {
-        if (data.type === 'progress') progress(data.fraction);
-        else if (data.type === 'ready') { this.abandon = null; resolve(data.revision); }
-        else if (data.id === undefined) reject(new Error(data.message));
+        if (data.type === 'progress') { dog.watch(data.stage); progress(data.fraction, data.stage); }
+        else if (data.type === 'ready') { dog.stop(); this.abandon = null; resolve(data.revision); }
+        else if (data.id === undefined) { dog.stop(); reject(workerError(LABEL, data)); }
         else this.settle(data);
       };
       worker.onerror = event => this.fail(new Error(event.message || 'Seal worker failed'));

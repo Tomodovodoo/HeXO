@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from proof import VerificationTimeout
@@ -68,6 +69,48 @@ class NativeStrategy(unittest.TestCase):
                     independent_verify(cert, OPEN_THREE, deadline_seconds=0)
         with self.assertRaises(VerificationTimeout):
             independent_verify(result['certificate'], OPEN_THREE, deadline_seconds=0)
+
+    def test_cooperative_cancel_keeps_native_worker_available(self):
+        engine = NativeTactics()
+        self.assertFalse(engine.cancel())
+        results = []
+        history = [[0, 0], [4, 0], [7, 0], [-1, 0], [-2, 0], [1, 0], [5, 0], [6, 0], [-2, 1]]
+        query = threading.Thread(target=lambda: results.append(engine.history(history, nodes=10000000, ms=20000)))
+        query.start()
+        deadline = time.perf_counter()+2
+        while not engine.cancel() and query.is_alive() and time.perf_counter() < deadline:
+            time.sleep(.001)
+        query.join(2)
+        self.assertFalse(query.is_alive())
+        self.assertEqual(results[0]['status'], 'UNKNOWN')
+        self.assertIn('cancelled', results[0]['reason'])
+        self.assertFalse(engine.cancel())
+        next_result = engine.history(IMMEDIATE, nodes=1000, ms=1000)
+        self.assertEqual(next_result['status'], 'PROVEN_WIN', next_result)
+
+    def test_isolated_cancel_retains_child_for_the_next_query(self):
+        from tests.reference import interleave
+        ours = [(q,r) for r in (0,3,6,9) for q in range(3)] + [(12,0)]
+        theirs = [(-1,0)] + [(6+(i%3)*3,2+3*(i//3)) for i in range(13)]
+        history = [list(p) for p in interleave([ours,theirs])]
+        tactics = IsolatedTactics()
+        try:
+            tactics.history(NO_THREAT, ms=10000)
+            pid = tactics.process.pid
+            results = []
+            query = threading.Thread(target=lambda: results.append(tactics.history(
+                history, root_moves=[[3,0],[5,0]], nodes=1000000, ms=20000, table_mb=4)))
+            query.start()
+            time.sleep(.05)
+            self.assertTrue(tactics.cancel())
+            query.join(2)
+            self.assertFalse(query.is_alive())
+            self.assertEqual((results[0]['status'], results[0]['reason']), ('UNKNOWN', 'cancelled'))
+            self.assertEqual(tactics.stats['kills'], 0)
+            self.assertEqual(tactics.history(IMMEDIATE, ms=1000)['status'], 'PROVEN_WIN')
+            self.assertEqual(tactics.process.pid, pid)
+        finally:
+            tactics.close()
 
     def test_shortest_tightens_the_certificate_to_the_fewest_turns(self):
         loose = self.engine.history(LATE_WIN, nodes=32768, ms=20000)

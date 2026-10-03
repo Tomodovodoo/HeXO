@@ -10,6 +10,11 @@
 //! search.
 
 use super::io::Position;
+use super::Ctl;
+
+fn check_control(ctl: &Ctl) -> Result<(), String> {
+    if ctl.expired() { Err("certificate cancelled or deadline".into()) } else { Ok(()) }
+}
 use super::kernel::{AndEval, KernelCtx, Node, OrEval};
 use super::pn::{after_attacker, node_key_at};
 use crate::forcing::{CellSet2, WinDepthHints};
@@ -98,8 +103,9 @@ pub(crate) fn reconstruct(
     pos: &Position,
     wide: bool,
     proven: &mut FxHashSet<u64>,
+    ctl: &Ctl,
 ) -> Result<ProofCertificate, String> {
-    reconstruct_at(pos, wide, proven, None, None)
+    reconstruct_at(pos, wide, proven, None, None, ctl)
 }
 
 /// Reconstruct the strategy proved at one exact attacker-turn horizon. Unlike
@@ -111,8 +117,9 @@ pub(crate) fn reconstruct_bounded(
     wide: bool,
     proven: &mut FxHashSet<u64>,
     remaining: u8,
+    ctl: &Ctl,
 ) -> Result<ProofCertificate, String> {
-    reconstruct_at(pos, wide, proven, Some(remaining), None)
+    reconstruct_at(pos, wide, proven, Some(remaining), None, ctl)
 }
 
 /// Guided variant: nodes the search closed via certificate win-depth hints have
@@ -124,8 +131,9 @@ pub(crate) fn reconstruct_bounded_guided(
     proven: &mut FxHashSet<u64>,
     remaining: u8,
     hints: &WinDepthHints,
+    ctl: &Ctl,
 ) -> Result<ProofCertificate, String> {
-    reconstruct_at(pos, wide, proven, Some(remaining), Some(hints))
+    reconstruct_at(pos, wide, proven, Some(remaining), Some(hints), ctl)
 }
 
 fn reconstruct_at(
@@ -134,7 +142,9 @@ fn reconstruct_at(
     proven: &mut FxHashSet<u64>,
     remaining: Option<u8>,
     hints: Option<&WinDepthHints>,
+    ctl: &Ctl,
 ) -> Result<ProofCertificate, String> {
+    check_control(ctl)?;
     let k = KernelCtx::new_wide(
         &pos.stones,
         pos.attacker,
@@ -152,6 +162,7 @@ fn reconstruct_at(
     }
     let mut builder = ProofBuilder {
         k,
+        ctl,
         proven,
         hints,
         memo: FxHashMap::default(),
@@ -169,6 +180,7 @@ fn reconstruct_at(
 
 struct ProofBuilder<'a> {
     k: KernelCtx,
+    ctl: &'a Ctl,
     proven: &'a mut FxHashSet<u64>,
     hints: Option<&'a WinDepthHints>,
     memo: FxHashMap<u64, u32>,
@@ -190,6 +202,7 @@ impl ProofBuilder<'_> {
     }
 
     fn emit(&mut self, node: Node, remaining: Option<u8>) -> Result<u32, String> {
+        check_control(self.ctl)?;
         let key = node_key_at(self.k.hash(), node, remaining);
         if let Some(&id) = self.memo.get(&key) {
             return Ok(id);
@@ -222,6 +235,7 @@ impl ProofBuilder<'_> {
                     let mut choices = Vec::new();
                     let child_remaining = after_attacker(remaining);
                     for (move_index, action) in moves.iter().enumerate() {
+                        check_control(self.ctl)?;
                         self.k.place_attacker(action);
                         let child_node = Node::And;
                         let child_key = node_key_at(self.k.hash(), child_node, child_remaining);
@@ -286,6 +300,7 @@ impl ProofBuilder<'_> {
                     let mut responses = Vec::with_capacity(covers.len());
                     let mut depth = 0;
                     for cover in covers {
+                        check_control(self.ctl)?;
                         self.k.place_defender(&cover);
                         let child_node = Node::Or { placements: 2 };
                         let child_key = node_key_at(self.k.hash(), child_node, remaining);
@@ -324,11 +339,20 @@ impl ProofBuilder<'_> {
 /// `verify` recomputes the complete defense sets and node depths first, a line
 /// returned here is a concrete witness attaining the certificate's worst-case
 /// attacker-turn bound (ties retain deterministic certificate order).
+#[cfg(test)]
 pub(crate) fn worst_case_pv(
     pos: &Position,
     certificate: &ProofCertificate,
 ) -> Result<Vec<Coord>, String> {
-    replay_pv(pos, certificate, true)
+    worst_case_pv_controlled(pos, certificate, &Ctl::new(0.0))
+}
+
+pub(crate) fn worst_case_pv_controlled(
+    pos: &Position,
+    certificate: &ProofCertificate,
+    ctl: &Ctl,
+) -> Result<Vec<Coord>, String> {
+    replay_pv(pos, certificate, true, ctl)
 }
 
 /// Replay the certificate's shortest line: the primary (shortest retained)
@@ -337,11 +361,20 @@ pub(crate) fn worst_case_pv(
 /// certificate can exhibit — the natural "example winning line" for the UI.
 /// The certificate's worst-case bound is unchanged; this only picks the
 /// defender's fastest-losing replies instead of the longest-delay ones.
+#[cfg(test)]
 pub(crate) fn shortest_pv(
     pos: &Position,
     certificate: &ProofCertificate,
 ) -> Result<Vec<Coord>, String> {
-    replay_pv(pos, certificate, false)
+    shortest_pv_controlled(pos, certificate, &Ctl::new(0.0))
+}
+
+pub(crate) fn shortest_pv_controlled(
+    pos: &Position,
+    certificate: &ProofCertificate,
+    ctl: &Ctl,
+) -> Result<Vec<Coord>, String> {
+    replay_pv(pos, certificate, false, ctl)
 }
 
 /// Shared DAG replay for [`worst_case_pv`] / [`shortest_pv`]. `worst_case`
@@ -351,14 +384,17 @@ fn replay_pv(
     pos: &Position,
     certificate: &ProofCertificate,
     worst_case: bool,
+    ctl: &Ctl,
 ) -> Result<Vec<Coord>, String> {
-    verify(pos, certificate)?;
+    verify_controlled(pos, certificate, ctl)?;
 
     fn depth(
         certificate: &ProofCertificate,
         id: u32,
         memo: &mut FxHashMap<u32, u32>,
+        ctl: &Ctl,
     ) -> Result<u32, String> {
+        check_control(ctl)?;
         if let Some(&known) = memo.get(&id) {
             return Ok(known);
         }
@@ -369,11 +405,11 @@ fn replay_pv(
         let value = match node {
             ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable { .. } => 1,
             ProofNode::AttackerMove { child, .. } => {
-                1u32.saturating_add(depth(certificate, *child, memo)?)
+                1u32.saturating_add(depth(certificate, *child, memo, ctl)?)
             }
             ProofNode::DefenderReplies { responses } => responses
                 .iter()
-                .map(|response| depth(certificate, response.child, memo))
+                .map(|response| depth(certificate, response.child, memo, ctl))
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .max()
@@ -384,7 +420,7 @@ fn replay_pv(
     }
 
     let mut depths = FxHashMap::default();
-    depth(certificate, certificate.root, &mut depths)?;
+    depth(certificate, certificate.root, &mut depths, ctl)?;
     let mut k = KernelCtx::new_wide(
         &pos.stones,
         pos.attacker,
@@ -396,6 +432,7 @@ fn replay_pv(
     let mut id = certificate.root;
     let mut pv = Vec::new();
     loop {
+        check_control(ctl)?;
         let node = certificate
             .nodes
             .get(id as usize)
@@ -455,7 +492,16 @@ pub fn verify_with_limit(
     certificate: &ProofCertificate,
     node_limit: usize,
 ) -> Result<ProofSummary, String> {
-    verify_with_limit_and_hints(pos, certificate, node_limit, false)
+    verify_with_limit_and_hints(pos, certificate, node_limit, false, &Ctl::new(0.0))
+        .map(|(summary, _, _)| summary)
+}
+
+pub(crate) fn verify_controlled(
+    pos: &Position,
+    certificate: &ProofCertificate,
+    ctl: &Ctl,
+) -> Result<ProofSummary, String> {
+    verify_with_limit_and_hints(pos, certificate, DEFAULT_VERIFY_NODE_LIMIT, false, ctl)
         .map(|(summary, _, _)| summary)
 }
 
@@ -464,8 +510,9 @@ pub fn verify_with_limit(
 pub(crate) fn verify_with_hints(
     pos: &Position,
     certificate: &ProofCertificate,
+    ctl: &Ctl,
 ) -> Result<(ProofSummary, WinDepthHints, Vec<GuidedOrNode>), String> {
-    verify_with_limit_and_hints(pos, certificate, DEFAULT_VERIFY_NODE_LIMIT, true)
+    verify_with_limit_and_hints(pos, certificate, DEFAULT_VERIFY_NODE_LIMIT, true, ctl)
 }
 
 fn verify_with_limit_and_hints(
@@ -473,7 +520,9 @@ fn verify_with_limit_and_hints(
     certificate: &ProofCertificate,
     node_limit: usize,
     collect_guidance: bool,
+    ctl: &Ctl,
 ) -> Result<(ProofSummary, WinDepthHints, Vec<GuidedOrNode>), String> {
+    check_control(ctl)?;
     if certificate.version != CERTIFICATE_VERSION {
         return Err(format!(
             "unsupported proof certificate version {}",
@@ -504,6 +553,7 @@ fn verify_with_limit_and_hints(
     .ok_or("could not build the proof-verification kernel")?;
     let mut verifier = ProofVerifier {
         certificate,
+        ctl,
         k,
         seen_states: FxHashMap::default(),
         verified_depths: FxHashMap::default(),
@@ -525,8 +575,9 @@ fn verify_with_limit_and_hints(
         ));
     }
     if collect_guidance {
-        let primary = primary_reachable(certificate);
+        let primary = primary_reachable(certificate, ctl)?;
         for node in &mut verifier.or_nodes {
+            check_control(ctl)?;
             node.primary = primary.contains(&node.id);
         }
     }
@@ -540,6 +591,7 @@ fn verify_with_limit_and_hints(
 
 struct ProofVerifier<'a> {
     certificate: &'a ProofCertificate,
+    ctl: &'a Ctl,
     k: KernelCtx,
     seen_states: FxHashMap<u32, (Node, Vec<(Coord, Player)>)>,
     verified_depths: FxHashMap<u32, u32>,
@@ -553,6 +605,7 @@ struct ProofVerifier<'a> {
 
 impl ProofVerifier<'_> {
     fn walk(&mut self, id: u32, expected: Node) -> Result<u32, String> {
+        check_control(self.ctl)?;
         let proof = self
             .certificate
             .nodes
@@ -622,6 +675,7 @@ impl ProofVerifier<'_> {
                 let mut primary_depth = None;
                 let mut ranked_actions = Vec::with_capacity(choices.len());
                 for response in choices {
+                    check_control(self.ctl)?;
                     let action = parse_action(&response.action)?;
                     if !supplied.insert(action) {
                         return Err(format!("node {id}: duplicate attacker alternative"));
@@ -664,6 +718,7 @@ impl ProofVerifier<'_> {
                 };
                 let mut supplied = FxHashMap::default();
                 for response in responses {
+                    check_control(self.ctl)?;
                     let action = parse_action(&response.action)?;
                     if supplied.insert(action, response.child).is_some() {
                         return Err(format!("node {id}: duplicate defender response"));
@@ -679,6 +734,7 @@ impl ProofVerifier<'_> {
                 let mut max_depth = 0;
                 let mut ranked_covers = Vec::with_capacity(covers.len());
                 for cover in covers {
+                    check_control(self.ctl)?;
                     let child = supplied[&cover];
                     self.k.place_defender(&cover);
                     self.edges += 1;
@@ -744,10 +800,11 @@ impl ProofVerifier<'_> {
 
 /// Nodes in the certificate's recommended all-defense strategy: primary attack
 /// at OR nodes, every response at AND nodes.
-fn primary_reachable(certificate: &ProofCertificate) -> FxHashSet<u32> {
+fn primary_reachable(certificate: &ProofCertificate, ctl: &Ctl) -> Result<FxHashSet<u32>, String> {
     let mut reached = FxHashSet::default();
     let mut pending = vec![certificate.root];
     while let Some(id) = pending.pop() {
+        check_control(ctl)?;
         if !reached.insert(id) {
             continue;
         }
@@ -760,7 +817,7 @@ fn primary_reachable(certificate: &ProofCertificate) -> FxHashSet<u32> {
             ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable { .. } => {}
         }
     }
-    reached
+    Ok(reached)
 }
 
 fn parse_action(cells: &[Coord]) -> Result<CellSet2, String> {
@@ -776,6 +833,31 @@ fn parse_action(cells: &[Coord]) -> Result<CellSet2, String> {
 #[cfg(test)]
 mod tests {
     use super::ProofNode;
+
+    #[test]
+    fn reconstruction_verification_and_pv_share_cancellation() {
+        use super::*;
+        let pos=Position {
+            stones:(0..5).map(|q|((q,0),Player::P1)).collect(),
+            attacker:Player::P1, placements_remaining:2,
+            config:super::super::io::PosConfig {win_length:6,placement_radius:8,max_moves:u32::MAX},
+        };
+        let kernel=KernelCtx::new_wide(&pos.stones,pos.attacker,6,8,true).unwrap();
+        let mut proven=FxHashSet::default();
+        proven.insert(node_key_at(kernel.hash(),Node::Or{placements:2},None));
+        let ctl=Ctl::new(0.0);
+        let certificate=reconstruct(&pos,true,&mut proven,&ctl).unwrap();
+        assert!(verify_controlled(&pos,&certificate,&ctl).is_ok());
+        for deadline in [false,true] {
+            let mut stopped=Ctl::new(0.0);
+            if deadline { stopped.deadline=Some(std::time::Instant::now()); }
+            else { stopped.cancel.store(true,std::sync::atomic::Ordering::Release); }
+            assert!(reconstruct(&pos,true,&mut proven,&stopped).is_err());
+            assert!(verify_controlled(&pos,&certificate,&stopped).is_err());
+            assert!(shortest_pv_controlled(&pos,&certificate,&stopped).is_err());
+            assert!(worst_case_pv_controlled(&pos,&certificate,&stopped).is_err());
+        }
+    }
 
     #[test]
     fn legacy_attacker_node_defaults_to_no_alternatives() {
