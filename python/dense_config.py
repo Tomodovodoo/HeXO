@@ -43,6 +43,11 @@ class ActorSettings:
     search_choice: str = 'gumbel'  # final move: Gumbel score or highest improved search policy ('policy')
     q_range_floor: float = 0.    # least Q range of the completed-Q rescale, 0 to 2 (neural_search); 0 keeps mctx's
     root_noise: float = 0.       # full searches' uniform share of root sampling, [0, 1) (neural_search); 0 = prior
+    # game_graph > 0: each game's trees are shared game graphs (neural_search.GameGraph) keeping at most that many
+    # expanded nodes between searches; 0 keeps one tree per model, pruned on every advance. pv_check (needs a game
+    # graph): share of a full search's simulations its principal-variation check takes (neural_search.Recheck).
+    game_graph: int = 0
+    pv_check: float = 0.
     cache_positions: int = 4096
     shard_games: int = 32
     opening_random_plies: float = 2.  # mean of an exponential; sampled from the search policy
@@ -117,6 +122,8 @@ class ActorSettings:
             raise ValueError('q_range_floor must lie in [0, 2]')
         if not 0 <= self.root_noise < 1:
             raise ValueError('root_noise must lie in [0, 1)')
+        if self.game_graph < 0 or not 0 <= self.pv_check < .5 or self.pv_check and not self.game_graph:
+            raise ValueError('game_graph must be nonnegative and pv_check in [0, 0.5) with a game graph')
         if self.cheap_root_samples < 1 or self.solver_leaf_nodes < 0:
             raise ValueError('cheap_root_samples must be positive and solver_leaf_nodes nonnegative')
         if self.net_kernels not in ('reference', 'fused'):

@@ -66,10 +66,19 @@ class FakeEngines:
 
     def __init__(self):
         self.calls, self.turns, self.lines, self.hold, self.release = [], [], [], False, threading.Event()
+        self.games, self.refreshes, self.graph = [], [], (None, 0)
 
-    def evaluate(self, entry, checkpoint, budget, history, watch, live=None, keep=False, line=None, known=None):
+    def evaluate(self, entry, checkpoint, budget, history, watch, live=None, keep=False, line=None, known=None,
+                 game=None, refresh=None, used=None):
         self.calls.append((checkpoint, dict(budget), [tuple(p) for p in history]))
         self.lines.append(line)
+        self.games.append(game)
+        if refresh is not None:
+            self.refreshes.append(len(history))
+        if game is not None:   # one graph per game, a new one when the weights change, as Engines.game_graph
+            if self.graph[0] != (game, checkpoint):
+                self.graph = (game, checkpoint), self.graph[1] + 1
+            used.append(self.graph[1])
         while self.hold and not self.release.is_set():
             watch(1)
             time.sleep(.01)
@@ -405,6 +414,63 @@ class Jobs(unittest.TestCase):
         self.assertIsNone(self.session.analyse(1))
         self.assertEqual(self.session.state()['evaluations'][1]['simulations'], PRESETS['bubble']['deep']['simulations'])
 
+    def test_an_analysis_refreshes_the_saved_positions_before_it(self):
+        self.session.configure_seat(1, 'human')
+        for move in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 1)]:
+            self.session.play(*move)
+        for ply in (1, 3):
+            self.session.analyse(ply, force=True)
+            wait(lambda: not self.session.state()['jobs'])
+        self.engines.refreshes.clear()
+        self.session.analyse(6, force=True)
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(self.engines.refreshes, [3])
+        self.assertEqual(set(self.engines.games), {self.session.analysis_line})
+        # Ply 1 is too far back to be refreshed at once, and the refresh at 3 searched the graph after 6 was saved;
+        # viewing 1 again searches the graph there again, which in turn leaves 3 and 6 behind.
+        self.assertEqual(self.session.state()['stale'], [1, 6])
+        self.session.analyse(1)
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(self.engines.refreshes, [3, 1])
+        self.assertEqual(self.session.state()['stale'], [3, 6])
+        # Another network's graph, then a rebuilt one for the first: neither stales what the first graph saved.
+        self.session.configure_analysis('bubble:fake', 'main/000001', auto=False)
+        self.session.analyse(6, force=True)
+        wait(lambda: not self.session.state()['jobs'])
+        self.session.configure_analysis('bubble:fake', auto=False)
+        self.session.analyse(6, force=True)
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(self.session.state()['stale'], [])
+        # A deepening tier's evaluation is refreshed under its own key and budget.
+        session, deep = self.session, PRESETS['bubble']['deep']
+        key = session.engine_key(session.analysis) + ':kept'
+        session.store.add(session.history[:4], key, deep, dict(value=.5, moves=[[9, 9]], top=[], pv=[], threat=[],
+                                                             proof=None, graph=[session.instance, session.analysis_graph, 0]))
+        self.assertEqual(session.state()['stale'], [4])
+        session.analyse(4)
+        wait(lambda: not session.state()['jobs'])
+        refreshed = session.store.get(session.history[:4], key, deep)['graph']
+        self.assertEqual(refreshed[2], session.graph_searches[session.analysis_graph])
+        self.assertEqual(session.state()['stale'], [6])
+        session.new_lines()   # undo, a new or loaded game: the next analysis searches a new graph
+        self.assertEqual(session.state()['stale'], [])
+        line = self.session.analysis_line
+        self.session.undo()
+        self.assertNotEqual(self.session.analysis_line, line)
+
+    def test_a_cancelled_analysis_still_counts_its_graph_search(self):
+        self.session.configure_seat(1, 'human')
+        for move in [(0, 0), (1, 0), (2, 0)]:
+            self.session.play(*move)
+        self.session.analyse(1, force=True)
+        wait(lambda: not self.session.state()['jobs'])
+        self.engines.hold = True
+        job = self.session.analyse(3, force=True)
+        wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']))
+        self.session.cancel(job)
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(self.session.state()['stale'], [1])
+
     def test_evaluations_follow_the_weights_not_the_name(self):
         self.session.configure_seat(1, 'human')
         self.session.analyse(0)
@@ -431,7 +497,8 @@ class Jobs(unittest.TestCase):
         self.session.analyse(3)
         self.engines.release.set()
         wait(lambda: not self.session.state()['jobs'])
-        self.assertEqual([len(call[2]) for call in self.engines.calls], [5, 3, 4, 2, 1, 0])
+        # The review's evaluations came from fresh trees, so the analysis at 3 refreshes none of them.
+        self.assertEqual(([len(call[2]) for call in self.engines.calls], self.engines.refreshes), ([5, 3, 4, 2, 1, 0], []))
 
     def test_changing_the_analysis_engine_cancels_its_old_work(self):
         self.session.configure_seat(1, 'human')
@@ -597,9 +664,10 @@ class Jobs(unittest.TestCase):
                           and j['status'] == 'queued'])
 
     def test_a_preset_without_a_solver_verdict_is_not_deepened_again(self):
-        def unsolved(entry, checkpoint, budget, history, watch, live=None, keep=False, line=None, known=None):
+        def unsolved(entry, checkpoint, budget, history, watch, live=None, keep=False, line=None, known=None, game=None,
+                     used=None):
             found, spent, key = FakeEngines.evaluate(self.engines, entry, checkpoint, budget, history, watch, keep=keep,
-                                                     line=line)
+                                                     line=line, game=game, used=used)
             return found, spent | dict(solver_nodes=0), key
         self.engines.evaluate = unsolved
         self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
@@ -836,8 +904,8 @@ class Ranked:
         return out
 
 
-class GameTrees(unittest.TestCase):
-    """A seat's game tree (Engines.game_trees) on the native search with a fake network."""
+class GameGraphs(unittest.TestCase):
+    """A seat's game graph (Engines.game_graph) on the native search with a fake network."""
 
     def setUp(self):
         from types import SimpleNamespace
@@ -856,7 +924,7 @@ class GameTrees(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def turn(self, history, line):
-        """Bubble's turn at `history` on `line` at 128 simulations; the visits each stone's search started from are
+        """Bubble's turn at `history` on `line` at 128 simulations; the visits each search pass started from are
         in `seen`."""
         self.seen.clear()
         entry = dict(kind='bubble', path=Path(RUN.name))
@@ -865,27 +933,88 @@ class GameTrees(unittest.TestCase):
         self.assertTrue(weights.endswith(':kept'))
         return [*history, *map(tuple, found['moves'])]
 
+    def graph(self, line):
+        return self.engines.graphs[('seat', line)][1]
+
     def test_the_next_turn_starts_from_the_visits_under_the_reply(self):
         history = self.turn([(0, 0)], 1)
         self.assertEqual(self.seen[0], 0)
-        tree = self.engines.games[1][1]
+        graph = self.graph(1)
         reply = legal_turn(history)
         history += map(tuple, reply)
         self.turn(history, 1)
-        self.assertIs(self.engines.games[1][1], tree)
+        self.assertIs(self.graph(1), graph)
         self.assertGreater(self.seen[0], 0)
 
-    def test_undo_a_new_game_and_a_new_line_start_afresh(self):
+    def test_a_line_returns_to_earlier_positions_and_a_new_line_starts_afresh(self):
         history = self.turn([(0, 0)], 1)
         history += map(tuple, legal_turn(history))
-        tree = self.engines.games[1][1]
+        graph = self.graph(1)
         self.turn(history[:1], 1)
-        self.assertEqual(self.seen[0], 0)
-        self.assertIsNot(self.engines.games[1][1], tree)
+        self.assertGreater(self.seen[0], 0)
+        self.assertIs(self.graph(1), graph)
         self.turn(history, 2)
         self.assertEqual(self.seen[0], 0)
         self.turn([(0, 0)], 3)
-        self.assertEqual(list(self.engines.games), [2, 3])
+        self.turn([(0, 0)], 4)
+        self.assertEqual(list(self.engines.graphs), [('seat', 2), ('seat', 3), ('seat', 4)])
+        self.assertIsNone(graph.ptr)
+
+
+CHAMPION = Path(os.environ.get('HEXO_RUN', Path(__file__).resolve().parents[1] / 'runs' / 'dense-v1')) / \
+    'checkpoints' / 'main' / '185000' / 'ema.pt'
+
+
+@unittest.skipUnless(CHAMPION.exists(), 'needs the main/185000 checkpoint of runs/dense-v1 (or of the run HEXO_RUN names)')
+class GraphAnalysis(unittest.TestCase):
+    """Analysis on one game graph with the real network on CPU. At A, yellow to move, a deep fresh search plays
+    [-2, 0] then [1, 0] at 87 percent; the position C after that turn is about even once searched as a root."""
+
+    def setUp(self):
+        self.a = import_history('version[1];\n1. [4,0][7,0];\n2. [0,-1][0,-2];\n3. [0,-3][6,0];\n4. [-1,0][5,0];\n'
+                                '5. [-2,1][-1,-1];')
+        self.c = [*self.a, (-2, 0), (1, 0)]
+        self.engines = Engines('cpu', tactical_package=Path(RUN.name) / 'missing')
+        self.addCleanup(self.engines.close)
+        self.entry = dict(kind='bubble', path=CHAMPION.parents[3])
+
+    def evaluate(self, history, simulations, refresh=None):
+        return self.engines.evaluate(self.entry, 'main/185000', dict(simulations=simulations, solver_nodes=0), history,
+                                     lambda n: None, game=1, **({'refresh': refresh} if refresh else {}))[0]
+
+    def turn(self):
+        """{stone: (completed Q as yellow's win chance, visits)} of the turn's two stones at A, and A's visits."""
+        graph = self.engines.graphs[1][1]
+        graph.at(self.a)
+        stats = graph.result(0, 0, 0, 0)
+        found = {stone: ((stats['completed_q'][i] + 1) / 2, int(stats['visits'][i]))
+                 for stone in ((-2, 0), (1, 0)) for i in [stats['actions'].tolist().index(list(stone))]}
+        return found, int(stats['visits'].sum())
+
+    def test_a_search_after_the_turn_lowers_the_turn_start(self):
+        deep = self.evaluate(self.c, 512)
+        self.assertLess(deep['value'], .55)
+        self.assertLess(self.evaluate(self.a, 256)['value'], .8)
+        for value, _ in self.turn()[0].values():
+            self.assertLess(value, .7)   # 87 percent before; C's value reaches A through the visits A gives it
+
+    def test_stepping_back_after_the_turn_redoes_the_turn_start(self):
+        # A, then C two stones on, then back at A: A's turn stones now carry C's search, and A's own search goes on
+        # from its counts instead of starting again.
+        first = self.evaluate(self.a, 256)
+        before, visits = self.turn()
+        self.evaluate(self.c, 512)
+        after, _ = self.turn()
+        again = self.evaluate(self.a, 512, refresh=dict(first, simulations=512, solver_nodes=0))   # as saved
+        resumed, total = self.turn()
+        self.assertGreater(total, visits + 128)
+        for stone in before:
+            self.assertLess(after[stone][0], .65)
+            self.assertLess(after[stone][0], before[stone][0])
+            self.assertGreaterEqual(resumed[stone][1], after[stone][1])
+        self.assertNotIn(tuple(again['moves'][0]), before)
+        shares = {tuple(row[:2]): row[2] for row in again['top']}
+        self.assertTrue(all(shares.get(stone, 0.) < .5 for stone in before))
 
 
 class Http(unittest.TestCase):
@@ -1757,9 +1886,9 @@ class TurnTrees(unittest.TestCase):
         from play import TurnSearch, solve
         actions = np.array([[1, 0], [2, 0]])
         results = iter([dict(action=[1, 0], policy=np.array([.6, .4]), actions=actions, values=np.array([.1, .2]),
-                             proven=0, exact_winner=-1, proof_plies=0),
+                             completed_q=np.array([.1, .2]), proven=0, exact_winner=-1, proof_plies=0),
                         dict(action=[2, 0], policy=np.array([0., 1.]), actions=actions, values=np.array([0., 1.]),
-                             proven=1, exact_winner=1, proof_plies=5)])
+                             completed_q=np.array([0., 1.]), proven=1, exact_winner=1, proof_plies=5)])
         turn = TurnSearch(None, None, [(0, 0)], 1, solve(None, [(0, 0)], 0), trees=lambda *a: (None, 1))
         try:
             turn.take(next(results))
@@ -1951,25 +2080,27 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(sorted(asked), sorted((position_text(h), side) for h in histories[:2] for side in ('mover', 'opponent')))
         self.assertTrue(all(f['solved'] for f in found))
 
-    def test_kept_trees_run_only_the_simulations_they_lack(self):
+    def test_a_tier_runs_only_the_simulations_its_root_lacks(self):
         from play import evaluate
         engines, bubble, history = Engines('cpu'), self.bubble(), [(0, 0)]
         self.addCleanup(engines.close)
         for tier in (8, 32, 128):
-            evaluate(bubble, None, history, tier, 0, trees=engines.kept_trees(bubble, history))
-        first = self.trees[0]
-        self.assertEqual([h for h, _, _ in first.searched], [[(0, 0)]] * 3)
-        self.assertEqual(sum(1 for t in self.trees if t.history == [(0, 0)]), 1)
-        self.assertGreaterEqual(first.searched[-1][2], 128)
-        self.assertLess(first.searched[-1][2], 128 + 16)
-        engines.kept_trees(bubble, [(0, 0), (1, 0)])
-        self.assertIsNone(first.ptr)
-        trees = engines.kept_trees(bubble, [(0, 0)], 'abc')
+            evaluate(bubble, None, history, tier, 0, trees=engines.game_graph(bubble, 1, keep=True))
+        graph = engines.graphs[1][1]
+        visits = int(graph.result(0, 0, 0, 0)['visits'].sum())
+        self.assertGreaterEqual(visits, 128)
+        # Both roots of the turn already hold 128 visits, so one more tier runs one simulation at each; the second
+        # stone's also counts at the first stone's edge.
+        evaluate(bubble, None, history, 128, 0, trees=engines.game_graph(bubble, 1, keep=True))
+        graph.at(history)
+        self.assertEqual(int(graph.result(0, 0, 0, 0)['visits'].sum()), visits + 2)
+        trees = engines.game_graph(bubble, 1, 'abc', keep=True)
         tree, missing = trees([(0, 0)], 32, bubble.evaluator)
+        self.assertIsNot(tree, graph)
+        self.assertIsNone(graph.ptr)
+        self.assertEqual(missing, 32)
         tree.search(10, root_samples=16, batch_size=16)
         self.assertEqual(trees([(0, 0)], 32, bubble.evaluator), (tree, 32 - int(tree.result(0, 0, 0, 0)['visits'].sum())))
-        engines.kept_trees(bubble, [(0, 0)], 'def')
-        self.assertIsNone(tree.ptr)
 
     def test_rows_put_proven_wins_first_and_proven_losses_last(self):
         import numpy as np

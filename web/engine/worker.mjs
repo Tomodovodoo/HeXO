@@ -7,7 +7,7 @@
  *     | {type: 'error', id?, message, stage?}: stages.mjs's loading stages; a stage in an error is where it stopped.
  */
 import createModule from './gumbel.mjs';
-import {Native, NeuralSearch, EvaluationCache, GameTrees} from './search.mjs';
+import {Native, NeuralSearch, EvaluationCache, GameGraphs, PV_CHECK} from './search.mjs';
 import {Network, probe, runtime} from './network.mjs';
 import {Stages, errorReport, stall} from './stages.mjs';
 import {principalVariation, topRows, Proofs, answered, settled, proofTurns} from './proof.mjs';
@@ -83,10 +83,10 @@ const searched = r => verified(r) || VERDICTS.has(r.reason);
 
 /** The root of the first stone's running search as the analysis panel shows it: {value (the mover's win chance), top}. */
 function rootRows(tree, choice) {
-  const {action, actions, policy, values} = tree.result(choice);
+  const {action, actions, policy, values, completed_q} = tree.result(choice);
   if (!action) return null;
   const value = policy.reduce((sum, p, i) => sum + p * values[i], 0);
-  return {value: Math.round((value + 1) / 2 * 1e4) / 1e4, top: topRows(actions, policy, values, action)};
+  return {value: Math.round((value + 1) / 2 * 1e4) / 1e4, top: topRows(actions, policy, completed_q, action)};
 }
 
 /** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms),
@@ -109,8 +109,8 @@ async function turn(request) {
   }
 }
 
-/** The search of `turn`, with `line` (a seat's game, see GameTrees) continuing that game's tree as a play.py seat does;
- * without it the turn searches a tree of its own. `known` (Proofs.list() of the game's table, or null) answers a
+/** The search of `turn`, with `line` (a seat's or the analysis board's game, see GameGraphs) searching that game's graph
+ * with the principal-variation check PV_CHECK as play.py does; without it the turn searches a tree of its own. `known` (Proofs.list() of the game's table, or null) answers a
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
@@ -121,7 +121,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   if (state.winner >= 0) throw new Error('The game has finished');
   const table = known ? new Proofs(known) : null, given = answered(native, history, table);
   if (given) return {...given, ms: Math.round(performance.now() - start)};
-  let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null;
+  let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null, touched = null;
   let failure = null;
   const note = r => { if (r.reason?.startsWith(FAILED)) failure = r.reason; return r; };
   const timed = ms != null, end = start + (ms ?? 0), solverEnd = start + .25 * (ms ?? 0);
@@ -182,18 +182,22 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       };
       if (simulations) {
         tree ??= line == null ? new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current})
-          : games.tree(line, current, {seed: 1740, tactics: true, qRangeFloor});
-        const evaluate = leaves => network.evaluate(leaves);
-        const unmarked = await tree.settle(table ? table.edges(current) : new Map(), {evaluate, cache, version: network.version});
+          : games.graph(line, current, {seed: 1740, tactics: true, qRangeFloor, model: network.version});
+        const evaluate = leaves => network.evaluate(leaves), edges = table ? table.edges(current) : new Map();
+        // `touched` names the game graph once this turn changed its statistics: marks settled, or a batch backed up.
+        const unmarked = await tree.settle(edges, {evaluate, cache, version: network.version});
+        if (line != null && edges.size) touched = tree.id;
         check();
         const result = settled(await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
+          ...(line == null ? {} : {pvCheck: PV_CHECK}),
           evaluate, prove, stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
-          onBatch: () => postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
-            ...(stone ? {} : {live: rootRows(tree, choice)})})}), unmarked, local.player);
+          onBatch: () => (line != null && (touched = tree.id), postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
+            ...(stone ? {} : {live: rootRows(tree, choice)})}))}), unmarked, local.player);
+        if (line != null && result.completed) touched = tree.id;
         check();
         completed += result.completed;
         if (result.action) {
-          ({action, policy, actions, values} = result);
+          ({action, policy, actions, completed_q: values} = result);
           stoneValue = result.proven ? result.proven : result.exact_winner >= 0 ? (result.exact_winner === local.player ? 1 : -1)
             : policy.reduce((sum, p, i) => sum + p * result.values[i], 0);
           if (proof === null && (result.proven > 0 || (result.proven < 0 && !moves.length))) {
@@ -210,6 +214,13 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       current.push([action[0], action[1]]);
       tree?.advance(action);
     }
+    if (line != null && tree && moves.length > 1 && !given) {
+      // The later stones' searches changed the graph under the first root: read that root again.
+      tree.at(history.map(p => [...p]));
+      const root = tree.result(choice);
+      top = topRows(root.actions, root.policy, root.completed_q, moves[0]);
+      value = (root.policy.reduce((sum, p, i) => sum + p * root.values[i], 0) + 1) / 2;
+    }
     if (proof) value = proof.winner === player ? 1 : 0;
     if (proof && !pv.length) {
       const after = table?.known([...history, ...moves]);
@@ -217,7 +228,12 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       if (after?.winner === proof.winner) pv.push(...after.pv.map(([q, r, side, ply]) => [q, r, side, ply + moves.length]));
     }
     return {moves, value: Math.round(value * 1e4) / 1e4, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
-      actual_completed: completed, actual_solver_nodes: solverUsed, ...(failure ? {solver_error: failure} : {})};
+      actual_completed: completed, actual_solver_nodes: solverUsed, graph_id: touched,
+      ...(failure ? {solver_error: failure} : {})};
+  } catch (error) {
+    // A turn that stops after touching its game graph names the graph, so the session can count that search.
+    if (error && typeof error === 'object') error.graph = touched;
+    throw error;
   } finally {
     if (line == null) tree?.close();
   }
@@ -264,7 +280,7 @@ async function load(options = {}) {
     ort = await runtime(device.provider, options.threads, stages);
     await use(options.model, stages);
     cache = new EvaluationCache(4096);
-    games = new GameTrees(native);
+    games = new GameGraphs(native);
     stages.enter('warmup', device.provider);
     const t = performance.now();
     for (const history of [[[0, 0]], [[0, 0], [1, 0], [0, 1], [5, 0], [6, 0]]]) {
@@ -311,7 +327,8 @@ onmessage = async ({data}) => {
       }
     }
   } catch (error) {
-    postMessage(error instanceof Cancelled ? {type: 'cancelled', id: data.id} : errorReport(error, data.id));
+    const graph = error?.graph ? {graph: error.graph} : {};
+    postMessage(error instanceof Cancelled ? {type: 'cancelled', id: data.id, ...graph} : {...errorReport(error, data.id), ...graph});
   } finally {
     cancelled.delete(data.id);
   }

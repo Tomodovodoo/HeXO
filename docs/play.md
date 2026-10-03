@@ -14,8 +14,8 @@ Placing a stone or pressing play resumes it.
 
 The board fills the page. The top-left card holds both seats; hover it, or click its header, to choose engines,
 checkpoints and strength. New, Undo and Pause sit at the bottom right, the move stepper at the bottom centre. The
-right panel holds the analysis engine, the evaluation bar, the candidate stones (policy share, then the mover's win
-chance after that stone), Import, Copy HTTTX, Review and the move list.
+right panel holds the analysis engine, the evaluation bar, the candidate stones (share of the improved policy, then
+the stone's completed Q as the mover's win chance), Import, Copy HTTTX, Review and the move list.
 
 ## Watch a bot match
 
@@ -232,9 +232,10 @@ the engine reports no progress) and its cancel button. The custom budget shows t
 (simulations, 0 plays the raw policy) and Solver (nodes, 0 turns it off; the solver gets up to a minute) for Bubble,
 Positions for Six, Search for Strix (at least 1), and ms (at least 10) for Native and Seal. Any larger whole number up to
 2,147,483,647 (the engines take 32-bit budgets) is accepted on both pages; it only takes longer.
-A Bubble seat, served or in the browser, keeps its search tree across turns like the evaluator, adding each turn's
-simulations to the visits already under the position until undo, a new or loaded game or a seat change, so its
-moves are saved with the kept-tree evaluations and never read back from the store.
+A Bubble seat, served or in the browser, keeps one search graph for its game (a `GameGraph`, see
+[neural-search.md](neural-search.md)), adding each turn's simulations to the visits already under the position until
+undo, a new or loaded game or a seat change, so its moves are saved with the kept-tree evaluations and never read
+back from the store. Each of its searches runs the principal-variation check with a quarter of the simulations.
 
 ### By hand
 
@@ -285,9 +286,16 @@ model, beside the one that plays engine moves, so they keep up during play. With
 position where a turn starts, plus any position you step to; while an engine seat plays it also deepens the current
 position through every preset, Lightning first, showing each as it lands and starting again when the position
 changes. That deepening runs last in the queue, gives way to any other analysis and slows down while an engine
-seat searches. Each preset continues the search trees of the one before on the same position, adding only the
-simulations they lack, and keeps a solver proof it already has; these evaluations are saved apart from fresh ones
-(their engine key ends in `:kept`), shown like them, and never used by review. A position without a saved
+seat searches. Each preset continues the search of the one before on the same position, adding only the
+simulations it lacks, and keeps a solver proof it already has; these evaluations are saved apart from fresh ones
+(their engine key ends in `:kept`), shown like them, and never used by review. All analysis of one game searches one
+game graph, kept until undo or a new or loaded game: a position reached from several analysed positions is one node,
+and the visits and values a search finds there count for every position before it. Each search runs the
+principal-variation check with a quarter of the simulations. When an analysis lands, the saved analyses of the four
+placements before it that came from the same graph are searched again with a quarter of their budget, so stepping
+back shows what the later search found; any other position of the game the graph has changed since its analysis is
+searched again the same way when you step to it. That search goes on from the visits the graph holds there. The share of the improved policy saturates at high budgets: its Q weight grows with the visits, so a
+deep search gives one stone nearly all of it. A position without a saved
 evaluation shows the search of the engine or analysis working on it as it goes. The search of a turn's second
 stone is saved as the evaluation of the position after its first stone, so every placement has rows. The slider
 rings the stop of the evaluation shown. Engine moves by the same checkpoint count as

@@ -31,7 +31,7 @@ import hexnet
 from dense_config import log_event
 from hexo import Game
 from legacy.klent import digest
-from neural_search import HOLD, EvaluationCache, NeuralSearch, checked, native
+from neural_search import HOLD, EvaluationCache, GameGraph, NeuralSearch, Recheck, checked, native
 from legacy.train import write_json
 from proof import VerificationTimeout
 from tactical_proof import independent_verify
@@ -51,6 +51,9 @@ STALE_SECONDS = 120.  # learner heartbeats older than this are ignored by Yield
 RESTART_SOURCE = ('shard', 'game', 'ply', 'kind', 'regret', 'plies_to_proof')  # buffer entry fields a restart records
 RESTART_SHARDS = 16   # source shards whose moves Restarts keeps
 CLOSE_SECONDS = 10.   # longest a finished game waits for proofs that may label its rows
+# Solver counts a checked search keeps from its first pass; proof fields come from the root after the check (a
+# first pass the solver or the tree proved is never checked).
+CARRIED = ('solver_nodes', 'solver_budget')
 
 
 def checkpoints(run):
@@ -222,7 +225,12 @@ class Model:
         self.evaluator = Evaluator(net, device, sha, max_batch, cuda_graphs=cuda_graphs)
         self.cache = EvaluationCache(cache_positions)
 
-    def tree(self, history, seed, tactics, graph=False, q_range_floor=0.):
+    def tree(self, history, seed, tactics, graph=False, q_range_floor=0., limit=0):
+        """A search tree from `history`: a GameGraph keeping at most `limit` expanded nodes when `limit` > 0, else a
+        NeuralSearch (a transposition graph with `graph`)."""
+        if limit:
+            return GameGraph(self.evaluator, self.sha, history, seed, self.cache, tactics, q_range_floor=q_range_floor,
+                             limit=limit)
         return NeuralSearch(self.evaluator, self.sha, history, seed, self.cache, tactics, graph=graph,
                             q_range_floor=q_range_floor)
 
@@ -287,6 +295,11 @@ class Engine:
     collects and fulfils the batch launched by the previous step, so the GPU works on one batch while the trees
     produce the next. It returns the slots whose games finished, including slots stopped because a searched
     position could not be encoded (`reason` set to 'span'; none of their requests is fulfilled afterwards).
+
+    A slot may also expose `recheck(result)` and `checking` (SelfPlayGame): each finished search goes through
+    `recheck` before `searched`; None means it started another search on the slot's tree, a principal-variation check
+    whose searches take no solver plan step, leaf proof or root prediction and whose final result keeps the first
+    search's solver counts and network value.
 
     Solver (dense_solver): a slot whose budgets are active under `schedule` (dense_solver.active) gets a dense_solver.Plan on the Engine's Solver (created on
     first use with `schedule`, default fixed budgets; `solver_async` picks its backend). A search that submits
@@ -428,7 +441,7 @@ class Engine:
             slot = slots[self.cursor % len(slots)]
             self.cursor += 1
             plan = self.plans.get(id(slot))
-            if plan and not plan.ready(slot):
+            if plan and not getattr(slot, 'checking', False) and not plan.ready(slot):
                 deferred = True
                 continue
             ptr = slot.tree.ptr
@@ -450,10 +463,11 @@ class Engine:
                         break
                     progress = True
                     result = slot.tree.result(0, 0, 0, 0)
-                    if plan and not plan.finish(slot, result):
+                    checking = getattr(slot, 'checking', False)
+                    if not checking and plan and not plan.finish(slot, result):
                         deferred = True
                         break
-                    leaf = self.leaf_roots.pop(id(slot), None)
+                    leaf = None if checking else self.leaf_roots.pop(id(slot), None)
                     if leaf is not None:
                         proof, verdict = leaf
                         stones, turns = proof.path(slot.tree.history)[1]
@@ -464,11 +478,16 @@ class Engine:
                         if not (result['proven'] > 0 and result.get('proof_plies', bound) < bound):
                             result.update(proven=1, proof=proof, proof_turns=turns, proof_action=[list(s) for s in stones],
                                           proof_plies=bound, action=list(stones[0]))
-                    result['network_value'] = self.root_predictions[id(slot)][2]
-                    if self.native_feed:
-                        value = self.feeds[slot.model].root_value(slot.tree)
-                        if value is not None:
-                            result['network_value'] = value
+                    if not checking:
+                        result['network_value'] = self.root_predictions[id(slot)][2]
+                        if self.native_feed:
+                            value = self.feeds[slot.model].root_value(slot.tree)
+                            if value is not None:
+                                result['network_value'] = value
+                    if hasattr(slot, 'recheck'):
+                        result = slot.recheck(result)
+                        if result is None:
+                            continue
                     self.searches += 1
                     if not slot.searched(result):
                         done.append(slot)
@@ -487,7 +506,7 @@ class Engine:
                 size = native.hxg_history(ptr, request, None)
                 history = np.empty((size, 2), np.int64)
                 native.hxg_history(ptr, request, history.ctypes.data)
-                if self.leaf_solver is not None:
+                if self.leaf_solver is not None and not getattr(slot, 'checking', False):
                     before = time.perf_counter()
                     proof = self.leaf_solver.history(history.tolist(), nodes=self.leaf_nodes, ms=10)
                     self.leaf_seconds += time.perf_counter()-before
@@ -687,8 +706,9 @@ class SelfPlayGame:
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) \
             if settings.opening_random_plies > 0 and restart is None and book is None else 0
         self.trees = {model: model.tree([tuple(m) for m in forced], seed+k, settings.tactics, settings.search_graph,
-                                        settings.q_range_floor)
+                                        settings.q_range_floor, settings.game_graph)
                       for k, model in enumerate(dict.fromkeys(sides))}
+        self.check = None
         self.game, self.moves, self.rows = Game(forced), forced, []
         self.values, self.full = [None]*len(forced), [False]*len(forced)
         self.network_values = [None]*len(forced)
@@ -705,15 +725,46 @@ class SelfPlayGame:
     def plan(self):
         """Draw the next search's kind (full with probability full_fraction), budget and root samples, and set the
         side to move's root noise: root_noise for a full search, 0 for a cheap one. With full_turns, the second stone
-        of a turn whose first stone this game searched keeps that stone's kind."""
+        of a turn whose first stone this game searched keeps that stone's kind. With pv_check a full search's budget
+        is its first pass (neural_search.Recheck, run by `recheck`)."""
         s = self.settings
         ply = len(self.moves) if s.full_turns else 0
         if not (ply and ply % 2 == 0 and ply > self.forced_plies):
             self.is_full = bool(self.rng.random() < s.full_fraction)
         self.budget = s.full_sims if self.is_full else s.cheap_sims
+        self.check = Recheck(self.tree, self.budget, s.pv_check) if s.pv_check and self.is_full else None
+        self.passes = []
+        if self.check is not None:
+            self.budget = self.check.budget
         self.samples = s.root_samples if self.is_full else min(s.root_samples, s.cheap_root_samples, s.cheap_sims)
         if s.root_noise:
             checked(native.hxg_root_noise(self.tree.ptr, s.root_noise if self.is_full else 0.))
+
+    @property
+    def checking(self):
+        """True while the tree searches a principal-variation check rather than the position to play."""
+        return self.check is not None and self.check.phase != 'first'
+
+    def recheck(self, result):
+        """Feed a finished search to the principal-variation check (neural_search.Recheck). None after starting
+        the check's next search on the tree; otherwise the result to play and record: `result` itself without a
+        check, else the root's statistics after it, with the first search's solver counts and network value and
+        `completed` summed over every pass."""
+        if self.check is None:
+            return result
+        self.passes.append(result)
+        budget = self.check.step(result)
+        if budget:
+            checked(native.hxg_begin(self.tree.ptr, budget, self.samples))
+            return None
+        check, self.check = self.check, None
+        first = self.passes[0]
+        if check.line is None:
+            return first
+        final = self.tree.result(0, 0, 0, 0)
+        final.update({k: first[k] for k in first if k not in final or k in CARRIED},
+                     completed=sum(r['completed'] for r in self.passes), pv_check=check.summary())
+        return final
 
     def searched(self, result):
         game, actions = self.game, result['actions']
