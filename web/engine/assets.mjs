@@ -111,13 +111,16 @@ export async function moduleUrl(file, progress) {
 }
 
 /**
- * Where an engine's `files` are: {state: 'local'} when this origin has them all (`local`), {state: 'cached'} when
- * the Cache API holds the others, {state: 'uncached'} when there is no Cache API (each load downloads them), else
+ * Where an engine's `files` are: {state: 'local'} when this origin has them all (a file marked `local` counts when
+ * a HEAD request for it here neither fails nor answers 404), {state: 'cached'} when the Cache API holds the others,
+ * {state: 'uncached'} when there is no Cache API (each load downloads them), else
  * {state: 'missing', files, bytes}: the files still to download, each with its size in `bytes` (from its manifest,
  * else the site's Content-Length), and their total.
  */
 export async function status(files) {
-  const away = files.filter(file => !file.local), store = await open();
+  const here = await Promise.all(files.map(async file => file.local
+    && ((await fetch(new URL(file.path, BASE), {method: 'HEAD'}).catch(() => null))?.status ?? 404) !== 404));
+  const away = files.filter((file, i) => !here[i]), store = await open();
   if (!away.length) return {state: 'local'};
   if (!store) return {state: 'uncached'};
   const missing = [];
