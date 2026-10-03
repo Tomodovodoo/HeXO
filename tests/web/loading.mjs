@@ -54,6 +54,9 @@ const loader = (fate, probe = options => ({provider: options.prefer === 'wasm' ?
       stages.enter('session', provider);
       if (fate({...options, provider}, 'use') === 'hang') return;
       post({type: 'result', id: message.id, result: provider});
+    } else {
+      post({type: 'progress', id: message.id, fraction: .5});
+      post({type: 'result', id: message.id, result: 'done'});
     }
   },
 });
@@ -100,6 +103,11 @@ const said = [];
 out.call_restarts = await observe(loader(gpu('use')), {}, async (engine, note) => engine.call({type: 'use'},
   {progress: (fraction, live, stage) => { note(stage); said.push(stageText(stage)); }}));
 out.call_restarts.call_stages = [...new Set(said)];
+out.calls_overlap = await observe(loader(gpu('use')), {}, async engine => {
+  const use = engine.call({type: 'use'});
+  await wait(5);
+  return [await engine.call({type: 'evaluate'}), await use];
+});
 
 out.threads = [{isolated: true, cores: 8}, {isolated: true, cores: 8, memory: 2}, {isolated: true, cores: 8, memory: 4},
   {isolated: true, cores: 8, memory: 8}, {isolated: true, cores: 2, memory: 2}, {isolated: false, cores: 8, memory: 8},

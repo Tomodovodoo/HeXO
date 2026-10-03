@@ -37,11 +37,10 @@ export class EngineWorker {
     this.ready = null;
     this.device = null;
     this.progress = () => {};
-    this.stage = null;
+    this.watched = new Map();   // the load ('load') or a call's id -> {stage, timer} while it is in a loading stage
     this.provider = null;
     this.fallback = null;
     this.booting = false;
-    this.timer = null;
     this.abandon = null;
   }
 
@@ -109,12 +108,19 @@ export class EngineWorker {
     ready.catch(error => { if (this.ready === ready) this.fail(error); });
   }
 
-  /** Re-arms the watchdog for `stage` (null: none), which hands `stalled` the stage's failure as 'timed out'. */
-  watch(stage, stalled) {
-    clearTimeout(this.timer);
-    this.stage = stage;
+  /** Re-arms the watchdog of `key` (the load, or a call's id) for `stage` (null: none), which hands `stalled` the
+   * stage's failure as 'timed out'. Each load and call has its own, so one call's progress leaves another's alone. */
+  watch(key, stage, stalled) {
+    clearTimeout(this.watched.get(key)?.timer);
+    this.watched.delete(key);
     if (stage?.provider) this.provider = stage.provider;
-    if (stage && LIMITS[stage.name]) this.timer = setTimeout(() => stalled(this.failure('timed out', stage, '')), LIMITS[stage.name]);
+    if (!stage || !LIMITS[stage.name]) return;
+    this.watched.set(key, {stage, timer: setTimeout(() => stalled(this.failure('timed out', stage, '')), LIMITS[stage.name])});
+  }
+
+  /** The loading stage the worker was last watched in, or null when nothing is loading. */
+  get stage() {
+    return [...this.watched.values()].at(-1)?.stage ?? null;
   }
 
   /** The error for `reason` ('failed' or 'timed out', with the worker's `detail`) in `stage`: a Stopped when another
@@ -138,11 +144,11 @@ export class EngineWorker {
       let ready = false;
       worker.onmessage = ({data}) => {
         if (this.worker !== worker) return;
-        if (data.type === 'ready') { ready = true; this.watch(null); this.abandon = null; this.device = data.device; resolve(data.device); return; }
+        if (data.type === 'ready') { ready = true; this.watch('load', null); this.abandon = null; this.device = data.device; resolve(data.device); return; }
         if (data.id === undefined) {
           if (data.type === 'progress') {
             if (data.stage?.fallback && !this.fallback) this.noticeProbe(data.stage);
-            this.watch(data.stage ?? null, loading);
+            this.watch('load', data.stage ?? null, loading);
             report(data.fraction, data.stage);
           } else if (data.type === 'error') {
             loading(this.failure('failed', data.stage, data.message));
@@ -151,8 +157,8 @@ export class EngineWorker {
         }
         const wait = this.waits.get(data.id);
         if (!wait) return;
-        if (data.type === 'progress') { this.watch(data.stage ?? null, calling); wait.progress(data.fraction, data.live, data.stage); return; }
-        this.watch(null);
+        if (data.type === 'progress') { this.watch(data.id, data.stage ?? null, calling); wait.progress(data.fraction, data.live, data.stage); return; }
+        this.watch(data.id, null);
         if (data.type === 'error' && RETRIED.has(data.stage?.name)) { calling(this.failure('failed', data.stage, data.message)); return; }
         this.waits.delete(data.id);
         if (data.type === 'result') wait.resolve(data.result);
@@ -163,7 +169,7 @@ export class EngineWorker {
         const error = this.failure('failed', this.stage, event.message || `${this.name} worker failed`);
         (ready ? calling : loading)(error);
       };
-      this.watch(first, loading);
+      this.watch('load', first, loading);
       report(0, first);
       worker.postMessage({type: 'load', options: this.options});
     });
@@ -213,7 +219,8 @@ export class EngineWorker {
 
   /** Ends the current worker and its watchdog. */
   halt() {
-    clearTimeout(this.timer);
+    for (const {timer} of this.watched.values()) clearTimeout(timer);
+    this.watched.clear();
     this.worker?.terminate();
     this.worker = null;
   }

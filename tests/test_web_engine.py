@@ -321,6 +321,8 @@ class Loading(unittest.TestCase):
         self.assertEqual(found['result'], 'wasm')
         self.assertEqual(found['starts'], [dict(prefer=None, threads=None), dict(prefer='wasm', threads=None)])
         self.assertEqual(found['call_stages'], ['starting GPU', *self.LOAD, 'starting CPU', 'warming up'])
+        overlap = self.out['calls_overlap']
+        self.assertEqual((overlap['result'], len(overlap['starts'])), (['done', 'wasm'], 2))
 
     def test_threads_follow_device_memory(self):
         self.assertEqual(self.out['threads'], [7, 2, 4, 7, 1, 1, 2])

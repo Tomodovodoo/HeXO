@@ -219,9 +219,14 @@ globalThis.fetch = async (input, init = {}) => {
 const big = {path: 'big.onnx', sha256: createHash('sha256').update(whole).digest('hex')};
 const first = await attempt(() => assets.cached(big));
 const parts = [...store.keys()].filter(k => k.includes('&part='));
+const resumable = globalThis.fetch;
+globalThis.fetch = async (input, init) => { if (String(input).endsWith('big.onnx')) throw new TypeError('Failed to fetch'); return resumable(input, init); };
+const offlineTry = await attempt(() => assets.cached(big));
+const kept = [...store.keys()].filter(k => k.includes('&part=')).length;
+globalThis.fetch = resumable;
 cut = false;
 const body = await assets.cached(big, (fraction, received, total) => seen.push([received, total]));
-out.resume = {first: first.error ?? 'loaded', parts: parts.length, ranges: ranged.filter(Boolean), same: Buffer.from(body).equals(whole),
+out.resume = {first: first.error ?? 'loaded', parts: parts.length, offline: [Boolean(offlineTry.error), kept], ranges: ranged.filter(Boolean), same: Buffer.from(body).equals(whole),
   start: seen.slice(0, 2), keys: [...store.keys()].length};
 
 // A download that receives nothing for LIMITS.idle ms stops with an error instead of waiting.

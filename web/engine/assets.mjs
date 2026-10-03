@@ -186,10 +186,10 @@ export async function cached(file, progress = () => {}) {
   progress(0, offset, file.bytes || 0);   // the download stage covers a request that never answers too
   let found = offset ? await locate(file.path, {cache: 'no-cache', headers: {Range: `bytes=${offset}-`}}).catch(() => null) : null;
   if (found?.response.status !== 206) {   // a new download, also when the server ignores the range
-    if (parts.length) await forget().catch(() => {});
+    found ??= await locate(file.path, {cache: 'no-cache'});   // a Cache API miss means new bytes: revalidate
+    if (parts.length) await forget().catch(() => {});   // only once the whole file is on its way
     parts = [];
     offset = 0;
-    found ??= await locate(file.path, {cache: 'no-cache'});   // a Cache API miss means new bytes: revalidate
   }
   const {response, local} = found;
   if (!local && !file.sha256) throw new Error(`${file.path}: the site's manifest has no SHA-256 for it`);

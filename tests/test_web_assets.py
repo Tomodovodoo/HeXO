@@ -103,7 +103,7 @@ class Resolver(unittest.TestCase):
 
     def test_an_interrupted_download_resumes_after_its_stored_part(self):
         case = self.out['resume']
-        self.assertEqual((case['first'], case['parts']), ('Failed to fetch', 1))
+        self.assertEqual((case['first'], case['parts'], case['offline']), ('Failed to fetch', 1, [True, 1]))
         self.assertEqual(case['ranges'], [f'bytes={4 * 2 ** 20}-'] * 2)
         self.assertTrue(case['same'])
         self.assertEqual(case['start'], [[4 * 2 ** 20, 0], [int(4.5 * 2 ** 20), 5 * 2 ** 20]])
