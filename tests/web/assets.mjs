@@ -194,6 +194,11 @@ const sixLate = new (await import('../../web/engine/six.mjs')).SixEngine();
 await sixLate.files();
 out.six_retry = sixLate.checkpoints;
 
+// The page's engine lists while Seal's files are on neither origin and the site has every other engine's.
+const seat = await import('../../web/engine/seat.mjs');
+await seat.survey();
+out.offered = ['browser:bubble', 'browser:seal', 'browser:strix', 'browser:six', 'six'].filter(id => seat.listed({id}));
+
 // A download cut off after its first part: the next load asks for the rest with a range and joins them.
 reset();
 const {LIMITS} = await import('../../web/engine/stages.mjs');

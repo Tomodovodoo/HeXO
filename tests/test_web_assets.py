@@ -123,6 +123,9 @@ class Resolver(unittest.TestCase):
         self.assertEqual(self.out['unpublished'], {'manifest': 'not on site', 'status': 'not on site', 'seal': 'not on site',
                                                    'strix': 'not on site', 'unreachable': 'error'})
 
+    def test_engine_lists_leave_out_engines_whose_files_no_origin_has(self):
+        self.assertEqual(self.out['offered'], ['browser:bubble', 'browser:strix', 'browser:six', 'six'])
+
 
 class Loaders(unittest.TestCase):
     def test_engine_loaders_fetch_through_assets(self):
