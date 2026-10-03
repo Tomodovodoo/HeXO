@@ -1,5 +1,6 @@
 """Native neural tree checks independent of trained model quality."""
 import importlib.util
+from pathlib import Path
 import unittest
 import numpy as np
 from hexo import Game
@@ -29,7 +30,45 @@ class Spread(Uniform):
             out.append(dict(p, q=np.full(len(p['actions']), value if (len(h)+1)//2 % 2 == 1 else -value)))
         return out
 
+class Ranked(Uniform):
+    """Logit -2k for the k-th legal move in native order, so a move's prior rank is its index."""
+    def evaluate(self, histories):
+        return [dict(p, logits=-2.*np.arange(len(p['actions']))) for p in super().evaluate(histories)]
+
+def recorded_position(ply=12):
+    """The first `ply` placements of the first game in tests/fixtures/actor_selfplay.npz."""
+    moves = np.load(Path(__file__).parent/'fixtures'/'actor_selfplay.npz')['moves']
+    return [tuple(map(int, m)) for m in moves[:ply]]
+
 class NeuralTree(unittest.TestCase):
+    def test_root_noise_samples_beyond_the_prior_and_leaves_the_target(self):
+        history = recorded_position()
+        def tree(**options):
+            search = NeuralSearch(Ranked(), 'root-noise', history, seed=11, **options)
+            self.addCleanup(search.close)
+            return search
+        plain, zero, noisy = tree().search(64, root_samples=8, batch_size=8), \
+            tree(root_noise=0.).search(64, root_samples=8, batch_size=8), tree(root_noise=.25)
+        for key in ('action', 'completed'):
+            self.assertEqual(zero[key], plain[key])
+        for key in ('visits', 'policy', 'scores', 'values'):
+            np.testing.assert_array_equal(zero[key], plain[key])
+        self.assertTrue((np.flatnonzero(plain['visits']) < 8).all())
+        result = noisy.search(64, root_samples=8, batch_size=8)
+        sampled = np.flatnonzero(result['visits'])
+        self.assertEqual(len(sampled), 8)
+        self.assertTrue((sampled >= 8).any())
+        native.hxg_root_noise(noisy.ptr, 0.)
+        np.testing.assert_array_equal(noisy.result(0, 0, 0, 0)['policy'], result['policy'])
+        unsampled = np.flatnonzero(result['visits'][:100] == 0)
+        np.testing.assert_allclose(result['policy'][unsampled]/result['policy'][unsampled[0]],
+                                   np.exp(-2.*(unsampled-unsampled[0])), rtol=1e-9)
+        given = tree().search(64, root_samples=8, batch_size=8, root_noise=.25)
+        np.testing.assert_array_equal(given['visits'], result['visits'])
+        for bad in (-.1, 1., float('nan')):
+            with self.assertRaisesRegex(ValueError, 'Invalid root noise'):
+                NeuralSearch(Uniform(), 'root-noise', root_noise=bad)
+
     def test_q_range_floor_flattens_only_small_spreads(self):
         def entropy(p):
             return float(-(p[p > 0]*np.log(p[p > 0])).sum())
