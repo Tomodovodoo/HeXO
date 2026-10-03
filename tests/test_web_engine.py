@@ -379,6 +379,8 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['before']['history'], [[0, 0], [0, 2], [1, 2]])
         self.assertEqual(result['after']['history'], result['before']['history'])
         self.assertEqual(result['after']['timings'], result['before']['timings'])
+        self.assertEqual(result['after']['turns'], result['before']['turns'])
+        self.assertGreater(result['before']['turns'], 0)
         self.assertEqual(result['after']['clock']['circle_ms'], result['before']['clock']['circle_ms'])
         self.assertGreater(result['after']['clock']['circle_ms'], 180000)
         self.assertIsNotNone(result['bookStart'])

@@ -162,7 +162,8 @@ export class BrowserSession extends OfflineSession {
     if (this.importing || this.initializing || this.conflicted) return this.saving;
     this.dirty = true;
     if (this.match && !this.match.pending_game && this.match.completed < this.match.games) {
-      this.match.position = {game: this.match.current, history: copy(this.history), records: copy(this.records), clock: this.clockNow(), opening: copy(this.book.opening)};
+      this.match.position = {game: this.match.current, history: copy(this.history), records: copy(this.records), clock: this.clockNow(), clockTurns: copy(this.clockTurns),
+        clockPartial: this.clockPartial + (this.clock?.started != null ? Date.now() - this.clock.started : 0), opening: copy(this.book.opening)};
     }
     const snapshot = this.snapshot(), freeplay = this.freeplay();
     this.saving = this.saving.then(async () => {
@@ -601,6 +602,7 @@ export class BrowserSession extends OfflineSession {
             if (!saved.pending_game && saved.position?.game === saved.completed + 1) {
               this.load(saved.position.history, true, saved.position.opening);
               this.records = copy(saved.position.records); this.clock = copy(saved.position.clock);
+              this.clockTurns = copy(saved.position.clockTurns || []); this.clockPartial = saved.position.clockPartial || 0;
               if (this.clock) { delete this.clock.started; delete this.clock.side; }
               this.seats = copy(saved.current % 2 ? saved.players : [...saved.players].reverse());
             } else this.beginMatchGame();

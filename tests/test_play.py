@@ -1399,6 +1399,8 @@ class FreeplayClock(unittest.TestCase):
             self.session.play(2, 0)
         saved = json.loads(next(Path(self.directory.name).glob('*-freeplay-*/game-0001.json')).read_text())
         self.assertEqual((saved['winner'], saved['reason'], saved['clock']['increment_ms']), (0, 'time', 1000.))
+        self.assertEqual(saved['turns'][-1]['circle_ms'], 0)
+        self.assertGreater(saved['turns'][-1]['cross_ms'], 1000)
         self.assertEqual([t['side'] for t in saved['turns']], [0, 1])
         self.session.new_game()
         state = self.session.state()

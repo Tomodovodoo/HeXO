@@ -175,7 +175,7 @@ if (job.kind === 'encode') {
   await s.startMatch({players:[{engine:'test'},{engine:'test'}],games:2,clock:{mode:'game',tc:'180+2'}});
   await until(() => s.history.length === 3 && s.running?.history.length === 3);
   await s.request('/match',{action:'stop'},'POST'); await s.idle; await s.saving;
-  const id=s.match.id, before={history:structuredClone(s.history),clock:s.clockNow(),timings:structuredClone(s.match.timings)};
+  const id=s.match.id, before={history:structuredClone(s.history),clock:s.clockNow(),timings:structuredClone(s.match.timings),turns:s.clockTurns.length};
   s.apply('/seat',{side:0,engine:'human'}); s.apply('/seat',{side:1,engine:'human'});
   await s.request('/match',{action:'resume'},'POST'); await until(()=>!!s.running);
   const sameBatchSeats=s.seats.map(s=>s.engine);
@@ -185,7 +185,7 @@ if (job.kind === 'encode') {
   await s.request('/import',{text:JSON.stringify({history:[[0,0]]})},'POST'); const imported=s.book.opening;
   await s.request('/match',{action:'resume',batch:id},'POST');
   await until(() => !!s.running); await s.request('/match',{action:'stop'},'POST'); await s.idle;
-  answer={before,after:{history:s.history,clock:s.clockNow(),timings:s.match.timings},bookStart,imported,auto:s.analysis.auto,sameBatchSeats};
+  answer={before,after:{history:s.history,clock:s.clockNow(),timings:s.match.timings,turns:s.clockTurns.length},bookStart,imported,auto:s.analysis.auto,sameBatchSeats};
 } else if (job.kind === 'lifecycle') {
   const entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', presets: {standard: {simulations: 1, solver_nodes: 0}}, clocks: true};
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));

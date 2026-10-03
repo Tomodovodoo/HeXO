@@ -2196,7 +2196,8 @@ class Session:
 
     def prepare_timed(self):
         """Replace the freeplay seats' timed engines: for a clocked game, one per engine seat, started in the background
-        while `clock_preparing` holds the clock and the moves. Call with the lock held."""
+        while `clock_preparing` holds the clock (stopped, its time so far kept for the turn) and the moves. Call with the
+        lock held."""
         for engine in self.seat_engines:
             if engine:
                 engine.close()
@@ -2205,6 +2206,7 @@ class Session:
         if self.match or self.clock_spec['mode'] == 'fixed' or not any(seats):
             self.clock_preparing = None
             return
+        self.pause_clock()
         self.clock_preparing = generation = object()
 
         def prepare():
@@ -2260,10 +2262,13 @@ class Session:
         if any(j.kind == 'move' and j.status == 'running' and getattr(j, 'received', None) is not None
                and not clock.expired(j.received) for j in self.jobs.values()):
             return
-        clock.stop()
+        spent = clock.stop() / 1e6 + self.clock_partial_ms
+        self.clock_partial_ms = 0
         self.outcome = dict(winner=1 - side, reason='time')
-        self.clock_turns.append(dict(ply=len(self.history), side=side, spent_ms=None, cross_ms=0 if side == 0 else None,
-                                     circle_ms=0 if side == 1 else None))
+        balances = clock.json()
+        self.clock_turns.append(dict(ply=len(self.history), side=side, spent_ms=round(spent),
+                                     cross_ms=0 if side == 0 else round(balances['cross_ms']),
+                                     circle_ms=0 if side == 1 else round(balances['circle_ms'])))
         self.stop_moves()
         self.changed()
 
