@@ -206,7 +206,7 @@ const failure = error => error instanceof NotOnSite ? {state: 'unpublished'} : {
  * session's on a static page, else the saved ones. */
 const chosen = id => {
   const session = page.browserPlay, choices = session ? [...session.seats, session.analysis] : [...config.seats, config.analysis];
-  return choices.filter(c => c?.engine === id && c.checkpoint).map(c => c.checkpoint);
+  return [...new Set(choices.filter(c => c?.engine === id && c.checkpoint).map(c => c.checkpoint))];
 };
 const remember = (id, promise) => { checks.set(id, Object.assign(promise, {stamp: chosen(id).join(',')})); return promise; };
 const check = id => checks.get(id)?.stamp === chosen(id).join(',') ? checks.get(id)

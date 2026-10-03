@@ -23,10 +23,14 @@ export class SixEngine extends EngineWorker {
     return this.call({type: 'turn', history, nodes: budget.nodes, network: budget.checkpoint ?? null}, options);
   }
 
-  /** {data, local}: six/networks/manifest.json (assets.mjs json()), whose network names refresh `checkpoints`. */
+  /** {data, local}: six/networks/manifest.json (assets.mjs json()), whose network names refresh `checkpoints`. A changed
+   * list ends a running worker, which holds the manifest it loaded with; the next call starts one on the new list. */
   async manifest() {
-    const found = await json(MANIFEST);
-    this.checkpoints.splice(0, Infinity, ...found.data.networks.map(n => n.name));
+    const found = await json(MANIFEST), names = found.data.networks.map(n => n.name);
+    if (names.join() !== this.checkpoints.join()) {
+      if (this.worker && this.checkpoints.length) this.close();
+      this.checkpoints.splice(0, Infinity, ...names);
+    }
     return found;
   }
 
