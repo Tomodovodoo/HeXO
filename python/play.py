@@ -781,10 +781,10 @@ class TurnSearch:
     Without a solver proof, a position the search proves has the turn's own stones as its `pv`. `request()` names the tree and simulations of the next search, None when the turn is
     complete, (None, 0) for the raw policy; `take(result)` applies that search's result, None for the raw policy.
     `trees(history, simulations, network)` gives the tree and the simulations to run for a stone; by default one
-    tree is advanced through the turn, each stone searched afresh with `simulations`. With a proof table `known`
-    (`Proofs`) a position it proves gets that proof and line unless the solver proved one, each search starts with
-    the root's proven edges settled (`Proofs.edges`), and a proof whose turn reaches a proven position continues
-    into that position's line."""
+    tree is advanced through the turn, each stone searched afresh with `simulations`. A seat's move passes its game
+    tree (`Engines.game_trees`). With a proof table `known` (`Proofs`) a position it proves gets that proof and line
+    unless the solver proved one, each search starts with the root's proven edges settled (`Proofs.edges`), and a
+    proof whose turn reaches a proven position continues into that position's line."""
 
     def __init__(self, bubble, network, history, simulations, solved, trees=None, q_range_floor=0., known=None):
         self.bubble, self.network, self.simulations, self.q_range_floor = bubble, network, simulations, q_range_floor
@@ -1018,7 +1018,7 @@ class Engines:
     def __init__(self, device, tactical_package=None, seal=None):
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
         self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
-        self.helpers, self.kept = [], None
+        self.helpers, self.kept, self.games = [], None, OrderedDict()
         self.external = {}
         self.children = {}
         self.last_turn = {}
@@ -1050,27 +1050,32 @@ class Engines:
             self.prover, self.prover_build = tactical_proof.IsolatedTactics(package, priority='below_normal'), build
         return self.prover, build
 
-    def evaluate(self, entry, checkpoint, budget, history, watch, device=None, live=None, keep=False, known=None):
+    def evaluate(self, entry, checkpoint, budget, history, watch, device=None, live=None, keep=False, line=None,
+                 known=None):
         """`evaluate` with the entry's export and the proof table `known`; returns the evaluation, the budget it
         really had (no solver nodes when the solver is not built) and the key of the weights it used (see
         `model_key`). With `keep` the search continues the trees kept from the last kept evaluation of this
-        position and model, running only the simulations they lack, and a proof found then is reused; its key ends
-        in `:kept`, so continued evaluations are never mistaken for fresh ones."""
+        position and model, running only the simulations they lack, and a proof found then is reused. With `line`
+        (a seat's game, see `Session.lines`) the search continues that game's tree (see `game_trees`). Either way
+        its key ends in `:kept`, so continued evaluations are never mistaken for fresh ones."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
         solver, build = self.solver() if budget['solver_nodes'] else (None, 'none')
         spent = budget if solver else budget | dict(solver_nodes=0)
         trees = solved = None
-        if keep and answered(history, known) is None:
-            trees, kept = self.kept_trees(bubble, history, build, entry.get('q_range_floor', 0.)), self.kept
-            proven = kept['solved'] if kept['solved'] and kept['solved']['proof'] else None
-            solved = proven or solve(solver, history, spent['solver_nodes'], watch)
-            kept['solved'] = solved
+        if keep:
+            if answered(history, known) is None:
+                trees, kept = self.kept_trees(bubble, history, build, entry.get('q_range_floor', 0.)), self.kept
+                proven = kept['solved'] if kept['solved'] and kept['solved']['proof'] else None
+                solved = proven or solve(solver, history, spent['solver_nodes'], watch)
+                kept['solved'] = solved
+        elif line is not None:
+            trees = self.game_trees(bubble, line, build, entry.get('q_range_floor', 0.))
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
                          solved, entry.get('q_range_floor', 0.), known)
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
         weights = search_key(bubble.sha256[:16], entry)
-        return found, spent, f"{weights}:{build if spent['solver_nodes'] else 'none'}" + (':kept' if keep else '')
+        return found, spent, f"{weights}:{build if spent['solver_nodes'] else 'none'}" + (':kept' if keep or line is not None else '')
 
     def kept_trees(self, bubble, history, build='none', q_range_floor=0.):
         """A `TurnSearch` tree source that keeps one tree per position of `history`'s turn for the next kept
@@ -1093,6 +1098,31 @@ class Engines:
             tree.evaluator = network
             visits = int(tree.result(0, 0, 0, 0)['visits'].sum())
             return tree, max(1, simulations - visits)
+        return trees
+
+    def game_trees(self, bubble, line, build='none', q_range_floor=0.):
+        """A `TurnSearch` tree source over the game tree of `line`: one tree per line, model, solver `build` and
+        `q_range_floor`, advanced through every stone played since its last search, by either side, then searched
+        with the full simulations on top of the visits it carried over. A position that does not extend the
+        tree's stones builds it afresh. The two most recently used lines keep their trees. Advancing frees every
+        subtree off the played line, so a tree holds only the subtree of its current position."""
+        from neural_search import NeuralSearch
+        key = (bubble.sha256, build, q_range_floor)
+
+        def trees(cells, simulations, network):
+            kept = self.games.pop(line, None)
+            if kept and (kept[0] != key or kept[1].history != cells[:len(kept[1].history)]):
+                kept[1].close()
+                kept = None
+            tree = kept[1] if kept else NeuralSearch(network, bubble.sha256, cells, seed=1740, cache=bubble.cache,
+                                                     tactics=True, q_range_floor=q_range_floor)
+            self.games[line] = key, tree
+            while len(self.games) > 2:
+                self.games.popitem(last=False)[1][1].close()
+            for cell in cells[len(tree.history):]:
+                tree.advance(cell)
+            tree.evaluator = network
+            return tree, simulations
         return trees
 
     def drop_kept(self):
@@ -1232,6 +1262,8 @@ class Engines:
     def close(self):
         """Release the models and end every child process."""
         self.drop_kept()
+        while self.games:
+            self.games.popitem()[1][1].close()
         for helper, _ in self.helpers:
             helper.close()
         self.helpers = []
@@ -1535,6 +1567,8 @@ class Session:
         self.lock, self.rescanning = threading.Condition(), threading.Lock()
         self.history, self.revision, self.paused = [], 0, False
         self.proofs = Proofs()
+        self.line_ids = itertools.count()
+        self.lines = [next(self.line_ids), next(self.line_ids)]
         self.instance, self.closing = os.urandom(4).hex(), False
         self.match, self.match_worker = None, None
         self.match_clock, self.timed_engines = None, []
@@ -1565,6 +1599,12 @@ class Session:
             checkpoint = None
         budget = budget_of(entry['presets'], preset, custom, entry['kind'])
         return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget)
+
+    def new_lines(self, *sides):
+        """Give `sides` (both when none) a new line: the game tree their Bubble seats search (see
+        `Engines.game_trees`). Undo, a new or loaded game and a seat change start one."""
+        for side in sides or (0, 1):
+            self.lines[side] = next(self.line_ids)
 
     def engine_key(self, seat):
         """Evaluations are keyed by the weights and the solver build that produced them ('none' for a budget
@@ -1701,7 +1741,7 @@ class Session:
         if winner < 0 and not self.paused and seat['engine'] != 'human' and not busy and not waiting:
             if self.match_clock and self.match and self.match['active'] and self.match_clock.running is None:
                 self.match_clock.start(player)
-            self.submit(Job('move', 1, self.history, side=player, seat=dict(seat)))
+            self.submit(Job('move', 1, self.history, side=player, seat=dict(seat), line=self.lines[player]))
         for job in self.jobs.values():
             stale = job.history != tuple(self.history[:len(job.history)])
             if job.kind in ('analyse', 'review') and job.status in ('queued', 'running') and stale:
@@ -1823,6 +1863,7 @@ class Session:
                                                    and len(self.history) in turn_starts(len(self.history) + 1)):
                 self.history.pop()
             self.stop_moves()
+            self.new_lines()
             self.changed()
 
     def new_game(self, people=None):
@@ -1877,6 +1918,7 @@ class Session:
             self.match_clock = None
             self.saved_game = saved_game
             self.stop_moves()
+            self.new_lines()
             self.changed()
 
     def stop_moves(self, side=None):
@@ -1892,6 +1934,7 @@ class Session:
             self.match_editable()
             self.seats[side] = self.seat(engine, checkpoint, preset, custom)
             self.stop_moves(side)
+            self.new_lines(side)
             self.changed()
 
     def configure_analysis(self, engine, checkpoint=None, preset='standard', custom=None, auto=True):
@@ -2297,6 +2340,7 @@ class Session:
                 self.analysis = self.analysis | dict(auto=False)
             self.history = [tuple(p) for p in openings[0]]
             self.seats = [{k: v for k, v in s.items() if k not in ('name', 'source')} for s in seats]
+            self.new_lines()
             self.paused = False
             self.save_match_position()
             self.changed()
@@ -2401,6 +2445,7 @@ class Session:
                 order = [0, 1] if number % 2 else [1, 0]
                 self.seats = [{k: v for k, v in match['players'][i].items() if k not in ('name', 'source')} for i in order]
                 self.stop_moves()
+                self.new_lines()
                 if self.analysis:
                     self.analysis['auto'] = False
                 self.paused = False
@@ -2516,6 +2561,7 @@ class Session:
                     order = [0, 1] if match['current'] % 2 else [1, 0]
                     self.seats = [{k: v for k, v in match['players'][i].items() if k not in ('name', 'source')}
                                   for i in order]
+                    self.new_lines()
                     self.save_match_position()
                     self.changed()
         except Exception as error:
@@ -2691,25 +2737,22 @@ class Session:
                 job.done += n
         return watch
 
-    def evaluation(self, job, seat, history, force=False, exact=False):
-        """The evaluation of `history` for `seat`, saved. Unless forced, a saved one is reused: at exactly the
-        seat's budget when `exact`, else at least as deep. A deepening tier continues the kept trees of its
-        position (see `Engines.evaluate`) and is saved under that mode's key."""
+    def evaluation(self, job, seat, history, force=False):
+        """The evaluation of `history` for `seat`, saved. Unless forced, a saved one at least as deep is reused.
+        A deepening tier continues the kept trees of its position and a move continues its seat's game tree (see
+        `Engines.evaluate`); a move never reuses a saved evaluation, and both are saved under the kept key."""
         key, budget, keep = self.engine_key(seat), self.engines.effective(seat['budget']), hasattr(job, 'tier')
+        line = getattr(job, 'line', None)
         if key is None:
             raise ValueError('The model file is gone; rescan the engines')
         key += ':kept' if keep else ''
-        if force:
-            saved = None
-        else:
-            saved = self.store.get(history, key, budget) if exact else self.store.covering(history, key, budget)
+        saved = None if force or line is not None else self.store.covering(history, key, budget)
         if saved:
-            job.cache_hit = True
             return saved
         live = (lambda seen: setattr(job, 'live', seen)) if job.kind != 'review' else None
         found, spent, weights = self.lane_engines(job).evaluate(
             self.entries[seat['engine']], seat['checkpoint'], budget, history, self.watcher(job, job.kind != 'review'),
-            live=live, keep=keep, known=self.proofs if job.kind != 'move' else None,
+            live=live, keep=keep, line=line, known=self.proofs if job.kind != 'move' else None,
             **({'device': seat['device']} if 'device' in seat else {}))
         if job.cancelled:
             raise Cancelled()
@@ -2804,11 +2847,9 @@ class Session:
                     game.close()
             if entry['kind'] == 'bubble':
                 job.total = max(1, seat['budget']['simulations']) * 2
-                found = self.evaluation(job, seat, history, exact=True)
+                found = self.evaluation(job, seat, history)
                 moves = found['moves']
-                cached = getattr(job, 'cache_hit', False)
-                counts = dict(completed=0 if cached else found.get('actual_completed'),
-                              solver_nodes=0 if cached else found.get('actual_solver_nodes'), cached=cached)
+                counts = dict(completed=found.get('actual_completed'), solver_nodes=found.get('actual_solver_nodes'))
             else:
                 moves = self.engines.turn(entry, seat['budget'], history, lambda: job.cancelled, seat['checkpoint'])
                 counts = getattr(self.engines, 'last_turn', {})

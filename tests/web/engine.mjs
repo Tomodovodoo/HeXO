@@ -2,6 +2,8 @@
 // {kind: 'encode', positions: [{history, actions}]} -> [{size, cells, far, ones: [flat plane indices], features: base64 float32}]
 // {kind: 'search', cases: [{history, seed, tactics, q_range_floor, root_noise, steps: [{simulations, root_samples, batch_size}], batches}]}
 //   replays the recorded evaluations batch by batch -> [[{action, policy, visits, completed}] per step]
+// {kind: 'game', simulations} -> turns of seats on GameTrees lines with a ranked network: the root visits each stone's
+//   search started from on the first and second turn of one line, at an undo and on a new line, and the lines kept
 // {kind: 'pv', history, certificate} -> {pv, plies} of the principal variation
 // {kind: 'rows', actions, policy, values, lead} -> top rows
 // {kind: 'overlay', cases: [{ev, stones}]} -> [boardOverlay(ev, stones)] from web/engine/overlay.js
@@ -14,7 +16,7 @@
 import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
-import {Native, NeuralSearch, EvaluationCache} from '../../web/engine/search.mjs';
+import {Native, NeuralSearch, EvaluationCache, GameTrees} from '../../web/engine/search.mjs';
 import {principalVariation, topRows, Proofs, answered, settled} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
@@ -63,6 +65,25 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'search') {
   answer = [];
   for (const item of job.cases) answer.push(await search(item));
+} else if (job.kind === 'game') {
+  const trees = new GameTrees(native), cache = new EvaluationCache(), options = {seed: 1740, tactics: true, qRangeFloor: 0};
+  const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map((_, i) => -2 * i), q: actions.map(() => 0)}));
+  const turn = async (line, history) => {
+    const player = native.game(history).player, current = history.map(p => [...p]), carried = [];
+    while (native.game(current).player === player && native.game(current).winner < 0) {
+      const tree = trees.tree(line, current, options);
+      carried.push(tree.result().visits.reduce((a, b) => a + b, 0));
+      current.push((await tree.search({simulations: job.simulations, rootSamples: 16, cache, evaluate})).action);
+    }
+    return {history: current, carried, tree: trees.trees.get(line).tree};
+  };
+  const first = await turn('a', [[0, 0]]), reply = [...first.history];
+  for (let i = 0; i < 2; i++) reply.push(native.legal(reply)[0]);
+  const second = await turn('a', reply);
+  answer = {first: first.carried, second: second.carried, same: second.tree === first.tree,
+    undone: (await turn('a', [[0, 0]])).carried, fresh: (await turn('b', reply)).carried};
+  await turn('c', [[0, 0]]);
+  answer.lines = [...trees.trees.keys()];
 } else if (job.kind === 'pv') {
   answer = principalVariation(native, job.history, job.certificate);
 } else if (job.kind === 'rows') {
@@ -146,6 +167,9 @@ if (job.kind === 'encode') {
   s.registerEngine(entry, adapter);
   s.seats = [s.spec({engine: 'test'}), {engine: 'human'}]; s.analysis = s.spec({engine: 'test', auto: true}); s.changed(); s.pump();
   for (let i = 0; s.running || s.jobs.some(j => j.status === 'queued'); i++) { if (i > 1000) throw Error('Analysis did not finish'); await new Promise(r => setTimeout(r, 1)); }
+  const moved = s.lookup([], s.spec({engine: 'test', preset: 'standard'}), true);
+  await s.request('/analyse', {ply: 0}, 'POST');
+  for (let i = 0; s.running || s.jobs.some(j => j.status === 'queued'); i++) { if (i > 1000) throw Error('Analysis did not finish'); await new Promise(r => setTimeout(r, 1)); }
   await s.saving;
   const id = s.gameId, original = JSON.stringify(await s.savedReplay(id, 1));
   const study = new BrowserSession(native); study.storage = s.storage; study.id = 'study'; await study.openGame(id, 1); study.registerEngine(entry, adapter);
@@ -157,7 +181,7 @@ if (job.kind === 'encode') {
   const label = imported.state().review[0].label;
   imported.registerEngine({...entry, version: 'v2'}, adapter);
   answer = {calls, history: reopened.history, simulations: reopened.state().evaluations[1].simulations, catalogue: await s.catalogue(), preserved: JSON.stringify(await s.savedReplay(id, 1)) === original,
-    variation: (await study.savedReplay(study.gameId, 1)).history, imported_label: label, changed_version: imported.state().evaluations, restored_identity: reopened.gameId === id};
+    variation: (await study.savedReplay(study.gameId, 1)).history, imported_label: label, move_reused: moved !== null, changed_version: imported.state().evaluations, restored_identity: reopened.gameId === id};
 } else if (job.kind === 'resume') {
   const s = new BrowserSession(native), wait = ms => new Promise(r => setTimeout(r, ms));
   const until = async condition => { for (let i = 0; !condition(); i++) { if (i > 3000) throw Error('Move did not start'); await wait(1); } };
@@ -225,8 +249,9 @@ if (job.kind === 'encode') {
   })});
   t.analysis = t.spec({engine: 'test'}); t.apply('/analyse', {ply: 0}); await until(() => !!t.running); await wait(2);
   const backup = await t.storage.backup(); backup.sessions = [{...t.snapshot(), history: [[0, 0]], records: []}];
-  const [status] = await t.request('/import', {text: JSON.stringify(backup)}, 'POST');
-  answer.imported = {status, history: t.history, saved: (await t.storage.get('sessions', 'live')).history};
+  const lines = [...t.lines], [status] = await t.request('/import', {text: JSON.stringify(backup)}, 'POST');
+  answer.imported = {status, history: t.history, saved: (await t.storage.get('sessions', 'live')).history,
+    renewed: t.lines.every((line, side) => line !== lines[side])};
   const u = new BrowserSession(native); let expired = false;
   u.registerEngine(entry, {turn: (history, budget, options) => new Promise((resolve, reject) => {
     options.signal.addEventListener('abort', () => { expired = true; setTimeout(() => reject(new DOMException('Cancelled', 'AbortError')), 20); });

@@ -45,13 +45,14 @@ export class BubbleEngine extends EngineWorker {
 
   /**
    * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor} (a
-   * PRESETS entry): the fields of python/play.py evaluate. `options.known` is the game's proof table (proof.mjs
-   * Proofs.list()) the turn may use. Aborting `signal` cancels it (rejects with an AbortError).
+   * PRESETS entry): the fields of python/play.py evaluate. `options.line`, a seat's game key, continues that game's
+   * search tree (worker.mjs); `options.known` is the game's proof table (proof.mjs Proofs.list()) the turn may use.
+   * Aborting `signal` cancels it (rejects with an AbortError).
    */
   turn(history, budget, options = {}) {
     return this.call({type: 'turn', history, simulations: budget.simulations, solverNodes: budget.solver_nodes,
       batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
-      known: options.known ?? null}, options);
+      line: options.line ?? null, known: options.known ?? null}, options);
   }
 
   /** One search of `simulations` from `history` (no solver): action, completed, elapsed_ms, evaluated, batches, policy.
