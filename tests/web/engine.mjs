@@ -23,6 +23,7 @@ import {principalVariation, topRows, Proofs, answered, settled, proofTurns} from
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
 import {defaultThreads} from '../../web/engine/network.mjs';
+import {Stages, errorReport, stall} from '../../web/engine/stages.mjs';
 import {BrowserSession, review} from '../../web/engine/play-session.mjs';
 import {PlayStorage} from '../../web/engine/storage.mjs';
 import {OpeningBook} from '../../web/engine/openings.mjs';
@@ -138,7 +139,8 @@ if (job.kind === 'encode') {
   const context = {Native, NeuralSearch, EvaluationCache, GameTrees, createModule, principalVariation, topRows,
     Proofs, answered, settled, proofTurns,
     URL, performance, setTimeout, clearTimeout, onmessage: null, postMessage: message => messages.push(message),
-    probe: async () => ({provider: 'wasm', precisions: ['fp32']}),
+    probe: async () => ({provider: 'wasm', precisions: ['fp32']}), runtime: async () => ({env: {wasm: {numThreads: 1}}}),
+    Stages, errorReport, stall,
     Network: {create: async () => ({version: 'uniform', precision: 'fp32', threads: 1,
       evaluate: async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}))})},
     Worker: class {
