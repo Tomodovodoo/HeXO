@@ -6,7 +6,7 @@
  * (localStorage).
  *
  * ENGINES lists them. Each is {entry, engine, record, build, listed?}: `listed` settles once `entry.checkpoints` is
- * read (the page redraws then), `build` is the command that builds its files into this
+ * read (the saved choices are then checked against it and the page redraws), `build` is the command that builds its files into this
  * checkout (shown when the public site does not serve them), `entry` is its picker entry ({id, kind, name, label,
  * checkpoints, presets}, with `badge` when the bot is not its kind and `analysis: true` when it can analyse), `engine.load(progress)` starts it (progress(fraction)
  * while it downloads), `engine.files()` lists the files it downloads (assets.mjs records, for the picker's download
@@ -393,6 +393,11 @@ async function serverless() {
 
 if (HOOKS.every(name => typeof original[name] === 'function')) {
   install();
-  for (const {listed} of ENGINES.values()) listed?.then(() => { if (state()) page.renderPanels(); });
+  for (const {entry, listed} of ENGINES.values()) listed?.then(() => {   // check restored networks against the list
+    const fix = choice => choice?.engine === entry.id ? pickEngine(entry.id, choice, choice.checkpoint) : choice;
+    config = {seats: config.seats.map(fix), analysis: fix(config.analysis)};
+    save();
+    if (state()) page.renderPanels();
+  });
   serverless().then(active=>{if(!active||page.browserPlay)page.resolvePlayReady?.()}).catch(error=>{original.toast(error.message)});
 } else console.warn('The browser engines need the play page functions:', HOOKS.filter(name => typeof original[name] !== 'function'));
