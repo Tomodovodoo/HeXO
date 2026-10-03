@@ -242,6 +242,7 @@ class IsolatedTactics:
         self.stats = dict(queries=0, spawns=0, kills=0, exits=0)
         self.lock = threading.Lock()
         self.control_lock, self.query_id, self.active_query = threading.Lock(), 0, None
+        self.cancelled_query = None
         self.job = _memory_job(memory_mb) if sys.platform == 'win32' else None
         self.replacement = None
         self._spawn()
@@ -347,6 +348,12 @@ class IsolatedTactics:
                 result.update(unknown('deadline', result.get('build_hash')), nodes_used=result.get('nodes_used', 0),
                               budget=result.get('budget'), gate_score=result.get('gate_score'))
             result['elapsed_ms'] = (time.perf_counter()-start)*1000
+            with self.control_lock:
+                if self.active_query is not None and self.cancelled_query == self.active_query[1]:
+                    result.update(unknown('cancelled', result.get('build_hash')), nodes_used=result.get('nodes_used', 0),
+                                  budget=result.get('budget'), gate_score=result.get('gate_score'))
+                    result.pop('certificate_json', None)
+                self.active_query = None
             return result
         except OSError:
             self._retire(killed=False)
@@ -371,6 +378,7 @@ class IsolatedTactics:
                 process.stdin.flush()
             except OSError:
                 return False
+            self.cancelled_query = query_id
             return True
 
     def abort(self):

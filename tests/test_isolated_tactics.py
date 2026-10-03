@@ -85,6 +85,7 @@ class Isolation(unittest.TestCase):
     def test_cooperative_cancel_reuses_child_and_ignores_idle_cancellation(self):
         pid = self.tactics.history([[0, 0]], ms=10000)['pid']
         self.assertFalse(self.tactics.cancel())
+
         results = []
         query = threading.Thread(target=lambda: results.append(self.tactics.history([[6, 6]], ms=20000)))
         query.start()
@@ -99,6 +100,31 @@ class Isolation(unittest.TestCase):
         self.assertEqual(self.tactics.stats['kills'], 0)
         self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
         self.assertFalse(self.tactics.cancel())
+
+    def test_cancel_during_result_transfer_suppresses_that_generation(self):
+        pid = self.tactics.history([[0, 0]], ms=10000)['pid']
+        entered, release = threading.Event(), threading.Event()
+        read = self.tactics._line
+
+        def delayed_result(deadline):
+            result = read(deadline)
+            entered.set()
+            release.wait(2)
+            return result
+
+        results = []
+        with patch.object(self.tactics, '_line', delayed_result):
+            query = threading.Thread(target=lambda: results.append(self.tactics.history([[5, 5]], ms=10000)))
+            query.start()
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(self.tactics.cancel())
+            release.set()
+            query.join(2)
+        self.assertFalse(query.is_alive())
+        self.assertEqual((results[0]['status'], results[0]['reason']), ('UNKNOWN', 'cancelled'))
+        self.assertIsNone(results[0]['certificate'])
+        self.assertNotIn('certificate_json', results[0])
+        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
 
     def test_memory_cap_ends_child(self):
         self.tactics.history([[0, 0]], ms=10000)
