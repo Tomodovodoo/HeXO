@@ -1,3 +1,4 @@
+import io
 import json
 import os
 from pathlib import Path
@@ -6,7 +7,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from tactical_proof import IsolatedTactics
+from tactical_proof import IsolatedTactics, _serve
 
 ENGINE = 'tests.test_isolated_tactics:ScriptedTactics'
 
@@ -125,6 +126,27 @@ class Isolation(unittest.TestCase):
         self.assertIsNone(results[0]['certificate'])
         self.assertNotIn('certificate_json', results[0])
         self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
+
+    def test_cancel_before_dispatch_keeps_result_schema(self):
+        request = dict(query_id=1, history=[[0, 0]], attacker='opponent', ms=1000)
+        source = io.StringIO('\n'+json.dumps(request)+'\n'+json.dumps(dict(cancel=1))+'\n')
+        output = io.StringIO()
+        import queue
+        make_queue = queue.Queue
+        # Consume both control messages before the server dispatches the query.
+        with patch('tactical_proof.sys.stdin', source), patch('tactical_proof.sys.stdout', output), \
+                patch.dict('sys.modules', resource=unittest.mock.Mock()), \
+                patch('tactical_proof.queue.Queue', side_effect=lambda _: make_queue()), \
+                patch('tactical_proof.threading.Thread') as reader:
+            reader.side_effect = lambda **kw: type('Reader', (), {'start': staticmethod(kw['target'])})()
+            _serve(ENGINE, '.', 256)
+        ready, result = map(json.loads, output.getvalue().splitlines())
+        self.assertTrue(ready['ready'])
+        self.assertEqual((result['status'], result['reason'], result['attacker']),
+                         ('UNKNOWN', 'cancelled', 'opponent'))
+        self.assertIsNone(result['budget'])
+        self.assertIsNone(result['gate_score'])
+        self.assertIsNone(result['certificate'])
 
     def test_memory_cap_ends_child(self):
         self.tactics.history([[0, 0]], ms=10000)

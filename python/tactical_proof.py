@@ -519,7 +519,8 @@ def _serve(engine, package, memory_mb, priority='None'):
             current_id = query_id
         start = time.perf_counter()
         if event.is_set():
-            result = unknown_result('cancelled', start, request.get('attacker', 'mover'), None)
+            result = dict(unknown_result('cancelled', start, request.get('attacker', 'mover'), None),
+                          budget=None, gate_score=None)
         else:
             if getattr(tactics, 'accepts_cancel_event', False):
                 request['cancel_event'] = event
