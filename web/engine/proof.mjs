@@ -130,8 +130,8 @@ export class Proofs {
     }
   }
   put(history, winner, plies, pv) {
-    const key = proofKey(history), old = this.entries.get(key);
-    if (old && !(old.winner === winner && plies < old.plies)) return;
+    const key = proofKey(history), old = this.entries.get(key), witnessed = line => line.length > 0 && line.every(stone => stone.length === 4);
+    if (old && !(old.winner === winner && (plies < old.plies || plies === old.plies && witnessed(pv) && !witnessed(old.pv)))) return;
     const stones = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));
     this.entries.set(key, {history: history.map(([q, r]) => [q, r]), winner, plies, pv, stones});
     if (!this.sizes.has(history.length)) this.sizes.set(history.length, new Set());
@@ -191,7 +191,8 @@ export function answered(native, history, known) {
 
 /** A search `result` (search.mjs NeuralSearch.result) of the side `mover` with the stones `edges` (Proofs.edges)
  * proves settled: their values become 1 or -1, a proven win is the choice (the shortest) and proves the position, a
- * proven loss leaves the policy and the choice while a stone remains that is not proven lost. */
+ * proven loss leaves the policy and the choice while a stone remains that is not proven lost, and when every stone is
+ * proven lost the position is lost and the choice is the loss that lasts longest. */
 export function settled(result, edges, mover) {
   if (!edges.size) return result;
   const values = [...result.values], policy = [...result.policy];
@@ -205,6 +206,10 @@ export function settled(result, edges, mover) {
   });
   if (win) return {...result, values, action: win.action, proven: 1, exact_winner: mover, proof_plies: win.distance};
   const total = policy.reduce((a, b) => a + b, 0);
+  if (!total && result.actions.every(([q, r]) => edges.has(`${q},${r}`))) {
+    const longest = result.actions.map(([q, r]) => edges.get(`${q},${r}`)).reduce((a, b) => b.distance > a.distance ? b : a);
+    return {...result, values, policy, action: longest.action, proven: -1, exact_winner: 1 - mover, proof_plies: longest.distance};
+  }
   if (!total) return {...result, values};
   const shares = policy.map(p => p / total), lost = edges.get(result.action?.join(','));
   return {...result, values, policy: shares, action: lost ? result.actions[shares.indexOf(Math.max(...shares))] : result.action};

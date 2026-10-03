@@ -689,7 +689,8 @@ class Proofs:
     def put(self, history, winner, plies, pv):
         key = proof_key(history)
         old = self.entries.get(key)
-        if old is None or old['winner'] == winner and plies < old['plies']:
+        witnessed = lambda line: bool(line) and all(len(stone) == 4 for stone in line)
+        if old is None or old['winner'] == winner and (plies, not witnessed(pv)) < (old['plies'], not witnessed(old['pv'])):
             stones = frozenset((q, r, player_at(i)) for i, (q, r) in enumerate(history))
             self.entries[key] = dict(winner=int(winner), plies=int(plies), pv=pv, stones=stones)
             self.sizes.setdefault(len(history), set()).add(key)

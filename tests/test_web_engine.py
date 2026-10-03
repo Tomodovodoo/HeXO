@@ -203,13 +203,15 @@ class BrowserProofs(unittest.TestCase):
     def test_the_table_matches_play(self):
         records = [([[0, 0], [1, 0], [2, 0]], dict(proof=dict(winner=1, turns=1, plies=4), pv=[[3, 0, 0, 1], [-1, 0, 0, 2]])),
                    ([[0, 0], [4, 4]], dict(proof=dict(winner=0, turns=1, plies=3), pv=[])),
+                   ([[0, 0], [4, 4]], dict(proof=dict(winner=0, turns=1, plies=3), pv=[[5, 4, 1, 1], [6, 4, 1, 2]])),
                    ([[0, 0], [5, 5], [6, 6]], dict(proof=dict(winner=1, turns=2, plies=7), pv=[[7, 7, 0, 1], [8, 8, 0, 2]])),
                    ([[0, 0], [2, 2]], dict(proof=dict(winner=0, turns=2), pv=[[3, 2, 1, 1], [3, 3, 1, 2]])),
                    ([[0, 0], [-2, 0], [-2, 1]], dict(proof=dict(winner=0, turns=2), pv=[[-3, 1, 0, 1]]))]
         queries = [[[0, 0]], [[0, 0], [1, 0]], [[0, 0], [5, 5]], [[0, 0], [1, 0], [2, 0], [3, 0]], [[0, 0], [9, 9]],
                    [[0, 0], [2, 2], [3, 2]], [[0, 0], [-2, 0], [-2, 1], [-3, 1]]]
         result = dict(actions=[[1, 0], [4, 4], [7, 7]], values=[.1, .2, .3], policy=[.2, .5, .3], action=[4, 4], proven=0)
-        found = node(dict(kind='table', records=records, queries=queries, result=result, mover=1))
+        lost = dict(actions=[[4, 4]], values=[.4], policy=[1.], action=[4, 4], proven=0)
+        found = node(dict(kind='table', records=records, queries=queries, result=result, lost=lost, mover=1))
         table = play.Proofs()
         for history, record in records:
             table.add(history, record)
@@ -218,6 +220,9 @@ class BrowserProofs(unittest.TestCase):
             self.assertEqual((answer['known'], sorted(answer['edges'])), (table.known(history), edges), history)
         self.assertEqual({k: found['settled'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
                          dict(action=[1, 0], proven=1, proof_plies=6, values=[1, -1, .3]))
+        self.assertEqual({k: found['lost'][k] for k in ('action', 'proven', 'exact_winner', 'proof_plies')},
+                         dict(action=[4, 4], proven=-1, exact_winner=0, proof_plies=4))
+        self.assertEqual(table.known([[0, 0], [4, 4]])['pv'], [[5, 4, 1, 1], [6, 4, 1, 2]])
 
     def test_a_proof_carries_back_and_stays_in_the_browser_session(self):
         from tests.test_tactical_proof import LATE_WIN
