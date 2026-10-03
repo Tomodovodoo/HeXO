@@ -315,6 +315,24 @@ class InjectionPoints(unittest.TestCase):
         off = from_position(dense_selfplay.SelfPlayGame([model, model], settings(
             full_fraction=1., max_plies=len(opening)+2), 7), opening)
         run([on, off])
+        fast_settings = settings(full_sims=65536, full_fraction=1., max_plies=len(opening)+2,
+                                 solver_root_nodes=NODES, solver_fixed_budgets=False,
+                                 solver_min_nodes=NODES, solver_cap_nodes=NODES, solver_gate_cap_nodes=NODES)
+        fast = from_position(dense_selfplay.SelfPlayGame([model, model], fast_settings, 7), opening)
+        solver = dense_solver.Solver(Schedule.of(fast_settings))
+        submit = solver.submit
+        def ready_query(*args, **kwargs):
+            query = submit(*args, **kwargs)
+            if query is not None:
+                query.ready(block=True)
+            return query
+        with mock.patch.object(fast, 'searched', wraps=fast.searched) as searched, \
+                mock.patch.object(dense_solver, 'Solver', return_value=solver), \
+                mock.patch.object(solver, 'submit', side_effect=ready_query):
+            run([fast], schedule=Schedule.of(fast_settings))
+        self.assertTrue(all(call.args[0]['completed'] < 64 for call in searched.call_args_list))
+        self.assertTrue(all(call.args[0]['network_value'] is not None for call in searched.call_args_list))
+        self.assertEqual(fast.moves[len(opening):], proof['moves'])
         episode, rows = on.episode()
         self.assertEqual(episode['moves'][len(opening):], proof['moves'])
         self.assertEqual([(r['proven'], r['proof_turns']) for r in rows], [(1, proof['proof_turns'])]*2)

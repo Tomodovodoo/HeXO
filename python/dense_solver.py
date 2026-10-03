@@ -3,8 +3,9 @@
 Points (Budgets: settings solver_root_nodes, solver_finalists, solver_finalist_nodes, solver_threat_nodes, plus
 Schedule.deep_nodes; 0 = off):
   root       at a turn start (a search with two placements left): does the side to move have a forced win? A proof
-             decides the move played for the whole turn, the certificate's first turn (both stones). The search runs
-             unchanged; at its end the certificate stone is marked exact-won (hxg_mark_exact), so the recorded
+             decides the move played for the whole turn, the certificate's first turn (both stones). Fixed-budget
+             search runs unchanged. Adaptive search settles a ready certificate after root expansion; otherwise
+             at its end the certificate stone is marked exact-won (hxg_mark_exact), so the recorded
              policy covers only proven winning stones, and the rows of both placements get the exact value +1
              (`proven`).
   threat     at a turn start: would the opponent have a forced win if it moved now with a fresh turn? Root actions on
@@ -775,9 +776,27 @@ class Plan:
         return True
 
     def ready(self, slot):
-        """Apply threat ordering or verified defence candidates, and retain finalist proofs. False defers
+        """Settle ready adaptive root proofs, apply threat ordering or verified defence candidates, and retain finalist proofs. False defers
         the slot to its next visit."""
         ptr = slot.tree.ptr
+        # Keep the root prediction and full legal policy row, then stop visits a ready proof already settles.
+        # UNKNOWN queries stay at their original consumption point, preserving adaptive lead-time estimates.
+        if not self.schedule.fixed_budgets and self.root is not None and self.root.future.done():
+            verdict = self.root.future.result()
+            if verdict['status'] == PROVEN_WIN and verdict.get('native_verified'):
+                history = tuple(map(tuple, slot.tree.history))
+                self.spent(self.root.result()[1])
+                self.proven(self.root, history)
+                self.root = None
+        if not self.schedule.fixed_budgets and self.proofs:
+            history = tuple(map(tuple, slot.tree.history))
+            move = self.move(mover(history), history)
+            if move is not None and native.hxg_stats(ptr, None, None, None, None):
+                bound = proof_plies(len(move[0]), move[1])
+                winner = native.hxg_exact(ptr)
+                if winner < 0 or winner == mover(history) and native.hxg_distance(ptr) >= bound:
+                    q, r = map(int, move[0][0])
+                    checked(native.hxg_mark_exact(ptr, q, r, mover(history), bound))
         if self.awaiting_finish:
             history = tuple(map(tuple, slot.tree.history))
             player = mover(history)
