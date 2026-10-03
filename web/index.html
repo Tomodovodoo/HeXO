@@ -1072,7 +1072,7 @@ $('import-dialog').onclose=async()=>{if($('import-dialog').returnValue==='ok'&&a
 $('import-dialog').ondragover=e=>e.preventDefault();
 $('import-dialog').ondrop=async e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)$('import-text').value=await f.text()};
 $('import-file').onchange=async e=>{const f=e.target.files[0];if(f)$('import-text').value=await f.text()};
-const entrants=[{engine:null,checkpoint:null,preset:'quick'},{engine:null,checkpoint:null,preset:'quick'}],tournament={games:8,openings:'wide',clock:'fixed',ms:5,tc:'180+2',max_placements:512};
+const entrants=[{engine:null,checkpoint:null,preset:'quick',custom:null},{engine:null,checkpoint:null,preset:'quick',custom:null}],tournament={games:8,openings:'wide',clock:{mode:'fixed'},max_placements:512};
 let savedKind='freeplay';
 function playerLabel(spec){if(typeof spec==='string')return spec;return spec.name+(spec.preset?' · '+spec.preset:'')+(spec.checkpoint?' · '+spec.checkpoint:'')}
 function savedPlayers(match){return match.player_specs||match.players}
@@ -1091,38 +1091,42 @@ function savedGameRow(match,r){
     ...(r.placements?[el('a',{class:'ib ghost',href:`/matches/game?${query}&format=htttx`,download:'','aria-label':'HTTTX',html:icon('download')})]:[]),
     ...(match.single&&globalThis.browserPlay?[el('button',{class:'btn','aria-label':'Delete game',onclick:()=>deleteSaved(match)},'Delete')]:[])));
 }
+/* a tournament entrant: engine, checkpoint, the same strength stops as a seat and its custom budget */
 function entrantRow(i){
   const spec=entrants[i],engines=S.engines.filter(e=>globalThis.browserPlay||!e.id.startsWith('browser:'));if(!engines.some(e=>e.id===spec.engine))spec.engine=engines[i%engines.length]?.id;
   const entry=entryOf(spec.engine);if(entry&&!(entry.checkpoints||[]).includes(spec.checkpoint))spec.checkpoint=entry.checkpoints?.[0]??null;
-  const pick=el('select',{'aria-label':'Engine'},engines.map(e=>{const b=e.badge||e.kind;return el('option',{value:e.id},b+(e.label&&e.label.toLowerCase()!==b?' · '+e.label:''))}));
-  pick.value=spec.engine;pick.onchange=()=>{spec.engine=pick.value;spec.checkpoint=null;renderTournamentForm()};
+  const pick=el('select',{'aria-label':'Engine',id:'t-engine'+i},engines.map(e=>{const b=e.badge||e.kind;return el('option',{value:e.id},b+(e.label&&e.label.toLowerCase()!==b?' · '+e.label:''))}));
+  pick.value=spec.engine;pick.onchange=()=>{spec.engine=pick.value;spec.checkpoint=null;spec.preset='quick';spec.custom=null;renderTournamentForm()};
   const parts=[pick];
-  if(entry?.checkpoints?.length>1){const cp=el('select',{'aria-label':'Checkpoint'},entry.checkpoints.map(c=>el('option',{value:c},c)));
+  if(entry?.checkpoints?.length>1){const cp=el('select',{'aria-label':'Checkpoint',id:'t-checkpoint'+i},entry.checkpoints.map(c=>el('option',{value:c},c)));
     cp.value=spec.checkpoint;cp.onchange=()=>spec.checkpoint=cp.value;parts.push(cp)}
-  const seat={preset:spec.preset,budget:{}};
-  return el('div',{class:'entrant',style:`--c:${COLORS[i]}`},el('div',{class:'row'},el('span',{class:'tag'},'AB'[i]),...parts),
-    strength(seat,ch=>{spec.preset=ch.preset;renderTournamentForm()},'t'+i,null));
+  const presets=entry?.presets||{},budget=spec.preset==='custom'?{...presets.standard,...spec.custom}:presets[spec.preset]||{};
+  const id='t'+i,config=el('button',{class:'ib ghost'+(configured.has(id)?' on':''),type:'button','aria-label':'Custom budget',html:icon('config')});
+  config.onclick=()=>{configured.has(id)?configured.delete(id):configured.add(id);renderTournamentForm()};
+  const box=[strength({preset:spec.preset},ch=>{spec.preset=ch.preset;spec.custom=null;renderTournamentForm()},id,config)];
+  if(configured.has(id))box.push(el('div',{class:'custom'},Object.entries(budget).filter(([k,v])=>typeof v==='number').map(([k,v])=>{
+    const input=el('input',{type:'number',inputmode:'numeric',value:v,min:0,'aria-label':FIELDS[k]||k,id:`${id}-${k}`});
+    input.onchange=()=>{spec.preset='custom';spec.custom={...Object.fromEntries(Object.entries(budget).filter(([,x])=>typeof x==='number')),[k]:Number(input.value)};renderTournamentForm()};
+    return el('label',{class:'field'},el('span',{},FIELDS[k]||k),input)})));
+  return el('div',{class:'entrant',style:`--c:${COLORS[i]}`},el('div',{class:'row'},el('span',{class:'tag'},'AB'[i]),...parts),...box);
 }
 function renderTournamentForm(){
-  const t=tournament,book=S.book?.available;if(!book&&t.openings!=='origin')t.openings='origin';
+  const t=tournament,book=S.book?.available,focused=document.activeElement?.id;if(!book&&t.openings!=='origin')t.openings='origin';
   const games=el('input',{id:'t-games',type:'number',inputmode:'numeric',min:2,step:2,value:t.games,'aria-label':'Games'});games.oninput=()=>t.games=Math.max(2,2*Math.round(Number(games.value)/2));
   const openings=el('select',{id:'t-openings','aria-label':'Openings'},['origin',...(book?['narrow','wide','all']:[])].map(o=>el('option',{value:o},o)));
   openings.value=t.openings;openings.onchange=()=>t.openings=openings.value;
   const limit=el('input',{id:'t-limit',type:'number',inputmode:'numeric',min:0,step:1,value:t.max_placements,'aria-label':'Stone limit'});limit.oninput=()=>t.max_placements=Number(limit.value);
-  const clock=el('select',{id:'t-clock','aria-label':'Clock'},[['fixed','budget'],['move','per turn'],['game','game clock']].map(([v,n])=>el('option',{value:v},n)));
-  clock.value=t.clock;clock.onchange=()=>{t.clock=clock.value;renderTournamentForm()};
-  const amount=t.clock==='move'?el('input',{id:'t-amount',type:'number',inputmode:'numeric',min:1,value:t.ms,'aria-label':'Seconds per turn'}):
-    t.clock==='game'?el('input',{id:'t-amount',value:t.tc,'aria-label':'Seconds plus increment'}):null;
-  if(amount)amount.oninput=()=>t.clock==='move'?t.ms=Number(amount.value):t.tc=amount.value;
+  const clock=clockPicker(t.clock,request=>{t.clock=request.mode==='game'?{mode:'game',...(([b,inc])=>({base_ms:b*1000,increment_ms:(inc||0)*1000}))(request.tc.split('+').map(Number))}:request;renderTournamentForm()},'t-clock');
   const start=el('button',{class:'btn primary'},'Start');start.onclick=startTournament;
   $('t-new').replaceChildren(entrantRow(0),entrantRow(1),el('div',{class:'form-grid'},
-    'Games',games,'Openings',openings,'Stone limit',el('span',{class:'row'},limit,el('span',{class:'hint'},'0 = uncapped')),'Clock',el('span',{class:'row'},clock,amount)),el('div',{class:'row'},el('span',{class:'spacer'}),start));
+    'Games',games,'Openings',openings,'Stone limit',el('span',{class:'row'},limit,el('span',{class:'hint'},'0 = uncapped')),'Clock',clock),el('div',{class:'row'},el('span',{class:'spacer'}),start));
+  if(focused&&$(focused))$(focused).focus();
 }
 async function startTournament(){
-  const t=tournament,players=entrants.map(e=>({engine:e.engine,preset:e.preset,...(e.checkpoint?{checkpoint:e.checkpoint}:{})}));
-  t.games=Math.max(2,2*Math.round(Number($('t-games').value)/2));t.openings=$('t-openings').value;t.clock=$('t-clock').value;t.max_placements=Number($('t-limit').value);
-  if($('t-amount')){if(t.clock==='move')t.ms=Number($('t-amount').value);else t.tc=$('t-amount').value}
-  const body={players,games:t.games,max_placements:t.max_placements,clock:t.clock==='fixed'?{mode:'fixed'}:t.clock==='move'?{mode:'move',ms:Math.round(t.ms*1000)}:{mode:'game',tc:t.tc}};
+  const t=tournament,players=entrants.map(e=>({engine:e.engine,preset:e.preset,...(e.preset==='custom'?{custom:e.custom}:{}),...(e.checkpoint?{checkpoint:e.checkpoint}:{})}));
+  t.games=Math.max(2,2*Math.round(Number($('t-games').value)/2));t.openings=$('t-openings').value;t.max_placements=Number($('t-limit').value);
+  const c=t.clock,clock=c.mode==='game'?{mode:'game',tc:`${c.base_ms/1000}${c.increment_ms?'+'+c.increment_ms/1000:''}`}:c;
+  const body={players,games:t.games,max_placements:t.max_placements,clock};
   Object.assign(body,t.openings==='origin'?{openings:[[[0,0]]]}:{opening_range:t.openings,unique_openings:t.games/2});
   if(await post('/match',{...body,replace:true})){savedKind='tournaments';$('tournament-dialog').close();showLivePosition()}
 }
