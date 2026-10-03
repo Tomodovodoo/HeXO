@@ -80,10 +80,10 @@ def turn_starts(length):
 
 
 def review_plies(history):
-    """Positions a review evaluates: every turn start, plus the final position unless the game is over."""
+    """Positions a review evaluates: every position before a stone, plus the final position unless the game is over."""
     game = replay(history)
     try:
-        return turn_starts(len(history)) + ([len(history)] if game.winner < 0 else [])
+        return list(range(len(history) + (game.winner < 0)))
     finally:
         game.close()
 
@@ -1514,35 +1514,47 @@ class Evaluations:
 # Review
 
 
+UNGRADED = dict(label=None, before=None, after=None, better=None, line=None)
+
+
 def review(history, lookup, winner=-1):
-    """Label every complete turn of `history` from saved evaluations.
+    """Label every turn of `history`, and each of its stones, from saved evaluations.
 
     `lookup(prefix)` returns the evaluation of a position (fields of `evaluate`) or None. A turn is judged on the
     mover's win probability before and after it; the first label that applies wins: win (made six), lost (the
-    opponent already had a proven win), kept or missed (the mover had one and kept it, or played the proven turn,
-    or lost it), allowed (handed the opponent one), found (proved one), best (the engine's own turn), then the
-    loss bands good (< 0.05), inaccuracy (< 0.10), mistake (< 0.20) and blunder. Turns lacking an evaluation get label None. For
-    inaccuracy and worse, missed and allowed, `better` is the engine's turn and `line` its continuation."""
-    turns = []
-    starts = turn_starts(len(history))
-    for s, e in zip(starts, [*starts[1:], len(history)]):
-        me = player_at(s)
+    opponent already had a proven win), kept or missed (the mover had one and kept it, or played the engine's
+    stones, or lost it), allowed (handed the opponent one), found (proved one), best (the engine's own stones), then
+    the loss bands good (< 0.05), inaccuracy (< 0.10), mistake (< 0.20) and blunder. For inaccuracy and worse,
+    missed and allowed, `better` is the engine's stones, as many as were played, and `line` its continuation, unless
+    the stones played were the engine's.
+    Each turn also has `grades`, one per stone with the same fields judged on that stone alone: the second stone
+    from the position after the first, where the engine's stone is its best second stone given the first. A turn
+    whose second stone is still to come is listed with label None and its first stone graded. Labels lacking an
+    evaluation are None."""
+    seen = {}
+
+    def look(prefix):
+        key = tuple(map(tuple, prefix))
+        if key not in seen:
+            seen[key] = lookup(prefix)
+        return seen[key]
+
+    def judge(s, e, me):
         stones = [list(p) for p in history[s:e]]
-        if e - s < (1 if s == 0 else 2) and not (e == len(history) and winner == me):
-            break
-        turn = dict(ply=s, player=me, stones=stones, label=None, before=None, after=None, better=None, line=None)
-        turns.append(turn)
+        grade = dict(UNGRADED)
         if e == len(history) and winner == me:
-            turn['label'] = 'win'
-            continue
-        before, after = lookup(history[:s]), lookup(history[:e])
+            grade['label'] = 'win'
+            return grade
+        before, after = look(history[:s]), look(history[:e])
         if before is None or after is None:
-            continue
-        turn['before'], turn['after'] = before['value'], 1 - after['value']
+            return grade
+        grade['before'] = before['value']
+        grade['after'] = after['value'] if player_at(e) == me else 1 - after['value']
         had = (before.get('proof') or {}).get('winner')
         has = (after.get('proof') or {}).get('winner')
-        loss = turn['before'] - turn['after']
-        played_best = bool(before['moves']) and sorted(map(tuple, before['moves'])) == sorted(map(tuple, stones))
+        loss = grade['before'] - grade['after']
+        engine = [tuple(m) for m in before['moves']]
+        played_best = bool(engine) and all(tuple(p) in engine for p in stones)
         if had == 1 - me:
             label = 'lost'
         elif had == me:
@@ -1555,15 +1567,26 @@ def review(history, lookup, winner=-1):
             label = 'best'
         else:
             label = 'good' if loss < .05 else 'inaccuracy' if loss < .1 else 'mistake' if loss < .2 else 'blunder'
-        turn['label'] = label
-        if label in ('inaccuracy', 'mistake', 'blunder', 'missed', 'allowed') and before['moves']:
-            turn['better'] = before['moves']
+        grade['label'] = label
+        if label in ('inaccuracy', 'mistake', 'blunder', 'missed', 'allowed') and engine and not played_best:
+            grade['better'] = before['moves'][:len(stones)]
             if before.get('pv'):
-                turn['line'] = before['pv']
+                grade['line'] = before['pv']
             else:
-                reply = lookup([*history[:s], *map(tuple, before['moves'])])
-                turn['line'] = [[*p, me] for p in before['moves']] + \
-                               [[*p, 1 - me] for p in (reply or {}).get('moves', [])]
+                reply = look([*history[:s], *engine])
+                grade['line'] = [[*p, me] for p in before['moves']] + \
+                                [[*p, 1 - me] for p in (reply or {}).get('moves', [])]
+        return grade
+
+    turns = []
+    starts = turn_starts(len(history))
+    for s, e in zip(starts, [*starts[1:], len(history)]):
+        if s == e:
+            break
+        me = player_at(s)
+        complete = e - s == (1 if s == 0 else 2) or e == len(history) and winner == me
+        turns.append(dict(ply=s, player=me, stones=[list(p) for p in history[s:e]],
+                          **(judge(s, e, me) if complete else UNGRADED), grades=[judge(p, p + 1, me) for p in range(s, e)]))
     return turns
 
 

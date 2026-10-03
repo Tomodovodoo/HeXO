@@ -17,27 +17,39 @@ const MAX_BUDGET = 2 ** 31 - 1;
 const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
-/** Labels every complete turn of `history` as python/play.py review does; `lookup(prefix, ply)` is the evaluation of a
- * position, given `ply` when the prefix is `history.slice(0, ply)`. */
+const UNGRADED = {label: null, before: null, after: null, better: null, line: null};
+
+/** Labels every turn of `history`, and each of its stones in `grades`, as python/play.py review does; `lookup(prefix,
+ * ply)` is the evaluation of a position, given `ply` when the prefix is `history.slice(0, ply)`. */
 export function review(history, lookup, winner = -1) {
+  const seen = new Map(), look = (prefix, ply) => {
+    const key = position(prefix);
+    if (!seen.has(key)) seen.set(key, lookup(prefix, ply));
+    return seen.get(key);
+  };
+  const judge = (s, e, me) => {
+    const stones = history.slice(s, e), grade = {...UNGRADED};
+    if (e === history.length && winner === me) return {...grade, label: 'win'};
+    const before = look(history.slice(0, s), s), after = look(history.slice(0, e), e);
+    if (!before || !after) return grade;
+    grade.before = before.value; grade.after = playerAt(e) === me ? after.value : 1 - after.value;
+    const had = before.proof?.winner, has = after.proof?.winner, loss = grade.before - grade.after, engine = (before.moves || []).map(p => p.join(','));
+    const best = engine.length > 0 && stones.every(p => engine.includes(p.join(',')));
+    grade.label = had === 1 - me ? 'lost' : had === me ? has === me || best ? 'kept' : 'missed' : has === 1 - me ? 'allowed'
+      : has === me ? 'found' : best ? 'best' : loss < .05 ? 'good' : loss < .1 ? 'inaccuracy' : loss < .2 ? 'mistake' : 'blunder';
+    if (['inaccuracy', 'mistake', 'blunder', 'missed', 'allowed'].includes(grade.label) && engine.length && !best) {
+      grade.better = before.moves.slice(0, stones.length);
+      grade.line = before.pv?.length ? before.pv : before.line?.length ? before.line : [...before.moves.map(p => [...p, me]), ...(look([...history.slice(0, s), ...before.moves])?.moves || []).map(p => [...p, 1 - me])];
+    }
+    return grade;
+  };
   const turns = [], ss = starts(history.length);
   for (let i = 0; i < ss.length; i++) {
-    const ply = ss[i], end = ss[i + 1] ?? history.length, me = playerAt(ply), stones = history.slice(ply, end);
-    if (stones.length < (ply ? 2 : 1) && !(end === history.length && winner === me)) break;
-    const turn = {ply, player: me, stones, label: null, before: null, after: null, better: null, line: null};
-    turns.push(turn);
-    if (end === history.length && winner === me) { turn.label = 'win'; continue; }
-    const before = lookup(history.slice(0, ply), ply), after = lookup(history.slice(0, end), end);
-    if (!before || !after) continue;
-    turn.before = before.value; turn.after = 1 - after.value;
-    const had = before.proof?.winner, has = after.proof?.winner, loss = turn.before - turn.after;
-    const best = before.moves?.length && JSON.stringify(before.moves.map(p => p.join(',')).sort()) === JSON.stringify(stones.map(p => p.join(',')).sort());
-    turn.label = had === 1 - me ? 'lost' : had === me ? has === me || best ? 'kept' : 'missed' : has === 1 - me ? 'allowed'
-      : has === me ? 'found' : best ? 'best' : loss < .05 ? 'good' : loss < .1 ? 'inaccuracy' : loss < .2 ? 'mistake' : 'blunder';
-    if (['inaccuracy', 'mistake', 'blunder', 'missed', 'allowed'].includes(turn.label) && before.moves?.length) {
-      turn.better = before.moves;
-      turn.line = before.pv?.length ? before.pv : before.line?.length ? before.line : [...before.moves.map(p => [...p, me]), ...(lookup([...history.slice(0, ply), ...before.moves])?.moves || []).map(p => [...p, 1 - me])];
-    }
+    const ply = ss[i], end = ss[i + 1] ?? history.length, me = playerAt(ply);
+    if (end === ply) break;
+    const complete = end - ply === (ply ? 2 : 1) || end === history.length && winner === me;
+    turns.push({ply, player: me, stones: history.slice(ply, end), ...(complete ? judge(ply, end, me) : UNGRADED),
+      grades: Array.from({length: end - ply}, (_, j) => judge(ply + j, ply + j + 1, me))});
   }
   return turns;
 }
@@ -298,8 +310,7 @@ export class BrowserSession extends OfflineSession {
       if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', this.history.slice(0, ply), this.analysis, {force: !!body.force});
     } else if (path === '/review') {
       if (!this.analysis || !this.adapters.has(this.analysis.engine)) throw Error('Choose an analysis engine');
-      const history = copy(this.history), plies = starts(history.length);
-      if (this.native.game(history).winner < 0 && !plies.includes(history.length)) plies.push(history.length);
+      const history = copy(this.history), plies = Array.from({length: history.length + (this.native.game(history).winner < 0)}, (_, i) => i);
       this.enqueue('review', history, this.reviewSpec(), {plies, cursor: 0, total: plies.length});
     } else if (path === '/cancel') {
       if (this.jobs.some(j => j.id === body.id && j.kind === 'move')) { this.paused = true; this.freezeClock(); }

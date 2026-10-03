@@ -318,6 +318,30 @@ class Bundle(unittest.TestCase):
                               values=None if values is None else values.tolist(), lead=lead))
             self.assertEqual(json.loads(json.dumps(found)), json.loads(json.dumps(expected)), case)
 
+    def test_review_matches_play(self):
+        rng = np.random.default_rng(5)
+        history = [[0, 0], [1, 0], [1, 1], [-1, 0], [-2, 0], [2, 2], [3, 3], [4, 4]]
+        win = lambda side: dict(winner=side, turns=1, plies=2)
+        cases = []
+        for case in range(24):
+            length = int(rng.integers(1, len(history) + 1))
+            evaluations = []
+            for ply in range(length + 1):
+                if rng.random() < .15:
+                    continue
+                moves = history[ply:ply + 2] if ply < length and rng.random() < .3 else rng.integers(5, 9, (2, 2)).tolist()
+                proof = win(int(rng.integers(2))) if rng.random() < .2 else None
+                evaluations.append([history[:ply], dict(value=round(float(rng.random()), 4), moves=moves, proof=proof,
+                                                        pv=[[*moves[0], 0, 1]] if proof and rng.random() < .5 else [])])
+            cases.append(dict(history=history[:length], evaluations=evaluations, winner=int(rng.integers(-1, 2))))
+        cases.append(dict(history=[], evaluations=[[[], dict(value=.5, moves=[[0, 0]], proof=None, pv=[])]], winner=-1))
+        found = node(dict(kind='review', cases=cases))
+        for case, answer in zip(cases, found):
+            table = {json.dumps(prefix): record for prefix, record in case['evaluations']}
+            expected = play.review(case['history'], lambda prefix: table.get(json.dumps([list(p) for p in prefix])),
+                                   case['winner'])
+            self.assertEqual(answer, json.loads(json.dumps(expected)), case)
+
     def test_thread_count_follows_isolation_and_cores(self):
         contexts = [dict(isolated=True, cores=24), dict(isolated=False, cores=24), dict(isolated=True, cores=2),
                     dict(isolated=True, cores=5)]
