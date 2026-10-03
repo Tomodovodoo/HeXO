@@ -89,6 +89,11 @@ await assets.install(before.files, fraction => fractions.push(fraction));
 out.status = {before: {state: before.state, bytes: before.bytes}, after: await assets.status(files), local: await assets.status(files.slice(0, 1)),
   last: fractions.at(-1)};
 
+const open = caches.open;
+caches.open = async () => { throw new Error('no Cache API'); };
+out.uncached = await assets.status(files);
+caches.open = open;
+
 // The engines' file lists on an origin without build outputs: everything comes from the site's manifests.
 reset();
 const pins = {};

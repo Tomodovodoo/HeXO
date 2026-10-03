@@ -198,6 +198,8 @@ const check = id => {
   if (!checks.has(id)) checks.set(id, ENGINES.get(id).engine.files().then(status, error => ({state: 'failed', error: error.message})));
   return checks.get(id);
 };
+/* States in which a browser engine plays without a download first: its files are here, cached, or cannot be cached. */
+const READY = new Set(['local', 'cached', 'uncached']);
 const megabytes = bytes => `${(bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0)} MB`;
 
 /** Draws picker row `row` of a browser engine: as it is when its files are here or cached, else as a download with
@@ -206,7 +208,7 @@ async function paint(row) {
   const id = row.dataset.engine, found = await check(id), running = downloads.get(id);
   if (!row.isConnected) return;
   row.querySelectorAll('.get, .size').forEach(node => node.remove());
-  const ready = !running && (found.state === 'local' || found.state === 'cached');
+  const ready = !running && READY.has(found.state);
   row.classList.remove('setup', 'running', 'failed');
   row.removeAttribute('aria-label');
   if (ready) return;
@@ -228,7 +230,8 @@ async function fetchEngine(id) {
     const found = await check(id);
     if (found.state === 'failed') throw new Error(found.error);
     if (found.state === 'missing') await download(found.files, fraction => { downloads.get(id).fraction = fraction; repaint(); });
-    checks.set(id, Promise.resolve({state: 'cached'}));
+    checks.delete(id);
+    if (!READY.has((await check(id)).state)) throw new Error('the downloaded files did not reach the browser cache');
   } catch (error) {
     checks.set(id, Promise.resolve({state: 'failed', error: error.message}));
     original.toast(`${ENGINES.get(id).entry.label}: ${error.message}`);
@@ -248,7 +251,7 @@ function openMenu(anchor, items, current, choose) {
     row.dataset.engine = item.id;
     row.onclick = async event => {
       const {state} = await check(item.id);
-      if (!downloads.has(item.id) && (state === 'local' || state === 'cached')) pick(event);
+      if (!downloads.has(item.id) && READY.has(state)) pick(event);
       else fetchEngine(item.id);
     };
     paint(row);
