@@ -252,7 +252,7 @@ export class BrowserSession extends OfflineSession {
       if (![0, 1].includes(body.side)) throw Error('Invalid seat');
       const seat = this.spec({...this.seats[body.side], ...body, budget: body.preset === 'custom' ? body.custom : undefined});
       if (this.timeControl.mode !== 'fixed') this.clockable(seat);
-      this.cancelJobs(j => j.kind === 'move'); this.seats[body.side] = seat;
+      this.cancelJobs(j => j.kind === 'move' && j.side === body.side); this.seats[body.side] = seat;
       if (this.clock?.side === body.side) this.freezeClock();
     } else if (path === '/clock') {
       if (this.saved_game) throw Error('A saved game has no clock');
