@@ -585,7 +585,7 @@ let frame=0;
 function draw(){if(!frame)frame=requestAnimationFrame(()=>{frame=0;paint()})}
 /* the stones shown: the history up to the viewed ply, then the person's stones still on their way to the server */
 function shownStones(){return view===S.history.length?[...S.history,...placing]:S.history.slice(0,view)}
-/* the lattice and the settled stones are kept in `layer`: rebuilt when the camera moves or the stones change other
+/* the lattice and the settled stones are kept in `layer`: rebuilt when the camera or perspective moves or the stones change other
    than by new ones, otherwise patched, so a placement redraws only the cells it touches and a landing animation or a
    hover only the stones that move */
 const layer=document.createElement('canvas'),lctx=layer.getContext('2d');let drawn={sig:null};
@@ -595,7 +595,7 @@ function emptyCell(x,y,near){
 }
 function clearCell(x,y){lctx.save();hexPath(x,y,CELL()+.6,lctx);lctx.clip();lctx.clearRect(x-cam.size,y-cam.size,2*cam.size,2*cam.size);lctx.restore()}
 function paintLayer(w,h,ratio,stones,occupied,legal,settled){
-  const sig=[w,h,ratio,cam.x,cam.y,cam.size].join('|'),size=cam.size,seen=(x,y)=>x>-size&&x<w+size&&y>-size&&y<h+size;
+  const sig=[w,h,ratio,cam.x,cam.y,cam.size,perspective].join('|'),size=cam.size,seen=(x,y)=>x>-size&&x<w+size&&y>-size&&y<h+size;
   const grows=drawn.sig===sig&&drawn.stones.length<=stones.length&&drawn.stones.every((k,i)=>k===key(...stones[i]))&&[...drawn.settled].every(i=>settled.has(i));
   lctx.setTransform(ratio,0,0,ratio,0,0);lctx.lineWidth=1;
   if(!grows){
