@@ -33,7 +33,7 @@ Runtime, the Bubble model, Six's networks, Shrimp's model, Seal and the Strix ne
 the picker anyway. One whose files are neither on this origin nor already downloaded shows a download button with
 its size; click it to fetch the files from the public site, after which the engine plays as usual. Picking such an
 engine for a seat without clicking downloads the same files on its first move. When the site answers 404 for one of
-an engine's files too (the site may stop publishing Seal and the Strix network), the row reads "local build" and a
+an engine's files too (the site serves Seal and the Strix network only while `PUBLISH_SEAL` and `PUBLISH_STRIX_NETWORK` are true), the row reads "local build" and a
 click shows the `tools/build_web.py` command that builds them here; nothing is downloaded or retried. Once the site
 serves the files again, the download works with no code change.
 
@@ -225,7 +225,8 @@ python -m unittest tests.test_web_seal
 `build_web.py seal` downloads Seal's four headers at the revision pinned in `tools/engines.json`, checks each
 against its SHA-256 and compiles them with `tools/seal_adapter.cpp`, the server's adapter, using the same em++ flags
 as `gumbel.wasm`. The headers are never committed; the Pages workflow installs emsdk 6.0.10 and builds Seal on every
-deployment. HexTicTacToe has no licence file; its author allows this use, so the site serves the compiled Seal.
+deployment. HexTicTacToe has no licence file, so the site serves the compiled Seal only while the repository variable
+`PUBLISH_SEAL` is `true`; a local build always makes it.
 
 The wasm is 115 KB and its glue 10 KB. The worker fetches `seal/manifest.json`, which pins both, then the glue and
 the wasm through `assets.mjs`, and calls `seal_move` exactly as the server does; Seal's clock is `performance.now()` in the
@@ -293,9 +294,10 @@ builds it with the rest.
 
 The network is not committed. `python tools/build_web.py strix-network` downloads the file pinned in
 `tools/engines.json` (2.8 MB, checked against its SHA-256) into `web/engine/strix/` with `networks.json`; without
-that file the page downloads the public site's ([Running a local copy](#running-a-local-copy)). The worker keeps `strix.wasm` and the network in the Cache API under their
-digests. The network's licence is unstated in the repository, and its author allows this use; the Pages workflow fetches it
-when the repository variable `PUBLISH_STRIX_NETWORK` is `true`, which it is. The engine code is MIT (`web/engine/strix/LICENSE-hexo-strix.txt`); the Rust
+that file the page downloads the public site's when it publishes one, and otherwise asks for a local build
+([Running a local copy](#running-a-local-copy)). The worker keeps `strix.wasm` and the network in the Cache API under their
+digests. The network's licence is unstated in the repository, so the Pages workflow fetches it only while the repository
+variable `PUBLISH_STRIX_NETWORK` is `true`; a local build always fetches it. The engine code is MIT (`web/engine/strix/LICENSE-hexo-strix.txt`); the Rust
 crates it links (serde, serde_json, rand, safetensors, rayon, rustc-hash) are MIT or Apache 2.0.
 
 A search runs on one thread. On the Ryzen 9 5900X under node 24, from a 19-stone position, a turn takes 1.0 s at
