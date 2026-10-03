@@ -309,6 +309,13 @@ def _worker(connection, cancellation, config):
             request = connection.recv()
             if request is None:
                 break
+            if request[0] == 'reset':
+                if kind == 'bubble':
+                    player.set_history(request[1])
+                    if hasattr(player, 'simulations_per_second'):
+                        del player.simulations_per_second
+                connection.send(('reset', None))
+                continue
             generation, history, limits = request
             def publish(result):
                 connection.send((generation, 'progress', result))
@@ -385,6 +392,43 @@ class TimedEngine:
 
     def set_history(self, history=()):
         pass  # Each request carries the complete confirmed history.
+
+    def wait_idle(self, timeout=5):
+        """Drain a cancelled turn before another engine takes the shared hardware."""
+        started = time.monotonic()
+        deadline = started + timeout
+        if not self.lock.acquire(timeout=max(0, timeout)):
+            raise TimeoutError('Engine controller did not become idle')
+        try:
+            if self.busy:
+                self.cancellation.set()
+            while self.busy:
+                left = deadline-time.monotonic()
+                if left <= 0:
+                    raise TimeoutError('Engine worker did not stop after its turn')
+                if self.connection.poll(min(.01, left)):
+                    ident, status, result = self.connection.recv()
+                    if ident != self.generation:
+                        continue
+                    if status in ('done', 'error'):
+                        self.busy = False
+                    if status == 'error':
+                        raise RuntimeError(result['message'])
+                elif not self.process.is_alive():
+                    raise RuntimeError('Engine worker exited')
+            return (time.monotonic()-started)*1000
+        finally:
+            self.lock.release()
+
+    def reset(self, history=(), timeout=5):
+        """Start a benchmark game with empty Bubble search and prediction caches."""
+        self.wait_idle(timeout)
+        with self.lock:
+            self.connection.send(('reset', history))
+            if not self.connection.poll(timeout):
+                raise TimeoutError('Engine game reset timed out')
+            if self.connection.recv() != ('reset', None):
+                raise RuntimeError('Engine game reset failed')
 
     def turn(self, game, milliseconds=None, *, clock=None, cancel=None, publish=None):
         history = [list(cell[:2]) for cell in game.cells]

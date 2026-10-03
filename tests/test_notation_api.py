@@ -268,6 +268,96 @@ class OfficialAPI(unittest.TestCase):
 
 
 class TimedClocks(unittest.TestCase):
+    def test_clocked_comparison_book_settings_and_paired_scores(self):
+        from timed_match import side_settings, paired_openings, comparison_summary
+        from dense_openings import canonical
+        with TemporaryDirectory() as directory:
+            path = Path(directory)/'settings.json'
+            path.write_text(json.dumps(dict(search=dict(root_samples=32, max_simulations=None),
+                                            solver=dict(enabled=False))), encoding='utf-8')
+            self.assertIsNone(side_settings(path)['search']['max_simulations'])
+            path.write_text(json.dumps(dict(search=dict(native_feed=True))), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'Unsupported search'):
+                side_settings(path)
+            starts = paired_openings(Path(directory), 4, 73, suite='standard-v1')
+            self.assertEqual(starts, paired_openings(Path(directory), 4, 73, suite='standard-v1'))
+            self.assertEqual(len({canonical(s['history'])[0] for s in starts}), 4)
+            self.assertTrue(all(s['key'] == canonical(s['history'])[0] for s in starts))
+            with self.assertRaisesRegex(ValueError, 'frozen'):
+                paired_openings(Path(directory), 1, 0, suite='book')
+        rows = [dict(seed=0, swapped=False, winner='x', reason='win'),
+                dict(seed=0, swapped=True, winner='o', reason='win'),
+                dict(seed=1, swapped=False, winner=None, reason='capped'),
+                dict(seed=1, swapped=True, winner='x', reason='win')]
+        self.assertIsNone(comparison_summary(rows[:1])['elo_delta'])
+        stats = comparison_summary(rows, True)
+        self.assertEqual((stats['wins'], stats['losses'], stats['capped'], stats['pairs']), (2, 1, 1, 2))
+        self.assertEqual(stats['pair_score'], .625)
+        rows[-1]['reason'] = 'crash'
+        stats = comparison_summary(rows, True)
+        self.assertFalse(stats['valid'])
+        self.assertIsNone(stats['elo_delta'])
+        self.assertIsNone(stats['decision'])
+
+    def test_fixed_turn_resource_drain_is_outside_both_players_clocks(self):
+        from timed_match import Match, play_turn
+        clock = [0]
+        class Engine:
+            def turn(self, game, **options):
+                self.options = options
+                clock[0] = 80_000_000
+                return dict(moves=[[1, 0], [2, 0]], evaluated=7, completed=8)
+            def wait_idle(self):
+                clock[0] = 500_000_000
+                return 420
+        engine = Engine()
+        with TemporaryDirectory() as directory:
+            match = Match(dict(players=dict(cross=dict(kind='native'), circle=dict(kind='native')),
+                               time_control='1', turn_cap_ms=100, fixed_turn_time=True),
+                          now=lambda: clock[0], directory=directory)
+            try:
+                match.start()
+                state = play_turn(match, engine, wait_worker=True, record_engine=True)
+                self.assertEqual(state['history'], [[0, 0], [1, 0], [2, 0]])
+                self.assertEqual((state['cross_ms'], state['circle_ms']), (1000, 920))
+                self.assertIsNone(engine.options['clock'])
+                self.assertEqual(engine.options['milliseconds'], 100)
+                events = [json.loads(line) for line in (match.directory/'events.jsonl').read_text().splitlines()]
+                reply = next(e for e in events if e['type'] == 'engine_reply')
+                self.assertEqual((reply['controller_ns'], reply['worker_wait_ms']), (80_000_000, 420))
+                self.assertEqual(next(e for e in events if e['type'] == 'turn')['elapsed_ns'], 80_000_000)
+                clock[0] += 10_000_000
+                self.assertEqual(match.snapshot()['cross_ms'], 990)
+            finally:
+                match.close()
+
+    def test_clocked_runner_saves_every_game_and_color_pair(self):
+        from timed_match import main
+        from timed_engine import legal_turn
+        from unittest.mock import MagicMock
+        engines = [MagicMock(), MagicMock()]
+        for index, engine in enumerate(engines):
+            engine.__enter__.return_value = engine
+            engine.identity = dict(checkpoint=f'arm-{index}')
+            engine.wait_idle.return_value = 0
+            engine.turn.side_effect = lambda game, **_kwargs: dict(
+                moves=legal_turn([cell[:2] for cell in game.cells]), evaluated=3, completed=4)
+        with TemporaryDirectory() as directory, patch('timed_match.TimedEngine', side_effect=engines):
+            output = Path(directory)/'match'
+            args = ['--a', 'native', '--b', 'native', '--pairs', '2', '--turn-ms', '100',
+                    '--max-placements', '5', '--out', str(output)]
+            main(args)
+            saved = json.loads((output/'summary.json').read_text())
+            self.assertEqual((saved['comparison']['games'], saved['comparison']['pairs']), (4, 2))
+            self.assertEqual(saved['comparison']['pair_score'], .5)
+            self.assertTrue(saved['comparison']['valid'])
+            self.assertEqual(len(list(output.glob('*/game.htttx'))), 4)
+            self.assertEqual(saved['timing']['a']['reported_evaluations'], 12)
+            self.assertEqual(saved['timing']['b']['reported_completed_visits'], 16)
+            self.assertTrue(all(e.reset.call_count == 4 for e in engines))
+            with self.assertRaises(SystemExit):
+                main(args)
+
     def test_half_turn_pause_increment_and_exact_deadline(self):
         from timed_match import Match
         clock = [0]
@@ -404,6 +494,11 @@ class TimedClocks(unittest.TestCase):
                 stopped.set()
                 result = engine.turn(game, 1000, cancel=stopped)
                 self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+                self.assertGreaterEqual(engine.wait_idle(), 0)
+                self.assertFalse(engine.busy)
+                engine.reset([[0, 0]])
+                reply = engine.turn(game, 30)
+                self.assertEqual(legal_turn([[0, 0]], reply['moves']), reply['moves'])
             finally:
                 game.close()
 
