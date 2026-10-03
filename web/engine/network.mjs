@@ -59,6 +59,13 @@ export async function runtimeFiles(provider) {
   return [api, `${runtime}.mjs`, `${runtime}.wasm`].map(name => ({path: `ort/${name}`, sha256: data.files?.[name], version: data.version, local}));
 }
 
+/** The runtime files a load on `provider` may read: runtimeFiles(provider), plus the WebAssembly runtime that a
+ * failed WebGPU start falls back to unless `prefer` fixed the device. */
+export async function loadFiles(provider, prefer) {
+  const files = await runtimeFiles(provider);
+  return provider === 'webgpu' && !prefer ? [...files, ...await runtimeFiles('wasm')] : files;
+}
+
 /** ONNX Runtime Web for `provider` on `threads` WebAssembly threads (null: defaultThreads); `progress(fraction)`
  * follows the wasm download. */
 export async function runtime(provider, threads, progress = () => {}) {

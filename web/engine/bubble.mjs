@@ -27,7 +27,7 @@ export async function isolate() {
 
 import {EngineWorker} from './engine-worker.mjs';
 import {workerUrl} from './assets.mjs';
-import {modelFiles, probe, runtimeFiles} from './network.mjs';
+import {loadFiles, modelFiles, probe} from './network.mjs';
 
 export class BubbleEngine extends EngineWorker {
   /** `model` is the manifest's path under web/engine; `prefer` 'wasm', 'webgpu-fp32' or 'webgpu-fp16' narrows the device choice. */
@@ -35,10 +35,12 @@ export class BubbleEngine extends EngineWorker {
     super(workerUrl('worker.mjs'), 'Bubble (browser)', {model, prefer, threads});
   }
 
-  /** The downloaded files (assets.mjs records) a load on this device reads: ONNX Runtime and the model graphs. */
+  /** The downloaded files (assets.mjs records) a load on this device may read: ONNX Runtime and the model graphs,
+   * with the WebAssembly runtime and the fp32 graph a WebGPU fallback needs. */
   async files() {
-    const device = await probe(this.options.prefer);
-    return [...await runtimeFiles(device.provider), ...(await modelFiles(device.precisions, this.options.model)).files];
+    const {provider, precisions} = await probe(this.options.prefer), {prefer} = this.options;
+    const graphs = provider === 'webgpu' && !prefer ? [...new Set([...precisions, 'fp32'])] : precisions;
+    return [...await loadFiles(provider, prefer), ...(await modelFiles(graphs, this.options.model)).files];
   }
 
   /**

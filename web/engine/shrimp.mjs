@@ -2,7 +2,7 @@
  * engines (seat.mjs). It plays as the server's Shrimp entry (tools/engines.json): Six's driver with these visits per
  * stone, mirrored into Six's frame. */
 import {json, workerUrl} from './assets.mjs';
-import {defaultThreads, probe, runtimeFiles} from './network.mjs';
+import {defaultThreads, loadFiles, probe} from './network.mjs';
 import {ShrimpNetwork} from './shrimp/network.mjs';
 
 /** The server entry's presets, as visits per stone; `simulations` is what the analysis panel shows. */
@@ -81,10 +81,11 @@ export class ShrimpEngine {
     });
   }
 
-  /** The downloaded files (assets.mjs records) a load on this device reads: ONNX Runtime, the graph and shrimp.wasm. */
+  /** The downloaded files (assets.mjs records) a load on this device may read: ONNX Runtime (with a WebGPU start's
+   * WebAssembly fallback), the graph and shrimp.wasm. */
   async files() {
     const [{provider}, {file}, {data, local}] = await Promise.all([probe(this.options.prefer), ShrimpNetwork.files(), json('build.json')]);
-    return [...await runtimeFiles(provider), file, {path: 'shrimp/shrimp.wasm', sha256: data.artefacts['shrimp/shrimp.wasm'], lines: true, local}];
+    return [...await loadFiles(provider, this.options.prefer), file, {path: 'shrimp/shrimp.wasm', sha256: data.artefacts['shrimp/shrimp.wasm'], lines: true, local}];
   }
 
   /** Ends the worker; pending loads and calls reject with an AbortError. */

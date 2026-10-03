@@ -2,7 +2,7 @@
  * as the server's Six: the same presets in Six protocol nodes, with the networks this site was built with. */
 import {EngineWorker} from './engine-worker.mjs';
 import {json, workerUrl} from './assets.mjs';
-import {probe, runtimeFiles} from './network.mjs';
+import {loadFiles, probe} from './network.mjs';
 
 export const PRESETS = {lightning: {nodes: 1500}, quick: {nodes: 6000}, standard: {nodes: 30000}, strong: {nodes: 135000},
   deep: {nodes: 500000}, dangerous: {nodes: 2000000}};
@@ -30,12 +30,13 @@ export class SixEngine extends EngineWorker {
     return found;
   }
 
-  /** The downloaded files (assets.mjs records) turns on this device read: ONNX Runtime and the networks named in
+  /** The downloaded files (assets.mjs records) turns on this device may read: ONNX Runtime (with a WebGPU start's
+   * WebAssembly fallback) and the networks named in
    * `networks` (manifest names; the newest when none of them is in the manifest). */
   async files(networks = []) {
     const [{provider}, {data, local}] = await Promise.all([probe(this.options.prefer), this.manifest()]);
     const chosen = data.networks.filter(n => networks.includes(n.name));
-    return [...await runtimeFiles(provider), ...(chosen.length ? chosen : data.networks.slice(0, 1))
+    return [...await loadFiles(provider, this.options.prefer), ...(chosen.length ? chosen : data.networks.slice(0, 1))
       .map(n => ({path: `six/networks/${n.file}`, sha256: n.sha256, bytes: n.bytes, local}))];
   }
 }

@@ -202,8 +202,12 @@ function controls(choice, send, id) {
  * `stamp` names the networks it covered; a different saved choice checks again. */
 const checks = new Map(), downloads = new Map();
 const failure = error => error instanceof NotOnSite ? {state: 'unpublished'} : {state: 'failed', error: error.message};
-/** The networks the saved seat and analysis choices pick for engine `id`, which its files() should cover. */
-const chosen = id => [...config.seats, config.analysis].filter(c => c?.engine === id && c.checkpoint).map(c => c.checkpoint);
+/** The networks the seat and analysis choices pick for engine `id`, which its files() should cover: the browser
+ * session's on a static page, else the saved ones. */
+const chosen = id => {
+  const session = page.browserPlay, choices = session ? [...session.seats, session.analysis] : [...config.seats, config.analysis];
+  return choices.filter(c => c?.engine === id && c.checkpoint).map(c => c.checkpoint);
+};
 const remember = (id, promise) => { checks.set(id, Object.assign(promise, {stamp: chosen(id).join(',')})); return promise; };
 const check = id => checks.get(id)?.stamp === chosen(id).join(',') ? checks.get(id)
   : remember(id, ENGINES.get(id).engine.files(chosen(id)).then(status).catch(failure));
