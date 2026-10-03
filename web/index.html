@@ -521,15 +521,15 @@ function accept(data){
   renderJobs();tickClocks();draw();
 }
 
-/* board geometry */
-function screen(q,r){return[canvas.clientWidth/2+cam.x+cam.size*SQ3*(q+r/2),canvas.clientHeight/2+cam.y+cam.size*1.5*r]}
-function axial(x,y){x-=canvas.clientWidth/2+cam.x;y-=canvas.clientHeight/2+cam.y;const q=(SQ3/3*x-y/3)/cam.size,r=2*y/3/cam.size,s=-q-r;
+/* board geometry: HTTTX axial cells, pointy-top, q to the right and r up and to the right as the notation's diagram draws them */
+function screen(q,r){return[canvas.clientWidth/2+cam.x+cam.size*SQ3*(q+r/2),canvas.clientHeight/2+cam.y-cam.size*1.5*r]}
+function axial(x,y){x-=canvas.clientWidth/2+cam.x;y-=canvas.clientHeight/2+cam.y;const q=(SQ3/3*x+y/3)/cam.size,r=-2*y/3/cam.size,s=-q-r;
   let a=Math.round(q),b=Math.round(r),c=Math.round(s);const da=Math.abs(a-q),db=Math.abs(b-r),dc=Math.abs(c-s);
   if(da>db&&da>dc)a=-b-c;else if(db>dc)b=-a-c;return[a,b]}
 function fit(){
   const h=S?S.history.slice(0,view):[];fitted=true;
   if(!h.length){cam={x:0,y:0,size:Math.max(16,Math.min(34,canvas.clientWidth/20,canvas.clientHeight/16))};return}
-  const pts=h.map(([q,r])=>[SQ3*(q+r/2),1.5*r]),xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
+  const pts=h.map(([q,r])=>[SQ3*(q+r/2),-1.5*r]),xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
   const w=Math.max(...xs)-Math.min(...xs)+10,hh=Math.max(...ys)-Math.min(...ys)+10;
   const size=Math.max(10,Math.min(34,canvas.clientWidth/w,(canvas.clientHeight-90)/hh));
   cam={size,x:-size*(Math.max(...xs)+Math.min(...xs))/2,y:-size*(Math.max(...ys)+Math.min(...ys))/2};
