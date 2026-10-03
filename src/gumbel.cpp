@@ -148,11 +148,14 @@ struct Tree {
   return out;
  }
  // Shared graph: makes `child` the child of `parent`'s edge `e`; the edge keeps its visits. An exact child settles
- // the edge; the parent's value becomes stale.
+ // the edge and the parent's verdict reaches its own stored parents (revise); otherwise the parent's value becomes
+ // stale.
  void attach(Node& parent,Edge& e,const std::shared_ptr<Node>& child) {
   e.child=child;child->parents.push_back(parent.weak_from_this());
-  if(child->exact_winner>=0 && tighten(child->exact_winner,child->distance+1,child->bound,e.exact_winner,e.distance,e.bound)){settle(parent);learn(parent);}
-  stale(parent);
+  if(child->exact_winner>=0 && tighten(child->exact_winner,child->distance+1,child->bound,e.exact_winner,e.distance,e.bound)){
+   settle(parent);learn(parent);revise(parent);
+  }
+  else stale(parent);
  }
  // Shared graph: attaches to a newly expanded node every legal move whose turn context the store already holds.
  // A move's position key follows from the node's own, so the full key is computed only for positions present.
