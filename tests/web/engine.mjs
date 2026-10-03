@@ -123,6 +123,10 @@ if (job.kind === 'encode') {
   const seated = Date.now(); slow.answer('/seat', {side: 1, engine: 'slow'}); await wait(500);
   answer.load_charged = {spent: slow.clockTurns[1]?.spent_ms ?? null, load: readyAt - seated};
   s.answer('/pause', {paused: true}); slow.answer('/pause', {paused: true});
+  const r = new BrowserSession(native); r.answer('/clock', {mode: 'game', tc: '60'}); await wait(150);
+  await r.persist(); await wait(250);
+  const back = new BrowserSession(native); back.storage = r.storage; await back.restore();
+  answer.reloaded = {balance: back.clock.cross_ms, partial: back.clockPartial}; r.freezeClock();
 } else if (job.kind === 'play') {
   const s = new BrowserSession(native), data = JSON.parse(readFileSync(new URL('../../web/engine/openings.json', import.meta.url)));
   s.bookData = new OpeningBook(data);

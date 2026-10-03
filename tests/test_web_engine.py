@@ -291,6 +291,8 @@ class Bundle(unittest.TestCase):
         self.assertGreaterEqual(result['paused_turn'], 190)
         self.assertGreaterEqual(result['load_charged']['load'], 290)
         self.assertLess(result['load_charged']['spent'], 150)
+        self.assertLess(result['reloaded']['balance'], 59700)
+        self.assertGreaterEqual(result['reloaded']['partial'], 390)
 
     def test_browser_notations_preserve_a_single_stone_final_turn(self):
         history = [[0, 0], [0, 2], [1, 2], [1, 0], [2, 0], [2, 3], [3, 3], [3, 0], [4, 0], [4, 4], [5, 4], [5, 0]]

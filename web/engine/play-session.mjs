@@ -153,7 +153,7 @@ export class BrowserSession extends OfflineSession {
   snapshot() {
     return {id: this.id, history: copy(this.history), seats: copy(this.seats), analysis: copy(this.analysis), paused: this.paused,
       book: copy(this.book), match: copy(this.match), saved_game: copy(this.saved_game), clock: this.clockNow(), timeControl: copy(this.timeControl),
-      clockTurns: copy(this.clockTurns), clockPartial: this.clockPartial, outcome: copy(this.outcome), gameId: this.gameId, gameCreated: this.gameCreated, records: copy(this.records)};
+      clockTurns: copy(this.clockTurns), clockPartial: this.clockPartial, outcome: copy(this.outcome), taken: Date.now(), gameId: this.gameId, gameCreated: this.gameCreated, records: copy(this.records)};
   }
   storageConflict() {
     this.conflicted = true; this.paused = true; this.freezeClock(); this.cancelJobs();
@@ -183,9 +183,15 @@ export class BrowserSession extends OfflineSession {
     this.coverage = coverage?.counts || {};
     this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false;
     if (saved) {
-      this.native.game(saved.history); Object.assign(this, {...saved, paused: true});
+      const {taken, ...fields} = saved;
+      this.native.game(saved.history); Object.assign(this, {...fields, paused: true});
       if (this.match) this.match.active = false;
-      if (this.clock) { delete this.clock.started; delete this.clock.side; }
+      if (this.clock?.started != null && taken) {
+        // The side was thinking when the page went away: the time since the snapshot counts against it.
+        const field = this.clock.side ? 'circle_ms' : 'cross_ms', now = Date.now();
+        this.clock[field] = Math.max(0, this.clock[field] - (now - taken)); this.clockPartial = (this.clockPartial || 0) + now - this.clock.started;
+      }
+      if (this.clock) { delete this.clock.started; delete this.clock.side; delete this.clock.running; }
       const game = this.gameId && await this.storage.get('games', this.gameId);
       if (game) { const {saved_at, ...content} = game; this.gameSignature = JSON.stringify(content); }
     }

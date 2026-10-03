@@ -190,6 +190,8 @@ async function run(key, task) {
     if (error.name !== 'AbortError') {
       failed = key;
       original.toast(error.message);
+      // The server counts a browser seat as a person, so its clock would run on into a loss on time.
+      if (task.kind === 'move' && state()?.clock_spec && state().clock_spec.mode !== 'fixed') original.post('/pause', {paused: true});
     }
     if (job === current) job = null;
   }
