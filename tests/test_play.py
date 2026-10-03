@@ -1431,13 +1431,28 @@ class FreeplayClock(unittest.TestCase):
 
             def close(self):
                 pass
-        self.session.prepare_timed = lambda: setattr(self.session, 'seat_engines', [None, Broken()])
+        self.session.prepare_timed = lambda sides=(0, 1): setattr(self.session, 'seat_engines', [None, Broken()])
         self.session.configure_seat(1, 'native:Native')
         wait(lambda: self.session.paused)
         before = self.session.state()['clock']
         time.sleep(.2)
         after = self.session.state()
         self.assertEqual((after['clock']['running'], after['clock']['circle_ms'], after['outcome']), (None, before['circle_ms'], None))
+
+    def test_changing_one_seat_keeps_the_other_seats_timed_engine(self):
+        with unittest.mock.patch('timed_engine.TimedEngine') as engine:
+            engine.side_effect = lambda config: unittest.mock.MagicMock(name=config['kind'])
+            self.session.configure_seat(0, 'native:Native')
+            self.session.configure_seat(1, 'native:Native')
+            self.session.pause(True)
+            self.session.set_clock(dict(mode='game', tc='60'))
+            wait(lambda: self.session.clock_preparing is None and all(self.session.seat_engines))
+            kept = self.session.seat_engines[1]
+            with self.session.lock:
+                self.session.prepare_timed([0])
+            wait(lambda: self.session.clock_preparing is None and self.session.seat_engines[0] is not None)
+            self.assertIs(self.session.seat_engines[1], kept)
+            kept.close.assert_not_called()
 
     def test_engines_report_where_the_server_runs_them(self):
         from play import device_of

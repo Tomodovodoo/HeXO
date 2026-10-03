@@ -1396,6 +1396,7 @@ class Session:
         self.match, self.match_worker = None, None
         self.game_clock, self.timed_engines = None, []
         self.clock_spec, self.seat_engines, self.clock_preparing = dict(mode='fixed'), [None, None], None
+        self.preparing_sides = set()
         self.outcome, self.clock_turns, self.notice, self.clock_partial_ms = None, [], None, 0
         self.match_file = None
         self.retries = {}
@@ -1754,7 +1755,7 @@ class Session:
             self.seats[side] = seat
             self.stop_moves(side)
             if not self.match:
-                self.prepare_timed()
+                self.prepare_timed([side])
             self.changed()
 
     def configure_analysis(self, engine, checkpoint=None, preset='standard', custom=None, auto=True):
@@ -2219,43 +2220,48 @@ class Session:
             self.prepare_timed()
             self.changed()
 
-    def prepare_timed(self):
-        """Replace the freeplay seats' timed engines: for a clocked game, one per engine seat, started in the background
-        while `clock_preparing` holds the clock (stopped, its time so far kept for the turn) and the moves. Call with the
-        lock held."""
-        for engine in self.seat_engines:
-            if engine:
-                engine.close()
-        self.seat_engines = [None, None]
-        seats = [dict(seat) if seat['engine'] != 'human' else None for seat in self.seats]
-        if self.match or self.clock_spec['mode'] == 'fixed' or not any(seats):
-            self.clock_preparing = None
+    def prepare_timed(self, sides=(0, 1)):
+        """Replace the timed engines of the freeplay `sides` (and of any still being prepared): for a clocked game, one per
+        engine seat, started in the background while `clock_preparing` holds new moves, and the clock too when it runs
+        for one of those sides (stopped, its time so far kept for the turn). The other side's engine keeps playing. Call
+        with the lock held."""
+        sides = set(sides) | self.preparing_sides
+        for side in sides:
+            if self.seat_engines[side]:
+                self.seat_engines[side].close()
+                self.seat_engines[side] = None
+        seats = {side: dict(self.seats[side]) for side in sides if self.seats[side]['engine'] != 'human'}
+        if self.match or self.clock_spec['mode'] == 'fixed' or not seats:
+            self.clock_preparing, self.preparing_sides = None, set()
             return
-        self.pause_clock()
-        self.clock_preparing = generation = object()
+        if self.game_clock and self.game_clock.running in sides:
+            self.pause_clock()
+        generation = self.clock_preparing = object()
+        self.preparing_sides = set(sides)
 
         def prepare():
             from timed_engine import TimedEngine
-            engines, failure = [None, None], None
+            engines, failure = {}, None
             try:
-                for side, seat in enumerate(seats):
-                    if seat:
-                        engines[side] = TimedEngine(self.timed_config(seat))
+                for side, seat in seats.items():
+                    engines[side] = TimedEngine(self.timed_config(seat))
             except Exception as error:
                 failure = error
             with self.lock:
-                if self.clock_preparing is not generation or self.closing:
-                    for engine in engines:
-                        if engine:
-                            engine.close()
-                    return
-                self.clock_preparing = None
+                if self.clock_preparing is not generation or self.closing or failure is not None:
+                    for engine in engines.values():
+                        engine.close()
+                    if self.clock_preparing is not generation or self.closing:
+                        return
+                self.clock_preparing, self.preparing_sides = None, set()
                 if failure is None:
-                    self.seat_engines = engines
+                    for side, engine in engines.items():
+                        self.seat_engines[side] = engine
                 else:
-                    for engine in engines:
+                    for engine in self.seat_engines:
                         if engine:
                             engine.close()
+                    self.seat_engines = [None, None]
                     self.clock_spec, self.notice = dict(mode='fixed'), f'The clock is off: {failure}'
                     self.reset_clock()
                 self.changed()
