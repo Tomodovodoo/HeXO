@@ -104,10 +104,12 @@ if (job.kind === 'encode') {
   s.answer('/seat', {side: 1, engine: 'timed'});
   await wait(60);
   answer.engine_turn = {history: s.history.length, asked, clock: s.clockNow()};
-  s.answer('/play', {q: 9, r: 9});
-  await wait(1500);
+  clearTimeout(s.flag); await wait(s.clockNow().cross_ms + 50);
+  answer.late = s.answer('/play', {q: 9, r: 9})[0];
   answer.timed_out = {state: (({winner, outcome}) => ({winner, outcome}))(s.state()), game: (await s.saving, await s.storage.get('games', s.gameId)), play: s.answer('/play', {q: 9, r: 8})[0]};
   s.answer('/new', {});
+  answer.long_clock = s.answer('/clock', {mode: 'game', tc: '3000000'})[0];
+  s.answer('/clock', {mode: 'game', tc: '0.3+1'});
   answer.fresh = {outcome: s.outcome, clock: s.clockNow()};
   s.answer('/seat', {side: 1, engine: 'human'}); s.answer('/clock', {mode: 'game', tc: '60'});
   await wait(100); s.answer('/pause', {paused: true}); await wait(100); s.answer('/pause', {paused: false}); await wait(100);

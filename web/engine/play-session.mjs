@@ -8,6 +8,8 @@ import {clockSpec, turnTime} from './clock.mjs';
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 const copy = value => structuredClone(value), position = history => history.map(p => p.join(',')).join(';');
 const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human'});
+/** The longest delay setTimeout keeps; a longer clock is checked again when it fires. */
+const MAX_TIMER = 2 ** 31 - 1;
 const REVIEW_PRESET = 'standard', FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
@@ -225,6 +227,9 @@ export class BrowserSession extends OfflineSession {
       const point = [body.q, body.r];
       if (!point.every(Number.isSafeInteger)) throw Error('Coordinates must be integers');
       const before = this.native.game(this.history);
+      if (before.winner < 0 && !this.outcome && this.clock?.side === before.player && this.clockNow()[before.player ? 'circle_ms' : 'cross_ms'] <= 0) {
+        this.chargeTurn(before.player); this.changed();
+      }
       if (before.winner >= 0 || this.outcome) throw Error('The game has finished');
       const after = this.native.game([...this.history, point]); this.forkGame(); this.history.push(point); this.paused = false;
       if (after.winner >= 0 || after.player !== before.player) this.chargeTurn(before.player);
@@ -369,7 +374,7 @@ export class BrowserSession extends OfflineSession {
   armFlag() {
     clearTimeout(this.flag);
     const c = this.clock;
-    if (c?.started != null) this.flag = setTimeout(() => this.checkTime(), Math.max(0, c[c.side ? 'circle_ms' : 'cross_ms'] - (Date.now() - c.started)) + 20);
+    if (c?.started != null) this.flag = setTimeout(() => this.checkTime(), Math.min(MAX_TIMER, Math.max(0, c[c.side ? 'circle_ms' : 'cross_ms'] - (Date.now() - c.started)) + 20));
   }
   /** Charges `side`'s completed turn at time `at`, with what it spent before a pause (`clockPartial`): finished late it loses on time; otherwise it gains its increment, or
    * a whole turn again on a per-turn clock. Logs the balances in `clockTurns`; true when the turn stands. */
@@ -390,7 +395,7 @@ export class BrowserSession extends OfflineSession {
     const c = this.clock;
     if (!c || c.started == null) return;
     const side = c.side, left = this.clockNow()[side ? 'circle_ms' : 'cross_ms'];
-    if (left > 0) { this.flag = setTimeout(() => this.checkTime(), left + 20); return; }
+    if (left > 0) { this.flag = setTimeout(() => this.checkTime(), Math.min(MAX_TIMER, left + 20)); return; }
     this.cancelJobs(j => j.kind === 'move');
     this.chargeTurn(side);
     if (this.match?.active) await this.finishMatch(1 - side, 'timeout');
