@@ -303,8 +303,9 @@ class Loading(unittest.TestCase):
         self.assertEqual(len(self.out['silent']['starts']), 3)
 
     def test_a_fixed_device_and_thread_count_do_not_fall_back(self):
-        found = self.out['fixed_device']
-        self.assertEqual((found['error'], found['notices'], len(found['starts'])), ('Bubble: starting GPU timed out', [], 1))
+        for case in ('fixed_device', 'fixed_gpu'):
+            found = self.out[case]
+            self.assertEqual((found['error'], found['notices'], len(found['starts'])), ('Bubble: starting GPU timed out', [], 1))
 
     def test_a_failed_download_is_not_retried_on_another_device(self):
         found = self.out['download_fails']

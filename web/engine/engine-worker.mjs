@@ -61,10 +61,12 @@ export class EngineWorker {
     return ready;
   }
 
-  /** The next step down from the current options: {options, text}, or null. */
+  /** The next step down from the current options: {options, text}, or null. One thread is a step only on WebAssembly,
+   * whose thread count it is. */
   step() {
     if (!this.options.prefer && this.provider !== 'wasm') return {options: {prefer: 'wasm'}, text: 'on CPU'};
-    if (this.options.threads === null && deviceThreads() > 1) return {options: {threads: 1}, text: 'on one thread'};
+    const cpu = this.provider === 'wasm' || this.options.prefer === 'wasm';
+    if (cpu && this.options.threads === null && deviceThreads() > 1) return {options: {threads: 1}, text: 'on one thread'};
     return null;
   }
 

@@ -99,6 +99,7 @@ out.download_fails = await observe(loader((device, name) => name === 'download' 
 out.probe_fell_back = await observe(loader(() => 'go', options => ({provider: 'wasm', ...(options.prefer ? {} : {fallback: 'timed out'})})));
 out.silent = await observe({load() {}, call() {}});
 out.fixed_device = await observe(loader(gpu('session')), {prefer: 'webgpu-fp32', threads: 2});
+out.fixed_gpu = await observe(loader(gpu('session')), {prefer: 'webgpu-fp16'});
 const said = [];
 out.call_restarts = await observe(loader(gpu('use')), {}, async (engine, note) => engine.call({type: 'use'},
   {progress: (fraction, live, stage) => { note(stage); said.push(stageText(stage)); }}));
