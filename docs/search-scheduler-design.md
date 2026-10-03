@@ -196,12 +196,14 @@ Proposed layout (estimate of sizes):
 | used clock | uint32 | 4 | eviction generation |
 | Q movement (EMA of absolute change per backup) | float | 4 | section C |
 | parents | small vector of node refs | 16 + 8 per extra | usually 1 or 2 |
-| legal list: action (int16 q, int16 r) and logit (float) | per legal move | 8 x L | sorted by prior, descending |
+| legal list: action (int32 q, int32 r) and logit (float) | per legal move | 12 x L | sorted by prior, descending; coordinates stay wide, a translated compact board can exceed int16 (lane review) |
 | touched edges: index, visits, pending, exact, distance, bound, eligible, child ref | per edge with a child, a visit, a pending descent or a proof | 20 x T | sparse |
 
-Total for L = 640 and T = 10: about 5.5 KB, ten times smaller than today. Unvisited edges need only their prior,
-because every unvisited eligible edge shares the same completed Q; the deterministic interior rule therefore picks
-the highest-prior unvisited edge, which the sorted legal list gives at once.
+Total for L = 640 and T = 10: about 8 KB, seven times smaller than today. Unvisited edges with no stored child
+need only their prior, because every such eligible edge shares the same completed Q; the deterministic interior
+rule therefore picks the highest-prior one, which the sorted legal list gives at once. An edge with zero visits
+from this parent but a stored child that holds evidence from another parent is a touched edge: it reads the
+child's value and is never part of the untouched group (lane review).
 
 Today's expansion also draws one random number per edge to "advance the stream" for every node, root or not
 (gumbel.cpp `fulfill`). Only root edges read Gumbel noise and `begin` redraws it. The compact path drops those draws.
@@ -291,12 +293,16 @@ f = 0.25, delta = 0.05 (section C.4), run concurrently instead of in sequence, a
 
 ### B.6 What a training row records
 
-The 207500 regression came from value targets taken from full searches 9.4 plies older than the row (measured,
-issue 220, 06:47 comment). The lane's teacher study found current cheap roots (BCE 0.3217) better than carried full
-roots (0.4022) at 17 to 48 remaining plies (measured, recovery-data-check-20261003.json). The graph must not bring
-back carried targets in a new form. Rules:
+Two measurements, kept apart from the hypothesis that joins them: during the 207500 regression the value targets
+came from full searches 9.4 plies older than the row and the calibration slope fell (issue 220, 06:47 comment);
+the lane's teacher study found current cheap roots (BCE 0.3217) better than carried full roots (0.4022) at 17 to
+48 remaining plies (recovery-data-check-20261003.json). Whether target age caused the regression is not
+established; what is established is that carried targets measure worse as teachers at those horizons. The graph
+must not bring back carried targets in a new form. Rules:
 
-1. A row's value target is its own root's q at the end of its own search. Retained and lineage visits are evidence
+1. A row records its own root's q at the end of its own search as the root search estimate, with provenance.
+   Today's teacher (policy-weighted raw child values with the fallback) stays the default; using the root q as
+   the teacher is a separate flag with its own strength and learning check (lane review). Retained and lineage visits are evidence
    about that same position, so they count, as tree reuse already does today.
 2. No row ever takes a value computed at another root, even an ancestor or descendant on the game line.
 3. A row is written once. Later evidence (a deeper search elsewhere that changes this root's q) never rewrites it.
@@ -327,7 +333,7 @@ and pointer-addressed storage does not.
 Precision: node mean value float64 (updated a million times at the root; float32 drifts); mirrored child Q and the
 cached transformed logit float32 (they feed an argmax and a softmax); logits float32 (the root target is built from
 them); visits int32; pending int16 (bounded by the batch); exact state packed in 16 bits (winner 2, bound 1,
-eligible 1, distance 12); action two int16; position key 128 bits; proof and disproof numbers uint32, spent uint16
+eligible 1, distance 12); action two int32, since a translated compact board can exceed int16; position key 128 bits; proof and disproof numbers uint32, spent uint16
 saturating, generation uint8.
 
 Layout: children are 32-byte records in the parent's contiguous block (node index, action, logit, mirrored Q,
@@ -521,7 +527,8 @@ deadline is within the guard; or no view can add a row (all wait at barriers, no
 batches are in flight. Fill counts unique rows after dedup.
 
 Double buffering: at most two batches in flight. The next batch stays mutable until handed to the feeder; a submitted
-batch is immutable (Sol). A third batch fills while two run.
+batch is immutable (Sol). A third batch fills while two run, so each canvas needs three staging sets, or an
+input-release event after the copy to device frees a set for the filling batch (lane review).
 
 Captures: CUDA graphs for 24 up to 128 rows and 32 up to 64 rows (PR 338 sizes), 32 above. Tails go to the next
 capture size up; padding is counted.
@@ -618,7 +625,7 @@ The 3070 Ti has 8 GB shared with the learner and the desktop.
 | Staging per batch | pinned host, 1 MB at 128 x 8 x 32 x 32 bytes; device BF16 input 2 MB | arithmetic |
 | Desktop browser | up to 2 GB observed | issue 220 03:30 comment |
 
-Decisions: keep the 384 MiB capture budget; capture 24/128 and 32/64; two staging sets per canvas (double buffer).
+Decisions: keep the 384 MiB capture budget; capture 24/128 and 32/64; three staging sets per canvas (two in flight, one filling), or two with an input-release event after the device copy.
 With H = 100 us one actor process can feed most of the GPU, so the actor count can drop from 4 to 2, saving about
 0.7 GB of context each (estimate). That is a run-owner decision after measurement.
 
@@ -739,7 +746,9 @@ Rules:
    should exist first, because it sets the priority.
 5. A proof under a node the GPU is evaluating can settle an ancestor (Sol). The ancestor's pending requests complete
    as in rule 2.
-6. A proof for a position the game can no longer reach (fewer stones than the board) is dropped. Counter: proofs
+6. In an advancing game, a proof for a position the game can no longer reach (fewer stones than the board) is
+   dropped. An analysis graph keeps every proof for the game's lifetime, since analysis revisits earlier positions
+   (lane review); the two expiry rules are separate settings. Counter: proofs
    arrived unreachable.
 7. UNKNOWN never marks a loss.
 
@@ -977,7 +986,9 @@ hxg_evict(tree, max nodes)
 ### J.4 Conflicts between PR 328 and the lane's feeder
 
 1. Pending requests and root moves. PR 328's `root_at` throws while any request is pending. The feeder keeps
-   requests alive across queued and in-flight batches. Any re-root in a continuous loop then throws.
+   requests alive across queued and in-flight batches. Today a tree begins only after its pending requests drain,
+   so this is not a leak in PR 340; it is the reason continuous views need re-root and incremental eviction that
+   work with requests pending.
 2. Eviction precondition. PR 328's `evict()` runs only when `requests.empty()`, at `begin` and `root_at`. With the
    feeder's cross-batch coalescing a game graph may never be idle at those points, so the store grows without bound.
 3. Visit weights. PR 328 sets edge visits to child visits in shared mode. The feeder's backups go through
