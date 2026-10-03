@@ -194,6 +194,48 @@ const sixLate = new (await import('../../web/engine/six.mjs')).SixEngine();
 await sixLate.files();
 out.six_retry = sixLate.checkpoints;
 
+// A download cut off after its first part: the next load asks for the rest with a range and joins them.
+reset();
+const {LIMITS} = await import('../../web/engine/stages.mjs');
+const whole = Buffer.from(Array.from({length: 5 * 2 ** 20}, (_, i) => i * 7 % 251)), MB = 2 ** 20;
+let cut = true;
+const ranged = [], seen = [], plain = globalThis.fetch;
+globalThis.fetch = async (input, init = {}) => {
+  const url = String(input);
+  if (!url.endsWith('big.onnx')) return plain(input, init);
+  ranged.push(init.headers?.Range ?? null);
+  if (url.startsWith(BASE)) return new Response('missing', {status: 404});
+  if (init.cache === 'reload') throw new TypeError('Failed to fetch');   // the whole-body retry fails too: the load ends
+  const start = Number(/bytes=(\d+)-/.exec(init.headers?.Range ?? '')?.[1] ?? 0), body = whole.subarray(start);
+  let at = 0;
+  const stream = new ReadableStream({pull(controller) {
+    if (cut && start + at >= 4.5 * MB) { controller.error(new TypeError('network changed')); return; }
+    if (at >= body.length) { controller.close(); return; }
+    controller.enqueue(body.subarray(at, at + MB / 2));
+    at += MB / 2;
+  }});
+  return Object.defineProperty(new Response(stream, {status: start ? 206 : 200, headers: {'Content-Length': String(body.length)}}), 'url', {value: url});
+};
+const big = {path: 'big.onnx', sha256: createHash('sha256').update(whole).digest('hex')};
+const first = await attempt(() => assets.cached(big));
+const parts = [...store.keys()].filter(k => k.includes('&part='));
+cut = false;
+const body = await assets.cached(big, (fraction, received, total) => seen.push([received, total]));
+out.resume = {first: first.error ?? 'loaded', parts: parts.length, ranges: ranged.filter(Boolean), same: Buffer.from(body).equals(whole),
+  start: seen[0], keys: [...store.keys()].length};
+
+// A download that receives nothing for LIMITS.idle ms stops with an error instead of waiting.
+reset();
+LIMITS.idle = 30;
+const requested = [];
+globalThis.fetch = async (input, init = {}) => {
+  requested.push(String(input));
+  if (String(input).startsWith(BASE)) return new Response('missing', {status: 404});
+  return new Response(new ReadableStream({pull: () => new Promise(() => {})}), {headers: {'Content-Length': '10'}});
+};
+out.idle = {...await attempt(() => assets.cached({path: 'quiet.onnx', sha256: 'x'})), requests: requested.length};
+globalThis.fetch = plain;
+
 const page = host => {
   globalThis.document = {querySelector: () => null};
   globalThis.location = {hostname: host, href: `http://${host}/`, search: '?assets=https://other.example/engine'};

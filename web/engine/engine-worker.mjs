@@ -1,84 +1,208 @@
 /* The page side of a browser engine's Web Worker. The worker answers {type: 'load', options} with 'progress'
- * ({fraction}) messages and then 'ready' ({device}) or 'error' ({message}); each call {type, id, ...} with 'progress'
- * ({id, fraction, live?}, `live` being a running search's root rows, passed to progress as its second argument)
- * messages and then 'result' ({id, result}), 'error' ({id, message}) or, after {type: 'cancel', id}, 'cancelled' ({id}). */
-import {defaultThreads} from './network.mjs';
+ * ({fraction, stage}) messages and then 'ready' ({device}) or 'error' ({message, stage?}); each call {type, id, ...}
+ * with 'progress' ({id, fraction, live?, stage?}: `live` a running search's root rows, passed to progress as its
+ * second argument, `stage` a loading stage while the call loads a network, its third) messages and then 'result'
+ * ({id, result}), 'error' ({id, message, stage?}) or, after {type: 'cancel', id}, 'cancelled' ({id}). Stages are
+ * stages.mjs's. */
+import {deviceThreads} from './network.mjs';
+import {LIMITS, stageText} from './stages.mjs';
 
-const READY_MS = 20000, STALLED = Symbol('stalled');
+/** Stages whose failure another device or thread count may avoid; a download fails the same way on any device. */
+const RETRIED = new Set(['probe', 'compile', 'session', 'timing', 'warmup']);
+
+/** The engines' fallback notices for the page: 'notice' events whose `detail` is {engine (the EngineWorker), text (one
+ * short line), cpu (true when the engine left WebGPU for WebAssembly)}. */
+export const notices = new EventTarget();
+
+/** A stage that stalled or failed: `reason` 'timed out' or 'failed', `detail` the worker's message. */
+class Stopped extends Error {
+  constructor(stage, reason, detail = '') {
+    super(`${stageText(stage)} ${reason}`);
+    this.stage = stage;
+    this.reason = reason;
+    this.detail = detail;
+  }
+}
 
 export class EngineWorker {
   /** `script` is the worker module URL, `name` the engine's name in messages, `options` go to the worker's load
-   * (`options.threads` null leaves the ONNX Runtime thread count to the worker). */
+   * (`options.threads` null leaves the ONNX Runtime thread count to the worker, `options.prefer` null the device). */
   constructor(script, name, options = {}) {
     this.script = script;
     this.name = name;
-    this.options = {threads: null, ...options};
+    this.options = {threads: null, prefer: null, ...options};
     this.calls = 0;
     this.waits = new Map();
     this.worker = null;
     this.ready = null;
-    this.abandon = null;
     this.device = null;
+    this.progress = () => {};
+    this.stage = null;
+    this.provider = null;
+    this.fallback = null;
+    this.booting = false;
+    this.timer = null;
+    this.abandon = null;
   }
 
   /**
-   * Starts the worker; `progress(fraction)` reports loading. Resolves to the worker's device. When the thread count
-   * was left to the worker and the runtime has not come up READY_MS after the downloads finished (its thread workers
-   * never start on some hosts), the worker is replaced by one running on a single thread; a further download (the
-   * WebAssembly runtime after a failed WebGPU start) suspends that watchdog.
+   * Starts the worker; `progress(fraction, stage)` reports loading (a stage carries `provider` once the probe has
+   * finished). Resolves to the worker's device, with `fallback` when the load left its first device. A stage that
+   * reports nothing for its LIMITS entry, or fails while RETRIED holds it, moves the engine one step down and starts
+   * a new worker: WebGPU to WebAssembly unless `prefer` fixed the device, then WebAssembly threads to one thread unless
+   * `threads` fixed them. Each step is logged and posts one notice naming the engine and the fallback. With no step
+   * left, or a failure in another stage, the load rejects with an error naming the engine and the stage.
    */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
-    const ready = this.ready = this.start(progress).catch(error => {
-      if (error !== STALLED) throw error;
-      console.warn(`${this.name}: the runtime did not start with its thread workers; retrying on one thread`);
-      this.options = {...this.options, threads: 1};
-      return this.start(progress);
-    });
+    this.progress = progress;
+    this.fallback = null;
+    const ready = this.ready = this.boot();
     ready.catch(error => { if (this.ready === ready) this.fail(error); });
     return ready;
   }
 
-  start(progress) {
+  /** The next step down from the current options: {options, text}, or null. */
+  step() {
+    if (!this.options.prefer && this.provider !== 'wasm') return {options: {prefer: 'wasm'}, text: 'on CPU'};
+    if (this.options.threads === null && deviceThreads() > 1) return {options: {threads: 1}, text: 'on one thread'};
+    return null;
+  }
+
+  /** Starts workers until one is ready, from `stopped` (a Stopped that ended the last worker) when given. */
+  async boot(stopped = null) {
+    this.booting = true;
+    try {
+      for (;;) {
+        if (stopped) {
+          const step = this.step(), what = `${this.name}: ${stopped.message}`;
+          console.warn(`${what}${stopped.detail ? ` (${stopped.detail})` : ''}${step ? `; running ${step.text}` : ''}`);
+          if (!step) throw new Error(what);
+          this.notice(`${what}, running ${step.text}`, step.options.prefer === 'wasm');
+          this.options = {...this.options, ...step.options};
+          this.fallback = stopped.message;
+        }
+        try {
+          const device = await this.start();
+          console.info(`${this.name} device:`, device);
+          return this.fallback ? {...device, fallback: this.fallback} : device;
+        } catch (error) {
+          if (!(error instanceof Stopped)) throw error;
+          stopped = error;
+        }
+      }
+    } finally {
+      this.booting = false;
+    }
+  }
+
+  /** Ends the worker after `stopped` during a call, starts the next step's worker and sends it the waiting calls. */
+  restart(stopped) {
+    this.halt();
+    const ready = this.ready = this.boot(stopped).then(device => {
+      for (const [id, wait] of this.waits) {
+        if (!wait.cancelled) this.worker.postMessage({...wait.message, id});
+        else { this.waits.delete(id); wait.reject(new DOMException('Cancelled', 'AbortError')); }
+      }
+      return device;
+    });
+    ready.catch(error => { if (this.ready === ready) this.fail(error); });
+  }
+
+  /** Re-arms the watchdog for `stage` (null: none), which hands `stalled` the stage's failure as 'timed out'. */
+  watch(stage, stalled) {
+    clearTimeout(this.timer);
+    this.stage = stage;
+    if (stage?.provider) this.provider = stage.provider;
+    if (stage && LIMITS[stage.name]) this.timer = setTimeout(() => stalled(this.failure('timed out', stage, '')), LIMITS[stage.name]);
+  }
+
+  /** The error for `reason` ('failed' or 'timed out', with the worker's `detail`) in `stage`: a Stopped when another
+   * step may avoid it, else an Error naming the engine and the stage. */
+  failure(reason, stage, detail) {
+    if (stage && RETRIED.has(stage.name)) return new Stopped(stage, reason, detail);
+    return new Error(stage ? `${this.name}: ${stageText(stage)} ${reason}${detail ? `: ${detail}` : ''}` : detail);
+  }
+
+  start() {
     return new Promise((resolve, reject) => {
-      const worker = this.worker = new Worker(this.script, {type: 'module'});
-      let timer = null;
-      const threaded = this.options.threads === null && defaultThreads({isolated: Boolean(globalThis.crossOriginIsolated),
-        cores: navigator.hardwareConcurrency || 2}) > 1;   // a single-threaded start has nothing to fall back to
-      const stall = armed => {   // the worker reports below .95 while downloading, at .95 while the runtime starts
-        clearTimeout(timer);
-        if (armed && threaded) timer = setTimeout(() => { if (this.worker === worker) { worker.terminate(); reject(STALLED); } }, READY_MS);
-      };
+      const worker = this.worker = new Worker(this.script, {type: 'module'}), first = {name: 'probe'};
       this.abandon = reject;
+      this.provider = null;
+      const report = (fraction, stage) => {
+        this.progress(fraction, stage);
+        for (const wait of this.waits.values()) wait.progress(fraction, undefined, stage);
+      };
+      const loading = error => { if (this.worker === worker) { this.halt(); reject(error); } };
+      const calling = error => { if (this.worker === worker) error instanceof Stopped ? this.restart(error) : this.fail(error); };
+      let ready = false;
       worker.onmessage = ({data}) => {
-        if (data.type === 'ready') { clearTimeout(timer); this.device = data.device; resolve(data.device); return; }
+        if (this.worker !== worker) return;
+        if (data.type === 'ready') { ready = true; this.watch(null); this.abandon = null; this.device = data.device; resolve(data.device); return; }
         if (data.id === undefined) {
-          if (data.type === 'progress') { progress(data.fraction); stall(data.fraction >= .95); }
-          else if (data.type === 'error') { clearTimeout(timer); reject(new Error(data.message)); }
+          if (data.type === 'progress') {
+            if (data.stage?.fallback && !this.fallback) this.noticeProbe(data.stage);
+            this.watch(data.stage ?? null, loading);
+            report(data.fraction, data.stage);
+          } else if (data.type === 'error') {
+            loading(this.failure('failed', data.stage, data.message));
+          }
           return;
         }
         const wait = this.waits.get(data.id);
         if (!wait) return;
-        if (data.type === 'progress') { wait.progress(data.fraction, data.live); return; }
+        if (data.type === 'progress') { this.watch(data.stage ?? null, calling); wait.progress(data.fraction, data.live, data.stage); return; }
+        this.watch(null);
+        if (data.type === 'error' && RETRIED.has(data.stage?.name)) { calling(this.failure('failed', data.stage, data.message)); return; }
         this.waits.delete(data.id);
         if (data.type === 'result') wait.resolve(data.result);
-        else wait.reject(data.type === 'cancelled' ? new DOMException('Cancelled', 'AbortError') : new Error(data.message));
+        else wait.reject(data.type === 'cancelled' ? new DOMException('Cancelled', 'AbortError') : this.failure('failed', data.stage, data.message));
       };
-      worker.onerror = event => { clearTimeout(timer); this.fail(new Error(event.message || `${this.name} worker failed`)); };
+      worker.onerror = event => {
+        if (this.worker !== worker) return;
+        const error = this.failure('failed', this.stage, event.message || `${this.name} worker failed`);
+        (ready ? calling : loading)(error);
+      };
+      this.watch(first, loading);
+      report(0, first);
       worker.postMessage({type: 'load', options: this.options});
     });
   }
 
-  /** Sends `message` once the worker is ready; aborting `signal` cancels it (rejects with an AbortError). */
+  /** Posts the notice for a probe that fell back to WebAssembly (stage.fallback, its reason), and keeps later workers
+   * off WebGPU. */
+  noticeProbe(stage) {
+    const what = `${this.name}: ${stageText({name: 'probe'})} ${stage.fallback}`;
+    console.warn(`${what}; running on CPU`);
+    this.notice(`${what}, running on CPU`, true);
+    this.fallback = `${stageText({name: 'probe'})} ${stage.fallback}`;
+    this.options = {...this.options, prefer: this.options.prefer ?? 'wasm'};
+  }
+
+  /** Dispatches a notice: `text` for the page, `cpu` when the engine left WebGPU for WebAssembly. */
+  notice(text, cpu) {
+    notices.dispatchEvent(new CustomEvent('notice', {detail: {engine: this, text, cpu}}));
+  }
+
+  /** Sends `message` once the worker is ready; aborting `signal` cancels it (rejects with an AbortError). A call that
+   * a restart catches goes to the new worker. */
   async call(message, {signal, progress = () => {}} = {}) {
-    await this.load();
+    for (let ready = null; ready !== this.ready;) {
+      ready = this.load();
+      await ready;
+    }
     const id = ++this.calls;
     return new Promise((resolve, reject) => {
       if (signal?.aborted || !this.worker) { reject(new DOMException(signal?.aborted ? 'Cancelled' : 'Closed', 'AbortError')); return; }
-      const worker = this.worker;
-      this.waits.set(id, {resolve, reject, progress});
-      signal?.addEventListener('abort', () => worker.postMessage({type: 'cancel', id}), {once: true});
-      worker.postMessage({...message, id});
+      const wait = {resolve, reject, progress, message, cancelled: false};
+      this.waits.set(id, wait);
+      signal?.addEventListener('abort', () => {
+        if (this.waits.get(id) !== wait) return;
+        wait.cancelled = true;
+        if (!this.booting) this.worker?.postMessage({type: 'cancel', id});
+        else { this.waits.delete(id); reject(new DOMException('Cancelled', 'AbortError')); }
+      }, {once: true});
+      this.worker.postMessage({...message, id});
     });
   }
 
@@ -87,10 +211,16 @@ export class EngineWorker {
     this.fail(new DOMException('Closed', 'AbortError'));
   }
 
-  /** Ends the worker and rejects the pending load and calls with `error`; the next call starts a new worker. */
-  fail(error) {
+  /** Ends the current worker and its watchdog. */
+  halt() {
+    clearTimeout(this.timer);
     this.worker?.terminate();
     this.worker = null;
+  }
+
+  /** Ends the worker and rejects the pending load and calls with `error`; the next call starts a new worker. */
+  fail(error) {
+    this.halt();
     this.ready = null;
     this.abandon?.(error);
     this.abandon = null;

@@ -86,6 +86,8 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .bar.running::after{content:"";position:absolute;top:0;bottom:0;left:0;width:30%;
   background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--c,var(--text)) 75%,transparent),transparent);animation:wait 1.6s ease-in-out infinite}
 @keyframes wait{from{transform:translateX(-100%)}to{transform:translateX(340%)}}
+.busy{display:flex;align-items:center;gap:6px;height:12px}.busy .bar{flex:1}
+.stage{font:10px var(--mono);color:var(--dim);white-space:nowrap}
 .spacer{flex:1}
 .row{display:flex;gap:6px;align-items:center}
 .stack{display:grid;gap:8px}
@@ -137,7 +139,7 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .clockpick .chips button:disabled{cursor:default;opacity:.5}
 .seat .x{width:22px;height:22px;border:0;background:transparent;color:var(--dim);cursor:pointer;display:grid;place-items:center;border-radius:6px}
 .seat .x:hover{color:var(--text);background:var(--raise-2)}
-.seat .bar{margin:2px 6px 0}
+.seat .busy{margin:1px 6px 0}
 .more{display:grid;grid-template-rows:0fr;transition:grid-template-rows .25s var(--ease) .1s}
 .more>div{overflow:hidden;display:grid;gap:6px;padding:0 4px}
 .more>div>:first-child{margin-top:6px}.more>div>:last-child{margin-bottom:6px}
@@ -361,7 +363,7 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
     <div class="part" id="analysis">
       <div class="engine" id="engine-head"></div>
       <div class="evalbar idle" id="evalbar"><i></i><b id="xv"></b><b id="ov"></b></div>
-      <div class="bar" id="analysis-progress" style="visibility:hidden;margin-top:-8px"><i></i></div>
+      <div class="busy" style="margin-top:-8px"><div class="bar" id="analysis-progress" style="visibility:hidden"><i></i></div><span class="stage" id="analysis-stage"></span></div>
       <div class="proof"><span id="xproof"></span><span id="oproof"></span></div>
       <div class="top" id="top"></div>
     </div>
@@ -824,7 +826,7 @@ function renderSeat(side){
   const controls=seat.engine==='human'?[]:seatControls(seat,send,'seat'+side,configButton('seat'+side,seat));
   if(seat.engine!=='human'&&entryOf(seat.engine)?.clocks)controls.push(clockPicker(S.clock_spec,spec=>post('/clock',spec),'clock-seat'+side));
   box.replaceChildren(el('div',{class:'seat-head'},el('i',{class:'hexdot',id:'dot'+side}),pick,el('span',{class:'clock',id:'clock'+side}),el('span',{id:'cancel'+side})),
-    el('div',{class:'bar',id:'busy'+side,style:'visibility:hidden'},el('i')),
+    el('div',{class:'busy'},el('div',{class:'bar',id:'busy'+side,style:'visibility:hidden'},el('i')),el('span',{class:'stage',id:'stage'+side})),
     ...(controls.length?[el('div',{class:'more'},el('div',{},controls))]:[]));
   box.firstChild.onclick=e=>{if(!e.target.closest('button')){pinned=!pinned;$('seats').classList.toggle('open',pinned)}};
   box.classList.toggle('active',S.winner<0&&S.player===side);
@@ -1007,7 +1009,7 @@ function renderJobs(){
   for(const side of[0,1]){const box=$('busy'+side);if(!box)continue;const job=S.jobs.find(j=>j.kind==='move'&&j.side===side);
     $('dot'+side)?.classList.toggle('thinking',!!job);
     const cancel=$('cancel'+side);
-    box.style.visibility=job?'visible':'hidden';
+    box.style.visibility=job?'visible':'hidden';$('stage'+side).textContent=job?.status==='running'?job.stage||'':'';
     if(!job){cancel.replaceChildren();continue}
     box.classList.toggle('running',job.status==='running');
     box.firstChild.style.transform=`scaleX(${Math.min(1,job.done/job.total)})`;
@@ -1022,6 +1024,7 @@ function renderJobs(){
   const ajob=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view&&j.status==='running'),progress=$('analysis-progress');
   progress.style.visibility=ajob?'visible':'hidden';progress.style.setProperty('--c',COLORS[playerAt(view)]);
   progress.classList.toggle('running',!!ajob);progress.firstChild.style.transform=`scaleX(${ajob?Math.min(1,ajob.done/ajob.total):0})`;
+  $('analysis-stage').textContent=ajob?.stage||'';
   const again=$('again');if(again){setIcon(again,analysing.length?'close':'again');
     again.onclick=async()=>{if(!analysing.length)return post('/analyse',{ply:view,force:true});
       const a=S.analysis;if(a.auto)await post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.budget,auto:false});

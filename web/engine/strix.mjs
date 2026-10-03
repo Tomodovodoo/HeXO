@@ -3,6 +3,7 @@
  * placement, with a network `python tools/build_web.py strix-network` placed in strix/ (listed in strix/networks.json,
  * the first is the default), or the site's when this origin has none. */
 import {json, workerUrl} from './assets.mjs';
+import {workerError} from './stages.mjs';
 
 import {NEURAL_PRESET} from './device.mjs';
 
@@ -48,7 +49,7 @@ export class StrixEngine {
     if (before && this.network?.sha256 !== before.sha256) this.close();
   }
 
-  /** Starts the worker with the current network; `progress(fraction)` reports the download. */
+  /** Starts the worker with the current network; `progress(fraction, stage)` reports the download and the compile. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
     if (!this.network) {
@@ -61,9 +62,9 @@ export class StrixEngine {
       const fail = error => { this.pending.delete(fail); reject(error); };
       this.pending.add(fail);
       worker.onmessage = ({data}) => {
-        if (data.type === 'progress' && data.id === undefined) progress(data.fraction);
+        if (data.type === 'progress' && data.id === undefined) progress(data.fraction, data.stage);
         else if (data.type === 'ready') { this.pending.delete(fail); resolve(data.info); }
-        else if (data.type === 'error') fail(new Error(data.message));
+        else if (data.type === 'error') fail(workerError(LABEL, data));
       };
       worker.onerror = event => fail(new Error(event.message || 'Strix worker failed'));
     });
