@@ -252,7 +252,10 @@ async function fetchEngine(id) {
     if (found.state === 'failed') throw new Error(found.error);
     if (found.state === 'missing') await download(found.files, fraction => { slot.fraction = fraction; repaint(); });
     checks.delete(id);
-    if (!READY.has((await check(id)).state)) throw new Error('the downloaded files did not reach the browser cache');
+    if (!READY.has((await check(id)).state)) {   // the browser would not keep them (a full quota): each load downloads them
+      remember(id, Promise.resolve({state: 'uncached'}));
+      original.toast(`${ENGINES.get(id).entry.label}: the browser did not keep the files, so each start downloads them`);
+    }
     if (failed?.split('|')[1] === id) failed = null;   // let this engine's work that failed for want of its files run again
     const session = page.browserPlay;
     if (session) {
