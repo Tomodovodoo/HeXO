@@ -1,15 +1,9 @@
+import {transform} from './symmetry.mjs';
 export function random(seed) {
   let state = seed >>> 0;
   return () => { state += 0x6D2B79F5; let n = Math.imul(state ^ state >>> 15, 1 | state); n ^= n + Math.imul(n ^ n >>> 7, 61 | n); return ((n ^ n >>> 14) >>> 0) / 4294967296; };
 }
 const shuffle = (items, rng) => { const out = [...items]; for (let i = out.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [out[i], out[j]] = [out[j], out[i]]; } return out; };
-export function transform(moves, symmetry) {
-  return moves.map(([q, r]) => {
-    if (symmetry >= 6) [q, r] = [q + r, -r];
-    for (let i = 0; i < symmetry % 6; i++) [q, r] = [-r, q + r];
-    return [q, r];
-  });
-}
 export class OpeningBook {
   constructor(data) { this.data = data; this.nodes = data.nodes; }
   pool(mode, count = 8) {

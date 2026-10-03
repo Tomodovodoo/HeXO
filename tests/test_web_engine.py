@@ -156,6 +156,23 @@ class PlayPage(unittest.TestCase):
             self.assertNotIn('data-k=you', text)
 
 
+@unittest.skipUnless(NODE, 'needs node')
+class BoardPerspective(unittest.TestCase):
+    """web/engine/symmetry.mjs: the 12 views of the play page's board and the steps between them."""
+    cells = [[0, 0], [1, 0], [0, 1], [2, -1], [-3, 5], [4, 2], [-1, -1]]
+
+    def test_views_are_the_hex_symmetries_and_their_inverses_undo_them(self):
+        done = subprocess.run([NODE, str(ROOT/'tests'/'web'/'symmetry.mjs')], input=json.dumps(dict(cells=self.cells)),
+                              capture_output=True, text=True, encoding='utf-8', check=True)
+        answer = json.loads(done.stdout)
+        cells = np.array(self.cells)
+        self.assertEqual({tuple(map(tuple, image)) for image in answer['images']},
+                         {tuple(map(tuple, cells @ m)) for m in hexcrop.SYMMETRIES})
+        for undone in answer['undone']:
+            self.assertEqual(undone, self.cells)
+        self.assertEqual(answer['reached'], list(range(12)))
+
+
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 @unittest.skipUnless(NODE, 'needs node')
 class Overlay(unittest.TestCase):
