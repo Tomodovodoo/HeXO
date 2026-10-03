@@ -1832,12 +1832,17 @@ class TurnTrees(unittest.TestCase):
         history = [(0, 0), (4, 0), (7, 0), (-2, 0), (-1, 0), (1, 0), (6, 0), (5, 0), (-1, -1),
                    (-3, 1), (-1, 1), (-2, -1), (-4, 0), (-3, 0), (0, -1), (-2, -3), (-2, -2),
                    (-2, 1), (-2, -5), (-3, -1), (-1, -3), (-5, 1), (0, -4), (-4, 1), (-4, -1), (-5, -1), (8, -8)]
-        bubble = self.bubble()
-        with unittest.mock.patch.object(bubble.evaluator, 'evaluate', side_effect=AssertionError('proof needs no net')):
-            found = evaluate(bubble, prover, history, 8, 1, solved=solve(None, history, 0))
-        self.assertEqual((found['proof']['winner'], found['value']), (0, 1.))
-        self.assertEqual(found['moves'], [[-4, -2], [-1, -5]])
-        self.assertEqual(found['actual_solver_nodes'], 1)
+        for prover in (prover, tactical_proof.IsolatedTactics(package=tactical_proof.PACKAGE)):
+            try:
+                bubble = self.bubble()
+                with unittest.mock.patch.object(bubble.evaluator, 'evaluate', side_effect=AssertionError('proof needs no net')):
+                    found = evaluate(bubble, prover, history, 8, 1, solved=solve(None, history, 0))
+                self.assertEqual((found['proof']['winner'], found['value']), (0, 1.))
+                self.assertEqual(found['moves'], [[-4, -2], [-1, -5]])
+                self.assertEqual(found['actual_solver_nodes'], 1)
+            finally:
+                if hasattr(prover, 'close'):
+                    prover.close()
 
     def test_leaf_proofs_keep_cancellation_and_close_the_tree(self):
         from play import evaluate, solve

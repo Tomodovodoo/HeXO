@@ -800,6 +800,8 @@ class SearchProofs:
         self.watch(0)
         start = time.perf_counter()
         result = self.prover.history(history, nodes=min(2048, max(1, self.left)), ms=allowance, certificate=certificate)
+        if result.get('certificate') is None and result.get('certificate_json'):
+            result['certificate'] = json.loads(result['certificate_json'])
         spent = result.get('nodes_used', 0)
         self.used += spent
         self.left = max(0, self.left - spent)
