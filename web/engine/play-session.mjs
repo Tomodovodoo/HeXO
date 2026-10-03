@@ -436,7 +436,12 @@ export class BrowserSession extends OfflineSession {
       if (job.kind === 'move' && this.clock) {
         const clock = this.clockNow();
         limit = clock[job.side ? 'circle_ms' : 'cross_ms']; ms = turnTime(this.control(), clock, job.side);
-        timer = setTimeout(() => { timeout = true; job.attempt.abort(); }, Math.max(1, limit));
+        const field = job.side ? 'circle_ms' : 'cross_ms', expire = () => {
+          const left = this.clockNow()?.[field] ?? 0;
+          if (left > 0) { timer = setTimeout(expire, Math.min(MAX_TIMER, left)); return; }
+          timeout = true; job.attempt.abort();
+        };
+        timer = setTimeout(expire, Math.min(MAX_TIMER, Math.max(1, limit)));
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
       try {
