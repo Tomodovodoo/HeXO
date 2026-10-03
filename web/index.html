@@ -684,7 +684,10 @@ $('tabs').onclick=e=>{const b=e.target.closest('button');if(!b)return;$('app').d
 /* engine picker: an entry shows its badge (which bot it is; `kind` is how the server runs it), and its label when that
    differs from the badge */
 let menuFor=null,pinned=false;
-function badge(kind,label,device){return[el('span',{class:'kind','data-k':kind},kind),label&&label.toLowerCase()!==kind?el('span',{class:'name'},label):null,device?el('span',{class:'kind device'},device):null]}
+/* an engine's badge, its label when it says more than the badge, and the device a browser engine runs on, which
+   stands for the label's "(browser)" once known */
+function badge(kind,label,device){const said=(device?label?.replace(/ \(browser\)$/,''):label)?.toLowerCase();
+  return[el('span',{class:'kind','data-k':kind},kind),said&&said!==kind?el('span',{class:'name'},label):null,device?el('span',{class:'kind device'},device):null]}
 function entryOf(id){return S.engines.find(x=>x.id===id)}
 function shown(seat){if(seat.engine==='human')return['human',null];const e=entryOf(seat.engine);return e?[e.badge||e.kind,e.label||e.name,e.device]:['?',seat.engine]}
 function isHuman(seat){return seat.engine==='human'}
