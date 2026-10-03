@@ -37,7 +37,7 @@ std::pair<Key,Key> keys(const Board& board) {
  for(size_t i=start>=2?start-2:0;i<start;++i){auto h=CellHash{}(board.history[i].c);context.a+=mix(h+0x7f1);context.b+=mix(h+0x3c9);}
  return {position,context};
 }
-struct Edge { Cell action;double logit=0,prior=0,sum=0,gumbel=0;int visits=0,pending=0,epoch=0,exact_winner=-1,distance=-1;bool eligible=true,bound=false;std::shared_ptr<Node> child; };
+struct Edge { Cell action;double logit=0,prior=0,sum=0,gumbel=0,weight=-1;int visits=0,pending=0,epoch=0,exact_winner=-1,distance=-1;bool eligible=true,bound=false;std::shared_ptr<Node> child; };
 // An exact winner comes with a distance: the placements within which that winner completes six from this position
 // (an edge counts its own placement) against any defence, combined by min at the winner's choices and max at the
 // loser's. It is exact for terminal and tactical results; `bound` marks an upper bound, which certificates give.
@@ -58,6 +58,7 @@ struct Tree {
  double range_floor=0;  // least Q range of the completed-Q rescale (transformed)
  double root_noise=0;   // uniform share of the root's candidate sampling distribution (sampling)
  double bonus(const Edge& e)const {auto i=defence.find(e.action);return i==defence.end()?0:i->second;}
+ std::vector<double> work;
  explicit Tree(uint64_t seed):rng(seed){}
  bool done()const {return requests.empty() && (board.winner>=0 || (root->expanded && root->exact_winner>=0) || completed>=budget);}
  // Edge value for the node's mover: exact, else in a graph the child's MCGS value (which may come from other
@@ -168,16 +169,25 @@ struct Tree {
  // losses and the non-winning edges of a won node set neither the mixed value, the visit scale nor the range.
  // The rescale divides by max(1e-8, range_floor, hi - lo), so a spread below range_floor is not stretched to the full scale.
  // Entries of ineligible edges are returned on the same scale but every caller discards them.
- std::vector<double> transformed(Node& node) {
+ std::vector<double>& transformed(Node& node) {
   double weighted=0,mass=0;int total=0,maximum=0;
   for(auto& e:node.edges)if(e.eligible){total+=e.visits;maximum=std::max(maximum,e.visits);if(e.visits){weighted+=e.prior*value(node,e);mass+=e.prior;}}
   double mixed=(node.value+total*(mass?weighted/mass:node.value))/(total+1),lo=1e300,hi=-1e300;
-  std::vector<double> q;
+  auto& q=work;q.clear();q.reserve(node.edges.size());
   for(auto& e:node.edges){q.push_back(known(e)?value(node,e):mixed);if(e.eligible){lo=std::min(lo,q.back());hi=std::max(hi,q.back());}}
   if(lo>hi)lo=hi=0;
   double range=std::max(std::max(1e-8,range_floor),hi-lo);
   for(auto& x:q)x=(x-lo)/range*(50+maximum)*0.1;
   return q;
+ }
+ // Stable interior softmax weights. Unknown edges share the same completed Q, so reuse their exp(logit)
+ // from expansion. Subnormal weights and a non-finite multiplier use the original shifted exponential.
+ int interior(Node& node,std::vector<double>& q) {
+  double maxlog=-1e300,unknown=-std::numeric_limits<double>::infinity();int visits=0;
+  for(int i=0;i<int(q.size());++i){auto& e=node.edges[i];if(e.eligible && !known(e))unknown=q[i];q[i]=e.eligible?q[i]+e.logit:-std::numeric_limits<double>::infinity();maxlog=std::max(maxlog,q[i]);visits+=e.visits+e.pending;}
+  double factor=std::exp(unknown-maxlog);
+  for(int i=0;i<int(q.size());++i){auto& e=node.edges[i];double x=0;if(e.eligible){if(!known(e) && std::isfinite(factor)){if(e.weight<0)e.weight=std::exp(e.logit);x=e.weight>=std::numeric_limits<double>::min() && std::isfinite(e.weight)?e.weight*factor:std::exp(q[i]-maxlog);}else x=std::exp(q[i]-maxlog);}q[i]=x;}
+  return visits;
  }
  // Root candidate sampling logits: each edge's logit, or with root_noise e > 0 log((1 - e) p + e / N) for the N
  // eligible edges, p their softmax over the eligible logits. Only the opening phase's Gumbel-top-k draws on these;
@@ -298,7 +308,7 @@ struct Tree {
   Restore restore(board);Node* node=root.get();Path path;path.leaf=node;
   for(auto& u:board.history)path.history.push_back(u.c);
   while(node->expanded){
-   auto q=transformed(*node);int chosen=-1;double best=-1e300;
+   auto& q=transformed(*node);int chosen=-1;double best=-1e300;
    if(node==root.get()){
     int considered=sequence[started];
     // Finish each visit layer before its values decide the next halving round.
@@ -313,8 +323,7 @@ struct Tree {
     // layer, continue the least-visited survivor rather than waiting for an eliminated action forever.
     if(chosen<0){int least=std::numeric_limits<int>::max();for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible)continue;double score=e.gumbel+e.logit+q[i]+bonus(e);if(e.epoch<least || (e.epoch==least && score>best)){least=e.epoch;best=score;chosen=i;}}}
    } else {
-    double maxlog=-1e300,total=0;int visits=0;for(int i=0;i<int(q.size());++i){q[i]=node->edges[i].eligible?q[i]+node->edges[i].logit:-std::numeric_limits<double>::infinity();maxlog=std::max(maxlog,q[i]);visits+=node->edges[i].visits+node->edges[i].pending;}
-    for(auto& x:q){x=std::exp(x-maxlog);total+=x;}
+    int visits=interior(*node,q);double total=std::accumulate(q.begin(),q.end(),0.);
     for(int i=0;i<int(q.size());++i){auto& e=node->edges[i];if(!e.eligible || (e.child && e.child->pending))continue;double score=q[i]/total-double(e.visits+e.pending)/(1+visits);if(score>best){best=score;chosen=i;}}
    }
    if(chosen<0)return 0;
@@ -343,7 +352,7 @@ struct Tree {
   auto& node=*path.leaf;double total=0;std::vector<double> weights(count);for(int i=0;i<count;++i)total+=weights[i]=std::exp(logits[i]-maximum);
   // Only root edges read their Gumbel noise and begin() redraws it, so interior edges just advance the stream.
   const bool at_root=&node==root.get();
-  node.value=0;node.edges.reserve(count);for(int i=0;i<count;++i){Edge edge;edge.action=legal[i];edge.logit=logits[i]-maximum;edge.prior=weights[i]/total;node.value+=edge.prior*values[i];double u=std::generate_canonical<double,53>(rng);if(at_root)edge.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));node.edges.push_back(std::move(edge));}
+  node.value=0;node.edges.reserve(count);for(int i=0;i<count;++i){Edge edge;edge.action=legal[i];edge.logit=logits[i]-maximum;edge.prior=weights[i]/total;edge.weight=weights[i];node.value+=edge.prior*values[i];double u=std::generate_canonical<double,53>(rng);if(at_root)edge.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));node.edges.push_back(std::move(edge));}
   node.expanded=true;node.remaining=path.remaining;
   // A retained proven loss covers every legal continuation even if this node had not needed expansion yet.
   if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges){edge.exact_winner=node.exact_winner;edge.distance=node.distance;edge.bound=true;}
