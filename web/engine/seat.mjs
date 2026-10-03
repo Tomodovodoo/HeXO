@@ -198,13 +198,15 @@ function controls(choice, send, id) {
 }
 
 /* Engine id -> a promise of its files' assets.mjs status(), {state: 'unpublished'} when neither this origin nor the
- * site has one of them (only a local build provides it), or {state: 'failed', error} for another failure. */
+ * site has one of them (only a local build provides it), or {state: 'failed', error} for another failure. Its
+ * `stamp` names the networks it covered; a different saved choice checks again. */
 const checks = new Map(), downloads = new Map();
 const failure = error => error instanceof NotOnSite ? {state: 'unpublished'} : {state: 'failed', error: error.message};
-const check = id => {
-  if (!checks.has(id)) checks.set(id, ENGINES.get(id).engine.files().then(status).catch(failure));
-  return checks.get(id);
-};
+/** The networks the saved seat and analysis choices pick for engine `id`, which its files() should cover. */
+const chosen = id => [...config.seats, config.analysis].filter(c => c?.engine === id && c.checkpoint).map(c => c.checkpoint);
+const remember = (id, promise) => { checks.set(id, Object.assign(promise, {stamp: chosen(id).join(',')})); return promise; };
+const check = id => checks.get(id)?.stamp === chosen(id).join(',') ? checks.get(id)
+  : remember(id, ENGINES.get(id).engine.files(chosen(id)).then(status).catch(failure));
 const unpublished = id => original.toast(`${ENGINES.get(id).entry.label} is not on the public site; build it here with ${ENGINES.get(id).build}`);
 /* States in which a browser engine plays without a download first: its files are here, cached, or cannot be cached. */
 const READY = new Set(['local', 'cached', 'uncached']);
@@ -248,7 +250,7 @@ async function fetchEngine(id) {
     checks.delete(id);
     if (!READY.has((await check(id)).state)) throw new Error('the downloaded files did not reach the browser cache');
   } catch (error) {
-    checks.set(id, Promise.resolve(failure(error)));
+    remember(id, Promise.resolve(failure(error)));
     if (error instanceof NotOnSite) unpublished(id);
     else original.toast(`${ENGINES.get(id).entry.label}: ${error.message}`);
   } finally {

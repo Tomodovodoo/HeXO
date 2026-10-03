@@ -66,7 +66,7 @@ export async function json(path) {
   const store = await open(), id = `${new URL(path, BASE).href}?manifest`;
   try {
     const {response, local} = await locate(path, {cache: 'no-cache'}), data = await response.json();
-    if (!local) await store?.put(id, new Response(JSON.stringify(data)));
+    if (!local) await store?.put(id, new Response(JSON.stringify(data))).catch(() => {});   // keeping it is best effort
     return {data, local};
   } catch (error) {
     const kept = !(error instanceof NotOnSite) && await store?.match(id);
@@ -117,10 +117,12 @@ export async function cached(file, progress = () => {}) {
   if (file.sha256 && await sha256(body, file.lines) !== file.sha256) {
     throw new Error(`${file.path} from ${local ? 'this site' : site()} does not match its SHA-256`);
   }
-  if (store) {
+  if (store) {   // keeping the bytes is best effort: a full quota still returns them
     const base = id.split('?')[0];
-    for (const old of await store.keys()) if (old.url.split('?')[0] === base) await store.delete(old);
-    await store.put(id, new Response(body.slice(0)));
+    try {
+      for (const old of await store.keys()) if (old.url.split('?')[0] === base) await store.delete(old);
+      await store.put(id, new Response(body.slice(0)));
+    } catch {}
   }
   progress(1);
   return body;

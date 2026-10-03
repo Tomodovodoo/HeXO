@@ -30,10 +30,13 @@ export class SixEngine extends EngineWorker {
     return found;
   }
 
-  /** The downloaded files (assets.mjs records) a first turn on this device reads: ONNX Runtime and the newest network. */
-  async files() {
-    const [{provider}, {data, local}] = await Promise.all([probe(this.options.prefer), this.manifest()]), [newest] = data.networks;
-    return [...await runtimeFiles(provider), {path: `six/networks/${newest.file}`, sha256: newest.sha256, bytes: newest.bytes, local}];
+  /** The downloaded files (assets.mjs records) turns on this device read: ONNX Runtime and the networks named in
+   * `networks` (manifest names; the newest when none of them is in the manifest). */
+  async files(networks = []) {
+    const [{provider}, {data, local}] = await Promise.all([probe(this.options.prefer), this.manifest()]);
+    const chosen = data.networks.filter(n => networks.includes(n.name));
+    return [...await runtimeFiles(provider), ...(chosen.length ? chosen : data.networks.slice(0, 1))
+      .map(n => ({path: `six/networks/${n.file}`, sha256: n.sha256, bytes: n.bytes, local}))];
   }
 }
 

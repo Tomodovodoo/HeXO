@@ -116,7 +116,7 @@ caches.open = open;
 reset();
 const pins = {};
 for (const path of ['ort/ort.wasm.min.mjs', 'ort/ort-wasm-simd-threaded.mjs', 'ort/ort-wasm-simd-threaded.wasm',
-  'model/bubble-fp32.onnx', 'six/networks/gen-2.onnx', 'strix/net.safetensors', 'shrimp/model/shrimp.onnx',
+  'model/bubble-fp32.onnx', 'six/networks/gen-2.onnx', 'six/networks/gen-1.onnx', 'strix/net.safetensors', 'shrimp/model/shrimp.onnx',
   'seal/engine.mjs', 'seal/engine.wasm', 'native/native.wasm', 'strix/strix.wasm', 'shrimp/shrimp.wasm']) {
   site.set(path, `bytes of ${path}`);
   pins[path] = hash(`bytes of ${path}`);
@@ -125,7 +125,8 @@ const name = path => path.slice(path.lastIndexOf('/') + 1);
 const manifests = {
   'ort/version.json': {version: '1.30.0', files: Object.fromEntries(Object.entries(pins).filter(([p]) => p.startsWith('ort/')).map(([p, h]) => [name(p), h]))},
   'model/manifest.json': {model_version: 'm', files: {'bubble-fp32.onnx': {sha256: pins['model/bubble-fp32.onnx'], bytes: 40}}},
-  'six/networks/manifest.json': {networks: [{name: 'gen-2', file: 'gen-2.onnx', sha256: pins['six/networks/gen-2.onnx'], bytes: 41}]},
+  'six/networks/manifest.json': {networks: [{name: 'gen-2', file: 'gen-2.onnx', sha256: pins['six/networks/gen-2.onnx'], bytes: 41},
+    {name: 'gen-1', file: 'gen-1.onnx', sha256: pins['six/networks/gen-1.onnx'], bytes: 41}]},
   'strix/networks.json': {networks: [{id: 'net', file: 'net.safetensors', sha256: pins['strix/net.safetensors'], size: 39}]},
   'shrimp/model/manifest.json': {files: {'shrimp.onnx': {sha256: pins['shrimp/model/shrimp.onnx'], bytes: 42}}},
   'seal/manifest.json': {revision: 'r', files: {'engine.mjs': pins['seal/engine.mjs'], 'engine.wasm': pins['seal/engine.wasm']}},
@@ -149,6 +150,7 @@ for (const [id, engine] of Object.entries(engines)) {
     downloads: requests.filter(r => !r.endsWith('.json')), cached: (await assets.status(listed)).state};
 }
 
+out.six_chosen = (await engines.six.files(['gen-1'])).map(f => f.path).filter(p => p.startsWith('six/'));
 const kind = async run => { try { await run(); return 'ok'; } catch (error) { return error instanceof assets.NotOnSite ? 'not on site' : 'error'; } };
 site.delete('seal/manifest.json');
 site.delete('strix/networks.json');

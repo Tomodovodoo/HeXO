@@ -88,7 +88,8 @@ class Resolver(unittest.TestCase):
 
 
     def test_six_fills_its_checkpoints_when_it_reads_the_manifest(self):
-        self.assertEqual(self.out['six_retry'], ['gen-2'])
+        self.assertEqual(self.out['six_retry'], ['gen-2', 'gen-1'])
+        self.assertEqual(self.out['six_chosen'], ['six/networks/gen-1.onnx'])
 
 
     def test_assets_query_is_honoured_only_on_a_loopback_page(self):
