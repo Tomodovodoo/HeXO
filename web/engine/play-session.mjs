@@ -224,8 +224,11 @@ export class BrowserSession extends OfflineSession {
     }
   }
   snapshot() {
+    // Match metadata is mutable; its saved record versions are not.
+    const match = this.match && copy({...this.match, position: this.match.position && {...this.match.position, records: []}});
+    if (match?.position) match.position.records = this.match.position.records?.slice();
     return {id: this.id, history: copy(this.history), seats: copy(this.seats), analysis: copy(this.analysis), paused: this.paused,
-      book: copy(this.book), match: copy(this.match), saved_game: copy(this.saved_game), clock: this.clockNow(), timeControl: copy(this.timeControl),
+      book: copy(this.book), match, saved_game: copy(this.saved_game), clock: this.clockNow(), timeControl: copy(this.timeControl),
       clockTurns: copy(this.clockTurns), clockPartial: this.clockPartial, outcome: copy(this.outcome), taken: Date.now(), gameId: this.gameId, gameCreated: this.gameCreated, records: this.records.slice()};
   }
   storageConflict() {
