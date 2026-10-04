@@ -1610,6 +1610,67 @@ class NativeScheduler(unittest.TestCase):
         self.finish(recovered)
         self.assertTrue(all(g.stats()['completed'] == 16 for g in recovered.games))
 
+    def test_prelaunch_proofs_retire_only_the_settled_games_subscribers(self):
+        from neural_search import checked
+        history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
+        graphs = [self.graph(history) for _ in range(2)]
+        for graph in graphs:
+            checked(native.hxg_tactics(graph.ptr, False))
+            graph.expand()
+        pool = self.pool(graphs, quantum=16, views=1, work=64)
+        pool.step()
+        before = pool.feed.stats()
+        # Only these first stones can finish P1's four or block both ends of P2's five.
+        safe = {(-2,0),(-1,0),(4,0),(5,0),(-1,3),(5,3)}
+        for action in Uniform().evaluate([history])[0]['actions']:
+            if tuple(action) not in safe:
+                graphs[0].mark(action, 1, 3)
+        self.assertEqual(native.hxg_exact(native.hxgo_root(pool.games[0].ptr)), -1)
+        retired = pool.feed.prune()
+        self.assertGreater(retired, 0)
+        self.assertEqual(before['pending_requests']-pool.feed.stats()['pending_requests'], retired)
+        self.assertEqual(pool.games[0].stats()['completed'], retired)
+        self.assertGreater(pool.games[1].stats()['pending'], 0)
+        self.assertEqual(pool.feed.pruning()['retired_requests'], retired)
+        self.assertEqual(pool.feed.prune(), 0)
+        for action in Uniform().evaluate([history])[0]['actions']:
+            if tuple(action) not in safe:
+                graphs[1].mark(action, 1, 3)
+        retired += pool.feed.prune()
+        self.assertGreater(pool.feed.pruning()['avoided_rows'], 0)
+        self.assertEqual(pool.feed.prune(), 0)
+        self.finish(pool)
+        self.assertGreaterEqual(pool.feed.pruning()['retired_requests'], retired)
+        for game in pool.games:
+            stats = game.stats()
+            self.assertEqual(stats['issued'], stats['completed']+stats['cancelled'])
+            self.assertEqual(int(game.evidence()['lifetime_credits'].sum()), stats['root_completed'])
+
+    def test_submitted_rows_keep_their_reservations_until_completion(self):
+        from neural_search import checked
+        history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
+        graph = self.graph(history)
+        checked(native.hxg_tactics(graph.ptr, False))
+        graph.expand()
+        pool = self.pool([graph], quantum=16, views=1, work=32)
+        pool.step()
+        batch = pool.feed.take(128)
+        before = pool.feed.stats()['pending_requests']
+        safe = {(-2,0),(-1,0),(4,0),(5,0),(-1,3),(5,3)}
+        for action in Uniform().evaluate([history])[0]['actions']:
+            if tuple(action) not in safe:
+                graph.mark(action, 1, 3)
+        self.assertEqual(pool.feed.prune(), 0)
+        self.assertEqual(pool.feed.stats()['pending_requests'], before)
+        self.answer(pool, batch)
+        counters = np.empty(6, np.uint64)
+        native.hxg_view_counters(native.hxgo_root(pool.games[0].ptr), counters.ctypes.data)
+        self.assertGreater(counters[4], 0)
+        self.finish(pool)
+        stats = pool.games[0].stats()
+        self.assertEqual(stats['issued'], stats['completed']+stats['cancelled'])
+        self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0,0))
+
     def test_unexpanded_exact_child_records_the_proof_instead_of_an_unset_mean(self):
         from neural_search import checked
         history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]

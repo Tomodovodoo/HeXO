@@ -21,6 +21,8 @@ bind('hxgf_detach', None, ptr, ptr)
 bind('hxgf_root_value', C.c_int, ptr, ptr, ptr)
 bind('hxgf_stats', None, ptr, ptr)
 bind('hxgf_queued', C.c_int64, ptr)
+bind('hxgf_prune', C.c_int, ptr)
+bind('hxgf_pruning', None, ptr, ptr)
 bind('hxgf_profile', None, ptr, C.c_int)
 bind('hxgf_times', None, ptr, ptr)
 
@@ -140,6 +142,18 @@ class NativeFeed:
     def queued(self):
         """Distinct unsubmitted neural rows, excluding cache hits and subscribers."""
         return int(native.hxgf_queued(self.ptr))
+
+    def prune(self):
+        """Retire settled queued subscribers. Submitted snapshots retain their ownership."""
+        count = native.hxgf_prune(self.ptr)
+        if count < 0:
+            checked(False)
+        return count
+
+    def pruning(self):
+        out = np.empty(3, np.uint64)
+        native.hxgf_pruning(self.ptr, out.ctypes.data)
+        return dict(retired_requests=int(out[0]), avoided_rows=int(out[1]), elapsed_ms=float(out[2])/1e6)
 
     def profile(self, enabled=True):
         native.hxgf_profile(self.ptr, enabled)

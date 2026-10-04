@@ -301,6 +301,13 @@ extern "C" HX_API const char* hxgm_model(void* p){return static_cast<owner::Pool
 extern "C" HX_API int hxgm_install(void* p,const uint64_t* ids,int count,const int64_t* offsets,const int64_t* actions,const double* logits,const double* values){try{return static_cast<owner::Pool*>(p)->install(ids,count,offsets,actions,logits,values);}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API void hxgm_stats(void* p,uint64_t* out){auto& pool=*static_cast<owner::Pool*>(p);uint64_t active=0,failed=0;for(size_t i=0;i<pool.games.size();++i){active+=!pool.games[i]->stopped;failed+=pool.failed[i];}std::array<uint64_t,5> stats{pool.steps,uint64_t(pool.games.size()),active,failed,pool.retargets};std::copy(stats.begin(),stats.end(),out);}
 extern "C" HX_API int hxgm_history(void* p,int i,int64_t* out){auto& pool=*static_cast<owner::Pool*>(p);if(i<0 || i>=int(pool.games.size()))return -1;auto& h=pool.games[i]->focus;if(out)for(size_t j=0;j<h.size();++j){out[2*j]=h[j].q;out[2*j+1]=h[j].r;}return int(h.size());}
+// Feed pruning runs between graph phases, before encoded snapshots are taken.
+extern "C" HX_API int hxg_retire(void* p,int id){try{
+ auto& tree=*static_cast<gumbel::Tree*>(p);auto found=tree.requests.find(id);
+ if(found==tree.requests.end())throw std::runtime_error("Unknown queued neural request");
+ tree.proof_root();if(!tree.proof_closed(found->second))return 0;
+ tree.requests.erase(found);return 1;
+}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 extern "C" HX_API int hxgm_record_history(void* p,int game,int record,int64_t* out){auto& pool=*static_cast<owner::Pool*>(p);if(game<0 || game>=int(pool.games.size()) || record<0 || record>=int(pool.games[game]->records.size()))return -1;auto& h=pool.games[game]->records[record].history;if(out)for(size_t j=0;j<h.size();++j){out[2*j]=h[j].q;out[2*j+1]=h[j].r;}return int(h.size());}
 
 extern "C" HX_API int hxgo_history(void* p,int64_t* out){auto& h=static_cast<owner::Owner*>(p)->focus;if(out)for(size_t i=0;i<h.size();++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}
