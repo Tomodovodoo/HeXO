@@ -77,7 +77,7 @@ SCHEMA = 'hexo-dense-shard-v1'
 FILES = ('episodes.json', 'rows.json', 'targets.npz')
 SIDECAR = 'proofs.jsonl'
 Ref = namedtuple('Ref', 'shard index row episode')
-Shard = namedtuple('Shard', 'game ply player remaining proven known_result proof_action legal offsets following start moves roots searched has_roots '
+Shard = namedtuple('Shard', 'game ply player remaining proven known_result proof_action search legal offsets following start moves roots searched has_roots '
                              'has_search winner side held')
 FUTURE = (6, 20)
 ORIGINS = ('converted', 'actor')
@@ -328,7 +328,7 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
         if len(p) and (not np.isfinite(p).all() or np.any(p < 0) or not np.isclose(p.sum(), 1, atol=1e-4)):
             raise ValueError('Invalid policy target')
     keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256', 'proven', 'proof_turns', 'proof_plies',
-            'solver_nodes', 'solver_budget', 'line', 'proof_action')
+            'solver_nodes', 'solver_budget', 'line', 'proof_action', 'search')
     counts = dict(games=len(episodes), rows=len(rows), policy_rows=sum(len(p) > 0 for p in policies),
                   opponent_rows=sum(not trained(episodes[r['game']], r['ply']) for r in rows),
                   terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes),
@@ -615,6 +615,7 @@ class ReplayWindow:
             proven=np.array([r.get('proven', 0) for r in rows], np.int8),
             known_result=np.array([known_result(episodes[r['game']], r['ply']) for r in rows], np.int8),
             proof_action={i: r['proof_action'] for i, r in enumerate(rows) if r.get('proof_action')},
+            search={i: r['search'] for i, r in enumerate(rows) if 'search' in r},
             legal=np.frombuffer(bytes.fromhex(''.join(r['legal_sha256'] for r in rows)), np.uint8).reshape(-1, 32),
             offsets=offsets, following=np.array([where.get((g, t+1), -1) for g, t in zip(game.tolist(), ply.tolist())], np.int32),
             start=np.cumsum([0]+[len(e['moves']) for e in episodes]).astype(np.int32),
@@ -836,6 +837,8 @@ class ReplayWindow:
             row['known_result'] = int(s.known_result[i])
         if i in s.proof_action:
             row['proof_action'] = s.proof_action[i]
+        if i in s.search:
+            row['search'] = s.search[i]
         if deblunder_row(row, int(s.winner[g]), self.deblunders[name]):
             row['deblunder'] = True
         episode = episode or dict(moves=s.moves[a:b].tolist(), winner=int(s.winner[g]), trained_side=None if s.side[g] < 0 else int(s.side[g]),

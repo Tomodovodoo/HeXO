@@ -44,6 +44,7 @@ py-modules = [
   "neural_search",
   "native_feed",
   "native_scheduler",
+  "native_selfplay",
   "native_dense",
   "puct_search",
   "notation",

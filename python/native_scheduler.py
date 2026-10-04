@@ -36,6 +36,9 @@ for name, result, args in (
     ('complete', C.c_int, [ptr, C.c_uint64, ptr, ptr, ptr, ptr]),
     ('abort', C.c_int, [ptr, C.c_uint64]), ('done', C.c_int, [ptr]),
     ('join', C.c_int, [ptr]), ('free', C.c_int, [ptr]), ('stats', None, [ptr, ptr]),
+    ('continuous', C.c_int, [ptr]), ('event', C.c_char_p, [ptr]),
+    ('retarget', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, ptr, C.c_int,
+                         C.c_uint64, C.c_double, C.c_int, C.c_int, C.c_double]),
 ):
     bind('hxb_'+name, result, *args)
 bind('hxp_new', ptr, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int)
@@ -44,6 +47,7 @@ for name, result, args in (
     ('drain', C.c_int, [ptr]), ('free', C.c_int, [ptr]),
     ('offer', C.c_int, [ptr, C.c_int, ptr, C.c_int, C.c_double]),
     ('stats', None, [ptr, ptr, ptr]), ('record', C.c_char_p, [ptr, C.c_int]),
+    ('generation', C.c_uint64, [ptr, C.c_int]), ('effort', C.c_int, [ptr, C.c_int, ptr]),
 ):
     bind('hxp_'+name, result, *args)
 
@@ -107,6 +111,17 @@ class ProofLoop:
         """Inspect verified evidence and its actual conditional request context."""
         import json
         return [json.loads(native.hxp_record(self.ptr, i)) for i in range(self.stats()['records'])]
+
+    def effort(self, game):
+        """Actual fresh work charged to the dispatched game/search generation.
+
+        Read after closing the inference service. Late cancelled jobs still belong
+        to their old generation; cache-hit historical counts never enter this ledger.
+        """
+        size = native.hxp_effort(self.ptr, game, None)
+        out = np.empty((size, 4), np.uint64)
+        native.hxp_effort(self.ptr, game, out.ctypes.data)
+        return {int(r[0]): dict(fresh_nodes=int(r[1]), queries=int(r[2]), missing_fresh=int(r[3])) for r in out}
 
     def close(self):
         if self._ptr:
@@ -405,8 +420,27 @@ class InferenceService:
         self.leases[token.value] = rows
         return token.value, model.value, rows
 
-    def start(self, ms=0):
+    def start(self, ms=0, *, continuous=False):
+        if continuous:
+            if ms:
+                raise ValueError('Continuous roots carry their own clock or work limit')
+            checked(native.hxb_continuous(self.ptr))
         checked(native.hxb_start(self.ptr, ms))
+
+    def retarget(self, producer, game, history, *, expected=0, work=0, ms=0, samples=16, views=8, noise=0.):
+        """Copy a next-root command to its native graph owner, never mutate it here."""
+        cells = np.ascontiguousarray(history, np.int64).reshape(-1, 2)
+        checked(native.hxb_retarget(self.ptr, producer, game, expected, cells.ctypes.data,
+                                    len(cells), work, ms, samples, views, noise))
+
+    def event(self):
+        """Consume one immutable, position-bound completion. None while roots run."""
+        import json
+        text = native.hxb_event(self.ptr)
+        if text is None:
+            self.done()  # Surface producer failures instead of silently waiting forever.
+            return None
+        return json.loads(text)
 
     def complete(self, token, rows):
         if self.leases.get(token) is not rows:
@@ -441,31 +475,35 @@ class InferenceService:
         if self._ptr:
             native.hxb_cancel(self._ptr)
 
-    def run(self, ms=0):
+    def pump(self):
+        """Launch/collect bulk forwards once, leaving per-game control to the caller."""
         import native_dense
+        while len(self.pending)<2:
+            batch = self.take(0 if self.pending else 2.)
+            if batch is None:
+                break
+            token, model, rows = batch
+            try:
+                handle = native_dense.submit(self.models[model], rows)
+            except BaseException:
+                self.cancel()
+                uncertain = [h for h in native_dense._quarantined if h.rows is rows]
+                if uncertain:
+                    self.pending.append((token, uncertain[0]))
+                else:
+                    self.abandon_fenced(token)
+                raise
+            self.pending.append((token, handle))
+        if self.pending:
+            token, handle = self.pending[0]
+            self.complete(token, handle.collect())
+            self.pending.pop(0)
+
+    def run(self, ms=0):
         try:
             self.start(ms)
             while not self.done():
-                while len(self.pending)<2:
-                    batch = self.take(0 if self.pending else 2.)
-                    if batch is None:
-                        break
-                    token, model, rows = batch
-                    try:
-                        handle = native_dense.submit(self.models[model], rows)
-                    except BaseException:
-                        self.cancel()
-                        uncertain = [h for h in native_dense._quarantined if h.rows is rows]
-                        if uncertain:
-                            self.pending.append((token, uncertain[0]))
-                        else:
-                            self.abandon_fenced(token)
-                        raise
-                    self.pending.append((token, handle))
-                if self.pending:
-                    token, handle = self.pending[0]
-                    self.complete(token, handle.collect())
-                    self.pending.pop(0)
+                self.pump()
         finally:
             self.close()
 

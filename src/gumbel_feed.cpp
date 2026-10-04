@@ -165,7 +165,7 @@ struct Feed {
     if(result<0)throw std::runtime_error(gumbel::error);
     if(result){++retired;++proof_requests;}return result!=0;
    });
-   if(task.subscribers.empty()){pending.erase(task.key);tasks.erase(found);--queued;++proof_rows;}
+   if(task.subscribers.empty()){forget(task.key,id);tasks.erase(found);--queued;++proof_rows;}
   }
   // A cancelled/settled row leaves no queued identity to inspect next time.
   std::erase_if(ready,[&](uint64_t id){auto it=tasks.find(id);return it==tasks.end() || it->second.submitted;});
@@ -178,9 +178,12 @@ struct Feed {
    int result=hxg_retire(subscriber.tree,subscriber.request);
    if(result<0)throw std::runtime_error(gumbel::error);if(result)++proof_requests;return result!=0;
   });
-  // Immutable snapshots survive retirement. The owner still completes this task once.
+  // Keep the submitted ID/snapshot, but do not let a new generation subscribe
+  // after an empty completion has already been queued for this task.
+  if(subscribers.empty())forget(found->second.key,id);
   return int(subscribers.size());
  }
+ void forget(const Key& key,uint64_t id){auto it=pending.find(key);if(it!=pending.end() && it->second==id)pending.erase(it);}
  void detach(void* tree) {
   // Detach before freeing or advancing a cancelled tree. Submitted rows retain no tree ownership.
   bool attached;{std::lock_guard lock(mutex);attached=roots.erase(tree)!=0;}
@@ -189,7 +192,8 @@ struct Feed {
   for(auto it=tasks.begin();it!=tasks.end();){
    auto& t=it->second;
    std::erase_if(t.subscribers,[&](Subscriber s){return s.tree==tree;});
-   if(t.subscribers.empty()&&!t.submitted){--queued;pending.erase(t.key);it=tasks.erase(it);}else ++it;
+   if(t.subscribers.empty())forget(t.key,it->first);
+   if(t.subscribers.empty()&&!t.submitted){--queued;it=tasks.erase(it);}else ++it;
   }
  }
 };
@@ -289,7 +293,7 @@ HX_API int hxgf_install(void* p,const uint64_t* ids,int count,const int64_t* off
  for(int i=0;i<count;++i){
   auto found=f.tasks.find(ids[i]);auto& task=found->second;
   if(predictions[i])f.put(task.key,std::move(predictions[i]));
-  f.pending.erase(task.key);f.tasks.erase(found);
+  f.forget(task.key,ids[i]);f.tasks.erase(found);
  }
  return output;
 }catch(const std::exception& e){gumbel::error=e.what();return -1;}}

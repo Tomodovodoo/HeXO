@@ -3747,6 +3747,259 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_continuous_cold_deadline_does_not_cancel_other_game(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        graphs = [NativeScheduler.graph(self) for _ in range(2)]
+        pool = NativeScheduler.pool(self,graphs,views=1,work=16)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.retarget(0,0,[[0,0]],ms=1,views=1)
+        service.retarget(0,1,[[0,0]],work=16,views=1)
+        time.sleep(.02)  # The cold clock expires before any inference result exists.
+        events = []
+        end = time.monotonic()+2
+        while len(events)<2 and time.monotonic()<end:
+            service.pump()
+            while (event:=service.event()) is not None:
+                events.append(event)
+        self.assertEqual(len(events),2)
+        by_game = {e['game']:e for e in events}
+        self.assertEqual(by_game[0]['error'],'deadline')
+        self.assertNotIn('edges',by_game[0])
+        self.assertNotIn('error',by_game[1])
+        self.assertIn(tuple(by_game[1]['action']),set(map(tuple,legal([[0,0]]))))
+        service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],
+                          service.stats()['active_producers']),(0,0,0))
+
+    def test_continuous_tighter_prefix_proof_changes_the_learner_witness(self):
+        from native_selfplay import play_cohort, label_prefixes
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY),'native-witness','fixed','cpu',32,64)
+        settings = dense_config.ActorSettings(full_fraction=1.,full_sims=16,root_samples=4,
+                                             game_graph=128,max_plies=6,tactics=False,opening_random_plies=0.)
+        game = dense_selfplay.SelfPlayGame([model,model],settings,23,native_owner=True)
+        episodes,rows,_ = play_cohort([game],producers=1,views=1)
+        actions = legal(game.moves[:1])
+        old,new = actions[:2].tolist()
+        label_prefixes(game,[[1,1,42,[old]]])
+        self.assertEqual(game.rows[1]['proof_plies'],42)
+        label_prefixes(game,[[1,1,34,[new]]])
+        label_prefixes(game,[[1,1,38,[old]]])  # A later weaker bound cannot replace it.
+        self.assertEqual(game.rows[1]['proof_action'],[new])
+        self.assertEqual(game.rows[1]['proof_plies'],34)
+        label_prefixes(game,[[1,1,28,[]]])
+        self.assertNotIn('proof_action',game.rows[1])
+        label_prefixes(game,[[1,1,30,[old]]])
+        self.assertNotIn('proof_action',game.rows[1])
+        second = legal(game.moves[:2])[0].tolist()
+        label_prefixes(game,[[2,1,34,[second]]])
+        self.assertEqual(game.rows[1]['proof_plies'],28)
+        self.assertNotIn('proof_action',game.rows[1])
+        label_prefixes(game,[[1,1,28,[new]]])
+        self.assertEqual(game.rows[1]['proof_action'],[new])
+        self.assertEqual(game.rows[1]['proof_plies'],28)
+        label_prefixes(game,[[2,1,20,[second]]])
+        self.assertEqual(game.rows[1]['proof_plies'],21)
+        self.assertEqual(game.rows[1]['proof_action'],[game.moves[1]])
+        label_prefixes(game,[[1,1,20,[new]]])
+        with self.assertRaisesRegex(ValueError,'contradicts'):
+            label_prefixes(game,[[1,0,30,[old]]])
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [dict(r,game=0) for r in game.rows]
+            dense_data.write_shard(Path(tmp)/'shards'/'000001',dict(actor_sha256='native-witness'),episodes,rows)
+            window = dense_data.ReplayWindow(Path(tmp),capacity_rows=128,validation_fraction=0.)
+            ref = window.ref('000001',1)
+            samples,targets = dense_data.examples(window,[ref],np.random.default_rng(23),proof_policy_weight=2.)
+            current = np.flatnonzero((samples[0].actions==np.asarray(new)).all(1))[0]
+            previous = np.flatnonzero((samples[0].actions==np.asarray(old)).all(1))[0]
+            self.assertEqual(np.argmax(targets[0]['policy']),current)
+            self.assertGreater(targets[0]['policy'][current],targets[0]['policy'][previous])
+            self.assertAlmostEqual(float(targets[0]['policy'].sum()),1.,places=6)
+
+    def test_continuous_prefix_labels_keep_only_shortest_graph_witnesses(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        graph = NativeScheduler.graph(self)
+        graph.expand()
+        actions = graph.result(0,0,0,0)['actions']
+        # Trusted proof inputs can have different upper bounds. A later row
+        # must receive only the shortest retained witnesses of its prefix.
+        graph.mark(actions[0],1,42)
+        graph.mark(actions[1],1,34)
+        pool = NativeScheduler.pool(self,[graph],views=1,work=8)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.retarget(0,0,[[0,0],actions[0].tolist()],work=8,views=1)
+        event = None
+        end = time.monotonic()+2
+        while event is None and time.monotonic()<end:
+            service.pump()
+            event = service.event()
+        self.assertIsNotNone(event)
+        prefix = next(r for r in event['exact_prefixes'] if r[0]==1)
+        self.assertEqual(prefix[1:], [1,34,[actions[1].tolist()]])
+        service.close()
+
+    def test_continuous_native_span_stops_only_its_game_and_rejects_legacy_budgets(self):
+        from native_selfplay import play_cohort
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'native-span', 'fixed', 'cpu', 32, 64)
+        settings = dense_config.ActorSettings(full_fraction=1., full_sims=16, root_samples=4,
+                                             game_graph=128, max_plies=6, tactics=False,
+                                             opening_random_plies=0.)
+        with self.assertRaisesRegex(ValueError,'frontier slice'):
+            dense_selfplay.SelfPlayGame([model,model],replace(settings,solver_root_nodes=32),1,native_owner=True)
+        with self.assertRaisesRegex(ValueError,'frontier slice'):
+            dense_selfplay.SelfPlayGame([model,model],replace(settings,solver_leaf_nodes=32),1,native_owner=True)
+        wide = line_history(34)
+        games = [dense_selfplay.SelfPlayGame([model,model],settings,1,native_owner=True,
+                    book=(dict(suite='test',key='wide',ply=len(wide)),wide)),
+                 dense_selfplay.SelfPlayGame([model,model],settings,2,native_owner=True)]
+        events = []
+        episodes, rows, receipt = play_cohort(games, producers=1, views=1,
+                                              progress=lambda index,event:events.append((index,event)))
+        self.assertEqual(episodes[0]['reason'], 'span')
+        self.assertEqual(list(map(tuple,episodes[0]['moves'])), wide)
+        self.assertFalse(any(r['game']==0 for r in rows))
+        self.assertEqual(len(episodes[1]['moves']),6)
+        self.assertEqual(len([r for r in rows if r['game']==1]),6)
+        self.assertTrue(any(index==0 and event.get('error')=='span' for index,event in events))
+        self.assertEqual((receipt['inference']['pending_rows'],receipt['inference']['inflight_batches'],
+                          receipt['inference']['active_producers']), (0,0,0))
+
+    def test_continuous_native_proofs_reach_played_rows_with_fresh_effort(self):
+        from native_selfplay import play_cohort
+        from tests.test_neural_search import NativeProofs
+        from tactical_proof import library, independent_verify
+        if not library().is_file():
+            self.skipTest('Build the tactical library first')
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'native-proof', 'fixed', 'cpu', 64, 64)
+        settings = dense_config.ActorSettings(full_fraction=1., full_sims=4096, game_graph=512,
+                                             max_plies=128, tactics=False, adjudicate_proven=True,
+                                             opening_random_plies=0.)
+        history = NativeProofs.opening
+        games = [dense_selfplay.SelfPlayGame([model,model], settings, 230+i, native_owner=True,
+                    book=(dict(suite='test', key=str(i), ply=len(history)), history)) for i in range(2)]
+        episodes, rows, receipt = play_cohort(games, producers=2, proof_workers=1, slice_ms=25, views=4)
+        self.assertTrue(all(e['winner']==0 and e['reason']=='proven' for e in episodes))
+        self.assertTrue(all(r['proven']==1 and r['proof_plies']>0 for r in rows))
+        self.assertTrue(all(r['search']['missing_fresh']==0 for r in rows))
+        self.assertGreater(sum(r['solver_nodes'] for r in rows),0)
+        self.assertEqual(sum(r['solver_nodes'] for r in rows), sum(s['fresh_nodes'] for s in receipt['proof_stats']))
+        self.assertTrue(receipt['proofs'])
+        for proof in receipt['proofs']:
+            self.assertEqual(independent_verify(proof['result']['certificate'],proof['request']['history'],
+                             attacker=proof['result']['attacker'],known=proof['request']['known']),proof['result']['status'])
+        self.assertTrue(all(s['active']==0 and s['queued']==0 and s['ready']==0 for s in receipt['proof_stats']))
+
+    def test_continuous_service_can_retarget_while_expired_batch_remains_in_flight(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        import native_dense
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=4,work=32,quantum=8)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.retarget(0,0,[(0,0)],ms=250.,views=4)
+        with self.assertRaisesRegex(ValueError,'matching game completion'):
+            service.retarget(0,0,[(0,0)],work=16)
+        batch = service.take(100.)
+        self.assertIsNotNone(batch)
+        token, _, rows = batch
+        service.complete(token,native_dense.submit(evaluator,rows).collect())
+        held = service.take(100.)
+        self.assertIsNotNone(held)
+        end = time.monotonic()+2
+        event = None
+        while event is None and time.monotonic()<end:
+            event = service.event()
+            time.sleep(.001)
+        self.assertIsNotNone(event)
+        self.assertEqual((event['history'],event['token']), ([[0,0]],1))
+        saved = copy.deepcopy(event)
+        service.retarget(0,0,[(0,0)],expected=1,work=16,samples=4,views=1)
+        with self.assertRaisesRegex(ValueError,'matching game completion'):
+            service.retarget(0,0,[(0,0)],expected=0,work=16)
+        token, _, rows = held
+        service.complete(token,native_dense.submit(evaluator,rows).collect())
+        second = None
+        end = time.monotonic()+2
+        while second is None and time.monotonic()<end:
+            service.pump()
+            second = service.event()
+        self.assertIsNotNone(second)
+        self.assertEqual((second['token'],second['completed'],second['root_completed']), (2,16,16))
+        self.assertEqual(saved,event)
+        self.assertEqual(int(np.asarray(second['edges'])[:,7].sum()),16)
+        service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],service.stats()['active_producers']),(0,0,0))
+
+    def test_continuous_native_selfplay_records_only_played_roots_and_replays_targets(self):
+        from native_selfplay import play_cohort
+        torch.set_num_threads(2)
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY), f'native-{k}', f'model-{k}', 'cpu', 32, 64) for k in range(2)]
+        settings = dense_config.ActorSettings(full_fraction=.5, full_sims=32, cheap_sims=8, root_samples=8,
+                                             cheap_root_samples=4, game_graph=192, max_plies=7, tactics=False,
+                                             opening_random_plies=0., root_noise=.2)
+        games = [dense_selfplay.SelfPlayGame([models[0], models[0]], settings, 120+i, native_owner=True) for i in range(2)]
+        games.append(dense_selfplay.SelfPlayGame(models, settings, 130, learner=1, opponent='model-0', native_owner=True))
+        events = []
+        with unittest.mock.patch.object(games[0], 'searched', wraps=games[0].searched) as searched:
+            episodes, rows, receipt = play_cohort(games, producers=2, quantum=8, views=4, cache=128,
+                                                progress=lambda index, event: events.append((index, event)))
+        self.assertTrue(all(call.args[0]['completed']==call.args[0]['search']['root_completed']
+                            for call in searched.call_args_list))
+        self.assertTrue(any(call.args[0]['search']['completed']>call.args[0]['completed']
+                            for call in searched.call_args_list))
+        self.assertTrue(all(event['network_value'] is not None for _, event in events if not event['history']))
+        self.assertEqual(len(episodes), 3)
+        self.assertEqual((receipt['inference']['pending_rows'], receipt['inference']['inflight_batches'],
+                          receipt['inference']['active_producers']), (0,0,0))
+        self.assertGreater(receipt['inference']['launched_rows'], 0)
+        for i, episode in enumerate(episodes):
+            played = [r for r in rows if r['game']==i]
+            self.assertEqual([r['ply'] for r in played], list(range(len(episode['moves']))))
+            self.assertEqual(len(episode['moves']), 7)
+            game = Game()
+            try:
+                for row, action in zip(played, episode['moves']):
+                    actions = np.asarray(game.legal_moves(), np.int64)
+                    self.assertEqual(dense_data.legal_digest(actions), row['legal_sha256'])
+                    self.assertIn(tuple(action), set(map(tuple, actions)))
+                    source = row['search']
+                    self.assertEqual(source['root_completed'], source['comparison_credits'])
+                    self.assertLessEqual(source['comparison_credits'], source['completed'])
+                    self.assertEqual(source['root_estimate'], episode['root_values'][row['ply']])
+                    self.assertEqual(source['fresh_nodes'], 0)
+                    if i==2 and row['player']==0:
+                        self.assertIsNone(row['policy'])
+                        self.assertIsNone(episode['root_values'][row['ply']])
+                    elif row['policy'] is not None:
+                        self.assertEqual(len(row['policy']), len(actions))
+                        self.assertAlmostEqual(float(row['policy'].sum()), 1., places=6)
+                    game.play(*action)
+            finally:
+                game.close()
+        self.assertTrue(any(not full for e in episodes for full in e['full_search']))
+        self.assertTrue(any(full for e in episodes for full in e['full_search']))
+        with tempfile.TemporaryDirectory() as run:
+            dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='native-0'), episodes, rows)
+            window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0.)
+            refs = [window.ref(name, index) for name, index in window.index]
+            self.assertTrue(refs)
+            self.assertTrue(all(r.row['search']['source']=='native-root' for r in refs))
+            samples, targets = dense_data.examples(window, refs, np.random.default_rng(0))
+            self.assertEqual(len(samples), len(refs))
+            self.assertTrue(all(np.isfinite(t['value']) for t in targets))
+
     def test_inference_service_rejected_manual_prediction_can_be_fenced_and_abandoned(self):
         import ctypes
         from native_scheduler import InferenceService
