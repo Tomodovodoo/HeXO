@@ -132,6 +132,15 @@ export function proofEvidence(result) {
   return {certificate, dependencies: dependencies.map((d, i) => ({fact: i, outcome: d.outcome})), solver_build: result.build_hash};
 }
 
+/** The continuation and bound of an already verified mover certificate. */
+export function winningLine(native, history, result, known = []) {
+  const line = principalVariation(native, history, result.certificate, {known}), {player, remaining} = native.game(history);
+  const reused = result.certificate.nodes.some(n => ['stamp', 'stamp_link', 'zone_replies'].includes(n.kind));
+  return {moves: result.moves.map(m => [...m]), pv: line.pv,
+    proof: {winner: player, turns: result.proof_turns, plies: reused ? remaining + 4 * (result.proof_turns - 1) : line.plies,
+      ...(result.dependencies?.length || reused ? proofEvidence(result) : {})}};
+}
+
 /** The winner's turns in a proof `plies` placements long from a position whose mover has `remaining` stones left
  * (python/play.py proof_turns). */
 export function proofTurns(plies, remaining, moverWins) {
@@ -176,12 +185,14 @@ export class Proofs {
     }
     return [...found.values()].sort((a, b) => a.history.length - b.history.length).slice(0, 2048);
   }
-  /** Index `record` (the fields of a turn) at `history` when it holds a proof; `id` skips a record already indexed. A
+  /** Index the root proof and the leaf continuations retained in `record.proofs`; `id` skips a record already indexed. A
    * proof without `plies` takes the bound its `turns` give (python/play.py proof_plies). */
   add(history, record, id = null) {
-    const proof = record?.proof;
-    if (!proof || id !== null && this.seen.has(id)) return;
+    if (!record || id !== null && this.seen.has(id)) return;
     if (id !== null) this.seen.add(id);
+    for (const fact of record.proofs || []) this.add(fact.history, {proof: {winner: fact.winner, plies: fact.plies}, pv: fact.pv});
+    const proof = record.proof;
+    if (!proof) return;
     const current = history.map(([q, r]) => [q, r]), pv = record.pv || [];
     const remaining = current.length % 2 ? 2 : 1, mover = sideAt(current.length);
     const plies = proof.plies || remaining + (proof.winner === mover ? 0 : 2) + 4 * (proof.turns - 1);

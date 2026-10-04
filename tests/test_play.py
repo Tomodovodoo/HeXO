@@ -123,6 +123,22 @@ def entries():
 
 
 class Store(unittest.TestCase):
+    def test_leaf_proofs_survive_a_later_unproven_record_and_disk_reload(self):
+        from play import Proofs
+        history, budget = [(0, 0)], dict(simulations=8, solver_nodes=0)
+        fact = dict(history=[[0, 0], [1, 0]], winner=1, plies=5,
+                    pv=[[2, 0, 1, 1], [3, 0, 1, 4], [4, 0, 1, 5]])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'evaluations.jsonl'
+            store = Evaluations(path)
+            store.add(history, 'test', budget, evaluation(.5) | dict(top=[], proofs=[fact]))
+            store.add(history, 'test', budget, evaluation(.5) | dict(top=[]))
+            restored = Evaluations(path)
+            self.assertEqual(restored.get(history, 'test', budget)['proofs'], [fact])
+            table = Proofs()
+            table.extend(restored, history)
+            self.assertEqual(table.known(history)['pv'], [[1, 0, 1, 1]] + [[*p[:3], p[3]+1] for p in fact['pv']])
+
     def test_appends_reloads_prefers_deepest_and_keeps_backups(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'evaluations.jsonl'
@@ -877,6 +893,14 @@ class Jobs(unittest.TestCase):
 
     def test_budgets(self):
         bubble = PRESETS['bubble']
+        leaves = dict(simulations=8, solver_nodes=0, leaf_nodes=2048, leaf_ms=1000)
+        self.assertEqual(budget_of(bubble, 'custom', leaves, 'bubble'), leaves)
+        self.assertEqual(presets_of('bubble', dict(quick=leaves))['quick'], leaves)
+        for extra in (dict(leaf_nodes=-1), dict(leaf_ms=0), dict(leaf_nodes='1')):
+            with self.assertRaises(ValueError):
+                budget_of(bubble, 'custom', extra, 'bubble')
+        with self.assertRaises(ValueError):
+            budget_of(PRESETS['native'], 'custom', dict(leaf_nodes=2048), 'native')
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=10 ** 6))['simulations'], 10 ** 6)
         for custom in (dict(simulations=-1), dict(simulations=2 ** 31), dict(ms=5), dict(simulations='8')):
@@ -1634,6 +1658,21 @@ class Matches(unittest.TestCase):
             self.session.resume_match(self.output)
         self.assertFalse(self.session.match['active'])
 
+    def test_leaf_only_match_records_and_checks_the_solver_build_during_play_and_resume(self):
+        self.engines.solver_build = lambda: 'old-build'
+        self.session.start_match(['bubble:2{simulations=8,solver_nodes=0,leaf_nodes=2048}', 'Other'],
+                                  output=self.output, max_placements=3)
+        wait(lambda: self.session.match['completed'] == 1)
+        self.assertEqual(self.session.match['players'][0]['source']['solver_build'], 'old-build')
+        self.engines.solver_build = lambda: 'new-build'
+        wait(lambda: self.session.match['error'] is not None)
+        self.assertIn('Tactical solver build changed', self.session.match['error'])
+        self.assertEqual(self.session.match['completed'], 1)
+        self.session.stop_match()
+        wait(lambda: not self.session.match_worker.is_alive())
+        with self.assertRaisesRegex(ValueError, 'Tactical solver build changed'):
+            self.session.resume_match(self.output)
+
     def test_saved_games_and_analysis_survive_restart_without_changing_live_play(self):
         self.session.archive = Path(self.directory.name) / 'archive'
         self.session.study_store = Path(self.directory.name) / 'analysis.jsonl'
@@ -2007,6 +2046,30 @@ class Proofs(unittest.TestCase):
 
 class TurnTrees(unittest.TestCase):
     """A fixed-budget play turn searches its second stone in the tree its first stone grew."""
+
+    def test_leaf_certificate_line_survives_a_saved_evaluation_and_reaches_the_turn_start(self):
+        import tactical_proof
+        from play import evaluate, Proofs
+        from tests.test_tactical_proof import LATE_WIN
+        history = [tuple(p) for p in LATE_WIN] + [(-1, -11)]
+        found = evaluate(self.bubble(), tactical_proof.NativeTactics(), history, 8, 0,
+                         leaf_nodes=2048, leaf_ms=1000)
+        self.assertEqual(found['proof']['winner'], 0)
+        self.assertEqual(len(found['moves']), 1)
+        self.assertGreater(len(found['pv']), 5)
+        self.assertEqual(found['pv'], found['proofs'][0]['pv'])
+        saved = json.loads(json.dumps(found))
+        table = Proofs()
+        table.add(history, saved)
+        half = table.known(history)
+        root = table.known(history[:-1])
+        self.assertEqual(half['pv'], saved['pv'])
+        self.assertEqual(root['plies'], half['plies'] + 1)
+        self.assertEqual(root['pv'], [[-1, -11, 0, 1]] + [[*p[:3], p[3] + 1] for p in saved['pv']])
+        # A leaf proof is retained even if the search has not established the whole root.
+        table = Proofs()
+        table.add(history[:-1], dict(proof=None, proofs=saved['proofs']))
+        self.assertEqual(table.known(history[:-1]), root)
 
     def setUp(self):
         import hexnet
@@ -2394,6 +2457,36 @@ class GameProofs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'], 60)
         return self.session.state()['evaluations'][ply]
 
+    def test_leaf_allowance_reaches_the_player_and_pooled_review_without_root_queries(self):
+        session = self.session
+        budget = dict(simulations=8, solver_nodes=0, leaf_nodes=2048, leaf_ms=1000)
+        session.configure_analysis('bubble:tiny', preset='custom', auto=False, custom=budget)
+        key = session.engine_key(session.analysis)
+        session.analyse(80)
+        wait(lambda: not session.state()['jobs'], 60)
+        saved = session.lookup(session.history)
+        self.assertEqual(saved['proof']['winner'], 0)
+        self.assertGreater(len(saved['pv']), 5)
+        self.assertEqual(saved['pv'], saved['proofs'][0]['pv'])
+        self.assertEqual((saved['engine'], saved['solver_nodes'], saved['leaf_nodes']), (key, 0, 2048))
+        self.assertGreater(saved['actual_solver_nodes'], 0)
+        self.assertLessEqual(saved['actual_solver_nodes'], 2048)
+        self.assertEqual(session.state()['evaluations'][79]['proof']['plies'], saved['proof']['plies'] + 1)
+        pooled = session.engines.evaluate_many(session.entries['bubble:tiny'], None, budget,
+                                               [list(session.history)], lambda n: None)
+        found, spent, weights = pooled[0]
+        self.assertEqual((spent, weights, found['pv']), (budget, key, saved['pv']))
+        session.configure_analysis('bubble:tiny', preset='custom', auto=False, custom=dict(simulations=8, solver_nodes=0))
+        self.assertNotEqual(session.engine_key(session.analysis), key)
+        self.assertIsNone(session.lookup(session.history))
+        self.assertEqual(session.state()['evaluations'][80]['pv'], saved['pv'])
+        unavailable = Engines('cpu', tactical_package=Path(RUN.name) / 'missing')
+        self.addCleanup(unavailable.close)
+        self.assertEqual(unavailable.effective(budget), budget | dict(leaf_nodes=0))
+        session.configure_analysis('bubble:tiny', preset='custom', auto=False, custom=budget)
+        with self.assertRaisesRegex(ValueError, 'leaf-proof allowance'):
+            session.timed_config(session.analysis)
+
     def test_a_proof_carries_back_to_the_played_move_and_stays(self):
         seven = self.analyse(80, 32768)
         self.assertEqual(seven['proof'], dict(winner=0, turns=5, plies=17))
@@ -2418,7 +2511,13 @@ class GameProofs(unittest.TestCase):
         self.addCleanup(archive.cleanup)
         self.session.archive = Path(archive.name)
         self.session.load(self.start + [(-1, -11)], True)
-        self.assertEqual(self.analyse(80, 32768)['proof']['plies'], 17)
+        found = self.analyse(80, 32768)
+        self.assertEqual(found['proof']['plies'], 17)
+        # A record whose root is unproven can still contain a verified leaf continuation, even on an undone branch.
+        fact = dict(history=[list(p) for p in self.session.history], winner=0, plies=17, pv=found['pv'])
+        self.session.store.add(self.session.history, self.session.engine_key(self.session.analysis), self.session.analysis['budget'],
+                               dict(moves=[], value=.5, top=[], proof=None, pv=[], threat=[], proofs=[fact]))
+        self.session.save_freeplay()
         self.session.undo()
         self.session.save_freeplay()
         ident = self.session.remember_match(self.session.freeplay_directory)

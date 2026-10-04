@@ -212,6 +212,21 @@ class Overlay(unittest.TestCase):
 class BrowserProofs(unittest.TestCase):
     """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
 
+    def test_leaf_certificate_is_visible_before_the_first_stone_and_after_reload(self):
+        from tests.test_tactical_proof import LATE_WIN
+        history = [list(p) for p in LATE_WIN] + [[-1, -11]]
+        found = node(dict(kind='worker-turn', adapter=True, history=history, simulations=8, nodes=0,
+                          leafNodes=2048, leafQueryMs=1000))
+        self.assertEqual(found['proof']['winner'], 0)
+        self.assertGreater(len(found['pv']), 5)
+        self.assertEqual(found['pv'], found['proofs'][0]['pv'])
+        line = [[-1, -11, 0, 1]] + [[*p[:3], p[3] + 1] for p in found['pv']]
+        for record in (found, dict(found, proof=None, pv=[])):
+            answer = node(dict(kind='proofs', history=history, ply=len(history), found=record))
+            for shown in (answer['analysed'], answer['undone']['shown'], answer['quick']['shown'], answer['reloaded']):
+                self.assertEqual(shown['pv'], line)
+                self.assertEqual(shown['proof']['plies'], found['proof']['plies'] + 1)
+
     def test_tighter_scalar_proof_does_not_suggest_half_a_turn(self):
         source = """import {Proofs,proven} from './web/engine/proof.mjs';
 const table=new Proofs(), root=[[0,0]], old={moves:[[2,0],[3,0]],value:1,proof:{winner:1,plies:10,turns:3},pv:[]};

@@ -62,7 +62,7 @@ REVIEW_CHUNK = 24                       # positions per pooled review step; urge
 LIMITS = dict(simulations=0, solver_nodes=0, ms=10, nodes=1)
 # The engines take budgets as 32-bit signed integers.
 MAX_BUDGET = 2 ** 31 - 1
-KIND_LIMITS = dict(strix=dict(simulations=1))
+KIND_LIMITS = dict(strix=dict(simulations=1), bubble=dict(leaf_nodes=0, leaf_ms=1))
 HEXO_SITES = {'hexo.did.science': 'https://hexo.did.science/api',
               'hexo.mineking.dev': 'https://hexo.mineking.dev/proxy/api'}
 SHOWN = ('id', 'name', 'label', 'kind', 'badge', 'presets', 'checkpoints')
@@ -301,7 +301,7 @@ def presets_of(kind, spec):
             if key == 'args' and kind == 'six' and isinstance(value, list) and all(isinstance(v, str) for v in value):
                 continue
             limits = LIMITS | KIND_LIMITS.get(kind, {})
-            if (key not in PRESETS[kind]['standard'] or type(value) is not int
+            if (key not in PRESETS[kind]['standard'] | KIND_LIMITS.get(kind, {}) or type(value) is not int
                     or not limits[key] <= value <= MAX_BUDGET):
                 raise ValueError(f'bad {key} in preset {name}')
         presets[name] = presets[name] | budget
@@ -455,9 +455,12 @@ def model_key(path):
     return file_digest(file_identity(path))[:16]
 
 
-def search_key(weights, entry):
-    """The model key `weights` of a Bubble entry's evaluations, marked with its Q range floor when it has one."""
-    return weights + (f"~q{entry['q_range_floor']!r}" if entry.get('q_range_floor') else '')
+def search_key(weights, entry, budget=None):
+    """The weights with the entry's Q floor and any optional leaf-proof allowance, so saved searches cannot mix."""
+    key = weights + (f"~q{entry['q_range_floor']!r}" if entry.get('q_range_floor') else '')
+    if budget and budget.get('leaf_nodes'):
+        key += f"~leaf{budget['leaf_nodes']}x{budget.get('leaf_ms', 10)}"
+    return key
 
 
 class Cancelled(Exception):
@@ -660,6 +663,18 @@ def proof_evidence(result, certificate):
                 solver_build=result.get('build_hash'))
 
 
+def winning_line(history, result, known=()):
+    """The continuation and bound of an already verified mover certificate."""
+    cert = result.get('certificate') or json.loads(result['certificate_json'])
+    pv, plies = principal_variation(history, cert, known=known)
+    reused = any(n['kind'] in ('stamp', 'stamp_link', 'zone_replies') for n in cert['nodes'])
+    if reused:
+        plies = (2 if len(history) % 2 else 1) + 4*(result['proof_turns']-1)
+    evidence = proof_evidence(result, cert) if result.get('dependencies') or reused else {}
+    return dict(moves=[list(m) for m in result['moves']], pv=pv,
+                proof=dict(winner=player_at(len(history)), turns=result['proof_turns'], plies=plies, **evidence))
+
+
 def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
     """What the solver knows of `history` for `evaluate`: `moves` and `pv` (see `principal_variation`) of a proven
     win for the side to move, its certificate tightened to the fewest attacker turns the budget allows, `proof`
@@ -690,14 +705,7 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
                                                 shortest=True, **mine_options), watch, prover.abort)
     found.update(solved=searched(mine), used=mine.get('nodes_used', 0))
     if verified(mine) and mine['moves']:
-        cert = mine.get('certificate') or json.loads(mine['certificate_json'])
-        pv, plies = principal_variation(history, cert, known=mine_known)
-        reused = any(n['kind'] in ('stamp', 'stamp_link', 'zone_replies') for n in cert['nodes'])
-        if reused:
-            plies = remaining + 4*(mine['proof_turns']-1)
-        evidence = proof_evidence(mine, cert) if mine.get('dependencies') or reused else {}
-        found.update(moves=[list(m) for m in mine['moves']], pv=pv,
-                     proof=dict(winner=player, turns=mine['proof_turns'], plies=plies, **evidence))
+        found.update(winning_line(history, mine, mine_known))
         return found
     theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline, **options),
                            watch, prover.abort)
@@ -753,10 +761,16 @@ class Proofs:
         self.entries, self.sizes, self.seen, self.lock = {}, {}, set(), threading.RLock()
 
     def add(self, history, record, line=None):
-        """Index `record` (fields of `evaluate`) at `history` when it holds a proof; `line`, the record's saved
-        text, skips a record already indexed."""
+        """Index the root proof and any leaf continuations retained in `record['proofs']`.
+        `line`, the record's saved text, skips a record already indexed."""
+        if line in self.seen:
+            return
+        for fact in record.get('proofs', []):
+            self.add(fact['history'], dict(proof=dict(winner=fact['winner'], plies=fact['plies']), pv=fact['pv']))
         proof = record.get('proof')
-        if not proof or line in self.seen:
+        if not proof:
+            if line is not None:
+                self.seen.add(line)
             return
         current = [tuple(map(int, p)) for p in history]
         plies, pv = proof_plies(proof, current), [list(p) for p in record.get('pv') or []]
@@ -954,6 +968,8 @@ class SearchProofs:
         self.query_ms = query_ms
         self.ms = min(60_000, max(10_000, nodes // 8))
         self.used = 0
+        self.records = {}
+        self.known = None
 
     def history(self, history, *, ms=10, certificate=None):
         allowance = min(ms, self.query_ms, int(self.ms))
@@ -969,6 +985,15 @@ class SearchProofs:
         self.left = max(0, self.left - spent)
         self.ms -= (time.perf_counter() - start) * 1000
         self.watch(0)
+        if verified(result) and result.get('moves'):
+            found = winning_line(history, result)
+            fact = dict(history=[list(p) for p in history], winner=found['proof']['winner'],
+                        plies=found['proof']['plies'], pv=found['pv'])
+            old = self.records.get(proof_key(history))
+            if old is None or (fact['plies'], -len(fact['pv'])) < (old['plies'], -len(old['pv'])):
+                self.records[proof_key(history)] = fact
+            if self.known is not None:
+                self.known.add(history, found)
         return result
 
 
@@ -1002,13 +1027,15 @@ class TurnSearch:
         self.node_value = None
         self.later, self.played = [], 0
         self.trees = trees or self.advanced
-        self.known = known
+        self.known = known if known is not None else Proofs()
         outcome = known.known(self.history) if known is not None and self.proof is None else None
         if outcome is not None and outcome['winner'] != self.player:
             self.proof = dict(winner=outcome['winner'], plies=outcome['plies'],
                               turns=proof_turns(outcome['plies'], self.local.remaining, False))
             self.pv = outcome['pv']
         self.proofs = proofs
+        if proofs is not None:
+            proofs.known = self.known
 
     def advanced(self, history, simulations, network):
         from neural_search import NeuralSearch
@@ -1101,10 +1128,19 @@ class TurnSearch:
         after = self.known.known([*self.history, *map(tuple, self.moves)]) if extended else None
         if after is not None and after['winner'] == self.proof['winner']:
             pv = pv + [[*p[:3], p[3] + len(self.moves)] for p in after['pv']]
-        return dict(moves=self.moves, value=round(value, 4), node_value=self.node_value, top=self.top, proof=self.proof, pv=pv,
+        found = dict(moves=self.moves, value=round(value, 4), node_value=self.node_value, top=self.top, proof=self.proof, pv=pv,
                     threat=self.threat, solved=self.solved, ms=round((time.perf_counter() - self.start) * 1000),
                     actual_completed=self.completed,
                     actual_solver_nodes=self.solver_used + (self.proofs.used if self.proofs else 0), later=self.later)
+        if self.proofs is not None and self.proofs.records:
+            found['proofs'] = list(self.proofs.records.values())
+        given = answered(self.history, self.known)
+        if given is not None and (not self.proof or given['proof']['plies'] <= proof_plies(self.proof, self.history)):
+            found.update({k: given[k] for k in ('moves', 'value', 'top', 'proof', 'pv')})
+        elif self.proof:
+            found['pv'] = self.known.line(self.history, dict(winner=self.proof['winner'],
+                plies=proof_plies(self.proof, self.history), pv=pv))
+        return found
 
     def close(self):
         if self.trees == self.advanced and self.tree is not None:
@@ -1317,24 +1353,25 @@ class Engines:
         ones. `used`, a list, receives the number `game_graph` gave each graph searched, before the search, so a
         caller sees it even when the search is cancelled."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
-        solver, build = self.solver() if budget['solver_nodes'] and refresh is None else (None, 'none')
-        spent = budget if solver or refresh is not None else budget | dict(solver_nodes=0)
+        solver, build = self.solver() if (budget['solver_nodes'] or budget.get('leaf_nodes')) and refresh is None else (None, 'none')
+        spent = budget if solver or refresh is not None else budget | {k: 0 for k in ('solver_nodes', 'leaf_nodes') if k in budget}
         trees = solved = None
         floor = entry.get('q_range_floor', 0.)
         if refresh is not None:
-            build = self.solver_build() if budget['solver_nodes'] else 'none'
+            build = self.solver_build() if budget['solver_nodes'] or budget.get('leaf_nodes') else 'none'
             share = max(1, round(PV_CHECK * refresh['simulations']))
             trees = self.game_graph(bubble, game, build, floor, share, used=used)
             solved = dict(moves=[], pv=[], proof=None, threat=refresh.get('threat') or [], solved=True, used=0)
         elif line is not None or game is not None:
             trees = self.game_graph(bubble, game if line is None else ('seat', line), build, floor, keep=keep, used=used)
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
-                         solved, floor, known, pv_check=PV_CHECK if trees else 0.)
+                         solved, floor, known, leaf_nodes=spent.get('leaf_nodes', 0) if solver else 0,
+                         leaf_ms=spent.get('leaf_ms', 10), pv_check=PV_CHECK if trees else 0.)
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
-        weights = search_key(bubble.sha256[:16], entry)
+        weights = search_key(bubble.sha256[:16], entry, spent)
         kept = ':kept' if keep or line is not None else ''
-        return found, spent, f"{weights}:{build if spent['solver_nodes'] else 'none'}{kept}"
+        return found, spent, f"{weights}:{build if spent['solver_nodes'] or spent.get('leaf_nodes') else 'none'}{kept}"
 
     def game_graph(self, bubble, game, build='none', q_range_floor=0., simulations=None, keep=False, used=None):
         """A `TurnSearch` tree source over the GameGraph of `game`: one graph per game, model, solver `build` and
@@ -1391,21 +1428,22 @@ class Engines:
         spread over REVIEW_SOLVERS workers; returns (evaluation, budget it really had, key of the weights) per
         position as `evaluate` does."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
-        provers, build = self.solvers(REVIEW_SOLVERS) if budget['solver_nodes'] else ([], 'none')
-        spent = budget if provers else budget | dict(solver_nodes=0)
+        provers, build = self.solvers(REVIEW_SOLVERS) if budget['solver_nodes'] or budget.get('leaf_nodes') else ([], 'none')
+        spent = budget if provers else budget | {k: 0 for k in ('solver_nodes', 'leaf_nodes') if k in budget}
         found = evaluate_many(bubble, provers, histories, spent['simulations'], spent['solver_nodes'], watch,
                               REVIEW_BATCH['cuda' if str(device or self.device).startswith('cuda') else 'cpu'],
-                              entry.get('q_range_floor', 0.), known)
+                              entry.get('q_range_floor', 0.), known, leaf_nodes=spent.get('leaf_nodes', 0),
+                              leaf_ms=spent.get('leaf_ms', 10))
         out = []
         for record in found:
             used = spent if record.pop('solved') else spent | dict(solver_nodes=0)
-            weights = search_key(bubble.sha256[:16], entry)
-            out.append((record, used, f"{weights}:{build if used['solver_nodes'] else 'none'}"))
+            weights = search_key(bubble.sha256[:16], entry, used)
+            out.append((record, used, f"{weights}:{build if used['solver_nodes'] or used.get('leaf_nodes') else 'none'}"))
         return out
 
     def effective(self, budget):
         """`budget` as it can run here: no solver nodes when the tactical library is not built."""
-        return budget if self.solver_build() != 'none' else budget | dict(solver_nodes=0)
+        return budget if self.solver_build() != 'none' else budget | {k: 0 for k in ('solver_nodes', 'leaf_nodes') if k in budget}
 
     def solver_build(self):
         """The first 8 hex digits of the tactical library's recorded SHA-256, or 'none' when the library or its
@@ -1584,6 +1622,10 @@ def well_formed(record):
             and all(isinstance(c, list) and 3 <= len(c) <= 5 and cells([c[:3]], 3, number) and all(map(number, c[3:]))
                     for c in record['top'])
             and (cells(record.get('pv', []), 3) or cells(record.get('pv', []), 4)) and cells(record.get('threat', []), 2)
+            and isinstance(record.get('proofs', []), list)
+            and all(isinstance(f, dict) and cells(f.get('history'), 2) and f.get('winner') in (0, 1)
+                    and type(f.get('plies')) is int and f['plies'] > 0 and cells(f.get('pv'), 4)
+                    for f in record.get('proofs', []))
             and (proof is None or isinstance(proof, dict) and proof.get('winner') in (0, 1)
                  and type(proof.get('turns')) is int))
 
@@ -1638,7 +1680,7 @@ class Evaluations:
         self.order.pop(full, None)
         self.order[full] = line
         self.by_position.setdefault((position, record['engine']), set()).add(budget)
-        if record.get('proof'):
+        if record.get('proof') or record.get('proofs'):
             self.proofs.setdefault(position, set()).add(full)
         else:
             self.proofs.get(position, set()).discard(full)
@@ -1654,8 +1696,18 @@ class Evaluations:
         record = dict(position=position_text(history), engine=engine, simulations=budget['simulations'],
                       solver_nodes=budget['solver_nodes'], **evaluation,
                       at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
-        line = json.dumps(record, separators=(',', ':'))
+        record.update({k: budget[k] for k in ('leaf_nodes', 'leaf_ms') if k in budget})
         with self.lock:
+            saved = self.order.get((self.key(history), engine, (budget['simulations'], budget['solver_nodes'])))
+            saved, facts = json.loads(saved) if saved else {}, {}
+            for fact in [*saved.get('proofs', []), *record.get('proofs', [])]:
+                key = proof_key(fact['history'])
+                old = facts.get(key)
+                if old is None or (fact['plies'], -len(fact['pv'])) < (old['plies'], -len(old['pv'])):
+                    facts[key] = fact
+            if facts:
+                record['proofs'] = list(facts.values())
+            line = json.dumps(record, separators=(',', ':'))
             if self.path:
                 with open(self.path, 'a', encoding='utf-8') as out:
                     out.write(line + '\n')
@@ -1834,7 +1886,7 @@ def budget_of(presets, preset, custom=None, kind=None):
     for key, value in (custom or {}).items():
         if key == 'args':
             continue
-        if key not in budget or key not in limits:
+        if (key not in budget and key not in KIND_LIMITS.get(kind, {})) or key not in limits:
             raise ValueError(f'{key} is not a budget of this engine')
         if type(value) is not int or not limits[key] <= value <= MAX_BUDGET:
             raise ValueError(f'{key} must be an integer from {limits[key]} to {MAX_BUDGET}')
@@ -1916,10 +1968,11 @@ class Session:
         without solver nodes); None when the weights file is gone."""
         try:
             entry = self.entries[seat['engine']]
-            weights = search_key(model_key(export_path(entry, seat['checkpoint'])), entry)
+            budget = self.engines.effective(seat['budget'])
+            weights = search_key(model_key(export_path(entry, seat['checkpoint'])), entry, budget)
         except (OSError, KeyError):
             return None
-        searched = self.engines.effective(seat['budget'])['solver_nodes']
+        searched = budget['solver_nodes'] or budget.get('leaf_nodes')
         return f"{weights}:{self.engines.solver_build() if searched else 'none'}"
 
     # Reading
@@ -2541,7 +2594,7 @@ class Session:
                                    (record['simulations'], record['solver_nodes']))
                             if key not in study.store.order:
                                 study.store.index(record, line.strip())
-                            if record.get('proof'):
+                            if record.get('proof') or record.get('proofs'):
                                 proven.append((record, line.strip()))
                         except (ValueError, KeyError, TypeError):
                             continue
@@ -2634,7 +2687,7 @@ class Session:
         files = [library]
         if entry['kind'] == 'bubble':
             files += [library.with_name(library.name.replace('hexo', 'hexo_gumbel'))]
-            source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] else 'none'
+            source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] or seat['budget'].get('leaf_nodes') else 'none'
         elif entry['kind'] == 'six':
             command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in source['command']]
             files += [path for path in command_files if path.is_file()] + list(entry.get('files', []))
@@ -2913,7 +2966,7 @@ class Session:
                 registry = {}
                 for seat in match['players']:
                     source = seat['source']
-                    if seat['budget'].get('solver_nodes') and source['solver_build'] != self.engines.solver_build():
+                    if (seat['budget'].get('solver_nodes') or seat['budget'].get('leaf_nodes')) and source['solver_build'] != self.engines.solver_build():
                         raise ValueError('Tactical solver build changed since the batch started')
                     if source.get('weights') and file_digest(file_identity(source['weights'])) != source['weights_sha256']:
                         raise ValueError('Checkpoint weights changed since the batch started')
@@ -2969,6 +3022,8 @@ class Session:
         if not keeps_clock(entry):
             raise ValueError(f"{entry['name']} plays a fixed budget; its adapter cannot keep a clock")
         if kind == 'bubble':
+            if budget.get('leaf_nodes'):
+                raise ValueError('The timed Bubble adapter does not support a separate leaf-proof allowance')
             return dict(kind=kind, model=str(export_path(entry, seat['checkpoint']).resolve()),
                         tactical_package=str(self.engines.tactical_package) if getattr(self.engines, 'tactical_package', None) else None,
                         device=seat.get('device', getattr(self.engines, 'device', 'cpu')), search=dict(enabled=budget['simulations'] > 0,
@@ -3303,6 +3358,7 @@ class Session:
                 timer.start()
         if refresh is not None:
             weights, spent = refresh['engine'], dict(simulations=refresh['simulations'], solver_nodes=refresh['solver_nodes'])
+            spent.update({k: refresh[k] for k in ('leaf_nodes', 'leaf_ms') if k in refresh})
         saved = self.save(history, weights, spent, found, model)
         if job.kind == 'analyse' and game is not None:
             if refresh is None:
@@ -3374,7 +3430,11 @@ class Session:
         later = found.pop('later', [])
         saved = self.store.get(history, weights, spent)
         if saved and saved.get('proof') and not found.get('proof'):
-            record = saved
+            if found.get('proofs'):
+                record = self.store.add(history, weights, spent, found | dict(model=model) |
+                                        {k: saved[k] for k in ('moves', 'value', 'top', 'proof', 'pv')})
+            else:
+                record = saved
         else:
             record = self.store.add(history, weights, spent, found | dict(model=model))
         self.proofs.add(history, record)
@@ -3410,7 +3470,7 @@ class Session:
             started = time.monotonic()
             if self.match and self.match['active']:
                 source = self.match['players'][job.side if self.match['current'] % 2 else 1-job.side]['source']
-                if seat['budget'].get('solver_nodes') and source['solver_build'] != self.engines.solver_build():
+                if (seat['budget'].get('solver_nodes') or seat['budget'].get('leaf_nodes')) and source['solver_build'] != self.engines.solver_build():
                     raise ValueError('Tactical solver build changed during this batch')
                 files = source['files'] | ({source['weights']: source['weights_sha256']} if source.get('weights') else {})
                 if any(file_digest(file_identity(path)) != digest for path, digest in files.items()):

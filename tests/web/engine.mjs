@@ -26,7 +26,7 @@ import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, PV_CHECK} from '../../web/engine/search.mjs';
-import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence} from '../../web/engine/proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
 import {defaultThreads} from '../../web/engine/network.mjs';
@@ -195,7 +195,7 @@ if (job.kind === 'encode') {
   let graph = null;
   const context = {Native, NeuralSearch, EvaluationCache, PV_CHECK, createModule, principalVariation, topRows,
     GameGraphs: class extends GameGraphs { graph(...args) { return graph = super.graph(...args); } },
-    Proofs, answered, settled, proofTurns, proofKey, proofEvidence,
+    Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine,
     URL, performance, setTimeout, clearTimeout, onmessage: null,
     postMessage: message => messages.push({...message, root: graph?.history.map(p => [...p])}),
     probe: async () => ({provider: 'wasm', precisions: ['fp32']}), runtime: async () => ({env: {wasm: {numThreads: 1}}}),
@@ -216,14 +216,36 @@ if (job.kind === 'encode') {
     .replaceAll('import.meta.url', JSON.stringify(workerUrl.href));
   runInNewContext(source, context);
   await context.onmessage({data: {type: 'load', options: {prefer: 'wasm'}}});
-  for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
+  if (job.adapter) {
+    const fetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({networks: []}));
+    const {BubbleEngine, PRESETS} = await import('../../web/engine/bubble.mjs');
+    globalThis.fetch = fetch;
+    const adapter = new BubbleEngine({model: 'test'}), session = new BrowserSession(native);
+    let calls = 0;
+    adapter.call = async request => {
+      const id = ++calls;
+      await context.onmessage({data: {...request, id}});
+      const reply = messages.find(m => m.id === id && (m.type === 'result' || m.type === 'error'));
+      if (reply?.type !== 'result') throw Error(reply?.message || 'Worker did not answer');
+      return reply.result;
+    };
+    session.registerEngine({id: 'test', kind: 'bubble', name: 'Bubble', presets: PRESETS}, adapter);
+    await session.request('/import', {text: JSON.stringify({history: job.history})}, 'POST');
+    await session.request('/analysis', {engine: 'test', preset: 'custom', auto: false, custom: {
+      simulations: job.simulations, solver_nodes: job.nodes, leaf_nodes: job.leafNodes || 0, leaf_ms: job.leafQueryMs ?? 10}}, 'POST');
+    await session.request('/analyse', {ply: job.history.length}, 'POST');
+    while (session.running || session.jobs.some(j => j.status === 'queued')) await new Promise(r => setTimeout(r, 1));
+    answer = session.lookup(job.history);
+    if (!answer) throw Error(JSON.stringify(session.state().jobs));
+  } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10,
       known: job.known || null, proofStamps: job.proofStamps}});
   }
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);
-  answer = glimpsing ? [1, 2].map(id => ({result: messages.find(m => m.id === id && m.type === 'result').result,
+  answer ??= glimpsing ? [1, 2].map(id => ({result: messages.find(m => m.id === id && m.type === 'result').result,
     live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root})),
     checked: messages.some(m => m.id === id && m.root && native.game(m.root).player !== mover)}))
     : messages.find(m => m.type === 'result').result;

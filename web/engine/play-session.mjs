@@ -4,7 +4,7 @@ import {PlayStorage} from './storage.mjs';
 import {OpeningBook} from './openings.mjs';
 import {readGame, exportGame, htttx} from './notation.mjs';
 import {clockSpec, turnTime} from './clock.mjs';
-import {Proofs, proven} from './proof.mjs';
+import {Proofs, proven, proofKey} from './proof.mjs';
 import {stageText} from './stages.mjs';
 import {PV_CHECK} from './search.mjs';
 
@@ -21,7 +21,7 @@ const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human
 const MAX_TIMER = 2 ** 31 - 1;
 /** The engines take budgets as 32-bit signed integers. */
 const MAX_BUDGET = 2 ** 31 - 1;
-const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
+const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions', leaf_nodes: 'Leaf solver', leaf_ms: 'Leaf query ms'};
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
 /** `promise`, or an AbortError as soon as `signal` aborts, so a job never waits on a load it no longer needs. */
@@ -128,7 +128,10 @@ export class BrowserSession extends OfflineSession {
     const preset = input.preset || entry.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget} : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
     for (const [name, value] of Object.entries(budget)) {
-      const least = {ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0);
+      const least = {ms: 10, nodes: 1, visits: 1, leaf_ms: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0);
+      if (name === 'leaf_nodes' || name === 'leaf_ms') {
+        if (entry.kind !== 'bubble' || typeof value !== 'number') throw Error(`${name} is a numeric Bubble budget`);
+      }
       if (typeof value === 'number' && (!Number.isInteger(value) || value < least || value > MAX_BUDGET)) throw Error(`${FIELD_NAMES[name] || name} must be a whole number from ${least} to ${MAX_BUDGET}`);
     }
     const checkpoint = input.checkpoint ?? entry.checkpoints?.[0] ?? null;
@@ -398,7 +401,13 @@ export class BrowserSession extends OfflineSession {
    * evaluation. */
   async record(history, spec, result, kept = false) {
     const id = this.cacheKey(history, spec) + (kept ? '|kept' : ''), saved = this.cache.get(id);
-    const record = saved?.proof && !result.proof ? saved : {...result, id, position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
+    const source = saved?.proof && !result.proof ? saved : result, facts = new Map();
+    for (const fact of [...(saved?.proofs || []), ...(result.proofs || [])]) {
+      const key = proofKey(fact.history), old = facts.get(key);
+      if (!old || fact.plies < old.plies || fact.plies === old.plies && fact.pv.length > old.pv.length) facts.set(key, fact);
+    }
+    const record = source === saved && !result.proofs?.length ? saved : {...source,
+      ...(facts.size ? {proofs: [...facts.values()]} : {}), id, position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
     if (record !== saved) {
       this.indexRecord(record); this.proofs.add(history, record, `${record.id}|${record.saved_at}`);
@@ -441,7 +450,7 @@ export class BrowserSession extends OfflineSession {
   indexRecord(record) {
     this.evaluationsVersion++;
     this.cache.set(record.id, record);
-    if (record.proof) {
+    if (record.proof || record.proofs?.length) {
       if (!this.provenRecords.has(record.position)) this.provenRecords.set(record.position, new Set());
       this.provenRecords.get(record.position).add(record.id);
     }
@@ -563,7 +572,7 @@ export class BrowserSession extends OfflineSession {
         timer = setTimeout(expire, Math.min(MAX_TIMER, Math.max(1, limit)));
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
-      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(PV_CHECK * job.spec.budget.simulations)), solver_nodes: 0}
+      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(PV_CHECK * job.spec.budget.simulations)), solver_nodes: 0, leaf_nodes: 0}
         : job.spec.budget;
       try {
         result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
