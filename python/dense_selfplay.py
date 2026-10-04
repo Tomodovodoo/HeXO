@@ -813,7 +813,7 @@ class SelfPlayGame:
             for tree in self.trees.values():
                 tree.advance((q, r))
         self.moves.append([q, r])
-        if result.get('proven'):
+        if result.get('proven') and not self.native_owner:
             action = (row.get('proof_action') or [[q, r]]) if result['proven'] > 0 else None
             self.label(ply, result['proven'], result['proof_turns'], action)
         if game.winner >= 0:

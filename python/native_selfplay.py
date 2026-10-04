@@ -8,6 +8,42 @@ from native_scheduler import SearchPool, InferenceService
 from dense_selfplay import record_network_values
 
 
+def label_prefixes(game, prefixes):
+    """Apply exact evidence to its played position, retaining the tightest witnesses."""
+    rows = {r['ply']:r for r in game.rows}
+    pending = list(prefixes)
+    while pending:
+        ply, exact, distance, witnesses = pending.pop()
+        row = rows.get(ply)
+        if row is None:
+            continue
+        proven = 1 if row['player']==exact else -1
+        if row.get('proven') and row['proven']!=proven:
+            raise ValueError('Graph proof contradicts an earlier exact played-root label')
+        old = max(0, row.get('proof_plies', 0))
+        tighter = distance>0 and (not old or distance<old)
+        if proven>0:
+            if tighter:
+                row.pop('proof_action', None)
+            if witnesses and (tighter or distance==old or (not old and distance<=0)):
+                row['proof_action'] = witnesses
+        else:
+            row.pop('proof_action', None)
+        # Graph bounds count placements, not certificate turns.
+        if not row.get('proven'):
+            row.update(proven=proven, proof_turns=0)
+        if distance>0:
+            row['proof_plies'] = min(old, distance) if old else distance
+        elif not old:
+            row.pop('proof_plies', None)
+        previous = rows.get(ply-1)
+        if previous is not None and previous['player']==exact:
+            # The winner can choose the played stone leading to this exact
+            # position. This does not prove a loss across unexamined replies.
+            bound = row.get('proof_plies',0)
+            pending.append((ply-1,exact,bound+1 if bound>0 else 0,[game.moves[ply-1]]))
+
+
 def play_cohort(games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                 batch_size=128, slice_ms=8, proof_workers=0, proof_package=None, ms=0,
                 progress=None):
@@ -85,15 +121,10 @@ def play_cohort(games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                                         root_estimate=None, solver_generation=event['solver_generation'])
                 more = game.searched(result)
                 result['search']['root_estimate'] = game.values[len(event['history'])]
-                for ply, exact, distance, witnesses in event['exact_prefixes']:
-                    row = next((r for r in game.rows if r['ply']==ply), None)
-                    if row is not None:
-                        proven = 1 if row['player']==exact else -1
-                        if row.get('proven') and row['proven']!=proven:
-                            raise ValueError('Graph proof contradicts an earlier exact played-root label')
-                        game.label(ply, proven, 0, witnesses if proven>0 and witnesses else None)
-                        if distance>0:
-                            row['proof_plies'] = min(row.get('proof_plies') or distance, distance)
+                prefixes = event['exact_prefixes']
+                if winner>=0:
+                    prefixes = [*prefixes,[len(event['history']),winner,event['proof_plies'],result['proof_action']]]
+                label_prefixes(game, prefixes)
                 if progress:
                     progress(index, event)
                 if more:

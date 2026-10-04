@@ -268,9 +268,10 @@ inline void Producer::run()noexcept{
 }
 inline std::string Producer::result(int index,uint64_t token){
  auto& o=*pool.games[index];auto& t=*o.views[0].tree;t.proof_root();auto& n=*t.root;
- if(pool.failed[index]){
+ if(pool.failed[index] || (!n.expanded && o.deadline)){
   auto producer=std::find_if(broker.producers.begin(),broker.producers.end(),[&](const auto& p){return p.get()==this;})-broker.producers.begin();
-  std::string out="{\"producer\":"+std::to_string(producer)+",\"model\":"+std::to_string(model)+",\"game\":"+std::to_string(index)+",\"token\":"+std::to_string(token)+",\"error\":\"span\",\"history\":[";
+  std::string reason=pool.failed[index]?"span":"deadline";
+  std::string out="{\"producer\":"+std::to_string(producer)+",\"model\":"+std::to_string(model)+",\"game\":"+std::to_string(index)+",\"token\":"+std::to_string(token)+",\"error\":\""+reason+"\",\"history\":[";
   for(size_t i=0;i<o.focus.size();++i){if(i)out+=',';out+='['+std::to_string(o.focus[i].q)+','+std::to_string(o.focus[i].r)+']';}return out+"]}";
  }
  if(!n.expanded || n.edges.empty())throw std::runtime_error("Continuous root has no legal search result");

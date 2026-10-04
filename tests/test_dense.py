@@ -3747,6 +3747,79 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_continuous_cold_deadline_does_not_cancel_other_game(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        graphs = [NativeScheduler.graph(self) for _ in range(2)]
+        pool = NativeScheduler.pool(self,graphs,views=1,work=16)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.retarget(0,0,[[0,0]],ms=1,views=1)
+        service.retarget(0,1,[[0,0]],work=16,views=1)
+        time.sleep(.02)  # The cold clock expires before any inference result exists.
+        events = []
+        end = time.monotonic()+2
+        while len(events)<2 and time.monotonic()<end:
+            service.pump()
+            while (event:=service.event()) is not None:
+                events.append(event)
+        self.assertEqual(len(events),2)
+        by_game = {e['game']:e for e in events}
+        self.assertEqual(by_game[0]['error'],'deadline')
+        self.assertNotIn('edges',by_game[0])
+        self.assertNotIn('error',by_game[1])
+        self.assertIn(tuple(by_game[1]['action']),set(map(tuple,legal([[0,0]]))))
+        service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],
+                          service.stats()['active_producers']),(0,0,0))
+
+    def test_continuous_tighter_prefix_proof_changes_the_learner_witness(self):
+        from native_selfplay import play_cohort, label_prefixes
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY),'native-witness','fixed','cpu',32,64)
+        settings = dense_config.ActorSettings(full_fraction=1.,full_sims=16,root_samples=4,
+                                             game_graph=128,max_plies=6,tactics=False,opening_random_plies=0.)
+        game = dense_selfplay.SelfPlayGame([model,model],settings,23,native_owner=True)
+        episodes,rows,_ = play_cohort([game],producers=1,views=1)
+        actions = legal(game.moves[:1])
+        old,new = actions[:2].tolist()
+        label_prefixes(game,[[1,1,42,[old]]])
+        self.assertEqual(game.rows[1]['proof_plies'],42)
+        label_prefixes(game,[[1,1,34,[new]]])
+        label_prefixes(game,[[1,1,38,[old]]])  # A later weaker bound cannot replace it.
+        self.assertEqual(game.rows[1]['proof_action'],[new])
+        self.assertEqual(game.rows[1]['proof_plies'],34)
+        label_prefixes(game,[[1,1,28,[]]])
+        self.assertNotIn('proof_action',game.rows[1])
+        label_prefixes(game,[[1,1,30,[old]]])
+        self.assertNotIn('proof_action',game.rows[1])
+        second = legal(game.moves[:2])[0].tolist()
+        label_prefixes(game,[[2,1,34,[second]]])
+        self.assertEqual(game.rows[1]['proof_plies'],28)
+        self.assertNotIn('proof_action',game.rows[1])
+        label_prefixes(game,[[1,1,28,[new]]])
+        self.assertEqual(game.rows[1]['proof_action'],[new])
+        self.assertEqual(game.rows[1]['proof_plies'],28)
+        label_prefixes(game,[[2,1,20,[second]]])
+        self.assertEqual(game.rows[1]['proof_plies'],21)
+        self.assertEqual(game.rows[1]['proof_action'],[game.moves[1]])
+        label_prefixes(game,[[1,1,20,[new]]])
+        with self.assertRaisesRegex(ValueError,'contradicts'):
+            label_prefixes(game,[[1,0,30,[old]]])
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [dict(r,game=0) for r in game.rows]
+            dense_data.write_shard(Path(tmp)/'shards'/'000001',dict(actor_sha256='native-witness'),episodes,rows)
+            window = dense_data.ReplayWindow(Path(tmp),capacity_rows=128,validation_fraction=0.)
+            ref = window.ref('000001',1)
+            samples,targets = dense_data.examples(window,[ref],np.random.default_rng(23),proof_policy_weight=2.)
+            current = np.flatnonzero((samples[0].actions==np.asarray(new)).all(1))[0]
+            previous = np.flatnonzero((samples[0].actions==np.asarray(old)).all(1))[0]
+            self.assertEqual(np.argmax(targets[0]['policy']),current)
+            self.assertGreater(targets[0]['policy'][current],targets[0]['policy'][previous])
+            self.assertAlmostEqual(float(targets[0]['policy'].sum()),1.,places=6)
+
     def test_continuous_prefix_labels_keep_only_shortest_graph_witnesses(self):
         from native_scheduler import InferenceService
         from tests.test_neural_search import NativeScheduler
