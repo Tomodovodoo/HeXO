@@ -1536,6 +1536,80 @@ class NativeScheduler(unittest.TestCase):
         finally:
             game.close()
 
+    def test_parallel_games_share_predictions_and_keep_each_roots_credits(self):
+        pool = self.pool([self.graph() for _ in range(24)], quantum=16, views=4,
+                         depth=4, work=96, workers=4, cache=2)
+        pool.limit_ready(16)
+        pool.step()
+        self.assertEqual((pool.feed.stats()['new_rows'], pool.feed.stats()['joined']), (1, 23))
+        self.finish(pool)
+        for game in pool.games:
+            stats = game.stats()
+            self.assertEqual(stats['completed'], 96)
+            self.assertEqual(stats['issued'], stats['completed']+stats['cancelled'])
+            self.assertEqual(int(game.evidence()['lifetime_credits'].sum()), stats['root_completed'])
+            self.assertGreater(stats['depth'], 0)
+        self.assertEqual((pool.feed.queued(), pool.feed.stats()['pending_requests']), (0, 0))
+
+    def test_parallel_watermark_admits_cursor_first_and_serves_all_games(self):
+        game = Game([(0, 0)])
+        try:
+            histories = [[(0, 0), action] for action in game.legal_moves()[:24]]
+        finally:
+            game.close()
+        for workers in (2, 4, 8):
+            with self.subTest(workers=workers):
+                pool = self.pool([self.graph(h) for h in histories], quantum=4,
+                                 views=1, work=4, workers=workers)
+                pool.limit_ready(1)
+                pool.step()
+                # Earlier cursor admission cannot be stolen by a faster worker.
+                self.assertGreater(pool.games[0].stats()['pending'], 0)
+                self.finish(pool)
+                self.assertTrue(all(g.stats()['completed'] == 4 for g in pool.games))
+                self.assertEqual(pool.feed.queued(), 0)
+                pool.close()
+
+    def test_parallel_queue_cancellation_and_retarget_ignore_late_subscribers(self):
+        pool = self.pool([self.graph() for _ in range(12)], quantum=16, views=4,
+                         work=64, workers=4)
+        pool.step()
+        late = pool.feed.take(128)
+        pool.cancel(game=0)
+        pool.retarget(1, [(0, 0), (1, 0), (2, 0)], work=32)
+        self.answer(pool, late)
+        self.assertEqual(pool.games[1].stats()['completed'], 0)
+        self.finish(pool)
+        self.assertEqual(pool.games[0].stats()['completed'], 0)
+        self.assertEqual(pool.games[1].stats()['completed'], 32)
+        self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0, 0))
+
+    def test_invalid_host_worker_configuration_releases_graph_ownership(self):
+        from native_scheduler import SearchPool
+        graph = self.graph()
+        for workers in (0, 17):
+            with self.assertRaisesRegex(ValueError, 'host worker count'):
+                SearchPool([graph], work=16, workers=workers)
+        pool = self.pool([graph], quantum=16, work=16, workers=2)
+        self.finish(pool)
+        self.assertEqual(pool.games[0].stats()['completed'], 16)
+
+    def test_parallel_install_error_joins_workers_and_releases_games(self):
+        graphs = [self.graph() for _ in range(12)]
+        pool = self.pool(graphs, quantum=16, work=32, workers=4)
+        pool.step()
+        ids, leaves = pool.feed.take(128)
+        predictions = Uniform().evaluate([h.tolist() for _, _, h in leaves])
+        with self.assertRaisesRegex(ValueError, 'Incomplete legal actions'):
+            pool.feed.install(ids, [(p['actions'][:-1], p['logits'][:-1], p['q'][:-1])
+                                    for p in predictions])
+        pool.abandon_fenced()
+        pool.close()
+        # The failed phase returned every graph before caller-side teardown.
+        recovered = self.pool(graphs, quantum=16, work=16, workers=4)
+        self.finish(recovered)
+        self.assertTrue(all(g.stats()['completed'] == 16 for g in recovered.games))
+
     def test_unexpanded_exact_child_records_the_proof_instead_of_an_unset_mean(self):
         from neural_search import checked
         history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
@@ -1578,6 +1652,30 @@ class NativeProofs(unittest.TestCase):
             if time.monotonic() >= end:
                 self.fail('Native proof work did not finish')
             time.sleep(.002)
+
+    def test_parallel_host_phases_deliver_proofs_without_cross_game_credits(self):
+        from tactical_proof import independent_verify
+        pool = self.pool([self.graph(self.opening) for _ in range(12)], quantum=16,
+                         views=4, work=4096, workers=4)
+        proofs = self.loop(pool, workers=2, queue=8)
+        for _ in range(1000):
+            pool.step()
+            self.answer(pool)
+            if pool.done():
+                break
+        self.assertTrue(pool.done())
+        proofs.drain()
+        self.assertTrue(all(native.hxg_exact(native.hxgo_root(game.ptr)) == 0 for game in pool.games))
+        self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0, 0))
+        records = proofs.records()
+        self.assertEqual({r['game'] for r in records}, set(range(12)))
+        for row in records:
+            self.assertEqual(independent_verify(row['result']['certificate'], row['request']['history'],
+                             attacker=row['result']['attacker'], known=row['request']['known']), row['result']['status'])
+        for game in pool.games:
+            stats = game.stats()
+            self.assertEqual(stats['issued'], stats['completed']+stats['cancelled'])
+            self.assertEqual(int(game.evidence()['lifetime_credits'].sum()), stats['root_completed'])
 
     def test_workers_consume_queued_jobs_without_owner_polling(self):
         from tactical_proof import independent_verify

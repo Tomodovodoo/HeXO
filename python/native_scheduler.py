@@ -1,4 +1,4 @@
-"""Native adaptive views and one frozen-model neural queue, called by one owner thread.
+"""Native adaptive views and one frozen-model neural queue, called by one coordinator.
 
 This is an explicit search API. Actors keep their existing target construction.
 Graph evidence and comparison credits are exported separately.
@@ -16,6 +16,7 @@ for name, result, args in (
     ('done', C.c_int, [ptr]), ('feed', ptr, [ptr]), ('admit', C.c_int, [ptr]),
     ('clock', C.c_int, [ptr, C.c_double]), ('owner', ptr, [ptr, C.c_int]),
     ('ready_limit', C.c_int, [ptr, C.c_int]),
+    ('workers', C.c_int, [ptr, C.c_int]),
     ('cancel_game', C.c_int, [ptr, C.c_int]),
     ('retarget', C.c_int, [ptr, C.c_int, ptr, C.c_int, C.c_uint64, C.c_double]),
     ('stats', None, [ptr, ptr]), ('install', C.c_int, [ptr, ptr, C.c_int, ptr, ptr, ptr, ptr]),
@@ -191,8 +192,10 @@ class SearchPool:
     `work` is an optional diagnostic ceiling, not the unit for speed acceptance.
     Arm a common clock after backend setup. Queued work can be abandoned only
     after every submitted GPU batch is fenced. close() rejects undrained work.
+    Native host workers own independent games during joined phases; caller-side
+    control, inspection, and proof delivery must stay between those phases.
     """
-    def __init__(self, sources, quantum=64, views=8, depth=8, work=128, seed=220, cache=8192):
+    def __init__(self, sources, quantum=64, views=8, depth=8, work=128, seed=220, cache=8192, workers=1):
         if not sources or any(not s.ptr for s in sources):
             raise ValueError('Open shared graphs are required')
         versions = {s.model_version for s in sources}
@@ -207,6 +210,11 @@ class SearchPool:
         self.games = [SearchView(self, i) for i in range(len(sources))]
         self.feed = _Feed(self)
         self.proofs = None
+        try:
+            checked(native.hxgm_workers(self.ptr, workers))
+        except BaseException:
+            self.close()
+            raise
 
     def enable_proofs(self, package=None, **options):
         """Opt in to concurrent proving. Actor/learner target construction is unchanged."""

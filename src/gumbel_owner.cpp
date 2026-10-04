@@ -1,4 +1,5 @@
-// Graph mutation, view allocation and gathering run on the caller's owner thread.
+// One host phase owns each game graph. Caller-side control and proof delivery
+// run between joined selection/installation phases.
 #include "gumbel.cpp"
 #include <chrono>
 #include <deque>
@@ -7,6 +8,8 @@ extern "C" void* hxgf_new(int);
 extern "C" void hxgf_free(void*);
 extern "C" void hxgf_stats(void*,int64_t*);
 extern "C" int64_t hxgf_queued(void*);
+extern "C" int hxgf_workers(void*,int,void* (*)(void*));
+extern "C" int hxgf_parallel(void*,int,void (*)(void*,int),void*,bool (*)(void*,int));
 extern "C" int hxgf_gather(void*,void*,int64_t*);
 extern "C" void hxgf_detach(void*,void*);
 extern "C" int hxgf_root_value(void*,void*,double*);
@@ -118,7 +121,7 @@ struct Owner {
   if(slot==views.size())views.push_back(std::move(v));else views[slot]=std::move(v);
   return start(views[slot]);
  }
- int step(int ready_limit=0){
+ int step(int ready_limit=0,bool admitted=false){
   if(stopped)return 0;auto begin=std::chrono::steady_clock::now();++ticks;
   if(expired()){deadline=true;stop();return 0;}
   auto& root=views[0];
@@ -129,9 +132,10 @@ struct Owner {
   int progress=0;
   size_t visited=0,first=ready_limit?view_cursor:0;
   while(visited<views.size()){
-   if(ready_limit && hxgf_queued(feed)>=ready_limit)break;
+   if(ready_limit && !admitted && hxgf_queued(feed)>=ready_limit)break;
    auto& v=views[(first+visited++)%views.size()];if(!v.active)continue;
    if(expired()){deadline=true;stop();return 0;}int64_t out[4];int status=hxgf_gather(feed,v.tree.get(),out);
+   admitted=false;
    if(status==-2)throw std::runtime_error(gumbel::error);progress+=int(out[0]);if(expired()){deadline=true;stop();return 0;}
   }
   // Pause between whole gathers, never inside a root visit layer. Resume with
@@ -193,12 +197,12 @@ extern "C" HX_API int hxgo_policy_audit(void* p,double* out){auto& o=*static_cas
  if(out)for(size_t i=0;i<node.edges.size();++i){auto& e=node.edges[i];uint64_t direct=i<o.direct_root_credits.size()?o.direct_root_credits[i]:0;if(o.views[0].active && i<t.root_edges.size())direct+=t.root_edges[i].credits;
   std::array<double,9> row{double(e.action.q),double(e.action.r),e.logit,raw[i],double(e.visits),double(i<t.root_edges.size()?t.root_edges[i].credits:0),double(i<o.last_root.size()?o.last_root[i].credits:0),e.eligible?1.:0.,double(direct)};std::copy(row.begin(),row.end(),out+9*i);}return int(node.edges.size());}
 
-// One native writer and one neural queue across independent games of one model.
+// One writer per game and one neural queue across independent games of one model.
 namespace owner {
 struct Pool {
  std::unique_ptr<void,FeedDeleter> owned_feed;void* feed;
  std::vector<std::unique_ptr<Owner>> games;std::vector<bool> failed;
- std::string model;size_t cursor=0;int ready_limit=0;uint64_t steps=0,retargets=0;bool stopped=false;
+ std::string model;size_t cursor=0;int ready_limit=0,host_workers=1;uint64_t steps=0,retargets=0;bool stopped=false;
  void* proof_owner=nullptr;void (*proof_step)(void*)=nullptr;void (*proof_retarget)(void*,int)=nullptr;
  Pool(void** sources,int count,int capacity,int quantum,int views,int depth,uint64_t work,const char* version,uint64_t seed):owned_feed(hxgf_new(capacity)),feed(owned_feed.get()),model(version?version:""){
   if(!sources || count<1 || count>1024 || !feed || model.empty())throw std::runtime_error("Invalid multi-game pool");
@@ -220,7 +224,21 @@ struct Pool {
    else {root.proof_root();if(root.board.winner>=0 || (root.root->expanded && root.root->exact_winner>=0))o->stop();}
   }
   size_t visited=0;
-  while(visited<games.size()){
+  if(host_workers>1 && (!ready_limit || hxgf_queued(feed)<ready_limit)){
+   struct Phase {Pool* pool;std::vector<int> progress;size_t admitted=0;bool closed=false;} phase{this,std::vector<int>(games.size())};
+   if(!hxgf_parallel(feed,int(games.size()),[](void* data,int index){
+    auto& phase=*static_cast<Phase*>(data);auto& p=*phase.pool;
+    auto& o=*p.games[(p.cursor+index)%p.games.size()];
+    if(!o.stopped)phase.progress[index]=o.step(p.ready_limit,true);
+   },&phase,[](void* data,int){
+    auto& phase=*static_cast<Phase*>(data);auto& p=*phase.pool;
+    if(phase.closed)return false;
+    if(p.ready_limit && hxgf_queued(p.feed)>=p.ready_limit){phase.closed=true;return false;}
+    ++phase.admitted;return true;
+   }))throw std::runtime_error(gumbel::error);
+   visited=phase.admitted;
+   for(int value:phase.progress)progress+=value;
+  }else while(visited<games.size()){
    if(ready_limit && hxgf_queued(feed)>=ready_limit)break;
    auto& o=*games[(cursor+visited++)%games.size()];if(!o.stopped)progress+=o.step(ready_limit);
   }
@@ -266,6 +284,11 @@ extern "C" HX_API void* hxgm_new(void** sources,int count,int capacity,int quant
 extern "C" HX_API int hxgm_free(void* p){auto& pool=*static_cast<owner::Pool*>(p);if(pool.proof_owner){gumbel::error="Close the proof loop before freeing its search pool";return 0;}pool.stop();int64_t stats[6];hxgf_stats(pool.feed,stats);if(stats[4]){gumbel::error="Drain or fenced-abandon global tasks before freeing pool";return 0;}delete &pool;return 1;}
 extern "C" HX_API int hxgm_step(void* p){try{return static_cast<owner::Pool*>(p)->step();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 extern "C" HX_API int hxgm_ready_limit(void* p,int rows){if(rows<0 || rows>16384){gumbel::error="Invalid neural ready limit";return 0;}static_cast<owner::Pool*>(p)->ready_limit=rows;return 1;}
+extern "C" HX_API int hxgm_workers(void* p,int count){try{
+ auto& pool=*static_cast<owner::Pool*>(p);if(pool.steps)throw std::runtime_error("Configure native host workers before the first phase");
+ if(!hxgf_workers(pool.feed,count,[](void* tree)->void*{return static_cast<gumbel::Tree*>(tree)->state.get();}))throw std::runtime_error(gumbel::error);
+ pool.host_workers=count;return 1;
+}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxgm_cancel(void* p){try{auto& pool=*static_cast<owner::Pool*>(p);pool.stop();if(pool.proof_step)pool.proof_step(pool.proof_owner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxgm_cancel_game(void* p,int i){try{auto& pool=*static_cast<owner::Pool*>(p);if(i<0 || i>=int(pool.games.size()))return 0;pool.games[i]->stop();pool.stopped=std::all_of(pool.games.begin(),pool.games.end(),[](const auto& o){return o->stopped;});if(pool.proof_step)pool.proof_step(pool.proof_owner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxgm_clock(void* p,double ms){try{static_cast<owner::Pool*>(p)->clock(ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
