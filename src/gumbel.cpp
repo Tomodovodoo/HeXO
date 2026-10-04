@@ -58,7 +58,7 @@ struct Edge { Cell action;double logit=0,prior=0,sum=0,weight=-1;int visits=0,pe
 // the last search step that touched the node, `context` its key in the store, and `carried` and `carried_sum` the
 // visits and value sum (for its mover) an evicted node of its context had when it left the store, less its own
 // network value, which the node's expansion supplies again.
-struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false;double value=0,q=0,carried_sum=0;uint64_t used=0;Key position,context;std::vector<Edge> edges;std::vector<std::weak_ptr<Node>> parents; };
+struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false;double value=0,q=0,carried_sum=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::vector<Edge> edges;std::vector<std::weak_ptr<Node>> parents; };
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1;std::vector<std::vector<Cell>> own,threats; };
@@ -70,6 +70,7 @@ struct GameStore {
  std::unordered_map<Key,std::shared_ptr<Node>,KeyHash> store;
  std::unordered_map<Key,Summary,KeyHash> evicted_stats;
  size_t limit=0;uint64_t clock=0;int64_t evicted=0;void* scheduler_owner=nullptr;
+ uint64_t half_losses=0;
  std::unordered_map<const void*,std::vector<Node*>> pins;
  // A native owner may observe installed evidence. Workers never call this.
  void* evidence_owner=nullptr;void (*evidence)(void*,Tree&,const Path&)=nullptr;
@@ -153,7 +154,9 @@ struct Tree {
   if(!graph){auto n=std::make_shared<Node>();n->player=board.player;return n;}
   auto [position,context]=keys(board);auto& slot=nodes[context];
   if(auto n=slot.lock())return n;
-  auto n=std::make_shared<Node>();n->player=board.player;n->position=position;n->context=context;n->stones=int(board.cells.size());slot=n;positions[position].push_back(n);
+  auto n=std::make_shared<Node>();n->player=board.player;n->remaining=board.remaining;n->position=position;n->context=context;n->stones=int(board.cells.size());
+  if(board.remaining==1 && !board.history.empty())n->first=board.history.back().c;
+  slot=n;positions[position].push_back(n);
   if(shared){
    store[context]=n;n->used=clock;
    if(auto old=evicted_stats.find(context);old!=evicted_stats.end()){
@@ -189,7 +192,29 @@ struct Tree {
  // visits (the playouts that went through it, and the credits of roots below it on their history) and reads its
  // child's value, so a child reached by both orders of a turn is not weighted twice.
  void current(Node& node) {
+  inherit_half_losses(node);
   for(auto& e:node.edges)if(e.child)clean(*e.child);
+ }
+ // Losing after A with one stone left proves every A,B continuation lost.
+ // At the sibling half-turn after B, mark A without materializing all pairs.
+ // Only new half-turn loss evidence rescans the existing legal edge list.
+ void inherit_half_losses(Node& node) {
+  if(state->scheduler_owner && !scheduler_owned)return;
+  if(!graph || !node.expanded || node.remaining!=1 || !node.stones || node.losses_seen==state->half_losses)return;
+  node.losses_seen=state->half_losses;bool changed=false;
+  const auto old=CellHash{}(node.first);const int p=node.player;
+  for(auto& edge:node.edges){
+   const auto h=CellHash{}(edge.action);
+   const Key other{node.position.a-mix(old^mix(p+1))+mix(h^mix(p+1)),
+                   node.position.b-mix(old+mix(p+911))+mix(h+mix(p+911))};
+   auto found=outcomes.find(other);
+   if(found==outcomes.end() || found->second.winner==p || found->second.distance<2)continue;
+   const auto& loss=found->second;
+   // The alternate half-turn includes one remaining defender placement, just
+   // as this edge does. A different response can only use a shorter distance.
+   changed|=tighten(loss.winner,loss.distance,true,edge.exact_winner,edge.distance,edge.bound);
+  }
+  if(changed){settle(node);learn(node);revise(node);}
  }
  void renew(Node& node) {current(node);refresh(node);node.dirty=false;}
  // Shared graph: the stored positions `history`'s strict prefixes reach, the longest first, each with the index of
@@ -340,9 +365,10 @@ struct Tree {
  // the entry changed.
  bool record(const Key& position,const Outcome& outcome) {
   auto [o,added]=outcomes.try_emplace(position,outcome);
-  if(added)return true;
+  auto changed_loss=[&](){if(outcome.winner!=outcome.player && outcome.stones>0 && outcome.stones%2==0)++state->half_losses;};
+  if(added){changed_loss();return true;}
   auto& old=o->second;bool changed=false;
-  if(old.winner!=outcome.winner){old=outcome;return true;}
+  if(old.winner!=outcome.winner){old=outcome;changed_loss();return true;}
   changed|=tighten(outcome.winner,outcome.distance,outcome.bound,old.winner,old.distance,old.bound);
   std::vector<EdgeProof> merged;merged.reserve(old.edges.size()+outcome.edges.size());
   auto i=old.edges.cbegin();auto j=outcome.edges.cbegin();
@@ -352,6 +378,7 @@ struct Tree {
    EdgeProof e=*i++;changed|=tighten(j->winner,j->distance,j->bound,e.winner,e.distance,e.bound);++j;merged.push_back(e);
   }
   old.edges=std::move(merged);
+  if(changed)changed_loss();
   return changed;
  }
  // Installs a proven outcome on a node of its position: an unexpanded node takes the verdict; an expanded node takes
@@ -504,6 +531,14 @@ struct Tree {
   if(edge==root->edges.end())throw std::runtime_error("Mark action is not a root edge");
   if(root->exact_winner>=0)return;
   edge->exact_winner=winner;edge->distance=distance;edge->bound=true;edge->sum=winner==root->player?edge->visits:-edge->visits;settle(*root);
+  if(graph && root->remaining==2 && winner!=root->player && distance>1){
+   const int p=root->player;const auto h=CellHash{}(action);
+   const Key half{root->position.a-mix(p*3+2+17)+mix(p*3+1+17)+mix(h^mix(p+1)),
+                  root->position.b-mix(p*3+2+71)+mix(p*3+1+71)+mix(h+mix(p+911))};
+   const Outcome loss{p,winner,distance-1,root->stones+1,true,{}};
+   if(record(half,loss))if(auto list=positions.find(half);list!=positions.end())
+    for(auto& w:std::vector(list->second))if(auto n=w.lock())if(apply(loss,*n)){learn(*n);revise(*n);}
+  }
   // A shared graph hands the verdict and the changed value on to the root's stored parents.
   if(shared){learn(*root);revise(*root);}
  }
@@ -569,6 +604,7 @@ struct Tree {
   for(auto& u:board.history)path.history.push_back(u.c);
   if(shared)++clock;
   while(node->expanded){
+   if(graph && !shared)inherit_half_losses(*node);
    if(shared){current(*node);node->used=clock;}
    auto& q=transformed(*node);int chosen=-1;double best=-1e300;
    if(node==root.get()){
@@ -647,6 +683,7 @@ struct Tree {
   const bool at_root=&node==root.get();if(at_root){root_edges.assign(count,{});root_prepared=true;}
   node.value=0;node.edges.reserve(count);for(int i=0;i<count;++i){Edge edge;edge.action=legal[i];edge.logit=logits[i]-maximum;edge.prior=weights[i]/total;edge.weight=weights[i];node.value+=edge.prior*values[i];double u=std::generate_canonical<double,53>(rng);if(at_root)root_edges[i].gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));node.edges.push_back(std::move(edge));}
   node.expanded=true;node.remaining=path.remaining;
+  if(graph && path.remaining==1 && !path.history.empty())node.first=path.history.back();
   // A retained proven loss covers every legal continuation even if this node had not needed expansion yet.
   if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges){edge.exact_winner=node.exact_winner;edge.distance=node.distance;edge.bound=true;}
   if(tactics)classify(path,node);
@@ -656,6 +693,7 @@ struct Tree {
    if(auto list=positions.find(node.position);list!=positions.end())
     for(auto& w:std::vector(list->second))if(auto peer=w.lock())if(peer.get()!=&node && peer->expanded && copy(*peer,node))settle(node);
    if(auto o=outcomes.find(node.position);o!=outcomes.end())apply(o->second,node);
+   inherit_half_losses(node);
    if(shared)link(path,node);
   }
   // A certificate adds its witness as a winning edge; settle keeps any shorter tactical win found by classify.
@@ -771,7 +809,7 @@ HX_API int hxg_tactics(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(
 // and proven outcomes are shared by position.
 HX_API int hxg_graph(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(p);if(t.root->expanded || !t.requests.empty() || t.state.use_count()>1)return 0;
  t.graph=enabled!=0;t.nodes.clear();t.outcomes.clear();t.positions.clear();
- if(t.graph){auto [position,context]=gumbel::keys(t.board);t.root->position=position;t.root->stones=int(t.board.cells.size());t.nodes[context]=t.root;t.positions[position].push_back(t.root);}
+ if(t.graph){auto [position,context]=gumbel::keys(t.board);t.root->position=position;t.root->stones=int(t.board.cells.size());t.root->remaining=t.board.remaining;if(!t.board.history.empty())t.root->first=t.board.history.back().c;t.nodes[context]=t.root;t.positions[position].push_back(t.root);}
  return 1;}
 // Makes the tree a shared game graph (graph search whose store keeps every node until evicted) before the root is
 // expanded; `limit` bounds the expanded nodes kept between searches (0: no bound). 0 with the error set otherwise.

@@ -1887,6 +1887,34 @@ class FreeplayClock(unittest.TestCase):
 
 
 class Proofs(unittest.TestCase):
+    def test_losing_half_turn_covers_both_orders_without_inventing_a_winning_line(self):
+        from play import Proofs, answered
+        root = [(0,0),(1,2),(2,2),(0,-2),(-2,0),(3,2),(4,2)]
+        a, b = (0,-3), (-3,0)
+        table = Proofs()
+        table.add(root+[a], dict(proof=dict(winner=1, plies=3), pv=[[2,-3,0,1]]))
+        self.assertEqual(table.edges(root+[b])[a], (1,3,dict(winner=1,plies=2,pv=[])))
+        self.assertIn(dict(history=[list(p) for p in root+[b,a]],winner=1,plies=2,pv=[]),table.facts(root+[b]))
+        self.assertIsNone(table.known(root+[b]))
+        for pair in ([a,b],[b,a]):
+            self.assertEqual(table.known(root+pair), dict(winner=1,plies=2,pv=[]))
+            self.assertIsNone(answered(root+pair, table))
+        # A winning half-turn is existential, so it cannot refute every second stone.
+        winning = Proofs()
+        winning.add(root+[a], dict(proof=dict(winner=0, plies=1)))
+        self.assertNotIn(a, winning.edges(root+[b]))
+        self.assertIsNone(winning.known(root+[b,a]))
+
+    def test_reordered_earlier_turn_reaches_known_win_with_the_remaining_stones(self):
+        from play import Proofs, answered
+        root = [(0,0),(8,0),(0,8),(1,0),(2,0),(-8,0),(0,-8),(0,3),(1,3),(8,-8),(-8,8)]
+        a,b,c,d,e,f = (3,0),(2,3),(8,1),(8,2),(3,3),(10,0)
+        table = Proofs()
+        table.add(root+[a,b,c,d,e,f], dict(proof=dict(winner=0, plies=4)))
+        result = answered(root+[a,e,c,d], table)
+        self.assertEqual({tuple(p) for p in result['moves']}, {b,f})
+        self.assertEqual((result['value'], result['proof']['plies'], result['actual_completed'], result['actual_solver_nodes']), (1.,6,0,0))
+
     def test_placements_become_the_winners_turns(self):
         self.assertEqual([proof_turns(p, 2, True) for p in (1, 2, 5, 6, 9, 10)], [1, 1, 2, 2, 3, 3])
         self.assertEqual([proof_turns(p, 1, True) for p in (1, 4, 5)], [1, 2, 2])

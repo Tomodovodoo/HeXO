@@ -259,7 +259,7 @@ if (job.kind === 'encode') {
   const table = new Proofs();
   for (const [history, record] of job.records) table.add(history, record);
   const rebuilt = new Proofs(table.list());
-  answer = {queries: job.queries.map(h => ({known: rebuilt.known(h), edges: [...rebuilt.edges(h).values()].map(e => [...e.action, e.winner, e.distance])})),
+  answer = {queries: job.queries.map(h => ({known: rebuilt.known(h), facts: rebuilt.facts(h), edges: [...rebuilt.edges(h).values()].map(e => [...e.action, e.winner, e.distance])})),
     settled: settled(job.result, rebuilt.edges(job.queries[0]), job.mover), lost: settled(job.lost, rebuilt.edges(job.queries[0]), job.mover),
     exact: settled(job.exact, rebuilt.edges(job.queries[0]), job.mover)};
 } else if (job.kind === 'proofs') {

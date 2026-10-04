@@ -1016,6 +1016,33 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual((after['exact_winner'], after['proven']), (mover, 1))
         self.assertEqual(after['values'][self.edge(after, b[-1])], 1.)
 
+    def test_losing_first_stone_is_refuted_in_either_order_without_pair_expansion(self):
+        # P1's open four is unstoppable after P0 spends A away from it.
+        root = [(0,0),(1,2),(2,2),(0,-2),(-2,0),(3,2),(4,2)]
+        a, b = (0,-3), (-3,0)
+        for materialized in (False, True):
+            with self.subTest(materialized=materialized):
+                graph = GameGraph(Uniform(), 'half-turn-permutation', root, tactics=False)
+                self.addCleanup(graph.close)
+                graph.search(1, root_samples=1)
+                graph.at(root + [b])
+                graph.search(1, root_samples=1)
+                graph.at(root)
+                if materialized:
+                    graph.at(root + [a])
+                    graph.search(1, root_samples=1)
+                    graph.prove_loss(1, 3)
+                else:
+                    graph.mark(a, 1, 4)
+                graph.at(root + [b])
+                result = graph.result(0,0,0,0)
+                edge = self.edge(result, a)
+                self.assertEqual((result['values'][edge], result['policy'][edge]), (-1., 0.))
+                self.assertEqual(result['proof_status'], 'UNKNOWN')
+                self.assertIn(dict(history=[list(p) for p in root + [b,a]], winner=1, plies=2), graph.facts())
+                graph.search(16, root_samples=4)
+                self.assertEqual(graph.result(0,0,0,0)['visits'][edge], 0)
+
     def test_the_same_seed_and_budgets_choose_the_same_moves(self):
         a = recorded_position(11)
         def run():

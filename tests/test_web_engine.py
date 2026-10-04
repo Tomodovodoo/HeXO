@@ -235,6 +235,8 @@ class BrowserProofs(unittest.TestCase):
                    ([[0, 0], [-2, 0], [-2, 1]], dict(proof=dict(winner=0, turns=2), pv=[[-3, 1, 0, 1]]))]
         queries = [[[0, 0]], [[0, 0], [1, 0]], [[0, 0], [5, 5]], [[0, 0], [1, 0], [2, 0], [3, 0]], [[0, 0], [9, 9]],
                    [[0, 0], [2, 2], [3, 2]], [[0, 0], [-2, 0], [-2, 1], [-3, 1]]]
+        # Lost A covers B,A, including after serializing and rebuilding the table.
+        queries += [[[0,0],[5,4],[4,4]], [[0,0],[4,4],[5,4]], [[0,0],[5,4]]]
         result = dict(actions=[[1, 0], [4, 4], [7, 7]], values=[.1, .2, .3], completed_q=[.1, .2, .3], policy=[.2, .5, .3],
                       action=[4, 4], proven=0)
         lost = dict(actions=[[4, 4]], values=[.4], completed_q=[.4], policy=[1.], action=[4, 4], proven=0)
@@ -246,6 +248,10 @@ class BrowserProofs(unittest.TestCase):
         for history, answer in zip(queries, found['queries']):
             edges = sorted([*action, winner, distance] for action, (winner, distance, _) in table.edges(history).items())
             self.assertEqual((answer['known'], sorted(answer['edges'])), (table.known(history), edges), history)
+            order = lambda f: json.dumps(f, sort_keys=True)
+            self.assertEqual(sorted(answer['facts'], key=order), sorted(table.facts(history), key=order))
+        self.assertIn([4,4,0,3], found['queries'][-1]['edges'])
+        self.assertEqual({k:found['queries'][-3]['known'][k] for k in ('winner','plies')}, dict(winner=0,plies=2))
         self.assertEqual({k: found['settled'][k] for k in ('action', 'proven', 'proof_plies', 'values', 'completed_q')},
                          dict(action=[1, 0], proven=1, proof_plies=6, values=[1, -1, .3], completed_q=[1, -1, .3]))
         self.assertEqual({k: found['exact'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
@@ -821,6 +827,23 @@ class Bundle(unittest.TestCase):
         self.assertGreater(len(steps[1]['at']), len(history))
         cases.insert(0, (dict(history=history, seed=1740, tactics=True, limit=4096, steps=steps,
                               batches=recorder.batches), results))
+        history = [[0,0],[1,2],[2,2],[0,-2],[-2,0],[3,2],[4,2]]
+        a, b = [0,-3], [-3,0]
+        recorder = Recorder(model)
+        graph = GameGraph(recorder, 'permutation', history, seed=1740, tactics=False, limit=4096)
+        try:
+            graph.expand()
+            graph.mark(a, 1, 4)
+            first = graph.search(16, root_samples=4, batch_size=4)
+            graph.at(history+[b])
+            second = graph.search(16, root_samples=4, batch_size=4)
+            self.assertEqual(second['policy'][second['actions'].tolist().index(a)], 0.)
+            steps = [dict(simulations=16, root_samples=4, batch_size=4, marks=[[*a,1,4]]),
+                     dict(simulations=16, root_samples=4, batch_size=4, at=history+[b])]
+            cases.insert(0, (dict(history=history, seed=1740, tactics=False, limit=4096, steps=steps,
+                                  batches=recorder.batches), [first, second]))
+        finally:
+            graph.close()
         answers = node(dict(kind='search', cases=[case for case, _ in cases]))
         for (case, results), answer in zip(cases, answers):
             self.assertEqual(len(answer), len(results))

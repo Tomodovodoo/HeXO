@@ -162,6 +162,20 @@ export class Proofs {
   list() {
     return [...this.entries.values()].map(({history, winner, plies, pv}) => ({history, winner, plies, pv}));
   }
+  /** Reachable exact solver premises, including the completed turns implied by lost half-turns. */
+  facts(history) {
+    const base = history.map(([q, r], i) => `${q},${r},${sideAt(i)}`), found = new Map();
+    for (const [key, entry] of this.entries) if (base.every(p => entry.stones.has(p))) {
+      const {history, winner, plies, pv} = entry;
+      found.set(key, {history, winner, plies, pv});
+    }
+    if (history.length && history.length % 2 === 0) for (const {action, winner, outcome} of this.edges(history).values()) {
+      if (winner === sideAt(history.length)) continue;
+      const child = [...history, action], key = proofKey(child), old = found.get(key);
+      if (!old || outcome.plies < old.plies) found.set(key, {history: child, ...outcome});
+    }
+    return [...found.values()].sort((a, b) => a.history.length - b.history.length).slice(0, 2048);
+  }
   /** Index `record` (the fields of a turn) at `history` when it holds a proof; `id` skips a record already indexed. A
    * proof without `plies` takes the bound its `turns` give (python/play.py proof_plies). */
   add(history, record, id = null) {
@@ -209,6 +223,18 @@ export class Proofs {
    * the stone itself; `outcome` is the position's {winner, plies, pv}. */
   edges(history) {
     const size = history.length, base = history.map(([q, r], i) => `${q},${r},${sideAt(i)}`), own = new Set(base), found = new Map();
+    // A lost half-turn after A covers A,B in either order. Its saved response
+    // need not be B, so carry the verdict without inventing a new PV.
+    if (size && size % 2 === 0) for (const key of this.sizes.get(size) || []) {
+      const entry = this.entries.get(key), mover = sideAt(size);
+      if (entry.winner === mover || entry.plies < 2) continue;
+      const missing = [...entry.stones].filter(p => !own.has(p)), replaced = base.filter(p => !entry.stones.has(p));
+      if (missing.length !== 1 || replaced.length !== 1 || replaced[0] !== `${history.at(-1)},${mover}`) continue;
+      const [q, r, side] = missing[0].split(',').map(Number);
+      if (side !== mover) continue;
+      const outcome = {winner: entry.winner, plies: entry.plies - 1, pv: []};
+      found.set(`${q},${r}`, {action: [q, r], winner: entry.winner, distance: entry.plies, outcome});
+    }
     for (const extra of [1, 2]) for (const key of this.sizes.get(size + extra) || []) {
       const entry = this.entries.get(key);
       if (!base.every(stone => entry.stones.has(stone))) continue;
@@ -229,7 +255,17 @@ export class Proofs {
   /** The outcome of `history` ({winner, plies, pv}) from its own entry, else the shortest win of the side to move
    * through `edges`, its line led by that stone and extended from stored children; null when nothing is known. */
   known(history) {
-    const own = this.entries.get(proofKey(history));
+    let own = this.entries.get(proofKey(history));
+    if (!own && history.length > 1 && history.length % 2 === 1) {
+      const mover = sideAt(history.length), base = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));
+      const last = new Set(history.slice(-2).map(p => `${p},${1-mover}`));
+      for (const key of this.sizes.get(history.length - 1) || []) {
+        const loss = this.entries.get(key);
+        if (loss.winner !== mover || loss.plies < 2 || ![...loss.stones].every(p => base.has(p))) continue;
+        if (![...base].some(p => !loss.stones.has(p) && last.has(p))) continue;
+        if (!own || own.plies > loss.plies - 1) own = {winner: mover, plies: loss.plies - 1, pv: []};
+      }
+    }
     if (own) return {winner: own.winner, plies: own.plies, pv: this.line(history, own)};
     const mover = sideAt(history.length);
     const wins = [...this.edges(history).values()].filter(e => e.winner === mover)
