@@ -49,7 +49,7 @@ struct Broker;
 struct Command {int game,samples,views;uint64_t token,work;double ms,noise;std::vector<int64_t> cells;
  int kind=0;std::shared_ptr<gumbel::GameStore> replacement;bool tactics=false;double range=0;uint64_t seed=0;};
 struct Producer:std::enable_shared_from_this<Producer> {
- Broker& broker;owner::Pool& pool;int model,index;
+ Broker& broker;owner::Pool& pool;int model,index,worker_request=0;
  std::atomic<bool> retiring=false;
  std::thread thread;std::deque<std::shared_ptr<Job>> completed;
  std::vector<std::shared_ptr<Job>> outstanding;bool done=false;uint64_t pause_ack=0;
@@ -102,7 +102,8 @@ struct Broker {
    if(!continuous || !started || cancelled || index<0 || index>=int(producers.size()) || !producers[index])
     throw std::runtime_error("Invalid producer retirement");
    producer=producers[index];
-   if(producer->retiring || !producer->commands.empty() ||
+   if(producer->retiring || producer->worker_request || !producer->commands.empty() ||
+      std::any_of(producer->requested.begin(),producer->requested.end(),[](bool b){return b;}) ||
       std::any_of(producer->released.begin(),producer->released.end(),[](bool b){return !b;}) ||
       std::any_of(producer->reported.begin(),producer->reported.end(),[](bool b){return !b;}))
     throw std::runtime_error("Consume every game retirement before detaching its producer");
@@ -119,6 +120,19 @@ struct Broker {
   return std::any_of(producers.begin(),producers.end(),[&](const auto& p){return p && p->model==model;}) ||
          std::any_of(tasks.begin(),tasks.end(),[&](const auto& task){return task.second->model==model;});
  }
+ void workers(int index,int count){
+  std::unique_lock lock(mutex);
+  if(!continuous || !started || cancelled || index<0 || index>=int(producers.size()) ||
+     !producers[index] || count<1 || count>16)throw std::runtime_error("Invalid native host allocation");
+  auto p=producers[index];
+  if(p->done || p->retiring || p->worker_request)throw std::runtime_error("Producer is unavailable for host allocation");
+  p->worker_request=count;wake.notify_all();
+  wake.wait(lock,[&]{return !p->worker_request || cancelled || p->done;});
+  if(!error.empty())throw std::runtime_error(error);
+  if(p->worker_request)throw std::runtime_error("Host allocation cancelled before acknowledgement");
+ }
+ int worker_request(Producer& p){std::lock_guard lock(mutex);return p.worker_request;}
+ void workers_ready(Producer& p){std::lock_guard lock(mutex);p.worker_request=0;wake.notify_all();}
  void fail(const std::string& message){
   {std::lock_guard lock(mutex);if(error.empty())error=message;}cancel();
  }
@@ -244,7 +258,7 @@ struct Broker {
   if(!out.empty())producer.pause_ack=0;return out;
  }
  void wait(Producer& producer){
-  std::unique_lock lock(mutex);wake.wait_for(lock,std::chrono::milliseconds(1),[&]{return cancelled || !producer.completed.empty() || !producer.commands.empty();});
+  std::unique_lock lock(mutex);wake.wait_for(lock,std::chrono::milliseconds(1),[&]{return cancelled || producer.worker_request || !producer.completed.empty() || !producer.commands.empty();});
  }
  bool done_locked()const{return started && std::all_of(producers.begin(),producers.end(),[](const auto& p){return !p || p->done;}) && flights.empty();}
  int take(int limit,double wait_ms,uint64_t* token,int* model,void** snapshot){
@@ -312,6 +326,12 @@ inline void Producer::run()noexcept{
  try{
   std::vector<uint64_t> active(pool.games.size()),retiring(pool.games.size());
   while(!broker.cancelled && (broker.continuous || pool.admit())){
+   if(int count=broker.worker_request(*this)){
+    // The preceding graph/feed phase has joined. Caller threads never resize
+    // worker storage while selection or installation is using it.
+    if(!hxgf_workers(pool.feed,count,[](void* tree)->void*{return static_cast<gumbel::Tree*>(tree)->state.get();}))throw std::runtime_error(gumbel::error);
+    pool.host_workers=count;broker.workers_ready(*this);
+   }
    for(auto& completion:broker.completions(*this)){
     auto& job=completion.job;std::vector<uint64_t> ids;
     std::vector<int64_t> offsets(1,0),actions;std::vector<double> logits,values;
@@ -426,6 +446,7 @@ HX_API void* hxb_new(int quantum,int pending,int merge,double latency){try{retur
 HX_API int hxb_attach(void* p,void* pool,int model){try{return static_cast<inference::Broker*>(p)->attach(*static_cast<owner::Pool*>(pool),model)+1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_detach(void* p,int producer){try{static_cast<inference::Broker*>(p)->detach(producer);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_model_pending(void* p,int model){return static_cast<inference::Broker*>(p)->model_pending(model);}
+HX_API int hxb_workers(void* p,int producer,int count){try{static_cast<inference::Broker*>(p)->workers(producer,count);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_start(void* p,double ms){try{static_cast<inference::Broker*>(p)->start(ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_continuous(void* p){auto& b=*static_cast<inference::Broker*>(p);if(b.started){gumbel::error="Configure continuous mode before starting";return 0;}b.continuous=true;return 1;}
 HX_API int hxb_retarget(void* p,int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise){try{static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}

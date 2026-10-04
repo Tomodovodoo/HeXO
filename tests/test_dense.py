@@ -3747,6 +3747,55 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_native_model_admission_waits_without_deadlocking_disjoint_historical_pairs(self):
+        from native_selfplay import ActorEngine
+        torch.set_num_threads(2)
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'admit-{k}','fixed','cpu',64,128) for k in range(4)]
+        settings = dense_config.ActorSettings(native_scheduler=True,native_producers=2,game_graph=192,
+            native_quantum=8,native_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=3,
+            opening_random_plies=0.)
+        engine = ActorEngine(settings)
+        self.addCleanup(engine.close)
+        for i in range(2):
+            engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,30+i,native_owner=True))
+        count,end = 0,time.monotonic()+10
+        while engine.slots and time.monotonic()<end:
+            for game in engine.step():
+                game.episode()
+                count += 1
+                if count==1:
+                    engine.add(dense_selfplay.SelfPlayGame([models[1],models[2]],settings,40,
+                                                         opponent='fixed-2',native_owner=True))
+                elif count==2:
+                    engine.add(dense_selfplay.SelfPlayGame([models[0],models[3]],settings,41,
+                                                         opponent='fixed-3',native_owner=True))
+            self.assertLessEqual(engine.summary()['host_workers'],2)
+        self.assertFalse(engine.slots)
+        self.assertEqual(count,4)
+
+    def test_native_actor_startup_pause_releases_unregistered_evaluator_captures(self):
+        from native_selfplay import ActorEngine
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'idle-{k}','fixed','cpu',64,128) for k in range(2)]
+        graphs = [unittest.mock.Mock(max_incremental_bytes=123,max_batch=128) for _ in models]
+        for model,graph in zip(models,graphs):
+            model.evaluator.graph = graph
+            model.evaluator.free.append({})
+            model.evaluator.staging['buffer'] = object()
+        engine = ActorEngine(dense_config.ActorSettings(native_scheduler=True,game_graph=192))
+        self.addCleanup(engine.close)
+        engine.synchronize_inflight(models)
+        self.assertTrue(engine.paused)
+        for model,graph in zip(models,graphs):
+            graph.close.assert_called_once_with()
+            self.assertIsNone(model.evaluator.graph)
+            self.assertFalse(model.evaluator.free)
+            self.assertFalse(model.evaluator.staging)
+        with unittest.mock.patch('hexnet_graphs.ActorGraph') as capture:
+            engine.resume()
+        self.assertFalse(engine.paused)
+        self.assertEqual(capture.call_count,2)
+        self.assertTrue(all(c.kwargs==dict(max_incremental_bytes=123,max_batch=128) for c in capture.call_args_list))
+
     def test_hot_producer_retirement_keeps_old_device_snapshot_and_new_model_separate(self):
         from native_scheduler import InferenceService
         from tests.test_neural_search import NativeScheduler
@@ -3832,6 +3881,7 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual(engine.evals,count)
                 elif len(episodes)==2:
                     engine.add(dense_selfplay.SelfPlayGame([models[2]]*2,settings,23,native_owner=True))
+            self.assertLessEqual(engine.summary()['host_workers'],settings.native_producers)
         self.assertFalse(engine.slots)
         self.assertTrue(overlap)
         self.assertEqual(len(episodes),4)
@@ -3907,6 +3957,8 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'frozen model'):
             service.replace(0,0,other,expected=2,work=16,views=1)
         service.replace(0,0,fresh,expected=2,work=16,samples=4,views=1)
+        with self.assertRaisesRegex(ValueError,'every game retirement'):
+            service.detach(0)
         self.assertIsNone(fresh.ptr)  # Successful transfer closed the caller Tree before native mutation.
         fresh.close()
         token, _, rows = held
@@ -4165,9 +4217,13 @@ class EngineTests(unittest.TestCase):
         service.start(continuous=True)
         service.retarget(0,0,[[0,0]],ms=1,views=1)
         service.retarget(0,1,[[0,0]],work=16,views=1)
-        time.sleep(.02)  # The cold clock expires before any inference result exists.
-        events = []
         end = time.monotonic()+2
+        event = None
+        while event is None and time.monotonic()<end:
+            event = service.event()
+            time.sleep(.001)
+        self.assertIsNotNone(event)  # No neural answer can arrive before this cold deadline.
+        events = [event]
         while len(events)<2 and time.monotonic()<end:
             service.pump()
             while (event:=service.event()) is not None:
@@ -6409,6 +6465,46 @@ class ActorModelTests(unittest.TestCase):
         samples,targets = dense_data.examples(window,refs,np.random.default_rng(0))
         self.assertEqual(len(samples),36)
         self.assertTrue(all(np.isfinite(t['value']) for t in targets))
+
+    def test_native_worker_acknowledges_learner_only_after_neural_fence_then_resumes(self):
+        from native_selfplay import ActorEngine
+        self.export('main/000010',1.)
+        config = dense_config.RunConfig(device='cpu',model=dense_config.ModelSettings(**{k:getattr(TINY,k)
+            for k in ('blocks','channels','pool_every','line_length','value_hidden','head_channels')}),
+            actor=dense_config.ActorSettings(native_scheduler=True,native_producers=2,native_quantum=8,
+                native_views=4,games_in_flight=2,leaf_batch=64,full_sims=16,cheap_sims=4,
+                root_samples=8,full_fraction=1.,game_graph=192,max_plies=6,cache_positions=128,shard_games=1,
+                opening_random_plies=0.,phase_follow=True,yield_below=0.,yield_check_seconds=0.))
+        dense_config.save(self.run,config)
+        learner = self.run/'learner-status.json'
+        learner.write_text(json.dumps(dict(updated_at=time.time(),stage='phase-idle',phase_rows=100)))
+        real_step,write = ActorEngine.step,dense_selfplay.write_json
+        owners,acks = [],[]
+        def step(engine):
+            finished = real_step(engine)
+            if not owners:
+                owners.append(engine)
+                learner.write_text(json.dumps(dict(updated_at=time.time(),stage='waiting-for-actors',
+                                                   phase_rows=100,phase_request='native-phase')))
+            return finished
+        def status(path,fields):
+            write(path,fields)
+            if Path(path).name=='actor-status.json' and fields['phase_ack'].get('main')=='native-phase':
+                service = owners[0].engine.service
+                self.assertTrue(service.paused())
+                before = service.stats()['launched_rows']
+                time.sleep(.02)
+                self.assertEqual(service.stats()['launched_rows'],before)
+                acks.append(fields['phase_ack'])
+                learner.write_text(json.dumps(dict(updated_at=time.time(),stage='phase-idle',phase_rows=100)))
+        with unittest.mock.patch.object(ActorEngine,'step',step),unittest.mock.patch.object(dense_selfplay,'write_json',status):
+            dense_selfplay.worker(SimpleNamespace(run=str(self.run),worker=0,games=4,initial_model=None))
+        self.assertEqual(acks,[dict(main='native-phase')])
+        final = json.loads((self.run/'actor-status.json').read_text())
+        self.assertEqual((final['stage'],final['games_completed']),('finished',4))
+        self.assertEqual(final['phase_ack'],{})
+        self.assertGreater(final['paused_seconds'],0)
+
 
 
 class PacerTests(unittest.TestCase):

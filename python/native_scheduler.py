@@ -33,6 +33,7 @@ bind('hxb_new', ptr, C.c_int, C.c_int, C.c_int, C.c_double)
 for name, result, args in (
     ('attach', C.c_int, [ptr, ptr, C.c_int]), ('start', C.c_int, [ptr, C.c_double]),
     ('detach', C.c_int, [ptr, C.c_int]), ('model_pending', C.c_int, [ptr, C.c_int]),
+    ('workers', C.c_int, [ptr, C.c_int, C.c_int]),
     ('cancel', None, [ptr]), ('take', C.c_int, [ptr, C.c_int, C.c_double, ptr, ptr, ptr]),
     ('complete', C.c_int, [ptr, C.c_uint64, ptr, ptr, ptr, ptr]),
     ('abort', C.c_int, [ptr, C.c_uint64]), ('done', C.c_int, [ptr]),
@@ -440,6 +441,10 @@ class InferenceService:
     def model_pending(self, model):
         """Keep weights alive while any producer or device task still uses them."""
         return bool(native.hxb_model_pending(self.ptr,model))
+
+    def workers(self, producer, count):
+        """Resize host workers on their owner thread between joined phases."""
+        checked(native.hxb_workers(self.ptr,producer,count))
 
     def take(self, wait_ms=0):
         from native_dense import PackedRows

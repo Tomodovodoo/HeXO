@@ -127,6 +127,8 @@ class ActorSettings:
                 any((self.solver_root_nodes,self.solver_finalist_nodes,self.solver_threat_nodes,
                      self.solver_deep_nodes,self.solver_leaf_nodes))):
             raise ValueError('native_scheduler requires game_graph and frontier slices instead of legacy solver budgets or PV checks')
+        if self.native_scheduler and self.historical_fraction and self.native_producers<2:
+            raise ValueError('Native historical games require at least two host workers')
         if self.native_packing and not self.native_feed:
             raise ValueError('native_packing requires native_feed')
         if self.native_feed and self.solver_leaf_nodes:

@@ -1384,7 +1384,10 @@ def worker(args):
                     paused_since = time.perf_counter()
                     log_event(run, 'actor', 'info', f'worker {args.worker} paused: {gate.reason}', process=args.worker)
                 if pending_ack or entered and settings.native_scheduler:
-                    engine.synchronize_inflight()
+                    if settings.native_scheduler:
+                        engine.synchronize_inflight([model,*(historical.models.values() if historical else [])])
+                    else:
+                        engine.synchronize_inflight()
                 if pending_ack:
                     phase_ack.update(pending_ack)
                     token_pause = True
