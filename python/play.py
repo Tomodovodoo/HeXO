@@ -2594,7 +2594,7 @@ class Session:
                                    (record['simulations'], record['solver_nodes']))
                             if key not in study.store.order:
                                 study.store.index(record, line.strip())
-                            if record.get('proof'):
+                            if record.get('proof') or record.get('proofs'):
                                 proven.append((record, line.strip()))
                         except (ValueError, KeyError, TypeError):
                             continue
@@ -2687,7 +2687,7 @@ class Session:
         files = [library]
         if entry['kind'] == 'bubble':
             files += [library.with_name(library.name.replace('hexo', 'hexo_gumbel'))]
-            source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] else 'none'
+            source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] or seat['budget'].get('leaf_nodes') else 'none'
         elif entry['kind'] == 'six':
             command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in source['command']]
             files += [path for path in command_files if path.is_file()] + list(entry.get('files', []))
@@ -2966,7 +2966,7 @@ class Session:
                 registry = {}
                 for seat in match['players']:
                     source = seat['source']
-                    if seat['budget'].get('solver_nodes') and source['solver_build'] != self.engines.solver_build():
+                    if (seat['budget'].get('solver_nodes') or seat['budget'].get('leaf_nodes')) and source['solver_build'] != self.engines.solver_build():
                         raise ValueError('Tactical solver build changed since the batch started')
                     if source.get('weights') and file_digest(file_identity(source['weights'])) != source['weights_sha256']:
                         raise ValueError('Checkpoint weights changed since the batch started')
@@ -3470,7 +3470,7 @@ class Session:
             started = time.monotonic()
             if self.match and self.match['active']:
                 source = self.match['players'][job.side if self.match['current'] % 2 else 1-job.side]['source']
-                if seat['budget'].get('solver_nodes') and source['solver_build'] != self.engines.solver_build():
+                if (seat['budget'].get('solver_nodes') or seat['budget'].get('leaf_nodes')) and source['solver_build'] != self.engines.solver_build():
                     raise ValueError('Tactical solver build changed during this batch')
                 files = source['files'] | ({source['weights']: source['weights_sha256']} if source.get('weights') else {})
                 if any(file_digest(file_identity(path)) != digest for path, digest in files.items()):

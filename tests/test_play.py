@@ -1658,6 +1658,21 @@ class Matches(unittest.TestCase):
             self.session.resume_match(self.output)
         self.assertFalse(self.session.match['active'])
 
+    def test_leaf_only_match_records_and_checks_the_solver_build_during_play_and_resume(self):
+        self.engines.solver_build = lambda: 'old-build'
+        self.session.start_match(['bubble:2{simulations=8,solver_nodes=0,leaf_nodes=2048}', 'Other'],
+                                  output=self.output, max_placements=3)
+        wait(lambda: self.session.match['completed'] == 1)
+        self.assertEqual(self.session.match['players'][0]['source']['solver_build'], 'old-build')
+        self.engines.solver_build = lambda: 'new-build'
+        wait(lambda: self.session.match['error'] is not None)
+        self.assertIn('Tactical solver build changed', self.session.match['error'])
+        self.assertEqual(self.session.match['completed'], 1)
+        self.session.stop_match()
+        wait(lambda: not self.session.match_worker.is_alive())
+        with self.assertRaisesRegex(ValueError, 'Tactical solver build changed'):
+            self.session.resume_match(self.output)
+
     def test_saved_games_and_analysis_survive_restart_without_changing_live_play(self):
         self.session.archive = Path(self.directory.name) / 'archive'
         self.session.study_store = Path(self.directory.name) / 'analysis.jsonl'
@@ -2496,7 +2511,13 @@ class GameProofs(unittest.TestCase):
         self.addCleanup(archive.cleanup)
         self.session.archive = Path(archive.name)
         self.session.load(self.start + [(-1, -11)], True)
-        self.assertEqual(self.analyse(80, 32768)['proof']['plies'], 17)
+        found = self.analyse(80, 32768)
+        self.assertEqual(found['proof']['plies'], 17)
+        # A record whose root is unproven can still contain a verified leaf continuation, even on an undone branch.
+        fact = dict(history=[list(p) for p in self.session.history], winner=0, plies=17, pv=found['pv'])
+        self.session.store.add(self.session.history, self.session.engine_key(self.session.analysis), self.session.analysis['budget'],
+                               dict(moves=[], value=.5, top=[], proof=None, pv=[], threat=[], proofs=[fact]))
+        self.session.save_freeplay()
         self.session.undo()
         self.session.save_freeplay()
         ident = self.session.remember_match(self.session.freeplay_directory)
