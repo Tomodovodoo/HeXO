@@ -211,6 +211,19 @@ class Overlay(unittest.TestCase):
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 class BrowserProofs(unittest.TestCase):
 
+    def test_matching_replay_precedes_newer_unrelated_records(self):
+        source = """import {Proofs} from './web/engine/proof.mjs';
+const proofs=new Proofs(),history=[[0,0],[1,0],[0,1]],record={proof:{winner:0,plies:20},pv:[]};
+proofs.add(history,record);
+for(let i=0;i<128;i++) proofs.add(Array.from({length:401},(_,j)=>[j,i+1]),record);
+const replay=proofs.replay(history);
+console.log(JSON.stringify({first:replay[0].history,cells:replay.reduce((n,r)=>n+r.history.length+r.pv.length,0)}));"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True, check=True)
+        result = json.loads(done.stdout)
+        self.assertEqual(result['first'], [[0,0],[1,0],[0,1]])
+        self.assertLessEqual(result['cells'], 50000)
+
     def test_failed_replays_leave_the_full_ordinary_solve_available(self):
         from tests.test_tactical_proof import FIXTURE
         history = FIXTURE['positions']['1790600287230040:30:248']

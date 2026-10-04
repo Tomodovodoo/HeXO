@@ -177,19 +177,21 @@ export class Proofs {
   /** Saved strategies supply moves for checked replay, never changed-board verdicts. */
   replay(history) {
     const own = (h, side) => h.filter((_, i) => sideAt(i) === side).map(p => p.join(',')).sort().join(';');
-    const at = [own(history, 0), own(history, 1)], available = new Set();
+    const at = [own(history, 0), own(history, 1)], applicable = new Set();
     for (const entry of this.strategies.values()) {
       const current = entry.history.slice();
-      if (own(current, entry.winner) === at[entry.winner]) available.add(entry.winner);
+      if (own(current, entry.winner) === at[entry.winner]) applicable.add(entry);
       for (let i = 0; i < entry.pv.length && current.length <= history.length + 2; i++) {
         const stone = entry.pv[i];
         if (stone.length !== 4 || stone[3] !== i + 1 || stone[2] !== sideAt(current.length)) break;
         current.push(stone.slice(0, 2));
-        if (own(current, entry.winner) === at[entry.winner]) { available.add(entry.winner); break; }
+        if (own(current, entry.winner) === at[entry.winner]) { applicable.add(entry); break; }
       }
     }
+    const available = new Set([...applicable].map(entry => entry.winner));
     let cells = 0;
-    return [...this.strategies.values()].reverse().filter(entry => {
+    return [...this.strategies.values()].reverse()
+      .sort((a, b) => Number(applicable.has(b)) - Number(applicable.has(a))).filter(entry => {
       if (!available.has(entry.winner) || cells + entry.history.length + entry.pv.length > 50000) return false;
       cells += entry.history.length + entry.pv.length;
       return true;
