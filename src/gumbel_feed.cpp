@@ -14,6 +14,9 @@
 #include <vector>
 #include <memory>
 #include <atomic>
+#ifdef HEXO_RECLAIM_PROFILE
+#include <cstdio>
+#endif
 
 namespace gumbel { extern thread_local std::string error; }
 extern "C" {
@@ -79,9 +82,29 @@ struct Feed {
  int64_t new_rows=0,joins=0,hits=0,installed=0;
  uint64_t proof_requests=0,proof_rows=0,prune_ns=0;
  std::atomic<int64_t> queued=0;
- bool profile=false;
+ bool profile=
+#ifdef HEXO_RECLAIM_PROFILE
+ true;
+#else
+ false;
+#endif
  uint64_t select_ns=0,identity_ns=0,cached_ns=0,install_ns=0;
  explicit Feed(int limit):capacity(limit) { if(limit<0)throw std::runtime_error("Negative feed cache capacity"); }
+#ifdef HEXO_RECLAIM_PROFILE
+ ~Feed(){
+  using Clock=std::chrono::steady_clock;
+  auto ns=[](auto start){return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count());};
+  uint64_t elements=0,bytes=0;auto cached=cache.size();int count=workers?workers->size():0;
+  for(auto& [key,row]:cache){auto& p=*row.prediction;elements+=p.logits.size();
+   bytes+=key.capacity()*sizeof(int64_t)+p.actions.capacity()*sizeof(int64_t)+(p.logits.capacity()+p.values.capacity())*sizeof(double);}
+  auto start=Clock::now();roots.clear();recency.clear();cache.clear();auto cache_ns=ns(start);
+  start=Clock::now();ready.clear();pending.clear();tasks.clear();auto tasks_ns=ns(start);
+  start=Clock::now();workers.reset();auto workers_ns=ns(start);
+  std::fprintf(stderr,"HEXO_RECLAIM {\"component\":\"feed\",\"cached_positions\":%llu,\"cached_policy_elements\":%llu,\"cached_capacity_bytes\":%llu,\"workers\":%d,\"cache_ns\":%llu,\"tasks_ns\":%llu,\"workers_ns\":%llu,\"selection_ns\":%llu,\"identity_ns\":%llu,\"cached_install_ns\":%llu,\"install_ns\":%llu}\n",
+   (unsigned long long)cached,(unsigned long long)elements,(unsigned long long)bytes,count,(unsigned long long)cache_ns,(unsigned long long)tasks_ns,(unsigned long long)workers_ns,
+   (unsigned long long)select_ns,(unsigned long long)identity_ns,(unsigned long long)cached_ns,(unsigned long long)install_ns);
+ }
+#endif
  std::shared_ptr<const Prediction> get(const Key& key) {
   auto found=cache.find(key);if(found==cache.end())return {};
   recency.splice(recency.begin(),recency,found->second.recency);return found->second.prediction;

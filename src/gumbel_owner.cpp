@@ -215,7 +215,22 @@ struct Pool {
    games.push_back(std::make_unique<Owner>(*static_cast<Tree*>(sources[i]),capacity,quantum,views,depth,work,0,seed+i,feed));
   }
  }
- ~Pool(){stop();}
+ ~Pool(){stop();
+#ifdef HEXO_RECLAIM_PROFILE
+  using Clock=std::chrono::steady_clock;
+  auto ns=[](auto start){return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count());};
+  uint64_t views=0,view_ns=0,aux_ns=0,graph_ns=0;auto count=games.size();
+  for(auto& owner:games){
+   auto graph=owner->game;views+=owner->views.size();
+   auto start=Clock::now();owner->views.clear();view_ns+=ns(start);
+   start=Clock::now();owner.reset();aux_ns+=ns(start);
+   start=Clock::now();graph.reset();graph_ns+=ns(start);
+  }
+  auto start=Clock::now();owned_feed.reset();auto feed_ns=ns(start);
+  std::fprintf(stderr,"HEXO_RECLAIM {\"component\":\"pool\",\"model\":\"%s\",\"games\":%llu,\"views\":%llu,\"views_ns\":%llu,\"aux_ns\":%llu,\"graph_ns\":%llu,\"feed_ns\":%llu}\n",model.c_str(),
+   (unsigned long long)count,(unsigned long long)views,(unsigned long long)view_ns,(unsigned long long)aux_ns,(unsigned long long)graph_ns,(unsigned long long)feed_ns);
+#endif
+ }
  void stop(){for(auto& o:games)o->stop();stopped=true;}
  int step(bool neural=true){
   if(proof_step)proof_step(proof_owner);
