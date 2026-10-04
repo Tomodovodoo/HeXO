@@ -27,7 +27,7 @@ struct Owner {
  std::vector<Cell> focus;std::mt19937_64 rng;uint64_t next_id=1,ticks=0,allocations=0,reclaimed=0,completed=0,issued=0,cancelled=0,created=0,retired=0,step_ns=0,discover_ns=0;
  int quantum,max_views,max_depth,sample_limit=16;size_t view_cursor=0;uint64_t work_limit;double time_limit_ms;std::chrono::steady_clock::time_point started;
  bool stopped=false,deadline=false,root_raw_known=false;double exploration=.2,root_raw=0;
- Owner(Tree& source,int capacity,int q,int count,int depth,uint64_t work,double ms,uint64_t seed,void* common=nullptr):owned_feed(common?nullptr:hxgf_new(capacity)),feed(common?common:owned_feed.get()),game(source.state),rng(seed),quantum(q),max_views(count),max_depth(depth),work_limit(work),time_limit_ms(ms),started(std::chrono::steady_clock::now()){
+ Owner(Tree& source,int capacity,int q,int count,int depth,uint64_t work,double ms,uint64_t seed,void* common=nullptr,int samples=16):owned_feed(common?nullptr:hxgf_new(capacity)),feed(common?common:owned_feed.get()),game(source.state),rng(seed),quantum(q),max_views(count),max_depth(depth),sample_limit(samples),work_limit(work),time_limit_ms(ms),started(std::chrono::steady_clock::now()){
   if(!source.shared || !feed || q<4 || count<1 || count>64 || depth<1 || depth>32 || !std::isfinite(ms) || ms<0 || (!work && !ms))throw std::runtime_error("Invalid native owner limits");
   if(game->scheduler_owner)throw std::runtime_error("Game already has a native owner");
   for(auto& [key,weak]:game->nodes)if(auto n=weak.lock())if(n->pending)throw std::runtime_error("Game has external pending neural work");
@@ -205,6 +205,7 @@ struct Pool {
  std::vector<std::unique_ptr<Owner>> games;std::vector<bool> failed;
  std::string model;size_t cursor=0;int ready_limit=0,host_workers=1;uint64_t steps=0,retargets=0;bool stopped=false;
  void* proof_owner=nullptr;void (*proof_step)(void*)=nullptr;void (*proof_retarget)(void*,int)=nullptr;
+ void (*proof_bind)(void*,int)=nullptr;
  void* inference_owner=nullptr;
  Pool(void** sources,int count,int capacity,int quantum,int views,int depth,uint64_t work,const char* version,uint64_t seed):owned_feed(hxgf_new(capacity)),feed(owned_feed.get()),model(version?version:""){
   if(!sources || count<1 || count>1024 || !feed || model.empty())throw std::runtime_error("Invalid multi-game pool");
@@ -273,6 +274,17 @@ struct Pool {
   o.completed=o.issued=o.cancelled=o.ticks=o.allocations=o.reclaimed=o.retired=o.step_ns=o.discover_ns=0;o.created=1;o.view_cursor=0;
   o.work_limit=work;o.time_limit_ms=ms;o.started=std::chrono::steady_clock::now();o.stopped=o.deadline=false;
   failed[index]=false;stopped=false;++retargets;o.start(root);
+ }
+ void replace(int index,Tree& source,int samples,int views,uint64_t work,double ms,double noise,uint64_t seed){
+  auto& old=*games[index];int quantum=old.quantum,depth=old.max_depth;
+  // Retirement already drained this slot's proof jobs and detached neural
+  // subscribers. Device snapshots own copied encodings, not the old store.
+  source.root_noise=noise;
+  auto replacement=std::make_unique<Owner>(source,0,quantum,views,depth,(work || ms)?work:uint64_t(quantum),ms,seed,feed,samples);
+  games[index]=std::move(replacement);
+  if(!work && !ms)games[index]->stop();
+  if(proof_bind)proof_bind(proof_owner,index);
+  failed[index]=false;stopped=false;++retargets;
  }
  int install(const uint64_t* ids,int count,const int64_t* offsets,const int64_t* actions,const double* logits,const double* values){
   size_t capacity=0;for(auto& o:games)capacity+=o->views.size();std::vector<void*> failures(capacity);

@@ -41,6 +41,9 @@ for name, result, args in (
     ('installed', C.c_uint64, [ptr]),
     ('retarget', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, ptr, C.c_int,
                          C.c_uint64, C.c_double, C.c_int, C.c_int, C.c_double]),
+    ('release', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64]),
+    ('replace', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, ptr, C.c_char_p, ptr, C.c_int,
+                         C.c_uint64, C.c_double, C.c_int, C.c_int, C.c_double, C.c_uint64]),
 ):
     bind('hxb_'+name, result, *args)
 bind('hxp_new', ptr, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int)
@@ -435,6 +438,25 @@ class InferenceService:
         checked(native.hxb_retarget(self.ptr, producer, game, expected, cells.ctypes.data,
                                     len(cells), work, ms, samples, views, noise))
 
+    def release(self, producer, game, *, expected):
+        """Retire one game; its immutable completion includes all late proof effort."""
+        checked(native.hxb_release(self.ptr, producer, game, expected))
+
+    def replace(self, producer, game, source, *, expected, work=0, ms=0, samples=16, views=8, noise=0., seed=0):
+        """Install a fresh game after release. Zero work/ms leaves it parked.
+
+        Success transfers the source Tree and closes its caller wrapper. The
+        command retains its store, not the caller's Tree address.
+        Old caller trees must close after release acknowledgement and before
+        replacement admission so their destructors cannot race the old owner.
+        Predictions are reusable only within the slot's frozen model identity.
+        """
+        cells = np.ascontiguousarray(source.history, np.int64).reshape(-1, 2)
+        checked(native.hxb_replace(self.ptr, producer, game, expected, source.ptr,
+                                    source.model_version.encode(), cells.ctypes.data, len(cells),
+                                    work, ms, samples, views, noise, seed))
+        source.ptr = None
+
     def event(self):
         """Consume one immutable, position-bound completion. None while roots run."""
         import json
@@ -444,12 +466,14 @@ class InferenceService:
             return None
         return json.loads(text)
 
-    def pause(self):
+    def pause(self, *, timeout=None):
         """Fence neural forwards and retain queued work; native CPU proofs continue.
 
         Requires continuous mode. Active forwards are collected and installed,
         not abandoned. A failed fence retains its handle for close()/retry.
         Timed roots still use wall time; fixed-work roots retain their work.
+        By default wait for acknowledgement. A caller deadline may be supplied
+        in seconds; timing out retains the paused service and active handles.
         """
         import time
         if set(self.leases)-{token for token, _ in self.pending}:
@@ -459,9 +483,10 @@ class InferenceService:
             token, handle = self.pending[0]
             self.complete(token, handle.collect())
             self.pending.pop(0)
-        end = time.monotonic()+5.
+        end = None if timeout is None else time.monotonic()+timeout
         while not self.paused():
-            if time.monotonic()>=end:
+            self.done()  # Surface an owner failure instead of waiting forever.
+            if end is not None and time.monotonic()>=end:
                 raise TimeoutError('Native producers have not acknowledged the neural pause')
             time.sleep(.001)
 

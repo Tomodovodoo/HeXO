@@ -20,6 +20,7 @@ void hxp_cancel(void*);
 void hxp_resume(void*);
 int hxp_drain(void*);
 uint64_t hxp_generation(void*,int);
+const char* hxp_release(void*,int);
 }
 
 namespace inference {
@@ -45,14 +46,15 @@ struct Task {
  std::vector<Subscriber> subscribers;Clock::time_point queued;bool flight=false,live=true;
 };
 struct Broker;
-struct Command {int game,samples,views;uint64_t token,work;double ms,noise;std::vector<int64_t> cells;};
+struct Command {int game,samples,views;uint64_t token,work;double ms,noise;std::vector<int64_t> cells;
+ int kind=0;std::shared_ptr<gumbel::GameStore> replacement;bool tactics=false;double range=0;uint64_t seed=0;};
 struct Producer {
  Broker& broker;owner::Pool& pool;int model;
  std::thread thread;std::deque<std::shared_ptr<Job>> completed;
  std::vector<std::shared_ptr<Job>> outstanding;bool done=false;uint64_t pause_ack=0;
  std::deque<Command> commands;std::vector<uint64_t> epochs;
- std::vector<bool> requested,reported;
- Producer(Broker& b,owner::Pool& p,int m):broker(b),pool(p),model(m),epochs(p.games.size()),requested(p.games.size()),reported(p.games.size(),true){}
+ std::vector<bool> requested,reported,released;
+ Producer(Broker& b,owner::Pool& p,int m):broker(b),pool(p),model(m),epochs(p.games.size()),requested(p.games.size()),reported(p.games.size(),true),released(p.games.size()){}
  void run()noexcept;
  std::string result(int index,uint64_t token);
 };
@@ -103,14 +105,40 @@ struct Broker {
    for(auto& p:producers)p->thread=std::thread([source=p.get()]{source->run();});
   }catch(...){cancel();for(auto& p:producers)if(p->thread.joinable())p->thread.join();throw;}
  }
- void retarget(int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise){
+ void retarget(int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,gumbel::Tree* source=nullptr,const char* version=nullptr,uint64_t seed=0){
   if(!continuous || !started || cancelled || producer<0 || producer>=int(producers.size()) || count<0 || (count && !cells) ||
-     (!work && !(ms>0)) || !std::isfinite(ms) || ms<0 || samples<1 || samples>1024 || views<1 || views>64 || !std::isfinite(noise) || noise<0 || noise>1)
+     (!work && !(ms>0) && !source) || !std::isfinite(ms) || ms<0 || samples<1 || samples>1024 || views<1 || views>64 || !std::isfinite(noise) || noise<0 || noise>1)
    throw std::runtime_error("Invalid continuous search command");
   std::lock_guard lock(mutex);auto& p=*producers[producer];
   if(game<0 || game>=int(p.epochs.size()) || p.done || p.requested[game] || expected!=p.epochs[game] || !p.reported[game])
    throw std::runtime_error("Consume the matching game completion before retargeting");
+  if(p.released[game]!=(source!=nullptr))throw std::runtime_error("Release the previous game before replacing its slot");
   Command command{game,samples,views,expected+1,work,ms,noise,{}};if(count)command.cells.assign(cells,cells+2*count);
+  if(source){
+   auto& old=*p.pool.games[game];
+   if(std::any_of(old.game->pins.begin(),old.game->pins.end(),[&](const auto& pin){
+       return std::none_of(old.views.begin(),old.views.end(),[&](const auto& view){return pin.first==view.tree.get();});}))
+    throw std::runtime_error("Close retired caller trees before replacing their slot");
+   if(!version || p.pool.model!=version || !source->shared || source->state->scheduler_owner || !source->requests.empty() || count!=int(source->board.history.size()) ||
+      std::any_of(source->state->pins.begin(),source->state->pins.end(),[&](const auto& pin){return pin.first!=source;}))
+    throw std::runtime_error("Replacement requires a fresh graph of the slot's frozen model");
+   for(int i=0;i<count;++i)if(source->board.history[i].c!=Cell{cells[2*i],cells[2*i+1]})throw std::runtime_error("Replacement history mismatch");
+   command.kind=2;command.replacement=source->state;command.tactics=source->tactics;command.range=source->range_floor;command.seed=seed;
+  }
+  p.commands.push_back(std::move(command));p.requested[game]=true;
+  // A successful replacement transfers the source Tree. Destroy its caller
+  // pin before the producer can mutate the retained store; shared ownership
+  // alone would not prevent concurrent unordered_map mutation on close().
+  if(source)delete source;
+  wake.notify_all();
+ }
+ void release(int producer,int game,uint64_t expected){
+  std::lock_guard lock(mutex);
+  if(!continuous || !started || cancelled || producer<0 || producer>=int(producers.size()))throw std::runtime_error("Invalid continuous release");
+  auto& p=*producers[producer];
+  if(game<0 || game>=int(p.epochs.size()) || p.done || p.requested[game] || !p.reported[game] || p.released[game] || expected!=p.epochs[game])
+   throw std::runtime_error("Consume the matching root completion before releasing its game");
+  Command command{};command.game=game;command.token=expected+1;command.kind=1;
   p.requested[game]=true;p.commands.push_back(std::move(command));wake.notify_all();
  }
  void pause(bool value){
@@ -129,8 +157,8 @@ struct Broker {
   return paused && flights.empty() && std::all_of(producers.begin(),producers.end(),[&](const auto& p){return p->done || (p->pause_ack==pause_epoch && p->completed.empty());});
  }
  std::vector<Command> commands(Producer& p){std::lock_guard lock(mutex);std::vector<Command> out(p.commands.begin(),p.commands.end());p.commands.clear();return out;}
- void publish(Producer& p,int game,uint64_t token,std::string event){
-  std::lock_guard lock(mutex);p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;events.push_back({&p,game,std::move(event)});wake.notify_all();
+ void publish(Producer& p,int game,uint64_t token,std::string event,bool released=false){
+  std::lock_guard lock(mutex);p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;p.released[game]=released;events.push_back({&p,game,std::move(event)});wake.notify_all();
  }
  const char* event(){
   std::lock_guard lock(mutex);if(!error.empty())throw std::runtime_error(error);if(events.empty())return nullptr;
@@ -247,7 +275,7 @@ struct Broker {
 };
 inline void Producer::run()noexcept{
  try{
-  std::vector<uint64_t> active(pool.games.size());
+  std::vector<uint64_t> active(pool.games.size()),retiring(pool.games.size());
   while(!broker.cancelled && (broker.continuous || pool.admit())){
    for(auto& completion:broker.completions(*this)){
     auto& job=completion.job;std::vector<uint64_t> ids;
@@ -260,6 +288,22 @@ inline void Producer::run()noexcept{
     if(completion.finished)std::erase(outstanding,job);
    }
    for(auto& command:broker.commands(*this)){
+    if(command.kind==1){
+     pool.games[command.game]->stop();
+     if(pool.proof_retarget)pool.proof_retarget(pool.proof_owner,command.game);
+     retiring[command.game]=command.token;continue;
+    }
+    if(command.kind==2){
+     gumbel::Tree source(command.seed,command.replacement);source.shared=source.graph=true;
+     source.tactics=command.tactics;source.range_floor=command.range;
+     std::vector<Cell> history;for(size_t i=0;i<command.cells.size();i+=2)history.push_back({command.cells[i],command.cells[i+1]});source.root_at(history);
+     pool.replace(command.game,source,command.samples,command.views,command.work,command.ms,command.noise,command.seed);
+     if(!command.work && !command.ms){
+      auto producer=std::find_if(broker.producers.begin(),broker.producers.end(),[&](const auto& p){return p.get()==this;})-broker.producers.begin();
+      broker.publish(*this,command.game,command.token,"{\"kind\":\"replaced\",\"producer\":"+std::to_string(producer)+",\"model\":"+std::to_string(model)+",\"game\":"+std::to_string(command.game)+",\"token\":"+std::to_string(command.token)+'}');
+     }else active[command.game]=command.token;
+     continue;
+    }
     auto& o=*pool.games[command.game];o.sample_limit=command.samples;o.max_views=command.views;
     o.views[0].tree->root_noise=command.noise;
     pool.retarget(command.game,command.cells.data(),int(command.cells.size()/2),command.work,command.ms);
@@ -271,6 +315,13 @@ inline void Producer::run()noexcept{
     if(job->installed[row])continue;
     int remaining=hxgf_retire(pool.feed,job->ids[row]);if(remaining<0)throw std::runtime_error(gumbel::error);
     if(!remaining)broker.withdraw(job,int(row));
+   }
+   for(size_t i=0;i<retiring.size();++i)if(retiring[i]){
+    const char* effort=pool.proof_owner?hxp_release(pool.proof_owner,int(i)):"[]";
+    if(!effort)continue;
+    auto producer=std::find_if(broker.producers.begin(),broker.producers.end(),[&](const auto& p){return p.get()==this;})-broker.producers.begin();
+    std::string event="{\"kind\":\"released\",\"producer\":"+std::to_string(producer)+",\"model\":"+std::to_string(model)+",\"game\":"+std::to_string(i)+",\"token\":"+std::to_string(retiring[i])+",\"effort\":"+effort+'}';
+    broker.publish(*this,int(i),retiring[i],std::move(event),true);retiring[i]=0;progress=1;
    }
    if(broker.continuous)for(size_t i=0;i<active.size();++i)if(active[i] && pool.games[i]->stopped){
     auto token=active[i];auto event=result(int(i),token);active[i]=0;broker.publish(*this,int(i),token,std::move(event));progress=1;
@@ -340,6 +391,8 @@ HX_API int hxb_attach(void* p,void* pool,int model){try{static_cast<inference::B
 HX_API int hxb_start(void* p,double ms){try{static_cast<inference::Broker*>(p)->start(ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_continuous(void* p){auto& b=*static_cast<inference::Broker*>(p);if(b.started){gumbel::error="Configure continuous mode before starting";return 0;}b.continuous=true;return 1;}
 HX_API int hxb_retarget(void* p,int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise){try{static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_release(void* p,int producer,int game,uint64_t expected){try{static_cast<inference::Broker*>(p)->release(producer,game,expected);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_replace(void* p,int producer,int game,uint64_t expected,void* source,const char* version,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,uint64_t seed){try{if(!source)throw std::runtime_error("Missing replacement graph");static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise,static_cast<gumbel::Tree*>(source),version,seed);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API const char* hxb_event(void* p){try{return static_cast<inference::Broker*>(p)->event();}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 HX_API int hxb_pause(void* p,int paused){try{static_cast<inference::Broker*>(p)->pause(paused!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_paused(void* p){try{return static_cast<inference::Broker*>(p)->fenced();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}

@@ -3747,6 +3747,168 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_native_pause_waits_for_acknowledgement_unless_caller_sets_timeout(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=16)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.pause()
+        # A slow but healthy owner must not be aborted by an implicit deadline.
+        with unittest.mock.patch.object(service,'paused',side_effect=[False,False,True]), \
+             unittest.mock.patch('time.monotonic',side_effect=[0.,6.]), unittest.mock.patch('time.sleep'):
+            service.pause()
+        with unittest.mock.patch.object(service,'paused',return_value=False), \
+             unittest.mock.patch('time.monotonic',side_effect=[0.,6.]):
+            with self.assertRaisesRegex(TimeoutError,'acknowledged'):
+                service.pause(timeout=1.)
+        self.assertTrue(service.paused())
+        self.assertEqual(service.stats()['launched_rows'],0)
+        service.close()
+
+    def test_continuous_slot_replacement_survives_an_old_device_snapshot(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        import native_dense
+        torch.set_num_threads(2)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        old = NativeScheduler.graph(self)
+        pool = NativeScheduler.pool(self,[old],views=4,work=32,quantum=8)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.retarget(0,0,[(0,0)],ms=250.,views=4)
+        token, _, rows = service.take(100.)
+        service.complete(token,native_dense.submit(evaluator,rows).collect())
+        held = service.take(100.)
+        self.assertIsNotNone(held)
+        event, end = None, time.monotonic()+3
+        while event is None and time.monotonic()<end:
+            event = service.event()
+            time.sleep(.001)
+        self.assertIsNotNone(event)
+        saved = copy.deepcopy(event)
+        fresh = NativeScheduler.graph(self)
+        with self.assertRaisesRegex(ValueError,'Release the previous game'):
+            service.replace(0,0,fresh,expected=1,work=16,views=1)
+        service.release(0,0,expected=1)
+        with self.assertRaisesRegex(ValueError,'matching root completion'):
+            service.release(0,0,expected=1)
+        released, end = None, time.monotonic()+3
+        while released is None and time.monotonic()<end:
+            released = service.event()
+            time.sleep(.001)
+        self.assertEqual((released['kind'],released['token'],released['effort']),('released',2,[]))
+        with self.assertRaisesRegex(ValueError,'Close retired caller trees'):
+            service.replace(0,0,fresh,expected=2,work=16,views=1)
+        self.assertIsNotNone(fresh.ptr)  # Rejection leaves the new graph caller-owned.
+        old.close()  # Close only after retirement acknowledgement, before old-owner destruction.
+        other = NativeScheduler.graph(self,version='other-model')
+        with self.assertRaisesRegex(ValueError,'frozen model'):
+            service.replace(0,0,other,expected=2,work=16,views=1)
+        service.replace(0,0,fresh,expected=2,work=16,samples=4,views=1)
+        self.assertIsNone(fresh.ptr)  # Successful transfer closed the caller Tree before native mutation.
+        fresh.close()
+        token, _, rows = held
+        service.complete(token,native_dense.submit(evaluator,rows).collect())
+        replacement, end = None, time.monotonic()+5
+        while replacement is None and time.monotonic()<end:
+            service.pump()
+            replacement = service.event()
+        self.assertIsNotNone(replacement)
+        self.assertEqual((replacement['token'],replacement['completed'],replacement['root_completed']),(3,16,16))
+        self.assertEqual(replacement['history'],[[0,0]])
+        self.assertEqual(int(np.asarray(replacement['edges'])[:,7].sum()),16)
+        self.assertEqual(saved,event)
+        service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],
+                          service.stats()['active_producers']),(0,0,0))
+
+    def test_native_stream_refills_slots_and_preserves_mixed_model_targets(self):
+        from native_selfplay import play_stream
+        torch.set_num_threads(2)
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'stream-{k}',f'fixed-{k}','cpu',32,64) for k in range(2)]
+        settings = dense_config.ActorSettings(full_fraction=.5,full_sims=32,cheap_sims=8,root_samples=8,
+                                             cheap_root_samples=4,game_graph=192,max_plies=7,tactics=False,
+                                             opening_random_plies=0.,root_noise=.2)
+        games = [dense_selfplay.SelfPlayGame(models,replace(settings,max_plies=3),10,learner=1,
+                    opponent='fixed-0',native_owner=True),
+                 dense_selfplay.SelfPlayGame(models,settings,20,learner=1,opponent='fixed-0',native_owner=True)]
+        counts, overlap = [1,1], []
+        def refill(slot, finished):
+            if slot==0:
+                overlap.append(len(games[1].moves)<settings.max_plies)
+            if counts[slot]==3:
+                return None
+            counts[slot] += 1
+            return dense_selfplay.SelfPlayGame(models,settings,30+slot*10+counts[slot],learner=1,
+                                               opponent='fixed-0',native_owner=True)
+        episodes,rows,receipt = play_stream(games,refill,producers=2,quantum=8,views=4,cache=128)
+        self.assertEqual(len(episodes),6)
+        self.assertTrue(overlap[0])  # A replacement starts while another original game is still live.
+        self.assertTrue(all(e['reason']=='cap' for e in episodes))
+        self.assertEqual((receipt['inference']['pending_rows'],receipt['inference']['inflight_batches'],
+                          receipt['inference']['active_producers']),(0,0,0))
+        for index,episode in enumerate(episodes):
+            played = [r for r in rows if r['game']==index]
+            self.assertEqual([r['ply'] for r in played],list(range(len(episode['moves']))))
+            for row in played:
+                source = row['search']
+                self.assertEqual(source['model'],models[row['player']].sha)
+                self.assertEqual(source['root_completed'],source['comparison_credits'])
+                self.assertEqual(source['fresh_nodes'],0)
+                self.assertEqual(source['root_estimate'],episode['root_values'][row['ply']])
+                if row['player']==0:
+                    self.assertIsNone(row['policy'])
+                elif row['policy'] is not None:
+                    self.assertAlmostEqual(float(row['policy'].sum()),1.,places=6)
+        with tempfile.TemporaryDirectory() as run:
+            dense_data.write_shard(Path(run)/'shards'/'000001',dict(actor_sha256='stream-1'),episodes,rows)
+            window = dense_data.ReplayWindow(run,capacity_rows=1000,validation_fraction=0.)
+            refs = [window.ref(name,index) for name,index in window.index]
+            samples,targets = dense_data.examples(window,refs,np.random.default_rng(0))
+            self.assertTrue(samples)
+            self.assertTrue(all(np.isfinite(t['value']) for t in targets))
+            self.assertTrue(all(r.row['search']['source']=='native-root' for r in refs))
+
+    def test_native_stream_closes_each_solver_ledger_before_refilling(self):
+        from native_selfplay import play_stream
+        from tests.test_neural_search import NativeProofs
+        from tactical_proof import library, independent_verify
+        if not library().is_file():
+            self.skipTest('Build the tactical library first')
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY),'stream-proof','fixed','cpu',64,64)
+        settings = dense_config.ActorSettings(full_fraction=1.,full_sims=4096,game_graph=512,
+                                             max_plies=128,tactics=False,adjudicate_proven=True,
+                                             opening_random_plies=0.)
+        history = NativeProofs.opening
+        games = [dense_selfplay.SelfPlayGame([model,model],settings,230+i,native_owner=True,
+                 book=(dict(suite='test',key=str(i),ply=len(history)),history)) for i in range(2)]
+        counts = [1,1]
+        def refill(slot, finished):
+            if counts[slot]==2:
+                return None
+            counts[slot] += 1
+            return dense_selfplay.SelfPlayGame([model,model],settings,240+slot,native_owner=True,
+                    book=(dict(suite='test',key=f'new-{slot}',ply=len(history)),history))
+        episodes,rows,receipt = play_stream(games,refill,producers=1,proof_workers=1,slice_ms=25,views=4)
+        self.assertEqual(len(episodes),4)
+        self.assertTrue(all(e['winner']==0 and e['reason']=='proven' for e in episodes))
+        self.assertTrue(all(r['proven']==1 and r['proof_plies']>0 for r in rows))
+        self.assertTrue(all(r['search']['missing_fresh']==0 for r in rows))
+        self.assertEqual(sum(r['solver_nodes'] for r in rows),sum(s['fresh_nodes'] for s in receipt['proof_stats']))
+        self.assertGreater(sum(r['solver_nodes'] for r in rows),0)
+        self.assertGreater(len({r['search']['solver_generation'] for r in rows}),1)
+        for proof in receipt['proofs']:
+            self.assertIn('generation',proof)
+            self.assertEqual(independent_verify(proof['result']['certificate'],proof['request']['history'],
+                             attacker=proof['result']['attacker'],known=proof['request']['known']),proof['result']['status'])
+        self.assertTrue(all(s['active']==0 and s['queued']==0 and s['ready']==0 and s['tasks']==0
+                            and s['facts']==0 for s in receipt['proof_stats']))
+
     def test_continuous_pause_installs_a_partial_native_job_without_launching_the_rest(self):
         from native_scheduler import InferenceService
         from tests.test_neural_search import NativeScheduler
