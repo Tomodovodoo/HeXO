@@ -107,6 +107,28 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'search') {
   answer = [];
   for (const item of job.cases) answer.push(await search(item));
+} else if (job.kind === 'views') {
+  const parent = new GameGraph(native, {history: job.history, seed: 3});
+  const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}));
+  let view, proof;
+  try {
+    await parent.search({simulations: 16, rootSamples: 4, batchSize: 4, evaluate});
+    const before = parent.counters(), beforeCredits = parent.credits();
+    view = parent.view(job.history, 19);
+    await view.search({simulations: 32, rootSamples: 8, batchSize: 8, evaluate});
+    answer = {before, after: parent.counters(), beforeCredits, afterCredits: parent.credits(), viewCredits: view.credits()};
+    parent.close();
+    await view.search({simulations: 8, rootSamples: 4, batchSize: 4, evaluate});
+    answer.survived = view.counters();
+    native.checked(native.m._hxg_begin(view.ptr, 8, 4));
+    const [id, leaf] = view.request();
+    if (id <= 0) throw new Error('Expected a pending neural leaf');
+    proof = view.view(leaf.history, 4);
+    proof.proveLoss(1 - native.game(leaf.history).player, 7);
+    view.fulfill(id, leaf.actions, (await evaluate([leaf]))[0]);
+    answer.retired = view.counters();
+    answer.proofValue = proof.result().node_value;
+  } finally { proof?.close(); view?.close(); parent.close(); }
 } else if (job.kind === 'game') {
   const trees = new GameGraphs(native), cache = new EvaluationCache(), options = {seed: 1740, tactics: true, qRangeFloor: 0};
   const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map((_, i) => -2 * i), q: actions.map(() => 0)}));

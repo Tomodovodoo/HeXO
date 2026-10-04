@@ -324,6 +324,35 @@ export class GameGraph extends NeuralSearch {
     super(native, {...options, limit: options.limit ?? GRAPH_LIMIT});
     this.id = globalThis.crypto.randomUUID();
   }
+  /** Independent sampling into the same game store. All views belong to the same graph-owner worker. */
+  view(history = this.history, seed = 1740) {
+    if (!this.ptr) throw new Error('Graph is closed');
+    const cells = this.n.cells(history);
+    try {
+      const ptr = this.m._hxg_view(this.ptr, cells, history.length, BigInt(seed));
+      this.n.checked(ptr);
+      const view = Object.create(GameGraph.prototype);
+      Object.assign(view, {n: this.n, m: this.m, ptr, history: history.map(p => [...p]), id: globalThis.crypto.randomUUID()});
+      return view;
+    } finally { this.m._free(cells); }
+  }
+  /** Current-root issued/completed/cancelled, view pending, lifetime retired results, live game views. */
+  counters() {
+    const pointer = this.n.alloc(48);
+    try {
+      this.m._hxg_view_counters(this.ptr, pointer);
+      const values = Array.from(this.n.view(BigUint64Array, pointer, 6), Number);
+      return Object.fromEntries(['issued', 'completed', 'cancelled', 'pending', 'retired', 'views'].map((name, i) => [name, values[i]]));
+    } finally { this.m._free(pointer); }
+  }
+  /** Direct completed comparison credits, excluding inherited visits, in result() action order. */
+  credits() {
+    const count = this.m._hxg_root_credits(this.ptr, 0), pointer = this.n.alloc(8 * count);
+    try {
+      this.m._hxg_root_credits(this.ptr, pointer);
+      return Array.from(this.n.view(BigUint64Array, pointer, count), Number);
+    } finally { this.m._free(pointer); }
+  }
   /** Moves the root to the position after `history`, keeping every node's statistics. */
   at(history) {
     const cells = this.n.cells(history);
