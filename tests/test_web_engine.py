@@ -575,12 +575,15 @@ class Bundle(unittest.TestCase):
                         self.assertEqual(glimpse['root'], root)
 
     def test_root_candidates_are_published_before_the_solver_runs(self):
-        for turn in node(dict(kind='glimpse', history=[[0, 0], [1, 0]], simulations=32, nodes=16)):
-            self.assertTrue(turn['queries'])
-            self.assertTrue(all(q['preview'] for q in turn['queries']))
-            self.assertEqual(turn['progress'][0]['stage']['name'], 'checking proof')
-            fractions = [p['fraction'] for p in turn['progress']]
-            self.assertEqual(fractions, sorted(fractions))
+        root = [[0, 0], [1, 0]]
+        for simulations in (0, 32):
+            for turn in node(dict(kind='glimpse', history=root, simulations=simulations, nodes=16)):
+                self.assertTrue(turn['queries'])
+                self.assertTrue(all(q['preview'] for q in turn['queries']))
+                self.assertEqual(turn['progress'][0]['stage']['name'], 'checking proof')
+                fractions = [p['fraction'] for p in turn['progress']]
+                self.assertEqual(fractions, sorted(fractions))
+                self.assertEqual(turn['evaluations'].count(root), 1)
 
     def test_analysis_bar_uses_the_mover_at_half_turn_positions(self):
         history = [[0, 0], [1, 0], [1, 1], [-1, 0]]

@@ -142,6 +142,17 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   let failure = null, nodeValue = null;
   const note = r => { if (r.reason?.startsWith(FAILED)) failure = r.reason; return r; };
   const timed = ms != null, end = start + (ms ?? 0), solverEnd = start + .25 * (ms ?? 0);
+  const predict = async (history, actions) => {
+    const key = cache.key(history, network.version);
+    let prediction = cache.get(key);
+    if (prediction === undefined) {
+      const [found] = await network.evaluate([{history, actions}]);
+      prediction = {logits: Float64Array.from(found.logits), q: Float64Array.from(found.q)};
+      cache.put(key, prediction);
+    }
+    check();
+    return prediction;
+  };
   const deadline = Math.min(60000, Math.max(10000, Math.floor(solverNodes / 8)));
   const solverMs = () => timed ? Math.max(1, Math.floor(Math.min(deadline, solverEnd - performance.now()))) : deadline;
   let leafNodes = leafBudget, leafMs = Math.min(60000, Math.max(10000, Math.floor(leafBudget / 8)));
@@ -168,14 +179,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
     if (solverNodes) {
       postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking proof'}});
       if (!timed) {
-        const actions = native.legal(history), key = cache.key(history, network.version);
-        let prediction = cache.get(key);
-        if (prediction === undefined) {
-          const [found] = await network.evaluate([{history, actions}]);
-          prediction = {logits: Float64Array.from(found.logits), q: Float64Array.from(found.q)};
-          cache.put(key, prediction);
-        }
-        check();
+        const actions = native.legal(history), prediction = await predict(history, actions);
         const maximum = Math.max(...prediction.logits), weights = Array.from(prediction.logits, l => Math.exp(l - maximum));
         const total = weights.reduce((a, b) => a + b, 0), policy = weights.map(w => w / total);
         const action = actions[policy.indexOf(Math.max(...policy))];
@@ -225,8 +229,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       const stone = moves.length, stoneEnd = !timed || local.remaining === 1 || stone ? end : searchStart + .6 * (end - searchStart);
       const raw = async () => {
         actions = native.legal(current);
-        const [prediction] = await network.evaluate([{history: current, actions}]);
-        check();
+        const prediction = await predict(current, actions);
         const maximum = Math.max(...prediction.logits), weights = Array.from(prediction.logits, l => Math.exp(l - maximum));
         const total = weights.reduce((a, b) => a + b, 0);
         policy = weights.map(w => w / total);

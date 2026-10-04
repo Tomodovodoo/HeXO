@@ -190,7 +190,7 @@ if (job.kind === 'encode') {
   } finally { tree.close(); }
 } else if (job.kind === 'worker-turn' || job.kind === 'glimpse') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
-  const messages = [], queries = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
+  const messages = [], queries = [], evaluations = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
   const glimpsing = job.kind === 'glimpse', mover = native.game(job.history).player;
   let graph = null;
   const context = {Native, NeuralSearch, EvaluationCache, PV_CHECK, createModule, principalVariation, topRows,
@@ -202,6 +202,7 @@ if (job.kind === 'encode') {
     Stages, errorReport, stall,
     Network: {create: async () => ({version: 'uniform', precision: 'fp32', threads: 1,
       evaluate: async leaves => leaves.map(({history, actions}) => {
+        if (messages.some(m => m.type === 'ready')) evaluations.push(history);
         const value = glimpsing ? (native.game(history).player === mover ? .86 : -.86) : 0;
         return {logits: actions.map((_, i) => glimpsing ? -2 * i : 0), q: actions.map(() => value)};
       })})},
@@ -247,7 +248,7 @@ if (job.kind === 'encode') {
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);
   answer ??= glimpsing ? [1, 2].map(id => ({result: messages.find(m => m.id === id && m.type === 'result').result,
-    progress: messages.filter(m => m.id === id && m.type === 'progress').map(m => ({fraction: m.fraction, stage: m.stage})), queries,
+    progress: messages.filter(m => m.id === id && m.type === 'progress').map(m => ({fraction: m.fraction, stage: m.stage})), queries, evaluations,
     live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root})),
     checked: messages.some(m => m.id === id && m.root && native.game(m.root).player !== mover)}))
     : messages.find(m => m.type === 'result').result;
