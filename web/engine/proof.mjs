@@ -168,6 +168,7 @@ export class Proofs {
     this.seen = new Set();
     this.edgeCache = new Map();
     this.knownCache = new Map();
+    this.choiceCache = new Map();
     this.strategies = new Map();
     for (const {history, winner, plies, pv} of list) this.put(history, winner, plies, pv);
   }
@@ -239,6 +240,7 @@ export class Proofs {
     if (old && !(old.winner === winner && (plies < old.plies || plies === old.plies && witnessed(pv) > witnessed(old.pv)))) return;
     this.edgeCache.clear();
     this.knownCache.clear();
+    this.choiceCache.clear();
     const stones = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));
     this.entries.set(key, {history: history.map(([q, r]) => [q, r]), winner, plies, pv, stones});
     if (!this.sizes.has(history.length)) this.sizes.set(history.length, new Set());
@@ -318,6 +320,14 @@ export class Proofs {
   }
   /** The tightest stored guarantee, also considering shorter winning continuations. */
   choice(history) {
+    const at = JSON.stringify(history);
+    if (this.choiceCache.has(at)) return this.choiceCache.get(at);
+    const found = this.choose(history);
+    this.choiceCache.set(at, found);
+    if (this.choiceCache.size > 4096) this.choiceCache.delete(this.choiceCache.keys().next().value);
+    return found;
+  }
+  choose(history) {
     let own = this.entries.get(proofKey(history));
     if (!own && history.length > 1 && history.length % 2 === 1) {
       const mover = sideAt(history.length), base = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));

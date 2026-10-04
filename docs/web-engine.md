@@ -37,6 +37,22 @@ backup file, import and export, the opening book, tournaments and clocks. It dif
   it; hexo.tyto.cc game links cannot be read cross-site, so the page asks for the game's HTTTX. Tyto analysis links
   are decoded in the page.
 
+Large analysis records are stored as lossless compressed blobs in IndexedDB. Snapshots reuse immutable record
+versions, so saving a deeply analysed game does not copy its proof trees on the UI thread. Earlier plain records
+still load, and updating an evaluation does not replace the older version in a saved game. The decoded-record
+cache holds at most 32 MiB of JSON by byte count, separate from the session's active analysis.
+
+Game and backup downloads of at least 256 KiB use `.json.gz` when compression makes them smaller. Import accepts
+these files directly, as well as ordinary JSON. Individual game text is limited to 32 MiB; a whole-library backup
+may be larger. The JSON inside has the same format and retains all analysis records and certificates. The HTTP
+replay response remains ordinary JSON.
+
+On a 5,288,454-byte study with 153 records, a Chrome IndexedDB check measured repeated save submission at
+0.52 ms, down from 308 ms, and completion at 8.53 ms, down from 534 ms. A fresh storage instance restored the
+records in 81 ms and built their first display state in 249 ms. The previous restore and first state took
+202 ms and 332 ms. Importing through the page and downloading then reimporting its 364 KB compressed export
+preserved all 153 records exactly. This is a large analysis study, not a typical game's storage cost.
+
 ## Bubble networks
 
 `build_web.py model` downloads every GitHub release named `bubble-<step>` that carries an `ema.pt` and exports each

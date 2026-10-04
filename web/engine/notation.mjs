@@ -187,9 +187,25 @@ function readTyto(code) {
   return [[0, 0], ...Array.from({length: values.length / 2}, (_, i) => fromSite(values.slice(2 * i, 2 * i + 2)))];
 }
 
+const MAX_GAME_BYTES = 32 * 1024 * 1024;
+
+/** Lossless file compression, also used for immutable analysis records in IndexedDB. */
+export async function compressFile(blob) {
+  if (typeof CompressionStream !== 'function') return blob;
+  const data = await new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).blob();
+  return data.size < blob.size ? new Blob([data], {type: 'application/gzip'}) : blob;
+}
+
+/** Accept ordinary files and their gzip downloads. readGame limits individual games; backups may be larger. */
+export async function readGameFile(file) {
+  const header = new Uint8Array(await file.slice(0, 2).arrayBuffer());
+  if (header[0] !== 31 || header[1] !== 139) return file.text();
+  return new Response(file.stream().pipeThrough(new DecompressionStream('gzip'))).text();
+}
+
 export async function readGame(text, native, fetcher = fetch) {
   text = text.trim();
-  if (text.length > 1048576) throw Error('Game text exceeds 1 MB');
+  if (text.length > MAX_GAME_BYTES) throw Error('Game text exceeds 32 MB');
   let history;
   if (/^https?:\/\//.test(text)) {
     const url = new URL(text), params = new URLSearchParams(url.hash.slice(1));
