@@ -980,6 +980,39 @@ class GameGraphs(unittest.TestCase):
         self.assertEqual(list(self.engines.graphs), [('seat', 2), ('seat', 3), ('seat', 4)])
         self.assertIsNone(graph.ptr)
 
+    def test_live_values_stay_at_the_requested_root_during_reply_checks(self):
+        from types import SimpleNamespace
+        from play import player_at
+        history = [(0, 0), (1, 0), (1, 1), (-1, 0)]
+        bubble = self.engines.bubble(None)
+        for length in (1, 2, 3, 4):
+            root, mover = history[:length], player_at(length)
+
+            def fixed(histories):
+                predictions = Ranked().evaluate(histories)
+                for h, prediction in zip(histories, predictions):
+                    prediction['q'].fill(.86 if player_at(len(h)) == mover else -.86)
+                return predictions
+
+            bubble.evaluator = SimpleNamespace(evaluate=fixed)
+            for repeat in range(2):
+                with self.subTest(length=length, repeat=repeat):
+                    self.seen.clear()
+                    live = []
+                    def receive(found):
+                        live.append((list(self.graph(length).history), found))
+                    # Every batch may publish, including the reply check and a search on a reused graph.
+                    clock = SimpleNamespace(**(vars(time) | dict(monotonic=iter(range(10000)).__next__)))
+                    with unittest.mock.patch('play.time', clock):
+                        found, _, _ = self.engines.evaluate(dict(kind='bubble', path=Path(RUN.name)), '',
+                            dict(simulations=32, solver_nodes=0), root, lambda n: None, live=receive, line=length)
+                    self.assertGreater(len(self.seen), 1, 'The principal-variation check must run')
+                    self.assertTrue(live)
+                    self.assertAlmostEqual(found['value'], .93, places=4)
+                    for position, glimpse in live:
+                        self.assertAlmostEqual(glimpse['value'], found['value'], places=4)
+                        self.assertEqual(position, root)
+
 
 CHAMPION = Path(os.environ.get('HEXO_RUN', Path(__file__).resolve().parents[1] / 'runs' / 'dense-v1')) / \
     'checkpoints' / 'main' / '185000' / 'ema.pt'

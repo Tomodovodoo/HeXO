@@ -192,7 +192,8 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
           ...(line == null ? {} : {pvCheck: PV_CHECK}),
           evaluate, prove, stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
           onBatch: () => (line != null && (touched = tree.id), postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
-            ...(stone ? {} : {live: rootRows(tree, choice)})}))}), unmarked, local.player);
+            // The PV check moves the root past this turn, where the opponent's value and candidates apply.
+            ...(stone || tree.history.length !== history.length ? {} : {live: rootRows(tree, choice)})}))}), unmarked, local.player);
         if (line != null && result.completed) touched = tree.id;
         check();
         completed += result.completed;
