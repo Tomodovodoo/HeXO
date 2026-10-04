@@ -20,6 +20,7 @@ bind('hxgf_install', C.c_int, ptr, ptr, C.c_int, ptr, ptr, ptr, ptr, ptr, C.c_in
 bind('hxgf_detach', None, ptr, ptr)
 bind('hxgf_root_value', C.c_int, ptr, ptr, ptr)
 bind('hxgf_stats', None, ptr, ptr)
+bind('hxgf_queued', C.c_int64, ptr)
 bind('hxgf_profile', None, ptr, C.c_int)
 bind('hxgf_times', None, ptr, ptr)
 
@@ -135,6 +136,10 @@ class NativeFeed:
         native.hxgf_stats(self.ptr, result.ctypes.data)
         return dict(zip(('new_rows', 'joined', 'cache_hits', 'installed', 'pending_rows', 'pending_requests'),
                         map(int, result)))
+
+    def queued(self):
+        """Distinct unsubmitted neural rows, excluding cache hits and subscribers."""
+        return int(native.hxgf_queued(self.ptr))
 
     def profile(self, enabled=True):
         native.hxgf_profile(self.ptr, enabled)

@@ -1366,6 +1366,93 @@ class NativeScheduler(unittest.TestCase):
         pool.cancel()
         self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0, 0))
 
+    def test_ready_watermark_returns_before_walking_every_game_and_resumes_fairly(self):
+        game = Game([(0, 0)])
+        try:
+            histories = [[(0, 0), action] for action in game.legal_moves()[:24]]
+        finally:
+            game.close()
+        pool = self.pool([self.graph(h) for h in histories], quantum=4, views=1, work=4)
+        pool.limit_ready(4)
+        pool.step()
+        self.assertEqual(pool.feed.queued(), 4)
+        self.assertEqual(pool.feed.stats()['new_rows'], 4)
+        pool.step()
+        self.assertEqual(pool.feed.stats()['new_rows'], 4)
+        self.finish(pool)
+        self.assertTrue(all(g.stats()['completed'] == 4 for g in pool.games))
+        self.assertEqual(pool.feed.queued(), 0)
+
+    def test_watermark_does_not_split_a_tree_visit_layer(self):
+        pool = self.pool([self.graph()], quantum=16, views=1, work=32)
+        pool.limit_ready(1)
+        pool.step()
+        self.assertEqual(pool.feed.queued(), 1)
+        self.answer(pool)
+        pool.step()
+        # Finish gathering the layer even when it exceeds the queue watermark.
+        self.assertGreater(pool.feed.queued(), 1)
+        self.assertLessEqual(pool.feed.queued(), 16)
+        self.finish(pool)
+        self.assertEqual(pool.games[0].stats()['completed'], 32)
+
+    def test_bounded_supply_keeps_deeper_views_and_sampling_credits_separate(self):
+        pool = self.pool([self.graph(), self.graph([(0, 0), (1, 0), (2, 0)])],
+                         quantum=16, views=4, depth=4, work=128)
+        pool.limit_ready(2)
+        self.finish(pool)
+        for game in pool.games:
+            stats = game.stats()
+            self.assertGreater(stats['depth'], 0)
+            self.assertEqual(stats['issued'], stats['completed']+stats['cancelled'])
+            self.assertEqual(int(game.evidence()['lifetime_credits'].sum()), stats['root_completed'])
+        self.assertEqual((pool.feed.queued(), pool.feed.stats()['pending_requests']), (0, 0))
+
+    def test_ready_counter_excludes_subscribers_and_submitted_rows_during_cancel(self):
+        pool = self.pool([self.graph(), self.graph()], quantum=16, views=1, work=16)
+        pool.step()
+        self.assertEqual((pool.feed.queued(), pool.feed.stats()['pending_requests']), (1, 2))
+        batch = pool.feed.take(1)
+        self.assertEqual((pool.feed.queued(), pool.feed.stats()['pending_rows']), (0, 1))
+        pool.cancel(game=0)
+        self.answer(pool, batch)
+        pool.step()
+        self.assertGreater(pool.feed.queued(), 0)
+        pool.cancel()
+        self.assertEqual((pool.feed.queued(), pool.feed.stats()['pending_rows']), (0, 0))
+
+    def test_full_ready_queue_still_services_the_clock_without_admission_calls(self):
+        import time
+        pool = self.pool([self.graph(), self.graph()], quantum=16, views=1, work=64)
+        pool.limit_ready(1)
+        pool.clock(100.)
+        pool.step()
+        self.assertEqual(pool.feed.queued(), 1)
+        time.sleep(.12)
+        pool.step()
+        self.assertTrue(pool.done())
+        self.assertTrue(all(g.stats()['deadline'] for g in pool.games))
+        self.assertEqual((pool.feed.queued(), pool.feed.stats()['pending_requests']), (0, 0))
+
+    def test_full_ready_queue_retires_a_cold_root_proved_by_another_producer(self):
+        graph = self.graph()
+        pool = self.pool([graph], quantum=16, views=1, work=64)
+        pool.limit_ready(1)
+        pool.step()
+        self.assertEqual(pool.feed.queued(), 1)
+        # Caller-verified defender evidence reaches the shared cold node.
+        self.assertTrue(native.hxg_prove_loss(graph.ptr, 0, 7))
+        pool.step()
+        self.assertTrue(pool.done())
+        self.assertEqual((pool.feed.queued(), pool.feed.stats()['pending_requests']), (0, 0))
+        self.assertEqual(pool.games[0].records()[-1]['root_estimate'], -1.)
+        game = Game([(0, 0)])
+        try:
+            self.assertEqual(pool.games[0].evidence()['actions'].tolist(),
+                             [list(a) for a in game.legal_moves()])
+        finally:
+            game.close()
+
     def test_unexpanded_exact_child_records_the_proof_instead_of_an_unset_mean(self):
         from neural_search import checked
         history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]

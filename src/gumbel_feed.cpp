@@ -69,7 +69,7 @@ struct Feed {
  std::unordered_map<Key,Cached,Hash> cache;
  std::list<Key> recency;
  std::unordered_map<void*,Root> roots;
- int64_t new_rows=0,joins=0,hits=0,installed=0;
+ int64_t new_rows=0,joins=0,hits=0,installed=0,queued=0;
  bool profile=false;
  uint64_t select_ns=0,identity_ns=0,cached_ns=0,install_ns=0;
  explicit Feed(int limit):capacity(limit) { if(limit<0)throw std::runtime_error("Negative feed cache capacity"); }
@@ -124,7 +124,7 @@ struct Feed {
     if(next==0)throw std::runtime_error("Feed task identity exhausted");
     uint64_t id=next++;pending.emplace(key,id);
     tasks.emplace(id,Task{std::move(key),std::move(history),{{tree,request}}});ready.push_back(id);
-    ++added;++new_rows;
+    ++added;++new_rows;++queued;
    }
   }
   out[0]=added;out[1]=hits-initial_hits;out[2]=joins-initial_joins;out[3]=progress;
@@ -143,7 +143,7 @@ struct Feed {
   for(auto it=tasks.begin();it!=tasks.end();){
    auto& t=it->second;
    std::erase_if(t.subscribers,[&](Subscriber s){return s.tree==tree;});
-   if(t.subscribers.empty()&&!t.submitted){pending.erase(t.key);it=tasks.erase(it);}else ++it;
+   if(t.subscribers.empty()&&!t.submitted){--queued;pending.erase(t.key);it=tasks.erase(it);}else ++it;
   }
  }
 };
@@ -182,7 +182,7 @@ HX_API int hxgf_take(void* p,int count,uint64_t* ids,void** trees,int* requests,
   auto& task=f.tasks.at(batch[i]);auto subscriber=task.subscribers.front();
   ids[i]=batch[i];trees[i]=subscriber.tree;requests[i]=subscriber.request;
   if(!handles_only){offsets[i]=size;if(!task.history.empty())std::copy(task.history.begin(),task.history.end(),history+2*size);}
-  size+=task.history.size()/2;task.submitted=true;
+  size+=task.history.size()/2;task.submitted=true;--f.queued;
  }
  if(!handles_only)offsets[count]=size;
  while(!f.ready.empty()){
@@ -231,6 +231,8 @@ HX_API void hxgf_stats(void* p,int64_t* out){
  auto& f=*static_cast<feeding::Feed*>(p);int64_t subscribers=0;for(auto& [id,t]:f.tasks)subscribers+=t.subscribers.size();
  out[0]=f.new_rows;out[1]=f.joins;out[2]=f.hits;out[3]=f.installed;out[4]=int64_t(f.tasks.size());out[5]=subscribers;
 }
+// Distinct neural rows ready to launch, excluding submitted work and subscribers.
+HX_API int64_t hxgf_queued(void* p){return static_cast<feeding::Feed*>(p)->queued;}
 HX_API void hxgf_profile(void* p,int enabled){static_cast<feeding::Feed*>(p)->profile=enabled!=0;}
 HX_API void hxgf_times(void* p,uint64_t* out){auto& f=*static_cast<feeding::Feed*>(p);out[0]=f.select_ns;out[1]=f.identity_ns;out[2]=f.cached_ns;out[3]=f.install_ns;}
 }
@@ -238,5 +240,5 @@ HX_API void hxgf_times(void* p,uint64_t* out){auto& f=*static_cast<feeding::Feed
 // Cancelled subscribers are detached before this call. Caller has fenced any GPU reads.
 extern "C" HX_API int hxgf_abandon_all(void* p){try{
  auto& f=*static_cast<feeding::Feed*>(p);for(auto& [id,t]:f.tasks)if(!t.subscribers.empty())throw std::runtime_error("Detach all subscribers before abandoning tasks");
- f.tasks.clear();f.pending.clear();f.ready.clear();return 1;
+ f.tasks.clear();f.pending.clear();f.ready.clear();f.queued=0;return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
