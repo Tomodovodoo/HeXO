@@ -74,6 +74,29 @@ struct Batch {
   if(legal && !hxg_encode_many(trees,requests,count,info.data(),planes.data(),bytes,cells.data(),actions.data(),legal))
    throw std::runtime_error(gumbel::error);
   // Match the evaluator's adjacent-size merge, retaining every row's original mapping.
+  regroup(std::move(by_size),merge_cells);
+ }
+ // Combine immutable row snapshots. The inference service never reads live trees.
+ Batch(void* const* sources,const int* rows,int count,int merge_cells,bool):info(12*int64_t(count)),offsets(count+1),decoded(count){
+  if(count<1 || merge_cells<0)throw std::runtime_error("Invalid snapshot combination");
+  std::map<int,std::vector<int>> by_size;
+  for(int i=0;i<count;++i){
+   if(!sources[i])throw std::runtime_error("Missing row snapshot");
+   auto& source=*static_cast<Batch*>(sources[i]);int id=rows[i];
+   if(id<0 || id>=int(source.decoded.size()))throw std::runtime_error("Invalid snapshot row");
+   const auto* original=source.info.data()+12*int64_t(id);auto* row=info.data()+12*int64_t(i);
+   std::copy(original,original+12,row);row[10]=int64_t(planes.size());row[11]=int64_t(cells.size());offsets[i]=int64_t(cells.size());
+   if(row[0]==-2){decoded[i]=1;continue;}
+   int64_t first=source.offsets[id],last=source.offsets[id+1],bytes=8*row[0]*row[0];
+   planes.insert(planes.end(),source.planes.begin()+original[10],source.planes.begin()+original[10]+bytes);
+   cells.insert(cells.end(),source.cells.begin()+first,source.cells.begin()+last);
+   actions.insert(actions.end(),source.actions.begin()+2*first,source.actions.begin()+2*last);
+   by_size[int(row[0])].push_back(i);
+  }
+  offsets[count]=int64_t(cells.size());logits.resize(cells.size());values.resize(cells.size());
+  regroup(std::move(by_size),merge_cells);
+ }
+ void regroup(std::map<int,std::vector<int>> by_size,int merge_cells){
   for(auto it=by_size.begin();it!=by_size.end();){auto next=std::next(it);if(next==by_size.end())break;
    if(int64_t(it->second.size())*(next->first*next->first-it->first*it->first)<merge_cells){
     next->second.insert(next->second.begin(),it->second.begin(),it->second.end());by_size.erase(it);
@@ -119,6 +142,10 @@ extern "C" {
 HX_API void* hxgp_new(void* const* trees,const int* requests,int count,int merge_cells){try{
  if(count<1 || !trees || !requests)throw std::runtime_error("Invalid packed batch inputs");
  return new packing::Batch(trees,requests,count,merge_cells);
+}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+HX_API void* hxgp_combine(void* const* sources,const int* rows,int count,int merge_cells){try{
+ if(!sources || !rows)throw std::runtime_error("Missing snapshot combination");
+ return new packing::Batch(sources,rows,count,merge_cells,true);
 }catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 HX_API void hxgp_free(void* p){delete static_cast<packing::Batch*>(p);}
 HX_API int hxgp_groups(void* p){return int(static_cast<packing::Batch*>(p)->groups.size());}

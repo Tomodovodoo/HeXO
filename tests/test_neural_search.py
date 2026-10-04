@@ -1268,6 +1268,99 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual((graph.history, late.summary()['searched'], late.step(None)), (a, False, 0))
 
 class NativeScheduler(unittest.TestCase):
+    def test_native_service_coalesces_producers_and_isolates_model_predictions(self):
+        import ctypes as C
+        from neural_search import bind, ptr
+        bind('hxgp_groups', C.c_int, ptr)
+        bind('hxgp_group', C.c_int, ptr, C.c_int, ptr)
+        bind('hxgp_decode', C.c_int, ptr, C.c_int, C.c_int, C.c_int, ptr, C.c_int64)
+        bind('hxgp_outputs', C.c_int, ptr, ptr)
+        bind('hxgp_free', None, ptr)
+        pools = [self.pool([self.graph(version=version)], views=1, work=16)
+                 for version in ('scheduler','scheduler','other')]
+        service = native.hxb_new(16, 2, 0, 20.)
+        leases, models = {}, set()
+        try:
+            self.assertTrue(native.hxb_attach(service, pools[0].ptr, 0))
+            self.assertTrue(native.hxb_attach(service, pools[1].ptr, 0))
+            self.assertEqual(native.hxb_attach(service, pools[2].ptr, 0), 0)
+            self.assertTrue(native.hxb_attach(service, pools[2].ptr, 1))
+            self.assertEqual(native.hxgm_step(pools[0].ptr), -1)
+            self.assertEqual(native.hxgm_free(pools[0].ptr), 0)
+            self.assertTrue(native.hxb_start(service, 0.))
+            for _ in range(1000):
+                if native.hxb_done(service):
+                    break
+                token, model, snapshot = C.c_uint64(), C.c_int(), ptr()
+                count = native.hxb_take(service, 128, 50., C.byref(token), C.byref(model), C.byref(snapshot))
+                self.assertGreaterEqual(count, 0, native.hxg_error().decode())
+                if not count:
+                    continue
+                leases[token.value] = snapshot.value
+                models.add(model.value)
+                value = .25 if model.value==0 else -.5
+                for group in range(native.hxgp_groups(snapshot)):
+                    size = np.empty(2, np.int64)
+                    self.assertTrue(native.hxgp_group(snapshot, group, size.ctypes.data))
+                    side, rows = map(int,size)
+                    output = np.zeros((rows,side*side+2), np.float32)
+                    output[:,-1] = 2*np.arctanh(value)
+                    self.assertTrue(native.hxgp_decode(snapshot, group, 0, rows, output.ctypes.data, output.size))
+                outputs = (ptr*4)()
+                self.assertTrue(native.hxgp_outputs(snapshot, outputs))
+                self.assertTrue(native.hxb_complete(service, token, *outputs))
+                native.hxgp_free(snapshot)
+                del leases[token.value]
+            else:
+                self.fail('Native producer service did not complete bounded work')
+            self.assertEqual(models, {0,1})
+            counters = np.empty(10, np.uint64)
+            native.hxb_stats(service, counters.ctypes.data)
+            self.assertGreater(counters[1], 0)
+            self.assertEqual(tuple(counters[7:]), (0,0,0))
+        finally:
+            native.hxb_cancel(service)
+            for token,snapshot in leases.items():
+                native.hxb_abort(service, token)
+                native.hxgp_free(snapshot)
+            self.assertTrue(native.hxb_join(service))
+            self.assertTrue(native.hxb_free(service))
+        for pool,value in zip(pools,(.25,.25,-.5)):
+            stats = pool.games[0].stats()
+            self.assertEqual((stats['completed'],stats['pending']), (16,0))
+            self.assertEqual(int(pool.games[0].evidence()['lifetime_credits'].sum()), 16)
+            self.assertAlmostEqual(pool.games[0].records()[0]['raw_value'], value)
+            self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']), (0,0))
+
+    def test_native_service_refuses_free_until_its_batch_is_fenced(self):
+        import ctypes as C
+        from neural_search import bind, ptr
+        bind('hxgp_free', None, ptr)
+        pool = self.pool([self.graph()], views=1, work=16)
+        service = native.hxb_new(16,2,0,0.)
+        token, model, snapshot = C.c_uint64(), C.c_int(), ptr()
+        try:
+            self.assertTrue(native.hxb_attach(service, pool.ptr, 0))
+            self.assertTrue(native.hxb_start(service, 1000.))
+            count = native.hxb_take(service,128,1000.,C.byref(token),C.byref(model),C.byref(snapshot))
+            self.assertGreater(count,0)
+            self.assertEqual(native.hxb_join(service),0)
+            self.assertEqual(native.hxb_free(service),0)
+            # This check launched no GPU; the immutable batch is already fenced.
+            self.assertTrue(native.hxb_abort(service,token))
+            native.hxgp_free(snapshot)
+            token.value=0
+            self.assertTrue(native.hxb_join(service))
+        finally:
+            native.hxb_cancel(service)
+            if token.value:
+                native.hxb_abort(service,token)
+                native.hxgp_free(snapshot)
+            self.assertTrue(native.hxb_join(service))
+            self.assertTrue(native.hxb_free(service))
+        self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
+        self.assertEqual(native.hxg_exact(native.hxgo_root(pool.games[0].ptr)),-1)
+
     def graph(self, history=((0, 0),), version='scheduler'):
         graph = GameGraph(Uniform(), version, history, limit=96)
         self.addCleanup(graph.close)

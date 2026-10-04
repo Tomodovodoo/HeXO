@@ -25,6 +25,17 @@ class PackedRows:
         if not self.ptr:
             checked(False)
         self.count = len(requests)
+        self._groups()
+
+    @classmethod
+    def from_native(cls, pointer, count):
+        """Adopt an immutable service snapshot; close() owns its native deletion."""
+        batch = cls.__new__(cls)
+        batch.ptr, batch.count = pointer, count
+        batch._groups()
+        return batch
+
+    def _groups(self):
         self.groups = []
         for index in range(native.hxgp_groups(self.ptr)):
             info = np.empty(2, np.int64)

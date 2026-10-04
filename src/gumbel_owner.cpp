@@ -204,6 +204,7 @@ struct Pool {
  std::vector<std::unique_ptr<Owner>> games;std::vector<bool> failed;
  std::string model;size_t cursor=0;int ready_limit=0,host_workers=1;uint64_t steps=0,retargets=0;bool stopped=false;
  void* proof_owner=nullptr;void (*proof_step)(void*)=nullptr;void (*proof_retarget)(void*,int)=nullptr;
+ void* inference_owner=nullptr;
  Pool(void** sources,int count,int capacity,int quantum,int views,int depth,uint64_t work,const char* version,uint64_t seed):owned_feed(hxgf_new(capacity)),feed(owned_feed.get()),model(version?version:""){
   if(!sources || count<1 || count>1024 || !feed || model.empty())throw std::runtime_error("Invalid multi-game pool");
   games.reserve(count);failed.resize(count);
@@ -279,26 +280,27 @@ struct Pool {
   return 1;
  }
 };
+Pool& caller(void* p){auto& pool=*static_cast<Pool*>(p);if(pool.inference_owner)throw std::runtime_error("Pool belongs to its native inference producer");return pool;}
 }
 extern "C" HX_API void* hxgm_new(void** sources,int count,int capacity,int quantum,int views,int depth,uint64_t work,const char* version,uint64_t seed){try{return new owner::Pool(sources,count,capacity,quantum,views,depth,work,version,seed);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
-extern "C" HX_API int hxgm_free(void* p){auto& pool=*static_cast<owner::Pool*>(p);if(pool.proof_owner){gumbel::error="Close the proof loop before freeing its search pool";return 0;}pool.stop();int64_t stats[6];hxgf_stats(pool.feed,stats);if(stats[4]){gumbel::error="Drain or fenced-abandon global tasks before freeing pool";return 0;}delete &pool;return 1;}
-extern "C" HX_API int hxgm_step(void* p){try{return static_cast<owner::Pool*>(p)->step();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
-extern "C" HX_API int hxgm_ready_limit(void* p,int rows){if(rows<0 || rows>16384){gumbel::error="Invalid neural ready limit";return 0;}static_cast<owner::Pool*>(p)->ready_limit=rows;return 1;}
+extern "C" HX_API int hxgm_free(void* p){auto& pool=*static_cast<owner::Pool*>(p);if(pool.inference_owner){gumbel::error="Close the inference service before freeing its search pool";return 0;}if(pool.proof_owner){gumbel::error="Close the proof loop before freeing its search pool";return 0;}pool.stop();int64_t stats[6];hxgf_stats(pool.feed,stats);if(stats[4]){gumbel::error="Drain or fenced-abandon global tasks before freeing pool";return 0;}delete &pool;return 1;}
+extern "C" HX_API int hxgm_step(void* p){try{return owner::caller(p).step();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
+extern "C" HX_API int hxgm_ready_limit(void* p,int rows){try{if(rows<0 || rows>16384)throw std::runtime_error("Invalid neural ready limit");owner::caller(p).ready_limit=rows;return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxgm_workers(void* p,int count){try{
- auto& pool=*static_cast<owner::Pool*>(p);if(pool.steps)throw std::runtime_error("Configure native host workers before the first phase");
+ auto& pool=owner::caller(p);if(pool.steps)throw std::runtime_error("Configure native host workers before the first phase");
  if(!hxgf_workers(pool.feed,count,[](void* tree)->void*{return static_cast<gumbel::Tree*>(tree)->state.get();}))throw std::runtime_error(gumbel::error);
  pool.host_workers=count;return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-extern "C" HX_API int hxgm_cancel(void* p){try{auto& pool=*static_cast<owner::Pool*>(p);pool.stop();if(pool.proof_step)pool.proof_step(pool.proof_owner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-extern "C" HX_API int hxgm_cancel_game(void* p,int i){try{auto& pool=*static_cast<owner::Pool*>(p);if(i<0 || i>=int(pool.games.size()))return 0;pool.games[i]->stop();pool.stopped=std::all_of(pool.games.begin(),pool.games.end(),[](const auto& o){return o->stopped;});if(pool.proof_step)pool.proof_step(pool.proof_owner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-extern "C" HX_API int hxgm_clock(void* p,double ms){try{static_cast<owner::Pool*>(p)->clock(ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-extern "C" HX_API int hxgm_retarget(void* p,int i,const int64_t* history,int count,uint64_t work,double ms){try{static_cast<owner::Pool*>(p)->retarget(i,history,count,work,ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-extern "C" HX_API int hxgm_admit(void* p){try{return static_cast<owner::Pool*>(p)->admit();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
+extern "C" HX_API int hxgm_cancel(void* p){try{auto& pool=owner::caller(p);pool.stop();if(pool.proof_step)pool.proof_step(pool.proof_owner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+extern "C" HX_API int hxgm_cancel_game(void* p,int i){try{auto& pool=owner::caller(p);if(i<0 || i>=int(pool.games.size()))return 0;pool.games[i]->stop();pool.stopped=std::all_of(pool.games.begin(),pool.games.end(),[](const auto& o){return o->stopped;});if(pool.proof_step)pool.proof_step(pool.proof_owner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+extern "C" HX_API int hxgm_clock(void* p,double ms){try{owner::caller(p).clock(ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+extern "C" HX_API int hxgm_retarget(void* p,int i,const int64_t* history,int count,uint64_t work,double ms){try{owner::caller(p).retarget(i,history,count,work,ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+extern "C" HX_API int hxgm_admit(void* p){try{return owner::caller(p).admit();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 extern "C" HX_API int hxgm_done(void* p){return static_cast<owner::Pool*>(p)->stopped;}
 extern "C" HX_API void* hxgm_feed(void* p){return static_cast<owner::Pool*>(p)->feed;}
 extern "C" HX_API void* hxgm_owner(void* p,int i){auto& pool=*static_cast<owner::Pool*>(p);return i<0 || i>=int(pool.games.size())?nullptr:pool.games[i].get();}
 extern "C" HX_API const char* hxgm_model(void* p){return static_cast<owner::Pool*>(p)->model.c_str();}
-extern "C" HX_API int hxgm_install(void* p,const uint64_t* ids,int count,const int64_t* offsets,const int64_t* actions,const double* logits,const double* values){try{return static_cast<owner::Pool*>(p)->install(ids,count,offsets,actions,logits,values);}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+extern "C" HX_API int hxgm_install(void* p,const uint64_t* ids,int count,const int64_t* offsets,const int64_t* actions,const double* logits,const double* values){try{return owner::caller(p).install(ids,count,offsets,actions,logits,values);}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API void hxgm_stats(void* p,uint64_t* out){auto& pool=*static_cast<owner::Pool*>(p);uint64_t active=0,failed=0;for(size_t i=0;i<pool.games.size();++i){active+=!pool.games[i]->stopped;failed+=pool.failed[i];}std::array<uint64_t,5> stats{pool.steps,uint64_t(pool.games.size()),active,failed,pool.retargets};std::copy(stats.begin(),stats.end(),out);}
 extern "C" HX_API int hxgm_history(void* p,int i,int64_t* out){auto& pool=*static_cast<owner::Pool*>(p);if(i<0 || i>=int(pool.games.size()))return -1;auto& h=pool.games[i]->focus;if(out)for(size_t j=0;j<h.size();++j){out[2*j]=h[j].q;out[2*j+1]=h[j].r;}return int(h.size());}
 // Feed pruning runs between graph phases, before encoded snapshots are taken.
@@ -311,4 +313,6 @@ extern "C" HX_API int hxg_retire(void* p,int id){try{
 extern "C" HX_API int hxgm_record_history(void* p,int game,int record,int64_t* out){auto& pool=*static_cast<owner::Pool*>(p);if(game<0 || game>=int(pool.games.size()) || record<0 || record>=int(pool.games[game]->records.size()))return -1;auto& h=pool.games[game]->records[record].history;if(out)for(size_t j=0;j<h.size();++j){out[2*j]=h[j].q;out[2*j+1]=h[j].r;}return int(h.size());}
 
 extern "C" HX_API int hxgo_history(void* p,int64_t* out){auto& h=static_cast<owner::Owner*>(p)->focus;if(out)for(size_t i=0;i<h.size();++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}
+
+#include "gumbel_broker.hpp"
 extern "C" HX_API int hxgo_record_history(void* p,int record,int64_t* out){auto& o=*static_cast<owner::Owner*>(p);if(record<0 || record>=int(o.records.size()))return -1;auto& h=o.records[record].history;if(out)for(size_t i=0;i<h.size();++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}
