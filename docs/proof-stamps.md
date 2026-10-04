@@ -37,8 +37,13 @@ add a missing reply. Protected cells keep the recorded moves available, and
 the counter-threat guards prevent a defender from winning instead of answering.
 The resulting induction follows the checked strategy to six in a row.
 
+The compiler shares identical proof branches before applying the strategy size
+limit. The checker still verifies each branch in its own board context.
+
 The compiler also tries the proof again with only its supporting stones left.
-When that replay succeeds, it saves this smaller source position. Composed
+It uses that smaller source only if its stamp still matches the original board.
+Removing enemy blockers can otherwise create a shorter strategy that cannot
+work with those blockers present. Composed
 proofs are expanded and rechecked before saving, so learning cannot create
 ever-growing chains of imported strategies.
 
@@ -87,7 +92,8 @@ attacking turn supplied through `root_moves`.
 
 `tools/tactical/stamps.json` contains primitive strategies produced by HeXO.
 `tools/proof_stamps.py --out PATH` regenerates them and runs the independent
-checker. The native worker checks these sources on first use. An explicit
+checker. The native worker checks these sources on first use. If a short query
+expires during loading, the next query resumes at the first unfinished entry. An explicit
 `library` list supplies other checked sources; `library=[]` skips builtin seeding
 without clearing strategies already learned in that worker.
 
