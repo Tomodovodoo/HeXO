@@ -751,7 +751,7 @@ def proof_plies(proof, history):
         game.close()
 
 
-def proof_line_length(history, winner, pv):
+def proof_line_length(history, winner, pv, offset=0):
     """Length of a drawn line ending in six; an incomplete line cannot win a distance tie."""
     if not pv or any(len(p) != 4 for p in pv):
         return math.inf
@@ -768,7 +768,7 @@ def proof_line_length(history, winner, pv):
                     break
                 count += 1
         if count >= 6:
-            return ply
+            return ply - offset
     return math.inf
 
 
@@ -825,15 +825,17 @@ class Proofs:
         current, pv, i = list(history), outcome.get('pv') or [], 0
         with self.lock:
             while i <= len(pv):
+                length = proof_line_length(current, outcome['winner'], pv[i:], i)
                 ready = self.known_cache.get(proof_key(current)) if i else None
                 if (ready is not None and ready['winner'] == outcome['winner'] and ready['plies'] + i <= outcome['plies']
-                        and math.isfinite(proof_line_length(current, ready['winner'], ready['pv']))):
+                        and math.isfinite(proof_line_length(current, ready['winner'], ready['pv']))
+                        and (ready['plies'] + i < outcome['plies'] or proof_line_length(current, ready['winner'], ready['pv']) <= length)):
                     return pv[:i] + [[*p[:3], p[3]+i] for p in ready['pv']]
                 entry = self.choice(current)
+                replacement = proof_line_length(current, entry['winner'], entry['pv']) if entry is not None else math.inf
                 if (entry is not None and entry['winner'] == outcome['winner'] and entry['plies'] + i <= outcome['plies']
-                        and (entry['plies'] + i < outcome['plies'] or len(entry['pv']) > len(pv) - i
-                             or proof_line_length(current, entry['winner'], entry['pv']) <
-                             proof_line_length(current, outcome['winner'], [[*p[:3], p[3]-i] for p in pv[i:] if len(p) == 4]))
+                        and (entry['plies'] + i < outcome['plies'] or replacement < length
+                             or replacement == length and len(entry['pv']) > len(pv) - i)
                         and all(len(p) == 4 for p in entry['pv'])):
                     pv = pv[:i] + [[*p[:3], p[3] + i] for p in entry['pv']]
                 if player_at(len(current)) != outcome['winner']:
@@ -895,7 +897,7 @@ class Proofs:
                     if len(missing) != 1 or len(replaced) != 1:
                         continue
                     first, prior = next(iter(missing)), next(iter(replaced))
-                    if first[2] != mover or prior != (*map(int, history[-1]), mover):
+                    if first[2] != mover or prior[2] != mover:
                         continue
                     outcome = dict(winner=entry['winner'], plies=entry['plies'] - 1, pv=[])
                     found[first[:2]] = (entry['winner'], entry['plies'], outcome)
@@ -925,8 +927,9 @@ class Proofs:
         with self.lock:
             entry = self.entries.get(proof_key(history))
             if entry is None and len(history) > 1 and len(history) % 2 == 1:
-                # Either order of the just-completed losing turn has the same
-                # outcome. A scalar win does not supply the next winning move.
+                # A losing half-turn covers adding any legal stone of its mover,
+                # even when that stone was earlier in this reordered history.
+                # A scalar win does not supply the next winning move.
                 base = frozenset((int(q), int(r), player_at(i)) for i, (q, r) in enumerate(history))
                 mover = player_at(len(history))
                 candidates = []
@@ -935,7 +938,7 @@ class Proofs:
                     if loss['winner'] != mover or loss['plies'] < 2 or not loss['stones'] < base:
                         continue
                     missing = next(iter(base - loss['stones']))
-                    if missing not in {(*map(int, p), 1-mover) for p in history[-2:]}:
+                    if missing[2] != 1-mover:
                         continue
                     candidates.append(dict(winner=mover, plies=loss['plies'] - 1, pv=[]))
                 if candidates:

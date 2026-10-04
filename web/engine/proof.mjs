@@ -128,7 +128,7 @@ const shifted = (pv, by) => pv.map(([q, r, side, ply]) => [q, r, side, ply + by]
 // A complete drawn line can break ties between equal proof bounds. A partial
 // line is not a quicker win. Omitted, irrelevant defender stones keep their
 // placement numbers, as in principalVariation's unstoppable ending.
-function lineLength(history, winner, pv) {
+function lineLength(history, winner, pv, offset = 0) {
   if (!pv.length || pv.some(p => p.length !== 4)) return Infinity;
   const own = new Set(history.filter((_, i) => sideAt(i) === winner).map(p => p.join(',')));
   for (const [q, r, side] of pv) if (side === winner) own.add(`${q},${r}`);
@@ -137,7 +137,7 @@ function lineLength(history, winner, pv) {
   for (const [dq, dr] of [[1, 0], [0, 1], [1, -1]]) {
     let count = 1;
     for (const sign of [-1, 1]) for (let i = 1; i < 6 && own.has(`${q + sign * i * dq},${r + sign * i * dr}`); i++) count++;
-    if (count >= 6) return ply;
+    if (count >= 6) return ply - offset;
   }
   return Infinity;
 }
@@ -271,15 +271,18 @@ export class Proofs {
     const current = history.map(p => [...p]);
     let pv = outcome.pv || [];
     for (let i = 0; i <= pv.length; i++) {
+      const length = lineLength(current, outcome.winner, pv.slice(i), i);
       const ready = i && this.knownCache.get(proofKey(current));
       if (ready?.winner === outcome.winner && ready.plies + i <= outcome.plies
-          && Number.isFinite(lineLength(current, ready.winner, ready.pv))) {
+          && Number.isFinite(lineLength(current, ready.winner, ready.pv))
+          && (ready.plies + i < outcome.plies || lineLength(current, ready.winner, ready.pv) <= length)) {
         return [...pv.slice(0, i), ...shifted(ready.pv, i)];
       }
       const entry = this.choice(current);
+      const replacement = entry ? lineLength(current, entry.winner, entry.pv) : Infinity;
       if (entry?.winner === outcome.winner && entry.plies + i <= outcome.plies
-          && (entry.plies + i < outcome.plies || entry.pv.length > pv.length - i
-            || lineLength(current, entry.winner, entry.pv) < lineLength(current, outcome.winner, shifted(pv.slice(i), -i)))
+          && (entry.plies + i < outcome.plies || replacement < length
+            || replacement === length && entry.pv.length > pv.length - i)
           && entry.pv.every(p => p.length === 4)) {
         pv = [...pv.slice(0, i), ...shifted(entry.pv, i)];
       }
@@ -314,11 +317,12 @@ export class Proofs {
     const size = history.length, base = history.map(([q, r], i) => `${q},${r},${sideAt(i)}`), own = new Set(base), found = new Map();
     // A lost half-turn after A covers A,B in either order. Its saved response
     // need not be B, so carry the verdict without inventing a new PV.
+    // B may be earlier in the supplied history: only board and phase matter.
     if (size && size % 2 === 0) for (const key of this.sizes.get(size) || []) {
       const entry = this.entries.get(key), mover = sideAt(size);
       if (entry.winner === mover || entry.plies < 2) continue;
       const missing = [...entry.stones].filter(p => !own.has(p)), replaced = base.filter(p => !entry.stones.has(p));
-      if (missing.length !== 1 || replaced.length !== 1 || replaced[0] !== `${history.at(-1)},${mover}`) continue;
+      if (missing.length !== 1 || replaced.length !== 1 || Number(replaced[0].split(',')[2]) !== mover) continue;
       const [q, r, side] = missing[0].split(',').map(Number);
       if (side !== mover) continue;
       const outcome = {winner: entry.winner, plies: entry.plies - 1, pv: []};
@@ -356,11 +360,10 @@ export class Proofs {
     let own = this.entries.get(proofKey(history));
     if (!own && history.length > 1 && history.length % 2 === 1) {
       const mover = sideAt(history.length), base = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));
-      const last = new Set(history.slice(-2).map(p => `${p},${1-mover}`));
       for (const key of this.sizes.get(history.length - 1) || []) {
         const loss = this.entries.get(key);
         if (loss.winner !== mover || loss.plies < 2 || ![...loss.stones].every(p => base.has(p))) continue;
-        if (![...base].some(p => !loss.stones.has(p) && last.has(p))) continue;
+        if (![...base].some(p => !loss.stones.has(p) && Number(p.split(',')[2]) === 1-mover)) continue;
         if (!own || own.plies > loss.plies - 1) own = {winner: mover, plies: loss.plies - 1, pv: []};
       }
     }

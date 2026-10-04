@@ -382,6 +382,44 @@ console.log(JSON.stringify([partial,proven(table,root,old,2)]));"""
             for h,r in records:
                 table.add(h,r)
             self.assertEqual(table.known(root),dict(winner=1,plies=25,pv=expected))
+        # A just-checked line must not be overwritten by an older, longer
+        # complete line while it is being shown, before it has been indexed.
+        table = play.Proofs()
+        table.add(root,old)
+        fresh = dict(winner=1,plies=25,pv=expected)
+        self.assertEqual(table.line(root,fresh),expected)
+        source = """import {Proofs} from './web/engine/proof.mjs';
+const {root,old,fresh}=JSON.parse(process.argv[1]), table=new Proofs();table.add(root,old);
+console.log(JSON.stringify(table.line(root,fresh)));"""
+        done = subprocess.run([NODE,'--input-type=module','-e',source,json.dumps(dict(root=root,old=old,fresh=fresh))],
+                              cwd=ROOT,capture_output=True,text=True,check=True)
+        self.assertEqual(json.loads(done.stdout),expected)
+
+    def test_reordered_histories_share_half_turn_deductions_regardless_of_query_order(self):
+        loss = [[0,0],[1,0],[2,0],[0,1],[0,2],[4,0]]
+        ordered = loss[:-1]+[[3,0]]
+        reordered = [ordered[i] for i in (0,5,2,3,4,1)]
+        queries = [reordered,ordered,reordered+[[4,0]],ordered+[[4,0]]]
+        source = """import {Proofs} from './web/engine/proof.mjs';
+const {loss,queries}=JSON.parse(process.argv[1]), results=[];
+for(const order of [queries,queries.slice().reverse()]){
+ const table=new Proofs();table.add(loss,{proof:{winner:0,plies:7},pv:[]});
+ const read=h=>({known:table.known(h),edges:[...table.edges(h).values()].map(e=>[...e.action,e.winner,e.distance])});
+ for(const h of order)read(h);results.push(queries.map(read));
+}console.log(JSON.stringify(results));"""
+        done = subprocess.run([NODE,'--input-type=module','-e',source,json.dumps(dict(loss=loss,queries=queries))],
+                              cwd=ROOT,capture_output=True,text=True,check=True)
+        first, reverse = json.loads(done.stdout)
+        self.assertEqual(first,reverse)
+        for result in first[:2]:
+            self.assertIn([4,0,0,7],result['edges'])
+        for result in first[2:]:
+            self.assertEqual(result['known'],dict(winner=0,plies=6,pv=[]))
+        table = play.Proofs()
+        table.add(loss,dict(proof=dict(winner=0,plies=7),pv=[]))
+        for history, expected in zip(queries,first):
+            self.assertEqual(table.known(history),expected['known'])
+            self.assertEqual(sorted([*a,w,d] for a,(w,d,_) in table.edges(history).items()),sorted(expected['edges']))
 
     def test_defender_reconsiders_its_longest_line_after_the_attack_improves(self):
         # One defensive choice initially lasts 15, the other 12. Improving the
