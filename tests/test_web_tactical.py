@@ -1,4 +1,5 @@
 """The WebAssembly tactical solver (web/engine/tactical.wasm via tactical.mjs) answers as the native library does."""
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -35,6 +36,23 @@ def wasm_results(queries):
 
 @unittest.skipUnless(NODE and WASM.exists() and library().exists(), 'needs node, web/engine/tactical.wasm and the native library')
 class WebTacticalParity(unittest.TestCase):
+    def test_duplicate_stamp_imports_match_native(self):
+        with NativeTactics(independent=True) as native:
+            native.history(OPEN_THREE, stamps=True, library=[], nodes=20000, ms=5000)
+            warm = native.history(OPEN_THREE, stamps=True, library=[], nodes=1, ms=5000)
+            source = warm['certificate']['nodes'][warm['certificate']['root']]['source']
+        reordered = copy.deepcopy(source)
+        reordered['stones'].reverse()
+        changed = OPEN_THREE + [[8,8],[10,8],[8,10],[10,10]]
+        options = dict(stamps=True, library=[source, reordered], nodes=1, ms=5000)
+        web = wasm_results([(changed, options)])[0]
+        with NativeTactics(independent=True) as native:
+            local = native.history(changed, **options)
+        self.assertEqual({k: web[k] for k in FIELDS}, {k: local[k] for k in FIELDS})
+        self.assertEqual(web['stamp_entries'], 1)
+        self.assertEqual(local['stamp_entries'], 1)
+        self.assertEqual(independent_verify(web['certificate'], changed), 'PROVEN_WIN')
+
     def test_learned_browser_stamp_keeps_the_real_board_blockers(self):
         proof = NativeTactics().history(LATE_WIN, nodes=50000, ms=3000)
         learned, reused = wasm_results([

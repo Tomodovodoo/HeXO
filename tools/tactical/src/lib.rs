@@ -286,7 +286,7 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
     let board=check::replay_controlled(&req.history,&ctl)?;
     if req.stamps {stamps::prune(&board);}
     if req.library.as_ref().is_some_and(|l|l.len()>32 || !req.stamps) {return Err("invalid stamp library request".into());}
-    if let Some(library)=&req.library {for source in library {stamps::remember(source.clone(),&ctl)?.portable.set(true);}}
+    if let Some(library)=&req.library {for source in library {stamps::import(source.clone(),&ctl)?;}}
     else if req.stamps {stamps::seed(&ctl)?;}
     let stamp_oracle=req.stamps.then(||stamps::Oracle::new(&ctl,&board));
     let _stamps=stamp_oracle.as_ref().map(|oracle|StampScope::new(oracle.clone()));

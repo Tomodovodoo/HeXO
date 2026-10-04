@@ -180,6 +180,21 @@ class NativeStrategy(unittest.TestCase):
         self.assertEqual(rejected['status'], 'UNKNOWN')
         self.assertEqual(learned['status'], 'PROVEN_WIN')
 
+    def test_reordered_stamp_import_keeps_one_checked_strategy(self):
+        with NativeTactics(independent=True) as engine:
+            learned = engine.history(OPEN_THREE, stamps=True, library=[], nodes=20000, ms=5000)
+            self.assertEqual(learned['status'], 'PROVEN_WIN')
+            warm = engine.history(OPEN_THREE, stamps=True, library=[], nodes=1, ms=5000)
+            source = warm['certificate']['nodes'][warm['certificate']['root']]['source']
+            reordered = copy.deepcopy(source)
+            reordered['stones'].reverse()
+            history = OPEN_THREE + [[8,8],[10,8],[8,10],[10,10]]
+            reused = engine.history(history, stamps=True, library=[reordered], nodes=1, ms=5000)
+            self.assertEqual(reused['status'], 'PROVEN_WIN', reused['reason'])
+            self.assertEqual(reused['stamp_entries'], warm['stamp_entries'])
+            self.assertEqual(reused['stamp_hits'], 1)
+            self.assertEqual(independent_verify(reused['certificate'], history), 'PROVEN_WIN')
+
     def test_quiet_defender_zone_covers_every_placement(self):
         history = [[0,0],[0,8],[8,0],[1,0],[0,1],[-8,0],[0,-8],[1,1],[12,-8],[-8,8]]
         reference = self.engine.history(history, attacker='defender', nodes=10000, ms=5000)

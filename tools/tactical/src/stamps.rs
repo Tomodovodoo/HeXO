@@ -32,6 +32,14 @@ fn rotate(mut p:Coord,sym:u8)->Coord {
     for _ in 0..sym%6 {p=(-p.1,p.0+p.1);} p
 }
 fn transform(p:Coord,sym:u8,offset:Coord)->Coord {let p=rotate(p,sym);(p.0+offset.0,p.1+offset.1)}
+fn transform_window(w:Window,sym:u8,offset:Coord)->Window {
+    let points=cells(w);let a=transform(points[0],sym,offset);let b=transform(points[5],sym,offset);
+    for (axis,(dq,dr)) in AXES.into_iter().enumerate() {
+        if b==(a.0+5*dq,a.1+5*dr) {return (a.0,a.1,axis as u8);}
+        if a==(b.0+5*dq,b.1+5*dr) {return (b.0,b.1,axis as u8);}
+    }
+    unreachable!("hex symmetry preserves six-cell windows")
+}
 fn inverse(p:Coord,sym:u8,offset:Coord)->Coord {
     let p=(p.0-offset.0,p.1-offset.1);let p=rotate(p,(6-sym%6)%6);
     if sym>=6 {(p.1,p.0)}else{p}
@@ -231,6 +239,43 @@ impl Stamp {
         true
     }
 
+    /// A sufficient implication between the predicates in `matches`, including
+    /// the win bound. Keep incomparable speed/applicability tradeoffs. Only
+    /// small shapes can relocate in lookup, so large strategies compare in
+    /// their actual game frame.
+    fn dominates(&self,other:&Self,ctl:&Ctl)->Result<bool,String> {
+        if self.source.remaining!=other.source.remaining
+            || (self.source.player==self.source.winner)!=(other.source.player==other.source.winner)
+            || self.turns>other.turns || self.required.len()>other.required.len() || self.empty.len()>other.empty.len()
+            || (self.allowance>0 && (other.allowance==0 || self.allowance>other.allowance)) {return Ok(false);}
+        if self.required.len()>4 {
+            control(ctl)?;
+            return Ok(self.source.winner==other.source.winner && self.dominates_at(other,0,(0,0)));
+        }
+        let anchor=*self.required.first().unwrap();
+        for sym in 0..12 {for &target in &other.required {
+            control(ctl)?;
+            let p=rotate(anchor,sym);let offset=(target.0-p.0,target.1-p.1);
+            if self.dominates_at(other,sym,offset) {return Ok(true);}
+        }}
+        Ok(false)
+    }
+    fn dominates_at(&self,other:&Self,sym:u8,offset:Coord)->bool {
+        let point=|p|transform(p,sym,offset);
+        if self.required.iter().any(|&p|!other.required.contains(&point(p)))
+            || self.empty.iter().any(|&p|!other.empty.contains(&point(p))) {return false;}
+        if self.allowance==0 {return true;}
+        // Every window exempted from the other's global counter-threat test
+        // must also be exempted from ours. Its lower allowance is no stricter.
+        if other.before.iter().any(|&p|!self.before.contains(&inverse(p,sym,offset))) {return false;}
+        self.guards.iter().all(|(&w,&limit)| {
+            let w=transform_window(w,sym,offset);let points=cells(w);
+            points.iter().any(|p|other.required.contains(p))
+                || other.guards.get(&w).is_some_and(|&bound|bound<=limit)
+                || (!points.iter().any(|p|other.before.contains(p)) && 5-other.allowance as i8<=limit)
+        })
+    }
+
     pub fn key(&self)->String {
         // Coordinates of the supporting stones, checked empty cells and every
         // counter-threat guard belong to the key, together with the real phase.
@@ -327,7 +372,7 @@ pub fn seed(ctl:&Ctl)->Result<(),String> {
     // A leaf query may expire between entries. Keep completed imports rather
     // than recompiling their original, unshared certificates next slice.
     for (i,entry) in entries.into_iter().enumerate().skip(SEEDED.with(Cell::get)) {
-        remember(entry.source,ctl)?.portable.set(true);
+        import(entry.source,ctl)?;
         SEEDED.with(|s|s.set(i+1));
     }
     SEEDED.with(|s|s.set(usize::MAX));Ok(())
@@ -335,20 +380,48 @@ pub fn seed(ctl:&Ctl)->Result<(),String> {
 struct CompileDepth;
 impl Drop for CompileDepth {fn drop(&mut self){DEPTH.with(|n|n.set(n.get()-1));}}
 pub fn remember(source:StampSource,ctl:&Ctl)->Result<Rc<Stamp>,String> {
+    remember_as(source,ctl,false)
+}
+pub fn import(source:StampSource,ctl:&Ctl)->Result<Rc<Stamp>,String> {
+    remember_as(source,ctl,true)
+}
+fn remember_as(source:StampSource,ctl:&Ctl,portable:bool)->Result<Rc<Stamp>,String> {
     let _time=measure("remember");
     control(ctl)?;
-    if let Some(stamp)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source==source).cloned()) {return Ok(stamp);}
+    if let Some(stamp)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source==source).cloned()) {
+        if portable {stamp.portable.set(true);}return Ok(stamp);
+    }
     DEPTH.with(|n|if n.get()>=8 {Err("nested stamp limit")} else {n.set(n.get()+1);Ok(())})?;
     let _depth=CompileDepth;
     let stamp=Rc::new(Stamp::compile(source,ctl)?);
-    if let Some(prior)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source==stamp.source).cloned()) {return Ok(prior);}
-    LIBRARY.with(|l| {
+    if let Some(prior)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source==stamp.source).cloned()) {
+        if portable {prior.portable.set(true);}return Ok(prior);
+    }
+    if portable {stamp.portable.set(true);}
+    LIBRARY.with(|l|->Result<(),String> {
         let mut list=l.borrow_mut();
+        let mut replaced=Vec::new();
+        for (i,prior) in list.iter().enumerate() {
+            let older=prior.dominates(&stamp,ctl)?;
+            let newer=stamp.dominates(prior,ctl)?;
+            if older && (!newer || prior.bytes<=stamp.bytes) {
+                if stamp.portable.get() {prior.portable.set(true);}
+                return Ok(());
+            }
+            if newer {replaced.push(i);}
+        }
+        for &i in replaced.iter().rev() {
+            if list[i].portable.get() {stamp.portable.set(true);}
+            list.remove(i);
+        }
         while !list.is_empty() && (list.len()>=MAX_STAMPS || list.iter().map(|s|s.bytes).sum::<usize>()+stamp.bytes>MAX_BYTES) {
             let evict=list.iter().position(|s|!s.portable.get()).unwrap_or(0);list.remove(evict);
         }
         list.push(stamp.clone());
-    });
+        Ok(())
+    })?;
+    // A caller may be checking this exact certificate or using its root move.
+    // Library dominance must not substitute another strategy or coordinate frame.
     Ok(stamp)
 }
 pub fn prune(board:&Board) {
@@ -483,5 +556,93 @@ impl StampOracle for Oracle {
         if stamp.matches(get,stones,mover,remaining) {return Some(stamp.turns);}
         let board=stones.iter().map(|&(p,s)|(p,side(s))).collect();
         verify(source,&board,ply(side(mover),remaining),source.winner,&self.ctl).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dominance_preserves_matches_and_speed_tradeoffs() {
+        let ctl=Ctl::new(0.0);
+        let source=StampSource{stones:(0..4).map(|q|((q,0),0)).collect(),player:0,remaining:2,winner:0,
+            certificate:ProofCertificate{version:1,width:"wide".into(),root:0,
+                nodes:vec![ProofNode::ImmediateWin{action:vec![(4,0),(5,0)]}]}};
+        let mut broad=Stamp::compile(source,&ctl).unwrap();
+        // Restrict a real proof with counter-threat predicates to test their
+        // implication independently of the strategy that generated them.
+        broad.allowance=2;broad.before.insert((2,9));broad.guards.insert((0,10,0),1);
+        let mut narrow=broad.clone();narrow.required.insert((9,9));narrow.empty.insert((8,8));
+        narrow.before.clear();narrow.guards.insert((0,10,0),0);narrow.turns+=1;
+        assert!(broad.dominates(&narrow,&ctl).unwrap());
+        assert!(!narrow.dominates(&broad,&ctl).unwrap());
+        let varied=[(0,10),(1,10),(2,10),(3,10),(4,10),(5,10),(2,9),(8,8)];
+        let mut accepted=0;
+        for mut code in 0..3usize.pow(varied.len() as u32) {
+            let mut board:Board=narrow.required.iter().map(|&p|(p,0)).collect();
+            for &p in &varied {let s=code%3;code/=3;if s>0 {board.insert(p,(s-1) as u8);}}
+            let stones:Vec<_>=board.iter().map(|(&p,&s)|(p,player(s))).collect();
+            let get=|p|board.get(&p).copied().map(player);
+            if narrow.matches(&get,&stones,Player::P1,2) {
+                accepted+=1;assert!(broad.matches(&get,&stones,Player::P1,2));
+            }
+        }
+        assert!(accepted>0);
+        let mut changed=broad.clone();changed.turns=narrow.turns+1;
+        assert!(!changed.dominates(&narrow,&ctl).unwrap());
+        changed=broad.clone();changed.source.remaining=1;
+        assert!(!changed.dominates(&narrow,&ctl).unwrap());
+        changed=broad.clone();changed.source.player=1;
+        assert!(!changed.dominates(&narrow,&ctl).unwrap());
+        changed=broad.clone();changed.guards.insert((0,10,0),-1);
+        assert!(!changed.dominates(&narrow,&ctl).unwrap());
+        changed=narrow.clone();changed.before.insert((20,20));
+        assert!(!broad.dominates(&changed,&ctl).unwrap());
+        changed=narrow.clone();changed.allowance=1;
+        assert!(!broad.dominates(&changed,&ctl).unwrap());
+    }
+
+    #[test]
+    fn symmetric_imports_share_storage_but_return_the_requested_strategy() {
+        LIBRARY.with(|l|l.borrow_mut().clear());
+        let ctl=Ctl::new(0.0);
+        let entries:serde_json::Value=serde_json::from_str(include_str!("../stamps.json")).unwrap();
+        let source:StampSource=serde_json::from_value(entries[0]["source"].clone()).unwrap();
+        let first=remember(source,&ctl).unwrap();
+        let original=first.source.clone();let count=stats().0;
+        assert_eq!(count,1);assert!(!first.portable.get());
+        for sym in 0..12 {
+            let source=transformed_source(&original,sym,(20,-10),sym%2==1);
+            let returned=import(source.clone(),&ctl).unwrap();
+            assert_eq!(returned.source,source);
+            assert_eq!(stats().0,count);
+            for (&w,_) in &first.guards {
+                let transformed:BTreeSet<_>=cells(w).into_iter().map(|p|transform(p,sym,(20,-10))).collect();
+                assert_eq!(transformed,cells(transform_window(w,sym,(20,-10))).into_iter().collect());
+            }
+        }
+        assert!(LIBRARY.with(|l|l.borrow().iter().all(|s|s.portable.get())));
+        LIBRARY.with(|l|l.borrow_mut().clear());
+    }
+
+    #[test]
+    fn replacement_keeps_portability_and_active_oracle_sources() {
+        LIBRARY.with(|l|l.borrow_mut().clear());
+        let ctl=Ctl::new(0.0);
+        let source=StampSource{stones:(0..4).map(|q|((q,0),0)).collect(),player:0,remaining:2,winner:0,
+            certificate:ProofCertificate{version:1,width:"wide".into(),root:0,
+                nodes:vec![ProofNode::ImmediateWin{action:vec![(4,0),(5,0)]}]}};
+        let mut narrow=Stamp::compile(source.clone(),&ctl).unwrap();
+        narrow.source.stones.reverse();narrow.empty.insert((8,8));narrow.portable.set(true);
+        let old_source=narrow.source.clone();
+        LIBRARY.with(|l|l.borrow_mut().push(Rc::new(narrow)));
+        let oracle=Oracle::new(&ctl,&source.stones.iter().copied().collect());
+        let broad=remember(source,&ctl).unwrap();
+        assert_eq!(stats().0,1);assert!(broad.portable.get());
+        assert!(!broad.empty.contains(&(8,8)));
+        assert_eq!(oracle.source(0),old_source);
+        assert!(LIBRARY.with(|l|Rc::ptr_eq(&l.borrow()[0],&broad)));
+        LIBRARY.with(|l|l.borrow_mut().clear());
     }
 }
