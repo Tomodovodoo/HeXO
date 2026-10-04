@@ -92,7 +92,8 @@ attacking turn supplied through `root_moves`.
 
 `tools/tactical/stamps.json` contains primitive strategies produced by HeXO.
 `tools/proof_stamps.py --out PATH` regenerates them and runs the independent
-checker. The native worker checks these sources on first use. An explicit
+checker. The native worker checks these sources on first use. If a short query
+expires during loading, the next query resumes at the first unfinished entry. An explicit
 `library` list supplies other checked sources; `library=[]` skips builtin seeding
 without clearing strategies already learned in that worker.
 

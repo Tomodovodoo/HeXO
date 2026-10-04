@@ -318,14 +318,19 @@ fn materialize(cert:&ProofCertificate,b:&Board,n:usize,winner:u8,ctl:&Ctl)->Resu
 thread_local! {
     static LIBRARY:RefCell<Vec<Rc<Stamp>>>=const{RefCell::new(Vec::new())};
     static DEPTH:Cell<u8>=const{Cell::new(0)};
-    static SEEDED:Cell<bool>=const{Cell::new(false)};
+    static SEEDED:Cell<usize>=const{Cell::new(0)};
 }
 pub fn seed(ctl:&Ctl)->Result<(),String> {
-    if SEEDED.with(Cell::get) {return Ok(());}
+    if SEEDED.with(Cell::get)==usize::MAX {return Ok(());}
     #[derive(serde::Deserialize)] struct Primitive {source:StampSource}
     let entries:Vec<Primitive>=serde_json::from_str(include_str!("../stamps.json")).map_err(|e|e.to_string())?;
-    for entry in entries {remember(entry.source,ctl)?.portable.set(true);}
-    SEEDED.with(|s|s.set(true));Ok(())
+    // A leaf query may expire between entries. Keep completed imports rather
+    // than recompiling their original, unshared certificates next slice.
+    for (i,entry) in entries.into_iter().enumerate().skip(SEEDED.with(Cell::get)) {
+        remember(entry.source,ctl)?.portable.set(true);
+        SEEDED.with(|s|s.set(i+1));
+    }
+    SEEDED.with(|s|s.set(usize::MAX));Ok(())
 }
 struct CompileDepth;
 impl Drop for CompileDepth {fn drop(&mut self){DEPTH.with(|n|n.set(n.get()-1));}}
