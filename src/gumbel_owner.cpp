@@ -240,7 +240,7 @@ extern "C" HX_API void* hxgm_new(void** sources,int count,int capacity,int quant
 extern "C" HX_API int hxgm_free(void* p){auto& pool=*static_cast<owner::Pool*>(p);pool.stop();int64_t stats[6];hxgf_stats(pool.feed,stats);if(stats[4]){gumbel::error="Drain or fenced-abandon global tasks before freeing pool";return 0;}delete &pool;return 1;}
 extern "C" HX_API int hxgm_step(void* p){try{return static_cast<owner::Pool*>(p)->step();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 extern "C" HX_API void hxgm_cancel(void* p){static_cast<owner::Pool*>(p)->stop();}
-extern "C" HX_API int hxgm_cancel_game(void* p,int i){auto& pool=*static_cast<owner::Pool*>(p);if(i<0 || i>=int(pool.games.size()))return 0;pool.games[i]->stop();return 1;}
+extern "C" HX_API int hxgm_cancel_game(void* p,int i){auto& pool=*static_cast<owner::Pool*>(p);if(i<0 || i>=int(pool.games.size()))return 0;pool.games[i]->stop();pool.stopped=std::all_of(pool.games.begin(),pool.games.end(),[](const auto& o){return o->stopped;});return 1;}
 extern "C" HX_API int hxgm_clock(void* p,double ms){try{static_cast<owner::Pool*>(p)->clock(ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxgm_retarget(void* p,int i,const int64_t* history,int count,uint64_t work,double ms){try{static_cast<owner::Pool*>(p)->retarget(i,history,count,work,ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxgm_admit(void* p){return static_cast<owner::Pool*>(p)->admit();}

@@ -1315,6 +1315,20 @@ class NativeScheduler(unittest.TestCase):
         self.assertIsNone(pool.games[0].choice())
         self.assertEqual(pool.games[1].stats()['completed'], 32)
 
+    def test_cancel_last_game_reports_completion_without_another_step(self):
+        pool = self.pool([self.graph(), self.graph()], quantum=16, views=2, work=32)
+        pool.step()
+        self.assertFalse(pool.done())
+        pool.cancel(game=0)
+        self.assertFalse(pool.done())
+        self.assertEqual(pool.stats()['active'], 1)
+        pool.cancel(game=1)
+        self.assertTrue(pool.done())
+        self.assertEqual((pool.stats()['active'], pool.feed.stats()['pending_requests']), (0, 0))
+        pool.retarget(0, [(0, 0)], work=16)
+        self.assertFalse(pool.done())
+        self.finish(pool)
+
     def test_six_hundred_games_share_one_queue_and_cancel_without_expansion(self):
         graphs = [self.graph() for _ in range(600)]
         pool = self.pool(graphs, quantum=4, views=1, work=4)
