@@ -3782,6 +3782,8 @@ class EngineTests(unittest.TestCase):
                                              opening_random_plies=0.)
         with self.assertRaisesRegex(ValueError,'frontier slice'):
             dense_selfplay.SelfPlayGame([model,model],replace(settings,solver_root_nodes=32),1,native_owner=True)
+        with self.assertRaisesRegex(ValueError,'frontier slice'):
+            dense_selfplay.SelfPlayGame([model,model],replace(settings,solver_leaf_nodes=32),1,native_owner=True)
         wide = line_history(34)
         games = [dense_selfplay.SelfPlayGame([model,model],settings,1,native_owner=True,
                     book=(dict(suite='test',key='wide',ply=len(wide)),wide)),
