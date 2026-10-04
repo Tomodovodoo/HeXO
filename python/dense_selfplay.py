@@ -691,7 +691,10 @@ class SelfPlayGame:
     move and ends the game there (`adjudicate`). With proven_line_rows, an applicable two-stone winning
     certificate may start with either legal stone so its continuation teaches both conditional complements."""
 
-    def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None):
+    def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None, *, native_owner=False):
+        self.native_owner = native_owner
+        if native_owner and (settings.game_graph <= 0 or settings.pv_check or settings.proven_line_rows):
+            raise ValueError('Native self-play requires game_graph, uses native depth views, and has no certificate line rows')
         self.sides, self.settings, self.seed, self.reason, self.adjudicated = sides, settings, seed, None, None
         self.solver, self.schedule = dense_solver.Budgets.of(settings), dense_solver.Schedule.of(settings)
         self.learner, self.opponent = learner, opponent
@@ -737,7 +740,7 @@ class SelfPlayGame:
         if self.check is not None:
             self.budget = self.check.budget
         self.samples = s.root_samples if self.is_full else min(s.root_samples, s.cheap_root_samples, s.cheap_sims)
-        if s.root_noise:
+        if s.root_noise and not self.native_owner:
             checked(native.hxg_root_noise(self.tree.ptr, s.root_noise if self.is_full else 0.))
 
     @property
@@ -772,6 +775,8 @@ class SelfPlayGame:
         trained = self.opponent is None or player == self.learner
         row = dict(ply=ply, player=player, remaining=game.remaining, legal_sha256=dense_data.legal_digest(actions),
                    policy=None)
+        if 'search' in result:
+            row['search'] = result['search']
         policy = result['policy']
         if self.is_full and trained and policy_target(result, player):
             if not np.isclose(policy.sum(), 1, atol=1e-6) or np.any(policy < 0):
@@ -802,8 +807,9 @@ class SelfPlayGame:
                 action = stones[int(self.rng.integers(2))]
         q, r = int(action[0]), int(action[1])
         game.play(q, r)
-        for tree in self.trees.values():
-            tree.advance((q, r))
+        if not self.native_owner:
+            for tree in self.trees.values():
+                tree.advance((q, r))
         self.moves.append([q, r])
         if result.get('proven'):
             action = (row.get('proof_action') or [[q, r]]) if result['proven'] > 0 else None

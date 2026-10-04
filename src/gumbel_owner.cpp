@@ -25,7 +25,7 @@ struct Owner {
  std::deque<Record> records;std::vector<gumbel::RootEdge> last_root;
  std::vector<uint64_t> direct_root_credits;
  std::vector<Cell> focus;std::mt19937_64 rng;uint64_t next_id=1,ticks=0,allocations=0,reclaimed=0,completed=0,issued=0,cancelled=0,created=0,retired=0,step_ns=0,discover_ns=0;
- int quantum,max_views,max_depth;size_t view_cursor=0;uint64_t work_limit;double time_limit_ms;std::chrono::steady_clock::time_point started;
+ int quantum,max_views,max_depth,sample_limit=16;size_t view_cursor=0;uint64_t work_limit;double time_limit_ms;std::chrono::steady_clock::time_point started;
  bool stopped=false,deadline=false;double exploration=.2;
  Owner(Tree& source,int capacity,int q,int count,int depth,uint64_t work,double ms,uint64_t seed,void* common=nullptr):owned_feed(common?nullptr:hxgf_new(capacity)),feed(common?common:owned_feed.get()),game(source.state),rng(seed),quantum(q),max_views(count),max_depth(depth),work_limit(work),time_limit_ms(ms),started(std::chrono::steady_clock::now()){
   if(!source.shared || !feed || q<4 || count<1 || count>64 || depth<1 || depth>32 || !std::isfinite(ms) || ms<0 || (!work && !ms))throw std::runtime_error("Invalid native owner limits");
@@ -45,7 +45,7 @@ struct Owner {
  bool start(View& v){
   uint64_t room=work_limit?work_limit-std::min(work_limit,completed+reserved()):uint64_t(quantum);
   int budget=int(std::min<uint64_t>(quantum,room));if(!budget || stopped || expired())return false;
-  v.tree->begin(budget,std::min(16,budget));v.active=true;v.discovered=false;++v.generation;++allocations;attach(v);return true;
+  v.tree->begin(budget,std::min(sample_limit,budget));v.active=true;v.discovered=false;++v.generation;++allocations;attach(v);return true;
  }
  void save_credits(Tree& t){
   if(direct_root_credits.empty())direct_root_credits.resize(t.root_edges.size());

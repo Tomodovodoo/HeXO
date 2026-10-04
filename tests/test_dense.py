@@ -3747,6 +3747,56 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_continuous_native_selfplay_records_only_played_roots_and_replays_targets(self):
+        from native_selfplay import play_cohort
+        torch.set_num_threads(2)
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY), f'native-{k}', f'model-{k}', 'cpu', 32, 64) for k in range(2)]
+        settings = dense_config.ActorSettings(full_fraction=.5, full_sims=32, cheap_sims=8, root_samples=8,
+                                             cheap_root_samples=4, game_graph=192, max_plies=7, tactics=False,
+                                             opening_random_plies=0., root_noise=.2)
+        games = [dense_selfplay.SelfPlayGame([models[0], models[0]], settings, 120+i, native_owner=True) for i in range(2)]
+        games.append(dense_selfplay.SelfPlayGame(models, settings, 130, learner=1, opponent='model-0', native_owner=True))
+        episodes, rows, receipt = play_cohort(games, producers=2, quantum=8, views=4, cache=128)
+        self.assertEqual(len(episodes), 3)
+        self.assertEqual((receipt['inference']['pending_rows'], receipt['inference']['inflight_batches'],
+                          receipt['inference']['active_producers']), (0,0,0))
+        self.assertGreater(receipt['inference']['launched_rows'], 0)
+        for i, episode in enumerate(episodes):
+            played = [r for r in rows if r['game']==i]
+            self.assertEqual([r['ply'] for r in played], list(range(len(episode['moves']))))
+            self.assertEqual(len(episode['moves']), 7)
+            game = Game()
+            try:
+                for row, action in zip(played, episode['moves']):
+                    actions = np.asarray(game.legal_moves(), np.int64)
+                    self.assertEqual(dense_data.legal_digest(actions), row['legal_sha256'])
+                    self.assertIn(tuple(action), set(map(tuple, actions)))
+                    source = row['search']
+                    self.assertEqual(source['root_completed'], source['comparison_credits'])
+                    self.assertLessEqual(source['comparison_credits'], source['completed'])
+                    self.assertEqual(source['root_estimate'], episode['root_values'][row['ply']])
+                    self.assertEqual(source['fresh_nodes'], 0)
+                    if i==2 and row['player']==0:
+                        self.assertIsNone(row['policy'])
+                        self.assertIsNone(episode['root_values'][row['ply']])
+                    elif row['policy'] is not None:
+                        self.assertEqual(len(row['policy']), len(actions))
+                        self.assertAlmostEqual(float(row['policy'].sum()), 1., places=6)
+                    game.play(*action)
+            finally:
+                game.close()
+        self.assertTrue(any(not full for e in episodes for full in e['full_search']))
+        self.assertTrue(any(full for e in episodes for full in e['full_search']))
+        with tempfile.TemporaryDirectory() as run:
+            dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='native-0'), episodes, rows)
+            window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0.)
+            refs = [window.ref(name, index) for name, index in window.index]
+            self.assertTrue(refs)
+            self.assertTrue(all(r.row['search']['source']=='native-root' for r in refs))
+            samples, targets = dense_data.examples(window, refs, np.random.default_rng(0))
+            self.assertEqual(len(samples), len(refs))
+            self.assertTrue(all(np.isfinite(t['value']) for t in targets))
+
     def test_inference_service_rejected_manual_prediction_can_be_fenced_and_abandoned(self):
         import ctypes
         from native_scheduler import InferenceService

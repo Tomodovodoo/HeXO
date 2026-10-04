@@ -21,6 +21,8 @@ struct Task {
 };
 struct Fact {std::vector<Cell> history;int winner,distance;};
 struct Frontier {
+ struct Effort {uint64_t fresh=0,queries=0,missing=0;};
+ std::map<uint64_t,Effort> effort;
  std::unordered_map<Key,std::shared_ptr<Task>,KeyHash> tasks;std::unordered_map<Key,Fact,KeyHash> facts;
  std::deque<Key> fact_order;uint64_t generation=1,revision=0,next=0,offers=0;size_t capacity;
  explicit Frontier(size_t cap):capacity(cap){}
@@ -167,7 +169,8 @@ struct Loop {
  }
  void install(Job& job){
   auto start=Clock::now();auto& o=*pool.games[job.game];auto& f=frontiers[job.game];auto& task=*job.task;
-  if(job.info[4])fresh+=job.info[3];else ++missing_fresh;
+  auto& effort=f.effort[job.generation];++effort.queries;
+  if(job.info[4]){fresh+=job.info[3];effort.fresh+=job.info[3];}else{++missing_fresh;++effort.missing;}
   o.game->pins.erase(job.task.get());task.flight=false;
   if(job.cancelled || job.generation!=f.generation){task.ready=Clock::now()+std::chrono::milliseconds(slice);return;}
   if(!job.error.empty())throw std::runtime_error(job.error);
@@ -226,3 +229,5 @@ extern "C" HX_API int hxp_offer(void* p,int game,const int64_t* cells,int count,
 extern "C" HX_API void hxp_stats(void* p,uint64_t* out,double* times){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);uint64_t active=0,tasks=0,facts=0;double service=0,idle=0;for(auto& w:loop.workers){active+=bool(w->active);service+=w->service;idle+=w->idle;}for(auto& f:loop.frontiers){tasks+=f.tasks.size();facts+=f.facts.size();}
  std::array<uint64_t,16> values{loop.ticks,loop.submitted,loop.started,loop.finished,loop.installed,loop.cancelled,loop.pruned,loop.unknown,loop.fresh,loop.missing_fresh,uint64_t(loop.queued.size()),active,uint64_t(loop.done.size()),tasks,facts,uint64_t(loop.records.size())};std::copy(values.begin(),values.end(),out);times[0]=service;times[1]=idle;times[2]=loop.snapshot_ns/1e6;times[3]=loop.install_ns/1e6;}
 extern "C" HX_API const char* hxp_record(void* p,int i){auto& records=static_cast<proving::Loop*>(p)->records;return i<0 || i>=int(records.size())?nullptr:records[i].c_str();}
+extern "C" HX_API uint64_t hxp_generation(void* p,int game){return static_cast<proving::Loop*>(p)->frontiers.at(game).generation;}
+extern "C" HX_API int hxp_effort(void* p,int game,uint64_t* out){auto& f=static_cast<proving::Loop*>(p)->frontiers.at(game);int i=0;for(auto [generation,e]:f.effort){if(out){std::array<uint64_t,4> row{generation,e.fresh,e.queries,e.missing};std::copy(row.begin(),row.end(),out+4*i);}++i;}return i;}
