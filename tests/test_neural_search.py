@@ -1110,6 +1110,69 @@ class SharedGraph(unittest.TestCase):
         unbounded.search(8, root_samples=4, batch_size=4)
         self.assertEqual(unbounded.store()['evicted'], 0)
 
+    def test_root_sampling_considers_a_stored_high_value_child(self):
+        # A neural estimate learned below x competes on its stored Q when sampling the earlier root.
+        a = recorded_position(11)
+        probe = self.graph(Uniform(), a)
+        actions = [tuple(map(int, action)) for action in probe.search(2, root_samples=2, batch_size=2)['actions']]
+        x = actions[-1]
+        mover = lambda n: 0 if n == 0 else ((n - 1) // 2 + 1) % 2
+        class Likes(Uniform):
+            def evaluate(self, histories):
+                predictions = super().evaluate(histories)
+                for history, prediction in zip(histories, predictions):
+                    if len(history) > len(a) and tuple(map(int, history[len(a)])) == x:
+                        prediction['q'][:] = 1. if mover(len(history)) == mover(len(a) + 1) else -1.
+                return predictions
+        graph = self.graph(Likes(), [*a, x])
+        graph.search(32, root_samples=4, batch_size=4)
+        graph.at(a)
+        chosen = graph.search(4, root_samples=2, batch_size=2)
+        self.assertEqual(tuple(map(int, chosen['action'])), x)
+        self.assertGreater(chosen['visits'][self.edge(chosen, x)], 0)
+
+    def test_opening_candidates_use_stored_scores_independent_of_batch_size(self):
+        class Changing(Spread):
+            def evaluate(self, histories):
+                predictions = super().evaluate(histories)
+                for history, prediction in zip(histories, predictions):
+                    if len(history) > 2:
+                        prediction['q'] *= -1.
+                return predictions
+        for retained in (False, True):
+            candidates = []
+            for batch in (1, 2, 8):
+                graph = GameGraph(Changing(.9), 'sampling', [(0, 0)], seed=0, tactics=False)
+                self.addCleanup(graph.close)
+                if retained:
+                    graph.search(1, root_samples=4, batch_size=8)
+                result = graph.search(8, root_samples=8, batch_size=batch)
+                chosen = result['actions'][graph.credits() > 0].tolist()
+                self.assertEqual(len(chosen), 8)
+                candidates.append(chosen)
+            with self.subTest(retained=retained):
+                self.assertEqual(candidates[0], candidates[1])
+                self.assertEqual(candidates[0], candidates[2])
+
+    def test_opening_scores_survive_leaving_and_resuming_the_root(self):
+        candidates = []
+        for revisit in (False, True):
+            evaluator = Spread(.9)
+            graph = self.graph(evaluator, [(0, 0)])
+            graph.search(1, root_samples=1)
+            native.hxg_begin(graph.ptr, 8, 8)
+            for i in range(8):
+                request, history = graph.request()
+                self.assertGreater(request, 0)
+                graph.fulfill(request, evaluator.evaluate([history])[0])
+                if revisit and i == 0:
+                    graph.at(history)
+                    graph.at([(0, 0)])
+            result = graph.result(0, 0, 0, 0)
+            self.assertEqual(result['completed'], 8)
+            candidates.append(result['actions'][graph.credits() > 0].tolist())
+        self.assertEqual(candidates[0], candidates[1])
+
     def test_a_search_counts_toward_the_order_of_its_own_history(self):
         # Both orders of A's turn reach C; a search at C reached by one order counts at that order's first stone only.
         a = recorded_position(11)
