@@ -1,9 +1,10 @@
 # Local proof reuse
 
-`python/play.py --proof-stamps` enables this path for the player, including its
-analysis workers. The Python solver API accepts `stamps=True`; the browser
-solver accepts the same option, and `Bubble.turn(..., {proofStamps: true})`
-passes it through the browser search worker. The default remains unchanged.
+The Python player and browser Bubble player enable this path by default,
+including analysis, saved-game review and clocked games. Use
+`python/play.py --no-proof-stamps` or `Bubble.turn(..., {proofStamps: false})`
+to disable it. Direct solver calls remain opt-in: the Python solver API accepts
+`stamps=True`, and the browser solver accepts the same option.
 
 A stamp is a complete checked strategy plus conditions under which that same
 strategy still wins. It is not a cached evaluation or a verdict copied from a
@@ -137,9 +138,29 @@ than the existing cache for identical boards.
 The real-position queries use 8192 nodes; the open-three comparison uses 50000.
 These are solver timings, not actor or GPU throughput claims. The library uses
 about 219 KiB of its accounting budget in this run. Reuse pays when a strategy
-matches; misses cost time, so this remains opt-in. A quiet diamond is also
+matches; misses cost time. A quiet diamond is also
 proved with a full two-stone defender turn, and independently checked, where
 the reference defender query returns UNKNOWN.
+
+Six recorded games were also replayed chronologically from dense-v1 shard
+`1791050712484684` (episodes 0–5), querying the mover and hypothetical opponent
+at every two-placement turn start through adjudication. One worker and its
+stamp cache lived through all six games in each mode, with 8192 nodes per query
+and no deadline hits. This includes learning and checking stamps. Both modes
+used the recorded moves, without network inference or new move selection.
+
+| Six-game replay | Reference | Stamps |
+|---|---:|---:|
+| Queries | 546 | 546 |
+| Solver time | 15.504 s | 31.374 s |
+| Fresh nodes | 341,767 | 341,727 |
+| Proven-win queries | 210 | 210 |
+
+All query outcomes agreed. The accepted certificates contained 77 stamp hits;
+the cache peaked at 497.4 KiB. Reuse across these turns saved only 40 fresh
+nodes, and total solver time rose 102%. The player default is enabled at the
+owner's request despite that measured cost; these figures do not establish a
+game-throughput benefit.
 
 The distinction between forcing, holding and unstoppable shapes is also useful
 in [Six's shape guide](https://github.com/CixMango/Six/blob/main/guide/shapes.md).

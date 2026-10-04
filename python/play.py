@@ -1190,7 +1190,7 @@ class SearchChild:
 class Engines:
     """Loaded engines, used only from the worker thread. Keeps the three most recent Bubble exports."""
 
-    def __init__(self, device, tactical_package=None, seal=None, *, proof_stamps=False):
+    def __init__(self, device, tactical_package=None, seal=None, *, proof_stamps=True):
         self.proof_stamps = proof_stamps
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
         self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
@@ -1340,7 +1340,7 @@ class Engines:
         record = binary.with_name(binary.name + '.json')
         try:
             build = file_build(str(package), file_identity(record), file_identity(binary))
-            return build + (':stamps' if self.proof_stamps else '')
+            return build + (':stamps' if self.proof_stamps and build != 'none' else '')
         except OSError:
             return 'none'
 
@@ -3792,7 +3792,8 @@ def main():
     parser.add_argument('--evaluations', type=Path,
                         help='saved evaluations file; default play-evaluations.jsonl in the run or models folder')
     parser.add_argument('--tactical-package', type=Path, help='directory with the built tactical solver')
-    parser.add_argument('--proof-stamps', action='store_true', help='reuse checked local strategies and test quiet defender turns')
+    parser.add_argument('--proof-stamps', action=argparse.BooleanOptionalAction, default=True,
+                        help='reuse checked local strategies and test quiet defender turns (default: enabled)')
     parser.add_argument('--device', default='auto', help='cuda, cpu, or auto: cuda when a GPU is available')
     parser.add_argument('--idle', action='store_true', help='start paused, without automatic analysis, for API clients')
     parser.add_argument('--list-engines', action='store_true', help='list engine ids, names and checkpoints, then exit')
