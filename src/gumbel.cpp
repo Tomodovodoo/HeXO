@@ -11,6 +11,7 @@
 #include <unordered_set>
 namespace gumbel {
 struct Node;
+struct Tree;
 // One proven edge of a position, sorted by action like the legal moves.
 struct EdgeProof { Cell action;int winner=-1,distance=-1;bool bound=false; };
 // A proven position: its mover, winner, distance and bound, the stones it holds and the edge proofs gathered from its
@@ -70,6 +71,8 @@ struct GameStore {
  std::unordered_map<Key,Summary,KeyHash> evicted_stats;
  size_t limit=0;uint64_t clock=0;int64_t evicted=0;void* scheduler_owner=nullptr;
  std::unordered_map<const void*,std::vector<Node*>> pins;
+ // A native owner may observe installed evidence. Workers never call this.
+ void* evidence_owner=nullptr;void (*evidence)(void*,Tree&,const Path&)=nullptr;
  bool pinned(const Node* node)const {
   for(auto& [view,list]:pins)if(std::find(list.begin(),list.end(),node)!=list.end())return true;
   return false;
@@ -637,7 +640,7 @@ struct Tree {
    auto& node=*path.leaf;
    if(node.exact_winner>=0 && node.exact_winner!=exact)throw std::runtime_error("Conflicting leaf proof");
    for(auto& edge:node.edges)if(edge.action==witness)tighten(exact,distance,true,edge.exact_winner,edge.distance,edge.bound);
-   settle(node);learn(node);revise(node);proof_closed(path);requests.erase(found);return;
+   settle(node);learn(node);revise(node);proof_closed(path);if(state->evidence)state->evidence(state->evidence_owner,*this,path);requests.erase(found);return;
   }
   auto& node=*path.leaf;double total=0;std::vector<double> weights(count);for(int i=0;i<count;++i)total+=weights[i]=std::exp(logits[i]-maximum);
   // Only root edges read their Gumbel noise and begin() redraws it, so interior edges just advance the stream.
@@ -657,7 +660,7 @@ struct Tree {
   }
   // A certificate adds its witness as a winning edge; settle keeps any shorter tactical win found by classify.
   if(exact>=0){for(auto& edge:node.edges)if(edge.action==witness && (edge.exact_winner!=exact || edge.distance>distance)){edge.exact_winner=exact;edge.distance=distance;edge.bound=true;}settle(node);}
-  node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);requests.erase(found);
+  node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);if(state->evidence)state->evidence(state->evidence_owner,*this,path);requests.erase(found);
  }
  // Installs a caller-verified certificate at pending leaf `id`: its first turn `moves` and `turns`, the most attacker
  // turns on any certificate path, which bound the win within move_count + 4 * (turns - 1) placements.

@@ -189,6 +189,7 @@ struct Pool {
  std::unique_ptr<void,FeedDeleter> owned_feed;void* feed;
  std::vector<std::unique_ptr<Owner>> games;std::vector<bool> failed;
  std::string model;size_t cursor=0;uint64_t steps=0,retargets=0;bool stopped=false;
+ void* proof_owner=nullptr;void (*proof_step)(void*)=nullptr;void (*proof_retarget)(void*,int)=nullptr;
  Pool(void** sources,int count,int capacity,int quantum,int views,int depth,uint64_t work,const char* version,uint64_t seed):owned_feed(hxgf_new(capacity)),feed(owned_feed.get()),model(version?version:""){
   if(!sources || count<1 || count>1024 || !feed || model.empty())throw std::runtime_error("Invalid multi-game pool");
   games.reserve(count);failed.resize(count);
@@ -200,11 +201,13 @@ struct Pool {
  ~Pool(){stop();}
  void stop(){for(auto& o:games)o->stop();stopped=true;}
  int step(){
+  if(proof_step)proof_step(proof_owner);
   if(stopped)return 0;int progress=0;++steps;
   for(size_t n=0;n<games.size();++n){auto& o=*games[(cursor+n)%games.size()];if(!o.stopped)progress+=o.step();}
   cursor=(cursor+1)%games.size();stopped=std::all_of(games.begin(),games.end(),[](const auto& o){return o->stopped;});return progress;
  }
  bool admit(){
+  if(proof_step)proof_step(proof_owner);
   bool active=false;for(auto& o:games){if(o->expired()){o->deadline=true;o->stop();}active|=!o->stopped;}
   stopped=!active;return active;
  }
@@ -216,6 +219,7 @@ struct Pool {
   if(index<0 || index>=int(games.size()) || count<0 || (count && !cells) || !std::isfinite(ms) || ms<0 || (!work && !ms))throw std::runtime_error("Invalid retarget");
   std::vector<Cell> history;history.reserve(count);Board checked;
   for(int i=0;i<count;++i){Cell cell{cells[2*i],cells[2*i+1]};if(!checked.legal(cell))throw std::runtime_error("Illegal retarget history");checked.make(cell);history.push_back(cell);}
+  if(proof_retarget)proof_retarget(proof_owner,index);
   auto& o=*games[index];o.stop();o.views.resize(1);auto& root=o.views[0];
   // Keep this Tree address alive for outstanding solver DTOs. Packed neural rows
   // already own their encoding snapshot; cancelled subscribers never install late.
@@ -237,13 +241,13 @@ struct Pool {
 };
 }
 extern "C" HX_API void* hxgm_new(void** sources,int count,int capacity,int quantum,int views,int depth,uint64_t work,const char* version,uint64_t seed){try{return new owner::Pool(sources,count,capacity,quantum,views,depth,work,version,seed);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
-extern "C" HX_API int hxgm_free(void* p){auto& pool=*static_cast<owner::Pool*>(p);pool.stop();int64_t stats[6];hxgf_stats(pool.feed,stats);if(stats[4]){gumbel::error="Drain or fenced-abandon global tasks before freeing pool";return 0;}delete &pool;return 1;}
+extern "C" HX_API int hxgm_free(void* p){auto& pool=*static_cast<owner::Pool*>(p);if(pool.proof_owner){gumbel::error="Close the proof loop before freeing its search pool";return 0;}pool.stop();int64_t stats[6];hxgf_stats(pool.feed,stats);if(stats[4]){gumbel::error="Drain or fenced-abandon global tasks before freeing pool";return 0;}delete &pool;return 1;}
 extern "C" HX_API int hxgm_step(void* p){try{return static_cast<owner::Pool*>(p)->step();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
-extern "C" HX_API void hxgm_cancel(void* p){static_cast<owner::Pool*>(p)->stop();}
-extern "C" HX_API int hxgm_cancel_game(void* p,int i){auto& pool=*static_cast<owner::Pool*>(p);if(i<0 || i>=int(pool.games.size()))return 0;pool.games[i]->stop();pool.stopped=std::all_of(pool.games.begin(),pool.games.end(),[](const auto& o){return o->stopped;});return 1;}
+extern "C" HX_API int hxgm_cancel(void* p){try{auto& pool=*static_cast<owner::Pool*>(p);pool.stop();if(pool.proof_step)pool.proof_step(pool.proof_owner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+extern "C" HX_API int hxgm_cancel_game(void* p,int i){try{auto& pool=*static_cast<owner::Pool*>(p);if(i<0 || i>=int(pool.games.size()))return 0;pool.games[i]->stop();pool.stopped=std::all_of(pool.games.begin(),pool.games.end(),[](const auto& o){return o->stopped;});if(pool.proof_step)pool.proof_step(pool.proof_owner);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxgm_clock(void* p,double ms){try{static_cast<owner::Pool*>(p)->clock(ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxgm_retarget(void* p,int i,const int64_t* history,int count,uint64_t work,double ms){try{static_cast<owner::Pool*>(p)->retarget(i,history,count,work,ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-extern "C" HX_API int hxgm_admit(void* p){return static_cast<owner::Pool*>(p)->admit();}
+extern "C" HX_API int hxgm_admit(void* p){try{return static_cast<owner::Pool*>(p)->admit();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 extern "C" HX_API int hxgm_done(void* p){return static_cast<owner::Pool*>(p)->stopped;}
 extern "C" HX_API void* hxgm_feed(void* p){return static_cast<owner::Pool*>(p)->feed;}
 extern "C" HX_API void* hxgm_owner(void* p,int i){auto& pool=*static_cast<owner::Pool*>(p);return i<0 || i>=int(pool.games.size())?nullptr:pool.games[i].get();}

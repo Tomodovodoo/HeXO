@@ -1359,5 +1359,220 @@ class NativeScheduler(unittest.TestCase):
         self.assertIsNone(record['raw_value'])
 
 
+class NativeProofs(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from tactical_proof import library
+        if not library().is_file():
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+
+    graph = NativeScheduler.graph
+    pool = NativeScheduler.pool
+    answer = NativeScheduler.answer
+    opening = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
+
+    def loop(self, pool, **options):
+        return pool.enable_proofs(slice_ms=1000, table_mb=1, **options)
+
+    def wait(self, predicate, seconds=5):
+        import time
+        end = time.monotonic()+seconds
+        while not predicate():
+            if time.monotonic() >= end:
+                self.fail('Native proof work did not finish')
+            time.sleep(.002)
+
+    def test_workers_consume_queued_jobs_without_owner_polling(self):
+        from tactical_proof import independent_verify
+        graphs = [self.graph(self.opening) for _ in range(4)]
+        pool = self.pool(graphs, quantum=16, views=1, work=4096)
+        proofs = self.loop(pool, workers=2, queue=8)
+        pool.step()
+        self.assertEqual(self.answer(pool), 1)  # Identical neural contexts coalesce across games.
+        proofs.step()
+        submitted = proofs.stats()['submitted']
+        self.assertEqual(submitted, 4)
+        # stats() neither admits work nor installs results. Workers consume all four jobs themselves.
+        self.wait(lambda: proofs.stats()['finished'] == submitted)
+        self.assertEqual(proofs.stats()['ready'], 4)
+        proofs.step()
+        self.assertEqual(proofs.stats()['installed'], 4)
+        self.assertEqual({native.hxg_exact(g.ptr) for g in graphs}, {0})
+        records = proofs.records()
+        self.assertEqual(len({r['id'] for r in records}), 4)
+        self.assertEqual({r['game'] for r in records}, set(range(4)))
+        for row in records:
+            self.assertEqual(row['request']['history'], self.opening)
+            self.assertEqual(independent_verify(row['result']['certificate'], self.opening,
+                             known=row['request']['known']), 'PROVEN_WIN')
+
+    def test_root_proof_overrides_late_neural_rows_and_releases_reservations(self):
+        graph = self.graph(self.opening)
+        pool = self.pool([graph], quantum=32, views=1, work=4096)
+        proofs = self.loop(pool, workers=1, queue=4)
+        pool.step()
+        self.answer(pool)
+        pool.step()
+        late = pool.feed.take(128)
+        self.assertIsNotNone(late)
+        self.wait(lambda: proofs.stats()['finished'] > 0)
+        proofs.step()
+        self.assertEqual(native.hxg_exact(graph.ptr), 0)
+        self.answer(pool, late)
+        pool.step()
+        self.assertTrue(pool.done())
+        self.assertEqual(native.hxg_exact(graph.ptr), 0)
+        self.assertEqual((pool.feed.stats()['pending_rows'], pool.games[0].stats()['pending']), (0, 0))
+        self.assertEqual(pool.games[0].records()[-1]['root_estimate'], 1.)
+
+    def test_arbitrary_defender_proof_reaches_other_contexts_and_ancestors(self):
+        from tactical_proof import independent_verify
+        history = self.opening+[[-1,0],[2,1]]
+        graph = self.graph(self.opening)
+        graph.search(4, root_samples=4, batch_size=4)
+        middle = graph.view(self.opening+[[-1,0]])
+        self.addCleanup(middle.close)
+        middle.search(4, root_samples=4, batch_size=4)
+        peer = graph.view(self.opening+[[2,1],[-1,0]])
+        self.addCleanup(peer.close)
+        pool = self.pool([graph], quantum=16, views=1, work=4096)
+        proofs = self.loop(pool, workers=1, queue=4)
+        proofs.offer(0, history, relevance=10.)
+        # The two placements have another neural context, but share rule-position proofs.
+        def settled():
+            proofs.step()
+            return native.hxg_exact(peer.ptr) == 0
+        self.wait(settled)
+        self.assertEqual(native.hxg_exact(graph.ptr), 0)
+        loss = next(r for r in proofs.records() if r['request']['history'] == history)
+        self.assertEqual(loss['result']['status'], 'PROVEN_LOSS')
+        self.assertEqual(independent_verify(loss['result']['certificate'], history, attacker='defender',
+                         known=loss['request']['known']), 'PROVEN_LOSS')
+
+    def test_unknown_and_forcing_disproof_never_become_game_losses(self):
+        graph = self.graph([[0,0],[1,2],[3,-1]])
+        pool = self.pool([graph], quantum=16, views=1, work=4096)
+        proofs = self.loop(pool, workers=1, queue=4)
+        pool.step()
+        self.answer(pool)
+        def tried_both():
+            proofs.step()
+            return proofs.stats()['unknown'] >= 2
+        self.wait(tried_both)
+        self.assertEqual(native.hxg_exact(graph.ptr), -1)
+        self.assertTrue(pool.games[0].evidence()['eligible'].all())
+        self.assertEqual(proofs.records(), [])
+
+    def test_drain_stops_admission_and_retarget_discards_old_completions(self):
+        graph = self.graph(self.opening)
+        pool = self.pool([graph], quantum=16, views=1, work=4096)
+        proofs = self.loop(pool, workers=1, queue=4)
+        pool.step()
+        self.answer(pool)
+        proofs.step()
+        self.wait(lambda: proofs.stats()['finished'] > 0)
+        pool.retarget(0, [[0,0],[1,2],[3,-1]], work=4096)
+        proofs.drain()
+        stats = proofs.stats()
+        self.assertEqual((stats['queued'], stats['active'], stats['ready']), (0, 0, 0))
+        self.assertEqual(proofs.records(), [])
+        pool.step()
+        self.answer(pool)
+        proofs.step()
+        self.assertEqual(proofs.stats()['submitted'], stats['submitted'])
+        self.assertEqual(native.hxg_exact(native.hxgo_root(pool.games[0].ptr)), -1)
+        proofs.resume()
+        proofs.step()
+        self.assertGreater(proofs.stats()['submitted'], stats['submitted'])
+
+    def test_attached_loop_prevents_pool_free_and_duplicate_owners(self):
+        graph = self.graph()
+        pool = self.pool([graph], quantum=16, work=32)
+        proofs = self.loop(pool, workers=1, queue=4)
+        with self.assertRaisesRegex(ValueError, 'already has a proof loop'):
+            pool.enable_proofs()
+        self.assertEqual(native.hxgm_free(pool.ptr), 0)
+        self.assertIn(b'Close the proof loop', native.hxg_error())
+        proofs.close()
+        pool.close()
+        with self.assertRaisesRegex(ValueError, 'closed'):
+            proofs.stats()
+
+    def test_cancel_rejects_a_ready_completion_before_installation(self):
+        graph = self.graph(self.opening)
+        pool = self.pool([graph], quantum=16, views=1, work=4096)
+        proofs = self.loop(pool, workers=1, queue=4)
+        pool.step()
+        self.answer(pool)
+        proofs.step()
+        self.wait(lambda: proofs.stats()['ready'] > 0)
+        pool.cancel()
+        proofs.drain()
+        self.assertEqual(proofs.stats()['installed'], 0)
+        self.assertGreater(proofs.stats()['cancelled'], 0)
+        self.assertEqual(native.hxg_exact(graph.ptr), -1)
+        self.assertEqual(proofs.records(), [])
+
+    def test_token_exhaustion_reports_zero_fresh_work_and_no_game_verdict(self):
+        graph = self.graph(self.opening)
+        pool = self.pool([graph], quantum=16, views=1, work=4096)
+        proofs = self.loop(pool, workers=1, queue=4)
+        lib = proofs.library.lib
+        tokens = [lib.hexo_tactical_prepare() for _ in range(64)]
+        for token in tokens:
+            self.addCleanup(lib.hexo_tactical_release, token)
+        self.assertTrue(all(tokens))
+        self.assertEqual(lib.hexo_tactical_prepare(), 0)
+        pool.step()
+        self.answer(pool)
+        proofs.step()
+        self.wait(lambda: proofs.stats()['finished'] > 0)
+        with self.assertRaisesRegex(ValueError, 'cancellation token limit'):
+            proofs.step()
+        self.assertEqual((proofs.stats()['fresh_nodes'], proofs.stats()['missing_fresh']), (0, 0))
+        self.assertEqual(native.hxg_exact(graph.ptr), -1)
+
+    def test_short_slice_collects_actual_work_without_publishing_a_late_verdict(self):
+        import ctypes as C
+        import json
+        from tactical_proof import NativeTactics
+        with NativeTactics(independent=True) as worker:
+            lib = worker.lib
+            for name, result, args in (
+                ('worker_answer', C.c_void_p, [C.c_void_p, C.c_char_p]),
+                ('answer_info', C.c_bool, [C.c_void_p, C.POINTER(C.c_uint64)]),
+                ('answer_json', C.c_void_p, [C.c_void_p]),
+                ('answer_free', None, [C.c_void_p]),
+            ):
+                function = getattr(lib, 'hexo_tactical_'+name)
+                function.argtypes, function.restype = args, result
+            token = lib.hexo_tactical_prepare()
+            self.assertTrue(token)
+            try:
+                request = dict(history=self.opening, ms=8, nodes=10_000_000, idtt_nodes=0, depth=8,
+                               table_mb=1, bounds=True, resume=True, request_id=token)
+                answer = lib.hexo_tactical_worker_answer(worker.worker, json.dumps(request).encode())
+                self.assertTrue(answer)
+                try:
+                    info = (C.c_uint64*13)()
+                    self.assertTrue(lib.hexo_tactical_answer_info(answer, info))
+                    raw = lib.hexo_tactical_answer_json(answer)
+                    try:
+                        row = json.loads(C.string_at(raw))
+                    finally:
+                        lib.hexo_tactical_free(raw)
+                    self.assertEqual((info[0], row['status'], row['native_verified']),
+                                     (0, 'UNKNOWN', False))
+                    self.assertEqual(info[4], 1)
+                    self.assertEqual(info[3], row['nodes_fresh'])
+                    self.assertIsNone(row['certificate'])
+                    self.assertFalse(worker.busy)
+                    self.assertEqual(row['last_worker_completion']['completed_queries'], 1)
+                finally:
+                    lib.hexo_tactical_answer_free(answer)
+            finally:
+                lib.hexo_tactical_release(token)
+
+
 if __name__ == '__main__':
     unittest.main()
