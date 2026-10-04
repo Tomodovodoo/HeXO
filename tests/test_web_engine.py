@@ -362,6 +362,56 @@ console.log(JSON.stringify([partial,proven(table,root,old,2)]));"""
             self.assertEqual(shown['moves'], [[0,1],[0,2]])
             self.assertEqual(shown['pv'], [[0,1,0,1],[0,2,0,2]])
 
+    def test_shorter_complete_line_reaches_parent_even_with_the_same_padded_bound(self):
+        root = [[0,0],[0,1]]
+        old_moves = [[1,1],[8,0],[8,1],[0,2],[0,3],[8,2],[9,2],[0,4],[0,5],[9,0],[10,0],[0,6]]
+        new_moves = [[8,0],[8,1],[0,3],[0,4],[8,2],[9,2],[0,5],[0,6]]
+        old = dict(moves=[[1,1]], value=1, top=[], proof=dict(winner=1,plies=25,turns=7),
+                   pv=[[*p,play.player_at(len(root)+i),i+1] for i,p in enumerate(old_moves)])
+        child = dict(moves=new_moves[:2], value=0, top=[], proof=dict(winner=1,plies=24,turns=6),
+                     pv=[[*p,play.player_at(len(root)+1+i),i+1] for i,p in enumerate(new_moves)])
+        history = root+[[0,2]]
+        expected = [[0,2,1,1]] + [[*p[:3],p[3]+1] for p in child['pv']]
+        answer = node(dict(kind='proofs',history=history,ply=len(history),found=child,records=[(root,old)]))
+        for shown in (answer['analysed'],answer['undone']['shown'],answer['quick']['shown'],answer['reloaded']):
+            self.assertEqual(shown['proof']['plies'],25)
+            self.assertEqual(shown['pv'],expected)
+            self.assertEqual(shown['moves'],[[0,2]])
+        for records in ([(root,old),(history,child)], [(history,child),(root,old)]):
+            table = play.Proofs()
+            for h,r in records:
+                table.add(h,r)
+            self.assertEqual(table.known(root),dict(winner=1,plies=25,pv=expected))
+
+    def test_defender_reconsiders_its_longest_line_after_the_attack_improves(self):
+        # One defensive choice initially lasts 15, the other 12. Improving the
+        # attack under the first to 8 must make the defender choose the second.
+        root = [[0,0],[1,0],[2,0]]
+        a, b = [0,1], [1,1]
+        records = [(root,dict(proof=dict(winner=1,plies=24),pv=[[*a,0,1],[0,2,0,2],[3,0,1,3]])),
+                   (root+[a],dict(proof=dict(winner=1,plies=15),pv=[[0,2,0,1],[10,-2,1,2],[11,-2,1,3],
+                        [9,-2,0,4],[9,-3,0,5],[3,0,1,6],[4,0,1,7],[8,0,0,8],[8,1,0,9],[5,0,1,10],
+                        [7,0,1,11],[9,1,0,12],[10,1,0,13],[6,0,1,14]])),
+                   (root+[b],dict(proof=dict(winner=1,plies=11),pv=[[1,2,0,1],[3,0,1,2],[7,0,1,3],
+                        [8,0,0,4],[8,1,0,5],[4,0,1,6],[8,-1,1,7],[9,0,0,8],[9,1,0,9],[5,0,1,10],[6,0,1,11]])),
+                   (root+[a,[0,2]],dict(proof=dict(winner=1,plies=6),pv=[[3,0,1,1],[4,0,1,2],
+                        [8,0,0,3],[8,1,0,4],[5,0,1,5],[6,0,1,6]]))]
+        source = """import {Proofs} from './web/engine/proof.mjs';
+const {root,records}=JSON.parse(process.argv[1]), table=new Proofs(), result=[];
+for(const [h,r] of records){table.add(h,r);result.push(table.known(root));}
+result.push(new Proofs(table.list()).known(root));console.log(JSON.stringify(result));"""
+        done = subprocess.run([NODE,'--input-type=module','-e',source,json.dumps(dict(root=root,records=records))],
+                              cwd=ROOT,capture_output=True,text=True,check=True)
+        results = json.loads(done.stdout)
+        self.assertEqual(results[-3]['pv'][0][:2],a)
+        self.assertEqual(results[-2]['pv'][0][:2],b,results[-2])
+        self.assertEqual(results[-1],results[-2])
+        self.assertEqual(results[-1]['plies'],24)
+        table = play.Proofs()
+        for (h,r), expected in zip(records,results):
+            table.add(h,r)
+            self.assertEqual(table.known(root),expected)
+
 
     def test_partial_proofs_gain_the_child_line_and_survive_reload(self):
         history = [[0, 0], [1, 0], [2, 0]]
@@ -603,6 +653,35 @@ class Bundle(unittest.TestCase):
                                  proofStamps=enabled))
                 self.assertEqual((turn['proof']['winner'], turn['proof']['plies']), (0, 1))
                 self.assertEqual(len(turn['pv']), 1)
+
+    def test_changed_stamp_returns_the_shortened_strategy_it_checked(self):
+        history = [[0,0],[1,-2],[-1,-2],[0,-2],[2,-1],[-2,-3],[3,-3],[4,-2],[6,-3],
+                   [1,-4],[5,-4],[8,-4],[10,-5],[7,-5],[6,-6],[12,-6],[14,-7],[9,-6],
+                   [11,-7],[15,-10],[17,-11],[13,-8],[14,-11],[15,-9],[16,-10],[13,-9],[14,-9]]
+        original = history[:-2] + [[14,-8],[19,-10]]
+        # The original five-turn strategy crosses both newly occupied cells.
+        # The raw checker can shorten it, so returning that OLD strategy for
+        # display used to throw "Illegal placement: 13,-9" after a checked win.
+        nodes = [dict(kind='unstoppable', threats=[[[12,-8],[17,-13]],[[16,-14],[16,-13]],[[16,-8],[16,-7]]])]
+        for action, responses in [([[16,-12],[16,-11]], [[[11,-9],[17,-9]],[[12,-9],[17,-9]],[[12,-9],[18,-9]]]),
+                                  ([[13,-9],[14,-9]], [[[12,-10],[18,-10]]]),
+                                  ([[13,-10],[14,-10]], [[[12,-5],[18,-11]],[[13,-6],[18,-11]],[[13,-6],[19,-12]]]),
+                                  ([[16,-9],[17,-10]], [[[15,-13],[15,-7]],[[15,-12],[15,-7]],[[15,-12],[15,-6]]])]:
+            nodes.append(dict(kind='attacker_move', action=action, child=len(nodes)-1))
+            nodes.append(dict(kind='defender_replies', responses=[dict(action=r, child=len(nodes)-1) for r in responses]))
+        nodes.append(dict(kind='attacker_move', action=[[15,-11],[15,-8]], child=len(nodes)-1))
+        source = dict(stones=[[p,play.player_at(i)] for i,p in enumerate(original)], player=0, remaining=2, winner=0,
+                      certificate=dict(version=1, width='wide', root=len(nodes)-1, nodes=nodes))
+        certificate = dict(version=1, width='wide', root=0, nodes=[dict(kind='stamp', source=source)])
+        cases = [history, history[:-2] + history[-2:][::-1]]
+        found = node(dict(kind='tactical', queries=[dict(history=h, options=dict(certificate=certificate, stamps=True,
+                                     nodes=20000, ms=10000)) for h in cases]))
+        for h, result in zip(cases, found):
+            self.assertEqual((result['status'], result['proof_turns']), ('PROVEN_WIN', 2))
+            self.assertEqual(tactical_proof.independent_verify(result['certificate'], h), 'PROVEN_WIN')
+            local = play.principal_variation(h, result['certificate'])
+            self.assertEqual(local[1], 6)
+            self.assertEqual(node(dict(kind='pv', history=h, certificate=result['certificate'])), dict(pv=local[0], plies=local[1]))
 
     def test_quiet_defender_certificate_has_the_same_browser_line(self):
         history = [[0,0],[0,8],[8,0],[1,0],[0,1],[-8,0],[0,-8],[1,1],[12,-8],[-8,8]]
