@@ -32,14 +32,6 @@ fn rotate(mut p:Coord,sym:u8)->Coord {
     for _ in 0..sym%6 {p=(-p.1,p.0+p.1);} p
 }
 fn transform(p:Coord,sym:u8,offset:Coord)->Coord {let p=rotate(p,sym);(p.0+offset.0,p.1+offset.1)}
-fn transform_window(w:Window,sym:u8,offset:Coord)->Window {
-    let points=cells(w);let a=transform(points[0],sym,offset);let b=transform(points[5],sym,offset);
-    for (axis,(dq,dr)) in AXES.into_iter().enumerate() {
-        if b==(a.0+5*dq,a.1+5*dr) {return (a.0,a.1,axis as u8);}
-        if a==(b.0+5*dq,b.1+5*dr) {return (b.0,b.1,axis as u8);}
-    }
-    unreachable!("hex symmetry preserves six-cell windows")
-}
 fn inverse(p:Coord,sym:u8,offset:Coord)->Coord {
     let p=(p.0-offset.0,p.1-offset.1);let p=rotate(p,(6-sym%6)%6);
     if sym>=6 {(p.1,p.0)}else{p}
@@ -240,48 +232,34 @@ impl Stamp {
     }
 
     /// A sufficient implication between the predicates in `matches`, including
-    /// the win bound. Keep incomparable speed/applicability tradeoffs. Only
-    /// small shapes can relocate in lookup, so large strategies compare in
-    /// their actual game frame.
+    /// the win bound and bounded discovery. Distinct fixed frames remain: the
+    /// geometry/instance caps can prevent rediscovery of a discarded frame.
     fn dominates(&self,other:&Self,ctl:&Ctl)->Result<bool,String> {
-        if self.source.remaining!=other.source.remaining
-            || (self.source.player==self.source.winner)!=(other.source.player==other.source.winner)
+        control(ctl)?;
+        if self.source.remaining!=other.source.remaining || self.source.player!=other.source.player
+            || self.source.winner!=other.source.winner
             || self.turns>other.turns || self.required.len()>other.required.len() || self.empty.len()>other.empty.len()
             || (self.allowance>0 && (other.allowance==0 || self.allowance>other.allowance)) {return Ok(false);}
-        if self.required.len()>4 {
-            control(ctl)?;
-            return Ok(self.source.winner==other.source.winner && self.dominates_at(other,0,(0,0)));
+        // A relocatable source also had capped candidates outside its fixed
+        // frame. Preserve their geometry and, for incremental discovery, the
+        // root mask filtering that leaves capacity for later occurrences.
+        if other.required.len()<=4 && (self.required!=other.required || (other.portable.get() && self.empty!=other.empty)) {
+            return Ok(false);
         }
-        let anchor=*self.required.first().unwrap();
-        for sym in 0..12 {for &target in &other.required {
-            control(ctl)?;
-            let p=rotate(anchor,sym);let offset=(target.0-p.0,target.1-p.1);
-            if self.dominates_at(other,sym,offset) {return Ok(true);}
-        }}
-        Ok(false)
+        Ok(self.dominates_here(other))
     }
-    fn dominates_at(&self,other:&Self,sym:u8,offset:Coord)->bool {
-        let point=|p|transform(p,sym,offset);
-        if self.required.iter().any(|&p|!other.required.contains(&point(p)))
-            || self.empty.iter().any(|&p|!other.empty.contains(&point(p))) {return false;}
+    fn dominates_here(&self,other:&Self)->bool {
+        if !self.required.is_subset(&other.required) || !self.empty.is_subset(&other.empty) {return false;}
         if self.allowance==0 {return true;}
         // Every window exempted from the other's global counter-threat test
         // must also be exempted from ours. Its lower allowance is no stricter.
-        if other.before.iter().any(|&p|!self.before.contains(&inverse(p,sym,offset))) {return false;}
+        if !other.before.is_subset(&self.before) {return false;}
         self.guards.iter().all(|(&w,&limit)| {
-            let w=transform_window(w,sym,offset);let points=cells(w);
+            let points=cells(w);
             points.iter().any(|p|other.required.contains(p))
                 || other.guards.get(&w).is_some_and(|&bound|bound<=limit)
                 || (!points.iter().any(|p|other.before.contains(p)) && 5-other.allowance as i8<=limit)
         })
-    }
-    fn inherit_discovery(&self,other:&Self) {
-        // A discarded source was also checked directly at its fixed coordinates
-        // below the query root. A relocated/colour-swapped replacement must be
-        // discoverable as its supporting stones are created during search.
-        if other.portable.get() || self.source.winner!=other.source.winner || !self.dominates_at(other,0,(0,0)) {
-            self.portable.set(true);
-        }
     }
 
     pub fn key(&self)->String {
@@ -413,13 +391,13 @@ fn remember_as(source:StampSource,ctl:&Ctl,portable:bool)->Result<Rc<Stamp>,Stri
             let older=prior.dominates(&stamp,ctl)?;
             let newer=stamp.dominates(prior,ctl)?;
             if older && (!newer || prior.bytes<=stamp.bytes) {
-                prior.inherit_discovery(&stamp);
+                if stamp.portable.get() {prior.portable.set(true);}
                 return Ok(());
             }
             if newer {replaced.push(i);}
         }
         for &i in replaced.iter().rev() {
-            stamp.inherit_discovery(&list[i]);
+            if list[i].portable.get() {stamp.portable.set(true);}
             list.remove(i);
         }
         while !list.is_empty() && (list.len()>=MAX_STAMPS || list.iter().map(|s|s.bytes).sum::<usize>()+stamp.bytes>MAX_BYTES) {
@@ -612,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn symmetric_imports_share_storage_but_return_the_requested_strategy() {
+    fn transformed_imports_return_the_requested_strategy_and_keep_fixed_frames() {
         LIBRARY.with(|l|l.borrow_mut().clear());
         let ctl=Ctl::new(0.0);
         let entries:serde_json::Value=serde_json::from_str(include_str!("../stamps.json")).unwrap();
@@ -624,13 +602,9 @@ mod tests {
             let source=transformed_source(&original,sym,(20,-10),sym%2==1);
             let returned=import(source.clone(),&ctl).unwrap();
             assert_eq!(returned.source,source);
-            assert_eq!(stats().0,count);
-            for (&w,_) in &first.guards {
-                let transformed:BTreeSet<_>=cells(w).into_iter().map(|p|transform(p,sym,(20,-10))).collect();
-                assert_eq!(transformed,cells(transform_window(w,sym,(20,-10))).into_iter().collect());
-            }
+            assert!(LIBRARY.with(|l|l.borrow().iter().any(|s|s.dominates(&returned,&ctl).unwrap())));
         }
-        assert!(LIBRARY.with(|l|l.borrow().iter().all(|s|s.portable.get())));
+        assert!(stats().0>1);
         LIBRARY.with(|l|l.borrow_mut().clear());
     }
 
@@ -642,34 +616,36 @@ mod tests {
             certificate:ProofCertificate{version:1,width:"wide".into(),root:0,
                 nodes:vec![ProofNode::ImmediateWin{action:vec![(4,0),(5,0)]}]}};
         let mut narrow=Stamp::compile(source.clone(),&ctl).unwrap();
-        narrow.source.stones.reverse();narrow.empty.insert((8,8));narrow.portable.set(true);
+        narrow.source.stones.reverse();narrow.allowance=2;narrow.guards.insert((8,8,0),0);narrow.portable.set(true);
         let old_source=narrow.source.clone();
         LIBRARY.with(|l|l.borrow_mut().push(Rc::new(narrow)));
         let oracle=Oracle::new(&ctl,&source.stones.iter().copied().collect());
         let broad=remember(source,&ctl).unwrap();
         assert_eq!(stats().0,1);assert!(broad.portable.get());
-        assert!(!broad.empty.contains(&(8,8)));
+        assert!(!broad.guards.contains_key(&(8,8,0)));
         assert_eq!(oracle.source(0),old_source);
         assert!(LIBRARY.with(|l|Rc::ptr_eq(&l.borrow()[0],&broad)));
         LIBRARY.with(|l|l.borrow_mut().clear());
     }
 
     #[test]
-    fn discarded_frames_remain_discoverable_below_the_query_root() {
+    fn fixed_frames_survive_saturated_geometry_discovery() {
         let ctl=Ctl::new(0.0);
         let source=StampSource{stones:(0..4).map(|q|((q,0),0)).collect(),player:0,remaining:2,winner:0,
             certificate:ProofCertificate{version:1,width:"wide".into(),root:0,
                 nodes:vec![ProofNode::ImmediateWin{action:vec![(4,0),(5,0)]}]}};
         let translated=transformed_source(&source,0,(20,-10),false);
-        // Both insertion orders exercise retaining an existing representative
-        // and replacing one with a smaller strategy in another frame.
+        // Neither frame relies on the other's capped geometry candidates.
         for sources in [[source.clone(),translated.clone()],[translated.clone(),source.clone()]] {
             LIBRARY.with(|l|l.borrow_mut().clear());
             for source in sources {remember(source,&ctl).unwrap();}
-            assert_eq!(stats().0,1);
-            assert!(LIBRARY.with(|l|l.borrow()[0].portable.get()));
+            assert_eq!(stats().0,2);
+            assert!(LIBRARY.with(|l|l.borrow().iter().all(|s|!s.portable.get())));
             let mut board:Board=[((20,-10),0),((21,-10),0)].into_iter().collect();
             let oracle=Oracle::new(&ctl,&board);
+            for candidates in oracle.candidates.borrow_mut().iter_mut() {
+                for i in 0..512 {candidates.insert((0,(1000+i,1000),false));}
+            }
             board.insert((22,-10),0);board.insert((23,-10),0);
             let stones:Vec<_>=board.iter().map(|(&p,&s)|(p,player(s))).collect();
             let (id,winner,turns)=oracle.lookup(1,&stones,&|p|board.get(&p).copied().map(player),Player::P1,2).unwrap();

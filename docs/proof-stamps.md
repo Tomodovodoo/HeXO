@@ -120,13 +120,12 @@ On insertion, the worker discards a stamp only when another checked strategy
 has the same winner relative to the mover and the same remaining placements,
 covers all its matching boards, and has an equal or shorter win bound. This compares
 supporting stones, protected empty cells, counter-threat guards and the common
-attacker prefix. Small relocatable shapes compare across all twelve hex
-symmetries, translations and colour swaps; large strategies compare in their
-actual game coordinates. Broader-but-slower strategies remain separate. Equal
+attacker prefix. Strategies compare in their actual game coordinates. Distinct
+fixed frames remain available even if capped geometric matching cannot discover
+them again. Small relocatable entries retain the same supporting geometry; an
+imported entry also retains its root mask filtering. Broader-but-slower strategies remain separate. Equal
 conditions and bounds keep the smaller compiled strategy. Portable status
-follows the retained entry; an active query keeps its original sources. If a
-replacement uses another coordinate frame or colour, it also becomes eligible
-for discovery when supporting stones are created below the query root.
+follows the retained entry; an active query keeps its original sources.
 
 This comparison runs only when learning or importing a stamp. The library
 remains local to one solver worker. Ordinary player analysis uses one worker;
@@ -192,19 +191,18 @@ threads. No query hit its deadline. All 546 outcomes still agreed.
 
 | Six-game replay | Before deduplication | After deduplication |
 |---|---:|---:|
-| Solver time | 28.922 s | 32.177 s |
-| Fresh nodes | 329,076 | 328,468 |
+| Solver time | 28.922 s | 28.171 s |
+| Fresh nodes | 329,076 | 329,076 |
 | Proven-win queries | 210 | 210 |
-| Stamp hits | 97 | 98 |
-| Peak compiled entries | 32 | 23 |
-| Mean compiled entries | 26.6 | 15.1 |
-| Peak accounted library size | 234.1 KiB | 275.3 KiB |
+| Stamp hits | 97 | 97 |
+| Peak compiled entries | 32 | 32 |
+| Mean compiled entries | 26.6 | 26.0 |
+| Peak accounted library size | 234.1 KiB | 179.6 KiB |
 
-The final version took 11.3% more time in this comparison. It preserves discovery
-of discarded coordinate frames below the query root, which costs extra matching
-work. Fewer duplicate templates left room for larger distinct proofs, so peak
-bytes increased within the same 4 MiB limit. These recorded continuations do not
-measure newly selected moves or games/hour.
+The final version took 2.6% less time and used 23.3% fewer peak accounted bytes
+in this comparison. Fresh nodes and stamp hits were unchanged. This small timing
+difference is one paired measurement, not evidence of a broad throughput gain.
+These recorded continuations do not measure newly selected moves or games/hour.
 
 The distinction between forcing, holding and unstoppable shapes is also useful
 in [Six's shape guide](https://github.com/CixMango/Six/blob/main/guide/shapes.md).
