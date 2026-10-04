@@ -3,7 +3,7 @@
 //! future defender stone can affect; a global check covers the remaining ones.
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::rc::Rc;
+use std::rc::{Rc,Weak};
 use hexo_engine::types::{Coord, Player};
 use hexo_solver::prover::Ctl;
 use hexo_solver::prover::certificate::{ProofCertificate, ProofNode, StampOracle, StampSource, StoneAt};
@@ -348,6 +348,7 @@ fn materialize(cert:&ProofCertificate,b:&Board,n:usize,winner:u8,ctl:&Ctl)->Resu
 
 thread_local! {
     static LIBRARY:RefCell<Vec<Rc<Stamp>>>=const{RefCell::new(Vec::new())};
+    static IMPORTS:RefCell<Vec<(Vec<u8>,Weak<Stamp>)>>=const{RefCell::new(Vec::new())};
     static DEPTH:Cell<u8>=const{Cell::new(0)};
     static SEEDED:Cell<usize>=const{Cell::new(0)};
 }
@@ -358,7 +359,7 @@ pub fn seed(ctl:&Ctl)->Result<(),String> {
     // A leaf query may expire between entries. Keep completed imports rather
     // than recompiling their original, unshared certificates next slice.
     for (i,entry) in entries.into_iter().enumerate().skip(SEEDED.with(Cell::get)) {
-        import(entry.source,ctl)?;
+        remember_as(entry.source,ctl,true)?;
         SEEDED.with(|s|s.set(i+1));
     }
     SEEDED.with(|s|s.set(usize::MAX));Ok(())
@@ -368,8 +369,33 @@ impl Drop for CompileDepth {fn drop(&mut self){DEPTH.with(|n|n.set(n.get()-1));}
 pub fn remember(source:StampSource,ctl:&Ctl)->Result<Rc<Stamp>,String> {
     remember_as(source,ctl,false)
 }
-pub fn import(source:StampSource,ctl:&Ctl)->Result<Rc<Stamp>,String> {
-    remember_as(source,ctl,true)
+fn import_bytes()->usize {IMPORTS.with(|i|i.borrow().iter().map(|(key,_)|key.len()+64).sum())}
+fn trim_imports(room:usize) {
+    IMPORTS.with(|i| {
+        let mut list=i.borrow_mut();list.retain(|(_,s)|s.strong_count()>0);
+        while !list.is_empty() && (list.len()>=MAX_STAMPS || list.iter().map(|(k,_)|k.len()+64).sum::<usize>()>room) {list.remove(0);}
+    });
+}
+pub fn import(source:StampSource,ctl:&Ctl)->Result<(),String> {
+    control(ctl)?;
+    if let Some(stamp)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source==source).cloned()) {
+        stamp.portable.set(true);return Ok(());
+    }
+    let mut key=serde_json::to_vec(&source).map_err(|e|e.to_string())?;key.shrink_to_fit();
+    let hit=IMPORTS.with(|i|i.borrow().iter().find_map(|(k,s)|if *k==key {s.upgrade()}else{None}));
+    if hit.is_some_and(|s|LIBRARY.with(|l|l.borrow().iter().any(|p|Rc::ptr_eq(p,&s)))) {return Ok(());}
+    let stamp=remember_as(source,ctl,true)?;
+    let entries=LIBRARY.with(|l|l.borrow().clone());
+    for retained in &entries {
+        if Rc::ptr_eq(retained,&stamp) || retained.dominates(&stamp,ctl)? {
+            let used=entries.iter().map(|s|s.bytes).sum::<usize>();
+            let bytes=key.len()+64;
+            trim_imports(MAX_BYTES.saturating_sub(used+bytes));
+            if used+import_bytes()+bytes<=MAX_BYTES {IMPORTS.with(|i|i.borrow_mut().push((key,Rc::downgrade(retained))));}
+            break;
+        }
+    }
+    Ok(())
 }
 fn remember_as(source:StampSource,ctl:&Ctl,portable:bool)->Result<Rc<Stamp>,String> {
     let _time=measure("remember");
@@ -400,7 +426,8 @@ fn remember_as(source:StampSource,ctl:&Ctl,portable:bool)->Result<Rc<Stamp>,Stri
             if list[i].portable.get() {stamp.portable.set(true);}
             list.remove(i);
         }
-        while !list.is_empty() && (list.len()>=MAX_STAMPS || list.iter().map(|s|s.bytes).sum::<usize>()+stamp.bytes>MAX_BYTES) {
+        trim_imports(MAX_BYTES.saturating_sub(list.iter().map(|s|s.bytes).sum::<usize>()+stamp.bytes));
+        while !list.is_empty() && (list.len()>=MAX_STAMPS || list.iter().map(|s|s.bytes).sum::<usize>()+stamp.bytes+import_bytes()>MAX_BYTES) {
             let evict=list.iter().position(|s|!s.portable.get()).unwrap_or(0);list.remove(evict);
         }
         list.push(stamp.clone());
@@ -416,7 +443,7 @@ pub fn prune(board:&Board) {
     LIBRARY.with(|l|l.borrow_mut().retain(|s|s.portable.get() || s.required.len()<=4 ||
         !(s.empty.iter().any(|p|board.contains_key(p)) || s.required.iter().any(|p|board.get(p).is_some_and(|&side|side!=s.source.winner)))));
 }
-pub fn stats()->(usize,usize) {LIBRARY.with(|l|{let l=l.borrow();(l.len(),l.iter().map(|s|s.bytes).sum())})}
+pub fn stats()->(usize,usize) {LIBRARY.with(|l|{let l=l.borrow();(l.len(),l.iter().map(|s|s.bytes).sum::<usize>()+import_bytes())})}
 pub fn verify(source:&StampSource,b:&Board,n:usize,winner:u8,ctl:&Ctl)->Result<u32,String> {
     let _time=measure("verify");
     if source.winner!=winner || check::phase(n)!=(source.player,source.remaining) {return Err("stamp winner/tempo mismatch".into());}
@@ -600,11 +627,28 @@ mod tests {
         assert_eq!(count,1);assert!(!first.portable.get());
         for sym in 0..12 {
             let source=transformed_source(&original,sym,(20,-10),sym%2==1);
-            let returned=import(source.clone(),&ctl).unwrap();
+            import(source.clone(),&ctl).unwrap();
+            let returned=remember(source.clone(),&ctl).unwrap();
             assert_eq!(returned.source,source);
             assert!(LIBRARY.with(|l|l.borrow().iter().any(|s|s.dominates(&returned,&ctl).unwrap())));
+            reset_timings(true);
+            import(source,&ctl).unwrap();
+            assert!(timings().get("compile").is_none());
+            reset_timings(false);
         }
         assert!(stats().0>1);
+        let mut duplicate=original.clone();
+        duplicate.certificate.nodes.extend(std::iter::repeat_n(original.certificate.nodes[0].clone(),512));
+        import(duplicate.clone(),&ctl).unwrap();
+        reset_timings(true);
+        import(duplicate.clone(),&ctl).unwrap();
+        assert!(timings().get("compile").is_none());
+        assert!(stats().1<=MAX_BYTES);
+        LIBRARY.with(|l|l.borrow_mut().clear());
+        reset_timings(true);
+        import(duplicate,&ctl).unwrap();
+        assert!(timings().get("compile").is_some());
+        reset_timings(false);
         LIBRARY.with(|l|l.borrow_mut().clear());
     }
 

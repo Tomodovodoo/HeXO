@@ -126,6 +126,10 @@ them again. Small relocatable entries retain the same supporting geometry; an
 imported entry also retains its root mask filtering. Broader-but-slower strategies remain separate. Equal
 conditions and bounds keep the smaller compiled strategy. Portable status
 follows the retained entry; an active query keeps its original sources.
+Repeated imports remember the complete validated source identity and the
+retained strategy that covers it. These aliases share the 4 MiB accounting
+budget and stop applying when that strategy leaves the library, so deduplication
+does not force the client to recheck a discarded certificate on every query.
 
 This comparison runs only when learning or importing a stamp. The library
 remains local to one solver worker. Ordinary player analysis uses one worker;
@@ -191,7 +195,7 @@ threads. No query hit its deadline. All 546 outcomes still agreed.
 
 | Six-game replay | Before deduplication | After deduplication |
 |---|---:|---:|
-| Solver time | 28.922 s | 28.171 s |
+| Solver time | 28.922 s | 28.595 s |
 | Fresh nodes | 329,076 | 329,076 |
 | Proven-win queries | 210 | 210 |
 | Stamp hits | 97 | 97 |
@@ -199,7 +203,7 @@ threads. No query hit its deadline. All 546 outcomes still agreed.
 | Mean compiled entries | 26.6 | 26.0 |
 | Peak accounted library size | 234.1 KiB | 179.6 KiB |
 
-The final version took 2.6% less time and used 23.3% fewer peak accounted bytes
+The final version took 1.1% less time and used 23.3% fewer peak accounted bytes
 in this comparison. Fresh nodes and stamp hits were unchanged. This small timing
 difference is one paired measurement, not evidence of a broad throughput gain.
 These recorded continuations do not measure newly selected moves or games/hour.
