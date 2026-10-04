@@ -893,6 +893,14 @@ class Jobs(unittest.TestCase):
 
     def test_budgets(self):
         bubble = PRESETS['bubble']
+        leaves = dict(simulations=8, solver_nodes=0, leaf_nodes=2048, leaf_ms=1000)
+        self.assertEqual(budget_of(bubble, 'custom', leaves, 'bubble'), leaves)
+        self.assertEqual(presets_of('bubble', dict(quick=leaves))['quick'], leaves)
+        for extra in (dict(leaf_nodes=-1), dict(leaf_ms=0), dict(leaf_nodes='1')):
+            with self.assertRaises(ValueError):
+                budget_of(bubble, 'custom', extra, 'bubble')
+        with self.assertRaises(ValueError):
+            budget_of(PRESETS['native'], 'custom', dict(leaf_nodes=2048), 'native')
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=10 ** 6))['simulations'], 10 ** 6)
         for custom in (dict(simulations=-1), dict(simulations=2 ** 31), dict(ms=5), dict(simulations='8')):
@@ -2433,6 +2441,36 @@ class GameProofs(unittest.TestCase):
         self.session.analyse(ply, force)
         wait(lambda: not self.session.state()['jobs'], 60)
         return self.session.state()['evaluations'][ply]
+
+    def test_leaf_allowance_reaches_the_player_and_pooled_review_without_root_queries(self):
+        session = self.session
+        budget = dict(simulations=8, solver_nodes=0, leaf_nodes=2048, leaf_ms=1000)
+        session.configure_analysis('bubble:tiny', preset='custom', auto=False, custom=budget)
+        key = session.engine_key(session.analysis)
+        session.analyse(80)
+        wait(lambda: not session.state()['jobs'], 60)
+        saved = session.lookup(session.history)
+        self.assertEqual(saved['proof']['winner'], 0)
+        self.assertGreater(len(saved['pv']), 5)
+        self.assertEqual(saved['pv'], saved['proofs'][0]['pv'])
+        self.assertEqual((saved['engine'], saved['solver_nodes'], saved['leaf_nodes']), (key, 0, 2048))
+        self.assertGreater(saved['actual_solver_nodes'], 0)
+        self.assertLessEqual(saved['actual_solver_nodes'], 2048)
+        self.assertEqual(session.state()['evaluations'][79]['proof']['plies'], saved['proof']['plies'] + 1)
+        pooled = session.engines.evaluate_many(session.entries['bubble:tiny'], None, budget,
+                                               [list(session.history)], lambda n: None)
+        found, spent, weights = pooled[0]
+        self.assertEqual((spent, weights, found['pv']), (budget, key, saved['pv']))
+        session.configure_analysis('bubble:tiny', preset='custom', auto=False, custom=dict(simulations=8, solver_nodes=0))
+        self.assertNotEqual(session.engine_key(session.analysis), key)
+        self.assertIsNone(session.lookup(session.history))
+        self.assertEqual(session.state()['evaluations'][80]['pv'], saved['pv'])
+        unavailable = Engines('cpu', tactical_package=Path(RUN.name) / 'missing')
+        self.addCleanup(unavailable.close)
+        self.assertEqual(unavailable.effective(budget), budget | dict(leaf_nodes=0))
+        session.configure_analysis('bubble:tiny', preset='custom', auto=False, custom=budget)
+        with self.assertRaisesRegex(ValueError, 'leaf-proof allowance'):
+            session.timed_config(session.analysis)
 
     def test_a_proof_carries_back_to_the_played_move_and_stays(self):
         seven = self.analyse(80, 32768)

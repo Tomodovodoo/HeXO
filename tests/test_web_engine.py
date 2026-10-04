@@ -215,7 +215,8 @@ class BrowserProofs(unittest.TestCase):
     def test_leaf_certificate_is_visible_before_the_first_stone_and_after_reload(self):
         from tests.test_tactical_proof import LATE_WIN
         history = [list(p) for p in LATE_WIN] + [[-1, -11]]
-        found = node(dict(kind='worker-turn', history=history, simulations=8, nodes=0, leafNodes=2048, leafQueryMs=1000))
+        found = node(dict(kind='worker-turn', adapter=True, history=history, simulations=8, nodes=0,
+                          leafNodes=2048, leafQueryMs=1000))
         self.assertEqual(found['proof']['winner'], 0)
         self.assertGreater(len(found['pv']), 5)
         self.assertEqual(found['pv'], found['proofs'][0]['pv'])
