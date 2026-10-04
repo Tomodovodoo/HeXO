@@ -3747,6 +3747,33 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_native_startup_queues_historical_models_within_the_host_allocation(self):
+        from native_selfplay import ActorEngine
+        torch.set_num_threads(2)
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'startup-{k}','fixed','cpu',64,128) for k in range(3)]
+        settings = dense_config.ActorSettings(native_scheduler=True,native_producers=2,game_graph=192,
+            native_quantum=8,native_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=3,
+            opening_random_plies=0.)
+        engine = ActorEngine(settings)
+        self.addCleanup(engine.close)
+        for i,pair in enumerate(([models[0]]*2,[models[0],models[1]],[models[0],models[2]])):
+            engine.add(dense_selfplay.SelfPlayGame(pair,settings,30+i,
+                       opponent=None if i==0 else f'fixed-{i}',native_owner=True))
+        episodes,parked = [],False
+        end = time.monotonic()+10
+        while engine.slots and time.monotonic()<end:
+            for game in engine.step():
+                episodes.append(game.episode())
+            parked |= bool(engine.engine.waiting)
+            self.assertLessEqual(engine.summary()['host_workers'],2)
+        self.assertTrue(parked)
+        self.assertFalse(engine.slots)
+        self.assertEqual(len(episodes),3)
+        self.assertEqual(sum(e.get('opponent') is not None for e,_ in episodes),2)
+        for episode,rows in episodes:
+            self.assertEqual(len(episode['moves']),3)
+            self.assertTrue(all(r['search']['model']==episode['actors'][str(r['player'])] for r in rows))
+
     def test_native_rejected_model_pair_does_not_consume_the_retired_slot(self):
         from native_selfplay import ActorEngine
         torch.set_num_threads(2)

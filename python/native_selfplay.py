@@ -69,22 +69,29 @@ class NativeGames:
         self.archived_proofs, self.archived_stats = deque(maxlen=512), deque(maxlen=512)
         self.options = dict(quantum=quantum,views=views,depth=depth,work=quantum,cache=cache,
                             workers=max(1,producers//len(self.models)))
-        self.host_budget = min(16,max(producers,len(self.models)))
+        self.host_budget = min(16,producers if dynamic else max(producers,len(self.models)))
         self.proof_options = dict(package=proof_package,workers=proof_workers,
                                   queue=max(4,proof_workers*2),slice_ms=slice_ms,table_mb=4)
         if dynamic:
             try:
+                if any(len({m.sha for m in g.trees})>self.host_budget for g in games):
+                    raise ValueError('Initial model set exceeds the native host allocation')
                 initial = list(self.models)
                 self.models = []
+                admitted = set()
+                for game in games:
+                    candidate = {m.sha for m in game.trees}
+                    if len(admitted|candidate)<=self.host_budget:
+                        admitted.update(candidate)
                 for model in initial:
-                    self.register(model, initial=True)
+                    if model.sha in admitted:
+                        self.register(model)
+                self.waiting.update(range(len(games)))
                 self.service = InferenceService(self.pools,[m.evaluator for m in self.models],batch_size=batch_size,
                     quantum=min(128,batch_size),pending=4)
                 self.service.start(continuous=True)
                 for key in self.idle:
                     self.service.release(*key,expected=0)
-                for index in range(len(games)):
-                    self.next_root(index)
             except BaseException:
                 self.close()
                 raise
@@ -128,7 +135,7 @@ class NativeGames:
     def done(self):
         return len(self.finished)==len(self.games)
 
-    def register(self, model, *, initial=False):
+    def register(self, model):
         """One frozen producer per model, with a reusable graph slot for each game."""
         if model.sha in self.groups:
             return True
@@ -139,11 +146,9 @@ class NativeGames:
             graph.max_batch = max(b for b in graph.BATCHES if b<=min(128,self.batch_size))
         sources, placeholders = [], {}
         for index,game in enumerate(self.games):
-            source = next((tree for m,tree in game.trees.items() if initial and m.sha==model.sha),None)
-            if source is None:
-                s = game.settings
-                source = model.tree([],game.seed+index,s.tactics,s.search_graph,s.q_range_floor,s.game_graph)
-                placeholders[index] = source
+            s = game.settings
+            source = model.tree([],game.seed+index,s.tactics,s.search_graph,s.q_range_floor,s.game_graph)
+            placeholders[index] = source
             sources.append(source)
         workers = self.allocate(model.sha).get(model.sha,1) if self.service else self.options['workers']
         pool = SearchPool(sources,seed=self.games[0].seed,**dict(self.options,workers=workers))
@@ -164,15 +169,10 @@ class NativeGames:
             for index,game in enumerate(self.games):
                 key = producer,index
                 self.epochs[key] = 0
-                if index in placeholders:
-                    self.lookup[key] = None
-                    self.idle[key] = placeholders[index]
-                    if self.service is not None:
-                        self.service.release(*key,expected=0)
-                else:
-                    actual = next(m for m in game.trees if m.sha==model.sha)
-                    self.mapping[index,actual] = key
-                    self.lookup[key] = index,actual
+                self.lookup[key] = None
+                self.idle[key] = placeholders[index]
+                if self.service is not None:
+                    self.service.release(*key,expected=0)
             return True
         except BaseException:
             if getattr(pool,'_service',None) is None:
