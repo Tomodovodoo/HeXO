@@ -774,11 +774,27 @@ class Proofs:
     def put(self, history, winner, plies, pv):
         key = proof_key(history)
         old = self.entries.get(key)
-        witnessed = lambda line: bool(line) and all(len(stone) == 4 for stone in line)
-        if old is None or old['winner'] == winner and (plies, not witnessed(pv)) < (old['plies'], not witnessed(old['pv'])):
+        witnessed = lambda line: len(line) if all(len(stone) == 4 for stone in line) else 0
+        if old is None or old['winner'] == winner and (plies, -witnessed(pv)) < (old['plies'], -witnessed(old['pv'])):
             stones = frozenset((q, r, player_at(i)) for i, (q, r) in enumerate(history))
             self.entries[key] = dict(history=[list(p) for p in history], winner=int(winner), plies=int(plies), pv=pv, stones=stones)
             self.sizes.setdefault(len(history), set()).add(key)
+
+    def line(self, history, outcome):
+        """Extend a partial line with later witnesses at the exact positions it reaches, within its proof bound.
+        Omitted defender stones end the walk because the position after them is unknown."""
+        current, pv, i = list(history), outcome.get('pv') or [], 0
+        with self.lock:
+            while i <= len(pv):
+                entry = self.entries.get(proof_key(current))
+                if (entry is not None and entry['winner'] == outcome['winner'] and entry['plies'] + i <= outcome['plies']
+                        and len(entry['pv']) > len(pv) - i and all(len(p) == 4 for p in entry['pv'])):
+                    pv = pv[:i] + [[*p[:3], p[3] + i] for p in entry['pv']]
+                if i == len(pv) or len(pv[i]) != 4 or pv[i][3] != i + 1 or pv[i][2] != player_at(len(current)):
+                    break
+                current.append(tuple(pv[i][:2]))
+                i += 1
+        return pv
 
     def facts(self, history):
         """Exact outcomes reachable from this board, nearest positions first."""
@@ -818,18 +834,19 @@ class Proofs:
 
     def known(self, history):
         """The outcome of `history` ({winner, plies, pv}) from its own entry, else the shortest win of the side to
-        move through `edges`, its line led by that stone; None when nothing is known."""
+        move through `edges`, its line led by that stone and extended from stored children; None when nothing is known."""
         with self.lock:
             entry = self.entries.get(proof_key(history))
         if entry is not None:
-            return {k: entry[k] for k in ('winner', 'plies', 'pv')}
+            return dict(winner=entry['winner'], plies=entry['plies'], pv=self.line(history, entry))
         mover = player_at(len(history))
         wins = sorted((d, a, o) for a, (w, d, o) in self.edges(history).items() if w == mover)
         if not wins:
             return None
         distance, action, outcome = wins[0]
-        return dict(winner=mover, plies=distance,
-                    pv=[[*action, mover, 1]] + [[*p[:3], p[3] + 1] for p in outcome['pv']])
+        found = dict(winner=mover, plies=distance,
+                     pv=[[*action, mover, 1]] + [[*p[:3], p[3] + 1] for p in outcome['pv']])
+        return dict(found, pv=self.line(history, found))
 
     def extend(self, store, history):
         """Index the saved evaluations holding a proof of every position of `history` (see `Evaluations.proven`)."""
@@ -1887,7 +1904,8 @@ class Session:
 
     def proven(self, history, found, played=None):
         """`found` (an evaluation, or None) with what the game's proof table proves of `history`: when `found` has
-        no proof, the position's own proof, its value (1 or 0 for the side to move) and its line; and each stone
+        no proof, the position's own proof, its value (1 or 0 for the side to move) and its line; an existing proof's
+        line extended from stored children; and each stone
         to a proven position as a top row marked won or lost, proven wins first, the shortest leading and among
         equals the stone `played` next in the game, losses last. A position the table proves without an evaluation
         gets one with no simulations; None when there is neither."""
@@ -1907,6 +1925,9 @@ class Session:
                 winner=outcome['winner'], plies=outcome['plies'], turns=proof_turns(outcome['plies'], remaining, won)))
             if found is None and won:
                 shown['moves'] = [p[:2] for i, p in enumerate(outcome['pv'][:remaining]) if p[2] == mover and p[3] == i + 1]
+        if shown.get('proof'):
+            shown['pv'] = self.proofs.line(history, dict(winner=shown['proof']['winner'],
+                                                        plies=proof_plies(shown['proof'], history), pv=shown.get('pv') or []))
         rows = [list(row) for row in shown.get('top') or []]
         for action, (winner, distance, _) in edges.items():
             row = next((row for row in rows if tuple(row[:2]) == action), None)
