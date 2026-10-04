@@ -52,7 +52,7 @@ GUMBEL_EXPORTS = ('malloc', 'free', 'hxg_new', 'hxg_free', 'hxg_error', 'hxg_beg
                   'hxg_legal', 'hxg_fulfill', 'hxg_cancel', 'hxg_advance', 'hxg_stats', 'hxg_policy', 'hxg_completed',
                   'hxg_done', 'hxg_tactics', 'hxg_graph', 'hxg_q_range_floor', 'hxg_root_noise', 'hxg_exact',
                   'hxg_distance', 'hxg_census', 'hxg_mark_exact', 'hxg_prove', 'hxg_share', 'hxg_root_at', 'hxg_store', 'hxg_q',
-                  'hxg_facts', 'hxg_prove_loss', 'hxg_value',
+                  'hxg_facts', 'hxg_prove_loss', 'hxg_value', 'hxg_view', 'hxg_view_counters', 'hxg_root_credits',
                   'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_moves')
 NATIVE_EXPORTS = ('malloc', 'free', 'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_search')
 WASM_FLAGS = ['-std=c++20', '-O3', '-fwasm-exceptions', '-msimd128', '-sMODULARIZE', '-sEXPORT_ES6',

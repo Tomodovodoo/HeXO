@@ -50,6 +50,10 @@ bind('hxg_q', C.c_int, ptr, ptr)
 bind('hxg_facts', C.c_int, ptr, ptr, C.c_int)
 bind('hxg_prove_loss', C.c_int, ptr, C.c_int, C.c_int)
 bind('hxg_value', C.c_double, ptr)
+if hasattr(native, 'hxg_view'):
+    bind('hxg_view', ptr, ptr, ints, C.c_int, C.c_uint64)
+    bind('hxg_view_counters', None, ptr, ptr)
+    bind('hxg_root_credits', C.c_int, ptr, ptr)
 HOLD = -3  # hxg_next: the search waits at its armed hold
 GRAPH_LIMIT = 4096  # expanded nodes a GameGraph keeps between searches, about 56 KB each at 640 legal moves
 PV_DROP = .05       # completed-Q fall (value units, -1 to 1) of the chosen stone that sends a checked search back
@@ -344,6 +348,41 @@ class GameGraph(NeuralSearch):
         cells = [(int(q), int(r)) for q, r in history]
         checked(native.hxg_root_at(self.ptr, np.asarray(cells, dtype=np.int64).reshape(-1, 2), len(cells)))
         self.history = cells
+
+    def view(self, history=None, seed=0):
+        """An independent search into this game's store. Calls from all views must use one owner thread.
+        The view shares model/cache and position evidence, but has its own sampling, pending requests and credits.
+        Closing either view leaves the other usable. Moving one view requires only its own requests to drain.
+        """
+        if not hasattr(native, 'hxg_view'):
+            raise RuntimeError('Rebuild the native search library for independent graph views')
+        if not self.ptr:
+            raise ValueError('Graph is closed')
+        cells = self.history if history is None else [(int(q), int(r)) for q, r in history]
+        address = native.hxg_view(self.ptr, np.asarray(cells, dtype=np.int64).reshape(-1, 2), len(cells), seed)
+        if not address:
+            checked(False)
+        view = object.__new__(GameGraph)
+        view.ptr, view.history = address, list(cells)
+        view.evaluator, view.model_version, view.cache = self.evaluator, self.model_version, self.cache
+        view.proof_solver, view.proof_ms = self.proof_solver, self.proof_ms
+        return view
+
+    def counters(self):
+        """This root comparison's issued/completed/cancelled simulations and this view's pending requests.
+        `retired` counts late results since view creation; `views` counts live views into the same game.
+        Shared visits are available separately in result().
+        """
+        out = np.zeros(6, np.uint64)
+        native.hxg_view_counters(self.ptr, out.ctypes.data)
+        return dict(zip(('issued', 'completed', 'cancelled', 'pending', 'retired', 'views'), map(int, out)))
+
+    def credits(self):
+        """Direct completed root comparison credits in result() action order, excluding inherited visits."""
+        size = native.hxg_root_credits(self.ptr, None)
+        out = np.empty(size, np.uint64)
+        native.hxg_root_credits(self.ptr, out.ctypes.data)
+        return out
 
     @property
     def root_version(self):

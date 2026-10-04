@@ -790,6 +790,161 @@ class Refuted(Ranked):
         return out
 
 class SharedGraph(unittest.TestCase):
+    def test_views_share_evidence_and_keep_comparison_credits_local(self):
+        graph = self.graph(Uniform(), recorded_position(11))
+        graph.search(16, root_samples=4, batch_size=4)
+        own = graph.counters()
+        own_credits = graph.credits().copy()
+        before = graph.result(0, 0, 0, 0)['visits'].sum()
+        view = graph.view(seed=19)
+        self.addCleanup(view.close)
+        view.search(32, root_samples=8, batch_size=8)
+        self.assertEqual(graph.counters(), dict(own, views=2))
+        np.testing.assert_array_equal(graph.credits(), own_credits)
+        self.assertEqual(int(view.credits().sum()), 32)
+        self.assertGreater(graph.result(0, 0, 0, 0)['visits'].sum(), before)
+        self.assertEqual(view.counters()['completed'], 32)
+        self.assertEqual(view.counters()['pending'], 0)
+
+    def test_polling_cold_view_metrics_does_not_change_its_first_choice(self):
+        graph = self.graph(Uniform(), recorded_position(11))
+        native.hxg_begin(graph.ptr, 8, 4)
+        request, history = graph.request()
+        graph.fulfill(request, Uniform().evaluate([history])[0])
+        polled, plain = graph.view(seed=11), graph.view(seed=11)
+        self.addCleanup(polled.close)
+        self.addCleanup(plain.close)
+        for _ in range(4):
+            polled.result(0, 0, 0, 0)
+            self.assertEqual(int(polled.credits().sum()), 0)
+        native.hxg_begin(polled.ptr, 8, 4)
+        native.hxg_begin(plain.ptr, 8, 4)
+        request, chosen = polled.request()
+        polled.fulfill(request, Uniform().evaluate([chosen])[0])
+        request, unpolled = plain.request()
+        self.assertGreater(request, 0)
+        self.assertEqual(chosen[len(graph.history)], unpolled[len(graph.history)])
+        native.hxg_cancel(plain.ptr)
+
+    def test_view_survives_source_close_and_other_view_can_move_with_pending_work(self):
+        graph = self.graph(Uniform(), recorded_position(11))
+        graph.search(16, root_samples=4, batch_size=4)
+        view = graph.view(seed=12)
+        self.addCleanup(view.close)
+        native.hxg_begin(graph.ptr, 8, 4)
+        request, history = graph.request()
+        self.assertGreater(request, 0)
+        view.at(history)
+        with self.assertRaisesRegex(ValueError, 'pending requests'):
+            graph.at(history)
+        graph.close()
+        result = view.search(16, root_samples=4, batch_size=4)
+        self.assertEqual(result['completed'], 16)
+        self.assertEqual(view.counters()['views'], 1)
+        self.assertEqual(view.counters()['pending'], 0)
+
+    def test_view_proof_retires_late_prediction_without_changing_exact_value(self):
+        graph = self.graph(Uniform(), recorded_position(11))
+        graph.search(16, root_samples=4, batch_size=4)
+        native.hxg_begin(graph.ptr, 8, 4)
+        request, history = graph.request()
+        self.assertGreater(request, 0)
+        proof = graph.view(history, seed=9)
+        self.addCleanup(proof.close)
+        game = Game(history)
+        winner = 1-game.player
+        game.close()
+        # A caller-verified loss arrives from another producer while this leaf is on the GPU.
+        self.assertTrue(native.hxg_prove_loss(proof.ptr, winner, 7))
+        graph.fulfill(request, Uniform().evaluate([history])[0])
+        self.assertEqual(native.hxg_exact(proof.ptr), winner)
+        self.assertEqual(native.hxg_value(proof.ptr), -1.)
+        self.assertEqual(graph.counters()['retired'], 1)
+        self.assertEqual(graph.counters()['pending'], 0)
+        self.assertEqual(graph.counters()['completed'], 1)
+        self.assertEqual(int(graph.credits().sum()), 1)
+        self.assertNotEqual(graph.request()[0], -2)
+        native.hxg_cancel(graph.ptr)
+
+    def test_view_sessions_resume_without_inheriting_another_roots_credits(self):
+        history = recorded_position(11)
+        graph = self.graph(Uniform(), history)
+        graph.search(16, root_samples=4, batch_size=4)
+        credits = graph.credits().copy()
+        counters = graph.counters()
+        graph.at([*history, tuple(graph.result(0, 0, 0, 0)['action'])])
+        self.assertEqual(int(graph.credits().sum()), 0)
+        graph.search(8, root_samples=4, batch_size=4)
+        graph.at(history)
+        np.testing.assert_array_equal(graph.credits(), credits)
+        self.assertEqual(graph.counters(), counters)
+
+    def test_eviction_pins_other_views_and_exact_roots_need_no_prediction(self):
+        graph = self.graph(Uniform(), recorded_position(11), limit=1)
+        graph.search(16, root_samples=4, batch_size=4)
+        child = [*graph.history, tuple(graph.result(0, 0, 0, 0)['action'])]
+        view = graph.view(child, seed=4)
+        self.addCleanup(view.close)
+        view.search(8, root_samples=4, batch_size=4)
+        graph.at(graph.history)
+        self.assertGreaterEqual(graph.store()['expanded'], 2)
+        self.assertEqual(view.search(8, root_samples=4, batch_size=4)['completed'], 8)
+        fresh = graph.view([*child, tuple(view.result(0, 0, 0, 0)['action'])], seed=2)
+        self.addCleanup(fresh.close)
+        game = Game(fresh.history)
+        winner = 1-game.player
+        game.close()
+        self.assertTrue(native.hxg_prove_loss(fresh.ptr, winner, 9))
+        native.hxg_begin(fresh.ptr, 32, 8)
+        self.assertEqual(fresh.request()[0], 0)
+        self.assertTrue(native.hxg_done(fresh.ptr))
+        self.assertEqual(fresh.counters()['pending'], 0)
+        self.assertEqual(fresh.counters()['issued'], 0)
+        result = fresh.result(0, 0, 0, 0)
+        self.assertTrue(np.isfinite(result['policy']).all())
+        self.assertAlmostEqual(float(result['policy'].sum()), 1.)
+
+    def test_live_views_prevent_resetting_shared_tables(self):
+        graph = self.graph(Uniform(), recorded_position(11))
+        view = graph.view(seed=2)
+        self.addCleanup(view.close)
+        self.assertEqual(native.hxg_graph(graph.ptr, 0), 0)
+        self.assertEqual(graph.counters()['views'], 2)
+
+    def test_late_certificate_tightens_materialized_leaf_without_duplicate_edges(self):
+        history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
+        parent = GameGraph(Uniform(), 'late-certificate', history, seed=3)
+        self.addCleanup(parent.close)
+        native.hxg_begin(parent.ptr, 8, 4)
+        parent_request, _ = parent.request()
+        child_history = [*history, (-1,0)]
+        child = parent.view(child_history, seed=4)
+        self.addCleanup(child.close)
+        native.hxg_begin(child.ptr, 8, 4)
+        child_request, _ = child.request()
+        # These turns really complete six; the first bound is deliberately loose.
+        game = Game(history)
+        game.play(-1,0)
+        game.play(4,0)
+        self.assertEqual(game.winner, 0)
+        game.close()
+        turn = np.array([[-1,0],[4,0]], np.int64)
+        self.assertTrue(native.hxg_prove(parent.ptr, parent_request, np.array(history, np.int64), len(history),
+                                        0, 2, turn, 2, 2))
+        before = child.result(0, 0, 0, 0)
+        self.assertEqual(native.hxg_distance(child.ptr), 5)
+        self.assertTrue(native.hxg_prove(child.ptr, child_request, np.array(child_history, np.int64),
+                                        len(child_history), 0, 1, np.array([[4,0]], np.int64), 1, 1))
+        after = child.result(0, 0, 0, 0)
+        self.assertEqual(len(after['actions']), len(before['actions']))
+        self.assertEqual(len({tuple(p) for p in after['actions']}), len(after['actions']))
+        self.assertEqual(native.hxg_distance(child.ptr), 1)
+        self.assertEqual(native.hxg_distance(parent.ptr), 2)
+        self.assertEqual(child.counters()['pending'], 0)
+        self.assertEqual(child.counters()['retired'], 1)
+        self.assertEqual(child.request()[0], 0)
+        self.assertAlmostEqual(float(after['policy'].sum()), 1.)
+
     def graph(self, evaluator, history, **options):
         graph = GameGraph(evaluator, 'game-graph', history, seed=5, tactics=True, **options)
         self.addCleanup(graph.close)

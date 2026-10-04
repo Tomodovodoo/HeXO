@@ -182,14 +182,24 @@ int main(){
   auto r=tree.transformed(m);assert(std::abs(r[0]-5.2)<1e-10 && std::abs(r[1])<1e-12);}
  // Final selection excludes eliminated actions despite a larger stale score.
  tree.root->expanded=true;tree.root->value=0;
- for(int i=0;i<2;++i){gumbel::Edge e;e.action={i,1};e.prior=.5;e.logit=i?0:100;e.epoch=i?4:1;tree.root->edges.push_back(std::move(e));}
+ for(int i=0;i<2;++i){gumbel::Edge e;e.action={i,1};e.prior=.5;e.logit=i?0:100;tree.root->edges.push_back(std::move(e));}
+ tree.prepare_root();tree.root_edges[0].epoch=1;tree.root_edges[1].epoch=4;
  int64_t actions[4];int visits[2];double values[2],scores[2];
  hxg_stats(&tree,actions,visits,values,scores);
  assert(!std::isfinite(scores[0]) && std::isfinite(scores[1]));
  // Reused estimates must not change the initial policy Gumbel sample.
- tree.root->edges[0].logit=1;tree.root->edges[0].gumbel=0;tree.root->edges[0].visits=10000;tree.root->edges[0].sum=-10000;
- tree.root->edges[1].logit=0;tree.root->edges[1].gumbel=0;tree.root->edges[1].visits=10000;tree.root->edges[1].sum=10000;
- for(auto& e:tree.root->edges)e.epoch=0;
+ tree.root->edges[0].logit=1;tree.root_edges[0].gumbel=0;tree.root->edges[0].visits=10000;tree.root->edges[0].sum=-10000;
+ tree.root->edges[1].logit=0;tree.root_edges[1].gumbel=0;tree.root->edges[1].visits=10000;tree.root->edges[1].sum=10000;
+ for(auto& e:tree.root_edges)e.epoch=0;
  int request=tree.request();assert(request>0 && tree.requests.at(request).edges.front().second==0);tree.cancel();
+ // Returning after advance resumes the source comparison's priority, bonuses and hold as well as its credits.
+ {gumbel::Tree view(3);assert(hxg_share(&view,32));view.root_at({{0,0}});view.begin(8,4);
+  int id=view.request();assert(id>0);auto legal=view.requests.at(id).legal;
+  std::vector<int64_t> cells;for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);}
+  std::vector<double> zeros(legal.size());view.fulfill(id,cells.data(),zeros.data(),zeros.data(),int(legal.size()));
+  Cell action=legal.front();view.priority={action};view.defence[action]=2.;view.hold=true;
+  view.advance(action);view.root_at({{0,0}});
+  assert(view.hold && view.priority==std::vector<Cell>{action} && view.defence.at(action)==2. && view.budget==8);
+ }
  std::cout<<"Exhaustive backup signs and partial proof trees, sequential-halving schedule and mixed-Q transform passed\n";
 }

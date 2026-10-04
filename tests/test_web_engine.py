@@ -718,6 +718,18 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answer['fresh'][0], 0)
         self.assertEqual(answer['lines'], ['b', 'c', 'd'])
 
+    def test_independent_views_share_proofs_and_keep_sampling_credits(self):
+        from tests.test_neural_search import recorded_position
+        found = node(dict(kind='views', history=recorded_position(11)))
+        self.assertEqual(found['after'], dict(found['before'], views=2))
+        self.assertEqual(found['beforeCredits'], found['afterCredits'])
+        self.assertEqual(sum(found['viewCredits']), 32)
+        self.assertEqual(found['survived']['completed'], 8)
+        self.assertEqual(found['survived']['views'], 1)
+        self.assertEqual(found['retired']['pending'], 0)
+        self.assertEqual(found['retired']['retired'], 1)
+        self.assertEqual(found['proofValue'], -1.)
+
     def test_a_root_reads_and_resumes_its_deeper_branch(self):
         """A -> B -> A in the browser's GameGraph: after B is searched as a root and found lost for A's mover, A's
         statistics for B hold that, A stops preferring B, and A's next search continues its counts."""
