@@ -3747,6 +3747,104 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_hot_producer_retirement_keeps_old_device_snapshot_and_new_model_separate(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        import native_dense
+        torch.set_num_threads(2)
+        old = NativeScheduler.graph(self)
+        pool = NativeScheduler.pool(self,[old],views=4,work=32,quantum=8)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.retarget(0,0,[(0,0)],ms=100.,views=4)
+        token,_,rows = service.take(100.)
+        service.complete(token,native_dense.submit(evaluator,rows).collect())
+        held = service.take(100.)
+        self.assertIsNotNone(held)
+        event,end = None,time.monotonic()+3
+        while event is None and time.monotonic()<end:
+            event = service.event()
+            time.sleep(.001)
+        self.assertIsNotNone(event)
+        with self.assertRaisesRegex(ValueError,'every game retirement'):
+            service.detach(0)
+        service.release(0,0,expected=event['token'])
+        released = None
+        while released is None and time.monotonic()<end:
+            released = service.event()
+            time.sleep(.001)
+        self.assertEqual(released['kind'],'released')
+        with self.assertRaisesRegex(ValueError,'caller trees'):
+            service.detach(0)
+        old.close()
+        service.detach(0)
+        pool.close()
+        self.assertTrue(service.model_pending(0))
+        fresh = NativeScheduler.graph(self,version='next-model')
+        other = NativeScheduler.pool(self,[fresh],views=1,work=16)
+        next_eval = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='next-model',max_batch=128)
+        producer,model = service.attach(other,next_eval)
+        self.assertEqual((producer,model),(0,1))
+        service.retarget(producer,0,[(0,0)],work=16,views=1)
+        token,_,rows = held
+        service.complete(token,native_dense.submit(evaluator,rows).collect())
+        self.assertFalse(service.model_pending(0))
+        event,end = None,time.monotonic()+3
+        while event is None and time.monotonic()<end:
+            service.pump()
+            event = service.event()
+        self.assertIsNotNone(event)
+        self.assertEqual((event['model'],event['token'],event['root_completed']),(1,1,16))
+        service.close()
+        self.assertEqual(service.stats()['active_producers'],0)
+
+    def test_native_actor_attaches_new_checkpoint_while_old_game_keeps_its_model(self):
+        from native_selfplay import ActorEngine
+        torch.set_num_threads(2)
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'rotate-{k}',f'fixed-{k}','cpu',64,128) for k in range(3)]
+        settings = dense_config.ActorSettings(native_scheduler=True,native_producers=2,native_views=4,
+            native_quantum=8,game_graph=192,full_sims=16,cheap_sims=4,full_fraction=.5,
+            max_plies=9,leaf_batch=64,opening_random_plies=0.)
+        engine = ActorEngine(settings)
+        self.addCleanup(engine.close)
+        games = [dense_selfplay.SelfPlayGame([models[0]]*2,replace(settings,max_plies=2),20,native_owner=True),
+                 dense_selfplay.SelfPlayGame([models[0]]*2,settings,21,native_owner=True)]
+        for game in games:
+            engine.add(game)
+        episodes,overlap = [],False
+        end = time.monotonic()+10
+        while engine.slots and time.monotonic()<end:
+            for game in engine.step():
+                episode,rows = game.episode()
+                episodes.append((episode,rows))
+                if game is games[0]:
+                    overlap = len(games[1].moves)<9
+                    engine.synchronize_inflight()
+                    count = engine.evals
+                    time.sleep(.02)
+                    self.assertTrue(engine.engine.service.paused())
+                    self.assertEqual(engine.engine.service.stats()['launched_rows'],engine.accounted[0])
+                    new = dense_selfplay.SelfPlayGame([models[1]]*2,settings,22,native_owner=True)
+                    engine.add(new)
+                    engine.resume()
+                    self.assertEqual(engine.evals,count)
+                elif len(episodes)==2:
+                    engine.add(dense_selfplay.SelfPlayGame([models[2]]*2,settings,23,native_owner=True))
+        self.assertFalse(engine.slots)
+        self.assertTrue(overlap)
+        self.assertEqual(len(episodes),4)
+        self.assertEqual({e['actor'] for e,_ in episodes},{m.sha for m in models})
+        for episode,rows in episodes:
+            self.assertTrue(all(row['search']['model']==episode['actor'] for row in rows))
+            self.assertTrue(all(row['search']['comparison_credits']==row['search']['root_completed'] for row in rows))
+            self.assertTrue(all(row['search']['root_estimate']==episode['root_values'][row['ply']] for row in rows))
+        engine.drain()
+        self.assertEqual(engine.engine.receipt['inference']['active_producers'],0)
+        self.assertEqual(engine.engine.receipt['inference']['pending_rows'],0)
+        self.assertGreater(engine.evals,0)
+
     def test_native_pause_waits_for_acknowledgement_unless_caller_sets_timeout(self):
         from native_scheduler import InferenceService
         from tests.test_neural_search import NativeScheduler
@@ -5613,6 +5711,7 @@ class YieldTests(unittest.TestCase):
     def test_drain_waits_for_gpu_events_without_consuming_predictions(self):
         events = [unittest.mock.Mock(), None, unittest.mock.Mock()]
         engine = dense_selfplay.Engine.__new__(dense_selfplay.Engine)
+        engine.native_packing = False
         engine.inflight = [(object(), object(), object(), (object(), object(), event, object())) for event in events]
         pending = list(engine.inflight)
         engine.synchronize_inflight()
@@ -5664,8 +5763,9 @@ class YieldTests(unittest.TestCase):
         class Engine:
             synchronize_inflight = dense_selfplay.Engine.synchronize_inflight
 
-            def __init__(self, *args):
+            def __init__(self, *args, **kwargs):
                 self.slots, self.closing, self.inflight = [], [], []
+                self.native_packing = False
                 self.searches = self.evals = self.calls = self.full_calls = 0
                 self.solver, self.steps = None, 0
 
@@ -6275,6 +6375,40 @@ class ActorModelTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([(e['previous'], e['checkpoint']) for e in events if e['kind'] == 'actor_model'],
                          [('main/000010', 'main/000020')])
+
+    def test_native_worker_publishes_rotating_checkpoint_rows_that_learner_can_read(self):
+        self.export('main/000010',1.)
+        self.export('main/000020',2.)
+        config = dense_config.RunConfig(device='cpu',model=dense_config.ModelSettings(**{k:getattr(TINY,k)
+            for k in ('blocks','channels','pool_every','line_length','value_hidden','head_channels')}),
+            actor=dense_config.ActorSettings(native_scheduler=True,native_producers=2,native_quantum=8,
+                native_views=4,games_in_flight=2,leaf_batch=64,full_sims=16,cheap_sims=4,
+                root_samples=8,full_fraction=1.,game_graph=192,max_plies=6,cache_positions=128,shard_games=1,
+                opening_random_plies=0.))
+        dense_config.save(self.run,config)
+        (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000010',reason='newest',vetoed=[])))
+        write_shard = dense_data.write_shard
+        def publish(path,identity,*args):
+            (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000020',reason='newest',vetoed=[])))
+            return write_shard(path,identity,*args)
+        with unittest.mock.patch.object(dense_data,'write_shard',publish):
+            dense_selfplay.worker(SimpleNamespace(run=str(self.run),worker=0,games=6,initial_model=None))
+        status = json.loads((self.run/'actor-status.json').read_text())
+        self.assertEqual((status['stage'],status['games_completed']),('finished',6))
+        self.assertEqual(status['native_scheduler']['inference']['active_producers'],0)
+        self.assertEqual(status['native_scheduler']['inference']['pending_rows'],0)
+        self.assertGreater(status['mean_batch'],0)
+        window = dense_data.ReplayWindow(self.run,capacity_rows=1000,validation_fraction=0.)
+        refs = [window.ref(name,index) for name,index in window.index]
+        self.assertEqual(len(refs),36)
+        self.assertEqual(len({r.row['search']['model'] for r in refs}),2)
+        for shard in dense_data.shard_dirs(self.run):
+            episodes = json.loads((shard/'episodes.json').read_text())
+            self.assertTrue(all(window.ref(shard.name,i).row['search']['model']==episodes[int(window.shards[shard.name].game[i])]['actor']
+                                for i in range(len(window.shards[shard.name].game))))
+        samples,targets = dense_data.examples(window,refs,np.random.default_rng(0))
+        self.assertEqual(len(samples),36)
+        self.assertTrue(all(np.isfinite(t['value']) for t in targets))
 
 
 class PacerTests(unittest.TestCase):

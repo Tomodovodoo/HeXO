@@ -32,6 +32,7 @@ bind('hxgf_abandon_all', C.c_int, ptr)
 bind('hxb_new', ptr, C.c_int, C.c_int, C.c_int, C.c_double)
 for name, result, args in (
     ('attach', C.c_int, [ptr, ptr, C.c_int]), ('start', C.c_int, [ptr, C.c_double]),
+    ('detach', C.c_int, [ptr, C.c_int]), ('model_pending', C.c_int, [ptr, C.c_int]),
     ('cancel', None, [ptr]), ('take', C.c_int, [ptr, C.c_int, C.c_double, ptr, ptr, ptr]),
     ('complete', C.c_int, [ptr, C.c_uint64, ptr, ptr, ptr, ptr]),
     ('abort', C.c_int, [ptr, C.c_uint64]), ('done', C.c_int, [ptr]),
@@ -385,7 +386,8 @@ class InferenceService:
         if not pools or batch_size<1 or batch_size>1024:
             raise ValueError('Open pools and a valid inference batch size are required')
         self.pools, self.models = [], list(evaluators)
-        versions = [e.model_version for e in self.models]
+        self.model_versions = versions = [e.model_version for e in self.models]
+        self.calls = self.full_calls = 0
         if len(versions)!=len(set(versions)) or any(p.model_version not in versions for p in pools):
             raise ValueError('One frozen evaluator is required for every pool model version')
         self.batch_size, self.pending, self.leases, self._stats = batch_size, [], {}, None
@@ -394,9 +396,7 @@ class InferenceService:
             checked(False)
         try:
             for pool in pools:
-                checked(native.hxb_attach(self._ptr, pool.ptr, versions.index(pool.model_version)))
-                pool._service = self
-                self.pools.append(pool)
+                self.attach(pool,self.models[versions.index(pool.model_version)])
         except BaseException:
             self.close()
             raise
@@ -406,6 +406,40 @@ class InferenceService:
         if not self._ptr:
             raise ValueError('Inference service is closed')
         return self._ptr
+
+    def attach(self, pool, evaluator):
+        """Add a frozen model producer without stopping other continuous games."""
+        if pool.model_version!=evaluator.model_version:
+            raise ValueError('Evaluator does not match the producer weights')
+        added = evaluator.model_version not in self.model_versions
+        if added:
+            self.model_versions.append(evaluator.model_version)
+            self.models.append(evaluator)
+        model = self.model_versions.index(evaluator.model_version)
+        status = native.hxb_attach(self.ptr,pool.ptr,model)
+        if not status:
+            if added:
+                self.model_versions.pop();self.models.pop()
+            checked(False)
+        producer = status-1
+        while len(self.pools)<=producer:
+            self.pools.append(None)
+        self.pools[producer] = pool
+        pool._service = self
+        if self.models[model] is None:
+            self.models[model] = evaluator
+        return producer,model
+
+    def detach(self, producer):
+        """Join a fully retired producer; other models/games remain active."""
+        pool = self.pools[producer]
+        checked(native.hxb_detach(self.ptr,producer))
+        pool._service = None
+        self.pools[producer] = None
+
+    def model_pending(self, model):
+        """Keep weights alive while any producer or device task still uses them."""
+        return bool(native.hxb_model_pending(self.ptr,model))
 
     def take(self, wait_ms=0):
         from native_dense import PackedRows
@@ -423,6 +457,8 @@ class InferenceService:
             checked(native.hxb_abort(self.ptr, token.value))
             raise
         self.leases[token.value] = rows
+        self.calls += 1
+        self.full_calls += count==self.batch_size
         return token.value, model.value, rows
 
     def start(self, ms=0, *, continuous=False):
@@ -591,4 +627,5 @@ class InferenceService:
             checked(native.hxb_free(self._ptr))
             self._ptr = None
             for pool in self.pools:
-                pool._service = None
+                if pool is not None:
+                    pool._service = None
