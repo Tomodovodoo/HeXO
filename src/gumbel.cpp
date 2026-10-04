@@ -86,15 +86,17 @@ struct GameStore {
   for(auto& [key,node]:store){edges+=node->edges.size();parents+=node->parents.size();bytes+=node->edges.capacity()*sizeof(Edge);
    for(auto& edge:node->edges)children+=bool(edge.child);}
   auto inventory=ns(start);std::array<uint64_t,6> times;
+  start=Clock::now();for(auto& [key,node]:store)node->edges.clear();auto edges_ns=ns(start);
+  start=Clock::now();for(auto& [key,node]:store)std::vector<Edge>().swap(node->edges);auto edge_free_ns=ns(start);
   start=Clock::now();pins.clear();times[0]=ns(start);
   start=Clock::now();evicted_stats.clear();times[1]=ns(start);
   start=Clock::now();store.clear();times[2]=ns(start);
   start=Clock::now();outcomes.clear();times[3]=ns(start);
   start=Clock::now();positions.clear();times[4]=ns(start);
   start=Clock::now();nodes.clear();times[5]=ns(start);
-  std::fprintf(stderr,"HEXO_RECLAIM {\"component\":\"game_store\",\"nodes\":%llu,\"legal_edges\":%llu,\"child_refs\":%llu,\"parent_refs\":%llu,\"edge_capacity_bytes\":%llu,\"inventory_ns\":%llu,\"pins_ns\":%llu,\"summaries_ns\":%llu,\"store_ns\":%llu,\"outcomes_ns\":%llu,\"positions_ns\":%llu,\"nodes_ns\":%llu}\n",
+  std::fprintf(stderr,"HEXO_RECLAIM {\"component\":\"game_store\",\"nodes\":%llu,\"legal_edges\":%llu,\"child_refs\":%llu,\"parent_refs\":%llu,\"edge_capacity_bytes\":%llu,\"inventory_ns\":%llu,\"edge_destruct_ns\":%llu,\"edge_free_ns\":%llu,\"pins_ns\":%llu,\"summaries_ns\":%llu,\"store_ns\":%llu,\"outcomes_ns\":%llu,\"positions_ns\":%llu,\"nodes_ns\":%llu}\n",
    (unsigned long long)count,(unsigned long long)edges,(unsigned long long)children,(unsigned long long)parents,(unsigned long long)bytes,(unsigned long long)inventory,
-   (unsigned long long)times[0],(unsigned long long)times[1],(unsigned long long)times[2],(unsigned long long)times[3],(unsigned long long)times[4],(unsigned long long)times[5]);
+   (unsigned long long)edges_ns,(unsigned long long)edge_free_ns,(unsigned long long)times[0],(unsigned long long)times[1],(unsigned long long)times[2],(unsigned long long)times[3],(unsigned long long)times[4],(unsigned long long)times[5]);
  }
 #endif
  bool pinned(const Node* node)const {
