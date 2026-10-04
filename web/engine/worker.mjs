@@ -126,10 +126,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null, touched = null;
   if (line != null) tree = games.graph(line, history, {seed: 1740, tactics: true, qRangeFloor, model: network.version});
   const merged = new Map((tree?.facts() || []).map(f => [proofKey(f.history), f]));
-  const base = history.map(([q, r], i) => `${q},${r},${((i + 1) >> 1) % 2}`);
-  for (const fact of table?.list() || []) {
-    const stones = new Set(fact.history.map(([q, r], i) => `${q},${r},${((i + 1) >> 1) % 2}`));
-    if (!base.every(s => stones.has(s))) continue;
+  for (const fact of table?.facts(history) || []) {
     const key = proofKey(fact.history), old = merged.get(key);
     if (old && old.winner !== fact.winner) throw new Error('Contradictory graph and stored proofs');
     if (!old || fact.plies <= old.plies) merged.set(key, fact);

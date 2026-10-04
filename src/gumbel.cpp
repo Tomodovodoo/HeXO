@@ -199,6 +199,7 @@ struct Tree {
  // At the sibling half-turn after B, mark A without materializing all pairs.
  // Only new half-turn loss evidence rescans the existing legal edge list.
  void inherit_half_losses(Node& node) {
+  if(state->scheduler_owner && !scheduler_owned)return;
   if(!graph || !node.expanded || node.remaining!=1 || !node.stones || node.losses_seen==state->half_losses)return;
   node.losses_seen=state->half_losses;bool changed=false;
   const auto old=CellHash{}(node.first);const int p=node.player;

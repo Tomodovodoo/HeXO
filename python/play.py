@@ -801,7 +801,16 @@ class Proofs:
         base = frozenset((int(q), int(r), player_at(i)) for i, (q, r) in enumerate(history))
         with self.lock:
             entries = sorted((e for e in self.entries.values() if base <= e['stones']), key=lambda e: len(e['history']))
-            return [{k: e[k] for k in ('history', 'winner', 'plies', 'pv')} for e in entries[:2048]]
+            found = {proof_key(e['history']): {k:e[k] for k in ('history', 'winner', 'plies', 'pv')} for e in entries[:2048]}
+        if history and len(history) % 2 == 0:
+            for action, (winner, _, outcome) in self.edges(history).items():
+                if winner == player_at(len(history)):
+                    continue
+                child = [list(p) for p in history] + [list(action)]
+                key, old = proof_key(child), found.get(proof_key(child))
+                if old is None or outcome['plies'] < old['plies']:
+                    found[key] = dict(history=child, **outcome)
+        return sorted(found.values(), key=lambda e: len(e['history']))[:2048]
 
     def edges(self, history):
         """{(q, r): (winner, distance, outcome)} for each stone from `history` whose position is proven: in the

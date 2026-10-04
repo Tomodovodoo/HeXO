@@ -162,6 +162,20 @@ export class Proofs {
   list() {
     return [...this.entries.values()].map(({history, winner, plies, pv}) => ({history, winner, plies, pv}));
   }
+  /** Reachable exact solver premises, including the completed turns implied by lost half-turns. */
+  facts(history) {
+    const base = history.map(([q, r], i) => `${q},${r},${sideAt(i)}`), found = new Map();
+    for (const [key, entry] of this.entries) if (base.every(p => entry.stones.has(p))) {
+      const {history, winner, plies, pv} = entry;
+      found.set(key, {history, winner, plies, pv});
+    }
+    if (history.length && history.length % 2 === 0) for (const {action, winner, outcome} of this.edges(history).values()) {
+      if (winner === sideAt(history.length)) continue;
+      const child = [...history, action], key = proofKey(child), old = found.get(key);
+      if (!old || outcome.plies < old.plies) found.set(key, {history: child, ...outcome});
+    }
+    return [...found.values()].sort((a, b) => a.history.length - b.history.length).slice(0, 2048);
+  }
   /** Index `record` (the fields of a turn) at `history` when it holds a proof; `id` skips a record already indexed. A
    * proof without `plies` takes the bound its `turns` give (python/play.py proof_plies). */
   add(history, record, id = null) {

@@ -1894,6 +1894,7 @@ class Proofs(unittest.TestCase):
         table = Proofs()
         table.add(root+[a], dict(proof=dict(winner=1, plies=3), pv=[[2,-3,0,1]]))
         self.assertEqual(table.edges(root+[b])[a], (1,3,dict(winner=1,plies=2,pv=[])))
+        self.assertIn(dict(history=[list(p) for p in root+[b,a]],winner=1,plies=2,pv=[]),table.facts(root+[b]))
         self.assertIsNone(table.known(root+[b]))
         for pair in ([a,b],[b,a]):
             self.assertEqual(table.known(root+pair), dict(winner=1,plies=2,pv=[]))
