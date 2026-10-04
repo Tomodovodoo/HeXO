@@ -976,7 +976,6 @@ function renderAnalysis(){
     d.onclick=()=>{const[sx,sy]=screen(t[0],t[1]);cam.x+=canvas.clientWidth/2-sx;cam.y+=canvas.clientHeight/2-sy;draw()};
     d.onmouseenter=()=>{hot=[t[0],t[1]];draw()};d.onmouseleave=()=>{hot=null;draw()};return d});
   while(rows.length<5)rows.push(el('div',{class:'blank'},el('span',{},rows.length+1),el('span',{},'·'),el('em'),el('span'),el('span')));
-  if(!ev?.proof&&top.length&&top.every(t=>t[4]<0))rows.push(el('small',{},`${top.length} replies refuted, not proven`));
   box.replaceChildren(...rows);
 }
 function renderStudy(){

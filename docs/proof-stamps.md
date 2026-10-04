@@ -116,6 +116,26 @@ or gives a required friendly cell to the opponent. Every hit is checked against
 the current board and tempo. No result survives merely because it matched an
 earlier position.
 
+On insertion, the worker discards a stamp only when another checked strategy
+has the same winner relative to the mover and the same remaining placements,
+covers all its matching boards, and has an equal or shorter win bound. This compares
+supporting stones, protected empty cells, counter-threat guards and the common
+attacker prefix. Strategies compare in their actual game coordinates. Distinct
+fixed frames remain available even if capped geometric matching cannot discover
+them again. Small relocatable entries retain the same supporting geometry; an
+imported entry also retains its root mask filtering. Broader-but-slower strategies remain separate. Equal
+conditions and bounds keep the smaller compiled strategy. Portable status
+follows the retained entry; an active query keeps its original sources.
+Repeated imports remember the complete validated source identity and the
+retained strategy that covers it. These aliases share the 4 MiB accounting
+budget and stop applying when that strategy leaves the library, so deduplication
+does not force the client to recheck a discarded certificate on every query.
+
+This comparison runs only when learning or importing a stamp. The library
+remains local to one solver worker. Ordinary player analysis uses one worker;
+Python batch review can use four processes with independent libraries. The
+browser solver uses one Web Worker. Deduplication adds no threads or locks.
+
 A quiet query permits at most 256 relevant cells at each split, the existing
 certificate node limit, and 8 MiB of distinct source strategies. Search work
 shares the query's node meter. Compilation and checking share its cancellation
@@ -167,6 +187,26 @@ the cache peaked at 497.4 KiB. Reuse across these turns saved only 40 fresh
 nodes, and total solver time rose 102%. The player default is enabled at the
 owner's request despite that measured cost; these figures do not establish a
 game-throughput benefit.
+
+After proof compaction, another paired replay of those same six games measured
+insertion-time deduplication. Both versions used stamps, one resident worker,
+8192 nodes per query, a 5-second safety cap, BelowNormal priority and two CPU
+threads. No query hit its deadline. All 546 outcomes still agreed.
+
+| Six-game replay | Before deduplication | After deduplication |
+|---|---:|---:|
+| Solver time | 28.922 s | 28.595 s |
+| Fresh nodes | 329,076 | 329,076 |
+| Proven-win queries | 210 | 210 |
+| Stamp hits | 97 | 97 |
+| Peak compiled entries | 32 | 32 |
+| Mean compiled entries | 26.6 | 26.0 |
+| Peak accounted library size | 234.1 KiB | 179.6 KiB |
+
+The final version took 1.1% less time and used 23.3% fewer peak accounted bytes
+in this comparison. Fresh nodes and stamp hits were unchanged. This small timing
+difference is one paired measurement, not evidence of a broad throughput gain.
+These recorded continuations do not measure newly selected moves or games/hour.
 
 The distinction between forcing, holding and unstoppable shapes is also useful
 in [Six's shape guide](https://github.com/CixMango/Six/blob/main/guide/shapes.md).
