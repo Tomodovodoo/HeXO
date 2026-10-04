@@ -199,6 +199,35 @@ also accepted the full changed-board certificate. These are one puzzle's
 measurements, not a general solver speed-up claim. The baseline did not finish,
 so the table does not assign it a time-to-solve ratio.
 
+The next optimization retains exact child-strategy compilations for the duration
+of one parent compilation. A child can be absent from the persistent library
+because another stamp covers it, while its specific moves still need checking
+inside the parent. The temporary memo compares the complete serialized source,
+keeps the usual library insertion and dominance rules, and clears on completion
+or failure. It permits 128 entries and 4 MiB of accounted source and stamp bytes.
+
+The following paired WASM run compares that memo against PR #369. The fixed set
+contains the existing 28 real positions, an open three, a quiet defender root,
+and the study's cold solve, warm reuse and saved-proof reload. Ordinary queries
+allow 65,536 nodes and 10 seconds. The study allows 524,288 nodes and 15 seconds;
+warm reuse allows one node and reload allows 20,000. Each version uses the same
+inputs and limits, at BelowNormal priority. Times include verification and JSON
+serialization. No query reaches its deadline.
+
+| Complete query | Before | After | Fresh nodes, both |
+|---|---:|---:|---:|
+| 30 ordinary positions, total | 7.502 s | 7.312 s | 64,012 |
+| Study, changed defence | 6.045 s | 4.585 s | 1,509 |
+| Study, warm reuse | 8.4 ms | 8.3 ms | 1 |
+| Study, fresh worker loading saved proof | 2.440 s | 1.147 s | 1 |
+| All 33 queries | 15.995 s | 13.052 s | 65,523 |
+
+All outcomes, node counts, bounds and certificates are identical. Both solve 14
+queries; the other 19 remain UNKNOWN. The study's cold query uses 4.77 CPU seconds
+in 4.58 wall seconds, consistent with one busy solver thread. Its bound is still
+62 placements, not a claim of a globally shortest win. The 2.6% difference on
+ordinary positions is too small for a general speed claim from this one run.
+
 Run `PYTHONPATH=python:. python tools/proof_stamps.py --benchmark results.json`
 in a fresh process (use `python;.` on Windows). The input file is the existing
 28-position fixture from dense-v1 shards. Queries have equal node budgets and

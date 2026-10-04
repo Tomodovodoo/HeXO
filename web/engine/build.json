@@ -9,7 +9,7 @@
   "tools/tactical/src/check.rs": "764eebd2a0a2523b39dac1cff6b0bd42bfa8d74f8a9d799aa7884498d564d0d4",
   "tools/tactical/src/lib.rs": "72db2cb38a2e11ac1a47b6b52d889a522b2dc2fd0f998b137f32d8b5c9f7f238",
   "tools/tactical/src/native_answer.rs": "cb8b9c500e20a4601f0069f4e95da166dc8f6aa8ec90d3781cad6d45bf78e42d",
-  "tools/tactical/src/stamps.rs": "5f0f9dcaf8d2e12294737c844c0cb1229c5500d315bb007f69f126e0a4fedecc",
+  "tools/tactical/src/stamps.rs": "a156431499a14bfa7366290de2d494c1629ea9008f1bf32c79472e56b2dd7568",
   "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/Cargo.toml": "c0ab6fd2fef9e17ed86e6aa73e805aa670742e7294b5d3dacb43542838cf8daa",
   "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/board.rs": "99d0a3f518be81c25b7be3d97a9d767b8010ddf2310099587ee6b08e7ec6d121",
   "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/game.rs": "98348bc3bb50f0191e2f9e86fbb361262a905c5c1bba2bd2b61cde9cb35b8265",
@@ -86,7 +86,7 @@
  "artefacts": {
   "gumbel.mjs": "8fa7d6101e7033a632492497b5f17f894e54b46e3467330768bf88da2110eb62",
   "gumbel.wasm": "a43796932f33f40bc9f4b1759555ebfb1ba79b44bd946554b2f300358cfce3e9",
-  "tactical.wasm": "206760e8c029e68cb4c5d5dd5a734f5acf4a6e550fdbb6d134346e11e58b8056",
+  "tactical.wasm": "a7b64a67d7cb527d288ad37f3725f73a3ccbfd6ae03ff6a3b9fbc20326c7c4b0",
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
   "native/native.wasm": "1bcd1d85021001f1afe9a9f62749dc606c7b210ae648ecc15f72fd2b95320dcd",
   "shrimp/shrimp.wasm": "caeed68606deaee3be330278c8e8c294c05c83e1045169ef203b7e537b1a47d4",

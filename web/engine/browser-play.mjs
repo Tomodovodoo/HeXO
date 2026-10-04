@@ -1,6 +1,7 @@
 import {BrowserSession} from './play-session.mjs';
 import {PlayStorage} from './storage.mjs';
 import {notePace} from './device.mjs';
+import {compressFile} from './notation.mjs';
 
 /** The tag the page shows for the device of an engine's load or loading stage: GPU when its network runs on WebGPU,
  * CPU otherwise (ONNX Runtime on WebAssembly, or an engine with no network). */
@@ -83,8 +84,13 @@ export async function mountPlay(engines, legacy) {
       try {
         const response = await fetch(url.href);
         if (!response.ok) throw Error((await response.json()).error);
-        const object = URL.createObjectURL(await response.blob()), a = document.createElement('a');
-        a.href = object; a.download = link.download || `game-${url.searchParams.get('game') || 'saved'}.htttx`;
+        let blob = await response.blob(), name = link.download || `game-${url.searchParams.get('game') || 'saved'}.htttx`;
+        if (name.endsWith('.json') && blob.size >= 262144) {
+          blob = await compressFile(blob);
+          if (blob.type === 'application/gzip') name += '.gz';
+        }
+        const object = URL.createObjectURL(blob), a = document.createElement('a');
+        a.href = object; a.download = name;
         document.body.append(a); a.click(); a.remove();
         setTimeout(() => URL.revokeObjectURL(object), 1000);
       } catch (error) { globalThis.toast(error.message); }

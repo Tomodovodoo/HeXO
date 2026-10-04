@@ -224,9 +224,12 @@ export class BrowserSession extends OfflineSession {
     }
   }
   snapshot() {
+    // Match metadata is mutable; its saved record versions are not.
+    const match = this.match && copy({...this.match, position: this.match.position && {...this.match.position, records: []}});
+    if (match?.position) match.position.records = this.match.position.records?.slice();
     return {id: this.id, history: copy(this.history), seats: copy(this.seats), analysis: copy(this.analysis), paused: this.paused,
-      book: copy(this.book), match: copy(this.match), saved_game: copy(this.saved_game), clock: this.clockNow(), timeControl: copy(this.timeControl),
-      clockTurns: copy(this.clockTurns), clockPartial: this.clockPartial, outcome: copy(this.outcome), taken: Date.now(), gameId: this.gameId, gameCreated: this.gameCreated, records: copy(this.records)};
+      book: copy(this.book), match, saved_game: copy(this.saved_game), clock: this.clockNow(), timeControl: copy(this.timeControl),
+      clockTurns: copy(this.clockTurns), clockPartial: this.clockPartial, outcome: copy(this.outcome), taken: Date.now(), gameId: this.gameId, gameCreated: this.gameCreated, records: this.records.slice()};
   }
   storageConflict() {
     this.conflicted = true; this.paused = true; this.freezeClock(); this.cancelJobs();
@@ -237,7 +240,7 @@ export class BrowserSession extends OfflineSession {
     if (this.importing || this.initializing || this.conflicted) return this.saving;
     this.dirty = true;
     if (this.match && !this.match.pending_game && this.match.completed < this.match.games) {
-      this.match.position = {game: this.match.current, history: copy(this.history), records: copy(this.records), clock: this.clockNow(), clockTurns: copy(this.clockTurns),
+      this.match.position = {game: this.match.current, history: copy(this.history), records: this.records.slice(), clock: this.clockNow(), clockTurns: copy(this.clockTurns),
         clockPartial: this.clockPartial + (this.clock?.started != null ? Date.now() - this.clock.started : 0), opening: copy(this.book.opening)};
     }
     const snapshot = this.snapshot(), freeplay = this.freeplay();
@@ -253,7 +256,7 @@ export class BrowserSession extends OfflineSession {
    * match always waits for Resume so no side's time runs unattended. */
   async restore({paused = false} = {}) {
     const [saved, coverage, evaluations] = await Promise.all([this.storage.get('sessions', this.id), this.storage.get('coverage', 'book'), this.storage.all('evaluations')]);
-    this.cache.clear(); this.index.clear(); this.provenRecords.clear(); this.proofs = new Proofs();
+    this.cache.clear(); this.index.clear(); this.provenRecords.clear(); this.proofs = new Proofs(); this.gameSignature = null; this.restoredGame = null;
     for (const r of evaluations) this.indexRecord(r);
     this.coverage = coverage?.counts || {};
     this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false; this.renewLines();
@@ -267,8 +270,7 @@ export class BrowserSession extends OfflineSession {
         this.clock[field] = Math.max(0, this.clock[field] - (now - taken)); this.clockPartial = (this.clockPartial || 0) + now - this.clock.started;
       }
       if (this.clock) { delete this.clock.started; delete this.clock.side; delete this.clock.running; }
-      const game = this.gameId && await this.storage.get('games', this.gameId);
-      if (game) { const {saved_at, ...content} = game; this.gameSignature = JSON.stringify(content); }
+      this.restoredGame = this.gameId && await this.storage.get('games', this.gameId);
     }
   }
   cancelJobs(predicate = () => true) {
@@ -295,11 +297,18 @@ export class BrowserSession extends OfflineSession {
     if (this.match || this.saved_game || !this.gameId) return null;
     const board = this.native.game(this.history).winner, winner = board >= 0 ? board : this.outcome?.winner ?? -1, players = this.seats.map(s => ({...s, name: this.entries.get(s.engine)?.name || 'Human'}));
     const game = {id: this.gameId, format: 'bubble-replay', version: 1, history: copy(this.history), players, winner: winner < 0 ? null : winner,
-      reason: this.outcome ? this.outcome.reason : winner >= 0 ? 'six' : 'saved', records: copy(this.records),
+      reason: this.outcome ? this.outcome.reason : winner >= 0 ? 'six' : 'saved', records: this.records.slice(),
       ...(this.timeControl.mode === 'fixed' ? {} : {clock: copy(this.timeControl), turns: copy(this.clockTurns)}), evaluations: this.state().evaluations, opening: copy(this.book.opening), created_at: this.gameCreated};
-    const signature = JSON.stringify(game);
-    if (signature === this.gameSignature) return null;
-    this.gameSignature = signature; game.saved_at = new Date().toISOString();
+    const {records, evaluations, ...metadata} = game, signature = JSON.stringify(metadata);
+    // Compare an old save once; later saves track immutable record versions.
+    if (this.restoredGame) {
+      const {saved_at, ...previous} = this.restoredGame; this.restoredGame = null;
+      if (JSON.stringify(game) === JSON.stringify(previous)) {
+        this.gameSignature = signature; this.gameRecords = this.records; this.gameEvaluations = evaluations;
+      }
+    }
+    if (signature === this.gameSignature && this.gameRecords === this.records && this.gameEvaluations === evaluations) return null;
+    this.gameSignature = signature; this.gameRecords = this.records; this.gameEvaluations = evaluations; game.saved_at = new Date().toISOString();
     const summary = {id: this.gameId, name: game.created_at.slice(0, 19).replace('T', ' '), games: 1, completed: 1,
       players: players.map(p => p.name), player_specs: players, created_at: game.created_at, wins: winner < 0 ? [0, 0] : [winner === 0 ? 1 : 0, winner === 1 ? 1 : 0], capped: 0,
       results: [{game: 1, winner: game.winner, reason: game.reason, placements: this.history.length, id: game.id}], single: true, kind: 'freeplay'};
@@ -672,7 +681,7 @@ export class BrowserSession extends OfflineSession {
   async finishMatch(winner, reason) {
     const m = this.match, game = m.current, aWinner = winner == null ? null : game % 2 ? winner : 1 - winner, id = `${m.id}:${game}`;
     const record = {id, format: 'bubble-replay', version: 1, game, history: copy(this.history), players: copy(this.seats), winner, reason,
-      evaluations: this.state().evaluations, records: copy(this.records), timings: copy(m.timings), opening: copy(this.book.opening), saved_at: new Date().toISOString(),
+      evaluations: this.state().evaluations, records: this.records.slice(), timings: copy(m.timings), opening: copy(this.book.opening), saved_at: new Date().toISOString(),
       ...(m.clock.mode === 'fixed' ? {} : {clock: copy(m.clock), turns: copy(this.clockTurns)})};
     m.results.push({id, game, winner: aWinner, reason, placements: this.history.length, opening: Math.floor((game - 1) / 2)});
     if (winner == null) m.capped++; else m.wins[aWinner]++;

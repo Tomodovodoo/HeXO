@@ -380,6 +380,7 @@ fn materialize(cert:&ProofCertificate,b:&Board,n:usize,winner:u8,ctl:&Ctl)->Resu
 thread_local! {
     static LIBRARY:RefCell<Vec<Rc<Stamp>>>=const{RefCell::new(Vec::new())};
     static IMPORTS:RefCell<Vec<(Vec<u8>,Weak<Stamp>)>>=const{RefCell::new(Vec::new())};
+    static COMPILED:RefCell<Vec<(Vec<u8>,Rc<Stamp>)>>=const{RefCell::new(Vec::new())};
     static DEPTH:Cell<u8>=const{Cell::new(0)};
     static SEEDED:Cell<usize>=const{Cell::new(0)};
 }
@@ -396,7 +397,9 @@ pub fn seed(ctl:&Ctl)->Result<(),String> {
     SEEDED.with(|s|s.set(usize::MAX));Ok(())
 }
 struct CompileDepth;
-impl Drop for CompileDepth {fn drop(&mut self){DEPTH.with(|n|n.set(n.get()-1));}}
+impl Drop for CompileDepth {fn drop(&mut self){DEPTH.with(|n|{
+    n.set(n.get()-1);if n.get()==0 {COMPILED.with(|c|c.borrow_mut().clear());}
+});}}
 pub fn remember(source:StampSource,ctl:&Ctl)->Result<Rc<Stamp>,String> {
     remember_as(source,ctl,false)
 }
@@ -434,9 +437,25 @@ fn remember_as(source:StampSource,ctl:&Ctl,portable:bool)->Result<Rc<Stamp>,Stri
     if let Some(stamp)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source==source).cloned()) {
         if portable {stamp.portable.set(true);}return Ok(stamp);
     }
+    // The persistent library may discard a covered child strategy. Retain its
+    // exact compilation while checking this parent, without substituting moves
+    // from the covering strategy or skipping normal library insertion below.
+    let key=if DEPTH.with(Cell::get)>0 && !portable {Some(serde_json::to_vec(&source).map_err(|e|e.to_string())?)} else {None};
+    let cached=key.as_ref().and_then(|key|COMPILED.with(|c|c.borrow().iter().find(|(k,_)|k==key).map(|(_,s)|s.clone())));
     DEPTH.with(|n|if n.get()>=32 {Err("nested stamp limit")} else {n.set(n.get()+1);Ok(())})?;
     let _depth=CompileDepth;
-    let stamp=Rc::new(Stamp::compile(source,ctl)?);
+    let stamp=if let Some(stamp)=cached {stamp} else {
+        let stamp=Rc::new(Stamp::compile(source,ctl)?);
+        if let Some(key)=key {
+            let bytes=key.len()+stamp.bytes;
+            if bytes<=MAX_BYTES {COMPILED.with(|c|{
+                let mut list=c.borrow_mut();
+                while !list.is_empty() && (list.len()>=128 || list.iter().map(|(k,s)|k.len()+s.bytes).sum::<usize>()+bytes>MAX_BYTES) {list.remove(0);}
+                list.push((key,stamp.clone()));
+            });}
+        }
+        stamp
+    };
     if let Some(prior)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source==stamp.source).cloned()) {
         if portable {prior.portable.set(true);}return Ok(prior);
     }
