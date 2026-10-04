@@ -212,6 +212,20 @@ class Overlay(unittest.TestCase):
 class BrowserProofs(unittest.TestCase):
     """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
 
+    def test_partial_proofs_gain_the_child_line_and_survive_reload(self):
+        history = [[0, 0], [1, 0], [2, 0]]
+        pv = [[1, 0, 1, 1], [2, 0, 1, 2], [2, 3, 0, 3], [3, 3, 0, 4], [3, 0, 1, 5], [4, 0, 1, 6]]
+        root = dict(moves=history[1:], top=[], value=1, proof=dict(winner=1, plies=6, turns=2), pv=pv[:2])
+        half = dict(moves=history[2:], top=[], value=1, proof=dict(winner=1, plies=5, turns=2), pv=[[2, 0, 1, 1]])
+        found = dict(moves=[[2, 3], [3, 3]], top=[], value=0, proof=dict(winner=1, plies=4, turns=1),
+                     pv=[[*p[:3], p[3] - 2] for p in pv[2:]])
+        answer = node(dict(kind='proofs', history=history, ply=3, found=found, records=[(history[:1], root), (history[:2], half)]))
+        line = [[*p[:3], p[3] - 1] for p in pv[1:]]
+        for shown in (answer['analysed'], answer['undone']['shown'], answer['quick']['shown'], answer['reloaded']):
+            self.assertEqual((shown['proof'], shown['value'], shown['pv']), (half['proof'], 1, line))
+        for shown in (answer['parent'], answer['reloadedParent']):
+            self.assertEqual((shown['proof'], shown['pv']), (root['proof'], pv))
+
     def test_the_table_matches_play(self):
         records = [([[0, 0], [1, 0], [2, 0]], dict(proof=dict(winner=1, turns=1, plies=4), pv=[[3, 0, 0, 1], [-1, 0, 0, 2]])),
                    ([[0, 0], [4, 4]], dict(proof=dict(winner=0, turns=1, plies=3), pv=[])),

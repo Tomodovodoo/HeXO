@@ -275,15 +275,17 @@ if (job.kind === 'encode') {
   s.registerEngine(entry, adapter);
   s.analysis = s.spec({engine: 'test', preset: 'standard'});
   await s.request('/import', {text: JSON.stringify({history: job.history})}, 'POST');
+  for (const [history, record] of job.records || []) await s.record(history, s.analysis, record);
   const shown = () => s.state().evaluations[job.ply - 1];
   for (const ply of [job.ply, job.ply - 1]) { await s.request('/analyse', {ply}, 'POST'); await settle(); }
   await s.record(s.history.slice(0, job.ply - 1), s.analysis, {moves: [], value: .5, top: [], proof: null, pv: [], threat: []});
-  answer = {analysed: shown(), sent: [...sent], kept: s.lookup(s.history.slice(0, job.ply - 1))?.proof ?? null};
-  await s.request('/undo', {}, 'POST'); answer.undone = {length: s.history.length, shown: shown()};
+  answer = {analysed: shown(), parent: s.state().evaluations[job.ply - 2], sent: [...sent], kept: s.lookup(s.history.slice(0, job.ply - 1))?.proof ?? null};
+  await s.request('/undo', {people: []}, 'POST'); answer.undone = {length: s.history.length, shown: shown()};
   await s.request('/analysis', {engine: 'test', preset: 'quick'}, 'POST'); await s.request('/analyse', {ply: job.ply - 1}, 'POST'); await settle();
   answer.quick = {shown: shown(), saved: s.lookup(s.history.slice(0, job.ply - 1))};
   const reopened = new BrowserSession(native); reopened.storage = s.storage; await reopened.restore(); reopened.registerEngine(entry, adapter);
   answer.reloaded = reopened.state().evaluations[job.ply - 1];
+  answer.reloadedParent = reopened.state().evaluations[job.ply - 2];
   const table = new Proofs();
   table.add(job.history, job.found);
   answer.given = answered(native, job.history.slice(0, job.ply - 1), table);

@@ -180,12 +180,29 @@ export class Proofs {
     }
   }
   put(history, winner, plies, pv) {
-    const key = proofKey(history), old = this.entries.get(key), witnessed = line => line.length > 0 && line.every(stone => stone.length === 4);
-    if (old && !(old.winner === winner && (plies < old.plies || plies === old.plies && witnessed(pv) && !witnessed(old.pv)))) return;
+    const key = proofKey(history), old = this.entries.get(key), witnessed = line => line.every(stone => stone.length === 4) ? line.length : 0;
+    if (old && !(old.winner === winner && (plies < old.plies || plies === old.plies && witnessed(pv) > witnessed(old.pv)))) return;
     const stones = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));
     this.entries.set(key, {history: history.map(([q, r]) => [q, r]), winner, plies, pv, stones});
     if (!this.sizes.has(history.length)) this.sizes.set(history.length, new Set());
     this.sizes.get(history.length).add(key);
+  }
+  /** Extend a saved partial line with later witnesses for the exact positions it reaches. A child must prove the
+   * same winner within the parent's remaining bound. Stop at omitted defender stones: their position is unknown. */
+  line(history, outcome) {
+    const current = history.map(p => [...p]);
+    let pv = outcome.pv || [];
+    for (let i = 0; i <= pv.length; i++) {
+      const entry = this.entries.get(proofKey(current));
+      if (entry?.winner === outcome.winner && entry.plies + i <= outcome.plies && entry.pv.length > pv.length - i
+          && entry.pv.every(p => p.length === 4)) {
+        pv = [...pv.slice(0, i), ...shifted(entry.pv, i)];
+      }
+      const stone = pv[i];
+      if (!stone || stone.length !== 4 || stone[3] !== i + 1 || stone[2] !== sideAt(current.length)) break;
+      current.push(stone.slice(0, 2));
+    }
+    return pv;
   }
   /** Map 'q,r' -> {action, winner, distance, outcome} for each stone from `history` whose position is proven: in the
    * table, or because one more stone by that position's mover reaches a position the mover wins. `distance` counts
@@ -210,16 +227,17 @@ export class Proofs {
     return found;
   }
   /** The outcome of `history` ({winner, plies, pv}) from its own entry, else the shortest win of the side to move
-   * through `edges`, its line led by that stone; null when nothing is known. */
+   * through `edges`, its line led by that stone and extended from stored children; null when nothing is known. */
   known(history) {
     const own = this.entries.get(proofKey(history));
-    if (own) return {winner: own.winner, plies: own.plies, pv: own.pv};
+    if (own) return {winner: own.winner, plies: own.plies, pv: this.line(history, own)};
     const mover = sideAt(history.length);
     const wins = [...this.edges(history).values()].filter(e => e.winner === mover)
       .sort((a, b) => a.distance - b.distance || a.action[0] - b.action[0] || a.action[1] - b.action[1]);
     if (!wins.length) return null;
     const {action, distance, outcome} = wins[0];
-    return {winner: mover, plies: distance, pv: [[...action, mover, 1], ...shifted(outcome.pv, 1)]};
+    const found = {winner: mover, plies: distance, pv: [[...action, mover, 1], ...shifted(outcome.pv, 1)]};
+    return {...found, pv: this.line(history, found)};
   }
 }
 
@@ -267,7 +285,8 @@ export function settled(result, edges, mover) {
 }
 
 /** `found` (an evaluation, or null) with what the table `known` proves of `history` (python/play.py Session.proven):
- * without its own proof, the position's proof, value and line; each stone to a proven position as a top row marked
+ * without its own proof, the position's proof, value and line; an existing proof's line extended from stored children;
+ * each stone to a proven position as a top row marked
  * won or lost, proven wins first, the shortest leading and among equals the stone `played` next in the game, losses
  * last. A proven position without an evaluation gets one with no simulations; null when there is neither. `remaining`
  * is the mover's stones left in the turn. */
@@ -280,6 +299,10 @@ export function proven(known, history, found, remaining, played = null) {
     Object.assign(shown, {value: won ? 1 : 0, pv: outcome.pv,
       proof: {winner: outcome.winner, turns: proofTurns(outcome.plies, remaining, won), plies: outcome.plies}});
     if (!found && won) shown.moves = outcome.pv.slice(0, remaining).filter((p, i) => p[2] === mover && p[3] === i + 1).map(p => [p[0], p[1]]);
+  }
+  if (shown.proof) {
+    const {winner, turns} = shown.proof, plies = shown.proof.plies || remaining + (winner === mover ? 0 : 2) + 4 * (turns - 1);
+    shown.pv = known.line(history, {winner, plies, pv: shown.pv || []});
   }
   const rows = (shown.top || []).map(row => [...row]);
   for (const {action, winner} of edges.values()) {

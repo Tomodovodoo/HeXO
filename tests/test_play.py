@@ -1892,6 +1892,42 @@ class Proofs(unittest.TestCase):
         self.assertEqual([proof_turns(p, 1, True) for p in (1, 4, 5)], [1, 2, 2])
         self.assertEqual([proof_turns(p, 2, False) for p in (3, 4, 7, 8)], [1, 1, 2, 2])
 
+    def test_later_witness_fills_saved_lines_back_through_the_turn(self):
+        from play import Proofs
+        from types import SimpleNamespace
+        history = [[0, 0], [1, 0], [2, 0]]
+        pv = [[1, 0, 1, 1], [2, 0, 1, 2], [2, 3, 0, 3], [3, 3, 0, 4], [3, 0, 1, 5], [4, 0, 1, 6]]
+        records = [(history[:1], evaluation(1., proof=dict(winner=1, plies=6), pv=pv[:2])),
+                   (history[:2], evaluation(1., proof=dict(winner=1, plies=5), pv=[[2, 0, 1, 1]])),
+                   (history, evaluation(0., proof=dict(winner=1, plies=4), pv=[[*p[:3], p[3] - 2] for p in pv[2:]]))]
+        for order in (records, records[::-1]):
+            table = Proofs()
+            for prefix, record in order:
+                table.add(prefix, record)
+            session = SimpleNamespace(proofs=table)
+            for ply, (prefix, saved) in enumerate(records, 1):
+                expected = [[*p[:3], p[3] - ply + 1] for p in pv[ply - 1:]]
+                self.assertEqual(table.known(prefix)['pv'], expected)
+                shown = Session.proven(session, prefix, saved)
+                self.assertEqual((shown['pv'], shown['proof']), (expected, saved['proof']))
+            self.assertEqual(len(records[0][1]['pv']), 2)
+
+    def test_longer_witness_survives_an_older_partial_record(self):
+        from play import Proofs
+        table = Proofs()
+        pv = [[1, 0, 1, 1], [2, 0, 1, 2]]
+        for line in (pv[:1], pv, pv[:1]):
+            table.add([[0, 0]], evaluation(1., proof=dict(winner=1, plies=6), pv=line))
+        self.assertEqual(table.known([[0, 0]])['pv'], pv)
+
+    def test_line_extension_keeps_the_winner_and_proof_bound(self):
+        from play import Proofs
+        history, pv = [[0, 0]], [[1, 0, 1, 1]]
+        table = Proofs()
+        table.add(history + [[1, 0]], evaluation(1., proof=dict(winner=1, plies=5), pv=[[2, 0, 1, 1]]))
+        for winner, plies in ((1, 5), (0, 6)):
+            self.assertEqual(table.line(history, dict(winner=winner, plies=plies, pv=pv)), pv)
+
 
 class TurnTrees(unittest.TestCase):
     """A fixed-budget play turn searches its second stone in the tree its first stone grew."""
