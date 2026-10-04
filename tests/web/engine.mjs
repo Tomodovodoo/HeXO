@@ -209,7 +209,9 @@ if (job.kind === 'encode') {
     Worker: class {
       postMessage({id, history, options}) {
         queries.push({preview: messages.some(m => m.live?.top?.length), stage: messages.at(-1)?.stage});
-        const result = solver.history(history, options);
+        const result = job.replayMiss && options.replay?.length
+          ? {status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: options.nodes, reason: 'replay work limit'}
+          : solver.history(history, options);
         queueMicrotask(() => this.onmessage({data: {id, result}}));
       }
       terminate() {}
@@ -233,17 +235,25 @@ if (job.kind === 'encode') {
       return reply.result;
     };
     session.registerEngine({id: 'test', kind: 'bubble', name: 'Bubble', presets: PRESETS}, adapter);
-    await session.request('/import', {text: JSON.stringify({history: job.history})}, 'POST');
-    await session.request('/analysis', {engine: 'test', preset: 'custom', auto: false, custom: {
+    const imported = await session.request('/import', {text: JSON.stringify({history: job.history, records: job.restore ? [] : job.records || []})}, 'POST');
+    if (imported[0] !== 200) throw Error(JSON.stringify(imported));
+    if (job.restore) {
+      session.records = job.records;
+      for (const record of job.records) await session.storage.put('evaluations', record);
+      await session.persist(); await session.saving; await session.restore({paused: true});
+    }
+    const configured = await session.request('/analysis', {engine: 'test', preset: 'custom', auto: false, custom: {
       simulations: job.simulations, solver_nodes: job.nodes, leaf_nodes: job.leafNodes || 0, leaf_ms: job.leafQueryMs ?? 10}}, 'POST');
-    await session.request('/analyse', {ply: job.history.length}, 'POST');
+    if (configured[0] !== 200) throw Error(JSON.stringify(configured));
+    const requested = await session.request('/analyse', {ply: job.history.length}, 'POST');
+    if (requested[0] !== 200) throw Error(JSON.stringify(requested));
     while (session.running || session.jobs.some(j => j.status === 'queued')) await new Promise(r => setTimeout(r, 1));
     answer = session.lookup(job.history);
     if (!answer) throw Error(JSON.stringify(session.state().jobs));
   } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10,
-      known: job.known || null, proofStamps: job.proofStamps}});
+      known: job.known || null, replay: job.replay || [], proofStamps: job.proofStamps}});
   }
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);

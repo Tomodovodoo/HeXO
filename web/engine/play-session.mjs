@@ -402,11 +402,13 @@ export class BrowserSession extends OfflineSession {
   async record(history, spec, result, kept = false) {
     const id = this.cacheKey(history, spec) + (kept ? '|kept' : ''), saved = this.cache.get(id);
     const source = saved?.proof && !result.proof ? saved : result, facts = new Map();
+    const strategy = saved?.strategy || saved?.proof?.certificate;
     for (const fact of [...(saved?.proofs || []), ...(result.proofs || [])]) {
       const key = proofKey(fact.history), old = facts.get(key);
       if (!old || fact.plies < old.plies || fact.plies === old.plies && fact.pv.length > old.pv.length) facts.set(key, fact);
     }
     const record = source === saved && !result.proofs?.length ? saved : {...source,
+      ...(strategy && source.proof?.winner === saved.proof?.winner && !source.proof?.certificate?.nodes.some(n => n.kind !== 'exact') ? {strategy} : {}),
       ...(facts.size ? {proofs: [...facts.values()]} : {}), id, position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
       simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
     if (record !== saved) {
@@ -577,6 +579,7 @@ export class BrowserSession extends OfflineSession {
       try {
         result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
           known: job.kind === 'move' ? null : (this.extendProofs(), this.proofs.list()),
+          replay: job.kind === 'move' || !budget.solver_nodes ? [] : this.proofs.replay(history),
           progress: (f, live, stage) => { job.done = job.kind === 'review' ? job.cursor + f : .1 + .9 * f; job.stage = stageText(stage); if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);

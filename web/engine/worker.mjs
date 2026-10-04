@@ -117,7 +117,7 @@ async function turn(request) {
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, proofStamps = true}) {
+async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true}) {
   await use(model, new Stages(postMessage, id));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
@@ -186,30 +186,40 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking proof'},
           live: rootRows(tree, choice) || {value: (prediction.q[0] + 1) / 2, top: topRows(actions, policy, null, action)}});
       }
+      let replayed = null;
+      if (proofStamps && !timed) for (const winner of [player, 1 - player]) {
+        const lines = replay.filter(r => r.winner === winner);
+        if (!lines.length) continue;
+        const found = note(await solve(id, history, {attacker: winner === player ? 'mover' : 'defender',
+          nodes: Math.min(solverNodes, 20000), ms: Math.min(15000, solverMs()), stamps: true, replay: lines}));
+        check();
+        solverUsed += found.nodes_used || 0;
+        if (found.native_verified && (found.status === 'PROVEN_WIN' || found.status === 'PROVEN_LOSS')) { replayed = found; break; }
+      }
       const mineFacts = facts.filter(f => f.history.length !== history.length || f.winner !== player);
-      const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true,
+      const mine = replayed || note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true,
         stamps: proofStamps,
         known: mineFacts.map(({history, winner, plies}) => ({history, winner, plies}))}));
       check();
-      solved = searched(mine);
-      solverUsed += mine.nodes_used || 0;
+      solved = replayed !== null || searched(mine);
+      if (!replayed) solverUsed += mine.nodes_used || 0;
       if (verified(mine) && mine.moves.length) {
         ({moves, pv, proof} = winningLine(native, history, mine, mineFacts));
         top = [[...moves[0], 1, 1, 1]];
       } else {
         postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking threats'}});
-        const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
+        const theirs = replayed || note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
         check();
-        solved = solved && searched(theirs);
-        solverUsed += theirs.nodes_used || 0;
+        solved = solved && (replayed !== null || searched(theirs));
+        if (!replayed) solverUsed += theirs.nodes_used || 0;
         if (verified(theirs)) threat = theirs.moves.map(m => [...m]);
-        if ((verified(theirs) || premises.length) && (!timed || performance.now() < solverEnd)) {
+        if ((replayed || verified(theirs) || premises.length) && (!timed || performance.now() < solverEnd)) {
           postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking defence'}});
-          const defended = note(await solve(id, history, {attacker: 'defender', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
+          const defended = replayed || note(await solve(id, history, {attacker: 'defender', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
           check();
           const lost = defended.status === 'PROVEN_LOSS' && defended.native_verified;
           solved = solved && (lost || searched(defended));
-          solverUsed += defended.nodes_used || 0;
+          if (!replayed) solverUsed += defended.nodes_used || 0;
           if (lost) {
             pv = principalVariation(native, history, defended.certificate, {attacker: 1 - player, known: facts}).pv;
             proof = {winner: 1 - player, turns: defended.proof_turns, plies: state.remaining + 2 + 4 * (defended.proof_turns - 1),

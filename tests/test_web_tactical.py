@@ -36,6 +36,18 @@ def wasm_results(queries):
 
 @unittest.skipUnless(NODE and WASM.exists() and library().exists(), 'needs node, web/engine/tactical.wasm and the native library')
 class WebTacticalParity(unittest.TestCase):
+    def test_changed_board_strategy_replay_matches_native(self):
+        with NativeTactics(independent=True) as native:
+            source = native.history(OPEN_THREE, nodes=20000, ms=5000)
+        replay = [dict(history=OPEN_THREE, winner=0, pv=[], certificate=source['certificate'])]
+        changed = [[7, 8] if p == [6, 8] else p for p in OPEN_THREE]
+        options = dict(stamps=True, library=[], replay=replay, nodes=20000, ms=5000)
+        web = wasm_results([(changed, options)])[0]
+        with NativeTactics(independent=True) as native:
+            local = native.history(changed, **options)
+        self.assertEqual({k: web[k] for k in FIELDS}, {k: local[k] for k in FIELDS})
+        self.assertEqual(independent_verify(web['certificate'], changed), 'PROVEN_WIN')
+
     def test_duplicate_stamp_imports_match_native(self):
         with NativeTactics(independent=True) as native:
             native.history(OPEN_THREE, stamps=True, library=[], nodes=20000, ms=5000)

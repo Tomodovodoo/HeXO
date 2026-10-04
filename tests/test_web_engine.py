@@ -210,7 +210,58 @@ class Overlay(unittest.TestCase):
 
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 class BrowserProofs(unittest.TestCase):
+
+    def test_matching_replay_precedes_newer_unrelated_records(self):
+        source = """import {Proofs} from './web/engine/proof.mjs';
+const proofs=new Proofs(),history=[[0,0],[1,0],[0,1]],record={proof:{winner:0,plies:20},pv:[]};
+proofs.add(history,record);
+for(let i=0;i<128;i++) proofs.add(Array.from({length:401},(_,j)=>[j,i+1]),record);
+const replay=proofs.replay(history);
+console.log(JSON.stringify({first:replay[0].history,cells:replay.reduce((n,r)=>n+r.history.length+r.pv.length,0)}));"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True, check=True)
+        result = json.loads(done.stdout)
+        self.assertEqual(result['first'], [[0,0],[1,0],[0,1]])
+        self.assertLessEqual(result['cells'], 50000)
+
+    def test_failed_replays_leave_the_full_ordinary_solve_available(self):
+        from tests.test_tactical_proof import FIXTURE
+        history = FIXTURE['positions']['1790600287230040:30:248']
+        replay = [dict(history=history, winner=winner, pv=[]) for winner in (0, 1)]
+        found = node(dict(kind='worker-turn', history=history, simulations=0, nodes=1300,
+                          replay=replay, replayMiss=True))
+        self.assertEqual(found['proof']['winner'], 0)
+        self.assertGreater(found['actual_solver_nodes'], 2600)
+        self.assertEqual(tactical_proof.independent_verify(found['proof']['certificate'], history), 'PROVEN_WIN')
     """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
+
+    def test_saved_strategy_survives_refresh_reload_and_replays_a_changed_board(self):
+        from tests.test_tactical_proof import OPEN_THREE
+        original = tactical_proof.NativeTactics().history(OPEN_THREE, nodes=20000, ms=5000)
+        pv = node(dict(kind='pv', history=OPEN_THREE, certificate=original['certificate']))
+        found = dict(proof=dict(winner=0, plies=pv['plies'], certificate=original['certificate']), pv=pv['pv'],
+                     moves=original['moves'], value=1, top=[], solved=True)
+        source = """import {readFileSync} from 'node:fs';
+import {BrowserSession} from './web/engine/play-session.mjs';
+import {Native} from './web/engine/search.mjs';
+import createModule from './web/engine/gumbel.mjs';
+const {history,found}=JSON.parse(readFileSync(0,'utf8')),native=new Native(await createModule());
+const session=new BrowserSession(native),entry={id:'test',kind:'bubble',name:'Test',presets:{standard:{simulations:8,solver_nodes:5000}}};
+session.registerEngine(entry,{});session.load(history,true);const spec=session.spec({engine:'test'});
+await session.record(history,spec,found);
+await session.record(history,spec,{...found,proof:{winner:0,plies:found.proof.plies}});
+await session.persist();await session.saving;
+const restored=new BrowserSession(native);restored.storage=session.storage;await restored.restore({paused:true});restored.extendProofs();
+const changed=history.map(p=>[...p]);changed[changed.length-1]=[7,8];
+console.log(JSON.stringify({records:restored.records,replay:restored.proofs.replay(changed),changed}));"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              input=json.dumps(dict(history=OPEN_THREE, found=found)), capture_output=True, text=True, check=True)
+        saved = json.loads(done.stdout)
+        self.assertEqual(saved['replay'][0]['certificate'], original['certificate'])
+        result = node(dict(kind='worker-turn', adapter=True, history=saved['changed'], records=saved['records'], simulations=8, nodes=5000))
+        self.assertEqual(result['proof']['winner'], 0)
+        self.assertEqual(result['actual_completed'], 0)
+        self.assertEqual(tactical_proof.independent_verify(result['proof']['certificate'], saved['changed']), 'PROVEN_WIN')
 
     def test_longer_defence_propagates_back_under_a_coarse_proof_bound(self):
         from types import SimpleNamespace

@@ -7,7 +7,7 @@ function proofArena(certificate) {
   if (!certificate.nodes.some(n => n.kind === 'stamp' || n.kind === 'stamp_link')) return certificate;
   const nodes = [];
   const append = (document, depth = 0) => {
-    if (depth > 8 || nodes.length + document.nodes.length > 200000) throw new Error('Proof source expansion limit');
+    if (depth > 32 || nodes.length + document.nodes.length > 200000) throw new Error('Proof source expansion limit');
     const offset = nodes.length;
     for (const node of document.nodes) nodes.push({...node});
     document.nodes.forEach((original, i) => {
@@ -138,7 +138,7 @@ export function winningLine(native, history, result, known = []) {
   const reused = result.certificate.nodes.some(n => ['stamp', 'stamp_link', 'zone_replies'].includes(n.kind));
   return {moves: result.moves.map(m => [...m]), pv: line.pv,
     proof: {winner: player, turns: result.proof_turns, plies: reused ? remaining + 4 * (result.proof_turns - 1) : line.plies,
-      ...(result.dependencies?.length || reused ? proofEvidence(result) : {})}};
+      ...proofEvidence(result)}};
 }
 
 /** The winner's turns in a proof `plies` placements long from a position whose mover has `remaining` stones left
@@ -168,10 +168,34 @@ export class Proofs {
     this.seen = new Set();
     this.edgeCache = new Map();
     this.knownCache = new Map();
+    this.strategies = new Map();
     for (const {history, winner, plies, pv} of list) this.put(history, winner, plies, pv);
   }
   list() {
     return [...this.entries.values()].map(({history, winner, plies, pv}) => ({history, winner, plies, pv}));
+  }
+  /** Saved strategies supply moves for checked replay, never changed-board verdicts. */
+  replay(history) {
+    const own = (h, side) => h.filter((_, i) => sideAt(i) === side).map(p => p.join(',')).sort().join(';');
+    const at = [own(history, 0), own(history, 1)], applicable = new Set();
+    for (const entry of this.strategies.values()) {
+      const current = entry.history.slice();
+      if (own(current, entry.winner) === at[entry.winner]) applicable.add(entry);
+      for (let i = 0; i < entry.pv.length && current.length <= history.length + 2; i++) {
+        const stone = entry.pv[i];
+        if (stone.length !== 4 || stone[3] !== i + 1 || stone[2] !== sideAt(current.length)) break;
+        current.push(stone.slice(0, 2));
+        if (own(current, entry.winner) === at[entry.winner]) { applicable.add(entry); break; }
+      }
+    }
+    const available = new Set([...applicable].map(entry => entry.winner));
+    let cells = 0;
+    return [...this.strategies.values()].reverse()
+      .sort((a, b) => Number(applicable.has(b)) - Number(applicable.has(a))).filter(entry => {
+      if (!available.has(entry.winner) || cells + entry.history.length + entry.pv.length > 50000) return false;
+      cells += entry.history.length + entry.pv.length;
+      return true;
+    }).slice(0, 256);
   }
   /** Reachable exact solver premises, including the completed turns implied by lost half-turns. */
   facts(history) {
@@ -195,6 +219,10 @@ export class Proofs {
     for (const fact of record.proofs || []) this.add(fact.history, {proof: {winner: fact.winner, plies: fact.plies}, pv: fact.pv});
     const proof = record.proof;
     if (!proof) return;
+    const key = proofKey(history), prior = this.strategies.get(key);
+    const certificate = proof.certificate?.nodes.some(n => n.kind !== 'exact') ? proof.certificate : record.strategy || prior?.certificate;
+    this.strategies.set(key, {history, winner: proof.winner, pv: record.pv || [], ...(certificate ? {certificate} : {})});
+    if (this.strategies.size > 256) this.strategies.delete(this.strategies.keys().next().value);
     const current = history.map(([q, r]) => [q, r]), pv = record.pv || [];
     const remaining = current.length % 2 ? 2 : 1, mover = sideAt(current.length);
     const plies = proof.plies || remaining + (proof.winner === mover ? 0 : 2) + 4 * (proof.turns - 1);

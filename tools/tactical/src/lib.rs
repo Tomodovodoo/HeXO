@@ -62,6 +62,7 @@ struct Request {
     #[serde(default)] known:Vec<Known>,
     #[serde(default)] stamps:bool,
     #[serde(default)] library:Option<Vec<StampSource>>,
+    #[serde(default)] replay:Vec<stamps::Replay>,
 }
 fn position(board:&check::Board,side:u8,remaining:u8)->Position {
     Position{stones:board.iter().map(|(&p,&s)|(p,if s==0{Player::P1}else{Player::P2})).collect(),
@@ -277,6 +278,7 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
         || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256
         || (req.resume && req.table_mb==0) || req.known.len()>4096
         || req.known.iter().map(|k|k.history.len()).sum::<usize>()>200_000
+        || (!req.replay.is_empty() && (!req.stamps || req.certificate.is_some() || req.root_moves.is_some()))
         || (req.attacker==Attacker::Defender && req.root_moves.is_some()) {return Err("invalid tactical limits".into());}
     let deadline=start+Duration::from_millis(req.ms as u64);
     let meter=Meter::new(req.nodes);
@@ -314,14 +316,15 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
     let ply=if req.attacker==Attacker::Opponent {check::flip(req.history.len())} else {req.history.len()};
     let (mover,remaining)=check::phase(ply);
     let side=if req.attacker==Attacker::Defender {1-mover} else {mover};
-    let cacheable=req.known.is_empty() && !req.stamps && req.attacker!=Attacker::Defender;
+    let cacheable=req.known.is_empty() && !req.stamps && req.replay.is_empty() && req.attacker!=Attacker::Defender;
     let fresh=req.certificate.is_none() && req.root_moves.is_none();
     let key=(board.iter().map(|(&p,&s)|(p,s)).collect(),side,remaining,req.nodes,req.idtt_nodes,
         if req.idtt_nodes>0 {req.depth} else {0},req.table_mb>0,req.shortest && fresh);
     let scope=json!({"rules":{"win_length":6,"placement_radius":8,"match_move_cap":null},
         "defenses":if req.stamps {"all legal covers; checked relevance zones for quiet and free-placement defender turns"}
             else {"all legal covers for the remaining stones including complete free-second frontier; quiet defender nodes unsupported"},
-        "attacks":"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN","checker_version":5,
+        "attacks":if req.replay.is_empty() {"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN"}
+            else {"saved move suggestions with all current forcing defenses; failed replay remains UNKNOWN"},"checker_version":5,
         "exact_premises":req.known.len(),
         "budget":{"nodes":req.nodes,"idtt_nodes":req.idtt_nodes,"idtt_depth_cap":req.depth,"safety_ms":req.ms,
             "work":"one shared meter over IDTT nodes, PDS-PN level-1 nodes and level-2 expansions; verifier path limit 128",
@@ -333,7 +336,9 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
     let mut proof_numbers=None;
     let mut resident_reused=false;
     let mut incomplete=None;
-    let cert=if let Some(cert)=req.certificate.clone() {Some(cert)} else if req.attacker==Attacker::Defender {
+    let cert=if !req.replay.is_empty() {
+        match stamps::replay(&req.replay,&board,ply,side,&ctl,req.nodes) {Ok(cert)=>Some(cert),Err(reason)=>{incomplete=Some(reason);None}}
+    } else if let Some(cert)=req.certificate.clone() {Some(cert)} else if req.attacker==Attacker::Defender {
         match defend(&board,ply,&req,&ctl,&meter) {Ok(cert)=>Some(cert),Err(reason)=>{incomplete=Some(reason);None}}
     } else if let Some(moves)=&req.root_moves {
         Some(complete_candidate(&board,ply,moves,&req,&ctl,&meter)?)
