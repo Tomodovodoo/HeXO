@@ -260,6 +260,7 @@ console.log(JSON.stringify([partial,proven(table,root,old,2)]));"""
         found = dict(moves=[[2, 3], [3, 3]], top=[], value=0, proof=dict(winner=1, plies=4, turns=1),
                      pv=[[*p[:3], p[3] - 2] for p in pv[2:]])
         answer = node(dict(kind='proofs', history=history, ply=3, found=found, records=[(history[:1], root), (history[:2], half)]))
+        self.assertTrue(answer['idleReuse'])
         line = [[*p[:3], p[3] - 1] for p in pv[1:]]
         for shown in (answer['analysed'], answer['undone']['shown'], answer['quick']['shown'], answer['reloaded']):
             self.assertEqual((shown['proof'], shown['value'], shown['pv']), (half['proof'], 1, line))
@@ -299,6 +300,8 @@ console.log(JSON.stringify([partial,proven(table,root,old,2)]));"""
         self.assertEqual({k:found['queries'][-4]['known'][k] for k in ('winner','plies')}, dict(winner=0,plies=2))
         self.assertEqual(found['queries'][-1]['known']['pv'][0],[1,1,0,1])
         self.assertEqual(found['queries'][-1]['known']['plies'],12)
+        self.assertEqual(found['queries'][-1]['shown']['moves'], [[1,1],[1,2]])
+        self.assertEqual(found['queries'][-1]['shown']['top'][0], [1,1,0,0,-1])
         self.assertEqual({k: found['settled'][k] for k in ('action', 'proven', 'proof_plies', 'values', 'completed_q')},
                          dict(action=[1, 0], proven=1, proof_plies=6, values=[1, -1, .3], completed_q=[1, -1, .3]))
         self.assertEqual({k: found['exact'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
@@ -531,10 +534,20 @@ class Bundle(unittest.TestCase):
                 with self.subTest(length=length, repeat=repeat):
                     self.assertTrue(turn['checked'], 'The principal-variation check must run')
                     self.assertTrue(turn['live'])
+                    fractions = [p['fraction'] for p in turn['progress']]
+                    self.assertEqual(fractions, sorted(fractions))
                     self.assertAlmostEqual(turn['result']['value'], .93, places=4)
                     for glimpse in turn['live']:
                         self.assertAlmostEqual(glimpse['value'], turn['result']['value'], places=4)
                         self.assertEqual(glimpse['root'], root)
+
+    def test_root_candidates_are_published_before_the_solver_runs(self):
+        for turn in node(dict(kind='glimpse', history=[[0, 0], [1, 0]], simulations=32, nodes=16)):
+            self.assertTrue(turn['queries'])
+            self.assertTrue(all(q['preview'] for q in turn['queries']))
+            self.assertEqual(turn['progress'][0]['stage']['name'], 'checking proof')
+            fractions = [p['fraction'] for p in turn['progress']]
+            self.assertEqual(fractions, sorted(fractions))
 
     def test_analysis_bar_uses_the_mover_at_half_turn_positions(self):
         history = [[0, 0], [1, 0], [1, 1], [-1, 0]]

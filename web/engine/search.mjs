@@ -254,7 +254,7 @@ export class NeuralSearch {
             for (const item of items) { this.fulfill(item.id, item.leaf.actions, predictions[i]); stats.evaluated++; }
             cache.put(items[0].key, {logits: Float64Array.from(predictions[i].logits), q: Float64Array.from(predictions[i].q)});
           });
-          onBatch(stats);
+          onBatch({...stats, completed: this.m._hxg_completed(this.ptr)});
           await nextTask();
         } else if (active) {
           finished();
@@ -382,19 +382,23 @@ export class GameGraph extends NeuralSearch {
   async search({pvCheck = 0, ...options} = {}) {
     const simulations = options.simulations ?? 128, reserve = Math.round(pvCheck * simulations);
     if (!(pvCheck > 0 && reserve && simulations - 2 * reserve >= 1)) return super.search(options);
-    const root = this.history.map(p => [...p]), first = await super.search({...options, simulations: simulations - 2 * reserve});
+    let completed = 0;
+    const onBatch = stats => options.onBatch?.({...stats, completed: completed + stats.completed});
+    const root = this.history.map(p => [...p]), first = await super.search({...options, onBatch, simulations: simulations - 2 * reserve});
+    completed += first.completed;
     const line = first.stopped ? null : this.afterTurn(first);
     if (!line) return first;
     const index = first.actions.findIndex(([q, r]) => q === first.action[0] && r === first.action[1]), before = first.completed_q[index];
     const passes = [first];
     this.at(line);
     try {
-      passes.push(await super.search({...options, simulations: reserve}));
+      passes.push(await super.search({...options, onBatch, simulations: reserve}));
+      completed += passes[1].completed;
     } finally {
       this.at(root);
     }
     const after = this.result().completed_q[index], searched = before - after > PV_DROP && !passes[1].stopped;
-    if (searched) passes.push(await super.search({...options, simulations: reserve}));
+    if (searched) passes.push(await super.search({...options, onBatch, simulations: reserve}));
     const result = searched ? passes[2] : {...passes[1], ...this.result(options.choice ?? 'policy')};
     for (const key of ['completed', 'evaluated', 'cache_hits', 'elapsed_ms']) result[key] = passes.reduce((sum, p) => sum + p[key], 0);
     return {...result, stopped: passes.some(p => p.stopped), pv_check: {line: line.slice(root.length), before, after, searched}};

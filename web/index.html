@@ -946,8 +946,8 @@ function selectedTurn(){if(!S||!view)return null;return S.review.find(t=>t.ply<=
    its top rows without the stones the search never tried (no policy share, not proven), which older saves kept */
 function liveAt(p){const j=S.jobs.find(j=>j.ply===p&&j.status==='running'&&j.live);
   return j?{value:j.live.value,top:j.live.top,refuted:j.live.refuted,threat:[],pv:[],proof:null,live:true}:null}
-function shownEval(p){const e=S.evaluations[p]||liveAt(p);if(!e)return e;
-  const top=(e.top||[]).filter(t=>t[2]>=.00005||t[4]>0),refuted=!e.proof&&top.length&&top.every(t=>t[4]<0);
+function shownEval(p){const saved=S.evaluations[p],e=saved?.proof?saved:liveAt(p)||saved;if(!e)return e;
+  const top=(e.top||[]).filter(t=>t[2]>=.00005||t[4]),refuted=!e.proof&&top.length&&top.every(t=>t[4]<0);
   const value=refuted?(e.node_value??(e.value>0&&e.value<1?e.value:null)):e.value;
   return {...e,top,value,refuted:refuted?top.length:0}}
 function finished(){return S.winner>=0&&view===S.history.length}

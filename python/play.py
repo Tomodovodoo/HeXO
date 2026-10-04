@@ -2042,6 +2042,12 @@ class Session:
         if shown.get('proof'):
             shown['pv'] = self.proofs.line(history, dict(winner=shown['proof']['winner'],
                                                         plies=proof_plies(shown['proof'], history), pv=shown.get('pv') or []))
+        lost = shown.get('proof') and shown['proof']['winner'] != mover
+        remaining = 2 if len(history) % 2 else 1
+        defence = [p[:2] for i, p in enumerate((shown.get('pv') or [])[:remaining])
+                   if len(p) == 4 and p[2] == mover and p[3] == i + 1] if lost else []
+        if len(defence) == remaining:
+            shown['moves'] = defence
         rows = [list(row) for row in shown.get('top') or []]
         for action, (winner, distance, _) in edges.items():
             row = next((row for row in rows if tuple(row[:2]) == action), None)
@@ -2049,6 +2055,14 @@ class Session:
                 rows.append(row := [*action, 0.])
             if row is not None:
                 row[3:] = [1., 1] if winner == mover else [0., -1]
+        if lost:
+            for row in rows:
+                row[3:] = [0., -1]
+            if defence:
+                row = next((r for r in rows if r[:2] == defence[0]), None)
+                if row is not None:
+                    rows.remove(row)
+                rows.insert(0, row if row is not None else [*defence[0], 0., 0., -1])
         flag = lambda row: row[4] if len(row) > 4 else 0
         rows.sort(key=lambda row: (1 - flag(row), edges.get(tuple(row[:2]), (0, math.inf))[1] if flag(row) > 0 else 0,
                                    flag(row) > 0 and played is not None and tuple(row[:2]) != tuple(played)))

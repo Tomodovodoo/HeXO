@@ -10,7 +10,7 @@ import createModule from './gumbel.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameGraphs, PV_CHECK} from './search.mjs';
 import {Network, probe, runtime} from './network.mjs';
 import {Stages, errorReport, stall} from './stages.mjs';
-import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine} from './proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine, proven} from './proof.mjs';
 
 const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 'defender counterwin',
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
@@ -83,6 +83,7 @@ const searched = r => verified(r) || VERDICTS.has(r.reason);
 
 /** The root of the first stone's running search as the analysis panel shows it: {value (the mover's win chance), top}. */
 function rootRows(tree, choice) {
+  if (!tree) return null;
   const {action, actions, policy, values, completed_q} = tree.result(choice);
   if (!action) return null;
   const top = topRows(actions, policy, completed_q, action);
@@ -165,6 +166,22 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   } : null;
   try {
     if (solverNodes) {
+      postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking proof'}});
+      if (!timed) {
+        const actions = native.legal(history), key = cache.key(history, network.version);
+        let prediction = cache.get(key);
+        if (prediction === undefined) {
+          const [found] = await network.evaluate([{history, actions}]);
+          prediction = {logits: Float64Array.from(found.logits), q: Float64Array.from(found.q)};
+          cache.put(key, prediction);
+        }
+        check();
+        const maximum = Math.max(...prediction.logits), weights = Array.from(prediction.logits, l => Math.exp(l - maximum));
+        const total = weights.reduce((a, b) => a + b, 0), policy = weights.map(w => w / total);
+        const action = actions[policy.indexOf(Math.max(...policy))];
+        postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking proof'},
+          live: rootRows(tree, choice) || {value: (prediction.q[0] + 1) / 2, top: topRows(actions, policy, null, action)}});
+      }
       const mineFacts = facts.filter(f => f.history.length !== history.length || f.winner !== player);
       const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true,
         stamps: proofStamps,
@@ -176,12 +193,14 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         ({moves, pv, proof} = winningLine(native, history, mine, mineFacts));
         top = [[...moves[0], 1, 1, 1]];
       } else {
+        postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking threats'}});
         const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
         check();
         solved = solved && searched(theirs);
         solverUsed += theirs.nodes_used || 0;
         if (verified(theirs)) threat = theirs.moves.map(m => [...m]);
         if ((verified(theirs) || premises.length) && (!timed || performance.now() < solverEnd)) {
+          postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking defence'}});
           const defended = note(await solve(id, history, {attacker: 'defender', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
           check();
           const lost = defended.status === 'PROVEN_LOSS' && defended.native_verified;
@@ -229,7 +248,8 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         const result = settled(await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
           ...(line == null ? {} : {pvCheck: PV_CHECK}),
           evaluate, prove, stop: () => cancelled.has(id) || timed && performance.now() >= stoneEnd,
-          onBatch: () => (line != null && (touched = tree.id), postMessage({type: 'progress', id, fraction: Math.min(1, (stone + tree.m._hxg_completed(tree.ptr) / simulations) / state.remaining),
+          onBatch: stats => (line != null && (touched = tree.id), postMessage({type: 'progress', id, fraction: Math.min(1, (stone + stats.completed / simulations) / state.remaining),
+            ...(tree.history.length !== current.length ? {stage: {name: 'checking reply'}} : {}),
             // The PV check moves the root past this turn, where the opponent's value and candidates apply.
             ...(stone || tree.history.length !== history.length ? {} : {live: rootRows(tree, choice)})}))}), unmarked, local.player);
         if (line != null && result.completed) touched = tree.id;
@@ -272,10 +292,10 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
     const knownTurn = answered(native, history, table);
     if (knownTurn && (!proof || knownTurn.proof.plies <= proof.plies)) ({moves, value, top, proof, pv} = knownTurn);
     else if (proof) pv = table.line(history, {winner: proof.winner, plies: proof.plies, pv});
-    return {moves, value: Math.round(value * 1e4) / 1e4, node_value: nodeValue, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
+    return proven(table, history, {moves, value: Math.round(value * 1e4) / 1e4, node_value: nodeValue, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
       actual_completed: completed, actual_solver_nodes: solverUsed, graph_id: touched,
       ...(leafProofs.size ? {proofs: [...leafProofs.values()]} : {}),
-      ...(failure ? {solver_error: failure} : {})};
+      ...(failure ? {solver_error: failure} : {})}, state.remaining);
   } catch (error) {
     // A turn that stops after touching its game graph names the graph, so the session can count that search.
     if (error && typeof error === 'object') error.graph = touched;
