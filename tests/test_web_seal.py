@@ -29,11 +29,14 @@ def browser(requests):
 
 def server(history, ms):
     from legacy.arena import Seal
+    from play import checked_turn
     game = Game()
     try:
         for q, r in history:
             game.play(q, r)
-        return [list(move) for move in Seal(SEAL)(game, ms)]
+        # The native adapter returns Seal's raw pair, as the browser's `raw` does.
+        # Play's existing normalizer turns that answer into executable placements.
+        return checked_turn(history, Seal(SEAL)(game, ms))
     finally:
         game.close()
 
@@ -50,15 +53,14 @@ class WebSealParity(unittest.TestCase):
                     try:
                         player, remaining = game.player, game.remaining
                         self.assertGreaterEqual(len(moves), 1)
-                        self.assertLessEqual(len(moves), 2)
+                        self.assertLessEqual(len(moves), remaining)
                         played = 0
-                        for q, r in moves[:remaining]:
+                        for q, r in moves:
+                            self.assertLess(game.winner, 0)
                             self.assertEqual(game.player, player)
                             self.assertTrue(game.legal(q, r))
                             game.play(q, r)
                             played += 1
-                            if game.winner >= 0:
-                                break
                         self.assertTrue(played == remaining or game.winner == player)
                         if history == IMMEDIATE:
                             self.assertEqual(game.winner, player)
@@ -72,6 +74,7 @@ class WebSealParity(unittest.TestCase):
         self.assertEqual(len(whole['moves']), 2)
         self.assertEqual(len(one_left['raw']), 2)
         self.assertEqual(one_left['moves'], one_left['raw'][:1])
+        self.assertEqual(len(server([[0, 0], [1, 0]], 50)), 1)
 
     def test_clock_and_board_range(self):
         far = [[8 * k, 0] for k in range(8)]
