@@ -8,7 +8,7 @@
   "tools/tactical/Cargo.toml": "e66ea325f4f19ff20aa23a313982dea56fc6da9cbb1bccc0024862ea8d1dec2a",
   "tools/tactical/src/check.rs": "764eebd2a0a2523b39dac1cff6b0bd42bfa8d74f8a9d799aa7884498d564d0d4",
   "tools/tactical/src/lib.rs": "021b645e17b5a19701d87384b6a5ddba549c2a5776aaef0d344dfff9a0d85323",
-  "tools/tactical/src/native_answer.rs": "b7378dcda168b9fc5bd5f7a35c5ce5668a43240357e188c331d2e3d48f95ee9d",
+  "tools/tactical/src/native_answer.rs": "cb8b9c500e20a4601f0069f4e95da166dc8f6aa8ec90d3781cad6d45bf78e42d",
   "tools/tactical/src/stamps.rs": "b70b37c28962f9faa1d883408d17aae647d804569038d01968a2eaa4018a96f0",
   "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/Cargo.toml": "c0ab6fd2fef9e17ed86e6aa73e805aa670742e7294b5d3dacb43542838cf8daa",
   "tools/tactical/vendor/hexo-strix/hexo-rs/hexo-engine/src/board.rs": "99d0a3f518be81c25b7be3d97a9d767b8010ddf2310099587ee6b08e7ec6d121",

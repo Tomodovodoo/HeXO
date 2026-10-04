@@ -4,6 +4,42 @@ use super::*;
 
 struct Answer {value:Value,info:[u64;13],moves:Vec<(i32,i32)>}
 
+// A native scheduler already owns a background dispatcher. After the slice ends
+// it must collect the cancelled worker's meter, rather than abandon its reply.
+// Legacy query callers keep their bounded-wait dispatch_on contract.
+fn complete(worker:&Worker,req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String> {
+    if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
+    let deadline=start+Duration::from_millis(req.ms as u64);
+    let cancel=query_control(req.request_id)?;
+    if cancel.load(Ordering::Acquire) {return Err("cancelled".into());}
+    if worker.state.busy.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err() {
+        return Err("native worker busy finishing bounded prior query".into());
+    }
+    *worker.state.active.lock().map_err(|_|"worker cancellation lock")?=Some(Arc::clone(&cancel));
+    let (send,recv)=mpsc::channel();
+    if worker.sender.as_ref().unwrap().send((req,start,Arc::clone(&cancel),send)).is_err() {
+        worker.state.busy.store(false,Ordering::Release);return Err("native worker stopped".into());
+    }
+    *dispatched=true;
+    let mut value=match recv.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result)=>result?,
+        Err(mpsc::RecvTimeoutError::Disconnected)=>return Err("native worker stopped".into()),
+        Err(mpsc::RecvTimeoutError::Timeout)=>{
+            cancel.store(true,Ordering::Release);
+            recv.recv().map_err(|_|"native worker stopped")??
+        }
+    };
+    // A queued reply can also be received after the clock. Neither receive
+    // route may expose an exact answer after cancellation or the deadline.
+    if cancel.load(Ordering::Acquire) || Instant::now()>=deadline {
+        value["status"]=json!("UNKNOWN");value["native_verified"]=json!(false);
+        value["moves"]=json!([]);value["certificate"]=Value::Null;
+        value["proof_turns"]=Value::Null;value["shortest"]=json!(false);
+        value["reason"]=json!("cancelled or deadline; completion collected");
+    }
+    Ok(value)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hexo_tactical_worker_answer(worker:*mut std::ffi::c_void,input:*const c_char)->*mut std::ffi::c_void {
     if worker.is_null() {return std::ptr::null_mut();}
@@ -11,7 +47,7 @@ pub unsafe extern "C" fn hexo_tactical_worker_answer(worker:*mut std::ffi::c_voi
         let worker=unsafe{&*worker.cast::<Worker>()};let mut scope=None;
         let mut value=unsafe{query_value(input,|req,start,dispatched| {
             scope=Some((req.history.len(),req.attacker));
-            dispatch_on(worker,req,start,dispatched)
+            complete(worker,req,start,dispatched)
         })};
         worker.stats(&mut value);
         let mut info=[0;13];let mut moves=vec![];

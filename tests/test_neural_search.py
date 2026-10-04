@@ -1532,6 +1532,47 @@ class NativeProofs(unittest.TestCase):
         self.assertEqual((proofs.stats()['fresh_nodes'], proofs.stats()['missing_fresh']), (0, 0))
         self.assertEqual(native.hxg_exact(graph.ptr), -1)
 
+    def test_short_slice_collects_actual_work_without_publishing_a_late_verdict(self):
+        import ctypes as C
+        import json
+        from tactical_proof import NativeTactics
+        with NativeTactics(independent=True) as worker:
+            lib = worker.lib
+            for name, result, args in (
+                ('worker_answer', C.c_void_p, [C.c_void_p, C.c_char_p]),
+                ('answer_info', C.c_bool, [C.c_void_p, C.POINTER(C.c_uint64)]),
+                ('answer_json', C.c_void_p, [C.c_void_p]),
+                ('answer_free', None, [C.c_void_p]),
+            ):
+                function = getattr(lib, 'hexo_tactical_'+name)
+                function.argtypes, function.restype = args, result
+            token = lib.hexo_tactical_prepare()
+            self.assertTrue(token)
+            try:
+                request = dict(history=self.opening, ms=8, nodes=10_000_000, idtt_nodes=0, depth=8,
+                               table_mb=1, bounds=True, resume=True, request_id=token)
+                answer = lib.hexo_tactical_worker_answer(worker.worker, json.dumps(request).encode())
+                self.assertTrue(answer)
+                try:
+                    info = (C.c_uint64*13)()
+                    self.assertTrue(lib.hexo_tactical_answer_info(answer, info))
+                    raw = lib.hexo_tactical_answer_json(answer)
+                    try:
+                        row = json.loads(C.string_at(raw))
+                    finally:
+                        lib.hexo_tactical_free(raw)
+                    self.assertEqual((info[0], row['status'], row['native_verified']),
+                                     (0, 'UNKNOWN', False))
+                    self.assertEqual(info[4], 1)
+                    self.assertEqual(info[3], row['nodes_fresh'])
+                    self.assertIsNone(row['certificate'])
+                    self.assertFalse(worker.busy)
+                    self.assertEqual(row['last_worker_completion']['completed_queries'], 1)
+                finally:
+                    lib.hexo_tactical_answer_free(answer)
+            finally:
+                lib.hexo_tactical_release(token)
+
 
 if __name__ == '__main__':
     unittest.main()

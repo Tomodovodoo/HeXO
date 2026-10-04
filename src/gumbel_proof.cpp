@@ -53,7 +53,7 @@ struct Frontier {
 };
 struct Job {
  uint64_t id=0,token=0;size_t game=0;std::shared_ptr<Task> task;std::shared_ptr<Node> pin;
- std::vector<Cell> history;std::string context,result,error;int side=0,worker=-1,preferred=-1;uint64_t generation=0,facts=0;
+ std::vector<Cell> history;std::string context,result,error;int side=0,worker=-1,preferred=-1,quantum=0;uint64_t generation=0,facts=0;
  Clock::time_point queued,started,deadline{};double elapsed=0,wait=0;bool cancelled=false,pruned=false;
  std::array<uint64_t,13> info{};std::array<int64_t,4> moves{};int move_count=0;
 };
@@ -120,7 +120,8 @@ struct Loop {
    {std::lock_guard lock(mutex);if(stopping || !enabled || live.size()>=capacity)return;}
    size_t i=0;auto task=take(i);if(!task)return;auto node=task->node.lock();auto& o=*pool.games[i];
    auto job=std::make_shared<Job>();job->id=++next;job->game=i;job->task=task;job->pin=node;job->history=task->history;
-   job->side=task->side;job->preferred=task->worker;job->generation=task->generation;job->facts=frontiers[i].revision;job->queued=Clock::now();job->context=context(i,job->history);
+   job->side=task->side;job->preferred=task->worker;job->quantum=std::min(1000,slice*int(uint64_t(1)<<std::min(6u,task->attempts[job->side])));
+   job->generation=task->generation;job->facts=frontiers[i].revision;job->queued=Clock::now();job->context=context(i,job->history);
    if(o.time_limit_ms)job->deadline=o.started+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double,std::milli>(o.time_limit_ms));
    task->flight=true;o.game->pins[task.get()]={node.get()};
    {std::lock_guard lock(mutex);live.emplace(job->id,job);queued.push_back(job);++submitted;}
@@ -137,7 +138,7 @@ struct Loop {
    job->info[4]=1; // Every pre-dispatch exit has confirmed zero fresh work.
    void* answer=nullptr;void* raw=nullptr;
    try {
-    int ms=slice;if(job->deadline!=Clock::time_point{})ms=std::min(ms,int(std::chrono::duration_cast<std::chrono::milliseconds>(job->deadline-Clock::now()).count()));
+    int ms=job->quantum;if(job->deadline!=Clock::time_point{})ms=std::min(ms,int(std::chrono::duration_cast<std::chrono::milliseconds>(job->deadline-Clock::now()).count()));
     if(ms<1)mark(*job);
     if(!job->cancelled){worker.token=api.prepare();if(!worker.token)job->error="cancellation token limit";
      else{job->token=worker.token;
