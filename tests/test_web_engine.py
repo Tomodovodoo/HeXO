@@ -210,6 +210,16 @@ class Overlay(unittest.TestCase):
 
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 class BrowserProofs(unittest.TestCase):
+
+    def test_failed_replays_leave_the_full_ordinary_solve_available(self):
+        from tests.test_tactical_proof import FIXTURE
+        history = FIXTURE['positions']['1790600287230040:30:248']
+        replay = [dict(history=history, winner=winner, pv=[]) for winner in (0, 1)]
+        found = node(dict(kind='worker-turn', history=history, simulations=0, nodes=1300,
+                          replay=replay, replayMiss=True))
+        self.assertEqual(found['proof']['winner'], 0)
+        self.assertGreater(found['actual_solver_nodes'], 2600)
+        self.assertEqual(tactical_proof.independent_verify(found['proof']['certificate'], history), 'PROVEN_WIN')
     """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
 
     def test_saved_strategy_survives_refresh_reload_and_replays_a_changed_board(self):

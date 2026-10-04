@@ -197,7 +197,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         if (found.native_verified && (found.status === 'PROVEN_WIN' || found.status === 'PROVEN_LOSS')) { replayed = found; break; }
       }
       const mineFacts = facts.filter(f => f.history.length !== history.length || f.winner !== player);
-      const mine = replayed || note(await solve(id, history, {attacker: 'mover', nodes: Math.max(1, solverNodes - solverUsed), ms: solverMs(), shortest: true,
+      const mine = replayed || note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true,
         stamps: proofStamps,
         known: mineFacts.map(({history, winner, plies}) => ({history, winner, plies}))}));
       check();

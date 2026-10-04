@@ -209,7 +209,9 @@ if (job.kind === 'encode') {
     Worker: class {
       postMessage({id, history, options}) {
         queries.push({preview: messages.some(m => m.live?.top?.length), stage: messages.at(-1)?.stage});
-        const result = solver.history(history, options);
+        const result = job.replayMiss && options.replay?.length
+          ? {status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: options.nodes, reason: 'replay work limit'}
+          : solver.history(history, options);
         queueMicrotask(() => this.onmessage({data: {id, result}}));
       }
       terminate() {}

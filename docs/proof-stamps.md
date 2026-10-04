@@ -71,7 +71,9 @@ The optional tactical API argument is `replay`, a list of records containing
 At most 256 records and 50,000 history/PV cells are accepted. Evidence scanning
 has a 200,000-node limit, and replay shares the query's node meter and deadline.
 The browser tries at most 20,000 nodes and 15 seconds per candidate winner
-before falling back to ordinary search. This archive replay runs in untimed
+before falling back to ordinary search with its full configured budget. Replay
+work is reported in the total used nodes but does not reduce that budget.
+This archive replay runs in untimed
 analysis and review; ordinary play and timed games keep their existing path.
 Disabling proof stamps also disables archive replay.
 
