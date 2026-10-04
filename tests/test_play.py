@@ -1887,6 +1887,18 @@ class FreeplayClock(unittest.TestCase):
 
 
 class Proofs(unittest.TestCase):
+    def test_tighter_scalar_proof_does_not_suggest_half_a_turn(self):
+        from play import Proofs
+        from types import SimpleNamespace
+        table, root = Proofs(), [(0,0)]
+        old = evaluation(1.,moves=[[2,0],[3,0]],proof=dict(winner=1,plies=10,turns=3),pv=[])
+        table.add(root,old)
+        table.add(root+[(1,0)],dict(proof=dict(winner=1,plies=5),pv=[]))
+        shown = Session.proven(SimpleNamespace(proofs=table),root,old)
+        self.assertEqual((shown['proof']['plies'],shown['moves'],shown['pv']),(6,[],[[1,0,1,1]]))
+        table.add(root,dict(proof=dict(winner=1,plies=1),pv=[[1,0,1,1]]))
+        self.assertEqual(Session.proven(SimpleNamespace(proofs=table),root,old)['moves'],[[1,0]])
+
     def test_shorter_child_replaces_an_existing_root_proof_and_saved_line(self):
         from play import Proofs
         from types import SimpleNamespace

@@ -1984,7 +1984,8 @@ class Session:
             shown.update(value=1. if won else 0., pv=outcome['pv'], proof=dict(
                 winner=outcome['winner'], plies=outcome['plies'], turns=proof_turns(outcome['plies'], remaining, won)))
             if won:
-                shown['moves'] = [p[:2] for i, p in enumerate(outcome['pv'][:remaining]) if p[2] == mover and p[3] == i + 1]
+                moves = [p[:2] for i, p in enumerate(outcome['pv'][:remaining]) if p[2] == mover and p[3] == i + 1]
+                shown['moves'] = moves if len(moves) == remaining or outcome['plies'] <= len(moves) else []
         if shown.get('proof'):
             shown['pv'] = self.proofs.line(history, dict(winner=shown['proof']['winner'],
                                                         plies=proof_plies(shown['proof'], history), pv=shown.get('pv') or []))

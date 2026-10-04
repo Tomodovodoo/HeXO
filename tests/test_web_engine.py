@@ -212,6 +212,18 @@ class Overlay(unittest.TestCase):
 class BrowserProofs(unittest.TestCase):
     """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
 
+    def test_tighter_scalar_proof_does_not_suggest_half_a_turn(self):
+        source = """import {Proofs,proven} from './web/engine/proof.mjs';
+const table=new Proofs(), root=[[0,0]], old={moves:[[2,0],[3,0]],value:1,proof:{winner:1,plies:10,turns:3},pv:[]};
+table.add(root,old); table.add([...root,[1,0]],{proof:{winner:1,plies:5},pv:[]});
+const partial=proven(table,root,old,2);
+table.add(root,{proof:{winner:1,plies:1},pv:[[1,0,1,1]]});
+console.log(JSON.stringify([partial,proven(table,root,old,2)]));"""
+        done = subprocess.run([NODE,'--input-type=module','-e',source],cwd=ROOT,capture_output=True,text=True,check=True)
+        partial, terminal = json.loads(done.stdout)
+        self.assertEqual((partial['proof']['plies'],partial['moves'],partial['pv']),(6,[],[[1,0,1,1]]))
+        self.assertEqual(terminal['moves'],[[1,0]])
+
     def test_shorter_proof_replaces_saved_parent_after_undo_and_reload(self):
         history = [[0,0],[1,0],[2,0],[0,1]]
         old = dict(moves=[[3,1],[4,1]], value=1, top=[], proof=dict(winner=0,plies=42,turns=11),
@@ -413,6 +425,31 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_late_marks_tighten_proven_browser_roots_and_shared_parents(self):
+        from tests.test_neural_search import Uniform
+        network = Uniform()
+        root = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        child = root+[[-1,0]]
+        batches = []
+        for history in (root,child,[[0,0]]):
+            prediction = network.evaluate([history])[0]
+            batches.append([dict(history=history,logits=prediction['logits'].tolist(),q=prediction['q'].tolist())])
+        steps = [dict(simulations=1,at=root,marks=[[-1,0,0,42]]),
+                 dict(simulations=1,at=root,marks=[[4,0,0,34]]),
+                 dict(simulations=1,at=child,marks=[[4,0,0,29]]),
+                 dict(simulations=1,at=root)]
+        lost = [[0,0]]
+        actions = network.evaluate([lost])[0]['actions'].tolist()
+        cases = [dict(history=root,seed=3,tactics=False,limit=4096,batches=batches[:2],steps=steps),
+                 dict(history=lost,seed=3,tactics=False,limit=4096,batches=batches[2:],
+                      steps=[dict(simulations=1,marks=[[*a,0,d] for a in actions]) for d in (33,17)])]
+        won, losses = node(dict(kind='search',cases=cases))
+        self.assertEqual([r['native_distance'] for r in won],[42,34,29,30])
+        self.assertEqual([r['proof_plies'] for r in won],[42,34,29,30])
+        self.assertEqual([r['native_distance'] for r in losses],[33,17])
+        self.assertEqual([r['proven'] for r in losses],[-1,-1])
+        self.assertTrue(all(r['unmarked']==0 for r in won+losses))
+
     def test_local_proofs_reach_browser_search_and_saved_lines(self):
         from tests.test_tactical_proof import OPEN_THREE
         history = OPEN_THREE + [[8,8],[10,8],[8,10],[10,10]]

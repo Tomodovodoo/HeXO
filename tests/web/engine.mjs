@@ -61,7 +61,7 @@ async function search(item) {
       const result = await tree.search({simulations: step.simulations, rootSamples: step.root_samples, batchSize: step.batch_size, cache,
         ...(step.choice ? {choice: step.choice} : {}), evaluate});
       out.push({action: result.action, policy: result.policy, visits: result.visits, completed: result.completed, proven: result.proven,
-        unmarked: unmarked.size});
+        proof_plies: result.proof_plies, native_distance: tree.m._hxg_distance(tree.ptr), unmarked: unmarked.size});
       if (!result.action) break;
       if (item.limit == null) tree.advance(result.action);
     }

@@ -350,7 +350,10 @@ export function proven(known, history, found, remaining, played = null) {
     const won = outcome.winner === mover;
     Object.assign(shown, {value: won ? 1 : 0, pv: outcome.pv,
       proof: {winner: outcome.winner, turns: proofTurns(outcome.plies, remaining, won), plies: outcome.plies}});
-    if (won) shown.moves = outcome.pv.slice(0, remaining).filter((p, i) => p[2] === mover && p[3] === i + 1).map(p => [p[0], p[1]]);
+    if (won) {
+      const moves = outcome.pv.slice(0, remaining).filter((p, i) => p[2] === mover && p[3] === i + 1).map(p => [p[0], p[1]]);
+      shown.moves = moves.length === remaining || outcome.plies <= moves.length ? moves : [];
+    }
   }
   if (shown.proof) {
     const {winner, turns} = shown.proof, plies = shown.proof.plies || remaining + (winner === mover ? 0 : 2) + 4 * (turns - 1);
