@@ -811,6 +811,23 @@ class Proofs:
         base = frozenset((int(q), int(r), player_at(i)) for i, (q, r) in enumerate(history))
         found = {}
         with self.lock:
+            # A lost half-turn after A covers every legal A,B. On the alternate
+            # half-turn after B, A reaches the same board. Keep only the verdict:
+            # the saved defender's reply/PV need not be B.
+            if size and size % 2 == 0:
+                mover = player_at(size)
+                for key in self.sizes.get(size, ()):
+                    entry = self.entries[key]
+                    if entry['winner'] == mover or entry['plies'] < 2:
+                        continue
+                    missing, replaced = entry['stones'] - base, base - entry['stones']
+                    if len(missing) != 1 or len(replaced) != 1:
+                        continue
+                    first, prior = next(iter(missing)), next(iter(replaced))
+                    if first[2] != mover or prior != (*map(int, history[-1]), mover):
+                        continue
+                    outcome = dict(winner=entry['winner'], plies=entry['plies'] - 1, pv=[])
+                    found[first[:2]] = (entry['winner'], entry['plies'], outcome)
             for extra in (1, 2):
                 for key in self.sizes.get(size + extra, ()):
                     entry = self.entries[key]
@@ -837,6 +854,22 @@ class Proofs:
         move through `edges`, its line led by that stone and extended from stored children; None when nothing is known."""
         with self.lock:
             entry = self.entries.get(proof_key(history))
+            if entry is None and len(history) > 1 and len(history) % 2 == 1:
+                # Either order of the just-completed losing turn has the same
+                # outcome. A scalar win does not supply the next winning move.
+                base = frozenset((int(q), int(r), player_at(i)) for i, (q, r) in enumerate(history))
+                mover = player_at(len(history))
+                candidates = []
+                for key in self.sizes.get(len(history) - 1, ()):
+                    loss = self.entries[key]
+                    if loss['winner'] != mover or loss['plies'] < 2 or not loss['stones'] < base:
+                        continue
+                    missing = next(iter(base - loss['stones']))
+                    if missing not in {(*map(int, p), 1-mover) for p in history[-2:]}:
+                        continue
+                    candidates.append(dict(winner=mover, plies=loss['plies'] - 1, pv=[]))
+                if candidates:
+                    entry = min(candidates, key=lambda e: e['plies'])
         if entry is not None:
             return dict(winner=entry['winner'], plies=entry['plies'], pv=self.line(history, entry))
         mover = player_at(len(history))
