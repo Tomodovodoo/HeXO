@@ -175,8 +175,8 @@ HX_API int hxgf_workers(void* p,int count,void* (*group)(void*)){try{
  auto& f=*static_cast<feeding::Feed*>(p);auto workers=std::make_unique<feeding::Workers>(count);
  f.workers=std::move(workers);f.group=group;return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-HX_API int hxgf_parallel(void* p,int count,void (*work)(void*,int),void* data){try{
- static_cast<feeding::Feed*>(p)->workers->run(count,work,data);return 1;
+HX_API int hxgf_parallel(void* p,int count,void (*work)(void*,int),void* data,bool (*admit)(void*,int)){try{
+ static_cast<feeding::Feed*>(p)->workers->run(count,work,data,admit);return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxgf_begin(void* p,void* tree,const int64_t* history,int n){try{static_cast<feeding::Feed*>(p)->begin(tree,history,n);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxgf_seed(void* p,void* tree,const int64_t* actions,const double* logits,const double* values,int count){try{

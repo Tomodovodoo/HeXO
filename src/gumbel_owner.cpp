@@ -9,7 +9,7 @@ extern "C" void hxgf_free(void*);
 extern "C" void hxgf_stats(void*,int64_t*);
 extern "C" int64_t hxgf_queued(void*);
 extern "C" int hxgf_workers(void*,int,void* (*)(void*));
-extern "C" int hxgf_parallel(void*,int,void (*)(void*,int),void*);
+extern "C" int hxgf_parallel(void*,int,void (*)(void*,int),void*,bool (*)(void*,int));
 extern "C" int hxgf_gather(void*,void*,int64_t*);
 extern "C" void hxgf_detach(void*,void*);
 extern "C" int hxgf_root_value(void*,void*,double*);
@@ -121,7 +121,7 @@ struct Owner {
   if(slot==views.size())views.push_back(std::move(v));else views[slot]=std::move(v);
   return start(views[slot]);
  }
- int step(int ready_limit=0){
+ int step(int ready_limit=0,bool admitted=false){
   if(stopped)return 0;auto begin=std::chrono::steady_clock::now();++ticks;
   if(expired()){deadline=true;stop();return 0;}
   auto& root=views[0];
@@ -132,9 +132,10 @@ struct Owner {
   int progress=0;
   size_t visited=0,first=ready_limit?view_cursor:0;
   while(visited<views.size()){
-   if(ready_limit && hxgf_queued(feed)>=ready_limit)break;
+   if(ready_limit && !admitted && hxgf_queued(feed)>=ready_limit)break;
    auto& v=views[(first+visited++)%views.size()];if(!v.active)continue;
    if(expired()){deadline=true;stop();return 0;}int64_t out[4];int status=hxgf_gather(feed,v.tree.get(),out);
+   admitted=false;
    if(status==-2)throw std::runtime_error(gumbel::error);progress+=int(out[0]);if(expired()){deadline=true;stop();return 0;}
   }
   // Pause between whole gathers, never inside a root visit layer. Resume with
@@ -224,14 +225,18 @@ struct Pool {
   }
   size_t visited=0;
   if(host_workers>1 && (!ready_limit || hxgf_queued(feed)<ready_limit)){
-   struct Phase {Pool* pool;std::vector<uint8_t> visited;std::vector<int> progress;} phase{this,std::vector<uint8_t>(games.size()),std::vector<int>(games.size())};
+   struct Phase {Pool* pool;std::vector<int> progress;size_t admitted=0;bool closed=false;} phase{this,std::vector<int>(games.size())};
    if(!hxgf_parallel(feed,int(games.size()),[](void* data,int index){
     auto& phase=*static_cast<Phase*>(data);auto& p=*phase.pool;
-    if(p.ready_limit && hxgf_queued(p.feed)>=p.ready_limit)return;
-    auto& o=*p.games[(p.cursor+index)%p.games.size()];phase.visited[index]=1;
-    if(!o.stopped)phase.progress[index]=o.step(p.ready_limit);
-   },&phase))throw std::runtime_error(gumbel::error);
-   while(visited<games.size() && phase.visited[visited])++visited;
+    auto& o=*p.games[(p.cursor+index)%p.games.size()];
+    if(!o.stopped)phase.progress[index]=o.step(p.ready_limit,true);
+   },&phase,[](void* data,int){
+    auto& phase=*static_cast<Phase*>(data);auto& p=*phase.pool;
+    if(phase.closed)return false;
+    if(p.ready_limit && hxgf_queued(p.feed)>=p.ready_limit){phase.closed=true;return false;}
+    ++phase.admitted;return true;
+   }))throw std::runtime_error(gumbel::error);
+   visited=phase.admitted;
    for(int value:phase.progress)progress+=value;
   }else while(visited<games.size()){
    if(ready_limit && hxgf_queued(feed)>=ready_limit)break;

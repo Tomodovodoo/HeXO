@@ -1468,6 +1468,25 @@ class NativeScheduler(unittest.TestCase):
             self.assertGreater(stats['depth'], 0)
         self.assertEqual((pool.feed.queued(), pool.feed.stats()['pending_requests']), (0, 0))
 
+    def test_parallel_watermark_admits_cursor_first_and_serves_all_games(self):
+        game = Game([(0, 0)])
+        try:
+            histories = [[(0, 0), action] for action in game.legal_moves()[:24]]
+        finally:
+            game.close()
+        for workers in (2, 4, 8):
+            with self.subTest(workers=workers):
+                pool = self.pool([self.graph(h) for h in histories], quantum=4,
+                                 views=1, work=4, workers=workers)
+                pool.limit_ready(1)
+                pool.step()
+                # Earlier cursor admission cannot be stolen by a faster worker.
+                self.assertGreater(pool.games[0].stats()['pending'], 0)
+                self.finish(pool)
+                self.assertTrue(all(g.stats()['completed'] == 4 for g in pool.games))
+                self.assertEqual(pool.feed.queued(), 0)
+                pool.close()
+
     def test_parallel_queue_cancellation_and_retarget_ignore_late_subscribers(self):
         pool = self.pool([self.graph() for _ in range(12)], quantum=16, views=4,
                          work=64, workers=4)
