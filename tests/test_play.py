@@ -1970,6 +1970,12 @@ class Proofs(unittest.TestCase):
         outcome = table.known(root)
         self.assertEqual(outcome['plies'], 12)
         self.assertEqual(outcome['pv'][0], [1,1,0,1])
+        from types import SimpleNamespace
+        saved = dict(old, moves=[[0,1],[0,2]], top=[[0,1,1,.1,0]])
+        shown = Session.proven(SimpleNamespace(proofs=table), root, saved)
+        self.assertEqual(shown['moves'], [[1,1],[1,2]])
+        self.assertEqual(shown['top'][0], [1,1,0.,0.,-1])
+        self.assertEqual(saved['moves'], [[0,1],[0,2]])
         # An unrelated slower upper bound cannot weaken the existing root guarantee.
         table.add(root+[(2,1)], dict(proof=dict(winner=1,plies=15),pv=[[2,2,0,1]]))
         self.assertEqual(table.known(root), outcome)

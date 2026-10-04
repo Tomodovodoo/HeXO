@@ -212,6 +212,39 @@ class Overlay(unittest.TestCase):
 class BrowserProofs(unittest.TestCase):
     """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
 
+    def test_longer_defence_propagates_back_under_a_coarse_proof_bound(self):
+        from types import SimpleNamespace
+        root = [[0,0],[1,-2],[-1,-2],[0,-2],[2,-1],[-2,-3],[3,-3],[4,-2],[6,-3],
+                [1,-4],[5,-4],[8,-4],[10,-5],[7,-5],[6,-6],[12,-6],[14,-7],[9,-6],[11,-7],
+                [15,-10],[17,-11],[13,-8],[14,-11],[0,-1],[0,1],[0,-3],[0,2],[1,0],[-1,2],
+                [3,-2],[-2,3],[2,0],[3,0],[4,0],[-2,0],[4,-1],[5,-2],[7,-4],[2,1],
+                [3,-1],[6,-1],[1,-1],[7,-1],[6,-2],[6,0]]
+        # The displayed line has 40 placements, but the certificate's turn bound is 52.
+        # The child after (6,-4) later gains a 47-placement witness, within that bound.
+        records = [(root, dict(proof=dict(winner=0,plies=52),
+                              pv=[[6,1,1,1],[6,-4,1,2],[18,-12,0,39],[19,-12,0,40]])),
+                   (root+[[6,-4]], dict(proof=dict(winner=0,plies=47),
+                                      pv=[[6,2,1,1],[18,-12,0,46],[19,-12,0,47]])),
+                   (root+[[6,-4],[6,2]], dict(proof=dict(winner=0,plies=20),
+                                             pv=[[18,-12,0,19],[19,-12,0,20]]))]
+        source = """import {readFileSync} from 'node:fs';
+import {Proofs,proven} from './web/engine/proof.mjs';
+const records=JSON.parse(readFileSync(0,'utf8')),root=records[0][0],table=new Proofs(),out=[];
+for(const [history,record] of records){table.add(history,record);out.push(proven(table,root,null,2));}
+console.log(JSON.stringify(out));"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT, input=json.dumps(records),
+                              capture_output=True, text=True, check=True)
+        browser = json.loads(done.stdout)
+        table, expected = play.Proofs(), []
+        for history, record in records:
+            table.add(history, record)
+            expected.append(play.Session.proven(SimpleNamespace(proofs=table), root, None))
+        self.assertEqual(browser, expected)
+        self.assertEqual([r['pv'][-1][3] for r in browser], [40,48,40])
+        self.assertEqual(browser[1]['moves'], [[6,-4],[6,2]])
+        self.assertEqual(browser[1]['top'][0][:2], [6,-4])
+        self.assertEqual([r['proof']['plies'] for r in browser], [52]*3)
+
     def test_leaf_certificate_is_visible_before_the_first_stone_and_after_reload(self):
         from tests.test_tactical_proof import LATE_WIN
         history = [list(p) for p in LATE_WIN] + [[-1, -11]]
@@ -260,6 +293,7 @@ console.log(JSON.stringify([partial,proven(table,root,old,2)]));"""
         found = dict(moves=[[2, 3], [3, 3]], top=[], value=0, proof=dict(winner=1, plies=4, turns=1),
                      pv=[[*p[:3], p[3] - 2] for p in pv[2:]])
         answer = node(dict(kind='proofs', history=history, ply=3, found=found, records=[(history[:1], root), (history[:2], half)]))
+        self.assertTrue(answer['idleReuse'])
         line = [[*p[:3], p[3] - 1] for p in pv[1:]]
         for shown in (answer['analysed'], answer['undone']['shown'], answer['quick']['shown'], answer['reloaded']):
             self.assertEqual((shown['proof'], shown['value'], shown['pv']), (half['proof'], 1, line))
@@ -299,6 +333,8 @@ console.log(JSON.stringify([partial,proven(table,root,old,2)]));"""
         self.assertEqual({k:found['queries'][-4]['known'][k] for k in ('winner','plies')}, dict(winner=0,plies=2))
         self.assertEqual(found['queries'][-1]['known']['pv'][0],[1,1,0,1])
         self.assertEqual(found['queries'][-1]['known']['plies'],12)
+        self.assertEqual(found['queries'][-1]['shown']['moves'], [[1,1],[1,2]])
+        self.assertEqual(found['queries'][-1]['shown']['top'][0], [1,1,0,0,-1])
         self.assertEqual({k: found['settled'][k] for k in ('action', 'proven', 'proof_plies', 'values', 'completed_q')},
                          dict(action=[1, 0], proven=1, proof_plies=6, values=[1, -1, .3], completed_q=[1, -1, .3]))
         self.assertEqual({k: found['exact'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
@@ -531,10 +567,23 @@ class Bundle(unittest.TestCase):
                 with self.subTest(length=length, repeat=repeat):
                     self.assertTrue(turn['checked'], 'The principal-variation check must run')
                     self.assertTrue(turn['live'])
+                    fractions = [p['fraction'] for p in turn['progress']]
+                    self.assertEqual(fractions, sorted(fractions))
                     self.assertAlmostEqual(turn['result']['value'], .93, places=4)
                     for glimpse in turn['live']:
                         self.assertAlmostEqual(glimpse['value'], turn['result']['value'], places=4)
                         self.assertEqual(glimpse['root'], root)
+
+    def test_root_candidates_are_published_before_the_solver_runs(self):
+        root = [[0, 0], [1, 0]]
+        for simulations in (0, 32):
+            for turn in node(dict(kind='glimpse', history=root, simulations=simulations, nodes=16)):
+                self.assertTrue(turn['queries'])
+                self.assertTrue(all(q['preview'] for q in turn['queries']))
+                self.assertEqual(turn['progress'][0]['stage']['name'], 'checking proof')
+                fractions = [p['fraction'] for p in turn['progress']]
+                self.assertEqual(fractions, sorted(fractions))
+                self.assertEqual(turn['evaluations'].count(root), 1)
 
     def test_analysis_bar_uses_the_mover_at_half_turn_positions(self):
         history = [[0, 0], [1, 0], [1, 1], [-1, 0]]

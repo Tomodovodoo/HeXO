@@ -169,11 +169,11 @@ export class BrowserSession extends OfflineSession {
   /** `record` (or null) at `history`, `played` the game's next stone, with what the game's proof table proves there
    * (proof.mjs proven). */
   withProofs(history, record, played = null) {
-    return proven(this.proofs, history, record, this.native.game(history).remaining, played);
+    return proven(this.proofs, history, record, history.length % 2 ? 2 : 1, played);
   }
   study(winner) {
-    const sig = `${this.revision}|${this.evaluationsVersion}|${this.records.length}`;
-    if (this.studied?.sig === sig) return this.studied;
+    const sig = `${position(this.history)}|${JSON.stringify(this.analysis)}|${this.analysis && this.engineKey(this.analysis)}|${this.evaluationsVersion}|${this.records.length}|${winner}`;
+    if (this.studied?.sig === sig && this.studied.proofs === this.proofs && this.studied.records === this.records) return this.studied;
     const positions = [''], evaluations = {}, engine = this.analysis && this.engineKey(this.analysis), spec = this.reviewSpec();
     for (const [q, r] of this.history) positions.push(positions.length > 1 ? `${positions.at(-1)};${q},${r}` : `${q},${r}`);
     this.extendProofs();
@@ -183,7 +183,7 @@ export class BrowserSession extends OfflineSession {
       if (record) evaluations[ply] = record;
     });
     const turns = review(this.history, (h, ply) => this.withProofs(h, this.lookupAt(ply === undefined ? position(h) : positions[ply], spec, true)), winner);
-    return this.studied = {sig, evaluations, review: turns};
+    return this.studied = {sig, proofs: this.proofs, records: this.records, evaluations, review: turns};
   }
   state() {
     const board = this.native.game(this.history), {player, remaining} = board, winner = board.winner >= 0 ? board.winner : this.outcome?.winner ?? -1;
@@ -577,7 +577,7 @@ export class BrowserSession extends OfflineSession {
       try {
         result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
           known: job.kind === 'move' ? null : (this.extendProofs(), this.proofs.list()),
-          progress: (f, live, stage) => { job.done = job.kind === 'review' ? job.cursor + f : f; job.stage = stageText(stage); if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
+          progress: (f, live, stage) => { job.done = job.kind === 'review' ? job.cursor + f : .1 + .9 * f; job.stage = stageText(stage); if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);
       const at = Date.now(), elapsed = this.clock?.started != null ? at - this.clock.started : null;

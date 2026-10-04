@@ -166,6 +166,8 @@ export class Proofs {
     this.entries = new Map();
     this.sizes = new Map();
     this.seen = new Set();
+    this.edgeCache = new Map();
+    this.knownCache = new Map();
     for (const {history, winner, plies, pv} of list) this.put(history, winner, plies, pv);
   }
   list() {
@@ -207,6 +209,8 @@ export class Proofs {
   put(history, winner, plies, pv) {
     const key = proofKey(history), old = this.entries.get(key), witnessed = line => line.every(stone => stone.length === 4) ? line.length : 0;
     if (old && !(old.winner === winner && (plies < old.plies || plies === old.plies && witnessed(pv) > witnessed(old.pv)))) return;
+    this.edgeCache.clear();
+    this.knownCache.clear();
     const stones = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));
     this.entries.set(key, {history: history.map(([q, r]) => [q, r]), winner, plies, pv, stones});
     if (!this.sizes.has(history.length)) this.sizes.set(history.length, new Set());
@@ -225,12 +229,17 @@ export class Proofs {
         pv = [...pv.slice(0, i), ...shifted(entry.pv, i)];
       }
       if (sideAt(current.length) !== outcome.winner) {
+        // A padded turn bound can outlast its drawn line. Resolve each child's
+        // current continuation before comparing how long the defences last.
         const replies = [...this.edges(current).values()]
-          .filter(e => e.winner === outcome.winner && e.distance + i <= outcome.plies && e.outcome.pv.length)
-          .sort((a, b) => b.distance - a.distance || a.action[0] - b.action[0] || a.action[1] - b.action[1]);
+          .filter(e => e.winner === outcome.winner)
+          .map(e => ({...e, outcome: this.known([...current, e.action]) || e.outcome}))
+          .filter(e => e.outcome.plies + 1 + i <= outcome.plies && e.outcome.pv.length)
+          .map(e => ({...e, length: (e.outcome.pv.at(-1)[3] ?? e.outcome.pv.length) + 1}))
+          .sort((a, b) => b.length - a.length || b.outcome.plies - a.outcome.plies || a.action[0] - b.action[0] || a.action[1] - b.action[1]);
         if (replies.length) {
           const reply = replies[0], first = pv[i]?.slice(0, 2).join(',');
-          if (first !== reply.action.join(',') && !replies.some(e => e.distance === reply.distance && e.action.join(',') === first)) {
+          if (first !== reply.action.join(',') && !replies.some(e => e.length === reply.length && e.outcome.plies === reply.outcome.plies && e.action.join(',') === first)) {
             pv = [...pv.slice(0, i), [...reply.action, sideAt(current.length), i + 1], ...shifted(reply.outcome.pv, i + 1)];
           }
         }
@@ -245,6 +254,8 @@ export class Proofs {
    * table, or because one more stone by that position's mover reaches a position the mover wins. `distance` counts
    * the stone itself; `outcome` is the position's {winner, plies, pv}. */
   edges(history) {
+    const at = JSON.stringify(history);
+    if (this.edgeCache.has(at)) return this.edgeCache.get(at);
     const size = history.length, base = history.map(([q, r], i) => `${q},${r},${sideAt(i)}`), own = new Set(base), found = new Map();
     // A lost half-turn after A covers A,B in either order. Its saved response
     // need not be B, so carry the verdict without inventing a new PV.
@@ -273,6 +284,8 @@ export class Proofs {
         if (!old || old.outcome.plies > outcome.plies) found.set(action, {action: [first[0], first[1]], winner: outcome.winner, distance: outcome.plies + 1, outcome});
       }
     }
+    this.edgeCache.set(at, found);
+    if (this.edgeCache.size > 4096) this.edgeCache.delete(this.edgeCache.keys().next().value);
     return found;
   }
   /** The tightest stored guarantee, also considering shorter winning continuations. */
@@ -298,8 +311,13 @@ export class Proofs {
   }
   /** Best known guarantee with its updated continuation, or null when nothing is proven. */
   known(history) {
+    const at = JSON.stringify(history);
+    if (this.knownCache.has(at)) return this.knownCache.get(at);
     const found = this.choice(history);
-    return found ? {winner: found.winner, plies: found.plies, pv: this.line(history, found)} : null;
+    const outcome = found ? {winner: found.winner, plies: found.plies, pv: this.line(history, found)} : null;
+    this.knownCache.set(at, outcome);
+    if (this.knownCache.size > 4096) this.knownCache.delete(this.knownCache.keys().next().value);
+    return outcome;
   }
 }
 
@@ -370,11 +388,22 @@ export function proven(known, history, found, remaining, played = null) {
     const {winner, turns} = shown.proof, plies = shown.proof.plies || remaining + (winner === mover ? 0 : 2) + 4 * (turns - 1);
     shown.pv = known.line(history, {winner, plies, pv: shown.pv || []});
   }
+  const lost = shown.proof && shown.proof.winner !== mover;
+  const defence = lost ? (shown.pv || []).slice(0, remaining)
+    .filter((p, i) => p.length === 4 && p[2] === mover && p[3] === i + 1).map(p => p.slice(0, 2)) : [];
+  if (defence.length === remaining) shown.moves = defence;
   const rows = (shown.top || []).map(row => [...row]);
   for (const {action, winner} of edges.values()) {
     let row = rows.find(r => r[0] === action[0] && r[1] === action[1]);
     if (!row && winner === mover) rows.push(row = [...action, 0]);
     if (row) row.splice(3, 2, winner === mover ? 1 : 0, winner === mover ? 1 : -1);
+  }
+  if (lost) {
+    for (const row of rows) row.splice(3, 2, 0, -1);
+    if (defence.length) {
+      const at = rows.findIndex(r => r[0] === defence[0][0] && r[1] === defence[0][1]);
+      rows.unshift(at < 0 ? [...defence[0], 0, 0, -1] : rows.splice(at, 1)[0]);
+    }
   }
   const flag = row => row[4] ?? 0, distance = row => flag(row) > 0 ? edges.get(`${row[0]},${row[1]}`)?.distance ?? Infinity : 0;
   const other = row => flag(row) > 0 && played !== null && (row[0] !== played[0] || row[1] !== played[1]) ? 1 : 0;

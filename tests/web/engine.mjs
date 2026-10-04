@@ -26,7 +26,7 @@ import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, PV_CHECK} from '../../web/engine/search.mjs';
-import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine} from '../../web/engine/proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine, proven} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
 import {defaultThreads} from '../../web/engine/network.mjs';
@@ -190,23 +190,25 @@ if (job.kind === 'encode') {
   } finally { tree.close(); }
 } else if (job.kind === 'worker-turn' || job.kind === 'glimpse') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
-  const messages = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
+  const messages = [], queries = [], evaluations = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
   const glimpsing = job.kind === 'glimpse', mover = native.game(job.history).player;
   let graph = null;
   const context = {Native, NeuralSearch, EvaluationCache, PV_CHECK, createModule, principalVariation, topRows,
     GameGraphs: class extends GameGraphs { graph(...args) { return graph = super.graph(...args); } },
-    Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine,
+    Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine, proven,
     URL, performance, setTimeout, clearTimeout, onmessage: null,
     postMessage: message => messages.push({...message, root: graph?.history.map(p => [...p])}),
     probe: async () => ({provider: 'wasm', precisions: ['fp32']}), runtime: async () => ({env: {wasm: {numThreads: 1}}}),
     Stages, errorReport, stall,
     Network: {create: async () => ({version: 'uniform', precision: 'fp32', threads: 1,
       evaluate: async leaves => leaves.map(({history, actions}) => {
+        if (messages.some(m => m.type === 'ready')) evaluations.push(history);
         const value = glimpsing ? (native.game(history).player === mover ? .86 : -.86) : 0;
         return {logits: actions.map((_, i) => glimpsing ? -2 * i : 0), q: actions.map(() => value)};
       })})},
     Worker: class {
       postMessage({id, history, options}) {
+        queries.push({preview: messages.some(m => m.live?.top?.length), stage: messages.at(-1)?.stage});
         const result = solver.history(history, options);
         queueMicrotask(() => this.onmessage({data: {id, result}}));
       }
@@ -246,6 +248,7 @@ if (job.kind === 'encode') {
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);
   answer ??= glimpsing ? [1, 2].map(id => ({result: messages.find(m => m.id === id && m.type === 'result').result,
+    progress: messages.filter(m => m.id === id && m.type === 'progress').map(m => ({fraction: m.fraction, stage: m.stage})), queries, evaluations,
     live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root})),
     checked: messages.some(m => m.id === id && m.root && native.game(m.root).player !== mover)}))
     : messages.find(m => m.type === 'result').result;
@@ -279,9 +282,14 @@ if (job.kind === 'encode') {
   answer = job.cases.map(({ev, stones}) => page.boardOverlay(ev, stones));
 } else if (job.kind === 'table') {
   const table = new Proofs();
-  for (const [history, record] of job.records) table.add(history, record);
+  for (const [history, record] of job.records) {
+    for (const h of job.queries) table.known(h);
+    table.add(history, record);
+  }
   const rebuilt = new Proofs(table.list());
-  answer = {queries: job.queries.map(h => ({known: rebuilt.known(h), facts: rebuilt.facts(h), edges: [...rebuilt.edges(h).values()].map(e => [...e.action, e.winner, e.distance])})),
+  answer = {queries: job.queries.map(h => ({known: rebuilt.known(h), facts: rebuilt.facts(h),
+    shown: proven(rebuilt, h, {moves: [], top: []}, h.length % 2 ? 2 : 1),
+    edges: [...rebuilt.edges(h).values()].map(e => [...e.action, e.winner, e.distance])})),
     settled: settled(job.result, rebuilt.edges(job.queries[0]), job.mover), lost: settled(job.lost, rebuilt.edges(job.queries[0]), job.mover),
     exact: settled(job.exact, rebuilt.edges(job.queries[0]), job.mover)};
 } else if (job.kind === 'proofs') {
@@ -302,6 +310,7 @@ if (job.kind === 'encode') {
   for (const ply of [job.ply, job.ply - 1]) { await s.request('/analyse', {ply}, 'POST'); await settle(); }
   await s.record(s.history.slice(0, job.ply - 1), s.analysis, {moves: [], value: .5, top: [], proof: null, pv: [], threat: []});
   answer = {analysed: shown(), parent: s.state().evaluations[job.ply - 2], sent: [...sent], kept: s.lookup(s.history.slice(0, job.ply - 1))?.proof ?? null};
+  const study = s.state().evaluations; s.changed(); answer.idleReuse = study === s.state().evaluations;
   await s.request('/undo', {people: []}, 'POST'); answer.undone = {length: s.history.length, shown: shown()};
   await s.request('/analysis', {engine: 'test', preset: 'quick'}, 'POST'); await s.request('/analyse', {ply: job.ply - 1}, 'POST'); await settle();
   answer.quick = {shown: shown(), saved: s.lookup(s.history.slice(0, job.ply - 1))};
