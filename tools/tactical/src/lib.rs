@@ -1,5 +1,7 @@
 mod check;
 mod stamps;
+#[cfg(not(target_family="wasm"))]
+mod native_answer;
 use std::collections::BTreeMap;
 use std::ffi::{CStr,CString,c_char};
 use std::sync::{Arc,Mutex,OnceLock};

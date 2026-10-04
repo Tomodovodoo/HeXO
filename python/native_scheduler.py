@@ -12,7 +12,7 @@ from native_feed import NativeFeed
 bind('hxgm_new', ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int,
      C.c_uint64, C.c_char_p, C.c_uint64)
 for name, result, args in (
-    ('free', C.c_int, [ptr]), ('step', C.c_int, [ptr]), ('cancel', None, [ptr]),
+    ('free', C.c_int, [ptr]), ('step', C.c_int, [ptr]), ('cancel', C.c_int, [ptr]),
     ('done', C.c_int, [ptr]), ('feed', ptr, [ptr]), ('admit', C.c_int, [ptr]),
     ('clock', C.c_int, [ptr, C.c_double]), ('owner', ptr, [ptr, C.c_int]),
     ('cancel_game', C.c_int, [ptr, C.c_int]),
@@ -27,6 +27,82 @@ for name, result, args in (
 ):
     bind('hxgo_'+name, result, *args)
 bind('hxgf_abandon_all', C.c_int, ptr)
+bind('hxp_new', ptr, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int)
+for name, result, args in (
+    ('step', C.c_int, [ptr]), ('cancel', None, [ptr]), ('resume', None, [ptr]),
+    ('drain', C.c_int, [ptr]), ('free', C.c_int, [ptr]),
+    ('offer', C.c_int, [ptr, C.c_int, ptr, C.c_int, C.c_double]),
+    ('stats', None, [ptr, ptr, ptr]), ('record', C.c_char_p, [ptr, C.c_int]),
+):
+    bind('hxp_'+name, result, *args)
+
+
+class ProofLoop:
+    """Native frontier and immutable jobs; Python never dispatches individual queries.
+
+    A slice is a CPU scheduling quantum. UNKNOWN remains unknown. Resident tables
+    survive slices and retargets; this does not restore a complete interrupted PN tree.
+    """
+    def __init__(self, pool, package=None, *, workers=2, queue=8, slice_ms=8, table_mb=4,
+                 tasks=256, stamps=False):
+        from tactical_proof import NativeTactics, PACKAGE
+        self.pool = pool
+        self.library = NativeTactics(PACKAGE if package is None else package)
+        names = ('worker_new', 'worker_free', 'worker_answer', 'answer_info', 'answer_moves',
+                 'answer_json', 'answer_free', 'free', 'prepare', 'cancel', 'release', 'worker_busy')
+        functions = np.asarray([C.cast(getattr(self.library.lib, 'hexo_tactical_'+name), ptr).value
+                                for name in names], np.uint64)
+        self._ptr = native.hxp_new(pool.ptr, functions.ctypes.data, workers, queue, slice_ms,
+                                   table_mb, tasks, bool(stamps))
+        if not self._ptr:
+            checked(False)
+
+    @property
+    def ptr(self):
+        if not self._ptr:
+            raise ValueError('Proof loop is closed')
+        return self._ptr
+
+    def step(self):
+        checked(native.hxp_step(self.ptr))
+
+    def cancel(self):
+        native.hxp_cancel(self.ptr)
+
+    def resume(self):
+        native.hxp_resume(self.ptr)
+
+    def drain(self):
+        """Stop admission, cancel outstanding jobs and wait for their native completion."""
+        checked(native.hxp_drain(self.ptr))
+
+    def offer(self, game, history, relevance=1.):
+        """Explicit analysis candidate. Normal candidates come from native graph evidence."""
+        cells = np.ascontiguousarray(history, np.int64).reshape(-1, 2)
+        checked(native.hxp_offer(self.ptr, game, cells.ctypes.data, len(cells), relevance))
+
+    def stats(self):
+        out, times = np.empty(16, np.uint64), np.empty(4, np.float64)
+        native.hxp_stats(self.ptr, out.ctypes.data, times.ctypes.data)
+        result = dict(zip(('ticks', 'submitted', 'started', 'finished', 'installed', 'cancelled',
+                           'pruned', 'unknown', 'fresh_nodes', 'missing_fresh', 'queued', 'active',
+                           'ready', 'tasks', 'facts', 'records'), map(int, out)))
+        result.update(zip(('worker_service_ms', 'worker_idle_ms', 'snapshot_ms', 'install_ms'),
+                          map(float, times)))
+        return result
+
+    def records(self):
+        """Inspect verified evidence and its actual conditional request context."""
+        import json
+        return [json.loads(native.hxp_record(self.ptr, i)) for i in range(self.stats()['records'])]
+
+    def close(self):
+        if self._ptr:
+            self.drain()
+            checked(native.hxp_free(self._ptr))
+            self._ptr = None
+            self.library.close()
+            self.pool.proofs = None
 
 
 class _Feed(NativeFeed):
@@ -129,6 +205,14 @@ class SearchPool:
             checked(False)
         self.games = [SearchView(self, i) for i in range(len(sources))]
         self.feed = _Feed(self)
+        self.proofs = None
+
+    def enable_proofs(self, package=None, **options):
+        """Opt in to concurrent proving. Actor/learner target construction is unchanged."""
+        if self.proofs is not None:
+            raise ValueError('Search pool already has a proof loop')
+        self.proofs = ProofLoop(self, package, **options)
+        return self.proofs
 
     @property
     def ptr(self):
@@ -146,14 +230,17 @@ class SearchPool:
         return status
 
     def admit(self):
-        return bool(native.hxgm_admit(self.ptr))
+        status = native.hxgm_admit(self.ptr)
+        if status < 0:
+            checked(False)
+        return bool(status)
 
     def done(self):
         return bool(native.hxgm_done(self.ptr))
 
     def cancel(self, game=None):
         if game is None:
-            native.hxgm_cancel(self.ptr)
+            checked(native.hxgm_cancel(self.ptr))
         else:
             checked(native.hxgm_cancel_game(self.ptr, game))
 
@@ -180,6 +267,8 @@ class SearchPool:
         from native_dense import submit
         pending = None
         self.clock(ms)
+        if self.proofs is not None:
+            self.proofs.resume()
         try:
             while self.admit():
                 self.step()
@@ -200,12 +289,20 @@ class SearchPool:
                 self.feed.install_packed(ids, handle.collect())
                 pending = None
         finally:
-            self.cancel()
-            if pending is not None:
-                pending[1].close()
-            self.abandon_fenced()
+            try:
+                try:
+                    self.cancel()
+                finally:
+                    if pending is not None:
+                        pending[1].close()
+                    self.abandon_fenced()
+            finally:
+                if self.proofs is not None:
+                    self.proofs.drain()
 
     def close(self):
         if self._ptr:
+            if self.proofs is not None:
+                self.proofs.close()
             checked(native.hxgm_free(self._ptr))
             self._ptr = None
