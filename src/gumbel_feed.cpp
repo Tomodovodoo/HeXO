@@ -221,6 +221,9 @@ HX_API int hxgf_install(void* p,const uint64_t* ids,int count,const int64_t* off
 HX_API void hxgf_detach(void* p,void* tree){static_cast<feeding::Feed*>(p)->detach(tree);}
 HX_API int hxgf_root_value(void* p,void* tree,double* value){
  auto& f=*static_cast<feeding::Feed*>(p);auto root=f.roots.find(tree);
+ if(root!=f.roots.end() && !root->second.known)if(auto cached=f.get(root->second.key)){
+  root->second.value=cached->prediction.values.front();root->second.known=true;
+ }
  if(root==f.roots.end()||!root->second.known)return 0;
  *value=root->second.value;return 1;
 }
@@ -231,3 +234,9 @@ HX_API void hxgf_stats(void* p,int64_t* out){
 HX_API void hxgf_profile(void* p,int enabled){static_cast<feeding::Feed*>(p)->profile=enabled!=0;}
 HX_API void hxgf_times(void* p,uint64_t* out){auto& f=*static_cast<feeding::Feed*>(p);out[0]=f.select_ns;out[1]=f.identity_ns;out[2]=f.cached_ns;out[3]=f.install_ns;}
 }
+
+// Cancelled subscribers are detached before this call. Caller has fenced any GPU reads.
+extern "C" HX_API int hxgf_abandon_all(void* p){try{
+ auto& f=*static_cast<feeding::Feed*>(p);for(auto& [id,t]:f.tasks)if(!t.subscribers.empty())throw std::runtime_error("Detach all subscribers before abandoning tasks");
+ f.tasks.clear();f.pending.clear();f.ready.clear();return 1;
+}catch(const std::exception& e){gumbel::error=e.what();return 0;}}

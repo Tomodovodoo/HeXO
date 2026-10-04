@@ -68,7 +68,7 @@ struct GameStore {
  std::unordered_map<Key,Outcome,KeyHash> outcomes;
  std::unordered_map<Key,std::shared_ptr<Node>,KeyHash> store;
  std::unordered_map<Key,Summary,KeyHash> evicted_stats;
- size_t limit=0;uint64_t clock=0;int64_t evicted=0;
+ size_t limit=0;uint64_t clock=0;int64_t evicted=0;void* scheduler_owner=nullptr;
  std::unordered_map<const void*,std::vector<Node*>> pins;
  bool pinned(const Node* node)const {
   for(auto& [view,list]:pins)if(std::find(list.begin(),list.end(),node)!=list.end())return true;
@@ -86,7 +86,8 @@ struct Tree {
  // Graph search (opt-in): nodes shared by turn-context key, proven outcomes shared by
  // position key. Tree search gives every edge its own child and keeps both tables empty.
  std::shared_ptr<GameStore> state;
- bool graph=false;
+ bool graph=false,scheduler_owned=false;
+ void owner_access()const {if(state->scheduler_owner && !scheduler_owned)throw std::runtime_error("Search belongs to its native scheduler");}
  decltype(GameStore::nodes)& nodes;decltype(GameStore::positions)& positions;decltype(GameStore::outcomes)& outcomes;
  // Shared game graph (opt-in, implies graph): `store` owns every node by turn-context key so roots can move to any
  // position (root_at) and back; an edge reads its child's visits and value (current); `limit` bounds the expanded
@@ -284,7 +285,7 @@ struct Tree {
  }
  // Shared graph: moves the root to the position after `history`, a node of the store or a new one attached under
  // its stored parents; every node keeps its statistics.
- void root_at(const std::vector<Cell>& history) {
+ void root_at(const std::vector<Cell>& history) {owner_access();
   if(!shared || !requests.empty())throw std::runtime_error("Root changes need a shared graph and no pending requests");
   Board next;for(auto c:history){if(!next.legal(c))throw std::runtime_error("Illegal root history");next.make(c);}
   save_root();board=next;priority.clear();defence.clear();hold=false;budget=started=completed=0;lineage.clear();++version;
@@ -503,7 +504,7 @@ struct Tree {
   // A shared graph hands the verdict and the changed value on to the root's stored parents.
   if(shared){learn(*root);revise(*root);}
  }
- void begin(int simulations,int sample) {
+ void begin(int simulations,int sample) {owner_access();
   if(!requests.empty()||simulations<1||sample<1)throw std::runtime_error("Invalid search budget or pending requests");
   budget=simulations;samples=sample;started=completed=0;issued=cancelled=0;root_edges.clear();root_prepared=false;hold=false;priority.clear();defence.clear();
   if(shared){
@@ -555,7 +556,7 @@ struct Tree {
  }
  // Next leaf request id; 0 when nothing can be requested now, -1 after a simulation that ended on an exact edge or
  // node, and -3 while a hold is armed and the search stands, with no request pending, at `last`.
- int request() {
+ int request() {owner_access();
   proof_root();if(board.winner>=0 || (root->expanded && root->exact_winner>=0))return 0;
   prepare_root();
   if(hold && started==last)return requests.empty()?-3:0;
@@ -699,7 +700,7 @@ struct Tree {
   }
  }
  void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].pending;if(!path.edges.empty()){--root_edges[path.edges.front().second].epoch;--started;++cancelled;}}requests.clear();}
- void advance(Cell action){if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::shared_ptr<Node> next;int winner=-1,distance=-1;bool bound=false;
+ void advance(Cell action){owner_access();if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::shared_ptr<Node> next;int winner=-1,distance=-1;bool bound=false;
   for(auto& e:root->edges)if(e.action==action){winner=e.exact_winner;distance=e.distance;bound=e.bound;next=shared?e.child:std::move(e.child);break;}
   save_root();board.make(action);root=next?std::move(next):child_here();root->player=board.player;restore_root();
   // A shared graph keeps the siblings and every earlier position; a new root joins its stored parents.

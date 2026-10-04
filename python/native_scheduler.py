@@ -1,0 +1,211 @@
+"""Native adaptive views and one frozen-model neural queue, called by one owner thread.
+
+This is an explicit search API. Actors keep their existing target construction.
+Graph evidence and comparison credits are exported separately.
+"""
+import ctypes as C
+import numpy as np
+from neural_search import native, bind, ptr, checked
+from native_feed import NativeFeed
+
+
+bind('hxgm_new', ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int,
+     C.c_uint64, C.c_char_p, C.c_uint64)
+for name, result, args in (
+    ('free', C.c_int, [ptr]), ('step', C.c_int, [ptr]), ('cancel', None, [ptr]),
+    ('done', C.c_int, [ptr]), ('feed', ptr, [ptr]), ('admit', C.c_int, [ptr]),
+    ('clock', C.c_int, [ptr, C.c_double]), ('owner', ptr, [ptr, C.c_int]),
+    ('cancel_game', C.c_int, [ptr, C.c_int]),
+    ('retarget', C.c_int, [ptr, C.c_int, ptr, C.c_int, C.c_uint64, C.c_double]),
+    ('stats', None, [ptr, ptr]), ('install', C.c_int, [ptr, ptr, C.c_int, ptr, ptr, ptr, ptr]),
+):
+    bind('hxgm_'+name, result, *args)
+for name, result, args in (
+    ('root', ptr, [ptr]), ('choice', C.c_int, [ptr, ptr]), ('stats', None, [ptr, ptr]),
+    ('records', C.c_int, [ptr, ptr, ptr]), ('history', C.c_int, [ptr, ptr]),
+    ('record_history', C.c_int, [ptr, C.c_int, ptr]), ('policy_audit', C.c_int, [ptr, ptr]),
+):
+    bind('hxgo_'+name, result, *args)
+bind('hxgf_abandon_all', C.c_int, ptr)
+
+
+class _Feed(NativeFeed):
+    def __init__(self, pool):
+        self.pool = pool
+
+    @property
+    def ptr(self):
+        return native.hxgm_feed(self.pool.ptr)
+
+    def _install(self, ids, *outputs):
+        checked(native.hxgm_install(self.pool.ptr, ids.ctypes.data, len(ids), *outputs))
+        return ()
+
+    def close(self):
+        raise ValueError('The scheduler owns this feed')
+
+
+class SearchView:
+    """Read a scheduled game's focus and its completed, position-bound search records."""
+    def __init__(self, pool, index):
+        self.pool, self.index = pool, index
+
+    @property
+    def ptr(self):
+        return native.hxgm_owner(self.pool.ptr, self.index)
+
+    def history(self):
+        count = native.hxgo_history(self.ptr, None)
+        out = np.empty((count, 2), np.int64)
+        native.hxgo_history(self.ptr, out.ctypes.data)
+        return out.tolist()
+
+    def choice(self):
+        out = np.empty(2, np.int64)
+        status = native.hxgo_choice(self.ptr, out.ctypes.data)
+        if status < 0:
+            checked(False)
+        return out.tolist() if status else None
+
+    def stats(self):
+        out = np.empty(20, np.uint64)
+        native.hxgo_stats(self.ptr, out.ctypes.data)
+        return dict(zip(('ticks', 'completed', 'issued', 'cancelled', 'created', 'retired',
+                         'candidates', 'live', 'pending', 'depth', 'root_completed', 'deadline',
+                         'step_ns', 'discover_ns', 'records', 'slots', 'last_root_credits',
+                         'root_passes', 'allocations', 'reclaimed'), map(int, out)))
+
+    def evidence(self):
+        """Complete legal set, shared Q evidence and three distinct sampling count bases.
+
+        This reports inputs to target construction. It does not choose a teacher temperature.
+        """
+        count = native.hxgo_policy_audit(self.ptr, None)
+        out = np.empty((count, 9), np.float64)
+        native.hxgo_policy_audit(self.ptr, out.ctypes.data)
+        return dict(actions=out[:, :2].astype(np.int64), logits=out[:, 2], completed_q=out[:, 3],
+                    shared_visits=out[:, 4].astype(np.int64), current_credits=out[:, 5].astype(np.int64),
+                    last_credits=out[:, 6].astype(np.int64), eligible=out[:, 7].astype(bool),
+                    lifetime_credits=out[:, 8].astype(np.int64))
+
+    def records(self):
+        count = native.hxgo_records(self.ptr, None, None)
+        metadata = np.empty((count, 10), np.uint64)
+        values = np.empty((count, 3), np.float64)
+        native.hxgo_records(self.ptr, metadata.ctypes.data, values.ctypes.data)
+        rows = []
+        for index, (a, b) in enumerate(zip(metadata, values)):
+            size = native.hxgo_record_history(self.ptr, index, None)
+            history = np.empty((size, 2), np.int64)
+            native.hxgo_record_history(self.ptr, index, history.ctypes.data)
+            rows.append(dict(game=self.index, view=int(a[0]), generation=int(a[1]),
+                             comparison_credits=int(a[2]), shared_evidence=int(a[3]),
+                             context=[int(a[4]), int(a[5])], depth=int(a[6]),
+                             exact_winner=int(a[7])-1, history=history.tolist(),
+                             root_estimate=float(b[0]) if a[9] else None,
+                             raw_value=float(b[1]) if a[8] else None,
+                             elapsed_ms=float(b[2])))
+        return rows
+
+
+class SearchPool:
+    """Independent games share neural work; same-game views share graph evidence.
+
+    `work` is an optional diagnostic ceiling, not the unit for speed acceptance.
+    Arm a common clock after backend setup. Queued work can be abandoned only
+    after every submitted GPU batch is fenced. close() rejects undrained work.
+    """
+    def __init__(self, sources, quantum=64, views=8, depth=8, work=128, seed=220, cache=8192):
+        if not sources or any(not s.ptr for s in sources):
+            raise ValueError('Open shared graphs are required')
+        versions = {s.model_version for s in sources}
+        if len(versions) != 1:
+            raise ValueError('One search pool requires one fixed model version')
+        self.model_version = versions.pop()
+        pointers = np.asarray([s.ptr for s in sources], np.uintp)
+        self._ptr = native.hxgm_new(pointers.ctypes.data, len(sources), cache, quantum, views,
+                                   depth, work, self.model_version.encode(), seed)
+        if not self._ptr:
+            checked(False)
+        self.games = [SearchView(self, i) for i in range(len(sources))]
+        self.feed = _Feed(self)
+
+    @property
+    def ptr(self):
+        if not self._ptr:
+            raise ValueError('Search pool is closed')
+        return self._ptr
+
+    def clock(self, ms):
+        checked(native.hxgm_clock(self.ptr, ms))
+
+    def step(self):
+        status = native.hxgm_step(self.ptr)
+        if status < 0:
+            checked(False)
+        return status
+
+    def admit(self):
+        return bool(native.hxgm_admit(self.ptr))
+
+    def done(self):
+        return bool(native.hxgm_done(self.ptr))
+
+    def cancel(self, game=None):
+        if game is None:
+            native.hxgm_cancel(self.ptr)
+        else:
+            checked(native.hxgm_cancel_game(self.ptr, game))
+
+    def retarget(self, game, history, work=0, ms=0):
+        cells = np.ascontiguousarray(history, np.int64).reshape(-1, 2)
+        checked(native.hxgm_retarget(self.ptr, game, cells.ctypes.data, len(cells), work, ms))
+
+    def stats(self):
+        out = np.empty(5, np.uint64)
+        native.hxgm_stats(self.ptr, out.ctypes.data)
+        return dict(zip(('steps', 'games', 'active', 'failed', 'retargets'), map(int, out)))
+
+    def abandon_fenced(self):
+        """Caller has completed every GPU fence. No cancelled row may still read graph storage."""
+        self.cancel()
+        checked(native.hxgf_abandon_all(self.feed.ptr))
+
+    def run(self, evaluator, ms, batch_size=128):
+        """Use dense_selfplay.Evaluator's packed forwards under one common clock.
+        Native gathering runs while the previous forward is in flight.
+        """
+        if evaluator.model_version != self.model_version:
+            raise ValueError('Evaluator does not match the pool weights')
+        from native_dense import submit
+        pending = None
+        self.clock(ms)
+        try:
+            while self.admit():
+                self.step()
+                if pending is not None:
+                    ids, handle = pending
+                    self.feed.install_packed(ids, handle.collect())
+                    pending = None
+                if self.admit():
+                    batch = self.feed.take_packed(batch_size)
+                    if batch is not None:
+                        ids, rows = batch
+                        pending = ids, submit(evaluator, rows)
+                if self.done():
+                    break
+            self.cancel()
+            if pending is not None:
+                ids, handle = pending
+                self.feed.install_packed(ids, handle.collect())
+                pending = None
+        finally:
+            self.cancel()
+            if pending is not None:
+                pending[1].close()
+            self.abandon_fenced()
+
+    def close(self):
+        if self._ptr:
+            checked(native.hxgm_free(self._ptr))
+            self._ptr = None

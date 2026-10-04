@@ -1157,5 +1157,193 @@ class SharedGraph(unittest.TestCase):
         late.abandon()   # out of time before the check's search
         self.assertEqual((graph.history, late.summary()['searched'], late.step(None)), (a, False, 0))
 
+class NativeScheduler(unittest.TestCase):
+    def graph(self, history=((0, 0),), version='scheduler'):
+        graph = GameGraph(Uniform(), version, history, limit=96)
+        self.addCleanup(graph.close)
+        return graph
+
+    def pool(self, graphs, **options):
+        from native_scheduler import SearchPool
+        pool = SearchPool(graphs, **options)
+        # These checks launch no GPU, so every taken row is already fenced.
+        self.addCleanup(lambda: pool._ptr and (pool.abandon_fenced(), pool.close()))
+        return pool
+
+    def answer(self, pool, batch=None):
+        batch = batch if batch is not None else pool.feed.take(128)
+        if batch is None:
+            return 0
+        ids, leaves = batch
+        predictions = Uniform().evaluate([h.tolist() for _, _, h in leaves])
+        pool.feed.install(ids, [(p['actions'], p['logits'], p['q']) for p in predictions])
+        return len(ids)
+
+    def finish(self, pool):
+        for _ in range(1000):
+            pool.step()
+            self.answer(pool)
+            if pool.done():
+                return
+        self.fail('A bounded search did not complete')
+
+    def test_adaptive_views_preserve_legal_coverage_and_credit_provenance(self):
+        pool = self.pool([self.graph()], quantum=16, views=8, depth=4, work=256)
+        self.finish(pool)
+        stats = pool.games[0].stats()
+        self.assertGreater(stats['created'], 1)
+        self.assertGreater(stats['depth'], 0)
+        self.assertLessEqual(stats['completed'], 256)
+        self.assertEqual(stats['issued'], stats['completed']+stats['cancelled'])
+        self.assertEqual((stats['pending'], pool.feed.stats()['pending_rows']), (0, 0))
+        evidence = pool.games[0].evidence()
+        game = Game([(0, 0)])
+        try:
+            self.assertEqual(evidence['actions'].tolist(), [list(a) for a in game.legal_moves()])
+            self.assertTrue(evidence['eligible'].all())
+            self.assertIn(pool.games[0].choice(), evidence['actions'].tolist())
+        finally:
+            game.close()
+        self.assertEqual(int(evidence['lifetime_credits'].sum()), stats['root_completed'])
+        records = pool.games[0].records()
+        self.assertTrue(any(r['depth'] > 0 for r in records))
+        for row in records:
+            self.assertEqual(len(row['history']), 1+row['depth'])
+            self.assertEqual(row['exact_winner'], -1)
+            self.assertEqual(row['root_estimate'], 0.)
+            self.assertEqual(row['raw_value'], 0.)
+
+    def test_global_queue_coalesces_games_without_sharing_their_sampling_credits(self):
+        pool = self.pool([self.graph(), self.graph()], quantum=16, views=1, work=16)
+        pool.step()
+        self.assertEqual(pool.feed.stats()['joined'], 1)
+        self.assertEqual(self.answer(pool), 1)
+        self.finish(pool)
+        self.assertEqual(pool.stats()['failed'], 0)
+        for game in pool.games:
+            stats = game.stats()
+            self.assertEqual(stats['completed'], 16)
+            self.assertEqual(int(game.evidence()['lifetime_credits'].sum()), 16)
+
+    def test_source_closure_is_safe_and_external_search_cannot_steal_the_graph(self):
+        from native_scheduler import SearchPool
+        source = self.graph()
+        pool = self.pool([source], quantum=16, work=32)
+        with self.assertRaisesRegex(ValueError, 'already has a native owner'):
+            SearchPool([source], work=32)
+        self.assertFalse(native.hxg_begin(source.ptr, 16, 8))
+        self.assertIn(b'native scheduler', native.hxg_error())
+        with self.assertRaisesRegex(ValueError, 'native scheduler'):
+            source.at([(0, 0), (1, 0)])
+        source.close()
+        self.finish(pool)
+        self.assertIsNotNone(pool.games[0].choice())
+        pool.close()
+        with self.assertRaisesRegex(ValueError, 'closed'):
+            pool.games[0].stats()
+
+    def test_retarget_cancels_old_subscribers_but_keeps_bound_record_histories(self):
+        source = self.graph()
+        pool = self.pool([source], quantum=16, views=2, work=64)
+        pool.step()
+        old = pool.feed.take(128)
+        pool.retarget(0, [(0, 0), (1, 0), (2, 0)], work=32)
+        self.answer(pool, old)
+        self.assertEqual(pool.games[0].stats()['completed'], 0)
+        self.finish(pool)
+        self.assertEqual(pool.games[0].history(), [[0, 0], [1, 0], [2, 0]])
+        records = pool.games[0].records()
+        self.assertTrue(any(len(r['history']) == 1 for r in records))
+        self.assertTrue(any(r['history'][:3] == [[0, 0], [1, 0], [2, 0]] for r in records))
+        self.assertEqual(pool.feed.stats()['pending_requests'], 0)
+
+    def test_teardown_refuses_submitted_work_until_fenced_abandon(self):
+        pool = self.pool([self.graph()], quantum=16, views=2, work=64)
+        pool.step()
+        batch = pool.feed.take(128)
+        self.assertIsNotNone(batch)
+        with self.assertRaisesRegex(ValueError, 'Drain or fenced-abandon'):
+            pool.close()
+        self.assertEqual(pool.feed.stats()['pending_requests'], 0)
+        # No GPU was launched in this check, so the batch is already fenced.
+        pool.abandon_fenced()
+        self.assertEqual(pool.feed.stats()['pending_rows'], 0)
+        pool.close()
+
+    def test_failed_prediction_stops_its_game_while_other_games_finish(self):
+        pool = self.pool([self.graph(), self.graph([(0, 0), (1, 0), (2, 0)])],
+                         quantum=16, views=2, work=32)
+        pool.step()
+        ids, leaves = pool.feed.take(128)
+        self.assertEqual(len(ids), 2)
+        prediction = Uniform().evaluate([leaves[1][2].tolist()])[0]
+        pool.feed.install(ids, [None, (prediction['actions'], prediction['logits'], prediction['q'])])
+        self.finish(pool)
+        self.assertEqual(pool.stats()['failed'], 1)
+        self.assertEqual(pool.games[1].stats()['completed'], 32)
+        self.assertEqual(pool.feed.stats()['pending_rows'], 0)
+
+    def test_common_clock_stops_admission_and_retarget_can_resume(self):
+        import time
+        pool = self.pool([self.graph(), self.graph()], quantum=16, views=2, work=64)
+        pool.clock(.1)
+        time.sleep(.002)
+        self.assertFalse(pool.admit())
+        self.assertTrue(pool.done())
+        self.assertTrue(all(g.stats()['deadline'] for g in pool.games))
+        self.assertTrue(all(g.records()[0]['root_estimate'] is None for g in pool.games))
+        pool.retarget(0, [(0, 0)], work=16)
+        self.finish(pool)
+        self.assertEqual(pool.games[0].stats()['completed'], 16)
+
+    def test_model_and_illegal_retarget_rejection_do_not_change_existing_search(self):
+        from native_scheduler import SearchPool
+        a, b = self.graph(version='a'), self.graph(version='b')
+        with self.assertRaisesRegex(ValueError, 'one fixed model'):
+            SearchPool([a, b])
+        pool = self.pool([a], quantum=16, work=16)
+        with self.assertRaisesRegex(ValueError, 'Illegal retarget'):
+            pool.retarget(0, [(0, 0), (0, 0)], work=16)
+        self.assertEqual(pool.games[0].history(), [[0, 0]])
+        self.finish(pool)
+
+    def test_terminal_focus_stops_without_starving_an_active_game(self):
+        terminal = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4),(-1,0),(4,0)]
+        pool = self.pool([self.graph(terminal), self.graph()], quantum=16, views=2, work=32)
+        self.finish(pool)
+        self.assertEqual(pool.games[0].stats()['completed'], 0)
+        self.assertIsNone(pool.games[0].choice())
+        self.assertEqual(pool.games[1].stats()['completed'], 32)
+
+    def test_six_hundred_games_share_one_queue_and_cancel_without_expansion(self):
+        graphs = [self.graph() for _ in range(600)]
+        pool = self.pool(graphs, quantum=4, views=1, work=4)
+        pool.step()
+        self.assertEqual(pool.stats()['games'], 600)
+        self.assertEqual(pool.feed.stats()['new_rows'], 1)
+        self.assertEqual(pool.feed.stats()['joined'], 599)
+        pool.cancel()
+        self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0, 0))
+
+    def test_unexpanded_exact_child_records_the_proof_instead_of_an_unset_mean(self):
+        from neural_search import checked
+        history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
+        graph = self.graph(history)
+        child = graph.view(history+[(-1,0)])
+        self.addCleanup(child.close)
+        checked(native.hxg_begin(graph.ptr, 16, 8))
+        request, _ = graph.request()
+        # This complete same-turn witness makes six, with no intervening defence.
+        witness = np.asarray([[-1,0],[4,0]], np.int64)
+        checked(native.hxg_prove(graph.ptr, request, np.asarray(history, np.int64), len(history),
+                                 0, 2, witness, 2, 1))
+        self.assertEqual(native.hxg_exact(child.ptr), 0)
+        pool = self.pool([child], quantum=16, views=1, work=16)
+        pool.cancel()
+        record = pool.games[0].records()[0]
+        self.assertEqual((record['exact_winner'], record['root_estimate']), (0, 1.))
+        self.assertIsNone(record['raw_value'])
+
+
 if __name__ == '__main__':
     unittest.main()
