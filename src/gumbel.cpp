@@ -523,14 +523,15 @@ struct Tree {
  }
  // Records an externally proven winner of the root edge `action` within `distance` placements (the edge's own
  // included): its value becomes exact (Q = +-1 for the root's mover) and the root is settled, so a lost edge leaves
- // the remaining halving rounds and the final selection. A root that is already exact is left unchanged.
+ // the remaining halving rounds and the final selection. Later proofs may tighten an already settled root.
  // In a shared graph the root's stored parents take the new verdict and value.
  void mark(Cell action,int winner,int distance) {
   if(!root->expanded || (winner!=0 && winner!=1) || distance<1)throw std::runtime_error("Mark needs an expanded root, a winner and a distance");
   auto edge=std::find_if(root->edges.begin(),root->edges.end(),[&](const Edge& e){return e.action==action;});
   if(edge==root->edges.end())throw std::runtime_error("Mark action is not a root edge");
-  if(root->exact_winner>=0)return;
-  edge->exact_winner=winner;edge->distance=distance;edge->bound=true;edge->sum=winner==root->player?edge->visits:-edge->visits;settle(*root);
+  if(root->exact_winner>=0 && root->exact_winner!=winner)return;
+  if(!tighten(winner,distance,true,edge->exact_winner,edge->distance,edge->bound))return;
+  edge->sum=winner==root->player?edge->visits:-edge->visits;settle(*root);
   if(graph && root->remaining==2 && winner!=root->player && distance>1){
    const int p=root->player;const auto h=CellHash{}(action);
    const Key half{root->position.a-mix(p*3+2+17)+mix(p*3+1+17)+mix(h^mix(p+1)),

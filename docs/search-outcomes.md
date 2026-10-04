@@ -42,6 +42,15 @@ is taken over eligible edges only.
 **Final move and targets.** A won root plays a shortest guaranteed win. A lost root plays among the losses that may
 resist longest, then by search score. A tree win shorter than a followed certificate replaces the certificate's move. The policy target of a won root covers only its shortest winning moves; a lost root records none.
 
+Later verified proofs can tighten an already proven root and propagate to its stored parents. Saved player proofs
+also compare the old guarantee with newly proven winning children, so finding a 29-placement win after one orange
+stone replaces a 42-placement root proof with a 30-placement guarantee, including that stone. The page updates both
+the displayed distance and the suggested turn, including after undo and reload.
+
+Saved lines follow the shortest known attack and the longest covered defensive reply that fits the proof's bound.
+A shorter line for one blue reply cannot tighten the guarantee over every blue reply. Certificate distances remain
+upper bounds on optimal play, and a loose longer certificate never replaces a tighter guarantee.
+
 **Sharing (graph search, `search_graph`, off by default).** Nodes are keyed by the evaluation cache's turn-context
 key (stones by colour, mover, remaining placements, the stone placed earlier in this turn, the opponent's previous
 turn; `dense_selfplay.position_key`), so the two orders of a turn meet at the next turn start and share statistics

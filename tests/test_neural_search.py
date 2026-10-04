@@ -790,6 +790,26 @@ class Refuted(Ranked):
         return out
 
 class SharedGraph(unittest.TestCase):
+    def test_later_marks_tighten_a_proven_root_and_its_stored_parent(self):
+        history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
+        graph = GameGraph(Uniform(), 'tighter-proof', history, seed=3, tactics=False)
+        self.addCleanup(graph.close)
+        graph.expand()
+        graph.mark((-1,0),0,42)
+        self.assertEqual(native.hxg_distance(graph.ptr),42)
+        graph.mark((4,0),0,34)
+        self.assertEqual(native.hxg_distance(graph.ptr),34)
+        self.assertEqual(graph.result(0,0,0,0)['action'],[4,0])
+        child = graph.view(history+[(-1,0)],seed=4)
+        self.addCleanup(child.close)
+        child.expand()
+        child.mark((4,0),0,29)
+        self.assertEqual(native.hxg_distance(graph.ptr),30)
+        self.assertEqual(graph.result(0,0,0,0)['action'],[-1,0])
+        child.mark((4,0),0,41)
+        graph.mark((4,0),0,42)
+        self.assertEqual(native.hxg_distance(graph.ptr),30)
+
     def test_views_share_evidence_and_keep_comparison_credits_local(self):
         graph = self.graph(Uniform(), recorded_position(11))
         graph.search(16, root_samples=4, batch_size=4)

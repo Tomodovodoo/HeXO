@@ -201,16 +201,28 @@ export class Proofs {
     if (!this.sizes.has(history.length)) this.sizes.set(history.length, new Set());
     this.sizes.get(history.length).add(key);
   }
-  /** Extend a saved partial line with later witnesses for the exact positions it reaches. A child must prove the
-   * same winner within the parent's remaining bound. Stop at omitted defender stones: their position is unknown. */
+  /** Shortest known attack, longest covered defence, within the proof's bound. A subset of defensive replies
+   * cannot tighten the universal bound. Stop at omitted defender stones: their position is unknown. */
   line(history, outcome) {
     const current = history.map(p => [...p]);
     let pv = outcome.pv || [];
     for (let i = 0; i <= pv.length; i++) {
-      const entry = this.entries.get(proofKey(current));
-      if (entry?.winner === outcome.winner && entry.plies + i <= outcome.plies && entry.pv.length > pv.length - i
+      const entry = this.choice(current);
+      if (entry?.winner === outcome.winner && entry.plies + i <= outcome.plies
+          && (entry.plies + i < outcome.plies || entry.pv.length > pv.length - i)
           && entry.pv.every(p => p.length === 4)) {
         pv = [...pv.slice(0, i), ...shifted(entry.pv, i)];
+      }
+      if (sideAt(current.length) !== outcome.winner) {
+        const replies = [...this.edges(current).values()]
+          .filter(e => e.winner === outcome.winner && e.distance + i <= outcome.plies && e.outcome.pv.length)
+          .sort((a, b) => b.distance - a.distance || a.action[0] - b.action[0] || a.action[1] - b.action[1]);
+        if (replies.length) {
+          const reply = replies[0], first = pv[i]?.slice(0, 2).join(',');
+          if (first !== reply.action.join(',') && !replies.some(e => e.distance === reply.distance && e.action.join(',') === first)) {
+            pv = [...pv.slice(0, i), [...reply.action, sideAt(current.length), i + 1], ...shifted(reply.outcome.pv, i + 1)];
+          }
+        }
       }
       const stone = pv[i];
       if (!stone || stone.length !== 4 || stone[3] !== i + 1 || stone[2] !== sideAt(current.length)) break;
@@ -252,9 +264,8 @@ export class Proofs {
     }
     return found;
   }
-  /** The outcome of `history` ({winner, plies, pv}) from its own entry, else the shortest win of the side to move
-   * through `edges`, its line led by that stone and extended from stored children; null when nothing is known. */
-  known(history) {
+  /** The tightest stored guarantee, also considering shorter winning continuations. */
+  choice(history) {
     let own = this.entries.get(proofKey(history));
     if (!own && history.length > 1 && history.length % 2 === 1) {
       const mover = sideAt(history.length), base = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));
@@ -266,14 +277,18 @@ export class Proofs {
         if (!own || own.plies > loss.plies - 1) own = {winner: mover, plies: loss.plies - 1, pv: []};
       }
     }
-    if (own) return {winner: own.winner, plies: own.plies, pv: this.line(history, own)};
     const mover = sideAt(history.length);
+    if (own && own.winner !== mover) return own;
     const wins = [...this.edges(history).values()].filter(e => e.winner === mover)
       .sort((a, b) => a.distance - b.distance || a.action[0] - b.action[0] || a.action[1] - b.action[1]);
-    if (!wins.length) return null;
+    if (!wins.length || own && (own.plies < wins[0].distance || own.plies === wins[0].distance && own.pv.length)) return own || null;
     const {action, distance, outcome} = wins[0];
-    const found = {winner: mover, plies: distance, pv: [[...action, mover, 1], ...shifted(outcome.pv, 1)]};
-    return {...found, pv: this.line(history, found)};
+    return {winner: mover, plies: distance, pv: [[...action, mover, 1], ...shifted(outcome.pv, 1)]};
+  }
+  /** Best known guarantee with its updated continuation, or null when nothing is proven. */
+  known(history) {
+    const found = this.choice(history);
+    return found ? {winner: found.winner, plies: found.plies, pv: this.line(history, found)} : null;
   }
 }
 
@@ -330,11 +345,15 @@ export function proven(known, history, found, remaining, played = null) {
   const outcome = known.known(history), edges = known.edges(history);
   if (!found && !outcome) return null;
   const mover = sideAt(history.length), shown = {...(found || {moves: [], top: [], threat: [], simulations: 0, solver_nodes: 0})};
-  if (outcome && !shown.proof) {
+  const oldPlies = shown.proof && (shown.proof.plies || remaining + (shown.proof.winner === mover ? 0 : 2) + 4 * (shown.proof.turns - 1));
+  if (outcome && (!shown.proof || outcome.winner === shown.proof.winner && outcome.plies < oldPlies)) {
     const won = outcome.winner === mover;
     Object.assign(shown, {value: won ? 1 : 0, pv: outcome.pv,
       proof: {winner: outcome.winner, turns: proofTurns(outcome.plies, remaining, won), plies: outcome.plies}});
-    if (!found && won) shown.moves = outcome.pv.slice(0, remaining).filter((p, i) => p[2] === mover && p[3] === i + 1).map(p => [p[0], p[1]]);
+    if (won) {
+      const moves = outcome.pv.slice(0, remaining).filter((p, i) => p[2] === mover && p[3] === i + 1).map(p => [p[0], p[1]]);
+      shown.moves = moves.length === remaining || outcome.plies <= moves.length ? moves : [];
+    }
   }
   if (shown.proof) {
     const {winner, turns} = shown.proof, plies = shown.proof.plies || remaining + (winner === mover ? 0 : 2) + 4 * (turns - 1);

@@ -1887,6 +1887,54 @@ class FreeplayClock(unittest.TestCase):
 
 
 class Proofs(unittest.TestCase):
+    def test_tighter_scalar_proof_does_not_suggest_half_a_turn(self):
+        from play import Proofs
+        from types import SimpleNamespace
+        table, root = Proofs(), [(0,0)]
+        old = evaluation(1.,moves=[[2,0],[3,0]],proof=dict(winner=1,plies=10,turns=3),pv=[])
+        table.add(root,old)
+        table.add(root+[(1,0)],dict(proof=dict(winner=1,plies=5),pv=[]))
+        shown = Session.proven(SimpleNamespace(proofs=table),root,old)
+        self.assertEqual((shown['proof']['plies'],shown['moves'],shown['pv']),(6,[],[[1,0,1,1]]))
+        table.add(root,dict(proof=dict(winner=1,plies=1),pv=[[1,0,1,1]]))
+        self.assertEqual(Session.proven(SimpleNamespace(proofs=table),root,old)['moves'],[[1,0]])
+
+    def test_shorter_child_replaces_an_existing_root_proof_and_saved_line(self):
+        from play import Proofs
+        from types import SimpleNamespace
+        root = [(0,0),(1,-2),(-1,-2),(0,-2),(2,-1),(-2,-3),(3,-3),(4,-2),(6,-3),
+                (1,-4),(5,-4),(8,-4),(10,-5),(7,-5),(6,-6),(12,-6),(14,-7),(9,-6),
+                (11,-7),(15,-10),(17,-11),(13,-8),(14,-11),(15,-9),(16,-10),(17,-10),(13,-7)]
+        old = evaluation(1., moves=[[0,-1],[0,1]], proof=dict(winner=0,plies=42,turns=11),
+                         pv=[[0,-1,0,1],[0,1,0,2]])
+        child = evaluation(1., proof=dict(winner=0,plies=29,turns=8), pv=[[19,-12,0,1]])
+        for records in ([(root,old),(root+[(18,-12)],child)], [(root+[(18,-12)],child),(root,old)]):
+            table = Proofs()
+            for history, record in records:
+                table.add(history, record)
+            expected = dict(winner=0,plies=30,pv=[[18,-12,0,1],[19,-12,0,2]])
+            self.assertEqual(table.known(root), expected)
+            shown = Session.proven(SimpleNamespace(proofs=table), root, old)
+            self.assertEqual(shown['proof'], dict(winner=0,plies=30,turns=8))
+            self.assertEqual(shown['moves'], [[18,-12],[19,-12]])
+            self.assertEqual(shown['pv'], expected['pv'])
+            self.assertEqual(old['proof']['plies'], 42)
+
+    def test_defender_line_keeps_longest_covered_reply_without_tightening_from_a_subset(self):
+        from play import Proofs
+        root = [(0,0),(1,0),(2,0)]
+        table = Proofs()
+        old = dict(proof=dict(winner=1,plies=12), pv=[[0,1,0,1],[0,2,0,2],[3,0,1,3]])
+        table.add(root, old)
+        table.add(root+[(0,1)], dict(proof=dict(winner=1,plies=3),pv=[[0,2,0,1],[3,0,1,2]]))
+        table.add(root+[(1,1)], dict(proof=dict(winner=1,plies=7),pv=[[1,2,0,1],[3,0,1,2]]))
+        outcome = table.known(root)
+        self.assertEqual(outcome['plies'], 12)
+        self.assertEqual(outcome['pv'][0], [1,1,0,1])
+        # An unrelated slower upper bound cannot weaken the existing root guarantee.
+        table.add(root+[(2,1)], dict(proof=dict(winner=1,plies=15),pv=[[2,2,0,1]]))
+        self.assertEqual(table.known(root), outcome)
+
     def test_losing_half_turn_covers_both_orders_without_inventing_a_winning_line(self):
         from play import Proofs, answered
         root = [(0,0),(1,2),(2,2),(0,-2),(-2,0),(3,2),(4,2)]
