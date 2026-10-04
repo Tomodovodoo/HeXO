@@ -27,7 +27,8 @@ fn check_nodes(nodes:u64)->usize {(nodes.saturating_mul(8)).clamp(50_000,200_000
 // IDTT verdict, so it is indistinguishable from a fresh search except for `cache_hit`.
 type Key=(Vec<((i32,i32),u8)>,u8,u8,u64,u64,u8,bool,bool);
 type Solved=(ProofCertificate,u64,Option<String>,bool);
-static CACHE:OnceLock<Mutex<BTreeMap<Key,Solved>>>=OnceLock::new();
+// Resident cache evidence belongs to the worker that established it.
+thread_local! {static CACHE:Mutex<BTreeMap<Key,Solved>>=Mutex::new(BTreeMap::new());}
 /// Whose forced win is asked: the side to move, or its opponent given a fresh
 /// two-placement turn on the current stones (a flipped-turn threat query).
 #[derive(Deserialize,Clone,Copy,PartialEq,Default)]
@@ -267,6 +268,9 @@ fn shorten(pos:&Position,cert:&ProofCertificate,req:&Request,ctl:&Ctl,meter:&Met
 /// clamp(8 * nodes, 50,000, 200,000) certificate nodes and visits. `ms` is only a
 /// safety cap, and a query that reaches it returns UNKNOWN.
 fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<Value,String> {
+    CACHE.with(|cache|run_cached(req,start,cancel,cache))
+}
+fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTreeMap<Key,Solved>>) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.nodes==0 || req.nodes>10_000_000
         || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256
         || (req.resume && req.table_mb==0) || req.known.len()>4096
@@ -320,7 +324,6 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
         "budget":{"nodes":req.nodes,"idtt_nodes":req.idtt_nodes,"idtt_depth_cap":req.depth,"safety_ms":req.ms,
             "work":"one shared meter over IDTT nodes, PDS-PN level-1 nodes and level-2 expansions; verifier path limit 128",
             "check_nodes":check_nodes(req.nodes)}});
-    let cache=CACHE.get_or_init(||Mutex::new(BTreeMap::new()));
     let mut cache_hit=false;
     let mut probe_verdict=None;
     let mut cached_nodes=None;
@@ -477,14 +480,17 @@ fn query_control(request_id:u64)->Result<Arc<AtomicBool>,String> {
         .pending.get(&request_id).cloned().ok_or("unknown cancellation token".into())
 }
 
-// One resident native worker. Search, certificate work and the raw-board checker
-// share a cancellation token; the isolated wrapper remains the hard-stop fallback.
+// Search, certificate work and the raw-board checker share a cancellation token.
+// Legacy calls retain a default instance; schedulers can own independent workers.
 #[cfg(not(target_family="wasm"))]
 type Work=(Request,Instant,Arc<AtomicBool>,mpsc::Sender<Result<Value,String>>);
 #[cfg(not(target_family="wasm"))]
-static WORKER:OnceLock<mpsc::SyncSender<Work>>=OnceLock::new();
-static BUSY:AtomicBool=AtomicBool::new(false);
-static LAST_WORK:OnceLock<Mutex<Value>>=OnceLock::new();
+#[derive(Default)]
+struct WorkerState {busy:AtomicBool,active:Mutex<Option<Arc<AtomicBool>>>,last:Mutex<Value>}
+#[cfg(not(target_family="wasm"))]
+struct Worker {sender:Option<mpsc::SyncSender<Work>>,thread:Option<std::thread::JoinHandle<()>>,state:Arc<WorkerState>}
+#[cfg(not(target_family="wasm"))]
+static WORKER:OnceLock<Worker>=OnceLock::new();
 #[cfg(target_family="wasm")]
 fn dispatch(req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String> {
     if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
@@ -509,19 +515,18 @@ fn thread_cpu_ms()->Option<f64> {
 #[cfg(not(any(windows,target_family="wasm")))]
 fn thread_cpu_ms()->Option<f64> {None}
 #[cfg(not(target_family="wasm"))]
-fn dispatch(req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String> {
-    if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
-    let deadline=start+Duration::from_millis(req.ms as u64);
-    let worker=WORKER.get_or_init(|| {
+impl Worker {
+    fn new()->Result<Self,String> {
         let (sender,receiver)=mpsc::sync_channel::<Work>(1);
-        std::thread::spawn(move || {
+        let state=Arc::new(WorkerState::default());let inner=Arc::clone(&state);
+        let thread=std::thread::Builder::new().name("hexo-proof".into()).spawn(move || {
             while let Ok((req,start,cancel,reply))=receiver.recv() {
                 let budget_ms=req.ms;let cpu_start=thread_cpu_ms();
                 let result=std::panic::catch_unwind(||run_controlled(req,start,Arc::clone(&cancel)))
                     .unwrap_or_else(|_|Err("native worker panic".into()));
                 let elapsed=start.elapsed().as_secs_f64()*1000.0;
                 let cpu=thread_cpu_ms().zip(cpu_start).map(|(a,b)|a-b);
-                if let Ok(mut stats)=LAST_WORK.get_or_init(||Mutex::new(Value::Null)).lock() {
+                if let Ok(mut stats)=inner.last.lock() {
                     let late=elapsed>=budget_ms as f64;
                     let previous=stats.clone();
                     let row=json!({"elapsed_ms":elapsed,"thread_cpu_ms":cpu,
@@ -533,19 +538,40 @@ fn dispatch(req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String
                         "total_thread_cpu_ms":cpu.map(|c|previous["total_thread_cpu_ms"].as_f64().unwrap_or(0.0)+c),
                         "last_after_deadline":if late {row}else{previous["last_after_deadline"].clone()}});
                 }
-                BUSY.store(false,Ordering::Release);
+                if let Ok(mut active)=inner.active.lock() {*active=None;}
+                inner.busy.store(false,Ordering::Release);
                 let _=reply.send(result);
             }
-        });
-        sender
-    });
+        }).map_err(|e|format!("native worker creation: {e}"))?;
+        Ok(Self{sender:Some(sender),thread:Some(thread),state})
+    }
+    fn stats(&self,value:&mut Value) {
+        value["background_worker_busy"]=json!(self.state.busy.load(Ordering::Acquire));
+        value["last_worker_completion"]=self.state.last.lock().map(|s|s.clone()).unwrap_or(Value::Null);
+    }
+}
+#[cfg(not(target_family="wasm"))]
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if let Ok(active)=self.state.active.lock() {if let Some(cancel)=active.as_ref() {cancel.store(true,Ordering::Release);}}
+        self.sender.take();
+        if let Some(thread)=self.thread.take() {let _=thread.join();}
+    }
+}
+#[cfg(not(target_family="wasm"))]
+fn dispatch_on(worker:&Worker,req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String> {
+    if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
+    let deadline=start+Duration::from_millis(req.ms as u64);
     let cancel=query_control(req.request_id)?;
     if cancel.load(Ordering::Acquire) {return Err("cancelled".into());}
-    if BUSY.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err() {
+    if worker.state.busy.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err() {
         return Err("native worker busy finishing bounded prior query".into());
     }
+    *worker.state.active.lock().map_err(|_|"worker cancellation lock")?=Some(Arc::clone(&cancel));
     let (send,recv)=mpsc::channel();
-    if worker.send((req,start,Arc::clone(&cancel),send)).is_err() {BUSY.store(false,Ordering::Release);return Err("native worker stopped".into());}
+    if worker.sender.as_ref().unwrap().send((req,start,Arc::clone(&cancel),send)).is_err() {
+        worker.state.busy.store(false,Ordering::Release);return Err("native worker stopped".into());
+    }
     *dispatched=true;
     match recv.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(result)=>result,
@@ -555,10 +581,28 @@ fn dispatch(req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String
         }
     }
 }
+#[cfg(not(target_family="wasm"))]
+fn default_worker()->Result<&'static Worker,String> {
+    if let Some(worker)=WORKER.get() {return Ok(worker);}
+    let _=WORKER.set(Worker::new()?);
+    Ok(WORKER.get().unwrap())
+}
+#[cfg(not(target_family="wasm"))]
+fn dispatch(req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String> {
+    dispatch_on(default_worker()?,req,start,dispatched)
+}
 
 /// One serialized native query at a time. Python holds a lock around calls.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hexo_tactical_query(input:*const c_char)->*mut c_char {
+    let mut value=unsafe{query_value(input,dispatch)};
+    #[cfg(not(target_family="wasm"))]
+    if let Some(worker)=WORKER.get() {worker.stats(&mut value);}
+    #[cfg(target_family="wasm")]
+    {value["background_worker_busy"]=json!(false);value["last_worker_completion"]=Value::Null;}
+    CString::new(value.to_string()).unwrap().into_raw()
+}
+unsafe fn query_value(input:*const c_char,dispatch:impl FnOnce(Request,Instant,&mut bool)->Result<Value,String>)->Value {
     let start=Instant::now();
     let mut dispatched=false;
     let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -573,11 +617,33 @@ pub unsafe extern "C" fn hexo_tactical_query(input:*const c_char)->*mut c_char {
         Ok(Err(reason))=>json!({"status":"UNKNOWN","native_verified":false,"reason":reason,"moves":[],"nodes_fresh":fresh}),
         Err(_)=>json!({"status":"UNKNOWN","native_verified":false,"reason":"native panic","moves":[],"nodes_fresh":fresh}),
     };
-    value["background_worker_busy"]=json!(BUSY.load(Ordering::Acquire));
-    value["last_worker_completion"]=LAST_WORK.get_or_init(||Mutex::new(Value::Null))
-        .lock().map(|stats|stats.clone()).unwrap_or(Value::Null);
     value["equal_compute_clock"]=json!(false);
-    CString::new(value.to_string()).unwrap().into_raw()
+    value
+}
+/// Independent resident worker. The owner must not free it during an ABI call.
+#[cfg(not(target_family="wasm"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn hexo_tactical_worker_new()->*mut std::ffi::c_void {
+    std::panic::catch_unwind(||Worker::new().map(|worker|Box::into_raw(Box::new(worker)).cast()))
+        .ok().and_then(Result::ok).unwrap_or(std::ptr::null_mut())
+}
+#[cfg(not(target_family="wasm"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hexo_tactical_worker_query(worker:*mut std::ffi::c_void,input:*const c_char)->*mut c_char {
+    let worker=unsafe{&*worker.cast::<Worker>()};
+    let mut value=unsafe{query_value(input,|req,start,dispatched|dispatch_on(worker,req,start,dispatched))};
+    worker.stats(&mut value);CString::new(value.to_string()).unwrap().into_raw()
+}
+#[cfg(not(target_family="wasm"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hexo_tactical_worker_busy(worker:*mut std::ffi::c_void)->bool {
+    unsafe{&*worker.cast::<Worker>()}.state.busy.load(Ordering::Acquire)
+}
+/// Cancels abandoned background work, joins the thread and releases its tables.
+#[cfg(not(target_family="wasm"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hexo_tactical_worker_free(worker:*mut std::ffi::c_void) {
+    if !worker.is_null() {drop(unsafe{Box::from_raw(worker.cast::<Worker>())});}
 }
 /// A request buffer of `len` spaces plus a NUL: the caller writes exactly `len` non-NUL bytes and
 /// releases it with hexo_tactical_free.
@@ -636,9 +702,10 @@ mod tests {
         hexo_tactical_release(token);
         #[cfg(not(target_family="wasm"))]
         {
-            assert!(!BUSY.swap(true,Ordering::AcqRel));
+            let worker=default_worker().unwrap();
+            assert!(!worker.state.busy.swap(true,Ordering::AcqRel));
             let result=query(r#"{"history":[],"ms":1000,"nodes":1,"idtt_nodes":0,"depth":8}"#);
-            BUSY.store(false,Ordering::Release);
+            worker.state.busy.store(false,Ordering::Release);
             assert!(result["reason"].as_str().unwrap().contains("busy"));
         }
     }

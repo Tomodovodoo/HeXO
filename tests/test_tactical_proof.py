@@ -37,6 +37,88 @@ class NativeStrategy(unittest.TestCase):
         except FileNotFoundError:
             raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
 
+    def test_independent_workers_keep_caches_and_stamps_separate(self):
+        with NativeTactics(independent=True) as first, NativeTactics(independent=True) as second:
+            options = dict(nodes=20000, ms=5000, table_mb=4, resume=True)
+            discovered = first.history(OPEN_THREE, **options)
+            reused = first.history(OPEN_THREE, **options)
+            separate = second.history(OPEN_THREE, **options)
+            self.assertEqual([r['status'] for r in (discovered, reused, separate)], ['PROVEN_WIN']*3)
+            self.assertGreater(discovered['nodes_fresh'], 0)
+            self.assertEqual(reused['nodes_fresh'], 0)
+            self.assertTrue(reused['cache_hit'])
+            self.assertFalse(separate['cache_hit'])
+            self.assertGreater(separate['nodes_fresh'], 0)
+            self.assertFalse(separate['resident_reused'])
+            learned = first.history(OPEN_THREE, stamps=True, library=[], nodes=20000, ms=5000)
+            changed = OPEN_THREE + [[8,8],[10,8],[8,10],[10,10]]
+            warm = first.history(changed, stamps=True, library=[], nodes=1, ms=5000)
+            cold = second.history(changed, stamps=True, library=[], nodes=1, ms=5000)
+            self.assertEqual((learned['status'], warm['status'], cold['status']),
+                             ('PROVEN_WIN', 'PROVEN_WIN', 'UNKNOWN'))
+            self.assertEqual(independent_verify(warm['certificate'], changed), 'PROVEN_WIN')
+
+    def test_independent_workers_overlap_and_cancel_only_their_query(self):
+        history = [[0,0],[4,0],[7,0],[-1,0],[-2,0],[1,0],[5,0],[6,0],[-2,1]]
+        with NativeTactics(independent=True) as first, NativeTactics(independent=True) as second:
+            results = [None, None]
+            start = threading.Barrier(3)
+            def query(i, engine):
+                start.wait()
+                results[i] = engine.history(history, nodes=10000000, ms=20000)
+            threads = [threading.Thread(target=query, args=(i, engine))
+                       for i, engine in enumerate((first, second))]
+            for thread in threads:
+                thread.start()
+            start.wait()
+            try:
+                deadline = time.perf_counter()+2
+                while not (first.busy and second.busy) and time.perf_counter() < deadline:
+                    time.sleep(.001)
+                self.assertTrue(first.busy and second.busy, results)
+                self.assertTrue(first.cancel())
+                threads[0].join(2)
+                self.assertFalse(threads[0].is_alive())
+                self.assertEqual(results[0]['status'], 'UNKNOWN')
+                self.assertIn('cancelled', results[0]['reason'])
+                if not second.busy:
+                    threads[1].join(1)
+                    self.assertNotIn('cancelled', results[1]['reason'])
+                replacement = first.history(IMMEDIATE, nodes=1000, ms=1000)
+                self.assertEqual(replacement['status'], 'PROVEN_WIN', replacement)
+            finally:
+                first.cancel()
+                second.cancel()
+                for thread in threads:
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive())
+            self.assertNotIn('native worker busy', results[1]['reason'])
+
+    def test_independent_close_stops_work_and_rejects_new_queries(self):
+        engine = NativeTactics(independent=True)
+        history = [[0,0],[4,0],[7,0],[-1,0],[-2,0],[1,0],[5,0],[6,0],[-2,1]]
+        results = []
+        thread = threading.Thread(target=lambda: results.append(engine.history(history, nodes=10000000, ms=20000)))
+        thread.start()
+        try:
+            deadline = time.perf_counter()+2
+            while not engine.busy and thread.is_alive() and time.perf_counter() < deadline:
+                time.sleep(.001)
+            self.assertTrue(engine.busy)
+            engine.close()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(engine.busy)
+            self.assertEqual(results[0]['status'], 'UNKNOWN')
+            self.assertIn('cancelled', results[0]['reason'])
+            with self.assertRaisesRegex(RuntimeError, 'closed'):
+                engine.history(IMMEDIATE)
+            engine.close()
+        finally:
+            engine.cancel()
+            thread.join(2)
+            engine.close()
+
     def test_local_stamp_reuses_changed_positions_and_checks_interference(self):
         learned = self.engine.history(OPEN_THREE, stamps=True, nodes=20000, ms=5000)
         self.assertEqual(learned['status'], 'PROVEN_WIN', learned['reason'])
