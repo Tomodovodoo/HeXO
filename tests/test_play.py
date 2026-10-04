@@ -956,6 +956,52 @@ class GameGraphs(unittest.TestCase):
     def graph(self, line):
         return self.engines.graphs[('seat', line)][1]
 
+    def test_defender_proof_uses_refuted_graph_edges_propagates_and_reloads(self):
+        from play import evaluate, Proofs
+        from neural_search import checked, native
+        from tactical_proof import NativeTactics
+        from tests.test_tactical_proof import OPEN_THREE
+        prover = NativeTactics()
+        history = OPEN_THREE + [[-1, 0], [2, 1]]
+        cold = prover.history(history, attacker='defender', nodes=10000, ms=5000)
+        self.assertEqual(cold['status'], 'PROVEN_LOSS')
+        replies = cold['certificate']['nodes'][0]['responses']
+        bubble = self.engines.bubble(None)
+        trees = self.engines.game_graph(bubble, 'defender')
+        graph, _ = trees(history[:-1], 32, bubble.evaluator)
+        # Start from a graph with exactly the imported facts. No local tactical
+        # classification should fill in its hundreds of still unknown edges.
+        checked(native.hxg_tactics(graph.ptr, 0))
+        graph.expand()
+        graph.at(history)
+        graph.expand()
+        # Exactly the four cover first stones are refuted. Hundreds of other
+        # root edges remain unresolved, so the graph alone cannot settle it.
+        for first in {tuple(p) for r in replies for p in r['action']}:
+            graph.at(history+[list(first)])
+            graph.prove_loss(0, 23)
+        graph.at(history)
+        self.assertEqual(graph.result(0, 0, 0, 0)['proven'], 0)
+        self.assertEqual(len(graph.facts()), 4)
+        from types import SimpleNamespace
+        found = evaluate(bubble, SimpleNamespace(history=prover.history, abort=prover.cancel), history, 32, 1, trees=trees)
+        self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
+        self.assertTrue(found['proof']['dependencies'])
+        checked_proof = prover.history(history, attacker='defender', certificate=found['proof']['certificate'],
+                                      known=[d['outcome'] for d in found['proof']['dependencies']], nodes=1, ms=1000)
+        self.assertEqual(checked_proof['status'], 'PROVEN_LOSS')
+        graph.at(history[:-1])
+        self.assertEqual(graph.result(0, 0, 0, 0)['proven'], 1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'proofs.jsonl'
+            store = Evaluations(path)
+            store.add(history, 'test', dict(simulations=32, solver_nodes=1), found)
+            restored = Evaluations(path)
+            known = Proofs()
+            known.extend(restored, history)
+            self.assertEqual(known.known(history)['winner'], 0)
+            self.assertEqual(known.known(history[:-1])['winner'], 0)
+
     def test_the_next_turn_starts_from_the_visits_under_the_reply(self):
         history = self.turn([(0, 0)], 1)
         self.assertEqual(self.seen[0], 0)

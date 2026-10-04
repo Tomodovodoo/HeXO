@@ -3,13 +3,15 @@
  * (python/play.py Proofs). */
 
 /** Most attacker turns on any path of `certificate` from each node, the completing turn included. */
-function depths(certificate) {
+function depths(certificate, known = []) {
   const memo = new Map();
   const turns = index => {
     if (!memo.has(index)) {
       const node = certificate.nodes[index];
       memo.set(index, node.kind === 'attacker_move' ? 1 + turns(node.child)
-        : node.kind === 'defender_replies' ? Math.max(...node.responses.map(r => turns(r.child))) : 1);
+        : node.kind === 'defender_replies' ? Math.max(...node.responses.map(r => turns(r.child)))
+        : node.kind === 'exact' ? proofTurns(known[node.fact].plies, known[node.fact].history.length % 2 ? 2 : 1,
+          sideAt(known[node.fact].history.length) === known[node.fact].winner) : 1);
     }
     return memo.get(index);
   };
@@ -29,18 +31,27 @@ function distance(a, b) {
  * nearest the attacker's last stone (least summed hex distance), then the first listed; at an unstoppable fork the
  * defender's two stones are left out, their plies skipped, and the shortest threat completes.
  */
-export function principalVariation(native, history, certificate) {
-  const turns = depths(certificate), current = history.map(p => [...p]), pv = [];
-  const near = reply => reply.action.reduce((sum, cell) => sum + distance(cell, pv.at(-1)), 0);
-  const attacker = native.game(current).player;
+export function principalVariation(native, history, certificate, {attacker = native.game(history).player, known = []} = {}) {
+  const turns = depths(certificate, known), current = history.map(p => [...p]), pv = [];
+  const near = reply => reply.action.reduce((sum, cell) => sum + distance(cell, pv.at(-1) || history.at(-1)), 0);
   let plies = 0, index = certificate.root;
   while (native.game(current).winner < 0) {
     const node = certificate.nodes[index];
+    if (node.kind === 'exact') {
+      const fact = known[node.fact];
+      const after = node.after || [], line = fact.pv || [];
+      if (JSON.stringify(line.slice(0, after.length).map(p => p.slice(0, 2))) === JSON.stringify(after)) {
+        pv.push(...line.slice(after.length).map(([q, r, side, ply]) => [q, r, side, ply + plies - after.length]));
+      }
+      plies += fact.plies - after.length;
+      break;
+    }
     if (node.kind === 'unstoppable') {
       if (node.threats?.length) {
         const threat = node.threats.reduce((a, b) => b.length < a.length ? b : a);
-        threat.forEach(([q, r], i) => pv.push([q, r, attacker, plies + 3 + i]));
-        plies += 2 + threat.length;
+        const remaining = native.game(current).remaining;
+        threat.forEach(([q, r], i) => pv.push([q, r, attacker, plies + remaining + 1 + i]));
+        plies += remaining + threat.length;
       }
       break;
     }
@@ -241,5 +252,7 @@ export function proven(known, history, found, remaining, played = null) {
   const other = row => flag(row) > 0 && played !== null && (row[0] !== played[0] || row[1] !== played[1]) ? 1 : 0;
   shown.top = rows.map((row, i) => [row, i]).sort(([a, i], [b, j]) => (1 - flag(a)) - (1 - flag(b)) || distance(a) - distance(b) || other(a) - other(b) || i - j)
     .map(([row]) => row).slice(0, 5);
+  shown.refuted = !shown.proof && shown.top.length && shown.top.every(row => flag(row) < 0) ? shown.top.length : 0;
+  if (shown.refuted && shown.node_value != null) shown.value = shown.node_value;
   return shown;
 }

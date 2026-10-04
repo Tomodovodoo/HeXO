@@ -184,6 +184,19 @@ impl KernelCtx {
         self.board.hash
     }
 
+    /// Exact graph outcomes close both OR and AND nodes. A win bound exceeding
+    /// a bounded probe's horizon says nothing about that shorter horizon.
+    pub(crate) fn exact(&self, node: Node, horizon: Option<u8>) -> Option<(u32, bool, u32)> {
+        let (player, remaining) = match node {
+            Node::Or { placements } => (self.atk, placements),
+            Node::And => (self.dfn, 2),
+        };
+        let (id, fact) = super::certificate::lookup_exact(self.hash(), player, remaining, || self.canonical_stones())?;
+        let won = fact.winner == self.atk;
+        if won && horizon.is_some_and(|n| u32::from(n) < fact.turns) { return None; }
+        Some((id, won, fact.turns))
+    }
+
     /// Canonical exact board snapshot used only by the proof-certificate
     /// verifier to ensure a DAG node is never reused for a different position.
     pub(crate) fn canonical_stones(&self) -> Vec<(Coord, Player)> {

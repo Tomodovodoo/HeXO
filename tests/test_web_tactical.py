@@ -35,6 +35,21 @@ def wasm_results(queries):
 
 @unittest.skipUnless(NODE and WASM.exists() and library().exists(), 'needs node, web/engine/tactical.wasm and the native library')
 class WebTacticalParity(unittest.TestCase):
+    def test_defender_roots_and_exact_graph_premises_match_native(self):
+        native = NativeTactics()
+        history = OPEN_THREE + [[-1, 0], [2, 1]]
+        known = [dict(history=history+[list(p)], winner=0, plies=23)
+                 for p in ((-3, 0), (-2, 0), (3, 0), (4, 0))]
+        queries = [(history, dict(attacker='defender', known=known, nodes=1, ms=5000)),
+                   (history+[[0, 1]], dict(attacker='defender', nodes=1, ms=5000)),
+                   (NO_THREAT, dict(attacker='defender', nodes=1, ms=5000))]
+        for (history, options), web in zip(queries, wasm_results(queries)):
+            local = native.history(history, **options)
+            self.assertEqual({k: web[k] for k in FIELDS}, {k: local[k] for k in FIELDS})
+            if web['native_verified']:
+                self.assertEqual(independent_verify(web['certificate'], history, attacker='defender',
+                                                    known=options.get('known', [])), 'PROVEN_LOSS')
+
     def test_resumed_browser_slices_report_bounds_and_fresh_work(self):
         history = FIXTURE['positions']['1790600287230040:30:248']
         options = dict(nodes=512, ms=20000, bounds=True, resume=True)

@@ -945,8 +945,11 @@ function selectedTurn(){if(!S||!view)return null;return S.review.find(t=>t.ply<=
 /* the evaluation shown for ply p: the saved one, else the search of a running move or analysis of that position;
    its top rows without the stones the search never tried (no policy share, not proven), which older saves kept */
 function liveAt(p){const j=S.jobs.find(j=>j.ply===p&&j.status==='running'&&j.live);
-  return j?{value:j.live.value,top:j.live.top,threat:[],pv:[],proof:null,live:true}:null}
-function shownEval(p){const e=S.evaluations[p]||liveAt(p);return e&&{...e,top:(e.top||[]).filter(t=>t[2]>=.00005||t[4]>0)}}
+  return j?{value:j.live.value,top:j.live.top,refuted:j.live.refuted,threat:[],pv:[],proof:null,live:true}:null}
+function shownEval(p){const e=S.evaluations[p]||liveAt(p);if(!e)return e;
+  const top=(e.top||[]).filter(t=>t[2]>=.00005||t[4]>0),refuted=!e.proof&&top.length&&top.every(t=>t[4]<0);
+  const value=refuted?(e.node_value??(e.value>0&&e.value<1?e.value:null)):e.value;
+  return {...e,top,value}}
 function finished(){return S.winner>=0&&view===S.history.length}
 function renderAnalysis(){
   const ev=shownEval(view),side=playerAt(view),bar=$('evalbar'),job=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view);
@@ -972,6 +975,7 @@ function renderAnalysis(){
     d.onclick=()=>{const[sx,sy]=screen(t[0],t[1]);cam.x+=canvas.clientWidth/2-sx;cam.y+=canvas.clientHeight/2-sy;draw()};
     d.onmouseenter=()=>{hot=[t[0],t[1]];draw()};d.onmouseleave=()=>{hot=null;draw()};return d});
   while(rows.length<5)rows.push(el('div',{class:'blank'},el('span',{},rows.length+1),el('span',{},'·'),el('em'),el('span'),el('span')));
+  if(!ev?.proof&&top.length&&top.every(t=>t[4]<0))rows.push(el('small',{},`${top.length} replies refuted, not proven`));
   box.replaceChildren(...rows);
 }
 function renderStudy(){

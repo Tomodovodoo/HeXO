@@ -505,10 +505,10 @@ def searched(result):
     """True when a solver query ran to a verdict (a proof, or a reason in `dense_solver.VERDICTS`); False when it
     failed to run (worker starting or restarting, deadline, crash)."""
     from dense_solver import VERDICTS
-    return verified(result) or result.get('reason') in VERDICTS
+    return (result.get('status') in ('PROVEN_WIN', 'PROVEN_LOSS') and result.get('native_verified')) or result.get('reason') in VERDICTS
 
 
-def principal_variation(history, certificate):
+def principal_variation(history, certificate, *, attacker=None, known=()):
     """The principal variation of a verified certificate for the side to move at `history`, as (stones, plies).
 
     `stones` are [q, r, player, ply] up to the winning stone, `ply` counting placements from 1: at each attacker
@@ -522,15 +522,27 @@ def principal_variation(history, certificate):
     proof = Proof([tuple(map(int, p)) for p in history], certificate)
     local, stones, plies, index = replay(history), [], 0, proof.root
     try:
-        attacker = local.player
-        near = lambda reply: sum(hex_distance(cell, stones[-1]) for cell in reply['action'])
+        attacker = local.player if attacker is None else attacker
+        for i, node in enumerate(proof.nodes):
+            if node['kind'] == 'exact':
+                fact = known[node['fact']]
+                n = len(fact['history'])
+                proof.depth[i] = proof_turns(fact['plies'], 2 if n % 2 else 1, player_at(n) == attacker)
+        near = lambda reply: sum(hex_distance(cell, stones[-1] if stones else history[-1]) for cell in reply['action'])
         while local.winner < 0:
             node = proof.nodes[index]
+            if node['kind'] == 'exact':
+                fact = known[node['fact']]
+                after, line = node.get('after', []), fact.get('pv', [])
+                if [p[:2] for p in line[:len(after)]] == after:
+                    stones += [[*p[:3], p[3] + plies - len(after)] for p in line[len(after):]]
+                plies += fact['plies'] - len(after)
+                break
             if node['kind'] == 'unstoppable':
                 if node.get('threats'):
                     threat = min(node['threats'], key=len)
-                    stones += [[int(q), int(r), attacker, plies + 3 + i] for i, (q, r) in enumerate(threat)]
-                    plies += 2 + len(threat)
+                    stones += [[int(q), int(r), attacker, plies + local.remaining + 1 + i] for i, (q, r) in enumerate(threat)]
+                    plies += local.remaining + len(threat)
                 break
             if node['kind'] == 'defender_replies':
                 reply = min(node['responses'], key=lambda r: (-proof.turns(r['child']), near(r)))
@@ -624,10 +636,13 @@ def glimpse(tree):
         return None
     policy = policy / policy.sum()
     top = top_rows(actions, policy, stats['completed_q'])
-    return dict(top=top, value=round((float(policy @ values) + 1) / 2, 4), completed=int(stats['completed']))
+    refuted = bool(top) and all(row[4] < 0 for row in top) and not stats.get('proven')
+    value = stats['node_value'] if refuted else float(policy @ values)
+    return dict(top=top, value=round((value + 1) / 2, 4), completed=int(stats['completed']),
+                refuted=len(top) if refuted else 0)
 
 
-def solve(prover, history, solver_nodes, watch=lambda n: None):
+def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
     """What the solver knows of `history` for `evaluate`: `moves` and `pv` (see `principal_variation`) of a proven
     win for the side to move, its certificate tightened to the fewest attacker turns the budget allows, `proof`
     ({winner, turns, plies} or None), `threat` (the stones of the opponent's forced win if it moved now), `solved`
@@ -637,22 +652,51 @@ def solve(prover, history, solver_nodes, watch=lambda n: None):
         return found
     history = [tuple(map(int, p)) for p in history]
     game = replay(history)
-    player = game.player
+    player, remaining = game.player, game.remaining
     game.close()
     deadline = min(60_000, max(10_000, solver_nodes // 8))
+    limited, cells = [], 0
+    for fact in known:
+        if len(limited) >= 4096 or cells + len(fact['history']) > 200_000:
+            break
+        limited.append(fact)
+        cells += len(fact['history'])
+    known = limited
+    premises = [{k: fact[k] for k in ('history', 'winner', 'plies')} for fact in known]
+    options = dict(known=premises) if premises else {}
     mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=deadline,
-                                                shortest=True), watch, prover.abort)
+                                                shortest=True, **options), watch, prover.abort)
     found.update(solved=searched(mine), used=mine.get('nodes_used', 0))
-    if verified(mine):
-        pv, plies = principal_variation(history, mine.get('certificate') or json.loads(mine['certificate_json']))
+    if verified(mine) and mine['moves']:
+        pv, plies = principal_variation(history, mine.get('certificate') or json.loads(mine['certificate_json']), known=known)
         found.update(moves=[list(m) for m in mine['moves']], pv=pv,
                      proof=dict(winner=player, turns=mine['proof_turns'], plies=plies))
         return found
-    theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline),
+    theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline, **options),
                            watch, prover.abort)
     found.update(solved=found['solved'] and searched(theirs), used=found['used'] + theirs.get('nodes_used', 0))
     if verified(theirs):
         found['threat'] = [list(m) for m in theirs['moves']]
+    if not verified(theirs) and not known:
+        return found
+    # The real defender root can use graph facts even when the flipped-turn
+    # proposal search did not find a threat within its budget.
+    defended = interruptible(lambda: prover.history(history, attacker='defender', nodes=solver_nodes, ms=deadline,
+                                                   **options), watch, prover.abort)
+    found.update(solved=found['solved'] and searched(defended), used=found['used'] + defended.get('nodes_used', 0))
+    if defended.get('status') == 'PROVEN_LOSS' and defended.get('native_verified'):
+        cert = defended.get('certificate') or json.loads(defended['certificate_json'])
+        pv, _ = principal_variation(history, cert, attacker=1-player, known=known)
+        dependencies = defended.get('dependencies', [])
+        indices = {d['fact']: i for i, d in enumerate(dependencies)}
+        cert = dict(cert, nodes=[dict(n, fact=indices[n['fact']]) if n['kind'] == 'exact' else n for n in cert['nodes']])
+        dependencies = [dict(fact=i, outcome=d['outcome']) for i, d in enumerate(dependencies)]
+        # The line can stop at an exact premise or an unstoppable fork without
+        # a displayed witness. Keep the verified worst-case bound, not its prefix.
+        plies = remaining + 2 + 4 * (defended['proof_turns'] - 1)
+        found.update(pv=pv, proof=dict(winner=1-player, turns=defended['proof_turns'], plies=plies,
+                                     certificate=cert, dependencies=dependencies,
+                                     solver_build=defended.get('build_hash')))
     return found
 
 
@@ -711,8 +755,15 @@ class Proofs:
         witnessed = lambda line: bool(line) and all(len(stone) == 4 for stone in line)
         if old is None or old['winner'] == winner and (plies, not witnessed(pv)) < (old['plies'], not witnessed(old['pv'])):
             stones = frozenset((q, r, player_at(i)) for i, (q, r) in enumerate(history))
-            self.entries[key] = dict(winner=int(winner), plies=int(plies), pv=pv, stones=stones)
+            self.entries[key] = dict(history=[list(p) for p in history], winner=int(winner), plies=int(plies), pv=pv, stones=stones)
             self.sizes.setdefault(len(history), set()).add(key)
+
+    def facts(self, history):
+        """Exact outcomes reachable from this board, nearest positions first."""
+        base = frozenset((int(q), int(r), player_at(i)) for i, (q, r) in enumerate(history))
+        with self.lock:
+            entries = sorted((e for e in self.entries.values() if base <= e['stones']), key=lambda e: len(e['history']))
+            return [{k: e[k] for k in ('history', 'winner', 'plies', 'pv')} for e in entries[:2048]]
 
     def edges(self, history):
         """{(q, r): (winner, distance, outcome)} for each stone from `history` whose position is proven: in the
@@ -850,6 +901,7 @@ class TurnSearch:
         self.moves, self.pv, self.proof = list(solved['moves']), solved['pv'], solved['proof']
         self.threat, self.solved, self.solver_used = solved['threat'], solved['solved'], solved['used']
         self.given, self.top, self.value, self.completed, self.tree = bool(self.moves), [], None, 0, None
+        self.node_value = None
         self.later, self.played = [], 0
         self.trees = trees or self.advanced
         self.known = known
@@ -876,6 +928,8 @@ class TurnSearch:
             return None, 0
         cells = [tuple(cell[:2]) for cell in self.local.cells]
         tree, simulations = self.trees(cells, self.simulations, self.network)
+        if self.proof is not None and self.proof['winner'] != self.player:
+            tree.prove_loss(self.proof['winner'], max(1, self.proof['plies'] - self.played))
         edges = self.known.edges(cells) if self.known is not None else {}
         if edges:
             tree.expand()
@@ -913,6 +967,7 @@ class TurnSearch:
         rows = top_rows(actions, policy, values, lead=stone, won=self.given)
         if not self.played:
             self.top, self.value = rows, (stone_value + 1) / 2
+            self.node_value = (result.get('node_value', stone_value) + 1) / 2 if result is not None else self.value
         else:
             if self.given:
                 exact = dict(self.proof, plies=self.proof['plies'] - self.played)
@@ -933,13 +988,16 @@ class TurnSearch:
             stats = self.tree.result(0, 0, 0, 0, choice='policy')
             self.top = top_rows(stats['actions'], stats['policy'], stats['completed_q'], lead=self.moves[0])
             self.value = (root_value(stats, self.player) + 1) / 2
+            self.node_value = (stats['node_value'] + 1) / 2
         value = (1. if self.proof['winner'] == self.player else 0.) if self.proof else self.value
+        if self.top and all(len(r) > 4 and r[4] < 0 for r in self.top) and not self.proof:
+            value = self.node_value
         pv = self.pv or ([[*m, self.player, i + 1] for i, m in enumerate(self.moves)] if self.proof else [])
         extended = self.known is not None and pv and not self.pv
         after = self.known.known([*self.history, *map(tuple, self.moves)]) if extended else None
         if after is not None and after['winner'] == self.proof['winner']:
             pv = pv + [[*p[:3], p[3] + len(self.moves)] for p in after['pv']]
-        return dict(moves=self.moves, value=round(value, 4), top=self.top, proof=self.proof, pv=pv,
+        return dict(moves=self.moves, value=round(value, 4), node_value=self.node_value, top=self.top, proof=self.proof, pv=pv,
                     threat=self.threat, solved=self.solved, ms=round((time.perf_counter() - self.start) * 1000),
                     actual_completed=self.completed,
                     actual_solver_nodes=self.solver_used + (self.proofs.used if self.proofs else 0), later=self.later)
@@ -989,8 +1047,22 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     if (found := answered(history, known)) is not None:
         return found
     proofs = SearchProofs(prover, leaf_nodes, watch, leaf_ms) if prover is not None and leaf_nodes and simulations else None
-    turn = TurnSearch(bubble, Watched(bubble.evaluator, observe), history, simulations,
-                      solved or solve(prover, history, solver_nodes, watch), trees, q_range_floor, known, proofs)
+    network = Watched(bubble.evaluator, observe)
+    facts = known.facts(history) if known is not None else []
+    if trees is not None:
+        tree, _ = trees(history, simulations, network)
+        # Native facts and persisted proof-table facts use the same rule identity.
+        merged = {proof_key(f['history']): f for f in tree.facts()}
+        for fact in facts:
+            key = proof_key(fact['history'])
+            old = merged.get(key)
+            if old is not None and old['winner'] != fact['winner']:
+                raise ValueError('Contradictory graph and stored proofs')
+            if old is None or fact['plies'] <= old['plies']:
+                merged[key] = fact
+        facts = sorted(merged.values(), key=lambda f: len(f['history']))[:2048]
+    turn = TurnSearch(bubble, network, history, simulations,
+                      solved or solve(prover, history, solver_nodes, watch, facts), trees, q_range_floor, known, proofs)
     try:
         while (asked := turn.request()) is not None:
             tree, count = asked
@@ -1023,7 +1095,7 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
         def ask(history):
             prover = free.get()
             try:
-                return solve(prover, history, solver_nodes, watch)
+                return solve(prover, history, solver_nodes, watch, known.facts(history) if known is not None else ())
             finally:
                 free.put(prover)
 
@@ -1149,12 +1221,6 @@ class Engines:
             trees = self.game_graph(bubble, game, build, floor, share, used=used)
             solved = dict(moves=[], pv=[], proof=None, threat=refresh.get('threat') or [], solved=True, used=0)
         elif line is not None or game is not None:
-            if keep and answered(history, known) is None:
-                if self.kept is None or self.kept[0] != (bubble.sha256, position_text(history), build):
-                    self.kept = (bubble.sha256, position_text(history), build), None
-                if not (self.kept[1] and self.kept[1]['proof']):
-                    self.kept = self.kept[0], solve(solver, history, spent['solver_nodes'], watch)
-                solved = self.kept[1]
             trees = self.game_graph(bubble, game if line is None else ('seat', line), build, floor, keep=keep, used=used)
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
                          solved, floor, known, pv_check=PV_CHECK if trees else 0.)
@@ -1820,6 +1886,9 @@ class Session:
         rows.sort(key=lambda row: (1 - flag(row), edges.get(tuple(row[:2]), (0, math.inf))[1] if flag(row) > 0 else 0,
                                    flag(row) > 0 and played is not None and tuple(row[:2]) != tuple(played)))
         shown['top'] = rows[:5]
+        shown['refuted'] = len(shown['top']) if shown['top'] and all(flag(r) < 0 for r in shown['top']) and not shown.get('proof') else 0
+        if shown['refuted'] and shown.get('node_value') is not None:
+            shown['value'] = shown['node_value']
         return shown
 
     def state(self):
@@ -1837,7 +1906,7 @@ class Session:
                 played = history[ply] if ply < len(history) else None
                 if (found := self.proven(history[:ply], self.lookup(history[:ply], keys), played)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
-                                        ('value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes')}
+                                        ('value', 'node_value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes', 'refuted')}
                     if self.stale(found, ply):
                         stale.append(ply)
             device = getattr(self.engines, 'device', 'cpu')

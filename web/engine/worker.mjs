@@ -10,7 +10,7 @@ import createModule from './gumbel.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameGraphs, PV_CHECK} from './search.mjs';
 import {Network, probe, runtime} from './network.mjs';
 import {Stages, errorReport, stall} from './stages.mjs';
-import {principalVariation, topRows, Proofs, answered, settled, proofTurns} from './proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey} from './proof.mjs';
 
 const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 'defender counterwin',
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
@@ -85,8 +85,10 @@ const searched = r => verified(r) || VERDICTS.has(r.reason);
 function rootRows(tree, choice) {
   const {action, actions, policy, values, completed_q} = tree.result(choice);
   if (!action) return null;
-  const value = policy.reduce((sum, p, i) => sum + p * values[i], 0);
-  return {value: Math.round((value + 1) / 2 * 1e4) / 1e4, top: topRows(actions, policy, completed_q, action)};
+  const top = topRows(actions, policy, completed_q, action);
+  const refuted = top.length && top.every(row => row[4] < 0) && tree.m._hxg_exact(tree.ptr) < 0;
+  const value = refuted ? tree.m._hxg_value(tree.ptr) : policy.reduce((sum, p, i) => sum + p * values[i], 0);
+  return {value: Math.round((value + 1) / 2 * 1e4) / 1e4, top, refuted: refuted ? top.length : 0};
 }
 
 /** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms),
@@ -122,7 +124,24 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   const table = known ? new Proofs(known) : null, given = answered(native, history, table);
   if (given) return {...given, ms: Math.round(performance.now() - start)};
   let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null, touched = null;
-  let failure = null;
+  if (line != null) tree = games.graph(line, history, {seed: 1740, tactics: true, qRangeFloor, model: network.version});
+  const merged = new Map((tree?.facts() || []).map(f => [proofKey(f.history), f]));
+  const base = history.map(([q, r], i) => `${q},${r},${((i + 1) >> 1) % 2}`);
+  for (const fact of table?.list() || []) {
+    const stones = new Set(fact.history.map(([q, r], i) => `${q},${r},${((i + 1) >> 1) % 2}`));
+    if (!base.every(s => stones.has(s))) continue;
+    const key = proofKey(fact.history), old = merged.get(key);
+    if (old && old.winner !== fact.winner) throw new Error('Contradictory graph and stored proofs');
+    if (!old || fact.plies <= old.plies) merged.set(key, fact);
+  }
+  const facts = [];
+  let cells = 0;
+  for (const fact of [...merged.values()].sort((a, b) => a.history.length - b.history.length)) {
+    if (facts.length >= 2048 || cells + fact.history.length > 200000) break;
+    facts.push(fact); cells += fact.history.length;
+  }
+  const premises = facts.map(({history, winner, plies}) => ({history, winner, plies}));
+  let failure = null, nodeValue = null;
   const note = r => { if (r.reason?.startsWith(FAILED)) failure = r.reason; return r; };
   const timed = ms != null, end = start + (ms ?? 0), solverEnd = start + .25 * (ms ?? 0);
   const deadline = Math.min(60000, Math.max(10000, Math.floor(solverNodes / 8)));
@@ -143,22 +162,36 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   } : null;
   try {
     if (solverNodes) {
-      const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true}));
+      const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true, known: premises}));
       check();
       solved = searched(mine);
       solverUsed += mine.nodes_used || 0;
-      if (verified(mine)) {
+      if (verified(mine) && mine.moves.length) {
         moves = mine.moves.map(m => [...m]);
-        const found = principalVariation(native, history, mine.certificate);
+        const found = principalVariation(native, history, mine.certificate, {known: facts});
         pv = found.pv;
         proof = {winner: player, turns: mine.proof_turns, plies: found.plies};
         top = [[...moves[0], 1, 1, 1]];
       } else {
-        const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs()}));
+        const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs(), known: premises}));
         check();
         solved = solved && searched(theirs);
         solverUsed += theirs.nodes_used || 0;
         if (verified(theirs)) threat = theirs.moves.map(m => [...m]);
+        if ((verified(theirs) || premises.length) && (!timed || performance.now() < solverEnd)) {
+          const defended = note(await solve(id, history, {attacker: 'defender', nodes: solverNodes, ms: solverMs(), known: premises}));
+          check();
+          const lost = defended.status === 'PROVEN_LOSS' && defended.native_verified;
+          solved = solved && (lost || searched(defended));
+          solverUsed += defended.nodes_used || 0;
+          if (lost) {
+            pv = principalVariation(native, history, defended.certificate, {attacker: 1 - player, known: facts}).pv;
+            const dependencies = defended.dependencies || [], indices = new Map(dependencies.map((d, i) => [d.fact, i]));
+            const certificate = {...defended.certificate, nodes: defended.certificate.nodes.map(n => n.kind === 'exact' ? {...n, fact: indices.get(n.fact)} : n)};
+            proof = {winner: 1 - player, turns: defended.proof_turns, plies: state.remaining + 2 + 4 * (defended.proof_turns - 1),
+              certificate, dependencies: dependencies.map((d, i) => ({fact: i, outcome: d.outcome})), solver_build: defended.build_hash};
+          }
+        }
       }
     }
     const outcome = proof === null ? table?.known(history) : null;
@@ -183,6 +216,10 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       if (simulations) {
         tree ??= line == null ? new NeuralSearch(native, {seed: 1740, tactics: true, qRangeFloor, history: current})
           : games.graph(line, current, {seed: 1740, tactics: true, qRangeFloor, model: network.version});
+        if (proof && proof.winner !== player) {
+          tree.proveLoss(proof.winner, Math.max(1, proof.plies - moves.length));
+          if (line != null) touched = tree.id;
+        }
         const evaluate = leaves => network.evaluate(leaves), edges = table ? table.edges(current) : new Map();
         // `touched` names the game graph once this turn changed its statistics: marks settled, or a batch backed up.
         const unmarked = await tree.settle(edges, {evaluate, cache, version: network.version});
@@ -199,6 +236,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         completed += result.completed;
         if (result.action) {
           ({action, policy, actions, completed_q: values} = result);
+          if (!moves.length) nodeValue = (result.node_value + 1) / 2;
           stoneValue = result.proven ? result.proven : result.exact_winner >= 0 ? (result.exact_winner === local.player ? 1 : -1)
             : policy.reduce((sum, p, i) => sum + p * result.values[i], 0);
           if (proof === null && (result.proven > 0 || (result.proven < 0 && !moves.length))) {
@@ -221,14 +259,16 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       const root = tree.result(choice);
       top = topRows(root.actions, root.policy, root.completed_q, moves[0]);
       value = (root.policy.reduce((sum, p, i) => sum + p * root.values[i], 0) + 1) / 2;
+      nodeValue = (root.node_value + 1) / 2;
     }
     if (proof) value = proof.winner === player ? 1 : 0;
+    if (!proof && top.length && top.every(row => row[4] < 0) && nodeValue != null) value = nodeValue;
     if (proof && !pv.length) {
       const after = table?.known([...history, ...moves]);
       pv = moves.map(([q, r], i) => [q, r, player, i + 1]);
       if (after?.winner === proof.winner) pv.push(...after.pv.map(([q, r, side, ply]) => [q, r, side, ply + moves.length]));
     }
-    return {moves, value: Math.round(value * 1e4) / 1e4, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
+    return {moves, value: Math.round(value * 1e4) / 1e4, node_value: nodeValue, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
       actual_completed: completed, actual_solver_nodes: solverUsed, graph_id: touched,
       ...(failure ? {solver_error: failure} : {})};
   } catch (error) {

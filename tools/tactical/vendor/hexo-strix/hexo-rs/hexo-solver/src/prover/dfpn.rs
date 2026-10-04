@@ -266,6 +266,12 @@ impl<'a> Dfpn<'a> {
     /// budget, so reuse across horizons is sound. Returns `None` on no hit.
     #[inline]
     fn hint_val(&mut self, node: Node, remaining: Option<u8>) -> Option<(u32, u32)> {
+        if let Some((_, won, _)) = self.k.exact(node, remaining) {
+            let key = node_key_at(self.k.hash(), node, remaining);
+            let (pn, dn) = if won { self.proven.insert(key); (0, INF) } else { (INF, 0) };
+            self.tt.store(key, pn, dn, 1);
+            return Some((pn, dn));
+        }
         let (hints, turns) = (self.hints.as_ref()?, remaining?);
         let (is_or, placements) = node.tag();
         let hash = self.k.hash();
@@ -911,7 +917,8 @@ pub(crate) fn solve_mode_at_guided(
         // proven inside a *discarded* level-2 PN tree, so their children aren't in
         // the proven set and this walk can come up short — fall back to the kernel
         // solver's own PV, which is guaranteed valid for a genuinely forced win.
-        if res.pv.is_empty() && !ctl.expired()
+        let external = res.certificate.as_ref().is_some_and(|c| c.nodes.iter().any(|n| matches!(n, super::certificate::ProofNode::Exact { .. })));
+        if res.pv.is_empty() && !external && !ctl.expired()
             && let Some(pv_ctx) = KernelCtx::new_wide(
             &pos.stones,
             pos.attacker,
@@ -928,7 +935,7 @@ pub(crate) fn solve_mode_at_guided(
                 res.depth = Some(turns);
             }
         }
-        if res.pv.is_empty() {
+        if res.pv.is_empty() && !external {
             if let Some((pv, depth)) = kernel_pv(pos, cfg, ctl) {
                 res.pv = pv;
                 res.depth = Some(depth);

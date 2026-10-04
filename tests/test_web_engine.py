@@ -373,6 +373,20 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_worker_proves_a_defender_root_from_saved_exact_replies(self):
+        from tests.test_tactical_proof import OPEN_THREE
+        history = OPEN_THREE + [[-1, 0], [2, 1]]
+        known = [dict(history=history+[list(p)], winner=0, plies=23, pv=[])
+                 for p in ((-3, 0), (-2, 0), (3, 0), (4, 0))]
+        found = node(dict(kind='worker-turn', history=history, simulations=16, nodes=1, known=known))
+        self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
+        self.assertTrue(found['proof']['dependencies'])
+        self.assertTrue(all(row[4] < 0 for row in found['top']))
+        local = play.principal_variation(history, found['proof']['certificate'], attacker=0, known=known)
+        web = node(dict(kind='pv', history=history, certificate=found['proof']['certificate'],
+                        options=dict(attacker=0, known=known)))
+        self.assertEqual(web, dict(pv=local[0], plies=local[1]))
+
     def test_live_values_stay_at_the_requested_root_during_reply_checks(self):
         history = [[0, 0], [1, 0], [1, 1], [-1, 0]]
         for length in (1, 2, 3, 4):

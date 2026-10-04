@@ -189,7 +189,7 @@ def solve(game, *, deadline, node_limit=10000, attack_turns=3, width=8):
             "elapsed_ms": (perf_counter()-start)*1000, "reason": reason}
 
 
-def verify(certificate, history, *, deadline=None):
+def verify(certificate, history, *, deadline=None, known=()):
     """Independent raw-board checker; return certified root status, raise ValueError for an invalid certificate or
     VerificationTimeout once perf_counter() reaches `deadline`.
 
@@ -265,6 +265,19 @@ def verify(certificate, history, *, deadline=None):
             require(winner == attacker)
             return
         require(winner == -1)
+        if kind == 'exact':
+            index = node['fact']
+            require(type(index) is int and 0 <= index < len(known))
+            fact = known[index]
+            prior = {}, 0, -1
+            for point in fact['history']:
+                prior = play(*prior, point)
+            if node.get('after'):
+                require(phase(prior[1])[0] != attacker and len(node['after']) == phase(prior[1])[1])
+                prior = fullturn(prior, node['after'])
+            require(prior[2] == -1 and prior[0] == board and phase(prior[1]) == phase(n))
+            require(fact['winner'] == attacker and type(fact['plies']) is int and fact['plies'] > 0)
+            return
         if kind == "move":
             require(side == attacker)
             walk(node["child"], fullturn(state, node["moves"]))

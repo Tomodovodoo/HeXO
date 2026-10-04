@@ -72,6 +72,58 @@ class NativeStrategy(unittest.TestCase):
         with self.assertRaises(VerificationTimeout):
             independent_verify(result['certificate'], OPEN_THREE, deadline_seconds=0)
 
+    def test_defender_root_reuses_the_three_exact_open_four_covers(self):
+        history = OPEN_THREE + [[-1, 0], [2, 1]]
+        cold = self.engine.history(history, attacker='defender', nodes=10000, ms=5000)
+        self.assertEqual(cold['status'], 'PROVEN_LOSS')
+        self.assertEqual(independent_verify(cold['certificate'], history, attacker='defender'), 'PROVEN_LOSS')
+        replies = cold['certificate']['nodes'][0]['responses']
+        self.assertEqual({tuple(map(tuple, r['action'])) for r in replies},
+                         {((-3, 0), (3, 0)), ((-2, 0), (3, 0)), ((-2, 0), (4, 0))})
+        known = [dict(history=history+r['action'], winner=0, plies=4*cold['proof_turns']) for r in replies]
+        # A one-node budget cannot re-solve the covers. All three are graph terminals.
+        warm = self.engine.history(history, attacker='defender', known=known, nodes=1, ms=1000, table_mb=4)
+        self.assertEqual((warm['status'], warm['exact_hits'], warm['nodes_fresh']), ('PROVEN_LOSS', 3, 0))
+        self.assertEqual(len(warm['certificate']['nodes']), 4)
+        self.assertEqual(independent_verify(warm['certificate'], history, attacker='defender', known=known), 'PROVEN_LOSS')
+        for premises in ([], known[:2], [dict(k, winner=1) for k in known]):
+            rejected = self.engine.history(history, attacker='defender', known=premises,
+                                           certificate=warm['certificate'], nodes=1, ms=1000)
+            self.assertEqual(rejected['status'], 'UNKNOWN')
+            with self.assertRaises(ValueError):
+                independent_verify(warm['certificate'], history, attacker='defender', known=premises)
+        # A subsequent query cannot use the preceding snapshot's resident or result cache.
+        fresh = self.engine.history(history, attacker='defender', nodes=1, ms=1000, table_mb=4)
+        self.assertEqual(fresh['status'], 'UNKNOWN')
+        half = history + [[-2, 0]]
+        result = self.engine.history(half, attacker='defender', known=known, nodes=1, ms=1000)
+        self.assertEqual((result['status'], result['exact_hits']), ('PROVEN_LOSS', 2))
+        self.assertEqual(independent_verify(result['certificate'], half, attacker='defender', known=known), 'PROVEN_LOSS')
+        immediate = history + [[0, 1]]
+        result = self.engine.history(immediate, attacker='defender', nodes=1, ms=1000)
+        self.assertEqual(result['status'], 'PROVEN_LOSS')
+        self.assertEqual(independent_verify(result['certificate'], immediate, attacker='defender'), 'PROVEN_LOSS')
+        # The graph need not have allocated second-stone children of a refuted first stone.
+        firsts = [dict(history=history+[list(p)], winner=0, plies=4*cold['proof_turns']+1)
+                  for p in {tuple(p) for r in replies for p in r['action']}]
+        result = self.engine.history(history, attacker='defender', known=firsts, nodes=1, ms=1000)
+        self.assertEqual((result['status'], result['nodes_fresh']), ('PROVEN_LOSS', 0))
+        self.assertEqual(independent_verify(result['certificate'], history, attacker='defender', known=firsts), 'PROVEN_LOSS')
+        self.assertTrue(all(len(n['after']) == 1 for n in result['certificate']['nodes'] if n['kind'] == 'exact'))
+        self.assertEqual(self.engine.history(NO_THREAT, attacker='defender', nodes=100, ms=1000)['status'], 'UNKNOWN')
+
+    def test_attacker_search_and_verifier_use_interior_graph_terminals(self):
+        post = OPEN_THREE + [[-1, 0], [2, 1]]
+        proven = self.engine.history(post, attacker='defender', nodes=10000, ms=5000)
+        self.assertEqual(proven['status'], 'PROVEN_LOSS')
+        known = [dict(history=post, winner=0, plies=4*proven['proof_turns']+2)]
+        result = self.engine.history(OPEN_THREE, known=known, nodes=1000, ms=2000)
+        self.assertEqual(result['status'], 'PROVEN_WIN')
+        self.assertGreater(result['exact_hits'], 0)
+        self.assertEqual(independent_verify(result['certificate'], OPEN_THREE, known=known), 'PROVEN_WIN')
+        with self.assertRaises(ValueError):
+            independent_verify(result['certificate'], OPEN_THREE)
+
     def test_cooperative_cancel_keeps_native_worker_available(self):
         engine = NativeTactics()
         self.assertFalse(engine.cancel())
