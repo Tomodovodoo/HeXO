@@ -66,6 +66,7 @@ struct Loop {
  std::unordered_map<uint64_t,std::shared_ptr<Job>> live;size_t capacity,cursor=0;int slice,table;bool stopping=false,enabled=true,stamps=false;
  uint64_t next=0,ticks=0,submitted=0,started=0,finished=0,installed=0,cancelled=0,pruned=0,unknown=0,fresh=0,missing_fresh=0,snapshot_ns=0,install_ns=0;
  std::deque<std::string> records;
+ std::string released_effort;
  Loop(owner::Pool& source,const uint64_t* functions,int count,int queue,int ms,int mb,int tasks,bool use_stamps):pool(source),api(functions),capacity(queue),slice(ms),table(mb),stamps(use_stamps){
   if(pool.proof_owner || count<1 || count>16 || queue<count || queue>128 || ms<1 || ms>1000 || mb<1 || mb>64 || tasks<8 || tasks>4096)throw std::runtime_error("Invalid native proof loop limits");
   frontiers.reserve(pool.games.size());for(size_t i=0;i<pool.games.size();++i)frontiers.emplace_back(tasks);
@@ -73,10 +74,12 @@ struct Loop {
    for(int i=0;i<count;++i){auto worker=std::make_unique<Worker>();worker->native=api.make();if(!worker->native)throw std::runtime_error("Could not create native proof worker");workers.push_back(std::move(worker));}
    for(size_t i=0;i<workers.size();++i)workers[i]->thread=std::thread([this,i]{run(i);});
   }catch(...){shutdown();throw;}
-  for(auto& game:pool.games){game->game->evidence_owner=this;game->game->evidence=[](void* p,Tree& t,const gumbel::Path& path){static_cast<Loop*>(p)->observe(t,path);};}
+  for(size_t i=0;i<pool.games.size();++i)bind(int(i));
   pool.proof_owner=this;pool.proof_step=[](void* p){static_cast<Loop*>(p)->step();};pool.proof_retarget=[](void* p,int i){static_cast<Loop*>(p)->retarget(i);};
+  pool.proof_bind=[](void* p,int i){static_cast<Loop*>(p)->bind(i);};
  }
- ~Loop(){shutdown();for(auto& game:pool.games){game->game->evidence=nullptr;game->game->evidence_owner=nullptr;}pool.proof_owner=nullptr;pool.proof_step=nullptr;pool.proof_retarget=nullptr;}
+ ~Loop(){shutdown();for(auto& game:pool.games){game->game->evidence=nullptr;game->game->evidence_owner=nullptr;}pool.proof_owner=nullptr;pool.proof_step=nullptr;pool.proof_retarget=nullptr;pool.proof_bind=nullptr;}
+ void bind(int game){auto& store=*pool.games[game]->game;store.evidence_owner=this;store.evidence=[](void* p,Tree& t,const gumbel::Path& path){static_cast<Loop*>(p)->observe(t,path);};}
  void mark(Job& job,bool obsolete=false){
   if(!job.cancelled){job.cancelled=true;++cancelled;}if(obsolete && !job.pruned){job.pruned=true;++pruned;}
   for(auto& worker:workers)if(worker->active.get()==&job && worker->token)api.cancel(worker->token);
@@ -189,7 +192,7 @@ struct Loop {
     publish(view,view.board,{player,player,distance,int(job.history.size()),true,{{first,player,distance,true}}});view.proof_root();
    }else if(!hxg_prove_loss(&view,1-player,4*int(job.info[2])+2))throw std::runtime_error(gumbel::error);
    f.remember(job.history,*view.root);f.tasks.erase(task.key);++installed;
-   if(!job.result.empty()){records.push_back("{\"id\":"+std::to_string(job.id)+",\"game\":"+std::to_string(job.game)+",\"request\":"+job.context+",\"result\":"+job.result+'}');if(records.size()>512)records.pop_front();}
+   if(!job.result.empty()){records.push_back("{\"id\":"+std::to_string(job.id)+",\"game\":"+std::to_string(job.game)+",\"generation\":"+std::to_string(job.generation)+",\"request\":"+job.context+",\"result\":"+job.result+'}');if(records.size()>512)records.pop_front();}
   }else{
    ++unknown;++task.attempts[job.side];task.worker=job.worker;task.cost=.5*task.cost+.5*job.elapsed;task.change=0;
    if(job.facts==f.revision && job.info[8] && job.info[6]>=1073741824 && job.info[7]==0)task.closed|=1<<job.side;
@@ -210,6 +213,14 @@ struct Loop {
   admit();
  }
  void retarget(int game){auto& f=frontiers[game];++f.generation;f.tasks.clear();std::lock_guard lock(mutex);for(auto& [id,job]:live)if(job->game==size_t(game))mark(*job,true);}
+ const char* release(int game){
+  {std::lock_guard lock(mutex);for(auto& [id,job]:live)if(job->game==size_t(game))return nullptr;}
+  auto& f=frontiers[game];released_effort="[";int count=0;
+  for(auto [generation,e]:f.effort){if(count++)released_effort+=',';released_effort+='['+std::to_string(generation)+','+std::to_string(e.fresh)+','+std::to_string(e.queries)+','+std::to_string(e.missing)+']';}
+  released_effort+=']';f.effort.clear();f.tasks.clear();f.facts.clear();f.fact_order.clear();f.next=f.offers=0;++f.revision;
+  auto& store=*pool.games[game]->game;store.evidence=nullptr;store.evidence_owner=nullptr;
+  return released_effort.c_str();
+ }
  void cancel_all(){std::lock_guard lock(mutex);enabled=false;for(auto& [id,job]:live)mark(*job);wake.notify_all();}
  void resume(){std::lock_guard lock(mutex);enabled=true;}
  void drain(){cancel_all();for(;;){collect();std::unique_lock lock(mutex);if(live.empty())break;wake.wait(lock,[&]{return !done.empty();});}}
@@ -230,4 +241,5 @@ extern "C" HX_API void hxp_stats(void* p,uint64_t* out,double* times){auto& loop
  std::array<uint64_t,16> values{loop.ticks,loop.submitted,loop.started,loop.finished,loop.installed,loop.cancelled,loop.pruned,loop.unknown,loop.fresh,loop.missing_fresh,uint64_t(loop.queued.size()),active,uint64_t(loop.done.size()),tasks,facts,uint64_t(loop.records.size())};std::copy(values.begin(),values.end(),out);times[0]=service;times[1]=idle;times[2]=loop.snapshot_ns/1e6;times[3]=loop.install_ns/1e6;}
 extern "C" HX_API const char* hxp_record(void* p,int i){auto& records=static_cast<proving::Loop*>(p)->records;return i<0 || i>=int(records.size())?nullptr:records[i].c_str();}
 extern "C" HX_API uint64_t hxp_generation(void* p,int game){return static_cast<proving::Loop*>(p)->frontiers.at(game).generation;}
+extern "C" HX_API const char* hxp_release(void* p,int game){return static_cast<proving::Loop*>(p)->release(game);}
 extern "C" HX_API int hxp_effort(void* p,int game,uint64_t* out){auto& f=static_cast<proving::Loop*>(p)->frontiers.at(game);int i=0;for(auto [generation,e]:f.effort){if(out){std::array<uint64_t,4> row{generation,e.fresh,e.queries,e.missing};std::copy(row.begin(),row.end(),out+4*i);}++i;}return i;}
