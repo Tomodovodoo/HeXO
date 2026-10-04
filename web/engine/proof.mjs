@@ -93,6 +93,13 @@ export function topRows(actions, policy, values, lead) {
 const sideAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 const shifted = (pv, by) => pv.map(([q, r, side, ply]) => [q, r, side, ply + by]);
 
+/** Compact a query's used premises for saving and later independent checking. */
+export function proofEvidence(result) {
+  const dependencies = result.dependencies || [], indices = new Map(dependencies.map((d, i) => [d.fact, i]));
+  const certificate = {...result.certificate, nodes: result.certificate.nodes.map(n => n.kind === 'exact' ? {...n, fact: indices.get(n.fact)} : n)};
+  return {certificate, dependencies: dependencies.map((d, i) => ({fact: i, outcome: d.outcome})), solver_build: result.build_hash};
+}
+
 /** The winner's turns in a proof `plies` placements long from a position whose mover has `remaining` stones left
  * (python/play.py proof_turns). */
 export function proofTurns(plies, remaining, moverWins) {

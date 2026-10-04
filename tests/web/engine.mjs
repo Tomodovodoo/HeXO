@@ -26,7 +26,7 @@ import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, PV_CHECK} from '../../web/engine/search.mjs';
-import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey} from '../../web/engine/proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
 import {defaultThreads} from '../../web/engine/network.mjs';
@@ -170,7 +170,7 @@ if (job.kind === 'encode') {
   let graph = null;
   const context = {Native, NeuralSearch, EvaluationCache, PV_CHECK, createModule, principalVariation, topRows,
     GameGraphs: class extends GameGraphs { graph(...args) { return graph = super.graph(...args); } },
-    Proofs, answered, settled, proofTurns, proofKey,
+    Proofs, answered, settled, proofTurns, proofKey, proofEvidence,
     URL, performance, setTimeout, clearTimeout, onmessage: null,
     postMessage: message => messages.push({...message, root: graph?.history.map(p => [...p])}),
     probe: async () => ({provider: 'wasm', precisions: ['fp32']}), runtime: async () => ({env: {wasm: {numThreads: 1}}}),
@@ -204,15 +204,16 @@ if (job.kind === 'encode') {
     : messages.find(m => m.type === 'result').result;
 } else if (job.kind === 'analysis-bar') {
   const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8');
-  answer = job.cases.map(({history, value, live}) => {
+  answer = job.cases.map(({history, value, live, top = [], node_value}) => {
     const elements = new Map(), element = () => ({classList: {toggle() {}}, style: {}, firstChild: {style: {}}, replaceChildren() {}});
+    const evaluation = {value, node_value, top, threat: []};
     const page = {view: history.length, COLORS: ['yellow', 'blue'],
       $: id => { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
-      S: {history, winner: -1, evaluations: live ? {} : {[history.length]: {value, top: [], threat: []}},
-        jobs: live ? [{kind: 'analyse', ply: history.length, status: 'running', live: {value, top: []}}] : []}};
+      S: {history, winner: -1, evaluations: live ? {} : {[history.length]: evaluation},
+        jobs: live ? [{kind: 'analyse', ply: history.length, status: 'running', live: evaluation}] : []}};
     runInNewContext(source.match(/^const playerAt=.*$/m)[0] + '\n' + source.match(/^const pct=.*$/m)[0] + '\n'
       + source.slice(source.indexOf('function liveAt('), source.indexOf('function renderStudy('))
-      + '\nrenderAnalysis.sig = JSON.stringify([view, false, [], []]); renderAnalysis();', page);
+      + '\nconst e=shownEval(view); renderAnalysis.sig = JSON.stringify([view, false, e.top, e.threat, false]); renderAnalysis();', page);
     return {x: elements.get('xv').textContent, o: elements.get('ov').textContent,
       transform: elements.get('evalbar').firstChild.style.transform};
   });

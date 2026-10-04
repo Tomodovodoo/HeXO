@@ -2299,6 +2299,23 @@ class GameProofs(unittest.TestCase):
 
 class PrincipalVariation(unittest.TestCase):
     """`principal_variation` and the solver step of an evaluation."""
+
+    def test_a_known_win_without_a_move_still_finds_and_saves_its_witness(self):
+        from play import solve
+        from tactical_proof import NativeTactics, independent_verify
+        from tests.test_tactical_proof import OPEN_THREE
+        from types import SimpleNamespace
+        engine = NativeTactics()
+        known = [dict(history=OPEN_THREE, winner=0, plies=24, pv=[]),
+                 dict(history=OPEN_THREE+[[-1, 0], [2, 1]], winner=0, plies=20, pv=[])]
+        found = solve(SimpleNamespace(history=engine.history, abort=engine.cancel), OPEN_THREE, 1000, known=known)
+        self.assertTrue(found['moves'])
+        proof = found['proof']
+        self.assertEqual(proof['winner'], 0)
+        self.assertTrue(proof['dependencies'])
+        self.assertEqual(independent_verify(proof['certificate'], OPEN_THREE,
+                                           known=[d['outcome'] for d in proof['dependencies']]), 'PROVEN_WIN')
+
     # Side 1 to move at [(0, 0)]: its two stones, then defender covers lasting one or two more attacker turns (of the
     # two longest, the far one listed first), then an unstoppable fork whose defender stones do not matter.
     CERTIFICATE = dict(root=0, nodes=[

@@ -642,6 +642,17 @@ def glimpse(tree):
                 refuted=len(top) if refuted else 0)
 
 
+def proof_evidence(result, certificate):
+    """Save only used premises, with dense indices so the saved certificate can
+    be checked against its own dependency list after the query is gone."""
+    dependencies = result.get('dependencies', [])
+    indices = {d['fact']: i for i, d in enumerate(dependencies)}
+    certificate = dict(certificate, nodes=[dict(n, fact=indices[n['fact']]) if n['kind'] == 'exact' else n
+                                         for n in certificate['nodes']])
+    return dict(certificate=certificate, dependencies=[dict(fact=i, outcome=d['outcome']) for i, d in enumerate(dependencies)],
+                solver_build=result.get('build_hash'))
+
+
 def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
     """What the solver knows of `history` for `evaluate`: `moves` and `pv` (see `principal_variation`) of a proven
     win for the side to move, its certificate tightened to the fewest attacker turns the budget allows, `proof`
@@ -664,13 +675,19 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
     known = limited
     premises = [{k: fact[k] for k in ('history', 'winner', 'plies')} for fact in known]
     options = dict(known=premises) if premises else {}
+    # A winner alone does not supply the winning turn. Keep searching for its
+    # witness, while still reusing every interior fact.
+    mine_known = [f for f in known if len(f['history']) != len(history) or f['winner'] != player]
+    mine_options = dict(known=[{k: f[k] for k in ('history', 'winner', 'plies')} for f in mine_known]) if mine_known else {}
     mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=deadline,
-                                                shortest=True, **options), watch, prover.abort)
+                                                shortest=True, **mine_options), watch, prover.abort)
     found.update(solved=searched(mine), used=mine.get('nodes_used', 0))
     if verified(mine) and mine['moves']:
-        pv, plies = principal_variation(history, mine.get('certificate') or json.loads(mine['certificate_json']), known=known)
+        cert = mine.get('certificate') or json.loads(mine['certificate_json'])
+        pv, plies = principal_variation(history, cert, known=mine_known)
+        evidence = proof_evidence(mine, cert) if mine.get('dependencies') else {}
         found.update(moves=[list(m) for m in mine['moves']], pv=pv,
-                     proof=dict(winner=player, turns=mine['proof_turns'], plies=plies))
+                     proof=dict(winner=player, turns=mine['proof_turns'], plies=plies, **evidence))
         return found
     theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline, **options),
                            watch, prover.abort)
@@ -687,16 +704,11 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
     if defended.get('status') == 'PROVEN_LOSS' and defended.get('native_verified'):
         cert = defended.get('certificate') or json.loads(defended['certificate_json'])
         pv, _ = principal_variation(history, cert, attacker=1-player, known=known)
-        dependencies = defended.get('dependencies', [])
-        indices = {d['fact']: i for i, d in enumerate(dependencies)}
-        cert = dict(cert, nodes=[dict(n, fact=indices[n['fact']]) if n['kind'] == 'exact' else n for n in cert['nodes']])
-        dependencies = [dict(fact=i, outcome=d['outcome']) for i, d in enumerate(dependencies)]
         # The line can stop at an exact premise or an unstoppable fork without
         # a displayed witness. Keep the verified worst-case bound, not its prefix.
         plies = remaining + 2 + 4 * (defended['proof_turns'] - 1)
         found.update(pv=pv, proof=dict(winner=1-player, turns=defended['proof_turns'], plies=plies,
-                                     certificate=cert, dependencies=dependencies,
-                                     solver_build=defended.get('build_hash')))
+                                     **proof_evidence(defended, cert)))
     return found
 
 

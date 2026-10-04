@@ -386,6 +386,13 @@ class Bundle(unittest.TestCase):
         web = node(dict(kind='pv', history=history, certificate=found['proof']['certificate'],
                         options=dict(attacker=0, known=known)))
         self.assertEqual(web, dict(pv=local[0], plies=local[1]))
+        known = [dict(history=OPEN_THREE, winner=0, plies=24, pv=[]),
+                 dict(history=history, winner=0, plies=20, pv=[])]
+        found = node(dict(kind='worker-turn', history=OPEN_THREE, simulations=16, nodes=1000, known=known))
+        self.assertTrue(found['moves'])
+        self.assertEqual(found['value'], 1.)
+        self.assertEqual(tactical_proof.independent_verify(found['proof']['certificate'], OPEN_THREE,
+                         known=[d['outcome'] for d in found['proof']['dependencies']]), 'PROVEN_WIN')
 
     def test_live_values_stay_at_the_requested_root_during_reply_checks(self):
         history = [[0, 0], [1, 0], [1, 1], [-1, 0]]
@@ -409,6 +416,10 @@ class Bundle(unittest.TestCase):
                 x = case['value'] if play.player_at(len(case['history'])) == 0 else 1 - case['value']
                 self.assertEqual((bar['x'], bar['o']), (round(100 * x), round(100 * (1 - x))))
                 self.assertAlmostEqual(float(bar['transform'][7:-1]), x)
+        cases = [dict(history=history[:2], value=.001 if live else 0, node_value=.001, top=[[2, 2, 1, 0, -1]], live=live)
+                 for live in (True, False)]
+        for bar in node(dict(kind='analysis-bar', cases=cases)):
+            self.assertEqual((bar['x'], bar['o']), ('>99', '<1'))
 
     def test_solver_leaves_prove_a_losing_half_turn(self):
         history = [[0, 0], [4, 0], [7, 0], [-2, 0], [-1, 0], [1, 0], [6, 0], [5, 0], [-1, -1],

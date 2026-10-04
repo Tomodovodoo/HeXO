@@ -10,7 +10,7 @@ import createModule from './gumbel.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameGraphs, PV_CHECK} from './search.mjs';
 import {Network, probe, runtime} from './network.mjs';
 import {Stages, errorReport, stall} from './stages.mjs';
-import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey} from './proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence} from './proof.mjs';
 
 const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 'defender counterwin',
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
@@ -162,15 +162,17 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   } : null;
   try {
     if (solverNodes) {
-      const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true, known: premises}));
+      const mineFacts = facts.filter(f => f.history.length !== history.length || f.winner !== player);
+      const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true,
+        known: mineFacts.map(({history, winner, plies}) => ({history, winner, plies}))}));
       check();
       solved = searched(mine);
       solverUsed += mine.nodes_used || 0;
       if (verified(mine) && mine.moves.length) {
         moves = mine.moves.map(m => [...m]);
-        const found = principalVariation(native, history, mine.certificate, {known: facts});
+        const found = principalVariation(native, history, mine.certificate, {known: mineFacts});
         pv = found.pv;
-        proof = {winner: player, turns: mine.proof_turns, plies: found.plies};
+        proof = {winner: player, turns: mine.proof_turns, plies: found.plies, ...(mine.dependencies?.length ? proofEvidence(mine) : {})};
         top = [[...moves[0], 1, 1, 1]];
       } else {
         const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs(), known: premises}));
@@ -186,10 +188,8 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
           solverUsed += defended.nodes_used || 0;
           if (lost) {
             pv = principalVariation(native, history, defended.certificate, {attacker: 1 - player, known: facts}).pv;
-            const dependencies = defended.dependencies || [], indices = new Map(dependencies.map((d, i) => [d.fact, i]));
-            const certificate = {...defended.certificate, nodes: defended.certificate.nodes.map(n => n.kind === 'exact' ? {...n, fact: indices.get(n.fact)} : n)};
             proof = {winner: 1 - player, turns: defended.proof_turns, plies: state.remaining + 2 + 4 * (defended.proof_turns - 1),
-              certificate, dependencies: dependencies.map((d, i) => ({fact: i, outcome: d.outcome})), solver_build: defended.build_hash};
+              ...proofEvidence(defended)};
           }
         }
       }
